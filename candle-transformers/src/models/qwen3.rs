@@ -282,6 +282,10 @@ impl DecoderLayer {
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
+
+    fn truncate_kv_cache(&mut self, seq_len: usize) {
+        self.self_attn.truncate_kv_cache(seq_len);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +319,12 @@ impl Model {
     fn clear_kv_cache(&mut self) {
         for l in &mut self.layers {
             l.clear_kv_cache();
+        }
+    }
+
+    fn truncate_kv_cache(&mut self, seq_len: usize) {
+        for l in &mut self.layers {
+            l.truncate_kv_cache(seq_len);
         }
     }
 
@@ -389,5 +399,9 @@ impl ModelForCausalLM {
 
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
+    }
+
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) {
+        self.base.truncate_kv_cache(seq_len);
     }
 }
