@@ -216,23 +216,33 @@ impl Qwen3Attention {
         // 4. RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
-        // 5. Decide if we can use Flash Attention (only when cache is empty)
+        // 5. Check if we can use Flash Attention
         let cache_is_empty = self.kv_cache.current_seq_len() == 0;
         let use_flash = self.use_flash_attn && cache_is_empty;
 
-        // 6. Attention with cache population
+        // 6. Attention
         let ctx = if use_flash {
-            // Try Flash Attention, but ALWAYS populate cache afterward
+            // Flash Attention natively supports GQA
             #[cfg(feature = "flash-attn")]
             {
-                match candle_flash_attn::flash_attn(&q, &k, &v, self.head_dim as f32, false) {
+                let q_cont = q.contiguous()?;
+                let k_cont = k.contiguous()?;
+                let v_cont = v.contiguous()?;
+
+                match candle_flash_attn::flash_attn(
+                    &q_cont,
+                    &k_cont,
+                    &v_cont,
+                    self.head_dim as f32,
+                    false,
+                ) {
                     Ok(result) => {
-                        // Flash succeeded! Now populate cache for next time
+                        // Populate cache with original K/V for next time
                         self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
                         result
                     }
                     Err(_) => {
-                        // Flash failed, fall back to standard with cache
+                        // Fallback to standard attention
                         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
                         let k = repeat_kv(k, self.num_kv_groups)?;
                         let v = repeat_kv(v, self.num_kv_groups)?;
@@ -242,14 +252,14 @@ impl Qwen3Attention {
             }
             #[cfg(not(feature = "flash-attn"))]
             {
-                // Flash not available, use standard with cache
+                // Flash not compiled, use standard
                 let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
                 let k = repeat_kv(k, self.num_kv_groups)?;
                 let v = repeat_kv(v, self.num_kv_groups)?;
                 self.standard_attention(&q, &k, &v, attn_mask)?
             }
         } else {
-            // Standard attention with KV cache (incremental generation)
+            // Standard attention with cache
             let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
             let k = repeat_kv(k, self.num_kv_groups)?;
             let v = repeat_kv(v, self.num_kv_groups)?;
