@@ -109,12 +109,14 @@ pub(crate) struct Qwen3Attention {
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
     kv_cache: KvCache,
+    use_flash_attn: bool,
 }
 
 impl Qwen3Attention {
     pub(crate) fn new(
         cfg: &Config,
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
+        use_flash_attn: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
@@ -175,6 +177,7 @@ impl Qwen3Attention {
             hidden_size,
             rotary_emb,
             kv_cache,
+            use_flash_attn,
         })
     }
 
@@ -203,7 +206,7 @@ impl Qwen3Attention {
             .transpose(1, 2)?;
 
         // 3. Per‑head RMSNorm
-        let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
+        let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
         let q_flat = self.q_norm.forward(&q_flat)?;
         let k_flat = self.k_norm.forward(&k_flat)?;
@@ -220,19 +223,49 @@ impl Qwen3Attention {
         let k = repeat_kv(k, self.num_kv_groups)?;
         let v = repeat_kv(v, self.num_kv_groups)?;
 
-        // 7. Attention score
+        // 7. Attention (Flash or Standard)
+        let ctx = if self.use_flash_attn {
+            // Try to use flash attention
+            #[cfg(feature = "flash-attn")]
+            {
+                match candle_flash_attn::flash_attn(&q, &k, &v, self.head_dim as f32, false) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Fallback to standard attention if flash attention fails
+                        self.standard_attention(&q, &k, &v, attn_mask)?
+                    }
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                // Flash attention requested but not compiled in, fallback to standard
+                self.standard_attention(&q, &k, &v, attn_mask)?
+            }
+        } else {
+            // Standard attention explicitly requested
+            self.standard_attention(&q, &k, &v, attn_mask)?
+        };
+
+        // 8. Output proj
+        ctx.transpose(1, 2)?
+            .reshape((b, l, self.hidden_size))?
+            .apply(&self.o_proj)
+    }
+
+    fn standard_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        attn_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
             scores = scores.broadcast_add(m)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
-
-        // 8. Output proj
-        ctx.transpose(1, 2)?
-            .reshape((b, l, self.hidden_size))?
-            .apply(&self.o_proj)
+        probs.matmul(&v)
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -253,8 +286,13 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
+    fn new(
+        cfg: &Config,
+        rotary: Arc<Qwen3RotaryEmbedding>,
+        use_flash_attn: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn = Qwen3Attention::new(cfg, rotary, use_flash_attn, vb.pp("self_attn"))?;
         let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let ln2 = RmsNorm::new(
@@ -298,14 +336,19 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(cfg, rotary.clone(), vb_l.pp(i))?);
+            layers.push(DecoderLayer::new(
+                cfg,
+                rotary.clone(),
+                use_flash_attn,
+                vb_l.pp(i),
+            )?);
         }
         Ok(Self {
             embed_tokens,
@@ -379,8 +422,8 @@ pub struct ModelForCausalLM {
 }
 
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base = Model::new(cfg, vb.clone())?;
+    pub fn new(cfg: &Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
+        let base = Model::new(cfg, use_flash_attn, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
         } else {

@@ -201,9 +201,11 @@ impl DecoderLayer {
         layer_idx: usize,
         cfg: &Config,
         rotary: Arc<Qwen3RotaryEmbedding>,
+        use_flash_attn: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(&cfg.into(), rotary, vb.pp("self_attn"))?;
+        let self_attn =
+            Qwen3Attention::new(&cfg.into(), rotary, use_flash_attn, vb.pp("self_attn"))?;
 
         // Decide whether to use MoE or regular MLP based on layer_idx and decoder_sparse_step
         let feed_forward =
@@ -256,7 +258,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(
@@ -267,7 +269,13 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(i, cfg, rotary.clone(), vb_l.pp(i))?);
+            layers.push(DecoderLayer::new(
+                i,
+                cfg,
+                rotary.clone(),
+                use_flash_attn,
+                vb_l.pp(i),
+            )?);
         }
         Ok(Self {
             embed_tokens,
@@ -341,8 +349,8 @@ pub struct ModelForCausalLM {
 }
 
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base = Model::new(cfg, vb.clone())?;
+    pub fn new(cfg: &Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
+        let base = Model::new(cfg, use_flash_attn, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
         } else {
