@@ -243,8 +243,16 @@ impl DecoderLayer {
         self.self_attn.clear_kv_cache();
     }
 
-    fn truncate_kv_cache(&mut self, seq_len: usize) {
-        self.self_attn.truncate_kv_cache(seq_len);
+    fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.self_attn.truncate_kv_cache(seq_len)
+    }
+
+    fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        self.self_attn.try_truncate_or_reset_kv_cache(seq_len)
+    }
+
+    fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        self.self_attn.try_reserve_kv_cache(additional_tokens)
     }
 }
 
@@ -292,10 +300,51 @@ impl Model {
         }
     }
 
-    fn truncate_kv_cache(&mut self, seq_len: usize) {
+    fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
         for l in &mut self.layers {
-            l.truncate_kv_cache(seq_len);
+            l.truncate_kv_cache(seq_len)?;
         }
+        Ok(())
+    }
+
+    fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        let mut all_success = true;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            match layer.try_truncate_or_reset_kv_cache(seq_len) {
+                Ok(success) => {
+                    if !success {
+                        all_success = false;
+                        // If this layer failed, reset all remaining layers
+                        for remaining_layer in &mut self.layers[i + 1..] {
+                            remaining_layer.clear_kv_cache();
+                        }
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Unexpected error, reset everything
+                    self.clear_kv_cache();
+                    return Err(e);
+                }
+            }
+        }
+
+        if !all_success {
+            // Some layer failed, reset all for consistency
+            self.clear_kv_cache();
+        }
+
+        Ok(all_success)
+    }
+
+    fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        for layer in &mut self.layers {
+            if !layer.try_reserve_kv_cache(additional_tokens) {
+                return false;
+            }
+        }
+        true
     }
 
     fn causal_mask(
@@ -371,7 +420,15 @@ impl ModelForCausalLM {
         self.base.clear_kv_cache();
     }
 
-    pub fn truncate_kv_cache(&mut self, seq_len: usize) {
-        self.base.truncate_kv_cache(seq_len);
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.base.truncate_kv_cache(seq_len)
+    }
+
+    pub fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        self.base.try_truncate_or_reset_kv_cache(seq_len)
+    }
+
+    pub fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        self.base.try_reserve_kv_cache(additional_tokens)
     }
 }

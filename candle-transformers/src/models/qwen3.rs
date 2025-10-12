@@ -159,9 +159,9 @@ impl Qwen3Attention {
         // Necessary because the hidden_size in the config isn't always accurate
         let hidden_size = head_dim * cfg.num_attention_heads;
 
-        // Initialize KV cache with 8192 tokens capacity to reduce initial memory allocation.
-        // The cache will grow in chunks of 8192 tokens when needed.
-        let kv_cache = KvCache::new(2, 8192);
+        // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
+        // The cache will grow in chunks of 512 tokens when needed.
+        let kv_cache = KvCache::new(2, 512);
 
         Ok(Self {
             q_proj,
@@ -216,37 +216,47 @@ impl Qwen3Attention {
         // 4. RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
-        // 5. Accumulate KV cache
-        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        // 5. Decide if we can use Flash Attention (only when cache is empty)
+        let cache_is_empty = self.kv_cache.current_seq_len() == 0;
+        let use_flash = self.use_flash_attn && cache_is_empty;
 
-        // 6. GQA repeat_kv
-        let k = repeat_kv(k, self.num_kv_groups)?;
-        let v = repeat_kv(v, self.num_kv_groups)?;
-
-        // 7. Attention (Flash or Standard)
-        let ctx = if self.use_flash_attn {
-            // Try to use flash attention
+        // 6. Attention with cache population
+        let ctx = if use_flash {
+            // Try Flash Attention, but ALWAYS populate cache afterward
             #[cfg(feature = "flash-attn")]
             {
                 match candle_flash_attn::flash_attn(&q, &k, &v, self.head_dim as f32, false) {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        // Flash succeeded! Now populate cache for next time
+                        self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+                        result
+                    }
                     Err(_) => {
-                        // Fallback to standard attention if flash attention fails
+                        // Flash failed, fall back to standard with cache
+                        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+                        let k = repeat_kv(k, self.num_kv_groups)?;
+                        let v = repeat_kv(v, self.num_kv_groups)?;
                         self.standard_attention(&q, &k, &v, attn_mask)?
                     }
                 }
             }
             #[cfg(not(feature = "flash-attn"))]
             {
-                // Flash attention requested but not compiled in, fallback to standard
+                // Flash not available, use standard with cache
+                let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+                let k = repeat_kv(k, self.num_kv_groups)?;
+                let v = repeat_kv(v, self.num_kv_groups)?;
                 self.standard_attention(&q, &k, &v, attn_mask)?
             }
         } else {
-            // Standard attention explicitly requested
+            // Standard attention with KV cache (incremental generation)
+            let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+            let k = repeat_kv(k, self.num_kv_groups)?;
+            let v = repeat_kv(v, self.num_kv_groups)?;
             self.standard_attention(&q, &k, &v, attn_mask)?
         };
 
-        // 8. Output proj
+        // 7. Output proj
         ctx.transpose(1, 2)?
             .reshape((b, l, self.hidden_size))?
             .apply(&self.o_proj)
@@ -272,8 +282,16 @@ impl Qwen3Attention {
         self.kv_cache.reset();
     }
 
-    pub fn truncate_kv_cache(&mut self, seq_len: usize) {
-        self.kv_cache.truncate(seq_len);
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.kv_cache.truncate(seq_len)
+    }
+
+    pub fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        self.kv_cache.try_truncate_or_reset(seq_len)
+    }
+
+    pub fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        self.kv_cache.try_reserve(additional_tokens)
     }
 }
 
@@ -321,8 +339,16 @@ impl DecoderLayer {
         self.self_attn.clear_kv_cache();
     }
 
-    fn truncate_kv_cache(&mut self, seq_len: usize) {
-        self.self_attn.truncate_kv_cache(seq_len);
+    fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.self_attn.truncate_kv_cache(seq_len)
+    }
+
+    fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        self.self_attn.try_truncate_or_reset_kv_cache(seq_len)
+    }
+
+    fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        self.self_attn.try_reserve_kv_cache(additional_tokens)
     }
 }
 
@@ -365,10 +391,52 @@ impl Model {
         }
     }
 
-    fn truncate_kv_cache(&mut self, seq_len: usize) {
+    fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
         for l in &mut self.layers {
-            l.truncate_kv_cache(seq_len);
+            l.truncate_kv_cache(seq_len)?;
         }
+        Ok(())
+    }
+
+    /// Try to truncate all layers, if any fail, reset all for consistency
+    fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        let mut all_success = true;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            match layer.try_truncate_or_reset_kv_cache(seq_len) {
+                Ok(success) => {
+                    if !success {
+                        all_success = false;
+                        // If this layer failed, reset all remaining layers
+                        for remaining_layer in &mut self.layers[i + 1..] {
+                            remaining_layer.clear_kv_cache();
+                        }
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Unexpected error, reset everything
+                    self.clear_kv_cache();
+                    return Err(e);
+                }
+            }
+        }
+
+        if !all_success {
+            // Some layer failed, reset all for consistency
+            self.clear_kv_cache();
+        }
+
+        Ok(all_success)
+    }
+
+    fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        for layer in &mut self.layers {
+            if !layer.try_reserve_kv_cache(additional_tokens) {
+                return false;
+            }
+        }
+        true
     }
 
     fn causal_mask(
@@ -444,7 +512,15 @@ impl ModelForCausalLM {
         self.base.clear_kv_cache();
     }
 
-    pub fn truncate_kv_cache(&mut self, seq_len: usize) {
-        self.base.truncate_kv_cache(seq_len);
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.base.truncate_kv_cache(seq_len)
+    }
+
+    pub fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        self.base.try_truncate_or_reset_kv_cache(seq_len)
+    }
+
+    pub fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        self.base.try_reserve_kv_cache(additional_tokens)
     }
 }

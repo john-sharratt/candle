@@ -50,9 +50,70 @@ impl Cache {
         Ok(data)
     }
 
-    pub fn truncate(&mut self, seq_len: usize) {
+    /// Truncate the cache to the specified sequence length, freeing unused memory
+    pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
         if seq_len < self.current_seq_len {
-            self.current_seq_len = seq_len;
+            if seq_len == 0 {
+                // Special case: completely clear the cache
+                self.all_data = None;
+                self.current_seq_len = 0;
+                self.max_seq_len = 0;
+            } else if let Some(old_tensor) = self.all_data.take() {
+                // Extract what we want to keep
+                let kept = old_tensor.narrow(self.dim, 0, seq_len)?;
+
+                // Force a copy to new storage
+                let new_tensor = kept.force_contiguous()?;
+
+                // Replace with new tensor
+                self.all_data = Some(new_tensor);
+                self.current_seq_len = seq_len;
+                self.max_seq_len = seq_len;
+            }
+        }
+        Ok(())
+    }
+
+    /// Try to truncate, but if OOM, do a full reset instead
+    /// Returns true if truncate succeeded, false if reset was performed
+    pub fn try_truncate_or_reset(&mut self, seq_len: usize) -> Result<bool> {
+        if seq_len < self.current_seq_len {
+            if seq_len == 0 {
+                self.reset();
+                return Ok(false);
+            }
+
+            if let Some(old_tensor) = self.all_data.take() {
+                // Try to narrow
+                let kept = match old_tensor.narrow(self.dim, 0, seq_len) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        // Narrow failed (shouldn't happen), reset
+                        self.reset();
+                        return Ok(false);
+                    }
+                };
+
+                // Try to copy
+                match kept.force_contiguous() {
+                    Ok(new_tensor) => {
+                        // Success!
+                        self.all_data = Some(new_tensor);
+                        self.current_seq_len = seq_len;
+                        self.max_seq_len = seq_len;
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        // OOM during copy - do full reset instead
+                        self.reset();
+                        Ok(false)
+                    }
+                }
+            } else {
+                Ok(true)
+            }
+        } else {
+            Ok(true)
         }
     }
 
@@ -150,9 +211,118 @@ impl KvCache {
         self.k.current_seq_len()
     }
 
-    pub fn truncate(&mut self, seq_len: usize) {
-        self.k.truncate(seq_len);
-        self.v.truncate(seq_len);
+    pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
+        self.k.truncate(seq_len)?;
+        self.v.truncate(seq_len)?;
+        Ok(())
+    }
+
+    /// Try to truncate, but if OOM, do a full reset instead
+    /// Returns true if truncate succeeded, false if reset was performed
+    pub fn try_truncate_or_reset(&mut self, seq_len: usize) -> Result<bool> {
+        // Try k first
+        let k_success = self.k.try_truncate_or_reset(seq_len)?;
+
+        if !k_success {
+            // K failed and was reset, reset v too for consistency
+            self.v.reset();
+            return Ok(false);
+        }
+
+        // Try v
+        let v_success = self.v.try_truncate_or_reset(seq_len)?;
+
+        if !v_success {
+            // V failed, reset k for consistency
+            self.k.reset();
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Try to reserve space for additional tokens by expanding capacity.
+    /// Maintains existing tokens. Returns true if successful, false if OOM.
+    pub fn try_reserve(&mut self, additional_tokens: usize) -> bool {
+        let current_len = self.current_seq_len();
+        let required_capacity = current_len + additional_tokens;
+
+        // Already have enough space
+        if required_capacity <= self.k.max_seq_len {
+            return true;
+        }
+
+        // Round up to nearest multiple of grow_by (e.g., 2048)
+        let new_capacity =
+            ((required_capacity + self.k.grow_by - 1) / self.k.grow_by) * self.k.grow_by;
+
+        // Expand k cache
+        if let Some(old_k) = self.k.all_data.take() {
+            let mut new_shape = old_k.dims().to_vec();
+            new_shape[self.k.dim] = new_capacity;
+
+            let new_k = match Tensor::zeros(new_shape, old_k.dtype(), old_k.device()) {
+                Ok(t) => t,
+                Err(_) => {
+                    self.k.all_data = Some(old_k);
+                    return false;
+                }
+            };
+
+            if current_len > 0 {
+                if new_k
+                    .slice_set(
+                        &old_k.narrow(self.k.dim, 0, current_len).unwrap(),
+                        self.k.dim,
+                        0,
+                    )
+                    .is_err()
+                {
+                    self.k.all_data = Some(old_k);
+                    return false;
+                }
+            }
+
+            self.k.all_data = Some(new_k);
+            self.k.max_seq_len = new_capacity;
+        } else {
+            self.k.max_seq_len = new_capacity;
+        }
+
+        // Expand v cache
+        if let Some(old_v) = self.v.all_data.take() {
+            let mut new_shape = old_v.dims().to_vec();
+            new_shape[self.v.dim] = new_capacity;
+
+            let new_v = match Tensor::zeros(new_shape, old_v.dtype(), old_v.device()) {
+                Ok(t) => t,
+                Err(_) => {
+                    self.v.all_data = Some(old_v);
+                    return false;
+                }
+            };
+
+            if current_len > 0 {
+                if new_v
+                    .slice_set(
+                        &old_v.narrow(self.v.dim, 0, current_len).unwrap(),
+                        self.v.dim,
+                        0,
+                    )
+                    .is_err()
+                {
+                    self.v.all_data = Some(old_v);
+                    return false;
+                }
+            }
+
+            self.v.all_data = Some(new_v);
+            self.v.max_seq_len = new_capacity;
+        } else {
+            self.v.max_seq_len = new_capacity;
+        }
+
+        true
     }
 
     pub fn reset(&mut self) {
