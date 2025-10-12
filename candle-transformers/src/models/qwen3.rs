@@ -235,7 +235,7 @@ impl Qwen3Attention {
             .apply(&self.o_proj)
     }
 
-    pub(crate) fn clear_kv_cache(&mut self) {
+    pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
 }
