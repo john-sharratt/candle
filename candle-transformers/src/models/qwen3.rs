@@ -238,6 +238,10 @@ impl Qwen3Attention {
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
     }
+
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) {
+        self.kv_cache.truncate(seq_len);
+    }
 }
 
 #[derive(Debug, Clone)]

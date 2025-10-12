@@ -50,6 +50,12 @@ impl Cache {
         Ok(data)
     }
 
+    pub fn truncate(&mut self, seq_len: usize) {
+        if seq_len < self.current_seq_len {
+            self.current_seq_len = seq_len;
+        }
+    }
+
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
         self.all_data = None;
@@ -142,6 +148,11 @@ impl KvCache {
 
     pub fn current_seq_len(&self) -> usize {
         self.k.current_seq_len()
+    }
+
+    pub fn truncate(&mut self, seq_len: usize) {
+        self.k.truncate(seq_len);
+        self.v.truncate(seq_len);
     }
 
     pub fn reset(&mut self) {
