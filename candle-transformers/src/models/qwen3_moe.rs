@@ -4,7 +4,7 @@ use crate::models::{
 };
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{kv_cache::KvCache, Activation, VarBuilder};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Config {
@@ -333,9 +333,9 @@ impl Model {
 }
 
 /// Inner model weights (wrapped in Arc for cheap cloning)
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ModelForCausalLMInner {
-    base: Model,
+    base: Mutex<Model>,
     lm_head: Linear,
 }
 
@@ -354,13 +354,16 @@ impl ModelForCausalLM {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         Ok(Self {
-            inner: Arc::new(ModelForCausalLMInner { base, lm_head }),
+            inner: Arc::new(ModelForCausalLMInner {
+                base: Mutex::new(base),
+                lm_head,
+            }),
         })
     }
 
     /// Create a new inference instance with its own KV cache
     pub fn new_instance(&self) -> InstanceForCausalLM {
-        let num_layers = self.inner.base.num_layers();
+        let num_layers = self.inner.base.lock().unwrap().num_layers();
         let caches = (0..num_layers).map(|_| KvCache::new(2, 512)).collect();
         InstanceForCausalLM {
             model: self.clone(),
@@ -375,9 +378,8 @@ impl ModelForCausalLM {
         offset: usize,
     ) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
-        self.inner
-            .base
-            .forward(caches, input, offset)?
+        let base = self.inner.base.lock().unwrap();
+        base.forward(caches, input, offset)?
             .narrow(1, l - 1, 1)?
             .apply(&self.inner.lm_head)
     }
