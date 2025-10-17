@@ -42,7 +42,10 @@ impl LogitsProcessor {
                     None => Sampling::All { temperature },
                     Some(k) => Sampling::TopK { k, temperature },
                 },
-                Some(p) => Sampling::TopP { p, temperature },
+                Some(p) => match top_k {
+                    None => Sampling::TopP { p, temperature },
+                    Some(k) => Sampling::TopKThenTopP { k, p, temperature },
+                },
             },
         };
         Self::from_sampling(seed, sampling)
