@@ -1411,6 +1411,62 @@ impl CudaStorage {
         result.div_at_indices_mut(_layout, indices, value)?;
         Ok(result)
     }
+
+    /// Fast scalar transfer - optimized for single-element copies.
+    /// Uses slice-based transfer to copy only a single element instead of the whole tensor.
+    /// This is much faster than `to_cpu_storage()` for extracting single values.
+    pub fn to_cpu_scalar<T>(&self, offset: usize) -> Result<T> 
+    where
+        T: DeviceRepr + WithDType + Copy,
+    {
+        use cudarc::driver::DeviceSlice;
+        
+        match &self.slice {
+            CudaStorageSlice::U8(slice) if T::DTYPE == DType::U8 => {
+                // Create a slice of just one element
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                // SAFETY: We've checked the dtype matches and vec has exactly 1 element
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            CudaStorageSlice::U32(slice) if T::DTYPE == DType::U32 => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            CudaStorageSlice::I64(slice) if T::DTYPE == DType::I64 => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            CudaStorageSlice::F32(slice) if T::DTYPE == DType::F32 => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            CudaStorageSlice::F64(slice) if T::DTYPE == DType::F64 => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            CudaStorageSlice::F16(slice) if T::DTYPE == DType::F16 => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            CudaStorageSlice::BF16(slice) if T::DTYPE == DType::BF16 => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(unsafe { std::mem::transmute_copy(&vec[0]) })
+            }
+            _ => {
+                // Fallback to full transfer for unsupported types
+                let cpu_storage = self.to_cpu_storage()?;
+                let data = T::cpu_storage_as_slice(&cpu_storage)?;
+                Ok(data[offset])
+            }
+        }
+    }
 }
 
 fn gemm_config<T>(

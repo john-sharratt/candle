@@ -450,10 +450,14 @@ mod tests {
 
         // Test with high temperature (more random)
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token_hot = logits.sample_multinomial(2.0, None, None, 42)?.to_scalar::<u32>()?;
+        let token_hot = logits
+            .sample_multinomial(2.0, None, None, 42)?
+            .to_scalar::<u32>()?;
 
         // Test with low temperature (more deterministic)
-        let token_cold = logits.sample_multinomial(0.1, None, None, 42)?.to_scalar::<u32>()?;
+        let token_cold = logits
+            .sample_multinomial(0.1, None, None, 42)?
+            .to_scalar::<u32>()?;
 
         assert!(token_hot < 4);
         assert!(token_cold < 4);
@@ -466,7 +470,9 @@ mod tests {
         let device = Device::Cpu;
 
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
-        let token = logits.sample_multinomial(1.0, Some(2), None, 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(1.0, Some(2), None, 42)?
+            .to_scalar::<u32>()?;
 
         assert!(token == 3 || token == 1);
 
@@ -478,7 +484,9 @@ mod tests {
         let device = Device::Cpu;
 
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(1.0, None, Some(0.8), 42)?
+            .to_scalar::<u32>()?;
 
         assert!(token < 4);
 
@@ -490,7 +498,9 @@ mod tests {
         let device = Device::Cpu;
 
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
-        let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(0.8, Some(4), Some(0.9), 42)?
+            .to_scalar::<u32>()?;
 
         assert!(token < 6);
 
@@ -503,8 +513,12 @@ mod tests {
 
         // Very low temperature should be nearly deterministic
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let token1 = logits.sample_multinomial(0.01, None, None, 42)?.to_scalar::<u32>()?;
-        let token2 = logits.sample_multinomial(0.01, None, None, 42)?.to_scalar::<u32>()?;
+        let token1 = logits
+            .sample_multinomial(0.01, None, None, 42)?
+            .to_scalar::<u32>()?;
+        let token2 = logits
+            .sample_multinomial(0.01, None, None, 42)?
+            .to_scalar::<u32>()?;
 
         assert_eq!(token1, token2);
         // Should almost always pick index 1 (highest logit)
@@ -558,14 +572,20 @@ mod tests {
         // Test 1: Basic sampling with GPU kernel
         println!("🧪 Testing GPU-native CUDA kernel implementation");
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
-        let token = logits.sample_multinomial(1.0, None, None, 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(1.0, None, None, 42)?
+            .to_scalar::<u32>()?;
         assert!(token < 5);
         println!("   ✅ Basic sampling: token {}", token);
 
         // Test 2: Temperature scaling on GPU
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let val_hot = logits.sample_multinomial(2.0, None, None, 123)?.to_scalar::<u32>()?;
-        let val_cold = logits.sample_multinomial(0.1, None, None, 123)?.to_scalar::<u32>()?;
+        let val_hot = logits
+            .sample_multinomial(2.0, None, None, 123)?
+            .to_scalar::<u32>()?;
+        let val_cold = logits
+            .sample_multinomial(0.1, None, None, 123)?
+            .to_scalar::<u32>()?;
         assert!(val_hot < 4);
         assert!(val_cold < 4);
         println!(
@@ -575,26 +595,36 @@ mod tests {
 
         // Test 3: Top-k filtering on GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5, 2.5], &device)?;
-        let token = logits.sample_multinomial(1.0, Some(3), None, 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(1.0, Some(3), None, 42)?
+            .to_scalar::<u32>()?;
         assert!(token < 7);
         println!("   ✅ Top-k filtering: token {}", token);
 
         // Test 4: Top-p (nucleus) sampling on GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(1.0, None, Some(0.8), 42)?
+            .to_scalar::<u32>()?;
         assert!(token < 4);
         println!("   ✅ Top-p sampling: token {}", token);
 
         // Test 5: Combined top-k and top-p on GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
-        let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(0.8, Some(4), Some(0.9), 42)?
+            .to_scalar::<u32>()?;
         assert!(token < 6);
         println!("   ✅ Combined top-k + top-p: token {}", token);
 
         // Test 6: Deterministic behavior with same seed
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let val1 = logits.sample_multinomial(0.01, None, None, 999)?.to_scalar::<u32>()?;
-        let val2 = logits.sample_multinomial(0.01, None, None, 999)?.to_scalar::<u32>()?;
+        let val1 = logits
+            .sample_multinomial(0.01, None, None, 999)?
+            .to_scalar::<u32>()?;
+        let val2 = logits
+            .sample_multinomial(0.01, None, None, 999)?
+            .to_scalar::<u32>()?;
         assert_eq!(val1, val2, "Same seed should give same result");
         println!("   ✅ Deterministic: seed 999 -> token {}", val1);
 
@@ -628,7 +658,9 @@ mod tests {
 
         let device = Device::new_metal(0)?;
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial(1.0, None, None, 42)?.to_scalar::<u32>()?;
+        let token = logits
+            .sample_multinomial(1.0, None, None, 42)?
+            .to_scalar::<u32>()?;
         assert!(token < 4);
 
         Ok(())
