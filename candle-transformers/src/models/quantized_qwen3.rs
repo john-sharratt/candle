@@ -183,6 +183,18 @@ impl AttentionWeights {
         })
     }
 
+    pub fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.kv_cache.truncate(seq_len)
+    }
+
+    pub fn reset_cache(&mut self) {
+        self.kv_cache.reset();
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.kv_cache.k_cache().current_seq_len()
+    }
+
     fn forward(&mut self, x: &Tensor, attn_mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b, l, _) = x.dims3()?;
@@ -283,6 +295,18 @@ impl LayerWeights {
             ln1,
             ln2,
         })
+    }
+
+    pub fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.self_attn.truncate_cache(seq_len)
+    }
+
+    pub fn reset_cache(&mut self) {
+        self.self_attn.reset_cache();
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.self_attn.cache_len()
     }
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
@@ -407,6 +431,33 @@ impl ModelWeights {
             })
             .collect();
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+    }
+
+    /// Truncate KV cache to specified sequence length
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.truncate_cache(seq_len)?;
+        }
+        Ok(())
+    }
+
+    /// Clear all KV caches (more efficient than forward with offset=0)
+    pub fn clear_all_caches(&mut self) {
+        for layer in &mut self.layers {
+            layer.reset_cache();
+        }
+    }
+
+    /// Get the current cache length (all layers should be same)
+    pub fn cache_len(&self) -> usize {
+        self.layers.first().map(|l| l.cache_len()).unwrap_or(0)
+    }
+
+    /// Rewind by N tokens from current position
+    pub fn rewind_by_tokens(&mut self, n_tokens: usize) -> Result<()> {
+        let current_len = self.cache_len();
+        let target_pos = current_len.saturating_sub(n_tokens);
+        self.truncate_kv_cache(target_pos)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
