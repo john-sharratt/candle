@@ -25,7 +25,7 @@ mod performance_demo {
                 println!("   Logits tensor device: {:?}", logits_gpu.device());
 
                 // Test GPU-native sampling
-                let token = logits_gpu.sample_multinomial_gpu(0.8, Some(50), Some(0.9), 42)?;
+                let token = logits_gpu.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
                 println!(
                     "   ✅ GPU-native sampling result: device={:?}, token={:?}",
                     token.device(),
@@ -48,7 +48,7 @@ mod performance_demo {
                 println!("   Logits tensor device: {:?}", logits_gpu.device());
 
                 // Test GPU-native sampling
-                let token = logits_gpu.sample_multinomial_gpu(0.8, Some(50), Some(0.9), 42)?;
+                let token = logits_gpu.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
                 println!(
                     "   ✅ GPU-native sampling result: device={:?}, token={:?}",
                     token.device(),
@@ -68,7 +68,7 @@ mod performance_demo {
         println!("   Logits tensor device: {:?}", logits_cpu.device());
 
         // Test CPU sampling
-        let token = logits_cpu.sample_multinomial_gpu(0.8, Some(50), Some(0.9), 42)?;
+        let token = logits_cpu.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
         println!(
             "   ✅ CPU sampling result: device={:?}, token={:?}",
             token.device(),
@@ -103,7 +103,7 @@ mod performance_demo {
         println!("   2. logits.sample_multinomial_gpu() // GPU→CPU only when needed");
         println!("   3. Return result on same device as input");
 
-        let token = logits.sample_multinomial_gpu(1.0, None, None, 42)?;
+        let token = logits.sample_multinomial(1.0, None, None, 42)?;
         println!("   Sample result: {:?}", token.to_vec1::<u32>()?[0]);
 
         println!("\n🎯 Key Benefits:");

@@ -87,10 +87,10 @@ fn benchmark_cpu_methods(
     }
     let traditional_time = start.elapsed();
 
-    // Benchmark 2: sample_multinomial_gpu (our optimized approach)
+    // Benchmark 2: sample_multinomial (our optimized approach)
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = logits.sample_multinomial_gpu(temperature, top_k, top_p, 12345 + i as u64)?;
+        let _token = logits.sample_multinomial(temperature, top_k, top_p, 12345 + i as u64)?;
     }
     let sample_gpu_time = start.elapsed();
 
@@ -103,7 +103,7 @@ fn benchmark_cpu_methods(
         traditional_time.as_micros() as f64 / iterations as f64
     );
     println!(
-        "   sample_multinomial_gpu: {:>8.2}ms ({:.1}μs/sample)",
+        "   sample_multinomial: {:>8.2}ms ({:.1}μs/sample)",
         sample_gpu_time.as_millis(),
         sample_gpu_time.as_micros() as f64 / iterations as f64
     );
@@ -254,10 +254,10 @@ fn benchmark_gpu_methods(
 
     let traditional_gpu_time = start.elapsed();
 
-    // Benchmark 2: sample_multinomial_gpu (optimized)
+    // Benchmark 2: sample_multinomial (optimized)
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = logits.sample_multinomial_gpu(temperature, top_k, top_p, 12345 + i as u64)?;
+        let _token = logits.sample_multinomial(temperature, top_k, top_p, 12345 + i as u64)?;
     }
 
     #[cfg(feature = "cuda")]
@@ -276,7 +276,7 @@ fn benchmark_gpu_methods(
         traditional_gpu_time.as_micros() as f64 / iterations as f64
     );
     println!(
-        "   sample_multinomial_gpu: {:>8.2}ms ({:.1}μs/sample) [optimized]",
+        "   sample_multinomial: {:>8.2}ms ({:.1}μs/sample) [optimized]",
         sample_gpu_time.as_millis(),
         sample_gpu_time.as_micros() as f64 / iterations as f64
     );
@@ -303,8 +303,8 @@ mod benchmark_tests {
         // Traditional CPU approach
         let token1 = naive_cpu_sampling(&logits, 0.8, Some(3), Some(0.9), 42)?;
 
-        // sample_multinomial_gpu
-        let token2 = logits.sample_multinomial_gpu(0.8, Some(3), Some(0.9), 42)?;
+        // sample_multinomial
+        let token2 = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
         let token2_val = token2.to_vec1::<u32>()?[0];
 
         // Both should produce valid token IDs
@@ -312,7 +312,7 @@ mod benchmark_tests {
         assert!(token2_val < 4);
 
         println!(
-            "✅ Sanity check: CPU={}, sample_multinomial_gpu={}",
+            "✅ Sanity check: CPU={}, sample_multinomial={}",
             token1, token2_val
         );
 
@@ -330,7 +330,7 @@ mod benchmark_tests {
 
         // Multiple sampling calls should be efficient
         for i in 0..10 {
-            let _token = logits.sample_multinomial_gpu(0.8, Some(50), Some(0.9), i)?;
+            let _token = logits.sample_multinomial(0.8, Some(50), Some(0.9), i)?;
         }
 
         println!("✅ Memory usage test passed - no excessive allocations");

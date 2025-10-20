@@ -172,10 +172,10 @@ impl Tensor {
     ///
     /// let device = Device::Cpu;
     /// let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-    /// let token = logits.sample_multinomial_gpu(0.8, Some(3), Some(0.9), 42)?;
+    /// let token = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn sample_multinomial_gpu(
+    pub fn sample_multinomial(
         &self,
         temperature: f32,
         top_k: Option<usize>,
@@ -185,7 +185,7 @@ impl Tensor {
         // Ensure input is 1D
         if self.rank() != 1 {
             crate::bail!(
-                "sample_multinomial_gpu requires 1D tensor, got shape: {:?}",
+                "sample_multinomial requires 1D tensor, got shape: {:?}",
                 self.shape()
             );
         }
@@ -196,7 +196,7 @@ impl Tensor {
             DType::F32 | DType::F64 | DType::F16 | DType::BF16
         ) {
             crate::bail!(
-                "sample_multinomial_gpu requires float tensor, got dtype: {:?}",
+                "sample_multinomial requires float tensor, got dtype: {:?}",
                 self.dtype()
             );
         }
@@ -224,7 +224,7 @@ mod tests {
 
         // Test with simple logits
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial_gpu(1.0, None, None, 42)?;
+        let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
         assert_eq!(token.shape().dims(), &[1]);
         assert_eq!(token.dtype(), DType::U32);
@@ -241,10 +241,10 @@ mod tests {
 
         // Test with high temperature (more random)
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token_hot = logits.sample_multinomial_gpu(2.0, None, None, 42)?;
+        let token_hot = logits.sample_multinomial(2.0, None, None, 42)?;
 
         // Test with low temperature (more deterministic)
-        let token_cold = logits.sample_multinomial_gpu(0.1, None, None, 42)?;
+        let token_cold = logits.sample_multinomial(0.1, None, None, 42)?;
 
         assert_eq!(token_hot.dtype(), DType::U32);
         assert_eq!(token_cold.dtype(), DType::U32);
@@ -257,7 +257,7 @@ mod tests {
         let device = Device::Cpu;
 
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
-        let token = logits.sample_multinomial_gpu(1.0, Some(2), None, 42)?;
+        let token = logits.sample_multinomial(1.0, Some(2), None, 42)?;
 
         let token_val = token.to_vec1::<u32>()?[0];
         // With top_k=2, should only sample from indices 3 or 1 (highest logits)
@@ -271,7 +271,7 @@ mod tests {
         let device = Device::Cpu;
 
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial_gpu(1.0, None, Some(0.8), 42)?;
+        let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?;
 
         assert_eq!(token.dtype(), DType::U32);
         let token_val = token.to_vec1::<u32>()?[0];
@@ -285,7 +285,7 @@ mod tests {
         let device = Device::Cpu;
 
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
-        let token = logits.sample_multinomial_gpu(0.8, Some(4), Some(0.9), 42)?;
+        let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?;
 
         assert_eq!(token.dtype(), DType::U32);
         let token_val = token.to_vec1::<u32>()?[0];
@@ -300,8 +300,8 @@ mod tests {
 
         // Very low temperature should be nearly deterministic
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let token1 = logits.sample_multinomial_gpu(0.01, None, None, 42)?;
-        let token2 = logits.sample_multinomial_gpu(0.01, None, None, 42)?;
+        let token1 = logits.sample_multinomial(0.01, None, None, 42)?;
+        let token2 = logits.sample_multinomial(0.01, None, None, 42)?;
 
         let val1 = token1.to_vec1::<u32>()?[0];
         let val2 = token2.to_vec1::<u32>()?[0];
@@ -320,15 +320,11 @@ mod tests {
 
         // Test with wrong rank
         let logits_2d = Tensor::new(&[[1.0f32, 2.0], [0.5, 3.0]], &device)?;
-        assert!(logits_2d
-            .sample_multinomial_gpu(1.0, None, None, 42)
-            .is_err());
+        assert!(logits_2d.sample_multinomial(1.0, None, None, 42).is_err());
 
         // Test with integer tensor - use i64 which is supported by WithDType
         let logits_int = Tensor::from_vec(vec![1i64, 2, 3], 3, &device)?;
-        assert!(logits_int
-            .sample_multinomial_gpu(1.0, None, None, 42)
-            .is_err());
+        assert!(logits_int.sample_multinomial(1.0, None, None, 42).is_err());
 
         Ok(())
     }
@@ -342,7 +338,7 @@ mod tests {
 
         let device = Device::new_cuda(0)?;
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial_gpu(1.0, None, None, 42)?;
+        let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
         assert_eq!(token.shape().dims(), &[1]);
         assert_eq!(token.dtype(), DType::U32);
@@ -363,7 +359,7 @@ mod tests {
 
         let device = Device::new_metal(0)?;
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-        let token = logits.sample_multinomial_gpu(1.0, None, None, 42)?;
+        let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
         assert_eq!(token.shape().dims(), &[1]);
         assert_eq!(token.dtype(), DType::U32);

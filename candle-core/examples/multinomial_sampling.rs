@@ -23,13 +23,13 @@ fn main() -> Result<()> {
 
     // Example 1: Basic sampling with temperature
     println!("\n🌡️  Example 1: Temperature sampling");
-    let token1 = logits_tensor.sample_multinomial_gpu(0.8, None, None, 42)?;
+    let token1 = logits_tensor.sample_multinomial(0.8, None, None, 42)?;
     println!(
         "   Temperature 0.8, seed 42: token {}",
         token1.to_vec1::<u32>()?[0]
     );
 
-    let token2 = logits_tensor.sample_multinomial_gpu(0.1, None, None, 42)?;
+    let token2 = logits_tensor.sample_multinomial(0.1, None, None, 42)?;
     println!(
         "   Temperature 0.1, seed 42: token {} (more deterministic)",
         token2.to_vec1::<u32>()?[0]
@@ -37,7 +37,7 @@ fn main() -> Result<()> {
 
     // Example 2: Top-k sampling
     println!("\n🔝 Example 2: Top-k sampling");
-    let token3 = logits_tensor.sample_multinomial_gpu(1.0, Some(3), None, 42)?;
+    let token3 = logits_tensor.sample_multinomial(1.0, Some(3), None, 42)?;
     println!(
         "   Top-k=3, seed 42: token {} (from top 3 tokens only)",
         token3.to_vec1::<u32>()?[0]
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
 
     // Example 3: Nucleus (Top-p) sampling
     println!("\n☢️  Example 3: Nucleus (Top-p) sampling");
-    let token4 = logits_tensor.sample_multinomial_gpu(1.0, None, Some(0.9), 42)?;
+    let token4 = logits_tensor.sample_multinomial(1.0, None, Some(0.9), 42)?;
     println!(
         "   Top-p=0.9, seed 42: token {} (nucleus sampling)",
         token4.to_vec1::<u32>()?[0]
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
 
     // Example 4: Combined top-k + top-p + temperature
     println!("\n🎛️  Example 4: Combined sampling");
-    let token5 = logits_tensor.sample_multinomial_gpu(0.8, Some(4), Some(0.95), 42)?;
+    let token5 = logits_tensor.sample_multinomial(0.8, Some(4), Some(0.95), 42)?;
     println!(
         "   Temperature=0.8, top-k=4, top-p=0.95, seed 42: token {}",
         token5.to_vec1::<u32>()?[0]
@@ -61,8 +61,8 @@ fn main() -> Result<()> {
 
     // Example 5: Reproducibility with same seed
     println!("\n🔄 Example 5: Reproducible sampling");
-    let token6a = logits_tensor.sample_multinomial_gpu(0.7, Some(3), Some(0.8), 123)?;
-    let token6b = logits_tensor.sample_multinomial_gpu(0.7, Some(3), Some(0.8), 123)?;
+    let token6a = logits_tensor.sample_multinomial(0.7, Some(3), Some(0.8), 123)?;
+    let token6b = logits_tensor.sample_multinomial(0.7, Some(3), Some(0.8), 123)?;
     println!(
         "   Same parameters, same seed: {} and {} (should be identical)",
         token6a.to_vec1::<u32>()?[0],
@@ -70,8 +70,8 @@ fn main() -> Result<()> {
     );
 
     // Example 6: Different seeds
-    let token7a = logits_tensor.sample_multinomial_gpu(0.7, Some(3), Some(0.8), 456)?;
-    let token7b = logits_tensor.sample_multinomial_gpu(0.7, Some(3), Some(0.8), 789)?;
+    let token7a = logits_tensor.sample_multinomial(0.7, Some(3), Some(0.8), 456)?;
+    let token7b = logits_tensor.sample_multinomial(0.7, Some(3), Some(0.8), 789)?;
     println!(
         "   Same parameters, different seeds: {} and {} (likely different)",
         token7a.to_vec1::<u32>()?[0],
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
 
     println!("\n🔧 Usage in your code:");
     println!("   // Replace: logits_processor.sample(&logits)");
-    println!("   // With:    logits.sample_multinomial_gpu(temperature, top_k, top_p, seed)");
+    println!("   // With:    logits.sample_multinomial(temperature, top_k, top_p, seed)");
 
     Ok(())
 }
@@ -115,7 +115,7 @@ mod integration_tests {
         let top_p = Some(0.9);
         let seed = 12345;
 
-        let sampled_token = logits.sample_multinomial_gpu(temperature, top_k, top_p, seed)?;
+        let sampled_token = logits.sample_multinomial(temperature, top_k, top_p, seed)?;
 
         // Step 3: Verify result is valid
         let token_id = sampled_token.to_vec1::<u32>()?[0];
@@ -157,8 +157,7 @@ mod integration_tests {
                 .collect();
 
             let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
-            let token =
-                logits.sample_multinomial_gpu(0.8, Some(10), Some(0.9), step as u64 + 42)?;
+            let token = logits.sample_multinomial(0.8, Some(10), Some(0.9), step as u64 + 42)?;
             let token_id = token.to_vec1::<u32>()?[0];
 
             generated_tokens.push(token_id);

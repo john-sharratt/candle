@@ -3,7 +3,7 @@ use std::time::Instant;
 
 /// Focused performance benchmark for QWEN3 use case  
 fn main() -> Result<()> {
-    println!("🎯 QWEN3 Performance Analysis: LogitsProcessor vs sample_multinomial_gpu\n");
+    println!("🎯 QWEN3 Performance Analysis: LogitsProcessor vs sample_multinomial\n");
 
     // QWEN3 typical parameters
     let vocab_size = 32000; // Typical QWEN vocabulary size
@@ -56,14 +56,14 @@ fn run_qwen3_benchmark(
     // Benchmark 1: Traditional CPU sampling (current approach)
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = sample_traditional_cpu(&logits_cpu, temperature, top_k, top_p, i as u64)?;
+        let _token = sample_traditional(&logits_cpu, temperature, top_k, top_p, i as u64)?;
     }
     let cpu_traditional_time = start.elapsed();
 
-    // Benchmark 2: sample_multinomial_gpu on CPU
+    // Benchmark 2: sample_multinomial on CPU
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = logits_cpu.sample_multinomial_gpu(temperature, top_k, top_p, i as u64)?;
+        let _token = logits_cpu.sample_multinomial(temperature, top_k, top_p, i as u64)?;
     }
     let cpu_optimized_time = start.elapsed();
 
@@ -75,7 +75,7 @@ fn run_qwen3_benchmark(
         cpu_traditional_time.as_micros() as f64 / iterations as f64
     );
     println!(
-        "   sample_multinomial_gpu: {:>8.2}ms ({:.1}μs/sample)",
+        "   sample_multinomial: {:>8.2}ms ({:.1}μs/sample)",
         cpu_optimized_time.as_millis(),
         cpu_optimized_time.as_micros() as f64 / iterations as f64
     );
@@ -134,7 +134,7 @@ fn test_gpu_scenario(
     // Benchmark 2: GPU-native approach - controlled transfers
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = logits_gpu.sample_multinomial_gpu(temperature, top_k, top_p, i as u64)?;
+        let _token = logits_gpu.sample_multinomial(temperature, top_k, top_p, i as u64)?;
         // Result is already on the correct device
     }
     gpu_device.synchronize()?;
@@ -148,7 +148,7 @@ fn test_gpu_scenario(
         gpu_traditional_time.as_micros() as f64 / iterations as f64
     );
     println!(
-        "   sample_multinomial_gpu: {:>8.2}ms ({:.1}μs/sample) [GPU-native]",
+        "   sample_multinomial: {:>8.2}ms ({:.1}μs/sample) [GPU-native]",
         gpu_optimized_time.as_millis(),
         gpu_optimized_time.as_micros() as f64 / iterations as f64
     );
@@ -193,7 +193,7 @@ fn simulate_gpu_transfers(
     // Direct approach
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = logits.sample_multinomial_gpu(temperature, top_k, top_p, i as u64)?;
+        let _token = logits.sample_multinomial(temperature, top_k, top_p, i as u64)?;
     }
     let optimized_time = start.elapsed();
 
@@ -205,7 +205,7 @@ fn simulate_gpu_transfers(
         simulated_gpu_time.as_micros() as f64 / iterations as f64
     );
     println!(
-        "   sample_multinomial_gpu:  {:>8.2}ms ({:.1}μs/sample)",
+        "   sample_multinomial:  {:>8.2}ms ({:.1}μs/sample)",
         optimized_time.as_millis(),
         optimized_time.as_micros() as f64 / iterations as f64
     );
@@ -314,7 +314,7 @@ mod tests {
         let logits = Tensor::new(&[2.0f32, 1.0, 0.5, 3.0], &device)?;
 
         let token1 = sample_traditional_cpu(&logits, 0.8, Some(3), Some(0.9), 42)?;
-        let token2 = logits.sample_multinomial_gpu(0.8, Some(3), Some(0.9), 42)?;
+        let token2 = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
         let token2_val = token2.to_vec1::<u32>()?[0];
 
         assert!(token1 < 4);
