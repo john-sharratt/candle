@@ -1030,10 +1030,7 @@ fn sub_at_indices(device: &Device) -> Result<()> {
     let t = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0, 50.0], device)?;
     let indices = [0u32, 2u32, 4u32];
     let result = t.sub_at_indices(&indices, 5.0)?;
-    assert_eq!(
-        result.to_vec1::<f32>()?,
-        &[5.0, 20.0, 25.0, 40.0, 45.0]
-    );
+    assert_eq!(result.to_vec1::<f32>()?, &[5.0, 20.0, 25.0, 40.0, 45.0]);
 
     // Test on 2D tensor with multiple dtypes
     let t2d = Tensor::arange(0f32, 12f32, device)?.reshape((4, 3))?;
