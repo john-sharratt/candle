@@ -130,53 +130,24 @@ impl CustomOp1 for MultinomialSampling {
         // Allocate output buffer on GPU (single u32)
         let output_slice = unsafe { device.alloc::<u32>(1)? };
 
-        // Calculate shared memory size
-        // We need: vocab_size floats for scores + vocab_size floats for probs + vocab_size uints for indices
-        let shared_mem_size = (vocab_size * 2 * std::mem::size_of::<f32>())
-            + (vocab_size * std::mem::size_of::<u32>());
-
-        // Check if shared memory size exceeds device limits (typically 48KB-96KB per block)
-        // For vocabularies > 4096, we need to use global memory instead
-        const MAX_SHARED_MEM: usize = 48 * 1024; // Conservative 48KB limit for compatibility
-
-        let use_simple_kernel = shared_mem_size > MAX_SHARED_MEM;
-
-        // Get the appropriate kernel based on dtype and vocab size
-        let (kernel_name, kernel_module) = if use_simple_kernel {
-            // Use simple kernel for large vocabularies (no shared memory, no top-k/top-p)
-            let name = match &storage.slice {
-                CudaStorageSlice::F32(_) => "simple_multinomial_f32",
-                CudaStorageSlice::F64(_) => "simple_multinomial_f64",
-                CudaStorageSlice::F16(_) => "simple_multinomial_f16",
-                CudaStorageSlice::BF16(_) => "simple_multinomial_bf16",
-                _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
-            };
-            use candle_kernels::MULTINOMIAL_SIMPLE;
-            (name, &MULTINOMIAL_SIMPLE)
-        } else {
-            // Use optimized kernel with shared memory for small vocabularies
-            let name = match &storage.slice {
-                CudaStorageSlice::F32(_) => "multinomial_f32",
-                CudaStorageSlice::F64(_) => "multinomial_f64",
-                CudaStorageSlice::F16(_) => "multinomial_f16",
-                CudaStorageSlice::BF16(_) => "multinomial_bf16",
-                _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
-            };
-            (name, &MULTINOMIAL)
+        // Use optimized parallel reduction kernel for all vocabulary sizes
+        let kernel_name = match &storage.slice {
+            CudaStorageSlice::F32(_) => "optimized_multinomial_f32",
+            CudaStorageSlice::F64(_) => "optimized_multinomial_f64",
+            CudaStorageSlice::F16(_) => "optimized_multinomial_f16",
+            CudaStorageSlice::BF16(_) => "optimized_multinomial_bf16",
+            _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
         };
 
         // Load kernel
-        let func = device.get_or_load_func(kernel_name, kernel_module)?;
+        let func = device.get_or_load_func(kernel_name, &MULTINOMIAL)?;
 
-        // Launch with single thread (kernel handles all work internally)
+        // Launch configuration with parallel threads
+        const THREADS_PER_BLOCK: u32 = 256;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
-            block_dim: (1, 1, 1),
-            shared_mem_bytes: if use_simple_kernel {
-                0
-            } else {
-                shared_mem_size as u32
-            },
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: (THREADS_PER_BLOCK as usize * std::mem::size_of::<f32>()) as u32,
         };
 
         let top_k_val = self.top_k.unwrap_or(0) as u32;

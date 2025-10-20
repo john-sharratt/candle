@@ -9,8 +9,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/sub_at_indices.cu");
     println!("cargo:rerun-if-changed=src/div_at_indices.cu");
     println!("cargo:rerun-if-changed=src/multinomial.cu");
-    println!("cargo:rerun-if-changed=src/multinomial_batch.cu");
-    println!("cargo:rerun-if-changed=src/multinomial_simple.cu");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
