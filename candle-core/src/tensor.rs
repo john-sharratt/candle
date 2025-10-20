@@ -584,10 +584,12 @@ impl Tensor {
     /// - Clone: ~20ms (bottleneck)
     /// - Kernel: <1ms for 50 indices
     ///
+    /// **For 20x+ speedup, use `sub_at_indices_mut()` instead (requires mutable tensor)**
+    ///
     /// **Workarounds for performance-critical code:**
     /// 1. Batch multiple sparse updates into a single call
     /// 2. Minimize consecutive sub_at_indices operations
-    /// 3. Keep tensor on CPU if doing many sparse updates
+    /// 3. Use sub_at_indices_mut() if you have a mutable tensor
     ///
     /// # Arguments
     /// * `indices` - Indices in the last dimension to update (can contain duplicates)
@@ -629,6 +631,73 @@ impl Tensor {
 
         let op = BackpropOp::none();
         Ok(from_storage(storage, self.shape().clone(), op, false))
+    }
+
+    /// In-place sparse subtraction - mutates the tensor directly without cloning.
+    ///
+    /// **This is 20x+ faster than `sub_at_indices()` for large tensors!**
+    ///
+    /// # Performance (150K vocab, 50 indices):
+    /// - `sub_at_indices()`: ~21ms (20ms clone + 1ms kernel)
+    /// - `sub_at_indices_mut()`: ~1ms (no clone, just kernel)
+    ///
+    /// # Important Notes
+    /// - Requires mutable tensor
+    /// - Cannot be used with tensors that have backprop tracking
+    /// - Modifies tensor in-place (no new tensor returned)
+    /// - **CUDA/CPU only** - Metal not yet supported
+    ///
+    /// # Arguments
+    /// * `indices` - Indices in the last dimension to update (can contain duplicates)
+    /// * `value` - Scalar value to subtract from each indexed element
+    ///
+    /// # Example
+    /// ```ignore
+    /// # use candle_core::{Tensor, Device, Result};
+    /// # fn main() -> Result<()> {
+    /// let mut logits = Tensor::zeros((2, 1000), candle_core::DType::F32, &Device::Cpu)?;
+    /// let penalty_tokens = vec![10u32, 25u32, 10u32];
+    /// logits.sub_at_indices_mut(&penalty_tokens, 5.0)?;  // 20x faster!
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn sub_at_indices_mut(&mut self, indices: &[u32], value: f32) -> Result<()> {
+        if self.elem_count() == 0 {
+            return Ok(());
+        }
+
+        // Validate indices
+        let dims = self.dims();
+        let vocab_size = dims[dims.len() - 1];
+
+        for &idx in indices {
+            if idx as usize >= vocab_size {
+                return Err(Error::DimOutOfRange {
+                    shape: self.shape().clone(),
+                    dim: (dims.len() - 1) as i32,
+                    op: "sub_at_indices_mut",
+                });
+            }
+        }
+
+        // Get mutable access to storage
+        let layout = self.layout().clone();
+        let mut storage = self.storage_mut();
+
+        // Dispatch to backend-specific in-place implementation
+        #[cfg(feature = "cuda")]
+        if let Storage::Cuda(cuda_storage) = &mut *storage {
+            return cuda_storage.sub_at_indices_mut(&layout, indices, value);
+        }
+
+        if let Storage::Cpu(cpu_storage) = &mut *storage {
+            return cpu_storage.sub_at_indices_mut(&layout, indices, value);
+        }
+
+        // Metal not yet supported for in-place mutation
+        Err(Error::Msg(
+            "sub_at_indices_mut is only supported on CPU and CUDA backends".to_string(),
+        ))
     }
 
     unary_op!(recip, Recip);
