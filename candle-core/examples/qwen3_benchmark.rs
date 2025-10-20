@@ -315,7 +315,7 @@ mod tests {
 
         let token1 = sample_traditional_cpu(&logits, 0.8, Some(3), Some(0.9), 42)?;
         let token2 = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
-        let token2_val = token2.to_vec1::<u32>()?[0];
+        let token2_val = token2.to_scalar::<u32>()?;
 
         assert!(token1 < 4);
         assert!(token2_val < 4);
