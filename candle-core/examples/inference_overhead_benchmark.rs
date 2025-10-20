@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use std::time::Instant;
 
 fn main() -> Result<()> {
@@ -22,7 +22,8 @@ fn main() -> Result<()> {
     let start = Instant::now();
     for i in 0..iterations {
         // Logits already on CPU, no transfer needed
-        let _token = cpu_logits.sample_multinomial(temperature, top_k, top_p, i as u64)?;
+        let token = cpu_logits.sample_multinomial(temperature, top_k, top_p, i as u64)?;
+        let _token_id = token.to_scalar::<u32>()?;
     }
     let cpu_time = start.elapsed();
 
@@ -48,9 +49,10 @@ fn main() -> Result<()> {
 
         // CPU sampling
         let token = cpu_logits.sample_multinomial(temperature, top_k, top_p, i as u64)?;
+        let _token_id = token.to_scalar::<u32>()?;
 
-        // CPU→GPU transfer (if we need token on GPU for next step)
-        let _gpu_token = token.to_device(&cuda_device)?;
+        // Note: In real inference, we'd need to transfer the token ID back to GPU
+        // for embedding lookup, but that's a single u32, not the whole logits tensor
     }
     let gpu_cpu_time = start.elapsed();
 
@@ -69,7 +71,8 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
     for i in 0..iterations {
-        // NO transfers! Sample directly on GPU
+        // NO transfers! Sample directly on GPU, result stays on GPU
+        // Token tensor stays on GPU - would be used for embedding lookup in real inference
         let _token = gpu_logits.sample_multinomial(temperature, top_k, top_p, i as u64)?;
     }
     let gpu_native_time = start.elapsed();
