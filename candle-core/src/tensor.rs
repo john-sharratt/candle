@@ -873,7 +873,6 @@ impl Tensor {
                 #[cfg(feature = "cuda")]
                 {
                     // Try optimized path if type supports it, otherwise fallback
-                    use cudarc::driver::DeviceRepr;
                     macro_rules! try_optimized {
                         ($ty:ty) => {
                             if S::DTYPE == <$ty as crate::WithDType>::DTYPE {
@@ -893,8 +892,9 @@ impl Tensor {
                     try_optimized!(half::f16);
                     try_optimized!(half::bf16);
 
-                    // Fallback to full transfer for unsupported types
-                    from_cpu_storage(&storage.to_cpu_storage()?)
+                    // Fast fallback: use slice-based transfer for all types
+                    // This is much faster than to_cpu_storage() which transfers the entire buffer
+                    from_cpu_storage(&storage.to_cpu_storage_scalar(self.layout().start_offset())?)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {

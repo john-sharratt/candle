@@ -1467,6 +1467,56 @@ impl CudaStorage {
             }
         }
     }
+
+    /// Transfer a single scalar element from GPU to CPU (type-erased version).
+    /// This is used as a fast fallback when the compile-time type is unknown.
+    /// Returns the value as a CpuStorage containing exactly one element.
+    pub fn to_cpu_storage_scalar(&self, offset: usize) -> Result<CpuStorage> {
+        use cudarc::driver::DeviceSlice;
+
+        match &self.slice {
+            CudaStorageSlice::U8(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::U8(vec))
+            }
+            CudaStorageSlice::U32(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::U32(vec))
+            }
+            CudaStorageSlice::I64(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::I64(vec))
+            }
+            CudaStorageSlice::BF16(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::BF16(vec))
+            }
+            CudaStorageSlice::F16(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::F16(vec))
+            }
+            CudaStorageSlice::F32(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::F32(vec))
+            }
+            CudaStorageSlice::F64(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::F64(vec))
+            }
+            CudaStorageSlice::F8E4M3(slice) => {
+                let single_slice = slice.slice(offset..offset + 1);
+                let vec = single_slice.stream().memcpy_dtov(&single_slice).w()?;
+                Ok(CpuStorage::F8E4M3(vec))
+            }
+        }
+    }
 }
 
 fn gemm_config<T>(
