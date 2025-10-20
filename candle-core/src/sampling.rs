@@ -121,26 +121,73 @@ impl CustomOp1 for MultinomialSampling {
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(&self, storage: &CudaStorage, layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        // ⚠️  PERFORMANCE WARNING: This temporarily transfers GPU→CPU→GPU
-        // This is a fallback implementation until native CUDA kernels are available
-        // 
-        // For production use with large vocabularies on GPU:
-        // 1. Keep logits on CPU if possible, OR
-        // 2. Use the planned native CUDA kernel implementation
-        // 
-        // TODO: Implement native CUDA multinomial sampling kernel that:
-        //   - Applies temperature/top-k/top-p on GPU
-        //   - Samples directly on GPU  
-        //   - Returns single u32 result without full logits transfer
-        
-        let cpu_storage = storage.to_cpu_storage()?;
-        let (result_cpu, shape) = self.cpu_fwd(&cpu_storage, layout)?;
+        use crate::cuda_backend::cudarc::driver::{LaunchAsync, LaunchConfig};
+        use crate::cuda_backend::WrapErr;
 
-        // Transfer minimal result back to CUDA  
-        let cuda_device = storage.device();
-        let result_cuda = cuda_device.storage_from_cpu_storage(&result_cpu)?;
-        Ok((result_cuda, shape))
-    }    #[cfg(feature = "metal")]
+        // 🚀 TRUE GPU-NATIVE SAMPLING - NO CPU TRANSFERS!
+        // All computation happens on GPU, only final u32 result
+
+        let device = storage.device();
+        let vocab_size = layout.shape().dims()[0];
+
+        // Allocate output buffer on GPU (single u32)
+        let output_slice = device.alloc::<u32>(1).w()?;
+
+        // Calculate shared memory size
+        // We need: vocab_size floats for scores + vocab_size floats for probs + vocab_size uints for indices
+        let shared_mem_size = (vocab_size * 2 * std::mem::size_of::<f32>())
+            + (vocab_size * std::mem::size_of::<u32>());
+
+        // Get the appropriate kernel based on dtype
+        let kernel_name = match storage {
+            CudaStorage::F32(_) => "multinomial_f32",
+            CudaStorage::F64(_) => "multinomial_f64",
+            CudaStorage::F16(_) => "multinomial_f16",
+            CudaStorage::BF16(_) => "multinomial_bf16",
+            _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
+        };
+
+        // Load and launch kernel
+        let kernels = device.kernels();
+        let func = kernels.load_kernel(kernel_name, candle_kernels::MULTINOMIAL)?;
+
+        // Launch with single thread (kernel handles all work internally)
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: shared_mem_size as u32,
+        };
+
+        let top_k_val = self.top_k.unwrap_or(0) as u32;
+        let top_p_val = self.top_p.unwrap_or(0.0) as f32;
+
+        // Get input slice
+        let logits_slice = match storage {
+            CudaStorage::F32(s) => s.as_cuda_slice()?,
+            CudaStorage::F64(s) => s.as_cuda_slice()?,
+            CudaStorage::F16(s) => s.as_cuda_slice()?,
+            CudaStorage::BF16(s) => s.as_cuda_slice()?,
+            _ => unreachable!(),
+        };
+
+        // Launch kernel: multinomial_kernel(logits, output, vocab_size, temperature, top_k, top_p, seed)
+        let params = (
+            logits_slice,
+            &output_slice,
+            vocab_size,
+            self.temperature,
+            top_k_val,
+            top_p_val,
+            self.seed,
+        );
+
+        unsafe { func.launch(cfg, params) }.w()?;
+
+        // Return result as CUDA storage (stays on GPU until user requests transfer)
+        let result_storage = CudaStorage::U32(output_slice);
+        Ok((result_storage, Shape::from(1)))
+    }
+    #[cfg(feature = "metal")]
     fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
         // For now, fall back to CPU implementation by transferring data
         // TODO: Implement proper Metal kernel for multinomial sampling
@@ -226,17 +273,17 @@ impl Tensor {
     }
 
     /// **High-performance CPU-only sampling** - avoids all GPU transfers
-    /// 
-    /// For GPU logits, this transfers once to CPU, samples efficiently, 
-    /// and returns u32 directly. Much faster than sample_multinomial() 
+    ///
+    /// For GPU logits, this transfers once to CPU, samples efficiently,
+    /// and returns u32 directly. Much faster than sample_multinomial()
     /// for GPU tensors when you need the final token ID.
-    /// 
+    ///
     /// # Performance Comparison
     /// ```ignore
     /// // ❌ SLOW: Hidden GPU→CPU→GPU transfers  
     /// let token_tensor = gpu_logits.sample_multinomial(temp, top_k, top_p, seed)?;
     /// let token_id = token_tensor.to_scalar::<u32>()?; // Another transfer!
-    /// 
+    ///
     /// // ✅ FAST: Single GPU→CPU transfer, direct result
     /// let token_id = gpu_logits.sample_multinomial_cpu(temp, top_k, top_p, seed)?;
     /// ```
@@ -272,7 +319,7 @@ impl Tensor {
         // Do efficient CPU sampling
         let sampling_op = MultinomialSampling::new(temperature, top_k, top_p, seed);
         let result_tensor = logits.apply_op1_no_bwd(&sampling_op)?;
-        
+
         // Extract result directly (no additional transfers)
         result_tensor.to_scalar::<u32>()
     }

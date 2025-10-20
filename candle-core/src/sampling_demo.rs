@@ -69,11 +69,7 @@ mod performance_demo {
 
         // Test CPU sampling
         let token = logits_cpu.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
-        println!(
-            "   ✅ CPU sampling result: device={:?}, token={:?}",
-            token.device(),
-            token.to_vec1::<u32>()?[0]
-        );
+        println!("   ✅ CPU sampling result: token={}", token);
 
         println!("\n📊 Performance Notes:");
         println!("   • GPU-native sampling avoids costly GPU→CPU transfers");
@@ -100,11 +96,11 @@ mod performance_demo {
         // Our new approach (explicit control)
         println!("\n✅ New approach (explicit device management):");
         println!("   1. Keep logits on GPU as long as possible");
-        println!("   2. logits.sample_multinomial_gpu() // GPU→CPU only when needed");
+        println!("   2. logits.sample_multinomial() // GPU→CPU only when needed");
         println!("   3. Return result on same device as input");
 
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
-        println!("   Sample result: {:?}", token.to_vec1::<u32>()?[0]);
+        println!("   Sample result: {}", token);
 
         println!("\n🎯 Key Benefits:");
         println!("   • Explicit device control");

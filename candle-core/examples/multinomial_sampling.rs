@@ -26,13 +26,13 @@ fn main() -> Result<()> {
     let token1 = logits_tensor.sample_multinomial(0.8, None, None, 42)?;
     println!(
         "   Temperature 0.8, seed 42: token {}",
-        token1.to_vec1::<u32>()?[0]
+        token1
     );
 
     let token2 = logits_tensor.sample_multinomial(0.1, None, None, 42)?;
     println!(
         "   Temperature 0.1, seed 42: token {} (more deterministic)",
-        token2.to_vec1::<u32>()?[0]
+        token2
     );
 
     // Example 2: Top-k sampling
