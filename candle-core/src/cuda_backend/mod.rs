@@ -1202,17 +1202,11 @@ impl CudaStorage {
         // Handle different data types
         let result = match &self.slice {
             CudaStorageSlice::F32(src) => {
-                // Clone the data to allow mutation
-                let dst = src.try_clone()?;
-
-                // Upload indices to device
-                let indices_dev = device.htod_sync_copy(indices).w()?;
-
-                // Get kernel function
+                let dst = src.try_clone().w()?;
+                let indices_dev = device.memcpy_stod(indices).w()?;
                 let func =
                     device.get_or_load_func("sub_at_indices_f32", &kernels::SUB_AT_INDICES)?;
 
-                // Launch kernel
                 let num_indices = indices.len();
                 let cfg = LaunchConfig::for_num_elems(num_indices as u32);
                 let mut builder = func.builder();
@@ -1220,14 +1214,13 @@ impl CudaStorage {
                 builder.arg(&indices_dev);
                 barg!(builder, num_indices);
                 barg!(builder, value);
-                // SAFETY: ffi.
                 unsafe { builder.launch(cfg) }.w()?;
 
                 CudaStorageSlice::F32(dst)
             }
             CudaStorageSlice::F16(src) => {
-                let dst = src.try_clone()?;
-                let indices_dev = device.htod_sync_copy(indices).w()?;
+                let dst = src.try_clone().w()?;
+                let indices_dev = device.memcpy_stod(indices).w()?;
                 let func =
                     device.get_or_load_func("sub_at_indices_f16", &kernels::SUB_AT_INDICES)?;
 
@@ -1243,8 +1236,8 @@ impl CudaStorage {
                 CudaStorageSlice::F16(dst)
             }
             CudaStorageSlice::BF16(src) => {
-                let dst = src.try_clone()?;
-                let indices_dev = device.htod_sync_copy(indices).w()?;
+                let dst = src.try_clone().w()?;
+                let indices_dev = device.memcpy_stod(indices).w()?;
                 let func =
                     device.get_or_load_func("sub_at_indices_bf16", &kernels::SUB_AT_INDICES)?;
 
@@ -1260,8 +1253,8 @@ impl CudaStorage {
                 CudaStorageSlice::BF16(dst)
             }
             CudaStorageSlice::F64(src) => {
-                let dst = src.try_clone()?;
-                let indices_dev = device.htod_sync_copy(indices).w()?;
+                let dst = src.try_clone().w()?;
+                let indices_dev = device.memcpy_stod(indices).w()?;
                 let func =
                     device.get_or_load_func("sub_at_indices_f64", &kernels::SUB_AT_INDICES)?;
 
