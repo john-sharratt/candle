@@ -1184,6 +1184,19 @@ fn div_at_indices(device: &Device) -> Result<()> {
     t.div_at_indices_mut(&indices, 5.0)?;
     assert_eq!(t.to_vec1::<f32>()?, &[2.0, 20.0, 6.0, 40.0]);
 
+    // Test mutable API with repeated indices
+    let mut t = Tensor::new(&[100.0f32, 100.0, 100.0, 100.0], device)?;
+    let indices = [1u32, 1u32, 2u32];
+    t.div_at_indices_mut(&indices, 2.0)?;
+    assert_eq!(t.to_vec1::<f32>()?, &[100.0, 25.0, 50.0, 100.0]);
+
+    // Test mutable API with different dtypes
+    let mut t_f16 = Tensor::new(&[12.0f32, 24.0, 36.0], device)?.to_dtype(DType::F16)?;
+    let indices = [0u32, 2u32];
+    t_f16.div_at_indices_mut(&indices, 3.0)?;
+    let result_f32 = t_f16.to_dtype(DType::F32)?;
+    assert_eq!(result_f32.to_vec1::<f32>()?, &[4.0, 24.0, 12.0]);
+
     Ok(())
 }
 
