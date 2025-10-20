@@ -57,6 +57,10 @@ impl crate::backend::BackendStorage for CudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    fn sub_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
         Err(Error::NotCompiledWithCudaSupport)
     }

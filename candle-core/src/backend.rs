@@ -21,6 +21,8 @@ pub trait BackendStorage: Sized {
 
     fn elu(&self, _: &Layout, _: f64) -> Result<Self>;
 
+    fn sub_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self>;
+
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self>;
 
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self>;

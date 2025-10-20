@@ -1,6 +1,6 @@
 use crate::source::{
     AFFINE, BINARY, CAST, CONV, FILL, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE,
-    SDPA, SORT, TERNARY, UNARY,
+    SDPA, SORT, SUB_AT_INDICES, TERNARY, UNARY,
 };
 use crate::{
     ComputePipeline, ConstantValues, Device, Function, Library, MTLCompileOptions, MTLMathMode,
@@ -94,6 +94,7 @@ impl Kernels {
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,
             Source::Sort => SORT,
+            Source::SubAtIndices => SUB_AT_INDICES,
             Source::Ternary => TERNARY,
             Source::Unary => UNARY,
             Source::Sdpa => SDPA,

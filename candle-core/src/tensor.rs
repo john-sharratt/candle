@@ -569,6 +569,38 @@ impl Tensor {
     broadcast_binary_op!(broadcast_gt, gt);
     broadcast_binary_op!(broadcast_ge, ge);
 
+    /// Subtract a scalar value from elements at specific indices.
+    ///
+    /// This is optimized for sparse updates (e.g., repetition penalties in text generation).
+    /// Much faster than broadcast operations when updating a small subset of indices.
+    pub fn sub_at_indices(&self, indices: &[u32], value: f32) -> Result<Self> {
+        if self.elem_count() == 0 {
+            return Ok(self.clone());
+        }
+
+        // Validate indices
+        let dims = self.dims();
+        let vocab_size = dims[dims.len() - 1];
+
+        for &idx in indices {
+            if idx as usize >= vocab_size {
+                return Err(Error::DimOutOfRange {
+                    shape: self.shape().clone(),
+                    dim: (dims.len() - 1) as i32,
+                    op: "sub_at_indices",
+                });
+            }
+        }
+
+        // Dispatch to backend-specific implementation
+        let storage = self
+            .storage()
+            .sub_at_indices(&self.layout(), indices, value)?;
+
+        let op = BackpropOp::none();
+        Ok(from_storage(storage, self.shape().clone(), op, false))
+    }
+
     unary_op!(recip, Recip);
     unary_op!(neg, Neg);
     unary_op!(exp, Exp);

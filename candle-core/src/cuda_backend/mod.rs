@@ -1195,6 +1195,97 @@ impl CudaStorage {
     pub fn as_cuda_slice_mut<T: CudaDType>(&mut self) -> Result<&mut CudaSlice<T>> {
         T::as_cuda_slice_mut(self)
     }
+
+    pub fn sub_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        let device = self.device().clone();
+
+        // Handle different data types
+        let result = match &self.slice {
+            CudaStorageSlice::F32(src) => {
+                // Clone the data to allow mutation
+                let dst = src.try_clone()?;
+
+                // Upload indices to device
+                let indices_dev = device.htod_sync_copy(indices).w()?;
+
+                // Get kernel function
+                let func =
+                    device.get_or_load_func("sub_at_indices_f32", &kernels::SUB_AT_INDICES)?;
+
+                // Launch kernel
+                let num_indices = indices.len();
+                let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                // SAFETY: ffi.
+                unsafe { builder.launch(cfg) }.w()?;
+
+                CudaStorageSlice::F32(dst)
+            }
+            CudaStorageSlice::F16(src) => {
+                let dst = src.try_clone()?;
+                let indices_dev = device.htod_sync_copy(indices).w()?;
+                let func =
+                    device.get_or_load_func("sub_at_indices_f16", &kernels::SUB_AT_INDICES)?;
+
+                let num_indices = indices.len();
+                let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+
+                CudaStorageSlice::F16(dst)
+            }
+            CudaStorageSlice::BF16(src) => {
+                let dst = src.try_clone()?;
+                let indices_dev = device.htod_sync_copy(indices).w()?;
+                let func =
+                    device.get_or_load_func("sub_at_indices_bf16", &kernels::SUB_AT_INDICES)?;
+
+                let num_indices = indices.len();
+                let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+
+                CudaStorageSlice::BF16(dst)
+            }
+            CudaStorageSlice::F64(src) => {
+                let dst = src.try_clone()?;
+                let indices_dev = device.htod_sync_copy(indices).w()?;
+                let func =
+                    device.get_or_load_func("sub_at_indices_f64", &kernels::SUB_AT_INDICES)?;
+
+                let num_indices = indices.len();
+                let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value as f64);
+                unsafe { builder.launch(cfg) }.w()?;
+
+                CudaStorageSlice::F64(dst)
+            }
+            _ => crate::bail!(
+                "sub_at_indices is only supported for float types (f16, bf16, f32, f64)"
+            ),
+        };
+
+        Ok(Self {
+            slice: result,
+            device,
+        })
+    }
 }
 
 fn gemm_config<T>(
@@ -1485,6 +1576,11 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         let slice = Elu(alpha).map(&self.slice, &device, layout)?;
         Ok(Self { slice, device })
+    }
+
+    fn sub_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Delegate to the inherent method
+        self.sub_at_indices(layout, indices, value)
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
