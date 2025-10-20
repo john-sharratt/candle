@@ -239,7 +239,7 @@ fn test_gguf_cache_truncate_by_tokens() -> Result<()> {
     model.rewind_by_tokens(3)?;
     assert_eq!(model.cache_len(), 5); // 8 - 3 = 5
 
-    // Truncate by 2 more tokens  
+    // Truncate by 2 more tokens
     model.rewind_by_tokens(2)?;
     assert_eq!(model.cache_len(), 3); // 5 - 2 = 3
 
@@ -263,10 +263,10 @@ fn test_gguf_cache_truncate_no_op() -> Result<()> {
     // Truncating to same position should be no-op
     model.truncate_kv_cache(5)?;
     assert_eq!(model.cache_len(), 5);
-    
-    // Truncating to larger position should be no-op  
+
+    // Truncating to larger position should be no-op
     model.truncate_kv_cache(10)?;
-    assert_eq!(model.cache_len(), 5);    // Rewinding by 0 tokens should be no-op
+    assert_eq!(model.cache_len(), 5); // Rewinding by 0 tokens should be no-op
     model.rewind_by_tokens(0)?;
     assert_eq!(model.cache_len(), 5);
 

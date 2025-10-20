@@ -12,6 +12,8 @@ pub enum Id {
     DivAtIndices,
     Fill,
     Indexing,
+    Multinomial,
+    MultinomialSimple,
     Quantized,
     Reduce,
     Sort,
@@ -20,7 +22,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 13] = [
+pub const ALL_IDS: [Id; 15] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -28,6 +30,8 @@ pub const ALL_IDS: [Id; 13] = [
     Id::DivAtIndices,
     Id::Fill,
     Id::Indexing,
+    Id::Multinomial,
+    Id::MultinomialSimple,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -78,6 +82,8 @@ mdl!(CONV, Conv);
 mdl!(DIV_AT_INDICES, DivAtIndices);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
+mdl!(MULTINOMIAL, Multinomial);
+mdl!(MULTINOMIAL_SIMPLE, MultinomialSimple);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
 mdl!(SORT, Sort);

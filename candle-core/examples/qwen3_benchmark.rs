@@ -56,7 +56,7 @@ fn run_qwen3_benchmark(
     // Benchmark 1: Traditional CPU sampling (current approach)
     let start = Instant::now();
     for i in 0..iterations {
-        let _token = sample_traditional(&logits_cpu, temperature, top_k, top_p, i as u64)?;
+        let _token = sample_traditional_cpu(&logits_cpu, temperature, top_k, top_p, i as u64)?;
     }
     let cpu_traditional_time = start.elapsed();
 

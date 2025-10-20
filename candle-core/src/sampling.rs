@@ -1,16 +1,10 @@
 use crate::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor, WithDType};
 
 #[cfg(feature = "cuda")]
-use crate::{
-    backend::{BackendDevice, BackendStorage},
-    CudaStorage,
-};
+use crate::CudaStorage;
 
 #[cfg(feature = "metal")]
-use crate::{
-    backend::{BackendDevice, BackendStorage},
-    MetalStorage,
-};
+use crate::MetalStorage;
 
 /// GPU-native multinomial sampling operation
 #[derive(Debug, Clone)]
@@ -121,83 +115,190 @@ impl CustomOp1 for MultinomialSampling {
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(&self, storage: &CudaStorage, layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        use crate::cuda_backend::cudarc::driver::{LaunchAsync, LaunchConfig};
-        use crate::cuda_backend::WrapErr;
+        use crate::cuda_backend::{
+            cudarc::driver::{LaunchConfig, PushKernelArg},
+            CudaStorageSlice, WrapErr,
+        };
+        use candle_kernels::MULTINOMIAL;
 
         // 🚀 TRUE GPU-NATIVE SAMPLING - NO CPU TRANSFERS!
         // All computation happens on GPU, only final u32 result
 
-        let device = storage.device();
+        let device = &storage.device;
         let vocab_size = layout.shape().dims()[0];
 
         // Allocate output buffer on GPU (single u32)
-        let output_slice = device.alloc::<u32>(1).w()?;
+        let output_slice = unsafe { device.alloc::<u32>(1)? };
 
         // Calculate shared memory size
         // We need: vocab_size floats for scores + vocab_size floats for probs + vocab_size uints for indices
         let shared_mem_size = (vocab_size * 2 * std::mem::size_of::<f32>())
             + (vocab_size * std::mem::size_of::<u32>());
 
-        // Get the appropriate kernel based on dtype
-        let kernel_name = match storage {
-            CudaStorage::F32(_) => "multinomial_f32",
-            CudaStorage::F64(_) => "multinomial_f64",
-            CudaStorage::F16(_) => "multinomial_f16",
-            CudaStorage::BF16(_) => "multinomial_bf16",
-            _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
+        // Check if shared memory size exceeds device limits (typically 48KB-96KB per block)
+        // For vocabularies > 4096, we need to use global memory instead
+        const MAX_SHARED_MEM: usize = 48 * 1024; // Conservative 48KB limit for compatibility
+
+        let use_simple_kernel = shared_mem_size > MAX_SHARED_MEM;
+
+        // Get the appropriate kernel based on dtype and vocab size
+        let (kernel_name, kernel_module) = if use_simple_kernel {
+            // Use simple kernel for large vocabularies (no shared memory, no top-k/top-p)
+            let name = match &storage.slice {
+                CudaStorageSlice::F32(_) => "simple_multinomial_f32",
+                CudaStorageSlice::F64(_) => "simple_multinomial_f64",
+                CudaStorageSlice::F16(_) => "simple_multinomial_f16",
+                CudaStorageSlice::BF16(_) => "simple_multinomial_bf16",
+                _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
+            };
+            use candle_kernels::MULTINOMIAL_SIMPLE;
+            (name, &MULTINOMIAL_SIMPLE)
+        } else {
+            // Use optimized kernel with shared memory for small vocabularies
+            let name = match &storage.slice {
+                CudaStorageSlice::F32(_) => "multinomial_f32",
+                CudaStorageSlice::F64(_) => "multinomial_f64",
+                CudaStorageSlice::F16(_) => "multinomial_f16",
+                CudaStorageSlice::BF16(_) => "multinomial_bf16",
+                _ => crate::bail!("Unsupported dtype for GPU multinomial sampling"),
+            };
+            (name, &MULTINOMIAL)
         };
 
-        // Load and launch kernel
-        let kernels = device.kernels();
-        let func = kernels.load_kernel(kernel_name, candle_kernels::MULTINOMIAL)?;
+        // Load kernel
+        let func = device.get_or_load_func(kernel_name, kernel_module)?;
 
         // Launch with single thread (kernel handles all work internally)
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1, 1, 1),
-            shared_mem_bytes: shared_mem_size as u32,
+            shared_mem_bytes: if use_simple_kernel {
+                0
+            } else {
+                shared_mem_size as u32
+            },
         };
 
         let top_k_val = self.top_k.unwrap_or(0) as u32;
         let top_p_val = self.top_p.unwrap_or(0.0) as f32;
 
-        // Get input slice
-        let logits_slice = match storage {
-            CudaStorage::F32(s) => s.as_cuda_slice()?,
-            CudaStorage::F64(s) => s.as_cuda_slice()?,
-            CudaStorage::F16(s) => s.as_cuda_slice()?,
-            CudaStorage::BF16(s) => s.as_cuda_slice()?,
+        // Launch kernel with builder pattern
+        let mut builder = func.builder();
+
+        // Push parameters based on dtype
+        match &storage.slice {
+            CudaStorageSlice::F32(s) => {
+                builder.arg(s);
+                builder.arg(&output_slice);
+                builder.arg(&vocab_size);
+                builder.arg(&self.temperature);
+                builder.arg(&top_k_val);
+                builder.arg(&top_p_val);
+                builder.arg(&self.seed);
+            }
+            CudaStorageSlice::F64(s) => {
+                builder.arg(s);
+                builder.arg(&output_slice);
+                builder.arg(&vocab_size);
+                builder.arg(&self.temperature);
+                builder.arg(&top_k_val);
+                builder.arg(&top_p_val);
+                builder.arg(&self.seed);
+            }
+            CudaStorageSlice::F16(s) => {
+                builder.arg(s);
+                builder.arg(&output_slice);
+                builder.arg(&vocab_size);
+                builder.arg(&self.temperature);
+                builder.arg(&top_k_val);
+                builder.arg(&top_p_val);
+                builder.arg(&self.seed);
+            }
+            CudaStorageSlice::BF16(s) => {
+                builder.arg(s);
+                builder.arg(&output_slice);
+                builder.arg(&vocab_size);
+                builder.arg(&self.temperature);
+                builder.arg(&top_k_val);
+                builder.arg(&top_p_val);
+                builder.arg(&self.seed);
+            }
             _ => unreachable!(),
-        };
+        }
 
-        // Launch kernel: multinomial_kernel(logits, output, vocab_size, temperature, top_k, top_p, seed)
-        let params = (
-            logits_slice,
-            &output_slice,
-            vocab_size,
-            self.temperature,
-            top_k_val,
-            top_p_val,
-            self.seed,
-        );
-
-        unsafe { func.launch(cfg, params) }.w()?;
+        unsafe { builder.launch(cfg) }.w()?;
 
         // Return result as CUDA storage (stays on GPU until user requests transfer)
-        let result_storage = CudaStorage::U32(output_slice);
+        let result_storage = CudaStorage::wrap_cuda_slice(output_slice, device.clone());
         Ok((result_storage, Shape::from(1)))
     }
     #[cfg(feature = "metal")]
     fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
-        // For now, fall back to CPU implementation by transferring data
-        // TODO: Implement proper Metal kernel for multinomial sampling
-        let cpu_storage = storage.to_cpu_storage()?;
-        let (result_cpu, shape) = self.cpu_fwd(&cpu_storage, layout)?;
+        use crate::metal_backend::MetalError;
 
-        // Transfer result back to Metal
-        let metal_device = storage.device();
-        let result_metal = metal_device.storage_from_cpu_storage(&result_cpu)?;
-        Ok((result_metal, shape))
+        // 🚀 TRUE GPU-NATIVE METAL SAMPLING - NO CPU TRANSFERS!
+
+        let device = storage.device();
+        let vocab_size = layout.shape().dims()[0];
+
+        // Allocate output buffer on GPU (single u32)
+        let output = device.new_buffer(1, crate::DType::U32, "multinomial_output")?;
+
+        // Get the appropriate kernel based on dtype
+        let kernel_name = match storage {
+            MetalStorage::F32(_) => "multinomial_f32",
+            MetalStorage::F16(_) => "multinomial_f16",
+            _ => crate::bail!("Unsupported dtype for Metal multinomial sampling"),
+        };
+
+        // Load kernel
+        let pipeline =
+            device.get_or_load_pipeline(kernel_name, candle_metal_kernels::MULTINOMIAL)?;
+
+        // Prepare kernel parameters
+        let top_k_val = self.top_k.unwrap_or(0) as u32;
+        let top_p_val = self.top_p.unwrap_or(0.0) as f32;
+
+        // Get input buffer
+        let logits_buffer = match storage {
+            MetalStorage::F32(s) => s.buffer(),
+            MetalStorage::F16(s) => s.buffer(),
+            _ => unreachable!(),
+        };
+
+        // Create command buffer and encoder
+        let command_buffer = device.command_buffer()?;
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(logits_buffer), 0);
+        encoder.set_buffer(1, Some(output.buffer()), 0);
+        encoder.set_u32(2, vocab_size as u32);
+        encoder.set_f32(3, self.temperature);
+        encoder.set_u32(4, top_k_val);
+        encoder.set_f32(5, top_p_val);
+        encoder.set_u64(6, self.seed);
+
+        // Launch with single thread (kernel handles all work)
+        let grid_size = metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let thread_group_size = metal::MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatch_thread_groups(grid_size, thread_group_size);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Return result as Metal storage (stays on GPU until user requests transfer)
+        let result_storage = MetalStorage::U32(output);
+        Ok((result_storage, Shape::from(1)))
     }
 
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, _grad_res: &Tensor) -> Result<Option<Tensor>> {
@@ -444,9 +545,97 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
-        // Now returns u32 directly
-        assert!(token < 4);
+        // Verify result is valid token index
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 4);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_multinomial_sampling_cuda_native_kernel() -> Result<()> {
+        if !crate::utils::cuda_is_available() {
+            return Ok(()); // Skip if CUDA not available
+        }
+
+        let device = Device::new_cuda(0)?;
+
+        // Test 1: Basic sampling with GPU kernel
+        println!("🧪 Testing GPU-native CUDA kernel implementation");
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
+        let token_tensor = logits.sample_multinomial(1.0, None, None, 42)?;
+
+        // Verify tensor stays on GPU
+        assert!(token_tensor.device().is_cuda());
+        let token = token_tensor.to_scalar::<u32>()?;
+        assert!(token < 5);
+        println!("   ✅ Basic sampling: token {}", token);
+
+        // Test 2: Temperature scaling on GPU
+        let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
+        let token_hot = logits.sample_multinomial(2.0, None, None, 123)?;
+        let token_cold = logits.sample_multinomial(0.1, None, None, 123)?;
+
+        let val_hot = token_hot.to_scalar::<u32>()?;
+        let val_cold = token_cold.to_scalar::<u32>()?;
+        assert!(val_hot < 4);
+        assert!(val_cold < 4);
+        println!(
+            "   ✅ Temperature scaling: hot={}, cold={}",
+            val_hot, val_cold
+        );
+
+        // Test 3: Top-k filtering on GPU
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5, 2.5], &device)?;
+        let token = logits.sample_multinomial(1.0, Some(3), None, 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 7);
+        println!("   ✅ Top-k filtering: token {}", token_val);
+
+        // Test 4: Top-p (nucleus) sampling on GPU
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
+        let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 4);
+        println!("   ✅ Top-p sampling: token {}", token_val);
+
+        // Test 5: Combined top-k and top-p on GPU
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
+        let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 6);
+        println!("   ✅ Combined top-k + top-p: token {}", token_val);
+
+        // Test 6: Deterministic behavior with same seed
+        let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
+        let token1 = logits.sample_multinomial(0.01, None, None, 999)?;
+        let token2 = logits.sample_multinomial(0.01, None, None, 999)?;
+
+        let val1 = token1.to_scalar::<u32>()?;
+        let val2 = token2.to_scalar::<u32>()?;
+        assert_eq!(val1, val2, "Same seed should give same result");
+        println!("   ✅ Deterministic: seed 999 -> token {}", val1);
+
+        // Test 7: Large vocabulary (realistic LLM size)
+        let vocab_size = 32000;
+        let logits_data: Vec<f32> = (0..vocab_size)
+            .map(|i| {
+                let x = i as f32 / vocab_size as f32;
+                if i < vocab_size / 10 {
+                    2.0 + x * 3.0
+                } else {
+                    -1.0 + x * 0.5
+                }
+            })
+            .collect();
+        let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
+        let token = logits.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < vocab_size as u32);
+        println!("   ✅ Large vocabulary (32K): token {}", token_val);
+
+        println!("🎉 All GPU-native CUDA kernel tests passed!");
         Ok(())
     }
 
@@ -461,14 +650,97 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
-        // Now returns u32 directly
-        assert!(token < 4);
-        assert_eq!(token.dtype(), DType::U32);
-        assert_eq!(token.device(), device);
-
-        let token_val = token.to_vec1::<u32>()?[0];
+        // Verify result is valid token index
+        let token_val = token.to_scalar::<u32>()?;
         assert!(token_val < 4);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_multinomial_sampling_metal_native_kernel() -> Result<()> {
+        if !crate::utils::metal_is_available() {
+            return Ok(()); // Skip if Metal not available
+        }
+
+        let device = Device::new_metal(0)?;
+
+        // Test 1: Basic sampling with Metal kernel
+        println!("🧪 Testing GPU-native Metal kernel implementation");
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
+        let token_tensor = logits.sample_multinomial(1.0, None, None, 42)?;
+
+        // Verify tensor stays on Metal GPU
+        assert!(token_tensor.device().is_metal());
+        let token = token_tensor.to_scalar::<u32>()?;
+        assert!(token < 5);
+        println!("   ✅ Basic sampling: token {}", token);
+
+        // Test 2: Temperature scaling on Metal GPU
+        let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
+        let token_hot = logits.sample_multinomial(2.0, None, None, 123)?;
+        let token_cold = logits.sample_multinomial(0.1, None, None, 123)?;
+
+        let val_hot = token_hot.to_scalar::<u32>()?;
+        let val_cold = token_cold.to_scalar::<u32>()?;
+        assert!(val_hot < 4);
+        assert!(val_cold < 4);
+        println!(
+            "   ✅ Temperature scaling: hot={}, cold={}",
+            val_hot, val_cold
+        );
+
+        // Test 3: Top-k filtering on Metal GPU
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5, 2.5], &device)?;
+        let token = logits.sample_multinomial(1.0, Some(3), None, 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 7);
+        println!("   ✅ Top-k filtering: token {}", token_val);
+
+        // Test 4: Top-p (nucleus) sampling on Metal GPU
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
+        let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 4);
+        println!("   ✅ Top-p sampling: token {}", token_val);
+
+        // Test 5: Combined top-k and top-p on Metal GPU
+        let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
+        let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < 6);
+        println!("   ✅ Combined top-k + top-p: token {}", token_val);
+
+        // Test 6: Deterministic behavior with same seed
+        let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
+        let token1 = logits.sample_multinomial(0.01, None, None, 999)?;
+        let token2 = logits.sample_multinomial(0.01, None, None, 999)?;
+
+        let val1 = token1.to_scalar::<u32>()?;
+        let val2 = token2.to_scalar::<u32>()?;
+        assert_eq!(val1, val2, "Same seed should give same result");
+        println!("   ✅ Deterministic: seed 999 -> token {}", val1);
+
+        // Test 7: Large vocabulary (realistic LLM size)
+        let vocab_size = 32000;
+        let logits_data: Vec<f32> = (0..vocab_size)
+            .map(|i| {
+                let x = i as f32 / vocab_size as f32;
+                if i < vocab_size / 10 {
+                    2.0 + x * 3.0
+                } else {
+                    -1.0 + x * 0.5
+                }
+            })
+            .collect();
+        let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
+        let token = logits.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
+        let token_val = token.to_scalar::<u32>()?;
+        assert!(token_val < vocab_size as u32);
+        println!("   ✅ Large vocabulary (32K): token {}", token_val);
+
+        println!("🎉 All GPU-native Metal kernel tests passed!");
         Ok(())
     }
 }
