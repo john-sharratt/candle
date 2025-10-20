@@ -121,18 +121,26 @@ impl CustomOp1 for MultinomialSampling {
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(&self, storage: &CudaStorage, layout: &Layout) -> Result<(CudaStorage, Shape)> {
-        // For now, fall back to CPU implementation by transferring data
-        // TODO: Implement proper CUDA kernel for multinomial sampling
+        // ⚠️  PERFORMANCE WARNING: This temporarily transfers GPU→CPU→GPU
+        // This is a fallback implementation until native CUDA kernels are available
+        // 
+        // For production use with large vocabularies on GPU:
+        // 1. Keep logits on CPU if possible, OR
+        // 2. Use the planned native CUDA kernel implementation
+        // 
+        // TODO: Implement native CUDA multinomial sampling kernel that:
+        //   - Applies temperature/top-k/top-p on GPU
+        //   - Samples directly on GPU  
+        //   - Returns single u32 result without full logits transfer
+        
         let cpu_storage = storage.to_cpu_storage()?;
         let (result_cpu, shape) = self.cpu_fwd(&cpu_storage, layout)?;
 
-        // Transfer result back to CUDA
+        // Transfer minimal result back to CUDA  
         let cuda_device = storage.device();
         let result_cuda = cuda_device.storage_from_cpu_storage(&result_cpu)?;
         Ok((result_cuda, shape))
-    }
-
-    #[cfg(feature = "metal")]
+    }    #[cfg(feature = "metal")]
     fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
         // For now, fall back to CPU implementation by transferring data
         // TODO: Implement proper Metal kernel for multinomial sampling
@@ -164,7 +172,8 @@ impl Tensor {
     /// * `seed` - Random seed for reproducible sampling
     ///
     /// # Returns
-    /// A tensor containing the sampled token index as u32
+    /// A tensor containing the sampled token index as u32, staying on original device.
+    /// Use `.to_scalar::<u32>()` to extract value with controlled transfer timing.
     ///
     /// # Example
     /// ```rust
@@ -172,7 +181,8 @@ impl Tensor {
     ///
     /// let device = Device::Cpu;
     /// let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-    /// let token = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
+    /// let token_tensor = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
+    /// let token_id = token_tensor.to_scalar::<u32>()?; // YOU control when transfer happens
     /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn sample_multinomial(
@@ -181,7 +191,7 @@ impl Tensor {
         top_k: Option<usize>,
         top_p: Option<f64>,
         seed: u64,
-    ) -> Result<u32> {
+    ) -> Result<Self> {
         // Ensure input is 1D
         if self.rank() != 1 {
             crate::bail!(
@@ -211,9 +221,60 @@ impl Tensor {
         let sampling_op = MultinomialSampling::new(temperature, top_k, top_p, seed);
         let result_tensor = logits.apply_op1_no_bwd(&sampling_op)?;
 
-        // Extract the scalar u32 value from the result tensor
-        let token = result_tensor.to_vec1::<u32>()?[0];
-        Ok(token)
+        // Return the tensor on original device - transfer timing controlled by user
+        Ok(result_tensor)
+    }
+
+    /// **High-performance CPU-only sampling** - avoids all GPU transfers
+    /// 
+    /// For GPU logits, this transfers once to CPU, samples efficiently, 
+    /// and returns u32 directly. Much faster than sample_multinomial() 
+    /// for GPU tensors when you need the final token ID.
+    /// 
+    /// # Performance Comparison
+    /// ```ignore
+    /// // ❌ SLOW: Hidden GPU→CPU→GPU transfers  
+    /// let token_tensor = gpu_logits.sample_multinomial(temp, top_k, top_p, seed)?;
+    /// let token_id = token_tensor.to_scalar::<u32>()?; // Another transfer!
+    /// 
+    /// // ✅ FAST: Single GPU→CPU transfer, direct result
+    /// let token_id = gpu_logits.sample_multinomial_cpu(temp, top_k, top_p, seed)?;
+    /// ```
+    pub fn sample_multinomial_cpu(
+        &self,
+        temperature: f32,
+        top_k: Option<usize>,
+        top_p: Option<f64>,
+        seed: u64,
+    ) -> Result<u32> {
+        // Ensure input is 1D
+        if self.rank() != 1 {
+            crate::bail!(
+                "sample_multinomial_cpu requires 1D tensor, got shape: {:?}",
+                self.shape()
+            );
+        }
+
+        // Convert to CPU if needed (single transfer for GPU tensors)
+        let cpu_logits = if self.device().is_cpu() {
+            self.clone()
+        } else {
+            self.to_device(&crate::Device::Cpu)?
+        };
+
+        // Convert to F32 if needed
+        let logits = if cpu_logits.dtype() == DType::F32 {
+            cpu_logits
+        } else {
+            cpu_logits.to_dtype(DType::F32)?
+        };
+
+        // Do efficient CPU sampling
+        let sampling_op = MultinomialSampling::new(temperature, top_k, top_p, seed);
+        let result_tensor = logits.apply_op1_no_bwd(&sampling_op)?;
+        
+        // Extract result directly (no additional transfers)
+        result_tensor.to_scalar::<u32>()
     }
 }
 
