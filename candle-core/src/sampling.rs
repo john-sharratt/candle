@@ -320,8 +320,7 @@ impl Tensor {
     /// * `seed` - Random seed for reproducible sampling
     ///
     /// # Returns
-    /// A tensor containing the sampled token index as u32, staying on original device.
-    /// Use `.to_scalar::<u32>()` to extract value with controlled transfer timing.
+    /// The sampled token index as u32.
     ///
     /// # Example
     /// ```rust
@@ -329,8 +328,7 @@ impl Tensor {
     ///
     /// let device = Device::Cpu;
     /// let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
-    /// let token_tensor = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
-    /// let token_id = token_tensor.to_scalar::<u32>()?; // YOU control when transfer happens
+    /// let token_id = logits.sample_multinomial(0.8, Some(3), Some(0.9), 42)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn sample_multinomial(
@@ -339,7 +337,7 @@ impl Tensor {
         top_k: Option<usize>,
         top_p: Option<f64>,
         seed: u64,
-    ) -> Result<Self> {
+    ) -> Result<u32> {
         // Ensure input is 1D
         if self.rank() != 1 {
             crate::bail!(
@@ -369,8 +367,8 @@ impl Tensor {
         let sampling_op = MultinomialSampling::new(temperature, top_k, top_p, seed);
         let result_tensor = logits.apply_op1_no_bwd(&sampling_op)?;
 
-        // Return the tensor on original device - transfer timing controlled by user
-        Ok(result_tensor)
+        // Extract scalar directly - single efficient transfer for GPU tensors
+        result_tensor.to_scalar::<u32>()
     }
 
     /// **High-performance CPU-only sampling** - avoids all GPU transfers
@@ -564,21 +562,14 @@ mod tests {
         // Test 1: Basic sampling with GPU kernel
         println!("🧪 Testing GPU-native CUDA kernel implementation");
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
-        let token_tensor = logits.sample_multinomial(1.0, None, None, 42)?;
-
-        // Verify tensor stays on GPU
-        assert!(token_tensor.device().is_cuda());
-        let token = token_tensor.to_scalar::<u32>()?;
+        let token = logits.sample_multinomial(1.0, None, None, 42)?;
         assert!(token < 5);
         println!("   ✅ Basic sampling: token {}", token);
 
         // Test 2: Temperature scaling on GPU
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let token_hot = logits.sample_multinomial(2.0, None, None, 123)?;
-        let token_cold = logits.sample_multinomial(0.1, None, None, 123)?;
-
-        let val_hot = token_hot.to_scalar::<u32>()?;
-        let val_cold = token_cold.to_scalar::<u32>()?;
+        let val_hot = logits.sample_multinomial(2.0, None, None, 123)?;
+        let val_cold = logits.sample_multinomial(0.1, None, None, 123)?;
         assert!(val_hot < 4);
         assert!(val_cold < 4);
         println!(
@@ -589,31 +580,25 @@ mod tests {
         // Test 3: Top-k filtering on GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5, 2.5], &device)?;
         let token = logits.sample_multinomial(1.0, Some(3), None, 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 7);
-        println!("   ✅ Top-k filtering: token {}", token_val);
+        assert!(token < 7);
+        println!("   ✅ Top-k filtering: token {}", token);
 
         // Test 4: Top-p (nucleus) sampling on GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 4);
-        println!("   ✅ Top-p sampling: token {}", token_val);
+        assert!(token < 4);
+        println!("   ✅ Top-p sampling: token {}", token);
 
         // Test 5: Combined top-k and top-p on GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
         let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 6);
-        println!("   ✅ Combined top-k + top-p: token {}", token_val);
+        assert!(token < 6);
+        println!("   ✅ Combined top-k + top-p: token {}", token);
 
         // Test 6: Deterministic behavior with same seed
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let token1 = logits.sample_multinomial(0.01, None, None, 999)?;
-        let token2 = logits.sample_multinomial(0.01, None, None, 999)?;
-
-        let val1 = token1.to_scalar::<u32>()?;
-        let val2 = token2.to_scalar::<u32>()?;
+        let val1 = logits.sample_multinomial(0.01, None, None, 999)?;
+        let val2 = logits.sample_multinomial(0.01, None, None, 999)?;
         assert_eq!(val1, val2, "Same seed should give same result");
         println!("   ✅ Deterministic: seed 999 -> token {}", val1);
 
@@ -631,9 +616,8 @@ mod tests {
             .collect();
         let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
         let token = logits.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < vocab_size as u32);
-        println!("   ✅ Large vocabulary (32K): token {}", token_val);
+        assert!(token < vocab_size as u32);
+        println!("   ✅ Large vocabulary (32K): token {}", token);
 
         println!("🎉 All GPU-native CUDA kernel tests passed!");
         Ok(())
@@ -649,10 +633,7 @@ mod tests {
         let device = Device::new_metal(0)?;
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
-
-        // Verify result is valid token index
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 4);
+        assert!(token < 4);
 
         Ok(())
     }
@@ -669,21 +650,14 @@ mod tests {
         // Test 1: Basic sampling with Metal kernel
         println!("🧪 Testing GPU-native Metal kernel implementation");
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
-        let token_tensor = logits.sample_multinomial(1.0, None, None, 42)?;
-
-        // Verify tensor stays on Metal GPU
-        assert!(token_tensor.device().is_metal());
-        let token = token_tensor.to_scalar::<u32>()?;
+        let token = logits.sample_multinomial(1.0, None, None, 42)?;
         assert!(token < 5);
         println!("   ✅ Basic sampling: token {}", token);
 
         // Test 2: Temperature scaling on Metal GPU
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let token_hot = logits.sample_multinomial(2.0, None, None, 123)?;
-        let token_cold = logits.sample_multinomial(0.1, None, None, 123)?;
-
-        let val_hot = token_hot.to_scalar::<u32>()?;
-        let val_cold = token_cold.to_scalar::<u32>()?;
+        let val_hot = logits.sample_multinomial(2.0, None, None, 123)?;
+        let val_cold = logits.sample_multinomial(0.1, None, None, 123)?;
         assert!(val_hot < 4);
         assert!(val_cold < 4);
         println!(
@@ -694,31 +668,25 @@ mod tests {
         // Test 3: Top-k filtering on Metal GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5, 2.5], &device)?;
         let token = logits.sample_multinomial(1.0, Some(3), None, 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 7);
-        println!("   ✅ Top-k filtering: token {}", token_val);
+        assert!(token < 7);
+        println!("   ✅ Top-k filtering: token {}", token);
 
         // Test 4: Top-p (nucleus) sampling on Metal GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 4);
-        println!("   ✅ Top-p sampling: token {}", token_val);
+        assert!(token < 4);
+        println!("   ✅ Top-p sampling: token {}", token);
 
         // Test 5: Combined top-k and top-p on Metal GPU
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
         let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < 6);
-        println!("   ✅ Combined top-k + top-p: token {}", token_val);
+        assert!(token < 6);
+        println!("   ✅ Combined top-k + top-p: token {}", token);
 
         // Test 6: Deterministic behavior with same seed
         let logits = Tensor::new(&[1.0f32, 5.0, 0.5, 2.0], &device)?;
-        let token1 = logits.sample_multinomial(0.01, None, None, 999)?;
-        let token2 = logits.sample_multinomial(0.01, None, None, 999)?;
-
-        let val1 = token1.to_scalar::<u32>()?;
-        let val2 = token2.to_scalar::<u32>()?;
+        let val1 = logits.sample_multinomial(0.01, None, None, 999)?;
+        let val2 = logits.sample_multinomial(0.01, None, None, 999)?;
         assert_eq!(val1, val2, "Same seed should give same result");
         println!("   ✅ Deterministic: seed 999 -> token {}", val1);
 
@@ -736,9 +704,8 @@ mod tests {
             .collect();
         let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
         let token = logits.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
-        let token_val = token.to_scalar::<u32>()?;
-        assert!(token_val < vocab_size as u32);
-        println!("   ✅ Large vocabulary (32K): token {}", token_val);
+        assert!(token < vocab_size as u32);
+        println!("   ✅ Large vocabulary (32K): token {}", token);
 
         println!("🎉 All GPU-native Metal kernel tests passed!");
         Ok(())
