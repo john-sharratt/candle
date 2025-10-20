@@ -75,6 +75,8 @@ pub mod op;
 pub mod pickle;
 pub mod quantized;
 pub mod safetensors;
+pub mod sampling;
+pub mod sampling_demo;
 pub mod scalar;
 pub mod shape;
 mod sort;
