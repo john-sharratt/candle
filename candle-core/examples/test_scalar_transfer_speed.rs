@@ -20,7 +20,11 @@ fn main() -> Result<()> {
         let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
 
         println!("📊 Test Setup:");
-        println!("   Tensor size: {} elements ({} KB)", vocab_size, vocab_size * 4 / 1024);
+        println!(
+            "   Tensor size: {} elements ({} KB)",
+            vocab_size,
+            vocab_size * 4 / 1024
+        );
         println!("   Device: GPU (CUDA)");
         println!();
 
@@ -32,23 +36,37 @@ fn main() -> Result<()> {
             let _vec = logits.to_vec1::<f32>()?;
         }
         let full_time = start.elapsed();
-        println!("   Time: {}ms for {} iterations", full_time.as_millis(), iterations);
-        println!("   Per call: {:.1}μs", full_time.as_micros() as f64 / iterations as f64);
+        println!(
+            "   Time: {}ms for {} iterations",
+            full_time.as_millis(),
+            iterations
+        );
+        println!(
+            "   Per call: {:.1}μs",
+            full_time.as_micros() as f64 / iterations as f64
+        );
         println!();
 
         // Test 2: Scalar transfer from last element (should be fast with optimization)
         println!("🚀 Test 2: Scalar transfer (optimized path)");
-        
+
         // Create a rank-0 tensor (scalar) on GPU
         let scalar_tensor = Tensor::new(&[42u32], &device)?.reshape(())?;
-        
+
         let start = Instant::now();
         for _ in 0..iterations {
             let _val = scalar_tensor.to_scalar::<u32>()?;
         }
         let scalar_time = start.elapsed();
-        println!("   Time: {}ms for {} iterations", scalar_time.as_millis(), iterations);
-        println!("   Per call: {:.1}μs", scalar_time.as_micros() as f64 / iterations as f64);
+        println!(
+            "   Time: {}ms for {} iterations",
+            scalar_time.as_millis(),
+            iterations
+        );
+        println!(
+            "   Per call: {:.1}μs",
+            scalar_time.as_micros() as f64 / iterations as f64
+        );
         println!();
 
         // Test 3: Sample and extract token (real-world use case)
@@ -59,8 +77,15 @@ fn main() -> Result<()> {
             let _token_id = token.to_scalar::<u32>()?;
         }
         let sample_time = start.elapsed();
-        println!("   Time: {}ms for {} iterations", sample_time.as_millis(), iterations);
-        println!("   Per call: {:.1}μs", sample_time.as_micros() as f64 / iterations as f64);
+        println!(
+            "   Time: {}ms for {} iterations",
+            sample_time.as_millis(),
+            iterations
+        );
+        println!(
+            "   Per call: {:.1}μs",
+            sample_time.as_micros() as f64 / iterations as f64
+        );
         println!();
 
         // Analysis
@@ -68,26 +93,37 @@ fn main() -> Result<()> {
         let full_us = full_time.as_micros() as f64 / iterations as f64;
         let scalar_us = scalar_time.as_micros() as f64 / iterations as f64;
         let sample_us = sample_time.as_micros() as f64 / iterations as f64;
-        
+
         println!("   Full transfer:      {:.1}μs", full_us);
         println!("   Scalar transfer:    {:.1}μs", scalar_us);
         println!("   Sample + extract:   {:.1}μs", sample_us);
         println!();
-        
+
         let speedup = full_us / scalar_us;
-        println!("   Scalar speedup: {:.1}x faster than full transfer ✅", speedup);
-        
+        println!(
+            "   Scalar speedup: {:.1}x faster than full transfer ✅",
+            speedup
+        );
+
         if scalar_us < 100.0 {
             println!("   ✅ SUCCESS: Scalar transfer is < 100μs (optimized path working!)");
         } else {
-            println!("   ⚠️  WARNING: Scalar transfer is {:.1}μs (expected < 100μs)", scalar_us);
+            println!(
+                "   ⚠️  WARNING: Scalar transfer is {:.1}μs (expected < 100μs)",
+                scalar_us
+            );
             println!("   This suggests the optimization may not be working correctly.");
         }
-        
+
         if sample_us < 1000.0 {
-            println!("   ✅ SUCCESS: Sample + extract is < 1ms (fast enough for real-time inference!)");
+            println!(
+                "   ✅ SUCCESS: Sample + extract is < 1ms (fast enough for real-time inference!)"
+            );
         } else {
-            println!("   ⚠️  Sample + extract is {:.1}ms (may be too slow for real-time)", sample_us / 1000.0);
+            println!(
+                "   ⚠️  Sample + extract is {:.1}ms (may be too slow for real-time)",
+                sample_us / 1000.0
+            );
         }
     }
 

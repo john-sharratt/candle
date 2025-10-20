@@ -1415,12 +1415,12 @@ impl CudaStorage {
     /// Fast scalar transfer - optimized for single-element copies.
     /// Uses slice-based transfer to copy only a single element instead of the whole tensor.
     /// This is much faster than `to_cpu_storage()` for extracting single values.
-    pub fn to_cpu_scalar<T>(&self, offset: usize) -> Result<T> 
+    pub fn to_cpu_scalar<T>(&self, offset: usize) -> Result<T>
     where
         T: DeviceRepr + WithDType + Copy,
     {
         use cudarc::driver::DeviceSlice;
-        
+
         match &self.slice {
             CudaStorageSlice::U8(slice) if T::DTYPE == DType::U8 => {
                 // Create a slice of just one element

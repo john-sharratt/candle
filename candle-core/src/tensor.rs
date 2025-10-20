@@ -877,12 +877,13 @@ impl Tensor {
                     macro_rules! try_optimized {
                         ($ty:ty) => {
                             if S::DTYPE == <$ty as crate::WithDType>::DTYPE {
-                                let val = storage.to_cpu_scalar::<$ty>(self.layout().start_offset())?;
+                                let val =
+                                    storage.to_cpu_scalar::<$ty>(self.layout().start_offset())?;
                                 return Ok(unsafe { std::mem::transmute_copy(&val) });
                             }
                         };
                     }
-                    
+
                     // Try each supported type
                     try_optimized!(u8);
                     try_optimized!(u32);
@@ -891,7 +892,7 @@ impl Tensor {
                     try_optimized!(f64);
                     try_optimized!(half::f16);
                     try_optimized!(half::bf16);
-                    
+
                     // Fallback to full transfer for unsupported types
                     from_cpu_storage(&storage.to_cpu_storage()?)
                 }

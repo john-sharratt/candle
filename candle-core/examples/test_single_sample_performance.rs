@@ -16,7 +16,9 @@ fn main() -> Result<()> {
         let vocab_size = 32000;
 
         // Create logits on GPU
-        let logits_data: Vec<f32> = (0..vocab_size).map(|i| i as f32 / vocab_size as f32).collect();
+        let logits_data: Vec<f32> = (0..vocab_size)
+            .map(|i| i as f32 / vocab_size as f32)
+            .collect();
         let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
 
         println!("📊 Test: Single sample operation");
@@ -67,9 +69,18 @@ fn main() -> Result<()> {
 
         // Analysis
         println!("📈 Analysis:");
-        println!("   Sample (GPU only):      {:.1}μs", sample_only.as_micros());
-        println!("   Sample + extract:       {:.1}μs", sample_extract.as_micros());
-        println!("   Transfer overhead:      {:.1}μs", sample_extract.as_micros() - sample_only.as_micros());
+        println!(
+            "   Sample (GPU only):      {:.1}μs",
+            sample_only.as_micros()
+        );
+        println!(
+            "   Sample + extract:       {:.1}μs",
+            sample_extract.as_micros()
+        );
+        println!(
+            "   Transfer overhead:      {:.1}μs",
+            sample_extract.as_micros() - sample_only.as_micros()
+        );
         println!("   Amortized per sample:   {:.1}μs", per_sample);
         println!();
 
@@ -81,7 +92,10 @@ fn main() -> Result<()> {
 
         // Calculate tokens/second
         let tokens_per_sec = 1_000_000.0 / per_sample;
-        println!("   Estimated throughput: {:.1} tokens/second", tokens_per_sec);
+        println!(
+            "   Estimated throughput: {:.1} tokens/second",
+            tokens_per_sec
+        );
     }
 
     #[cfg(not(feature = "cuda"))]
