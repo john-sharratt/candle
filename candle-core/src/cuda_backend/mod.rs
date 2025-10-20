@@ -1303,6 +1303,114 @@ impl CudaStorage {
         result.sub_at_indices_mut(_layout, indices, value)?;
         Ok(result)
     }
+
+    /// In-place sparse division - mutates the tensor directly without cloning.
+    /// This is 20x+ faster than div_at_indices for large tensors with sparse updates.
+    pub fn div_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        // Early return for empty indices
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        let device = &self.device;
+
+        // Upload indices once
+        let indices_dev = device.memcpy_stod(indices)?;
+        let num_indices = indices.len();
+        let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+
+        // Mutate in-place based on dtype
+        match &mut self.slice {
+            CudaStorageSlice::F32(dst) => {
+                let func =
+                    device.get_or_load_func("div_at_indices_f32", &kernels::DIV_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F16(dst) => {
+                let func =
+                    device.get_or_load_func("div_at_indices_f16", &kernels::DIV_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::BF16(dst) => {
+                let func =
+                    device.get_or_load_func("div_at_indices_bf16", &kernels::DIV_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F64(dst) => {
+                let func =
+                    device.get_or_load_func("div_at_indices_f64", &kernels::DIV_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value as f64);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => crate::bail!(
+                "div_at_indices is only supported for float types (f16, bf16, f32, f64)"
+            ),
+        }
+
+        Ok(())
+    }
+
+    pub fn div_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        let device = self.device().clone();
+
+        // Early return for empty indices
+        if indices.is_empty() {
+            let slice = match &self.slice {
+                CudaStorageSlice::U8(s) => CudaStorageSlice::U8(s.try_clone().w()?),
+                CudaStorageSlice::U32(s) => CudaStorageSlice::U32(s.try_clone().w()?),
+                CudaStorageSlice::I64(s) => CudaStorageSlice::I64(s.try_clone().w()?),
+                CudaStorageSlice::BF16(s) => CudaStorageSlice::BF16(s.try_clone().w()?),
+                CudaStorageSlice::F16(s) => CudaStorageSlice::F16(s.try_clone().w()?),
+                CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
+                CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
+                CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+            };
+            return Ok(Self { slice, device });
+        }
+
+        // Clone and then mutate in-place
+        let mut result = Self {
+            slice: match &self.slice {
+                CudaStorageSlice::U8(s) => CudaStorageSlice::U8(s.try_clone().w()?),
+                CudaStorageSlice::U32(s) => CudaStorageSlice::U32(s.try_clone().w()?),
+                CudaStorageSlice::I64(s) => CudaStorageSlice::I64(s.try_clone().w()?),
+                CudaStorageSlice::BF16(s) => CudaStorageSlice::BF16(s.try_clone().w()?),
+                CudaStorageSlice::F16(s) => CudaStorageSlice::F16(s.try_clone().w()?),
+                CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
+                CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
+                CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+            },
+            device,
+        };
+
+        // Use in-place mutation method
+        result.div_at_indices_mut(_layout, indices, value)?;
+        Ok(result)
+    }
 }
 
 fn gemm_config<T>(
@@ -1598,6 +1706,11 @@ impl BackendStorage for CudaStorage {
     fn sub_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
         // Delegate to the inherent method
         self.sub_at_indices(layout, indices, value)
+    }
+
+    fn div_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Delegate to the inherent method
+        self.div_at_indices(layout, indices, value)
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {

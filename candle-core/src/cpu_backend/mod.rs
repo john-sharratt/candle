@@ -1781,6 +1781,79 @@ impl CpuStorage {
             _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "sub_at_indices").bt()),
         }
     }
+
+    /// In-place sparse division - mutates the storage directly without cloning.
+    pub fn div_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] /= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] /= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] /= value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] /= value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "div_at_indices").bt()),
+        }
+        Ok(())
+    }
+
+    pub fn div_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        match self {
+            Self::BF16(storage) => {
+                let mut data = storage.to_vec();
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    data[idx as usize] /= value_bf16;
+                }
+                Ok(Self::BF16(data))
+            }
+            Self::F16(storage) => {
+                let mut data = storage.to_vec();
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    data[idx as usize] /= value_f16;
+                }
+                Ok(Self::F16(data))
+            }
+            Self::F32(storage) => {
+                let mut data = storage.to_vec();
+                for &idx in indices {
+                    data[idx as usize] /= value;
+                }
+                Ok(Self::F32(data))
+            }
+            Self::F64(storage) => {
+                let mut data = storage.to_vec();
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    data[idx as usize] /= value_f64;
+                }
+                Ok(Self::F64(data))
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "div_at_indices").bt()),
+        }
+    }
 }
 
 impl BackendStorage for CpuStorage {
@@ -2213,6 +2286,11 @@ impl BackendStorage for CpuStorage {
     fn sub_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
         // Delegate to the inherent method
         self.sub_at_indices(layout, indices, value)
+    }
+
+    fn div_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Delegate to the inherent method
+        self.div_at_indices(layout, indices, value)
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {

@@ -65,6 +65,10 @@ impl crate::backend::BackendStorage for MetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    fn div_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
         Err(Error::NotCompiledWithMetalSupport)
     }

@@ -323,6 +323,63 @@ impl BackendStorage for MetalStorage {
         Ok(Self::new(buffer, device.clone(), el, dtype))
     }
 
+    fn div_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Early return for empty indices - just clone the buffer
+        if indices.is_empty() {
+            return self.try_clone(layout);
+        }
+
+        let device = self.device().clone();
+        let shape = layout.shape();
+        let el = shape.elem_count();
+        let dtype = self.dtype;
+
+        // Get the vocab size (last dimension)
+        let dims = shape.dims();
+        let vocab_size = dims[dims.len() - 1];
+
+        // Create output buffer
+        let buffer = device.new_buffer(el, dtype, "div_at_indices")?;
+
+        // Upload indices to GPU
+        let indices_buffer =
+            device.new_buffer(indices.len(), DType::U32, "div_at_indices_indices")?;
+        device.write_buffer(&indices_buffer, indices)?;
+
+        // Execute kernel
+        let command_buffer = self.device.command_buffer()?;
+        let src = buffer_o(&self.buffer, layout, dtype);
+
+        let name = match dtype {
+            DType::F32 => "div_at_indices_f32",
+            DType::F16 => "div_at_indices_f16",
+            DType::BF16 => "div_at_indices_bf16",
+            dtype => crate::bail!("Metal div_at_indices {dtype:?} not implemented"),
+        };
+
+        candle_metal_kernels::call_div_at_indices(
+            &device.device,
+            &command_buffer,
+            &device.kernels,
+            name,
+            el,
+            vocab_size,
+            &indices_buffer,
+            indices.len(),
+            value,
+            src,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(Self::new(buffer, device.clone(), el, dtype))
+    }
+
+    fn div_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Forward to inherent implementation
+        self.div_at_indices(layout, indices, value)
+    }
+
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
         let device = self.device.clone();
 

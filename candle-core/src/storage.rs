@@ -155,6 +155,28 @@ impl Storage {
         }
     }
 
+    pub(crate) fn div_at_indices(
+        &self,
+        layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.div_at_indices(layout, indices, value)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.div_at_indices(layout, indices, value)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.div_at_indices(layout, indices, value)?;
+                Ok(Self::Metal(storage))
+            }
+        }
+    }
+
     pub(crate) fn cmp(
         &self,
         op: CmpOp,

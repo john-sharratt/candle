@@ -9,6 +9,7 @@ pub enum Id {
     Binary,
     Cast,
     Conv,
+    DivAtIndices,
     Fill,
     Indexing,
     Quantized,
@@ -19,11 +20,12 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 12] = [
+pub const ALL_IDS: [Id; 13] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
     Id::Conv,
+    Id::DivAtIndices,
     Id::Fill,
     Id::Indexing,
     Id::Quantized,
@@ -73,6 +75,7 @@ mdl!(AFFINE, Affine);
 mdl!(BINARY, Binary);
 mdl!(CAST, Cast);
 mdl!(CONV, Conv);
+mdl!(DIV_AT_INDICES, DivAtIndices);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
 mdl!(QUANTIZED, Quantized);

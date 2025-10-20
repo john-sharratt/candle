@@ -1108,6 +1108,85 @@ fn sub_at_indices(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn div_at_indices(device: &Device) -> Result<()> {
+    // Test basic division on a 1D tensor
+    let t = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0, 50.0], device)?;
+    let indices = [0u32, 2u32, 4u32];
+    let result = t.div_at_indices(&indices, 2.0)?;
+    assert_eq!(result.to_vec1::<f32>()?, &[5.0, 20.0, 15.0, 40.0, 25.0]);
+
+    // Test on 2D tensor with multiple dtypes
+    let t2d = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0], device)?.reshape((2, 3))?;
+    assert_eq!(
+        t2d.to_vec2::<f32>()?,
+        &[[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]
+    );
+
+    // Divide first and last elements
+    let indices = [0u32, 5u32];
+    let result = t2d.flatten_all()?.div_at_indices(&indices, 10.0)?;
+    let result = result.reshape((2, 3))?;
+    assert_eq!(
+        result.to_vec2::<f32>()?,
+        &[[1.0, 20.0, 30.0], [40.0, 50.0, 6.0]]
+    );
+
+    // Test with repeated indices (important for repeat penalty use case)
+    let t = Tensor::new(&[100.0f32, 100.0, 100.0, 100.0], device)?;
+    let indices = [1u32, 1u32, 2u32];
+    let result = t.div_at_indices(&indices, 2.0)?;
+    // Index 1 should be divided twice (100 / 2 / 2 = 25), index 2 once (100 / 2 = 50)
+    assert_eq!(result.to_vec1::<f32>()?, &[100.0, 25.0, 50.0, 100.0]);
+
+    // Test with f16 dtype
+    let t_f16 = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0], device)?.to_dtype(DType::F16)?;
+    let indices = [0u32, 3u32];
+    let result = t_f16.div_at_indices(&indices, 2.0)?;
+    let result_f32 = result.to_dtype(DType::F32)?;
+    assert_eq!(result_f32.to_vec1::<f32>()?, &[5.0, 20.0, 30.0, 20.0]);
+
+    // Test with bf16 dtype
+    let t_bf16 = Tensor::new(&[12.0f32, 24.0, 36.0, 48.0], device)?.to_dtype(DType::BF16)?;
+    let indices = [1u32, 2u32];
+    let result = t_bf16.div_at_indices(&indices, 3.0)?;
+    let result_f32 = result.to_dtype(DType::F32)?;
+    assert_eq!(result_f32.to_vec1::<f32>()?, &[12.0, 8.0, 12.0, 48.0]);
+
+    // Test with f64 dtype
+    let t_f64 = Tensor::new(&[100.0f64, 200.0, 300.0], device)?.to_dtype(DType::F64)?;
+    let indices = [0u32, 2u32];
+    let result = t_f64.div_at_indices(&indices, 2.0)?;
+    assert_eq!(result.to_vec1::<f64>()?, &[50.0, 200.0, 150.0]);
+
+    // Test empty indices
+    let t = Tensor::new(&[1.0f32, 2.0, 3.0], device)?;
+    let indices: [u32; 0] = [];
+    let result = t.div_at_indices(&indices, 10.0)?;
+    assert_eq!(result.to_vec1::<f32>()?, &[1.0, 2.0, 3.0]);
+
+    // Test large batch of indices (simulate repeat penalty on logits)
+    let t = Tensor::ones((1000,), DType::F32, device)?.affine(2.0, 0.0)?;
+    let indices: Vec<u32> = (0..500).map(|i| i * 2).collect();
+    let result = t.div_at_indices(&indices, 2.0)?;
+    let result_vec = result.to_vec1::<f32>()?;
+    // Even indices should be 1.0, odd indices should be 2.0
+    for (i, &val) in result_vec.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!((val - 1.0).abs() < 1e-6);
+        } else {
+            assert!((val - 2.0).abs() < 1e-6);
+        }
+    }
+
+    // Test mutable API (performance optimization)
+    let mut t = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0], device)?;
+    let indices = [0u32, 2u32];
+    t.div_at_indices_mut(&indices, 5.0)?;
+    assert_eq!(t.to_vec1::<f32>()?, &[2.0, 20.0, 6.0, 40.0]);
+
+    Ok(())
+}
+
 fn slice_scatter(device: &Device) -> Result<()> {
     let t = Tensor::arange(0f32, 12f32, device)?.reshape((4, 3))?;
     assert_eq!(
@@ -1768,6 +1847,12 @@ test_device!(
     sub_at_indices_cpu,
     sub_at_indices_gpu,
     sub_at_indices_metal
+);
+test_device!(
+    div_at_indices,
+    div_at_indices_cpu,
+    div_at_indices_gpu,
+    div_at_indices_metal
 );
 test_device!(gather, gather_cpu, gather_gpu, gather_metal);
 test_device!(scatter, scatter_cpu, scatter_gpu, scatter_metal);
