@@ -181,7 +181,7 @@ impl Tensor {
         top_k: Option<usize>,
         top_p: Option<f64>,
         seed: u64,
-    ) -> Result<Self> {
+    ) -> Result<u32> {
         // Ensure input is 1D
         if self.rank() != 1 {
             crate::bail!(
@@ -209,7 +209,11 @@ impl Tensor {
         };
 
         let sampling_op = MultinomialSampling::new(temperature, top_k, top_p, seed);
-        logits.apply_op1_no_bwd(&sampling_op)
+        let result_tensor = logits.apply_op1_no_bwd(&sampling_op)?;
+
+        // Extract the scalar u32 value from the result tensor
+        let token = result_tensor.to_vec1::<u32>()?[0];
+        Ok(token)
     }
 }
 
@@ -226,11 +230,8 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
-        assert_eq!(token.shape().dims(), &[1]);
-        assert_eq!(token.dtype(), DType::U32);
-
-        let token_val = token.to_vec1::<u32>()?[0];
-        assert!(token_val < 4); // Should be valid index
+        // Now returns u32 directly
+        assert!(token < 4); // Should be valid index
 
         Ok(())
     }
@@ -246,8 +247,9 @@ mod tests {
         // Test with low temperature (more deterministic)
         let token_cold = logits.sample_multinomial(0.1, None, None, 42)?;
 
-        assert_eq!(token_hot.dtype(), DType::U32);
-        assert_eq!(token_cold.dtype(), DType::U32);
+        // Now returns u32 directly
+        assert!(token_hot < 4);
+        assert!(token_cold < 4);
 
         Ok(())
     }
@@ -259,9 +261,8 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1], &device)?;
         let token = logits.sample_multinomial(1.0, Some(2), None, 42)?;
 
-        let token_val = token.to_vec1::<u32>()?[0];
-        // With top_k=2, should only sample from indices 3 or 1 (highest logits)
-        assert!(token_val == 3 || token_val == 1);
+        // Now returns u32 directly
+        assert!(token == 3 || token == 1);
 
         Ok(())
     }
@@ -273,9 +274,8 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, Some(0.8), 42)?;
 
-        assert_eq!(token.dtype(), DType::U32);
-        let token_val = token.to_vec1::<u32>()?[0];
-        assert!(token_val < 4);
+        // Now returns u32 directly
+        assert!(token < 4);
 
         Ok(())
     }
@@ -287,9 +287,8 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0, 0.1, 1.5], &device)?;
         let token = logits.sample_multinomial(0.8, Some(4), Some(0.9), 42)?;
 
-        assert_eq!(token.dtype(), DType::U32);
-        let token_val = token.to_vec1::<u32>()?[0];
-        assert!(token_val < 6);
+        // Now returns u32 directly
+        assert!(token < 6);
 
         Ok(())
     }
@@ -303,13 +302,10 @@ mod tests {
         let token1 = logits.sample_multinomial(0.01, None, None, 42)?;
         let token2 = logits.sample_multinomial(0.01, None, None, 42)?;
 
-        let val1 = token1.to_vec1::<u32>()?[0];
-        let val2 = token2.to_vec1::<u32>()?[0];
-
-        // Same seed should give same result
-        assert_eq!(val1, val2);
+        // Now returns u32 directly
+        assert_eq!(token1, token2);
         // Should almost always pick index 1 (highest logit)
-        assert_eq!(val1, 1);
+        assert_eq!(token1, 1);
 
         Ok(())
     }
@@ -340,12 +336,8 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
-        assert_eq!(token.shape().dims(), &[1]);
-        assert_eq!(token.dtype(), DType::U32);
-        assert_eq!(token.device(), device);
-
-        let token_val = token.to_vec1::<u32>()?[0];
-        assert!(token_val < 4);
+        // Now returns u32 directly
+        assert!(token < 4);
 
         Ok(())
     }
@@ -361,7 +353,8 @@ mod tests {
         let logits = Tensor::new(&[1.0f32, 2.0, 0.5, 3.0], &device)?;
         let token = logits.sample_multinomial(1.0, None, None, 42)?;
 
-        assert_eq!(token.shape().dims(), &[1]);
+        // Now returns u32 directly
+        assert!(token < 4);
         assert_eq!(token.dtype(), DType::U32);
         assert_eq!(token.device(), device);
 
