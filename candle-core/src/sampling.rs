@@ -1,10 +1,16 @@
 use crate::{CpuStorage, CustomOp1, DType, Layout, Result, Shape, Tensor, WithDType};
 
 #[cfg(feature = "cuda")]
-use crate::{backend::{BackendDevice, BackendStorage}, CudaStorage};
+use crate::{
+    backend::{BackendDevice, BackendStorage},
+    CudaStorage,
+};
 
 #[cfg(feature = "metal")]
-use crate::{backend::{BackendDevice, BackendStorage}, MetalStorage};
+use crate::{
+    backend::{BackendDevice, BackendStorage},
+    MetalStorage,
+};
 
 /// GPU-native multinomial sampling operation
 #[derive(Debug, Clone)]
