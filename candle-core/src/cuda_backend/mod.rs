@@ -1199,10 +1199,25 @@ impl CudaStorage {
     pub fn sub_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
         let device = self.device().clone();
 
+        // Early return for empty indices
+        if indices.is_empty() {
+            let slice = match &self.slice {
+                CudaStorageSlice::U8(s) => CudaStorageSlice::U8(s.try_clone().w()?),
+                CudaStorageSlice::U32(s) => CudaStorageSlice::U32(s.try_clone().w()?),
+                CudaStorageSlice::I64(s) => CudaStorageSlice::I64(s.try_clone().w()?),
+                CudaStorageSlice::BF16(s) => CudaStorageSlice::BF16(s.try_clone().w()?),
+                CudaStorageSlice::F16(s) => CudaStorageSlice::F16(s.try_clone().w()?),
+                CudaStorageSlice::F32(s) => CudaStorageSlice::F32(s.try_clone().w()?),
+                CudaStorageSlice::F64(s) => CudaStorageSlice::F64(s.try_clone().w()?),
+                CudaStorageSlice::F8E4M3(s) => CudaStorageSlice::F8E4M3(s.try_clone().w()?),
+            };
+            return Ok(Self { slice, device });
+        }
+
         // Handle different data types
         let result = match &self.slice {
             CudaStorageSlice::F32(src) => {
-                let dst = src.try_clone().w()?;
+                let mut dst = src.try_clone().w()?;
                 let indices_dev = device.memcpy_stod(indices)?;
                 let func =
                     device.get_or_load_func("sub_at_indices_f32", &kernels::SUB_AT_INDICES)?;
@@ -1210,7 +1225,7 @@ impl CudaStorage {
                 let num_indices = indices.len();
                 let cfg = LaunchConfig::for_num_elems(num_indices as u32);
                 let mut builder = func.builder();
-                builder.arg(&dst);
+                builder.arg(&mut dst);
                 builder.arg(&indices_dev);
                 barg!(builder, num_indices);
                 barg!(builder, value);
@@ -1219,7 +1234,7 @@ impl CudaStorage {
                 CudaStorageSlice::F32(dst)
             }
             CudaStorageSlice::F16(src) => {
-                let dst = src.try_clone().w()?;
+                let mut dst = src.try_clone().w()?;
                 let indices_dev = device.memcpy_stod(indices)?;
                 let func =
                     device.get_or_load_func("sub_at_indices_f16", &kernels::SUB_AT_INDICES)?;
@@ -1227,7 +1242,7 @@ impl CudaStorage {
                 let num_indices = indices.len();
                 let cfg = LaunchConfig::for_num_elems(num_indices as u32);
                 let mut builder = func.builder();
-                builder.arg(&dst);
+                builder.arg(&mut dst);
                 builder.arg(&indices_dev);
                 barg!(builder, num_indices);
                 barg!(builder, value);
@@ -1236,7 +1251,7 @@ impl CudaStorage {
                 CudaStorageSlice::F16(dst)
             }
             CudaStorageSlice::BF16(src) => {
-                let dst = src.try_clone().w()?;
+                let mut dst = src.try_clone().w()?;
                 let indices_dev = device.memcpy_stod(indices)?;
                 let func =
                     device.get_or_load_func("sub_at_indices_bf16", &kernels::SUB_AT_INDICES)?;
@@ -1244,7 +1259,7 @@ impl CudaStorage {
                 let num_indices = indices.len();
                 let cfg = LaunchConfig::for_num_elems(num_indices as u32);
                 let mut builder = func.builder();
-                builder.arg(&dst);
+                builder.arg(&mut dst);
                 builder.arg(&indices_dev);
                 barg!(builder, num_indices);
                 barg!(builder, value);
@@ -1253,7 +1268,7 @@ impl CudaStorage {
                 CudaStorageSlice::BF16(dst)
             }
             CudaStorageSlice::F64(src) => {
-                let dst = src.try_clone().w()?;
+                let mut dst = src.try_clone().w()?;
                 let indices_dev = device.memcpy_stod(indices)?;
                 let func =
                     device.get_or_load_func("sub_at_indices_f64", &kernels::SUB_AT_INDICES)?;
@@ -1261,7 +1276,7 @@ impl CudaStorage {
                 let num_indices = indices.len();
                 let cfg = LaunchConfig::for_num_elems(num_indices as u32);
                 let mut builder = func.builder();
-                builder.arg(&dst);
+                builder.arg(&mut dst);
                 builder.arg(&indices_dev);
                 barg!(builder, num_indices);
                 barg!(builder, value as f64);

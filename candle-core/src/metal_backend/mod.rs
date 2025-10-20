@@ -272,6 +272,11 @@ impl BackendStorage for MetalStorage {
     }
 
     fn sub_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Early return for empty indices - just clone the buffer
+        if indices.is_empty() {
+            return self.try_clone(layout);
+        }
+
         let device = self.device().clone();
         let shape = layout.shape();
         let el = shape.elem_count();
