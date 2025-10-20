@@ -62,8 +62,8 @@ impl Cache {
                 // Extract what we want to keep
                 let kept = old_tensor.narrow(self.dim, 0, seq_len)?;
 
-                // Force a copy to new storage
-                let new_tensor = kept.force_contiguous()?;
+                // Copy to new storage (only if non-contiguous)
+                let new_tensor = kept.contiguous()?;
 
                 // Replace with new tensor
                 self.all_data = Some(new_tensor);
@@ -94,8 +94,8 @@ impl Cache {
                     }
                 };
 
-                // Try to copy
-                match kept.force_contiguous() {
+                // Try to copy (only if non-contiguous)
+                match kept.contiguous() {
                     Ok(new_tensor) => {
                         // Success!
                         self.all_data = Some(new_tensor);
