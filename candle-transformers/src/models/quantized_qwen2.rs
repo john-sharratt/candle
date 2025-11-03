@@ -304,15 +304,38 @@ impl ModelWeights {
     }
 
     fn causal_mask(&mut self, seq_len: usize, offset: usize) -> Result<Tensor> {
-        // Check if we can reuse the last mask - common in streaming scenarios
         let cache_key = (seq_len, offset);
         if let Some((last_key, ref mask)) = self.last_mask {
             if last_key == cache_key {
                 return Ok(mask.clone());
             }
+
+            // OPTIMIZATION: If seq_len matches and we're just adding more offset (batched processing),
+            // expand the existing mask instead of recreating from scratch
+            let (last_seq_len, last_offset) = last_key;
+            if last_seq_len == seq_len && last_offset < offset {
+                // We can expand: remove the batch/head dims, expand, then re-add them
+                let mask_core = mask.squeeze(0)?.squeeze(0)?; // (seq_len, last_seq_len + last_offset)
+                let old_total_len = last_seq_len + last_offset;
+                let new_total_len = seq_len + offset;
+                let cols_to_add = new_total_len - old_total_len;
+
+                if cols_to_add > 0 {
+                    // Create new columns: for row i, columns [last_offset+i+1..new_total_len] should be 0.0
+                    // (all newly cached positions are visible)
+                    let new_cols = Tensor::zeros((seq_len, cols_to_add), DType::F32, &self.device)?;
+
+                    // Concatenate along the column dimension (dim 1)
+                    let expanded_mask = Tensor::cat(&[&mask_core, &new_cols], 1)?;
+                    let expanded_mask = expanded_mask.unsqueeze(0)?.unsqueeze(0)?;
+
+                    self.last_mask = Some((cache_key, expanded_mask.clone()));
+                    return Ok(expanded_mask);
+                }
+            }
         }
 
-        // Create mask directly on GPU using tensor operations - much faster than CPU Vec!
+        // Create mask from scratch (first call or incompatible dimensions)
         let minf = f32::NEG_INFINITY;
         let total_len = seq_len + offset;
 
@@ -390,7 +413,27 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.truncate_cache(seq_len)?;
         }
-        // Invalidate cached mask after truncation
+
+        // Try to truncate the cached mask to match the new cache length
+        if let Some(((mask_seq_len, mask_offset), ref mask)) = self.last_mask {
+            let mask_total_len = mask_seq_len + mask_offset;
+
+            // If we're truncating to a length within the mask's coverage AND
+            // the seq_len dimension matches (common in batched processing),
+            // we can slice the mask instead of recreating it
+            if mask_seq_len == mask_seq_len && seq_len < mask_total_len && seq_len >= mask_seq_len {
+                // Slice the mask: keep only the first seq_len columns
+                // Mask shape: (1, 1, mask_seq_len, mask_total_len)
+                // After slice: (1, 1, mask_seq_len, seq_len)
+                if let Ok(truncated_mask) = mask.narrow(3, 0, seq_len) {
+                    let new_offset = seq_len - mask_seq_len;
+                    self.last_mask = Some(((mask_seq_len, new_offset), truncated_mask));
+                    return Ok(());
+                }
+            }
+        }
+
+        // Otherwise, clear the mask - it will be recreated on next forward
         self.last_mask = None;
         Ok(())
     }
