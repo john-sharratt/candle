@@ -312,15 +312,32 @@ impl ModelWeights {
             }
         }
 
-        // Create new mask
+        // Create mask directly on GPU using tensor operations - much faster than CPU Vec!
         let minf = f32::NEG_INFINITY;
-        let mask: Vec<_> = (0..seq_len)
-            .flat_map(|i| {
-                (0..(seq_len + offset)).map(move |j| if j <= i + offset { 0.0 } else { minf })
-            })
-            .collect();
-        let mask = Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), &self.device)?
-            .to_dtype(DType::F32)?;
+        let total_len = seq_len + offset;
+
+        // Create range tensors on GPU
+        let row_indices = Tensor::arange(0u32, seq_len as u32, &self.device)?
+            .to_dtype(DType::F32)?
+            .unsqueeze(1)? // (seq_len, 1)
+            .broadcast_as((seq_len, total_len))?;
+        let col_indices = Tensor::arange(0u32, total_len as u32, &self.device)?
+            .to_dtype(DType::F32)?
+            .unsqueeze(0)? // (1, total_len)
+            .broadcast_as((seq_len, total_len))?;
+
+        // mask[i,j] = (j <= i + offset) ? 0.0 : -inf
+        let offset_tensor =
+            Tensor::new(&[offset as f32], &self.device)?.broadcast_as((seq_len, total_len))?;
+        let threshold = (row_indices + offset_tensor)?;
+
+        // where(col_indices > threshold, -inf, 0.0)
+        let mask = col_indices.gt(&threshold)?.where_cond(
+            &Tensor::new(&[minf], &self.device)?.broadcast_as((seq_len, total_len))?,
+            &Tensor::new(&[0.0f32], &self.device)?.broadcast_as((seq_len, total_len))?,
+        )?;
+
+        let mask = mask.unsqueeze(0)?.unsqueeze(0)?; // Add batch and head dimensions
 
         // Store as the last used mask
         self.last_mask = Some((cache_key, mask.clone()));
@@ -346,6 +363,7 @@ impl ModelWeights {
 
         let _enter = self.span.enter();
         let mut layer_in = self.tok_embeddings.forward(x)?;
+
         for layer in self.layers.iter_mut() {
             let x = layer_in;
             let residual = &x;
