@@ -19,7 +19,6 @@ use candle::{
     DType, Device, IndexOp, Result, Tensor,
 };
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -54,17 +53,10 @@ struct LayerWeights {
     head_dim: usize,
     cos: Tensor,
     sin: Tensor,
-    neg_inf: Tensor,
     kv_cache: KvCache,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
-}
-
-fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Tensor> {
-    let shape = mask.shape();
-    let m = mask.where_cond(&on_true.broadcast_as(shape.dims())?, on_false)?;
-    Ok(m)
 }
 
 impl LayerWeights {
@@ -141,8 +133,15 @@ impl LayerWeights {
         let att = match mask {
             None => att,
             Some(mask) => {
-                let mask = mask.broadcast_as(att.shape())?;
-                masked_fill(&att, &mask, &self.neg_inf)?
+                // Convert mask to attention scores dtype if needed
+                let mask_dtype = mask.dtype();
+                let att_dtype = att.dtype();
+                let mask = if mask_dtype != att_dtype {
+                    mask.to_dtype(att_dtype)?
+                } else {
+                    mask.clone()
+                };
+                att.broadcast_add(&mask)?
             }
         };
         let att = candle_nn::ops::softmax_last_dim(&att)?;
@@ -159,7 +158,7 @@ pub struct ModelWeights {
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
-    masks: HashMap<usize, Tensor>,
+    device: Device,
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -210,8 +209,6 @@ impl ModelWeights {
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
             .unwrap_or_else(|_| embedding_length / head_count);
-
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings.dequantize(device)?;
@@ -282,7 +279,6 @@ impl ModelWeights {
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
-                neg_inf: neg_inf.clone(),
                 kv_cache: KvCache::new(2, context_length),
                 span_attn,
                 span_rot,
@@ -298,32 +294,40 @@ impl ModelWeights {
             layers,
             norm,
             output,
-            masks: HashMap::new(),
+            device: device.clone(),
             span,
             span_output,
         })
     }
 
-    fn mask(&mut self, t: usize, device: &Device) -> Result<Tensor> {
-        if let Some(mask) = self.masks.get(&t) {
-            Ok(mask.clone())
-        } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
-                .collect();
-            let mask = Tensor::from_slice(&mask, (t, t), device)?;
-            self.masks.insert(t, mask.clone());
-            Ok(mask)
-        }
+    fn causal_mask(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
+        let minf = f32::NEG_INFINITY;
+        let mask: Vec<_> = (0..seq_len)
+            .flat_map(|i| {
+                (0..(seq_len + offset)).map(move |j| if j <= i + offset { 0.0 } else { minf })
+            })
+            .collect();
+        Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), &self.device)?
+            .to_dtype(DType::F32)
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
+
+        // Get current cache length to use as offset for mask
+        let cache_offset = self
+            .layers
+            .first()
+            .map(|layer| layer.cache_len())
+            .unwrap_or(0);
+
         let mask = if seq_len == 1 {
             None
         } else {
-            Some(self.mask(seq_len, x.device())?)
+            // Dynamic mask computation with proper offset
+            Some(self.causal_mask(seq_len, cache_offset)?)
         };
+
         let _enter = self.span.enter();
         let mut layer_in = self.tok_embeddings.forward(x)?;
         for layer in self.layers.iter_mut() {
