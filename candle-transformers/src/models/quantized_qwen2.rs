@@ -19,6 +19,7 @@ use candle::{
     DType, Device, IndexOp, Result, Tensor,
 };
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -159,6 +160,7 @@ pub struct ModelWeights {
     norm: RmsNorm,
     output: QMatMul,
     device: Device,
+    mask_cache: HashMap<(usize, usize), Tensor>, // Cache by (seq_len, offset)
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -295,20 +297,32 @@ impl ModelWeights {
             norm,
             output,
             device: device.clone(),
+            mask_cache: HashMap::new(),
             span,
             span_output,
         })
     }
 
-    fn causal_mask(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
+    fn causal_mask(&mut self, seq_len: usize, offset: usize) -> Result<Tensor> {
+        // Check cache first for performance
+        let cache_key = (seq_len, offset);
+        if let Some(mask) = self.mask_cache.get(&cache_key) {
+            return Ok(mask.clone());
+        }
+
+        // Compute mask if not cached
         let minf = f32::NEG_INFINITY;
         let mask: Vec<_> = (0..seq_len)
             .flat_map(|i| {
                 (0..(seq_len + offset)).map(move |j| if j <= i + offset { 0.0 } else { minf })
             })
             .collect();
-        Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), &self.device)?
-            .to_dtype(DType::F32)
+        let mask = Tensor::from_slice(&mask, (1, 1, seq_len, seq_len + offset), &self.device)?
+            .to_dtype(DType::F32)?;
+
+        // Cache the mask
+        self.mask_cache.insert(cache_key, mask.clone());
+        Ok(mask)
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -356,6 +370,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.truncate_cache(seq_len)?;
         }
+        // Clear mask cache to prevent stale masks after truncation
+        self.mask_cache.clear();
         Ok(())
     }
 
@@ -364,6 +380,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.reset_cache();
         }
+        // Clear mask cache as well
+        self.mask_cache.clear();
     }
 
     /// Get the current cache length (all layers should have same length)

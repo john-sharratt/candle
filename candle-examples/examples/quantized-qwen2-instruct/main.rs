@@ -27,8 +27,28 @@ enum Which {
     W2_7b,
     #[value(name = "72b")]
     W2_72b,
+    #[value(name = "7b-q4")]
+    W2_5_7bQ4,
+    #[value(name = "7b-q5")]
+    W2_5_7bQ5,
     #[value(name = "deepseekr1-qwen7b")]
     DeepseekR1Qwen7B,
+    #[value(name = "qwen25-14b-q6")]
+    Qwen25_14bQ6,
+    #[value(name = "qwen25-14b-q5")]
+    Qwen25_14bQ5,
+    #[value(name = "qwen30-8b-f16")]
+    Qwen30_8bF16,
+    #[value(name = "qwen30-8b-q5")]
+    Qwen30_8bQ5,
+    #[value(name = "qwen25-7b-f16")]
+    Qwen25_7bF16,
+    #[value(name = "qwen25-7b-q5")]
+    Qwen25_7bQ5,
+    #[value(name = "qwen25-1b-q3")]
+    Qwen25_1bQ3,
+    #[value(name = "qwen25-1b-q2")]
+    Qwen25_1bQ2,
 }
 
 #[derive(Parser, Debug)]
@@ -104,6 +124,10 @@ impl Args {
                     Which::W2_1_5b => "Qwen/Qwen2-1.5B-Instruct",
                     Which::W2_7b => "Qwen/Qwen2-7B-Instruct",
                     Which::W2_72b => "Qwen/Qwen2-72B-Instruct",
+                    Which::W2_5_7bQ4 | Which::W2_5_7bQ5 | Which::Qwen25_7bF16 | Which::Qwen25_7bQ5 => "Qwen/Qwen2.5-7B-Instruct",
+                    Which::Qwen30_8bF16 | Which::Qwen30_8bQ5 => "Qwen/Qwen3-8B-Instruct",
+                    Which::Qwen25_14bQ6 | Which::Qwen25_14bQ5 => "Qwen/Qwen2.5-14B-Instruct",
+                    Which::Qwen25_1bQ3 | Which::Qwen25_1bQ2 => "Qwen/Qwen2.5-1.5B-Instruct",
                     Which::DeepseekR1Qwen7B => "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                 };
                 let api = api.model(repo.to_string());
@@ -136,6 +160,56 @@ impl Args {
                     Which::W2_72b => (
                         "Qwen/Qwen2-72B-Instruct-GGUF",
                         "qwen2-72b-instruct-q4_0.gguf",
+                        "main",
+                    ),
+                    Which::W2_5_7bQ4 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+                        "main",
+                    ),
+                    Which::W2_5_7bQ5 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_7bF16 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-f16.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_7bQ5 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen30_8bF16 => (
+                        "bartowski/Qwen3-8B-Instruct-GGUF",
+                        "Qwen3-8B-Instruct-f16.gguf",
+                        "main",
+                    ),
+                    Which::Qwen30_8bQ5 => (
+                        "bartowski/Qwen3-8B-Instruct-GGUF",
+                        "Qwen3-8B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_14bQ6 => (
+                        "bartowski/Qwen2.5-14B-Instruct-GGUF",
+                        "Qwen2.5-14B-Instruct-Q6_K.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_14bQ5 => (
+                        "bartowski/Qwen2.5-14B-Instruct-GGUF",
+                        "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_1bQ3 => (
+                        "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+                        "Qwen2.5-1.5B-Instruct-Q3_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_1bQ2 => (
+                        "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+                        "Qwen2.5-1.5B-Instruct-Q2_K.gguf",
                         "main",
                     ),
                     Which::DeepseekR1Qwen7B => (
