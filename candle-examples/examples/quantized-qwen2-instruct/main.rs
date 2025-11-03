@@ -124,7 +124,10 @@ impl Args {
                     Which::W2_1_5b => "Qwen/Qwen2-1.5B-Instruct",
                     Which::W2_7b => "Qwen/Qwen2-7B-Instruct",
                     Which::W2_72b => "Qwen/Qwen2-72B-Instruct",
-                    Which::W2_5_7bQ4 | Which::W2_5_7bQ5 | Which::Qwen25_7bF16 | Which::Qwen25_7bQ5 => "Qwen/Qwen2.5-7B-Instruct",
+                    Which::W2_5_7bQ4
+                    | Which::W2_5_7bQ5
+                    | Which::Qwen25_7bF16
+                    | Which::Qwen25_7bQ5 => "Qwen/Qwen2.5-7B-Instruct",
                     Which::Qwen30_8bF16 | Which::Qwen30_8bQ5 => "Qwen/Qwen3-8B-Instruct",
                     Which::Qwen25_14bQ6 | Which::Qwen25_14bQ5 => "Qwen/Qwen2.5-14B-Instruct",
                     Which::Qwen25_1bQ3 | Which::Qwen25_1bQ2 => "Qwen/Qwen2.5-1.5B-Instruct",
