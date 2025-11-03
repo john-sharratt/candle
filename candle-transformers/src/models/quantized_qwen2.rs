@@ -18,7 +18,7 @@ use candle::{
     quantized::{gguf_file, QMatMul},
     DType, Device, IndexOp, Result, Tensor,
 };
-use candle_nn::{Embedding, Module};
+use candle_nn::{kv_cache::KvCache, Embedding, Module};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ struct LayerWeights {
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
@@ -77,19 +77,15 @@ impl LayerWeights {
     }
 
     fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
-        if let Some((k_cache, v_cache)) = &self.kv_cache {
-            let current_len = k_cache.dim(2)?;
-            if seq_len < current_len {
-                let k = k_cache.narrow(2, 0, seq_len)?;
-                let v = v_cache.narrow(2, 0, seq_len)?;
-                self.kv_cache = Some((k, v));
-            }
-        }
-        Ok(())
+        self.kv_cache.truncate(seq_len)
     }
 
     fn reset_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.reset();
+    }
+
+    fn cache_len(&self) -> usize {
+        self.kv_cache.current_seq_len()
     }
 
     fn forward_attn(
@@ -122,25 +118,20 @@ impl LayerWeights {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // let (q, k) = self
-        //     .rotary_embedding
-        //     .apply_rotary_emb_qkv(&q, &k, index_pos)?;
-        let q = self.apply_rotary_emb(&q, index_pos)?;
-        let k = self.apply_rotary_emb(&k, index_pos)?;
+        // Use the cache length as the position offset for RoPE
+        // This automatically handles cache truncation correctly
+        let cache_len = self.kv_cache.current_seq_len();
 
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                if index_pos == 0 {
-                    (k, v)
-                } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?;
-                    (k, v)
-                }
-            }
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        // Reset cache if starting from position 0
+        if index_pos == 0 {
+            self.kv_cache.reset();
+        }
+
+        let q = self.apply_rotary_emb(&q, cache_len)?;
+        let k = self.apply_rotary_emb(&k, cache_len)?;
+
+        // Append to cache and get full K,V tensors
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         // Support for MQA, useful for 70B models and mistral.
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
@@ -214,7 +205,11 @@ impl ModelWeights {
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
-        let head_dim = embedding_length / head_count;
+        // Try to read head_dim from metadata first (for Qwen2.5+), fallback to calculation
+        let head_dim = md_get("qwen2.attention.key_length")
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or_else(|_| embedding_length / head_count);
 
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -288,7 +283,7 @@ impl ModelWeights {
                 n_kv_head: head_count_kv,
                 head_dim,
                 neg_inf: neg_inf.clone(),
-                kv_cache: None,
+                kv_cache: KvCache::new(2, context_length),
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -365,5 +360,13 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.reset_cache();
         }
+    }
+
+    /// Get the current cache length (all layers should have same length)
+    pub fn cache_len(&self) -> usize {
+        self.layers
+            .first()
+            .map(|layer| layer.cache_len())
+            .unwrap_or(0)
     }
 }
