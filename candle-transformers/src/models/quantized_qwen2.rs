@@ -159,7 +159,6 @@ pub struct ModelWeights {
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
-    device: Device,
     mask_cache: CausalMaskCache,
     span: tracing::Span,
     span_output: tracing::Span,
@@ -191,6 +190,15 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_with_options(ct, reader, device, None)
+    }
+
+    pub fn from_gguf_with_options<R: std::io::Seek + std::io::Read>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        max_kv_cache_len: Option<usize>,
+    ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
@@ -201,6 +209,12 @@ impl ModelWeights {
         let embedding_length = md_get("qwen2.embedding_length")?.to_u32()? as usize;
         let context_length = md_get("qwen2.context_length")?.to_u32()? as usize;
         let block_count = md_get("qwen2.block_count")?.to_u32()? as usize;
+
+        // Cap initial KV cache allocation at a reasonable size to avoid OOM on large context models
+        // The cache will grow dynamically if needed, but this prevents pre-allocating 131k+ tokens
+        const REASONABLE_INITIAL_CACHE_SIZE: usize = 4096;
+        let kv_cache_len =
+            max_kv_cache_len.unwrap_or_else(|| context_length.min(REASONABLE_INITIAL_CACHE_SIZE));
         let rms_norm_eps = md_get("qwen2.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen2.rope.freq_base")
             .and_then(|m| m.to_f32())
@@ -281,7 +295,7 @@ impl ModelWeights {
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
-                kv_cache: KvCache::new(2, context_length),
+                kv_cache: KvCache::new(2, kv_cache_len),
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -296,7 +310,6 @@ impl ModelWeights {
             layers,
             norm,
             output,
-            device: device.clone(),
             mask_cache: CausalMaskCache::new(device.clone()),
             span,
             span_output,
