@@ -64,6 +64,8 @@ mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod gpu_keepalive;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]

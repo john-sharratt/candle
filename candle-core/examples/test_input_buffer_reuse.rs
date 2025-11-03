@@ -35,8 +35,9 @@ fn test_cuda_performance() -> Result<()> {
     }
     device.synchronize()?;
     let baseline_time = start.elapsed();
-    println!("   Time: {:?} ({:.2}μs per token)\n", 
-        baseline_time, 
+    println!(
+        "   Time: {:?} ({:.2}μs per token)\n",
+        baseline_time,
         baseline_time.as_micros() as f64 / iterations as f64
     );
 
@@ -51,7 +52,8 @@ fn test_cuda_performance() -> Result<()> {
     }
     device.synchronize()?;
     let optimized_time = start.elapsed();
-    println!("   Time: {:?} ({:.2}μs per token)\n", 
+    println!(
+        "   Time: {:?} ({:.2}μs per token)\n",
         optimized_time,
         optimized_time.as_micros() as f64 / iterations as f64
     );
@@ -59,18 +61,18 @@ fn test_cuda_performance() -> Result<()> {
     // Test 3: Verify correctness
     println!("📊 Test 3: Verify correctness");
     let token = 12345u32;
-    
+
     // Method 1: New tensor
     let input1 = Tensor::new(&[token], &device)?.reshape((1, 1))?;
-    
+
     // Method 2: Reuse buffer
     let token_cpu = Tensor::new(&[token], &Device::Cpu)?;
     let input2 = token_cpu.to_device(&device)?.reshape((1, 1))?;
-    
+
     // Verify values match
     let val1 = input1.to_vec2::<u32>()?;
     let val2 = input2.to_vec2::<u32>()?;
-    
+
     assert_eq!(val1, val2, "Values should match!");
     assert_eq!(val1[0][0], token, "Token should be preserved!");
     println!("   ✅ Values match: {}\n", token);
@@ -79,12 +81,12 @@ fn test_cuda_performance() -> Result<()> {
     println!("📈 Results:");
     println!("   Baseline:  {:?}", baseline_time);
     println!("   Optimized: {:?}", optimized_time);
-    
+
     let speedup = baseline_time.as_micros() as f64 / optimized_time.as_micros() as f64;
     println!("   Speedup:   {:.2}x", speedup);
-    
-    let time_saved = (baseline_time.as_micros() as f64 - optimized_time.as_micros() as f64) 
-        / iterations as f64;
+
+    let time_saved =
+        (baseline_time.as_micros() as f64 - optimized_time.as_micros() as f64) / iterations as f64;
     println!("   Time saved per token: {:.2}μs", time_saved);
 
     if speedup > 1.0 {
@@ -110,7 +112,8 @@ fn test_cpu_performance() -> Result<()> {
         let _input = Tensor::new(&[token], &device)?.reshape((1, 1))?;
     }
     let baseline_time = start.elapsed();
-    println!("   Time: {:?} ({:.2}μs per token)\n", 
+    println!(
+        "   Time: {:?} ({:.2}μs per token)\n",
         baseline_time,
         baseline_time.as_micros() as f64 / iterations as f64
     );
@@ -124,7 +127,8 @@ fn test_cpu_performance() -> Result<()> {
         _buffer = Tensor::new(&[token], &device)?.reshape((1, 1))?;
     }
     let optimized_time = start.elapsed();
-    println!("   Time: {:?} ({:.2}μs per token)\n", 
+    println!(
+        "   Time: {:?} ({:.2}μs per token)\n",
         optimized_time,
         optimized_time.as_micros() as f64 / iterations as f64
     );

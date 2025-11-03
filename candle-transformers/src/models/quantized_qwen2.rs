@@ -76,6 +76,22 @@ impl LayerWeights {
         candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
     }
 
+    fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        if let Some((k_cache, v_cache)) = &self.kv_cache {
+            let current_len = k_cache.dim(2)?;
+            if seq_len < current_len {
+                let k = k_cache.narrow(2, 0, seq_len)?;
+                let v = v_cache.narrow(2, 0, seq_len)?;
+                self.kv_cache = Some((k, v));
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_cache(&mut self) {
+        self.kv_cache = None;
+    }
+
     fn forward_attn(
         &mut self,
         x: &Tensor,
@@ -334,5 +350,20 @@ impl ModelWeights {
         let x = x.i((.., seq_len - 1, ..))?;
         let _enter = self.span_output.enter();
         self.output.forward(&x)
+    }
+
+    /// Truncate KV cache to specified sequence length
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.truncate_cache(seq_len)?;
+        }
+        Ok(())
+    }
+
+    /// Clear all KV caches (more efficient than forward with offset=0)
+    pub fn clear_all_caches(&mut self) {
+        for layer in &mut self.layers {
+            layer.reset_cache();
+        }
     }
 }

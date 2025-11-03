@@ -40,7 +40,7 @@ pub(super) fn forward_and_sample_token(
         // Continuation: only use the NEW token (last one)
         &tokens[tokens.len() - 1..]
     };
-    
+
     let input = Tensor::new(input_tokens, &factory.device)?.unsqueeze(0)?;
     let input_time = input_start.elapsed();
 
