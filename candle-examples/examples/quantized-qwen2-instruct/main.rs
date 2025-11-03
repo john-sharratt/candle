@@ -371,6 +371,61 @@ fn main() -> anyhow::Result<()> {
             offset += chunk.len();
         }
         eprintln!("=== BATCHED PROCESSING COMPLETE ===\n");
+
+        // Test partial truncation (keep first 300 tokens)
+        if offset > 300 {
+            eprintln!("=== TESTING PARTIAL TRUNCATE ({}→300 tokens) ===", offset);
+            let truncate_start = std::time::Instant::now();
+            model.truncate_kv_cache(300)?;
+            eprintln!(
+                "Partial truncate completed in {:.3}ms",
+                truncate_start.elapsed().as_secs_f64() * 1000.0
+            );
+            eprintln!("Cache length after truncate: {}\n", model.cache_len());
+
+            // Continue processing from truncated position
+            eprintln!("=== CONTINUING AFTER PARTIAL TRUNCATE ===");
+            let continue_tokens = &tokens[300..offset.min(tokens.len())];
+            let continue_chunks: Vec<_> = continue_tokens.chunks(100).collect();
+
+            let mut new_offset = 300;
+            for (batch_idx, chunk) in continue_chunks.iter().enumerate() {
+                let batch_start = std::time::Instant::now();
+                let input = Tensor::new(*chunk, &device)?.unsqueeze(0)?;
+
+                let logits = model.forward(&input, new_offset)?;
+
+                if let candle::Device::Cuda(cuda_device) = &device {
+                    cuda_device.synchronize()?;
+                }
+                let batch_time = batch_start.elapsed();
+
+                eprintln!(
+                    "Batch {} (tokens {}→{}): {:.3}s cache_len={}",
+                    batch_idx,
+                    new_offset,
+                    new_offset + chunk.len(),
+                    batch_time.as_secs_f64(),
+                    new_offset + chunk.len()
+                );
+
+                let logits = logits.squeeze(0)?;
+                next_token = logits_processor.sample(&logits)?;
+                new_offset += chunk.len();
+            }
+            eprintln!("=== CONTINUE AFTER TRUNCATE COMPLETE ===\n");
+        }
+
+        // Test full truncation (clear all caches)
+        eprintln!("=== TESTING FULL TRUNCATE (clear all) ===");
+        let full_truncate_start = std::time::Instant::now();
+        model.clear_all_caches();
+        eprintln!(
+            "Full truncate completed in {:.3}ms",
+            full_truncate_start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("Cache length after full clear: {}\n", model.cache_len());
+
         next_token
     };
     let prompt_dt = start_prompt_processing.elapsed();

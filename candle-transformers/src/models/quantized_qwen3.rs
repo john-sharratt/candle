@@ -7,6 +7,7 @@
 //! - [Qwen3 Models](https://huggingface.co/Qwen/Qwen3-0.6B) (architecture based on official implementations)
 //!
 use super::with_tracing::QMatMul;
+use crate::models::causal_mask_cache::CausalMaskCache;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Tensor};
@@ -327,6 +328,7 @@ pub struct ModelWeights {
     lm_head: QMatMul,
     device: Device,
     dtype: DType,
+    mask_cache: CausalMaskCache,
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -401,36 +403,10 @@ impl ModelWeights {
             lm_head,
             device: device.clone(),
             dtype,
+            mask_cache: CausalMaskCache::new(device.clone()),
             span,
             span_output,
         })
-    }
-
-    fn causal_mask(
-        &self,
-        b: usize,
-        tgt: usize,
-        offset: usize,
-        sw: Option<usize>,
-    ) -> Result<Tensor> {
-        let minf = f32::NEG_INFINITY;
-        let mask: Vec<_> = (0..tgt)
-            .flat_map(|i| {
-                (0..(tgt + offset)).map(move |j| {
-                    let past_ok = j <= i + offset;
-                    let sw_ok = match sw {
-                        Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
-                        None => true,
-                    };
-                    if past_ok && sw_ok {
-                        0.
-                    } else {
-                        minf
-                    }
-                })
-            })
-            .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
     /// Truncate KV cache to specified sequence length
@@ -438,6 +414,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.truncate_cache(seq_len)?;
         }
+        // Truncate the cached mask to match
+        self.mask_cache.truncate(seq_len)?;
         Ok(())
     }
 
@@ -446,6 +424,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.reset_cache();
         }
+        // Clear cached mask
+        self.mask_cache.clear();
     }
 
     /// Get the current cache length (all layers should be same)
@@ -462,12 +442,13 @@ impl ModelWeights {
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (b, l) = input.dims2()?;
+        let (_b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
         let causal_mask = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(b, l, offset, None)?)
+            // Use shared mask cache with GPU-accelerated creation
+            Some(self.mask_cache.get_mask(l, offset)?)
         };
         for layer in &mut self.layers {
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;

@@ -13,6 +13,7 @@
 //! - [Model Card](https://huggingface.co/Qwen/Qwen2)
 //!
 
+use crate::models::causal_mask_cache::CausalMaskCache;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::{
     quantized::{gguf_file, QMatMul},
@@ -159,8 +160,7 @@ pub struct ModelWeights {
     norm: RmsNorm,
     output: QMatMul,
     device: Device,
-    // Cache only the last used mask - simple and effective for streaming
-    last_mask: Option<((usize, usize), Tensor)>,
+    mask_cache: CausalMaskCache,
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -297,74 +297,10 @@ impl ModelWeights {
             norm,
             output,
             device: device.clone(),
-            last_mask: None,
+            mask_cache: CausalMaskCache::new(device.clone()),
             span,
             span_output,
         })
-    }
-
-    fn causal_mask(&mut self, seq_len: usize, offset: usize) -> Result<Tensor> {
-        let cache_key = (seq_len, offset);
-        if let Some((last_key, ref mask)) = self.last_mask {
-            if last_key == cache_key {
-                return Ok(mask.clone());
-            }
-
-            // OPTIMIZATION: If seq_len matches and we're just adding more offset (batched processing),
-            // expand the existing mask instead of recreating from scratch
-            let (last_seq_len, last_offset) = last_key;
-            if last_seq_len == seq_len && last_offset < offset {
-                // We can expand: remove the batch/head dims, expand, then re-add them
-                let mask_core = mask.squeeze(0)?.squeeze(0)?; // (seq_len, last_seq_len + last_offset)
-                let old_total_len = last_seq_len + last_offset;
-                let new_total_len = seq_len + offset;
-                let cols_to_add = new_total_len - old_total_len;
-
-                if cols_to_add > 0 {
-                    // Create new columns: for row i, columns [last_offset+i+1..new_total_len] should be 0.0
-                    // (all newly cached positions are visible)
-                    let new_cols = Tensor::zeros((seq_len, cols_to_add), DType::F32, &self.device)?;
-
-                    // Concatenate along the column dimension (dim 1)
-                    let expanded_mask = Tensor::cat(&[&mask_core, &new_cols], 1)?;
-                    let expanded_mask = expanded_mask.unsqueeze(0)?.unsqueeze(0)?;
-
-                    self.last_mask = Some((cache_key, expanded_mask.clone()));
-                    return Ok(expanded_mask);
-                }
-            }
-        }
-
-        // Create mask from scratch (first call or incompatible dimensions)
-        let minf = f32::NEG_INFINITY;
-        let total_len = seq_len + offset;
-
-        // Create range tensors on GPU
-        let row_indices = Tensor::arange(0u32, seq_len as u32, &self.device)?
-            .to_dtype(DType::F32)?
-            .unsqueeze(1)? // (seq_len, 1)
-            .broadcast_as((seq_len, total_len))?;
-        let col_indices = Tensor::arange(0u32, total_len as u32, &self.device)?
-            .to_dtype(DType::F32)?
-            .unsqueeze(0)? // (1, total_len)
-            .broadcast_as((seq_len, total_len))?;
-
-        // mask[i,j] = (j <= i + offset) ? 0.0 : -inf
-        let offset_tensor =
-            Tensor::new(&[offset as f32], &self.device)?.broadcast_as((seq_len, total_len))?;
-        let threshold = (row_indices + offset_tensor)?;
-
-        // where(col_indices > threshold, -inf, 0.0)
-        let mask = col_indices.gt(&threshold)?.where_cond(
-            &Tensor::new(&[minf], &self.device)?.broadcast_as((seq_len, total_len))?,
-            &Tensor::new(&[0.0f32], &self.device)?.broadcast_as((seq_len, total_len))?,
-        )?;
-
-        let mask = mask.unsqueeze(0)?.unsqueeze(0)?; // Add batch and head dimensions
-
-        // Store as the last used mask
-        self.last_mask = Some((cache_key, mask.clone()));
-        Ok(mask)
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -380,8 +316,8 @@ impl ModelWeights {
         let mask = if seq_len == 1 {
             None
         } else {
-            // Dynamic mask computation with proper offset
-            Some(self.causal_mask(seq_len, cache_offset)?)
+            // Dynamic mask computation with proper offset using shared cache
+            Some(self.mask_cache.get_mask(seq_len, cache_offset)?)
         };
 
         let _enter = self.span.enter();
@@ -413,28 +349,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.truncate_cache(seq_len)?;
         }
-
-        // Try to truncate the cached mask to match the new cache length
-        if let Some(((mask_seq_len, mask_offset), ref mask)) = self.last_mask {
-            let mask_total_len = mask_seq_len + mask_offset;
-
-            // If we're truncating to a length within the mask's coverage AND
-            // the seq_len dimension matches (common in batched processing),
-            // we can slice the mask instead of recreating it
-            if mask_seq_len == mask_seq_len && seq_len < mask_total_len && seq_len >= mask_seq_len {
-                // Slice the mask: keep only the first seq_len columns
-                // Mask shape: (1, 1, mask_seq_len, mask_total_len)
-                // After slice: (1, 1, mask_seq_len, seq_len)
-                if let Ok(truncated_mask) = mask.narrow(3, 0, seq_len) {
-                    let new_offset = seq_len - mask_seq_len;
-                    self.last_mask = Some(((mask_seq_len, new_offset), truncated_mask));
-                    return Ok(());
-                }
-            }
-        }
-
-        // Otherwise, clear the mask - it will be recreated on next forward
-        self.last_mask = None;
+        // Truncate the cached mask to match
+        self.mask_cache.truncate(seq_len)?;
         Ok(())
     }
 
@@ -443,8 +359,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.reset_cache();
         }
-        // Invalidate cached mask
-        self.last_mask = None;
+        // Clear cached mask
+        self.mask_cache.clear();
     }
 
     /// Get the current cache length (all layers should have same length)

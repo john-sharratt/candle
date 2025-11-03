@@ -20,6 +20,7 @@ pub mod bert;
 pub mod bigcode;
 pub mod blip;
 pub mod blip_text;
+pub mod causal_mask_cache;
 pub mod chatglm;
 pub mod chinese_clip;
 pub mod clip;
