@@ -7,7 +7,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo:rerun-if-changed=src/binary_op_macros.cuh");
     println!("cargo:rerun-if-changed=src/sub_at_indices.cu");
+    println!("cargo:rerun-if-changed=src/sub_at_indices_with_values.cu");
     println!("cargo:rerun-if-changed=src/div_at_indices.cu");
+    println!("cargo:rerun-if-changed=src/mul_at_indices.cu");
     println!("cargo:rerun-if-changed=src/multinomial.cu");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

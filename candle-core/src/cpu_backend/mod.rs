@@ -1745,6 +1745,57 @@ impl CpuStorage {
         Ok(())
     }
 
+    /// In-place sparse subtraction with per-index values - mutates the storage directly without cloning.
+    /// Each index gets its own value to subtract: data[indices[i]] -= values[i]
+    pub fn sub_at_indices_mut_with_values(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        values: &[f32],
+    ) -> Result<()> {
+        if indices.len() != values.len() {
+            crate::bail!(
+                "indices and values must have the same length, got {} and {}",
+                indices.len(),
+                values.len()
+            );
+        }
+
+        match self {
+            Self::BF16(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    let value_bf16 = bf16::from_f32(value);
+                    storage[*idx as usize] -= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    let value_f16 = f16::from_f32(value);
+                    storage[*idx as usize] -= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    storage[*idx as usize] -= value;
+                }
+            }
+            Self::F64(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    let value_f64 = value as f64;
+                    storage[*idx as usize] -= value_f64;
+                }
+            }
+            _ => {
+                return Err(Error::UnsupportedDTypeForOp(
+                    self.dtype(),
+                    "sub_at_indices_with_values",
+                )
+                .bt())
+            }
+        }
+        Ok(())
+    }
+
     pub fn sub_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
         match self {
             Self::BF16(storage) => {
@@ -1780,6 +1831,42 @@ impl CpuStorage {
             }
             _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "sub_at_indices").bt()),
         }
+    }
+
+    /// In-place sparse multiplication - mutates the storage directly without cloning.
+    pub fn mul_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] *= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] *= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] *= value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] *= value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "mul_at_indices").bt()),
+        }
+        Ok(())
     }
 
     /// In-place sparse division - mutates the storage directly without cloning.

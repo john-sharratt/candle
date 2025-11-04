@@ -1266,6 +1266,98 @@ impl CudaStorage {
         Ok(())
     }
 
+    /// In-place sparse subtraction with per-index values - mutates the tensor directly without cloning.
+    /// Each index gets its own value: data[indices[i]] -= values[i]
+    /// This is 20x+ faster than sub_at_indices for large tensors with sparse updates.
+    pub fn sub_at_indices_mut_with_values(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        values: &[f32],
+    ) -> Result<()> {
+        if indices.len() != values.len() {
+            crate::bail!(
+                "indices and values must have the same length, got {} and {}",
+                indices.len(),
+                values.len()
+            );
+        }
+
+        // Early return for empty indices
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        let device = &self.device;
+
+        // Upload indices and values to GPU
+        let indices_dev = device.memcpy_stod(indices)?;
+        let values_dev = device.memcpy_stod(values)?;
+        let num_indices = indices.len();
+        let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+
+        // Mutate in-place based on dtype
+        match &mut self.slice {
+            CudaStorageSlice::F32(dst) => {
+                let func = device.get_or_load_func(
+                    "sub_at_indices_with_values_f32",
+                    &kernels::SUB_AT_INDICES_WITH_VALUES,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                builder.arg(&values_dev);
+                barg!(builder, num_indices);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F16(dst) => {
+                let func = device.get_or_load_func(
+                    "sub_at_indices_with_values_f16",
+                    &kernels::SUB_AT_INDICES_WITH_VALUES,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                builder.arg(&values_dev);
+                barg!(builder, num_indices);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::BF16(dst) => {
+                let func = device.get_or_load_func(
+                    "sub_at_indices_with_values_bf16",
+                    &kernels::SUB_AT_INDICES_WITH_VALUES,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                builder.arg(&values_dev);
+                barg!(builder, num_indices);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F64(dst) => {
+                // Convert f32 values to f64 for the kernel
+                let values_f64: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+                let values_dev_f64 = device.memcpy_stod(&values_f64)?;
+
+                let func = device.get_or_load_func(
+                    "sub_at_indices_with_values_f64",
+                    &kernels::SUB_AT_INDICES_WITH_VALUES,
+                )?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                builder.arg(&values_dev_f64);
+                barg!(builder, num_indices);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => crate::bail!(
+                "sub_at_indices_with_values is only supported for float types (f16, bf16, f32, f64)"
+            ),
+        }
+
+        Ok(())
+    }
+
     pub fn sub_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
         let device = self.device().clone();
 
@@ -1368,6 +1460,76 @@ impl CudaStorage {
             }
             _ => crate::bail!(
                 "div_at_indices is only supported for float types (f16, bf16, f32, f64)"
+            ),
+        }
+
+        Ok(())
+    }
+
+    /// In-place sparse multiplication - mutates the tensor directly without cloning.
+    /// This is 20x+ faster than mul_at_indices for large tensors with sparse updates.
+    pub fn mul_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        // Early return for empty indices
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        let device = &self.device;
+
+        // Upload indices once
+        let indices_dev = device.memcpy_stod(indices)?;
+        let num_indices = indices.len();
+        let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+
+        // Mutate in-place based on dtype
+        match &mut self.slice {
+            CudaStorageSlice::F32(dst) => {
+                let func =
+                    device.get_or_load_func("mul_at_indices_f32", &kernels::MUL_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F16(dst) => {
+                let func =
+                    device.get_or_load_func("mul_at_indices_f16", &kernels::MUL_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::BF16(dst) => {
+                let func =
+                    device.get_or_load_func("mul_at_indices_bf16", &kernels::MUL_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F64(dst) => {
+                let func =
+                    device.get_or_load_func("mul_at_indices_f64", &kernels::MUL_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value as f64);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => crate::bail!(
+                "mul_at_indices is only supported for float types (f16, bf16, f32, f64)"
             ),
         }
 
