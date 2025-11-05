@@ -1978,6 +1978,55 @@ impl CpuStorage {
             _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "div_at_indices").bt()),
         }
     }
+
+    /// Get maximum absolute value from a range in the storage.
+    /// Useful for checking KV cache health by examining only the most recently added layer.
+    ///
+    /// # Arguments
+    /// * `start` - Starting index (inclusive)
+    /// * `end` - Ending index (exclusive)
+    ///
+    /// # Returns
+    /// Maximum absolute value in the range as f32
+    pub fn max_abs_in_range(&self, start: usize, end: usize) -> Result<f32> {
+        if start >= end {
+            return Ok(0.0);
+        }
+
+        let max_val = match self {
+            Self::BF16(storage) => {
+                let slice = storage.get(start..end)
+                    .ok_or_else(|| Error::Msg("Range out of bounds".to_string()))?;
+                slice.iter()
+                    .map(|&v| v.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+            }
+            Self::F16(storage) => {
+                let slice = storage.get(start..end)
+                    .ok_or_else(|| Error::Msg("Range out of bounds".to_string()))?;
+                slice.iter()
+                    .map(|&v| v.to_f32().abs())
+                    .fold(0.0f32, f32::max)
+            }
+            Self::F32(storage) => {
+                let slice = storage.get(start..end)
+                    .ok_or_else(|| Error::Msg("Range out of bounds".to_string()))?;
+                slice.iter()
+                    .map(|&v| v.abs())
+                    .fold(0.0f32, f32::max)
+            }
+            Self::F64(storage) => {
+                let slice = storage.get(start..end)
+                    .ok_or_else(|| Error::Msg("Range out of bounds".to_string()))?;
+                slice.iter()
+                    .map(|&v| v.abs() as f32)
+                    .fold(0.0f32, f32::max)
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "max_abs_in_range").bt()),
+        };
+
+        Ok(max_val)
+    }
 }
 
 impl BackendStorage for CpuStorage {

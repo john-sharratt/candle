@@ -1026,6 +1026,47 @@ impl Tensor {
         ))
     }
 
+    /// Get the maximum absolute value from a specific range in the tensor.
+    /// 
+    /// This is useful for checking KV cache health by examining only the most recently
+    /// added layer/sequence position. Instead of checking the entire cache, you can
+    /// check just the new tokens added in each iteration.
+    ///
+    /// **CPU only** - Returns the max absolute value as f32.
+    ///
+    /// # Arguments
+    /// * `start` - Starting index in the flattened tensor (inclusive)
+    /// * `end` - Ending index in the flattened tensor (exclusive)
+    ///
+    /// # Example
+    /// ```ignore
+    /// # use candle_core::{Tensor, Device, Result};
+    /// # fn main() -> Result<()> {
+    /// // Check the last layer added to KV cache
+    /// let seq_len = 10; // tokens processed so far
+    /// let head_dim = 128;
+    /// let start = (seq_len - 1) * head_dim; // Last token
+    /// let end = seq_len * head_dim;
+    /// 
+    /// let max_val = kv_cache.max_abs_in_range(start, end)?;
+    /// if max_val > 100.0 {
+    ///     eprintln!("⚠️ KV cache outlier detected: {:.2}", max_val);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_abs_in_range(&self, start: usize, end: usize) -> Result<f32> {
+        let storage = self.storage();
+        
+        if let Storage::Cpu(cpu_storage) = &*storage {
+            return cpu_storage.max_abs_in_range(start, end);
+        }
+        
+        Err(Error::Msg(
+            "max_abs_in_range is only supported on CPU backend".to_string(),
+        ))
+    }
+
     /// Multiply tensor values at specific indices by a scalar.
     ///
     /// This operation is useful for applying scaling operations in language models:
