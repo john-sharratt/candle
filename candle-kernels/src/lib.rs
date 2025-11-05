@@ -13,6 +13,7 @@ pub enum Id {
     DivAtIndices,
     Fill,
     Indexing,
+    MaxAbsInRange,
     Multinomial,
     MulAtIndices,
     Quantized,
@@ -24,7 +25,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 17] = [
+pub const ALL_IDS: [Id; 18] = [
     Id::AddAtIndices,
     Id::Affine,
     Id::Binary,
@@ -33,6 +34,7 @@ pub const ALL_IDS: [Id; 17] = [
     Id::DivAtIndices,
     Id::Fill,
     Id::Indexing,
+    Id::MaxAbsInRange,
     Id::Multinomial,
     Id::MulAtIndices,
     Id::Quantized,
@@ -87,6 +89,7 @@ mdl!(CONV, Conv);
 mdl!(DIV_AT_INDICES, DivAtIndices);
 mdl!(FILL, Fill);
 mdl!(INDEXING, Indexing);
+mdl!(MAX_ABS_IN_RANGE, MaxAbsInRange);
 mdl!(MULTINOMIAL, Multinomial);
 mdl!(MUL_AT_INDICES, MulAtIndices);
 mdl!(QUANTIZED, Quantized);

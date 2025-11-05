@@ -1055,16 +1055,44 @@ impl Tensor {
     /// # Ok(())
     /// # }
     /// ```
+    /// Get the maximum absolute value in a range [start, end).
+    /// 
+    /// This is optimized for KV cache health monitoring where you only want to check
+    /// the most recently added layer without scanning the entire cache history.
+    /// 
+    /// On GPU, the reduction happens directly on device with only a single scalar
+    /// transferred back to CPU, making it extremely efficient.
+    ///
+    /// # Arguments
+    /// * `start` - Starting index (inclusive)
+    /// * `end` - Ending index (exclusive)
+    ///
+    /// # Returns
+    /// Maximum absolute value in the range as f32
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Check only the last token in KV cache
+    /// let seq_len = 10;
+    /// let head_dim = 128;
+    /// let start = (seq_len - 1) * head_dim;
+    /// let end = seq_len * head_dim;
+    /// let max_val = kv_cache.max_abs_in_range(start, end)?;
+    /// if max_val > 100.0 {
+    ///     // Terminate - corruption detected
+    /// }
+    /// ```
     pub fn max_abs_in_range(&self, start: usize, end: usize) -> Result<f32> {
         let storage = self.storage();
+        let layout = self.layout();
         
-        if let Storage::Cpu(cpu_storage) = &*storage {
-            return cpu_storage.max_abs_in_range(start, end);
+        match &*storage {
+            Storage::Cpu(cpu_storage) => cpu_storage.max_abs_in_range(start, end),
+            Storage::Cuda(cuda_storage) => cuda_storage.max_abs_in_range(layout, start, end),
+            Storage::Metal(_) => Err(Error::Msg(
+                "max_abs_in_range is not yet implemented for Metal backend".to_string(),
+            )),
         }
-        
-        Err(Error::Msg(
-            "max_abs_in_range is only supported on CPU backend".to_string(),
-        ))
     }
 
     /// Multiply tensor values at specific indices by a scalar.
