@@ -1288,6 +1288,112 @@ fn div_at_indices(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn add_at_indices(device: &Device) -> Result<()> {
+    // Test basic addition on a 1D tensor
+    let t = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0, 50.0], device)?;
+    let indices = [0u32, 2u32, 4u32];
+    let result = t.add_at_indices(&indices, 5.0)?;
+    assert_eq!(result.to_vec1::<f32>()?, &[15.0, 20.0, 35.0, 40.0, 55.0]);
+
+    // Test on 2D tensor
+    let t2d = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], device)?.reshape((2, 3))?;
+    assert_eq!(t2d.to_vec2::<f32>()?, &[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+
+    // Add to first and last elements
+    let indices = [0u32, 5u32];
+    let result = t2d.flatten_all()?.add_at_indices(&indices, 10.0)?;
+    let result = result.reshape((2, 3))?;
+    assert_eq!(
+        result.to_vec2::<f32>()?,
+        &[[11.0, 2.0, 3.0], [4.0, 5.0, 16.0]]
+    );
+
+    // Test with repeated indices (compound addition)
+    let t = Tensor::new(&[2.0f32, 2.0, 2.0, 2.0], device)?;
+    let indices = [1u32, 1u32, 2u32];
+    let result = t.add_at_indices(&indices, 3.0)?;
+    // Index 1 should be incremented twice (2 + 3 + 3 = 8), index 2 once (2 + 3 = 5)
+    assert_eq!(result.to_vec1::<f32>()?, &[2.0, 8.0, 5.0, 2.0]);
+
+    // Test with f16 dtype
+    let t_f16 = Tensor::new(&[2.0f32, 4.0, 6.0, 8.0], device)?.to_dtype(DType::F16)?;
+    let indices = [0u32, 3u32];
+    let result = t_f16.add_at_indices(&indices, 1.5)?;
+    let result_f32 = result.to_dtype(DType::F32)?;
+    assert_eq!(result_f32.to_vec1::<f32>()?, &[3.5, 4.0, 6.0, 9.5]);
+
+    // Test with bf16 dtype
+    let t_bf16 = Tensor::new(&[3.0f32, 6.0, 9.0, 12.0], device)?.to_dtype(DType::BF16)?;
+    let indices = [1u32, 2u32];
+    let result = t_bf16.add_at_indices(&indices, 2.5)?;
+    let result_f32 = result.to_dtype(DType::F32)?;
+    // bf16 has lower precision, so use a tolerance
+    let expected = vec![3.0, 8.5, 11.5, 12.0];
+    let actual = result_f32.to_vec1::<f32>()?;
+    for (a, e) in actual.iter().zip(expected.iter()) {
+        assert!((a - e).abs() < 0.1, "Expected {}, got {}", e, a);
+    }
+
+    // Test with f64 dtype
+    let t_f64 = Tensor::new(&[10.0f64, 20.0, 30.0], device)?.to_dtype(DType::F64)?;
+    let indices = [0u32, 2u32];
+    let result = t_f64.add_at_indices(&indices, 1.5)?;
+    assert_eq!(result.to_vec1::<f64>()?, &[11.5, 20.0, 31.5]);
+
+    // Test empty indices
+    let t = Tensor::new(&[1.0f32, 2.0, 3.0], device)?;
+    let indices: [u32; 0] = [];
+    let result = t.add_at_indices(&indices, 10.0)?;
+    assert_eq!(result.to_vec1::<f32>()?, &[1.0, 2.0, 3.0]);
+
+    // Test large batch of indices
+    let t = Tensor::ones((1000,), DType::F32, device)?.affine(2.0, 0.0)?;
+    let indices: Vec<u32> = (0..500).map(|i| i * 2).collect();
+    let result = t.add_at_indices(&indices, 3.0)?;
+    let result_vec = result.to_vec1::<f32>()?;
+    // Even indices should be 5.0 (2.0 + 3.0), odd indices should be 2.0
+    for (i, &val) in result_vec.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!((val - 5.0).abs() < 1e-6);
+        } else {
+            assert!((val - 2.0).abs() < 1e-6);
+        }
+    }
+
+    // Test mutable API (performance optimization)
+    let mut t = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0], device)?;
+    let indices = [0u32, 2u32];
+    t.add_at_indices_mut(&indices, 5.0)?;
+    assert_eq!(t.to_vec1::<f32>()?, &[15.0, 20.0, 35.0, 40.0]);
+
+    // Test mutable API with repeated indices
+    let mut t = Tensor::new(&[2.0f32, 2.0, 2.0, 2.0], device)?;
+    let indices = [1u32, 1u32, 2u32];
+    t.add_at_indices_mut(&indices, 3.0)?;
+    assert_eq!(t.to_vec1::<f32>()?, &[2.0, 8.0, 5.0, 2.0]);
+
+    // Test mutable API with different dtypes
+    let mut t_f16 = Tensor::new(&[4.0f32, 8.0, 12.0], device)?.to_dtype(DType::F16)?;
+    let indices = [0u32, 2u32];
+    t_f16.add_at_indices_mut(&indices, 2.5)?;
+    let result_f32 = t_f16.to_dtype(DType::F32)?;
+    assert_eq!(result_f32.to_vec1::<f32>()?, &[6.5, 8.0, 14.5]);
+
+    // Test with zero addition
+    let mut t = Tensor::new(&[10.0f32, 20.0, 30.0], device)?;
+    let indices = [0u32, 2u32];
+    t.add_at_indices_mut(&indices, 0.0)?;
+    assert_eq!(t.to_vec1::<f32>()?, &[10.0, 20.0, 30.0]);
+
+    // Test with negative addition (subtraction)
+    let mut t = Tensor::new(&[10.0f32, 20.0, 30.0], device)?;
+    let indices = [1u32];
+    t.add_at_indices_mut(&indices, -5.0)?;
+    assert_eq!(t.to_vec1::<f32>()?, &[10.0, 15.0, 30.0]);
+
+    Ok(())
+}
+
 fn mul_at_indices(device: &Device) -> Result<()> {
     // Test basic multiplication on a 1D tensor
     let t = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0, 50.0], device)?;
@@ -2061,6 +2167,12 @@ test_device!(
     div_at_indices_cpu,
     div_at_indices_gpu,
     div_at_indices_metal
+);
+test_device!(
+    add_at_indices,
+    add_at_indices_cpu,
+    add_at_indices_gpu,
+    add_at_indices_metal
 );
 test_device!(
     mul_at_indices,

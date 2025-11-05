@@ -1196,6 +1196,80 @@ impl CudaStorage {
         T::as_cuda_slice_mut(self)
     }
 
+    /// In-place sparse addition - mutates the tensor directly without cloning.
+    /// This is 20x+ faster than add_at_indices for large tensors with sparse updates.
+    pub fn add_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        // Early return for empty indices
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        let device = &self.device;
+
+        // Upload indices once
+        let indices_dev = device.memcpy_stod(indices)?;
+        let num_indices = indices.len();
+        let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+
+        // Mutate in-place based on dtype
+        match &mut self.slice {
+            CudaStorageSlice::F32(dst) => {
+                let func =
+                    device.get_or_load_func("add_at_indices_f32", &kernels::ADD_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                barg!(builder, 1usize);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F16(dst) => {
+                let func =
+                    device.get_or_load_func("add_at_indices_f16", &kernels::ADD_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                barg!(builder, 1usize);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::BF16(dst) => {
+                let func =
+                    device.get_or_load_func("add_at_indices_bf16", &kernels::ADD_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value);
+                barg!(builder, 1usize);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F64(dst) => {
+                let func =
+                    device.get_or_load_func("add_at_indices_f64", &kernels::ADD_AT_INDICES)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, value as f64);
+                barg!(builder, 1usize);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => crate::bail!(
+                "add_at_indices is only supported for float types (f16, bf16, f32, f64)"
+            ),
+        }
+
+        Ok(())
+    }
+
     /// In-place sparse subtraction - mutates the tensor directly without cloning.
     /// This is 20x+ faster than sub_at_indices for large tensors with sparse updates.
     pub fn sub_at_indices_mut(

@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/compatibility.cuh");
     println!("cargo:rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo:rerun-if-changed=src/binary_op_macros.cuh");
+    println!("cargo:rerun-if-changed=src/add_at_indices.cu");
     println!("cargo:rerun-if-changed=src/sub_at_indices.cu");
     println!("cargo:rerun-if-changed=src/sub_at_indices_with_values.cu");
     println!("cargo:rerun-if-changed=src/div_at_indices.cu");

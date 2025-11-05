@@ -5,6 +5,7 @@ mod ptx {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Id {
+    AddAtIndices,
     Affine,
     Binary,
     Cast,
@@ -23,7 +24,8 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 16] = [
+pub const ALL_IDS: [Id; 17] = [
+    Id::AddAtIndices,
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -77,6 +79,7 @@ macro_rules! mdl {
     };
 }
 
+mdl!(ADD_AT_INDICES, AddAtIndices);
 mdl!(AFFINE, Affine);
 mdl!(BINARY, Binary);
 mdl!(CAST, Cast);

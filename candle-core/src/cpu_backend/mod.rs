@@ -1745,6 +1745,43 @@ impl CpuStorage {
         Ok(())
     }
 
+    /// In-place sparse addition - mutates the storage directly without cloning.
+    /// Adds a scalar value to elements at the specified indices: data[indices[i]] += value
+    pub fn add_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] += value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] += value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] += value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] += value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "add_at_indices").bt()),
+        }
+        Ok(())
+    }
+
     /// In-place sparse subtraction with per-index values - mutates the storage directly without cloning.
     /// Each index gets its own value to subtract: data[indices[i]] -= values[i]
     pub fn sub_at_indices_mut_with_values(
