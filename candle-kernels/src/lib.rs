@@ -17,6 +17,7 @@ pub enum Id {
     MulAtIndices,
     Quantized,
     Reduce,
+    RepeatPenalty,
     Sort,
     SubAtIndices,
     SubAtIndicesWithValues,
@@ -24,7 +25,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 17] = [
+pub const ALL_IDS: [Id; 18] = [
     Id::AddAtIndices,
     Id::Affine,
     Id::Binary,
@@ -37,6 +38,7 @@ pub const ALL_IDS: [Id; 17] = [
     Id::MulAtIndices,
     Id::Quantized,
     Id::Reduce,
+    Id::RepeatPenalty,
     Id::Sort,
     Id::SubAtIndices,
     Id::SubAtIndicesWithValues,
@@ -91,6 +93,7 @@ mdl!(MULTINOMIAL, Multinomial);
 mdl!(MUL_AT_INDICES, MulAtIndices);
 mdl!(QUANTIZED, Quantized);
 mdl!(REDUCE, Reduce);
+mdl!(REPEAT_PENALTY, RepeatPenalty);
 mdl!(SORT, Sort);
 mdl!(SUB_AT_INDICES, SubAtIndices);
 mdl!(SUB_AT_INDICES_WITH_VALUES, SubAtIndicesWithValues);

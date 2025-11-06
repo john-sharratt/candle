@@ -1610,6 +1610,78 @@ impl CudaStorage {
         Ok(())
     }
 
+    /// In-place repeat penalty - applies penalty based on logit sign in a single GPU kernel pass.
+    /// For positive logits: divides by penalty (reduces probability)
+    /// For negative/zero logits: multiplies by penalty (reduces probability)
+    /// This is extremely efficient as it combines the logic from both div_at_indices and mul_at_indices.
+    pub fn repeat_penalty_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        penalty: f32,
+    ) -> Result<()> {
+        // Early return for empty indices or penalty of 1.0 (no-op)
+        if indices.is_empty() || penalty == 1.0 {
+            return Ok(());
+        }
+
+        let device = &self.device;
+
+        // Upload indices once
+        let indices_dev = device.memcpy_stod(indices)?;
+        let num_indices = indices.len();
+        let cfg = LaunchConfig::for_num_elems(num_indices as u32);
+
+        // Mutate in-place based on dtype
+        match &mut self.slice {
+            CudaStorageSlice::F32(dst) => {
+                let func =
+                    device.get_or_load_func("repeat_penalty_f32", &kernels::REPEAT_PENALTY)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, penalty);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F16(dst) => {
+                let func =
+                    device.get_or_load_func("repeat_penalty_f16", &kernels::REPEAT_PENALTY)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, penalty);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::BF16(dst) => {
+                let func =
+                    device.get_or_load_func("repeat_penalty_bf16", &kernels::REPEAT_PENALTY)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, penalty);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            CudaStorageSlice::F64(dst) => {
+                let func =
+                    device.get_or_load_func("repeat_penalty_f64", &kernels::REPEAT_PENALTY)?;
+                let mut builder = func.builder();
+                builder.arg(dst);
+                builder.arg(&indices_dev);
+                barg!(builder, num_indices);
+                barg!(builder, penalty as f64);
+                unsafe { builder.launch(cfg) }.w()?;
+            }
+            _ => crate::bail!(
+                "repeat_penalty is only supported for float types (f16, bf16, f32, f64)"
+            ),
+        }
+
+        Ok(())
+    }
+
     pub fn div_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
         let device = self.device().clone();
 
