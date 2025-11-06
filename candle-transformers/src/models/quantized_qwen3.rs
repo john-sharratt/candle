@@ -116,7 +116,7 @@ impl RotaryEmbedding {
     /// Apply RoPE (q, k shape: B x H x L x D)
     fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
-        
+
         // Check if offset + seq_len would exceed precomputed RoPE buffer
         let max_cached_len = self.cos.dim(0)?;
         let cos = if offset + seq_len <= max_cached_len {
@@ -131,7 +131,7 @@ impl RotaryEmbedding {
             let pos_tensor = Tensor::from_vec(positions, (seq_len,), self.cos.device())?;
             self.cos.index_select(&pos_tensor, 0)?.to_dtype(q.dtype())?
         };
-        
+
         let sin = if offset + seq_len <= max_cached_len {
             self.sin.narrow(0, offset, seq_len)?.to_dtype(q.dtype())?
         } else {
@@ -141,7 +141,7 @@ impl RotaryEmbedding {
             let pos_tensor = Tensor::from_vec(positions, (seq_len,), self.sin.device())?;
             self.sin.index_select(&pos_tensor, 0)?.to_dtype(q.dtype())?
         };
-        
+
         let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))

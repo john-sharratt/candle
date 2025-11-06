@@ -8,7 +8,7 @@ fn test_qwen3_rope_beyond_max_positions() -> Result<()> {
     let head_dim = 128;
     let max_position_embeddings = 1024; // Intentionally small for testing
     let rope_theta: f64 = 1000000.0;
-    
+
     // Build RoPE embeddings manually (mimicking RotaryEmbedding::new)
     let dim = head_dim;
     let inv_freq: Vec<_> = (0..dim)
@@ -23,7 +23,7 @@ fn test_qwen3_rope_beyond_max_positions() -> Result<()> {
     let freqs = t.matmul(&inv_freq)?;
     let sin = freqs.sin()?;
     let cos = freqs.cos()?;
-    
+
     // Test 1: Normal case within bounds (offset=512, seq_len=128)
     let offset1 = 512;
     let seq_len1 = 128;
@@ -32,8 +32,11 @@ fn test_qwen3_rope_beyond_max_positions() -> Result<()> {
     let sin1 = sin.narrow(0, offset1, seq_len1)?;
     assert_eq!(cos1.dims(), &[seq_len1, inv_freq_len]);
     assert_eq!(sin1.dims(), &[seq_len1, inv_freq_len]);
-    println!("✓ Test 1: Normal case (offset={}, seq_len={}) passed", offset1, seq_len1);
-    
+    println!(
+        "✓ Test 1: Normal case (offset={}, seq_len={}) passed",
+        offset1, seq_len1
+    );
+
     // Test 2: Boundary case at exact limit (offset=1000, seq_len=24)
     let offset2 = 1000;
     let seq_len2 = 24;
@@ -42,8 +45,11 @@ fn test_qwen3_rope_beyond_max_positions() -> Result<()> {
     let sin2 = sin.narrow(0, offset2, seq_len2)?;
     assert_eq!(cos2.dims(), &[seq_len2, inv_freq_len]);
     assert_eq!(sin2.dims(), &[seq_len2, inv_freq_len]);
-    println!("✓ Test 2: Boundary case (offset={}, seq_len={}) passed", offset2, seq_len2);
-    
+    println!(
+        "✓ Test 2: Boundary case (offset={}, seq_len={}) passed",
+        offset2, seq_len2
+    );
+
     // Test 3: Beyond bounds with modulo wrapping (offset=2000, seq_len=1)
     let offset3 = 2000;
     let seq_len3 = 1;
@@ -56,22 +62,31 @@ fn test_qwen3_rope_beyond_max_positions() -> Result<()> {
     let sin3 = sin.index_select(&pos_tensor, 0)?;
     assert_eq!(cos3.dims(), &[seq_len3, inv_freq_len]);
     assert_eq!(sin3.dims(), &[seq_len3, inv_freq_len]);
-    
+
     // Verify that position 2000 wraps to position 976 (2000 % 1024)
     let expected_pos = (offset3 % max_position_embeddings) as usize;
     let cos_expected = cos.narrow(0, expected_pos, 1)?;
     let sin_expected = sin.narrow(0, expected_pos, 1)?;
-    
+
     let cos3_data = cos3.to_vec2::<f32>()?;
     let cos_expected_data = cos_expected.to_vec2::<f32>()?;
-    assert_eq!(cos3_data, cos_expected_data, "cos values should match after wrapping");
-    
+    assert_eq!(
+        cos3_data, cos_expected_data,
+        "cos values should match after wrapping"
+    );
+
     let sin3_data = sin3.to_vec2::<f32>()?;
     let sin_expected_data = sin_expected.to_vec2::<f32>()?;
-    assert_eq!(sin3_data, sin_expected_data, "sin values should match after wrapping");
-    
-    println!("✓ Test 3: Beyond bounds wrapping (offset={}, wraps to {}) passed", offset3, expected_pos);
-    
+    assert_eq!(
+        sin3_data, sin_expected_data,
+        "sin values should match after wrapping"
+    );
+
+    println!(
+        "✓ Test 3: Beyond bounds wrapping (offset={}, wraps to {}) passed",
+        offset3, expected_pos
+    );
+
     // Test 4: Far beyond bounds (offset=10000, seq_len=10)
     let offset4 = 10000;
     let seq_len4 = 10;
@@ -83,8 +98,11 @@ fn test_qwen3_rope_beyond_max_positions() -> Result<()> {
     let sin4 = sin.index_select(&pos_tensor4, 0)?;
     assert_eq!(cos4.dims(), &[seq_len4, inv_freq_len]);
     assert_eq!(sin4.dims(), &[seq_len4, inv_freq_len]);
-    println!("✓ Test 4: Far beyond bounds (offset={}, seq_len={}) passed", offset4, seq_len4);
-    
+    println!(
+        "✓ Test 4: Far beyond bounds (offset={}, seq_len={}) passed",
+        offset4, seq_len4
+    );
+
     println!("\n✅ All RoPE long context tests passed!");
     Ok(())
 }

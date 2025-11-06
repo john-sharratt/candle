@@ -12,7 +12,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/div_at_indices.cu");
     println!("cargo:rerun-if-changed=src/mul_at_indices.cu");
     println!("cargo:rerun-if-changed=src/multinomial.cu");
-    println!("cargo:rerun-if-changed=src/max_abs_in_range.cu");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
