@@ -55,8 +55,32 @@ impl Qwen3RotaryEmbedding {
     /// Apply RoPE (q, k shape: B x H x L x D)
     pub(crate) fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
         let (_, _, seq_len, _) = q.dims4()?;
-        let cos = self.cos.narrow(0, offset, seq_len)?;
-        let sin = self.sin.narrow(0, offset, seq_len)?;
+        
+        // Check if offset + seq_len would exceed precomputed RoPE buffer
+        let max_cached_len = self.cos.dim(0)?;
+        let cos = if offset + seq_len <= max_cached_len {
+            // Fast path: use precomputed values
+            self.cos.narrow(0, offset, seq_len)?
+        } else {
+            // Slow path: use modulo wrapping for positions beyond cache
+            // This handles long context by reusing RoPE patterns
+            let positions: Vec<u32> = (offset..offset + seq_len)
+                .map(|pos| (pos % max_cached_len) as u32)
+                .collect();
+            let pos_tensor = Tensor::from_vec(positions, (seq_len,), self.cos.device())?;
+            self.cos.index_select(&pos_tensor, 0)?
+        };
+        
+        let sin = if offset + seq_len <= max_cached_len {
+            self.sin.narrow(0, offset, seq_len)?
+        } else {
+            let positions: Vec<u32> = (offset..offset + seq_len)
+                .map(|pos| (pos % max_cached_len) as u32)
+                .collect();
+            let pos_tensor = Tensor::from_vec(positions, (seq_len,), self.sin.device())?;
+            self.sin.index_select(&pos_tensor, 0)?
+        };
+        
         let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q_embed, k_embed))
