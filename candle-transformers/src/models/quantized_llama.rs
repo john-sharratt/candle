@@ -165,8 +165,10 @@ struct LayerWeights {
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Tensor> {
     let shape = mask.shape();
     // mask is F32: 0.0 = visible, -inf = masked
-    // where_cond interprets non-zero as true, so -inf -> on_true, 0.0 -> on_false
-    let m = mask.where_cond(&on_true.broadcast_as(shape.dims())?, on_false)?;
+    // Convert to U8 for where_cond: 0.0 -> 0u8 (false), -inf -> 1u8 (true)
+    let zero = Tensor::new(&[0.0f32], mask.device())?.broadcast_as(shape.dims())?;
+    let mask_u8 = mask.ne(&zero)?; // not equal to 0.0 gives U8 tensor
+    let m = mask_u8.where_cond(&on_true.broadcast_as(shape.dims())?, on_false)?;
     Ok(m)
 }
 
