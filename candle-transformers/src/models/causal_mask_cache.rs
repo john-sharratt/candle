@@ -61,7 +61,7 @@ impl CausalMaskCache {
     }
 
     /// Create a causal mask using GPU tensor operations
-    /// Returns U8 mask where 0 = visible, 1 = masked
+    /// Returns F32 mask where 0.0 = visible, -inf = masked
     fn create_mask_gpu(&self, seq_len: usize, offset: usize) -> Result<Tensor> {
         let total_len = seq_len + offset;
 
@@ -74,7 +74,7 @@ impl CausalMaskCache {
             .unsqueeze(0)? // (1, total_len)
             .broadcast_as((seq_len, total_len))?;
 
-        // mask[i,j] = (j > i + offset) ? 1 : 0
+        // mask[i,j] = (j > i + offset) ? -inf : 0.0
         // Calculate threshold as U32: row_indices + offset
         let offset_tensor =
             Tensor::new(&[offset as u32], &self.device)?.broadcast_as((seq_len, total_len))?;
@@ -83,14 +83,12 @@ impl CausalMaskCache {
         // Compare as U32: col_indices > threshold returns U8 (0 or 1)
         let mask_u8 = col_indices.gt(&threshold)?;
 
-        // Convert to F32 for compatibility: 0 -> 0.0, 1 -> -inf
-        let mask = mask_u8.to_dtype(DType::F32)?;
-        let neg_inf = Tensor::new(&[f32::NEG_INFINITY], &self.device)?;
-        let zero = Tensor::new(&[0.0f32], &self.device)?;
-        let mask = mask.where_cond(
-            &neg_inf.broadcast_as(mask.shape())?,
-            &zero.broadcast_as(mask.shape())?,
-        )?;
+        // Convert U8 to F32 for mask values: 0u8 -> 0.0f32, 1u8 -> -inf
+        // Use where_cond with U8 condition
+        let neg_inf =
+            Tensor::new(&[f32::NEG_INFINITY], &self.device)?.broadcast_as((seq_len, total_len))?;
+        let zero = Tensor::new(&[0.0f32], &self.device)?.broadcast_as((seq_len, total_len))?;
+        let mask = mask_u8.where_cond(&neg_inf, &zero)?;
 
         // Add batch and head dimensions: (seq_len, total_len) -> (1, 1, seq_len, total_len)
         mask.unsqueeze(0)?.unsqueeze(0)
