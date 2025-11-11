@@ -65,24 +65,26 @@ impl CausalMaskCache {
         let minf = f32::NEG_INFINITY;
         let total_len = seq_len + offset;
 
-        // Create range tensors on GPU
+        // Create range tensors on GPU as U32 for comparison
         let row_indices = Tensor::arange(0u32, seq_len as u32, &self.device)?
-            .to_dtype(DType::F32)?
             .unsqueeze(1)? // (seq_len, 1)
             .broadcast_as((seq_len, total_len))?;
 
         let col_indices = Tensor::arange(0u32, total_len as u32, &self.device)?
-            .to_dtype(DType::F32)?
             .unsqueeze(0)? // (1, total_len)
             .broadcast_as((seq_len, total_len))?;
 
         // mask[i,j] = (j <= i + offset) ? 0.0 : -inf
+        // Calculate threshold as U32: row_indices + offset
         let offset_tensor =
-            Tensor::new(&[offset as f32], &self.device)?.broadcast_as((seq_len, total_len))?;
+            Tensor::new(&[offset as u32], &self.device)?.broadcast_as((seq_len, total_len))?;
         let threshold = (row_indices + offset_tensor)?;
 
-        // where(col_indices > threshold, -inf, 0.0)
-        let mask = col_indices.gt(&threshold)?.where_cond(
+        // Compare as U32: col_indices > threshold
+        let mask_bool = col_indices.gt(&threshold)?;
+
+        // Convert to F32 mask: where(mask_bool, -inf, 0.0)
+        let mask = mask_bool.where_cond(
             &Tensor::new(&[minf], &self.device)?.broadcast_as((seq_len, total_len))?,
             &Tensor::new(&[0.0f32], &self.device)?.broadcast_as((seq_len, total_len))?,
         )?;
