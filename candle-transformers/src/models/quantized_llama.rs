@@ -22,7 +22,7 @@ use crate::quantized_nn::RmsNorm;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file};
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Module};
+use candle_nn::{kv_cache::KvCache, Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
@@ -157,7 +157,7 @@ struct LayerWeights {
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
@@ -170,6 +170,18 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Ten
 }
 
 impl LayerWeights {
+    pub fn truncate_cache(&mut self, seq_len: usize) -> Result<()> {
+        self.kv_cache.truncate(seq_len)
+    }
+
+    pub fn reset_cache(&mut self) {
+        self.kv_cache.reset();
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.kv_cache.k_cache().current_seq_len()
+    }
+
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
@@ -209,19 +221,11 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                if index_pos == 0 {
-                    (k, v)
-                } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?;
-                    (k, v)
-                }
-            }
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        // Reset KV cache if we're at the first position
+        if index_pos == 0 {
+            self.kv_cache.reset();
+        }
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         let y = if q.device().is_metal() && seq_len == 1 {
             // SDPA will do MQA for us
@@ -311,6 +315,9 @@ impl ModelWeights {
             let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
             let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
+            // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
+            // The cache will grow in chunks of 512 tokens when needed.
+            let kv_cache = KvCache::new(2, 2048);
             layers.push(LayerWeights {
                 attention_wq: QMatMul::from_qtensor(attention_wq)?,
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -325,7 +332,7 @@ impl ModelWeights {
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
-                kv_cache: None,
+                kv_cache,
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -434,6 +441,9 @@ impl ModelWeights {
             let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
             let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
+            // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
+            // The cache will grow in chunks of 512 tokens when needed.
+            let kv_cache = KvCache::new(2, 2048);
             layers.push(LayerWeights {
                 attention_wq: QMatMul::from_qtensor(attention_wq)?,
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -448,7 +458,7 @@ impl ModelWeights {
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
-                kv_cache: None,
+                kv_cache,
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -478,6 +488,33 @@ impl ModelWeights {
             self.masks.insert(t, mask.clone());
             Ok(mask)
         }
+    }
+
+    /// Truncate KV cache to specified sequence length
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.truncate_cache(seq_len)?;
+        }
+        Ok(())
+    }
+
+    /// Clear all KV caches (more efficient than forward with offset=0)
+    pub fn clear_all_caches(&mut self) {
+        for layer in &mut self.layers {
+            layer.reset_cache();
+        }
+    }
+
+    /// Get the current cache length (all layers should be same)
+    pub fn cache_len(&self) -> usize {
+        self.layers.first().map(|l| l.cache_len()).unwrap_or(0)
+    }
+
+    /// Rewind by N tokens from current position
+    pub fn rewind_by_tokens(&mut self, n_tokens: usize) -> Result<()> {
+        let current_len = self.cache_len();
+        let target_pos = current_len.saturating_sub(n_tokens);
+        self.truncate_kv_cache(target_pos)
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
