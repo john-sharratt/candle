@@ -16,8 +16,7 @@
 //! ![](https://raw.githubusercontent.com/huggingface/candle/main/candle-examples/examples/quantized/assets/aoc.gif)
 //!
 
-use std::collections::HashMap;
-
+use crate::models::causal_mask_cache::CausalMaskCache;
 use crate::quantized_nn::RmsNorm;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file};
@@ -264,7 +263,7 @@ pub struct ModelWeights {
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
-    masks: HashMap<usize, Tensor>,
+    mask_cache: CausalMaskCache,
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -349,7 +348,7 @@ impl ModelWeights {
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
-            masks: HashMap::new(),
+            mask_cache: CausalMaskCache::new(ct.device.clone()),
             span,
             span_output,
         })
@@ -475,23 +474,10 @@ impl ModelWeights {
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
-            masks: HashMap::new(),
+            mask_cache: CausalMaskCache::new(device.clone()),
             span,
             span_output,
         })
-    }
-
-    fn mask(&mut self, t: usize, device: &Device) -> Result<Tensor> {
-        if let Some(mask) = self.masks.get(&t) {
-            Ok(mask.clone())
-        } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
-                .collect();
-            let mask = Tensor::from_slice(&mask, (t, t), device)?;
-            self.masks.insert(t, mask.clone());
-            Ok(mask)
-        }
     }
 
     /// Truncate KV cache to specified sequence length
@@ -499,6 +485,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.truncate_cache(seq_len)?;
         }
+        // Truncate the cached mask to match
+        self.mask_cache.truncate(seq_len)?;
         Ok(())
     }
 
@@ -507,6 +495,8 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.reset_cache();
         }
+        // Clear cached mask
+        self.mask_cache.clear();
     }
 
     /// Get the current cache length (all layers should be same)
@@ -526,7 +516,8 @@ impl ModelWeights {
         let mask = if seq_len == 1 {
             None
         } else {
-            Some(self.mask(seq_len, x.device())?)
+            // Use shared mask cache with GPU-accelerated creation
+            Some(self.mask_cache.get_mask(seq_len, index_pos)?)
         };
         let _enter = self.span.enter();
         let mut layer_in = self.tok_embeddings.forward(x)?;
