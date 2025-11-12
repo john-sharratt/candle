@@ -154,6 +154,11 @@ impl CausalMaskCache {
     pub fn clear(&mut self) {
         self.last_mask = None;
     }
+
+    /// Get the device this cache is associated with
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 #[cfg(test)]

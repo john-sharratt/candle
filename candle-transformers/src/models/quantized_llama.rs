@@ -261,7 +261,7 @@ impl LayerWeights {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
@@ -270,6 +270,51 @@ pub struct ModelWeights {
     mask_cache: CausalMaskCache,
     span: tracing::Span,
     span_output: tracing::Span,
+}
+
+impl Clone for ModelWeights {
+    fn clone(&self) -> Self {
+        // Clone layers with fresh KV caches
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let kv_cache_capacity = layer.kv_cache.k_cache().max_seq_len();
+                LayerWeights {
+                    // These tensors are cheap to clone (reference-counted, shared memory)
+                    attention_wq: layer.attention_wq.clone(),
+                    attention_wk: layer.attention_wk.clone(),
+                    attention_wv: layer.attention_wv.clone(),
+                    attention_wo: layer.attention_wo.clone(),
+                    attention_norm: layer.attention_norm.clone(),
+                    mlp_or_moe: layer.mlp_or_moe.clone(),
+                    ffn_norm: layer.ffn_norm.clone(),
+                    cos: layer.cos.clone(),
+                    sin: layer.sin.clone(),
+                    neg_inf: layer.neg_inf.clone(),
+                    n_head: layer.n_head,
+                    n_kv_head: layer.n_kv_head,
+                    head_dim: layer.head_dim,
+                    // Create fresh, empty KV cache with same capacity
+                    kv_cache: KvCache::new(2, kv_cache_capacity),
+                    span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
+                    span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
+                    span_mlp: tracing::span!(tracing::Level::TRACE, "attn-mlp"),
+                }
+            })
+            .collect();
+
+        Self {
+            tok_embeddings: self.tok_embeddings.clone(),
+            layers,
+            norm: self.norm.clone(),
+            output: self.output.clone(),
+            // Create fresh mask cache with same device to avoid sharing cached masks
+            mask_cache: CausalMaskCache::new(self.mask_cache.device().clone()),
+            span: tracing::span!(tracing::Level::TRACE, "model"),
+            span_output: tracing::span!(tracing::Level::TRACE, "output"),
+        }
+    }
 }
 
 fn precomput_freqs_cis(
@@ -544,5 +589,137 @@ impl ModelWeights {
         let x = x.i((.., seq_len - 1, ..))?;
         let _enter = self.span_output.enter();
         self.output.forward(&x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::quantized::gguf_file;
+
+    #[test]
+    fn test_clone_with_independent_kv_cache() -> Result<()> {
+        // Download a small Llama model from HuggingFace
+        // Using Llama-3.2-1B-Instruct (smallest available for fast testing)
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
+
+        let repo = api.model("bartowski/Llama-3.2-1B-Instruct-GGUF".to_string());
+        let model_path = repo.get("Llama-3.2-1B-Instruct-Q4_K_M.gguf").map_err(|e| {
+            candle::Error::Msg(format!(
+                "Failed to download model: {}. This test requires internet access.",
+                e
+            ))
+        })?;
+
+        println!("Model downloaded to: {:?}", model_path);
+
+        let device = Device::cuda_if_available(0)?;
+        println!("Using device: {:?}", device);
+
+        // Load model
+        let mut file = std::fs::File::open(&model_path)?;
+        let content = gguf_file::Content::read(&mut file)?;
+        let mut model = ModelWeights::from_gguf(content, &mut file, &device)?;
+
+        println!("Model loaded, starting 500-token prefill...");
+
+        // Step 1: Advance model forward by 500+ tokens to populate KV cache
+        // Using token ID 1 (typically a valid token in most vocabularies)
+        let prefill_tokens = 500;
+        for i in 0..prefill_tokens {
+            let input = Tensor::new(&[1u32], &device)?.unsqueeze(0)?;
+            let _output = model.forward(&input, i)?;
+
+            if (i + 1) % 100 == 0 {
+                println!("  Prefill progress: {}/{}", i + 1, prefill_tokens);
+            }
+        }
+
+        let original_cache_len = model.cache_len();
+        assert_eq!(
+            original_cache_len, prefill_tokens,
+            "Original model should have {} tokens in cache",
+            prefill_tokens
+        );
+        println!("✓ Original model cache: {} tokens", original_cache_len);
+
+        // Step 2: Clone the model
+        println!("\nCloning model...");
+        let mut cloned_model = model.clone();
+        let clone_initial_cache_len = cloned_model.cache_len();
+        assert_eq!(
+            clone_initial_cache_len, 0,
+            "Cloned model should start with empty cache"
+        );
+        println!(
+            "✓ Cloned model cache: {} tokens (empty)",
+            clone_initial_cache_len
+        );
+
+        // Step 3: Advance clone forward with new prompt (different token: 2)
+        println!("\nAdvancing clone with new prompt (100 tokens)...");
+        let clone_tokens = 100;
+        for i in 0..clone_tokens {
+            let input = Tensor::new(&[2u32], &device)?.unsqueeze(0)?;
+            let _output = cloned_model.forward(&input, i)?;
+        }
+
+        let clone_cache_len = cloned_model.cache_len();
+        assert_eq!(
+            clone_cache_len, clone_tokens,
+            "Clone should have {} tokens in cache",
+            clone_tokens
+        );
+        println!("✓ Clone cache after generation: {} tokens", clone_cache_len);
+
+        // Step 4: Verify original model cache is still intact
+        let original_cache_len_after_clone = model.cache_len();
+        assert_eq!(
+            original_cache_len_after_clone, prefill_tokens,
+            "Original model cache should still have {} tokens (not affected by clone)",
+            prefill_tokens
+        );
+        println!(
+            "✓ Original cache after clone generation: {} tokens (unchanged)",
+            original_cache_len_after_clone
+        );
+
+        // Step 5: Advance original forward with continuation (token 3)
+        println!("\nAdvancing original model (50 more tokens)...");
+        let original_continue_tokens = 50;
+        for i in 0..original_continue_tokens {
+            let input = Tensor::new(&[3u32], &device)?.unsqueeze(0)?;
+            let _output = model.forward(&input, prefill_tokens + i)?;
+        }
+
+        let original_final_cache_len = model.cache_len();
+        assert_eq!(
+            original_final_cache_len,
+            prefill_tokens + original_continue_tokens,
+            "Original model should have {} tokens in cache",
+            prefill_tokens + original_continue_tokens
+        );
+        println!(
+            "✓ Original cache after continuation: {} tokens",
+            original_final_cache_len
+        );
+
+        // Verify caches are completely independent
+        assert_ne!(
+            original_final_cache_len, clone_cache_len,
+            "Original and clone should have different cache lengths"
+        );
+
+        println!("\n=== Test Summary ===");
+        println!(
+            "✓ Original model: {} tokens in cache",
+            original_final_cache_len
+        );
+        println!("✓ Cloned model: {} tokens in cache", clone_cache_len);
+        println!("✓ Caches are completely independent");
+        println!("✓ Clone did not affect original model state");
+
+        Ok(())
     }
 }
