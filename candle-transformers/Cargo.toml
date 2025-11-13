@@ -15,8 +15,10 @@ byteorder = { workspace = true }
 candle = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 candle-nn = { workspace = true }
+cudarc = { workspace = true, optional = true }
 fancy-regex = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
+memmap2 = { workspace = true }
 num-traits = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -31,7 +33,7 @@ hf-hub = { workspace = true }
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate"]
-cuda = ["candle/cuda", "candle-nn/cuda"]
+cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc"]
 cudnn = ["candle/cudnn", "candle-nn/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl"]

@@ -16,6 +16,7 @@ exclude = [
     "candle-kernels",
     "candle-metal-kernels",
     "candle-onnx",
+    "test_pinned_mmap",
 ]
 resolver = "2"
 

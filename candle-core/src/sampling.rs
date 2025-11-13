@@ -613,8 +613,9 @@ mod tests {
             .collect();
         let logits = Tensor::from_vec(logits_data, vocab_size, &device)?;
         let token = logits.sample_multinomial(0.8, Some(50), Some(0.9), 42)?;
-        assert!(token < vocab_size as u32);
-        println!("   ✅ Large vocabulary (32K): token {}", token);
+        let token_scalar = token.to_vec0::<u32>()?;
+        assert!(token_scalar < vocab_size as u32);
+        println!("   ✅ Large vocabulary (32K): token {}", token_scalar);
 
         println!("🎉 All GPU-native CUDA kernel tests passed!");
         Ok(())
