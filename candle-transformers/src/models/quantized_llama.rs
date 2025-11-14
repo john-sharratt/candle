@@ -21,7 +21,7 @@ use crate::quantized_nn::RmsNorm;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file};
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, kv_cache::Fp8KvCache, Embedding, Module};
+use candle_nn::{kv_cache::Fp8KvCache, kv_cache::KvCache, Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 4096;
 

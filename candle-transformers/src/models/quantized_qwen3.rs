@@ -11,7 +11,7 @@ use crate::models::causal_mask_cache::CausalMaskCache;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, kv_cache::Fp8KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::Fp8KvCache, kv_cache::KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
