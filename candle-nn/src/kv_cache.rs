@@ -2,6 +2,24 @@
 //!
 use candle::{DType, Device, Result, Tensor};
 
+/// FP8/BF16 quantization utilities for KV cache
+/// Note: We use BF16 as storage format because candle's F8E4M3 support is incomplete
+/// (cat and copy_strided_src operations don't work with F8E4M3). BF16 still provides
+/// ~50% memory savings compared to F32 (2 bytes vs 4 bytes).
+trait Fp8Quantize {
+    fn to_fp8(&self) -> Result<Tensor>;
+}
+
+impl Fp8Quantize for Tensor {
+    /// Convert tensor to BF16 for quantized storage
+    /// Despite the name "fp8", we use BF16 due to candle limitations with F8E4M3
+    fn to_fp8(&self) -> Result<Tensor> {
+        // Simply convert to BF16 - this gives us 50% memory savings
+        // and has full operation support in candle
+        self.to_dtype(DType::BF16)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Cache {
     // all_data is an option on a Tensor, this makes it possible to only create the actual tensor
@@ -328,6 +346,267 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k.reset();
         self.v.reset();
+    }
+}
+
+/// FP8-quantized KV cache for memory efficiency
+/// Note: Despite the name, stores K and V tensors in BF16 format (not F8E4M3) due to
+/// incomplete F8E4M3 support in candle. BF16 still provides ~50% memory savings vs F32.
+#[derive(Debug, Clone)]
+pub struct Fp8KvCache {
+    k_data: Option<Tensor>,  // Stored in BF16
+    v_data: Option<Tensor>,  // Stored in BF16
+    dim: usize,
+    current_seq_len: usize,
+    grow_by: usize,
+    max_seq_len: usize,
+}
+
+impl Fp8KvCache {
+    pub fn new(dim: usize, max_seq_len: usize) -> Self {
+        Self {
+            k_data: None,
+            v_data: None,
+            dim,
+            current_seq_len: 0,
+            grow_by: max_seq_len,
+            max_seq_len,
+        }
+    }
+
+    pub fn current_seq_len(&self) -> usize {
+        self.current_seq_len
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// Get current K cache data (converted to F32)
+    pub fn k(&self) -> Result<Option<Tensor>> {
+        match &self.k_data {
+            None => Ok(None),
+            Some(data) => {
+                let current = data.narrow(self.dim, 0, self.current_seq_len)?;
+                let f32_data = current.to_dtype(DType::F32)?;
+                Ok(Some(f32_data))
+            }
+        }
+    }
+
+    /// Get current V cache data (converted to F32)
+    pub fn v(&self) -> Result<Option<Tensor>> {
+        match &self.v_data {
+            None => Ok(None),
+            Some(data) => {
+                let current = data.narrow(self.dim, 0, self.current_seq_len)?;
+                let f32_data = current.to_dtype(DType::F32)?;
+                Ok(Some(f32_data))
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.current_seq_len = 0;
+        self.k_data = None;
+        self.v_data = None;
+    }
+
+    pub fn truncate(&mut self, seq_len: usize) -> Result<()> {
+        if seq_len < self.current_seq_len {
+            if seq_len == 0 {
+                self.reset();
+            } else {
+                // Truncate K cache
+                if let Some(old_k) = self.k_data.take() {
+                    let kept = old_k.narrow(self.dim, 0, seq_len)?;
+                    let new_k = kept.contiguous()?;
+                    self.k_data = Some(new_k);
+                }
+                
+                // Truncate V cache
+                if let Some(old_v) = self.v_data.take() {
+                    let kept = old_v.narrow(self.dim, 0, seq_len)?;
+                    let new_v = kept.contiguous()?;
+                    self.v_data = Some(new_v);
+                }
+                
+                self.current_seq_len = seq_len;
+                self.max_seq_len = seq_len;
+            }
+        }
+        Ok(())
+    }
+
+    /// Try to truncate, but if OOM, do a full reset instead
+    pub fn try_truncate_or_reset(&mut self, seq_len: usize) -> Result<bool> {
+        if seq_len < self.current_seq_len {
+            if seq_len == 0 {
+                self.reset();
+                return Ok(false);
+            }
+
+            // Try to truncate K
+            let k_success = if let Some(old_k) = self.k_data.take() {
+                match old_k.narrow(self.dim, 0, seq_len) {
+                    Ok(kept) => match kept.contiguous() {
+                        Ok(new_k) => {
+                            self.k_data = Some(new_k);
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                }
+            } else {
+                true
+            };
+
+            if !k_success {
+                self.reset();
+                return Ok(false);
+            }
+
+            // Try to truncate V
+            let v_success = if let Some(old_v) = self.v_data.take() {
+                match old_v.narrow(self.dim, 0, seq_len) {
+                    Ok(kept) => match kept.contiguous() {
+                        Ok(new_v) => {
+                            self.v_data = Some(new_v);
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                }
+            } else {
+                true
+            };
+
+            if !v_success {
+                self.reset();
+                return Ok(false);
+            }
+
+            self.current_seq_len = seq_len;
+            self.max_seq_len = seq_len;
+            Ok(true)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Append K and V tensors to the cache, storing in BF16 for memory efficiency
+    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let seq_len = k.dim(self.dim)?;
+
+        // Convert to BF16 for storage (50% memory savings vs F32)
+        let k_store = k.to_fp8()?;  // Actually converts to BF16
+        let v_store = v.to_fp8()?;
+
+        // Initialize K cache if needed
+        if self.k_data.is_none() {
+            let mut shape = k_store.dims().to_vec();
+            shape[self.dim] = self.max_seq_len;
+            let k_storage = Tensor::zeros(shape, DType::BF16, k_store.device())?;
+            self.k_data = Some(k_storage);
+        }
+        
+        // Initialize V cache if needed
+        if self.v_data.is_none() {
+            let mut shape = v_store.dims().to_vec();
+            shape[self.dim] = self.max_seq_len;
+            let v_storage = Tensor::zeros(shape, DType::BF16, v_store.device())?;
+            self.v_data = Some(v_storage);
+        }
+
+        let k_data = self.k_data.as_mut().unwrap();
+        let v_data = self.v_data.as_mut().unwrap();
+
+        // Grow if needed
+        while self.current_seq_len + seq_len > self.max_seq_len {
+            let mut k_shape = k_store.dims().to_vec();
+            k_shape[self.dim] = self.grow_by;
+            let next_k = Tensor::zeros(k_shape, DType::BF16, k_store.device())?;
+            *k_data = Tensor::cat(&[&*k_data, &next_k], self.dim)?;
+
+            let mut v_shape = v_store.dims().to_vec();
+            v_shape[self.dim] = self.grow_by;
+            let next_v = Tensor::zeros(v_shape, DType::BF16, v_store.device())?;
+            *v_data = Tensor::cat(&[&*v_data, &next_v], self.dim)?;
+
+            self.max_seq_len += self.grow_by;
+        }
+
+        // Insert new data into cache using narrow + cat
+        let k_before = if self.current_seq_len > 0 {
+            Some(k_data.narrow(self.dim, 0, self.current_seq_len)?)
+        } else {
+            None
+        };
+        
+        let remaining = self.max_seq_len - self.current_seq_len - seq_len;
+        let k_after = if remaining > 0 {
+            Some(k_data.narrow(self.dim, self.current_seq_len + seq_len, remaining)?)
+        } else {
+            None
+        };
+
+        // Reconstruct K with new data
+        let new_k = match (k_before, k_after) {
+            (Some(before), Some(after)) => Tensor::cat(&[&before, &k_store, &after], self.dim)?,
+            (Some(before), None) => Tensor::cat(&[&before, &k_store], self.dim)?,
+            (None, Some(after)) => Tensor::cat(&[&k_store, &after], self.dim)?,
+            (None, None) => k_store.clone(),
+        };
+        *k_data = new_k;
+
+        // Same for V
+        let v_before = if self.current_seq_len > 0 {
+            Some(v_data.narrow(self.dim, 0, self.current_seq_len)?)
+        } else {
+            None
+        };
+        
+        let v_after = if remaining > 0 {
+            Some(v_data.narrow(self.dim, self.current_seq_len + seq_len, remaining)?)
+        } else {
+            None
+        };
+
+        let new_v = match (v_before, v_after) {
+            (Some(before), Some(after)) => Tensor::cat(&[&before, &v_store, &after], self.dim)?,
+            (Some(before), None) => Tensor::cat(&[&before, &v_store], self.dim)?,
+            (None, Some(after)) => Tensor::cat(&[&v_store, &after], self.dim)?,
+            (None, None) => v_store.clone(),
+        };
+        *v_data = new_v;
+
+        self.current_seq_len += seq_len;
+
+        // Return current data (converted to F32)
+        let out_k = self.k()?;
+        let out_v = self.v()?;
+        
+        let k_result = match out_k {
+            None => {
+                let mut shape = k.dims().to_vec();
+                shape[self.dim] = 0;
+                Tensor::zeros(shape, k.dtype(), k.device())?
+            }
+            Some(k) => k,
+        };
+        
+        let v_result = match out_v {
+            None => {
+                let mut shape = v.dims().to_vec();
+                shape[self.dim] = 0;
+                Tensor::zeros(shape, v.dtype(), v.device())?
+            }
+            Some(v) => v,
+        };
+
+        Ok((k_result, v_result))
     }
 }
 

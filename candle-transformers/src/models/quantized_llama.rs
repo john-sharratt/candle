@@ -21,9 +21,61 @@ use crate::quantized_nn::RmsNorm;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file};
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Embedding, Module};
+use candle_nn::{kv_cache::KvCache, kv_cache::Fp8KvCache, Embedding, Module};
 
 pub const MAX_SEQ_LEN: usize = 4096;
+
+/// KV Cache variant - either regular or FP8 quantized
+#[derive(Debug, Clone)]
+enum KvCacheVariant {
+    Regular(KvCache),
+    Fp8(Fp8KvCache),
+}
+
+impl KvCacheVariant {
+    fn new_regular(dim: usize, max_seq_len: usize) -> Self {
+        Self::Regular(KvCache::new(dim, max_seq_len))
+    }
+
+    fn new_fp8(dim: usize, max_seq_len: usize) -> Self {
+        Self::Fp8(Fp8KvCache::new(dim, max_seq_len))
+    }
+
+    fn current_seq_len(&self) -> usize {
+        match self {
+            Self::Regular(cache) => cache.current_seq_len(),
+            Self::Fp8(cache) => cache.current_seq_len(),
+        }
+    }
+
+    fn max_seq_len(&self) -> usize {
+        match self {
+            Self::Regular(cache) => cache.k_cache().max_seq_len(),
+            Self::Fp8(cache) => cache.max_seq_len(),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Regular(cache) => cache.reset(),
+            Self::Fp8(cache) => cache.reset(),
+        }
+    }
+
+    fn truncate(&mut self, seq_len: usize) -> Result<()> {
+        match self {
+            Self::Regular(cache) => cache.truncate(seq_len),
+            Self::Fp8(cache) => cache.truncate(seq_len),
+        }
+    }
+
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Regular(cache) => cache.append(k, v),
+            Self::Fp8(cache) => cache.append(k, v),
+        }
+    }
+}
 
 /// Guard for CUDA-registered mmap memory. Automatically unregisters on drop.
 #[cfg(feature = "cuda")]
@@ -173,7 +225,7 @@ struct LayerWeights {
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
-    kv_cache: KvCache,
+    kv_cache: KvCacheVariant,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
@@ -199,7 +251,7 @@ impl LayerWeights {
     }
 
     pub fn cache_len(&self) -> usize {
-        self.kv_cache.k_cache().current_seq_len()
+        self.kv_cache.current_seq_len()
     }
 
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -296,7 +348,11 @@ impl Clone for ModelWeights {
             .layers
             .iter()
             .map(|layer| {
-                let kv_cache_capacity = layer.kv_cache.k_cache().max_seq_len();
+                let kv_cache_capacity = layer.kv_cache.max_seq_len();
+                let kv_cache = match &layer.kv_cache {
+                    KvCacheVariant::Regular(_) => KvCacheVariant::new_regular(2, kv_cache_capacity),
+                    KvCacheVariant::Fp8(_) => KvCacheVariant::new_fp8(2, kv_cache_capacity),
+                };
                 LayerWeights {
                     // These tensors are cheap to clone (reference-counted, shared memory)
                     attention_wq: layer.attention_wq.clone(),
@@ -313,7 +369,7 @@ impl Clone for ModelWeights {
                     n_kv_head: layer.n_kv_head,
                     head_dim: layer.head_dim,
                     // Create fresh, empty KV cache with same capacity
-                    kv_cache: KvCache::new(2, kv_cache_capacity),
+                    kv_cache,
                     span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                     span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
                     span_mlp: tracing::span!(tracing::Level::TRACE, "attn-mlp"),
@@ -386,7 +442,7 @@ impl ModelWeights {
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
             // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
             // The cache will grow in chunks of 512 tokens when needed.
-            let kv_cache = KvCache::new(2, 2048);
+            let kv_cache = KvCacheVariant::new_regular(2, 2048);
             layers.push(LayerWeights {
                 attention_wq: QMatMul::from_qtensor(attention_wq)?,
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -512,7 +568,7 @@ impl ModelWeights {
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
             // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
             // The cache will grow in chunks of 512 tokens when needed.
-            let kv_cache = KvCache::new(2, 2048);
+            let kv_cache = KvCacheVariant::new_regular(2, 2048);
             layers.push(LayerWeights {
                 attention_wq: QMatMul::from_qtensor(attention_wq)?,
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -547,27 +603,27 @@ impl ModelWeights {
     }
 
     /// Load model from GGUF file using memory-mapped I/O for zero-copy tensor loading.
-    /// 
+    ///
     /// This method eliminates intermediate RAM allocations and copies by using mmap:
     /// - Traditional: File → Vec<u8> → GPU (2 copies, 2x peak RAM)
     /// - This method: File (mmap) → GPU (1 copy, 1x peak RAM)
-    /// 
+    ///
     /// Benefits:
     /// - **Eliminates RAM allocation** for tensor data
     /// - **Eliminates file→RAM copy** - only mmap→GPU remains
     /// - **Lower peak memory usage** - no temporary buffers
     /// - **OS page cache efficiency** - kernel optimizes page access
-    /// 
+    ///
     /// # Arguments
     /// * `file_path` - Path to the GGUF file
     /// * `device` - Device to load tensors onto
-    /// 
+    ///
     /// # Example
     /// ```no_run
     /// use candle_core::Device;
     /// use candle_transformers::models::quantized_llama::ModelWeights;
     /// use std::path::Path;
-    /// 
+    ///
     /// let path = Path::new("model.gguf");
     /// let device = Device::cuda_if_available(0)?;
     /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
@@ -583,25 +639,25 @@ impl ModelWeights {
                 .map(&file)
                 .map_err(|e| candle::Error::Msg(format!("Failed to mmap file: {}", e)))?
         };
-        
+
         // On CUDA devices, register mmap as mapped pinned memory for TRUE zero-copy
         // This allows GPU to read model weights directly from disk via PCIe without CPU copy!
         #[cfg(feature = "cuda")]
         let _mmap_guard = if matches!(device, Device::Cuda(_)) {
             use cudarc::driver::sys;
-            
+
             let ptr = mmap.as_ptr() as *mut std::ffi::c_void;
             let len = mmap.len();
-            
+
             // Register mmap with CUDA - allows GPU to read directly via PCIe
             let register_result = unsafe {
                 sys::cuMemHostRegister_v2(
                     ptr,
                     len,
-                    (sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY) as u32
+                    (sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY) as u32,
                 )
             };
-            
+
             match register_result.result() {
                 Ok(_) => {
                     // Successfully registered! GPU can now read mmap directly
@@ -615,10 +671,10 @@ impl ModelWeights {
         } else {
             None
         };
-        
+
         #[cfg(not(feature = "cuda"))]
         let _mmap_guard: Option<()> = None;
-        
+
         // Parse GGUF metadata from mmap (23x faster than reading from File!)
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
@@ -650,22 +706,21 @@ impl ModelWeights {
 
         // Helper to load tensor from mmap
         let load_tensor = |name: &str| -> Result<QTensor> {
-            let tensor_info = ct.tensor_infos.get(name)
+            let tensor_info = ct
+                .tensor_infos
+                .get(name)
                 .ok_or_else(|| candle::Error::Msg(format!("tensor {} not found", name)))?;
             tensor_info.read_from_mmap(&mmap, ct.tensor_data_offset, device)
         };
 
         let tok_embeddings_q = load_tensor("token_embd.weight")?;
         let tok_embeddings = tok_embeddings_q.dequantize(device)?;
-        let norm = RmsNorm::from_qtensor(
-            load_tensor("output_norm.weight")?,
-            rms_norm_eps,
-        )?;
+        let norm = RmsNorm::from_qtensor(load_tensor("output_norm.weight")?, rms_norm_eps)?;
         let output = match load_tensor("output.weight") {
             Ok(tensor) => tensor,
             Err(_) => tok_embeddings_q,
         };
-        
+
         let mut layers = Vec::with_capacity(block_count);
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
@@ -673,7 +728,7 @@ impl ModelWeights {
             let attention_wk = load_tensor(&format!("{prefix}.attn_k.weight"))?;
             let attention_wv = load_tensor(&format!("{prefix}.attn_v.weight"))?;
             let attention_wo = load_tensor(&format!("{prefix}.attn_output.weight"))?;
-            
+
             let mlp_or_moe = if n_expert <= 1 {
                 let feed_forward_w1 = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
                 let feed_forward_w2 = load_tensor(&format!("{prefix}.ffn_down.weight"))?;
@@ -702,14 +757,14 @@ impl ModelWeights {
                     experts,
                 }
             };
-            
+
             let attention_norm = load_tensor(&format!("{prefix}.attn_norm.weight"))?;
             let ffn_norm = load_tensor(&format!("{prefix}.ffn_norm.weight"))?;
             let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
             let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
-            let kv_cache = KvCache::new(2, 2048);
-            
+            let kv_cache = KvCacheVariant::new_regular(2, 2048);
+
             layers.push(LayerWeights {
                 attention_wq: QMatMul::from_qtensor(attention_wq)?,
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
@@ -730,7 +785,7 @@ impl ModelWeights {
                 span_mlp,
             })
         }
-        
+
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
         Ok(Self {
@@ -761,6 +816,25 @@ impl ModelWeights {
         }
         // Clear cached mask
         self.mask_cache.clear();
+    }
+
+    /// Enable FP8 quantization for KV cache (reduces memory by ~50%)
+    /// This will reset all existing caches and switch to FP8 storage.
+    /// Note: This involves quantization overhead but saves significant memory.
+    pub fn enable_fp8_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            let max_seq_len = layer.kv_cache.max_seq_len();
+            layer.kv_cache = KvCacheVariant::new_fp8(2, max_seq_len);
+        }
+    }
+
+    /// Disable FP8 quantization for KV cache (uses more memory but faster)
+    /// This will reset all existing caches and switch to regular storage.
+    pub fn disable_fp8_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            let max_seq_len = layer.kv_cache.max_seq_len();
+            layer.kv_cache = KvCacheVariant::new_regular(2, max_seq_len);
+        }
     }
 
     /// Get the current cache length (all layers should be same)
@@ -836,7 +910,10 @@ mod tests {
         let load_start = std::time::Instant::now();
         let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let load_duration = load_start.elapsed();
-        println!("✓ Model loaded in {:.3}s using mmap\n", load_duration.as_secs_f64());
+        println!(
+            "✓ Model loaded in {:.3}s using mmap\n",
+            load_duration.as_secs_f64()
+        );
 
         println!("Starting 500-token prefill...");
 

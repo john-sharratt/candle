@@ -127,3 +127,6 @@ pub mod with_tracing;
 pub mod wuerstchen;
 pub mod xlm_roberta;
 pub mod yi;
+
+#[cfg(test)]
+mod fp8_kv_cache_tests;

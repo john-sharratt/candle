@@ -1,8 +1,7 @@
 /// Benchmark comparing sequential reader vs mmap tensor loading
-/// 
+///
 /// Usage: Download a GGUF model and run:
 ///   cargo run --release --features cuda --example benchmark_mmap -- /path/to/model.gguf
-
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Result};
 use std::time::Instant;
@@ -31,12 +30,9 @@ fn main() -> Result<()> {
     // Load metadata
     let mut file = std::fs::File::open(&model_path)?;
     let content = gguf_file::Content::read(&mut file)?;
-    
+
     // Get first 50 tensors as sample
-    let tensor_names: Vec<String> = content.tensor_infos.keys()
-        .take(50)
-        .cloned()
-        .collect();
+    let tensor_names: Vec<String> = content.tensor_infos.keys().take(50).cloned().collect();
 
     println!("Loading {} tensors for comparison\n", tensor_names.len());
 
@@ -56,13 +52,15 @@ fn main() -> Result<()> {
     use memmap2::MmapOptions;
     let file = std::fs::File::open(&model_path)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
-    
+
     let mut file = std::fs::File::open(&model_path)?;
     let content = gguf_file::Content::read(&mut file)?;
-    
+
     let start = Instant::now();
     for name in &tensor_names {
-        let tensor_info = content.tensor_infos.get(name)
+        let tensor_info = content
+            .tensor_infos
+            .get(name)
             .ok_or_else(|| candle_core::Error::Msg(format!("tensor {} not found", name)))?;
         let _tensor = tensor_info.read_from_mmap(&mmap, content.tensor_data_offset, &device)?;
     }
@@ -78,7 +76,7 @@ fn main() -> Result<()> {
     println!("mmap:       {:.3}s", mmap_time.as_secs_f64());
     println!("Speedup:    {:.2}x", speedup);
     println!("Faster by:  {:.1}%", improvement);
-    
+
     if mmap_time < sequential_time {
         println!("\n✓ mmap optimization successful!");
         #[cfg(feature = "cuda")]

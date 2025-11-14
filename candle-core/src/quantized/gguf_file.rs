@@ -80,7 +80,7 @@ impl TensorInfo {
     }
 
     /// Read tensor data from memory-mapped file without intermediate allocation.
-    /// 
+    ///
     /// This eliminates the Vec<u8> allocation and copy by reading directly from mmap.
     /// Benefits:
     /// - No RAM allocation for tensor data

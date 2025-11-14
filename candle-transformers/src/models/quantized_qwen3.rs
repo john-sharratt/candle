@@ -11,9 +11,61 @@ use crate::models::causal_mask_cache::CausalMaskCache;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
+use candle_nn::{kv_cache::KvCache, kv_cache::Fp8KvCache, Activation, Embedding, Module};
 use std::io::{Read, Seek};
 use std::sync::Arc;
+
+/// KV Cache variant - either regular or FP8 quantized
+#[derive(Debug, Clone)]
+enum KvCacheVariant {
+    Regular(KvCache),
+    Fp8(Fp8KvCache),
+}
+
+impl KvCacheVariant {
+    fn new_regular(dim: usize, max_seq_len: usize) -> Self {
+        Self::Regular(KvCache::new(dim, max_seq_len))
+    }
+
+    fn new_fp8(dim: usize, max_seq_len: usize) -> Self {
+        Self::Fp8(Fp8KvCache::new(dim, max_seq_len))
+    }
+
+    fn current_seq_len(&self) -> usize {
+        match self {
+            Self::Regular(cache) => cache.current_seq_len(),
+            Self::Fp8(cache) => cache.current_seq_len(),
+        }
+    }
+
+    fn max_seq_len(&self) -> usize {
+        match self {
+            Self::Regular(cache) => cache.k_cache().max_seq_len(),
+            Self::Fp8(cache) => cache.max_seq_len(),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Regular(cache) => cache.reset(),
+            Self::Fp8(cache) => cache.reset(),
+        }
+    }
+
+    fn truncate(&mut self, seq_len: usize) -> Result<()> {
+        match self {
+            Self::Regular(cache) => cache.truncate(seq_len),
+            Self::Fp8(cache) => cache.truncate(seq_len),
+        }
+    }
+
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            Self::Regular(cache) => cache.append(k, v),
+            Self::Fp8(cache) => cache.append(k, v),
+        }
+    }
+}
 
 /// Guard for CUDA-registered mmap memory. Automatically unregisters on drop.
 #[cfg(feature = "cuda")]
@@ -153,7 +205,7 @@ struct AttentionWeights {
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: KvCache,
+    kv_cache: KvCacheVariant,
     span_attn: tracing::Span,
 }
 
@@ -179,7 +231,7 @@ impl AttentionWeights {
 
         // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
         // The cache will grow in chunks of 512 tokens when needed.
-        let kv_cache = KvCache::new(2, 512);
+        let kv_cache = KvCacheVariant::new_regular(2, 512);
 
         let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
 
@@ -209,7 +261,7 @@ impl AttentionWeights {
     }
 
     pub fn cache_len(&self) -> usize {
-        self.kv_cache.k_cache().current_seq_len()
+        self.kv_cache.current_seq_len()
     }
 
     fn forward(&mut self, x: &Tensor, attn_mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
@@ -354,7 +406,11 @@ impl Clone for ModelWeights {
             .layers
             .iter()
             .map(|layer| {
-                let kv_cache_capacity = layer.self_attn.kv_cache.k_cache().max_seq_len();
+                let kv_cache_capacity = layer.self_attn.kv_cache.max_seq_len();
+                let kv_cache = match &layer.self_attn.kv_cache {
+                    KvCacheVariant::Regular(_) => KvCacheVariant::new_regular(2, kv_cache_capacity),
+                    KvCacheVariant::Fp8(_) => KvCacheVariant::new_fp8(2, kv_cache_capacity),
+                };
                 let rotary_emb = layer.self_attn.rotary_emb.clone();
 
                 LayerWeights {
@@ -375,7 +431,7 @@ impl Clone for ModelWeights {
                         head_dim: layer.self_attn.head_dim,
                         rotary_emb,
                         // Create fresh, empty KV cache with same capacity
-                        kv_cache: KvCache::new(2, kv_cache_capacity),
+                        kv_cache,
                         span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                     },
                 }
@@ -470,27 +526,27 @@ impl ModelWeights {
     }
 
     /// Load model from GGUF file using memory-mapped I/O for zero-copy tensor loading.
-    /// 
+    ///
     /// This method eliminates intermediate RAM allocations and copies by using mmap:
     /// - Traditional: File → Vec<u8> → GPU (2 copies, 2x peak RAM)
     /// - This method: File (mmap) → GPU (1 copy, 1x peak RAM)
-    /// 
+    ///
     /// Benefits:
     /// - **Eliminates RAM allocation** for tensor data
     /// - **Eliminates file→RAM copy** - only mmap→GPU remains
     /// - **Lower peak memory usage** - no temporary buffers
     /// - **OS page cache efficiency** - kernel optimizes page access
-    /// 
+    ///
     /// # Arguments
     /// * `file_path` - Path to the GGUF file
     /// * `device` - Device to load tensors onto
-    /// 
+    ///
     /// # Example
     /// ```no_run
     /// use candle_core::Device;
     /// use candle_transformers::models::quantized_qwen3::ModelWeights;
     /// use std::path::Path;
-    /// 
+    ///
     /// let path = Path::new("model.gguf");
     /// let device = Device::cuda_if_available(0)?;
     /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
@@ -506,25 +562,25 @@ impl ModelWeights {
                 .map(&file)
                 .map_err(|e| candle::Error::Msg(format!("Failed to mmap file: {}", e)))?
         };
-        
+
         // On CUDA devices, register mmap as mapped pinned memory for TRUE zero-copy
         // This allows GPU to read model weights directly from disk via PCIe without CPU copy!
         #[cfg(feature = "cuda")]
         let _mmap_guard = if matches!(device, Device::Cuda(_)) {
             use cudarc::driver::sys;
-            
+
             let ptr = mmap.as_ptr() as *mut std::ffi::c_void;
             let len = mmap.len();
-            
+
             // Register mmap with CUDA - allows GPU to read directly via PCIe
             let register_result = unsafe {
                 sys::cuMemHostRegister_v2(
                     ptr,
                     len,
-                    (sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY) as u32
+                    (sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_READ_ONLY) as u32,
                 )
             };
-            
+
             match register_result.result() {
                 Ok(_) => {
                     // Successfully registered! GPU can now read mmap directly
@@ -539,10 +595,10 @@ impl ModelWeights {
         } else {
             None
         };
-        
+
         #[cfg(not(feature = "cuda"))]
         let _mmap_guard: Option<()> = None;
-        
+
         // Parse GGUF metadata from mmap (23x faster than reading from File!)
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct = gguf_file::Content::read(&mut cursor)?;
@@ -573,14 +629,15 @@ impl ModelWeights {
 
         // Helper to load tensor from mmap
         let load_tensor = |name: &str| -> Result<QTensor> {
-            let tensor_info = ct.tensor_infos.get(name)
+            let tensor_info = ct
+                .tensor_infos
+                .get(name)
                 .ok_or_else(|| candle::Error::Msg(format!("tensor {} not found", name)))?;
             tensor_info.read_from_mmap(&mmap, ct.tensor_data_offset, device)
         };
 
-        let load_qmatmul = |name: &str| -> Result<QMatMul> {
-            QMatMul::from_weights(load_tensor(name)?.into())
-        };
+        let load_qmatmul =
+            |name: &str| -> Result<QMatMul> { QMatMul::from_weights(load_tensor(name)?.into()) };
 
         let load_rms_norm = |name: &str, eps: f64| -> Result<RmsNorm> {
             RmsNorm::from_qtensor(load_tensor(name)?, eps)
@@ -627,7 +684,7 @@ impl ModelWeights {
                 num_kv_groups: num_attention_heads / num_kv_heads,
                 head_dim,
                 rotary_emb: rotary.clone(),
-                kv_cache: KvCache::new(2, 512),
+                kv_cache: KvCacheVariant::new_regular(2, 512),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
             };
 
@@ -635,7 +692,7 @@ impl ModelWeights {
             let gate_proj = load_qmatmul(&format!("{prefix}.ffn_gate.weight"))?;
             let up_proj = load_qmatmul(&format!("{prefix}.ffn_up.weight"))?;
             let down_proj = load_qmatmul(&format!("{prefix}.ffn_down.weight"))?;
-            
+
             let mlp = MlpWeights {
                 gate_proj,
                 up_proj,
@@ -690,6 +747,25 @@ impl ModelWeights {
         }
         // Clear cached mask
         self.mask_cache.clear();
+    }
+
+    /// Enable FP8 quantization for KV cache (reduces memory by ~50%)
+    /// This will reset all existing caches and switch to FP8 storage.
+    /// Note: This involves quantization overhead but saves significant memory.
+    pub fn enable_fp8_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            let max_seq_len = layer.self_attn.kv_cache.max_seq_len();
+            layer.self_attn.kv_cache = KvCacheVariant::new_fp8(2, max_seq_len);
+        }
+    }
+
+    /// Disable FP8 quantization for KV cache (uses more memory but faster)
+    /// This will reset all existing caches and switch to regular storage.
+    pub fn disable_fp8_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            let max_seq_len = layer.self_attn.kv_cache.max_seq_len();
+            layer.self_attn.kv_cache = KvCacheVariant::new_regular(2, max_seq_len);
+        }
     }
 
     /// Get the current cache length (all layers should be same)
@@ -758,7 +834,10 @@ mod tests {
         let load_start = std::time::Instant::now();
         let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let load_duration = load_start.elapsed();
-        println!("✓ Model loaded in {:.3}s using mmap\n", load_duration.as_secs_f64());
+        println!(
+            "✓ Model loaded in {:.3}s using mmap\n",
+            load_duration.as_secs_f64()
+        );
 
         println!("Starting 500-token prefill...");
 
@@ -870,7 +949,7 @@ mod tests {
 
         // Using Llama-3.2-3B (larger than 0.6B but not too huge for testing)
         let repo = api.model("bartowski/Llama-3.2-3B-Instruct-GGUF".to_string());
-        
+
         let model_path = repo.get("Llama-3.2-3B-Instruct-Q4_K_M.gguf").map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download model: {}. This test requires internet access.",
@@ -892,13 +971,16 @@ mod tests {
 
         // Check file size
         let metadata = std::fs::metadata(&model_path)?;
-        println!("File size: {:.2} GB\n", metadata.len() as f64 / 1_000_000_000.0);
+        println!(
+            "File size: {:.2} GB\n",
+            metadata.len() as f64 / 1_000_000_000.0
+        );
 
         // Warm up run
         println!("Warming up (loading once to populate OS cache)...");
         let mut file = std::fs::File::open(&model_path)?;
         let content = gguf_file::Content::read(&mut file)?;
-        
+
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
         let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
         println!("Warmup complete.\n");
@@ -909,11 +991,11 @@ mod tests {
         for i in 0..3 {
             let mut file = std::fs::File::open(&model_path)?;
             let content = gguf_file::Content::read(&mut file)?;
-            
+
             let start = std::time::Instant::now();
             let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
             let duration = start.elapsed();
-            
+
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
             durations.push(duration.as_secs_f64());
         }
@@ -939,7 +1021,7 @@ mod tests {
 
         // Using Llama-3.2-3B (larger than 0.6B but not too huge for testing)
         let repo = api.model("bartowski/Llama-3.2-3B-Instruct-GGUF".to_string());
-        
+
         let model_path = repo.get("Llama-3.2-3B-Instruct-Q4_K_M.gguf").map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download model: {}. This test requires internet access.",
@@ -961,7 +1043,10 @@ mod tests {
 
         // Check file size
         let metadata = std::fs::metadata(&model_path)?;
-        println!("File size: {:.2} GB\n", metadata.len() as f64 / 1_000_000_000.0);
+        println!(
+            "File size: {:.2} GB\n",
+            metadata.len() as f64 / 1_000_000_000.0
+        );
 
         // Warm up run
         println!("Warming up (loading once to populate OS cache)...");
@@ -976,7 +1061,7 @@ mod tests {
             let start = std::time::Instant::now();
             let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
             let duration = start.elapsed();
-            
+
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
             durations.push(duration.as_secs_f64());
         }
@@ -1006,7 +1091,7 @@ mod tests {
             hf_hub::RepoType::Model,
             "main".to_string(),
         ));
-        
+
         let model_path = repo.get("Qwen3-0.6B-Q4_K_M.gguf").map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download model: {}. This test requires internet access.",
@@ -1033,18 +1118,26 @@ mod tests {
         println!("First load (cold start):");
         let mut file = std::fs::File::open(&model_path)?;
         let content = gguf_file::Content::read(&mut file)?;
-        
+
         let start = std::time::Instant::now();
         let model = ModelWeights::from_gguf(content, &mut file, &device)?;
         let duration = start.elapsed();
-        println!("  Time: {:.3}s ({} layers)", duration.as_secs_f64(), model.layers.len());
+        println!(
+            "  Time: {:.3}s ({} layers)",
+            duration.as_secs_f64(),
+            model.layers.len()
+        );
 
         println!("\n--- mmap Loading (File→GPU direct) ---");
         println!("First load (cold start):");
         let start = std::time::Instant::now();
         let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let duration = start.elapsed();
-        println!("  Time: {:.3}s ({} layers)", duration.as_secs_f64(), model.layers.len());
+        println!(
+            "  Time: {:.3}s ({} layers)",
+            duration.as_secs_f64(),
+            model.layers.len()
+        );
 
         println!("\nNote: Both methods may benefit from OS caching after first HF download.");
         println!("For true cold start, clear system cache or test on first download.");
@@ -1065,7 +1158,7 @@ mod tests {
             hf_hub::RepoType::Model,
             "main".to_string(),
         ));
-        
+
         let model_path = repo.get("Qwen3-0.6B-Q4_K_M.gguf").map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download model: {}. This test requires internet access.",
@@ -1099,12 +1192,17 @@ mod tests {
         for i in 0..3 {
             let mut file = std::fs::File::open(&model_path)?;
             let content = gguf_file::Content::read(&mut file)?;
-            
+
             let start = std::time::Instant::now();
             let model = ModelWeights::from_gguf(content, &mut file, &device)?;
             let duration = start.elapsed();
-            
-            println!("  Run {}: {:.3}s ({} layers)", i + 1, duration.as_secs_f64(), model.layers.len());
+
+            println!(
+                "  Run {}: {:.3}s ({} layers)",
+                i + 1,
+                duration.as_secs_f64(),
+                model.layers.len()
+            );
             durations.push(duration.as_secs_f64());
         }
 
@@ -1133,7 +1231,7 @@ mod tests {
             hf_hub::RepoType::Model,
             "main".to_string(),
         ));
-        
+
         let model_path = repo.get("Qwen3-0.6B-Q4_K_M.gguf").map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download model: {}. This test requires internet access.",
@@ -1166,8 +1264,13 @@ mod tests {
             let start = std::time::Instant::now();
             let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
             let duration = start.elapsed();
-            
-            println!("  Run {}: {:.3}s ({} layers)", i + 1, duration.as_secs_f64(), model.layers.len());
+
+            println!(
+                "  Run {}: {:.3}s ({} layers)",
+                i + 1,
+                duration.as_secs_f64(),
+                model.layers.len()
+            );
             durations.push(duration.as_secs_f64());
         }
 
@@ -1186,8 +1289,8 @@ mod tests {
     #[test]
     #[ignore] // Run manually with: cargo test diagnose_mmap_performance --release --features cuda -- --ignored --nocapture
     fn diagnose_mmap_performance() -> Result<()> {
-        use std::time::Instant;
         use std::io::{Read, Seek};
+        use std::time::Instant;
 
         let api = hf_hub::api::sync::Api::new()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
@@ -1197,7 +1300,7 @@ mod tests {
             hf_hub::RepoType::Model,
             "main".to_string(),
         ));
-        
+
         let model_path = repo.get("Qwen3-0.6B-Q4_K_M.gguf").map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download model: {}. This test requires internet access.",
@@ -1216,7 +1319,7 @@ mod tests {
         let start = Instant::now();
         let file = std::fs::File::open(&model_path)?;
         let open_time = start.elapsed();
-        
+
         let start = Instant::now();
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let mmap_time = start.elapsed();
@@ -1226,15 +1329,18 @@ mod tests {
         // Test 2: Read GGUF header
         println!("\nTest 2: Parse GGUF metadata");
         let mut file = std::fs::File::open(&model_path)?;
-        
+
         let start = Instant::now();
         let ct = gguf_file::Content::read(&mut file)?;
         let header_time = start.elapsed();
-        
-        println!("  Header parse: {:.3}ms", header_time.as_secs_f64() * 1000.0);
+
+        println!(
+            "  Header parse: {:.3}ms",
+            header_time.as_secs_f64() * 1000.0
+        );
         println!("  Tensors found: {}", ct.tensor_infos.len());
         println!("  Metadata items: {}", ct.metadata.len());
-        
+
         // Let's check if reading from mmap would be faster
         drop(file);
         println!("\nTest 2b: Parse GGUF metadata from mmap");
@@ -1242,23 +1348,28 @@ mod tests {
         let file = std::fs::File::open(&model_path)?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let mmap_read_time = start.elapsed();
-        
+
         // Parse directly from mmap slice
         let start = Instant::now();
         let mut cursor = std::io::Cursor::new(&mmap[..]);
         let ct_from_mmap = gguf_file::Content::read(&mut cursor)?;
         let parse_from_mmap_time = start.elapsed();
-        
-        println!("  Mmap + parse from mmap: {:.3}ms", 
-                 (mmap_read_time.as_secs_f64() + parse_from_mmap_time.as_secs_f64()) * 1000.0);
-        println!("  Speedup vs file read: {:.2}x", 
-                 header_time.as_secs_f64() / (mmap_read_time.as_secs_f64() + parse_from_mmap_time.as_secs_f64()));
+
+        println!(
+            "  Mmap + parse from mmap: {:.3}ms",
+            (mmap_read_time.as_secs_f64() + parse_from_mmap_time.as_secs_f64()) * 1000.0
+        );
+        println!(
+            "  Speedup vs file read: {:.2}x",
+            header_time.as_secs_f64()
+                / (mmap_read_time.as_secs_f64() + parse_from_mmap_time.as_secs_f64())
+        );
 
         // Test 3: Load tensors from mmap
         println!("\nTest 3: Load tensors from mmap to GPU");
         let device = Device::new_cuda(0)?;
         let start = Instant::now();
-        
+
         let mut total_bytes = 0;
         let mut tensor_count = 0;
         for (_name, tensor_info) in ct_from_mmap.tensor_infos.iter() {
@@ -1266,17 +1377,25 @@ mod tests {
             let block_size = tensor_info.ggml_dtype.block_size();
             let size_in_bytes = tensor_elems / block_size * tensor_info.ggml_dtype.type_size();
             total_bytes += size_in_bytes;
-            
+
             let _ = tensor_info.read_from_mmap(&mmap, ct_from_mmap.tensor_data_offset, &device)?;
             tensor_count += 1;
         }
-        
+
         let tensor_load_time = start.elapsed();
         println!("  Tensors loaded: {}", tensor_count);
-        println!("  Tensor loading time: {:.3}ms", tensor_load_time.as_secs_f64() * 1000.0);
-        println!("  Total tensor data: {:.2} MB", total_bytes as f64 / 1_000_000.0);
-        println!("  Effective bandwidth: {:.2} GB/s", 
-                 (total_bytes as f64 / 1_000_000_000.0) / tensor_load_time.as_secs_f64());
+        println!(
+            "  Tensor loading time: {:.3}ms",
+            tensor_load_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  Total tensor data: {:.2} MB",
+            total_bytes as f64 / 1_000_000.0
+        );
+        println!(
+            "  Effective bandwidth: {:.2} GB/s",
+            (total_bytes as f64 / 1_000_000_000.0) / tensor_load_time.as_secs_f64()
+        );
 
         // Test 4: Compare with sequential read
         println!("\nTest 4: Sequential read for comparison");
@@ -1285,23 +1404,49 @@ mod tests {
         let content = gguf_file::Content::read(&mut file)?;
         let _model = ModelWeights::from_gguf(content, &mut file, &device)?;
         let sequential_time = start.elapsed();
-        println!("  Sequential total: {:.3}ms", sequential_time.as_secs_f64() * 1000.0);
+        println!(
+            "  Sequential total: {:.3}ms",
+            sequential_time.as_secs_f64() * 1000.0
+        );
 
         // Summary
-        let total_mmap = open_time.as_secs_f64() + mmap_time.as_secs_f64() + 
-                         header_time.as_secs_f64() + tensor_load_time.as_secs_f64();
-        
+        let total_mmap = open_time.as_secs_f64()
+            + mmap_time.as_secs_f64()
+            + header_time.as_secs_f64()
+            + tensor_load_time.as_secs_f64();
+
         println!("\n=== Summary ===");
         println!("Mmap breakdown:");
-        println!("  File open:      {:.3}ms", open_time.as_secs_f64() * 1000.0);
-        println!("  Mmap create:    {:.3}ms", mmap_time.as_secs_f64() * 1000.0);
-        println!("  Header parse:   {:.3}ms", header_time.as_secs_f64() * 1000.0);
-        println!("  Tensor loading: {:.3}ms", tensor_load_time.as_secs_f64() * 1000.0);
+        println!(
+            "  File open:      {:.3}ms",
+            open_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  Mmap create:    {:.3}ms",
+            mmap_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  Header parse:   {:.3}ms",
+            header_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  Tensor loading: {:.3}ms",
+            tensor_load_time.as_secs_f64() * 1000.0
+        );
         println!("  Total:          {:.3}ms", total_mmap * 1000.0);
-        println!("\nSequential: {:.3}ms", sequential_time.as_secs_f64() * 1000.0);
-        println!("Ratio: {:.2}x ({})", 
-                 total_mmap / sequential_time.as_secs_f64(),
-                 if total_mmap < sequential_time.as_secs_f64() { "mmap faster" } else { "sequential faster" });
+        println!(
+            "\nSequential: {:.3}ms",
+            sequential_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "Ratio: {:.2}x ({})",
+            total_mmap / sequential_time.as_secs_f64(),
+            if total_mmap < sequential_time.as_secs_f64() {
+                "mmap faster"
+            } else {
+                "sequential faster"
+            }
+        );
 
         Ok(())
     }
