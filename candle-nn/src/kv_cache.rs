@@ -354,8 +354,8 @@ impl KvCache {
 /// incomplete F8E4M3 support in candle. BF16 still provides ~50% memory savings vs F32.
 #[derive(Debug, Clone)]
 pub struct Fp8KvCache {
-    k_data: Option<Tensor>,  // Stored in BF16
-    v_data: Option<Tensor>,  // Stored in BF16
+    k_data: Option<Tensor>, // Stored in BF16
+    v_data: Option<Tensor>, // Stored in BF16
     dim: usize,
     current_seq_len: usize,
     grow_by: usize,
@@ -417,20 +417,24 @@ impl Fp8KvCache {
             if seq_len == 0 {
                 self.reset();
             } else {
-                // Truncate K cache
+                // Truncate K cache - explicitly manage memory to avoid OOM
                 if let Some(old_k) = self.k_data.take() {
                     let kept = old_k.narrow(self.dim, 0, seq_len)?;
+                    // Drop old_k before allocating new contiguous tensor
+                    drop(old_k);
                     let new_k = kept.contiguous()?;
                     self.k_data = Some(new_k);
                 }
-                
-                // Truncate V cache
+
+                // Truncate V cache - explicitly manage memory to avoid OOM
                 if let Some(old_v) = self.v_data.take() {
                     let kept = old_v.narrow(self.dim, 0, seq_len)?;
+                    // Drop old_v before allocating new contiguous tensor
+                    drop(old_v);
                     let new_v = kept.contiguous()?;
                     self.v_data = Some(new_v);
                 }
-                
+
                 self.current_seq_len = seq_len;
                 self.max_seq_len = seq_len;
             }
@@ -446,17 +450,23 @@ impl Fp8KvCache {
                 return Ok(false);
             }
 
-            // Try to truncate K
+            // Try to truncate K - drop old tensor before allocating new one
             let k_success = if let Some(old_k) = self.k_data.take() {
                 match old_k.narrow(self.dim, 0, seq_len) {
-                    Ok(kept) => match kept.contiguous() {
-                        Ok(new_k) => {
-                            self.k_data = Some(new_k);
-                            true
+                    Ok(kept) => {
+                        drop(old_k); // Free memory before allocating contiguous tensor
+                        match kept.contiguous() {
+                            Ok(new_k) => {
+                                self.k_data = Some(new_k);
+                                true
+                            }
+                            Err(_) => false,
                         }
-                        Err(_) => false,
-                    },
-                    Err(_) => false,
+                    }
+                    Err(_) => {
+                        drop(old_k);
+                        false
+                    }
                 }
             } else {
                 true
@@ -467,17 +477,23 @@ impl Fp8KvCache {
                 return Ok(false);
             }
 
-            // Try to truncate V
+            // Try to truncate V - drop old tensor before allocating new one
             let v_success = if let Some(old_v) = self.v_data.take() {
                 match old_v.narrow(self.dim, 0, seq_len) {
-                    Ok(kept) => match kept.contiguous() {
-                        Ok(new_v) => {
-                            self.v_data = Some(new_v);
-                            true
+                    Ok(kept) => {
+                        drop(old_v); // Free memory before allocating contiguous tensor
+                        match kept.contiguous() {
+                            Ok(new_v) => {
+                                self.v_data = Some(new_v);
+                                true
+                            }
+                            Err(_) => false,
                         }
-                        Err(_) => false,
-                    },
-                    Err(_) => false,
+                    }
+                    Err(_) => {
+                        drop(old_v);
+                        false
+                    }
                 }
             } else {
                 true
@@ -501,7 +517,7 @@ impl Fp8KvCache {
         let seq_len = k.dim(self.dim)?;
 
         // Convert to BF16 for storage (50% memory savings vs F32)
-        let k_store = k.to_fp8()?;  // Actually converts to BF16
+        let k_store = k.to_fp8()?; // Actually converts to BF16
         let v_store = v.to_fp8()?;
 
         // Initialize K cache if needed
@@ -511,7 +527,7 @@ impl Fp8KvCache {
             let k_storage = Tensor::zeros(shape, DType::BF16, k_store.device())?;
             self.k_data = Some(k_storage);
         }
-        
+
         // Initialize V cache if needed
         if self.v_data.is_none() {
             let mut shape = v_store.dims().to_vec();
@@ -528,66 +544,60 @@ impl Fp8KvCache {
             let mut k_shape = k_store.dims().to_vec();
             k_shape[self.dim] = self.grow_by;
             let next_k = Tensor::zeros(k_shape, DType::BF16, k_store.device())?;
-            *k_data = Tensor::cat(&[&*k_data, &next_k], self.dim)?;
+            let old_k = std::mem::replace(k_data, Tensor::cat(&[&*k_data, &next_k], self.dim)?);
+            drop(old_k); // Explicitly free old tensor
 
             let mut v_shape = v_store.dims().to_vec();
             v_shape[self.dim] = self.grow_by;
             let next_v = Tensor::zeros(v_shape, DType::BF16, v_store.device())?;
-            *v_data = Tensor::cat(&[&*v_data, &next_v], self.dim)?;
+            let old_v = std::mem::replace(v_data, Tensor::cat(&[&*v_data, &next_v], self.dim)?);
+            drop(old_v); // Explicitly free old tensor
 
             self.max_seq_len += self.grow_by;
         }
 
-        // Insert new data into cache using narrow + cat
-        let k_before = if self.current_seq_len > 0 {
-            Some(k_data.narrow(self.dim, 0, self.current_seq_len)?)
-        } else {
-            None
-        };
-        
-        let remaining = self.max_seq_len - self.current_seq_len - seq_len;
-        let k_after = if remaining > 0 {
-            Some(k_data.narrow(self.dim, self.current_seq_len + seq_len, remaining)?)
-        } else {
-            None
-        };
+        // Try to use slice_set for in-place update (most memory efficient)
+        // For BF16, slice_set should work (unlike F8E4M3)
+        match k_data.slice_set(&k_store, self.dim, self.current_seq_len) {
+            Ok(_) => {
+                // In-place update succeeded
+                v_data.slice_set(&v_store, self.dim, self.current_seq_len)?;
+            }
+            Err(_) => {
+                // Fallback: reconstruct tensors (slower, more memory)
+                // Explicitly drop old tensors to free memory before allocating new ones
+                let k_before = k_data.narrow(self.dim, 0, self.current_seq_len)?;
+                let remaining = self.max_seq_len - self.current_seq_len - seq_len;
 
-        // Reconstruct K with new data
-        let new_k = match (k_before, k_after) {
-            (Some(before), Some(after)) => Tensor::cat(&[&before, &k_store, &after], self.dim)?,
-            (Some(before), None) => Tensor::cat(&[&before, &k_store], self.dim)?,
-            (None, Some(after)) => Tensor::cat(&[&k_store, &after], self.dim)?,
-            (None, None) => k_store.clone(),
-        };
-        *k_data = new_k;
+                let new_k = if remaining > 0 {
+                    let k_after =
+                        k_data.narrow(self.dim, self.current_seq_len + seq_len, remaining)?;
+                    Tensor::cat(&[&k_before, &k_store, &k_after], self.dim)?
+                } else {
+                    Tensor::cat(&[&k_before, &k_store], self.dim)?
+                };
+                let old_k = std::mem::replace(k_data, new_k);
+                drop(old_k);
 
-        // Same for V
-        let v_before = if self.current_seq_len > 0 {
-            Some(v_data.narrow(self.dim, 0, self.current_seq_len)?)
-        } else {
-            None
-        };
-        
-        let v_after = if remaining > 0 {
-            Some(v_data.narrow(self.dim, self.current_seq_len + seq_len, remaining)?)
-        } else {
-            None
-        };
-
-        let new_v = match (v_before, v_after) {
-            (Some(before), Some(after)) => Tensor::cat(&[&before, &v_store, &after], self.dim)?,
-            (Some(before), None) => Tensor::cat(&[&before, &v_store], self.dim)?,
-            (None, Some(after)) => Tensor::cat(&[&v_store, &after], self.dim)?,
-            (None, None) => v_store.clone(),
-        };
-        *v_data = new_v;
+                let v_before = v_data.narrow(self.dim, 0, self.current_seq_len)?;
+                let new_v = if remaining > 0 {
+                    let v_after =
+                        v_data.narrow(self.dim, self.current_seq_len + seq_len, remaining)?;
+                    Tensor::cat(&[&v_before, &v_store, &v_after], self.dim)?
+                } else {
+                    Tensor::cat(&[&v_before, &v_store], self.dim)?
+                };
+                let old_v = std::mem::replace(v_data, new_v);
+                drop(old_v);
+            }
+        }
 
         self.current_seq_len += seq_len;
 
         // Return current data (converted to F32)
         let out_k = self.k()?;
         let out_v = self.v()?;
-        
+
         let k_result = match out_k {
             None => {
                 let mut shape = k.dims().to_vec();
@@ -596,7 +606,7 @@ impl Fp8KvCache {
             }
             Some(k) => k,
         };
-        
+
         let v_result = match out_v {
             None => {
                 let mut shape = v.dims().to_vec();
