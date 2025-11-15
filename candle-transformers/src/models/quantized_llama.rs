@@ -523,7 +523,7 @@ impl ModelWeights {
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
-        activation_dtype: Option<DType>,
+        _activation_dtype: Option<DType>,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -552,12 +552,7 @@ impl ModelWeights {
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
-        let mut tok_embeddings = tok_embeddings_q.dequantize(device)?;
-
-        // Apply activation dtype override if specified
-        if let Some(dtype) = activation_dtype {
-            tok_embeddings = tok_embeddings.to_dtype(dtype)?;
-        }
+        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
         let norm = RmsNorm::from_qtensor(
             ct.tensor(reader, "output_norm.weight", device)?,
             rms_norm_eps,
@@ -680,14 +675,14 @@ impl ModelWeights {
     /// ```
     ///
     /// # Arguments
-    /// * `activation_dtype` - Optional dtype for activations (None = use model's native dtype)
-    ///   - `Some(DType::BF16)` - Use BF16 for ~50% memory savings
-    ///   - `Some(DType::F16)` - Use FP16 for ~50% memory savings
-    ///   - `None` - Use model's native dtype (backwards compatible)
+    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = F32)
+    ///   - `Some(DType::BF16)` - Use BF16 for RoPE (slightly less memory)
+    ///   - `Some(DType::F16)` - Use FP16 for RoPE (slightly less memory)
+    ///   - `None` - Use F32 (default, most accurate)
     pub fn from_gguf_by_path(
         file_path: &std::path::Path,
         device: &Device,
-        activation_dtype: Option<DType>,
+        _activation_dtype: Option<DType>,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
 
@@ -773,12 +768,7 @@ impl ModelWeights {
         };
 
         let tok_embeddings_q = load_tensor("token_embd.weight")?;
-        let mut tok_embeddings = tok_embeddings_q.dequantize(device)?;
-
-        // Apply activation dtype override if specified
-        if let Some(dtype) = activation_dtype {
-            tok_embeddings = tok_embeddings.to_dtype(dtype)?;
-        }
+        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
         let norm = RmsNorm::from_qtensor(load_tensor("output_norm.weight")?, rms_norm_eps)?;
         let output = match load_tensor("output.weight") {
             Ok(tensor) => tensor,

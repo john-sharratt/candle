@@ -453,10 +453,10 @@ impl ModelWeights {
     /// Load model from GGUF with optional activation dtype override
     ///
     /// # Arguments
-    /// * `activation_dtype` - Optional dtype for intermediate activations (None = use model's native dtype)
-    ///   - `Some(DType::BF16)` - Use BF16 for ~50% memory savings with minimal accuracy loss
-    ///   - `Some(DType::F16)` - Use FP16 for ~50% memory savings
-    ///   - `None` - Use model's native dtype from GGUF metadata (backwards compatible)
+    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = use model's native dtype)
+    ///   - `Some(DType::BF16)` - Use BF16 for RoPE (slightly less memory)
+    ///   - `Some(DType::F16)` - Use FP16 for RoPE (slightly less memory)
+    ///   - `None` - Use model's native dtype from GGUF metadata (F16/F32)
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -560,10 +560,10 @@ impl ModelWeights {
     /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    /// Load model from file path with optional activation dtype override
+    /// Load model from file path with optional RoPE dtype override
     ///
     /// # Arguments
-    /// * `activation_dtype` - Optional dtype for activations (None = use model's native dtype)
+    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = use model's native dtype)
     pub fn from_gguf_by_path(
         file_path: &std::path::Path,
         device: &Device,
