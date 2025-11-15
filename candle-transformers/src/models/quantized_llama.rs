@@ -276,18 +276,17 @@ impl LayerWeights {
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
 
+        // Reshape and transpose in one go for better performance
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
             .transpose(1, 2)?;
         let k = k
             .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
             .transpose(1, 2)?;
+        // V contiguous only needed for prompt processing, no-op for single token
         let v = v
             .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
             .transpose(1, 2)?
-            // This call to contiguous ensures that the fast kernel can be called below. It's
-            // actually a no-op except when processing the initial prompt so has no significant
-            // impact on performance.
             .contiguous()?;
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
@@ -302,9 +301,54 @@ impl LayerWeights {
         // KV cache already returns contiguous tensors
         // Removing redundant contiguous() calls saves 2 memory allocations per layer
 
-        let y = if q.device().is_metal() && seq_len == 1 {
-            // SDPA will do MQA for us
+        // Use optimized attention kernels when available
+        let y = if seq_len == 1 && q.device().is_metal() {
+            // Metal SDPA for single token (handles MQA)
             candle_nn::ops::sdpa(&q, &k, &v, 1. / (self.head_dim as f32).sqrt(), 1.)?
+        } else if seq_len > 1 && matches!(q.device(), Device::Cuda(_)) {
+            // Use Flash Attention for prompt processing on CUDA (O(N) memory, faster)
+            #[cfg(feature = "flash-attn")]
+            {
+                // Flash Attention expects (B, S, H, D) format
+                let q_fa = q.transpose(1, 2)?; // (B, H, S, D) -> (B, S, H, D)
+                let k_fa = k.transpose(1, 2)?;
+                let v_fa = v.transpose(1, 2)?;
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true) {
+                    Ok(out) => out.transpose(1, 2)?, // Back to (B, H, S, D)
+                    Err(_) => {
+                        // Fallback to standard attention if flash-attn fails
+                        let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
+                        let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
+                        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                        let att = match mask {
+                            None => att,
+                            Some(mask) => {
+                                let mask = mask.broadcast_as(att.shape())?;
+                                masked_fill(&att, &mask, &self.neg_inf)?
+                            }
+                        };
+                        let att = candle_nn::ops::softmax_last_dim(&att)?;
+                        att.matmul(&v)?
+                    }
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                // Standard attention fallback
+                let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
+                let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
+                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = match mask {
+                    None => att,
+                    Some(mask) => {
+                        let mask = mask.broadcast_as(att.shape())?;
+                        masked_fill(&att, &mask, &self.neg_inf)?
+                    }
+                };
+                let att = candle_nn::ops::softmax_last_dim(&att)?;
+                att.matmul(&v)?
+            }
         } else {
             // Support for MQA, useful for 70B models and mistral.
             let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
@@ -319,8 +363,8 @@ impl LayerWeights {
                 }
             };
             let att = candle_nn::ops::softmax_last_dim(&att)?;
-            // Convert to contiguous as matmul doesn't support strided vs for now.
-            att.matmul(&v.contiguous()?)?
+            // V is already contiguous from cache or transpose
+            att.matmul(&v)?
         };
 
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
