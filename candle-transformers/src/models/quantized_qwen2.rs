@@ -226,7 +226,8 @@ impl LayerWeights {
                 let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
                 let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
                 let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, seq_len != 1) {
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true) {
                     Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
                     Err(_) => standard_attention()?,
                 }
