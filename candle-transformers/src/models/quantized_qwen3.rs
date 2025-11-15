@@ -323,6 +323,7 @@ impl AttentionWeights {
 
         let ctx = if l > 1 {
             // Use Flash Attention for multi-token sequences
+            // Flash Attention provides its own causal masking, so we ignore attn_mask
             #[cfg(feature = "flash-attn")]
             {
                 let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
