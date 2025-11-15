@@ -49,7 +49,7 @@ impl TextGeneration {
         eos_tokens: Vec<u32>,
     ) -> Self {
         let logits_processor =
-            LogitsProcessor::new(args.seed, Some(args.temperature), Some(args.top_p));
+            LogitsProcessor::new(args.seed, Some(args.temperature), Some(args.top_p), None);
         Self {
             model,
             tokenizer,

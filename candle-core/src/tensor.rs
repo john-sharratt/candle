@@ -1193,7 +1193,7 @@ impl Tensor {
         }
 
         // Get mutable access to storage
-        let layout = self.layout().clone();
+        let _layout = self.layout().clone();
         let mut storage = self.storage_mut();
 
         // Dispatch to backend-specific in-place implementation

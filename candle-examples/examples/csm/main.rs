@@ -192,6 +192,7 @@ fn main() -> Result<()> {
         args.seed,
         Some(args.temperature),
         None,
+        None,
     );
     let tokens = voices
         .get("tokens")

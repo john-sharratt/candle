@@ -2,7 +2,7 @@
 ///
 /// This demonstrates the performance-optimized pattern for applying
 /// repetition penalties during token sampling.
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 
 fn main() -> Result<()> {
     let device = Device::cuda_if_available(0)?;

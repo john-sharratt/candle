@@ -1,7 +1,7 @@
 // Test batched GPU multinomial sampling
 // This properly batches samples to leverage GPU parallelism
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 use std::time::Instant;
 
 const BATCH_SIZE: usize = 10_000; // Process 10K samples in parallel
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     let mut results = Vec::with_capacity(BATCH_SIZE);
     for i in 0..BATCH_SIZE {
         // Extract single sample logits
-        let sample_logits = logits.get(i)?;
+        let _sample_logits = logits.get(i)?;
 
         // For now, simulate processing
         results.push(i as u32 % VOCAB_SIZE as u32);

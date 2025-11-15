@@ -399,7 +399,7 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DType, Device};
+    use crate::Device;
 
     #[test]
     fn test_multinomial_sampling_cpu() -> Result<()> {

@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use candle::{quantized::gguf_file, Device, Tensor};
+use candle::{quantized::gguf_file, Tensor};
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3;
 use tokenizers::Tokenizer;
 
@@ -52,9 +52,7 @@ fn main() -> Result<()> {
     println!("   Device: {:?}", device);
 
     // Load tokenizer
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(anyhow::Error::msg)?;
-    // Load tokenizer
-    let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
 
     // Create a long conversation targeting 4000+ tokens
     println!("\n💬 Creating long conversation...");

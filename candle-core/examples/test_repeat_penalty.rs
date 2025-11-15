@@ -3,7 +3,7 @@
 /// The repeat_penalty operation applies penalty differently based on logit sign:
 /// - Positive logits: divided by penalty (reduces probability)
 /// - Negative/zero logits: multiplied by penalty (reduces probability)
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 
 fn test_cpu() -> Result<()> {
     println!("Testing CPU implementation...");

@@ -1,10 +1,8 @@
-use crate::{DType, Device, Result, Tensor};
-
 /// Example demonstrating the performance difference between implicit and explicit GPU→CPU transfers
 /// in sampling operations.
 #[cfg(test)]
 mod performance_demo {
-    use super::*;
+    use crate::{Device, Result, Tensor};
 
     #[test]
     fn demonstrate_sampling_performance() -> Result<()> {

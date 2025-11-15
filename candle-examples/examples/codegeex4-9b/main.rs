@@ -31,7 +31,7 @@ impl TextGeneration {
         device: &Device,
         dtype: DType,
     ) -> Self {
-        let logits_processor = LogitsProcessor::new(seed, Some(temp), Some(top_p));
+        let logits_processor = LogitsProcessor::new(seed, Some(temp), Some(top_p), None);
         Self {
             model,
             tokenizer,
