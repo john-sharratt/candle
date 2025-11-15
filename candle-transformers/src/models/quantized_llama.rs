@@ -302,59 +302,10 @@ impl LayerWeights {
         // Removing redundant contiguous() calls saves 2 memory allocations per layer
 
         // Use optimized attention kernels when available
-        let y = if seq_len == 1 && q.device().is_metal() {
-            // Metal SDPA for single token (handles MQA)
-            candle_nn::ops::sdpa(&q, &k, &v, 1. / (self.head_dim as f32).sqrt(), 1.)?
-        } else if seq_len > 1 && matches!(q.device(), Device::Cuda(_)) {
-            // Use Flash Attention for prompt processing on CUDA (O(N) memory, faster)
-            #[cfg(feature = "flash-attn")]
-            {
-                // Flash Attention expects (B, S, H, D) format and BF16/F16 dtype
-                // Convert F32 QMatMul outputs to BF16 for Flash Attention
-                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?; // (B, H, S, D) -> (B, S, H, D)
-                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                let scale = 1.0 / (self.head_dim as f32).sqrt();
-                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true) {
-                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?, // Back to F32 (B, H, S, D)
-                    Err(_) => {
-                        // Fallback to standard attention if flash-attn fails
-                        let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
-                        let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
-                        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                        let att = match mask {
-                            None => att,
-                            Some(mask) => {
-                                let mask = mask.broadcast_as(att.shape())?;
-                                masked_fill(&att, &mask, &self.neg_inf)?
-                            }
-                        };
-                        let att = candle_nn::ops::softmax_last_dim(&att)?;
-                        att.matmul(&v)?
-                    }
-                }
-            }
-            #[cfg(not(feature = "flash-attn"))]
-            {
-                // Standard attention fallback
-                let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
-                let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
-                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                let att = match mask {
-                    None => att,
-                    Some(mask) => {
-                        let mask = mask.broadcast_as(att.shape())?;
-                        masked_fill(&att, &mask, &self.neg_inf)?
-                    }
-                };
-                let att = candle_nn::ops::softmax_last_dim(&att)?;
-                att.matmul(&v)?
-            }
-        } else {
-            // Support for MQA, useful for 70B models and mistral.
-            let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
-            let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
-
+        // Standard attention implementation - used as fallback or primary path
+        let standard_attention = || -> Result<Tensor> {
+            let k = crate::utils::repeat_kv(k.clone(), self.n_head / self.n_kv_head)?;
+            let v = crate::utils::repeat_kv(v.clone(), self.n_head / self.n_kv_head)?;
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             let att = match mask {
                 None => att,
@@ -364,8 +315,30 @@ impl LayerWeights {
                 }
             };
             let att = candle_nn::ops::softmax_last_dim(&att)?;
-            // V is already contiguous from cache or transpose
-            att.matmul(&v)?
+            att.matmul(&v)
+        };
+
+        let y = if seq_len == 1 && q.device().is_metal() {
+            // Metal SDPA for single token (handles MQA)
+            candle_nn::ops::sdpa(&q, &k, &v, 1. / (self.head_dim as f32).sqrt(), 1.)?
+        } else if seq_len > 1 && matches!(q.device(), Device::Cuda(_)) {
+            // Use Flash Attention for prompt processing on CUDA (O(N) memory, faster)
+            #[cfg(feature = "flash-attn")]
+            {
+                // Flash Attention expects (B, S, H, D) format and BF16/F16 dtype
+                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true) {
+                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
+                    Err(_) => standard_attention()?,
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            standard_attention()?
+        } else {
+            standard_attention()?
         };
 
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;

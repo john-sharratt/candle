@@ -303,56 +303,8 @@ impl AttentionWeights {
         let k = repeat_kv(k, self.num_kv_groups)?;
         let v = repeat_kv(v, self.num_kv_groups)?;
 
-        let ctx = if l > 1 {
-            // Use Flash Attention for multi-token sequences
-            #[cfg(feature = "flash-attn")]
-            {
-                // Flash Attention requires F16 or BF16, but quantized models output F32
-                // Convert to BF16 for Flash Attention, then back to F32
-                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, l != 1) {
-                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
-                    Err(_) => {
-                        // Fallback to standard attention if Flash Attention fails
-                        let scale = 1.0 / (self.head_dim as f64).sqrt();
-                        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-                        if let Some(m) = attn_mask {
-                            let m_dtype = m.dtype();
-                            let scores_dtype = scores.dtype();
-                            let mask = if m_dtype != scores_dtype {
-                                m.to_dtype(scores_dtype)?
-                            } else {
-                                m.clone()
-                            };
-                            scores = scores.broadcast_add(&mask)?;
-                        }
-                        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-                        probs.matmul(&v)?
-                    }
-                }
-            }
-            #[cfg(not(feature = "flash-attn"))]
-            {
-                // Standard attention path
-                let scale = 1.0 / (self.head_dim as f64).sqrt();
-                let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-                if let Some(m) = attn_mask {
-                    let m_dtype = m.dtype();
-                    let scores_dtype = scores.dtype();
-                    let mask = if m_dtype != scores_dtype {
-                        m.to_dtype(scores_dtype)?
-                    } else {
-                        m.clone()
-                    };
-                    scores = scores.broadcast_add(&mask)?;
-                }
-                let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-                probs.matmul(&v)?
-            }
-        } else {
-            // Standard attention for single token (autoregressive generation)
+        // Standard attention implementation - used as fallback or primary path
+        let standard_attention = || -> Result<Tensor> {
             let scale = 1.0 / (self.head_dim as f64).sqrt();
             let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
             if let Some(m) = attn_mask {
@@ -366,7 +318,25 @@ impl AttentionWeights {
                 scores = scores.broadcast_add(&mask)?;
             }
             let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-            probs.matmul(&v)?
+            probs.matmul(&v)
+        };
+
+        let ctx = if l > 1 {
+            // Use Flash Attention for multi-token sequences
+            #[cfg(feature = "flash-attn")]
+            {
+                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, l != 1) {
+                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
+                    Err(_) => standard_attention()?,
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            standard_attention()?
+        } else {
+            standard_attention()?
         }; // (B, H, L, D)
         let reshaped_ctx = ctx
             .transpose(1, 2)?

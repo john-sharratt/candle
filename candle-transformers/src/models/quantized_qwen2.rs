@@ -199,60 +199,8 @@ impl LayerWeights {
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 
-        let y = if seq_len > 1 {
-            // Use Flash Attention for multi-token sequences
-            #[cfg(feature = "flash-attn")]
-            {
-                // Flash Attention requires F16 or BF16, but quantized models output F32
-                // Convert to BF16 for Flash Attention, then back to F32
-                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
-                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, seq_len != 1) {
-                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
-                    Err(_) => {
-                        // Fallback to standard attention if Flash Attention fails
-                        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                        let att = match mask {
-                            None => att,
-                            Some(mask) => {
-                                let mask_dtype = mask.dtype();
-                                let att_dtype = att.dtype();
-                                let mask = if mask_dtype != att_dtype {
-                                    mask.to_dtype(att_dtype)?
-                                } else {
-                                    mask.clone()
-                                };
-                                att.broadcast_add(&mask)?
-                            }
-                        };
-                        let att = candle_nn::ops::softmax_last_dim(&att)?;
-                        att.matmul(&v.contiguous()?)?.transpose(1, 2)?
-                    }
-                }
-            }
-            #[cfg(not(feature = "flash-attn"))]
-            {
-                // Standard attention path
-                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                let att = match mask {
-                    None => att,
-                    Some(mask) => {
-                        let mask_dtype = mask.dtype();
-                        let att_dtype = att.dtype();
-                        let mask = if mask_dtype != att_dtype {
-                            mask.to_dtype(att_dtype)?
-                        } else {
-                            mask.clone()
-                        };
-                        att.broadcast_add(&mask)?
-                    }
-                };
-                let att = candle_nn::ops::softmax_last_dim(&att)?;
-                att.matmul(&v.contiguous()?)?.transpose(1, 2)?
-            }
-        } else {
-            // Standard attention for single token (autoregressive generation)
+        // Standard attention implementation - used as fallback or primary path
+        let standard_attention = || -> Result<Tensor> {
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             let att = match mask {
                 None => att,
@@ -268,7 +216,25 @@ impl LayerWeights {
                 }
             };
             let att = candle_nn::ops::softmax_last_dim(&att)?;
-            att.matmul(&v.contiguous()?)?.transpose(1, 2)?
+            att.matmul(&v.contiguous()?)?.transpose(1, 2)
+        };
+
+        let y = if seq_len > 1 {
+            // Use Flash Attention for multi-token sequences
+            #[cfg(feature = "flash-attn")]
+            {
+                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, seq_len != 1) {
+                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
+                    Err(_) => standard_attention()?,
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            standard_attention()?
+        } else {
+            standard_attention()?
         };
         let y = y.reshape(&[b_sz, seq_len, n_embd])?;
         let y = self.attention_wo.forward(&y)?;
