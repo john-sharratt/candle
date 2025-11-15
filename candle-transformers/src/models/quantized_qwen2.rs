@@ -310,7 +310,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_with_options(ct, reader, device, None, None)
+        Self::from_gguf_with_options(ct, reader, device, None)
     }
 
     /// Load model from GGUF file using memory-mapped I/O for zero-copy tensor loading.
@@ -337,21 +337,11 @@ impl ModelWeights {
     ///
     /// let path = Path::new("model.gguf");
     /// let device = Device::cuda_if_available(0)?;
-    /// let model = ModelWeights::from_gguf_by_path(path, &device, None)?;
+    /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    ///
-    /// # Arguments
-    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = F32)
-    ///   - `Some(DType::BF16)` - Use BF16 for RoPE (slightly less memory)
-    ///   - `Some(DType::F16)` - Use FP16 for RoPE (slightly less memory)
-    ///   - `None` - Use F32 (default, most accurate)
-    pub fn from_gguf_by_path(
-        file_path: &std::path::Path,
-        device: &Device,
-        activation_dtype: Option<DType>,
-    ) -> Result<Self> {
-        Self::from_gguf_by_path_with_options(file_path, device, None, activation_dtype)
+    pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
+        Self::from_gguf_by_path_with_options(file_path, device, None)
     }
 
     /// Load model from GGUF file using memory-mapped I/O with custom options.
@@ -359,7 +349,6 @@ impl ModelWeights {
         file_path: &std::path::Path,
         device: &Device,
         max_kv_cache_len: Option<usize>,
-        _activation_dtype: Option<DType>,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
 
@@ -533,7 +522,6 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
         max_kv_cache_len: Option<usize>,
-        _activation_dtype: Option<DType>,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -767,7 +755,7 @@ mod tests {
         // Load model using optimized mmap path
         println!("Loading model with mmap optimization...");
         let load_start = std::time::Instant::now();
-        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let load_duration = load_start.elapsed();
         println!(
             "✓ Model loaded in {:.3}s using mmap\n",

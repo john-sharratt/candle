@@ -523,7 +523,6 @@ impl ModelWeights {
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
-        _activation_dtype: Option<DType>,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -670,20 +669,10 @@ impl ModelWeights {
     ///
     /// let path = Path::new("model.gguf");
     /// let device = Device::cuda_if_available(0)?;
-    /// let model = ModelWeights::from_gguf_by_path(path, &device, None)?;
+    /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    ///
-    /// # Arguments
-    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = F32)
-    ///   - `Some(DType::BF16)` - Use BF16 for RoPE (slightly less memory)
-    ///   - `Some(DType::F16)` - Use FP16 for RoPE (slightly less memory)
-    ///   - `None` - Use F32 (default, most accurate)
-    pub fn from_gguf_by_path(
-        file_path: &std::path::Path,
-        device: &Device,
-        _activation_dtype: Option<DType>,
-    ) -> Result<Self> {
+    pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
         use memmap2::MmapOptions;
 
         // Open file and create memory map for zero-copy access
@@ -962,7 +951,7 @@ mod tests {
         // Load model using optimized mmap path
         println!("Loading model with mmap optimization...");
         let load_start = std::time::Instant::now();
-        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let load_duration = load_start.elapsed();
         println!(
             "✓ Model loaded in {:.3}s using mmap\n",

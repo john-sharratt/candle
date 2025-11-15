@@ -450,18 +450,11 @@ impl Clone for ModelWeights {
 }
 
 impl ModelWeights {
-    /// Load model from GGUF with optional activation dtype override
-    ///
-    /// # Arguments
-    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = use model's native dtype)
-    ///   - `Some(DType::BF16)` - Use BF16 for RoPE (slightly less memory)
-    ///   - `Some(DType::F16)` - Use FP16 for RoPE (slightly less memory)
-    ///   - `None` - Use model's native dtype from GGUF metadata (F16/F32)
+    /// Load model from GGUF file
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
-        activation_dtype: Option<DType>,
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
         let md_get = |s: &str| match gg.metadata().get(s) {
@@ -478,8 +471,8 @@ impl ModelWeights {
         let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
 
-        // Use override dtype if provided, otherwise use model's native dtype
-        let native_dtype = match gg.metadata().get("general.dtype") {
+        // Extract model's native dtype from metadata
+        let dtype = match gg.metadata().get("general.dtype") {
             Some(v) => match v.to_u32() {
                 Ok(0) => DType::F32,
                 Ok(1) => DType::F16,
@@ -487,7 +480,6 @@ impl ModelWeights {
             },
             None => DType::F16,
         };
-        let dtype = activation_dtype.unwrap_or(native_dtype);
 
         let embed_tensor = gg.tensor("token_embd.weight")?;
         let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
@@ -560,15 +552,7 @@ impl ModelWeights {
     /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    /// Load model from file path with optional RoPE dtype override
-    ///
-    /// # Arguments
-    /// * `activation_dtype` - Optional dtype override for RoPE embeddings (None = use model's native dtype)
-    pub fn from_gguf_by_path(
-        file_path: &std::path::Path,
-        device: &Device,
-        activation_dtype: Option<DType>,
-    ) -> Result<Self> {
+    pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
         use memmap2::MmapOptions;
 
         // Open file and create memory map for zero-copy access
@@ -634,8 +618,8 @@ impl ModelWeights {
         let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
 
-        // Use override dtype if provided, otherwise use model's native dtype
-        let native_dtype = match ct.metadata.get("general.dtype") {
+        // Extract model's native dtype from metadata
+        let dtype = match ct.metadata.get("general.dtype") {
             Some(v) => match v.to_u32() {
                 Ok(0) => DType::F32,
                 Ok(1) => DType::F16,
@@ -643,7 +627,6 @@ impl ModelWeights {
             },
             None => DType::F16,
         };
-        let dtype = activation_dtype.unwrap_or(native_dtype);
 
         // Helper to load tensor from mmap
         let load_tensor = |name: &str| -> Result<QTensor> {
@@ -850,7 +833,7 @@ mod tests {
         // Load model using optimized mmap path
         println!("Loading model with mmap optimization...");
         let load_start = std::time::Instant::now();
-        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let load_duration = load_start.elapsed();
         println!(
             "✓ Model loaded in {:.3}s using mmap\n",
@@ -1000,7 +983,7 @@ mod tests {
         let content = gguf_file::Content::read(&mut file)?;
 
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
-        let _model = LlamaModelWeights::from_gguf(content, &mut file, &device, None)?;
+        let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times
@@ -1011,7 +994,7 @@ mod tests {
             let content = gguf_file::Content::read(&mut file)?;
 
             let start = std::time::Instant::now();
-            let _model = LlamaModelWeights::from_gguf(content, &mut file, &device, None)?;
+            let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
             let duration = start.elapsed();
 
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
@@ -1069,7 +1052,7 @@ mod tests {
         // Warm up run
         println!("Warming up (loading once to populate OS cache)...");
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
-        let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times
@@ -1077,7 +1060,7 @@ mod tests {
         let mut durations = Vec::new();
         for i in 0..3 {
             let start = std::time::Instant::now();
-            let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
             let duration = start.elapsed();
 
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
@@ -1138,7 +1121,7 @@ mod tests {
         let content = gguf_file::Content::read(&mut file)?;
 
         let start = std::time::Instant::now();
-        let model = ModelWeights::from_gguf(content, &mut file, &device, None)?;
+        let model = ModelWeights::from_gguf(content, &mut file, &device)?;
         let duration = start.elapsed();
         println!(
             "  Time: {:.3}s ({} layers)",
@@ -1149,7 +1132,7 @@ mod tests {
         println!("\n--- mmap Loading (File→GPU direct) ---");
         println!("First load (cold start):");
         let start = std::time::Instant::now();
-        let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         let duration = start.elapsed();
         println!(
             "  Time: {:.3}s ({} layers)",
@@ -1201,7 +1184,7 @@ mod tests {
         println!("Warming up (loading once to populate OS cache)...");
         let mut file = std::fs::File::open(&model_path)?;
         let content = gguf_file::Content::read(&mut file)?;
-        let _ = ModelWeights::from_gguf(content, &mut file, &device, None)?;
+        let _ = ModelWeights::from_gguf(content, &mut file, &device)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times and take average
@@ -1212,7 +1195,7 @@ mod tests {
             let content = gguf_file::Content::read(&mut file)?;
 
             let start = std::time::Instant::now();
-            let model = ModelWeights::from_gguf(content, &mut file, &device, None)?;
+            let model = ModelWeights::from_gguf(content, &mut file, &device)?;
             let duration = start.elapsed();
 
             println!(
@@ -1272,7 +1255,7 @@ mod tests {
 
         // Warm up run to ensure file is in OS cache
         println!("Warming up (loading once to populate OS cache)...");
-        let _ = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+        let _ = ModelWeights::from_gguf_by_path(&model_path, &device)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times and take average
@@ -1280,7 +1263,7 @@ mod tests {
         let mut durations = Vec::new();
         for i in 0..3 {
             let start = std::time::Instant::now();
-            let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
             let duration = start.elapsed();
 
             println!(
@@ -1419,7 +1402,7 @@ mod tests {
         let start = Instant::now();
         let mut file = std::fs::File::open(&model_path)?;
         let content = gguf_file::Content::read(&mut file)?;
-        let _model = ModelWeights::from_gguf(content, &mut file, &device, None)?;
+        let _model = ModelWeights::from_gguf(content, &mut file, &device)?;
         let sequential_time = start.elapsed();
         println!(
             "  Sequential total: {:.3}ms",
