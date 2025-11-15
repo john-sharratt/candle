@@ -1000,7 +1000,7 @@ mod tests {
         let content = gguf_file::Content::read(&mut file)?;
 
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
-        let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
+        let _model = LlamaModelWeights::from_gguf(content, &mut file, &device, None)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times
@@ -1011,7 +1011,7 @@ mod tests {
             let content = gguf_file::Content::read(&mut file)?;
 
             let start = std::time::Instant::now();
-            let _model = LlamaModelWeights::from_gguf(content, &mut file, &device)?;
+            let _model = LlamaModelWeights::from_gguf(content, &mut file, &device, None)?;
             let duration = start.elapsed();
 
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
@@ -1069,7 +1069,7 @@ mod tests {
         // Warm up run
         println!("Warming up (loading once to populate OS cache)...");
         use crate::models::quantized_llama::ModelWeights as LlamaModelWeights;
-        let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         println!("Warmup complete.\n");
 
         // Actual benchmark - run 3 times
@@ -1077,7 +1077,7 @@ mod tests {
         let mut durations = Vec::new();
         for i in 0..3 {
             let start = std::time::Instant::now();
-            let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device)?;
+            let _model = LlamaModelWeights::from_gguf_by_path(&model_path, &device, None)?;
             let duration = start.elapsed();
 
             println!("  Run {}: {:.3}s", i + 1, duration.as_secs_f64());
@@ -1307,7 +1307,6 @@ mod tests {
     #[test]
     #[ignore] // Run manually with: cargo test diagnose_mmap_performance --release --features cuda -- --ignored --nocapture
     fn diagnose_mmap_performance() -> Result<()> {
-        use std::io::{Read, Seek};
         use std::time::Instant;
 
         let api = hf_hub::api::sync::Api::new()
@@ -1339,7 +1338,7 @@ mod tests {
         let open_time = start.elapsed();
 
         let start = Instant::now();
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let _mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let mmap_time = start.elapsed();
         println!("  File open: {:.3}ms", open_time.as_secs_f64() * 1000.0);
         println!("  Mmap create: {:.3}ms", mmap_time.as_secs_f64() * 1000.0);

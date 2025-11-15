@@ -41,7 +41,7 @@ mod tests {
 
         // Test 1: Regular cache inference
         println!("1. Testing with REGULAR cache...");
-        let mut model_regular = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let mut model_regular = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         
         let mut regular_outputs = Vec::new();
         for i in 0..50 {
@@ -54,7 +54,7 @@ mod tests {
 
         // Test 2: FP8 cache inference
         println!("\n2. Testing with FP8 cache...");
-        let mut model_fp8 = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let mut model_fp8 = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         model_fp8.enable_fp8_kv_cache();
         
         let mut fp8_outputs = Vec::new();
@@ -129,7 +129,7 @@ mod tests {
 
         // Test with regular cache
         println!("1. Testing with REGULAR cache...");
-        let mut model_regular = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let mut model_regular = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         
         let mut regular_outputs = Vec::new();
         for i in 0..30 {
@@ -141,7 +141,7 @@ mod tests {
 
         // Test with FP8 cache
         println!("\n2. Testing with FP8 cache...");
-        let mut model_fp8 = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let mut model_fp8 = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         model_fp8.enable_fp8_kv_cache();
         
         let mut fp8_outputs = Vec::new();
@@ -190,7 +190,7 @@ mod tests {
         println!("✓ Model downloaded\n");
 
         println!("Loading model with FP8 cache enabled...");
-        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         model.enable_fp8_kv_cache();
         println!("✓ Model loaded with FP8 cache\n");
 

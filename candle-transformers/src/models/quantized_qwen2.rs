@@ -310,7 +310,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_with_options(ct, reader, device, None)
+        Self::from_gguf_with_options(ct, reader, device, None, None)
     }
 
     /// Load model from GGUF file using memory-mapped I/O for zero-copy tensor loading.
@@ -337,11 +337,21 @@ impl ModelWeights {
     ///
     /// let path = Path::new("model.gguf");
     /// let device = Device::cuda_if_available(0)?;
-    /// let model = ModelWeights::from_gguf_by_path(path, &device)?;
+    /// let model = ModelWeights::from_gguf_by_path(path, &device, None)?;
     /// # Ok::<(), candle_core::Error>(())
     /// ```
-    pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
-        Self::from_gguf_by_path_with_options(file_path, device, None)
+    ///
+    /// # Arguments
+    /// * `activation_dtype` - Optional dtype for activations (None = use model's native dtype)
+    ///   - `Some(DType::BF16)` - Use BF16 for ~50% memory savings
+    ///   - `Some(DType::F16)` - Use FP16 for ~50% memory savings
+    ///   - `None` - Use model's native dtype (backwards compatible)
+    pub fn from_gguf_by_path(
+        file_path: &std::path::Path,
+        device: &Device,
+        activation_dtype: Option<DType>,
+    ) -> Result<Self> {
+        Self::from_gguf_by_path_with_options(file_path, device, None, activation_dtype)
     }
 
     /// Load model from GGUF file using memory-mapped I/O with custom options.
@@ -349,6 +359,7 @@ impl ModelWeights {
         file_path: &std::path::Path,
         device: &Device,
         max_kv_cache_len: Option<usize>,
+        activation_dtype: Option<DType>,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
 
@@ -436,7 +447,12 @@ impl ModelWeights {
         };
 
         let tok_embeddings = load_tensor("token_embd.weight")?;
-        let tok_embeddings = tok_embeddings.dequantize(device)?;
+        let mut tok_embeddings = tok_embeddings.dequantize(device)?;
+        
+        // Apply activation dtype override if specified
+        if let Some(dtype) = activation_dtype {
+            tok_embeddings = tok_embeddings.to_dtype(dtype)?;
+        }
         let norm = RmsNorm::from_qtensor(load_tensor("output_norm.weight")?, rms_norm_eps)?;
         let output = match load_tensor("output.weight") {
             Ok(v) => QMatMul::from_qtensor(v)?,
@@ -522,6 +538,7 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
         max_kv_cache_len: Option<usize>,
+        activation_dtype: Option<DType>,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -551,7 +568,12 @@ impl ModelWeights {
             .unwrap_or_else(|_| embedding_length / head_count);
 
         let tok_embeddings = ct.tensor(reader, "token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings.dequantize(device)?;
+        let mut tok_embeddings = tok_embeddings.dequantize(device)?;
+        
+        // Apply activation dtype override if specified
+        if let Some(dtype) = activation_dtype {
+            tok_embeddings = tok_embeddings.to_dtype(dtype)?;
+        }
         let norm = RmsNorm::from_qtensor(
             ct.tensor(reader, "output_norm.weight", device)?,
             rms_norm_eps,
@@ -755,7 +777,7 @@ mod tests {
         // Load model using optimized mmap path
         println!("Loading model with mmap optimization...");
         let load_start = std::time::Instant::now();
-        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         let load_duration = load_start.elapsed();
         println!(
             "✓ Model loaded in {:.3}s using mmap\n",
