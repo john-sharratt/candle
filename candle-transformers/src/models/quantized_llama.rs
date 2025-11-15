@@ -309,13 +309,14 @@ impl LayerWeights {
             // Use Flash Attention for prompt processing on CUDA (O(N) memory, faster)
             #[cfg(feature = "flash-attn")]
             {
-                // Flash Attention expects (B, S, H, D) format
-                let q_fa = q.transpose(1, 2)?; // (B, H, S, D) -> (B, S, H, D)
-                let k_fa = k.transpose(1, 2)?;
-                let v_fa = v.transpose(1, 2)?;
+                // Flash Attention expects (B, S, H, D) format and BF16/F16 dtype
+                // Convert F32 QMatMul outputs to BF16 for Flash Attention
+                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?; // (B, H, S, D) -> (B, S, H, D)
+                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
                 let scale = 1.0 / (self.head_dim as f32).sqrt();
                 match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true) {
-                    Ok(out) => out.transpose(1, 2)?, // Back to (B, H, S, D)
+                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?, // Back to F32 (B, H, S, D)
                     Err(_) => {
                         // Fallback to standard attention if flash-attn fails
                         let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
@@ -1055,6 +1056,109 @@ mod tests {
         println!("✓ Cloned model: {} tokens in cache", clone_cache_len);
         println!("✓ Caches are completely independent");
         println!("✓ Clone did not affect original model state");
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test --features cuda,flash-attn -- --ignored test_flash_attention_prompt
+    fn test_flash_attention_prompt() -> Result<()> {
+        println!("\n=== Testing Flash Attention for Prompt Processing ===\n");
+
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
+
+        let repo = api.model("bartowski/Llama-3.2-1B-Instruct-GGUF".to_string());
+        let model_path = repo.get("Llama-3.2-1B-Instruct-Q4_K_M.gguf").map_err(|e| {
+            candle::Error::Msg(format!(
+                "Failed to download model: {}. This test requires internet access.",
+                e
+            ))
+        })?;
+
+        println!("Model downloaded to: {:?}", model_path);
+
+        let device = Device::new_cuda(0).map_err(|e| {
+            candle::Error::Msg(format!(
+                "CUDA required for this test: {}. Use --features cuda,flash-attn",
+                e
+            ))
+        })?;
+        println!("Using device: {:?}\n", device);
+
+        // Load model
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        println!("✓ Model loaded\n");
+
+        // Test 1: Process a long prompt (should trigger Flash Attention)
+        println!("Test 1: Long prompt processing (64 tokens)");
+        let prompt_len = 64;
+        let prompt_tokens: Vec<u32> = (0..prompt_len).map(|i| (i % 1000 + 1) as u32).collect();
+        let prompt = Tensor::new(&prompt_tokens[..], &device)?.unsqueeze(0)?;
+
+        let start = std::time::Instant::now();
+        let output = model.forward(&prompt, 0)?;
+        let duration = start.elapsed();
+
+        println!("  ✓ Processed {} tokens", prompt_len);
+        println!("  Time: {:.3}ms", duration.as_secs_f64() * 1000.0);
+        println!("  Output shape: {:?}", output.shape());
+        println!("  Cache length: {}", model.cache_len());
+        assert_eq!(model.cache_len(), prompt_len);
+
+        // Test 2: Single token generation (should use standard attention)
+        println!("\nTest 2: Single token generation (autoregressive)");
+        let start = std::time::Instant::now();
+        let output = model.forward(&Tensor::new(&[1u32], &device)?.unsqueeze(0)?, prompt_len)?;
+        let duration = start.elapsed();
+
+        println!("  ✓ Generated 1 token");
+        println!("  Time: {:.3}ms", duration.as_secs_f64() * 1000.0);
+        println!("  Output shape: {:?}", output.shape());
+        println!("  Cache length: {}", model.cache_len());
+        assert_eq!(model.cache_len(), prompt_len + 1);
+
+        // Test 3: Another multi-token sequence (Flash Attention again)
+        println!("\nTest 3: Another multi-token batch (32 tokens)");
+        model.clear_all_caches();
+        let batch_len = 32;
+        let batch_tokens: Vec<u32> = (0..batch_len).map(|i| (i % 500 + 1) as u32).collect();
+        let batch = Tensor::new(&batch_tokens[..], &device)?.unsqueeze(0)?;
+
+        let start = std::time::Instant::now();
+        let output = model.forward(&batch, 0)?;
+        let duration = start.elapsed();
+
+        println!("  ✓ Processed {} tokens", batch_len);
+        println!("  Time: {:.3}ms", duration.as_secs_f64() * 1000.0);
+        println!("  Output shape: {:?}", output.shape());
+        println!("  Cache length: {}", model.cache_len());
+        assert_eq!(model.cache_len(), batch_len);
+
+        // Test 4: Verify numerical stability
+        println!("\nTest 4: Numerical stability check");
+        model.clear_all_caches();
+        let test_tokens = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+        let test_input = Tensor::new(&test_tokens[..], &device)?.unsqueeze(0)?;
+
+        let output1 = model.forward(&test_input, 0)?;
+        model.clear_all_caches();
+        let output2 = model.forward(&test_input, 0)?;
+
+        // Check outputs are identical (or very close due to BF16 precision)
+        let diff = (&output1 - &output2)?.abs()?.max(0)?.to_vec0::<f32>()?;
+        println!("  Max difference between runs: {:.6}", diff);
+        assert!(diff < 1e-3, "Outputs should be consistent");
+        println!("  ✓ Outputs are consistent");
+
+        println!("\n=== Flash Attention Test Summary ===");
+        println!("✓ Long prompt processing works (64 tokens)");
+        println!("✓ Single token generation works");
+        println!("✓ Multi-token batching works (32 tokens)");
+        println!("✓ Numerical stability verified");
+        println!(
+            "Note: Flash Attention is used for seq_len > 1 on CUDA, fallback for seq_len == 1\n"
+        );
 
         Ok(())
     }
