@@ -300,11 +300,11 @@ impl AttentionWeights {
 
         // KV cache already returns contiguous tensors, repeat_kv works with views
         // Removing redundant contiguous() saves 3 memory allocations per layer
-        let k = repeat_kv(k, self.num_kv_groups)?;
-        let v = repeat_kv(v, self.num_kv_groups)?;
 
         // Standard attention implementation - used as fallback or primary path
         let standard_attention = || -> Result<Tensor> {
+            let k = repeat_kv(k.clone(), self.num_kv_groups)?;
+            let v = repeat_kv(v.clone(), self.num_kv_groups)?;
             let scale = 1.0 / (self.head_dim as f64).sqrt();
             let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
             if let Some(m) = attn_mask {

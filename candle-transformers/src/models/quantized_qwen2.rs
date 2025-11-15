@@ -195,12 +195,11 @@ impl LayerWeights {
         // Append to cache and get full K,V tensors (already contiguous)
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
-        // Support for MQA - repeat_kv works efficiently with views
-        let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
-
         // Standard attention implementation - used as fallback or primary path
         let standard_attention = || -> Result<Tensor> {
+            // Support for MQA - repeat_kv works efficiently with views
+            let k = repeat_kv(k.clone(), self.n_head / self.n_kv_head)?;
+            let v = repeat_kv(v.clone(), self.n_head / self.n_kv_head)?;
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             let att = match mask {
                 None => att,
