@@ -1146,9 +1146,10 @@ mod tests {
         let output2 = model.forward(&test_input, 0)?;
 
         // Check outputs are identical (or very close due to BF16 precision)
-        let diff = (&output1 - &output2)?.abs()?.max(0)?.to_vec0::<f32>()?;
-        println!("  Max difference between runs: {:.6}", diff);
-        assert!(diff < 1e-3, "Outputs should be consistent");
+        let diff = (&output1 - &output2)?.abs()?.flatten_all()?.max(0)?;
+        let diff_val = diff.to_vec0::<f32>()?;
+        println!("  Max difference between runs: {:.6}", diff_val);
+        assert!(diff_val < 1e-3, "Outputs should be consistent");
         println!("  ✓ Outputs are consistent");
 
         println!("\n=== Flash Attention Test Summary ===");
