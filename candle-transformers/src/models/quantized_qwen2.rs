@@ -19,7 +19,7 @@ use candle::{
     quantized::{gguf_file, QMatMul},
     DType, Device, IndexOp, Result, Tensor,
 };
-use candle_nn::{kv_cache::KvCache, kv_cache::Fp8KvCache, Embedding, Module};
+use candle_nn::{kv_cache::Fp8KvCache, kv_cache::KvCache, Embedding, Module};
 
 /// KV Cache variant - either regular or FP8 quantized
 #[derive(Debug, Clone)]
@@ -192,10 +192,10 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, cache_len)?;
         let k = self.apply_rotary_emb(&k, cache_len)?;
 
-        // Append to cache and get full K,V tensors
+        // Append to cache and get full K,V tensors (already contiguous)
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
-        // Support for MQA, useful for 70B models and mistral.
+        // Support for MQA - repeat_kv works efficiently with views
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 

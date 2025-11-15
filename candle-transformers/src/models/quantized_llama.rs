@@ -299,9 +299,8 @@ impl LayerWeights {
         }
         let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
-        // Make tensor contiguous to avoid some strided copies
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
+        // KV cache already returns contiguous tensors
+        // Removing redundant contiguous() calls saves 2 memory allocations per layer
 
         let y = if q.device().is_metal() && seq_len == 1 {
             // SDPA will do MQA for us
