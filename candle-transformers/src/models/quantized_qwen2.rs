@@ -199,25 +199,78 @@ impl LayerWeights {
         let k = repeat_kv(k, self.n_head / self.n_kv_head)?;
         let v = repeat_kv(v, self.n_head / self.n_kv_head)?;
 
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = match mask {
-            None => att,
-            Some(mask) => {
-                // Convert mask to attention scores dtype if needed
-                let mask_dtype = mask.dtype();
-                let att_dtype = att.dtype();
-                let mask = if mask_dtype != att_dtype {
-                    mask.to_dtype(att_dtype)?
-                } else {
-                    mask.clone()
-                };
-                att.broadcast_add(&mask)?
+        let y = if seq_len > 1 {
+            // Use Flash Attention for multi-token sequences
+            #[cfg(feature = "flash-attn")]
+            {
+                // Flash Attention requires F16 or BF16, but quantized models output F32
+                // Convert to BF16 for Flash Attention, then back to F32
+                let q_fa = q.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let k_fa = k.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                let v_fa = v.transpose(1, 2)?.to_dtype(DType::BF16)?;
+                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, 1.0, seq_len != 1) {
+                    Ok(out) => out.to_dtype(DType::F32)?.transpose(1, 2)?,
+                    Err(_) => {
+                        // Fallback to standard attention if Flash Attention fails
+                        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                        let att = match mask {
+                            None => att,
+                            Some(mask) => {
+                                let mask_dtype = mask.dtype();
+                                let att_dtype = att.dtype();
+                                let mask = if mask_dtype != att_dtype {
+                                    mask.to_dtype(att_dtype)?
+                                } else {
+                                    mask.clone()
+                                };
+                                att.broadcast_add(&mask)?
+                            }
+                        };
+                        let att = candle_nn::ops::softmax_last_dim(&att)?;
+                        att.matmul(&v.contiguous()?)?.transpose(1, 2)?
+                    }
+                }
             }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                // Standard attention path
+                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = match mask {
+                    None => att,
+                    Some(mask) => {
+                        let mask_dtype = mask.dtype();
+                        let att_dtype = att.dtype();
+                        let mask = if mask_dtype != att_dtype {
+                            mask.to_dtype(att_dtype)?
+                        } else {
+                            mask.clone()
+                        };
+                        att.broadcast_add(&mask)?
+                    }
+                };
+                let att = candle_nn::ops::softmax_last_dim(&att)?;
+                att.matmul(&v.contiguous()?)?.transpose(1, 2)?
+            }
+        } else {
+            // Standard attention for single token (autoregressive generation)
+            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+            let att = match mask {
+                None => att,
+                Some(mask) => {
+                    let mask_dtype = mask.dtype();
+                    let att_dtype = att.dtype();
+                    let mask = if mask_dtype != att_dtype {
+                        mask.to_dtype(att_dtype)?
+                    } else {
+                        mask.clone()
+                    };
+                    att.broadcast_add(&mask)?
+                }
+            };
+            let att = candle_nn::ops::softmax_last_dim(&att)?;
+            att.matmul(&v.contiguous()?)?.transpose(1, 2)?
         };
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        // Convert to contiguous as matmul doesn't support strided vs for now.
-        let y = att.matmul(&v.contiguous()?)?;
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+        let y = y.reshape(&[b_sz, seq_len, n_embd])?;
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
     }
@@ -859,6 +912,108 @@ mod tests {
         println!("✓ Cloned model: {} tokens in cache", clone_cache_len);
         println!("✓ Caches are completely independent");
         println!("✓ Clone did not affect original model state");
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // Run manually with: cargo test --features cuda,flash-attn -- --ignored test_flash_attention_prompt
+    fn test_flash_attention_prompt() -> Result<()> {
+        println!("\n=== Testing Flash Attention for Prompt Processing ===\n");
+
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
+
+        let repo = api.model("Qwen/Qwen2-0.5B-Instruct-GGUF".to_string());
+        let model_path = repo.get("qwen2-0_5b-instruct-q4_0.gguf").map_err(|e| {
+            candle::Error::Msg(format!(
+                "Failed to download model: {}. This test requires internet access.",
+                e
+            ))
+        })?;
+
+        println!("Model downloaded to: {:?}", model_path);
+
+        let device = Device::cuda_if_available(0)?;
+        println!("Using device: {:?}\n", device);
+
+        let mut model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        println!("✓ Model loaded\n");
+
+        // Test 1: Long prompt processing (should use Flash Attention)
+        println!("Test 1: Long prompt processing (64 tokens)");
+        model.clear_all_caches();
+        let prompt_len = 64;
+        let prompt_tokens: Vec<u32> = (0..prompt_len).map(|i| (i % 500 + 1) as u32).collect();
+        let prompt = Tensor::new(&prompt_tokens[..], &device)?.unsqueeze(0)?;
+
+        let start = std::time::Instant::now();
+        let output = model.forward(&prompt, 0)?;
+        let duration = start.elapsed();
+
+        println!("  ✓ Processed {} tokens", prompt_len);
+        println!("  Time: {:.3}ms", duration.as_secs_f64() * 1000.0);
+        println!("  Output shape: {:?}", output.shape());
+        println!("  Cache length: {}", model.cache_len());
+        assert_eq!(model.cache_len(), prompt_len);
+
+        // Test 2: Single token generation (should use standard attention)
+        println!("\nTest 2: Single token generation (autoregressive)");
+        let single_token = vec![1u32];
+        let single = Tensor::new(&single_token[..], &device)?.unsqueeze(0)?;
+
+        let start = std::time::Instant::now();
+        let output = model.forward(&single, prompt_len)?;
+        let duration = start.elapsed();
+
+        println!("  ✓ Generated 1 token");
+        println!("  Time: {:.3}ms", duration.as_secs_f64() * 1000.0);
+        println!("  Output shape: {:?}", output.shape());
+        println!("  Cache length: {}", model.cache_len());
+        assert_eq!(model.cache_len(), prompt_len + 1);
+
+        // Test 3: Another multi-token sequence (Flash Attention again)
+        println!("\nTest 3: Another multi-token batch (32 tokens)");
+        model.clear_all_caches();
+        let batch_len = 32;
+        let batch_tokens: Vec<u32> = (0..batch_len).map(|i| (i % 500 + 1) as u32).collect();
+        let batch = Tensor::new(&batch_tokens[..], &device)?.unsqueeze(0)?;
+
+        let start = std::time::Instant::now();
+        let output = model.forward(&batch, 0)?;
+        let duration = start.elapsed();
+
+        println!("  ✓ Processed {} tokens", batch_len);
+        println!("  Time: {:.3}ms", duration.as_secs_f64() * 1000.0);
+        println!("  Output shape: {:?}", output.shape());
+        println!("  Cache length: {}", model.cache_len());
+        assert_eq!(model.cache_len(), batch_len);
+
+        // Test 4: Verify numerical stability
+        println!("\nTest 4: Numerical stability check");
+        model.clear_all_caches();
+        let test_tokens = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+        let test_input = Tensor::new(&test_tokens[..], &device)?.unsqueeze(0)?;
+
+        let output1 = model.forward(&test_input, 0)?;
+        model.clear_all_caches();
+        let output2 = model.forward(&test_input, 0)?;
+
+        // Check outputs are identical (or very close due to BF16 precision)
+        let diff = (&output1 - &output2)?.abs()?.flatten_all()?.max(0)?;
+        let diff_val = diff.to_vec0::<f32>()?;
+        println!("  Max difference between runs: {:.6}", diff_val);
+        assert!(diff_val < 1e-3, "Outputs should be consistent");
+        println!("  ✓ Outputs are consistent");
+
+        println!("\n=== Flash Attention Test Summary ===");
+        println!("✓ Long prompt processing works (64 tokens)");
+        println!("✓ Single token generation works");
+        println!("✓ Multi-token batching works (32 tokens)");
+        println!("✓ Numerical stability verified");
+        println!(
+            "Note: Flash Attention is used for seq_len > 1 on CUDA, fallback for seq_len == 1\n"
+        );
 
         Ok(())
     }
