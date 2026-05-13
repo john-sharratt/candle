@@ -2,15 +2,23 @@
 //!
 //! Owns all knowledge about *where* entries live across the three storage tiers
 //! and *how recently* they were used.  [`Substrate`](super::substrate::Substrate)
-//! is a dumb content store; this module is the eviction brain.
+//! is the data store (warm tier); this module is the VRAM accounting and LRU
+//! eviction brain.
 //!
 //! # Tiers
 //!
 //! ```text
-//!  Hot  (VRAM)  — SubstrateCache::hot_*   — GPU-resident ChunkGids
-//!  Warm (RAM)   — Substrate::turns/sections — CPU-resident ChunkGids  ← main map
+//!  Hot  (VRAM)  — tracked here: byte accounting + LRU per SubstrateKey
+//!  Warm (RAM)   — Substrate::turns / sections — single source of truth for data
 //!  Cold (NVMe)  — not yet implemented
 //! ```
+//!
+//! The hot tier does NOT duplicate entry data.  It only records how many VRAM
+//! bytes each entry occupies and when it was last accessed.  All actual entry
+//! data lives in the warm tier (`Substrate`).  When the scheduler prefills a
+//! turn's KV blocks onto the GPU, it calls [`SubstrateCache::mark_hot`] to
+//! register the VRAM cost; when those blocks are evicted it calls
+//! [`SubstrateCache::mark_cold`].
 //!
 //! # Shared ownership
 //!
@@ -23,7 +31,7 @@
 //! # Hot-tier accounting and budget
 //!
 //! `hot_bytes` tracks the total VRAM occupied by GPU-resident entries.
-//! `hot_budget` caps that total; once set, every `insert_*` call evicts the
+//! `hot_budget` caps that total; once set, every `mark_hot` call evicts the
 //! least-recently-used hot entries before admitting the new one.
 //!
 //! The budget should be set **after** model weights are loaded and resident —
@@ -33,10 +41,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ahash::AHashMap;
-
 use crate::projection::{SectionId, TimelineId, TurnIndex};
-use crate::substrate::{SectionEntryData, TurnEntryData};
 
 // ── SubstrateKey ──────────────────────────────────────────────────────────────
 
@@ -52,36 +57,35 @@ pub enum SubstrateKey {
 
 /// All mutable state for the hot tier.  Plain fields — no atomics, no nested
 /// locks.  Always accessed under the single `Mutex` in [`SubstrateCache`].
+///
+/// Only accounting data lives here (byte totals, LRU timestamps).  Entry data
+/// lives in `Substrate::turns` / `Substrate::sections` (warm tier).
 #[derive(Debug)]
 struct SubstrateCacheInner {
-    hot_sections: AHashMap<SectionId, SectionEntryData>,
-    hot_turns: AHashMap<(TimelineId, TurnIndex), TurnEntryData>,
     /// Running VRAM total for all hot-tier entries.
     hot_bytes: u64,
     /// Per-entry VRAM byte count for precise subtraction on removal.
-    hot_entry_bytes: AHashMap<SubstrateKey, u64>,
+    hot_entry_bytes: ahash::AHashMap<SubstrateKey, u64>,
     /// VRAM budget. `None` = unlimited.
     hot_budget: Option<u64>,
     /// Monotonic counter; incremented on every `record_access` call.
     access_clock: u64,
     /// Last-access tick per hot-tier entry.
-    hot_last_used: AHashMap<SubstrateKey, u64>,
-    /// Hot-tier lookup hits (entry found in hot map).
+    hot_last_used: ahash::AHashMap<SubstrateKey, u64>,
+    /// Hot-tier lookup hits.
     hit_count: u64,
-    /// Hot-tier lookup misses (entry absent from hot map).
+    /// Hot-tier lookup misses.
     miss_count: u64,
 }
 
 impl SubstrateCacheInner {
     fn new(hot_budget: Option<u64>) -> Self {
         Self {
-            hot_sections: AHashMap::new(),
-            hot_turns: AHashMap::new(),
             hot_bytes: 0,
-            hot_entry_bytes: AHashMap::new(),
+            hot_entry_bytes: ahash::AHashMap::new(),
             hot_budget,
             access_clock: 0,
-            hot_last_used: AHashMap::new(),
+            hot_last_used: ahash::AHashMap::new(),
             hit_count: 0,
             miss_count: 0,
         }
@@ -102,83 +106,47 @@ impl SubstrateCacheInner {
         candidates.into_iter().take(n).map(|(_, key)| key).collect()
     }
 
-    fn entry_bytes(sealed: &Arc<Vec<candle_nn::kv_cache::SealedSequence>>) -> u64 {
-        sealed
-            .iter()
-            .flat_map(|seq| seq.chunks.iter())
-            .map(|c| c.byte_size)
-            .sum()
-    }
-
-    fn evict_to_budget(&mut self, needed_bytes: u64) {
-        let Some(budget) = self.hot_budget else { return };
-        if needed_bytes == 0 || self.hot_bytes.saturating_add(needed_bytes) <= budget {
-            return;
+    /// Evict LRU hot entries until `self.hot_bytes + needed_bytes <= budget`.
+    /// Returns the evicted keys so callers can act on them (e.g. move GPU
+    /// blocks to warm tier).
+    fn evict_to_budget(&mut self, needed_bytes: u64) -> Vec<SubstrateKey> {
+        let Some(budget) = self.hot_budget else { return vec![] };
+        if self.hot_bytes.saturating_add(needed_bytes) <= budget {
+            return vec![];
         }
-        let n = self.hot_turns.len() + self.hot_sections.len();
+        let n = self.hot_entry_bytes.len();
         let candidates = self.lru_n(n);
+        let mut evicted = Vec::new();
         for key in candidates {
             if self.hot_bytes.saturating_add(needed_bytes) <= budget {
                 break;
             }
-            match key {
-                SubstrateKey::Turn(tl, idx) => { self.remove_turn(tl, idx); }
-                SubstrateKey::Section(sid) => { self.remove_section(sid); }
-            }
+            self.mark_cold(key);
+            evicted.push(key);
         }
+        evicted
     }
 
-    fn insert_turn(&mut self, timeline: TimelineId, index: TurnIndex, entry: TurnEntryData) {
-        let key = SubstrateKey::Turn(timeline, index);
+    fn mark_hot(&mut self, key: SubstrateKey, byte_size: u64) {
+        // Remove old accounting for this key if re-marking.
         if let Some(old) = self.hot_entry_bytes.remove(&key) {
             self.hot_bytes = self.hot_bytes.saturating_sub(old);
         }
-        let bytes = Self::entry_bytes(&entry.sealed);
-        self.evict_to_budget(bytes);
-        if bytes > 0 {
-            self.hot_entry_bytes.insert(key, bytes);
-            self.hot_bytes = self.hot_bytes.saturating_add(bytes);
+        if byte_size > 0 {
+            self.hot_entry_bytes.insert(key, byte_size);
+            self.hot_bytes = self.hot_bytes.saturating_add(byte_size);
         }
         self.hot_last_used.entry(key).or_insert(0);
-        self.hot_turns.insert((timeline, index), entry);
     }
 
-    fn remove_turn(&mut self, timeline: TimelineId, index: TurnIndex) -> Option<TurnEntryData> {
-        let key = SubstrateKey::Turn(timeline, index);
+    fn mark_cold(&mut self, key: SubstrateKey) {
         if let Some(bytes) = self.hot_entry_bytes.remove(&key) {
             self.hot_bytes = self.hot_bytes.saturating_sub(bytes);
         }
         self.hot_last_used.remove(&key);
-        self.hot_turns.remove(&(timeline, index))
-    }
-
-    fn insert_section(&mut self, section: SectionId, entry: SectionEntryData) {
-        let key = SubstrateKey::Section(section);
-        if let Some(old) = self.hot_entry_bytes.remove(&key) {
-            self.hot_bytes = self.hot_bytes.saturating_sub(old);
-        }
-        let bytes = Self::entry_bytes(&entry.sealed);
-        self.evict_to_budget(bytes);
-        if bytes > 0 {
-            self.hot_entry_bytes.insert(key, bytes);
-            self.hot_bytes = self.hot_bytes.saturating_add(bytes);
-        }
-        self.hot_last_used.entry(key).or_insert(0);
-        self.hot_sections.insert(section, entry);
-    }
-
-    fn remove_section(&mut self, section: SectionId) -> Option<SectionEntryData> {
-        let key = SubstrateKey::Section(section);
-        if let Some(bytes) = self.hot_entry_bytes.remove(&key) {
-            self.hot_bytes = self.hot_bytes.saturating_sub(bytes);
-        }
-        self.hot_last_used.remove(&key);
-        self.hot_sections.remove(&section)
     }
 
     fn clear(&mut self) {
-        self.hot_sections.clear();
-        self.hot_turns.clear();
         self.hot_bytes = 0;
         self.hot_entry_bytes.clear();
         self.hot_last_used.clear();
@@ -194,8 +162,13 @@ impl SubstrateCacheInner {
 
 // ── SubstrateCache ────────────────────────────────────────────────────────────
 
-/// Shared hot-tier cache.  Cheaply cloneable — every clone shares the same
-/// inner state via `Arc<Mutex<>>`.
+/// Shared hot-tier VRAM accounting cache.  Cheaply cloneable — every clone
+/// shares the same inner state via `Arc<Mutex<>>`.
+///
+/// Does **not** store entry data.  Call [`SubstrateCache::mark_hot`] when GPU
+/// blocks are prefilled for an entry, and [`SubstrateCache::mark_cold`] when
+/// they are evicted.  All entry data lives in
+/// [`Substrate`](super::substrate::Substrate).
 #[derive(Clone, Debug)]
 pub struct SubstrateCache {
     inner: Arc<Mutex<SubstrateCacheInner>>,
@@ -243,7 +216,7 @@ impl SubstrateCache {
     /// Activate (or replace) the VRAM budget on an already-constructed cache.
     ///
     /// Mirrors the calculation in [`SubstrateCache::new`].  Does not
-    /// immediately evict; eviction is demand-driven on the next `insert_*`.
+    /// immediately evict; eviction is demand-driven on the next `mark_hot`.
     pub fn activate_budget(
         &self,
         free_vram_bytes: u64,
@@ -279,81 +252,60 @@ impl SubstrateCache {
 
     /// Return the `n` least-recently-used hot-tier keys.
     ///
-    /// Entries with `last_used == 0` (inserted but never accessed) sort to
+    /// Entries with `last_used == 0` (registered but never accessed) sort to
     /// the front and are evicted first.
     pub fn lru_entries(&self, n: usize) -> Vec<SubstrateKey> {
         self.inner.lock().map(|g| g.lru_n(n)).unwrap_or_default()
     }
 
-    // ── Hot-tier operations ───────────────────────────────────────────────────
+    // ── Hot-tier accounting ───────────────────────────────────────────────────
 
-    pub fn insert_turn(&self, timeline: TimelineId, index: TurnIndex, entry: TurnEntryData) {
+    /// Register `key` as GPU-resident with `byte_size` VRAM bytes.
+    ///
+    /// If the budget would be exceeded, evicts the LRU entries first and
+    /// returns their keys so the caller can move those entries' GPU blocks
+    /// to warm/cold storage.  Returns `vec![]` when no eviction was needed.
+    pub fn mark_hot(&self, key: SubstrateKey, byte_size: u64) -> Vec<SubstrateKey> {
+        self.inner.lock().map_or(vec![], |mut inner| {
+            let evicted = inner.evict_to_budget(byte_size);
+            inner.mark_hot(key, byte_size);
+            evicted
+        })
+    }
+
+    /// Deregister `key` from hot tier (GPU blocks evicted or freed).
+    pub fn mark_cold(&self, key: SubstrateKey) {
         if let Ok(mut inner) = self.inner.lock() {
-            inner.insert_turn(timeline, index, entry);
+            inner.mark_cold(key);
         }
     }
 
-    /// Apply `f` to the hot-tier turn entry if present.  Increments hit/miss counter.
-    pub fn with_turn_mut<F>(&self, timeline: TimelineId, index: TurnIndex, f: F)
-    where
-        F: FnOnce(&mut TurnEntryData),
-    {
+    // ── Hit/miss counters (used by callers that do hot-first lookups) ─────────
+
+    /// Increment the hot-tier hit counter.
+    pub fn record_hit(&self) {
         if let Ok(mut inner) = self.inner.lock() {
-            if inner.hot_turns.contains_key(&(timeline, index)) {
-                inner.hit_count += 1;
-                if let Some(entry) = inner.hot_turns.get_mut(&(timeline, index)) {
-                    f(entry);
-                }
-            } else {
-                inner.miss_count += 1;
-            }
+            inner.hit_count += 1;
         }
     }
 
-    pub fn remove_turn(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<TurnEntryData> {
-        self.inner.lock().ok()?.remove_turn(timeline, index)
-    }
-
-    pub fn insert_section(&self, section: SectionId, entry: SectionEntryData) {
+    /// Increment the hot-tier miss counter.
+    pub fn record_miss(&self) {
         if let Ok(mut inner) = self.inner.lock() {
-            inner.insert_section(section, entry);
+            inner.miss_count += 1;
         }
     }
 
-    /// Apply `f` to the hot-tier section entry if present.  Increments hit/miss counter.
-    pub fn with_section_mut<F>(&self, section: SectionId, f: F)
-    where
-        F: FnOnce(&mut SectionEntryData),
-    {
-        if let Ok(mut inner) = self.inner.lock() {
-            if inner.hot_sections.contains_key(&section) {
-                inner.hit_count += 1;
-                if let Some(entry) = inner.hot_sections.get_mut(&section) {
-                    f(entry);
-                }
-            } else {
-                inner.miss_count += 1;
-            }
-        }
-    }
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    pub fn remove_section(&self, section: SectionId) -> Option<SectionEntryData> {
-        self.inner.lock().ok()?.remove_section(section)
-    }
-
-    /// Clear all hot-tier entries, byte totals, and LRU state.
-    /// Does not reset `hot_budget`.
+    /// Clear all hot-tier accounting.  Does not reset `hot_budget`.
     pub fn clear(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.clear();
         }
     }
 
-    /// Clear all hot-tier entries and reset hit/miss counters.
+    /// Clear all hot-tier accounting and reset hit/miss counters.
     /// Preserves `hot_budget`.
     pub fn purge(&self) {
         if let Ok(mut inner) = self.inner.lock() {

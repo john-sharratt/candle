@@ -60,6 +60,7 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::SigEntry;
 
+
 // ── Per-turn statistics ───────────────────────────────────────────────────────
 
 /// Five aggregations of per-token agreement values within a single turn at
@@ -340,7 +341,6 @@ impl Substrate {
             text: String::new(),
             token_ids: TokenBuffer::default(),
         };
-        self.cache.insert_turn(timeline, idx, entry.clone());
         self.turns.insert((timeline, idx), entry);
         idx
     }
@@ -394,14 +394,9 @@ impl Substrate {
     ) {
         if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
             entry.role = role;
-            entry.text = text.clone();
-            entry.token_ids = token_ids.clone();
-        }
-        self.cache.with_turn_mut(timeline, index, |entry| {
-            entry.role = role;
             entry.text = text;
             entry.token_ids = token_ids;
-        });
+        }
     }
 
     pub fn role_of(&self, timeline: TimelineId, index: TurnIndex) -> Role {
@@ -432,9 +427,6 @@ impl Substrate {
         if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
             entry.block_range = (block_start, block_end);
         }
-        self.cache.with_turn_mut(timeline, index, |entry| {
-            entry.block_range = (block_start, block_end);
-        });
     }
 
     pub fn extend_turn(
@@ -448,17 +440,12 @@ impl Substrate {
             entry.token_count = entry.token_count.saturating_add(additional_tokens);
             entry.block_range.1 = new_block_end;
         }
-        self.cache.with_turn_mut(timeline, index, |entry| {
-            entry.token_count = entry.token_count.saturating_add(additional_tokens);
-            entry.block_range.1 = new_block_end;
-        });
     }
 
     pub fn set_scores(&mut self, timeline: TimelineId, index: TurnIndex, scores: PerDepthScores) {
         if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
             entry.scores = scores;
         }
-        self.cache.with_turn_mut(timeline, index, |entry| { entry.scores = scores; });
     }
 
     pub fn block_range_of(&self, timeline: TimelineId, index: TurnIndex) -> (u64, u64) {
@@ -474,9 +461,8 @@ impl Substrate {
         entries: Vec<crate::provenance::SigEntry>,
     ) {
         if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
-            entry.sig_entries = entries.clone();
+            entry.sig_entries = entries;
         }
-        self.cache.with_turn_mut(timeline, index, |entry| { entry.sig_entries = entries; });
     }
 
     pub fn extend_sig_entries(
@@ -485,11 +471,9 @@ impl Substrate {
         index: TurnIndex,
         entries: impl IntoIterator<Item = crate::provenance::SigEntry>,
     ) {
-        let entries: Vec<_> = entries.into_iter().collect();
         if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
-            entry.sig_entries.extend(entries.iter().copied());
+            entry.sig_entries.extend(entries);
         }
-        self.cache.with_turn_mut(timeline, index, |entry| { entry.sig_entries.extend(entries); });
     }
 
     pub fn sig_entries_of(
@@ -638,7 +622,6 @@ impl Substrate {
         if let Some(e) = self.sections.get_mut(&section) {
             e.block_range = (block_start, block_end);
         }
-        self.cache.with_section_mut(section, |e| { e.block_range = (block_start, block_end); });
     }
 
     pub fn section_sealed_of(&self, section: SectionId) -> Option<Arc<Vec<SealedSequence>>> {
@@ -662,7 +645,6 @@ impl Substrate {
         if let Some(e) = self.sections.get_mut(&section) {
             e.scores = scores;
         }
-        self.cache.with_section_mut(section, |e| { e.scores = scores; });
     }
 
     pub fn section_sig_entries(&self, section: SectionId) -> &[crate::provenance::SigEntry] {
