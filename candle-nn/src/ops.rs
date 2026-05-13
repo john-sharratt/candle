@@ -89,44 +89,77 @@ impl candle::CustomOp1 for Sigmoid {
         layout: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle::backend::BackendStorage;
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
-        };
-        use candle::cuda_backend::SlicePtrOrNull;
-        use candle::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
-        use candle::{CudaDevice, WithDType};
-
-        struct S;
-        impl Map1 for S {
-            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
-                &self,
-                src: &CudaSlice<T>,
-                dev: &CudaDevice,
-                layout: &Layout,
-            ) -> Result<CudaSlice<T>> {
-                let shape = layout.shape();
-                let dims = shape.dims();
-                let el_count = shape.elem_count();
-                let cfg = LaunchConfig::for_num_elems(el_count as u32);
-                let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
-                let src = &src.slice(layout.start_offset()..);
-                let func = dev.get_or_load_func(&kernel_name::<T>("usigmoid"), &kernels::UNARY)?;
-                // SAFETY: Set later by running the kernel.
-                let out = unsafe { dev.alloc::<T>(el_count)? };
-
-                let mut builder = func.builder();
-                candle::builder_arg!(builder, el_count, dims.len());
-                ds.builder_arg(&mut builder);
-                builder.arg(src);
-                builder.arg(&out);
-                // SAFETY: ffi.
-                unsafe { builder.launch(cfg) }.w()?;
-                Ok(out)
-            }
-        }
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
         let dev = storage.device();
-        let slice = S.map(&storage.slice, dev, layout)?;
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let el_count = shape.elem_count();
+        let start_offset = layout.start_offset();
+        let stream = dev.cuda_stream();
+
+        // Get dtype for FFI dispatcher
+        let dtype = match &storage.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::unary::UnaryDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::unary::UnaryDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::unary::UnaryDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::unary::UnaryDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::unary::UnaryDType::F8E4M3 as i32,
+            _ => candle::bail!("sigmoid not supported for dtype {:?}", storage.dtype()),
+        };
+
+        // Prepare dims/strides info for non-contiguous tensors
+        let info: Option<candle::cuda_backend::cudarc::driver::CudaSlice<usize>> =
+            if layout.is_contiguous() {
+                None
+            } else {
+                Some(dev.memcpy_stod(&[dims, layout.stride()].concat())?)
+            };
+        let info_ptr = match &info {
+            Some(s) => {
+                let (ptr, _guard) = s.device_ptr(&stream);
+                ptr as *const usize
+            }
+            None => std::ptr::null(),
+        };
+
+        // Macro to handle each dtype case with proper scoping for guards
+        macro_rules! sigmoid_impl {
+            ($src_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(start_offset..);
+                let out = unsafe { dev.alloc::<$rust_type>(el_count)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (out_ptr, _out_guard) = out.device_ptr(&stream);
+                    let _info_guard = info.as_ref().map(|s| s.device_ptr(&stream));
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_unary_op(sigmoid)", file!(), line!());
+                    unsafe {
+                        kernels::simple::unary::run_unary_op(
+                            kernels::simple::unary::UnaryOp::Sigmoid as i32,
+                            dtype,
+                            el_count,
+                            dims.len(),
+                            info_ptr,
+                            src_ptr as *const std::ffi::c_void,
+                            out_ptr as *mut std::ffi::c_void,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(out)
+            }};
+        }
+
+        let slice = match &storage.slice {
+            CudaStorageSlice::F32(s) => sigmoid_impl!(s, F32, f32),
+            CudaStorageSlice::F64(s) => sigmoid_impl!(s, F64, f64),
+            CudaStorageSlice::F16(s) => sigmoid_impl!(s, F16, half::f16),
+            CudaStorageSlice::BF16(s) => sigmoid_impl!(s, BF16, half::bf16),
+            CudaStorageSlice::F8E4M3(s) => sigmoid_impl!(s, F8E4M3, float8::F8E4M3),
+            _ => candle::bail!("sigmoid not supported for dtype {:?}", storage.dtype()),
+        };
+
         let dst = candle::CudaStorage {
             slice,
             device: dev.clone(),
@@ -356,50 +389,65 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         storage: &candle::CudaStorage,
         layout: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
+
+        let dev = storage.device();
+        let stream = dev.cuda_stream();
+
+        let (o1, o2) = match layout.contiguous_offsets() {
+            None => candle::bail!("input has to be contiguous"),
+            Some(offsets) => offsets,
         };
-        use candle::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
-        use candle::{CudaDevice, WithDType};
+        let el = layout.shape().elem_count();
+        let dims = layout.shape().dims();
+        let dim_m1 = dims[dims.len() - 1];
+        let n_cols = dim_m1 as i32;
+        let n_rows = (el / dim_m1) as i32;
 
-        struct S;
-        impl Map1 for S {
-            fn f<T: DeviceRepr + WithDType>(
-                &self,
-                src: &CudaSlice<T>,
-                dev: &CudaDevice,
-                layout: &Layout,
-            ) -> Result<CudaSlice<T>> {
-                let src = match layout.contiguous_offsets() {
-                    None => candle::bail!("input has to be contiguous"),
-                    Some((o1, o2)) => src.slice(o1..o2),
-                };
-                let el = layout.shape().elem_count();
-                let dims = layout.shape().dims();
-                let dim_m1 = dims[dims.len() - 1];
-                let (n_rows, n_cols) = (el / dim_m1, dim_m1);
+        // Get dtype for FFI dispatcher
+        let dtype = match &storage.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::reduce::FloatDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::reduce::FloatDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::reduce::FloatDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::reduce::FloatDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::reduce::FloatDType::F8E4M3 as i32,
+            _ => candle::bail!("softmax not supported for dtype {:?}", storage.dtype()),
+        };
 
-                let cfg = LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (1, 32, 1),
-                    shared_mem_bytes: 0,
-                };
-                let func = dev.get_or_load_func(&kernel_name::<T>("softmax"), &kernels::REDUCE)?;
-                // SAFETY: Set later by running the kernel.
-                let dst = unsafe { dev.alloc::<T>(el)? };
-                let mut builder = func.builder();
-                builder.arg(&src);
-                builder.arg(&dst);
-                candle::builder_arg!(builder, n_cols as i32);
-                // SAFETY: ffi.
-                unsafe { builder.launch(cfg) }.w()?;
-                Ok(dst)
-            }
+        macro_rules! softmax_impl {
+            ($src_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(o1..o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_softmax_op", file!(), line!());
+                    unsafe {
+                        kernels::simple::reduce::run_softmax_op(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            n_rows,
+                            n_cols,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
         }
 
-        use candle::backend::BackendStorage;
-        let dev = storage.device();
-        let slice = S.map(&storage.slice, dev, layout)?;
+        let slice = match &storage.slice {
+            CudaStorageSlice::F32(src) => softmax_impl!(src, F32, f32),
+            CudaStorageSlice::F64(src) => softmax_impl!(src, F64, f64),
+            CudaStorageSlice::F16(src) => softmax_impl!(src, F16, half::f16),
+            CudaStorageSlice::BF16(src) => softmax_impl!(src, BF16, half::bf16),
+            CudaStorageSlice::F8E4M3(src) => softmax_impl!(src, F8E4M3, float8::F8E4M3),
+            _ => candle::bail!("softmax not supported for dtype {:?}", storage.dtype()),
+        };
+
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
@@ -535,60 +583,81 @@ impl candle::CustomOp2 for RmsNorm {
         s2: &candle::CudaStorage,
         l2: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
-        };
-        use candle::cuda_backend::{kernel_name, kernels, Map2, WrapErr};
-        use candle::{CudaDevice, WithDType};
-
-        struct S {
-            eps: f32,
-        }
-        impl Map2 for S {
-            fn f<T: DeviceRepr + WithDType>(
-                &self,
-                src: &CudaSlice<T>,
-                layout: &Layout,
-                alpha: &CudaSlice<T>,
-                alpha_layout: &Layout,
-                dev: &CudaDevice,
-            ) -> Result<CudaSlice<T>> {
-                let src = match layout.contiguous_offsets() {
-                    None => candle::bail!("input has to be contiguous"),
-                    Some((o1, o2)) => src.slice(o1..o2),
-                };
-                let alpha = match alpha_layout.contiguous_offsets() {
-                    None => candle::bail!("alpha has to be contiguous"),
-                    Some((o1, o2)) => alpha.slice(o1..o2),
-                };
-                let el = layout.shape().elem_count();
-                let dims = layout.shape().dims();
-                let dim_m1 = dims[dims.len() - 1];
-                let (n_rows, n_cols) = (el / dim_m1, dim_m1);
-
-                let block_size = if n_cols < 1024 { 32 } else { 1024 };
-                let cfg = LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let func = dev.get_or_load_func(&kernel_name::<T>("rmsnorm"), &kernels::REDUCE)?;
-                // SAFETY: Set later by running the kernel.
-                let dst = unsafe { dev.alloc::<T>(el)? };
-                let mut builder = func.builder();
-                builder.arg(&src);
-                builder.arg(&dst);
-                builder.arg(&alpha);
-                candle::builder_arg!(builder, n_cols as i32, block_size as i32, self.eps);
-                // SAFETY: ffi.
-                unsafe { builder.launch(cfg) }.w()?;
-                Ok(dst)
-            }
-        }
-
         use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
+
         let dev = s1.device();
-        let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, dev)?;
+        let stream = dev.cuda_stream();
+
+        let (src_o1, src_o2) = match l1.contiguous_offsets() {
+            None => candle::bail!("input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (alpha_o1, alpha_o2) = match l2.contiguous_offsets() {
+            None => candle::bail!("alpha has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+
+        let el = l1.shape().elem_count();
+        let dims = l1.shape().dims();
+        let dim_m1 = dims[dims.len() - 1];
+        let n_cols = dim_m1 as i32;
+        let n_rows = (el / dim_m1) as i32;
+
+        // Get dtype for FFI dispatcher
+        let dtype = match &s1.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::reduce::FloatDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::reduce::FloatDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::reduce::FloatDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::reduce::FloatDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::reduce::FloatDType::F8E4M3 as i32,
+            _ => candle::bail!("rmsnorm not supported for dtype {:?}", s1.dtype()),
+        };
+
+        macro_rules! rmsnorm_impl {
+            ($src_slice:expr, $alpha_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(src_o1..src_o2);
+                let alpha = $alpha_slice.slice(alpha_o1..alpha_o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                    let (alpha_ptr, _alpha_guard) = alpha.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_rmsnorm_op", file!(), line!());
+                    unsafe {
+                        kernels::simple::reduce::run_rmsnorm_op(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            alpha_ptr as *const std::ffi::c_void,
+                            n_rows,
+                            n_cols,
+                            self.eps,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
+        }
+
+        let slice = match (&s1.slice, &s2.slice) {
+            (CudaStorageSlice::F32(src), CudaStorageSlice::F32(alpha)) => {
+                rmsnorm_impl!(src, alpha, F32, f32)
+            }
+            (CudaStorageSlice::F16(src), CudaStorageSlice::F16(alpha)) => {
+                rmsnorm_impl!(src, alpha, F16, half::f16)
+            }
+            (CudaStorageSlice::BF16(src), CudaStorageSlice::BF16(alpha)) => {
+                rmsnorm_impl!(src, alpha, BF16, half::bf16)
+            }
+            (CudaStorageSlice::F8E4M3(src), CudaStorageSlice::F8E4M3(alpha)) => {
+                rmsnorm_impl!(src, alpha, F8E4M3, float8::F8E4M3)
+            }
+            _ => candle::bail!("rmsnorm: dtype mismatch between input and alpha"),
+        };
+
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),
@@ -666,6 +735,176 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
         )
     }
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
+}
+
+// =============================================================================
+// Fused SiLU-Mul: out = silu(gate) * up
+// =============================================================================
+// Eliminates 1 kernel launch + 1 intermediate allocation per call.
+// This is the core SwiGLU activation used in MoE expert FFNs.
+
+#[derive(Debug, Clone)]
+struct SiluMul;
+
+impl candle::CustomOp2 for SiluMul {
+    fn name(&self) -> &'static str {
+        "fused-silu-mul"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        fn inner<T: candle::WithDType + num_traits::Float>(
+            gate: &[T],
+            gate_layout: &Layout,
+            up: &[T],
+            up_layout: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let gate = match gate_layout.contiguous_offsets() {
+                None => candle::bail!("fused-silu-mul: gate must be contiguous"),
+                Some((o1, o2)) => &gate[o1..o2],
+            };
+            let up = match up_layout.contiguous_offsets() {
+                None => candle::bail!("fused-silu-mul: up must be contiguous"),
+                Some((o1, o2)) => &up[o1..o2],
+            };
+            let one = T::from(1.0f64).unwrap();
+            let dst: Vec<T> = gate
+                .par_iter()
+                .zip(up.par_iter())
+                .map(|(&g, &u)| {
+                    // silu(g) * u = g / (1 + exp(-g)) * u
+                    let silu_g = g / (one + (-g).exp());
+                    silu_g * u
+                })
+                .collect();
+            let storage = candle::WithDType::to_cpu_storage_owned(dst);
+            Ok((storage, gate_layout.shape().clone()))
+        }
+
+        use CpuStorage as C;
+        match (s1, s2) {
+            (C::BF16(s1), C::BF16(s2)) => inner::<half::bf16>(s1, l1, s2, l2),
+            (C::F16(s1), C::F16(s2)) => inner::<half::f16>(s1, l1, s2, l2),
+            (C::F32(s1), C::F32(s2)) => inner::<f32>(s1, l1, s2, l2),
+            (C::F64(s1), C::F64(s2)) => inner::<f64>(s1, l1, s2, l2),
+            _ => candle::bail!("fused-silu-mul: unsupported dtype combination"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout,
+        s2: &candle::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
+
+        let dev = s1.device();
+        let stream = dev.cuda_stream();
+
+        let el = l1.shape().elem_count();
+        if el != l2.shape().elem_count() {
+            candle::bail!(
+                "fused-silu-mul: shape mismatch {:?} vs {:?}",
+                l1.shape(),
+                l2.shape()
+            );
+        }
+
+        // Both inputs must be contiguous (they're fresh GEMM outputs).
+        let (gate_o1, gate_o2) = match l1.contiguous_offsets() {
+            None => candle::bail!("fused-silu-mul: gate must be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (up_o1, up_o2) = match l2.contiguous_offsets() {
+            None => candle::bail!("fused-silu-mul: up must be contiguous"),
+            Some(offsets) => offsets,
+        };
+
+        let dtype = match &s1.slice {
+            CudaStorageSlice::F32(_) => {
+                kernels::simple::fused_silu_mul::FusedSiluMulDType::F32 as i32
+            }
+            CudaStorageSlice::F16(_) => {
+                kernels::simple::fused_silu_mul::FusedSiluMulDType::F16 as i32
+            }
+            CudaStorageSlice::BF16(_) => {
+                kernels::simple::fused_silu_mul::FusedSiluMulDType::BF16 as i32
+            }
+            CudaStorageSlice::F8E4M3(_) => {
+                kernels::simple::fused_silu_mul::FusedSiluMulDType::F8E4M3 as i32
+            }
+            _ => candle::bail!("fused-silu-mul: unsupported dtype {:?}", s1.dtype()),
+        };
+
+        macro_rules! silu_mul_impl {
+            ($gate_slice:expr, $up_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let gate = $gate_slice.slice(gate_o1..gate_o2);
+                let up = $up_slice.slice(up_o1..up_o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (gate_ptr, _g_guard) = gate.device_ptr(&stream);
+                    let (up_ptr, _u_guard) = up.device_ptr(&stream);
+                    let (dst_ptr, _d_guard) = dst.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_fused_silu_mul", file!(), line!());
+                    unsafe {
+                        kernels::simple::fused_silu_mul::run_fused_silu_mul(
+                            dtype,
+                            el,
+                            0,                // num_dims = 0 → contiguous
+                            std::ptr::null(), // dims_and_strides = null → contiguous
+                            gate_ptr as *const std::ffi::c_void,
+                            up_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
+        }
+
+        let slice = match (&s1.slice, &s2.slice) {
+            (CudaStorageSlice::F32(gate), CudaStorageSlice::F32(up)) => {
+                silu_mul_impl!(gate, up, F32, f32)
+            }
+            (CudaStorageSlice::F16(gate), CudaStorageSlice::F16(up)) => {
+                silu_mul_impl!(gate, up, F16, half::f16)
+            }
+            (CudaStorageSlice::BF16(gate), CudaStorageSlice::BF16(up)) => {
+                silu_mul_impl!(gate, up, BF16, half::bf16)
+            }
+            (CudaStorageSlice::F8E4M3(gate), CudaStorageSlice::F8E4M3(up)) => {
+                silu_mul_impl!(gate, up, F8E4M3, float8::F8E4M3)
+            }
+            _ => candle::bail!("fused-silu-mul: dtype mismatch between gate and up"),
+        };
+
+        let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+}
+
+/// Fused SiLU-Mul activation: `silu(gate) * up`.
+///
+/// This is the SwiGLU activation pattern used in MoE expert FFNs.
+/// On CUDA, this runs as a single fused kernel instead of separate
+/// `silu()` + `mul()` calls, saving 1 kernel launch and 1 intermediate
+/// tensor allocation per invocation.
+pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    gate.apply_op2_no_bwd(up, &SiluMul)
 }
 
 #[derive(Debug, Clone)]
@@ -767,68 +1006,96 @@ impl candle::CustomOp3 for LayerNorm {
         s3: &candle::CudaStorage,
         l3: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
-        };
-        use candle::cuda_backend::{kernel_name, kernels, Map3, WrapErr};
-        use candle::{CudaDevice, WithDType};
-
-        struct S {
-            eps: f32,
-        }
-        impl Map3 for S {
-            fn f<T: DeviceRepr + WithDType>(
-                &self,
-                src: &CudaSlice<T>,
-                layout: &Layout,
-                alpha: &CudaSlice<T>,
-                alpha_layout: &Layout,
-                beta: &CudaSlice<T>,
-                beta_layout: &Layout,
-                dev: &CudaDevice,
-            ) -> Result<CudaSlice<T>> {
-                let src = match layout.contiguous_offsets() {
-                    None => candle::bail!("input has to be contiguous"),
-                    Some((o1, o2)) => src.slice(o1..o2),
-                };
-                let alpha = match alpha_layout.contiguous_offsets() {
-                    None => candle::bail!("alpha has to be contiguous"),
-                    Some((o1, o2)) => alpha.slice(o1..o2),
-                };
-                let beta = match beta_layout.contiguous_offsets() {
-                    None => candle::bail!("beta has to be contiguous"),
-                    Some((o1, o2)) => beta.slice(o1..o2),
-                };
-                let el = layout.shape().elem_count();
-                let dims = layout.shape().dims();
-                let dim_m1 = dims[dims.len() - 1];
-                let (n_rows, n_cols) = (el / dim_m1, dim_m1);
-
-                let block_size = if n_cols < 1024 { 32 } else { 1024 };
-                let cfg = LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let func =
-                    dev.get_or_load_func(&kernel_name::<T>("layernorm"), &kernels::REDUCE)?;
-                // SAFETY: Set later by running the kernel.
-                let dst = unsafe { dev.alloc::<T>(el)? };
-                let mut builder = func.builder();
-                builder.arg(&src);
-                builder.arg(&dst);
-                builder.arg(&alpha);
-                builder.arg(&beta);
-                candle::builder_arg!(builder, n_cols as i32, block_size as i32, self.eps);
-                // SAFETY: ffi.
-                unsafe { builder.launch(cfg) }.w()?;
-                Ok(dst)
-            }
-        }
-
         use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
+
         let dev = s1.device();
-        let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, &s3.slice, l3, dev)?;
+        let stream = dev.cuda_stream();
+
+        let (src_o1, src_o2) = match l1.contiguous_offsets() {
+            None => candle::bail!("input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (alpha_o1, alpha_o2) = match l2.contiguous_offsets() {
+            None => candle::bail!("alpha has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (beta_o1, beta_o2) = match l3.contiguous_offsets() {
+            None => candle::bail!("beta has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+
+        let el = l1.shape().elem_count();
+        let dims = l1.shape().dims();
+        let dim_m1 = dims[dims.len() - 1];
+        let n_cols = dim_m1 as i32;
+        let n_rows = (el / dim_m1) as i32;
+
+        // Get dtype for FFI dispatcher
+        let dtype = match &s1.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::reduce::FloatDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::reduce::FloatDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::reduce::FloatDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::reduce::FloatDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::reduce::FloatDType::F8E4M3 as i32,
+            _ => candle::bail!("layernorm not supported for dtype {:?}", s1.dtype()),
+        };
+
+        macro_rules! layernorm_impl {
+            ($src_slice:expr, $alpha_slice:expr, $beta_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(src_o1..src_o2);
+                let alpha = $alpha_slice.slice(alpha_o1..alpha_o2);
+                let beta = $beta_slice.slice(beta_o1..beta_o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                    let (alpha_ptr, _alpha_guard) = alpha.device_ptr(&stream);
+                    let (beta_ptr, _beta_guard) = beta.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_layernorm_op", file!(), line!());
+                    unsafe {
+                        kernels::simple::reduce::run_layernorm_op(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            alpha_ptr as *const std::ffi::c_void,
+                            beta_ptr as *const std::ffi::c_void,
+                            n_rows,
+                            n_cols,
+                            self.eps,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
+        }
+
+        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+            (
+                CudaStorageSlice::F32(src),
+                CudaStorageSlice::F32(alpha),
+                CudaStorageSlice::F32(beta),
+            ) => layernorm_impl!(src, alpha, beta, F32, f32),
+            (
+                CudaStorageSlice::F16(src),
+                CudaStorageSlice::F16(alpha),
+                CudaStorageSlice::F16(beta),
+            ) => layernorm_impl!(src, alpha, beta, F16, half::f16),
+            (
+                CudaStorageSlice::BF16(src),
+                CudaStorageSlice::BF16(alpha),
+                CudaStorageSlice::BF16(beta),
+            ) => layernorm_impl!(src, alpha, beta, BF16, half::bf16),
+            (
+                CudaStorageSlice::F8E4M3(src),
+                CudaStorageSlice::F8E4M3(alpha),
+                CudaStorageSlice::F8E4M3(beta),
+            ) => layernorm_impl!(src, alpha, beta, F8E4M3, float8::F8E4M3),
+            _ => candle::bail!("layernorm: dtype mismatch between input, alpha, and beta"),
+        };
+
         let dst = candle::cuda_backend::CudaStorage {
             slice,
             device: dev.clone(),

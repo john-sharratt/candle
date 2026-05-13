@@ -1079,18 +1079,18 @@ impl PyTensor {
     fn quantize(&self, quantized_dtype: &str) -> PyResult<PyQTensor> {
         use ::candle::quantized;
         let res = match quantized_dtype.to_lowercase().as_str() {
-            "q2k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q2K),
-            "q3k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q3K),
+            "q2k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q2_K),
+            "q3k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q3_K),
             "q4_0" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q4_0),
             "q4_1" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q4_1),
-            "q4k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q4K),
+            "q4k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q4_K),
             "q5_0" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q5_0),
             "q5_1" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q5_1),
-            "q5k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q5K),
-            "q6k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q6K),
+            "q5k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q5_K),
+            "q6k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q6_K),
             "q8_0" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q8_0),
             "q8_1" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q8_1),
-            "q8k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q8K),
+            "q8k" => quantized::QTensor::quantize(self, quantized::GgmlDType::Q8_K),
             "f16" => quantized::QTensor::quantize(self, quantized::GgmlDType::F16),
             "f32" => quantized::QTensor::quantize(self, quantized::GgmlDType::F32),
             dt => {

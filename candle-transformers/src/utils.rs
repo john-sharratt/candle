@@ -33,6 +33,20 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         // Using cat is faster than a broadcast as it avoids going through a potentially
         // strided copy.
         // https://github.com/huggingface/candle/pull/2043
-        Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+        // Optimize common cases to avoid vec allocation overhead
+        let repeated = match n_rep {
+            2 => Tensor::cat(&[&xs, &xs], 2)?,
+            4 => {
+                let doubled = Tensor::cat(&[&xs, &xs], 2)?;
+                Tensor::cat(&[&doubled, &doubled], 2)?
+            }
+            8 => {
+                let doubled = Tensor::cat(&[&xs, &xs], 2)?;
+                let quad = Tensor::cat(&[&doubled, &doubled], 2)?;
+                Tensor::cat(&[&quad, &quad], 2)?
+            }
+            _ => Tensor::cat(&vec![&xs; n_rep], 2)?,
+        };
+        repeated.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
     }
 }

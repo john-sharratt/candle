@@ -1,0 +1,362 @@
+//! Key-Value cache implementations for transformer attention.
+//!
+//! This module provides several types of KV cache:
+//!
+//! - **Contiguous caches** (`Cache`, `KvCache`): Traditional dense storage that grows as needed
+//! - **Chunked (paged) caches** (`ChunkedKvBacking`): Block-based storage with:
+//!   - Arc-based prefix sharing (copy-on-write)
+//!   - Per-sequence slot allocation
+//!   - Efficient memory reuse via free lists
+//! - **Rotating caches** (`RotatingCache`, `RotatingKvCache`): Fixed-size sliding window caches
+//! - **Scattered caches** (`ScatteredKvCache`): Sparse caches with batch masking
+//!
+//! # Example
+//!
+//! ```ignore
+//! use candle_nn::kv_cache::{KvCache, ChunkedKvBacking};
+//!
+//! // Create a contiguous cache
+//! let mut cache = KvCache::new(2, 1024);
+//!
+//! // Or create a chunked (paged) cache for prefix sharing
+//! let backing = ChunkedKvBacking::new(
+//!     batch_size, n_kv_head, head_dim,
+//!     chunk_size, arena_chunks,
+//!     dtype, &device, max_seq_len
+//! )?;
+//! cache.set_chunked_backing(&backing, batch_idx, None)?;
+//! ```
+
+use candle::quantized::{GgmlDType, QTensor};
+use candle::{DType, Tensor};
+
+mod arena_table;
+mod cache;
+mod chunked;
+mod rotating;
+
+pub use arena_table::{
+    ArenaEntry, ArenaFormatTag, ArenaLocation, PaletteSubEntry, PerHeadEntry, PerHeadTable,
+    ResolvedArenaInfo, N_PALETTE,
+};
+pub use cache::{Cache, CacheIntegrityResult, KvCache};
+pub use chunked::sampled_selection::SampleFormat;
+pub(crate) use chunked::Arena; // Internal use only
+#[cfg(feature = "cuda")]
+pub use chunked::BackgroundQuantizer;
+pub use chunked::StoragePolicy;
+pub use chunked::{
+    arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, CHUNK_SIZE,
+};
+pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
+pub use chunked::{
+    production_adaptive_candidates, ChunkGid, ChunkGidPool, ChunkMeta, ChunkedKvBacking,
+    CompressionPolicy, HeadGids, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
+    PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
+    PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
+    QWEN3_MOE_KV_FACTORS,
+};
+pub use rotating::{
+    IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
+};
+
+// ==================== Paged KV Arenas Trait ====================
+
+/// Trait for accessing paged KV arenas.
+///
+/// This abstraction allows attention kernels to work with any paged KV storage
+/// implementation, and enables testing with mock implementations.
+pub trait PagedKvArenas {
+    /// Number of KV heads.
+    fn n_kv_head(&self) -> usize;
+
+    /// Dimension of each head.
+    fn head_dim(&self) -> usize;
+
+    /// Storage format for K cache.
+    fn k_format(&self) -> KvFormat;
+
+    /// Storage format for V cache.
+    fn v_format(&self) -> KvFormat;
+
+    /// Get float arenas (K, V). Returns None if using quantized storage.
+    fn float_arenas(&self) -> Option<(Vec<Tensor>, Vec<Tensor>)>;
+
+    /// Get quantized arenas (K, V). Returns None if using float storage.
+    fn quantized_arenas(&self) -> Option<(Vec<QTensor>, Vec<QTensor>)>;
+
+    /// Returns true if using quantized storage.
+    fn is_quantized(&self) -> bool {
+        self.k_format().is_quantized() || self.v_format().is_quantized()
+    }
+}
+
+// ==================== Quantization Format Types ====================
+
+/// Quantized storage format for KV cache.
+///
+/// This type represents the quantization scheme without exposing internal
+/// implementation details (GGML types).
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, strum_macros::EnumIter)]
+pub enum QuantFormat {
+    /// 4-bit quantization with FP16 scale per 32 elements.
+    /// 18 bytes per 32 elements (0.5625 bytes/element).
+    Q4_0,
+    /// 4-bit quantization with FP16 scale and min per 32 elements.
+    /// 20 bytes per 32 elements (0.625 bytes/element).
+    Q4_1,
+    /// 5-bit quantization with FP16 scale per 32 elements.
+    /// 22 bytes per 32 elements (2 byte scale + 4 byte qh + 16 byte ql).
+    Q5_0,
+    /// 5-bit quantization with FP16 scale and min per 32 elements.
+    /// 24 bytes per 32 elements (2 byte scale + 2 byte min + 4 byte qh + 16 byte ql).
+    Q5_1,
+    /// 8-bit quantization with FP16 scale per 32 elements.
+    /// 34 bytes per 32 elements (1.0625 bytes/element).
+    Q8_0,
+    /// 8-bit quantization with FP16 scale and sum per 32 elements.
+    /// 36 bytes per 32 elements (1.125 bytes/element).
+    Q8_1,
+    /// Q4 with attention-sink sub-block scaling, 20 bytes per 32 elements.
+    Q4_KS,
+    /// Q8 with attention-sink sub-block scaling, 36 bytes per 32 elements.
+    Q8_KS,
+    /// 2-bit symmetric quantization, 10 bytes per 32 elements.
+    Q2_0,
+    /// 3-bit symmetric quantization, 14 bytes per 32 elements.
+    Q3_0,
+    /// R16: Raw F16 with reserved Q-capture space, 128 bytes per 32 elements.
+    R16,
+    /// Q0: Zero block (1 byte per 32 elements).
+    Q0,
+    /// Q1_S: 1-bit sign + INT8 scale (5 bytes per 32 elements).
+    Q1_S,
+    /// Q2_S: 2-bit symmetric + INT8 scale (9 bytes per 32 elements).
+    Q2_S,
+    /// Q2_A: 2-bit asymmetric + INT8 scale + INT8 bias (10 bytes per 32 elements).
+    Q2_A,
+    /// Q2_1: 2-bit asymmetric + F16 scale + F16 min (12 bytes per 32 elements).
+    Q2_1,
+    /// Q3_1: 3-bit asymmetric + F16 scale + F16 min (16 bytes per 32 elements).
+    Q3_1,
+    /// Q0_V: Per-Block Parametric-Curve Quantization (2 bytes per 32 elements,
+    Q0_V,
+    /// Q1_A: 1-bit asymmetric, separate amplitude per sign (6 bytes per 32 elements).
+    Q1_A,
+    /// Q0_X: INT8 bulk anchor + one outlier escape (2 bytes per 32 elements).
+    Q0_X,
+    /// Q0_M2: 2-centroid palette + 8-bit quartet mask (3 bytes per 32 elements).
+    Q0_M2,
+    /// Q0_M4: 4-centroid palette + 32-bit pair mask (8 bytes per 32 elements).
+    Q0_M4,
+}
+
+impl QuantFormat {
+    /// Block size for this format.
+    /// All quants use 32-element blocks.
+    pub const fn block_size(&self) -> usize {
+        32
+    }
+
+    /// Bytes per block of 32 elements. Sourced via `size_of::<BlockX>()` on
+    /// the canonical Rust block struct so this stays in sync if a struct
+    /// gains/loses a field — the Rust struct, in turn, is locked to its CUDA
+    /// counterpart by `static_assert(sizeof(block_x) == N)` in
+    /// `candle-kernels/src/blocks.cuh`.
+    pub const fn bytes_per_block(&self) -> usize {
+        use candle::quantized::k_quants::{
+            BlockQ0, BlockQ0M2, BlockQ0M4, BlockQ0V, BlockQ0X, BlockQ1A, BlockQ1S, BlockQ2A,
+            BlockQ2S, BlockQ2_0, BlockQ2_1, BlockQ3_0, BlockQ3_1, BlockQ4_0, BlockQ4_1, BlockQ4_KS,
+            BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ8_KS, BlockR16,
+        };
+        use std::mem::size_of;
+        match self {
+            // d:f16 (2) + qs[16]: 4-bit nibbles for 32 elems.
+            Self::Q4_0 => size_of::<BlockQ4_0>(),
+            // d:f16 (2) + m:f16 (2) + qs[16]: 4-bit nibbles + min offset.
+            Self::Q4_1 => size_of::<BlockQ4_1>(),
+            // d:f16 (2) + qh[4] high-bit + qs[16] low-4-bit: 5-bit per elem.
+            Self::Q5_0 => size_of::<BlockQ5_0>(),
+            // d:f16 (2) + m:f16 (2) + qh[4] + qs[16]: asymmetric 5-bit.
+            Self::Q5_1 => size_of::<BlockQ5_1>(),
+            // d:f16 (2) + qs[32] i8: full 8-bit per elem.
+            Self::Q8_0 => size_of::<BlockQ8_0>(),
+            // d:f16 (2) + s:f16 sum (2) + qs[32] i8: 8-bit + cached row sum.
+            Self::Q8_1 => size_of::<BlockQ8_1>(),
+            // d:f16 (2) + sa:u8 + sb:u8 sub-block scales + qs[16] 4-bit:
+            // attention-sink-aware K-side fine scaling on first 4 elems.
+            Self::Q4_KS => size_of::<BlockQ4_KS>(),
+            // d:f16 (2) + sa:u8 + sb:u8 sub-block scales + qs[32] i8:
+            // attention-sink-aware K-side fine scaling, 8-bit elems.
+            Self::Q8_KS => size_of::<BlockQ8_KS>(),
+            // d:f16 (2) + qs[8]: 2-bit symmetric, decode d * (q − 1.5).
+            Self::Q2_0 => size_of::<BlockQ2_0>(),
+            // d:f16 (2) + qh[4] high-bit + qs[8] low-2-bit: 3-bit symmetric.
+            Self::Q3_0 => size_of::<BlockQ3_0>(),
+            // d[32] f16 (64) + q[32] u16 reserved Q-capture space (64).
+            Self::R16 => size_of::<BlockR16>(),
+            // Single INT8 centroid byte — every lane in the block decodes to
+            // the same value: `centroid / 127 / outer_scale`. Per-block
+            // constant; the cheapest legitimate quant at 1 byte / 32 lanes
+            // (0.25 BPE), useful for near-flat blocks.
+            Self::Q0 => size_of::<BlockQ0>(),
+            // scale: 1 byte FP8(E4M3) + qs[4] sign bits (1 bit × 32 elems).
+            Self::Q1_S => size_of::<BlockQ1S>(),
+            // scale: 1 byte FP8(E4M3) + qs[8] 2-bit symmetric quants.
+            Self::Q2_S => size_of::<BlockQ2S>(),
+            // scale + bias: 2 bytes FP8(E4M3) + qs[8] 2-bit asymmetric.
+            Self::Q2_A => size_of::<BlockQ2A>(),
+            // dm: u32 packed (f16 scale | f16 min) + qs[8] 2-bit asymmetric.
+            Self::Q2_1 => size_of::<BlockQ2_1>(),
+            // dm: u32 packed (f16 scale | f16 min) + qh[4] + qs[8] 3-bit asym.
+            Self::Q3_1 => size_of::<BlockQ3_1>(),
+            // lo: u8 curve_idx (0..255) | hi: 5-bit scale_idx + 3-bit
+            // centroid_idx — parametric-curve quantization, 0.5 BPE.
+            Self::Q0_V => size_of::<BlockQ0V>(),
+            // scale_pos:i8 + scale_neg:i8 amplitudes + qs[4] sign bits.
+            Self::Q1_A => size_of::<BlockQ1A>(),
+            // bulk_anchor:i8 + outlier_packed:u8 (5-bit lane | 3-bit signed
+            // delta) — flat block + one outlier escape, 0.5 BPE.
+            Self::Q0_X => size_of::<BlockQ0X>(),
+            // val_fp8[2] + qmask:u8 — 2 FP8(E4M3) centroids + per-quartet
+            // mask choosing which centroid each lane uses.
+            Self::Q0_M2 => size_of::<BlockQ0M2>(),
+            // val_fp8[4] + qmask:u32 — 4 FP8(E4M3) centroids + 2-bit-per-pair
+            // selector mask choosing one centroid per pair of lanes.
+            Self::Q0_M4 => size_of::<BlockQ0M4>(),
+        }
+    }
+
+    /// Approximate bytes per element.
+    pub fn bytes_per_elem(&self) -> f32 {
+        self.bytes_per_block() as f32 / self.block_size() as f32
+    }
+
+    /// Approximate bits per element.
+    pub fn bits_per_elem(&self) -> f32 {
+        self.bytes_per_elem() * 8.0
+    }
+
+    /// Convert to internal GGML quantization type.
+    pub fn to_ggml_dtype(&self) -> GgmlDType {
+        match self {
+            Self::Q4_0 => GgmlDType::Q4_0,
+            Self::Q4_1 => GgmlDType::Q4_1,
+            Self::Q5_0 => GgmlDType::Q5_0,
+            Self::Q5_1 => GgmlDType::Q5_1,
+            Self::Q8_0 => GgmlDType::Q8_0,
+            Self::Q8_1 => GgmlDType::Q8_1,
+            Self::Q4_KS => GgmlDType::Q4_KS,
+            Self::Q8_KS => GgmlDType::Q8_KS,
+            Self::Q2_0 => GgmlDType::Q2_0,
+            Self::Q3_0 => GgmlDType::Q3_0,
+            Self::R16 => GgmlDType::R16,
+            Self::Q0 => GgmlDType::Q0,
+            Self::Q1_S => GgmlDType::Q1_S,
+            Self::Q2_S => GgmlDType::Q2_S,
+            Self::Q2_A => GgmlDType::Q2_A,
+            Self::Q2_1 => GgmlDType::Q2_1,
+            Self::Q3_1 => GgmlDType::Q3_1,
+            Self::Q0_V => GgmlDType::Q0_V,
+            Self::Q1_A => GgmlDType::Q1_A,
+            Self::Q0_X => GgmlDType::Q0_X,
+            Self::Q0_M2 => GgmlDType::Q0_M2,
+            Self::Q0_M4 => GgmlDType::Q0_M4,
+        }
+    }
+
+    /// Check if this quantization format is supported by the paged attention kernel.
+    ///
+    /// The kernel supports on-the-fly dequantization for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1.
+    /// K-quant formats (Q2K-Q6K) are NOT supported due to their complex block
+    /// structure.
+    pub const fn is_kernel_supported(&self) -> bool {
+        match self {
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::Q4_KS
+            | Self::Q8_KS
+            | Self::Q2_0
+            | Self::Q3_0
+            | Self::R16
+            | Self::Q0
+            | Self::Q1_S
+            | Self::Q2_S
+            | Self::Q2_A
+            | Self::Q2_1
+            | Self::Q3_1
+            | Self::Q0_V
+            | Self::Q1_A
+            | Self::Q0_X
+            | Self::Q0_M2
+            | Self::Q0_M4 => true,
+        }
+    }
+}
+
+/// Storage format for KV cache - either standard float or block-quantized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum KvFormat {
+    /// Standard floating-point storage (F32, F16, BF16, F8E4M3).
+    Float(DType),
+    /// Block-quantized storage (Q4_0, Q8_0).
+    Quantized(QuantFormat),
+}
+
+impl KvFormat {
+    /// Returns true if this format is quantized.
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized(_))
+    }
+
+    /// Returns the DType if this is a float format, None for quantized.
+    pub fn dtype(&self) -> Option<DType> {
+        match self {
+            Self::Float(dt) => Some(*dt),
+            Self::Quantized(_) => None,
+        }
+    }
+
+    /// Approximate bytes per element.
+    pub fn bytes_per_elem(&self) -> f32 {
+        match self {
+            Self::Float(dt) => dt.size_in_bytes() as f32,
+            Self::Quantized(qf) => qf.bytes_per_elem(),
+        }
+    }
+
+    /// Returns the QuantFormat if this is quantized, None for float.
+    pub fn as_quant(&self) -> Option<QuantFormat> {
+        match self {
+            Self::Quantized(qf) => Some(*qf),
+            Self::Float(_) => None,
+        }
+    }
+}
+
+impl Default for KvFormat {
+    fn default() -> Self {
+        Self::Float(DType::BF16)
+    }
+}
+
+impl From<DType> for KvFormat {
+    fn from(dt: DType) -> Self {
+        Self::Float(dt)
+    }
+}
+
+impl From<QuantFormat> for KvFormat {
+    fn from(qf: QuantFormat) -> Self {
+        Self::Quantized(qf)
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -383,7 +383,7 @@ impl ModelForCausalLM {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let base = Model::new(cfg, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
+            Linear::from_weights(base.embed_tokens.embeddings_native(), None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };

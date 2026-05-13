@@ -360,7 +360,7 @@ impl TextDecoder {
 
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
         let b_size = x.dim(0)?;
-        let w = self.token_embedding.embeddings().broadcast_left(b_size)?;
+        let w = self.token_embedding.embeddings()?.broadcast_left(b_size)?;
         let logits = {
             let _enter = self.span_final.enter();
             x.matmul(&w.t()?)?

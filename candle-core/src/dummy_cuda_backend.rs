@@ -57,6 +57,14 @@ impl crate::backend::BackendStorage for CudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    fn sub_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
+    fn div_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
         Err(Error::NotCompiledWithCudaSupport)
     }
@@ -74,6 +82,16 @@ impl crate::backend::BackendStorage for CudaStorage {
     }
 
     fn binary_impl<B: BinaryOpT>(&self, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
+    fn binary_inplace_impl(
+        &mut self,
+        _op: crate::op::BinaryInplaceOp,
+        _rhs: &Self,
+        _lhs_l: &Layout,
+        _rhs_l: &Layout,
+    ) -> Result<()> {
         Err(Error::NotCompiledWithCudaSupport)
     }
 

@@ -558,7 +558,7 @@ impl VisionEmbeddings {
             cfg.hidden_size(),
             vb.pp("position_embedding"),
         )?;
-        let position_embedding = embedder.embeddings();
+        let position_embedding = embedder.embeddings_native();
         let position_embedding = position_embedding
             .reshape((
                 1,

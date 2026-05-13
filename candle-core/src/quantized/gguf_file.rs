@@ -78,6 +78,50 @@ impl TensorInfo {
             device,
         )
     }
+
+    /// Read tensor data from memory-mapped file without intermediate allocation.
+    ///
+    /// This eliminates the Vec<u8> allocation and copy by reading directly from mmap.
+    /// Benefits:
+    /// - No RAM allocation for tensor data
+    /// - No file→RAM copy (only mmap→GPU copy)
+    /// - Lower peak memory usage
+    /// - OS page cache efficiency
+    pub fn read_from_mmap(
+        &self,
+        mmap: &[u8],
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+            )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let start = (tensor_data_offset + self.offset) as usize;
+        let end = start + size_in_bytes;
+
+        if end > mmap.len() {
+            crate::bail!(
+                "tensor data extends beyond file boundary: offset={}, size={}, file_len={}",
+                start,
+                size_in_bytes,
+                mmap.len()
+            );
+        }
+
+        // Read directly from mmap - no intermediate copy!
+        let raw_data = &mmap[start..end];
+        super::ggml_file::qtensor_from_ggml(
+            self.ggml_dtype,
+            raw_data,
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -436,7 +480,7 @@ impl Content {
 
             dimensions.reverse();
             let ggml_dtype = reader.read_u32::<LittleEndian>()?;
-            let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
+            let ggml_dtype = GgmlDType::from_gguf_file_code(ggml_dtype)?;
             let offset = reader.read_u64::<LittleEndian>()?;
             tensor_infos.insert(
                 tensor_name,
@@ -510,7 +554,7 @@ pub fn write<W: std::io::Seek + std::io::Write>(
         for &dim in dims.iter().rev() {
             w.write_u64::<LittleEndian>(dim as u64)?;
         }
-        w.write_u32::<LittleEndian>(tensor.dtype().to_u32())?;
+        w.write_u32::<LittleEndian>(tensor.dtype().to_gguf_file_code())?;
         w.write_u64::<LittleEndian>(offset as u64)?;
         offsets.push(offset);
         let size_in_bytes = tensor.storage_size_in_bytes();

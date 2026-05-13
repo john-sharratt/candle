@@ -164,20 +164,20 @@ impl PromptEncoder {
         let point_embedding = labels.lt(0f32)?.where_cond(
             &self
                 .not_a_point_embed
-                .embeddings()
+                .embeddings_native()
                 .broadcast_as(zeros.shape())?,
             &point_embedding,
         )?;
         let labels0 = labels.eq(0f32)?.where_cond(
             &self.point_embeddings[0]
-                .embeddings()
+                .embeddings_native()
                 .broadcast_as(zeros.shape())?,
             &zeros,
         )?;
         let point_embedding = (point_embedding + labels0)?;
         let labels1 = labels.eq(1f32)?.where_cond(
             &self.point_embeddings[1]
-                .embeddings()
+                .embeddings_native()
                 .broadcast_as(zeros.shape())?,
             &zeros,
         )?;
@@ -193,8 +193,8 @@ impl PromptEncoder {
             .forward_with_coords(&coords, self.input_image_size)?;
         let ce1 = corner_embedding.i((.., 0))?;
         let ce2 = corner_embedding.i((.., 1))?;
-        let ce1 = (ce1 + self.point_embeddings[2].embeddings())?;
-        let ce2 = (ce2 + self.point_embeddings[3].embeddings())?;
+        let ce1 = (ce1 + self.point_embeddings[2].embeddings_native())?;
+        let ce2 = (ce2 + self.point_embeddings[3].embeddings_native())?;
         Tensor::cat(&[&ce1, &ce2], 1)
     }
 
@@ -218,14 +218,14 @@ impl PromptEncoder {
             (Some(se_points), None) => se_points,
             (None, Some(se_boxes)) => se_boxes,
             (None, None) => {
-                let dev = self.no_mask_embed.embeddings().device();
-                Tensor::zeros((1, 0, self.embed_dim), DType::F32, dev)?
+                let emb = self.no_mask_embed.embeddings_native();
+                Tensor::zeros((1, 0, self.embed_dim), DType::F32, emb.device())?
             }
         };
 
         let dense_embeddings = match masks {
             None => {
-                let emb = self.no_mask_embed.embeddings();
+                let emb = self.no_mask_embed.embeddings_native();
                 emb.reshape((1, (), 1, 1))?.expand((
                     1,
                     emb.elem_count(),

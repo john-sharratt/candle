@@ -491,4 +491,42 @@ impl Device {
             Self::Metal(d) => d.synchronize(),
         }
     }
+
+    /// Returns (free, total) GPU memory in bytes.
+    ///
+    /// For CUDA devices, queries `cuMemGetInfo`. For CPU/Metal, returns `(0, 0)`.
+    pub fn mem_get_info(&self) -> Result<(usize, usize)> {
+        match self {
+            Self::Cpu => Ok((0, 0)),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(d) => d.mem_get_info(),
+            #[cfg(not(feature = "cuda"))]
+            Self::Cuda(_) => Ok((0, 0)),
+            Self::Metal(_) => Ok((0, 0)),
+        }
+    }
+
+    /// Returns the L2 cache size in bytes.
+    ///
+    /// For CUDA, queries the actual device L2 cache size.
+    /// For Metal, returns a conservative estimate (32MB for Apple Silicon).
+    /// For CPU, returns a reasonable default (8MB typical for modern CPUs).
+    pub fn l2_cache_size(&self) -> Result<usize> {
+        match self {
+            Self::Cpu => {
+                // Most modern CPUs have 8-64MB L3 cache which acts as shared cache
+                // Use 8MB as conservative default
+                Ok(8 * 1024 * 1024)
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(d) => d.l2_cache_size(),
+            #[cfg(not(feature = "cuda"))]
+            Self::Cuda(_) => Ok(64 * 1024 * 1024), // Unreachable, but provide default
+            Self::Metal(_) => {
+                // Apple Silicon has unified memory with ~32MB system-level cache
+                // M1/M2/M3 don't expose L2 directly, use conservative estimate
+                Ok(32 * 1024 * 1024)
+            }
+        }
+    }
 }

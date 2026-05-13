@@ -73,11 +73,11 @@ fn vec_dot_reference(a: &[f32], b: &[f32]) -> f32 {
 fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
     let err = match dtype {
         GgmlDType::F16 => 0.000010,
-        GgmlDType::Q2K => 0.004086,
-        GgmlDType::Q3K => 0.016148,
-        GgmlDType::Q4K => 0.002425,
-        GgmlDType::Q5K => 0.000740,
-        GgmlDType::Q6K => 0.000952,
+        GgmlDType::Q2_K => 0.004086,
+        GgmlDType::Q3_K => 0.016148,
+        GgmlDType::Q4_K => 0.002425,
+        GgmlDType::Q5_K => 0.000740,
+        GgmlDType::Q6_K => 0.000952,
         GgmlDType::Q4_0 => 0.001143,
         GgmlDType::Q4_1 => 0.007784,
         GgmlDType::Q5_0 => 0.001353,
@@ -85,7 +85,7 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         GgmlDType::Q8_0 => 0.000092,
 
         // Not from the ggml repo.
-        GgmlDType::Q8K => 0.00065,
+        GgmlDType::Q8_K => 0.00065,
         _ => candle::bail!("No GGML results for quantization type {dtype:?}",),
     };
     Ok(err)
@@ -158,36 +158,36 @@ fn quantized_matmul_q80() -> Result<()> {
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q2k() -> Result<()> {
-    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ2K>()?;
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ2_K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q3k() -> Result<()> {
-    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ3K>()?;
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ3_K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q4k() -> Result<()> {
-    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ4K>()?;
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ4_K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q5k() -> Result<()> {
-    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ5K>()?;
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ5_K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q6k() -> Result<()> {
-    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ6K>()?;
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ6_K>()?;
     Ok(())
 }
 
 #[wasm_bindgen_test]
 fn quantized_matmul_q8k() -> Result<()> {
-    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ8K>()?;
+    ggml_matmul_error_test::<candle::quantized::k_quants::BlockQ8_K>()?;
     Ok(())
 }

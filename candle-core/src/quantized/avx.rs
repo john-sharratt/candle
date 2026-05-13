@@ -1,5 +1,6 @@
 use super::k_quants::{
-    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0, QK8_0, QK_K,
+    BlockQ2_K, BlockQ3_K, BlockQ4_0, BlockQ4_K, BlockQ5_K, BlockQ6_K, BlockQ8_0, BlockQ8_K, QK8_0,
+    QK_K,
 };
 use byteorder::{ByteOrder, LittleEndian};
 use half::f16;
@@ -128,7 +129,7 @@ unsafe fn get_scale_shuffle_q3k(i: usize) -> __m256i {
 }
 
 #[inline(always)]
-pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
+pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q6k_8k: {n} is not divisible by {QK_K}"
@@ -221,7 +222,7 @@ unsafe fn mm256_set_m128i(a: __m128i, b: __m128i) -> __m256i {
 }
 
 #[inline(always)]
-pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
+pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q2k_q8k: {n} is not divisible by {QK_K}"
@@ -304,7 +305,7 @@ pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32
 }
 
 #[inline(always)]
-pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q3k_q8k: {n} is not divisible by {QK_K}"
@@ -440,7 +441,7 @@ pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32
 }
 
 #[inline(always)]
-pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q4k_q8k: {n} is not divisible by {QK_K}"
@@ -525,7 +526,7 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
 }
 
 #[inline(always)]
-pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q5k_q8k: {n} is not divisible by {QK_K}"
@@ -638,7 +639,7 @@ pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32
 }
 
 #[inline(always)]
-pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
+pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8_K], ys: &[BlockQ8_K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q8k_8k: {n} is not divisible by {QK_K}"

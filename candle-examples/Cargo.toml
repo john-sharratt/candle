@@ -161,3 +161,21 @@ required-features = ["symphonia"]
 [[example]]
 name = "bert_single_file_binary"
 required-features = ["bert-single-file-binary-builder"]
+
+[[example]]
+name = "llama-parallel-batching"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen2-parallel-batching"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen3-parallel-batching"
+required-features = ["cuda"]
+
+[[example]]
+name = "ruler-eval"
+
+[[example]]
+name = "perplexity-eval"

@@ -2,6 +2,14 @@
 use super::GgmlDType;
 use crate::{CudaDevice, CudaStorage, Error, Result};
 
+pub fn set_force_dmmv(_f: bool) {}
+
+/// Dummy implementation for non-CUDA builds
+pub fn get_dispatch_info(_batch_size: i32, _weight_bytes: usize) -> String {
+    "cpu".to_string()
+}
+
+#[derive(Clone)]
 pub struct QCudaStorage {
     dtype: GgmlDType,
     device: CudaDevice,
@@ -28,6 +36,10 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn dequantize_bf16(&self, _elem_count: usize) -> Result<CudaStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn quantize(&mut self, _src: &CudaStorage) -> Result<()> {
         Err(Error::NotCompiledWithCudaSupport)
     }
@@ -36,7 +48,24 @@ impl QCudaStorage {
         0
     }
 
+    pub fn data(&self) -> Result<Vec<u8>> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
+    pub fn data_range(&self, _range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn fwd(
+        &self,
+        _self_shape: &crate::Shape,
+        _storage: &CudaStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
+    pub fn fwd_into_dtype(
         &self,
         _self_shape: &crate::Shape,
         _storage: &CudaStorage,

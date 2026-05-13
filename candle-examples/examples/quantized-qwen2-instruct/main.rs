@@ -8,6 +8,7 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
 
+use candle::backend::BackendDevice;
 use candle::quantized::gguf_file;
 use candle::Tensor;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
@@ -27,8 +28,28 @@ enum Which {
     W2_7b,
     #[value(name = "72b")]
     W2_72b,
+    #[value(name = "7b-q4")]
+    W2_5_7bQ4,
+    #[value(name = "7b-q5")]
+    W2_5_7bQ5,
     #[value(name = "deepseekr1-qwen7b")]
     DeepseekR1Qwen7B,
+    #[value(name = "qwen25-14b-q6")]
+    Qwen25_14bQ6,
+    #[value(name = "qwen25-14b-q5")]
+    Qwen25_14bQ5,
+    #[value(name = "qwen30-8b-f16")]
+    Qwen30_8bF16,
+    #[value(name = "qwen30-8b-q5")]
+    Qwen30_8bQ5,
+    #[value(name = "qwen25-7b-f16")]
+    Qwen25_7bF16,
+    #[value(name = "qwen25-7b-q5")]
+    Qwen25_7bQ5,
+    #[value(name = "qwen25-1b-q3")]
+    Qwen25_1bQ3,
+    #[value(name = "qwen25-1b-q2")]
+    Qwen25_1bQ2,
 }
 
 #[derive(Parser, Debug)]
@@ -104,6 +125,13 @@ impl Args {
                     Which::W2_1_5b => "Qwen/Qwen2-1.5B-Instruct",
                     Which::W2_7b => "Qwen/Qwen2-7B-Instruct",
                     Which::W2_72b => "Qwen/Qwen2-72B-Instruct",
+                    Which::W2_5_7bQ4
+                    | Which::W2_5_7bQ5
+                    | Which::Qwen25_7bF16
+                    | Which::Qwen25_7bQ5 => "Qwen/Qwen2.5-7B-Instruct",
+                    Which::Qwen30_8bF16 | Which::Qwen30_8bQ5 => "Qwen/Qwen3-8B-Instruct",
+                    Which::Qwen25_14bQ6 | Which::Qwen25_14bQ5 => "Qwen/Qwen2.5-14B-Instruct",
+                    Which::Qwen25_1bQ3 | Which::Qwen25_1bQ2 => "Qwen/Qwen2.5-1.5B-Instruct",
                     Which::DeepseekR1Qwen7B => "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                 };
                 let api = api.model(repo.to_string());
@@ -136,6 +164,56 @@ impl Args {
                     Which::W2_72b => (
                         "Qwen/Qwen2-72B-Instruct-GGUF",
                         "qwen2-72b-instruct-q4_0.gguf",
+                        "main",
+                    ),
+                    Which::W2_5_7bQ4 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+                        "main",
+                    ),
+                    Which::W2_5_7bQ5 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_7bF16 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-f16.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_7bQ5 => (
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "Qwen2.5-7B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen30_8bF16 => (
+                        "bartowski/Qwen3-8B-Instruct-GGUF",
+                        "Qwen3-8B-Instruct-f16.gguf",
+                        "main",
+                    ),
+                    Which::Qwen30_8bQ5 => (
+                        "bartowski/Qwen3-8B-Instruct-GGUF",
+                        "Qwen3-8B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_14bQ6 => (
+                        "bartowski/Qwen2.5-14B-Instruct-GGUF",
+                        "Qwen2.5-14B-Instruct-Q6_K.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_14bQ5 => (
+                        "bartowski/Qwen2.5-14B-Instruct-GGUF",
+                        "Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_1bQ3 => (
+                        "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+                        "Qwen2.5-1.5B-Instruct-Q3_K_M.gguf",
+                        "main",
+                    ),
+                    Which::Qwen25_1bQ2 => (
+                        "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+                        "Qwen2.5-1.5B-Instruct-Q2_K.gguf",
                         "main",
                     ),
                     Which::DeepseekR1Qwen7B => (
@@ -199,7 +277,7 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
 
-    let mut model = {
+    let model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
         let mut total_size_in_bytes = 0;
         for (_, tensor) in model.tensor_infos.iter() {
@@ -216,6 +294,8 @@ fn main() -> anyhow::Result<()> {
         Qwen2::from_gguf(model, &mut file, &device)?
     };
     println!("model built");
+
+    let mut caches = model.create_kv_caches(2048);
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
@@ -253,17 +333,107 @@ fn main() -> anyhow::Result<()> {
     let start_prompt_processing = std::time::Instant::now();
     let mut next_token = if !args.split_prompt {
         let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, 0)?;
+        let logits = model.forward(&mut caches, &input, 0)?;
         let logits = logits.squeeze(0)?;
         logits_processor.sample(&logits)?
     } else {
+        // Mimic user's app: process prompt in batches of 100 tokens
+        eprintln!("\n=== BATCHED PROMPT PROCESSING (like user's app) ===");
+        let batch_size = 100;
         let mut next_token = 0;
-        for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
+        let mut offset = 0;
+        let token_chunks: Vec<_> = tokens.chunks(batch_size).collect();
+
+        for (batch_idx, chunk) in token_chunks.iter().enumerate() {
+            let batch_start = std::time::Instant::now();
+            let input = Tensor::new(*chunk, &device)?.unsqueeze(0)?;
+
+            let forward_start = std::time::Instant::now();
+            let logits = model.forward(&mut caches, &input, offset)?;
+            let forward_time = forward_start.elapsed();
+
+            // Synchronize to get accurate timing
+            if let candle::Device::Cuda(cuda_device) = &device {
+                cuda_device.synchronize()?;
+            }
+            let batch_time = batch_start.elapsed();
+
+            eprintln!(
+                "Batch {} (tokens {}→{}): total={:.3}s forward={:.3}s cache_len={}",
+                batch_idx,
+                offset,
+                offset + chunk.len(),
+                batch_time.as_secs_f64(),
+                forward_time.as_secs_f64(),
+                offset + chunk.len()
+            );
+
             let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
+            next_token = logits_processor.sample(&logits)?;
+            offset += chunk.len();
         }
+        eprintln!("=== BATCHED PROCESSING COMPLETE ===\n");
+
+        // Test partial truncation (keep first 300 tokens)
+        if offset > 300 {
+            eprintln!("=== TESTING PARTIAL TRUNCATE ({}→300 tokens) ===", offset);
+            let truncate_start = std::time::Instant::now();
+            caches.truncate(300)?;
+            eprintln!(
+                "Partial truncate completed in {:.3}ms",
+                truncate_start.elapsed().as_secs_f64() * 1000.0
+            );
+            eprintln!(
+                "Cache length after truncate: {}\n",
+                caches.current_seq_len()
+            );
+
+            // Continue processing from truncated position
+            eprintln!("=== CONTINUING AFTER PARTIAL TRUNCATE ===");
+            let continue_tokens = &tokens[300..offset.min(tokens.len())];
+            let continue_chunks: Vec<_> = continue_tokens.chunks(100).collect();
+
+            let mut new_offset = 300;
+            for (batch_idx, chunk) in continue_chunks.iter().enumerate() {
+                let batch_start = std::time::Instant::now();
+                let input = Tensor::new(*chunk, &device)?.unsqueeze(0)?;
+
+                let logits = model.forward(&mut caches, &input, new_offset)?;
+
+                if let candle::Device::Cuda(cuda_device) = &device {
+                    cuda_device.synchronize()?;
+                }
+                let batch_time = batch_start.elapsed();
+
+                eprintln!(
+                    "Batch {} (tokens {}→{}): {:.3}s cache_len={}",
+                    batch_idx,
+                    new_offset,
+                    new_offset + chunk.len(),
+                    batch_time.as_secs_f64(),
+                    new_offset + chunk.len()
+                );
+
+                let logits = logits.squeeze(0)?;
+                next_token = logits_processor.sample(&logits)?;
+                new_offset += chunk.len();
+            }
+            eprintln!("=== CONTINUE AFTER TRUNCATE COMPLETE ===\n");
+        }
+
+        // Test full truncation (clear all caches)
+        eprintln!("=== TESTING FULL TRUNCATE (clear all) ===");
+        let full_truncate_start = std::time::Instant::now();
+        caches.reset();
+        eprintln!(
+            "Full truncate completed in {:.3}ms",
+            full_truncate_start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "Cache length after full clear: {}\n",
+            caches.current_seq_len()
+        );
+
         next_token
     };
     let prompt_dt = start_prompt_processing.elapsed();
@@ -282,8 +452,30 @@ fn main() -> anyhow::Result<()> {
     let start_post_prompt = std::time::Instant::now();
     let mut sampled = 0;
     for index in 0..to_sample {
+        let token_start = std::time::Instant::now();
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, tokens.len() + index)?;
+
+        let forward_start = std::time::Instant::now();
+        let logits = model.forward(&mut caches, &input, tokens.len() + index)?;
+        let forward_elapsed = forward_start.elapsed();
+
+        // Synchronize GPU to measure true per-token time
+        if let candle::Device::Cuda(cuda_device) = &device {
+            cuda_device.synchronize()?;
+        }
+        let token_elapsed = token_start.elapsed();
+
+        // Print timing every 50 tokens to detect slowdowns
+        if index > 0 && index % 50 == 0 {
+            eprintln!(
+                "Token {}: total={:.2}ms forward={:.2}ms cache_len={}",
+                index,
+                token_elapsed.as_secs_f64() * 1000.0,
+                forward_elapsed.as_secs_f64() * 1000.0,
+                tokens.len() + index
+            );
+        }
+
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits

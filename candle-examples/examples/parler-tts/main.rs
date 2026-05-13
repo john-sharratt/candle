@@ -185,6 +185,7 @@ fn main() -> anyhow::Result<()> {
         args.seed,
         Some(args.temperature),
         args.top_p,
+        None,
     );
     println!("starting generation...");
     let codes = model.generate(&prompt_tokens, &description_tokens, lp, args.max_steps)?;

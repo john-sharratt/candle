@@ -83,7 +83,7 @@ impl candle::CustomOp3 for RotaryEmbI {
                 s3.dtype()
             ),
         }
-    }
+    }   
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
@@ -95,63 +95,102 @@ impl candle::CustomOp3 for RotaryEmbI {
         s3: &candle::CudaStorage,
         l3: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
-        };
-        use candle::cuda_backend::{kernel_name, kernels, WrapErr};
-        use candle::{CudaDevice, WithDType};
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
-        fn inner<T: DeviceRepr + WithDType>(
-            src: &CudaSlice<T>,
-            l_src: &Layout,
-            cos: &CudaSlice<T>,
-            l_cos: &Layout,
-            sin: &CudaSlice<T>,
-            l_sin: &Layout,
-            dev: &CudaDevice,
-        ) -> Result<CudaSlice<T>> {
-            let src = match l_src.contiguous_offsets() {
-                None => candle::bail!("src input has to be contiguous"),
-                Some((o1, o2)) => src.slice(o1..o2),
-            };
-            let cos = match l_cos.contiguous_offsets() {
-                None => candle::bail!("cos input has to be contiguous"),
-                Some((o1, o2)) => cos.slice(o1..o2),
-            };
-            let sin = match l_sin.contiguous_offsets() {
-                None => candle::bail!("sin input has to be contiguous"),
-                Some((o1, o2)) => sin.slice(o1..o2),
-            };
-            let (b, h, t, d) = l_src.shape().dims4()?;
-            let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
-                (h * t * d) as u32
-            } else {
-                0u32
-            };
-            let el = b * h * t * d;
-            let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
-            let func = dev.get_or_load_func(&kernel_name::<T>("rope_i"), &kernels::REDUCE)?;
-            // SAFETY: Set later by running the kernel.
-            let dst = unsafe { dev.alloc::<T>(el)? };
-            let mut builder = func.builder();
-            builder.arg(&src);
-            builder.arg(&cos);
-            builder.arg(&sin);
-            builder.arg(&dst);
-            candle::builder_arg!(builder, (b * h) as u32, (t * d) as u32, stride_b);
-            // SAFETY: ffi.
-            unsafe { builder.launch(cfg) }.w()?;
-            Ok(dst)
+        let dev = s1.device();
+        let stream = dev.cuda_stream();
+
+        let (src_o1, src_o2) = match l1.contiguous_offsets() {
+            None => candle::bail!("src input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (cos_o1, cos_o2) = match l2.contiguous_offsets() {
+            None => candle::bail!("cos input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (sin_o1, sin_o2) = match l3.contiguous_offsets() {
+            None => candle::bail!("sin input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+
+        let (b, h, t, d) = l1.shape().dims4()?;
+        let stride_b = if l2.dims().len() == 3 && l3.dims().len() == 3 {
+            (h * t * d) as u32
+        } else {
+            0u32
+        };
+        let el = b * h * t * d;
+        let bh = (b * h) as u32;
+        let td = (t * d) as u32;
+
+        // Get dtype for FFI dispatcher
+        let dtype = match &s1.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::reduce::FloatDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::reduce::FloatDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::reduce::FloatDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::reduce::FloatDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::reduce::FloatDType::F8E4M3 as i32,
+            _ => candle::bail!("rope_i not supported for dtype {:?}", s1.dtype()),
+        };
+
+        macro_rules! rope_i_impl {
+            ($src_slice:expr, $cos_slice:expr, $sin_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(src_o1..src_o2);
+                let cos = $cos_slice.slice(cos_o1..cos_o2);
+                let sin = $sin_slice.slice(sin_o1..sin_o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (cos_ptr, _cos_guard) = cos.device_ptr(&stream);
+                    let (sin_ptr, _sin_guard) = sin.device_ptr(&stream);
+                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_rope_i_op", file!(), line!());
+                    unsafe {
+                        kernels::simple::reduce::run_rope_i_op(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            cos_ptr as *const std::ffi::c_void,
+                            sin_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            bh,
+                            td,
+                            stride_b,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
         }
 
-        use candle::backend::BackendStorage;
-        use candle::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
-        let dev = s1.device();
         let slice = match (&s1.slice, &s2.slice, &s3.slice) {
-            (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (
+                CudaStorageSlice::BF16(src),
+                CudaStorageSlice::BF16(cos),
+                CudaStorageSlice::BF16(sin),
+            ) => rope_i_impl!(src, cos, sin, BF16, half::bf16),
+            (
+                CudaStorageSlice::F16(src),
+                CudaStorageSlice::F16(cos),
+                CudaStorageSlice::F16(sin),
+            ) => rope_i_impl!(src, cos, sin, F16, half::f16),
+            (
+                CudaStorageSlice::F32(src),
+                CudaStorageSlice::F32(cos),
+                CudaStorageSlice::F32(sin),
+            ) => rope_i_impl!(src, cos, sin, F32, f32),
+            (
+                CudaStorageSlice::F64(src),
+                CudaStorageSlice::F64(cos),
+                CudaStorageSlice::F64(sin),
+            ) => rope_i_impl!(src, cos, sin, F64, f64),
+            (
+                CudaStorageSlice::F8E4M3(src),
+                CudaStorageSlice::F8E4M3(cos),
+                CudaStorageSlice::F8E4M3(sin),
+            ) => rope_i_impl!(src, cos, sin, F8E4M3, float8::F8E4M3),
             _ => candle::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
@@ -377,63 +416,104 @@ impl candle::CustomOp3 for RotaryEmb {
         s3: &candle::CudaStorage,
         l3: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
-        };
-        use candle::cuda_backend::{kernel_name, kernels, WrapErr};
-        use candle::{CudaDevice, WithDType};
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
-        fn inner<T: DeviceRepr + WithDType>(
-            src: &CudaSlice<T>,
-            l_src: &Layout,
-            cos: &CudaSlice<T>,
-            l_cos: &Layout,
-            sin: &CudaSlice<T>,
-            l_sin: &Layout,
-            dev: &CudaDevice,
-        ) -> Result<CudaSlice<T>> {
-            let src = match l_src.contiguous_offsets() {
-                None => candle::bail!("src input has to be contiguous"),
-                Some((o1, o2)) => src.slice(o1..o2),
-            };
-            let cos = match l_cos.contiguous_offsets() {
-                None => candle::bail!("cos input has to be contiguous"),
-                Some((o1, o2)) => cos.slice(o1..o2),
-            };
-            let sin = match l_sin.contiguous_offsets() {
-                None => candle::bail!("sin input has to be contiguous"),
-                Some((o1, o2)) => sin.slice(o1..o2),
-            };
-            let (b, h, t, d) = l_src.shape().dims4()?;
-            let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
-                (h * t * d) as u32
-            } else {
-                0u32
-            };
-            let el = b * h * t * d;
-            let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
-            let func = dev.get_or_load_func(&kernel_name::<T>("rope"), &kernels::REDUCE)?;
-            // SAFETY: Set later by running the kernel.
-            let dst = unsafe { dev.alloc::<T>(el)? };
-            let mut builder = func.builder();
-            builder.arg(&src);
-            builder.arg(&cos);
-            builder.arg(&sin);
-            builder.arg(&dst);
-            candle::builder_arg!(builder, (b * h) as u32, (t * d) as u32, d as u32, stride_b);
-            // SAFETY: ffi.
-            unsafe { builder.launch(cfg) }.w()?;
-            Ok(dst)
+        let dev = s1.device();
+        let stream = dev.cuda_stream();
+
+        let (src_o1, src_o2) = match l1.contiguous_offsets() {
+            None => candle::bail!("src input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (cos_o1, cos_o2) = match l2.contiguous_offsets() {
+            None => candle::bail!("cos input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (sin_o1, sin_o2) = match l3.contiguous_offsets() {
+            None => candle::bail!("sin input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+
+        let (b, h, t, d) = l1.shape().dims4()?;
+        let stride_b = if l2.dims().len() == 3 && l3.dims().len() == 3 {
+            (h * t * d) as u32
+        } else {
+            0u32
+        };
+        let el = b * h * t * d;
+        let bh = (b * h) as u32;
+        let td = (t * d) as u32;
+        let d_val = d as u32;
+
+        // Get dtype for FFI dispatcher
+        let dtype = match &s1.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::reduce::FloatDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::reduce::FloatDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::reduce::FloatDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::reduce::FloatDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::reduce::FloatDType::F8E4M3 as i32,
+            _ => candle::bail!("rope not supported for dtype {:?}", s1.dtype()),
+        };
+
+        macro_rules! rope_impl {
+            ($src_slice:expr, $cos_slice:expr, $sin_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(src_o1..src_o2);
+                let cos = $cos_slice.slice(cos_o1..cos_o2);
+                let sin = $sin_slice.slice(sin_o1..sin_o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (cos_ptr, _cos_guard) = cos.device_ptr(&stream);
+                    let (sin_ptr, _sin_guard) = sin.device_ptr(&stream);
+                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_rope_op", file!(), line!());
+                    unsafe {
+                        kernels::simple::reduce::run_rope_op(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            cos_ptr as *const std::ffi::c_void,
+                            sin_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            bh,
+                            td,
+                            d_val,
+                            stride_b,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
         }
 
-        use candle::backend::BackendStorage;
-        use candle::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
-        let dev = s1.device();
         let slice = match (&s1.slice, &s2.slice, &s3.slice) {
-            (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (
+                CudaStorageSlice::BF16(src),
+                CudaStorageSlice::BF16(cos),
+                CudaStorageSlice::BF16(sin),
+            ) => rope_impl!(src, cos, sin, BF16, half::bf16),
+            (
+                CudaStorageSlice::F16(src),
+                CudaStorageSlice::F16(cos),
+                CudaStorageSlice::F16(sin),
+            ) => rope_impl!(src, cos, sin, F16, half::f16),
+            (
+                CudaStorageSlice::F32(src),
+                CudaStorageSlice::F32(cos),
+                CudaStorageSlice::F32(sin),
+            ) => rope_impl!(src, cos, sin, F32, f32),
+            (
+                CudaStorageSlice::F64(src),
+                CudaStorageSlice::F64(cos),
+                CudaStorageSlice::F64(sin),
+            ) => rope_impl!(src, cos, sin, F64, f64),
+            (
+                CudaStorageSlice::F8E4M3(src),
+                CudaStorageSlice::F8E4M3(cos),
+                CudaStorageSlice::F8E4M3(sin),
+            ) => rope_impl!(src, cos, sin, F8E4M3, float8::F8E4M3),
             _ => candle::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),
@@ -646,63 +726,102 @@ impl candle::CustomOp3 for RotaryEmbThd {
         s3: &candle::CudaStorage,
         l3: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle::cuda_backend::cudarc::driver::{
-            CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
-        };
-        use candle::cuda_backend::{kernel_name, kernels, WrapErr};
-        use candle::{CudaDevice, WithDType};
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::{kernels, CudaStorageSlice};
 
-        fn inner<T: DeviceRepr + WithDType>(
-            src: &CudaSlice<T>,
-            l_src: &Layout,
-            cos: &CudaSlice<T>,
-            l_cos: &Layout,
-            sin: &CudaSlice<T>,
-            l_sin: &Layout,
-            dev: &CudaDevice,
-        ) -> Result<CudaSlice<T>> {
-            let src = match l_src.contiguous_offsets() {
-                None => candle::bail!("src input has to be contiguous"),
-                Some((o1, o2)) => src.slice(o1..o2),
-            };
-            let cos = match l_cos.contiguous_offsets() {
-                None => candle::bail!("cos input has to be contiguous"),
-                Some((o1, o2)) => cos.slice(o1..o2),
-            };
-            let sin = match l_sin.contiguous_offsets() {
-                None => candle::bail!("sin input has to be contiguous"),
-                Some((o1, o2)) => sin.slice(o1..o2),
-            };
-            let (b, t, h, d) = l_src.shape().dims4()?;
-            let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
-                (h * t * d) as u32
-            } else {
-                0u32
-            };
-            let el = b * h * t * d;
-            let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
-            let func = dev.get_or_load_func(&kernel_name::<T>("rope_thd"), &kernels::REDUCE)?;
-            // SAFETY: Set later by running the kernel.
-            let dst = unsafe { dev.alloc::<T>(el)? };
-            let mut builder = func.builder();
-            builder.arg(&src);
-            builder.arg(&cos);
-            builder.arg(&sin);
-            builder.arg(&dst);
-            candle::builder_arg!(builder, b as u32, t as u32, h as u32, d as u32, stride_b);
-            // SAFETY: ffi.
-            unsafe { builder.launch(cfg) }.w()?;
-            Ok(dst)
+        let dev = s1.device();
+        let stream = dev.cuda_stream();
+
+        let (src_o1, src_o2) = match l1.contiguous_offsets() {
+            None => candle::bail!("src input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (cos_o1, cos_o2) = match l2.contiguous_offsets() {
+            None => candle::bail!("cos input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+        let (sin_o1, sin_o2) = match l3.contiguous_offsets() {
+            None => candle::bail!("sin input has to be contiguous"),
+            Some(offsets) => offsets,
+        };
+
+        let (b, t, h, d) = l1.shape().dims4()?;
+        let stride_b = if l2.dims().len() == 3 && l3.dims().len() == 3 {
+            (h * t * d) as u32
+        } else {
+            0u32
+        };
+        let el = b * h * t * d;
+
+        // Get dtype for FFI dispatcher
+        let dtype = match &s1.slice {
+            CudaStorageSlice::F32(_) => kernels::simple::reduce::FloatDType::F32 as i32,
+            CudaStorageSlice::F64(_) => kernels::simple::reduce::FloatDType::F64 as i32,
+            CudaStorageSlice::F16(_) => kernels::simple::reduce::FloatDType::F16 as i32,
+            CudaStorageSlice::BF16(_) => kernels::simple::reduce::FloatDType::BF16 as i32,
+            CudaStorageSlice::F8E4M3(_) => kernels::simple::reduce::FloatDType::F8E4M3 as i32,
+            _ => candle::bail!("rope_thd not supported for dtype {:?}", s1.dtype()),
+        };
+
+        macro_rules! rope_thd_impl {
+            ($src_slice:expr, $cos_slice:expr, $sin_slice:expr, $dtype_variant:ident, $rust_type:ty) => {{
+                let src = $src_slice.slice(src_o1..src_o2);
+                let cos = $cos_slice.slice(cos_o1..cos_o2);
+                let sin = $sin_slice.slice(sin_o1..sin_o2);
+                let dst = unsafe { dev.alloc::<$rust_type>(el)? };
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&stream);
+                    let (cos_ptr, _cos_guard) = cos.device_ptr(&stream);
+                    let (sin_ptr, _sin_guard) = sin.device_ptr(&stream);
+                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                    #[cfg(feature = "cuda")]
+                    candle::set_kernel_breadcrumb("run_rope_thd_op", file!(), line!());
+                    unsafe {
+                        kernels::simple::reduce::run_rope_thd_op(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            cos_ptr as *const std::ffi::c_void,
+                            sin_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut std::ffi::c_void,
+                            b as u32,
+                            t as u32,
+                            h as u32,
+                            d as u32,
+                            stride_b,
+                        );
+                    }
+                }
+                CudaStorageSlice::$dtype_variant(dst)
+            }};
         }
 
-        use candle::backend::BackendStorage;
-        use candle::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
-        let dev = s1.device();
         let slice = match (&s1.slice, &s2.slice, &s3.slice) {
-            (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
-            (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (
+                CudaStorageSlice::BF16(src),
+                CudaStorageSlice::BF16(cos),
+                CudaStorageSlice::BF16(sin),
+            ) => rope_thd_impl!(src, cos, sin, BF16, half::bf16),
+            (
+                CudaStorageSlice::F16(src),
+                CudaStorageSlice::F16(cos),
+                CudaStorageSlice::F16(sin),
+            ) => rope_thd_impl!(src, cos, sin, F16, half::f16),
+            (
+                CudaStorageSlice::F32(src),
+                CudaStorageSlice::F32(cos),
+                CudaStorageSlice::F32(sin),
+            ) => rope_thd_impl!(src, cos, sin, F32, f32),
+            (
+                CudaStorageSlice::F64(src),
+                CudaStorageSlice::F64(cos),
+                CudaStorageSlice::F64(sin),
+            ) => rope_thd_impl!(src, cos, sin, F64, f64),
+            (
+                CudaStorageSlice::F8E4M3(src),
+                CudaStorageSlice::F8E4M3(cos),
+                CudaStorageSlice::F8E4M3(sin),
+            ) => rope_thd_impl!(src, cos, sin, F8E4M3, float8::F8E4M3),
             _ => candle::bail!(
                 "unsupported dtype for rope {:?} {:?} {:?}",
                 s1.dtype(),

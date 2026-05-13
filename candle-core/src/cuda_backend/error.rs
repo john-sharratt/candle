@@ -22,7 +22,7 @@ pub enum CudaError {
     UnsupportedDtype { dtype: DType, op: &'static str },
 
     #[error("internal error '{0}'")]
-    InternalError(&'static str),
+    InternalError(String),
 
     #[error("matmul is only supported for contiguous tensors lstride: {lhs_stride:?} rstride: {rhs_stride:?} mnk: {mnk:?}")]
     MatMulNonContiguous {

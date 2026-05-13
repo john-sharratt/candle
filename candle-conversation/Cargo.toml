@@ -1,0 +1,78 @@
+[package]
+name = "candle-conversation"
+version.workspace = true
+edition.workspace = true
+description = "Turn-based conversation engine for the candle inference stack"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+ahash = { workspace = true }
+base64 = { workspace = true }
+candle = { workspace = true }
+candle-kernels = { workspace = true, optional = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true, features = ["ruler-bench"] }
+crossbeam = { workspace = true }
+cudarc = { workspace = true, optional = true }
+fs2 = { workspace = true }
+memmap2 = { workspace = true }
+tempfile = { workspace = true }
+hf-hub = { workspace = true, optional = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+hf-hub = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap.workspace = true
+clap-verbosity-flag.workspace = true
+term_size = { workspace = true }
+
+[features]
+default = []
+sig-trace = []   # enables per-chunk BDP signature tracing (TRACE level, high volume)
+# Records the per-slot token stream (every injected section, every
+# projected turn, prefilled user text, decoded tokens, post-decode
+# tail) and emits a `=== KV cache token dump (turn complete) ===`
+# trace at the end of each turn under the
+# `candle_conversation::scheduler::context_dump` target.  Useful for
+# diagnosing prompt/format/role-marker bugs; off by default because
+# the per-token recording allocates and the dump itself is large.
+context-dump = []
+cuda = [
+    "candle/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "dep:candle-kernels",
+    "dep:cudarc",
+]
+hub = ["dep:hf-hub"]
+metal = ["candle/metal", "candle-nn/metal", "candle-transformers/metal"]
+# Exposes test-introspection methods (warm_pool, warm_turn_slots,
+# hot/warm_turn_ids_sorted, tiered_store()) that are otherwise hidden from the
+# public API.  Enable with --features test-helpers in integration-test runs.
+test-helpers = []
+
+[[example]]
+name = "chat"
+required-features = ["cuda", "hub"]
+
+[[example]]
+name = "tree_gen"
+required-features = ["cuda", "hub"]
+
+[[example]]
+name = "ruler_stream"
+required-features = ["cuda", "hub"]

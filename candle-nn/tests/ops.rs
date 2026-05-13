@@ -320,7 +320,7 @@ fn sigmoid(device: &Device) -> Result<()> {
     let s1 = candle_nn::ops::sigmoid(&tensor)?;
     let s2 = (1. / (1. + tensor.neg()?.exp()?)?)?;
     let diff = (s1 - s2)?.abs()?.sum_all()?.to_vec0::<f32>()?;
-    assert_eq!(diff, 0.);
+    assert!(diff < 1e-5);
     Ok(())
 }
 

@@ -2,6 +2,7 @@ pub const AFFINE: &str = include_str!("metal_src/affine.metal");
 pub const BINARY: &str = include_str!("metal_src/binary.metal");
 pub const CAST: &str = include_str!("metal_src/cast.metal");
 pub const CONV: &str = include_str!("metal_src/conv.metal");
+pub const DIV_AT_INDICES: &str = include_str!("metal_src/div_at_indices.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
 pub const INDEXING: &str = include_str!("metal_src/indexing.metal");
 pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
@@ -10,6 +11,7 @@ pub const QUANTIZED: &str = include_str!("metal_src/quantized.metal");
 pub const RANDOM: &str = include_str!("metal_src/random.metal");
 pub const REDUCE: &str = include_str!("metal_src/reduce.metal");
 pub const SORT: &str = include_str!("metal_src/sort.metal");
+pub const SUB_AT_INDICES: &str = include_str!("metal_src/sub_at_indices.metal");
 pub const TERNARY: &str = include_str!("metal_src/ternary.metal");
 pub const UNARY: &str = include_str!("metal_src/unary.metal");
 pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.metal");
@@ -20,6 +22,7 @@ pub enum Source {
     Binary,
     Cast,
     Conv,
+    DivAtIndices,
     Fill,
     Gemm,
     Indexing,
@@ -28,6 +31,7 @@ pub enum Source {
     Random,
     Reduce,
     Sort,
+    SubAtIndices,
     Ternary,
     Unary,
     Sdpa,

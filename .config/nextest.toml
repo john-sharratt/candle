@@ -1,0 +1,9 @@
+[profile.default]
+# Treat tests as timed out if they run longer than 10 seconds.
+# nextest terminates them after the configured period count.
+slow-timeout = { period = "10s", terminate-after = 1 }
+fail-fast = false
+retries = 0
+
+[profile.ci]
+inherits = "default"

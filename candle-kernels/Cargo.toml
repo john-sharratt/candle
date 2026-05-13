@@ -10,6 +10,19 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+half = { version = "2.5.0", features = ["num-traits"] }
+float8 = { version = "0.4.2", features = ["num-traits"] }
+# Shared with build.rs via include!() — kernel_tool binary needs these at runtime
+anyhow = "1.0"
+flate2 = "1"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
 
 [build-dependencies]
-bindgen_cuda = "0.1.1"
+anyhow = "1.0"
+flate2 = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "kernel_tool"
+path = "src/bin/kernel_tool.rs"

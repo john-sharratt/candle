@@ -1115,8 +1115,7 @@ impl DebertaV2Encoder {
             .rel_embeddings
             .as_ref()
             .context("self.rel_embeddings not present when using relative_attention")?
-            .embeddings()
-            .clone();
+            .embeddings_native();
 
         if !self.norm_rel_ebd.contains("layer_norm") {
             return Ok(Some(rel_embeddings));

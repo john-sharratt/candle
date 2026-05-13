@@ -606,7 +606,7 @@ impl MTModel {
         let target_vocab_size = cfg.decoder_vocab_size.unwrap_or(cfg.vocab_size);
         let final_logits_bias = vb.get((1, target_vocab_size), "final_logits_bias")?;
         let model = Model::new(cfg, vb.pp("model"))?;
-        let lm_head = Linear::from_weights(model.shared.embeddings().clone(), None);
+        let lm_head = Linear::from_weights(model.shared.embeddings()?, None);
         Ok(Self {
             model,
             lm_head,

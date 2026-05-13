@@ -184,7 +184,10 @@ impl MaskDecoder {
     ) -> Result<(Tensor, Tensor)> {
         // Concatenate output tokens.
         let output_tokens = Tensor::cat(
-            &[self.iou_token.embeddings(), self.mask_tokens.embeddings()],
+            &[
+                self.iou_token.embeddings_native(),
+                self.mask_tokens.embeddings_native(),
+            ],
             0,
         )?;
         let (d1, d2) = output_tokens.dims2()?;

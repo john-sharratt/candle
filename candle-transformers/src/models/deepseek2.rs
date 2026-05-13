@@ -969,7 +969,7 @@ impl DeepSeekV2 {
         let lm_head = if !cfg.tie_word_embeddings {
             candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         } else {
-            candle_nn::Linear::new(embed_tokens.embeddings().clone(), None)
+            candle_nn::Linear::new(embed_tokens.embeddings_native(), None)
         };
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
 

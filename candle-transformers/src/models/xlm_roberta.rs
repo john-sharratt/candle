@@ -450,7 +450,7 @@ impl XLMRobertaForMaskedLM {
                 .roberta
                 .embeddings
                 .word_embeddings
-                .embeddings()
+                .embeddings_native()
                 .t()?
                 .unsqueeze(0)?,
         )?;

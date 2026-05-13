@@ -17,6 +17,7 @@ use candle_transformers::models::quantized_llama as model;
 use model::ModelWeights;
 
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
+const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
 #[derive(Debug)]
 enum Prompt {
@@ -470,7 +471,7 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
 
-    let mut model = match model_path.extension().and_then(|v| v.to_str()) {
+    let model = match model_path.extension().and_then(|v| v.to_str()) {
         Some("gguf") => {
             let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
             let mut total_size_in_bytes = 0;
@@ -535,6 +536,8 @@ fn main() -> anyhow::Result<()> {
     };
     println!("model built");
 
+    let mut caches = model.create_kv_caches(DEFAULT_MAX_SEQ_LEN);
+
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
     let prompt = match args.prompt.as_deref() {
@@ -591,8 +594,8 @@ fn main() -> anyhow::Result<()> {
 
         let prompt_tokens = [&pre_prompt_tokens, tokens.get_ids()].concat();
         let to_sample = args.sample_len.saturating_sub(1);
-        let prompt_tokens = if prompt_tokens.len() + to_sample > model::MAX_SEQ_LEN - 10 {
-            let to_remove = prompt_tokens.len() + to_sample + 10 - model::MAX_SEQ_LEN;
+        let prompt_tokens = if prompt_tokens.len() + to_sample > DEFAULT_MAX_SEQ_LEN - 10 {
+            let to_remove = prompt_tokens.len() + to_sample + 10 - DEFAULT_MAX_SEQ_LEN;
             prompt_tokens[prompt_tokens.len().saturating_sub(to_remove)..].to_vec()
         } else {
             prompt_tokens
@@ -616,14 +619,14 @@ fn main() -> anyhow::Result<()> {
         let start_prompt_processing = std::time::Instant::now();
         let mut next_token = if !args.split_prompt {
             let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, 0)?;
+            let logits = model.forward(&mut caches, &input, 0)?;
             let logits = logits.squeeze(0)?;
             logits_processor.sample(&logits)?
         } else {
             let mut next_token = 0;
             for (pos, token) in prompt_tokens.iter().enumerate() {
                 let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-                let logits = model.forward(&input, pos)?;
+                let logits = model.forward(&mut caches, &input, pos)?;
                 let logits = logits.squeeze(0)?;
                 next_token = logits_processor.sample(&logits)?
             }
@@ -651,7 +654,7 @@ fn main() -> anyhow::Result<()> {
         let mut sampled = 0;
         for index in 0..to_sample {
             let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, prompt_tokens.len() + index)?;
+            let logits = model.forward(&mut caches, &input, prompt_tokens.len() + index)?;
             let logits = logits.squeeze(0)?;
             let logits = if args.repeat_penalty == 1. {
                 logits

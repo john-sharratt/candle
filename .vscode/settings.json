@@ -1,4 +1,8 @@
 {
+    "rust-analyzer.cargo.features": [
+        "cuda",
+        "test-helpers"
+    ],
     "[python]": {
         "editor.defaultFormatter": "ms-python.black-formatter"
     },

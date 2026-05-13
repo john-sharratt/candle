@@ -8,6 +8,7 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
 
+use candle::backend::BackendDevice;
 use candle::quantized::gguf_file;
 use candle::Tensor;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
@@ -183,7 +184,7 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
 
-    let mut model = {
+    let model = {
         let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
         let mut total_size_in_bytes = 0;
         for (_, tensor) in model.tensor_infos.iter() {
@@ -200,6 +201,8 @@ fn main() -> anyhow::Result<()> {
         Qwen3::from_gguf(model, &mut file, &device)?
     };
     println!("model built");
+
+    let mut caches = model.create_kv_caches(2048);
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
@@ -241,17 +244,107 @@ fn main() -> anyhow::Result<()> {
 
     let mut next_token = if !args.split_prompt {
         let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, 0)?;
+        let logits = model.forward(&mut caches, &input, 0)?;
         let logits = logits.squeeze(0)?;
         logits_processor.sample(&logits)?
     } else {
+        // Mimic user's app: process prompt in batches of 100 tokens
+        eprintln!("\n=== BATCHED PROMPT PROCESSING (like user's app) ===");
+        let batch_size = 100;
         let mut next_token = 0;
-        for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
+        let mut offset = 0;
+        let token_chunks: Vec<_> = tokens.chunks(batch_size).collect();
+
+        for (batch_idx, chunk) in token_chunks.iter().enumerate() {
+            let batch_start = std::time::Instant::now();
+            let input = Tensor::new(*chunk, &device)?.unsqueeze(0)?;
+
+            let forward_start = std::time::Instant::now();
+            let logits = model.forward(&mut caches, &input, offset)?;
+            let forward_time = forward_start.elapsed();
+
+            // Synchronize to get accurate timing
+            if let candle::Device::Cuda(cuda_device) = &device {
+                cuda_device.synchronize()?;
+            }
+            let batch_time = batch_start.elapsed();
+
+            eprintln!(
+                "Batch {} (tokens {}→{}): total={:.3}s forward={:.3}s cache_len={}",
+                batch_idx,
+                offset,
+                offset + chunk.len(),
+                batch_time.as_secs_f64(),
+                forward_time.as_secs_f64(),
+                offset + chunk.len()
+            );
+
             let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
+            next_token = logits_processor.sample(&logits)?;
+            offset += chunk.len();
         }
+        eprintln!("=== BATCHED PROCESSING COMPLETE ===\n");
+
+        // Test partial truncation (keep first 300 tokens)
+        if offset > 300 {
+            eprintln!("=== TESTING PARTIAL TRUNCATE ({}→300 tokens) ===", offset);
+            let truncate_start = std::time::Instant::now();
+            caches.truncate(300)?;
+            eprintln!(
+                "Partial truncate completed in {:.3}ms",
+                truncate_start.elapsed().as_secs_f64() * 1000.0
+            );
+            eprintln!(
+                "Cache length after truncate: {}\n",
+                caches.current_seq_len()
+            );
+
+            // Continue processing from truncated position
+            eprintln!("=== CONTINUING AFTER PARTIAL TRUNCATE ===");
+            let continue_tokens = &tokens[300..offset.min(tokens.len())];
+            let continue_chunks: Vec<_> = continue_tokens.chunks(100).collect();
+
+            let mut new_offset = 300;
+            for (batch_idx, chunk) in continue_chunks.iter().enumerate() {
+                let batch_start = std::time::Instant::now();
+                let input = Tensor::new(*chunk, &device)?.unsqueeze(0)?;
+
+                let logits = model.forward(&mut caches, &input, new_offset)?;
+
+                if let candle::Device::Cuda(cuda_device) = &device {
+                    cuda_device.synchronize()?;
+                }
+                let batch_time = batch_start.elapsed();
+
+                eprintln!(
+                    "Batch {} (tokens {}→{}): {:.3}s cache_len={}",
+                    batch_idx,
+                    new_offset,
+                    new_offset + chunk.len(),
+                    batch_time.as_secs_f64(),
+                    new_offset + chunk.len()
+                );
+
+                let logits = logits.squeeze(0)?;
+                next_token = logits_processor.sample(&logits)?;
+                new_offset += chunk.len();
+            }
+            eprintln!("=== CONTINUE AFTER TRUNCATE COMPLETE ===\n");
+        }
+
+        // Test full truncation (clear all caches)
+        eprintln!("=== TESTING FULL TRUNCATE (clear all) ===");
+        let full_truncate_start = std::time::Instant::now();
+        caches.reset();
+        eprintln!(
+            "Full truncate completed in {:.3}ms",
+            full_truncate_start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "Cache length after full clear: {}\n",
+            caches.current_seq_len()
+        );
+
         next_token
     };
 
@@ -271,7 +364,7 @@ fn main() -> anyhow::Result<()> {
     let mut sampled = 0;
     for index in 0..to_sample {
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, tokens.len() + index)?;
+        let logits = model.forward(&mut caches, &input, tokens.len() + index)?;
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits

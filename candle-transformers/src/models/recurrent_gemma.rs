@@ -604,7 +604,7 @@ impl Model {
             layers.push(layer)
         }
         let final_norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("final_norm"))?;
-        let lm_head = Linear::new(embed_tokens.embeddings().clone(), None);
+        let lm_head = Linear::new(embed_tokens.embeddings_native(), None);
         Ok(Self {
             embed_tokens,
             layers,

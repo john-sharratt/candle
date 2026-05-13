@@ -930,7 +930,7 @@ impl T5ForConditionalGeneration {
         let output = {
             let _enter = self.span_decode_head.enter();
             match self.lm_head {
-                None => sequence_output.matmul(&self.shared.embeddings().t()?)?,
+                None => sequence_output.matmul(&self.shared.embeddings()?.t()?)?,
                 Some(ref lm_head) => lm_head.forward(&sequence_output)?,
             }
         };

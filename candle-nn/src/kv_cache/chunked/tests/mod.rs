@@ -1,0 +1,23 @@
+//! Test modules for chunked KV cache components.
+//!
+//! This module organizes comprehensive tests for all major files:
+//!
+//! - `types_tests` - Tests for ChunkHandle, ChunkRef, SlotState, ChunkedState
+//! - `arena_tests` - Tests for Arena, ArenaKey, ArenaStorage, StoragePolicy, ChunkStatus
+//! - `backing_tests` - Tests for ChunkedKvBacking constructors and accessors
+//! - `alloc_tests` - Tests for allocation methods
+//! - `io_tests` - Tests for read_contiguous and write_contiguous
+//! - `sequence_ops_tests` - Tests for alloc/free/share/fork operations
+//! - `chunk_ops_tests` - Tests for migrate, copy, convert, prepare, reconcile
+
+mod types_tests;
+mod arena_tests;
+mod backing_tests;
+mod alloc_tests;
+mod io_tests;
+mod sequence_ops_tests;
+mod chunk_ops_tests;
+pub mod dump_reader;
+mod kv_stats_tests;
+mod gpu_chunks_tests;
+mod gather_r16_tests;

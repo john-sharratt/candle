@@ -49,5 +49,4 @@ extern "C" {
 
         softcap: f32,
     );
-
 }

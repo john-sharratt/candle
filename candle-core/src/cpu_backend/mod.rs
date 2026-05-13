@@ -1708,6 +1708,276 @@ impl CpuStorage {
         };
         Ok(s)
     }
+
+    /// In-place sparse subtraction - mutates the storage directly without cloning.
+    pub fn sub_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] -= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] -= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] -= value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] -= value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "sub_at_indices").bt()),
+        }
+        Ok(())
+    }
+
+    /// In-place sparse addition - mutates the storage directly without cloning.
+    /// Adds a scalar value to elements at the specified indices: data[indices[i]] += value
+    pub fn add_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] += value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] += value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] += value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] += value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "add_at_indices").bt()),
+        }
+        Ok(())
+    }
+
+    /// In-place sparse subtraction with per-index values - mutates the storage directly without cloning.
+    /// Each index gets its own value to subtract: data[indices[i]] -= values[i]
+    pub fn sub_at_indices_mut_with_values(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        values: &[f32],
+    ) -> Result<()> {
+        if indices.len() != values.len() {
+            crate::bail!(
+                "indices and values must have the same length, got {} and {}",
+                indices.len(),
+                values.len()
+            );
+        }
+
+        match self {
+            Self::BF16(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    let value_bf16 = bf16::from_f32(value);
+                    storage[*idx as usize] -= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    let value_f16 = f16::from_f32(value);
+                    storage[*idx as usize] -= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    storage[*idx as usize] -= value;
+                }
+            }
+            Self::F64(storage) => {
+                for (idx, &value) in indices.iter().zip(values.iter()) {
+                    let value_f64 = value as f64;
+                    storage[*idx as usize] -= value_f64;
+                }
+            }
+            _ => {
+                return Err(Error::UnsupportedDTypeForOp(
+                    self.dtype(),
+                    "sub_at_indices_with_values",
+                )
+                .bt())
+            }
+        }
+        Ok(())
+    }
+
+    pub fn sub_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        match self {
+            Self::BF16(storage) => {
+                let mut data = storage.to_vec();
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    data[idx as usize] -= value_bf16;
+                }
+                Ok(Self::BF16(data))
+            }
+            Self::F16(storage) => {
+                let mut data = storage.to_vec();
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    data[idx as usize] -= value_f16;
+                }
+                Ok(Self::F16(data))
+            }
+            Self::F32(storage) => {
+                let mut data = storage.to_vec();
+                for &idx in indices {
+                    data[idx as usize] -= value;
+                }
+                Ok(Self::F32(data))
+            }
+            Self::F64(storage) => {
+                let mut data = storage.to_vec();
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    data[idx as usize] -= value_f64;
+                }
+                Ok(Self::F64(data))
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "sub_at_indices").bt()),
+        }
+    }
+
+    /// In-place sparse multiplication - mutates the storage directly without cloning.
+    pub fn mul_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] *= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] *= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] *= value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] *= value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "mul_at_indices").bt()),
+        }
+        Ok(())
+    }
+
+    /// In-place sparse division - mutates the storage directly without cloning.
+    pub fn div_at_indices_mut(
+        &mut self,
+        _layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<()> {
+        match self {
+            Self::BF16(storage) => {
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] /= value_bf16;
+                }
+            }
+            Self::F16(storage) => {
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    storage[idx as usize] /= value_f16;
+                }
+            }
+            Self::F32(storage) => {
+                for &idx in indices {
+                    storage[idx as usize] /= value;
+                }
+            }
+            Self::F64(storage) => {
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    storage[idx as usize] /= value_f64;
+                }
+            }
+            _ => return Err(Error::UnsupportedDTypeForOp(self.dtype(), "div_at_indices").bt()),
+        }
+        Ok(())
+    }
+
+    pub fn div_at_indices(&self, _layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        match self {
+            Self::BF16(storage) => {
+                let mut data = storage.to_vec();
+                let value_bf16 = bf16::from_f32(value);
+                for &idx in indices {
+                    data[idx as usize] /= value_bf16;
+                }
+                Ok(Self::BF16(data))
+            }
+            Self::F16(storage) => {
+                let mut data = storage.to_vec();
+                let value_f16 = f16::from_f32(value);
+                for &idx in indices {
+                    data[idx as usize] /= value_f16;
+                }
+                Ok(Self::F16(data))
+            }
+            Self::F32(storage) => {
+                let mut data = storage.to_vec();
+                for &idx in indices {
+                    data[idx as usize] /= value;
+                }
+                Ok(Self::F32(data))
+            }
+            Self::F64(storage) => {
+                let mut data = storage.to_vec();
+                let value_f64 = value as f64;
+                for &idx in indices {
+                    data[idx as usize] /= value_f64;
+                }
+                Ok(Self::F64(data))
+            }
+            _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "div_at_indices").bt()),
+        }
+    }
 }
 
 impl BackendStorage for CpuStorage {
@@ -2137,6 +2407,16 @@ impl BackendStorage for CpuStorage {
         }
     }
 
+    fn sub_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Delegate to the inherent method
+        self.sub_at_indices(layout, indices, value)
+    }
+
+    fn div_at_indices(&self, layout: &Layout, indices: &[u32], value: f32) -> Result<Self> {
+        // Delegate to the inherent method
+        self.div_at_indices(layout, indices, value)
+    }
+
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         match self {
             Self::BF16(storage) => {
@@ -2272,6 +2552,215 @@ impl BackendStorage for CpuStorage {
                 .bt())
             }
         }
+    }
+
+    fn binary_inplace_impl(
+        &mut self,
+        op: crate::op::BinaryInplaceOp,
+        rhs: &Self,
+        lhs_l: &Layout,
+        rhs_l: &Layout,
+    ) -> Result<()> {
+        use crate::op::BinaryInplaceOp;
+
+        // lhs must be contiguous for in-place operations
+        if !lhs_l.is_contiguous() {
+            return Err(Error::Msg(
+                "in-place binary op requires contiguous lhs tensor".to_string(),
+            )
+            .bt());
+        }
+
+        // Save dtypes for error message before consuming self
+        let lhs_dtype = self.dtype();
+        let rhs_dtype = rhs.dtype();
+
+        // Check for min/max on integer types (not supported for consistency with CUDA)
+        let is_integer = matches!(lhs_dtype, DType::U8 | DType::U32 | DType::I64);
+        if is_integer && matches!(op, BinaryInplaceOp::Min | BinaryInplaceOp::Max) {
+            return Err(Error::Msg(format!(
+                "min/max in-place ops not supported for integer dtype {:?}",
+                lhs_dtype
+            ))
+            .bt());
+        }
+
+        // Helper macro to apply operation element-wise
+        macro_rules! apply_inplace {
+            ($lhs:expr, $rhs_slice:expr, $lhs_l:expr, $rhs_l:expr, $op_fn:expr) => {{
+                let lhs_start = $lhs_l.start_offset();
+                let rhs_start = $rhs_l.start_offset();
+                let elem_count = $lhs_l.shape().elem_count();
+
+                if $rhs_l.is_contiguous() {
+                    // Fast path: both contiguous
+                    for i in 0..elem_count {
+                        $lhs[lhs_start + i] = $op_fn($lhs[lhs_start + i], $rhs_slice[rhs_start + i]);
+                    }
+                } else {
+                    // Slow path: rhs is strided
+                    let dims = $lhs_l.dims();
+                    let rhs_strides = $rhs_l.stride();
+                    for i in 0..elem_count {
+                        // Calculate strided index for rhs
+                        let mut rhs_idx = rhs_start;
+                        let mut tmp = i;
+                        for d in (0..dims.len()).rev() {
+                            let coord = tmp % dims[d];
+                            tmp /= dims[d];
+                            rhs_idx += coord * rhs_strides[d];
+                        }
+                        $lhs[lhs_start + i] = $op_fn($lhs[lhs_start + i], $rhs_slice[rhs_idx]);
+                    }
+                }
+            }};
+        }
+
+        match (self, rhs, op) {
+            // F32
+            (Self::F32(lhs), Self::F32(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a + b);
+            }
+            (Self::F32(lhs), Self::F32(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a - b);
+            }
+            (Self::F32(lhs), Self::F32(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a * b);
+            }
+            (Self::F32(lhs), Self::F32(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a / b);
+            }
+            (Self::F32(lhs), Self::F32(rhs_data), BinaryInplaceOp::Min) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: f32, b| a.min(b));
+            }
+            (Self::F32(lhs), Self::F32(rhs_data), BinaryInplaceOp::Max) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: f32, b| a.max(b));
+            }
+            // F64
+            (Self::F64(lhs), Self::F64(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a + b);
+            }
+            (Self::F64(lhs), Self::F64(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a - b);
+            }
+            (Self::F64(lhs), Self::F64(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a * b);
+            }
+            (Self::F64(lhs), Self::F64(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a / b);
+            }
+            (Self::F64(lhs), Self::F64(rhs_data), BinaryInplaceOp::Min) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: f64, b| a.min(b));
+            }
+            (Self::F64(lhs), Self::F64(rhs_data), BinaryInplaceOp::Max) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: f64, b| a.max(b));
+            }
+            // F16
+            (Self::F16(lhs), Self::F16(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a + b);
+            }
+            (Self::F16(lhs), Self::F16(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a - b);
+            }
+            (Self::F16(lhs), Self::F16(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a * b);
+            }
+            (Self::F16(lhs), Self::F16(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a / b);
+            }
+            (Self::F16(lhs), Self::F16(rhs_data), BinaryInplaceOp::Min) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: half::f16, b| a.min(b));
+            }
+            (Self::F16(lhs), Self::F16(rhs_data), BinaryInplaceOp::Max) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: half::f16, b| a.max(b));
+            }
+            // BF16
+            (Self::BF16(lhs), Self::BF16(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a + b);
+            }
+            (Self::BF16(lhs), Self::BF16(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a - b);
+            }
+            (Self::BF16(lhs), Self::BF16(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a * b);
+            }
+            (Self::BF16(lhs), Self::BF16(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a / b);
+            }
+            (Self::BF16(lhs), Self::BF16(rhs_data), BinaryInplaceOp::Min) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: half::bf16, b| a.min(b));
+            }
+            (Self::BF16(lhs), Self::BF16(rhs_data), BinaryInplaceOp::Max) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: half::bf16, b| a.max(b));
+            }
+            // F8E4M3
+            (Self::F8E4M3(lhs), Self::F8E4M3(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a + b);
+            }
+            (Self::F8E4M3(lhs), Self::F8E4M3(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a - b);
+            }
+            (Self::F8E4M3(lhs), Self::F8E4M3(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a * b);
+            }
+            (Self::F8E4M3(lhs), Self::F8E4M3(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a, b| a / b);
+            }
+            (Self::F8E4M3(lhs), Self::F8E4M3(rhs_data), BinaryInplaceOp::Min) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: float8::F8E4M3, b| a.min(b));
+            }
+            (Self::F8E4M3(lhs), Self::F8E4M3(rhs_data), BinaryInplaceOp::Max) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: float8::F8E4M3, b| a.max(b));
+            }
+            // U8 (no min/max)
+            (Self::U8(lhs), Self::U8(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u8, b| a.wrapping_add(b));
+            }
+            (Self::U8(lhs), Self::U8(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u8, b| a.wrapping_sub(b));
+            }
+            (Self::U8(lhs), Self::U8(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u8, b| a.wrapping_mul(b));
+            }
+            (Self::U8(lhs), Self::U8(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u8, b| a / b);
+            }
+            // U32 (no min/max)
+            (Self::U32(lhs), Self::U32(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u32, b| a.wrapping_add(b));
+            }
+            (Self::U32(lhs), Self::U32(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u32, b| a.wrapping_sub(b));
+            }
+            (Self::U32(lhs), Self::U32(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u32, b| a.wrapping_mul(b));
+            }
+            (Self::U32(lhs), Self::U32(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: u32, b| a / b);
+            }
+            // I64 (no min/max)
+            (Self::I64(lhs), Self::I64(rhs_data), BinaryInplaceOp::Add) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: i64, b| a.wrapping_add(b));
+            }
+            (Self::I64(lhs), Self::I64(rhs_data), BinaryInplaceOp::Sub) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: i64, b| a.wrapping_sub(b));
+            }
+            (Self::I64(lhs), Self::I64(rhs_data), BinaryInplaceOp::Mul) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: i64, b| a.wrapping_mul(b));
+            }
+            (Self::I64(lhs), Self::I64(rhs_data), BinaryInplaceOp::Div) => {
+                apply_inplace!(lhs, rhs_data, lhs_l, rhs_l, |a: i64, b| a / b);
+            }
+            _ => {
+                return Err(Error::DTypeMismatchBinaryOp {
+                    lhs: lhs_dtype,
+                    rhs: rhs_dtype,
+                    op: "binary_inplace",
+                }
+                .bt())
+            }
+        }
+        Ok(())
     }
 
     fn copy2d(

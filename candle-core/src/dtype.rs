@@ -2,10 +2,11 @@
 #![allow(clippy::redundant_closure_call)]
 use crate::backend::BackendStorage;
 use crate::cpu::kernels::VecOps;
+use crate::quantized::GgmlDType;
 use crate::{CpuStorage, CpuStorageRef, Error, Result};
 
 /// The different types of elements allowed in tensors.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, strum_macros::EnumIter)]
 pub enum DType {
     // Floating-point 8 bits integer (4-bit exponent, 3-bit mantissa).
     F8E4M3,
@@ -23,6 +24,21 @@ pub enum DType {
     F32,
     // Floating-point using double precision (64 bits).
     F64,
+}
+
+impl DType {
+    pub fn to_ggml_dtype(&self) -> GgmlDType {
+        match self {
+            DType::F8E4M3 => GgmlDType::F8E4M3,
+            DType::U8 => GgmlDType::U8,
+            DType::U32 => GgmlDType::U32,
+            DType::I64 => GgmlDType::I64,
+            DType::BF16 => GgmlDType::BF16,
+            DType::F16 => GgmlDType::F16,
+            DType::F32 => GgmlDType::F32,
+            DType::F64 => GgmlDType::F64,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

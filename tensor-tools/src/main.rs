@@ -19,7 +19,7 @@ impl QuantizationMode {
                 if should_quantize {
                     let tensor = tensor.dequantize(&Device::Cpu)?;
                     if name == "output.weight" {
-                        QTensor::quantize(&tensor, GgmlDType::Q6K)
+                        QTensor::quantize(&tensor, GgmlDType::Q6_K)
                     } else {
                         QTensor::quantize(&tensor, dtype)
                     }
@@ -64,12 +64,12 @@ impl Quantization {
             Quantization::Q5_1 => GgmlDType::Q5_1,
             Quantization::Q8_0 => GgmlDType::Q8_0,
             Quantization::Q8_1 => GgmlDType::Q8_1,
-            Quantization::Q2k => GgmlDType::Q2K,
-            Quantization::Q3k => GgmlDType::Q3K,
-            Quantization::Q4k => GgmlDType::Q4K,
-            Quantization::Q5k => GgmlDType::Q5K,
-            Quantization::Q6k => GgmlDType::Q6K,
-            Quantization::Q8k => GgmlDType::Q8K,
+            Quantization::Q2k => GgmlDType::Q2_K,
+            Quantization::Q3k => GgmlDType::Q3_K,
+            Quantization::Q4k => GgmlDType::Q4_K,
+            Quantization::Q5k => GgmlDType::Q5_K,
+            Quantization::Q6k => GgmlDType::Q6_K,
+            Quantization::Q8k => GgmlDType::Q8_K,
             Quantization::F16 => GgmlDType::F16,
             Quantization::F32 => GgmlDType::F32,
         }
@@ -115,6 +115,23 @@ enum Command {
         /// Enable verbose mode.
         #[arg(short, long)]
         verbose: bool,
+
+        /// For GGUF: list metadata keys only (and skip tensor listing).
+        ///
+        /// This is useful for probing large GGUF files where metadata contains very large arrays
+        /// (e.g. tokenizer tables) that would otherwise flood the output.
+        #[arg(long)]
+        metadata_keys: bool,
+
+        /// For GGUF metadata listing: only keep keys containing any of these substrings.
+        /// Matching is case-insensitive. Can be specified multiple times.
+        #[arg(long)]
+        metadata_filter: Vec<String>,
+
+        /// For GGUF metadata listing: also print a compact value summary.
+        /// Arrays are summarized as (type + length) rather than fully expanded.
+        #[arg(long)]
+        metadata_values: bool,
     },
 
     Print {
@@ -160,6 +177,53 @@ enum Command {
         #[arg(long)]
         out_file: std::path::PathBuf,
     },
+}
+
+fn gguf_value_kind(v: &gguf_file::Value) -> &'static str {
+    match v {
+        gguf_file::Value::U8(_) => "u8",
+        gguf_file::Value::I8(_) => "i8",
+        gguf_file::Value::U16(_) => "u16",
+        gguf_file::Value::I16(_) => "i16",
+        gguf_file::Value::U32(_) => "u32",
+        gguf_file::Value::I32(_) => "i32",
+        gguf_file::Value::U64(_) => "u64",
+        gguf_file::Value::I64(_) => "i64",
+        gguf_file::Value::F32(_) => "f32",
+        gguf_file::Value::F64(_) => "f64",
+        gguf_file::Value::Bool(_) => "bool",
+        gguf_file::Value::String(_) => "string",
+        gguf_file::Value::Array(_) => "array",
+    }
+}
+
+fn compact_gguf_value(v: &gguf_file::Value) -> String {
+    const MAX_STR: usize = 160;
+    match v {
+        gguf_file::Value::U8(x) => format!("{x}"),
+        gguf_file::Value::I8(x) => format!("{x}"),
+        gguf_file::Value::U16(x) => format!("{x}"),
+        gguf_file::Value::I16(x) => format!("{x}"),
+        gguf_file::Value::U32(x) => format!("{x}"),
+        gguf_file::Value::I32(x) => format!("{x}"),
+        gguf_file::Value::U64(x) => format!("{x}"),
+        gguf_file::Value::I64(x) => format!("{x}"),
+        gguf_file::Value::F32(x) => format!("{x}"),
+        gguf_file::Value::F64(x) => format!("{x}"),
+        gguf_file::Value::Bool(x) => format!("{x}"),
+        gguf_file::Value::String(s) => {
+            if s.len() <= MAX_STR {
+                format!("\"{s}\"")
+            } else {
+                let prefix = &s[..MAX_STR];
+                format!("\"{prefix}…\" (len={})", s.len())
+            }
+        }
+        gguf_file::Value::Array(arr) => {
+            let elem_kind = arr.first().map(gguf_value_kind).unwrap_or("?");
+            format!("Array(len={}, elem={})", arr.len(), elem_kind)
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -300,6 +364,9 @@ fn run_ls(
     file: &std::path::PathBuf,
     format: Option<Format>,
     verbose: bool,
+    metadata_keys: bool,
+    metadata_filter: &[String],
+    metadata_values: bool,
     device: &Device,
 ) -> Result<()> {
     let format = match format {
@@ -377,14 +444,43 @@ fn run_ls(
         Format::Gguf => {
             let mut file = std::fs::File::open(file)?;
             let content = gguf_file::Content::read(&mut file)?;
+            let mut metadata = content.metadata.into_iter().collect::<Vec<_>>();
+            metadata.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let filters_lc: Vec<String> = metadata_filter
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            let key_matches = |k: &str| {
+                if filters_lc.is_empty() {
+                    true
+                } else {
+                    let k_lc = k.to_ascii_lowercase();
+                    filters_lc.iter().any(|f| k_lc.contains(f))
+                }
+            };
+
+            if metadata_keys {
+                for (key, value) in metadata.iter() {
+                    if !key_matches(key) {
+                        continue;
+                    }
+                    if metadata_values {
+                        println!("{key}: {}", compact_gguf_value(value));
+                    } else {
+                        println!("{key}: {}", gguf_value_kind(value));
+                    }
+                }
+                return Ok(());
+            }
+
             if verbose {
-                let mut metadata = content.metadata.into_iter().collect::<Vec<_>>();
-                metadata.sort_by(|a, b| a.0.cmp(&b.0));
                 println!("metadata entries ({})", metadata.len());
                 for (key, value) in metadata.iter() {
-                    println!("  {key}: {value:?}");
+                    println!("  {key}: {}", compact_gguf_value(value));
                 }
             }
+
             let mut tensors = content.tensor_infos.into_iter().collect::<Vec<_>>();
             tensors.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, info) in tensors.iter() {
@@ -514,13 +610,24 @@ fn main() -> anyhow::Result<()> {
             files,
             format,
             verbose,
+            metadata_keys,
+            metadata_filter,
+            metadata_values,
         } => {
             let multiple_files = files.len() > 1;
             for file in files.iter() {
                 if multiple_files {
                     println!("--- {file:?} ---");
                 }
-                run_ls(file, format.clone(), verbose, &device)?
+                run_ls(
+                    file,
+                    format.clone(),
+                    verbose,
+                    metadata_keys,
+                    &metadata_filter,
+                    metadata_values,
+                    &device,
+                )?
             }
         }
         Command::Print {

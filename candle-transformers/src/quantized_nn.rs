@@ -18,13 +18,13 @@ pub struct Embedding {
 impl Embedding {
     pub fn new(d1: usize, d2: usize, vb: VarBuilder) -> Result<Self> {
         let embeddings = vb.get((d1, d2), "weight")?.dequantize(vb.device())?;
-        let inner = candle_nn::Embedding::new(embeddings, d2);
+        let inner = candle_nn::Embedding::new(embeddings, d2)?;
         let span = tracing::span!(tracing::Level::TRACE, "embedding");
         Ok(Self { inner, span })
     }
 
-    pub fn embeddings(&self) -> &Tensor {
-        self.inner.embeddings()
+    pub fn embeddings(&self) -> Result<Tensor> {
+        Ok(self.inner.embeddings_native())
     }
 }
 
@@ -121,6 +121,13 @@ impl RmsNorm {
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+        let x_dtype = x.dtype();
+
+        let weight = if x_dtype == self.weight.dtype() {
+            self.weight.clone()
+        } else {
+            self.weight.to_dtype(x_dtype)?
+        };
+        candle_nn::ops::rms_norm(x, &weight, self.eps as f32)
     }
 }

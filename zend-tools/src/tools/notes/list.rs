@@ -1,0 +1,58 @@
+//! notes_list tool.
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+use crate::{RegisteredTool, Tool, ToolContext};
+use super::NotesError;
+
+#[derive(Deserialize, JsonSchema, Validate)]
+pub struct ListRequest {
+    pub prefix: Option<String>,
+    pub tags: Option<Vec<String>>,
+    #[validate(range(min = 1, max = 200))]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct ListEntry {
+    pub key: String,
+    pub bytes: usize,
+    pub tags: Vec<String>,
+    pub updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct ListResponse {
+    pub notes: Vec<ListEntry>,
+    pub total_matches: usize,
+}
+
+pub struct NotesList;
+
+impl Tool for NotesList {
+    const NAME: &'static str = "notes_list";
+    const DESCRIPTION: &'static str =
+        "List notes by key prefix and/or tags. Returns metadata without content.";
+
+    type Request = ListRequest;
+    type Response = ListResponse;
+    type Error = NotesError;
+
+    fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, NotesError> {
+        let prefix = req.prefix.as_deref().unwrap_or("");
+        let tags = req.tags.as_deref().unwrap_or(&[]);
+        let max = req.max_results.unwrap_or(50) as usize;
+        let (entries, total) = ctx.notes.list(prefix, tags, max);
+        let notes = entries.into_iter().map(|e| ListEntry {
+            key: e.key,
+            bytes: e.bytes,
+            tags: e.tags,
+            updated_at: e.updated_at,
+        }).collect();
+        Ok(ListResponse { notes, total_matches: total })
+    }
+}
+
+pub const NOTES_LIST: RegisteredTool = RegisteredTool::new::<NotesList>();

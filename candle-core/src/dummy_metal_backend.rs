@@ -61,6 +61,14 @@ impl crate::backend::BackendStorage for MetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    fn sub_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    fn div_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
         Err(Error::NotCompiledWithMetalSupport)
     }
@@ -78,6 +86,16 @@ impl crate::backend::BackendStorage for MetalStorage {
     }
 
     fn binary_impl<B: BinaryOpT>(&self, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    fn binary_inplace_impl(
+        &mut self,
+        _op: crate::op::BinaryInplaceOp,
+        _rhs: &Self,
+        _lhs_l: &Layout,
+        _rhs_l: &Layout,
+    ) -> Result<()> {
         Err(Error::NotCompiledWithMetalSupport)
     }
 

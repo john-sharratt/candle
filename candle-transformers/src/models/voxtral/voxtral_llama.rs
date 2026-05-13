@@ -452,7 +452,7 @@ impl VoxtralLlama {
     pub fn load(vb: VarBuilder, cfg: &VoxtralLlamaConfig) -> Result<Self> {
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(wte.embeddings().clone(), None)
+            Linear::from_weights(wte.embeddings_native(), None)
         } else {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };

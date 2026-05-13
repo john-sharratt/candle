@@ -55,10 +55,8 @@ impl ArgSort {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use crate::cuda_backend::cudarc::driver::{
-        CudaSlice, DeviceRepr, LaunchConfig, ValidAsZeroBits,
-    };
-    use crate::cuda_backend::{kernel_name, kernels, CudaStorageSlice as S, WrapErr};
+    use crate::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, ValidAsZeroBits};
+    use crate::cuda_backend::{kernels, CudaStorageSlice as S};
     use crate::{CudaDevice, WithDType};
 
     fn next_power_of_2(x: usize) -> usize {
@@ -69,6 +67,22 @@ mod cuda {
         n
     }
 
+    /// Convert WithDType to SortDType for FFI dispatcher
+    fn dtype_to_sort_dtype<T: WithDType>() -> i32 {
+        use crate::DType;
+        use kernels::simple::sort::SortDType;
+        match T::DTYPE {
+            DType::F32 => SortDType::F32 as i32,
+            DType::F64 => SortDType::F64 as i32,
+            DType::F16 => SortDType::F16 as i32,
+            DType::BF16 => SortDType::BF16 as i32,
+            DType::U8 => SortDType::U8 as i32,
+            DType::U32 => SortDType::U32 as i32,
+            DType::I64 => SortDType::I64 as i32,
+            DType::F8E4M3 => SortDType::F32 as i32, // Fallback to F32 for unsupported type
+        }
+    }
+
     impl crate::cuda_backend::Map1Any for ArgSort {
         fn f<T: DeviceRepr + WithDType + ValidAsZeroBits, W: Fn(CudaSlice<T>) -> S>(
             &self,
@@ -77,33 +91,51 @@ mod cuda {
             layout: &crate::Layout,
             _wrap: W,
         ) -> Result<S> {
-            use cudarc::driver::PushKernelArg;
-
             let slice = match layout.contiguous_offsets() {
                 None => crate::bail!("input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
             let elem_count = layout.shape().elem_count();
             let dst = unsafe { dev.alloc::<u32>(elem_count)? };
-            let func = if self.asc {
-                dev.get_or_load_func(&kernel_name::<T>("asort_asc"), &kernels::SORT)?
-            } else {
-                dev.get_or_load_func(&kernel_name::<T>("asort_desc"), &kernels::SORT)?
-            };
             let ncols = self.last_dim;
             let nrows = elem_count / ncols;
             let ncols_pad = next_power_of_2(ncols);
-            let cfg = LaunchConfig {
-                grid_dim: (nrows as u32, 1, 1),
-                block_dim: (ncols_pad as u32, 1, 1),
-                shared_mem_bytes: (ncols_pad * std::mem::size_of::<u32>()) as u32,
-            };
+            let shared_mem_size = ncols_pad * std::mem::size_of::<u32>();
             let stream = dev.cuda_stream();
-            let mut builder = stream.launch_builder(&func);
-            let ncols = ncols as i32;
-            let ncols_pad = ncols_pad as i32;
-            builder.arg(&slice).arg(&dst).arg(&ncols).arg(&ncols_pad);
-            unsafe { builder.launch(cfg) }.w()?;
+
+            // Wrap FFI call in block so guards drop before we move dst
+            {
+                // Get pointers for FFI
+                let (src_ptr, _src_guard) = slice.device_ptr(&stream);
+                let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                let dtype = dtype_to_sort_dtype::<T>();
+
+                unsafe {
+                    if self.asc {
+                        kernels::simple::sort::run_argsort_asc(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut u32,
+                            ncols as i32,
+                            ncols_pad as i32,
+                            nrows as i32,
+                            shared_mem_size,
+                            std::ptr::null_mut(), // Use default stream
+                        );
+                    } else {
+                        kernels::simple::sort::run_argsort_desc(
+                            dtype,
+                            src_ptr as *const std::ffi::c_void,
+                            dst_ptr as *mut u32,
+                            ncols as i32,
+                            ncols_pad as i32,
+                            nrows as i32,
+                            shared_mem_size,
+                            std::ptr::null_mut(), // Use default stream
+                        );
+                    }
+                }
+            }
             Ok(S::U32(dst))
         }
     }

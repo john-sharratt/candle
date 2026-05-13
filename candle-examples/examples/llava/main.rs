@@ -14,7 +14,7 @@ use candle_transformers::models::llava::config::{
 use candle_transformers::models::llava::{config::LLaVAConfig, LLaVA};
 use clap::Parser;
 use constants::*;
-use conversation::Conversation;
+use conversation::Sequence;
 use hf_hub::api::sync::Api;
 use image_processor::{process_image, ImageProcessor};
 use std::io::Write;
@@ -246,8 +246,8 @@ fn main() -> Result<()> {
 
     let mut conv = match args.conv_mode {
         Some(conv_mode) => match conv_mode.as_str() {
-            "chatml_direct" => Conversation::conv_chatml_direct(),
-            "llava_v1" => Conversation::conv_llava_v1(),
+            "chatml_direct" => Sequence::conv_chatml_direct(),
+            "llava_v1" => Sequence::conv_llava_v1(),
             _ => todo!("not implement yet"),
         },
         None => bail!("conv_mode is required"),

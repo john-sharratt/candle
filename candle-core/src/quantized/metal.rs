@@ -4,6 +4,7 @@ use crate::{DType, MetalDevice, MetalStorage, Result, Shape, D};
 use candle_metal_kernels::metal::Buffer;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
@@ -294,6 +295,34 @@ impl QMetalStorage {
         }
         self.device.wait_until_completed()?;
         Ok(read_to_vec::<u8>(&buffer, self.buffer.length() as usize))
+    }
+
+    /// Copy a byte range of the quantized data to CPU as a `Vec<u8>`.
+    ///
+    /// Issues a single ranged blit instead of copying the entire
+    /// buffer.  Mirrors [`QCudaStorage::data_range`] for the Metal
+    /// backend.
+    pub fn data_range(&self, range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        let buf_len = self.buffer.length() as usize;
+        if range.end > buf_len {
+            crate::bail!(
+                "data_range: range {:?} exceeds buffer length {}",
+                range,
+                buf_len,
+            );
+        }
+        let len = range.end - range.start;
+        let buffer = self.device.allocate_buffer(len as u64)?;
+        {
+            let command_buffer = self.device.command_buffer()?;
+            command_buffer.set_label("to_cpu_range");
+            let blit = command_buffer.blit_command_encoder();
+            blit.set_label("blit_to_cpu_range");
+            blit.copy_from_buffer(&self.buffer, range.start as u64, &buffer, 0, len as u64);
+            blit.end_encoding();
+        }
+        self.device.wait_until_completed()?;
+        Ok(read_to_vec::<u8>(&buffer, len))
     }
 }
 

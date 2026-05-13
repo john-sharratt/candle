@@ -10,6 +10,9 @@ mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod k_quants;
+// Note: the previous `q0_v_test` module has been removed — it tested the OLD
+// (sign + shape + curve_pos) Q0_V format that no longer exists. The new
+// (curve + scale + centroid) format will get a fresh test suite.
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(feature = "metal"))]
@@ -19,9 +22,35 @@ mod metal {
 #[cfg(feature = "cuda")]
 pub mod cuda;
 #[cfg(not(feature = "cuda"))]
+mod dummy_pinned_staging;
+#[cfg(feature = "cuda")]
+pub mod pinned_staging;
+#[cfg(not(feature = "cuda"))]
+pub mod pinned_staging {
+    pub use super::dummy_pinned_staging::*;
+}
+#[cfg(not(feature = "cuda"))]
 mod cuda {
     pub use super::dummy_cuda::*;
 }
+
+#[cfg(feature = "cuda")]
+pub use cuda::cuda_flush_l2;
+pub use cuda::get_dispatch_info;
+#[cfg(feature = "cuda")]
+pub use cuda::grouped_matmul_gemx;
+pub use cuda::set_force_dmmv;
+#[cfg(feature = "cuda")]
+pub use cuda::{
+    alloc_host_mapped, get_vram_info, register_mmap_cuda, HostMappedAlloc, MmapRegistration,
+};
+#[cfg(feature = "cuda")]
+pub use cuda::{
+    arena_compact_copy, arena_compact_copy_async, arena_compact_patch, arena_compact_patch_async,
+    CompactMove,
+};
+#[cfg(feature = "cuda")]
+pub use cuda::{load_repacked, load_repacked_on_stream, repack_to_host, repacked_size_bytes};
 
 #[cfg(target_feature = "neon")]
 pub mod neon;
@@ -32,6 +61,7 @@ use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
 
+#[derive(Clone)]
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
@@ -60,6 +90,16 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+}
+
+impl Clone for QStorage {
+    fn clone(&self) -> Self {
+        match self {
+            QStorage::Cpu(storage) => QStorage::Cpu(storage.clone_box()),
+            QStorage::Metal(storage) => QStorage::Metal(storage.clone()),
+            QStorage::Cuda(storage) => QStorage::Cuda(storage.clone()),
+        }
+    }
 }
 
 impl QStorage {
@@ -123,35 +163,495 @@ impl QStorage {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
                 Ok(Cow::from(data))
             }
-            QStorage::Metal(_) | QStorage::Cuda(_) => {
-                crate::bail!("not implemented");
+            QStorage::Cuda(storage) => {
+                let vec = storage.data()?;
+                Ok(Cow::from(vec))
             }
+            QStorage::Metal(_) => {
+                crate::bail!("data() not implemented for Metal storage");
+            }
+        }
+    }
+
+    /// Read just `range` bytes of the storage's raw quantized data.
+    ///
+    /// Backend-specific behaviour:
+    /// - **CPU**: zero-copy `Cow::Borrowed` of the underlying slice.
+    /// - **CUDA**: single ranged `cuMemcpyDtoH` copying only
+    ///   `range.len()` bytes — does **not** copy the whole arena and
+    ///   then slice on the CPU side.
+    /// - **Metal**: ranged blit copying only the requested span.
+    ///
+    /// Use this everywhere a caller previously did
+    /// `&storage.data()?[range]` — the slice form copies the entire
+    /// arena over PCIe just to discard most of it.
+    fn data_range(&self, range: std::ops::Range<usize>) -> Result<Cow<'_, [u8]>> {
+        match self {
+            QStorage::Cpu(storage) => {
+                let data_ptr = storage.as_ptr();
+                let size_in_bytes = storage.storage_size_in_bytes();
+                if range.end > size_in_bytes {
+                    crate::bail!(
+                        "data_range: range {:?} exceeds storage byte_len {}",
+                        range,
+                        size_in_bytes,
+                    );
+                }
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
+                Ok(Cow::Borrowed(&data[range]))
+            }
+            QStorage::Cuda(storage) => {
+                let vec = storage.data_range(range)?;
+                Ok(Cow::Owned(vec))
+            }
+            QStorage::Metal(storage) => Ok(Cow::Owned(storage.data_range(range)?)),
+        }
+    }
+
+    /// Get the CUDA device pointer for the raw quantized data.
+    /// Returns None for non-CUDA storage.
+    #[cfg(feature = "cuda")]
+    fn cuda_data_ptr(&self) -> Option<u64> {
+        match self {
+            QStorage::Cuda(storage) => Some(storage.data_ptr()),
+            _ => None,
+        }
+    }
+
+    /// Get a reference to the inner [`QCudaStorage`], if CUDA-backed.
+    #[cfg(feature = "cuda")]
+    pub fn as_cuda(&self) -> Option<&cuda::QCudaStorage> {
+        match self {
+            QStorage::Cuda(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Get a mutable CUDA device pointer for the raw quantized data.
+    /// Returns None for non-CUDA storage.
+    #[cfg(feature = "cuda")]
+    fn cuda_data_ptr_mut(&mut self) -> Option<u64> {
+        match self {
+            QStorage::Cuda(storage) => Some(storage.data_ptr_mut()),
+            _ => None,
+        }
+    }
+
+    /// Copy bytes from `src` into `self` at the given byte offset.
+    ///
+    /// # Arguments
+    /// * `src` - Source storage to copy from
+    /// * `byte_offset` - Byte offset in destination where copy begins
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Storages are on different devices
+    /// - Byte offset + src size exceeds destination size
+    fn slice_scatter(&mut self, src: &QStorage, byte_offset: usize) -> Result<()> {
+        let src_size = src.size_in_bytes();
+        let dst_size = self.size_in_bytes();
+        if byte_offset + src_size > dst_size {
+            crate::bail!(
+                "slice_scatter: source ({} bytes) at offset {} exceeds destination ({} bytes)",
+                src_size,
+                byte_offset,
+                dst_size
+            )
+        }
+
+        match (self, src) {
+            (QStorage::Cpu(dst), QStorage::Cpu(src)) => {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_ptr() as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr.add(byte_offset), src_size);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            (QStorage::Cuda(dst), QStorage::Cuda(src)) => {
+                let device = dst.device().clone();
+                let src_view = src.bytes();
+                let mut dst_view = dst
+                    .bytes_mut()
+                    .slice_mut(byte_offset..byte_offset + src_size);
+                device.memcpy_dtod(&src_view, &mut dst_view)?;
+                Ok(())
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_dst), QStorage::Metal(_src)) => {
+                crate::bail!("slice_scatter not yet implemented for Metal")
+            }
+            _ => crate::bail!("slice_scatter: device mismatch between source and destination"),
+        }
+    }
+
+    /// Copy a byte range from one QStorage to another without dequantization.
+    ///
+    /// Both source and destination must be on the same device. Copies `byte_len`
+    /// bytes from `src` starting at `src_byte_offset` into `self` at `dst_byte_offset`.
+    fn slice_range_copy(
+        &mut self,
+        src: &QStorage,
+        src_byte_offset: usize,
+        dst_byte_offset: usize,
+        byte_len: usize,
+    ) -> Result<()> {
+        let src_size = src.size_in_bytes();
+        let dst_size = self.size_in_bytes();
+        if src_byte_offset + byte_len > src_size {
+            crate::bail!(
+                "slice_range_copy: src range {}..{} exceeds src size {}",
+                src_byte_offset,
+                src_byte_offset + byte_len,
+                src_size
+            )
+        }
+        if dst_byte_offset + byte_len > dst_size {
+            crate::bail!(
+                "slice_range_copy: dst range {}..{} exceeds dst size {}",
+                dst_byte_offset,
+                dst_byte_offset + byte_len,
+                dst_size
+            )
+        }
+
+        match (self, src) {
+            (QStorage::Cpu(dst), QStorage::Cpu(src)) => {
+                let src_ptr = src.as_ptr();
+                let dst_ptr = dst.as_ptr() as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(src_byte_offset),
+                        dst_ptr.add(dst_byte_offset),
+                        byte_len,
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            (QStorage::Cuda(dst), QStorage::Cuda(src)) => {
+                let device = dst.device().clone();
+                let src_view = src
+                    .bytes()
+                    .slice(src_byte_offset..src_byte_offset + byte_len);
+                let mut dst_view = dst
+                    .bytes_mut()
+                    .slice_mut(dst_byte_offset..dst_byte_offset + byte_len);
+                device.memcpy_dtod(&src_view, &mut dst_view)?;
+                Ok(())
+            }
+            // GPU→CPU: DtoH byte copy (warm-tier migration).
+            #[cfg(feature = "cuda")]
+            (QStorage::Cpu(dst), QStorage::Cuda(src)) => {
+                let src_view = src
+                    .bytes()
+                    .slice(src_byte_offset..src_byte_offset + byte_len);
+                let cpu_bytes: Vec<u8> = src.device().memcpy_dtov(&src_view)?;
+                let dst_ptr = dst.as_ptr() as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        cpu_bytes.as_ptr(),
+                        dst_ptr.add(dst_byte_offset),
+                        byte_len,
+                    );
+                }
+                Ok(())
+            }
+            // CPU→GPU: HtoD byte copy (hot-tier re-injection).
+            #[cfg(feature = "cuda")]
+            (QStorage::Cuda(dst), QStorage::Cpu(src)) => {
+                let device = dst.device().clone();
+                let src_ptr = src.as_ptr();
+                let src_bytes = unsafe {
+                    std::slice::from_raw_parts(src_ptr.add(src_byte_offset), byte_len)
+                };
+                let mut dst_view = dst
+                    .bytes_mut()
+                    .slice_mut(dst_byte_offset..dst_byte_offset + byte_len);
+                device.memcpy_htod(src_bytes, &mut dst_view)?;
+                Ok(())
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_dst), QStorage::Metal(_src)) => {
+                crate::bail!("slice_range_copy not yet implemented for Metal")
+            }
+            _ => crate::bail!("slice_range_copy: device mismatch between source and destination"),
+        }
+    }
+
+    /// Quantize f32 data directly into this storage at the given byte offset.
+    ///
+    /// This is optimized for GPU by using CUDA quantization kernels that write
+    /// directly to the destination buffer, avoiding intermediate allocations.
+    ///
+    /// # Arguments
+    /// * `src` - Source float storage
+    /// * `elem_count` - Number of f32 elements to quantize
+    /// * `byte_offset` - Byte offset in destination where quantized data starts
+    ///
+    /// # Errors
+    /// Returns an error if storages are on different devices or CPU is used.
+    #[cfg(feature = "cuda")]
+    fn quantize_into(
+        &mut self,
+        src: &Storage,
+        elem_count: usize,
+        byte_offset: usize,
+    ) -> Result<()> {
+        match (self, src) {
+            (QStorage::Cuda(dst), Storage::Cuda(src)) => {
+                dst.quantize_into(src, elem_count, byte_offset)
+            }
+            (QStorage::Cpu(dst), Storage::Cpu(src)) => {
+                let mut tmp = dst.dtype().cpu_zeros(elem_count);
+                tmp.from_float(src.as_slice::<f32>()?);
+                let src_size = tmp.storage_size_in_bytes();
+                let dst_size = dst.storage_size_in_bytes();
+                if byte_offset + src_size > dst_size {
+                    crate::bail!(
+                        "quantize_into: source ({} bytes) at offset {} exceeds destination ({} bytes)",
+                        src_size,
+                        byte_offset,
+                        dst_size
+                    )
+                }
+                let src_ptr = tmp.as_ptr();
+                let dst_ptr = dst.as_ptr() as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr.add(byte_offset), src_size);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_), _) => {
+                crate::bail!("quantize_into: Metal quantization not yet implemented")
+            }
+            _ => crate::bail!("quantize_into: device mismatch between source and destination"),
+        }
+    }
+
+    /// Quantize f32 data with fused transpose from [H, T, D] to [H, D, T] layout.
+    ///
+    /// This fuses the memory layout transformation with quantization to avoid
+    /// intermediate allocations. Used for KV cache quantization.
+    ///
+    /// # Arguments
+    /// * `src` - Source float storage with shape [n_head, chunk_size, head_dim]
+    /// * `n_head` - Number of heads
+    /// * `chunk_size` - Number of tokens (must be 32)
+    /// * `head_dim` - Dimension per head
+    /// * `byte_offset` - Byte offset in destination
+    ///
+    /// # Errors
+    /// Returns an error if dtype is not Q4_0/Q8_0 or devices mismatch.
+    #[cfg(feature = "cuda")]
+    fn quantize_transposed_into(
+        &mut self,
+        src: &Storage,
+        n_head: usize,
+        chunk_size: usize,
+        head_dim: usize,
+        byte_offset: usize,
+    ) -> Result<()> {
+        match (self, src) {
+            (QStorage::Cuda(dst), Storage::Cuda(src)) => {
+                dst.quantize_transposed_into(src, n_head, chunk_size, head_dim, byte_offset)
+            }
+            (QStorage::Cpu(_), _) => {
+                crate::bail!(
+                    "quantize_transposed_into: CPU not supported, use separate transpose + quantize"
+                )
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_), _) => {
+                crate::bail!("quantize_transposed_into: Metal not yet implemented")
+            }
+            _ => crate::bail!("quantize_transposed_into: device mismatch"),
+        }
+    }
+
+    /// Dequantize a range of elements directly into a destination storage buffer.
+    ///
+    /// # Errors
+    /// Returns an error if storages are on different devices or CPU is used.
+    #[cfg(feature = "cuda")]
+    fn dequantize_into(
+        &self,
+        dst: &mut Storage,
+        elem_count: usize,
+        src_byte_offset: usize,
+        dst_elem_offset: usize,
+    ) -> Result<()> {
+        match (self, dst) {
+            (QStorage::Cuda(src), Storage::Cuda(dst)) => {
+                src.dequantize_into(dst, elem_count, src_byte_offset, dst_elem_offset)
+            }
+            (QStorage::Cpu(_), _) => {
+                crate::bail!("dequantize_into: CPU not supported, use dequantize()")
+            }
+            #[cfg(feature = "metal")]
+            (QStorage::Metal(_), _) => {
+                crate::bail!("dequantize_into: Metal not yet implemented")
+            }
+            _ => crate::bail!("dequantize_into: device mismatch between source and destination"),
         }
     }
 }
 
+#[repr(u32)]
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlDType {
-    F32,
-    F16,
-    BF16,
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Q8_0,
-    Q8_1,
-    Q2K,
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
-    Q8K,
+    F32 = 0,
+    F16 = 1,
+    BF16 = 2,
+    /// R16: Raw F16 + reserved Q-capture space (128 bytes per 32 elements)
+    R16 = 3,
+    /// P2: 2-bit palette index (1 byte per 4 head_dim positions, pure arena routing)
+    P2 = 4,
+    /// AWQ 4-bit with group size 128
+    QAWQ = 5,
+    QAWQ_G64 = 6,
+    /// Quant blocks
+    Q8_0 = 7,
+    Q8_1 = 8,
+    Q8_K = 9,
+    Q8_KS = 10,
+
+    Q6_K = 11,
+
+    Q5_0 = 12,
+    Q5_1 = 13,
+    Q5_K = 14,
+
+    Q4_0 = 15,
+    Q4_1 = 16,
+    Q4_K = 17,
+    Q4_KS = 18,
+
+    Q3_0 = 19,
+    Q3_1 = 20,
+    Q3_K = 21,
+
+    Q2_0 = 22,
+    Q2_1 = 23,
+    Q2_K = 24,
+    Q2_S = 25,
+    Q2_A = 26,
+
+    Q1_S = 27,
+
+    Q0_V = 28,
+    Q1_A = 29,
+    Q0_X = 30,
+    Q0_M2 = 31,
+    Q0_M4 = 32,
+    Q0 = 33,
+
+    F8E4M3 = 34,
+    F8E5M2 = 35,
+
+    U8 = 36,
+    I8 = 37,
+    U16 = 38,
+    I16 = 39,
+    U32 = 40,
+    I32 = 41,
+    U64 = 42,
+    I64 = 43,
+    F64 = 44,
 }
 
 impl GgmlDType {
+    /// Map an in-workspace integer (`GgmlDType as u32` discriminant) back to
+    /// the corresponding `GgmlDType` variant.  This is the identity mapping —
+    /// `from_u32(Self::Q4_K as u32)` returns `Self::Q4_K`.
+    ///
+    /// ⚠ This is NOT the GGUF/GGML on-disk file-format code.  Use
+    /// `from_gguf_file_code` when reading raw integers from GGUF/GGML files.
+    ///
+    /// Every other integer used for a quant format inside the workspace —
+    /// the C++ `QType` in `block_compact.cuh`, `ArenaFormat::*` in
+    /// `arena_table.cuh`, `SELECT_FMT_*` in `select_kv_format.cuh`, the
+    /// KV-side Rust `QType` in `candle_kernels/src/simple/quantized.rs`,
+    /// the matmul-side Rust `QType` in `candle_kernels/src/quantized/api.rs`,
+    /// and every `qtype: i32` FFI argument — all use `GgmlDType as u32`.
+    #[allow(dead_code)]
     pub(crate) fn from_u32(u: u32) -> Result<Self> {
         let dtype = match u {
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::BF16,
+            3 => Self::R16,
+            4 => Self::P2,
+            5 => Self::QAWQ,
+            6 => Self::QAWQ_G64,
+            7 => Self::Q8_0,
+            8 => Self::Q8_1,
+            9 => Self::Q8_K,
+            10 => Self::Q8_KS,
+            11 => Self::Q6_K,
+            12 => Self::Q5_0,
+            13 => Self::Q5_1,
+            14 => Self::Q5_K,
+            15 => Self::Q4_0,
+            16 => Self::Q4_1,
+            17 => Self::Q4_K,
+            18 => Self::Q4_KS,
+            19 => Self::Q3_0,
+            20 => Self::Q3_1,
+            21 => Self::Q3_K,
+            22 => Self::Q2_0,
+            23 => Self::Q2_1,
+            24 => Self::Q2_K,
+            25 => Self::Q2_S,
+            26 => Self::Q2_A,
+            27 => Self::Q1_S,
+            28 => Self::Q0_V,
+            29 => Self::Q1_A,
+            30 => Self::Q0_X,
+            31 => Self::Q0_M2,
+            32 => Self::Q0_M4,
+            33 => Self::Q0,
+            34 => Self::F8E4M3,
+            35 => Self::F8E5M2,
+            36 => Self::U8,
+            37 => Self::I8,
+            38 => Self::U16,
+            39 => Self::I16,
+            40 => Self::U32,
+            41 => Self::I32,
+            42 => Self::U64,
+            43 => Self::I64,
+            44 => Self::F64,
+            _ => crate::bail!("unknown dtype discriminant {u}"),
+        };
+        Ok(dtype)
+    }
+
+    /// Return the in-workspace integer representation (`GgmlDType as u32`).
+    ///
+    /// ⚠ This is NOT the GGUF/GGML on-disk file-format code.  Use
+    /// `to_gguf_file_code` when writing integers to GGUF/GGML files.
+    #[allow(dead_code)]
+    pub(crate) fn to_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Decode a GGUF / GGML **on-disk file-format** dtype code into our
+    /// in-memory `GgmlDType`.
+    ///
+    /// ⚠ THIS IS THE SINGLE TRANSLATION BOUNDARY between the on-disk GGUF
+    /// integer and everything inside the workspace.  The on-disk numbering
+    /// (upstream llama.cpp) differs from the workspace discriminants:
+    ///   * On-disk: Q4_K=12, Q5_K=13, Q6_K=14, Q8_K=15, BF16=30, …
+    ///   * In-workspace: Q4_K=17, Q5_K=14, Q6_K=11, Q8_K=9, BF16=2, …
+    ///
+    /// `from_gguf_file_code` and `to_gguf_file_code` are each other's inverse.
+    pub(crate) fn from_gguf_file_code(u: u32) -> Result<Self> {
+        let dtype = match u {
+            // Standard GGML file codes (match llama.cpp ggml.h).
             0 => Self::F32,
             1 => Self::F16,
             2 => Self::Q4_0,
@@ -160,20 +660,57 @@ impl GgmlDType {
             7 => Self::Q5_1,
             8 => Self::Q8_0,
             9 => Self::Q8_1,
-            10 => Self::Q2K,
-            11 => Self::Q3K,
-            12 => Self::Q4K,
-            13 => Self::Q5K,
-            14 => Self::Q6K,
-            15 => Self::Q8K,
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
+            12 => Self::Q4_K,
+            13 => Self::Q5_K,
+            14 => Self::Q6_K,
+            15 => Self::Q8_K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
-            _ => crate::bail!("unknown dtype for tensor {u}"),
+            // AWQ types use IDs 100+ to avoid conflicts with GGML types
+            100 => Self::QAWQ,
+            101 => Self::QAWQ_G64,
+            // Candle-specific extensions use IDs 200+ to stay clear of future GGML / AWQ additions.
+            200 => Self::Q4_KS,
+            201 => Self::Q8_KS,
+            202 => Self::Q2_0,
+            203 => Self::Q3_0,
+            204 => Self::Q2_S,
+            205 => Self::Q2_A,
+            206 => Self::Q1_S,
+            207 => Self::R16,
+            208 => Self::Q0,
+            209 => Self::Q3_1,
+            210 => Self::Q2_1,
+            211 => Self::P2,
+            212 => Self::Q0_V,
+            213 => Self::Q1_A,
+            214 => Self::Q0_X,
+            215 => Self::Q0_M2,
+            216 => Self::Q0_M4,
+            217 => Self::F8E4M3,
+            218 => Self::F8E5M2,
+            230 => Self::F64,
+            231 => Self::U8,
+            232 => Self::I8,
+            233 => Self::U16,
+            234 => Self::I16,
+            235 => Self::U32,
+            236 => Self::I32,
+            237 => Self::U64,
+            238 => Self::I64,
+            _ => crate::bail!("unknown gguf file dtype code {u}"),
         };
         Ok(dtype)
     }
 
-    pub(crate) fn to_u32(self) -> u32 {
+    /// Encode a `GgmlDType` back into its GGUF / GGML on-disk file-format code.
+    ///
+    /// ⚠ MUST be the exact inverse of `from_gguf_file_code` above — the output
+    /// is the integer written to disk in GGUF tensor metadata, NOT the
+    /// `#[repr(u32)]` discriminant of this enum.
+    pub(crate) fn to_gguf_file_code(self) -> u32 {
         match self {
             Self::F32 => 0,
             Self::F16 => 1,
@@ -183,43 +720,122 @@ impl GgmlDType {
             Self::Q5_1 => 7,
             Self::Q8_0 => 8,
             Self::Q8_1 => 9,
-            Self::Q2K => 10,
-            Self::Q3K => 11,
-            Self::Q4K => 12,
-            Self::Q5K => 13,
-            Self::Q6K => 14,
-            Self::Q8K => 15,
-            // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+            Self::Q2_K => 10,
+            Self::Q3_K => 11,
+            Self::Q4_K => 12,
+            Self::Q5_K => 13,
+            Self::Q6_K => 14,
+            Self::Q8_K => 15,
             Self::BF16 => 30,
+            Self::QAWQ => 100,
+            Self::QAWQ_G64 => 101,
+            Self::Q4_KS => 200,
+            Self::Q8_KS => 201,
+            Self::Q2_0 => 202,
+            Self::Q3_0 => 203,
+            Self::Q2_S => 204,
+            Self::Q2_A => 205,
+            Self::Q1_S => 206,
+            Self::R16 => 207,
+            Self::Q0 => 208,
+            Self::Q3_1 => 209,
+            Self::Q2_1 => 210,
+            Self::P2 => 211,
+            Self::Q0_V => 212,
+            Self::Q1_A => 213,
+            Self::Q0_X => 214,
+            Self::Q0_M2 => 215,
+            Self::Q0_M4 => 216,
+            Self::F8E4M3 => 217,
+            Self::F8E5M2 => 218,
+            Self::F64 => 230,
+            Self::U8 => 231,
+            Self::I8 => 232,
+            Self::U16 => 233,
+            Self::I16 => 234,
+            Self::U32 => 235,
+            Self::I32 => 236,
+            Self::U64 => 237,
+            Self::I64 => 238,
         }
     }
 
     /// The block dtype
     pub fn cpu_zeros(&self, elem_count: usize) -> Box<dyn QuantizedType> {
         match self {
+            Self::F64 => Box::new(vec![f64::zeros(); elem_count]),
             Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
             Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
+            Self::F8E4M3 => Box::new(vec![BlockQ8_0::zeros(); elem_count]),
+            Self::F8E5M2 => Box::new(vec![BlockQ8_0::zeros(); elem_count]),
+            Self::U8 => Box::new(vec![u8::zeros(); elem_count]),
+            Self::I8 => Box::new(vec![i8::zeros(); elem_count]),
+            Self::U16 => Box::new(vec![u16::zeros(); elem_count]),
+            Self::I16 => Box::new(vec![i16::zeros(); elem_count]),
+            Self::U32 => Box::new(vec![u32::zeros(); elem_count]),
+            Self::I32 => Box::new(vec![i32::zeros(); elem_count]),
+            Self::U64 => Box::new(vec![u64::zeros(); elem_count]),
+            Self::I64 => Box::new(vec![i64::zeros(); elem_count]),
             Self::Q4_0 => Box::new(vec![BlockQ4_0::zeros(); elem_count / BlockQ4_0::BLCK_SIZE]),
             Self::Q4_1 => Box::new(vec![BlockQ4_1::zeros(); elem_count / BlockQ4_1::BLCK_SIZE]),
             Self::Q5_0 => Box::new(vec![BlockQ5_0::zeros(); elem_count / BlockQ5_0::BLCK_SIZE]),
             Self::Q5_1 => Box::new(vec![BlockQ5_1::zeros(); elem_count / BlockQ5_1::BLCK_SIZE]),
             Self::Q8_0 => Box::new(vec![BlockQ8_0::zeros(); elem_count / BlockQ8_0::BLCK_SIZE]),
             Self::Q8_1 => Box::new(vec![BlockQ8_1::zeros(); elem_count / BlockQ8_1::BLCK_SIZE]),
-            Self::Q2K => Box::new(vec![BlockQ2K::zeros(); elem_count / BlockQ2K::BLCK_SIZE]),
-            Self::Q3K => Box::new(vec![BlockQ3K::zeros(); elem_count / BlockQ3K::BLCK_SIZE]),
-            Self::Q4K => Box::new(vec![BlockQ4K::zeros(); elem_count / BlockQ4K::BLCK_SIZE]),
-            Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
-            Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
-            Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
+            Self::Q2_K => Box::new(vec![BlockQ2_K::zeros(); elem_count / BlockQ2_K::BLCK_SIZE]),
+            Self::Q3_K => Box::new(vec![BlockQ3_K::zeros(); elem_count / BlockQ3_K::BLCK_SIZE]),
+            Self::Q4_K => Box::new(vec![BlockQ4_K::zeros(); elem_count / BlockQ4_K::BLCK_SIZE]),
+            Self::Q5_K => Box::new(vec![BlockQ5_K::zeros(); elem_count / BlockQ5_K::BLCK_SIZE]),
+            Self::Q6_K => Box::new(vec![BlockQ6_K::zeros(); elem_count / BlockQ6_K::BLCK_SIZE]),
+            Self::Q8_K => Box::new(vec![BlockQ8_K::zeros(); elem_count / BlockQ8_K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+            Self::QAWQ => Box::new(vec![BlockQAWQ::zeros(); elem_count / BlockQAWQ::BLCK_SIZE]),
+            Self::QAWQ_G64 => Box::new(vec![
+                BlockQAWQ_G64::zeros();
+                elem_count / BlockQAWQ_G64::BLCK_SIZE
+            ]),
+            Self::Q4_KS => Box::new(vec![
+                BlockQ4_KS::zeros();
+                elem_count / BlockQ4_KS::BLCK_SIZE
+            ]),
+            Self::Q8_KS => Box::new(vec![
+                BlockQ8_KS::zeros();
+                elem_count / BlockQ8_KS::BLCK_SIZE
+            ]),
+            Self::Q2_0 => Box::new(vec![BlockQ2_0::zeros(); elem_count / BlockQ2_0::BLCK_SIZE]),
+            Self::Q3_0 => Box::new(vec![BlockQ3_0::zeros(); elem_count / BlockQ3_0::BLCK_SIZE]),
+            Self::R16 => Box::new(vec![BlockR16::zeros(); elem_count / BlockR16::BLCK_SIZE]),
+            Self::Q0 => Box::new(vec![BlockQ0::zeros(); elem_count / BlockQ0::BLCK_SIZE]),
+            Self::Q1_S => Box::new(vec![BlockQ1S::zeros(); elem_count / BlockQ1S::BLCK_SIZE]),
+            Self::Q2_S => Box::new(vec![BlockQ2S::zeros(); elem_count / BlockQ2S::BLCK_SIZE]),
+            Self::Q2_A => Box::new(vec![BlockQ2A::zeros(); elem_count / BlockQ2A::BLCK_SIZE]),
+            Self::Q2_1 => Box::new(vec![BlockQ2_1::zeros(); elem_count / BlockQ2_1::BLCK_SIZE]),
+            Self::Q3_1 => Box::new(vec![BlockQ3_1::zeros(); elem_count / BlockQ3_1::BLCK_SIZE]),
+            Self::P2 => Box::new(vec![BlockP2::zeros(); elem_count / BlockP2::BLCK_SIZE]),
+            Self::Q0_V => Box::new(vec![BlockQ0V::zeros(); elem_count / BlockQ0V::BLCK_SIZE]),
+            Self::Q1_A => Box::new(vec![BlockQ1A::zeros(); elem_count / BlockQ1A::BLCK_SIZE]),
+            Self::Q0_X => Box::new(vec![BlockQ0X::zeros(); elem_count / BlockQ0X::BLCK_SIZE]),
+            Self::Q0_M2 => Box::new(vec![BlockQ0M2::zeros(); elem_count / BlockQ0M2::BLCK_SIZE]),
+            Self::Q0_M4 => Box::new(vec![BlockQ0M4::zeros(); elem_count / BlockQ0M4::BLCK_SIZE]),
         }
     }
     /// The type size for blocks in bytes.
     pub fn type_size(&self) -> usize {
         use k_quants::*;
         match self {
+            Self::F64 => 8,
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
+            Self::F8E4M3 => 1,
+            Self::F8E5M2 => 1,
+            Self::U8 => 1,
+            Self::I8 => 1,
+            Self::U16 => 2,
+            Self::I16 => 2,
+            Self::U32 => 4,
+            Self::I32 => 4,
+            Self::U64 => 8,
+            Self::I64 => 8,
             Self::Q4_0 => std::mem::size_of::<BlockQ4_0>(),
             Self::Q4_1 => std::mem::size_of::<BlockQ4_1>(),
             Self::Q5_0 => std::mem::size_of::<BlockQ5_0>(),
@@ -227,12 +843,31 @@ impl GgmlDType {
             // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/ggml.c#L932
             Self::Q8_0 => std::mem::size_of::<BlockQ8_0>(),
             Self::Q8_1 => std::mem::size_of::<BlockQ8_1>(),
-            Self::Q2K => std::mem::size_of::<BlockQ2K>(),
-            Self::Q3K => std::mem::size_of::<BlockQ3K>(),
-            Self::Q4K => std::mem::size_of::<BlockQ4K>(),
-            Self::Q5K => std::mem::size_of::<BlockQ5K>(),
-            Self::Q6K => std::mem::size_of::<BlockQ6K>(),
-            Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::Q2_K => std::mem::size_of::<BlockQ2_K>(),
+            Self::Q3_K => std::mem::size_of::<BlockQ3_K>(),
+            Self::Q4_K => std::mem::size_of::<BlockQ4_K>(),
+            Self::Q5_K => std::mem::size_of::<BlockQ5_K>(),
+            Self::Q6_K => std::mem::size_of::<BlockQ6_K>(),
+            Self::Q8_K => std::mem::size_of::<BlockQ8_K>(),
+            Self::QAWQ => std::mem::size_of::<BlockQAWQ>(),
+            Self::QAWQ_G64 => std::mem::size_of::<BlockQAWQ_G64>(),
+            Self::Q4_KS => std::mem::size_of::<BlockQ4_KS>(),
+            Self::Q8_KS => std::mem::size_of::<BlockQ8_KS>(),
+            Self::Q2_0 => std::mem::size_of::<BlockQ2_0>(),
+            Self::Q3_0 => std::mem::size_of::<BlockQ3_0>(),
+            Self::R16 => std::mem::size_of::<BlockR16>(),
+            Self::Q0 => std::mem::size_of::<BlockQ0>(),
+            Self::Q1_S => std::mem::size_of::<BlockQ1S>(),
+            Self::Q2_S => std::mem::size_of::<BlockQ2S>(),
+            Self::Q2_A => std::mem::size_of::<BlockQ2A>(),
+            Self::Q2_1 => std::mem::size_of::<BlockQ2_1>(),
+            Self::Q3_1 => std::mem::size_of::<BlockQ3_1>(),
+            Self::P2 => std::mem::size_of::<BlockP2>(),
+            Self::Q0_V => std::mem::size_of::<BlockQ0V>(),
+            Self::Q1_A => std::mem::size_of::<BlockQ1A>(),
+            Self::Q0_X => std::mem::size_of::<BlockQ0X>(),
+            Self::Q0_M2 => std::mem::size_of::<BlockQ0M2>(),
+            Self::Q0_M4 => std::mem::size_of::<BlockQ0M4>(),
         }
     }
 
@@ -240,14 +875,45 @@ impl GgmlDType {
     pub fn block_size(&self) -> usize {
         match self {
             Self::F32 => 1,
+            Self::F64 => 1,
             Self::F16 | Self::BF16 => 1,
+            Self::F8E4M3 => 1,
+            Self::F8E5M2 => 1,
+            Self::U8 => 1,
+            Self::I8 => 1,
+            Self::U16 => 1,
+            Self::I16 => 1,
+            Self::U32 => 1,
+            Self::I32 => 1,
+            Self::U64 => 1,
+            Self::I64 => 1,
             Self::Q4_0 => k_quants::QK4_0,
             Self::Q4_1 => k_quants::QK4_1,
             Self::Q5_0 => k_quants::QK5_0,
             Self::Q5_1 => k_quants::QK5_1,
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K => {
+                k_quants::QK_K
+            }
+            Self::QAWQ | Self::QAWQ_G64 => k_quants::QK_AWQ,
+            Self::Q4_KS => k_quants::QK_Q4_KS,
+            Self::Q8_KS => k_quants::QK_Q8_KS,
+            Self::Q2_0 => k_quants::QK2_0,
+            Self::Q3_0 => k_quants::QK3_0,
+            Self::R16 => k_quants::QK_R16,
+            Self::Q0 => k_quants::QK_Q0,
+            Self::Q1_S => k_quants::QK1_S,
+            Self::Q2_S => k_quants::QK2_S,
+            Self::Q2_A => k_quants::QK2_A,
+            Self::Q2_1 => k_quants::QK2_1,
+            Self::Q3_1 => k_quants::QK3_1,
+            Self::P2 => k_quants::QK_P2,
+            Self::Q0_V => k_quants::QK_Q0_V,
+            Self::Q1_A => k_quants::QK1_A,
+            Self::Q0_X => k_quants::QK_Q0_X,
+            Self::Q0_M2 => k_quants::QK_Q0_M2,
+            Self::Q0_M4 => k_quants::QK_Q0_M4,
         }
     }
 }
@@ -263,9 +929,10 @@ pub trait QuantizedType: Send + Sync {
     #[allow(clippy::wrong_self_convention)]
     fn from_float(&mut self, xs: &[f32]);
     fn size(&self) -> usize;
+    fn clone_box(&self) -> Box<dyn QuantizedType>;
 }
 
-impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
+impl<T: k_quants::GgmlType + Send + Sync + Clone + 'static> QuantizedType for Vec<T> {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
         k_quants::matmul(mkn, lhs, self.as_slice(), dst)
     }
@@ -299,6 +966,10 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn as_ptr(&self) -> *const u8 {
         self.as_ptr() as *const u8
     }
+
+    fn clone_box(&self) -> Box<dyn QuantizedType> {
+        Box::new(self.clone())
+    }
 }
 
 impl std::fmt::Debug for QTensor {
@@ -328,11 +999,45 @@ impl QTensor {
         Ok(Self { storage, shape })
     }
 
+    /// Create a zero-initialized quantized tensor.
+    ///
+    /// Used for arena allocation in quantized KV cache.
+    ///
+    /// # Arguments
+    /// * `shape` - Shape of the tensor (must be divisible by block size)
+    /// * `dtype` - Quantization type (Q4_0, Q8_0, etc.)
+    /// * `device` - Device to allocate on (CPU, CUDA, Metal)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let arena = QTensor::zeros((1024, 128), GgmlDType::Q8_0, &device)?;
+    /// ```
+    pub fn zeros<S: Into<Shape>>(shape: S, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        let block_size = dtype.block_size();
+        check_shape(&shape, block_size)?;
+        let elem_count = shape.elem_count();
+        if !elem_count.is_multiple_of(block_size) {
+            crate::bail!(
+                "tensor size ({shape:?}) is not divisible by block size {}",
+                block_size
+            )
+        }
+        let storage = device.qzeros(elem_count, dtype)?;
+        Self::new(storage, shape)
+    }
+
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
-        let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
+        // force_contiguous ensures the storage exactly matches the shape,
+        // even for narrowed/sliced tensors where is_contiguous() may be true
+        // but the underlying storage has more elements.
+        let src = src
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .force_contiguous()?;
         let elem_count = shape.elem_count();
         if !elem_count.is_multiple_of(block_size) {
             crate::bail!(
@@ -348,12 +1053,66 @@ impl QTensor {
         })
     }
 
+    /// Create a `QTensor` from raw GGML quantized bytes, backed by host-mapped
+    /// (pinned) memory instead of VRAM.
+    ///
+    /// This is the VRAM-overflow equivalent of [`ggml_file::qtensor_from_ggml`].
+    /// The tensor data lives in pinned host RAM and is GPU-accessible over PCIe.
+    /// CUDA kernels work transparently — just at PCIe bandwidth instead of VRAM.
+    ///
+    /// Returns `(qtensor, guard)`. The caller must keep `guard` alive for the
+    /// lifetime of the tensor.
+    ///
+    /// On non-CUDA devices, falls back to `qtensor_from_ggml` (no guard needed).
+    #[cfg(feature = "cuda")]
+    pub fn from_host_mapped_ggml(
+        ggml_dtype: GgmlDType,
+        raw_data: &[u8],
+        dims: Vec<usize>,
+        device: &Device,
+    ) -> Result<(Self, cuda::HostMappedAlloc)> {
+        match device {
+            Device::Cuda(cuda_dev) => {
+                let elem_count: usize = dims.iter().product();
+                let block_size = ggml_dtype.block_size();
+                if elem_count % block_size != 0 {
+                    crate::bail!(
+                        "element count {elem_count} not divisible by block size {block_size}"
+                    );
+                }
+                let (storage, guard) = cuda::QCudaStorage::from_host_mapped(
+                    raw_data, elem_count, ggml_dtype, cuda_dev,
+                )?;
+                let qt = Self::new(QStorage::Cuda(storage), dims)?;
+                Ok((qt, guard))
+            }
+            _ => {
+                // Non-CUDA: no host-mapped concept, use a dummy guard.
+                // This path should not normally be hit — callers gate on Device::Cuda.
+                crate::bail!("from_host_mapped_ggml requires a CUDA device");
+            }
+        }
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.storage.dtype()
     }
 
     pub fn device(&self) -> Device {
         self.storage.device()
+    }
+
+    /// Get a mutable reference to the underlying storage.
+    ///
+    /// Used by the expert LRU cache to overwrite pre-allocated VRAM slot
+    /// contents via `QCudaStorage::copy_from_host`.
+    pub fn storage_mut(&mut self) -> &mut QStorage {
+        &mut self.storage
+    }
+
+    /// Get a shared reference to the underlying storage.
+    pub fn storage(&self) -> &QStorage {
+        &self.storage
     }
 
     pub fn rank(&self) -> usize {
@@ -387,12 +1146,581 @@ impl QTensor {
         }
     }
 
+    pub fn dequantize_bf16(&self, device: &Device) -> Result<Tensor> {
+        // In the CUDA case, we have a specialized kernel path (currently via F16)
+        match &self.storage {
+            QStorage::Cuda(s) => {
+                let s = s.dequantize_bf16(self.shape.elem_count())?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Cuda(s), self.shape.clone(), none, false)
+                    .to_device(device)
+            }
+            _ => {
+                let s = self.dequantize(device)?.to_dtype(crate::DType::BF16)?;
+                Ok(s)
+            }
+        }
+    }
+
+    /// Repack quantized weights to K/128 format with embedded scales.
+    ///
+    /// The K/128 format stores 128 elements per block with scales embedded inline,
+    /// enabling efficient 16-thread cooperative loads in CUDA kernels.
+    ///
+    /// # Returns
+    /// A new QTensor with repacked storage
+    #[cfg(feature = "cuda")]
+    pub fn repack_gemx(&self) -> Result<Self> {
+        match &self.storage {
+            QStorage::Cuda(s) => {
+                let new_storage = s.repack_gemx(&self.shape)?;
+                Ok(Self {
+                    storage: QStorage::Cuda(new_storage),
+                    shape: self.shape.clone(),
+                })
+            }
+            _ => crate::bail!("repack_gemx is only supported on CUDA"),
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn repack_gemx(&self) -> Result<Self> {
+        crate::bail!("repack_gemx requires the cuda feature")
+    }
+
+    /// Get the size in bytes after GEMX repacking, without actually repacking.
+    #[cfg(feature = "cuda")]
+    pub fn repacked_size(&self) -> Result<usize> {
+        match &self.storage {
+            QStorage::Cuda(s) => s.repacked_size(&self.shape),
+            _ => crate::bail!("repacked_size is only supported on CUDA"),
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn repacked_size(&self) -> Result<usize> {
+        crate::bail!("repacked_size requires the cuda feature")
+    }
+
+    /// Check if this tensor's dtype supports GEMX repacking.
+    #[cfg(feature = "cuda")]
+    pub fn supports_gemx_repacking(&self) -> bool {
+        match &self.storage {
+            QStorage::Cuda(s) => s.supports_gemx_repacking(),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn supports_gemx_repacking(&self) -> bool {
+        false
+    }
+
     pub fn storage_size_in_bytes(&self) -> usize {
         self.storage.size_in_bytes()
     }
 
     pub fn data(&self) -> Result<Cow<'_, [u8]>> {
         self.storage.data()
+    }
+
+    /// Read `range` bytes of the underlying raw quantized data.
+    ///
+    /// Replaces the `&qtensor.data()?[range]` pattern: that form pulls
+    /// the **entire** arena across PCIe (for CUDA) or the full buffer
+    /// (for Metal) and then throws away everything outside `range`.
+    /// This method does a single ranged DMA for exactly `range.len()`
+    /// bytes — no kernel, no full-buffer copy.
+    ///
+    /// On CPU storage it returns a borrowed slice (zero copy).  On
+    /// CUDA / Metal it returns an owned `Vec<u8>` of just the requested
+    /// span.
+    pub fn data_range(&self, range: std::ops::Range<usize>) -> Result<Cow<'_, [u8]>> {
+        self.storage.data_range(range)
+    }
+
+    /// Copy the raw quantized data to a host buffer on the given CUDA stream.
+    ///
+    /// When `dst` is backed by pinned memory (`cuMemAllocHost`), the copy
+    /// is truly asynchronous — the CPU returns immediately.  This is the
+    /// D2H eviction path for the two-tier expert cache.
+    ///
+    /// `dst` must be at least [`storage_size_in_bytes()`](Self::storage_size_in_bytes) bytes.
+    #[cfg(feature = "cuda")]
+    pub fn copy_data_to_host_on_stream(
+        &self,
+        dst: &mut [u8],
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        match &self.storage {
+            QStorage::Cuda(s) => s.copy_to_host_on_stream(dst, stream),
+            _ => crate::bail!("copy_data_to_host_on_stream requires CUDA storage"),
+        }
+    }
+
+    /// Get the CUDA device pointer for the raw quantized data.
+    /// Returns None for non-CUDA storage.
+    ///
+    /// This is used by paged attention kernels that need direct GPU access
+    /// to quantized KV cache arenas.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_data_ptr(&self) -> Option<u64> {
+        self.storage.cuda_data_ptr()
+    }
+
+    /// Get a mutable CUDA device pointer for the raw quantized data.
+    /// Returns None for non-CUDA storage.
+    ///
+    /// This is used by batched quantization kernels that write directly
+    /// to quantized KV cache arenas.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_data_ptr_mut(&mut self) -> Option<u64> {
+        self.storage.cuda_data_ptr_mut()
+    }
+
+    /// Copy quantized blocks from `src` into `self` at the given element offset.
+    ///
+    /// This is the primary mechanism for writing into quantized KV cache arenas.
+    /// Both tensors must have the same dtype and be on the same device.
+    ///
+    /// # Arguments
+    /// * `src` - Source QTensor to copy from (must be 1D or have same shape except for scatter dim)
+    /// * `elem_offset` - Element offset (must be block-aligned, i.e., multiple of block_size)
+    ///
+    /// # Requirements
+    /// - Both tensors must have the same dtype
+    /// - Both tensors must be on the same device
+    /// - `elem_offset` must be a multiple of block_size (32)
+    /// - `elem_offset + src.elem_count()` must not exceed `self.elem_count()`
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Create arena of 256 elements
+    /// let arena = QTensor::zeros((256,), GgmlDType::Q8_0, &device)?;
+    ///
+    /// // Create new KV data (64 elements = 2 blocks)
+    /// let new_kv = QTensor::quantize(&new_data, GgmlDType::Q8_0)?;
+    ///
+    /// // Scatter at offset 64 (block-aligned)
+    /// arena.slice_scatter(&new_kv, 64)?;
+    /// ```
+    pub fn slice_scatter(&mut self, src: &QTensor, elem_offset: usize) -> Result<()> {
+        // Validate dtype match
+        if self.dtype() != src.dtype() {
+            crate::bail!(
+                "slice_scatter: dtype mismatch ({:?} vs {:?})",
+                self.dtype(),
+                src.dtype()
+            )
+        }
+
+        // Validate device match
+        if self.device().location() != src.device().location() {
+            crate::bail!("slice_scatter: device mismatch")
+        }
+
+        // Validate block alignment
+        let block_size = self.storage.block_size();
+        if !elem_offset.is_multiple_of(block_size) {
+            crate::bail!(
+                "slice_scatter: element offset {} is not aligned to block size {}",
+                elem_offset,
+                block_size
+            )
+        }
+
+        // Validate bounds
+        let src_elems = src.shape.elem_count();
+        let dst_elems = self.shape.elem_count();
+        if elem_offset + src_elems > dst_elems {
+            crate::bail!(
+                "slice_scatter: source ({} elements) at offset {} exceeds destination ({} elements)",
+                src_elems,
+                elem_offset,
+                dst_elems
+            )
+        }
+
+        // Calculate byte offset based on blocks
+        let block_offset = elem_offset / block_size;
+        let bytes_per_block = self.dtype().type_size();
+        let byte_offset = block_offset * bytes_per_block;
+
+        self.storage.slice_scatter(&src.storage, byte_offset)
+    }
+
+    /// Copy a range of elements from another QTensor into this one, without
+    /// dequantization. Both must have the same dtype and be on the same device.
+    /// Offsets must be block-aligned.
+    pub fn slice_range_copy(
+        &mut self,
+        src: &QTensor,
+        src_elem_offset: usize,
+        dst_elem_offset: usize,
+        elem_count: usize,
+    ) -> Result<()> {
+        if self.dtype() != src.dtype() {
+            crate::bail!(
+                "slice_range_copy: dtype mismatch ({:?} vs {:?})",
+                self.dtype(),
+                src.dtype()
+            )
+        }
+
+        let block_size = self.storage.block_size();
+        if !src_elem_offset.is_multiple_of(block_size)
+            || !dst_elem_offset.is_multiple_of(block_size)
+            || !elem_count.is_multiple_of(block_size)
+        {
+            crate::bail!(
+                "slice_range_copy: offsets/count must be block-aligned (block_size={})",
+                block_size
+            )
+        }
+
+        let bytes_per_block = self.dtype().type_size();
+        let src_byte_offset = (src_elem_offset / block_size) * bytes_per_block;
+        let dst_byte_offset = (dst_elem_offset / block_size) * bytes_per_block;
+        let byte_len = (elem_count / block_size) * bytes_per_block;
+
+        self.storage
+            .slice_range_copy(&src.storage, src_byte_offset, dst_byte_offset, byte_len)
+    }
+
+    /// Quantize a float tensor directly into this QTensor at the given element offset.
+    ///
+    /// This is optimized for GPU operations by using CUDA quantization kernels that
+    /// write directly to the destination buffer, avoiding intermediate allocations.
+    /// This is the preferred method for quantizing data into KV cache arenas.
+    ///
+    /// # Arguments
+    /// * `src` - Source float tensor (will be converted to f32 and made contiguous)
+    /// * `elem_offset` - Element offset (must be block-aligned, i.e., multiple of block_size)
+    ///
+    /// # Requirements
+    /// - Both tensors must be on the same CUDA device
+    /// - `elem_offset` must be a multiple of block_size (32 for standard, 256 for K-quants)
+    /// - `elem_offset + src.elem_count()` must not exceed `self.elem_count()`
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Create arena of 256 elements
+    /// let arena = QTensor::zeros((256,), GgmlDType::Q8_0, &device)?;
+    ///
+    /// // Float data to quantize (64 elements = 2 blocks)
+    /// let float_data = Tensor::randn(0.0, 1.0, (64,), &device)?;
+    ///
+    /// // Quantize directly at offset 64 (block-aligned)
+    /// arena.quantize_into(&float_data, 64)?;
+    /// ```
+    #[cfg(feature = "cuda")]
+    pub fn quantize_into(&mut self, src: &Tensor, elem_offset: usize) -> Result<()> {
+        // Validate device match
+        if self.device().location() != src.device().location() {
+            crate::bail!("quantize_into: device mismatch")
+        }
+
+        // Validate block alignment
+        let block_size = self.storage.block_size();
+        if !elem_offset.is_multiple_of(block_size) {
+            crate::bail!(
+                "quantize_into: element offset {} is not aligned to block size {}",
+                elem_offset,
+                block_size
+            )
+        }
+
+        // Validate bounds
+        let src_elems = src.elem_count();
+        let dst_elems = self.shape.elem_count();
+        if elem_offset + src_elems > dst_elems {
+            crate::bail!(
+                "quantize_into: source ({} elements) at offset {} exceeds destination ({} elements)",
+                src_elems,
+                elem_offset,
+                dst_elems
+            )
+        }
+
+        // Convert source to f32 and make contiguous
+        let src = src
+            .to_dtype(crate::DType::F32)?
+            .flatten_all()?
+            .force_contiguous()?;
+
+        // Calculate byte offset
+        let block_offset = elem_offset / block_size;
+        let bytes_per_block = self.dtype().type_size();
+        let byte_offset = block_offset * bytes_per_block;
+
+        // Get underlying storage and call quantize_into
+        let (src_storage, _src_layout) = src.storage_and_layout();
+        self.storage
+            .quantize_into(&src_storage, src_elems, byte_offset)
+    }
+
+    /// Quantize f32 data with fused transpose from [H, T, D] to [H, D, T] layout.
+    ///
+    /// This fuses the memory layout transformation with quantization to avoid
+    /// intermediate allocations. Used for KV cache quantization where:
+    /// - Input layout: [n_head, chunk_size, head_dim] - channel-oriented float
+    /// - Output layout: [n_head, head_dim, chunk_size] - token-oriented quant
+    ///
+    /// # Arguments
+    /// * `src` - Source tensor with shape [n_head, chunk_size, head_dim]
+    /// * `elem_offset` - Element offset in destination (block-aligned for this dtype)
+    ///
+    /// # Supported Types
+    /// Only Q4_0 and Q8_0 are supported for fused transpose+quantize.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Quantize a [8, 32, 128] float chunk into quantized storage at offset 0
+    /// quantized_arena.quantize_transposed_into(&float_chunk, 0)?;
+    /// // The result is stored as [8, 128] Q8_0/Q4_0 blocks (token-oriented layout)
+    /// ```
+    #[cfg(feature = "cuda")]
+    pub fn quantize_transposed_into(&mut self, src: &Tensor, elem_offset: usize) -> Result<()> {
+        // Validate device match
+        if self.device().location() != src.device().location() {
+            crate::bail!("quantize_transposed_into: device mismatch")
+        }
+
+        // Validate supported quantized dtypes (all standard 32-element formats)
+        match self.dtype() {
+            GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q8_1
+            | GgmlDType::Q4_KS
+            | GgmlDType::Q8_KS => {}
+            other => crate::bail!(
+                "quantize_transposed_into: only Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q4_KS/Q8_KS supported, got {:?}",
+                other
+            ),
+        }
+
+        // Validate supported source dtypes - kernel handles conversion inline
+        match src.dtype() {
+            crate::DType::F32 | crate::DType::F16 | crate::DType::BF16 | crate::DType::F8E4M3 => {}
+            other => crate::bail!(
+                "quantize_transposed_into: source dtype must be F32/F16/BF16/F8E4M3, got {:?}",
+                other
+            ),
+        }
+
+        // Validate input shape
+        let dims = src.dims();
+        if dims.len() != 3 {
+            crate::bail!(
+                "quantize_transposed_into: expected 3D tensor [H, T, D], got {}D",
+                dims.len()
+            )
+        }
+        let n_head = dims[0];
+        let chunk_size = dims[1];
+        let head_dim = dims[2];
+
+        // Validate chunk_size is 32 (required for Q4_0/Q8_0 GGML blocks)
+        if chunk_size != 32 {
+            crate::bail!(
+                "quantize_transposed_into: chunk_size must be 32 for Q4_0/Q8_0, got {}",
+                chunk_size
+            )
+        }
+
+        // Validate block alignment
+        let block_size = self.storage.block_size();
+        if !elem_offset.is_multiple_of(block_size) {
+            crate::bail!(
+                "quantize_transposed_into: element offset {} not aligned to block size {}",
+                elem_offset,
+                block_size
+            )
+        }
+
+        // Validate bounds: output has n_head * head_dim blocks of chunk_size elements each
+        let src_elems = src.elem_count();
+        let dst_elems = self.shape.elem_count();
+        if elem_offset + src_elems > dst_elems {
+            crate::bail!(
+                "quantize_transposed_into: source ({} elements) at offset {} exceeds destination ({} elements)",
+                src_elems,
+                elem_offset,
+                dst_elems
+            )
+        }
+
+        // Ensure contiguous layout for correct memory access pattern
+        // Kernel assumes [H, T, D] row-major layout with strides [T*D, D, 1]
+        let src = src.force_contiguous()?;
+
+        // Calculate byte offset
+        let block_offset = elem_offset / block_size;
+        let bytes_per_block = self.dtype().type_size();
+        let byte_offset = block_offset * bytes_per_block;
+
+        // Get underlying storage and call quantize_transposed_into
+        let (src_storage, _src_layout) = src.storage_and_layout();
+        self.storage.quantize_transposed_into(
+            &src_storage,
+            n_head,
+            chunk_size,
+            head_dim,
+            byte_offset,
+        )
+    }
+
+    /// Dequantize a range of elements from this quantized tensor into a destination tensor.
+    ///
+    /// This efficiently dequantizes a specific chunk without processing the entire tensor.
+    ///
+    /// # Arguments
+    /// * `dst` - Destination tensor (must be f16, bf16, or f32, contiguous, on same device)
+    /// * `src_elem_offset` - Element offset in source (this tensor) to read from
+    /// * `dst_elem_offset` - Element offset in destination to write to
+    /// * `elem_count` - Number of elements to dequantize
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Dequantize 128 elements from offset 256 in quantized tensor to offset 0 in float tensor
+    /// quantized_arena.dequantize_into(&mut float_chunk, 256, 0, 128)?;
+    /// ```
+    #[cfg(feature = "cuda")]
+    pub fn dequantize_into(
+        &self,
+        dst: &mut Tensor,
+        src_elem_offset: usize,
+        dst_elem_offset: usize,
+        elem_count: usize,
+    ) -> Result<()> {
+        // Validate device match
+        if self.device().location() != dst.device().location() {
+            crate::bail!("dequantize_into: device mismatch")
+        }
+
+        // Validate block alignment
+        let block_size = self.storage.block_size();
+        if !src_elem_offset.is_multiple_of(block_size) {
+            crate::bail!(
+                "dequantize_into: source element offset {} is not aligned to block size {}",
+                src_elem_offset,
+                block_size
+            )
+        }
+
+        // Validate source bounds
+        let src_elems = self.shape.elem_count();
+        if src_elem_offset + elem_count > src_elems {
+            crate::bail!(
+                "dequantize_into: reading {} elements at offset {} exceeds source ({} elements)",
+                elem_count,
+                src_elem_offset,
+                src_elems
+            )
+        }
+
+        // Validate destination bounds
+        let dst_elems = dst.elem_count();
+        if dst_elem_offset + elem_count > dst_elems {
+            crate::bail!(
+                "dequantize_into: writing {} elements at offset {} exceeds destination ({} elements)",
+                elem_count,
+                dst_elem_offset,
+                dst_elems
+            )
+        }
+
+        // Calculate byte offset in source
+        let block_offset = src_elem_offset / block_size;
+        let bytes_per_block = self.dtype().type_size();
+        let byte_offset = block_offset * bytes_per_block;
+
+        // Get underlying storage and call dequantize_into
+        let (mut dst_storage, _dst_layout) = dst.storage_mut_and_layout();
+        self.storage
+            .dequantize_into(&mut dst_storage, elem_count, byte_offset, dst_elem_offset)
+    }
+
+    /// Concatenate multiple quantized tensors along the first dimension (row concat).
+    ///
+    /// This is primarily intended for CUDA inference optimizations (e.g. fusing Q/K/V
+    /// projections into a single matmul) without dequantizing/requantizing.
+    ///
+    /// Requirements:
+    /// - All tensors are rank-2 with shapes (n_i, k)
+    /// - All tensors share the same dtype, device, and k
+    #[cfg(feature = "cuda")]
+    pub fn concat_rows_cuda(qtensors: &[&QTensor]) -> Result<QTensor> {
+        if qtensors.is_empty() {
+            crate::bail!("concat_rows_cuda requires at least one tensor")
+        }
+
+        let dtype = qtensors[0].dtype();
+        let device = qtensors[0].device();
+        let (mut total_n, k) = qtensors[0].shape.dims2()?;
+
+        for (i, t) in qtensors.iter().enumerate() {
+            if t.rank() != 2 {
+                crate::bail!(
+                    "concat_rows_cuda expects rank-2 tensors, got rank {}",
+                    t.rank()
+                )
+            }
+            if t.dtype() != dtype {
+                crate::bail!(
+                    "concat_rows_cuda dtype mismatch at {i}: {:?} vs {:?}",
+                    t.dtype(),
+                    dtype
+                )
+            }
+            if t.device().location() != device.location() {
+                crate::bail!("concat_rows_cuda device mismatch at {i}")
+            }
+            let (n_i, k_i) = t.shape.dims2()?;
+            if k_i != k {
+                crate::bail!("concat_rows_cuda column mismatch at {i}: {} vs {}", k_i, k)
+            }
+            if i != 0 {
+                total_n += n_i;
+            }
+        }
+
+        match (&qtensors[0].storage, device) {
+            (QStorage::Cuda(_), Device::Cuda(cuda_dev)) => {
+                let elem_count = total_n * k;
+                let mut out_storage = cuda::QCudaStorage::zeros(&cuda_dev, elem_count, dtype)?;
+                let mut byte_off = 0usize;
+
+                for (i, t) in qtensors.iter().enumerate() {
+                    let (n_i, k_i) = t.shape.dims2()?;
+                    let _ = (n_i, k_i);
+
+                    let src = match &t.storage {
+                        QStorage::Cuda(s) => s,
+                        _ => crate::bail!("concat_rows_cuda expects CUDA storage at {i}"),
+                    };
+                    let len = src.byte_len();
+
+                    let src_view = src.bytes();
+                    let mut dst_view = out_storage.bytes_mut().slice_mut(byte_off..byte_off + len);
+
+                    cuda_dev.memcpy_dtod(&src_view, &mut dst_view)?;
+                    byte_off += len;
+                }
+
+                let out = QTensor::new(QStorage::Cuda(out_storage), (total_n, k))?;
+                Ok(out)
+            }
+            _ => crate::bail!("concat_rows_cuda is only supported for CUDA QTensor storage"),
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn concat_rows_cuda(_qtensors: &[&QTensor]) -> Result<QTensor> {
+        crate::bail!("concat_rows_cuda requires the cuda feature")
     }
 }
 
@@ -401,6 +1729,16 @@ pub enum QMatMul {
     QTensor(std::sync::Arc<QTensor>),
     Tensor(Tensor),
     TensorF16(Tensor),
+}
+
+impl QMatMul {
+    /// Get the inner `QTensor` if this is the quantized variant.
+    pub fn qtensor(&self) -> Option<&QTensor> {
+        match self {
+            QMatMul::QTensor(qt) => Some(qt),
+            _ => None,
+        }
+    }
 }
 
 thread_local! {
@@ -425,6 +1763,17 @@ thread_local! {
     }
 }
 
+thread_local! {
+    static DEQUANTIZE_ALL_BF16: bool = {
+        match std::env::var("CANDLE_DEQUANTIZE_ALL_BF16") {
+            Ok(s) => {
+                !s.is_empty() && s != "0"
+            },
+            Err(_) => false,
+        }
+    }
+}
+
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         let dequantize = match qtensor.dtype() {
@@ -437,6 +1786,9 @@ impl QMatMul {
         } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
             let tensor = qtensor.dequantize_f16(&qtensor.device())?;
             Self::TensorF16(tensor)
+        } else if DEQUANTIZE_ALL_BF16.with(|b| *b) {
+            let tensor = qtensor.dequantize_bf16(&qtensor.device())?;
+            Self::TensorF16(tensor)
         } else {
             Self::QTensor(qtensor)
         };
@@ -447,23 +1799,58 @@ impl QMatMul {
         Self::from_arc(std::sync::Arc::new(qtensor))
     }
 
-    pub fn dequantize_f16(&self) -> Result<Tensor> {
+    #[allow(unused_variables)]
+    pub fn forward_via_gemx(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => t.dequantize_f16(&t.device()),
-            Self::Tensor(t) => t.to_dtype(DType::F16),
-            Self::TensorF16(t) => Ok(t.clone()),
+            Self::QTensor(t) => {
+                // For CUDA, we need to call the storage directly with compute_type
+                match &t.storage {
+                    #[cfg(feature = "cuda")]
+                    QStorage::Cuda(cuda_storage) => {
+                        let storage = xs.storage_and_layout().0;
+                        let layout = xs.layout();
+                        let cuda_xs = match &*storage {
+                            Storage::Cuda(s) => s,
+                            _ => crate::bail!("expected CUDA storage for quantized matmul"),
+                        };
+                        // K/128 blocks have embedded scales, no external scales needed
+                        let (out_storage, out_shape) =
+                            cuda_storage.fwd_via_gemx(&t.shape, cuda_xs, layout)?;
+                        let none = crate::op::BackpropOp::none();
+                        Ok(crate::tensor::from_storage(
+                            Storage::Cuda(out_storage),
+                            out_shape,
+                            none,
+                            false,
+                        ))
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    QStorage::Cuda(_) => {
+                        crate::bail!("CUDA support not compiled")
+                    }
+                    // For non-CUDA, fall back to standard forward
+                    _ => xs.apply_op1_no_bwd(t.as_ref()),
+                }
+            }
+            // For dequantized tensors, use standard matmul
+            Self::Tensor(w) => {
+                let w = match *xs.dims() {
+                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                    _ => w.t()?,
+                };
+                xs.matmul(&w)
+            }
+            Self::TensorF16(w) => {
+                let in_dtype = xs.dtype();
+                let w = match *xs.dims() {
+                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                    _ => w.t()?,
+                };
+                xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+            }
         }
-    }
-
-    pub fn forward_via_f16(&self, xs: &Tensor) -> Result<Tensor> {
-        let w = self.dequantize_f16()?;
-        let in_dtype = xs.dtype();
-        let w = match *xs.dims() {
-            [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-            [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-            _ => w.t()?,
-        };
-        xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
     }
 }
 
@@ -552,5 +1939,61 @@ impl crate::Module for QMatMul {
                 xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ggml_dtype_lock_tests {
+    //! These tests pin the exact integer value for every `GgmlDType` variant.
+    //! They must stay in lockstep with:
+    //!   - The C++ `QType` enum in candle-kernels/src/quantized/block_compact.cuh
+    //!     (locked in via `static_assert` in that file)
+    //!   - The Rust `QType` enum in candle-kernels/src/quantized/api.rs (which
+    //!     has its own matching `qtype_values_are_stable` test)
+    //!   - `ArenaFormat::*` in candle-kernels/src/arena_table.cuh
+    //!   - `SELECT_FMT_*` in candle-kernels/src/quantize/select_kv_format.cuh
+    //!
+    //! F32/F16/BF16 (0/1/2) are specific to GgmlDType — they do not appear in
+    //! QType, which starts at R16=3.
+    use super::GgmlDType;
+
+    #[test]
+    fn ggml_dtype_values_are_stable() {
+        assert_eq!(GgmlDType::F32 as u32, 0);
+        assert_eq!(GgmlDType::F16 as u32, 1);
+        assert_eq!(GgmlDType::BF16 as u32, 2);
+        assert_eq!(GgmlDType::R16 as u32, 3);
+        assert_eq!(GgmlDType::P2 as u32, 4);
+        assert_eq!(GgmlDType::QAWQ as u32, 5);
+        assert_eq!(GgmlDType::QAWQ_G64 as u32, 6);
+        assert_eq!(GgmlDType::Q8_0 as u32, 7);
+        assert_eq!(GgmlDType::Q8_1 as u32, 8);
+        assert_eq!(GgmlDType::Q8_K as u32, 9);
+        assert_eq!(GgmlDType::Q8_KS as u32, 10);
+        assert_eq!(GgmlDType::Q6_K as u32, 11);
+        assert_eq!(GgmlDType::Q5_0 as u32, 12);
+        assert_eq!(GgmlDType::Q5_1 as u32, 13);
+        assert_eq!(GgmlDType::Q5_K as u32, 14);
+        assert_eq!(GgmlDType::Q4_0 as u32, 15);
+        assert_eq!(GgmlDType::Q4_1 as u32, 16);
+        assert_eq!(GgmlDType::Q4_K as u32, 17);
+        assert_eq!(GgmlDType::Q4_KS as u32, 18);
+        assert_eq!(GgmlDType::Q3_0 as u32, 19);
+        assert_eq!(GgmlDType::Q3_1 as u32, 20);
+        assert_eq!(GgmlDType::Q3_K as u32, 21);
+        assert_eq!(GgmlDType::Q2_0 as u32, 22);
+        assert_eq!(GgmlDType::Q2_1 as u32, 23);
+        assert_eq!(GgmlDType::Q2_K as u32, 24);
+        assert_eq!(GgmlDType::Q2_S as u32, 25);
+        assert_eq!(GgmlDType::Q2_A as u32, 26);
+        assert_eq!(GgmlDType::Q1_S as u32, 27);
+        assert_eq!(GgmlDType::Q0_V as u32, 28);
+        assert_eq!(GgmlDType::Q1_A as u32, 29);
+        assert_eq!(GgmlDType::Q0_X as u32, 30);
+        assert_eq!(GgmlDType::Q0_M2 as u32, 31);
+        assert_eq!(GgmlDType::Q0_M4 as u32, 32);
+        assert_eq!(GgmlDType::Q0 as u32, 33);
+        assert_eq!(GgmlDType::F8E4M3 as u32, 34);
+        assert_eq!(GgmlDType::F8E5M2 as u32, 35);
     }
 }

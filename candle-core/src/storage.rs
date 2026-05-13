@@ -133,6 +133,50 @@ impl Storage {
         }
     }
 
+    pub(crate) fn sub_at_indices(
+        &self,
+        layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.sub_at_indices(layout, indices, value)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.sub_at_indices(layout, indices, value)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.sub_at_indices(layout, indices, value)?;
+                Ok(Self::Metal(storage))
+            }
+        }
+    }
+
+    pub(crate) fn div_at_indices(
+        &self,
+        layout: &Layout,
+        indices: &[u32],
+        value: f32,
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.div_at_indices(layout, indices, value)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.div_at_indices(layout, indices, value)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.div_at_indices(layout, indices, value)?;
+                Ok(Self::Metal(storage))
+            }
+        }
+    }
+
     pub(crate) fn cmp(
         &self,
         op: CmpOp,
@@ -200,6 +244,24 @@ impl Storage {
                 Ok(Self::Metal(storage))
             }
         }
+    }
+
+    /// In-place type conversion. Returns true if conversion was done in-place,
+    /// false if the caller should fall back to regular to_dtype.
+    ///
+    /// For non-CUDA backends, this always returns false (not supported).
+    /// For CUDA, it attempts in-place conversion if the buffer is large enough.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn to_dtype_mut(&mut self, layout: &Layout, dtype: DType) -> Result<bool> {
+        match self {
+            Self::Cuda(storage) => storage.to_dtype_mut(layout, dtype),
+            _ => Ok(false), // CPU and Metal don't support in-place conversion
+        }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub(crate) fn to_dtype_mut(&mut self, _layout: &Layout, _dtype: DType) -> Result<bool> {
+        Ok(false) // Not supported without CUDA
     }
 
     pub(crate) fn apply_op1(&self, l: &Layout, c: &dyn CustomOp1) -> Result<(Self, Shape)> {
@@ -365,6 +427,34 @@ impl Storage {
                 }
                 .bt())
             }
+        }
+    }
+
+    pub(crate) fn binary_inplace_impl(
+        &mut self,
+        op: crate::op::BinaryInplaceOp,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+    ) -> Result<()> {
+        self.same_device(rhs, "binary_inplace")?;
+        self.same_dtype(rhs, "binary_inplace")?;
+        match (self, rhs) {
+            (Storage::Cpu(lhs), Storage::Cpu(rhs)) => {
+                lhs.binary_inplace_impl(op, rhs, lhs_layout, rhs_layout)
+            }
+            (Self::Cuda(lhs), Self::Cuda(rhs)) => {
+                lhs.binary_inplace_impl(op, rhs, lhs_layout, rhs_layout)
+            }
+            (Self::Metal(lhs), Self::Metal(rhs)) => {
+                lhs.binary_inplace_impl(op, rhs, lhs_layout, rhs_layout)
+            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
+                lhs: lhs.device().location(),
+                rhs: rhs.device().location(),
+                op: "binary_inplace",
+            }
+            .bt()),
         }
     }
 

@@ -293,7 +293,7 @@ impl Model {
         let ln_weight = Tensor::ones(cfg.hidden_size, vb.dtype(), vb.device())?;
         let norm = LayerNorm::new_no_bias(ln_weight, 1e-5);
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            Linear::new(embed_tokens.embeddings_native(), None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };

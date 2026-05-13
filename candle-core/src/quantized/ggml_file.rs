@@ -169,23 +169,154 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q8_0 => {
             from_raw_data::<k_quants::BlockQ8_0>(raw_data, size_in_bytes, dims, device)
         }
-        GgmlDType::Q2K => {
-            from_raw_data::<k_quants::BlockQ2K>(raw_data, size_in_bytes, dims, device)
+        GgmlDType::Q2_K => {
+            from_raw_data::<k_quants::BlockQ2_K>(raw_data, size_in_bytes, dims, device)
         }
-        GgmlDType::Q3K => {
-            from_raw_data::<k_quants::BlockQ3K>(raw_data, size_in_bytes, dims, device)
+        GgmlDType::Q3_K => {
+            from_raw_data::<k_quants::BlockQ3_K>(raw_data, size_in_bytes, dims, device)
         }
-        GgmlDType::Q4K => {
-            from_raw_data::<k_quants::BlockQ4K>(raw_data, size_in_bytes, dims, device)
+        GgmlDType::Q4_K => {
+            from_raw_data::<k_quants::BlockQ4_K>(raw_data, size_in_bytes, dims, device)
         }
-        GgmlDType::Q5K => {
-            from_raw_data::<k_quants::BlockQ5K>(raw_data, size_in_bytes, dims, device)
+        GgmlDType::Q5_K => {
+            from_raw_data::<k_quants::BlockQ5_K>(raw_data, size_in_bytes, dims, device)
         }
-        GgmlDType::Q6K => {
-            from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
+        GgmlDType::Q6_K => {
+            from_raw_data::<k_quants::BlockQ6_K>(raw_data, size_in_bytes, dims, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
+}
+
+/// Like [`qtensor_from_ggml`], but issues the VRAM allocation and H2D memcpy
+/// on a caller-supplied CUDA stream so the transfer can overlap with compute
+/// on the device's main stream.
+///
+/// Only meaningful on CUDA; will panic if `device` is not a CUDA device
+/// (callers should gate on that).
+///
+/// # Safety
+///
+/// The returned `QTensor` must not be used on any other stream until the
+/// copy-stream work has been synchronised via an event.
+#[cfg(feature = "cuda")]
+pub fn qtensor_from_ggml_on_stream(
+    ggml_dtype: GgmlDType,
+    raw_data: &[u8],
+    dims: Vec<usize>,
+    cuda_device: &crate::CudaDevice,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<super::QTensor> {
+    let tensor_elems = dims.iter().product::<usize>();
+    let block_size = ggml_dtype.block_size();
+    if tensor_elems % block_size != 0 {
+        crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+    }
+    let size_in_bytes = tensor_elems / block_size * ggml_dtype.type_size();
+
+    match ggml_dtype {
+        GgmlDType::F32 => {
+            from_raw_data_on_stream::<f32>(raw_data, size_in_bytes, dims, cuda_device, stream)
+        }
+        GgmlDType::F16 => {
+            from_raw_data_on_stream::<half::f16>(raw_data, size_in_bytes, dims, cuda_device, stream)
+        }
+        GgmlDType::BF16 => from_raw_data_on_stream::<half::bf16>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q4_0 => from_raw_data_on_stream::<k_quants::BlockQ4_0>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q4_1 => from_raw_data_on_stream::<k_quants::BlockQ4_1>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q5_0 => from_raw_data_on_stream::<k_quants::BlockQ5_0>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q5_1 => from_raw_data_on_stream::<k_quants::BlockQ5_1>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q8_0 => from_raw_data_on_stream::<k_quants::BlockQ8_0>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q2_K => from_raw_data_on_stream::<k_quants::BlockQ2_K>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q3_K => from_raw_data_on_stream::<k_quants::BlockQ3_K>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q4_K => from_raw_data_on_stream::<k_quants::BlockQ4_K>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q5_K => from_raw_data_on_stream::<k_quants::BlockQ5_K>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        GgmlDType::Q6_K => from_raw_data_on_stream::<k_quants::BlockQ6_K>(
+            raw_data,
+            size_in_bytes,
+            dims,
+            cuda_device,
+            stream,
+        ),
+        _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn from_raw_data_on_stream<T: super::GgmlType + Send + Sync + 'static>(
+    raw_data: &[u8],
+    size_in_bytes: usize,
+    dims: Vec<usize>,
+    cuda_device: &crate::CudaDevice,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<super::QTensor> {
+    let raw_data_ptr = raw_data.as_ptr();
+    let n_blocks = size_in_bytes / std::mem::size_of::<T>();
+    let data = unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) };
+    let data = super::cuda::load_quantized_on_stream(cuda_device, stream, data)?;
+    super::QTensor::new(data, dims)
 }
 
 fn read_one_tensor<R: std::io::Seek + std::io::Read>(
@@ -196,7 +327,7 @@ fn read_one_tensor<R: std::io::Seek + std::io::Read>(
     let n_dims = reader.read_u32::<LittleEndian>()?;
     let name_len = reader.read_u32::<LittleEndian>()?;
     let ggml_dtype = reader.read_u32::<LittleEndian>()?;
-    let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
+    let ggml_dtype = GgmlDType::from_gguf_file_code(ggml_dtype)?;
     let mut dims = vec![0u32; n_dims as usize];
     reader.read_u32_into::<LittleEndian>(&mut dims)?;
     // The dimensions are stored in reverse order, see for example:

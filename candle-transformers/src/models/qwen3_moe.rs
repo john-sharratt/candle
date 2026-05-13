@@ -3,7 +3,7 @@ use crate::models::{
     with_tracing::{linear_no_bias, Linear, RmsNorm},
 };
 use candle::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::{Activation, VarBuilder};
+use candle_nn::{kv_cache::KvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -201,9 +201,11 @@ impl DecoderLayer {
         layer_idx: usize,
         cfg: &Config,
         rotary: Arc<Qwen3RotaryEmbedding>,
+        use_flash_attn: bool,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(&cfg.into(), rotary, vb.pp("self_attn"))?;
+        let self_attn =
+            Qwen3Attention::new(&cfg.into(), rotary, use_flash_attn, vb.pp("self_attn"))?;
 
         // Decide whether to use MoE or regular MLP based on layer_idx and decoder_sparse_step
         let feed_forward =
@@ -228,17 +230,19 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(
+        &self,
+        cache: &mut KvCache,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
-        let h = self.self_attn.forward(&h, mask, offset)?;
+        let h = self.self_attn.forward(cache, &h, mask, offset)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.feed_forward)?;
         x + h2
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -252,7 +256,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
         let rotary = Arc::new(Qwen3RotaryEmbedding::new(
@@ -263,7 +267,13 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(i, cfg, rotary.clone(), vb_l.pp(i))?);
+            layers.push(DecoderLayer::new(
+                i,
+                cfg,
+                rotary.clone(),
+                use_flash_attn,
+                vb_l.pp(i),
+            )?);
         }
         Ok(Self {
             embed_tokens,
@@ -274,10 +284,8 @@ impl Model {
         })
     }
 
-    fn clear_kv_cache(&mut self) {
-        for l in &mut self.layers {
-            l.clear_kv_cache();
-        }
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     fn causal_mask(
@@ -307,7 +315,7 @@ impl Model {
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn forward(&self, caches: &mut [KvCache], input: &Tensor, offset: usize) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
 
@@ -317,39 +325,186 @@ impl Model {
             Some(self.causal_mask(b, l, offset, None)?)
         };
 
-        for layer in &mut self.layers {
-            h = layer.forward(&h, causal.as_ref(), offset)?;
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            h = layer.forward(cache, &h, causal.as_ref(), offset)?;
         }
         self.norm.forward(&h)
     }
 }
 
+/// Inner model weights (wrapped in Arc for cheap cloning)
 #[derive(Debug, Clone)]
-pub struct ModelForCausalLM {
+struct ModelForCausalLMInner {
     base: Model,
     lm_head: Linear,
 }
 
+/// Shareable model - cheap to clone due to internal Arc
+#[derive(Debug, Clone)]
+pub struct ModelForCausalLM {
+    inner: Arc<ModelForCausalLMInner>,
+}
+
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base = Model::new(cfg, vb.clone())?;
+    pub fn new(cfg: &Config, use_flash_attn: bool, vb: VarBuilder) -> Result<Self> {
+        let base = Model::new(cfg, use_flash_attn, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
+            Linear::from_weights(base.embed_tokens.embeddings_native(), None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
-        Ok(Self { base, lm_head })
+        Ok(Self {
+            inner: Arc::new(ModelForCausalLMInner { base, lm_head }),
+        })
     }
 
-    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    /// Create a new inference instance with its own KV cache
+    pub fn new_instance(&self) -> InstanceForCausalLM {
+        let num_layers = self.inner.base.num_layers();
+        let caches = (0..num_layers).map(|_| KvCache::new(2, 512)).collect();
+        InstanceForCausalLM {
+            model: self.clone(),
+            caches,
+        }
+    }
+
+    fn forward_inner(
+        &self,
+        caches: &mut [KvCache],
+        input: &Tensor,
+        offset: usize,
+    ) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
-        self.base
-            .forward(input, offset)?
+        self.inner
+            .base
+            .forward(caches, input, offset)?
             .narrow(1, l - 1, 1)?
-            .apply(&self.lm_head)
+            .apply(&self.inner.lm_head)
+    }
+}
+
+/// Instance of a model with its own KV cache state
+/// This is what you use for inference - each thread gets its own instance
+pub struct InstanceForCausalLM {
+    model: ModelForCausalLM,
+    caches: Vec<KvCache>,
+}
+
+impl InstanceForCausalLM {
+    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        self.model.forward_inner(&mut self.caches, input, offset)
     }
 
     pub fn clear_kv_cache(&mut self) {
-        self.base.clear_kv_cache();
+        for cache in &mut self.caches {
+            cache.reset();
+        }
+    }
+
+    pub fn truncate_kv_cache(&mut self, seq_len: usize) -> Result<()> {
+        for cache in &mut self.caches {
+            cache.truncate(seq_len)?;
+        }
+        Ok(())
+    }
+
+    pub fn try_truncate_or_reset_kv_cache(&mut self, seq_len: usize) -> Result<bool> {
+        let mut all_success = true;
+
+        for (i, cache) in self.caches.iter_mut().enumerate() {
+            match cache.try_truncate_or_reset(seq_len) {
+                Ok(success) => {
+                    if !success {
+                        all_success = false;
+                        // If this cache failed, reset all remaining caches
+                        for remaining_cache in &mut self.caches[i + 1..] {
+                            remaining_cache.reset();
+                        }
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Unexpected error, reset everything
+                    self.clear_kv_cache();
+                    return Err(e);
+                }
+            }
+        }
+
+        if !all_success {
+            // Some cache failed, reset all for consistency
+            self.clear_kv_cache();
+        }
+
+        Ok(all_success)
+    }
+
+    pub fn try_reserve_kv_cache(&mut self, additional_tokens: usize) -> bool {
+        for cache in &mut self.caches {
+            if !cache.try_reserve(additional_tokens) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Keep static helper methods on ModelForCausalLM for compatibility
+impl ModelForCausalLM {
+    pub fn forward(&self, caches: &mut [KvCache], input: &Tensor, offset: usize) -> Result<Tensor> {
+        self.forward_inner(caches, input, offset)
+    }
+
+    pub fn clear_kv_cache(caches: &mut [KvCache]) {
+        for cache in caches {
+            cache.reset();
+        }
+    }
+
+    pub fn truncate_kv_cache(caches: &mut [KvCache], seq_len: usize) -> Result<()> {
+        for cache in caches {
+            cache.truncate(seq_len)?;
+        }
+        Ok(())
+    }
+
+    pub fn try_truncate_or_reset_kv_cache(caches: &mut [KvCache], seq_len: usize) -> Result<bool> {
+        let mut all_success = true;
+
+        for (i, cache) in caches.iter_mut().enumerate() {
+            match cache.try_truncate_or_reset(seq_len) {
+                Ok(success) => {
+                    if !success {
+                        all_success = false;
+                        // If this cache failed, reset all remaining caches
+                        for remaining_cache in &mut caches[i + 1..] {
+                            remaining_cache.reset();
+                        }
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Unexpected error, reset everything
+                    Self::clear_kv_cache(caches);
+                    return Err(e);
+                }
+            }
+        }
+
+        if !all_success {
+            // Some cache failed, reset all for consistency
+            Self::clear_kv_cache(caches);
+        }
+
+        Ok(all_success)
+    }
+
+    pub fn try_reserve_kv_cache(caches: &mut [KvCache], additional_tokens: usize) -> bool {
+        for cache in caches {
+            if !cache.try_reserve(additional_tokens) {
+                return false;
+            }
+        }
+        true
     }
 }

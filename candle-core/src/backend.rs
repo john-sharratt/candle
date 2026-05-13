@@ -1,6 +1,6 @@
 //! Traits to Define Backend Behavior
 //!
-use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+use crate::op::{BinaryInplaceOp, BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Layout, Result, Shape};
 
 pub trait BackendStorage: Sized {
@@ -21,6 +21,10 @@ pub trait BackendStorage: Sized {
 
     fn elu(&self, _: &Layout, _: f64) -> Result<Self>;
 
+    fn sub_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self>;
+
+    fn div_at_indices(&self, _: &Layout, _: &[u32], _: f32) -> Result<Self>;
+
     fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self>;
 
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self>;
@@ -30,6 +34,16 @@ pub trait BackendStorage: Sized {
     fn unary_impl<B: UnaryOpT>(&self, _: &Layout) -> Result<Self>;
 
     fn binary_impl<B: BinaryOpT>(&self, _: &Self, _: &Layout, _: &Layout) -> Result<Self>;
+
+    /// In-place binary operation: self = self OP rhs
+    /// Self (lhs) MUST be contiguous for in-place operations.
+    fn binary_inplace_impl(
+        &mut self,
+        _op: BinaryInplaceOp,
+        _rhs: &Self,
+        _lhs_l: &Layout,
+        _rhs_l: &Layout,
+    ) -> Result<()>;
 
     fn where_cond(&self, _: &Layout, _: &Self, _: &Layout, _: &Self, _: &Layout) -> Result<Self>;
 

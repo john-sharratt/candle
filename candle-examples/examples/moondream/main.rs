@@ -43,7 +43,7 @@ impl TextGeneration {
         verbose_prompt: bool,
         device: &Device,
     ) -> Self {
-        let logits_processor = LogitsProcessor::new(seed, temp, top_p);
+        let logits_processor = LogitsProcessor::new(seed, temp, top_p, None);
         Self {
             model,
             tokenizer,

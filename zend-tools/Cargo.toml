@@ -1,0 +1,56 @@
+[package]
+name = "zend-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Tool registry and execution for the Zen Code daemon."
+
+[lib]
+name = "zend_tools"
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+schemars   = { workspace = true }
+validator  = { workspace = true }
+
+reqwest = { version = "0.12", features = ["blocking", "json", "cookies"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+evalexpr = "12"
+rand = { workspace = true }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+sha2 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+md-5 = "0.10"
+sha3 = "0.10"
+blake3 = "1"
+hmac = "0.12"
+digest = "0.10"
+hkdf = "0.12"
+aes-gcm = { version = "0.10", features = ["std"] }
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+argon2 = "0.5"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+scrypt = "0.11"
+totp-rs = { version = "5", features = ["otpauth"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+ssh2 = "0.9"
+native-tls = "0.2"
+dns-lookup = "2"
+hex = "0.4"
+base64 = { workspace = true }
+scraper = "0.21"
+byteorder = { workspace = true }
+
+[dev-dependencies]
+tokio     = { version = "1", features = ["macros", "rt"] }
+wiremock  = "0.6"
+pretty_assertions = "1"

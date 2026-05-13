@@ -12,6 +12,7 @@ macro_rules! test_device {
 
         #[cfg(feature = "cuda")]
         #[test]
+        #[serial_test::serial]
         fn $test_cuda() -> Result<()> {
             $fn_name(&Device::new_cuda(0)?)
         }

@@ -157,7 +157,6 @@ impl Tensor {
         let (storage, shape) = self.storage().apply_op1(self.layout(), c)?;
         Ok(from_storage(storage, shape, BackpropOp::none(), false))
     }
-
     /// Applies a binary custom op without backward support
     pub fn apply_op2_no_bwd<C: CustomOp2>(&self, rhs: &Self, c: &C) -> Result<Self> {
         let (storage, shape) =
@@ -465,7 +464,7 @@ impl InplaceOp1 for UgIOp1 {
         use crate::cuda_backend::WrapErr;
         use cudarc::driver::PushKernelArg;
 
-        let elem_count = layout.shape().elem_count();
+        let _elem_count = layout.shape().elem_count();
         let stream = sto.device.cuda_stream();
         // TODO: support more dtypes.
         let sto = sto.as_cuda_slice::<f32>()?;
@@ -473,14 +472,11 @@ impl InplaceOp1 for UgIOp1 {
             None => crate::bail!("input has to be contiguous"),
             Some((o1, o2)) => sto.slice(o1..o2),
         };
-        let (g, b) = if elem_count % 32 == 0 {
-            (elem_count / 32, 32)
-        } else {
-            (elem_count, 1)
-        };
+        // The ug-generated kernel already contains its own loop over all elements,
+        // so we only need to launch a single thread.
         let cfg = cudarc::driver::LaunchConfig {
-            grid_dim: (g as u32, 1, 1),
-            block_dim: (b as u32, 1, 1),
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = stream.launch_builder(&self.func);

@@ -28,27 +28,42 @@ impl LogitsProcessor {
         Self { rng, sampling }
     }
 
-    pub fn new(seed: u64, temperature: Option<f64>, top_p: Option<f64>) -> Self {
+    pub fn new(
+        seed: u64,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<usize>,
+    ) -> Self {
         let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
         let sampling = match temperature {
             None => Sampling::ArgMax,
             Some(temperature) => match top_p {
-                None => Sampling::All { temperature },
-                Some(p) => Sampling::TopP { p, temperature },
+                None => match top_k {
+                    None => Sampling::All { temperature },
+                    Some(k) => Sampling::TopK { k, temperature },
+                },
+                Some(p) => match top_k {
+                    None => Sampling::TopP { p, temperature },
+                    Some(k) => Sampling::TopKThenTopP { k, p, temperature },
+                },
             },
         };
         Self::from_sampling(seed, sampling)
     }
 
-    fn sample_argmax(&mut self, logits: Tensor) -> Result<u32> {
-        let logits_v: Vec<f32> = logits.to_vec1()?;
-        let next_token = logits_v
-            .iter()
-            .enumerate()
-            .max_by(|(_, u), (_, v)| u.total_cmp(v))
-            .map(|(i, _)| i as u32)
-            .context("empty logits")?;
-        Ok(next_token)
+    fn sample_argmax(&mut self, logits: &Tensor) -> Result<u32> {
+        // Use Candle's argmax reduction so this can stay on-device (e.g. CUDA) and
+        // avoids full-vocab dtype casts + host transfers.
+        let idx = logits.argmax(candle::D::Minus1)?;
+        match idx.rank() {
+            0 => idx.to_vec0::<u32>(),
+            1 => idx
+                .to_vec1::<u32>()?
+                .first()
+                .copied()
+                .context("empty logits"),
+            r => candle::bail!("unexpected argmax rank {r} for logits"),
+        }
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
@@ -123,25 +138,34 @@ impl LogitsProcessor {
     }
 
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
-        let logits = logits.to_dtype(DType::F32)?;
-        let prs = |temperature: f64| -> Result<Vec<f32>> {
-            let logits = (&logits / temperature)?;
-            let prs = candle_nn::ops::softmax_last_dim(&logits)?;
-            let mut prs = prs.to_vec1()?;
-            f(&mut prs);
-            Ok(prs)
-        };
-
         let next_token = match &self.sampling {
             Sampling::ArgMax => self.sample_argmax(logits)?,
             Sampling::GumbelSoftmax { temperature } => {
+                // Cast to f32, doing the Gumbel softmax in bf16/f16 can be unstable.
+                let logits = logits.to_dtype(DType::F32)?;
                 self.sample_gumbel_softmax(&logits, *temperature)?
             }
             Sampling::All { temperature } => {
+                let logits = logits.to_dtype(DType::F32)?;
+                let prs = |temperature: f64| -> Result<Vec<f32>> {
+                    let logits = (&logits / temperature)?;
+                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
+                    let mut prs = prs.to_vec1()?;
+                    f(&mut prs);
+                    Ok(prs)
+                };
                 let prs = prs(*temperature)?;
                 self.sample_multinomial(&prs)?
             }
             Sampling::TopP { p, temperature } => {
+                let logits = logits.to_dtype(DType::F32)?;
+                let prs = |temperature: f64| -> Result<Vec<f32>> {
+                    let logits = (&logits / temperature)?;
+                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
+                    let mut prs = prs.to_vec1()?;
+                    f(&mut prs);
+                    Ok(prs)
+                };
                 let mut prs = prs(*temperature)?;
                 if *p <= 0.0 || *p >= 1.0 {
                     // simply sample from the predicted probability distribution
@@ -152,10 +176,26 @@ impl LogitsProcessor {
                 }
             }
             Sampling::TopK { k, temperature } => {
+                let logits = logits.to_dtype(DType::F32)?;
+                let prs = |temperature: f64| -> Result<Vec<f32>> {
+                    let logits = (&logits / temperature)?;
+                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
+                    let mut prs = prs.to_vec1()?;
+                    f(&mut prs);
+                    Ok(prs)
+                };
                 let mut prs = prs(*temperature)?;
                 self.sample_topk(&mut prs, *k)?
             }
             Sampling::TopKThenTopP { k, p, temperature } => {
+                let logits = logits.to_dtype(DType::F32)?;
+                let prs = |temperature: f64| -> Result<Vec<f32>> {
+                    let logits = (&logits / temperature)?;
+                    let prs = candle_nn::ops::softmax_last_dim(&logits)?;
+                    let mut prs = prs.to_vec1()?;
+                    f(&mut prs);
+                    Ok(prs)
+                };
                 let mut prs = prs(*temperature)?;
                 self.sample_topk_topp(&mut prs, *k, *p as f32)?
             }

@@ -285,7 +285,7 @@ impl Model {
             layers.push(layer)
         }
         let norm = layer_norm(cfg.hidden_size, cfg.norm_epsilon, vb_m.pp("norm"))?;
-        let lm_head = candle_nn::Linear::new(embed_tokens.embeddings().clone(), None);
+        let lm_head = candle_nn::Linear::new(embed_tokens.embeddings_native(), None);
         Ok(Self {
             embed_tokens,
             layers,

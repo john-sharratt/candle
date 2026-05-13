@@ -1,0 +1,164 @@
+//! `zend` — Zen Code daemon.
+//!
+//! Run from the root of your workspace:
+//!
+//! ```text
+//! zend                        # workspace = cwd, port 8080
+//! zend /path/to/project       # explicit workspace path
+//! zend --port 9090            # custom port
+//! ```
+//!
+//! Continue configuration:
+//! ```json
+//! { "provider": "openai", "apiBase": "http://localhost:8080", "model": "zen-code" }
+//! ```
+
+mod api;
+mod config;
+mod download;
+mod log_broadcast;
+mod session;
+mod tools;
+mod types;
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::Parser;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+use config::DaemonConfig;
+use log_broadcast::{BusWriter, LogBus};
+use session::ZendSession;
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "zend",
+    about = "Zen Code daemon — persistent AI coding assistant",
+    long_about = None,
+)]
+struct Cli {
+    /// Root of the workspace to analyse.  Defaults to the current directory.
+    #[arg(default_value = ".")]
+    workspace: PathBuf,
+
+    /// TCP port to listen on.
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
+
+    /// Increase log verbosity.  -v = DEBUG, -vv = TRACE.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // ── Panic hook ────────────────────────────────────────────────────────────
+    //
+    // Force-captures a full backtrace on every panic (no RUST_BACKTRACE needed)
+    // and includes the last CUDA kernel name that was launched on the crashing
+    // thread.  The kernel name is written into a thread-local breadcrumb before
+    // every unsafe kernel FFI call, so it is available here even though CUDA
+    // errors surface asynchronously at a later DtoH / synchronize point.
+    std::panic::set_hook(Box::new(|info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        // zend always links candle with the "cuda" feature — call unconditionally.
+        let kernel = candle::last_cuda_kernel_launch();
+        eprintln!("\n=== PANIC ===\n{info}\nLast CUDA kernel: {kernel}\n\n{bt}\n=============\n");
+    }));
+
+    // ── CLI (parsed first so we know verbosity before init) ──────────────────
+
+    let cli = Cli::parse();
+
+    // ── Logging ───────────────────────────────────────────────────────────────
+    //
+    // Two fmt layers sharing the same filter:
+    //  • stdout  — ANSI colours for the terminal
+    //  • broadcast — plain text piped to the web log pane via WebSocket
+
+    let log = LogBus::new();
+
+    let level = match cli.verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::from_default_env()
+        .add_directive(format!("zend={level}").parse()?)
+        .add_directive(format!("candle_conversation={level}").parse()?);
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_filter(filter.clone());
+
+    let ws_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(BusWriter(Arc::clone(&log)))
+        .with_filter(filter);
+
+    tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(ws_layer)
+        .init();
+
+    let workspace = cli
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| cli.workspace.clone());
+
+    let config = DaemonConfig {
+        workspace: workspace.clone(),
+        port: cli.port,
+    };
+
+    tracing::info!(workspace = %workspace.display(), port = cli.port, "starting zend");
+
+    // ── Session + router ──────────────────────────────────────────────────────
+
+    let session = Arc::new(ZendSession::new(config.clone(), Arc::clone(&log)));
+    session.start_loading();
+    let router  = api::router(Arc::clone(&session));
+
+    // ── Bind ──────────────────────────────────────────────────────────────────
+
+    let addr     = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    tracing::info!(
+        addr = %addr,
+        "ready — API: http://{addr}/v1/chat/completions \
+               — web: http://{addr}/",
+    );
+
+    // ── Background: workspace scan ────────────────────────────────────────────
+
+    tokio::spawn(async move {
+        tracing::info!("scanning workspace...");
+        tokio::task::spawn_blocking(move || scan_workspace(&workspace))
+            .await
+            .ok();
+        tracing::info!("scan complete");
+    });
+
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+// ── Workspace scan ────────────────────────────────────────────────────────────
+
+fn scan_workspace(root: &std::path::Path) {
+    let file_count = std::fs::read_dir(root)
+        .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
+        .unwrap_or(0);
+
+    tracing::info!(
+        root = %root.display(),
+        top_level_files = file_count,
+        "workspace scan placeholder",
+    );
+}

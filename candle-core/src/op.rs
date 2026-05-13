@@ -48,6 +48,17 @@ pub enum BinaryOp {
     Minimum,
 }
 
+/// In-place binary operations (lhs = lhs OP rhs)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryInplaceOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+}
+
 // Unary ops with no argument
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {

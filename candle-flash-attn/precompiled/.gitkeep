@@ -1,0 +1,2 @@
+# This directory contains precompiled Flash Attention kernel object files
+# to speed up builds by avoiding recompilation when source hasn't changed.

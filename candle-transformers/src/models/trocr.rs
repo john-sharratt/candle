@@ -125,7 +125,7 @@ impl TrOCRLearnedPositionalEmbedding {
             0,
         )?
         .contiguous()?;
-        let emb = Embedding::new(emb, embedding_dim);
+        let emb = Embedding::new(emb, embedding_dim)?;
         Ok(Self {
             offset: cfg.pad_token_id + 1,
             weights: emb,
@@ -440,7 +440,7 @@ impl TrOCRForCausalLM {
     pub fn new(decoder_cfg: &TrOCRConfig, vb: VarBuilder) -> Result<Self> {
         let decoder = TrOCRDecoder::new(decoder_cfg, vb.clone())?;
         let output_projection = if decoder_cfg.tie_word_embeddings {
-            candle_nn::Linear::new(decoder.embed_tokens.embeddings().clone(), None)
+            candle_nn::Linear::new(decoder.embed_tokens.embeddings_native(), None)
         } else {
             candle_nn::linear_no_bias(
                 decoder_cfg.d_model,

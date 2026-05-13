@@ -19,6 +19,13 @@ Cargo.lock
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+# Precompiled CUDA kernel archives — large binary build artifacts, never commit
+candle-kernels/precompiled/
+
+# Large test / benchmark output files
+test_out_full.txt
+ruler_stream.jsonl
+
 *tokenizer*.json
 *.npz
 
@@ -46,3 +53,8 @@ out.wav
 bria.mp3
 bria.safetensors
 bria.wav
+
+# CUDA kernel staged .o cache (per-kernel incremental compilation)
+candle-kernels/staged/
+candle-kernels/build_link_tmp/
+candle-kernels/build_tool/

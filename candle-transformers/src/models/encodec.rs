@@ -260,7 +260,7 @@ impl EuclideanCodebook {
         Ok(Self {
             inited,
             cluster_size,
-            embed: candle_nn::Embedding::new(embed, cfg.codebook_dim()),
+            embed: candle_nn::Embedding::new(embed, cfg.codebook_dim())?,
             embed_avg,
             c2,
         })
@@ -271,7 +271,7 @@ impl EuclideanCodebook {
         target_shape.pop();
         let xs = xs.flatten_to(D::Minus2)?;
         let _ = xs.dims2()?;
-        let dot_prod = xs.matmul(&self.embed.embeddings().t()?)?;
+        let dot_prod = xs.matmul(&self.embed.embeddings_native().t()?)?;
         let codes = self.c2.broadcast_sub(&dot_prod)?.argmin(D::Minus1)?;
         codes.reshape(target_shape)
     }
@@ -281,7 +281,7 @@ impl EuclideanCodebook {
         target_shape.pop();
         let xs = xs.flatten_to(D::Minus2)?;
         let _ = xs.dims2()?;
-        let codes = Tensor::apply_op2(&xs, self.embed.embeddings(), CodebookEncode)?;
+        let codes = Tensor::apply_op2(&xs, &self.embed.embeddings_native(), CodebookEncode)?;
         codes.reshape(target_shape)
     }
 

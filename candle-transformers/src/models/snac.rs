@@ -624,7 +624,7 @@ impl VectorQuantizer {
         let (b, d, t) = latents.dims3()?;
         let encodings = latents.transpose(1, 2)?.reshape((b * t, d))?;
         let encodings = normalize(&encodings)?;
-        let codebook = normalize(self.codebook.embeddings())?;
+        let codebook = normalize(&self.codebook.embeddings_native())?;
         let dist = (encodings
             .sqr()?
             .sum_keepdim(1)?

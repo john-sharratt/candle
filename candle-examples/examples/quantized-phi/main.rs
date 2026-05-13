@@ -4,6 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
+use candle_nn::kv_caches::KvCaches;
+use candle_transformers::models::causal_mask_cache::CausalMaskCache;
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
@@ -164,12 +166,32 @@ enum Model {
     Phi3b(Phi3b),
 }
 
+enum ModelCaches {
+    Phi2,
+    Phi3,
+    Phi3b(KvCaches<CausalMaskCache>),
+}
+
 impl Model {
-    fn forward(&mut self, xs: &Tensor, pos: usize) -> candle::Result<Tensor> {
+    fn forward(
+        &mut self,
+        caches: &mut ModelCaches,
+        xs: &Tensor,
+        pos: usize,
+    ) -> candle::Result<Tensor> {
+        match (self, caches) {
+            (Self::Phi2(m), ModelCaches::Phi2) => m.forward(xs, pos),
+            (Self::Phi3(m), ModelCaches::Phi3) => m.forward(xs, pos),
+            (Self::Phi3b(m), ModelCaches::Phi3b(c)) => m.forward(c, xs, pos),
+            _ => candle::bail!("Mismatched model and caches"),
+        }
+    }
+
+    fn create_caches(&self) -> ModelCaches {
         match self {
-            Self::Phi2(m) => m.forward(xs, pos),
-            Self::Phi3(m) => m.forward(xs, pos),
-            Self::Phi3b(m) => m.forward(xs, pos),
+            Self::Phi2(_) => ModelCaches::Phi2,
+            Self::Phi3(_) => ModelCaches::Phi3,
+            Self::Phi3b(m) => ModelCaches::Phi3b(m.create_kv_caches(2048)),
         }
     }
 }
@@ -231,6 +253,8 @@ fn main() -> anyhow::Result<()> {
     };
     println!("model built");
 
+    let mut caches = model.create_caches();
+
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
     let prompt_str = args.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string());
@@ -260,14 +284,14 @@ fn main() -> anyhow::Result<()> {
     let start_prompt_processing = std::time::Instant::now();
     let mut next_token = if !args.split_prompt {
         let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, 0)?;
+        let logits = model.forward(&mut caches, &input, 0)?;
         let logits = logits.squeeze(0)?;
         logits_processor.sample(&logits)?
     } else {
         let mut next_token = 0;
         for (pos, token) in tokens.iter().enumerate() {
             let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
+            let logits = model.forward(&mut caches, &input, pos)?;
             let logits = logits.squeeze(0)?;
             next_token = logits_processor.sample(&logits)?
         }
@@ -288,7 +312,7 @@ fn main() -> anyhow::Result<()> {
     let mut sampled = 0;
     for index in 0..to_sample {
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, tokens.len() + index)?;
+        let logits = model.forward(&mut caches, &input, tokens.len() + index)?;
         let logits = logits.squeeze(0)?;
         let logits = if args.repeat_penalty == 1. {
             logits

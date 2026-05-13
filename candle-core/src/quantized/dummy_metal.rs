@@ -2,6 +2,7 @@
 use super::GgmlDType;
 use crate::{Error, MetalDevice, MetalStorage, Result};
 
+#[derive(Clone)]
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
@@ -30,6 +31,10 @@ impl QMetalStorage {
 
     pub fn storage_size_in_bytes(&self) -> usize {
         0
+    }
+
+    pub fn data_range(&self, _range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        Err(Error::NotCompiledWithMetalSupport)
     }
 
     pub fn fwd(

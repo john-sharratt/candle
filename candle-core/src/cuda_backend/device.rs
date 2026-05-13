@@ -1,6 +1,5 @@
 use crate::backend::BackendDevice;
 use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
-pub use candle_kernels as kernels;
 pub use cudarc;
 use cudarc::driver::CudaFunction;
 use float8::F8E4M3;
@@ -26,17 +25,15 @@ impl DeviceId {
 struct CudaRng(cudarc::curand::CudaRng);
 unsafe impl Send for CudaRng {}
 
-pub struct ModuleStore {
-    mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
-}
-
 #[derive(Clone)]
 pub struct CudaDevice {
     id: DeviceId,
     context: Arc<cudarc::driver::CudaContext>,
-    modules: Arc<std::sync::RwLock<ModuleStore>>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
+    /// Dedicated background stream for quantize/compact kernels so they can
+    /// overlap with main-stream decode work.
+    bg_stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
 }
@@ -145,6 +142,20 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// Returns the background stream used for quantize/compact kernels.
+    /// Separate from the main stream so these operations can overlap with decode.
+    pub fn cuda_bg_stream(&self) -> Arc<cudarc::driver::CudaStream> {
+        self.bg_stream.clone()
+    }
+
+    /// Returns the underlying CUDA context.
+    ///
+    /// Useful for creating secondary streams ([`CudaContext::new_stream`]) or
+    /// events ([`CudaContext::new_event`]) for overlapping DMA and compute.
+    pub fn cuda_context(&self) -> &Arc<cudarc::driver::CudaContext> {
+        &self.context
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///
@@ -170,7 +181,7 @@ impl CudaDevice {
         kernel: ug::lang::ssa::Kernel,
     ) -> Result<CudaFunc> {
         let mut buf = vec![];
-        ug_cuda::code_gen::gen(&mut buf, func_name, &kernel)?;
+        ug_cuda::code_gen::r#gen(&mut buf, func_name, &kernel)?;
         let cuda_code = String::from_utf8(buf)?;
         let opts = cudarc::nvrtc::CompileOptions {
             use_fast_math: Some(true),
@@ -213,46 +224,85 @@ impl CudaDevice {
             stream: self.stream.clone(),
         })
     }
-
-    pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
-        let ms = self.modules.read().unwrap();
-        if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
-            let func = mdl.load_function(fn_name).w()?;
-            return Ok(CudaFunc {
-                func,
-                stream: self.stream.clone(),
-            });
-        }
-        drop(ms);
-        let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
-        ms.mdls[mdl.index()] = Some(cuda_module.clone());
-        let func = cuda_module.load_function(fn_name).w()?;
-        Ok(CudaFunc {
-            func,
-            stream: self.stream.clone(),
-        })
-    }
 }
 
 impl CudaDevice {
+    /// Validates that the device meets the minimum compute capability (SM 8.0 / Ampere).
+    /// All precompiled CUDA kernels target SM80; older GPUs will produce incorrect results.
+    fn validate_compute_capability(context: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
+        use cudarc::driver::sys::CUdevice_attribute;
+        let major = context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .w()?;
+        let minor = context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .w()?;
+        if major < 8 {
+            crate::bail!(
+                "CUDA device (SM {major}.{minor}) does not meet the minimum requirement of \
+                 SM 8.0 (Ampere). Precompiled kernels target SM80 and will not run correctly \
+                 on older hardware."
+            );
+        }
+        Ok(())
+    }
+
     pub fn new_with_stream(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        Self::validate_compute_capability(&context)?;
         let stream = context.new_stream().w()?;
+        let bg_stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
-        let module_store = ModuleStore {
-            mdls: [const { None }; kernels::ALL_IDS.len()],
-        };
         Ok(Self {
             id: DeviceId::new(),
             context,
             stream,
+            bg_stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
-            modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Returns the compute capability of this device as a (major, minor) tuple.
+    pub fn compute_capability(&self) -> Result<(i32, i32)> {
+        use cudarc::driver::sys::CUdevice_attribute;
+        let major = self
+            .context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .w()?;
+        let minor = self
+            .context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .w()?;
+        Ok((major, minor))
+    }
+
+    /// Returns the L2 cache size in bytes.
+    pub fn l2_cache_size(&self) -> Result<usize> {
+        use cudarc::driver::sys::CUdevice_attribute;
+        let size = self
+            .context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+            .w()?;
+        Ok(size as usize)
+    }
+
+    /// Returns true if this device supports tensor cores (SM >= 8.0, i.e., Ampere or newer).
+    pub fn supports_tensor_cores(&self) -> bool {
+        self.compute_capability()
+            .map(|(major, _minor)| major >= 8)
+            .unwrap_or(false)
+    }
+
+    /// Returns (free, total) GPU memory in bytes.
+    ///
+    /// Binds this device's CUDA context to the current thread and queries
+    /// `cuMemGetInfo_v2` for the actual free and total device memory.
+    pub fn mem_get_info(&self) -> Result<(usize, usize)> {
+        self.context.bind_to_thread().w()?;
+        cudarc::driver::result::mem_get_info().w()
     }
 }
 
@@ -261,19 +311,18 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+        Self::validate_compute_capability(&context)?;
         let stream = context.default_stream();
+        let bg_stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
-        let module_store = ModuleStore {
-            mdls: [const { None }; kernels::ALL_IDS.len()],
-        };
         Ok(Self {
             id: DeviceId::new(),
             context,
             stream,
+            bg_stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
-            modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
@@ -365,9 +414,8 @@ impl BackendDevice for CudaDevice {
         let slice = if lo == 0. && up == 1.0 {
             slice
         } else {
-            use super::utils::Map1;
             let layout = Layout::contiguous(shape);
-            super::Affine(up - lo, lo).map(&slice, self, &layout)?
+            super::run_affine_ffi(&slice, self, &layout, up - lo, lo)?
         };
         Ok(CudaStorage {
             slice,

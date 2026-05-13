@@ -212,7 +212,7 @@ impl Model {
         let logits = xs
             .narrow(1, seq_len - 1, 1)?
             .squeeze(1)?
-            .matmul(&self.wte.embeddings().t()?)?
+            .matmul(&self.wte.embeddings()?.t()?)?
             .squeeze(1)?;
         Ok(logits)
     }

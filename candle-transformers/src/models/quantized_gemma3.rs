@@ -16,35 +16,17 @@
 
 use crate::quantized_nn::RmsNorm;
 use candle::quantized::gguf_file;
-use candle::quantized::QTensor;
 use candle::D;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
+
+use super::quantized_matmul::QMatMul;
 
 pub const MAX_SEQ_LEN: usize = 131072; // Gemma 3 supports 128K context window
 pub const DEFAULT_SLIDING_WINDOW_TYPE: usize = 6;
 pub const DEFAULT_ROPE_FREQUENCY: f32 = 1_000_000.;
 pub const DEFAULT_ROPE_FREQUENCY_SLIDING: f32 = 10_000.;
 pub const DEFAULT_ROPE_FREQUENCY_SCALE_FACTOR: f32 = 1.;
-
-#[derive(Debug, Clone)]
-struct QMatMul {
-    inner: candle::quantized::QMatMul,
-    span: tracing::Span,
-}
-
-impl QMatMul {
-    fn from_qtensor(qtensor: QTensor) -> Result<Self> {
-        let inner = candle::quantized::QMatMul::from_qtensor(qtensor)?;
-        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
-        Ok(Self { inner, span })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
-        self.inner.forward(xs)
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -412,7 +394,7 @@ impl ModelWeights {
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
 
         Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings: Embedding::new(tok_embeddings, embedding_length)?,
             embedding_length,
             layers,
             norm,

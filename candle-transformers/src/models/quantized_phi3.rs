@@ -20,9 +20,11 @@ use candle::quantized::QTensor;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{kv_cache::KvCache, Embedding, RmsNorm};
 
+use super::quantized_matmul::QMatMul;
+
 #[derive(Debug, Clone)]
 struct QLinear {
-    inner: candle::quantized::QMatMul,
+    inner: QMatMul,
     span: tracing::Span,
 }
 
@@ -35,7 +37,7 @@ impl QLinear {
     ) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         let w = ct.tensor(r, &format!("{name}.weight"), device)?;
-        let inner = candle::quantized::QMatMul::from_qtensor(w)?;
+        let inner = QMatMul::from_qtensor(w)?;
         Ok(Self { inner, span })
     }
 }
@@ -291,7 +293,7 @@ impl ModelWeights {
         let span = tracing::span!(tracing::Level::TRACE, "model");
         let span_output = tracing::span!(tracing::Level::TRACE, "output");
         Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings: Embedding::new(tok_embeddings, embedding_length)?,
             layers,
             output_norm,
             output,

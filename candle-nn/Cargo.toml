@@ -10,8 +10,10 @@ license.workspace = true
 readme = "README.md"
 
 [dependencies]
+ahash = { workspace = true }
 accelerate-src = { workspace = true, optional = true }
 candle = { workspace = true }
+float8 = { workspace = true }
 half = { workspace = true }
 thiserror = { workspace = true }
 intel-mkl-src = { workspace = true, optional = true }
@@ -22,11 +24,16 @@ serde = { workspace = true }
 objc2-metal = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
 libc = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+rand = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-rand = { workspace = true }
 rand_distr = { workspace = true }
 criterion = { workspace = true }
 
@@ -34,6 +41,8 @@ criterion = { workspace = true }
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
 cuda = ["candle/cuda"]
+verbose = []
+dont_check = []
 cudnn = ["candle/cudnn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl"]
 metal = ["candle/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]

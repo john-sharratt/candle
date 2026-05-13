@@ -13,10 +13,16 @@ readme = "README.md"
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
 candle = { workspace = true }
+ahash = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
+candle-kernels = { workspace = true, optional = true }
 candle-nn = { workspace = true }
+cudarc = { workspace = true, optional = true }
 fancy-regex = { workspace = true }
+float8 = { workspace = true }
+half = "2.3.1"
 intel-mkl-src = { workspace = true, optional = true }
+memmap2 = { workspace = true }
 num-traits = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -24,12 +30,22 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_plain = { workspace = true }
 tracing = { workspace = true }
+tokenizers = { workspace = true, optional = true }
+
+[dev-dependencies]
+hf-hub = { workspace = true }
+tokenizers = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate"]
-cuda = ["candle/cuda", "candle-nn/cuda"]
+cuda = ["candle/cuda", "candle-nn/cuda", "dep:cudarc", "dep:candle-kernels"]
+verbose = ["candle-nn/verbose"]
 cudnn = ["candle/cudnn", "candle-nn/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl"]
 metal = ["candle/metal", "candle-nn/metal"]
+profile = []
+huge-context = []
+ruler-bench = ["dep:tokenizers"]

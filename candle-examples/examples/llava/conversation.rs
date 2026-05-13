@@ -2,7 +2,7 @@ pub enum SeparatorStyle {
     Two,
     Mpt,
 }
-pub struct Conversation {
+pub struct Sequence {
     pub system: String,
     pub roles: Vec<String>,
     pub messages: Vec<(String, Option<String>)>,
@@ -13,7 +13,7 @@ pub struct Conversation {
     pub version: String,
 }
 
-impl Conversation {
+impl Sequence {
     pub fn new(
         system: &str,
         roles: &[String],
@@ -23,7 +23,7 @@ impl Conversation {
         sep2: Option<&str>,
         version: &str,
     ) -> Self {
-        Conversation {
+        Sequence {
             system: system.to_string(),
             roles: roles.to_vec(),
             messages: Vec::new(),
@@ -36,7 +36,7 @@ impl Conversation {
     }
 
     pub fn conv_chatml_direct() -> Self {
-        Conversation::new(
+        Sequence::new(
             "<|im_start|>system\nAnswer the questions.",
             &[
                 "<|im_start|>user\n".to_string(),
@@ -51,7 +51,7 @@ impl Conversation {
     }
 
     pub fn conv_llava_v1() -> Self {
-        Conversation::new(
+        Sequence::new(
             "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions.",
             &[
                 "USER".to_string(),

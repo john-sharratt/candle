@@ -333,7 +333,7 @@ impl Model {
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(embed_tokens.embeddings().clone(), None)
+            Linear::from_weights(embed_tokens.embeddings_native(), None)
         } else {
             linear(cfg.hidden_size, cfg.vocab_size, false, vb.pp("lm_head"))?
         };

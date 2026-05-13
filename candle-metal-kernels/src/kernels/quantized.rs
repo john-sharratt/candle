@@ -132,7 +132,6 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q4K => "kernel_mul_mv_q4_K_f32",
         GgmlDType::Q5K => "kernel_mul_mv_q5_K_f32",
         GgmlDType::Q6K => "kernel_mul_mv_q6_K_f32",
-        GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
         GgmlDType::F16 => "kernel_mul_mv_f16_f32",
         GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
         GgmlDType::F32 => "kernel_mul_mv_f32_f32",

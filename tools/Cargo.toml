@@ -1,0 +1,11 @@
+[package]
+name = "parquet2text"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "parquet2text"
+path = "parquet2text.rs"
+
+[dependencies]
+parquet = "53"

@@ -523,7 +523,7 @@ impl GraniteMoeHybrid {
         let x = self.ln_f.forward(&x)?;
         let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
         // Project to vocabulary size
-        let logits = x.matmul(&self.word_token_embedding.embeddings().t()?)?;
+        let logits = x.matmul(&self.word_token_embedding.embeddings_native().t()?)?;
         let logits = logits.to_dtype(DType::F32)?;
         // Scale the logits if needed (that's also different from Granite 1)
         let scaled_logits = if (self.logits_scale - 1.0).abs() < f32::EPSILON {

@@ -64,6 +64,9 @@ mod dtype;
 pub mod dummy_cuda_backend;
 mod dummy_metal_backend;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod gpu_keepalive;
+pub mod gpu_memory;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
@@ -75,6 +78,8 @@ pub mod op;
 pub mod pickle;
 pub mod quantized;
 pub mod safetensors;
+pub mod sampling;
+pub mod sampling_demo;
 pub mod scalar;
 pub mod shape;
 mod sort;
@@ -106,6 +111,10 @@ pub use variable::Var;
 
 #[cfg(feature = "cuda")]
 pub use cuda_backend as cuda;
+#[cfg(feature = "cuda")]
+pub use cuda_backend::last_cuda_kernel_launch;
+#[cfg(feature = "cuda")]
+pub use cuda_backend::set_kernel_breadcrumb;
 
 #[cfg(not(feature = "cuda"))]
 pub use dummy_cuda_backend as cuda;
@@ -143,6 +152,10 @@ impl ToUsize2 for (usize, usize) {
 /// Defining a module with forward method using a single argument.
 pub trait Module {
     fn forward(&self, xs: &Tensor) -> Result<Tensor>;
+
+    fn forward_as_dtype(&self, xs: &Tensor, dtype: DType) -> Result<Tensor> {
+        self.forward(xs)?.to_dtype(dtype)
+    }
 }
 
 impl<T: Fn(&Tensor) -> Result<Tensor>> Module for T {

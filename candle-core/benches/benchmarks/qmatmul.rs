@@ -53,16 +53,20 @@ fn criterion_benchmark(c: &mut Criterion) {
         for dtype in [
             GgmlDType::F32,
             GgmlDType::F16,
-            GgmlDType::Q4_0,
-            GgmlDType::Q4_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q8_1,
+            GgmlDType::Q8_K,
+            GgmlDType::Q8_KS,
+            GgmlDType::Q6_K,
             GgmlDType::Q5_0,
             GgmlDType::Q5_1,
-            GgmlDType::Q8_0,
-            GgmlDType::Q2K,
-            GgmlDType::Q3K,
-            GgmlDType::Q4K,
-            GgmlDType::Q5K,
-            GgmlDType::Q6K,
+            GgmlDType::Q5_K,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q4_K,
+            GgmlDType::Q4_KS,
+            GgmlDType::Q3_K,
+            GgmlDType::Q2_K,
         ] {
             run_bench(c, &device, dtype);
         }

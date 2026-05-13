@@ -1,0 +1,43 @@
+[package]
+name = "zend"
+version = "0.1.0"
+edition = "2021"
+description = "Zen Code daemon — persistent AI coding assistant"
+
+[[bin]]
+name = "zend"
+path = "src/main.rs"
+
+[lib]
+name = "zend"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+axum         = { version = "0.7", features = ["macros", "ws"] }
+tower-http   = { version = "0.5" }
+tokio        = { version = "1",   features = ["full"] }
+futures      = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+include_dir  = { version = "0.7" }
+mime_guess   = { version = "2" }
+reqwest      = { version = "0.12", features = ["stream"] }
+
+candle              = { workspace = true, features = ["cuda"] }
+candle-conversation = { path = "../candle-conversation", features = ["hub", "cuda"] }
+zend-tools          = { path = "../zend-tools" }
+regex               = "1"
+
+[dev-dependencies]
+tokenizers = { workspace = true }
+
+[features]
+default = []
+# Enable to run GPU-backed integration tests (needs CUDA + GGUF model on disk).
+cuda = []

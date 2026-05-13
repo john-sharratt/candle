@@ -16,13 +16,13 @@ impl Embedding {
 
     pub fn from_weights(weights: Tensor) -> Result<Self> {
         let (_in_size, out_size) = weights.dims2()?;
-        let inner = candle_nn::Embedding::new(weights, out_size);
+        let inner = candle_nn::Embedding::new(weights, out_size)?;
         let span = tracing::span!(tracing::Level::TRACE, "embedding");
         Ok(Self { inner, span })
     }
 
-    pub fn embeddings(&self) -> &Tensor {
-        self.inner.embeddings()
+    pub fn embeddings(&self) -> Result<Tensor> {
+        Ok(self.inner.embeddings_native())
     }
 }
 
@@ -101,8 +101,7 @@ pub fn conv2d(
 // QMatMul wrapper adding some tracing.
 #[derive(Clone)]
 pub struct QMatMul {
-    inner: candle::quantized::QMatMul,
-    span: tracing::Span,
+    inner: super::quantized_matmul::QMatMul,
 }
 
 impl QMatMul {
@@ -112,21 +111,18 @@ impl QMatMul {
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
         let ws = vb.get((in_dim, out_dim), "weight")?;
-        let inner = candle::quantized::QMatMul::from_arc(ws)?;
-        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
-        Ok(Self { inner, span })
+        let inner = super::quantized_matmul::QMatMul::from_weights(ws.into())?;
+        Ok(Self { inner })
     }
 
     pub fn from_weights(ws: std::sync::Arc<candle::quantized::QTensor>) -> Result<Self> {
-        let inner = candle::quantized::QMatMul::from_arc(ws)?;
-        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
-        Ok(Self { inner, span })
+        let inner = super::quantized_matmul::QMatMul::from_weights(ws)?;
+        Ok(Self { inner })
     }
 }
 
 impl Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let _enter = self.span.enter();
         self.inner.forward(xs)
     }
 }
