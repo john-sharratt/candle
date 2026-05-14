@@ -27,6 +27,7 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
+        inject_no_think_block: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
     }
 }
@@ -45,6 +46,7 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
+        inject_no_think_block: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
     }
 }
@@ -67,6 +69,7 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
+        inject_no_think_block: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
     }
 }
@@ -85,6 +88,7 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
+        inject_no_think_block: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
     }
 }
@@ -103,6 +107,7 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
+        inject_no_think_block: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
     }
 }

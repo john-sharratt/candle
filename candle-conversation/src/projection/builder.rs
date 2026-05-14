@@ -629,18 +629,7 @@ impl Builder {
     ///
     /// IDs are fixed at 1 each; there is no name map.
     ///
-    /// **Important**: the synthetic schema's "frame" section content
-    /// is intentionally **empty**.  `system_prompt_text` is wired in
-    /// by the conversation layer via the `system_section_id`
-    /// ingestion path — duplicating it as a layer-section ingest
-    /// would inject the same KV bytes twice onto every parent slot,
-    /// corrupting the model's attention state.  The frame section
-    /// is kept (with empty content) only because the schema
-    /// validator requires every layer to declare at least one
-    /// system-prompt section.  `insert_section_collection` skips
-    /// empty content so no slot is allocated for it.
     pub fn for_plain_prompt(system_prompt_text: &str) -> Self {
-        let _ = system_prompt_text;
         use super::ids::{GroupId, LayerId, SectionId};
         use super::schema::{
             Budget, DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionSchema,
@@ -664,9 +653,7 @@ impl Builder {
                     items: vec![super::schema::SystemPromptItem::Section(SectionSchema {
                         id: section_id,
                         name: "frame".to_string(),
-                        // Empty — the conversation's `system_section_id`
-                        // is what carries the actual text.
-                        content: String::new(),
+                        content: system_prompt_text.to_string(),
                         priority: 50.0,
                     })],
                 },

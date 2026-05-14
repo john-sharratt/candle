@@ -1914,72 +1914,72 @@ impl ChunkedKvBacking {
                 );
             }
         }
-        if r16_block_indices.is_empty() {
-            return Ok(vec![]);
-        }
+        let mut result: Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> =
+            Vec::with_capacity(block_gids.len());
 
-        let n_r16_blocks = r16_block_indices.len();
-        let n_warps = n_r16_blocks * n_kv_head * N_PALETTE;
-        let total_elems = n_warps * elems_per_subband;
+        if !r16_block_indices.is_empty() {
+            let n_r16_blocks = r16_block_indices.len();
+            let n_warps = n_r16_blocks * n_kv_head * N_PALETTE;
+            let total_elems = n_warps * elems_per_subband;
 
-        // Step 3: HtoD upload of pointer arrays, alloc combined output, launch.
-        let k_ptrs_gpu = cuda_dev.memcpy_stod(&k_ptrs)?;
-        let v_ptrs_gpu = cuda_dev.memcpy_stod(&v_ptrs)?;
+            // Step 3: HtoD upload of pointer arrays, alloc combined output, launch.
+            let k_ptrs_gpu = cuda_dev.memcpy_stod(&k_ptrs)?;
+            let v_ptrs_gpu = cuda_dev.memcpy_stod(&v_ptrs)?;
 
-        // Combined buffer: [K section][Q section][V section], each `total_elems` halves.
-        let out_kqv = unsafe { cuda_dev.alloc::<half::f16>(3 * total_elems)? };
+            // Combined buffer: [K section][Q section][V section], each `total_elems` halves.
+            let out_kqv = unsafe { cuda_dev.alloc::<half::f16>(3 * total_elems)? };
 
-        let stream = cuda_dev.cuda_stream();
-        {
-            let (kp, _kg) = k_ptrs_gpu.device_ptr(&stream);
-            let (vp, _vg) = v_ptrs_gpu.device_ptr(&stream);
-            let (okqv, _g) = out_kqv.device_ptr(&stream);
-            candle::set_kernel_breadcrumb("run_gather_r16_kv_f16", file!(), line!());
-            unsafe {
-                kernels::simple::gather_r16_kv::run_gather_r16_kv_f16(
-                    kp as *const i64,
-                    vp as *const i64,
-                    okqv as *mut std::ffi::c_void,
-                    n_warps as i32,
-                    sub_head_dim as i32,
-                    stream.cu_stream() as *mut _,
-                );
-            }
-        }
-
-        // Step 4: single DtoH copy of combined K/Q/V output.
-        let kqv_cpu: Vec<half::f16> = cuda_dev.memcpy_dtov(&out_kqv)?;
-        let k_cpu = &kqv_cpu[..total_elems];
-        let q_cpu = &kqv_cpu[total_elems..2 * total_elems];
-        let v_cpu = &kqv_cpu[2 * total_elems..];
-
-        // Step 5: transpose d-major kernel output → token-major and convert F16 → F32.
-        //
-        // The kernel writes d-major within each warp (= one head×palette sub-band):
-        //   kqv[warp_off + d * CHUNK_SIZE + token]
-        // The consumer (r16_block_to_turn_signatures) expects token-major:
-        //   q_flat[warp_off + token * sub_head_dim + d]
-        //
-        // We fold the transpose into the F16→F32 conversion — no extra allocation.
-        let n_subbands = n_kv_head * N_PALETTE;
-        let mut result = Vec::with_capacity(n_r16_blocks);
-        for (bi, block_idx) in r16_block_indices.iter().enumerate() {
-            let mut k_f32 = Vec::with_capacity(elems_per_block);
-            let mut v_f32 = Vec::with_capacity(elems_per_block);
-            let mut q_f32 = Vec::with_capacity(elems_per_block);
-            for warp_local in 0..n_subbands {
-                let warp_off = bi * elems_per_block + warp_local * elems_per_subband;
-                for t in 0..CHUNK_SIZE {
-                    for d in 0..sub_head_dim {
-                        // d-major read → token-major push order
-                        let src = warp_off + d * CHUNK_SIZE + t;
-                        k_f32.push(k_cpu[src].to_f32());
-                        v_f32.push(v_cpu[src].to_f32());
-                        q_f32.push(q_cpu[src].to_f32());
-                    }
+            let stream = cuda_dev.cuda_stream();
+            {
+                let (kp, _kg) = k_ptrs_gpu.device_ptr(&stream);
+                let (vp, _vg) = v_ptrs_gpu.device_ptr(&stream);
+                let (okqv, _g) = out_kqv.device_ptr(&stream);
+                candle::set_kernel_breadcrumb("run_gather_r16_kv_f16", file!(), line!());
+                unsafe {
+                    kernels::simple::gather_r16_kv::run_gather_r16_kv_f16(
+                        kp as *const i64,
+                        vp as *const i64,
+                        okqv as *mut std::ffi::c_void,
+                        n_warps as i32,
+                        sub_head_dim as i32,
+                        stream.cu_stream() as *mut _,
+                    );
                 }
             }
-            result.push((*block_idx, k_f32, v_f32, q_f32));
+
+            // Step 4: single DtoH copy of combined K/Q/V output.
+            let kqv_cpu: Vec<half::f16> = cuda_dev.memcpy_dtov(&out_kqv)?;
+            let k_cpu = &kqv_cpu[..total_elems];
+            let q_cpu = &kqv_cpu[total_elems..2 * total_elems];
+            let v_cpu = &kqv_cpu[2 * total_elems..];
+
+            // Step 5: transpose d-major kernel output → token-major and convert F16 → F32.
+            //
+            // The kernel writes d-major within each warp (= one head×palette sub-band):
+            //   kqv[warp_off + d * CHUNK_SIZE + token]
+            // The consumer (r16_block_to_turn_signatures) expects token-major:
+            //   q_flat[warp_off + token * sub_head_dim + d]
+            //
+            // We fold the transpose into the F16→F32 conversion — no extra allocation.
+            let n_subbands = n_kv_head * N_PALETTE;
+            for (bi, block_idx) in r16_block_indices.iter().enumerate() {
+                let mut k_f32 = Vec::with_capacity(elems_per_block);
+                let mut v_f32 = Vec::with_capacity(elems_per_block);
+                let mut q_f32 = Vec::with_capacity(elems_per_block);
+                for warp_local in 0..n_subbands {
+                    let warp_off = bi * elems_per_block + warp_local * elems_per_subband;
+                    for t in 0..CHUNK_SIZE {
+                        for d in 0..sub_head_dim {
+                            // d-major read → token-major push order
+                            let src = warp_off + d * CHUNK_SIZE + t;
+                            k_f32.push(k_cpu[src].to_f32());
+                            v_f32.push(v_cpu[src].to_f32());
+                            q_f32.push(q_cpu[src].to_f32());
+                        }
+                    }
+                }
+                result.push((*block_idx, k_f32, v_f32, q_f32));
+            }
         }
 
         Ok(result)

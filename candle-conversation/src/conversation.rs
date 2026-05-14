@@ -667,7 +667,9 @@ impl Sequence {
             self.config.dialect.user_end,
             self.config.dialect.active_assistant_start(
                 self.config.suppress_thinking,
-                self.config.thinking_capable && self.config.dialect.supports_no_think(),
+                self.config.thinking_capable
+                    && (!self.config.suppress_thinking || self.config.inject_no_think_block)
+                    && self.config.dialect.supports_no_think(),
             ),
         );
         let prefill_tokens = self.tokenize(&formatted)?;
@@ -831,7 +833,9 @@ impl Sequence {
             self.config.dialect.user_end,
             self.config.dialect.active_assistant_start(
                 self.config.suppress_thinking,
-                self.config.thinking_capable && self.config.dialect.supports_no_think(),
+                self.config.thinking_capable
+                    && (!self.config.suppress_thinking || self.config.inject_no_think_block)
+                    && self.config.dialect.supports_no_think(),
             ),
             assistant_text,
         );

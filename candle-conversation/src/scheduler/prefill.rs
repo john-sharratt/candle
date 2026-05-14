@@ -428,20 +428,65 @@ impl Scheduler {
             }
         }
 
+        let sampling_temperature = work.sampling.temperature;
+
         if self.is_eos(first_token) || work.max_decode_tokens == 0 {
-            self.finish_immediately(
-                work.sequence_id,
-                first_token,
-                &work.event_tx,
-                prefill_ms,
-                turn_start,
-            );
+            // View sequences (SubmitTurn path): the prefill already wrote KV
+            // blocks that must be finalized onto the parent and sealed into
+            // the substrate.  Insert as a finished DecodeState so
+            // cleanup_finished runs finalize_view + perform_seal_and_write.
+            //
+            // Non-view sequences (raw RULER / summarisation): no parent to
+            // finalize and seal=None is correct — use the fast path.
+            if self.turn_views.contains_key(&work.sequence_id) {
+                self.active_decodes.insert(
+                    work.sequence_id,
+                    DecodeState {
+                        event_tx: work.event_tx,
+                        generated_tokens: TokenBuffer::from(vec![first_token]),
+                        max_tokens: work.max_decode_tokens,
+                        sampling_config: work.sampling,
+                        seal_action: work.seal_action,
+                        post_decode_tokens: work.post_decode_tokens,
+                        prefill_tokens: work.tokens,
+                        prefill_text: work.prefill_text,
+                        finished: true,
+                        decode_start: Instant::now(),
+                        prefill_ms,
+                        prefill_token_count: context_depth,
+                        turn_start,
+                        health: {
+                            let mut hs = crate::decode_health::DecodeHealthState::new(
+                                self.health_config.repetition_window,
+                                self.health_config.health_log_capacity,
+                            );
+                            hs.apply_baseline_config(
+                                self.health_config.entropy_baseline_window,
+                                self.health_config.entropy_trend_relative_factor,
+                                self.health_config.entropy_trend_absolute_min_nats,
+                            );
+                            hs.inside_think_block = initial_inside_think_block;
+                            hs.skip_entropy_checks = sampling_temperature <= 0.01;
+                            hs
+                        },
+                        reprojection: work.reprojection,
+                        last_reproject_at: 0,
+                        prov_sig_entries: Vec::new(),
+                    },
+                );
+            } else {
+                self.finish_immediately(
+                    work.sequence_id,
+                    first_token,
+                    &work.event_tx,
+                    prefill_ms,
+                    turn_start,
+                );
+            }
             return;
         }
 
         let _ = work.event_tx.send(TurnEvent::Token(first_token));
-
-        let sampling_temperature = work.sampling.temperature;
 
         self.active_decodes.insert(
             work.sequence_id,
@@ -480,6 +525,7 @@ impl Scheduler {
                 // first sampled token already pre-installed in
                 // `generated_tokens`).
                 last_reproject_at: 0,
+                prov_sig_entries: Vec::new(),
             },
         );
     }

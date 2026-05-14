@@ -82,6 +82,14 @@ impl Scheduler {
             );
         }
 
+        // Extract provenance Q-sigs after advance_sequence so the offset is
+        // current.  The newly-completed block (if any) is guaranteed R16 —
+        // it finished this step and the bg_quantizer cannot have touched it
+        // yet.  Results accumulate in DecodeState::prov_sig_entries and are
+        // passed to perform_seal_and_write, making seal-time extraction cover
+        // only the final partial block (also always R16).
+        self.extract_prov_after_step(&seq_ids);
+
         // Clone sampling configs before taking mutable references
         let configs: Vec<SamplingConfig> = seq_ids
             .iter()

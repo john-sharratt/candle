@@ -367,6 +367,14 @@ struct DecodeState {
     /// time `generated_tokens.len()` becomes a multiple of
     /// `every_n_tokens`.  Carried across mid-decode swaps unchanged.
     reprojection: Option<ReprojectionPolicy>,
+    /// Provenance `SigEntry` records accumulated during decode by
+    /// `extract_prov_after_step`.  Each entry covers one 32-token
+    /// block extracted immediately after the forward pass that completed
+    /// it, while the R16 backing is still intact.  Passed to
+    /// `perform_seal_and_write` so seal-time extraction covers only the
+    /// residual partial block (and any post-decode tail tokens), not the
+    /// bulk that the bg_quantizer may have already compressed.
+    prov_sig_entries: Vec<crate::provenance::SigEntry>,
     /// `generated_tokens.len()` at the most recent successful
     /// reprojection (or `0` at decode start).  Defines the lower edge
     /// of the next probe window: probe spans
@@ -1038,6 +1046,7 @@ impl Scheduler {
                 self.slot_conversations.remove(&sequence_id);
                 self.slot_targets.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
+                self.slot_sig_blocks_processed.remove(&sequence_id);
                 true
             }
 
@@ -1083,6 +1092,7 @@ impl Scheduler {
                                     seal_block_from,
                                     &SealAction::Section { section_id, tokens: Arc::new(tokens.to_vec()) },
                                     None,
+                                    vec![],
                                 )
                                 .and_then(|opt| {
                                     opt.ok_or_else(|| {
@@ -1678,6 +1688,11 @@ impl Scheduler {
                 // pin).  The resulting `SealResult` rides along on the Done
                 // event so the conversation-side post-actions (cold store,
                 // BDP scan) can run without a second round trip.
+                //
+                // `pre_sigs` carries SigEntry records already extracted
+                // during decode (per-step, while R16 was intact).  Move them
+                // out before borrowing `state.seal_action` for the match.
+                let pre_sigs = state.prov_sig_entries;
                 let seal_result = match &state.seal_action {
                     SealAction::None => None,
                     action => {
@@ -1724,6 +1739,7 @@ impl Scheduler {
                             seal_block_from,
                             action,
                             turn_content,
+                            pre_sigs,
                         )
                         .unwrap_or_else(|e| {
                             tracing::warn!(
@@ -1898,6 +1914,7 @@ impl Scheduler {
             seal_block_from,
             &SealAction::Section { section_id, tokens },
             None,
+            vec![],
         )?;
         seal.ok_or_else(|| {
             ConversationError::Channel(
@@ -1922,6 +1939,7 @@ impl Scheduler {
         seal_block_from: usize,
         seal_action: &SealAction,
         turn_content: Option<TurnContent>,
+        pre_sigs: Vec<crate::provenance::SigEntry>,
     ) -> Result<Option<SealResult>, ConversationError> {
         // The substrate target (where a `SealAction::Turn` write
         // lands) is read from `slot_targets` rather than threaded
@@ -1958,9 +1976,22 @@ impl Scheduler {
         };
 
         // Extract sigs at all three depths.
+        // `pre_sigs` carries entries already extracted during decode (while R16
+        // was intact); seal-time extraction covers only the residual range that
+        // wasn't reached before the bg_quantizer compressed earlier blocks.
         let [syn_idx, sem_idx, prag_idx] = self.provenance_layer_indices;
-        let mut new_sig_entries: Vec<crate::provenance::SigEntry> = Vec::new();
+        let mut new_sig_entries: Vec<crate::provenance::SigEntry> = pre_sigs;
         let mut new_processed = prev_processed;
+
+        // Actual fill count of the last block — may be < CHUNK_SIZE for the
+        // partial tail.  Used below to strip zero-padded garbage signatures
+        // that the gather kernel reads from uninitialized arena slots.
+        let tail_tokens = snapshot.chunks
+            .get(block_count.saturating_sub(1))
+            .map(|c| c.token_count as usize)
+            .filter(|&t| t > 0)
+            .unwrap_or(candle_nn::CHUNK_SIZE);
+
         if let Some(range) = sig_range {
             let syn = self.handle_extract_signatures(seal_slot.0, syn_idx, Some(range));
             let sem = self.handle_extract_signatures(seal_slot.0, sem_idx, Some(range));
@@ -1968,9 +1999,12 @@ impl Scheduler {
             if let (Ok(syn_b), Ok(sem_b), Ok(prag_b)) = (syn, sem, prag) {
                 let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
                 for j in 0..total {
-                    let n = syn_b[j].sigs.len()
+                    let raw_n = syn_b[j].sigs.len()
                         .min(sem_b[j].sigs.len())
                         .min(prag_b[j].sigs.len());
+                    // Cap the final block to its actual fill to avoid appending
+                    // zero-padded signatures from uninitialized arena slots.
+                    let n = if j + 1 == total { raw_n.min(tail_tokens) } else { raw_n };
                     match self.provenance.append(
                         &syn_b[j].sigs[..n],
                         &sem_b[j].sigs[..n],
@@ -1999,9 +2033,8 @@ impl Scheduler {
             Ok(sealed) => std::sync::Arc::new(sealed),
             Err(e) => {
                 tracing::error!(
-                    target: "candle_conversation::scheduler::seal",
-                    seal_slot = %seal_slot,
-                    "snapshot_sequence_per_layer failed — aborting seal: {e}",
+                    "snapshot_per_layer failed: seal_slot={} err={}",
+                    seal_slot.0, e,
                 );
                 return Ok(None);
             }
@@ -2119,6 +2152,97 @@ impl Scheduler {
             candle_nn::CHUNK_SIZE,
         );
         Ok(sigs)
+    }
+
+    /// Extract Q-vector provenance signatures for newly-completed 32-token
+    /// blocks across all active decode sequences, immediately after each
+    /// forward pass while the R16 backing is still intact.
+    ///
+    /// Called right after `forward_batched` returns.  Results are accumulated
+    /// in `DecodeState::prov_sig_entries` and passed wholesale to
+    /// `perform_seal_and_write` at Done time, so seal-time extraction only
+    /// covers the residual partial block (guaranteed to still be R16 since
+    /// the bg_quantizer never compresses the active block).
+    pub(super) fn extract_prov_after_step(&mut self, seq_ids: &[SequenceId]) {
+        let [syn_idx, sem_idx, prag_idx] = self.provenance_layer_indices;
+        let provenance = Arc::clone(&self.provenance);
+
+        for &seq_id in seq_ids {
+            // Only view-based sequences have entries in turn_views.
+            let view_state = match self.turn_views.get(&seq_id).copied() {
+                Some(v) => v,
+                None => continue,
+            };
+            let parent_id = view_state.parent_id;
+            let turn_start = view_state.turn_start_parent_blocks;
+
+            // Complete blocks = tokens written / CHUNK_SIZE.  The active
+            // (partial) block is excluded — not yet finalized, and the
+            // bg_quantizer never compresses it, so it's safely extractable
+            // at seal time.
+            let view_offset = self.session.sequence_offset(seq_id.0).unwrap_or(0);
+            let complete_view_blocks = view_offset / candle_nn::CHUNK_SIZE;
+
+            // prev = high-water mark from prior steps.  Also skip any
+            // borrowed blocks (indices < turn_start) which belong to the
+            // projected context, not this turn.
+            let prev = self.slot_sig_blocks_processed.get(&parent_id).copied().unwrap_or(0);
+            let extract_from = prev.max(turn_start);
+
+            if complete_view_blocks <= extract_from {
+                continue;
+            }
+            let range = (extract_from, complete_view_blocks);
+
+            // Extract Q-sigs from R16 blocks on the view slot.  All three
+            // provenance layers share the same block range.
+            let syn = self.handle_extract_signatures(seq_id.0, syn_idx, Some(range));
+            let sem = self.handle_extract_signatures(seq_id.0, sem_idx, Some(range));
+            let prag = self.handle_extract_signatures(seq_id.0, prag_idx, Some(range));
+
+            let (syn_b, sem_b, prag_b) = match (syn, sem, prag) {
+                (Ok(s), Ok(sm), Ok(p)) => (s, sm, p),
+                _ => continue,
+            };
+
+            let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
+            if total == 0 {
+                continue;
+            }
+
+            let mut new_entries: Vec<crate::provenance::SigEntry> = Vec::with_capacity(total);
+            let mut new_high = prev;
+            for j in 0..total {
+                let n = syn_b[j].sigs.len()
+                    .min(sem_b[j].sigs.len())
+                    .min(prag_b[j].sigs.len());
+                match provenance.append(
+                    &syn_b[j].sigs[..n],
+                    &sem_b[j].sigs[..n],
+                    &prag_b[j].sigs[..n],
+                ) {
+                    Ok(entry) => {
+                        new_entries.push(entry);
+                        new_high = extract_from + j + 1;
+                    }
+                    Err(e) => tracing::warn!(
+                        "prov extract: parent={} block={}: {e}",
+                        parent_id,
+                        extract_from + j,
+                    ),
+                }
+            }
+
+            // Update high-water mark so the next step and seal skip
+            // already-extracted blocks.
+            if new_high > prev {
+                self.slot_sig_blocks_processed.insert(parent_id, new_high);
+            }
+            // Append new entries to the sequence's accumulated list.
+            if let Some(state) = self.active_decodes.get_mut(&seq_id) {
+                state.prov_sig_entries.extend(new_entries);
+            }
+        }
     }
 
     /// Carve a view sequence borrowing the requested ranges from

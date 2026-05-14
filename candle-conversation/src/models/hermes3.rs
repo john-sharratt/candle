@@ -27,6 +27,7 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
         supports_thinking: false,
+        inject_no_think_block: true,
         non_thinking_sampling: None,
     }
 }
@@ -49,6 +50,7 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
         max_seq_len: 8192,
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
         supports_thinking: false,
+        inject_no_think_block: true,
         non_thinking_sampling: None,
     }
 }

@@ -19,6 +19,10 @@ impl Scheduler {
     fn run_decode_until_budget(&mut self) {
         for _ in 0..DECODE_BUDGET {
             if self.decode_width() == 0 {
+                // No live decode work, but there may be sequences inserted as
+                // finished during the prefill phase (EOS on first token) that
+                // the decode loop never had a chance to clean up.
+                self.cleanup_finished();
                 return;
             }
             self.batch_decode_step();

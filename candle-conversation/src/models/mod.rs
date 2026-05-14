@@ -180,11 +180,15 @@ pub struct ModelSpec {
     /// Recommended default sampling strategy for this model family.
     pub default_sampling: SamplingConfig,
     /// Whether this model supports thinking/reasoning mode (`<think>` blocks).
-    ///
-    /// When `true` and the user has NOT enabled `--thinking`, the engine
-    /// prefills an empty `<think></think>` block after the assistant header
-    /// to suppress internal reasoning output.
     pub supports_thinking: bool,
+
+    /// When `true` and `supports_thinking` is also `true`, an empty
+    /// `<think>\n\n</think>\n\n` block is prefilled after the assistant header
+    /// when thinking is suppressed.  Set to `false` for models (e.g. the MoE
+    /// 30B-A3B) that reliably honour `/no_think` without needing the explicit
+    /// block — omitting the block lets them start the response with a clean
+    /// `<tool_call>` or text without an extra suppression step.
+    pub inject_no_think_block: bool,
     /// Alternate sampling parameters used when thinking is suppressed.
     ///
     /// Qwen3 recommends different settings for non-thinking mode:

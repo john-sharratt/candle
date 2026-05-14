@@ -221,7 +221,17 @@ impl ConversationEngine {
         // Build a synthetic single-layer / single-group projection from the
         // raw prompt and delegate to the projection-aware constructor,
         // which mints a fresh `TimelineId` internally.
-        let builder = Builder::for_plain_prompt(system_prompt);
+        //
+        // `for_plain_prompt` stores the text as the schema section content,
+        // and `new_with_projection` wraps it with dialect markers at ingest
+        // time — so we strip the markers here before passing the inner text.
+        let inner_prompt = {
+            let s = system_prompt
+                .strip_prefix(config.dialect.system_start)
+                .unwrap_or(system_prompt);
+            s.strip_suffix(config.dialect.system_end).unwrap_or(s)
+        };
+        let builder = Builder::for_plain_prompt(inner_prompt);
         let (layer_id, group_id) = {
             let layer = &builder.schema().layers[0];
             (layer.id, layer.groups[0].id)
@@ -298,6 +308,20 @@ impl ConversationEngine {
     /// Get the shared tokenizer.
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
+    }
+
+    /// Get a clone of the shared provenance file.
+    ///
+    /// Allows external code (e.g. data-generation tools) to read back
+    /// the signatures written during turn seals.  The Arc keeps the
+    /// backing file alive as long as any clone exists.
+    pub fn provenance_file(&self) -> Arc<ProvenanceFile> {
+        Arc::clone(&self.provenance)
+    }
+
+    /// Get the provenance layer indices `[syntactic, semantic, pragmatic]`.
+    pub fn provenance_layer_indices(&self) -> [usize; 3] {
+        self.provenance_layer_indices
     }
 
     /// Low-level helper used by benchmarks (e.g. RULER): create a fresh

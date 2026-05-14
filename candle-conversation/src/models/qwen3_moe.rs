@@ -28,6 +28,7 @@ pub(super) fn qwen3_30b_a3b_q4() -> ModelSpec {
         max_seq_len: 4096,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
+        inject_no_think_block: false,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
     }
 }

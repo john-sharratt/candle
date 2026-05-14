@@ -1272,6 +1272,13 @@ pub struct SequenceConfig {
     /// non-thinking models.
     pub thinking_capable: bool,
 
+    /// When `true` and `suppress_thinking` is also `true`, prefill an empty
+    /// `<think>\n\n</think>\n\n` block after the assistant header to explicitly
+    /// close the think channel before generation.  When `false` the assistant
+    /// header is left clean and the model relies on `/no_think` alone (preferred
+    /// for models like Qwen3-30B-A3B that honour the token without the block).
+    pub inject_no_think_block: bool,
+
     /// Sequence tree policy: summarization cadence, KV tier formats,
     /// cognitive task prompts, etc.
     pub tree: ConversationTreeConfig,

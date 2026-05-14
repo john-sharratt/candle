@@ -27,6 +27,7 @@ pub(super) fn qwen2_0_5b() -> ModelSpec {
         max_seq_len: 4096,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2"),
         supports_thinking: false,
+        inject_no_think_block: true,
         non_thinking_sampling: None,
     }
 }

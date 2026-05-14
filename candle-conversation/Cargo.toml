@@ -76,3 +76,13 @@ required-features = ["cuda", "hub"]
 [[example]]
 name = "ruler_stream"
 required-features = ["cuda", "hub"]
+
+[[example]]
+name = "gen_tool_provenance_data"
+
+[[example]]
+name = "gen_real_provenance_data"
+required-features = ["cuda", "hub"]
+
+[[example]]
+name = "dump_provenance_samples"
