@@ -2048,6 +2048,54 @@ pub struct ViewSequence {
 /// This trait provides a high-level API for batched inference using
 /// [`BatchedInferenceSession`] to manage KV cache state.
 ///
+/// Layer index pairs for the three provenance signature depths.
+///
+/// Layout: `[syn_l0, syn_l4, sem_l0, sem_l4, prag_l0, prag_l4]`.
+///
+/// Each band uses two layers — band-start (`l0 = centre − 4`, clamped) and
+/// band-centre (`l4`) — whose multi-head Q sign bits are XOR-folded into a
+/// single 128-bit signature per token (`MH_XOR_QQ_l0xl4`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProvenanceLayerIndices {
+    pub syn_l0:  usize,
+    pub syn_l4:  usize,
+    pub sem_l0:  usize,
+    pub sem_l4:  usize,
+    pub prag_l0: usize,
+    pub prag_l4: usize,
+}
+
+impl ProvenanceLayerIndices {
+    /// Flat array form `[syn_l0, syn_l4, sem_l0, sem_l4, prag_l0, prag_l4]`.
+    pub fn as_array(self) -> [usize; 6] {
+        [self.syn_l0, self.syn_l4, self.sem_l0, self.sem_l4, self.prag_l0, self.prag_l4]
+    }
+}
+
+/// Static model properties that are cheap to copy and independent of any inference session.
+///
+/// Captured once (before the model moves to the scheduler thread) via
+/// [`ManagedBatchedModel::model_core_properties`] and stored wherever these values are needed.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelCoreProperties {
+    /// Number of transformer layers.
+    pub num_layers: usize,
+    /// Number of KV heads per layer.
+    pub n_kv_heads: usize,
+    /// Dimension of each attention head.
+    pub head_dim: usize,
+    /// Layer-index pairs for the three provenance signature depth bands.
+    pub provenance_layer_indices: ProvenanceLayerIndices,
+    /// Per-model multiplier for the K high adaptive threshold.
+    pub k_hi_error_threshold_factor: f32,
+    /// Per-model multiplier for the K low adaptive threshold.
+    pub k_low_error_threshold_factor: f32,
+    /// Per-model multiplier for the V high (strict) adaptive threshold.
+    pub v_hi_error_threshold_factor: f32,
+    /// Per-model multiplier for the V low (lenient) adaptive threshold.
+    pub v_low_error_threshold_factor: f32,
+}
+
 /// **You don't need to implement this trait manually.** Any type that implements
 /// [`BatchedModel`] automatically gets a `ManagedBatchedModel` implementation
 /// via the blanket impl.
@@ -2061,45 +2109,39 @@ pub trait ManagedBatchedModel {
     /// Device the model is on.
     fn device(&self) -> &Device;
 
-    /// Layer indices for the three provenance signature depths:
-    /// `[syntactic, semantic, pragmatic]`.
+    /// Snapshot of all static model properties.
     ///
-    /// Syntactic ≈ 15% depth — surface form (exact token identity, symbols).
-    /// Semantic  ≈ 50% depth — concepts, entities, topics.
-    /// Pragmatic ≈ 85% depth — task context, reasoning intent.
-    ///
-    /// The default derives indices from `num_layers()` using those percentages.
-    /// Override to pin empirically better layers for a specific architecture.
-    fn provenance_layer_indices(&self) -> [usize; 3] {
+    /// Cheap to copy; use this to capture model metadata before the model is moved to
+    /// another thread.  The default derives `provenance_layer_indices` from `num_layers()`
+    /// and sets threshold factors to `1.0`.  The blanket impl for `BatchedInference<M>`
+    /// overrides this to read per-model threshold factors from the inner `BatchedModelCore`.
+    fn model_core_properties(&self) -> ModelCoreProperties {
         let n = self.num_layers();
-        if n == 0 {
-            return [0, 0, 0];
+        let provenance_layer_indices = if n == 0 {
+            ProvenanceLayerIndices { syn_l0: 0, syn_l4: 0, sem_l0: 0, sem_l4: 0, prag_l0: 0, prag_l4: 0 }
+        } else {
+            let syn  = (n * 15 / 100).max(1);
+            let sem  = n / 2;
+            let prag = (n * 85 / 100).min(n - 1);
+            ProvenanceLayerIndices {
+                syn_l0:  syn.saturating_sub(4),
+                syn_l4:  syn,
+                sem_l0:  sem.saturating_sub(4),
+                sem_l4:  sem,
+                prag_l0: prag.saturating_sub(4),
+                prag_l4: prag,
+            }
+        };
+        ModelCoreProperties {
+            num_layers: n,
+            n_kv_heads: self.n_kv_head(),
+            head_dim: self.head_dim(),
+            provenance_layer_indices,
+            k_hi_error_threshold_factor: 1.0,
+            k_low_error_threshold_factor: 1.0,
+            v_hi_error_threshold_factor: 1.0,
+            v_low_error_threshold_factor: 1.0,
         }
-        [
-            (n * 15 / 100).max(1),
-            n / 2,
-            (n * 85 / 100).min(n - 1),
-        ]
-    }
-
-    /// Per-model multiplier for the K high adaptive threshold.
-    fn k_hi_error_threshold_factor(&self) -> f32 {
-        1.0
-    }
-
-    /// Per-model multiplier for the K low adaptive threshold.
-    fn k_low_error_threshold_factor(&self) -> f32 {
-        1.0
-    }
-
-    /// Per-model multiplier for the V high (strict) adaptive threshold.
-    fn v_hi_error_threshold_factor(&self) -> f32 {
-        1.0
-    }
-
-    /// Per-model multiplier for the V low (lenient) adaptive threshold.
-    fn v_low_error_threshold_factor(&self) -> f32 {
-        1.0
     }
 
     /// Run a batched forward pass for specific sequences.
@@ -2146,14 +2188,15 @@ pub trait ManagedBatchedModel {
     /// Create a batched inference session configured for this model.
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
         let mut config = config;
-        config.k_hi_error_threshold_factor *= self.k_hi_error_threshold_factor();
-        config.k_low_error_threshold_factor *= self.k_low_error_threshold_factor();
-        config.v_hi_error_threshold_factor *= self.v_hi_error_threshold_factor();
-        config.v_low_error_threshold_factor *= self.v_low_error_threshold_factor();
+        let props = self.model_core_properties();
+        config.k_hi_error_threshold_factor *= props.k_hi_error_threshold_factor;
+        config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
+        config.v_hi_error_threshold_factor  *= props.v_hi_error_threshold_factor;
+        config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         BatchedInferenceSession::new(
-            self.num_layers(),
-            self.n_kv_head(),
-            self.head_dim(),
+            props.num_layers,
+            props.n_kv_heads,
+            props.head_dim,
             self.device(),
             config,
         )
@@ -2176,10 +2219,11 @@ pub trait ManagedBatchedModel {
         config: BatchedConfig,
     ) -> Result<BatchedInferenceSession> {
         let mut config = config;
-        config.k_hi_error_threshold_factor *= self.k_hi_error_threshold_factor();
-        config.k_low_error_threshold_factor *= self.k_low_error_threshold_factor();
-        config.v_hi_error_threshold_factor *= self.v_hi_error_threshold_factor();
-        config.v_low_error_threshold_factor *= self.v_low_error_threshold_factor();
+        let props = self.model_core_properties();
+        config.k_hi_error_threshold_factor *= props.k_hi_error_threshold_factor;
+        config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
+        config.v_hi_error_threshold_factor  *= props.v_hi_error_threshold_factor;
+        config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let backings = source.backings().iter().cloned().collect();
         Ok(BatchedInferenceSession::new_with_backings(
             backings,
@@ -2233,20 +2277,33 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         self.model().device()
     }
 
-    fn k_hi_error_threshold_factor(&self) -> f32 {
-        self.model().k_hi_error_threshold_factor()
-    }
-
-    fn k_low_error_threshold_factor(&self) -> f32 {
-        self.model().k_low_error_threshold_factor()
-    }
-
-    fn v_hi_error_threshold_factor(&self) -> f32 {
-        self.model().v_hi_error_threshold_factor()
-    }
-
-    fn v_low_error_threshold_factor(&self) -> f32 {
-        self.model().v_low_error_threshold_factor()
+    fn model_core_properties(&self) -> ModelCoreProperties {
+        let n = self.model().num_layers();
+        let provenance_layer_indices = if n == 0 {
+            ProvenanceLayerIndices { syn_l0: 0, syn_l4: 0, sem_l0: 0, sem_l4: 0, prag_l0: 0, prag_l4: 0 }
+        } else {
+            let syn  = (n * 15 / 100).max(1);
+            let sem  = n / 2;
+            let prag = (n * 85 / 100).min(n - 1);
+            ProvenanceLayerIndices {
+                syn_l0:  syn.saturating_sub(4),
+                syn_l4:  syn,
+                sem_l0:  sem.saturating_sub(4),
+                sem_l4:  sem,
+                prag_l0: prag.saturating_sub(4),
+                prag_l4: prag,
+            }
+        };
+        ModelCoreProperties {
+            num_layers: n,
+            n_kv_heads: self.model().n_kv_head(),
+            head_dim: self.model().head_dim(),
+            provenance_layer_indices,
+            k_hi_error_threshold_factor: self.model().k_hi_error_threshold_factor(),
+            k_low_error_threshold_factor: self.model().k_low_error_threshold_factor(),
+            v_hi_error_threshold_factor:  self.model().v_hi_error_threshold_factor(),
+            v_low_error_threshold_factor: self.model().v_low_error_threshold_factor(),
+        }
     }
 
     fn forward_batched(

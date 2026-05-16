@@ -22,13 +22,19 @@
 //! and re-projects the visible window.  No fork, no separate query
 //! API — the live sequence is its own probe.
 
+pub mod raw_store;
 pub mod scan;
 pub mod signature;
 pub mod store;
 
-pub use scan::{BdpScanner, DEFAULT_HIT_THRESHOLD, DEFAULT_TOP_K};
+pub use raw_store::{
+    band_layer_indices, build_token_blob, extract_k_vector, extract_q_vector_r16,
+    RawFileHeader, RawProvenanceFile, RawSigEntry,
+};
+pub use scan::{BdpScanner, TokenHit, DEFAULT_HIT_THRESHOLD, DEFAULT_SPAN_ALPHA, DEFAULT_TOP_K};
 pub use signature::{
-    extract_signatures_from_r16_dump, r16_block_to_turn_signatures, TokenSignature,
-    TurnSignatures,
+    extract_mh_signatures_from_r16_dump, extract_signatures_from_r16_dump,
+    merge_turn_signatures_xor, r16_block_to_turn_signatures, r16_block_to_turn_signatures_mh,
+    TokenSignature, TurnSignatures,
 };
 pub use store::{ProbeSignatures, ProvenanceFile, SigEntry, TurnChunkRank};

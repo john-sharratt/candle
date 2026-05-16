@@ -58,3 +58,6 @@ bria.wav
 candle-kernels/staged/
 candle-kernels/build_link_tmp/
 candle-kernels/build_tool/
+
+# Raw R16 KV tensor dumps (large; signatures.prov and MANIFEST.json are tracked)
+**/raw_kvq.prov

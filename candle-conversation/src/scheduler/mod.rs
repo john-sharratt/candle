@@ -13,33 +13,31 @@ use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
-use crate::projection::{
-    Builder, Conversation, GroupId, ProjectionTarget, SectionId, TurnIndex,
-};
+use crate::projection::{Builder, Conversation, GroupId, ProjectionTarget, SectionId, TurnIndex};
 #[cfg(feature = "sig-trace")]
 use crate::provenance::TokenSignature;
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::think_strip::strip_think_blocks;
 use crate::token_buffer::TokenBuffer;
-use crate::TurnStats;
+use crate::{ProvenanceFile, TurnStats};
 
 use candle::{Device, IndexOp, Tensor};
-use candle_nn::kv_cache::SealedSequence;
 #[cfg(feature = "sig-trace")]
 use candle_nn::kv_cache::SealedChunk;
+use candle_nn::kv_cache::SealedSequence;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel,
+    BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, ProvenanceLayerIndices,
 };
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Scheduler request types (sent from caller threads)
 // ────────────────────────────────────────────────────────────────────────────
-
 
 /// Requests sent from caller threads to the scheduler.
 pub(crate) enum SchedulerRequest {
@@ -212,6 +210,28 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
+    /// Extract raw K and Q float vectors from the KV cache for a list of
+    /// layer indices, synchronously on the scheduler thread.
+    ///
+    /// Returns one entry per requested layer index: `(layer_idx,
+    /// Vec<(block_idx, k_flat, v_flat, q_flat)>)` where k/v/q layouts match
+    /// `dump_r16_kv_for_provenance`.  Used by data-generation tools to capture
+    /// raw KVQ data for offline signature-strategy experimentation.
+    ///
+    /// Call this after `finish_turn` and before dropping the sequence —
+    /// the parent slot's KV cache remains live in that window.
+    ExtractRawKvq {
+        sequence_id: SequenceId,
+        /// Layer indices to extract.  May include duplicates or be out of order.
+        layer_indices: Vec<usize>,
+        /// Block range `(lo, hi)` — only blocks `[lo, hi)` are extracted.
+        /// Pass `None` to extract all blocks for the sequence.
+        block_range: Option<(usize, usize)>,
+        response_tx: Sender<
+            Result<Vec<(usize, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>)>, ConversationError>,
+        >,
+    },
+
     /// Shut down the scheduler.
     Shutdown,
 }
@@ -247,7 +267,10 @@ struct PhaseTimer {
 impl PhaseTimer {
     #[inline]
     fn new(phase: &'static str) -> Self {
-        Self { phase, start: Instant::now() }
+        Self {
+            phase,
+            start: Instant::now(),
+        }
     }
 }
 
@@ -294,7 +317,7 @@ pub(crate) struct ReprojectionPolicy {
     pub(crate) projection: Arc<Builder>,
     pub(crate) substrate: Conversation,
     pub(crate) provenance: Arc<crate::provenance::ProvenanceFile>,
-    pub(crate) provenance_layer_indices: [usize; 3],
+    pub(crate) provenance_layer_indices: ProvenanceLayerIndices,
     /// Cadence trigger: re-project after every `every_n_tokens` decoded
     /// tokens.  `0` disables the cadence trigger (punctuation triggers
     /// can still fire).
@@ -317,6 +340,10 @@ pub(crate) struct ReprojectionPolicy {
     /// re-orients at semantic transition points rather than waiting
     /// for the next fixed-cadence trigger.
     pub(crate) trigger_token_ids: Arc<Vec<u32>>,
+    /// Span α for the BDP scanner.  Must match the α in `FIXED_FORMULA` so
+    /// scores produced during reprojection are consistent with the scores the
+    /// projection engine reads when computing group scores.
+    pub(crate) span_alpha: f32,
 }
 
 /// Inputs the scheduler needs to run `Builder::project()` itself for a
@@ -449,7 +476,10 @@ pub(crate) enum SealAction {
     Turn,
     /// Seal the parent slot and pin the result on the workspace
     /// substrate under `section_id` via `set_section_full`.
-    Section { section_id: SectionId, tokens: Arc<Vec<u32>> },
+    Section {
+        section_id: SectionId,
+        tokens: Arc<Vec<u32>>,
+    },
     /// Skip the seal entirely.  Used by raw RULER eval and
     /// summarisation paths that don't write to the substrate.
     None,
@@ -649,10 +679,8 @@ pub(crate) struct Scheduler {
     /// all slots append into this same mmap-backed file.
     provenance: Arc<crate::provenance::ProvenanceFile>,
 
-    /// Provenance layer indices `[syntactic, semantic, pragmatic]` —
-    /// the layers from which Q sign-bits are extracted on each seal.
-    provenance_layer_indices: [usize; 3],
-
+    /// Static model properties captured at engine construction.
+    model_core: ModelCoreProperties,
 }
 
 /// Per-chunk debug trace of the BDP signatures emitted at seal time.
@@ -717,11 +745,11 @@ impl Scheduler {
         vocab_size: usize,
         max_recent_len: usize,
         show_special_tokens: bool,
-        penalty_log_path: Option<std::path::PathBuf>,
+        penalty_log_path: Option<PathBuf>,
         health_config: DecodeHealthConfig,
         max_prefill_chunk: usize,
-        provenance: Arc<crate::provenance::ProvenanceFile>,
-        provenance_layer_indices: [usize; 3],
+        provenance: Arc<ProvenanceFile>,
+        model_core: ModelCoreProperties,
     ) -> Self {
         let device = model.device().clone();
         let sampler = BatchedSampler::new(
@@ -754,7 +782,7 @@ impl Scheduler {
             slot_targets: HashMap::new(),
             slot_sig_blocks_processed: HashMap::new(),
             provenance,
-            provenance_layer_indices,
+            model_core,
             turn_views: HashMap::new(),
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
@@ -875,61 +903,60 @@ impl Scheduler {
                 // — reset `parent_id` to empty and write the
                 // projected sections + projected turns from the
                 // substrate onto it.
-                let (projected_sections, projected_turns) =
-                    if let (Some(inputs), Some(target)) =
-                        (projection_inputs.as_ref(), slot_target)
-                    {
-                        let conversation = match self.slot_conversations.get(&parent_id) {
-                            Some(c) => c.clone(),
-                            None => {
-                                let _ = event_tx.send(TurnEvent::Error(
-                                    ConversationError::Channel(format!(
-                                        "submit_turn: no conversation registered for slot {parent_id}"
-                                    )),
-                                ));
-                                return true;
-                            }
-                        };
-                        // Target-aware read: the projection sees only
-                        // `target.timeline` within `target.group`,
-                        // masking sibling timelines.
-                        let view = conversation.read_for(target);
-                        let projection = inputs.projection.project(target, &view);
-                        // The schema's projection is the single source
-                        // of truth for system-side sections — emit
-                        // exactly what the projection picked, in
-                        // declaration order.  The legacy
-                        // "always prepend `system_section_id`" path
-                        // (a monolithic ChatML-wrapped duplicate of
-                        // the schema fragments) has been removed; the
-                        // schema items now compose the full system
-                        // prompt on their own.
-                        let mut sections: Vec<SectionId> =
-                            Vec::with_capacity(projection.system_prompt.len());
-                        for sec in &projection.system_prompt {
-                            if view.section_sealed_of(sec.id).is_some() {
-                                sections.push(sec.id);
-                            }
+                let (projected_sections, projected_turns) = if let (Some(inputs), Some(target)) =
+                    (projection_inputs.as_ref(), slot_target)
+                {
+                    let conversation = match self.slot_conversations.get(&parent_id) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let _ =
+                                event_tx
+                                    .send(TurnEvent::Error(ConversationError::Channel(format!(
+                                    "submit_turn: no conversation registered for slot {parent_id}"
+                                ))));
+                            return true;
                         }
-                        // Translate each projected (group, idx) to its
-                        // owning timeline before checking for sealed
-                        // bytes.  Phase 1 single-timeline-per-group
-                        // makes this lookup unambiguous; Phase 3 will
-                        // route via target.timeline for target.group.
-                        let turns: Vec<(GroupId, TurnIndex)> = projection
-                            .turns
-                            .iter()
-                            .filter_map(|resolved| {
-                                let g = resolved.group();
-                                let t = resolved.index();
-                                let timeline = view.timelines_for_group(g).next()?;
-                                view.turn_sealed_of(timeline, t).map(|_| (g, t))
-                            })
-                            .collect();
-                        (sections, turns)
-                    } else {
-                        (Vec::new(), Vec::new())
                     };
+                    // Target-aware read: the projection sees only
+                    // `target.timeline` within `target.group`,
+                    // masking sibling timelines.
+                    let view = conversation.read_for(target);
+                    let projection = inputs.projection.project(target, &view);
+                    // The schema's projection is the single source
+                    // of truth for system-side sections — emit
+                    // exactly what the projection picked, in
+                    // declaration order.  The legacy
+                    // "always prepend `system_section_id`" path
+                    // (a monolithic ChatML-wrapped duplicate of
+                    // the schema fragments) has been removed; the
+                    // schema items now compose the full system
+                    // prompt on their own.
+                    let mut sections: Vec<SectionId> =
+                        Vec::with_capacity(projection.system_prompt.len());
+                    for sec in &projection.system_prompt {
+                        if view.section_sealed_of(sec.id).is_some() {
+                            sections.push(sec.id);
+                        }
+                    }
+                    // Translate each projected (group, idx) to its
+                    // owning timeline before checking for sealed
+                    // bytes.  Phase 1 single-timeline-per-group
+                    // makes this lookup unambiguous; Phase 3 will
+                    // route via target.timeline for target.group.
+                    let turns: Vec<(GroupId, TurnIndex)> = projection
+                        .turns
+                        .iter()
+                        .filter_map(|resolved| {
+                            let g = resolved.group();
+                            let t = resolved.index();
+                            let timeline = view.timelines_for_group(g).next()?;
+                            view.turn_sealed_of(timeline, t).map(|_| (g, t))
+                        })
+                        .collect();
+                    (sections, turns)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
                 if let Err(e) = self.apply_projection(
                     parent_id,
@@ -950,12 +977,9 @@ impl Scheduler {
                 // divided value silently under-counts, leaving the
                 // tail invisible to the view.  See
                 // `BatchedInferenceSession::sequence_block_count`.
-                let parent_block_count = self
-                    .session
-                    .sequence_block_count(parent_id.0)
-                    .unwrap_or(0);
-                let parent_offset_for_log =
-                    self.session.sequence_offset(parent_id.0).unwrap_or(0);
+                let parent_block_count =
+                    self.session.sequence_block_count(parent_id.0).unwrap_or(0);
+                let parent_offset_for_log = self.session.sequence_offset(parent_id.0).unwrap_or(0);
                 tracing::info!(
                     target: "candle_conversation::scheduler::view_create",
                     parent = parent_id.0,
@@ -1090,7 +1114,10 @@ impl Scheduler {
                                 .perform_seal_and_write(
                                     sequence_id,
                                     seal_block_from,
-                                    &SealAction::Section { section_id, tokens: Arc::new(tokens.to_vec()) },
+                                    &SealAction::Section {
+                                        section_id,
+                                        tokens: Arc::new(tokens.to_vec()),
+                                    },
                                     None,
                                     vec![],
                                 )
@@ -1129,13 +1156,20 @@ impl Scheduler {
                 let result = if section_ids.is_empty() {
                     Ok(())
                 } else {
-                    self.apply_projection(
-                        sequence_id,
-                        BlockCount(0),
-                        &section_ids,
-                        &[],
-                    )
+                    self.apply_projection(sequence_id, BlockCount(0), &section_ids, &[])
                 };
+                let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::ExtractRawKvq {
+                sequence_id,
+                layer_indices,
+                block_range,
+                response_tx,
+            } => {
+                let result =
+                    self.handle_extract_raw_kvq(sequence_id.0, &layer_indices, block_range);
                 let _ = response_tx.send(result);
                 true
             }
@@ -1182,7 +1216,11 @@ impl Scheduler {
         }
 
         tracing::debug!(
-            kind = if target.is_some() { "targeted" } else { "scratch" },
+            kind = if target.is_some() {
+                "targeted"
+            } else {
+                "scratch"
+            },
             "allocated empty slot {}",
             slot_id,
         );
@@ -1267,11 +1305,7 @@ impl Scheduler {
         // message.  For subsequent submits the slot already
         // carries the conversation's accumulated history; we leave
         // it alone and let the user message append at the tail.
-        let slot_already_populated = self
-            .session
-            .sequence_offset(parent_id.0)
-            .unwrap_or(0)
-            > 0;
+        let slot_already_populated = self.session.sequence_offset(parent_id.0).unwrap_or(0) > 0;
         if slot_already_populated {
             return Ok(());
         }
@@ -1293,10 +1327,7 @@ impl Scheduler {
         // `reproject_view`'s lookups resolve to the new parent layout.
         enum InjectedUnit {
             Section(SectionId),
-            Turn(
-                GroupId,
-                TurnIndex,
-            ),
+            Turn(GroupId, TurnIndex),
         }
 
         // Resolve the conversation handle bound to this slot — every
@@ -1533,7 +1564,10 @@ impl Scheduler {
 
         // 3. Allocate the fresh GPU sequence; it'll receive the
         // projected chunks via inject_sealed_at_tail.
-        let new_seq_idx = self.session.create_sequence().map_err(ConversationError::Model)?;
+        let new_seq_idx = self
+            .session
+            .create_sequence()
+            .map_err(ConversationError::Model)?;
         let new_seq_id = SequenceId(new_seq_idx);
 
         // 4. Inject as live ChunkWindows on the new sequence.
@@ -1632,16 +1666,10 @@ impl Scheduler {
                 // model didn't emit these — we synthesise them as if
                 // it did.
                 if !state.post_decode_tokens.is_empty() {
-                    if let Err(e) = self.run_prefill_with_shift(
-                        seal_slot,
-                        &state.post_decode_tokens[..],
-                        0,
-                    ) {
-                        tracing::warn!(
-                            "post-decode prefill failed for slot {}: {}",
-                            seal_slot,
-                            e,
-                        );
+                    if let Err(e) =
+                        self.run_prefill_with_shift(seal_slot, &state.post_decode_tokens[..], 0)
+                    {
+                        tracing::warn!("post-decode prefill failed for slot {}: {}", seal_slot, e,);
                     }
                 }
 
@@ -1709,9 +1737,7 @@ impl Scheduler {
                                     .unwrap_or_default()
                             };
                             let mut full_text = String::with_capacity(
-                                state.prefill_text.len()
-                                    + text.len()
-                                    + post_decode_text.len(),
+                                state.prefill_text.len() + text.len() + post_decode_text.len(),
                             );
                             full_text.push_str(&state.prefill_text);
                             full_text.push_str(&text);
@@ -1742,11 +1768,7 @@ impl Scheduler {
                             pre_sigs,
                         )
                         .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                "post-Done seal failed for slot {}: {}",
-                                seal_slot,
-                                e,
-                            );
+                            tracing::warn!("post-Done seal failed for slot {}: {}", seal_slot, e,);
                             None
                         })
                     }
@@ -1777,11 +1799,9 @@ impl Scheduler {
     pub(super) fn prepare_section_ingest(
         &mut self,
         sequence_id: SequenceId,
-        #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))]
-        section_id: SectionId,
+        #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))] section_id: SectionId,
         prefix_section_ids: &[SectionId],
-        #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))]
-        tokens: &TokenBuffer,
+        #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))] tokens: &TokenBuffer,
     ) -> Result<usize, ConversationError> {
         // 1. Defensive truncate.
         self.session
@@ -1818,8 +1838,7 @@ impl Scheduler {
                         }
                         for layer_idx in 0..n_layers {
                             let layer_seq = &sealed[layer_idx];
-                            per_layer_chunks[layer_idx]
-                                .extend(layer_seq.chunks.iter().cloned());
+                            per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
                             per_layer_token_count[layer_idx] += layer_seq.token_count;
                         }
                     }
@@ -1953,10 +1972,7 @@ impl Scheduler {
         // under-count when the slot's chunks include partials from
         // back-to-back section injection.  See
         // `BatchedInferenceSession::sequence_block_count`.
-        let block_count = self
-            .session
-            .sequence_block_count(seal_slot.0)
-            .unwrap_or(0);
+        let block_count = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);
         if block_count <= seal_block_from {
             return Ok(None);
         }
@@ -1975,36 +1991,53 @@ impl Scheduler {
             None
         };
 
-        // Extract sigs at all three depths.
+        // Extract sigs at all three depths (MH_XOR_QQ_l0xl4: dual-layer, all heads).
         // `pre_sigs` carries entries already extracted during decode (while R16
         // was intact); seal-time extraction covers only the residual range that
         // wasn't reached before the bg_quantizer compressed earlier blocks.
-        let [syn_idx, sem_idx, prag_idx] = self.provenance_layer_indices;
+        let ProvenanceLayerIndices {
+            syn_l0,
+            syn_l4,
+            sem_l0,
+            sem_l4,
+            prag_l0,
+            prag_l4,
+        } = self.model_core.provenance_layer_indices;
         let mut new_sig_entries: Vec<crate::provenance::SigEntry> = pre_sigs;
         let mut new_processed = prev_processed;
 
         // Actual fill count of the last block — may be < CHUNK_SIZE for the
         // partial tail.  Used below to strip zero-padded garbage signatures
         // that the gather kernel reads from uninitialized arena slots.
-        let tail_tokens = snapshot.chunks
+        let tail_tokens = snapshot
+            .chunks
             .get(block_count.saturating_sub(1))
             .map(|c| c.token_count as usize)
             .filter(|&t| t > 0)
             .unwrap_or(candle_nn::CHUNK_SIZE);
 
         if let Some(range) = sig_range {
-            let syn = self.handle_extract_signatures(seal_slot.0, syn_idx, Some(range));
-            let sem = self.handle_extract_signatures(seal_slot.0, sem_idx, Some(range));
-            let prag = self.handle_extract_signatures(seal_slot.0, prag_idx, Some(range));
+            let syn =
+                self.handle_extract_mh_dual_signatures(seal_slot.0, syn_l0, syn_l4, Some(range));
+            let sem =
+                self.handle_extract_mh_dual_signatures(seal_slot.0, sem_l0, sem_l4, Some(range));
+            let prag =
+                self.handle_extract_mh_dual_signatures(seal_slot.0, prag_l0, prag_l4, Some(range));
             if let (Ok(syn_b), Ok(sem_b), Ok(prag_b)) = (syn, sem, prag) {
                 let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
                 for j in 0..total {
-                    let raw_n = syn_b[j].sigs.len()
+                    let raw_n = syn_b[j]
+                        .sigs
+                        .len()
                         .min(sem_b[j].sigs.len())
                         .min(prag_b[j].sigs.len());
                     // Cap the final block to its actual fill to avoid appending
                     // zero-padded signatures from uninitialized arena slots.
-                    let n = if j + 1 == total { raw_n.min(tail_tokens) } else { raw_n };
+                    let n = if j + 1 == total {
+                        raw_n.min(tail_tokens)
+                    } else {
+                        raw_n
+                    };
                     match self.provenance.append(
                         &syn_b[j].sigs[..n],
                         &sem_b[j].sigs[..n],
@@ -2020,7 +2053,8 @@ impl Scheduler {
                 new_processed = sig_from + total;
             }
         }
-        self.slot_sig_blocks_processed.insert(seal_slot, new_processed);
+        self.slot_sig_blocks_processed
+            .insert(seal_slot, new_processed);
 
         // GPU-resident sealed sequences.  No CPU round-trip: the
         // substrate stores `Arc<Vec<SealedSequence>>` with the same
@@ -2034,7 +2068,8 @@ impl Scheduler {
             Err(e) => {
                 tracing::error!(
                     "snapshot_per_layer failed: seal_slot={} err={}",
-                    seal_slot.0, e,
+                    seal_slot.0,
+                    e,
                 );
                 return Ok(None);
             }
@@ -2063,9 +2098,7 @@ impl Scheduler {
         match seal_action {
             SealAction::Turn => {
                 let target = seal_target.ok_or_else(|| {
-                    ConversationError::Channel(
-                        "SealAction::Turn missing seal_target".into(),
-                    )
+                    ConversationError::Channel("SealAction::Turn missing seal_target".into())
                 })?;
                 let TurnContent {
                     role,
@@ -2073,17 +2106,19 @@ impl Scheduler {
                     token_ids,
                 } = turn_content.unwrap_or_default();
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
-                let idx = conversation.record_turn(
-                    target.timeline,
-                    role,
-                    text,
-                    token_ids,
-                    turn_token_count,
-                    block_from as u64,
-                    block_to as u64,
-                    Arc::new(delta_gpu),
-                    |seqs| Ok(seqs.to_vec()),
-                ).map_err(ConversationError::Model)?;
+                let idx = conversation
+                    .record_turn(
+                        target.timeline,
+                        role,
+                        text,
+                        token_ids,
+                        turn_token_count,
+                        block_from as u64,
+                        block_to as u64,
+                        Arc::new(delta_gpu),
+                        |seqs| Ok(seqs.to_vec()),
+                    )
+                    .map_err(ConversationError::Model)?;
                 if !new_sig_entries.is_empty() {
                     let mut view = conversation.write();
                     view.set_sig_entries(target.timeline, idx, new_sig_entries.clone());
@@ -2099,7 +2134,8 @@ impl Scheduler {
                     Arc::new(delta_gpu),
                     |seqs| Ok(seqs.to_vec()),
                     Arc::clone(tokens),
-                ).map_err(ConversationError::Model)?;
+                )
+                .map_err(ConversationError::Model)?;
             }
             SealAction::None => unreachable!("filtered above"),
         }
@@ -2115,43 +2151,97 @@ impl Scheduler {
         }))
     }
 
-    // ── Provenance signature extraction ───────────────────────────────
+    // ── Raw KVQ extraction ────────────────────────────────────────────
 
-    /// Extract binary provenance signatures from R16 KV data.
+    /// Extract raw K/V/Q float data for multiple layer indices.
     ///
-    /// When `block_range` is `Some((lo, hi))` only blocks `[lo, hi)` are
-    /// copied from the GPU; pass `None` to dump the full sequence.
-    fn handle_extract_signatures(
+    /// Calls the R16 dump path for each layer and returns results in the
+    /// same order as `layer_indices`.  Each element is
+    /// `(layer_idx, Vec<(block_idx, k_flat, v_flat, q_flat)>)`.
+    fn handle_extract_raw_kvq(
         &self,
         seq_idx: usize,
-        layer_idx: usize,
+        layer_indices: &[usize],
+        block_range: Option<(usize, usize)>,
+    ) -> Result<Vec<(usize, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>)>, ConversationError> {
+        layer_indices
+            .iter()
+            .map(|&layer_idx| {
+                #[cfg(feature = "cuda")]
+                let blocks = self
+                    .session
+                    .gather_r16_kv_for_provenance(seq_idx, layer_idx, block_range)
+                    .map_err(ConversationError::Model)?;
+                #[cfg(not(feature = "cuda"))]
+                let blocks = self
+                    .session
+                    .dump_r16_kv_for_provenance(seq_idx, layer_idx, block_range)
+                    .map_err(ConversationError::Model)?;
+                Ok((layer_idx, blocks))
+            })
+            .collect()
+    }
+
+    // ── Provenance signature extraction ───────────────────────────────
+
+    /// Dual-layer multi-head variant for MH_XOR_QQ_l0xl4.
+    ///
+    /// Extracts R16 Q data for `layer_a` (band-start, l0) and `layer_b`
+    /// (band-centre, l4), builds a multi-head [`TurnSignatures`] for each,
+    /// then XOR-folds them token-by-token.  This is the production path for
+    /// the `MH_XOR_QQ_l0xl4` strategy.
+    fn handle_extract_mh_dual_signatures(
+        &self,
+        seq_idx: usize,
+        layer_a: usize,
+        layer_b: usize,
         block_range: Option<(usize, usize)>,
     ) -> Result<Vec<crate::provenance::TurnSignatures>, ConversationError> {
         #[cfg(feature = "cuda")]
-        let blocks = self
-            .session
-            .gather_r16_kv_for_provenance(seq_idx, layer_idx, block_range)
-            .map_err(ConversationError::Model)?;
+        let (blocks_a, blocks_b) = {
+            let mut layers = self
+                .session
+                .gather_r16_kv_provenance_layers(seq_idx, &[layer_a, layer_b], block_range)
+                .map_err(ConversationError::Model)?
+                .into_iter();
+            let a = layers.next().unwrap_or_default();
+            let b = layers.next().unwrap_or_default();
+            (a, b)
+        };
         #[cfg(not(feature = "cuda"))]
-        let blocks = self
-            .session
-            .dump_r16_kv_for_provenance(seq_idx, layer_idx, block_range)
-            .map_err(ConversationError::Model)?;
+        let (blocks_a, blocks_b) = {
+            let a = self
+                .session
+                .dump_r16_kv_for_provenance(seq_idx, layer_a, block_range)
+                .map_err(ConversationError::Model)?;
+            let b = self
+                .session
+                .dump_r16_kv_for_provenance(seq_idx, layer_b, block_range)
+                .map_err(ConversationError::Model)?;
+            (a, b)
+        };
 
-        if blocks.is_empty() {
+        if blocks_a.is_empty() {
             return Ok(vec![]);
         }
 
         let n_kv_head = self.session.n_kv_head();
         let head_dim = self.session.head_dim();
+        let chunk = candle_nn::CHUNK_SIZE;
 
-        let sigs = crate::provenance::signature::extract_signatures_from_r16_dump(
-            &blocks,
-            n_kv_head,
-            head_dim,
-            candle_nn::CHUNK_SIZE,
+        let sigs_a = crate::provenance::extract_mh_signatures_from_r16_dump(
+            &blocks_a, n_kv_head, head_dim, chunk,
         );
-        Ok(sigs)
+        let sigs_b = crate::provenance::extract_mh_signatures_from_r16_dump(
+            &blocks_b, n_kv_head, head_dim, chunk,
+        );
+
+        let merged = sigs_a
+            .iter()
+            .zip(sigs_b.iter())
+            .map(|(a, b)| crate::provenance::merge_turn_signatures_xor(a, b))
+            .collect();
+        Ok(merged)
     }
 
     /// Extract Q-vector provenance signatures for newly-completed 32-token
@@ -2164,7 +2254,14 @@ impl Scheduler {
     /// covers the residual partial block (guaranteed to still be R16 since
     /// the bg_quantizer never compresses the active block).
     pub(super) fn extract_prov_after_step(&mut self, seq_ids: &[SequenceId]) {
-        let [syn_idx, sem_idx, prag_idx] = self.provenance_layer_indices;
+        let ProvenanceLayerIndices {
+            syn_l0,
+            syn_l4,
+            sem_l0,
+            sem_l4,
+            prag_l0,
+            prag_l4,
+        } = self.model_core.provenance_layer_indices;
         let provenance = Arc::clone(&self.provenance);
 
         for &seq_id in seq_ids {
@@ -2186,7 +2283,11 @@ impl Scheduler {
             // prev = high-water mark from prior steps.  Also skip any
             // borrowed blocks (indices < turn_start) which belong to the
             // projected context, not this turn.
-            let prev = self.slot_sig_blocks_processed.get(&parent_id).copied().unwrap_or(0);
+            let prev = self
+                .slot_sig_blocks_processed
+                .get(&parent_id)
+                .copied()
+                .unwrap_or(0);
             let extract_from = prev.max(turn_start);
 
             if complete_view_blocks <= extract_from {
@@ -2194,11 +2295,11 @@ impl Scheduler {
             }
             let range = (extract_from, complete_view_blocks);
 
-            // Extract Q-sigs from R16 blocks on the view slot.  All three
-            // provenance layers share the same block range.
-            let syn = self.handle_extract_signatures(seq_id.0, syn_idx, Some(range));
-            let sem = self.handle_extract_signatures(seq_id.0, sem_idx, Some(range));
-            let prag = self.handle_extract_signatures(seq_id.0, prag_idx, Some(range));
+            // Extract Q-sigs from R16 blocks on the view slot (MH_XOR_QQ_l0xl4).
+            let syn = self.handle_extract_mh_dual_signatures(seq_id.0, syn_l0, syn_l4, Some(range));
+            let sem = self.handle_extract_mh_dual_signatures(seq_id.0, sem_l0, sem_l4, Some(range));
+            let prag =
+                self.handle_extract_mh_dual_signatures(seq_id.0, prag_l0, prag_l4, Some(range));
 
             let (syn_b, sem_b, prag_b) = match (syn, sem, prag) {
                 (Ok(s), Ok(sm), Ok(p)) => (s, sm, p),
@@ -2213,7 +2314,9 @@ impl Scheduler {
             let mut new_entries: Vec<crate::provenance::SigEntry> = Vec::with_capacity(total);
             let mut new_high = prev;
             for j in 0..total {
-                let n = syn_b[j].sigs.len()
+                let n = syn_b[j]
+                    .sigs
+                    .len()
                     .min(sem_b[j].sigs.len())
                     .min(prag_b[j].sigs.len());
                 match provenance.append(
@@ -2266,10 +2369,7 @@ impl Scheduler {
         // injection are not visible to the divided value.  See
         // `BatchedInferenceSession::sequence_block_count`.
         let raw_ranges: Vec<(usize, usize)> = if visible_block_ranges.is_empty() {
-            let total_blocks = self
-                .session
-                .sequence_block_count(parent_id.0)
-                .unwrap_or(0);
+            let total_blocks = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
             if total_blocks == 0 {
                 vec![]
             } else {
@@ -2396,10 +2496,7 @@ impl Scheduler {
     ///
     /// Errors propagate from the underlying session ops; the caller
     /// (decode loop) marks the view as finished on failure.
-    fn reproject_view(
-        &mut self,
-        view_id: SequenceId,
-    ) -> Result<SequenceId, ConversationError> {
+    fn reproject_view(&mut self, view_id: SequenceId) -> Result<SequenceId, ConversationError> {
         let _t_total = PhaseTimer::new("reproject_total");
         // Clone the policy out — `swap_view_with_new_ranges` mutates
         // `active_decodes` so we cannot hold a borrow over it.
@@ -2475,58 +2572,68 @@ impl Scheduler {
                 .session
                 .gather_r16_kv_provenance_layers(
                     view_id.0,
-                    &policy.provenance_layer_indices,
+                    &policy.provenance_layer_indices.as_array(),
                     range,
                 )
                 .map_err(ConversationError::Model)?
                 .into_iter();
-            let raw_syn  = layers.next().unwrap_or_default();
-            let raw_sem  = layers.next().unwrap_or_default();
-            let raw_prag = layers.next().unwrap_or_default();
-            (raw_syn, raw_sem, raw_prag)
+            let raw_syn_l0 = layers.next().unwrap_or_default();
+            let raw_syn_l4 = layers.next().unwrap_or_default();
+            let raw_sem_l0 = layers.next().unwrap_or_default();
+            let raw_sem_l4 = layers.next().unwrap_or_default();
+            let raw_prag_l0 = layers.next().unwrap_or_default();
+            let raw_prag_l4 = layers.next().unwrap_or_default();
+            (
+                raw_syn_l0,
+                raw_syn_l4,
+                raw_sem_l0,
+                raw_sem_l4,
+                raw_prag_l0,
+                raw_prag_l4,
+            )
         };
         #[cfg(not(feature = "cuda"))]
         let raw_layers = {
-            let raw_syn = self
-                .session
-                .dump_r16_kv_for_provenance(view_id.0, policy.provenance_layer_indices[0], range)
-                .map_err(ConversationError::Model)?;
-            let raw_sem = self
-                .session
-                .dump_r16_kv_for_provenance(view_id.0, policy.provenance_layer_indices[1], range)
-                .map_err(ConversationError::Model)?;
-            let raw_prag = self
-                .session
-                .dump_r16_kv_for_provenance(view_id.0, policy.provenance_layer_indices[2], range)
-                .map_err(ConversationError::Model)?;
-            (raw_syn, raw_sem, raw_prag)
+            let li = policy.provenance_layer_indices;
+            let dump = |layer| {
+                self.session
+                    .dump_r16_kv_for_provenance(view_id.0, layer, range)
+                    .map_err(ConversationError::Model)
+            };
+            (
+                dump(li.syn_l0)?,
+                dump(li.syn_l4)?,
+                dump(li.sem_l0)?,
+                dump(li.sem_l4)?,
+                dump(li.prag_l0)?,
+                dump(li.prag_l4)?,
+            )
         };
-        let (raw_syn, raw_sem, raw_prag) = raw_layers;
-        if raw_syn.is_empty() {
+        let (raw_syn_l0, raw_syn_l4, raw_sem_l0, raw_sem_l4, raw_prag_l0, raw_prag_l4) = raw_layers;
+        if raw_syn_l0.is_empty() {
             return Ok(view_id);
         }
 
         let n_kv_head = self.session.n_kv_head();
         let head_dim = self.session.head_dim();
-        let block_indices: Vec<usize> = raw_syn.iter().map(|(idx, _, _, _)| *idx).collect();
-        let syn_blocks = crate::provenance::extract_signatures_from_r16_dump(
-            &raw_syn,
-            n_kv_head,
-            head_dim,
-            self.chunk_size,
-        );
-        let sem_blocks = crate::provenance::extract_signatures_from_r16_dump(
-            &raw_sem,
-            n_kv_head,
-            head_dim,
-            self.chunk_size,
-        );
-        let prag_blocks = crate::provenance::extract_signatures_from_r16_dump(
-            &raw_prag,
-            n_kv_head,
-            head_dim,
-            self.chunk_size,
-        );
+        let chunk = self.chunk_size;
+        let block_indices: Vec<usize> = raw_syn_l0.iter().map(|(idx, _, _, _)| *idx).collect();
+
+        let merge = |a: &[_], b: &[_]| {
+            let sa = crate::provenance::extract_mh_signatures_from_r16_dump(
+                a, n_kv_head, head_dim, chunk,
+            );
+            let sb = crate::provenance::extract_mh_signatures_from_r16_dump(
+                b, n_kv_head, head_dim, chunk,
+            );
+            sa.iter()
+                .zip(sb.iter())
+                .map(|(x, y)| crate::provenance::merge_turn_signatures_xor(x, y))
+                .collect::<Vec<_>>()
+        };
+        let syn_blocks = merge(&raw_syn_l0, &raw_syn_l4);
+        let sem_blocks = merge(&raw_sem_l0, &raw_sem_l4);
+        let prag_blocks = merge(&raw_prag_l0, &raw_prag_l4);
 
         // 3. Build per-depth probe vectors from the window + structural
         //    filter.  For a view position `p ∈ [probe_lo, probe_hi)`:
@@ -2617,7 +2724,7 @@ impl Scheduler {
             return Ok(view_id);
         }
 
-        let mut scanner = crate::provenance::BdpScanner::new();
+        let mut scanner = crate::provenance::BdpScanner::new().with_span_alpha(policy.span_alpha);
         scanner.scan(
             &policy.provenance,
             &probe_syn,
@@ -2657,14 +2764,10 @@ impl Scheduler {
             ConversationError::Channel(format!("reproject: missing view state {view_id}"))
         })?;
         let parent_id = view_state.parent_id;
-        let (projected_sections, projected_turns): (
-            Vec<SectionId>,
-            Vec<(GroupId, TurnIndex)>,
-        ) = {
+        let (projected_sections, projected_turns): (Vec<SectionId>, Vec<(GroupId, TurnIndex)>) = {
             let view = policy.substrate.read_for(policy.target);
             let projection = policy.projection.project(policy.target, &view);
-            let mut sections: Vec<SectionId> =
-                Vec::with_capacity(projection.system_prompt.len());
+            let mut sections: Vec<SectionId> = Vec::with_capacity(projection.system_prompt.len());
             for sec in &projection.system_prompt {
                 if view.section_sealed_of(sec.id).is_some() {
                     sections.push(sec.id);
@@ -2774,15 +2877,13 @@ impl Scheduler {
             snapshot
                 .into_iter()
                 .map(|seq| {
-                    let chunks: Vec<candle_nn::kv_cache::SealedChunk> = if tail_start
-                        < seq.chunks.len()
-                    {
-                        seq.chunks[tail_start..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    let token_count: usize =
-                        chunks.iter().map(|c| c.token_count as usize).sum();
+                    let chunks: Vec<candle_nn::kv_cache::SealedChunk> =
+                        if tail_start < seq.chunks.len() {
+                            seq.chunks[tail_start..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                    let token_count: usize = chunks.iter().map(|c| c.token_count as usize).sum();
                     candle_nn::kv_cache::SealedSequence {
                         chunks,
                         token_count,
@@ -2838,10 +2939,8 @@ impl Scheduler {
             &projected_sections,
             &projected_turns,
         )?;
-        let mut new_prefix_block_count = self
-            .session
-            .sequence_block_count(parent_id.0)
-            .unwrap_or(0);
+        let mut new_prefix_block_count =
+            self.session.sequence_block_count(parent_id.0).unwrap_or(0);
 
         // ── Critical: discard parent's tail partial when the
         //    captured COW chunk will duplicate it.
@@ -2883,10 +2982,7 @@ impl Scheduler {
         }
 
         // Append the captured tail to parent (metadata-only Arc clone).
-        let tail_token_count: usize = tail_per_layer
-            .first()
-            .map(|s| s.token_count)
-            .unwrap_or(0);
+        let tail_token_count: usize = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
         if tail_token_count > 0 {
             self.session
                 .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
@@ -2910,10 +3006,7 @@ impl Scheduler {
 
         // Carve a fresh view from the rebuilt parent.  Empty
         // `effective_ranges` means "borrow every chunk".
-        let parent_block_count = self
-            .session
-            .sequence_block_count(parent_id.0)
-            .unwrap_or(0);
+        let parent_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
         let effective_ranges: Vec<BlockRange> = if parent_block_count == 0 {
             Vec::new()
         } else {
@@ -2992,7 +3085,6 @@ impl Scheduler {
 
         Ok(new_view_id)
     }
-
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3156,8 +3248,24 @@ mod tests {
             None,              // penalty_log_path
             DecodeHealthConfig::default(),
             512, // max_prefill_chunk
-        Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
-            [0, 1, 2],
+            Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
+            ModelCoreProperties {
+                num_layers: 6,
+                n_kv_heads: 4,
+                head_dim: 128,
+                provenance_layer_indices: ProvenanceLayerIndices {
+                    syn_l0: 0,
+                    syn_l4: 1,
+                    sem_l0: 2,
+                    sem_l4: 3,
+                    prag_l0: 4,
+                    prag_l4: 5,
+                },
+                k_hi_error_threshold_factor: 1.0,
+                k_low_error_threshold_factor: 1.0,
+                v_hi_error_threshold_factor: 1.0,
+                v_low_error_threshold_factor: 1.0,
+            },
         );
         (scheduler, tx)
     }
@@ -3258,9 +3366,24 @@ mod tests {
             None,
             DecodeHealthConfig::default(),
             512,
-        
             Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
-            [0, 1, 2],
+            ModelCoreProperties {
+                num_layers: 6,
+                n_kv_heads: 4,
+                head_dim: 128,
+                provenance_layer_indices: ProvenanceLayerIndices {
+                    syn_l0: 0,
+                    syn_l4: 1,
+                    sem_l0: 2,
+                    sem_l4: 3,
+                    prag_l0: 4,
+                    prag_l4: 5,
+                },
+                k_hi_error_threshold_factor: 1.0,
+                k_low_error_threshold_factor: 1.0,
+                v_hi_error_threshold_factor: 1.0,
+                v_low_error_threshold_factor: 1.0,
+            },
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -3284,10 +3407,7 @@ mod tests {
             .advance_sequence(parent_raw, tokens.len())
             .unwrap();
 
-        let result = scheduler.create_view(
-            parent_id,
-            &[BlockRange::new(0, 1)],
-        );
+        let result = scheduler.create_view(parent_id, &[BlockRange::new(0, 1)]);
         assert!(result.is_ok(), "view creation failed: {:?}", result.err());
     }
 
@@ -3312,16 +3432,35 @@ mod tests {
             None,
             DecodeHealthConfig::default(),
             512,
-        
             Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
-            [0, 1, 2],
+            ModelCoreProperties {
+                num_layers: 6,
+                n_kv_heads: 4,
+                head_dim: 128,
+                provenance_layer_indices: ProvenanceLayerIndices {
+                    syn_l0: 0,
+                    syn_l4: 1,
+                    sem_l0: 2,
+                    sem_l4: 3,
+                    prag_l0: 4,
+                    prag_l4: 5,
+                },
+                k_hi_error_threshold_factor: 1.0,
+                k_low_error_threshold_factor: 1.0,
+                v_hi_error_threshold_factor: 1.0,
+                v_low_error_threshold_factor: 1.0,
+            },
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
         let parent_id = SequenceId(parent_raw);
 
         let result = scheduler.create_view(parent_id, &[]);
-        assert!(result.is_ok(), "sentinel + empty parent should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "sentinel + empty parent should succeed: {:?}",
+            result.err()
+        );
     }
 
     // ── View swap tests ──────────────────────────────────────────────────────
@@ -3335,5 +3474,4 @@ mod tests {
     // migrate to the new view id, `DecodeState.event_tx` survives —
     // are now exercised end-to-end by the `zend` coherence integration
     // test, which fires reproject many times in a real decode loop.
-
 }

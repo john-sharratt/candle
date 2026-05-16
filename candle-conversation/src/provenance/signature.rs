@@ -69,23 +69,17 @@ impl TokenSignature {
     /// Hamming agreement: number of bits that agree between `self` and `other`.
     ///
     /// Equivalent to `128 - hamming_distance`.  Maximum = 128, baseline random = 64.
+    /// Compiles to two POPCNT instructions on x86-64.
     #[inline]
     pub fn agreement(&self, other: &Self) -> u32 {
-        self.bits
-            .iter()
-            .zip(other.bits.iter())
-            .map(|(&a, &b)| (!(a ^ b)).count_ones())
-            .sum()
+        (!(self.as_u128() ^ other.as_u128())).count_ones()
     }
 
     /// Hamming distance: number of bits that differ.
+    /// Compiles to a single POPCNT instruction on x86-64.
     #[inline]
     pub fn hamming_distance(&self, other: &Self) -> u32 {
-        self.bits
-            .iter()
-            .zip(other.bits.iter())
-            .map(|(&a, &b)| (a ^ b).count_ones())
-            .sum()
+        (self.as_u128() ^ other.as_u128()).count_ones()
     }
 
     /// Raw bits as u128 for efficient bulk operations.
@@ -157,8 +151,8 @@ const N_PALETTE: usize = 4;
 /// Convert R16 Q data for one KV block into a `TurnSignatures`.
 ///
 /// `q_flat` layout: `[head][palette][token][sub_dim]` as returned by
-/// `dump_r16_kv_for_provenance`.  Only head 0 is used — multi-head XOR
-/// folding was removed as it did not improve retrieval quality.
+/// `dump_r16_kv_for_provenance`.  Only head 0 is used — production
+/// provenance should call [`r16_block_to_turn_signatures_mh`] instead.
 pub fn r16_block_to_turn_signatures(
     q_flat: &[f32],
     n_kv_head: usize,
@@ -190,6 +184,70 @@ pub fn r16_block_to_turn_signatures(
     TurnSignatures { sigs }
 }
 
+/// Multi-head version of [`r16_block_to_turn_signatures`].
+///
+/// XOR-folds the sign bits of **all** `n_kv_head` KV heads (each contributing
+/// 128 bits) into a single 128-bit [`TokenSignature`] per token.
+///
+/// `q_flat` layout: `[head][palette][token][sub_dim]`.
+pub fn r16_block_to_turn_signatures_mh(
+    q_flat: &[f32],
+    n_kv_head: usize,
+    head_dim: usize,
+    n_tokens_in_block: usize,
+) -> TurnSignatures {
+    let sub_head_dim = (head_dim / N_PALETTE).max(1);
+    let elems_per_subband = CHUNK_SIZE * sub_head_dim;
+    let floats_per_head = N_PALETTE * elems_per_subband;
+
+    if n_kv_head == 0 || q_flat.len() < floats_per_head {
+        return TurnSignatures::default();
+    }
+
+    let n_heads = n_kv_head.min(q_flat.len() / floats_per_head).max(1);
+    let n_tokens = n_tokens_in_block.min(CHUNK_SIZE);
+
+    // Scratch buffers — one per head, reused across tokens.
+    let mut head_bufs: Vec<Vec<f32>> =
+        (0..n_heads).map(|_| Vec::with_capacity(head_dim)).collect();
+
+    let mut sigs = Vec::with_capacity(n_tokens);
+    for t in 0..n_tokens {
+        for (h, buf) in head_bufs.iter_mut().enumerate() {
+            buf.clear();
+            let head_start = h * floats_per_head;
+            for p in 0..N_PALETTE {
+                let palette_base = head_start + p * elems_per_subband;
+                let token_base = palette_base + t * sub_head_dim;
+                let end = (token_base + sub_head_dim).min(q_flat.len());
+                if token_base < q_flat.len() {
+                    buf.extend_from_slice(&q_flat[token_base..end]);
+                }
+            }
+        }
+        let refs: Vec<&[f32]> = head_bufs.iter().map(|v| v.as_slice()).collect();
+        sigs.push(TokenSignature::from_q_multi(&refs));
+    }
+    TurnSignatures { sigs }
+}
+
+/// XOR-fold two [`TurnSignatures`] token-by-token into a single merged set.
+///
+/// Used to combine dual-layer signatures: if `a` encodes multi-head sign bits
+/// from the band-start layer and `b` from the band-centre layer, the merged
+/// result encodes both jointly in one 128-bit signature per token.
+/// Length is `min(a.len(), b.len())`.
+pub fn merge_turn_signatures_xor(a: &TurnSignatures, b: &TurnSignatures) -> TurnSignatures {
+    let n = a.sigs.len().min(b.sigs.len());
+    TurnSignatures {
+        sigs: a.sigs[..n]
+            .iter()
+            .zip(b.sigs[..n].iter())
+            .map(|(sa, sb)| TokenSignature::from_u128(sa.as_u128() ^ sb.as_u128()))
+            .collect(),
+    }
+}
+
 /// Extract `TurnSignatures` from the raw output of `dump_r16_kv_for_provenance`.
 ///
 /// `blocks`: each element is `(block_idx, k_flat, v_flat, q_flat)`.
@@ -203,6 +261,23 @@ pub fn extract_signatures_from_r16_dump(
     blocks
         .iter()
         .map(|(_, _k, _v, q)| r16_block_to_turn_signatures(q, n_kv_head, head_dim, tokens_per_block))
+        .collect()
+}
+
+/// Multi-head version of [`extract_signatures_from_r16_dump`].
+///
+/// Folds all `n_kv_head` heads via XOR into each token's 128-bit signature.
+pub fn extract_mh_signatures_from_r16_dump(
+    blocks: &[(usize, Vec<f32>, Vec<f32>, Vec<f32>)],
+    n_kv_head: usize,
+    head_dim: usize,
+    tokens_per_block: usize,
+) -> Vec<TurnSignatures> {
+    blocks
+        .iter()
+        .map(|(_, _k, _v, q)| {
+            r16_block_to_turn_signatures_mh(q, n_kv_head, head_dim, tokens_per_block)
+        })
         .collect()
 }
 

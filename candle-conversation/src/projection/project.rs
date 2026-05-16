@@ -24,7 +24,7 @@
 //!  │           apply_selection(rule, threshold, turns, budget=None)     │
 //!  │           → "natural" set the rule would pick if unconstrained     │
 //!  ├────────────────────────────────────────────────────────────────────┤
-//!  │  STEP 5.  Group score = layer.score_formula(natural turn scores)   │
+//!  │  STEP 5.  Group score = FIXED_FORMULA.aggregate(natural scores)    │
 //!  ├────────────────────────────────────────────────────────────────────┤
 //!  │  STEP 6.  Layer threshold gate                                     │
 //!  │           drop groups with derived score < layer.score_threshold   │
@@ -99,10 +99,16 @@ use super::ids::{GroupId, LayerId, SectionId, TurnId, TurnIndex};
 use super::reconcile::{flexbox_distribute, FlexItem};
 use crate::substrate::ContentResolver;
 use super::schema::{
-    GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema, SelectionRule,
+    GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema, ScoreFormula, SelectionRule,
     SystemPromptItem,
 };
 use super::selection::apply_selection;
+
+/// Fixed scoring formula used for all turn scoring and section selection.
+/// Calibrated against real Qwen3-30B-A3B Q-vector data; span α=2.0 with
+/// pragmatic-only depth weights dominates all other formulas for tool
+/// selection (min_ratio 5.54 vs 1.14–1.40 for alternatives).
+pub(super) const FIXED_FORMULA: ScoreFormula = ScoreFormula::Span { alpha: 2.0 };
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -217,7 +223,6 @@ pub fn run<R: ContentResolver>(
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
-        let formula = layer.score_formula;
         let weights = layer.depth_weights;
         for group in &layer.groups {
             // Masking: for the target layer, only the target group is visible.
@@ -229,7 +234,7 @@ pub fn run<R: ContentResolver>(
             let all_turns: Vec<(TurnIndex, f32)> = (0..count)
                 .map(|i| {
                     let idx = TurnIndex(i);
-                    let score = resolver.turn_score(group.id, idx, formula, &weights);
+                    let score = resolver.turn_score(group.id, idx, FIXED_FORMULA, &weights);
                     (idx, score)
                 })
                 .collect();
@@ -264,8 +269,7 @@ pub fn run<R: ContentResolver>(
     // ── Step 5: Group scores ──────────────────────────────────────────────────
     for gs in &mut group_states {
         let scores: Vec<f32> = gs.selected.iter().map(|(_, s)| *s).collect();
-        let layer = &visible_layers[gs.layer_idx];
-        gs.group_score = layer.score_formula.aggregate(&scores);
+        gs.group_score = FIXED_FORMULA.aggregate(&scores);
     }
 
     // ── Step 6: Layer score threshold ────────────────────────────────────────
@@ -518,10 +522,11 @@ fn select_collection_sections<R: ContentResolver>(
                 .iter()
                 .enumerate()
                 .map(|(decl, s)| {
+                    let dw = coll.depth_weights.as_ref().unwrap_or(&layer.depth_weights);
                     let score = resolver.section_score(
                         s.id,
-                        coll.score_formula,
-                        &layer.depth_weights,
+                        FIXED_FORMULA,
+                        dw,
                     );
                     (decl, s, score)
                 })
@@ -544,10 +549,11 @@ fn select_collection_sections<R: ContentResolver>(
             .sections
             .iter()
             .map(|s| {
+                let dw = coll.depth_weights.as_ref().unwrap_or(&layer.depth_weights);
                 let score = resolver.section_score(
                     s.id,
-                    coll.score_formula,
-                    &layer.depth_weights,
+                    FIXED_FORMULA,
+                    dw,
                 );
                 (s, score)
             })

@@ -12,6 +12,7 @@ use crate::projection::{
     SystemPromptItem, TurnIndex,
 };
 use crate::provenance::ProvenanceFile;
+use candle_transformers::models::batched_inference::ModelCoreProperties;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
@@ -124,10 +125,8 @@ pub struct Sequence {
     /// values in the workspace substrate per `(group, turn)` key.
     provenance: Arc<ProvenanceFile>,
 
-    /// Layer indices for provenance extraction: `[syntactic, semantic, pragmatic]`.
-    ///
-    /// Set from `ManagedBatchedModel::provenance_layer_indices()` at construction.
-    provenance_layer_indices: [usize; 3],
+    /// Static model properties captured at engine construction.
+    model_core: ModelCoreProperties,
 
     /// Number of 32-token KV blocks already indexed in `ProvenanceFile`.
     /// Passed to the seal step so extraction starts from the first
@@ -177,7 +176,7 @@ impl Sequence {
         config: SequenceConfig,
         chunk_size: usize,
         provenance: Arc<ProvenanceFile>,
-        provenance_layer_indices: [usize; 3],
+        model_core: ModelCoreProperties,
         substrate: Conversation,
     ) -> crate::Result<Self> {
         // Persistence is now a property of the workspace `Conversation`
@@ -208,7 +207,7 @@ impl Sequence {
             current_blocks: BlockCount(0),
             chunk_size,
             provenance,
-            provenance_layer_indices,
+            model_core,
             sig_blocks_processed: 0,
             projection: Arc::new(projection),
             substrate,
@@ -1052,7 +1051,7 @@ impl Sequence {
             current_blocks: self.current_blocks,
             chunk_size: self.chunk_size,
             provenance: self.provenance.clone(),
-            provenance_layer_indices: self.provenance_layer_indices,
+            model_core: self.model_core,
             // The fork inherits all parent blocks already indexed.  Sig extraction
             // during seal_and_detach_into uses this as the range start, so only the
             // delta (blocks added after the fork) gets scanned — not the entire
@@ -1110,6 +1109,32 @@ impl Sequence {
         self.tree.clear_turns();
 
         Ok(())
+    }
+
+    /// Extract raw K/V/Q float data from the KV cache for a set of layer
+    /// indices, synchronously on the scheduler thread.
+    ///
+    /// Call this after [`Self::finish_turn`] and before dropping the sequence —
+    /// the parent slot's KV cache is live in that window.
+    ///
+    /// Returns one entry per requested layer in the same order:
+    /// `(layer_idx, Vec<(block_idx, k_flat, v_flat, q_flat)>)`.
+    pub fn extract_raw_kvq(
+        &self,
+        layer_indices: Vec<usize>,
+        block_range: Option<(usize, usize)>,
+    ) -> crate::Result<Vec<(usize, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>)>> {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::ExtractRawKvq {
+                sequence_id: self.id,
+                layer_indices,
+                block_range,
+                response_tx: tx,
+            })
+            .map_err(|_| crate::error::ConversationError::SchedulerGone)?;
+        rx.recv()
+            .map_err(|_| crate::error::ConversationError::SchedulerGone)?
     }
 
     /// Close this conversation, releasing the sequence slot.
@@ -1289,11 +1314,12 @@ impl Sequence {
             projection: Arc::clone(&self.projection),
             substrate: self.substrate.clone(),
             provenance: Arc::clone(&self.provenance),
-            provenance_layer_indices: self.provenance_layer_indices,
+            provenance_layer_indices: self.model_core.provenance_layer_indices,
             every_n_tokens: n,
             max_probe_tokens: self.config.reproject_max_probe_tokens.max(1),
             probe_filter_token_ids: probe_filter,
             trigger_token_ids: trigger_ids,
+            span_alpha: self.projection.span_alpha(),
         })
     }
 

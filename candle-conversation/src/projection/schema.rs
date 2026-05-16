@@ -10,7 +10,7 @@
 //! ```text
 //!  Schema
 //!  └── layers: Vec<LayerSchema>
-//!      └── LayerSchema { name, window, score_formula, score_threshold,
+//!      └── LayerSchema { name, window, score_threshold,
 //!                        budget, system_prompt, groups: Vec<GroupSchema> }
 //!          ├── system_prompt: SystemPromptSchema  { sections: [SectionSchema] }
 //!          │   └── (used when THIS layer is the projection target)
@@ -47,7 +47,6 @@
 //! | `Budget.min_percent`  | `None`                  |
 //! | `Budget.max_percent`  | `None`                  |
 //! | `score_threshold`     | `0.0`                   |
-//! | `score_formula`       | [`ScoreFormula::Max`]   |
 //! | selection rule        | [`SelectionRule::AlwaysVisible`] |
 //!
 //! `LayerSchema.window` has no default — it must be declared.
@@ -143,9 +142,14 @@ pub struct SectionCollection {
     /// Sections below this score are filtered before selection.
     /// Default `0.0`.
     pub score_threshold: f32,
-    /// How per-section depth scores combine into a single score.
-    /// Default [`ScoreFormula::Max`].
-    pub score_formula: ScoreFormula,
+    /// Per-collection BDP depth weights for section scoring.  When
+    /// `Some`, overrides the enclosing layer's `depth_weights` for this
+    /// collection's selection.  When `None`, falls back to the layer's
+    /// value.  Allows different collections within the same layer to
+    /// weight the three BDP bands independently (e.g. a `tools`
+    /// collection calibrated for pragmatic-only while turn scoring uses
+    /// semantic-heavy weights).
+    pub depth_weights: Option<DepthWeights>,
 }
 
 impl Default for SectionCollection {
@@ -156,7 +160,7 @@ impl Default for SectionCollection {
             sections: Vec::new(),
             selection: SelectionRule::AlwaysVisible,
             score_threshold: 0.0,
-            score_formula: ScoreFormula::Max,
+            depth_weights: None,
         }
     }
 }
@@ -204,10 +208,13 @@ pub struct DepthWeights {
 
 impl Default for DepthWeights {
     fn default() -> Self {
+        // Universal calibration optimum (cross-corpus BDP sweep, 2026-05-16):
+        // syn:1 / sem:1 / prag:4 → 0.167 / 0.167 / 0.667 normalised.
+        // MRR=0.854, Top-1=81.6% across 640 probes × 64 items (8 layers).
         Self {
             syntactic: 1.0,
-            semantic: 1.0,
-            pragmatic: 1.0,
+            semantic:  1.0,
+            pragmatic: 4.0,
         }
     }
 }
@@ -228,10 +235,10 @@ impl DepthWeights {
 
 /// Schema for one cognitive layer.
 ///
-/// A layer aggregates multiple [`GroupSchema`]s. The layer's
-/// [`ScoreFormula`] composes turn scores into a per-group score, used both
-/// for the layer-level threshold gate and for emission ordering within the
-/// layer.
+/// A layer aggregates multiple [`GroupSchema`]s. Turn scores aggregate
+/// into a per-group score via the fixed [`super::project::FIXED_FORMULA`],
+/// used both for the layer-level threshold gate and for emission ordering
+/// within the layer.
 ///
 /// # Per-target turn budget
 ///
@@ -250,8 +257,6 @@ pub struct LayerSchema {
     pub name: String,
     /// Free-form description. Not used by the engine.
     pub description: String,
-    /// How turn scores aggregate into a single group score.
-    pub score_formula: ScoreFormula,
     /// Groups whose derived score is below this threshold are filtered from
     /// the layer before reconciliation. Default `0.0` (no gate).
     pub score_threshold: f32,
@@ -387,6 +392,7 @@ pub enum SelectionRule {
 /// | `Mean`          | Arithmetic mean. Penalises noisy groups.               |
 /// | `TopKMean { k }` | Mean of the top-`k` scores. Smoothed peak.            |
 /// | `Count`         | Number of eligible turns. Score-independent salience.  |
+/// | `Span { alpha }` | Σ L^α over consecutive runs of above-threshold probe positions. Rewards sustained relevance. |
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScoreFormula {
     Max,
@@ -394,6 +400,11 @@ pub enum ScoreFormula {
     Mean,
     TopKMean { k: usize },
     Count,
+    /// Power-law span scoring: consecutive runs of probe tokens that each find
+    /// an above-threshold corpus match score L^α (default α=2.0).  Isolated
+    /// hits score 1.0; a run of 3 scores 9.0.  The group-level aggregate
+    /// (turn scores → group score) uses Max of per-turn span scores.
+    Span { alpha: f32 },
 }
 
 /// The complete parsed, validated schema. Immutable after construction.

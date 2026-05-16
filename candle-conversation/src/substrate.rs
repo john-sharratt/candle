@@ -81,6 +81,11 @@ pub struct TurnScores {
     pub top_k_mean: f32,
     /// Number of pairs whose agreement crossed a "high-relevance" threshold.
     pub count: f32,
+    /// Span score: Σ L^α over consecutive runs of probe token positions that
+    /// had at least one above-threshold corpus match.  α is configured on the
+    /// BdpScanner (default 2.0).  Isolated hits (L=1) score 1.0; a run of L
+    /// consecutive probe tokens scores L^α, rewarding sustained attention.
+    pub span: f32,
 }
 
 impl TurnScores {
@@ -95,6 +100,7 @@ impl TurnScores {
             ScoreFormula::Mean => self.mean,
             ScoreFormula::TopKMean { .. } => self.top_k_mean,
             ScoreFormula::Count => self.count,
+            ScoreFormula::Span { .. } => self.span,
         }
     }
 }
@@ -848,7 +854,7 @@ mod tests {
 
         let stored = sub.turn_sealed_of(timeline, idx).unwrap();
         // The stored sealed is the migrated result (same content, may be new Arc).
-        drop(migrated_ptr); // just to use the binding
+        let _ = migrated_ptr;
         assert!(sub.turn_sealed_of(timeline, idx).is_some());
         drop(stored);
     }

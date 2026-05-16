@@ -5,6 +5,7 @@ use candle::quantized::pinned_staging::GpuBuf;
 use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use candle::*;
 pub(crate) use candle_nn::kv_cache::KvCache;
+#[cfg(feature = "cuda")]
 pub(crate) use candle_nn::kv_cache::CHUNK_SIZE;
 
 

@@ -52,7 +52,7 @@ The combination of bounded numerical error and compositional reasoning at unboun
 
 2. **Two-Phase KV Cache Quantization with Prefill Refresh** — a turn-boundary prefill refresh strategy that eliminates autoregressive error accumulation, coupled with an adaptive per-block selection kernel that assigns independent K/V formats based on asymmetric error metrics grounded in the softmax-amplified K vs. linear-bounded V error propagation asymmetry [AsymKV, COLING 2025]. Compression ratios span three tiers from near-lossless (top-quality) to high-compression, validated end-to-end by the multi-session story rewrite test (§9.8).
 
-3. **Attentional Provenance Indexing with Speculative Context Decode** — capturing Q vectors as persistent cognitive-state fingerprints, enabling 3–10ms CPU-side approximate attention over 50K+ conversation turns and 100K+ facts via a three-tier depth fingerprint and six INT8 matrix multiplies. During generation, Speculative Context Decode (§6.5) pipelines a variable-window probe session — up to 64 tokens, terminated at newline boundaries — in parallel with each real decode session: the probe's Q/K fingerprints drive CPU provenance scoring at each reasoning step boundary, assembling the next context window while the current one decodes. The 3–10ms CPU scan latency is fully hidden behind parallel GPU computation, yielding near-zero visible overhead. Probe tokens are discarded and never enter the KV cache. Evaluated in §9.12 on the system's own 2.2M-line Rust/CUDA Candle fork (~20M tokens of learning-phase conversation): each probe cycle during reasoning retrieves the next dependency node at the model's natural reasoning granularity, producing compositional dependency analysis across direct, transitive, and architectural categories that single pre-generation retrieval cannot replicate.
+3. **Attentional Provenance Indexing with Speculative Context Decode** — capturing Q vectors as persistent cognitive-state fingerprints and binarising them into 128-bit BDP signatures via an 8-head XOR fold across two syntactic-band layer depths (MH_XOR_QQ_l0×l4), enabling 3–10ms CPU-side section discrimination and corpus retrieval via span-scored BDP matching (α=2.0) and six INT8 matrix multiplies over 50K+ conversation turns and 100K+ facts. During generation, Speculative Context Decode (§6.5) pipelines a variable-window probe session — up to 64 tokens, terminated at newline boundaries — in parallel with each real decode session: the probe's Q/K fingerprints drive CPU provenance scoring at each reasoning step boundary, assembling the next context window while the current one decodes. The 3–10ms CPU scan latency is fully hidden behind parallel GPU computation, yielding near-zero visible overhead. Probe tokens are discarded and never enter the KV cache. Evaluated in §9.12 on the system's own 2.2M-line Rust/CUDA Candle fork (~20M tokens of learning-phase conversation): each probe cycle during reasoning retrieves the next dependency node at the model's natural reasoning granularity, producing compositional dependency analysis across direct, transitive, and architectural categories that single pre-generation retrieval cannot replicate.
 
 4. **Unbounded Three-Tier Paged Context** — a VRAM-hot / CPU RAM-warm / disk-cold paged context architecture, together with a formal proof that total numerical error per generation step — from any source, including F16 rounding — is bounded by a constant O(1) independent of context depth N under provenance-selected attention, in contrast with the O(N) scaling of full-attention systems. This result is independent of hardware: more VRAM defers the accumulation threshold but does not eliminate the structural problem, which is architectural rather than representational. The theorem establishes that bounded error accumulation at unbounded context depth requires decoupling of working set size from context depth — a property our architecture provides and standard full-attention systems cannot.
 
@@ -287,6 +287,20 @@ The three-band structure is grounded in layer-wise emotion probing research [Zha
 
 **Q→K distributional gap handling.** Liu et al. [NeurIPS 2025] quantified that Q vectors deviate more than 10× farther from K vectors than K vectors deviate from each other, causing standard ANNS to degrade severely. K fingerprint construction uses Q-aware token selection: tokens selected by Q·K inner product score rather than K magnitude. This selects K tokens maximally visible from the Q distribution at construction time, mitigating the OOD gap rather than suffering it at retrieval time. The Q→Q matching component (dominant for history and mood retrieval) operates entirely within-distribution.
 
+**Binary Directional Provenance (BDP) signature.** Within the syntactic band, section-level discrimination uses a 128-bit BDP signature derived from an 8-head XOR fold across two structurally distinct syntactic-band layer depths. Per token at layers $\ell_0$ (band start, model layer 3) and $\ell_4$ (band centre, model layer 7):
+
+$$	ext{TokenSignature} = igoplus_{i=0}^{3} 	ext{sign}(Q^{\ell_0}_i) \;\oplus\; igoplus_{i=0}^{3} 	ext{sign}(Q^{\ell_4}_i)$$
+
+where $Q^{\ell}_i \in \mathbb{R}^{128}$ is the Q vector for KV head $i$ at syntactic band layer $\ell$, and sign(·) binarises to $\{-1,+1\}^{128}$. The XOR fold across 8 (head, layer) subspaces produces a fingerprint that is stable under sustained directional focus (all heads coherently agree) and cancels under noise (heads disagree). Similarity between two signatures is measured by BDP: XNOR + popcount agreement in $[0, 128]$. A per-section score accumulates BDP hits from probe tokens; span scoring with $lpha=2.0$ contributes $L^2$ for each run of $L$ consecutive hits to the same section, strongly rewarding sustained directional focus over isolated coincidental hits.
+
+**Span scoring (α=2.0).** For each consecutive run of $L$ probe tokens all producing BDP hits to the same section at a given depth band, the contribution to that section's score is $L^2$ rather than $L$. The quadratic reward strongly distinguishes sustained directional focus — the signature of genuine section intent — from isolated coincidental hits:
+
+$$S(\text{section}) = \frac{1}{3}\sum_{b}\sum_{\text{runs}} L_b^2$$
+
+where the outer sum is over the three depth bands, and the inner sum is over consecutive hit-runs of length $L_b$ to that section at depth band $b$. The final discrimination ratio is $S(\text{target}) / \bar{S}(\text{other sections})$.
+
+This scoring penalises isolated hits and rewards coherent multi-token focus. Combined with the 8-head dual-layer fingerprint, it achieves min\_ratio $> 1.0$ on every probe under both count and span scoring across all 8 tested tool sections on Qwen3-30B-A3B — including the hardest pair (file\_read vs file\_write, min\_ratio 2.53 under span). Full validation is in §9.10.
+
 ### 6.3 Sequential Section Resolution
 
 Each turn executes a sequential dynamic section resolution loop before generation begins. Dynamic sections are any context components whose content depends on the current query state — examples include persona, response style, domain knowledge, or conversation history. Each section is backed by a candidate library with precomputed KV representations. Selection proceeds in order: each probe generates a short token window under the system prompt for that section, captures the Q fingerprint, runs the CPU flat scan, and loads the winning candidate's KV into the context. Each subsequent probe executes into the context already committed by prior probes — Q vectors reflect genuine intent conditioned on all prior commitments.
@@ -303,7 +317,7 @@ This is structurally different from prior probe-reset architectures that generat
 
 ### 6.4 CPU-Side Flat Scan
 
-The full fingerprint index for 50K turns + 100K facts fits in approximately 126MB of CPU RAM — typically in L3 cache on modern server CPUs. Six INT8 matrix multiplies over this index, parallelised across 6+ CPU threads via VNNI instructions, complete in 3–10ms regardless of corpus size. This replaces hierarchical navigation (beam walks, recursive tree descent, iterative probe-reset cycles) with a single flat scan.
+The full fingerprint index for 50K turns + 100K facts fits in approximately 126MB of CPU RAM — typically in L3 cache on modern server CPUs. Six INT8 matrix multiplies over this index, parallelised across 6+ CPU threads via VNNI instructions, complete in 3–10ms regardless of corpus size. This replaces hierarchical navigation (beam walks, recursive tree descent, iterative probe-reset cycles) with a single flat scan. For section-level scoring during generation (§6.5), the flat scan is replaced by BDP matching with span scoring α=2.0 on the TokenSignature index (§6.2).
 
 Scoring formula for any indexed item:
 
@@ -313,7 +327,7 @@ score = Σ_b w_Kb × (kprobe_b · K_b) + Σ_b w_Qb × (qprobe_b · Q_b)
 where b ∈ {syntactic, semantic, pragmatic}
 ```
 
-where b ∈ {syntactic, semantic, pragmatic}. Component-specific weights reflect the three-band layer regime: Q_pragmatic dominates for history (w=0.50) and mood (w=0.45) because pragmatic-band Q captures the richest cognitive-state fingerprint; K_semantic and K_syntactic dominate for facts because topical content retrieval is primarily semantic and lexical.
+where b ∈ {syntactic, semantic, pragmatic}. Component-specific weights reflect the three-band layer regime: Q_pragmatic dominates for history (w=0.50) and mood (w=0.45) because pragmatic-band Q captures the richest cognitive-state fingerprint; K_semantic and K_syntactic dominate for facts because topical content retrieval is primarily semantic and lexical. This weighted dot-product scoring applies to corpus retrieval (history, facts, mood, templates). Section-level discrimination during generation uses the BDP TokenSignature mechanism (§6.2, §9.10).
 
 **Multi-resolution history.** The conversation history B-tree is retained as a pre-computation infrastructure rather than a navigation mechanism. Summary nodes at multiple resolutions are indexed alongside verbatim turns. The flat scan surfaces the appropriate resolution automatically: if a span summary and its verbatim children both score highly, a resolution policy selects verbatim when they fit within budget. No hierarchical traversal.
 
@@ -329,7 +343,7 @@ Sections §6.3 and §6.4 describe provenance retrieval *before* generation begin
 - **DECODE_N** — autoregressively decodes real output tokens against the context window assembled from PROBE_N's fingerprints. The token count matches whatever PROBE_N produced before termination. These tokens are kept and seal into 32-token paged blocks normally.
 - **PROBE_{N+1}** — speculatively decodes up to 64 tokens (or until newline), continuing from the probe trajectory. These tokens are discarded and never enter the KV cache.  Their Q/K fingerprints are captured.
 
-*Barrier.* Both sessions join. CPU provenance scoring runs on PROBE_{N+1}'s fingerprints — overlapping with the final tokens of each session where possible. The context window for DECODE_{N+1} is assembled. Return to steady state.
+*Barrier.* Both sessions join. CPU BDP scoring runs on PROBE_{N+1}'s TokenSignatures — span-scored across consecutive runs of BDP hits to each candidate section, overlapping with the final tokens of each session where possible. The highest-scoring sections' KV blocks are loaded into the context window for DECODE_{N+1}. Return to steady state.
 
 **Newline-terminated variable window.** The probe terminates at the first newline, with a 64-token cap as a safety valve. Newlines in model output — particularly within thinking blocks — mark the completion of a discrete reasoning step; the Q vectors at a newline boundary encode what the model is reaching for next, making them the optimal fingerprint capture point. The variable window adapts naturally to the model's reasoning rhythm: a query prompting rapid short inferences triggers more frequent context updates; a query requiring extended chains of logic produces longer probe windows with more developed fingerprints. No tuning parameter. The model's own structural markers determine retrieval frequency.
 
@@ -598,11 +612,73 @@ This result supports a strong generalization claim: pre-RoPE K/V activation stru
 
 ### 9.10 Ablation: Attentional Provenance Indexing
 
-Retrieval quality on held-out conversation sets comparing Q→Q provenance matching against simpler baselines:
+**Production result: min\_ratio > 1.0 on every probe, every tool, under both count and span scoring.** The locked production strategy MH\_XOR\_QQ\_l0×l4 + span α=2.0 is the only tested strategy to achieve this. Full sweep documented below.
 
-| Retrieval method | History recall @10 | Scan latency | Notes |
-|---|---|---|---|
-*Preliminary — recall comparison across retrieval methods in progress. The key claim is that Q→Q matching surfaces contextually relevant turns that K-only matching misses, particularly when prior turns share cognitive context but not surface vocabulary; quantitative validation will be reported in v2.*
+**Strategy sweep.** A 48-probe harness evaluated 8 tool sections × 6 positive scenarios on Qwen3-30B-A3B, capturing raw F32 K and Q vectors from the syntactic band (centre layer 7, ±4 layers = 9 layers). Each strategy defines a `TokenSignature` binarisation; discrimination quality is measured by the **discrimination ratio** = intra\_score / inter\_mean\_score. A ratio > 1 means the correct section outscores all others on average; **min\_ratio > 1.0** means it does so on every probe — the production reliability bar.
+
+**§1 sweep (count scoring, 48 probes):**
+
+| Strategy | min\_ratio | mean\_ratio |
+|---|---|---|
+| **MH\_XOR\_QQ\_l4** (4-head XOR, layer 4) | **1.065** | **1.274** |
+| MH\_XOR\_QQ\_l8 | 1.020 | 1.209 |
+| MH\_XOR\_QQ\_l0 | 0.995 | 1.197 |
+| QQ single-head (best) | 0.66 | 0.95 |
+| KK single-head (best) | 0.57 | 0.92 |
+| BandMeanQQ (average across 9 layers) | 0.58 | 0.89 |
+| QK per-head (best mean) | 0.00 | 2.43* |
+
+*QK mean\_ratio inflated by 0/0 → ∞ artifacts on zero-signal probes; corrected ratio is no-information.
+
+Single-head and band-average strategies all have min\_ratio below 1.0: no reliable discrimination across all probes. Q→K strategies have min\_ratio = 0 on some probes. Only the multi-head XOR family (MH\_XOR\_QQ) achieves reliable count discrimination, confirming that Q→Q matching is the correct signal and that multi-head XOR folding is necessary to suppress false positives.
+
+**§3 span scoring (α=2.0, top strategies):**
+
+| Strategy | count mean | span α=2.0 mean |
+|---|---|---|
+| MH\_XOR\_QQ\_l0 | 1.197 | 3.069 |
+| MH\_XOR\_QQ\_l4 | 1.274 | — |
+
+Span scoring with α=2.0 delivers ~2.5× better mean discrimination than count alone for the MH\_XOR\_QQ family (3.07 vs 1.27). Single-head QQ sees almost no lift from span scoring (0.95 → ~1.10), confirming that span amplifies genuine sustained focus rather than masking a weak count signal.
+
+**§8 dual-layer combination: MH\_XOR\_QQ\_l0×l4.**
+
+The strategy sweep revealed a structural tension: layer 0 (model layer 3) produces smooth sequential Q patterns — long span runs, good for span scoring; layer 4 (model layer 7) is more token-selective — sharper per-token discrimination, better for count. An 8-head XOR fold across both layers simultaneously captures both properties:
+
+$$	ext{TokenSignature} = igoplus_{i=0}^{3}	ext{sign}(Q^{\ell_0}_i) \;\oplus\; igoplus_{i=0}^{3}	ext{sign}(Q^{\ell_4}_i)$$
+
+Three combination algorithms were evaluated:
+
+| Strategy | min\_ratio (count) | min\_ratio (span α=2.0) | mean\_ratio (count) | mean\_ratio (span α=2.0) |
+|---|---|---|---|---|
+| **A: MH\_XOR\_QQ\_l0×l4 (8-head XOR fold)** | **1.419** | **2.528** | **1.747** | **5.314** |
+| C: gated span (l0, gate=l4) | — | 1.534 | — | 3.328 |
+| B: normalised span(l0) + count(l4) | 1.354 | — | 2.068 | — |
+| MH\_XOR\_QQ\_l0 span α=2.0 (prior best) | 0.995 | 1.613 | 1.197 | 3.069 |
+| MH\_XOR\_QQ\_l4 count (prior best) | 1.065 | — | 1.274 | — |
+
+**Algorithm A (8-head XOR fold) is the only strategy that achieves min\_ratio > 1.0 on every probe under both count and span scoring across all 8 tools.** The prior champion (l0 span α=2.0) required span scoring to rescue file\_read from a sub-threshold count floor (cnt\_min=0.995). Algorithm A clears the bar under count alone (file\_read cnt\_min=1.42), making span a performance amplifier rather than a safety net.
+
+**Per-tool results (MH\_XOR\_QQ\_l0×l4, span α=2.0, 48 probes):**
+
+| Tool | count mean | span α=2.0 mean | count min | span α=2.0 min |
+|---|---|---|---|---|
+| web\_search | 2.082 | 7.543 | 1.992 | 6.879 |
+| weather | 2.001 | 5.471 | 1.940 | 4.667 |
+| file\_write | 1.698 | 5.601 | 1.602 | 5.024 |
+| code\_run | 1.871 | 6.805 | 1.698 | 5.532 |
+| random | 1.679 | 5.860 | 1.647 | 4.696 |
+| datetime | 1.590 | 4.647 | 1.509 | 3.500 |
+| calculator | 1.540 | 3.525 | 1.446 | 2.530 |
+| **file\_read** | 1.511 | 3.061 | **1.419** | **2.528** |
+
+file\_read and file\_write are the hardest pair (naturally similar KV patterns, overlapping Q sign space). Both clear min\_ratio > 1.0 under count alone at 1.42 and 1.60 respectively. The span amplification is strongest for semantically sharp tools (web\_search, code\_run) where decode tokens form long coherent runs.
+
+**Why Algorithm A dominates B and C.** Algorithm A applies the joint dual-layer constraint at the fingerprint level before thresholding. A spurious match must simultaneously agree across 8 head-subspaces from two structurally distinct depths — the joint false-positive probability falls approximately as the product of the two layers' individual rates. Algorithm C applies the same logical constraint at the token-hit level after independent thresholding, losing tokens where one layer's BDP value falls just below threshold. Algorithm B sums normalised scores from independent passes, missing the multiplicative suppression that XOR-folding achieves.
+
+**Production design.** MH\_XOR\_QQ\_l0×l4 with span α=2.0 is the locked production strategy. The formula is in §6.2; the span scoring formula is in §6.2. This section documents the empirical evidence supporting that choice.
+
+**Open items for v2.** Boundary and negative scenarios (false-positive rate), cross-band extension (semantic and pragmatic bands), α sensitivity above 2.0, and model portability (threshold and layer ranking re-measurement for each new model variant).
 
 ### 9.11 Concurrent Persistent-Memory Session Result
 
@@ -830,7 +906,7 @@ The combination is what the application requires. None of it is achievable throu
 
 The transformer attention mechanism is a retrieval system: Q vectors query against K vectors, scores select candidates, V values are aggregated weighted by relevance. That is what softmax attention computes. That is all it has ever computed. The architecture is a learned retrieval system operating over a fixed context window.
 
-This system performs the same operation at two scales. The provenance index does approximate attention over the full unbounded context on CPU — six INT8 matmuls scoring Q fingerprints against stored K and Q fingerprints — to select which blocks enter the working set. The GPU attention kernel then performs exact attention over the selected working set. Coarse retrieval selecting for fine retrieval. The only structural difference from standard attention is granularity: standard attention performs flat retrieval over all N tokens at O(N) cost; this system performs hierarchical retrieval — approximate selection on CPU, exact attention on GPU — at O(1) cost per generation step.
+This system performs the same operation at two scales. The provenance index does approximate attention over the full unbounded context on CPU — six INT8 matmuls for corpus retrieval, BDP span scoring for section discrimination during generation — selecting which blocks enter the working set. The GPU attention kernel then performs exact attention over the selected working set. Coarse retrieval selecting for fine retrieval. The only structural difference from standard attention is granularity: standard attention performs flat retrieval over all N tokens at O(N) cost; this system performs hierarchical retrieval — approximate selection on CPU, exact attention on GPU — at O(1) cost per generation step.
 
 When a reviewer characterises this as "RAG with extra steps," the correct response is: RAG replaces attention with an external retrieval system that has no attentional continuity — content retrieved by BM25 or embedding similarity is injected into a fresh context, severing the causal chain that attention depends on. This system extends the retrieval that attention already is to unbounded depth, without severing anything. The mechanism is preserved; the scaling constraint is removed. This comes with a different binding constraint that full attention does not have: retrieval quality. Full attention over N tokens attends to all N exactly. This system selects B tokens from N via approximate provenance matching — if the provenance system surfaces the wrong B tokens, the generation step lacks the correct context regardless of how precisely those B tokens are attended. The guarantee is bounded numerical error on the attended set, not guaranteed relevance of the attended set. This is a meaningful distinction: the system trades the O(N) error problem for a retrieval quality problem that the provenance mechanism is designed to bound but cannot eliminate. RAG abandons the attention mechanism entirely and substitutes something categorically weaker. The distinction between this system and RAG is not one of implementation style — it is a difference in what property is preserved; the distinction between this system and full attention is a different trade-off, not a strict dominance.
 

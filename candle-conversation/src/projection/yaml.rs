@@ -26,8 +26,10 @@
 //!     window: <usize>              # total turn-budget when this layer is the
 //!                                  # projection target — distributed via flex
 //!                                  # across all visible layers below it.
-//!     score_formula: max | sum | mean | top_k_mean | count   # default max
-//!     score_formula_k: <usize>     # required only for top_k_mean (default 3)
+//!     depth_weights:               # optional; default 1.0/1.0/1.0 equal weights
+//!       syntactic: <float>
+//!       semantic: <float>
+//!       pragmatic: <float>
 //!     score_threshold: <float>     # default 0.0
 //!     budget: { priority, min_percent, max_percent }   # this layer's flex
 //!                                  # weight when some *other* layer is the
@@ -64,7 +66,7 @@ use serde::Deserialize;
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::schema::{
-    Budget, DepthWeights, GroupSchema, LayerSchema, ScoreFormula, Schema, SectionCollection,
+    Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection,
     SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema,
 };
 
@@ -183,10 +185,8 @@ enum YamlSystemPromptItem {
         selection: YamlSelection,
         #[serde(default)]
         score_threshold: f32,
-        #[serde(default = "default_formula")]
-        score_formula: String,
         #[serde(default)]
-        score_formula_k: Option<usize>,
+        depth_weights: Option<YamlDepthWeights>,
         #[serde(default)]
         sections: Vec<YamlSection>,
     },
@@ -199,10 +199,6 @@ struct YamlLayer {
     description: String,
     /// Total turn-budget when this layer is the projection target.
     window: usize,
-    #[serde(default = "default_formula")]
-    score_formula: String,
-    #[serde(default)]
-    score_formula_k: Option<usize>,
     #[serde(default)]
     score_threshold: f32,
     #[serde(default)]
@@ -260,10 +256,6 @@ struct YamlSelection {
     historical_top_k: Option<usize>,
 }
 
-fn default_formula() -> String {
-    "max".to_string()
-}
-
 // ── Conversion ────────────────────────────────────────────────────────────────
 
 fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
@@ -278,7 +270,6 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
         let lid = LayerId::new(li as u32 + 1);
         maps.layer_names.insert(yl.name.clone(), lid);
 
-        let score_formula = parse_formula(&yl.name, &yl.score_formula, yl.score_formula_k)?;
         let layer_budget = parse_budget(&yl.name, &yl.budget)?;
 
         // ── this layer's system_prompt items ─────────────────────────────────
@@ -339,8 +330,7 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                     name,
                     selection,
                     score_threshold,
-                    score_formula,
-                    score_formula_k,
+                    depth_weights: coll_depth_weights_yaml,
                     sections,
                 } => {
                     if !layer_collection_names.insert(name.clone()) {
@@ -355,8 +345,6 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                             value: *score_threshold,
                         });
                     }
-                    let coll_formula =
-                        parse_formula(&label, score_formula, *score_formula_k)?;
 
                     let mut sec_schemas = Vec::with_capacity(sections.len());
                     for s in sections {
@@ -375,13 +363,19 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                         });
                     }
 
+                    let coll_dw = parse_depth_weights(&label, coll_depth_weights_yaml.as_ref())?;
+                    let coll_dw_opt = if coll_depth_weights_yaml.is_some() {
+                        Some(coll_dw)
+                    } else {
+                        None
+                    };
                     items.push(SystemPromptItem::Collection(SectionCollection {
                         id: cid,
                         name: name.clone(),
                         sections: sec_schemas,
                         selection: coll_selection,
                         score_threshold: *score_threshold,
-                        score_formula: coll_formula,
+                        depth_weights: coll_dw_opt,
                     }));
                     maps.collection_names.insert((lid, name.clone()), cid);
                 }
@@ -430,7 +424,6 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
             id: lid,
             name: yl.name.clone(),
             description: yl.description.clone(),
-            score_formula,
             score_threshold: yl.score_threshold,
             window: yl.window,
             budget: layer_budget,
@@ -480,29 +473,6 @@ fn parse_budget(name: &str, yb: &YamlBudget) -> Result<Budget, ConstructionError
         min_percent: yb.min_percent,
         max_percent: yb.max_percent,
     })
-}
-
-fn parse_formula(
-    name: &str,
-    s: &str,
-    k: Option<usize>,
-) -> Result<ScoreFormula, ConstructionError> {
-    match s {
-        "max" => Ok(ScoreFormula::Max),
-        "sum" => Ok(ScoreFormula::Sum),
-        "mean" => Ok(ScoreFormula::Mean),
-        "top_k_mean" => {
-            let kv = k.unwrap_or(3);
-            if kv == 0 {
-                return Err(ConstructionError::InvalidTopKMeanK {
-                    name: name.to_string(),
-                });
-            }
-            Ok(ScoreFormula::TopKMean { k: kv })
-        }
-        "count" => Ok(ScoreFormula::Count),
-        other => Err(ConstructionError::UnknownScoreFormula(other.to_string())),
-    }
 }
 
 fn parse_depth_weights(

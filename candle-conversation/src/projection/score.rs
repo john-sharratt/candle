@@ -50,6 +50,13 @@ impl ScoreFormula {
                 sorted[..take].iter().copied().sum::<f32>() / take as f32
             }
             ScoreFormula::Count => scores.len() as f32,
+            // At the group level, span of a turn list = max per-turn span score.
+            // The actual span computation happens inside the Aggregator per turn;
+            // here we just pick the most span-relevant turn to represent the group.
+            ScoreFormula::Span { .. } => scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max),
         }
     }
 }

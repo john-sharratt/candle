@@ -1048,28 +1048,6 @@ layers:
 }
 
 #[test]
-fn yaml_unknown_score_formula_is_error() {
-    let yaml = r#"
-layers:
-  - name: layer
-    system_prompt:
-      sections:
-        - id: s1
-          content: "X"
-    window: 9000
-    score_formula: fancy_formula
-    groups:
-      - id: grp
-        selection: { kind: always_visible }
-"#;
-    let err = Builder::from_yaml(yaml).unwrap_err();
-    assert!(matches!(
-        err,
-        super::error::ConstructionError::UnknownScoreFormula(_)
-    ));
-}
-
-#[test]
 fn yaml_invalid_priority_zero_is_error() {
     let yaml = r#"
 layers:
@@ -2001,11 +1979,12 @@ layers:
 // ── DepthWeights ──────────────────────────────────────────────────────────────
 
 #[test]
-fn depth_weights_default_is_equal_mean() {
+fn depth_weights_default_is_universal_optimum() {
     use super::schema::DepthWeights;
     let w = DepthWeights::default();
-    // (1*3 + 1*6 + 1*9) / 3 = 6.0
-    assert_eq!(w.combine(3.0, 6.0, 9.0), 6.0);
+    // Universal calibration optimum: syn:1 / sem:1 / prag:4
+    // (1*3 + 1*6 + 4*9) / 6 = 45/6 = 7.5
+    assert!((w.combine(3.0, 6.0, 9.0) - 7.5).abs() < 1e-6);
 }
 
 #[test]
@@ -2168,9 +2147,9 @@ layers:
         g,
         idx,
         PerDepthScores {
-            syn: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0 },
-            sem: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0 },
-            prag: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0 },
+            syn: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0 },
+            sem: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0 },
+            prag: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0 },
         },
     );
 
@@ -2218,7 +2197,7 @@ layers:
     );
 
     // Equal weights: (10 + 50 + 100) / 3 = 53.333...
-    let equal = DepthWeights::default();
+    let equal = DepthWeights { syntactic: 1.0, semantic: 1.0, pragmatic: 1.0 };
     let s = r.turn_score(g, idx, ScoreFormula::Max, &equal);
     assert!((s - 53.333_33).abs() < 1e-3);
 
@@ -2271,9 +2250,9 @@ layers:
             g,
             idx,
             PerDepthScores {
-                syn: TurnScores { max: s, ..Default::default() },
-                sem: TurnScores { max: s, ..Default::default() },
-                prag: TurnScores { max: s, ..Default::default() },
+                syn: TurnScores { span: s, ..Default::default() },
+                sem: TurnScores { span: s, ..Default::default() },
+                prag: TurnScores { span: s, ..Default::default() },
             },
         );
     }
@@ -2325,18 +2304,18 @@ layers:
         g,
         a,
         PerDepthScores {
-            syn: TurnScores { max: 100.0, ..Default::default() },
+            syn: TurnScores { span: 100.0, ..Default::default() },
             sem: TurnScores::default(),
-            prag: TurnScores { max: 1.0, ..Default::default() },
+            prag: TurnScores { span: 1.0, ..Default::default() },
         },
     );
     r.set_scores_for_test(
         g,
         bturn,
         PerDepthScores {
-            syn: TurnScores { max: 1.0, ..Default::default() },
+            syn: TurnScores { span: 1.0, ..Default::default() },
             sem: TurnScores::default(),
-            prag: TurnScores { max: 100.0, ..Default::default() },
+            prag: TurnScores { span: 100.0, ..Default::default() },
         },
     );
 
@@ -2358,18 +2337,18 @@ layers:
         g2,
         a2,
         PerDepthScores {
-            syn: TurnScores { max: 100.0, ..Default::default() },
+            syn: TurnScores { span: 100.0, ..Default::default() },
             sem: TurnScores::default(),
-            prag: TurnScores { max: 1.0, ..Default::default() },
+            prag: TurnScores { span: 1.0, ..Default::default() },
         },
     );
     r2.set_scores_for_test(
         g2,
         b2,
         PerDepthScores {
-            syn: TurnScores { max: 1.0, ..Default::default() },
+            syn: TurnScores { span: 1.0, ..Default::default() },
             sem: TurnScores::default(),
-            prag: TurnScores { max: 100.0, ..Default::default() },
+            prag: TurnScores { span: 100.0, ..Default::default() },
         },
     );
     let proj = b_prag.project(ProjectionTarget { layer: layer2, group: g2, timeline: TimelineId::for_test(1) }, &r2);
@@ -2793,7 +2772,6 @@ fn add_collection_appends_and_returns_id() {
             "tools",
             super::schema::SelectionRule::TopK { k: 3 },
             0.0,
-            super::schema::ScoreFormula::Max,
         )
         .unwrap();
     assert_eq!(b.id_for_collection_in(dialogue, "tools"), Some(cid));
@@ -2810,7 +2788,6 @@ fn add_section_to_collection_appends_in_collection() {
             "tools",
             super::schema::SelectionRule::TopK { k: 2 },
             0.0,
-            super::schema::ScoreFormula::Max,
         )
         .unwrap();
     let t1 = b
@@ -2868,7 +2845,6 @@ fn duplicate_collection_name_fails() {
         "tools",
         super::schema::SelectionRule::AlwaysVisible,
         0.0,
-        super::schema::ScoreFormula::Max,
     )
     .unwrap();
     let r = b.add_collection(
@@ -2876,7 +2852,6 @@ fn duplicate_collection_name_fails() {
         "tools",
         super::schema::SelectionRule::AlwaysVisible,
         0.0,
-        super::schema::ScoreFormula::Max,
     );
     assert!(matches!(
         r,

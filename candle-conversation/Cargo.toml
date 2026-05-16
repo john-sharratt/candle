@@ -86,3 +86,7 @@ required-features = ["cuda", "hub"]
 
 [[example]]
 name = "dump_provenance_samples"
+
+[[test]]
+name = "projection_harness"
+path = "tests/projection_harness/main.rs"

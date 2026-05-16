@@ -30,7 +30,7 @@
 //! ```text
 //! Schema (immutable after construction)
 //! └── Layers                                   [ordered, layer 0 first]
-//!     ├── Layer { name, window, score_formula, score_threshold, budget }
+//!     ├── Layer { name, window, score_threshold, budget }
 //!     │   │
 //!     │   │   `window` = total turn-budget when THIS layer is the
 //!     │   │             projection target.  Different targets get
@@ -97,7 +97,7 @@
 //!   │ 4. Apply selection rules under unbounded budget                │
 //!   │    → naturally-selected turns per group                        │
 //!   ├────────────────────────────────────────────────────────────────┤
-//!   │ 5. Compute group scores via layer.score_formula(...)           │
+//!   │ 5. Compute group scores via FIXED_FORMULA (Span α=2.0)         │
 //!   ├────────────────────────────────────────────────────────────────┤
 //!   │ 6. Apply layer score thresholds → surviving groups             │
 //!   ├────────────────────────────────────────────────────────────────┤

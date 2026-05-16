@@ -3,6 +3,7 @@
 use candle_conversation::projection::{SectionId, TimelineAllocator, TurnIndex};
 use candle_conversation::substrate_cache::{SubstrateCache, SubstrateKey};
 
+#[allow(dead_code)]
 fn timeline_key(n: u64, idx: u32) -> SubstrateKey {
     let alloc = TimelineAllocator::new();
     // Consume (n-1) ids then take the n-th.

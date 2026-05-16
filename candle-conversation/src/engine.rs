@@ -10,7 +10,7 @@ use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::token_buffer::TokenBuffer;
 
 use candle_nn::CHUNK_SIZE;
-use candle_transformers::models::batched_inference::ManagedBatchedModel;
+use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use crossbeam::channel;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -67,13 +67,8 @@ pub struct ConversationEngine {
     /// turns are indexed in the same mmap-backed store.
     provenance: Arc<ProvenanceFile>,
 
-    /// Provenance layer indices `[syntactic, semantic, pragmatic]`.
-    ///
-    /// Captured from `ManagedBatchedModel::provenance_layer_indices()` before
-    /// the model is moved to the scheduler thread.  Passed to every new
-    /// sequence so the post-Done seal and the in-decode reprojection
-    /// path know which layers to extract Q sign-bits from.
-    provenance_layer_indices: [usize; 3],
+    /// Static model properties captured before the model moves to the scheduler thread.
+    model_core: ModelCoreProperties,
 }
 
 impl ConversationEngine {
@@ -100,11 +95,8 @@ impl ConversationEngine {
             .create_batched_session(config.batched_config.clone())
             .map_err(ConversationError::Model)?;
 
-        // Capture provenance layer indices before the model moves
-        // into the scheduler thread; passed to every new sequence so
-        // the post-Done seal and the in-decode reprojection path know
-        // which layers to extract Q sign-bits from.
-        let auto_provenance_layer_indices = model.provenance_layer_indices();
+        // Capture model metadata before the model moves to the scheduler thread.
+        let model_core = model.model_core_properties();
 
         let eos_tokens = config.eos_tokens.clone();
         let vocab_size = config.vocab_size;
@@ -162,7 +154,7 @@ impl ConversationEngine {
                     health_config,
                     config.scheduler.large_prefill_max_tokens,
                     scheduler_provenance,
-                    auto_provenance_layer_indices,
+                    model_core,
                 );
                 scheduler.run();
             })
@@ -176,7 +168,7 @@ impl ConversationEngine {
             tokenizer: Arc::new(tokenizer),
             config,
             provenance,
-            provenance_layer_indices: auto_provenance_layer_indices,
+            model_core,
             conversation,
             substrate_cache,
         })
@@ -298,7 +290,7 @@ impl ConversationEngine {
             config,
             CHUNK_SIZE,
             provenance,
-            self.provenance_layer_indices,
+            self.model_core,
             self.conversation.clone(),
         )?;
 
@@ -319,9 +311,9 @@ impl ConversationEngine {
         Arc::clone(&self.provenance)
     }
 
-    /// Get the provenance layer indices `[syntactic, semantic, pragmatic]`.
-    pub fn provenance_layer_indices(&self) -> [usize; 3] {
-        self.provenance_layer_indices
+    /// Static model properties captured at engine construction.
+    pub fn model_core_properties(&self) -> ModelCoreProperties {
+        self.model_core
     }
 
     /// Low-level helper used by benchmarks (e.g. RULER): create a fresh

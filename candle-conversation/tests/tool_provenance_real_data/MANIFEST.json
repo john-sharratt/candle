@@ -2,8 +2,11 @@
   "version": 1,
   "model": "Qwen3-30B-A3B-Q4_K_M",
   "provenance_layer_indices": [
+    3,
     7,
+    20,
     24,
+    36,
     40
   ],
   "scenarios": [

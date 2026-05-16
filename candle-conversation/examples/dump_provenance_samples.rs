@@ -69,7 +69,7 @@ struct Scenario {
 #[derive(Debug, Deserialize)]
 struct Manifest {
     model: String,
-    provenance_layer_indices: [usize; 3],
+    provenance_layer_indices: [usize; 6],
     scenarios: Vec<Scenario>,
 }
 

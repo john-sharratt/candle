@@ -13,11 +13,9 @@
 //!   │   (yaml.rs)          │ DuplicateGroupName                          │
 //!   │                      │ DuplicateSectionName                        │
 //!   │                      │ UnknownSelectionKind                        │
-//!   │                      │ UnknownScoreFormula                         │
 //!   │                      │ InvalidPriority      (priority <= 0)        │
 //!   │                      │ InvalidPercentage    (outside 0..=100)      │
 //!   │                      │ InvalidTopK          (k missing or 0)       │
-//!   │                      │ InvalidTopKMeanK     (k = 0)                │
 //!   │                      │ InvalidConversationK (recent=0 AND tk=0)    │
 //!   ├──────────────────────┼─────────────────────────────────────────────┤
 //!   │ Construction-time    │ MinPercentExceedsTotal                      │
@@ -57,11 +55,6 @@ pub enum ConstructionError {
     /// (`always_visible`, `top_k`, `single`, `conversation`).
     #[error("unknown selection kind {0:?}")]
     UnknownSelectionKind(String),
-
-    /// Score formula is not in the closed set
-    /// (`max`, `sum`, `mean`, `top_k_mean`, `count`).
-    #[error("unknown score formula {0:?}")]
-    UnknownScoreFormula(String),
 
     /// Priority must be a positive float.
     #[error("priority for {name:?} must be positive, got {value}")]
@@ -109,10 +102,6 @@ pub enum ConstructionError {
     /// `top_k` selection had a missing or zero `k`.
     #[error("top_k k must be >= 1 for {name:?}")]
     InvalidTopK { name: String },
-
-    /// `top_k_mean` formula had `k = 0`.
-    #[error("top_k_mean k must be >= 1 for {name:?}")]
-    InvalidTopKMeanK { name: String },
 
     /// `conversation` selection had both `recent = 0` and
     /// `historical_top_k = 0` (no turns can ever survive).

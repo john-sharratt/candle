@@ -88,8 +88,7 @@ layers:
       counts.  Populated by Phase 1 of the trunk-analysis pipeline; one entry
       per repo.
     window: 6000
-    score_formula: max
-    score_threshold: 0.0
+    score_threshold: 0.0    # span scale: calibrated per-layer thresholds needed
     budget:
       priority: 5
       max_percent: 5     # capped — small layer, no need to grow
@@ -115,9 +114,13 @@ layers:
       per (file × scope) chunk.  Highest token-density per turn — selection
       trims aggressively.
     window: 6000
-    score_formula: top_k_mean
-    score_formula_k: 5
-    score_threshold: 0.2
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: cross-corpus sweep, 640 probes × 64 items.
+    # sem+prag (prag-heavy): MRR=1.000, Top-1=100%.  Raw ratio: sem:3, prag:4.
+    depth_weights:
+      syntactic: 0.0
+      semantic:  3.0
+      pragmatic: 4.0
     budget:
       priority: 25
     system_prompt:
@@ -134,7 +137,7 @@ layers:
     groups:
       - id: scopes
         selection: { kind: top_k, k: 8 }
-        score_threshold: 0.3
+        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
         budget:
           priority: 100
 
@@ -144,9 +147,14 @@ layers:
       Code artifacts defined per file (Phase 3).  Structs, traits, functions,
       enums, type aliases.  One turn per file.
     window: 8000
-    score_formula: top_k_mean
-    score_formula_k: 3
-    score_threshold: 0.15
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: syntactic-only: MRR=0.483, Top-1=42.5%.
+    # Weakest cross-corpus signal — confused with other code-analysis layers.
+    # Syntactic band best isolates file-level structural patterns.
+    depth_weights:
+      syntactic: 1.0
+      semantic:  0.0
+      pragmatic: 0.0
     budget:
       priority: 10
     system_prompt:
@@ -167,7 +175,7 @@ layers:
     groups:
       - id: artifacts
         selection: { kind: top_k, k: 8 }
-        score_threshold: 0.2
+        score_threshold: 1.0  # bimodal: ~80% of inter are zero-score; cuts zero floor, preserves all non-zero hits
         budget:
           priority: 100
 
@@ -177,9 +185,13 @@ layers:
       Per-file dependency mapping (Phase 4).  Direct imports, transitive
       deps, implicit couplings.  Crucial for cross-cutting questions.
     window: 8000
-    score_formula: top_k_mean
-    score_formula_k: 3
-    score_threshold: 0.2
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: syn+prag (prag-heavy): MRR=0.960, Top-1=93.8%.
+    # Raw ratio: syn:1, prag:3.
+    depth_weights:
+      syntactic: 1.0
+      semantic:  0.0
+      pragmatic: 3.0
     budget:
       priority: 15
     system_prompt:
@@ -203,7 +215,7 @@ layers:
     groups:
       - id: dependencies
         selection: { kind: top_k, k: 6 }
-        score_threshold: 0.3
+        score_threshold: 0.0  # inverted within-layer signal — no useful threshold; TopK handles ranking
         budget:
           priority: 100
 
@@ -213,9 +225,13 @@ layers:
       Why each artifact exists, what role it plays, what assumptions it
       encodes (Phase 5).
     window: 8000
-    score_formula: top_k_mean
-    score_formula_k: 3
-    score_threshold: 0.2
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: syn+sem (syn-heavy): MRR=1.000, Top-1=100%.
+    # Raw ratio: syn:3, sem:2.
+    depth_weights:
+      syntactic: 3.0
+      semantic:  2.0
+      pragmatic: 0.0
     budget:
       priority: 20
     system_prompt:
@@ -237,7 +253,7 @@ layers:
     groups:
       - id: architecture
         selection: { kind: top_k, k: 5 }
-        score_threshold: 0.3
+        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
         budget:
           priority: 100
 
@@ -247,8 +263,13 @@ layers:
       Risks, smells, performance concerns, security gaps, missing error
       handling (Phase 6).
     window: 8000
-    score_formula: max
-    score_threshold: 0.3
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: semantic-only: MRR=0.629, Top-1=58.7%.
+    # Weakest non-code layer — conceptual critique vocabulary is largely semantic.
+    depth_weights:
+      syntactic: 0.0
+      semantic:  1.0
+      pragmatic: 0.0
     budget:
       priority: 15
     system_prompt:
@@ -271,7 +292,7 @@ layers:
     groups:
       - id: critique
         selection: { kind: top_k, k: 4 }
-        score_threshold: 0.35
+        score_threshold: 1.0  # bimodal: ~70% of inter are zero-score; cuts zero floor, preserves all non-zero hits
         budget:
           priority: 100
 
@@ -281,8 +302,14 @@ layers:
       Concrete bugs and failure modes per file with severity + fix
       suggestion (Phase 7).
     window: 8000
-    score_formula: max
-    score_threshold: 0.3
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: syntactic-only: MRR=1.000, Top-1=100%.
+    # Bug analysis produces highly idiomatic low-level syntactic patterns
+    # (error checks, boundary conditions) that are perfectly distinctive.
+    depth_weights:
+      syntactic: 1.0
+      semantic:  0.0
+      pragmatic: 0.0
     budget:
       priority: 20
     system_prompt:
@@ -316,7 +343,7 @@ layers:
     groups:
       - id: bugs
         selection: { kind: top_k, k: 4 }
-        score_threshold: 0.4
+        score_threshold: 250.0  # intra floor=367 > 250; cuts weakest inter without touching real hits
         budget:
           priority: 100
 
@@ -325,8 +352,13 @@ layers:
     description: |
       Per-day converged summaries of prior developer conversations.
     window: 8000
-    score_formula: max
-    score_threshold: 0.15
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: syn+sem (sem-heavy): MRR=0.981, Top-1=96.2%.
+    # Raw ratio: syn:1, sem:3.
+    depth_weights:
+      syntactic: 1.0
+      semantic:  3.0
+      pragmatic: 0.0
     budget:
       priority: 30
     system_prompt:
@@ -349,7 +381,7 @@ layers:
     groups:
       - id: days
         selection: { kind: top_k, k: 4 }
-        score_threshold: 0.2
+        score_threshold: 0.0  # overlapping distributions — no useful threshold; TopK handles ranking
         budget:
           priority: 100
 
@@ -358,9 +390,14 @@ layers:
     description: |
       Speculative exploration logs from the overnight dream phase.
     window: 8000
-    score_formula: top_k_mean
-    score_formula_k: 2
-    score_threshold: 0.25
+    score_threshold: 0.0
+    # Calibrated 2026-05-16: all three bands (syn-dominant): MRR=0.868, Top-1=78.8%.
+    # Raw ratio: syn:3, sem:1, prag:2.  Speculative content is stylistically
+    # varied — no single band dominates; all three contribute marginal SNR.
+    depth_weights:
+      syntactic: 3.0
+      semantic:  1.0
+      pragmatic: 2.0
     budget:
       priority: 10
     system_prompt:
@@ -385,7 +422,7 @@ layers:
     groups:
       - id: dreams
         selection: { kind: top_k, k: 3 }
-        score_threshold: 0.3
+        score_threshold: 100.0  # cuts near-zero inter cluster (p0-p5=0–20); intra floor=295
         budget:
           priority: 100
 
@@ -401,7 +438,6 @@ layers:
       The active developer conversation served to the VS Code extension or
       web chat.
     window: 16000
-    score_formula: max
     score_threshold: 0.0
     budget:
       priority: 100
@@ -486,8 +522,11 @@ layers:
         - kind: collection
           name: tools
           selection: { kind: top_k, k: 3 }
-          score_threshold: 0.0
-          score_formula: max
+          score_threshold: 140.70   # calibrated: prag_only, TP=100%, FP=9% on tools corpus
+          depth_weights:
+            syntactic: 0.0
+            semantic: 0.0
+            pragmatic: 1.0
           sections: []
 
         - kind: section

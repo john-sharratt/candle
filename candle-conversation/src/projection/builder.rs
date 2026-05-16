@@ -378,6 +378,20 @@ impl Builder {
             .copied()
     }
 
+    /// The span α used by [`super::project::FIXED_FORMULA`].
+    ///
+    /// The BDP scanner in the reprojection path must use the same alpha so
+    /// scores accumulated during live decode are consistent with the scores
+    /// the projection engine reads at group-scoring time (step 5 of the
+    /// pipeline).  Returns `DEFAULT_SPAN_ALPHA` for non-Span formulas as a
+    /// safe fallback.
+    pub fn span_alpha(&self) -> f32 {
+        match super::project::FIXED_FORMULA {
+            super::schema::ScoreFormula::Span { alpha } => alpha,
+            _ => crate::provenance::DEFAULT_SPAN_ALPHA,
+        }
+    }
+
     // ── Runtime mutators ─────────────────────────────────────────────────────
     //
     // These mutate the schema after YAML parse, before the first
@@ -445,7 +459,6 @@ impl Builder {
         name: impl Into<String>,
         selection: super::schema::SelectionRule,
         score_threshold: f32,
-        score_formula: super::schema::ScoreFormula,
     ) -> Result<super::ids::CollectionId, ConstructionError> {
         let name: String = name.into();
         let layer_idx = self.layer_idx(layer)?;
@@ -466,7 +479,7 @@ impl Builder {
                 sections: Vec::new(),
                 selection,
                 score_threshold,
-                score_formula,
+                depth_weights: None,
             }),
         );
         self.name_maps
@@ -632,7 +645,7 @@ impl Builder {
     pub fn for_plain_prompt(system_prompt_text: &str) -> Self {
         use super::ids::{GroupId, LayerId, SectionId};
         use super::schema::{
-            Budget, DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionSchema,
+            Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionSchema,
             SelectionRule, SystemPromptSchema,
         };
 
@@ -645,7 +658,6 @@ impl Builder {
                 id: layer_id,
                 name: "dialogue".to_string(),
                 description: String::new(),
-                score_formula: ScoreFormula::Max,
                 score_threshold: 0.0,
                 window: 32_768,
                 budget: Budget { priority: 100.0, min_percent: None, max_percent: None },

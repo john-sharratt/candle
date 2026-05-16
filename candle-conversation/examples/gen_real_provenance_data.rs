@@ -1,7 +1,13 @@
 //! Generate real tool-provenance KV/Q fixtures using Qwen3-30B-A3B.
 //!
-//! Runs all 128 tool-scenario prompts through the model in parallel batches,
-//! capturing real Q sign-bit signatures from the KV-cache seal at each turn.
+//! Produces two output files:
+//!
+//! 1. `signatures.prov` + `MANIFEST.json` — existing sign-bit signatures
+//!    (used by the projection harness and the live BDP scanner).
+//!
+//! 2. `raw_kvq.prov` + `RAW_MANIFEST.json` — raw f32 K and Q vectors across
+//!    a 20%-wide layer band centred on the three provenance depth slices.
+//!    Used by the harness to sweep signature strategies offline.
 //!
 //! # How parallelism works
 //!
@@ -27,6 +33,7 @@
 //! ```
 //!
 //! Output: `tests/tool_provenance_real_data/{signatures.prov,MANIFEST.json}`
+//!          `tests/tool_provenance_real_data/{raw_kvq.prov,RAW_MANIFEST.json}`
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -34,6 +41,9 @@ use std::time::Instant;
 use candle::Device;
 use candle_conversation::{
     models::{Dialect, Model},
+    provenance::{
+        band_layer_indices, build_token_blob, RawFileHeader, RawProvenanceFile, RawSigEntry,
+    },
     ProvenanceFile, SamplingConfig, SigEntry, TurnHandle,
 };
 use candle_conversation::Sequence;
@@ -82,6 +92,10 @@ struct Args {
     /// Overwrite existing output without prompting.
     #[arg(long)]
     force: bool,
+
+    /// Skip generating raw KVQ data (only sign-bit signatures).
+    #[arg(long)]
+    skip_raw: bool,
 }
 
 // ── Manifest types ────────────────────────────────────────────────────────────
@@ -139,8 +153,31 @@ struct OutScenario {
 struct OutManifest {
     version: u32,
     model: String,
-    provenance_layer_indices: [usize; 3],
+    provenance_layer_indices: [usize; 6],
     scenarios: Vec<OutScenario>,
+}
+
+/// Output scenario written to RAW_MANIFEST.json.
+#[derive(Debug, Serialize)]
+struct RawOutScenario {
+    id: String,
+    tool: Option<String>,
+    case_type: CaseType,
+    raw_byte_offset: u64,
+    raw_token_count: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct RawOutManifest {
+    version: u32,
+    model: String,
+    n_kv_heads: u32,
+    head_dim: u32,
+    n_layers_per_band: u32,
+    band_half_width: u32,
+    band_centers: [u32; 3],
+    n_total_layers: u32,
+    scenarios: Vec<RawOutScenario>,
 }
 
 // ── In-flight batch slot ──────────────────────────────────────────────────────
@@ -155,6 +192,24 @@ struct Slot {
     /// Kept alive until `finish_turn` — dropping it frees the KV cache slot.
     conv: Sequence,
     handle: TurnHandle,
+}
+
+// ── Band computation ──────────────────────────────────────────────────────────
+
+/// Build the three-band layer index lists from provenance centres and model size.
+fn compute_bands(
+    prov_layers: [usize; 6],
+    n_total_layers: usize,
+    n_layers_per_band: usize,
+) -> [[Vec<usize>; 3]; 1] {
+    let half = n_layers_per_band / 2;
+    // prov_layers = [syn_l0, syn_l4, sem_l0, sem_l4, prag_l0, prag_l4]
+    // Band centres are the l4 values (indices 1, 3, 5).
+    [[
+        band_layer_indices(prov_layers[1], half, n_total_layers, n_layers_per_band),
+        band_layer_indices(prov_layers[3], half, n_total_layers, n_layers_per_band),
+        band_layer_indices(prov_layers[5], half, n_total_layers, n_layers_per_band),
+    ]]
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -177,17 +232,18 @@ fn main() -> anyhow::Result<()> {
 
     // Guard output directory.
     let sig_path = args.output.join("signatures.prov");
-    if sig_path.exists() {
-        if !args.force {
-            eprintln!(
-                "Output already exists at {}.  Use --force to overwrite.",
-                sig_path.display()
-            );
-            std::process::exit(1);
+    let raw_path = args.output.join("raw_kvq.prov");
+    for path in [&sig_path, &raw_path] {
+        if path.exists() {
+            if !args.force {
+                eprintln!(
+                    "Output already exists at {}.  Use --force to overwrite.",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+            std::fs::remove_file(path)?;
         }
-        // Remove the stale file so ProvenanceFile::open starts at offset 0,
-        // not at the end of the old file.
-        std::fs::remove_file(&sig_path)?;
     }
     std::fs::create_dir_all(&args.output)?;
 
@@ -214,25 +270,62 @@ fn main() -> anyhow::Result<()> {
     let dialect: Dialect = builder.spec().dialect.clone();
 
     println!("Model loaded in {:.1}s", t_load.elapsed().as_secs_f64());
-    let prov_layers = engine.provenance_layer_indices();
+    let model_core = engine.model_core_properties();
+    let prov_layers = model_core.provenance_layer_indices.as_array();
+    let n_kv_heads = model_core.n_kv_heads;
+    let head_dim = model_core.head_dim;
+    let n_total_layers = model_core.num_layers;
+    let n_layers_per_band = (n_total_layers * 20 / 100).max(1);
+    let band_half_width = n_layers_per_band / 2;
+
     println!("Provenance layer indices: {prov_layers:?}");
+    println!("Model: n_kv_heads={n_kv_heads}, head_dim={head_dim}, n_layers={n_total_layers}");
+    println!("Raw band: n_layers_per_band={n_layers_per_band}, half={band_half_width}");
     println!("Batch size: {}", args.batch_size);
 
-    // ── Output ProvenanceFile (persistent) ───────────────────────────────────
+    // Compute band layer indices for raw extraction.
+    let bands = &compute_bands(prov_layers, n_total_layers, n_layers_per_band)[0];
+    let all_layer_indices: Vec<usize> = bands.iter().flat_map(|b| b.iter().copied()).collect();
+    // Deduplicated but keep first-occurrence order for the layer→(band, layer_in_band) map.
+    let mut layer_to_band_slot: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for (band, band_layers) in bands.iter().enumerate() {
+        for (slot, &layer_idx) in band_layers.iter().enumerate() {
+            layer_to_band_slot.entry(layer_idx).or_default().push((band, slot));
+        }
+    }
+    let unique_layers: Vec<usize> = {
+        let mut seen = std::collections::HashSet::new();
+        all_layer_indices.iter().copied().filter(|l| seen.insert(*l)).collect()
+    };
+
+    // Build raw file header.
+    let raw_header = RawFileHeader {
+        n_kv_heads: n_kv_heads as u32,
+        head_dim: head_dim as u32,
+        n_layers_per_band: n_layers_per_band as u32,
+        band_half_width: band_half_width as u32,
+        band_centers: [
+            prov_layers[1] as u32,
+            prov_layers[3] as u32,
+            prov_layers[5] as u32,
+        ],
+        n_total_layers: n_total_layers as u32,
+    };
+
+    // ── Output files ─────────────────────────────────────────────────────────
 
     let out_pf = ProvenanceFile::open(&sig_path)?;
+    let out_raw_pf = if args.skip_raw {
+        None
+    } else {
+        Some(RawProvenanceFile::create(&raw_path, raw_header)?)
+    };
+
     let mut out_scenarios: Vec<OutScenario> = Vec::with_capacity(total);
+    let mut raw_scenarios: Vec<RawOutScenario> = Vec::with_capacity(total);
 
     // ── Batched inference loop ────────────────────────────────────────────────
-    //
-    // Phase A — submit: create batch_size sequences, call submit_turn on each
-    //           (non-blocking).  All SubmitTurn messages queue in the scheduler
-    //           channel; the scheduler batches their prefills and decodes.
-    //
-    // Phase B — drain: wait for each handle in submission order, finish_turn,
-    //           read real Q signatures, write to output file.  By the time we
-    //           reach the last handle in the batch, the scheduler has typically
-    //           finished it already.
 
     let t_start = Instant::now();
     let mut completed = 0usize;
@@ -256,7 +349,6 @@ fn main() -> anyhow::Result<()> {
             let global_idx = batch_idx + i;
             let formatted_sp = dialect.format_system_prompt(&s.system_prompt);
             let mut conv = engine.new_conversation(&formatted_sp, conv_config.clone())?;
-            // submit_turn queues the request and returns immediately.
             let handle = conv.submit_turn(&s.user_prompt)?;
             slots.push(Slot {
                 global_idx,
@@ -269,7 +361,7 @@ fn main() -> anyhow::Result<()> {
             });
         }
         println!(
-            "  Submitted {} turns in {:.1}ms — scheduler is running them in parallel",
+            "  Submitted {} turns in {:.1}ms",
             slots.len(),
             t_submit.elapsed().as_secs_f64() * 1000.0
         );
@@ -283,6 +375,77 @@ fn main() -> anyhow::Result<()> {
 
             let resp = handle.wait()?;
             conv.finish_turn(handle, &resp)?;
+
+            // ── Extract raw KVQ before the KV cache is freed ─────────────────
+            let raw_entry: Option<RawSigEntry> = if let Some(ref raw_pf) = out_raw_pf {
+                let seal = resp.seal.as_ref();
+                if let Some(seal) = seal {
+                    let block_range = Some((seal.block_from, seal.block_to));
+                    match conv.extract_raw_kvq(unique_layers.clone(), block_range) {
+                        Ok(layer_data) => {
+                            // Build a (layer_idx → blocks) map.
+                            let layer_map: std::collections::HashMap<usize, &Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> =
+                                layer_data.iter().map(|(li, blocks)| (*li, blocks)).collect();
+
+                            // Collect per-band-layer raw block data for build_token_blob.
+                            let n_blocks = seal.block_to.saturating_sub(seal.block_from);
+                            let total_tokens = seal.turn_token_count;
+                            let chunk_size = candle_nn::CHUNK_SIZE;
+
+                            let mut all_token_bytes: Vec<u8> = Vec::new();
+
+                            for block_offset in 0..n_blocks {
+                                let tokens_this_block = if block_offset + 1 < n_blocks {
+                                    chunk_size
+                                } else {
+                                    let rem = total_tokens % chunk_size;
+                                    if rem == 0 { chunk_size } else { rem }
+                                };
+
+                                // Build band_layer_data for this block: [band][layer_in_band] → (k, q)
+                                let band_layer_data: [Vec<(&[f32], &[f32])>; 3] = std::array::from_fn(|band| {
+                                    bands[band]
+                                        .iter()
+                                        .map(|&layer_idx| {
+                                            if let Some(blocks) = layer_map.get(&layer_idx) {
+                                                // Find the block at block_offset within the seal range.
+                                                let abs_block = seal.block_from + block_offset;
+                                                if let Some((_, k, _v, q)) = blocks.iter().find(|(bi, ..)| *bi == abs_block) {
+                                                    (k.as_slice(), q.as_slice())
+                                                } else {
+                                                    (&[][..], &[][..])
+                                                }
+                                            } else {
+                                                (&[][..], &[][..])
+                                            }
+                                        })
+                                        .collect()
+                                });
+
+                                let blob = build_token_blob(&raw_header, tokens_this_block, &band_layer_data);
+                                all_token_bytes.extend_from_slice(&blob);
+                            }
+
+                            match raw_pf.append(&all_token_bytes) {
+                                Ok(e) => Some(e),
+                                Err(err) => {
+                                    eprintln!("  [{global_idx}] WARNING: raw append failed: {err}");
+                                    None
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("  [{global_idx}] WARNING: extract_raw_kvq failed: {err}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             drop(conv); // release KV slot for the next batch
 
             let seal = match &resp.seal {
@@ -321,6 +484,16 @@ fn main() -> anyhow::Result<()> {
                 preview,
             );
 
+            if let Some(re) = raw_entry {
+                raw_scenarios.push(RawOutScenario {
+                    id: id.clone(),
+                    tool: tool.clone(),
+                    case_type,
+                    raw_byte_offset: re.byte_offset,
+                    raw_token_count: re.token_count,
+                });
+            }
+
             out_scenarios.push(OutScenario {
                 id,
                 tool,
@@ -336,7 +509,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── Write manifest ────────────────────────────────────────────────────────
+    // ── Write manifests ───────────────────────────────────────────────────────
 
     let out_manifest = OutManifest {
         version: 1,
@@ -346,6 +519,34 @@ fn main() -> anyhow::Result<()> {
     };
     let manifest_out = args.output.join("MANIFEST.json");
     std::fs::write(&manifest_out, serde_json::to_string_pretty(&out_manifest)?)?;
+
+    if out_raw_pf.is_some() && !raw_scenarios.is_empty() {
+        let raw_manifest = RawOutManifest {
+            version: 1,
+            model: "Qwen3-30B-A3B-Q4_K_M".to_string(),
+            n_kv_heads: n_kv_heads as u32,
+            head_dim: head_dim as u32,
+            n_layers_per_band: n_layers_per_band as u32,
+            band_half_width: band_half_width as u32,
+            band_centers: [
+                prov_layers[1] as u32,
+                prov_layers[3] as u32,
+                prov_layers[5] as u32,
+            ],
+            n_total_layers: n_total_layers as u32,
+            scenarios: raw_scenarios,
+        };
+        let raw_manifest_out = args.output.join("RAW_MANIFEST.json");
+        std::fs::write(&raw_manifest_out, serde_json::to_string_pretty(&raw_manifest)?)?;
+        println!(
+            "  raw_kvq.prov    : {} bytes",
+            std::fs::metadata(&raw_path)?.len()
+        );
+        println!(
+            "  RAW_MANIFEST.json: {} bytes",
+            std::fs::metadata(&raw_manifest_out)?.len()
+        );
+    }
 
     let elapsed = t_start.elapsed().as_secs_f64();
     println!(

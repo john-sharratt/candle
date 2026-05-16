@@ -1,0 +1,912 @@
+{
+  "version": 1,
+  "model": "Qwen3-30B-A3B-Q4_K_M",
+  "n_kv_heads": 4,
+  "head_dim": 128,
+  "n_layers_per_band": 9,
+  "band_half_width": 4,
+  "band_centers": [
+    7,
+    24,
+    40
+  ],
+  "n_total_layers": 48,
+  "scenarios": [
+    {
+      "id": "weather_pos_0",
+      "tool": "weather",
+      "case_type": "positive",
+      "raw_byte_offset": 64,
+      "raw_token_count": 52
+    },
+    {
+      "id": "weather_pos_1",
+      "tool": "weather",
+      "case_type": "positive",
+      "raw_byte_offset": 5750848,
+      "raw_token_count": 52
+    },
+    {
+      "id": "weather_pos_2",
+      "tool": "weather",
+      "case_type": "positive",
+      "raw_byte_offset": 11501632,
+      "raw_token_count": 52
+    },
+    {
+      "id": "weather_pos_3",
+      "tool": "weather",
+      "case_type": "positive",
+      "raw_byte_offset": 17252416,
+      "raw_token_count": 53
+    },
+    {
+      "id": "weather_pos_4",
+      "tool": "weather",
+      "case_type": "positive",
+      "raw_byte_offset": 23113792,
+      "raw_token_count": 52
+    },
+    {
+      "id": "weather_pos_5",
+      "tool": "weather",
+      "case_type": "positive",
+      "raw_byte_offset": 28864576,
+      "raw_token_count": 51
+    },
+    {
+      "id": "weather_bnd_0",
+      "tool": "weather",
+      "case_type": "boundary",
+      "raw_byte_offset": 34504768,
+      "raw_token_count": 55
+    },
+    {
+      "id": "weather_bnd_1",
+      "tool": "weather",
+      "case_type": "boundary",
+      "raw_byte_offset": 40587328,
+      "raw_token_count": 52
+    },
+    {
+      "id": "weather_bnd_2",
+      "tool": "weather",
+      "case_type": "boundary",
+      "raw_byte_offset": 46338112,
+      "raw_token_count": 60
+    },
+    {
+      "id": "weather_bnd_3",
+      "tool": "weather",
+      "case_type": "boundary",
+      "raw_byte_offset": 52973632,
+      "raw_token_count": 54
+    },
+    {
+      "id": "weather_neg_0",
+      "tool": "weather",
+      "case_type": "negative",
+      "raw_byte_offset": 58945600,
+      "raw_token_count": 48
+    },
+    {
+      "id": "weather_neg_1",
+      "tool": "weather",
+      "case_type": "negative",
+      "raw_byte_offset": 64254016,
+      "raw_token_count": 98
+    },
+    {
+      "id": "weather_neg_2",
+      "tool": "weather",
+      "case_type": "negative",
+      "raw_byte_offset": 75092032,
+      "raw_token_count": 98
+    },
+    {
+      "id": "weather_neg_3",
+      "tool": "weather",
+      "case_type": "negative",
+      "raw_byte_offset": 85930048,
+      "raw_token_count": 119
+    },
+    {
+      "id": "weather_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 99090496,
+      "raw_token_count": 169
+    },
+    {
+      "id": "weather_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 117780544,
+      "raw_token_count": 169
+    },
+    {
+      "id": "web_search_pos_0",
+      "tool": "web_search",
+      "case_type": "positive",
+      "raw_byte_offset": 136470592,
+      "raw_token_count": 86
+    },
+    {
+      "id": "web_search_pos_1",
+      "tool": "web_search",
+      "case_type": "positive",
+      "raw_byte_offset": 145981504,
+      "raw_token_count": 74
+    },
+    {
+      "id": "web_search_pos_2",
+      "tool": "web_search",
+      "case_type": "positive",
+      "raw_byte_offset": 154165312,
+      "raw_token_count": 87
+    },
+    {
+      "id": "web_search_pos_3",
+      "tool": "web_search",
+      "case_type": "positive",
+      "raw_byte_offset": 163786816,
+      "raw_token_count": 81
+    },
+    {
+      "id": "web_search_pos_4",
+      "tool": "web_search",
+      "case_type": "positive",
+      "raw_byte_offset": 172744768,
+      "raw_token_count": 175
+    },
+    {
+      "id": "web_search_pos_5",
+      "tool": "web_search",
+      "case_type": "positive",
+      "raw_byte_offset": 192098368,
+      "raw_token_count": 78
+    },
+    {
+      "id": "web_search_bnd_0",
+      "tool": "web_search",
+      "case_type": "boundary",
+      "raw_byte_offset": 200724544,
+      "raw_token_count": 52
+    },
+    {
+      "id": "web_search_bnd_1",
+      "tool": "web_search",
+      "case_type": "boundary",
+      "raw_byte_offset": 206475328,
+      "raw_token_count": 74
+    },
+    {
+      "id": "web_search_bnd_2",
+      "tool": "web_search",
+      "case_type": "boundary",
+      "raw_byte_offset": 214659136,
+      "raw_token_count": 179
+    },
+    {
+      "id": "web_search_bnd_3",
+      "tool": "web_search",
+      "case_type": "boundary",
+      "raw_byte_offset": 234455104,
+      "raw_token_count": 64
+    },
+    {
+      "id": "web_search_neg_0",
+      "tool": "web_search",
+      "case_type": "negative",
+      "raw_byte_offset": 241532992,
+      "raw_token_count": 116
+    },
+    {
+      "id": "web_search_neg_1",
+      "tool": "web_search",
+      "case_type": "negative",
+      "raw_byte_offset": 254361664,
+      "raw_token_count": 81
+    },
+    {
+      "id": "web_search_neg_2",
+      "tool": "web_search",
+      "case_type": "negative",
+      "raw_byte_offset": 263319616,
+      "raw_token_count": 61
+    },
+    {
+      "id": "web_search_neg_3",
+      "tool": "web_search",
+      "case_type": "negative",
+      "raw_byte_offset": 270065728,
+      "raw_token_count": 59
+    },
+    {
+      "id": "web_search_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 276590656,
+      "raw_token_count": 169
+    },
+    {
+      "id": "web_search_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 295280704,
+      "raw_token_count": 170
+    },
+    {
+      "id": "file_write_pos_0",
+      "tool": "file_write",
+      "case_type": "positive",
+      "raw_byte_offset": 314081344,
+      "raw_token_count": 88
+    },
+    {
+      "id": "file_write_pos_1",
+      "tool": "file_write",
+      "case_type": "positive",
+      "raw_byte_offset": 323813440,
+      "raw_token_count": 168
+    },
+    {
+      "id": "file_write_pos_2",
+      "tool": "file_write",
+      "case_type": "positive",
+      "raw_byte_offset": 342392896,
+      "raw_token_count": 83
+    },
+    {
+      "id": "file_write_pos_3",
+      "tool": "file_write",
+      "case_type": "positive",
+      "raw_byte_offset": 351572032,
+      "raw_token_count": 92
+    },
+    {
+      "id": "file_write_pos_4",
+      "tool": "file_write",
+      "case_type": "positive",
+      "raw_byte_offset": 361746496,
+      "raw_token_count": 169
+    },
+    {
+      "id": "file_write_pos_5",
+      "tool": "file_write",
+      "case_type": "positive",
+      "raw_byte_offset": 380436544,
+      "raw_token_count": 169
+    },
+    {
+      "id": "file_write_bnd_0",
+      "tool": "file_write",
+      "case_type": "boundary",
+      "raw_byte_offset": 399126592,
+      "raw_token_count": 168
+    },
+    {
+      "id": "file_write_bnd_1",
+      "tool": "file_write",
+      "case_type": "boundary",
+      "raw_byte_offset": 417706048,
+      "raw_token_count": 170
+    },
+    {
+      "id": "file_write_bnd_2",
+      "tool": "file_write",
+      "case_type": "boundary",
+      "raw_byte_offset": 436506688,
+      "raw_token_count": 170
+    },
+    {
+      "id": "file_write_bnd_3",
+      "tool": "file_write",
+      "case_type": "boundary",
+      "raw_byte_offset": 455307328,
+      "raw_token_count": 173
+    },
+    {
+      "id": "file_write_neg_0",
+      "tool": "file_write",
+      "case_type": "negative",
+      "raw_byte_offset": 474439744,
+      "raw_token_count": 79
+    },
+    {
+      "id": "file_write_neg_1",
+      "tool": "file_write",
+      "case_type": "negative",
+      "raw_byte_offset": 483176512,
+      "raw_token_count": 78
+    },
+    {
+      "id": "file_write_neg_2",
+      "tool": "file_write",
+      "case_type": "negative",
+      "raw_byte_offset": 491802688,
+      "raw_token_count": 82
+    },
+    {
+      "id": "file_write_neg_3",
+      "tool": "file_write",
+      "case_type": "negative",
+      "raw_byte_offset": 500871232,
+      "raw_token_count": 45
+    },
+    {
+      "id": "file_write_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 505847872,
+      "raw_token_count": 173
+    },
+    {
+      "id": "file_write_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 524980288,
+      "raw_token_count": 171
+    },
+    {
+      "id": "file_read_pos_0",
+      "tool": "file_read",
+      "case_type": "positive",
+      "raw_byte_offset": 543891520,
+      "raw_token_count": 50
+    },
+    {
+      "id": "file_read_pos_1",
+      "tool": "file_read",
+      "case_type": "positive",
+      "raw_byte_offset": 549421120,
+      "raw_token_count": 49
+    },
+    {
+      "id": "file_read_pos_2",
+      "tool": "file_read",
+      "case_type": "positive",
+      "raw_byte_offset": 554840128,
+      "raw_token_count": 49
+    },
+    {
+      "id": "file_read_pos_3",
+      "tool": "file_read",
+      "case_type": "positive",
+      "raw_byte_offset": 560259136,
+      "raw_token_count": 51
+    },
+    {
+      "id": "file_read_pos_4",
+      "tool": "file_read",
+      "case_type": "positive",
+      "raw_byte_offset": 565899328,
+      "raw_token_count": 52
+    },
+    {
+      "id": "file_read_pos_5",
+      "tool": "file_read",
+      "case_type": "positive",
+      "raw_byte_offset": 571650112,
+      "raw_token_count": 47
+    },
+    {
+      "id": "file_read_bnd_0",
+      "tool": "file_read",
+      "case_type": "boundary",
+      "raw_byte_offset": 576847936,
+      "raw_token_count": 74
+    },
+    {
+      "id": "file_read_bnd_1",
+      "tool": "file_read",
+      "case_type": "boundary",
+      "raw_byte_offset": 585031744,
+      "raw_token_count": 87
+    },
+    {
+      "id": "file_read_bnd_2",
+      "tool": "file_read",
+      "case_type": "boundary",
+      "raw_byte_offset": 594653248,
+      "raw_token_count": 78
+    },
+    {
+      "id": "file_read_bnd_3",
+      "tool": "file_read",
+      "case_type": "boundary",
+      "raw_byte_offset": 603279424,
+      "raw_token_count": 92
+    },
+    {
+      "id": "file_read_neg_0",
+      "tool": "file_read",
+      "case_type": "negative",
+      "raw_byte_offset": 613453888,
+      "raw_token_count": 70
+    },
+    {
+      "id": "file_read_neg_1",
+      "tool": "file_read",
+      "case_type": "negative",
+      "raw_byte_offset": 621195328,
+      "raw_token_count": 48
+    },
+    {
+      "id": "file_read_neg_2",
+      "tool": "file_read",
+      "case_type": "negative",
+      "raw_byte_offset": 626503744,
+      "raw_token_count": 56
+    },
+    {
+      "id": "file_read_neg_3",
+      "tool": "file_read",
+      "case_type": "negative",
+      "raw_byte_offset": 632696896,
+      "raw_token_count": 66
+    },
+    {
+      "id": "file_read_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 639995968,
+      "raw_token_count": 169
+    },
+    {
+      "id": "file_read_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 658686016,
+      "raw_token_count": 172
+    },
+    {
+      "id": "code_run_pos_0",
+      "tool": "code_run",
+      "case_type": "positive",
+      "raw_byte_offset": 677707840,
+      "raw_token_count": 78
+    },
+    {
+      "id": "code_run_pos_1",
+      "tool": "code_run",
+      "case_type": "positive",
+      "raw_byte_offset": 686334016,
+      "raw_token_count": 91
+    },
+    {
+      "id": "code_run_pos_2",
+      "tool": "code_run",
+      "case_type": "positive",
+      "raw_byte_offset": 696397888,
+      "raw_token_count": 79
+    },
+    {
+      "id": "code_run_pos_3",
+      "tool": "code_run",
+      "case_type": "positive",
+      "raw_byte_offset": 705134656,
+      "raw_token_count": 77
+    },
+    {
+      "id": "code_run_pos_4",
+      "tool": "code_run",
+      "case_type": "positive",
+      "raw_byte_offset": 713650240,
+      "raw_token_count": 71
+    },
+    {
+      "id": "code_run_pos_5",
+      "tool": "code_run",
+      "case_type": "positive",
+      "raw_byte_offset": 721502272,
+      "raw_token_count": 75
+    },
+    {
+      "id": "code_run_bnd_0",
+      "tool": "code_run",
+      "case_type": "boundary",
+      "raw_byte_offset": 729796672,
+      "raw_token_count": 95
+    },
+    {
+      "id": "code_run_bnd_1",
+      "tool": "code_run",
+      "case_type": "boundary",
+      "raw_byte_offset": 740302912,
+      "raw_token_count": 62
+    },
+    {
+      "id": "code_run_bnd_2",
+      "tool": "code_run",
+      "case_type": "boundary",
+      "raw_byte_offset": 747159616,
+      "raw_token_count": 69
+    },
+    {
+      "id": "code_run_bnd_3",
+      "tool": "code_run",
+      "case_type": "boundary",
+      "raw_byte_offset": 754790464,
+      "raw_token_count": 104
+    },
+    {
+      "id": "code_run_neg_0",
+      "tool": "code_run",
+      "case_type": "negative",
+      "raw_byte_offset": 766292032,
+      "raw_token_count": 112
+    },
+    {
+      "id": "code_run_neg_1",
+      "tool": "code_run",
+      "case_type": "negative",
+      "raw_byte_offset": 778678336,
+      "raw_token_count": 66
+    },
+    {
+      "id": "code_run_neg_2",
+      "tool": "code_run",
+      "case_type": "negative",
+      "raw_byte_offset": 785977408,
+      "raw_token_count": 82
+    },
+    {
+      "id": "code_run_neg_3",
+      "tool": "code_run",
+      "case_type": "negative",
+      "raw_byte_offset": 795045952,
+      "raw_token_count": 88
+    },
+    {
+      "id": "code_run_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 804778048,
+      "raw_token_count": 174
+    },
+    {
+      "id": "code_run_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 824021056,
+      "raw_token_count": 170
+    },
+    {
+      "id": "datetime_pos_0",
+      "tool": "datetime",
+      "case_type": "positive",
+      "raw_byte_offset": 842821696,
+      "raw_token_count": 53
+    },
+    {
+      "id": "datetime_pos_1",
+      "tool": "datetime",
+      "case_type": "positive",
+      "raw_byte_offset": 848683072,
+      "raw_token_count": 53
+    },
+    {
+      "id": "datetime_pos_2",
+      "tool": "datetime",
+      "case_type": "positive",
+      "raw_byte_offset": 854544448,
+      "raw_token_count": 53
+    },
+    {
+      "id": "datetime_pos_3",
+      "tool": "datetime",
+      "case_type": "positive",
+      "raw_byte_offset": 860405824,
+      "raw_token_count": 53
+    },
+    {
+      "id": "datetime_pos_4",
+      "tool": "datetime",
+      "case_type": "positive",
+      "raw_byte_offset": 866267200,
+      "raw_token_count": 52
+    },
+    {
+      "id": "datetime_pos_5",
+      "tool": "datetime",
+      "case_type": "positive",
+      "raw_byte_offset": 872017984,
+      "raw_token_count": 48
+    },
+    {
+      "id": "datetime_bnd_0",
+      "tool": "datetime",
+      "case_type": "boundary",
+      "raw_byte_offset": 877326400,
+      "raw_token_count": 56
+    },
+    {
+      "id": "datetime_bnd_1",
+      "tool": "datetime",
+      "case_type": "boundary",
+      "raw_byte_offset": 883519552,
+      "raw_token_count": 51
+    },
+    {
+      "id": "datetime_bnd_2",
+      "tool": "datetime",
+      "case_type": "boundary",
+      "raw_byte_offset": 889159744,
+      "raw_token_count": 57
+    },
+    {
+      "id": "datetime_bnd_3",
+      "tool": "datetime",
+      "case_type": "boundary",
+      "raw_byte_offset": 895463488,
+      "raw_token_count": 53
+    },
+    {
+      "id": "datetime_neg_0",
+      "tool": "datetime",
+      "case_type": "negative",
+      "raw_byte_offset": 901324864,
+      "raw_token_count": 50
+    },
+    {
+      "id": "datetime_neg_1",
+      "tool": "datetime",
+      "case_type": "negative",
+      "raw_byte_offset": 906854464,
+      "raw_token_count": 48
+    },
+    {
+      "id": "datetime_neg_2",
+      "tool": "datetime",
+      "case_type": "negative",
+      "raw_byte_offset": 912162880,
+      "raw_token_count": 52
+    },
+    {
+      "id": "datetime_neg_3",
+      "tool": "datetime",
+      "case_type": "negative",
+      "raw_byte_offset": 917913664,
+      "raw_token_count": 50
+    },
+    {
+      "id": "datetime_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 923443264,
+      "raw_token_count": 168
+    },
+    {
+      "id": "datetime_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 942022720,
+      "raw_token_count": 169
+    },
+    {
+      "id": "calculator_pos_0",
+      "tool": "calculator",
+      "case_type": "positive",
+      "raw_byte_offset": 960712768,
+      "raw_token_count": 56
+    },
+    {
+      "id": "calculator_pos_1",
+      "tool": "calculator",
+      "case_type": "positive",
+      "raw_byte_offset": 966905920,
+      "raw_token_count": 55
+    },
+    {
+      "id": "calculator_pos_2",
+      "tool": "calculator",
+      "case_type": "positive",
+      "raw_byte_offset": 972988480,
+      "raw_token_count": 58
+    },
+    {
+      "id": "calculator_pos_3",
+      "tool": "calculator",
+      "case_type": "positive",
+      "raw_byte_offset": 979402816,
+      "raw_token_count": 51
+    },
+    {
+      "id": "calculator_pos_4",
+      "tool": "calculator",
+      "case_type": "positive",
+      "raw_byte_offset": 985043008,
+      "raw_token_count": 54
+    },
+    {
+      "id": "calculator_pos_5",
+      "tool": "calculator",
+      "case_type": "positive",
+      "raw_byte_offset": 991014976,
+      "raw_token_count": 75
+    },
+    {
+      "id": "calculator_bnd_0",
+      "tool": "calculator",
+      "case_type": "boundary",
+      "raw_byte_offset": 999309376,
+      "raw_token_count": 57
+    },
+    {
+      "id": "calculator_bnd_1",
+      "tool": "calculator",
+      "case_type": "boundary",
+      "raw_byte_offset": 1005613120,
+      "raw_token_count": 53
+    },
+    {
+      "id": "calculator_bnd_2",
+      "tool": "calculator",
+      "case_type": "boundary",
+      "raw_byte_offset": 1011474496,
+      "raw_token_count": 59
+    },
+    {
+      "id": "calculator_bnd_3",
+      "tool": "calculator",
+      "case_type": "boundary",
+      "raw_byte_offset": 1017999424,
+      "raw_token_count": 59
+    },
+    {
+      "id": "calculator_neg_0",
+      "tool": "calculator",
+      "case_type": "negative",
+      "raw_byte_offset": 1024524352,
+      "raw_token_count": 70
+    },
+    {
+      "id": "calculator_neg_1",
+      "tool": "calculator",
+      "case_type": "negative",
+      "raw_byte_offset": 1032265792,
+      "raw_token_count": 54
+    },
+    {
+      "id": "calculator_neg_2",
+      "tool": "calculator",
+      "case_type": "negative",
+      "raw_byte_offset": 1038237760,
+      "raw_token_count": 55
+    },
+    {
+      "id": "calculator_neg_3",
+      "tool": "calculator",
+      "case_type": "negative",
+      "raw_byte_offset": 1044320320,
+      "raw_token_count": 65
+    },
+    {
+      "id": "calculator_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 1051508800,
+      "raw_token_count": 171
+    },
+    {
+      "id": "calculator_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 1070420032,
+      "raw_token_count": 184
+    },
+    {
+      "id": "random_pos_0",
+      "tool": "random",
+      "case_type": "positive",
+      "raw_byte_offset": 1090768960,
+      "raw_token_count": 56
+    },
+    {
+      "id": "random_pos_1",
+      "tool": "random",
+      "case_type": "positive",
+      "raw_byte_offset": 1096962112,
+      "raw_token_count": 63
+    },
+    {
+      "id": "random_pos_2",
+      "tool": "random",
+      "case_type": "positive",
+      "raw_byte_offset": 1103929408,
+      "raw_token_count": 69
+    },
+    {
+      "id": "random_pos_3",
+      "tool": "random",
+      "case_type": "positive",
+      "raw_byte_offset": 1111560256,
+      "raw_token_count": 57
+    },
+    {
+      "id": "random_pos_4",
+      "tool": "random",
+      "case_type": "positive",
+      "raw_byte_offset": 1117864000,
+      "raw_token_count": 71
+    },
+    {
+      "id": "random_pos_5",
+      "tool": "random",
+      "case_type": "positive",
+      "raw_byte_offset": 1125716032,
+      "raw_token_count": 73
+    },
+    {
+      "id": "random_bnd_0",
+      "tool": "random",
+      "case_type": "boundary",
+      "raw_byte_offset": 1133789248,
+      "raw_token_count": 102
+    },
+    {
+      "id": "random_bnd_1",
+      "tool": "random",
+      "case_type": "boundary",
+      "raw_byte_offset": 1145069632,
+      "raw_token_count": 67
+    },
+    {
+      "id": "random_bnd_2",
+      "tool": "random",
+      "case_type": "boundary",
+      "raw_byte_offset": 1152479296,
+      "raw_token_count": 64
+    },
+    {
+      "id": "random_bnd_3",
+      "tool": "random",
+      "case_type": "boundary",
+      "raw_byte_offset": 1159557184,
+      "raw_token_count": 160
+    },
+    {
+      "id": "random_neg_0",
+      "tool": "random",
+      "case_type": "negative",
+      "raw_byte_offset": 1177251904,
+      "raw_token_count": 51
+    },
+    {
+      "id": "random_neg_1",
+      "tool": "random",
+      "case_type": "negative",
+      "raw_byte_offset": 1182892096,
+      "raw_token_count": 65
+    },
+    {
+      "id": "random_neg_2",
+      "tool": "random",
+      "case_type": "negative",
+      "raw_byte_offset": 1190080576,
+      "raw_token_count": 54
+    },
+    {
+      "id": "random_neg_3",
+      "tool": "random",
+      "case_type": "negative",
+      "raw_byte_offset": 1196052544,
+      "raw_token_count": 53
+    },
+    {
+      "id": "random_no_tool_0",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 1201913920,
+      "raw_token_count": 173
+    },
+    {
+      "id": "random_no_tool_1",
+      "tool": null,
+      "case_type": "no_tool",
+      "raw_byte_offset": 1221046336,
+      "raw_token_count": 170
+    }
+  ]
+}
