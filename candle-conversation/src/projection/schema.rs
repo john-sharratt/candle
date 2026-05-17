@@ -405,6 +405,13 @@ pub enum ScoreFormula {
     /// hits score 1.0; a run of 3 scores 9.0.  The group-level aggregate
     /// (turn scores → group score) uses Max of per-turn span scores.
     Span { alpha: f32 },
+    /// Per-token excess: Σ over probe tokens of `max(0, best_agreement − 64)`.
+    /// Recentered on the random XOR-popcount baseline and reduced per probe
+    /// token, with no hit threshold.  Calibrated as the strongest
+    /// **prefill-phase** section-scoring formula — it recovers the weak,
+    /// sub-threshold signal that `Span` (run-based) and `Max` (extreme-value)
+    /// miss when the model is *reading* a query rather than generating.
+    PerTokenExcess,
 }
 
 /// The complete parsed, validated schema. Immutable after construction.

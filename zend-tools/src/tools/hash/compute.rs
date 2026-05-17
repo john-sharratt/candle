@@ -28,8 +28,10 @@ pub struct HashCompute;
 impl Tool for HashCompute {
     const NAME: &'static str = "hash_compute";
     const DESCRIPTION: &'static str =
-        "Compute a cryptographic hash of data. Supports sha256, sha512, sha1, md5, \
-         sha3_256, sha3_512, blake3. Returns hex or base64 digest.";
+        "Compute a one-shot cryptographic digest — a fixed-size fingerprint — \
+         of data, using sha256, sha512, sha1, md5, sha3_256, sha3_512, or \
+         blake3. Returns the digest as hex or base64 for content \
+         fingerprinting and integrity checks.";
 
     type Request = ComputeRequest;
     type Response = ComputeResponse;

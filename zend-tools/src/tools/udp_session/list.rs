@@ -27,7 +27,7 @@ pub struct UdpSessionList;
 
 impl Tool for UdpSessionList {
     const NAME: &'static str = "udp_session_list";
-    const DESCRIPTION: &'static str = "List all open UDP sessions.";
+    const DESCRIPTION: &'static str = "Enumerate the UDP datagram sockets currently bound in this conversation, with each default peer.";
 
     type Request = ListRequest;
     type Response = ListResponse;

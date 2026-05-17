@@ -169,13 +169,6 @@ pub struct SamplingConfig {
     /// `.`, `!`, `?`, `\n`).  If empty, `graceful_eot_after` is a no-op.
     pub sentence_end_token_ids: Vec<i32>,
 
-    /// Token ID for the bare newline character `\n`.
-    ///
-    /// Resolved automatically from the tokenizer at engine startup.
-    /// Used to inject a newline before a forced `</think>` so the closing
-    /// tag always starts on its own line.  `-1` = not found / disabled.
-    pub newline_token_id: i32,
-
     /// After this many generated tokens, wait for the next sentence-ending
     /// token (`.`, `!`, `?`, or `\n` — resolved from the tokenizer at engine
     /// startup) and then emit EOS.  Mirrors the `graceful_eot_after` mechanism
@@ -232,7 +225,6 @@ impl Default for SamplingConfig {
             force_eot_after: 0,
             graceful_eot_after: 0,
             sentence_end_token_ids: Vec::new(),
-            newline_token_id: -1,
             graceful_eos_after: 0,
             forced_eos_after: 0,
             banned_tokens: Vec::new(),
@@ -297,16 +289,15 @@ impl SamplingConfig {
             // token IDs are resolved automatically from the tokenizer in
             // `resolve_thinking_tokens()` during engine startup.
             "qwen3" | "qwen3moe" | "qwen2moe" => Self::top_k_top_p(40, 0.95, 0.8)
-                .with_repeat_penalty(1.05)
+                // Matched to the LM Studio reference run: temp=0.8, top_k=40,
+                // top_p=0.95, repeat_penalty=1.1.  The DRY, presence, and
+                // cross-turn penalties were dropped (2026-05-17): DRY's
+                // exponential n-gram penalty corrupts verbatim copying of
+                // numbers, identifiers, and code — unacceptable for a coding
+                // assistant — and the reference run uses none of them.  Only
+                // a gentle multiplicative repeat_penalty remains.
+                .with_repeat_penalty(1.1)
                 .with_repeat_last_n(128)
-                .with_presence_penalty(0.2)
-                .with_cross_turn_penalty(1.03)
-                // DRY: range 1024 covers ~5 full turns of 200-token responses within
-                // the 2048-token recent buffer.  allowed_length=2 so 3-token matches
-                // start getting a soft nudge (0.48); stays gentle through token 5 (1.23)
-                // then accelerates sharply — 5.04 at 8 tokens and beyond.
-                // multiplier=0.3, base=1.6: low entry point, high exponential tail.
-                .with_dry_penalty(0.3, 1.6, 2, 1024)
                 // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400.
                 // eot_ramp_start/len are in thinking-token counts; these IDs are resolved
                 // from the tokenizer at engine startup.
@@ -570,13 +561,6 @@ impl SamplingConfig {
             self.think_start_token_id = id as i32;
             tracing::debug!("Resolved <think> token ID: {}", id);
         }
-        // Resolve the bare newline token ID for EOT newline injection.
-        self.newline_token_id = tokenizer
-            .token_to_id("\n")
-            .map(|id| id as i32)
-            .unwrap_or(-1);
-        tracing::debug!("Resolved \\n token ID: {}", self.newline_token_id);
-
         // Resolve sentence-end token IDs for graceful_eot_after.
         // We probe both the bare character and common BPE compound forms.
         self.sentence_end_token_ids.clear();

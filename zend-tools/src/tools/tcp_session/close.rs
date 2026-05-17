@@ -23,7 +23,7 @@ pub struct TcpSessionClose;
 
 impl Tool for TcpSessionClose {
     const NAME: &'static str = "tcp_session_close";
-    const DESCRIPTION: &'static str = "Close a TCP session.";
+    const DESCRIPTION: &'static str = "Close a raw TCP stream socket, dropping the connection and freeing its buffers. Use when a custom-protocol or non-HTTP byte-stream exchange is finished.";
 
     type Request = CloseRequest;
     type Response = CloseResponse;

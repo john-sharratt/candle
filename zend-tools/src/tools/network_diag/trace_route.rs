@@ -35,8 +35,9 @@ pub struct TraceRoute;
 impl Tool for TraceRoute {
     const NAME: &'static str = "trace_route";
     const DESCRIPTION: &'static str =
-        "Trace the network path to a host showing each hop. \
-         Use for: diagnosing routing issues, measuring per-hop latency.";
+        "Map the router-by-router path packets take to reach a host, \
+         reporting every intermediate hop and its latency. Use to locate \
+         where along the route traffic fails or slows.";
 
     type Request = TraceRequest;
     type Response = TraceResponse;

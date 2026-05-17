@@ -28,7 +28,7 @@ pub struct TelnetSessionList;
 
 impl Tool for TelnetSessionList {
     const NAME: &'static str = "telnet_session_list";
-    const DESCRIPTION: &'static str = "List all open Telnet sessions.";
+    const DESCRIPTION: &'static str = "Enumerate the Telnet terminal sessions currently open to network devices in this conversation.";
 
     type Request = ListRequest;
     type Response = ListResponse;

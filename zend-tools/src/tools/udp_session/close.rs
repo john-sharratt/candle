@@ -23,7 +23,7 @@ pub struct UdpSessionClose;
 
 impl Tool for UdpSessionClose {
     const NAME: &'static str = "udp_session_close";
-    const DESCRIPTION: &'static str = "Close a UDP session.";
+    const DESCRIPTION: &'static str = "Release a UDP datagram socket and free its bound port. Connectionless — no peer is notified.";
 
     type Request = CloseRequest;
     type Response = CloseResponse;

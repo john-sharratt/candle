@@ -29,8 +29,9 @@ pub struct HkdfExtract;
 impl Tool for HkdfExtract {
     const NAME: &'static str = "hkdf_extract";
     const DESCRIPTION: &'static str =
-        "HKDF-Extract: derive a pseudorandom key from input key material. \
-         Part of RFC 5869 HKDF. Supports sha256 and sha512.";
+        "HKDF-Extract (RFC 5869): condense raw, possibly non-uniform input \
+         key material into one uniformly-random pseudorandom key — the first \
+         stage of the HKDF derivation chain. Supports sha256 and sha512.";
 
     type Request = HkdfExtractRequest;
     type Response = HkdfExtractResponse;

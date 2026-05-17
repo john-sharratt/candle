@@ -28,7 +28,9 @@ pub struct HashStateFinalize;
 impl Tool for HashStateFinalize {
     const NAME: &'static str = "hash_state_finalize";
     const DESCRIPTION: &'static str =
-        "Finalize a hash state and return the digest. By default deletes the state after.";
+        "Conclude a streaming hash computation and emit the final digest over \
+         everything absorbed so far, discarding the accumulated state by \
+         default.";
 
     type Request = FinalizeRequest;
     type Response = FinalizeResponse;

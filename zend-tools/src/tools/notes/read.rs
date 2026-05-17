@@ -27,7 +27,9 @@ pub struct NotesRead;
 
 impl Tool for NotesRead {
     const NAME: &'static str = "notes_read";
-    const DESCRIPTION: &'static str = "Read a note by key from persistent storage.";
+    const DESCRIPTION: &'static str =
+        "Retrieve the full body content of one stored note by its exact key. \
+         Notes persist across conversations.";
 
     type Request = ReadRequest;
     type Response = ReadResponse;

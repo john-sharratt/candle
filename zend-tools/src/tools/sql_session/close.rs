@@ -24,7 +24,7 @@ pub struct SqlSessionClose;
 impl Tool for SqlSessionClose {
     const NAME: &'static str = "sql_session_close";
     const DESCRIPTION: &'static str =
-        "Close a SQL session, releasing the database connection.";
+        "End a database session, releasing its SQLite connection handle.";
     type Request = CloseRequest;
     type Response = CloseResponse;
     type Error = SqlError;

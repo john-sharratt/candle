@@ -28,7 +28,7 @@ pub struct TcpSessionList;
 
 impl Tool for TcpSessionList {
     const NAME: &'static str = "tcp_session_list";
-    const DESCRIPTION: &'static str = "List all open TCP sessions.";
+    const DESCRIPTION: &'static str = "Enumerate the raw TCP stream sockets currently open in this conversation, with each peer address and idle state.";
 
     type Request = ListRequest;
     type Response = ListResponse;

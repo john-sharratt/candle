@@ -264,6 +264,9 @@ impl RawProvenanceFile {
 
         let mut state = self.state.lock().unwrap();
         let byte_offset = state.write_pos;
+
+        use std::io::Seek;
+        state.file.seek(std::io::SeekFrom::Start(byte_offset))?;
         state.file.write_all(token_data)?;
         state.file.flush()?;
         state.write_pos += token_data.len() as u64;

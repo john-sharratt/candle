@@ -2147,9 +2147,9 @@ layers:
         g,
         idx,
         PerDepthScores {
-            syn: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0 },
-            sem: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0 },
-            prag: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0 },
+            syn: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
+            sem: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
+            prag: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
         },
     );
 

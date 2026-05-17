@@ -470,7 +470,6 @@ impl Scheduler {
                             hs
                         },
                         reprojection: work.reprojection,
-                        last_reproject_at: 0,
                         prov_sig_entries: Vec::new(),
                     },
                 );
@@ -519,12 +518,6 @@ impl Scheduler {
                     hs
                 },
                 reprojection: work.reprojection,
-                // Probe window starts at decode-start; the first reproject
-                // fires after `every_n_tokens` decoded tokens, at which
-                // point the probe spans the just-decoded tokens (plus the
-                // first sampled token already pre-installed in
-                // `generated_tokens`).
-                last_reproject_at: 0,
                 prov_sig_entries: Vec::new(),
             },
         );

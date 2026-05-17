@@ -35,8 +35,10 @@ pub struct AeadDecrypt;
 impl Tool for AeadDecrypt {
     const NAME: &'static str = "aead_decrypt";
     const DESCRIPTION: &'static str =
-        "Decrypt data with an AEAD cipher (AES-256-GCM or ChaCha20-Poly1305). \
-         Returns plaintext as text if valid UTF-8, otherwise hex.";
+        "Decrypt and authenticate AEAD ciphertext — AES-256-GCM or \
+         ChaCha20-Poly1305 — verifying the integrity tag and rejecting any \
+         tampered input. Returns recovered plaintext as text when valid \
+         UTF-8, otherwise hex.";
 
     type Request = AeadDecryptRequest;
     type Response = AeadDecryptResponse;

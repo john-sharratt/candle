@@ -616,6 +616,49 @@ impl Sequence {
         rx.recv().map_err(|_| ConversationError::SchedulerGone)?
     }
 
+    /// Prefill `text` through a throw-away scratch slot and return the
+    /// Q-sign-bit [`SigEntry`] values extracted from that prefill.
+    ///
+    /// No decode step is run; the slot is freed immediately after the seal.
+    /// The returned entries reference the same engine-level
+    /// [`ProvenanceFile`] that [`ConversationEngine::provenance_file`]
+    /// returns, so callers can read the raw bytes back with
+    /// `pf.read_entry(entry)`.
+    ///
+    /// Intended for the calibration harness: generates prefill-phase Q
+    /// vectors from representative user prompts so they can be compared
+    /// against decode-phase vectors to measure the information gain of
+    /// running a full decode probe.
+    pub fn prefill_sigs_for(
+        &self,
+        text: &str,
+    ) -> crate::Result<Vec<crate::provenance::SigEntry>> {
+        let tokens = self.tokenize(text)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Use a reserved throwaway section ID — the substrate entry for
+        // this ID is overwritten on each call, which is harmless since
+        // callers read from `seal.new_sig_entries` directly rather than
+        // from the substrate.
+        let dummy_id = SectionId::new(u32::MAX);
+        let slot_id = self.alloc_scratch_slot()?;
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::IngestSection {
+                sequence_id: slot_id,
+                section_id: dummy_id,
+                prefix_section_ids: vec![],
+                tokens,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        let seal = rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+        let _ = self.scheduler_tx.send(SchedulerRequest::FreeSequence {
+            sequence_id: slot_id,
+        });
+        Ok(seal.new_sig_entries)
+    }
 
     /// Submit a user turn for processing.
     ///
@@ -1406,6 +1449,19 @@ impl Sequence {
             d.no_think_block,
             d.no_think,
             d.think_block,
+        ] {
+            add(&mut ids, s);
+        }
+
+        // Category 4: JSON structural punctuation.  Tool-definition
+        // sections are prefilled as JSON blobs and tool calls are emitted
+        // as JSON; braces, brackets, quotes and separators carry no
+        // semantic signal and match across every section purely on shared
+        // JSON structure — pure BDP noise.  Both bare forms and the BPE
+        // merges a tokenizer emits inside compact JSON are added.
+        for s in [
+            "{", "}", "[", "]", ":", ",", "\"",
+            "{\"", "\"}", "\"}}", "\":\"", "\",\"", "\":", "\",", "[{", "}]",
         ] {
             add(&mut ids, s);
         }

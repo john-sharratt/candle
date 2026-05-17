@@ -30,7 +30,7 @@ pub struct SshSessionList;
 
 impl Tool for SshSessionList {
     const NAME: &'static str = "ssh_session_list";
-    const DESCRIPTION: &'static str = "List all open SSH sessions with their status.";
+    const DESCRIPTION: &'static str = "Enumerate the secure shell sessions currently logged in to remote servers, with each host and connection status.";
 
     type Request = ListRequest;
     type Response = ListResponse;

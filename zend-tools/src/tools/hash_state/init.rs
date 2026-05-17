@@ -27,9 +27,10 @@ pub struct HashStateInit;
 impl Tool for HashStateInit {
     const NAME: &'static str = "hash_state_init";
     const DESCRIPTION: &'static str =
-        "Initialize an incremental hash state for streaming data. \
-         Use for: hashing large data in chunks, computing checksums over streams. \
-         Returns id for subsequent update/finalize calls.";
+        "Begin an incremental, streaming hash computation — data is fed in \
+         chunks rather than all at once. Returns a state id for the \
+         subsequent hash_state_update and hash_state_finalize calls. Use \
+         when the input is too large to hold in memory at once.";
 
     type Request = InitRequest;
     type Response = InitResponse;

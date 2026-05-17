@@ -32,8 +32,9 @@ pub struct HkdfExpandLabel;
 impl Tool for HkdfExpandLabel {
     const NAME: &'static str = "hkdf_expand_label";
     const DESCRIPTION: &'static str =
-        "TLS 1.3 HKDF-Expand-Label. Derives keying material from a PRK using a labeled context. \
-         Use for: TLS key schedule analysis, deriving traffic secrets.";
+        "HKDF-Expand-Label from the TLS 1.3 key schedule: expand a \
+         pseudorandom key into named traffic secrets using a labeled, \
+         versioned context. Use for TLS 1.3 key-schedule analysis.";
 
     type Request = HkdfExpandLabelRequest;
     type Response = HkdfExpandLabelResponse;

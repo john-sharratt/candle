@@ -30,7 +30,9 @@ pub struct FileList;
 impl Tool for FileList {
     const NAME: &'static str = "file_list";
     const DESCRIPTION: &'static str =
-        "List files in the virtual filesystem, optionally filtered by path prefix.";
+        "Enumerate the files currently in the session virtual filesystem, \
+         optionally narrowed to a path prefix. Returns names and sizes, not \
+         file contents.";
 
     type Request = ListRequest;
     type Response = ListResponse;

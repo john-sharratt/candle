@@ -30,8 +30,9 @@ pub struct BytesTranscode;
 impl Tool for BytesTranscode {
     const NAME: &'static str = "bytes_transcode";
     const DESCRIPTION: &'static str =
-        "Convert data between encodings: hex, base64, base64url, utf8. \
-         Use for: encoding conversions, format normalization.";
+        "Re-encode data between byte representations — hex, base64, \
+         base64url, and raw utf8 — without changing the underlying bytes. \
+         Use to normalize how a payload is written, not what it contains.";
 
     type Request = TranscodeRequest;
     type Response = TranscodeResponse;

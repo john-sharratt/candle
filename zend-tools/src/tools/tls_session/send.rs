@@ -26,7 +26,7 @@ pub struct TlsSessionSend;
 
 impl Tool for TlsSessionSend {
     const NAME: &'static str = "tls_session_send";
-    const DESCRIPTION: &'static str = "Send data over an open TLS session.";
+    const DESCRIPTION: &'static str = "Transmit application data over an open TLS channel; the payload is encrypted on the wire automatically.";
 
     type Request = SendRequest;
     type Response = SendResponse;

@@ -23,7 +23,7 @@ pub struct TelnetSessionClose;
 
 impl Tool for TelnetSessionClose {
     const NAME: &'static str = "telnet_session_close";
-    const DESCRIPTION: &'static str = "Close a Telnet session.";
+    const DESCRIPTION: &'static str = "End a Telnet terminal session to a network device, releasing the plaintext terminal connection.";
 
     type Request = CloseRequest;
     type Response = CloseResponse;

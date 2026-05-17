@@ -32,8 +32,9 @@ pub struct HmacCompute;
 impl Tool for HmacCompute {
     const NAME: &'static str = "hmac_compute";
     const DESCRIPTION: &'static str =
-        "Compute an HMAC over data using a key. Supports sha256, sha512, sha1. \
-         Use for: API request signing, message authentication.";
+        "Compute a keyed HMAC authentication tag over a message (sha256, \
+         sha512, or sha1). Use to sign API requests or to confirm a message \
+         arrived unaltered from a party holding the shared secret key.";
 
     type Request = HmacRequest;
     type Response = HmacResponse;

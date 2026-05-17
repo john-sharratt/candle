@@ -25,8 +25,9 @@ pub struct HostInfo;
 impl Tool for HostInfo {
     const NAME: &'static str = "host_info";
     const DESCRIPTION: &'static str =
-        "Resolve a hostname to IPs and perform reverse DNS lookup. \
-         Use for: host investigation, checking DNS records.";
+        "Profile a host: resolve its name to IP addresses, then run a \
+         reverse-DNS lookup back from those IPs. Use for host identification \
+         and DNS-record auditing — no connectivity probe is sent.";
 
     type Request = HostInfoRequest;
     type Response = HostInfoResponse;

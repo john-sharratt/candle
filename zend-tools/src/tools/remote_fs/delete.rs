@@ -27,7 +27,7 @@ pub struct RemoteFsSessionDelete;
 
 impl Tool for RemoteFsSessionDelete {
     const NAME: &'static str = "remote_fs_session_delete";
-    const DESCRIPTION: &'static str = "Delete a file on the remote SFTP filesystem.";
+    const DESCRIPTION: &'static str = "Remove a file on a remote host's filesystem over SFTP. For the local session VFS use file_delete instead.";
     type Request = DeleteRequest;
     type Response = DeleteResponse;
     type Error = RemoteFsError;

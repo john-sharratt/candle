@@ -28,6 +28,9 @@ mod cases {
     mod conversation_layer;
     mod file_layer;
     mod formula_comparison;
+    mod formula_experiments;
+    mod prefill_formula_comparison;
+    mod production_query_diagnostic;
     mod raw_strategy_comparison;
     mod report;
     mod tools_layer;

@@ -216,7 +216,7 @@ pub use error::ConstructionError;
 pub use ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnId, TurnIndex,
 };
-pub use project::{Projection, ProjectionTarget, ResolvedSection, ResolvedTurn};
+pub use project::{Projection, ProjectionMode, ProjectionTarget, ResolvedSection, ResolvedTurn};
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};
 pub use crate::substrate::{

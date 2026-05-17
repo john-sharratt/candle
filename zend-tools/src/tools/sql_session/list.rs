@@ -19,7 +19,7 @@ pub struct SqlSessionList;
 
 impl Tool for SqlSessionList {
     const NAME: &'static str = "sql_session_list";
-    const DESCRIPTION: &'static str = "List open SQL sessions for the current conversation.";
+    const DESCRIPTION: &'static str = "Enumerate the database sessions currently open in this conversation, with each database path and connection state.";
     type Request = ListRequest;
     type Response = ListResponse;
     type Error = SqlError;

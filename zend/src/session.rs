@@ -118,12 +118,15 @@ impl InferenceState {
             .map_err(|e| anyhow::anyhow!("base conv create: {e}"))?;
 
         // Section ingestion (prelude + parallel tool-section forks +
-        // outro) now happens eagerly inside
+        // outro) happens eagerly inside
         // `new_conversation_with_projection`: the schema's declared
         // sections / collections are pinned into the workspace
         // substrate at construction time via `insert_section` /
-        // `insert_section_collection`.  The standalone
-        // `preemptive_prefill()` shim has been removed.
+        // `insert_section_collection`.  Each tool section's BDP sigs come
+        // from that single prefill of its JSON definition; JSON
+        // structural tokens are excluded from the reprojection probe
+        // (`build_reproject_probe_filter_token_ids`) so they don't add
+        // shared-structure noise to section scoring.
         tracing::info!(
             n_tool_sections = tool_sections.len(),
             "base conversation ready (prelude + tool catalog + outro pinned at init)",

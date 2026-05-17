@@ -30,7 +30,7 @@ pub struct RemoteFsSessionStat;
 
 impl Tool for RemoteFsSessionStat {
     const NAME: &'static str = "remote_fs_session_stat";
-    const DESCRIPTION: &'static str = "Stat a file or directory on a remote SFTP filesystem.";
+    const DESCRIPTION: &'static str = "Retrieve metadata — size, type, permissions, timestamps — for one file or directory on a remote host over SFTP, without transferring contents.";
     type Request = StatRequest;
     type Response = StatResponse;
     type Error = RemoteFsError;

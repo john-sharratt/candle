@@ -392,6 +392,37 @@
     .lv-INFO  { color: #38b285; background: rgba(45,154,114,0.14); }
     .lv-WARN  { color: #d4a020; background: rgba(212,160,32,0.14); }
     .lv-ERROR { color: #e05555; background: rgba(224,85,85,0.14); }
+
+    /* ── Tool call card ───────────────────────────────────────────────── */
+    .tool-call-card {
+      margin: 0.5rem 0;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent-dim);
+      border-radius: 8px;
+      overflow: hidden;
+      font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace;
+      font-size: 0.82rem;
+    }
+    .tool-call-card.tool-call-pending { border-left-color: var(--text-muted); }
+    .tool-call-header {
+      display: flex; align-items: center; gap: 0.5rem;
+      padding: 0.4rem 0.75rem;
+      background: var(--bg-code-hdr);
+      border-bottom: 1px solid var(--border-code);
+    }
+    .tool-call-icon { color: var(--accent-dim); font-size: 0.8rem; }
+    .tool-call-name { font-weight: 600; color: var(--accent); letter-spacing: 0.02em; }
+    .tool-call-card.tool-call-pending .tool-call-name {
+      color: var(--text-muted);
+      animation: tool-pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes tool-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .tool-call-args { padding: 0.4rem 0.75rem 0.5rem; display: flex; flex-direction: column; gap: 0.15rem; }
+    .tool-call-arg  { display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; }
+    .tool-call-arg-key { color: var(--text-dim); white-space: nowrap; }
+    .tool-call-arg-sep { color: var(--text-muted); }
+    .tool-call-arg-val { color: var(--text-code); word-break: break-word; }
   </style>
 </head>
 <body>
@@ -574,7 +605,7 @@ function rebuildChatView(conv) {
       if (msg.role === 'user') appendUserTurn(msg.content);
       else {
         const { bubble, cursor } = appendAssistantTurn();
-        bubble.innerHTML = renderMd(msg.content);
+        bubble.innerHTML = renderContent(msg.content, false);
         cursor.remove();
       }
     }
@@ -673,6 +704,72 @@ function preprocess(raw) {
 
 function renderMd(raw) {
   return marked.parse(preprocess(raw));
+}
+
+function renderToolCallCard({ complete, json }) {
+  if (!complete) {
+    return '<div class="tool-call-card tool-call-pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
+  }
+  let parsed;
+  try { parsed = JSON.parse(json.trim()); } catch {
+    return `<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">tool call</span></div><div class="tool-call-args"><div class="tool-call-arg"><span class="tool-call-arg-val">${esc(json.trim())}</span></div></div></div>`;
+  }
+  const name = parsed.name || '(unknown)';
+  const args = parsed.arguments ?? parsed.params ?? {};
+  const argsHtml = Object.entries(args).map(([k, v]) =>
+    `<div class="tool-call-arg"><span class="tool-call-arg-key">${esc(k)}</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">${esc(typeof v === 'string' ? v : JSON.stringify(v))}</span></div>`
+  ).join('');
+  return `<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">${esc(name)}</span></div>${argsHtml ? `<div class="tool-call-args">${argsHtml}</div>` : ''}</div>`;
+}
+
+function renderContent(text, streaming) {
+  const segments = [];
+  let remaining = text;
+
+  // Complete tool calls with opener: <tool_call>JSON</tool_call>
+  remaining = remaining.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (_, json) => {
+    const marker = `\x00TC:${segments.length}\x00`;
+    segments.push({ complete: true, json });
+    return marker;
+  });
+
+  // Complete tool calls without opener (Qwen3 quirk): JSON}</tool_call>
+  while (remaining.includes('</tool_call>')) {
+    const closeIdx = remaining.indexOf('</tool_call>');
+    const before = remaining.slice(0, closeIdx);
+    const jsonStart = before.lastIndexOf('{');
+    if (jsonStart !== -1) {
+      const marker = `\x00TC:${segments.length}\x00`;
+      segments.push({ complete: true, json: before.slice(jsonStart) });
+      remaining = before.slice(0, jsonStart) + marker + remaining.slice(closeIdx + '</tool_call>'.length);
+    } else {
+      remaining = before + remaining.slice(closeIdx + '</tool_call>'.length);
+    }
+  }
+
+  // Incomplete opener at end (still streaming)
+  const openIdx = remaining.lastIndexOf('<tool_call>');
+  if (openIdx !== -1) {
+    if (streaming) {
+      const marker = `\x00TC:${segments.length}\x00`;
+      segments.push({ complete: false, json: remaining.slice(openIdx + '<tool_call>'.length) });
+      remaining = remaining.slice(0, openIdx) + marker;
+    } else {
+      remaining = remaining.slice(0, openIdx) + remaining.slice(openIdx + '<tool_call>'.length);
+    }
+  }
+
+  // Render: split on \x00TC:N\x00 markers, alternating text / tool-call
+  const parts = remaining.split(/\x00TC:(\d+)\x00/);
+  let html = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) {
+      if (parts[i]) html += marked.parse(preprocess(parts[i]));
+    } else {
+      html += renderToolCallCard(segments[parseInt(parts[i], 10)]);
+    }
+  }
+  return html;
 }
 
 function copyCode(btn) {
@@ -785,7 +882,7 @@ async function send(text) {
         if (!delta) continue;
         if (firstToken) { firstToken = false; loadingEl.remove(); bubble.appendChild(cursor); }
         accumulated += delta;
-        bubble.innerHTML = renderMd(accumulated);
+        bubble.innerHTML = renderContent(accumulated, true);
         bubble.appendChild(cursor);
         if (activeId === convId) chatScrollToBottom();
       }

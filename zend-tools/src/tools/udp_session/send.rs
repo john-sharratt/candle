@@ -25,7 +25,7 @@ pub struct UdpSessionSend;
 
 impl Tool for UdpSessionSend {
     const NAME: &'static str = "udp_session_send";
-    const DESCRIPTION: &'static str = "Send a UDP datagram. Provide data as text or hex.";
+    const DESCRIPTION: &'static str = "Transmit one fire-and-forget UDP datagram to a peer, payload as text or hex. No delivery acknowledgement.";
 
     type Request = SendRequest;
     type Response = SendResponse;

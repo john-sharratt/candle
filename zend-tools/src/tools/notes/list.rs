@@ -34,7 +34,9 @@ pub struct NotesList;
 impl Tool for NotesList {
     const NAME: &'static str = "notes_list";
     const DESCRIPTION: &'static str =
-        "List notes by key prefix and/or tags. Returns metadata without content.";
+        "Browse stored notes by key prefix or tag, returning each note's key, \
+         tags, and timestamps — metadata only, not the body text. Use to \
+         discover which notes exist before reading one.";
 
     type Request = ListRequest;
     type Response = ListResponse;

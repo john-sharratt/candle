@@ -53,11 +53,6 @@ pub struct SequenceSamplingState {
     /// Reset when the sequence exits thinking (`</think>` is emitted).
     pub thinking_len: i32,
 
-    /// If `true`, the next sampled token will be unconditionally replaced with
-    /// the `</think>` EOT token.  Set when the EOT override logic injects a
-    /// `\n` newline *before* EOT so the closing tag appears on its own line.
-    pub pending_eot: bool,
-
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
 }
@@ -72,7 +67,6 @@ impl SequenceSamplingState {
             current_len: 0,
             in_thinking: false,
             thinking_len: 0,
-            pending_eot: false,
             rng_offset: 0,
         }
     }
@@ -128,7 +122,6 @@ impl SequenceSamplingState {
         self.current_len = 0;
         self.in_thinking = false;
         self.thinking_len = 0;
-        self.pending_eot = false;
         self.rng_offset = 0;
     }
 
@@ -318,13 +311,7 @@ impl BatchedSampler {
             let mut token = processor.sample(&seq_logits)?;
 
             // EOT overrides: force </think> when thinking budget is exhausted.
-            // If the last token wasn't a newline, inject \n first (pending_eot=true)
-            // so </think> always appears on its own line.
-            if state.pending_eot {
-                // Previous step injected \n; now close the think block.
-                token = config.eot_token_id as u32;
-                state.pending_eot = false;
-            } else if config.eot_token_id >= 0 && state.in_thinking {
+            if config.eot_token_id >= 0 && state.in_thinking {
                 let should_force = (config.graceful_eot_after > 0
                     && state.thinking_len >= config.graceful_eot_after
                     && state
@@ -335,20 +322,7 @@ impl BatchedSampler {
                     || (config.force_eot_after > 0 && state.thinking_len >= config.force_eot_after);
 
                 if should_force {
-                    let last_is_nl = config.newline_token_id >= 0
-                        && state
-                            .recent_tokens
-                            .last()
-                            .map(|&t| t == config.newline_token_id)
-                            .unwrap_or(false);
-                    if last_is_nl || config.newline_token_id < 0 {
-                        // Already on a fresh line, or no newline token available — close immediately.
-                        token = config.eot_token_id as u32;
-                    } else {
-                        // Inject \n now; EOT fires on the next step.
-                        token = config.newline_token_id as u32;
-                        state.pending_eot = true;
-                    }
+                    token = config.eot_token_id as u32;
                 }
             }
 
@@ -560,13 +534,7 @@ impl BatchedSampler {
             let mut token = output_tokens[i];
 
             // EOT overrides: force </think> when thinking budget is exhausted.
-            // If the last token wasn't a newline, inject \n first (pending_eot=true)
-            // so </think> always appears on its own line.
-            if state.pending_eot {
-                // Previous step injected \n; now close the think block.
-                token = config.eot_token_id as u32;
-                state.pending_eot = false;
-            } else if config.eot_token_id >= 0 && state.in_thinking {
+            if config.eot_token_id >= 0 && state.in_thinking {
                 let should_force = (config.graceful_eot_after > 0
                     && state.thinking_len >= config.graceful_eot_after
                     && state
@@ -577,20 +545,7 @@ impl BatchedSampler {
                     || (config.force_eot_after > 0 && state.thinking_len >= config.force_eot_after);
 
                 if should_force {
-                    let last_is_nl = config.newline_token_id >= 0
-                        && state
-                            .recent_tokens
-                            .last()
-                            .map(|&t| t == config.newline_token_id)
-                            .unwrap_or(false);
-                    if last_is_nl || config.newline_token_id < 0 {
-                        // Already on a fresh line, or no newline token available — close immediately.
-                        token = config.eot_token_id as u32;
-                    } else {
-                        // Inject \n now; EOT fires on the next step.
-                        token = config.newline_token_id as u32;
-                        state.pending_eot = true;
-                    }
+                    token = config.eot_token_id as u32;
                 }
             }
 

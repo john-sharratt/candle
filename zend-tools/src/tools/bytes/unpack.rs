@@ -27,8 +27,9 @@ pub struct BytesUnpack;
 impl Tool for BytesUnpack {
     const NAME: &'static str = "bytes_unpack";
     const DESCRIPTION: &'static str =
-        "Unpack binary bytes into structured values using a format string. \
-         Inverse of bytes_pack.";
+        "Decode a raw byte buffer back into structured values — fixed-width \
+         integers, floats, and strings — using a struct-style format string. \
+         The inverse of bytes_pack.";
 
     type Request = UnpackRequest;
     type Response = UnpackResponse;

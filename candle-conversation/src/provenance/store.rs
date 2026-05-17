@@ -184,6 +184,8 @@ impl ProvenanceFile {
         let mut state = self.state.lock().unwrap();
         let byte_offset = state.write_pos;
 
+        use std::io::Seek;
+        state.file.seek(std::io::SeekFrom::Start(byte_offset))?;
         for sig in syntactic.iter().chain(semantic.iter()).chain(pragmatic.iter()) {
             state.file.write_all(sig.as_bytes())?;
         }

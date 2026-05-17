@@ -29,7 +29,7 @@ pub struct TlsSessionList;
 
 impl Tool for TlsSessionList {
     const NAME: &'static str = "tls_session_list";
-    const DESCRIPTION: &'static str = "List all open TLS sessions.";
+    const DESCRIPTION: &'static str = "Enumerate the TLS-encrypted connections currently open in this conversation, with each peer host and certificate identity.";
 
     type Request = ListRequest;
     type Response = ListResponse;

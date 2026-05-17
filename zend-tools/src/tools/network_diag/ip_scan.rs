@@ -34,8 +34,9 @@ pub struct IpScan;
 impl Tool for IpScan {
     const NAME: &'static str = "ip_scan";
     const DESCRIPTION: &'static str =
-        "Scan a CIDR subnet for live hosts by attempting TCP port 80 connection. \
-         Blocks 169.254.x.x link-local. Use for: LAN discovery, network mapping.";
+        "Sweep an entire CIDR subnet for live hosts, probing TCP port 80 on \
+         each address in the range. Use for LAN discovery and network \
+         mapping; link-local 169.254.x.x ranges are blocked.";
 
     type Request = IpScanRequest;
     type Response = IpScanResponse;

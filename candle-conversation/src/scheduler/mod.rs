@@ -13,7 +13,9 @@ use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
-use crate::projection::{Builder, Conversation, GroupId, ProjectionTarget, SectionId, TurnIndex};
+use crate::projection::{
+    Builder, Conversation, GroupId, ProjectionMode, ProjectionTarget, SectionId, TurnIndex,
+};
 #[cfg(feature = "sig-trace")]
 use crate::provenance::TokenSignature;
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
@@ -402,14 +404,6 @@ struct DecodeState {
     /// residual partial block (and any post-decode tail tokens), not the
     /// bulk that the bg_quantizer may have already compressed.
     prov_sig_entries: Vec<crate::provenance::SigEntry>,
-    /// `generated_tokens.len()` at the most recent successful
-    /// reprojection (or `0` at decode start).  Defines the lower edge
-    /// of the next probe window: probe spans
-    /// `generated_tokens[last_reproject_at..len()]`, then capped to the
-    /// most recent `max_probe_tokens` of that range.  Invariant in
-    /// `generated_tokens` space (not view-position space) so swaps
-    /// that re-key the view don't perturb it.
-    last_reproject_at: usize,
     /// Trailing structural tokens written into the slot after decode
     /// finishes, before the seal.  Lifted to a forward pass in
     /// `cleanup_finished` so the turn's pinned KV closes its own
@@ -921,7 +915,13 @@ impl Scheduler {
                     // `target.timeline` within `target.group`,
                     // masking sibling timelines.
                     let view = conversation.read_for(target);
-                    let projection = inputs.projection.project(target, &view);
+                    // Prefill mode: section scoring uses the calibrated
+                    // prefill profile (Max / semantic depth, no threshold)
+                    // against the prefill-Q section corpus.
+                    let projection =
+                        inputs
+                            .projection
+                            .project_with_mode(target, &view, ProjectionMode::Prefill);
                     // The schema's projection is the single source
                     // of truth for system-side sections — emit
                     // exactly what the projection picked, in
@@ -2512,46 +2512,35 @@ impl Scheduler {
         // 1. Compute the probe window.
         //
         //    R16 captures Q on every forward pass (prefill *and* decode),
-        //    so live signatures reflect the model's most recent
-        //    attention intent — sealing has nothing to do with R16
-        //    availability; it's a turn-end operation that writes
-        //    per-chunk `SigEntry` records into [`ProvenanceFile`].
+        //    so live signatures cover the full view — both the user's
+        //    prefill query and any decode tokens emitted so far.
         //
-        //    The probe is intentionally scoped to "what the model is
-        //    thinking *now*" rather than the full live history:
+        //    The window is: min(max_probe_tokens, view_offset)
         //
-        //      window_size = min(decoded_count - last_reproject_at,
-        //                        max_probe_tokens)
-        //
-        //    so the BDP probe represents the most recent thought
-        //    segment — bounded above to keep the probe focused, lower
-        //    bounded by the previous re-projection point so we don't
-        //    re-probe content the prior fire already accounted for.
-        //
-        //    All probe positions live inside the view's decoded region;
-        //    `last_reproject_at` is invariant in `generated_tokens`
-        //    space, so the window is correct across mid-decode swaps.
+        //    No lower bound on the decoded-delta; structural/turn-boundary
+        //    tokens are already excluded by `probe_filter_token_ids`, so
+        //    there is no need to clip to decode-only positions.  Including
+        //    the prefill query is essential: at first reprojection (e.g.
+        //    after `<tool_call>\n`) the decode delta is tiny and would
+        //    miss the user's intent entirely.
         let view_offset = self.session.sequence_offset(view_id.0).unwrap_or(0);
         if view_offset == 0 {
             return Ok(view_id);
         }
 
-        let (decoded_count, last_at, generated_tokens_snapshot) = {
+        let (decoded_count, generated_tokens_snapshot, prefill_tokens_snapshot) = {
             let state = self.active_decodes.get(&view_id).ok_or_else(|| {
                 ConversationError::Channel(format!("reproject: missing decode state {view_id}"))
             })?;
             (
                 state.generated_tokens.len(),
-                state.last_reproject_at,
                 state.generated_tokens.clone(),
+                state.prefill_tokens.clone(),
             )
         };
 
         let max_probe = policy.max_probe_tokens.max(1);
-        let window = decoded_count
-            .saturating_sub(last_at)
-            .min(max_probe)
-            .min(view_offset);
+        let window = max_probe.min(view_offset);
         if window == 0 {
             return Ok(view_id);
         }
@@ -2660,10 +2649,18 @@ impl Scheduler {
                 let hi = probe_hi.min(block_end);
                 for p in lo..hi {
                     let slot = p - block_start;
-                    let decoded_idx = decoded_count - (view_offset - p);
-                    if let Some(&tok) = generated_tokens_snapshot.get(decoded_idx) {
-                        if filter.contains(&tok) {
-                            continue;
+                    // `view_offset - p` is the distance from the current
+                    // decode head back to position `p`.  If that distance
+                    // is within the decode buffer the token is a generated
+                    // token and may be filtered; positions further back
+                    // are prefill tokens — include them unconditionally.
+                    let dist = view_offset - p;
+                    if dist <= decoded_count {
+                        let decoded_idx = decoded_count - dist;
+                        if let Some(&tok) = generated_tokens_snapshot.get(decoded_idx) {
+                            if filter.contains(&tok) {
+                                continue;
+                            }
                         }
                     }
                     if let Some(&sig) = block_sigs.sigs.get(slot) {
@@ -2724,6 +2721,69 @@ impl Scheduler {
             return Ok(view_id);
         }
 
+        // ── Trace-only validation: probe health + section corpus health ────────
+        if tracing::enabled!(tracing::Level::TRACE) {
+            // Probe stats
+            let probe_n = probe_syn.len();
+            let probe_nonzero_syn = probe_syn.iter().filter(|s| s.as_u128() != 0).count();
+            let probe_nonzero_prag = probe_prag.iter().filter(|s| s.as_u128() != 0).count();
+            tracing::trace!(
+                probe_tokens = probe_n,
+                probe_window = format!("{}..{}", probe_lo, probe_hi),
+                nonzero_syn = probe_nonzero_syn,
+                nonzero_prag = probe_nonzero_prag,
+                "reproject probe health"
+            );
+
+            // Decode probe positions to text: decode + prefill regions only,
+            // positions that fall in the borrowed-parent region are marked <parent>.
+            let pf_len = prefill_tokens_snapshot.len();
+            let probe_text: Vec<String> = (probe_lo..probe_hi)
+                .map(|p| {
+                    let dist = view_offset - p;
+                    let tok = if dist <= decoded_count {
+                        generated_tokens_snapshot.get(decoded_count - dist).copied()
+                    } else {
+                        let pf_dist = dist - decoded_count;
+                        if pf_dist <= pf_len {
+                            prefill_tokens_snapshot.get(pf_len - pf_dist).copied()
+                        } else {
+                            None
+                        }
+                    };
+                    match tok {
+                        Some(id) => self
+                            .tokenizer
+                            .decode(&[id], true)
+                            .unwrap_or_else(|_| format!("[{}]", id)),
+                        None => "<parent>".to_string(),
+                    }
+                })
+                .collect();
+            tracing::trace!(
+                tokens = ?probe_text,
+                "reproject probe tokens"
+            );
+
+            // Section corpus health
+            for (sid, entries) in &section_corpus {
+                let total_tokens: usize = entries.iter().map(|e| e.token_count as usize).sum();
+                let nonzero_entries = entries.iter().filter(|e| e.token_count > 0).count();
+                let name = policy
+                    .projection
+                    .section(*sid)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("<unknown>");
+                tracing::trace!(
+                    section = name,
+                    sig_entries = entries.len(),
+                    nonzero_entries,
+                    total_tokens,
+                    "reproject section corpus"
+                );
+            }
+        }
+
         let mut scanner = crate::provenance::BdpScanner::new().with_span_alpha(policy.span_alpha);
         scanner.scan(
             &policy.provenance,
@@ -2766,7 +2826,13 @@ impl Scheduler {
         let parent_id = view_state.parent_id;
         let (projected_sections, projected_turns): (Vec<SectionId>, Vec<(GroupId, TurnIndex)>) = {
             let view = policy.substrate.read_for(policy.target);
-            let projection = policy.projection.project(policy.target, &view);
+            // Prefill mode: the section corpus is prefill-Q of tool
+            // descriptions, so reprojection scores it with the calibrated
+            // prefill profile (Max / semantic, no threshold gate).
+            let projection =
+                policy
+                    .projection
+                    .project_with_mode(policy.target, &view, ProjectionMode::Prefill);
             let mut sections: Vec<SectionId> = Vec::with_capacity(projection.system_prompt.len());
             for sec in &projection.system_prompt {
                 if view.section_sealed_of(sec.id).is_some() {
@@ -3057,8 +3123,6 @@ impl Scheduler {
         // parent for the new view; replace it with the live one
         // carried across from the old view so DRY history and
         // per-turn counters survive.
-        let mut decode_state = decode_state;
-        decode_state.last_reproject_at = decoded_count;
         self.active_decodes.insert(new_view_id, decode_state);
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);

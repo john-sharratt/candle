@@ -29,8 +29,9 @@ pub struct BytesXor;
 impl Tool for BytesXor {
     const NAME: &'static str = "bytes_xor";
     const DESCRIPTION: &'static str =
-        "XOR two byte sequences. If lengths differ, the shorter is zero-padded. \
-         Use for: OTP analysis, key masking, binary diffs.";
+        "Combine two byte sequences with a bitwise XOR, zero-padding the \
+         shorter one. Use for one-time-pad analysis, keystream masking, and \
+         computing bitwise differences between binary blobs.";
 
     type Request = XorRequest;
     type Response = XorResponse;

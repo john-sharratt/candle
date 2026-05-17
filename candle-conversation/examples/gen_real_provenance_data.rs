@@ -96,6 +96,12 @@ struct Args {
     /// Skip generating raw KVQ data (only sign-bit signatures).
     #[arg(long)]
     skip_raw: bool,
+
+    /// Append new scenarios to an existing output corpus.
+    /// Reads existing MANIFEST.json, skips already-processed scenario IDs,
+    /// and appends only the new entries to signatures.prov + MANIFEST.json.
+    #[arg(long)]
+    append: bool,
 }
 
 // ── Manifest types ────────────────────────────────────────────────────────────
@@ -136,7 +142,7 @@ struct InManifest {
 }
 
 /// Output scenario written to real MANIFEST.json.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OutScenario {
     id: String,
     tool: Option<String>,
@@ -144,12 +150,18 @@ struct OutScenario {
     user_prompt: String,
     generated_text: String,
     turn_id: u64,
+    /// Decode-phase Q vectors (model generating the tool-call response).
     byte_offset: u64,
     token_count: u16,
     block_count: usize,
+    /// Prefill-phase Q vectors (model reading the user prompt only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_byte_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefill_token_count: Option<u16>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct OutManifest {
     version: u32,
     model: String,
@@ -158,7 +170,7 @@ struct OutManifest {
 }
 
 /// Output scenario written to RAW_MANIFEST.json.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawOutScenario {
     id: String,
     tool: Option<String>,
@@ -167,7 +179,7 @@ struct RawOutScenario {
     raw_token_count: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawOutManifest {
     version: u32,
     model: String,
@@ -227,22 +239,60 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
     let in_manifest: InManifest = serde_json::from_str(&text)?;
-    let total = in_manifest.scenarios.len();
-    println!("Loaded {total} scenarios from {}", prompts_manifest.display());
+    let all_count = in_manifest.scenarios.len();
 
     // Guard output directory.
     let sig_path = args.output.join("signatures.prov");
+    let prefill_sig_path = args.output.join("prefill_signatures.prov");
     let raw_path = args.output.join("raw_kvq.prov");
-    for path in [&sig_path, &raw_path] {
-        if path.exists() {
-            if !args.force {
-                eprintln!(
-                    "Output already exists at {}.  Use --force to overwrite.",
-                    path.display()
-                );
-                std::process::exit(1);
+
+    // Collect already-processed IDs when appending.
+    let existing_ids: std::collections::HashSet<String> = if args.append {
+        let manifest_out = args.output.join("MANIFEST.json");
+        if manifest_out.exists() {
+            let text = std::fs::read_to_string(&manifest_out)?;
+            // OutManifest has a `scenarios` array; parse just enough.
+            #[derive(serde::Deserialize)]
+            struct MinScenario { id: String }
+            #[derive(serde::Deserialize)]
+            struct MinManifest { scenarios: Vec<MinScenario> }
+            let m: MinManifest = serde_json::from_str(&text)?;
+            m.scenarios.into_iter().map(|s| s.id).collect()
+        } else {
+            std::collections::HashSet::new()
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // In append mode, only process scenarios not yet in the output manifest.
+    let scenarios_to_run: Vec<&InScenario> = if args.append && !existing_ids.is_empty() {
+        in_manifest.scenarios.iter()
+            .filter(|s| !existing_ids.contains(&s.id))
+            .collect()
+    } else {
+        in_manifest.scenarios.iter().collect()
+    };
+    let total = scenarios_to_run.len();
+    if args.append {
+        println!("Loaded {all_count} scenarios from {}; {total} new (skipping {} already done)",
+            prompts_manifest.display(), all_count - total);
+    } else {
+        println!("Loaded {total} scenarios from {}", prompts_manifest.display());
+    }
+
+    if !args.append {
+        for path in [&sig_path, &prefill_sig_path, &raw_path] {
+            if path.exists() {
+                if !args.force {
+                    eprintln!(
+                        "Output already exists at {}.  Use --force to overwrite.",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+                std::fs::remove_file(path)?;
             }
-            std::fs::remove_file(path)?;
         }
     }
     std::fs::create_dir_all(&args.output)?;
@@ -316,8 +366,11 @@ fn main() -> anyhow::Result<()> {
     // ── Output files ─────────────────────────────────────────────────────────
 
     let out_pf = ProvenanceFile::open(&sig_path)?;
+    let out_prefill_pf = ProvenanceFile::open(&prefill_sig_path)?;
     let out_raw_pf = if args.skip_raw {
         None
+    } else if args.append && raw_path.exists() {
+        Some(RawProvenanceFile::open(&raw_path)?)
     } else {
         Some(RawProvenanceFile::create(&raw_path, raw_header)?)
     };
@@ -330,7 +383,7 @@ fn main() -> anyhow::Result<()> {
     let t_start = Instant::now();
     let mut completed = 0usize;
 
-    for (batch_start, chunk) in in_manifest.scenarios.chunks(args.batch_size).enumerate() {
+    for (batch_start, chunk) in scenarios_to_run.chunks(args.batch_size).enumerate() {
         let batch_idx = batch_start * args.batch_size;
         println!(
             "\n── Batch {}/{} (scenarios {}-{}) ──",
@@ -446,6 +499,49 @@ fn main() -> anyhow::Result<()> {
                 None
             };
 
+            // ── Capture prefill Q from user prompt (scratch-slot, no decode) ──
+            let prefill_out_entry: Option<SigEntry> = match conv.prefill_sigs_for(&user_prompt) {
+                Ok(prefill_sigs) if !prefill_sigs.is_empty() => {
+                    let mut pre_syn = Vec::new();
+                    let mut pre_sem = Vec::new();
+                    let mut pre_prag = Vec::new();
+                    let mut ok = true;
+                    for entry in &prefill_sigs {
+                        match pf.read_entry(*entry) {
+                            Ok((s, se, p)) => {
+                                pre_syn.extend(s);
+                                pre_sem.extend(se);
+                                pre_prag.extend(p);
+                            }
+                            Err(e) => {
+                                eprintln!("  [{global_idx}] WARNING: prefill read_entry failed: {e}");
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok && !pre_syn.is_empty() {
+                        match out_prefill_pf.append(&pre_syn, &pre_sem, &pre_prag) {
+                            Ok(e) => Some(e),
+                            Err(e) => {
+                                eprintln!("  [{global_idx}] WARNING: prefill append failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Ok(_) => {
+                    eprintln!("  [{global_idx}] WARNING: prefill_sigs_for returned empty for {id}");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("  [{global_idx}] WARNING: prefill_sigs_for failed: {e}");
+                    None
+                }
+            };
+
             drop(conv); // release KV slot for the next batch
 
             let seal = match &resp.seal {
@@ -504,6 +600,8 @@ fn main() -> anyhow::Result<()> {
                 byte_offset: out_entry.byte_offset,
                 token_count: out_entry.token_count,
                 block_count: seal.block_count,
+                prefill_byte_offset: prefill_out_entry.map(|e| e.byte_offset),
+                prefill_token_count: prefill_out_entry.map(|e| e.token_count),
             });
             completed += 1;
         }
@@ -511,16 +609,45 @@ fn main() -> anyhow::Result<()> {
 
     // ── Write manifests ───────────────────────────────────────────────────────
 
+    // In append mode, merge new scenarios with existing ones.
+    let final_scenarios = if args.append {
+        let manifest_out_path = args.output.join("MANIFEST.json");
+        if manifest_out_path.exists() {
+            let existing_text = std::fs::read_to_string(&manifest_out_path)?;
+            let mut existing: OutManifest = serde_json::from_str(&existing_text)?;
+            existing.scenarios.extend(out_scenarios);
+            existing.scenarios
+        } else {
+            out_scenarios
+        }
+    } else {
+        out_scenarios
+    };
+
     let out_manifest = OutManifest {
         version: 1,
         model: "Qwen3-30B-A3B-Q4_K_M".to_string(),
         provenance_layer_indices: prov_layers,
-        scenarios: out_scenarios,
+        scenarios: final_scenarios,
     };
     let manifest_out = args.output.join("MANIFEST.json");
     std::fs::write(&manifest_out, serde_json::to_string_pretty(&out_manifest)?)?;
 
     if out_raw_pf.is_some() && !raw_scenarios.is_empty() {
+        // In append mode, merge with existing raw manifest.
+        let final_raw_scenarios = if args.append {
+            let raw_manifest_out_path = args.output.join("RAW_MANIFEST.json");
+            if raw_manifest_out_path.exists() {
+                let existing_text = std::fs::read_to_string(&raw_manifest_out_path)?;
+                let mut existing: RawOutManifest = serde_json::from_str(&existing_text)?;
+                existing.scenarios.extend(raw_scenarios);
+                existing.scenarios
+            } else {
+                raw_scenarios
+            }
+        } else {
+            raw_scenarios
+        };
         let raw_manifest = RawOutManifest {
             version: 1,
             model: "Qwen3-30B-A3B-Q4_K_M".to_string(),
@@ -534,7 +661,7 @@ fn main() -> anyhow::Result<()> {
                 prov_layers[5] as u32,
             ],
             n_total_layers: n_total_layers as u32,
-            scenarios: raw_scenarios,
+            scenarios: final_raw_scenarios,
         };
         let raw_manifest_out = args.output.join("RAW_MANIFEST.json");
         std::fs::write(&raw_manifest_out, serde_json::to_string_pretty(&raw_manifest)?)?;

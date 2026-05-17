@@ -28,8 +28,9 @@ pub struct HashScan;
 impl Tool for HashScan {
     const NAME: &'static str = "hash_scan";
     const DESCRIPTION: &'static str =
-        "Identify which hash algorithm produced a known hash by trying all supported algorithms. \
-         Returns the matching algorithm and digest if found.";
+        "Given a digest of unknown origin, identify which algorithm produced \
+         it by recomputing the candidate input's hash under every supported \
+         algorithm and matching. Returns the algorithm name when found.";
 
     type Request = ScanRequest;
     type Response = ScanResponse;

@@ -993,6 +993,111 @@ fn calibrated_threshold_derivation() {
         });
     }
 
+    // ── Tools collection calibration ──────────────────────────────────────────
+    // Mirror the cognitive-layer calibration for the tools collection.
+    // Uses prag_only depth weights (from score_threshold_and_weight_calibration).
+    // Prefers tool_provenance_real_data; falls back to tool_provenance_data.
+    {
+        let real_tool_path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/"))
+            .join("tool_provenance_real_data")
+            .join("MANIFEST.json");
+        let (tool_dir, tool_is_real) = if real_tool_path.exists() {
+            ("tool_provenance_real_data", true)
+        } else {
+            ("tool_provenance_data", false)
+        };
+
+        let tool_dir_path = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/")).join(tool_dir);
+        let tool_json = std::fs::read_to_string(tool_dir_path.join("MANIFEST.json"))
+            .unwrap_or_else(|e| panic!("{}/MANIFEST.json not found: {}", tool_dir, e));
+        let tool_manifest: crate::corpus::Manifest = serde_json::from_str(&tool_json)
+            .unwrap_or_else(|e| panic!("{}/MANIFEST.json parse failed: {}", tool_dir, e));
+        let tool_pf = candle_conversation::provenance::ProvenanceFile::open(tool_dir_path.join("signatures.prov"))
+            .unwrap_or_else(|e| panic!("{}/signatures.prov open failed: {}", tool_dir, e));
+
+        let tools_weights = DepthWeights { syntactic: 0.0, semantic: 0.0, pragmatic: 1.0 };
+
+        // Assign SectionId 1..=8 for the 8 tools.
+        let tool_names = crate::corpus::TOOLS;
+        let tool_to_sid: HashMap<&str, SectionId> = tool_names.iter().enumerate()
+            .map(|(i, &t)| (t, SectionId::new((i + 1) as u32)))
+            .collect();
+
+        let mut tool_intra: Vec<f32> = Vec::new();
+        let mut tool_inter: Vec<f32> = Vec::new();
+
+        for probe in tool_manifest.scenarios.iter()
+            .filter(|s| s.tool.is_some()
+                && matches!(s.case_type, crate::corpus::CaseType::Positive | crate::corpus::CaseType::Boundary))
+        {
+            let probe_tool = probe.tool.as_deref().unwrap();
+            let probe_sid = tool_to_sid[probe_tool];
+
+            let (probe_syn, probe_sem, probe_prag) = tool_pf
+                .read_entry(SigEntry { byte_offset: probe.byte_offset, token_count: probe.token_count })
+                .expect("read probe sigs");
+
+            let corpus: Vec<(SectionId, Vec<SigEntry>)> = tool_names.iter()
+                .map(|&t| {
+                    let sid = tool_to_sid[t];
+                    let entries: Vec<SigEntry> = tool_manifest.scenarios.iter()
+                        .filter(|s| {
+                            s.tool.as_deref() == Some(t)
+                                && s.case_type == crate::corpus::CaseType::Positive
+                                && s.id != probe.id
+                        })
+                        .map(|s| SigEntry { byte_offset: s.byte_offset, token_count: s.token_count })
+                        .collect();
+                    (sid, entries)
+                })
+                .collect();
+
+            let mut scanner = BdpScanner::new();
+            scanner.scan_sections(&tool_pf, &probe_syn, &probe_sem, &probe_prag, &corpus)
+                .expect("scan_sections failed");
+
+            for (&sid, &s) in scanner.section_scores().iter() {
+                let score = tools_weights.combine(
+                    s.syn.pick(formula), s.sem.pick(formula), s.prag.pick(formula));
+                if sid == probe_sid { tool_intra.push(score); } else { tool_inter.push(score); }
+            }
+        }
+
+        tool_intra.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        tool_inter.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let tool_threshold  = pct(&tool_inter, 0.95);
+        let tool_mean_intra = mean_f(&tool_intra);
+        let tool_mean_inter = mean_f(&tool_inter);
+        let tool_ratio      = if tool_mean_inter > 0.0 { tool_mean_intra / tool_mean_inter } else { 1.0 };
+        let tool_tp = tool_intra.iter().filter(|&&s| s >= tool_threshold).count() as f32
+            / tool_intra.len().max(1) as f32;
+        let tool_fp = tool_inter.iter().filter(|&&s| s >= tool_threshold).count() as f32
+            / tool_inter.len().max(1) as f32;
+
+        let pcts = [0.0_f32, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99, 1.0];
+        println!("\n── tools {} ──", if tool_is_real { "(real)" } else { "(synth)" });
+        println!("  {:>5}  {:>10}  {:>10}", "pct", "intra", "inter");
+        for &p in &pcts {
+            let vi = pct(&tool_intra, p);
+            let ve = pct(&tool_inter, p);
+            let marker = if vi > ve { " ←" } else { "" };
+            println!("  {:>4.0}%  {:>10.1}  {:>10.1}{}", p * 100.0, vi, ve, marker);
+        }
+        println!("  mean   {:>10.1}  {:>10.1}  ratio={:.3}", tool_mean_intra, tool_mean_inter, tool_ratio);
+
+        summary.push(LayerThreshold {
+            name: "tools".to_string(),
+            threshold: tool_threshold,
+            mean_intra: tool_mean_intra,
+            mean_inter: tool_mean_inter,
+            ratio: tool_ratio,
+            tp: tool_tp,
+            fp: tool_fp,
+            is_real: tool_is_real,
+        });
+    }
+
     // ── Full detail table ─────────────────────────────────────────────────────
     let sep = "=".repeat(96);
     let dash = "-".repeat(96);
@@ -1026,7 +1131,12 @@ fn calibrated_threshold_derivation() {
 /// pragmatic bands, Span α=2.0) and reports MRR + top-1 accuracy per content type.
 ///
 /// Expected runtime: ~25–35 min.  Run with `-- --nocapture` for live progress.
+///
+/// Ignored by default — far too slow for routine runs.  Invoke explicitly:
+/// `cargo test -p candle-conversation --test projection_harness
+///  cross_corpus_provenance_sweep -- --ignored --nocapture`.
 #[test]
+#[ignore = "long-running calibration sweep (~25-35 min); run explicitly with --ignored"]
 fn cross_corpus_provenance_sweep() {
     const LAYERS: &[(&str, &str, &str, &[&str])] = &[
         ("code_reading_provenance_real_data",          "code_reading_provenance_data",          "code_reading",
@@ -1274,4 +1384,214 @@ fn cross_corpus_provenance_sweep() {
             best.per_layer_top1[li] * 100.0);
     }
     println!("{sep}");
+}
+
+/// Per-tool score dump for specific probe scenarios.
+///
+/// For each named probe, prints all 8 tool scores in descending order so
+/// you can see exactly which tools the projection engine would select at a
+/// given threshold and k.
+///
+/// Run with `-- --nocapture`.
+#[test]
+fn tool_score_dump() {
+    let (manifest, pf) = crate::corpus::load_fixtures();
+    let h = crate::harness::Harness::build();
+
+    // Probes to inspect — the new "use a tool" calculator cases plus two
+    // control cases (a classic arithmetic query and a no-tool probe).
+    let probe_ids: &[&str] = &[
+        "calculator_pos_6",   // "Use a tool and determine 14634535 + 623452345."
+        "calculator_pos_7",   // "Use a tool to compute 9872534 * 3."
+        "calculator_pos_8",   // "Use a tool to calculate 55^3."
+        "calculator_pos_9",   // "Use a tool to figure out 2^20 - 1."
+        "calculator_pos_0",   // "What's 847 divided by 23?"  — classic
+        "calculator_pos_1",   // "Calculate the square root of 1764."
+        "datetime_pos_0",     // "What's the current time in New York?"
+        "weather_pos_0",      // "What's the weather like in Seattle today?"
+    ];
+
+    let formula = candle_conversation::projection::ScoreFormula::Span { alpha: 2.0 };
+    let weights = candle_conversation::projection::DepthWeights {
+        syntactic: 0.0, semantic: 0.0, pragmatic: 1.0
+    };
+
+    let threshold = 140.70_f32;
+    let k = 3usize;
+
+    println!("\n{}", "=".repeat(90));
+    println!("Per-tool BDP scores  |  Span α=2.0  |  prag_only  |  threshold={threshold}  k={k}");
+    println!("{}", "=".repeat(90));
+
+    for &probe_id in probe_ids {
+        // Look up the probe to display its user prompt.
+        let probe_text = manifest.scenarios.iter()
+            .find(|s| s.id == probe_id)
+            .and_then(|s| {
+                // The real manifest (OutScenario) has user_prompt; try to deserialize it.
+                // Fallback to just the id.
+                Some(s.id.as_str())
+            })
+            .unwrap_or(probe_id);
+
+        // Skip probes not in the real manifest (might not exist yet).
+        if !manifest.scenarios.iter().any(|s| s.id == probe_id) {
+            println!("\n  [skip] {} — not in real manifest", probe_id);
+            continue;
+        }
+
+        let resolver = h.scan(&pf, &manifest, probe_id);
+
+        // Collect (tool, score) pairs and sort descending.
+        let mut scores: Vec<(&str, f32)> = TOOLS.iter()
+            .map(|&t| {
+                let sid = h.tool_section_ids[t];
+                let s = resolver.section_scores.get(&sid).copied()
+                    .unwrap_or_default();
+                let score = weights.combine(
+                    s.syn.pick(formula), s.sem.pick(formula), s.prag.pick(formula));
+                (t, score)
+            })
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        println!("\n  probe: {}", probe_id);
+        println!("  {:<14} {:>10}  {}", "tool", "score", "selected?");
+        println!("  {}", "-".repeat(45));
+        let mut selected = 0;
+        for (i, (tool, score)) in scores.iter().enumerate() {
+            let passes_thresh = *score >= threshold;
+            let in_topk = i < k && passes_thresh;
+            if passes_thresh { selected += 1; }
+            let marker = if in_topk && selected <= k {
+                format!("✓ rank {}", i + 1)
+            } else if passes_thresh {
+                format!("  rank {} (over threshold but k limit)", i + 1)
+            } else {
+                format!("  rank {} (below threshold)", i + 1)
+            };
+            println!("  {:<14} {:>10.1}  {}", tool, score, marker);
+        }
+        let selected_tools: Vec<&str> = scores.iter().take(k)
+            .filter(|(_, s)| *s >= threshold)
+            .map(|(t, _)| *t)
+            .collect();
+        println!("  → projected tools: {:?}", selected_tools);
+    }
+    println!("\n{}", "=".repeat(90));
+}
+
+/// Validate that every scenario in both manifests has readable, non-zero data
+/// in its backing prov file and that no entry runs past EOF.
+///
+/// Run with `-- --nocapture` to see the per-scenario report.
+#[test]
+fn validate_corpus() {
+    use candle_conversation::provenance::SigEntry;
+
+    let dir = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/tool_provenance_real_data",
+    ));
+
+    // ── signatures.prov ──────────────────────────────────────────────────────
+
+    let sig_path = dir.join("signatures.prov");
+    let sig_file_len = std::fs::metadata(&sig_path)
+        .expect("signatures.prov not found")
+        .len();
+
+    let (manifest, pf) = crate::corpus::load_fixtures();
+    const BYTES_PER_TOKEN: u64 = 3 * 16; // NUM_DEPTHS * TokenSignature::BYTE_LEN
+
+    let mut sig_errors = 0usize;
+    let mut sig_ok = 0usize;
+
+    println!("\n── signatures.prov  ({} bytes, {} scenarios) ──", sig_file_len, manifest.scenarios.len());
+    for s in &manifest.scenarios {
+        let entry_bytes = s.token_count as u64 * BYTES_PER_TOKEN;
+        let end = s.byte_offset + entry_bytes;
+
+        if end > sig_file_len {
+            println!("  FAIL  {}  byte_offset={} token_count={} → end={} > file_len={}",
+                s.id, s.byte_offset, s.token_count, end, sig_file_len);
+            sig_errors += 1;
+            continue;
+        }
+
+        let entry = SigEntry { byte_offset: s.byte_offset, token_count: s.token_count };
+        let (syn, sem, prag) = pf.read_entry(entry).expect("read_entry failed");
+
+        if syn.is_empty() {
+            println!("  FAIL  {}  read_entry returned empty vectors", s.id);
+            sig_errors += 1;
+            continue;
+        }
+
+        // Check that at least one signature is non-zero across all three depths.
+        let all_zero = syn.iter().chain(sem.iter()).chain(prag.iter())
+            .all(|sig| sig.as_bytes().iter().all(|&b| b == 0));
+        if all_zero {
+            println!("  FAIL  {}  all signatures are zero", s.id);
+            sig_errors += 1;
+            continue;
+        }
+
+        sig_ok += 1;
+    }
+    println!("  {} ok, {} failed", sig_ok, sig_errors);
+
+    // ── raw_kvq.prov ─────────────────────────────────────────────────────────
+
+    if let Some((raw_manifest, raw_pf)) = crate::corpus::try_load_raw_fixtures() {
+        let raw_path = dir.join("raw_kvq.prov");
+        let raw_file_len = std::fs::metadata(&raw_path)
+            .expect("raw_kvq.prov not found")
+            .len();
+        let bpt = raw_pf.header().bytes_per_token() as u64;
+
+        let mut raw_errors = 0usize;
+        let mut raw_ok = 0usize;
+
+        println!("\n── raw_kvq.prov  ({} bytes, {} scenarios, bpt={}) ──",
+            raw_file_len, raw_manifest.scenarios.len(), bpt);
+        for s in &raw_manifest.scenarios {
+            let entry_bytes = s.raw_token_count as u64 * bpt;
+            let end = s.raw_byte_offset + entry_bytes;
+
+            if end > raw_file_len {
+                println!("  FAIL  {}  raw_byte_offset={} raw_token_count={} → end={} > file_len={}",
+                    s.id, s.raw_byte_offset, s.raw_token_count, end, raw_file_len);
+                raw_errors += 1;
+                continue;
+            }
+
+            use candle_conversation::provenance::RawSigEntry;
+            let entry = RawSigEntry { byte_offset: s.raw_byte_offset, token_count: s.raw_token_count };
+            match raw_pf.read_entry_bytes(entry) {
+                Ok(bytes) if bytes.is_empty() => {
+                    println!("  FAIL  {}  read_entry_bytes returned empty", s.id);
+                    raw_errors += 1;
+                }
+                Ok(bytes) => {
+                    let all_zero = bytes.iter().all(|&b| b == 0);
+                    if all_zero {
+                        println!("  FAIL  {}  all bytes are zero", s.id);
+                        raw_errors += 1;
+                    } else {
+                        raw_ok += 1;
+                    }
+                }
+                Err(e) => {
+                    println!("  FAIL  {}  read_entry_bytes error: {}", s.id, e);
+                    raw_errors += 1;
+                }
+            }
+        }
+        println!("  {} ok, {} failed", raw_ok, raw_errors);
+
+        assert_eq!(raw_errors, 0, "{raw_errors} raw corpus entries are corrupt or out-of-bounds");
+    }
+
+    assert_eq!(sig_errors, 0, "{sig_errors} signature corpus entries are corrupt or out-of-bounds");
 }

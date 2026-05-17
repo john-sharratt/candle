@@ -19,7 +19,7 @@ pub struct RemoteFsSessionList;
 
 impl Tool for RemoteFsSessionList {
     const NAME: &'static str = "remote_fs_session_list";
-    const DESCRIPTION: &'static str = "List open remote filesystem sessions.";
+    const DESCRIPTION: &'static str = "Enumerate the remote-filesystem sessions currently connected to hosts over SFTP in this conversation.";
     type Request = FsListRequest;
     type Response = FsListResponse;
     type Error = RemoteFsError;

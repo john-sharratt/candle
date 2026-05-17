@@ -33,8 +33,9 @@ pub struct SignatureVerify;
 impl Tool for SignatureVerify {
     const NAME: &'static str = "signature_verify";
     const DESCRIPTION: &'static str =
-        "Verify a digital signature over data using a public key. \
-         Supports ed25519 and p256_sha256.";
+        "Check whether a digital signature over a message was genuinely \
+         produced by the holder of a given public key (ed25519 or \
+         p256_sha256). Returns whether the signature is authentic.";
 
     type Request = SigVerifyRequest;
     type Response = SigVerifyResponse;

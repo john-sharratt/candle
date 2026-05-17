@@ -40,7 +40,7 @@
 
 use super::error::ConstructionError;
 use super::ids::{GroupId, LayerId, SectionId};
-use super::project::{run, Projection, ProjectionTarget};
+use super::project::{run, Projection, ProjectionMode, ProjectionTarget};
 use crate::substrate::ContentResolver;
 use super::schema::{GroupSchema, LayerSchema, Schema, SectionSchema};
 use super::yaml::{from_yaml, NameMaps};
@@ -618,6 +618,10 @@ impl Builder {
 
     /// Run the full projection pipeline for the given `target`.
     ///
+    /// Uses [`ProjectionMode::Decode`] — the steady-state mode for continuous
+    /// reprojection during decode.  Call [`Self::project_with_mode`] with
+    /// [`ProjectionMode::Prefill`] for the pre-decode initial-guess pass.
+    ///
     /// See [`super::project`] for the 12-step pipeline. Pure given a valid
     /// schema and a working resolver — never errors.
     pub fn project<R: ContentResolver>(
@@ -625,7 +629,21 @@ impl Builder {
         target: ProjectionTarget,
         resolver: &R,
     ) -> Projection {
-        run(&self.schema, target, resolver)
+        run(&self.schema, target, resolver, ProjectionMode::Decode)
+    }
+
+    /// Run the projection pipeline for an explicit [`ProjectionMode`].
+    ///
+    /// `Prefill` mode scores collections with the calibrated prefill profile
+    /// (`Max` formula, semantic depth, no score threshold) so a useful
+    /// initial section guess can be made before any decode probe runs.
+    pub fn project_with_mode<R: ContentResolver>(
+        &self,
+        target: ProjectionTarget,
+        resolver: &R,
+        mode: ProjectionMode,
+    ) -> Projection {
+        run(&self.schema, target, resolver, mode)
     }
 
     // ── Synthetic construction ────────────────────────────────────────────────

@@ -30,7 +30,7 @@ pub struct TlsSessionRecv;
 
 impl Tool for TlsSessionRecv {
     const NAME: &'static str = "tls_session_recv";
-    const DESCRIPTION: &'static str = "Receive data from an open TLS session.";
+    const DESCRIPTION: &'static str = "Read decrypted application data from an open TLS channel; decryption and certificate handling are transparent.";
 
     type Request = RecvRequest;
     type Response = RecvResponse;

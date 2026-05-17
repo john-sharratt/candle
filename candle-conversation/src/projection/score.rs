@@ -57,6 +57,12 @@ impl ScoreFormula {
                 .iter()
                 .copied()
                 .fold(f32::NEG_INFINITY, f32::max),
+            // Like Span: the per-turn pertok_excess is computed in the
+            // Aggregator; the group is represented by its strongest turn.
+            ScoreFormula::PerTokenExcess => scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max),
         }
     }
 }

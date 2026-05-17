@@ -35,9 +35,9 @@ pub struct NotesSearch;
 impl Tool for NotesSearch {
     const NAME: &'static str = "notes_search";
     const DESCRIPTION: &'static str =
-        "Search persistent notes by content substring and/or tags. \
-         Returns matching notes with snippets and relevance. \
-         At least one of query or tags must be provided.";
+        "Find stored notes by a content substring or tag match, returning \
+         ranked hits with text snippets. Use when the note's exact key is \
+         unknown; supply a query, tags, or both.";
 
     type Request = SearchRequest;
     type Response = SearchResponse;

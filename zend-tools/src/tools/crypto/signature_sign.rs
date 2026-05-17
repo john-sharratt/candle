@@ -31,8 +31,9 @@ pub struct SignatureSign;
 impl Tool for SignatureSign {
     const NAME: &'static str = "signature_sign";
     const DESCRIPTION: &'static str =
-        "Sign data using a private key from the credential store. \
-         Supports ed25519 and p256_sha256.";
+        "Produce a digital signature over a message using a private signing \
+         key from the credential store (ed25519 or p256_sha256). Proves \
+         authorship; the counterpart signature_verify checks it.";
 
     type Request = SigSignRequest;
     type Response = SigSignResponse;

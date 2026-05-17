@@ -59,6 +59,12 @@ use crate::projection::{PerDepthScores, SectionId, TimelineId, TurnIndex, TurnSc
 /// 64; useful directional signal starts around 80–90.  90 is conservative.
 pub const DEFAULT_HIT_THRESHOLD: u32 = 90;
 
+/// Expected XOR-popcount agreement between two independent 128-bit
+/// signatures — half the 128 bits agree by chance.  The `pertok_excess`
+/// metric scores agreement *relative to* this baseline so a pure-noise pair
+/// contributes ~0 rather than ~64.
+pub const AGREEMENT_BASELINE: f32 = 64.0;
+
 /// Default `K` for the `top_k_mean` metric.  Matches the projection schema's
 /// `score_formula_k` default.
 pub const DEFAULT_TOP_K: usize = 8;
@@ -83,6 +89,11 @@ struct Aggregator {
     /// token.  Lazily allocated on first hit (saves the alloc when no
     /// above-threshold pairs occur at all).
     probe_hits: Vec<bool>,
+    /// Per-probe-token best (max) agreement across all corpus tokens — the
+    /// graded, threshold-free counterpart to `probe_hits`.  Drives the
+    /// `pertok_excess` metric.  Sized to the probe length on first
+    /// `accumulate_depth` call; accumulates the max across multi-chunk turns.
+    probe_best: Vec<u32>,
     /// α exponent for the span score (default 2.0).
     span_alpha: f32,
 }
@@ -97,6 +108,7 @@ impl Aggregator {
             top_k: Vec::with_capacity(top_k_capacity),
             top_k_capacity,
             probe_hits: Vec::new(),
+            probe_best: Vec::new(),
             span_alpha,
         }
     }
@@ -107,6 +119,16 @@ impl Aggregator {
     fn ensure_probe_hits(&mut self, probe_len: usize) {
         if self.probe_hits.is_empty() {
             self.probe_hits.resize(probe_len, false);
+        }
+    }
+
+    /// Ensure `probe_best` is sized for `probe_len` tokens.  Called once per
+    /// `accumulate_depth` — unlike `probe_hits` it tracks every pair, not
+    /// just above-threshold ones, so it is sized eagerly.
+    #[inline]
+    fn ensure_probe_best(&mut self, probe_len: usize) {
+        if self.probe_best.len() < probe_len {
+            self.probe_best.resize(probe_len, 0);
         }
     }
 
@@ -148,6 +170,15 @@ impl Aggregator {
             .map(|run| (run.len() as f32).powf(self.span_alpha))
             .sum();
 
+        // PerTokenExcess: Σ over probe tokens of max(0, best_agreement − 64).
+        // Recentered (noise → ~0) and per-probe-token (one promiscuous token
+        // cannot inflate it), threshold-free so weak sub-90 signal survives.
+        let pertok_excess: f32 = self
+            .probe_best
+            .iter()
+            .map(|&a| (a as f32 - AGREEMENT_BASELINE).max(0.0))
+            .sum();
+
         TurnScores {
             max: self.max as f32,
             sum: self.sum as f32,
@@ -155,6 +186,7 @@ impl Aggregator {
             top_k_mean,
             count: self.count_hits as f32,
             span,
+            pertok_excess,
         }
     }
 }
@@ -503,11 +535,15 @@ fn accumulate_depth_scalar(
     agg: &mut Aggregator,
     hit_threshold: u32,
 ) {
+    agg.ensure_probe_best(probe.len());
     for ci in 0..n {
         let c_bytes = &data[ci * TokenSignature::BYTE_LEN..(ci + 1) * TokenSignature::BYTE_LEN];
         for (pi, p) in probe.iter().enumerate() {
             let agreement = popcount_xnor(c_bytes, p.as_bytes());
             agg.observe(agreement, hit_threshold);
+            if agreement > agg.probe_best[pi] {
+                agg.probe_best[pi] = agreement;
+            }
             if agreement >= hit_threshold {
                 agg.ensure_probe_hits(probe.len());
                 agg.probe_hits[pi] = true;
@@ -540,6 +576,7 @@ unsafe fn accumulate_depth_avx2(
     let lo_mask = _mm256_set1_epi8(0x0F_u8 as i8);
     let zero = _mm256_setzero_si256();
 
+    agg.ensure_probe_best(probe.len());
     for (pi, p) in probe.iter().enumerate() {
         // Broadcast 16-byte probe → 32-byte YMM (same value in both halves).
         let probe128 = _mm_loadu_si128(p.as_bytes().as_ptr() as *const __m128i);
@@ -547,6 +584,7 @@ unsafe fn accumulate_depth_avx2(
 
         let mut ci = 0usize;
         let mut probe_hit = false;
+        let mut best_pi = 0u32;
         // Two corpus tokens (32 bytes) per AVX2 iteration.
         while ci + 2 <= n {
             let corpus256 =
@@ -577,6 +615,7 @@ unsafe fn accumulate_depth_avx2(
             let ag1 = 128 - hdist1;
             agg.observe(ag0, hit_threshold);
             agg.observe(ag1, hit_threshold);
+            best_pi = best_pi.max(ag0).max(ag1);
             if ag0 >= hit_threshold || ag1 >= hit_threshold {
                 probe_hit = true;
             }
@@ -588,11 +627,15 @@ unsafe fn accumulate_depth_avx2(
             let c = &data[ci * B..(ci + 1) * B];
             let ag = popcount_xnor(c, p.as_bytes());
             agg.observe(ag, hit_threshold);
+            best_pi = best_pi.max(ag);
             if ag >= hit_threshold {
                 probe_hit = true;
             }
         }
 
+        if best_pi > agg.probe_best[pi] {
+            agg.probe_best[pi] = best_pi;
+        }
         if probe_hit {
             agg.ensure_probe_hits(probe.len());
             agg.probe_hits[pi] = true;

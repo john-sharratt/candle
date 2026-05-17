@@ -24,7 +24,7 @@ pub struct RemoteFsSessionClose;
 impl Tool for RemoteFsSessionClose {
     const NAME: &'static str = "remote_fs_session_close";
     const DESCRIPTION: &'static str =
-        "Close a remote filesystem session, tearing down the SFTP/SSH connection.";
+        "End a remote-filesystem session, tearing down the SFTP transport to the remote host.";
     type Request = CloseRequest;
     type Response = CloseResponse;
     type Error = RemoteFsError;

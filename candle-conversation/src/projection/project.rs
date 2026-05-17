@@ -99,8 +99,8 @@ use super::ids::{GroupId, LayerId, SectionId, TurnId, TurnIndex};
 use super::reconcile::{flexbox_distribute, FlexItem};
 use crate::substrate::ContentResolver;
 use super::schema::{
-    GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema, ScoreFormula, SelectionRule,
-    SystemPromptItem,
+    DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema, ScoreFormula,
+    SelectionRule, SystemPromptItem,
 };
 use super::selection::apply_selection;
 
@@ -109,6 +109,63 @@ use super::selection::apply_selection;
 /// pragmatic-only depth weights dominates all other formulas for tool
 /// selection (min_ratio 5.54 vs 1.14–1.40 for alternatives).
 pub(super) const FIXED_FORMULA: ScoreFormula = ScoreFormula::Span { alpha: 2.0 };
+
+/// Which inference phase a projection is being computed for.
+///
+/// Decode and prefill produce structurally different Q vectors and so need
+/// different collection-scoring configs (calibrated 2026-05-17 against real
+/// Qwen3-30B-A3B data — see `tests/projection_harness/cases/`):
+///
+/// - **Decode** — Q vectors captured while the model *generates* a tool-call
+///   response.  They form a coherent run, so `Span{alpha:2.0}` on pragmatic
+///   depth dominates (min_ratio 5.96).  This is the steady-state mode used by
+///   continuous reprojection during decode.
+/// - **Prefill** — Q vectors captured while the model *reads* the user prompt.
+///   The signal is weak and lives *below* the hit threshold, so run-based
+///   (`Span`) and extreme-value (`Max`) formulas miss it.  `PerTokenExcess`
+///   on pragmatic depth — recentered on the noise baseline, per-probe-token,
+///   threshold-free — recovers it (full-corpus top-1 58% / top-3 74%, vs
+///   `Max` 38% and `Span` 43%).  The intra/inter ratio is still thin, so the
+///   `score_threshold` gate is skipped; selection is pure top-k by rank.
+///   Used for the initial-guess section injection before decode refines it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionMode {
+    Prefill,
+    Decode,
+}
+
+/// Section-scoring configuration resolved from a [`ProjectionMode`].
+struct CollectionScoring {
+    /// Formula passed to `ContentResolver::section_score`.
+    formula: ScoreFormula,
+    /// When `Some`, overrides both the collection's and the layer's depth
+    /// weights.  When `None`, the collection/layer YAML weights apply.
+    weights_override: Option<DepthWeights>,
+    /// When `false`, `score_threshold` is not used as a gate — every section
+    /// competes on rank alone (the prefill ratio is too thin to threshold).
+    apply_threshold: bool,
+}
+
+impl ProjectionMode {
+    fn collection_scoring(self) -> CollectionScoring {
+        match self {
+            ProjectionMode::Decode => CollectionScoring {
+                formula: FIXED_FORMULA,
+                weights_override: None,
+                apply_threshold: true,
+            },
+            ProjectionMode::Prefill => CollectionScoring {
+                formula: ScoreFormula::PerTokenExcess,
+                weights_override: Some(DepthWeights {
+                    syntactic: 0.0,
+                    semantic: 0.0,
+                    pragmatic: 1.0,
+                }),
+                apply_threshold: false,
+            },
+        }
+    }
+}
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -188,6 +245,7 @@ pub fn run<R: ContentResolver>(
     schema: &Schema,
     target: ProjectionTarget,
     resolver: &R,
+    mode: ProjectionMode,
 ) -> Projection {
     // ── Step 1: Mask ─────────────────────────────────────────────────────────
     let target_layer_idx = schema
@@ -257,6 +315,12 @@ pub fn run<R: ContentResolver>(
                 })
                 .collect();
 
+            tracing::debug!(
+                group = %group.name,
+                selected = format!("{}/{}", selected.len(), all_turns.len()),
+                "projection"
+            );
+
             group_states.push(GroupState {
                 schema: group,
                 layer_idx: li,
@@ -313,7 +377,7 @@ pub fn run<R: ContentResolver>(
         .layers
         .iter()
         .find(|l| l.id == target.layer)
-        .map(|l| emit_system_prompt_items(l, resolver))
+        .map(|l| emit_system_prompt_items(l, resolver, mode))
         .unwrap_or_default();
 
     if group_states.is_empty() {
@@ -481,7 +545,9 @@ pub fn run<R: ContentResolver>(
 fn emit_system_prompt_items<R: ContentResolver>(
     layer: &LayerSchema,
     resolver: &R,
+    mode: ProjectionMode,
 ) -> Vec<ResolvedSection> {
+    let scoring = mode.collection_scoring();
     let mut out: Vec<ResolvedSection> = Vec::new();
     for item in &layer.system_prompt.items {
         match item {
@@ -489,7 +555,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                 out.push(ResolvedSection { id: s.id });
             }
             SystemPromptItem::Collection(coll) => {
-                out.extend(select_collection_sections(coll, layer, resolver));
+                out.extend(select_collection_sections(coll, layer, resolver, &scoring));
             }
         }
     }
@@ -506,10 +572,18 @@ fn select_collection_sections<R: ContentResolver>(
     coll: &SectionCollection,
     layer: &LayerSchema,
     resolver: &R,
+    scoring: &CollectionScoring,
 ) -> Vec<ResolvedSection> {
     if coll.sections.is_empty() {
         return Vec::new();
     }
+    // Mode-resolved depth weights: a prefill override beats the collection's
+    // own YAML weights, which in turn beat the layer fallback.
+    let dw = scoring
+        .weights_override
+        .as_ref()
+        .or(coll.depth_weights.as_ref())
+        .unwrap_or(&layer.depth_weights);
     match &coll.selection {
         SelectionRule::AlwaysVisible => coll
             .sections
@@ -517,20 +591,35 @@ fn select_collection_sections<R: ContentResolver>(
             .map(|s| ResolvedSection { id: s.id })
             .collect(),
         SelectionRule::TopK { k } => {
-            let mut scored: Vec<(usize, &SectionSchema, f32)> = coll
+            let all_scored: Vec<(usize, &SectionSchema, f32)> = coll
                 .sections
                 .iter()
                 .enumerate()
                 .map(|(decl, s)| {
-                    let dw = coll.depth_weights.as_ref().unwrap_or(&layer.depth_weights);
-                    let score = resolver.section_score(
-                        s.id,
-                        FIXED_FORMULA,
-                        dw,
-                    );
+                    let score = resolver.section_score(s.id, scoring.formula, dw);
                     (decl, s, score)
                 })
-                .filter(|(_, _, score)| *score >= coll.score_threshold)
+                .collect();
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let mut by_score = all_scored.clone();
+                by_score.sort_by(|(_, _, a), (_, _, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let scores_str = by_score
+                    .iter()
+                    .map(|(_, s, sc)| format!("{}={:.1}", s.name, sc))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::trace!(
+                    collection = %coll.name,
+                    threshold = coll.score_threshold,
+                    scores = %scores_str,
+                    "projection scores"
+                );
+            }
+            let mut scored: Vec<(usize, &SectionSchema, f32)> = all_scored
+                .into_iter()
+                .filter(|(_, _, score)| {
+                    !scoring.apply_threshold || *score >= coll.score_threshold
+                })
                 .collect();
             scored.sort_by(|(ai, a, asc), (bi, b, bsc)| {
                 bsc.partial_cmp(asc)
@@ -540,24 +629,26 @@ fn select_collection_sections<R: ContentResolver>(
             });
             scored.truncate(*k);
             scored.sort_by_key(|(i, _, _)| *i);
-            scored
-                .into_iter()
+            let selected: Vec<ResolvedSection> = scored
+                .iter()
                 .map(|(_, s, _)| ResolvedSection { id: s.id })
-                .collect()
+                .collect();
+            tracing::debug!(
+                collection = %coll.name,
+                selected = format!("{}/{}", selected.len(), coll.sections.len()),
+                sections = ?scored.iter().map(|(_, s, _)| s.name.as_str()).collect::<Vec<_>>(),
+                "projection"
+            );
+            selected
         }
         SelectionRule::Single => coll
             .sections
             .iter()
             .map(|s| {
-                let dw = coll.depth_weights.as_ref().unwrap_or(&layer.depth_weights);
-                let score = resolver.section_score(
-                    s.id,
-                    FIXED_FORMULA,
-                    dw,
-                );
+                let score = resolver.section_score(s.id, scoring.formula, dw);
                 (s, score)
             })
-            .filter(|(_, score)| *score >= coll.score_threshold)
+            .filter(|(_, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
             .max_by(|(a, asc), (b, bsc)| {
                 asc.partial_cmp(bsc)
                     .unwrap_or(std::cmp::Ordering::Equal)

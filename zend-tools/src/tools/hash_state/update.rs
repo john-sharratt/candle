@@ -27,7 +27,9 @@ pub struct HashStateUpdate;
 impl Tool for HashStateUpdate {
     const NAME: &'static str = "hash_state_update";
     const DESCRIPTION: &'static str =
-        "Feed data into a running hash state. Can be called multiple times.";
+        "Absorb another chunk of data into an in-progress streaming hash \
+         computation. Call repeatedly to feed a large input piece by piece \
+         before hash_state_finalize emits the digest.";
 
     type Request = UpdateRequest;
     type Response = UpdateResponse;

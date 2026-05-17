@@ -516,3 +516,116 @@ signature overlap; or add a content-type discriminator at the retrieval layer.
 
 - Investigate static_analysis confusion: test with 16-item corpus or per-content-type scoring.
 - Re-derive all thresholds on production hardware (2× RTX 5090) using Qwen3-235B-A22B.
+
+---
+
+# Tool-Selection Calibration — 2026-05-17
+
+## Problem
+
+Tool-section selection in `zend` was failing: the `tools` collection scored every
+section ~0 and selected `0/93`, so the model generated tool calls with no tool
+definitions in context and hallucinated tool names (`"math"` instead of
+`calculator`).
+
+Root cause: section ingestion (`insert_section_collection`) stored each section's
+BDP sigs from prefilling the **tool-definition JSON text**.  The live reprojection
+probe is the model's Q vectors over the **user request**.  Those two Q-vector
+spaces are uncorrelated — the scan scored pure noise.
+
+## Prefill vs decode Q vectors
+
+The model produces structurally different Q vectors in two phases:
+
+| Phase | When | Signal shape |
+|-------|------|--------------|
+| **Prefill** | model *reads* the user prompt | weak; tool-topic signal is a scattered peak among function/digit tokens |
+| **Decode** | model *generates* the tool call | rich; a coherent run of tool-call-intent tokens |
+
+`gen_real_provenance_data` now captures **both** per scenario — `signatures.prov`
+(decode) and `prefill_signatures.prov` (prefill) — and the projection engine has a
+`ProjectionMode` (`Prefill` / `Decode`) selecting a per-phase scoring profile.
+
+## Single-probe diagnostic — `calculator_pos_prod_1`
+
+The exact failing production query (`"use a tool, determine 123891283 + 123124"`)
+was added as a calibration scenario.  Hit-log breakdown, semantic depth:
+
+| Phase | discriminative probe tokens | verdict |
+|-------|------------------------------|---------|
+| Prefill | **1** distinct probe token produced any hit — and it hit all 8 tools | signal-starved |
+| Decode | **16** probe tokens hit `calculator` *exclusively* (agreement 90–117) | signal-rich |
+
+Prefill-Q of a digit-heavy query is near-orthogonal to the corpus.  Decode-Q is
+strongly discriminative.
+
+## The XOR agreement and its two flaws
+
+`agreement = popcount(XNOR(probe_sig, corpus_sig))` ∈ `0..=128`; random baseline
+= 64.  The value is graded — `max`/`sum`/`mean`/`top_k_mean` use it directly,
+`count`/`span` threshold it at 90.  Two flaws surfaced:
+
+1. **64-bit noise pedestal** — `sum` adds raw agreement, so `sum ≈ 64·N + signal`;
+   the pedestal swamps the signal and scales with corpus size.
+2. **Pooling loses probe-token diversity** — `max`/`sum`/`mean`/`top_k_mean` pool
+   *all* (probe,corpus) pairs, so one promiscuous probe token matching many corpus
+   tokens inflates the score.  Only `span` is per-probe-token — but it is binary.
+
+## New formula — `PerTokenExcess`
+
+```
+score = Σ over probe tokens of  max(0, best_agreement(token) − 64)
+```
+
+Recentered (noise → ~0), per-probe-token (collapse to best-per-token before
+summing), and threshold-free (captures sub-90 prefill signal).  Implemented by
+tracking a per-probe-token best-agreement array in the `BdpScanner` aggregator.
+
+## Full-corpus sweep — 53 positive probes, 8-tool corpus
+
+**Test**: `formula_experiments::formula_corpus_sweep`
+
+```
+DECODE                top-1   top-3   mean_ratio   min_ratio
+  raw_max (sem)        100%    100%        1.15        1.13
+  span_a2 (prag)       100%    100%       14.02        4.18
+  pertok_excess (prag) 100%    100%        1.69        1.41
+
+PREFILL               top-1   top-3   mean_ratio   min_ratio
+  raw_max (sem)         60%     79%        1.02        0.99
+  span_a2 (prag)        43%     58%        4.02        0.44
+  pertok_excess (prag)  58%     74%        1.21        0.91
+```
+
+## Decision
+
+- **Decode mode**: keep `Span { alpha: 2.0 }` on pragmatic depth.  All formulas
+  reach 100% top-1 on the clean corpus, but `Span`'s discrimination ratio (14×)
+  dwarfs `PerTokenExcess`'s (1.7×) — far more robust at 93-tool scale.  Unchanged.
+- **Prefill mode**: `ScoreFormula::PerTokenExcess` on pragmatic depth, no
+  threshold gate.  Best prefill formula — 58% top-1 / 74% top-3, beating `Max`
+  (38%) and `Span` (43%).  A weak rough-guess, but the best available.
+
+## Applied changes
+
+| File | Change |
+|------|--------|
+| `candle-conversation/src/provenance/scan.rs` | `Aggregator` tracks per-probe-token best agreement; `TurnScores.pertok_excess` computed in `finish()`; `AGREEMENT_BASELINE = 64.0` |
+| `candle-conversation/src/substrate.rs` | `TurnScores.pertok_excess` field; `TurnScores::pick` handles `PerTokenExcess` |
+| `candle-conversation/src/projection/schema.rs` | `ScoreFormula::PerTokenExcess` variant |
+| `candle-conversation/src/projection/score.rs` | `PerTokenExcess` group-level aggregate (max of per-turn values) |
+| `candle-conversation/src/projection/project.rs` | `ProjectionMode` enum; `Prefill` profile → `PerTokenExcess` / pragmatic / no threshold; `Decode` profile → `Span 2.0` |
+| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` + `reproject_view` call `project_with_mode(.., Prefill)` |
+| `candle-conversation/src/conversation.rs` | `prefill_sigs_for`, `reseed_section_sigs_from_prefill` |
+| `zend/src/session.rs` | re-seeds tool-section sigs from prefilling each tool's description after `base_conv` build |
+| `zend/src/tools.rs` | `install_tool_catalog` returns each tool's description as probe text |
+
+## Pending
+
+- **Prefill caps at ~58% top-1** and degrades at 93-tool scale — a weak initial
+  guess no matter the formula.  The robust path is a **decode section corpus**:
+  a warm decode probe per tool (generate a representative tool call, capture
+  decode-Q) scored with `Span 2.0` — the 100%-top-1, ratio-14 configuration.
+- Section probe text is currently the tool *description* (register mismatch with
+  user queries); representative per-tool user-query probes would sharpen prefill.
+- Re-run the production `zend` test to confirm `calculator` is now selected.

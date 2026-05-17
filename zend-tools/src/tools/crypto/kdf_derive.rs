@@ -36,8 +36,9 @@ pub struct KdfDerive;
 impl Tool for KdfDerive {
     const NAME: &'static str = "kdf_derive";
     const DESCRIPTION: &'static str =
-        "Derive a key from a password using argon2id, pbkdf2_sha256, or scrypt. \
-         Use for: password hashing, key stretching.";
+        "Stretch a low-entropy password into a cryptographic key with a slow, \
+         memory-hard KDF — argon2id, pbkdf2_sha256, or scrypt. Use for \
+         password hashing and brute-force-resistant key derivation.";
 
     type Request = KdfRequest;
     type Response = KdfResponse;

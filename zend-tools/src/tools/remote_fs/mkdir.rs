@@ -28,7 +28,7 @@ pub struct RemoteFsSessionMkdir;
 
 impl Tool for RemoteFsSessionMkdir {
     const NAME: &'static str = "remote_fs_session_mkdir";
-    const DESCRIPTION: &'static str = "Create a directory on the remote SFTP filesystem.";
+    const DESCRIPTION: &'static str = "Create a new directory on a remote host's filesystem over SFTP.";
     type Request = MkdirRequest;
     type Response = MkdirResponse;
     type Error = RemoteFsError;

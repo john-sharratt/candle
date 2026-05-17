@@ -86,6 +86,12 @@ pub struct TurnScores {
     /// BdpScanner (default 2.0).  Isolated hits (L=1) score 1.0; a run of L
     /// consecutive probe tokens scores L^α, rewarding sustained attention.
     pub span: f32,
+    /// Per-token excess: Σ over probe tokens of `max(0, best_agreement − 64)`.
+    /// Recentered on the random baseline (noise → ~0) and reduced per probe
+    /// token (a single promiscuous token cannot inflate it), with no hit
+    /// threshold so weak sub-90 signal survives.  Calibrated as the strongest
+    /// prefill-phase section-scoring metric.
+    pub pertok_excess: f32,
 }
 
 impl TurnScores {
@@ -101,6 +107,7 @@ impl TurnScores {
             ScoreFormula::TopKMean { .. } => self.top_k_mean,
             ScoreFormula::Count => self.count,
             ScoreFormula::Span { .. } => self.span,
+            ScoreFormula::PerTokenExcess => self.pertok_excess,
         }
     }
 }

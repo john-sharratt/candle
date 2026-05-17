@@ -23,7 +23,7 @@ pub struct SshSessionClose;
 
 impl Tool for SshSessionClose {
     const NAME: &'static str = "ssh_session_close";
-    const DESCRIPTION: &'static str = "Close an SSH session and free its resources.";
+    const DESCRIPTION: &'static str = "End a secure shell session on a remote server, terminating the encrypted login and freeing its working state.";
 
     type Request = CloseRequest;
     type Response = CloseResponse;

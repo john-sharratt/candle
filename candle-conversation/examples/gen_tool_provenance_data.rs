@@ -50,6 +50,11 @@ struct Args {
     /// Overwrite existing files without prompting.
     #[arg(long)]
     force: bool,
+
+    /// Append new scenarios to an existing corpus instead of regenerating.
+    /// Only generates scenarios whose IDs are not already present in MANIFEST.json.
+    #[arg(long)]
+    append: bool,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -652,6 +657,22 @@ fn prompts(tool: &str, case_type: CaseType, variant: usize, wrong_tool: &str) ->
             "Calculate compound interest: £10,000 at 5% per year for 3 years.".into(),
             r#"<tool_call>{"name":"calculator","arguments":{"expression":"10000*(1.05^3)"}}</tool_call>"#.into(),
         ),
+        ("calculator", CaseType::Positive, 6) => (
+            "Use a tool and determine 14634535 + 623452345.".into(),
+            r#"<tool_call>{"name":"calculator","arguments":{"expression":"14634535 + 623452345"}}</tool_call>"#.into(),
+        ),
+        ("calculator", CaseType::Positive, 7) => (
+            "Use a tool to compute 9872534 * 3.".into(),
+            r#"<tool_call>{"name":"calculator","arguments":{"expression":"9872534 * 3"}}</tool_call>"#.into(),
+        ),
+        ("calculator", CaseType::Positive, 8) => (
+            "Use a tool to calculate 55^3.".into(),
+            r#"<tool_call>{"name":"calculator","arguments":{"expression":"55^3"}}</tool_call>"#.into(),
+        ),
+        ("calculator", CaseType::Positive, 9) => (
+            "Use a tool to figure out 2^20 - 1.".into(),
+            r#"<tool_call>{"name":"calculator","arguments":{"expression":"2^20 - 1"}}</tool_call>"#.into(),
+        ),
         ("calculator", CaseType::Boundary, 0) => (
             "Roughly how much is 17 times 23?".into(),
             "17 × 23 is 391 — close to 400 as a rough mental estimate.".into(),
@@ -920,11 +941,74 @@ fn generate(dir: &Path) -> anyhow::Result<Manifest> {
     Ok(manifest)
 }
 
+// ── Append mode ───────────────────────────────────────────────────────────────
+
+/// Generate only the scenarios missing from an existing corpus and append them.
+fn generate_append(dir: &Path) -> anyhow::Result<()> {
+    let manifest_path = dir.join("MANIFEST.json");
+    let prov_path = dir.join("signatures.prov");
+
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {} — run without --append first", manifest_path.display(), e))?;
+    let mut manifest: Manifest = serde_json::from_str(&text)?;
+
+    let existing_ids: std::collections::HashSet<String> =
+        manifest.scenarios.iter().map(|s| s.id.clone()).collect();
+    let mut turn_id: u64 = manifest.scenarios.iter().map(|s| s.turn_id).max().map(|x| x + 1).unwrap_or(0);
+
+    // Open prov file in append mode (ProvenanceFile::open seeks to end automatically).
+    let pf = ProvenanceFile::open(&prov_path)?;
+
+    let mut added = 0;
+
+    // Only calculator has variants 6-9 defined; generate whichever are missing.
+    let tool = "calculator";
+    let tool_idx = TOOLS.iter().position(|&t| t == tool).unwrap();
+    let wrong_tool = TOOLS[(tool_idx + 4) % TOOLS.len()];
+    let concept = name_concept_u128(tool);
+    let sys = system_prompt_for_tool(tool);
+
+    for n in 6..=9usize {
+        let id = format!("{}_pos_{}", tool, n);
+        if existing_ids.contains(&id) {
+            eprintln!("  skip {id} (already present)");
+            continue;
+        }
+        let extra = fnv64(format!("{}+pos+{}", tool, n).as_bytes());
+        let sigs: Vec<TokenSignature> =
+            (0..TOKENS_PER_CHUNK).map(|i| make_sig(concept, 12, i, extra)).collect();
+        let entry = pf.append(&sigs, &sigs, &sigs)?;
+        let (user_prompt, assistant_prompt) = prompts(tool, CaseType::Positive, n, wrong_tool);
+        manifest.scenarios.push(Scenario {
+            id: id.clone(),
+            tool: Some(tool.to_string()),
+            case_type: CaseType::Positive,
+            system_prompt: sys.clone(),
+            user_prompt,
+            assistant_prompt,
+            turn_id,
+            byte_offset: entry.byte_offset,
+            token_count: entry.token_count,
+        });
+        println!("  + {id}");
+        turn_id += 1;
+        added += 1;
+    }
+
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    println!("Appended {added} new scenarios to {}", dir.display());
+    Ok(())
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let dir = &args.output;
+
+    if args.append {
+        return generate_append(dir);
+    }
 
     let manifest_path = dir.join("MANIFEST.json");
     let prov_path = dir.join("signatures.prov");

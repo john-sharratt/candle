@@ -30,7 +30,7 @@ pub struct RemoteFsSessionRename;
 impl Tool for RemoteFsSessionRename {
     const NAME: &'static str = "remote_fs_session_rename";
     const DESCRIPTION: &'static str =
-        "Rename or move a file/directory on the remote SFTP filesystem.";
+        "Rename or move a file or directory on a remote host's filesystem over SFTP.";
     type Request = RenameRequest;
     type Response = RenameResponse;
     type Error = RemoteFsError;

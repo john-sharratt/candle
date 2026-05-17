@@ -28,8 +28,15 @@ pub struct Scenario {
     pub id: String,
     pub tool: Option<String>,
     pub case_type: CaseType,
+    /// Decode-phase Q-vector entry.
     pub byte_offset: u64,
     pub token_count: u16,
+    /// Prefill-phase Q-vector entry (present only when generated with the
+    /// dual-capture path of `gen_real_provenance_data`).
+    #[serde(default)]
+    pub prefill_byte_offset: Option<u64>,
+    #[serde(default)]
+    pub prefill_token_count: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +84,53 @@ pub fn load_fixtures() -> (Manifest, ProvenanceFile) {
     let pf = ProvenanceFile::open(dir.join("signatures.prov"))
         .expect("signatures.prov open failed");
     (manifest, pf)
+}
+
+/// Load the prefill-phase fixtures, if present.
+///
+/// Returns a `Manifest` whose `byte_offset`/`token_count` are remapped to the
+/// prefill entries, so every existing [`Harness`] scan path works unchanged —
+/// the harness just sees a corpus of prefill Q vectors instead of decode ones.
+///
+/// Scenarios without prefill data are dropped.  Returns `None` when
+/// `prefill_signatures.prov` is absent or no scenario carries prefill offsets
+/// (e.g. data generated before the dual-capture path landed).
+pub fn try_load_prefill_fixtures() -> Option<(Manifest, ProvenanceFile)> {
+    let dir = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/tool_provenance_real_data",
+    ));
+    let prefill_prov = dir.join("prefill_signatures.prov");
+    if !prefill_prov.exists() {
+        return None;
+    }
+    let json = std::fs::read_to_string(dir.join("MANIFEST.json"))
+        .expect("tool_provenance_real_data/MANIFEST.json not found");
+    let manifest: Manifest = serde_json::from_str(&json).expect("MANIFEST.json parse failed");
+
+    let remapped: Vec<Scenario> = manifest
+        .scenarios
+        .into_iter()
+        .filter_map(|s| {
+            let byte_offset = s.prefill_byte_offset?;
+            let token_count = s.prefill_token_count?;
+            Some(Scenario {
+                id: s.id,
+                tool: s.tool,
+                case_type: s.case_type,
+                byte_offset,
+                token_count,
+                prefill_byte_offset: None,
+                prefill_token_count: None,
+            })
+        })
+        .collect();
+    if remapped.is_empty() {
+        return None;
+    }
+
+    let pf = ProvenanceFile::open(prefill_prov).expect("prefill_signatures.prov open failed");
+    Some((Manifest { scenarios: remapped }, pf))
 }
 
 pub fn try_load_raw_fixtures() -> Option<(RawManifest, RawProvenanceFile)> {

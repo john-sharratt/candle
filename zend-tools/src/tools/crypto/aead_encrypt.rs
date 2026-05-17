@@ -35,8 +35,10 @@ pub struct AeadEncrypt;
 impl Tool for AeadEncrypt {
     const NAME: &'static str = "aead_encrypt";
     const DESCRIPTION: &'static str =
-        "Encrypt data with an AEAD cipher (AES-256-GCM or ChaCha20-Poly1305). \
-         Returns ciphertext and nonce. Provide key as 32-byte hex.";
+        "Encrypt plaintext into authenticated ciphertext with an AEAD cipher — \
+         AES-256-GCM or ChaCha20-Poly1305 — giving confidentiality and \
+         tamper-detection in one step. Returns ciphertext plus a fresh nonce; \
+         key provided as 32-byte hex.";
 
     type Request = AeadEncryptRequest;
     type Response = AeadEncryptResponse;

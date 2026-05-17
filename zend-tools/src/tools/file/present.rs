@@ -26,8 +26,9 @@ pub struct FilePresent;
 impl Tool for FilePresent {
     const NAME: &'static str = "file_present";
     const DESCRIPTION: &'static str =
-        "Present one or more VFS files to the user. Returns which files were found \
-         and presented vs missing.";
+        "Surface one or more virtual-filesystem files to the user in the chat \
+         interface, reporting which paths were found and shown versus \
+         missing.";
 
     type Request = PresentRequest;
     type Response = PresentResponse;

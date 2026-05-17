@@ -23,7 +23,7 @@ pub struct TlsSessionClose;
 
 impl Tool for TlsSessionClose {
     const NAME: &'static str = "tls_session_close";
-    const DESCRIPTION: &'static str = "Close a TLS session.";
+    const DESCRIPTION: &'static str = "Shut a TLS-encrypted connection, sending close-notify and freeing the certificate-verified channel.";
 
     type Request = CloseRequest;
     type Response = CloseResponse;

@@ -75,8 +75,8 @@ pub struct ToolResult {
 ///    tool in the registry, registering one section per tool with the
 ///    Hermes-format JSON line as its content.
 /// 3. Returns `(tool_name, section_id, json_line)` triples in registry
-///    order so the caller can prefill each section's KV cache and
-///    capture per-section sigs.
+///    order.  Each section's BDP sigs come from the single prefill of
+///    its `json_line` content during `insert_section_collection`.
 ///
 /// Static framing sections (mode/frame/grounding/tools_intro/
 /// tools_outro) are *outside* the collection — they always emit.  The
@@ -113,19 +113,22 @@ pub fn install_tool_catalog(
     Ok(out)
 }
 
-/// Render one tool's metadata as the Hermes-format JSON line that goes
-/// inside `<tools>...</tools>`.
+/// Render one tool's metadata as the JSON line that goes inside
+/// `<tools>...</tools>`.
 ///
-/// Format: `{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}`
+/// Flat shape — `{"name":"...","description":"...","parameters":{...}}` —
+/// deliberately mirrors the tool-*call* shape the model must emit
+/// (`{"name":...,"arguments":...}`).  The canonical Qwen3
+/// `{"type":"function","function":{...}}` wrapper is dropped on purpose:
+/// with `"function"` as a prominent definition key, Qwen3-30B-A3B echoed it
+/// into calls (`{"function":"calculate",...}`) instead of using `"name"`.
+/// Flattening also saves ~10 tokens per tool across the 90+ tool catalog.
 fn render_tool_json_line(tool: &registry::RegisteredTool) -> String {
     let schema = (tool.schema)();
     let blob = serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": schema,
-        }
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": schema,
     });
     serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
@@ -225,6 +228,11 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
 
 #[derive(Deserialize)]
 struct RawCall {
+    /// `function` is accepted as an alias for `name`: Qwen3-30B-A3B
+    /// occasionally emits `{"function":"<tool>", "arguments":{...}}` instead
+    /// of `{"name":"<tool>", ...}`.  Tolerating it costs nothing and
+    /// recovers an otherwise-lost tool call.
+    #[serde(alias = "function")]
     name: String,
     #[serde(default)]
     arguments: Option<Value>,

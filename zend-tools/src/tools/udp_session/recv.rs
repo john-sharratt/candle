@@ -29,7 +29,7 @@ pub struct UdpSessionRecv;
 
 impl Tool for UdpSessionRecv {
     const NAME: &'static str = "udp_session_recv";
-    const DESCRIPTION: &'static str = "Receive a UDP datagram.";
+    const DESCRIPTION: &'static str = "Read one incoming UDP datagram, returning its packet payload and the sender's address.";
 
     type Request = RecvRequest;
     type Response = RecvResponse;
