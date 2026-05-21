@@ -14,11 +14,11 @@ use tokio::io::AsyncWriteExt;
 
 // ── Model coordinates ─────────────────────────────────────────────────────────
 
-const MODEL_REPO: &str  = "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF";
-const MODEL_FILE: &str  = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
-const TOK_REPO:   &str  = "Qwen/Qwen3-30B-A3B-Instruct-2507";
-const TOK_FILE:   &str  = "tokenizer.json";
-const MODEL_BYTES: u64  = 17_100_000_000; // ~17 GB; fallback when Content-Length absent
+const MODEL_REPO: &str = "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF";
+const MODEL_FILE: &str = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
+const TOK_REPO: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+const TOK_FILE: &str = "tokenizer.json";
+const MODEL_BYTES: u64 = 17_100_000_000; // ~17 GB; fallback when Content-Length absent
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ pub async fn ensure_model(
     tokio::fs::create_dir_all(&dir).await?;
 
     let model_path = resolve_file(MODEL_REPO, MODEL_FILE, Some(MODEL_BYTES), &dir, status).await?;
-    let tok_path   = resolve_file(TOK_REPO,   TOK_FILE,   None,             &dir, status).await?;
+    let tok_path = resolve_file(TOK_REPO, TOK_FILE, None, &dir, status).await?;
 
     Ok((model_path, tok_path))
 }
@@ -41,26 +41,38 @@ pub async fn ensure_model(
 
 /// Resolve a model file: our cache → HF hub cache → download.
 async fn resolve_file(
-    repo:      &str,
-    filename:  &str,
+    repo: &str,
+    filename: &str,
     size_hint: Option<u64>,
-    our_dir:   &Path,
-    status:    &tokio::sync::watch::Sender<String>,
+    our_dir: &Path,
+    status: &tokio::sync::watch::Sender<String>,
 ) -> anyhow::Result<PathBuf> {
     // 1. Our own cache.
     let our_path = our_dir.join(filename);
     if our_path.exists() {
-        let gb = tokio::fs::metadata(&our_path).await.map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
+        let gb = tokio::fs::metadata(&our_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0) as f64
+            / 1e9;
         tracing::info!("cache hit: {} ({:.2} GB)", filename, gb);
-        status.send(format!("Found {} ({:.1} GB)", filename, gb)).ok();
+        status
+            .send(format!("Found {} ({:.1} GB)", filename, gb))
+            .ok();
         return Ok(our_path);
     }
 
     // 2. HuggingFace hub cache (hf-hub or huggingface-cli may have already downloaded it).
     if let Some(hf_path) = hf_hub_path(repo, filename) {
         let gb = hf_path.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1e9;
-        tracing::info!("found in HF hub cache: {} ({:.2} GB)", hf_path.display(), gb);
-        status.send(format!("Found {} ({:.1} GB)", filename, gb)).ok();
+        tracing::info!(
+            "found in HF hub cache: {} ({:.2} GB)",
+            hf_path.display(),
+            gb
+        );
+        status
+            .send(format!("Found {} ({:.1} GB)", filename, gb))
+            .ok();
         return Ok(hf_path);
     }
 
@@ -127,10 +139,10 @@ fn hf_hub_root() -> PathBuf {
 ///
 /// Writes to a `.part` sidecar and atomically renames on success.
 async fn fetch(
-    url:       &str,
-    dest:      &Path,
+    url: &str,
+    dest: &Path,
     size_hint: Option<u64>,
-    status:    &tokio::sync::watch::Sender<String>,
+    status: &tokio::sync::watch::Sender<String>,
 ) -> anyhow::Result<()> {
     let part = dest.with_extension("part");
     if part.exists() {
@@ -142,9 +154,13 @@ async fn fetch(
         req = req.bearer_auth(token);
     }
 
-    let resp  = req.send().await?.error_for_status()?;
+    let resp = req.send().await?.error_for_status()?;
     let total = resp.content_length().or(size_hint).unwrap_or(0);
-    let name  = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let name = dest
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     if total > 0 {
         let msg = format!("Downloading {} ({:.1} GB)…", name, total as f64 / 1e9);
@@ -156,10 +172,10 @@ async fn fetch(
         status.send(msg).ok();
     }
 
-    let mut file       = tokio::fs::File::create(&part).await?;
-    let mut stream     = resp.bytes_stream();
+    let mut file = tokio::fs::File::create(&part).await?;
+    let mut stream = resp.bytes_stream();
     let mut downloaded = 0u64;
-    let mut last_pct   = 0u64;
+    let mut last_pct = 0u64;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -172,7 +188,9 @@ async fn fetch(
                 last_pct = pct;
                 let msg = format!(
                     "Downloading {} — {:.1}/{:.1} GB ({pct}%)",
-                    name, downloaded as f64 / 1e9, total as f64 / 1e9,
+                    name,
+                    downloaded as f64 / 1e9,
+                    total as f64 / 1e9,
                 );
                 tracing::info!("{}", msg);
                 status.send(msg).ok();
@@ -183,6 +201,10 @@ async fn fetch(
     file.flush().await?;
     drop(file);
     tokio::fs::rename(&part, dest).await?;
-    tracing::info!("download complete: {}  ({:.2} GB)", name, downloaded as f64 / 1e9);
+    tracing::info!(
+        "download complete: {}  ({:.2} GB)",
+        name,
+        downloaded as f64 / 1e9
+    );
     Ok(())
 }

@@ -60,7 +60,6 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::SigEntry;
 
-
 // ── Per-turn statistics ───────────────────────────────────────────────────────
 
 /// Five aggregations of per-token agreement values within a single turn at
@@ -262,7 +261,10 @@ impl Substrate {
     /// Pass a clone of the engine-level cache so VRAM accounting and the
     /// eviction budget are shared across all sessions.
     pub fn with_cache(cache: SubstrateCache) -> Self {
-        Self { cache, ..Self::default() }
+        Self {
+            cache,
+            ..Self::default()
+        }
     }
 
     // ── Timeline registry ────────────────────────────────────────────────────
@@ -397,6 +399,44 @@ impl Substrate {
         Ok(idx)
     }
 
+    /// Insert a turn reconstructed from the redo log — the substrate-reload
+    /// path (§16.12 of `docs/kv_tier_migration.md`).
+    ///
+    /// Unlike [`Self::append_full`], the per-layer [`SealedSequence`]s are
+    /// already built (cold-loaded from disk via `load_stream`), so no
+    /// GPU→CPU migration closure runs. The caller must
+    /// [`Self::register_timeline`] first. Turns must be restored in
+    /// `turn_index` order so the appended `TurnIndex` matches the persisted
+    /// one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_turn(
+        &mut self,
+        timeline: TimelineId,
+        role: Role,
+        text: String,
+        token_ids: TokenBuffer,
+        token_count: usize,
+        block_start: u64,
+        block_end: u64,
+        sealed: Arc<Vec<SealedSequence>>,
+    ) -> TurnIndex {
+        let tail = self.tails.entry(timeline).or_default();
+        let idx = TurnIndex(tail.len() as u32);
+        tail.push(idx);
+        let entry = TurnEntryData {
+            token_count,
+            block_range: (block_start, block_end),
+            scores: PerDepthScores::default(),
+            sig_entries: Vec::new(),
+            sealed,
+            role,
+            text,
+            token_ids,
+        };
+        self.turns.insert((timeline, idx), entry);
+        idx
+    }
+
     pub fn set_turn_content(
         &mut self,
         timeline: TimelineId,
@@ -504,7 +544,9 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
-        self.turns.get(&(timeline, index)).map(|e| Arc::clone(&e.sealed))
+        self.turns
+            .get(&(timeline, index))
+            .map(|e| Arc::clone(&e.sealed))
     }
 
     pub fn scores_of(&self, timeline: TimelineId, index: TurnIndex) -> PerDepthScores {
@@ -571,7 +613,8 @@ impl Substrate {
         abs_reserve_bytes: u64,
         rel_reserve_frac: f64,
     ) {
-        self.cache.activate_budget(free_vram_bytes, abs_reserve_bytes, rel_reserve_frac);
+        self.cache
+            .activate_budget(free_vram_bytes, abs_reserve_bytes, rel_reserve_frac);
     }
 
     /// Total VRAM currently occupied by all GPU-resident (hot-tier) entries.
@@ -847,17 +890,19 @@ mod tests {
         let migrated_ptr = Arc::as_ptr(&migrated);
         let migrated_clone = Arc::clone(&migrated);
 
-        let idx = sub.append_full(
-            timeline,
-            Role::User,
-            "hello".to_string(),
-            TokenBuffer::default(),
-            3,
-            0,
-            1,
-            Arc::new(vec![]),
-            move |_| Ok((*migrated_clone).clone()),
-        ).unwrap();
+        let idx = sub
+            .append_full(
+                timeline,
+                Role::User,
+                "hello".to_string(),
+                TokenBuffer::default(),
+                3,
+                0,
+                1,
+                Arc::new(vec![]),
+                move |_| Ok((*migrated_clone).clone()),
+            )
+            .unwrap();
 
         let stored = sub.turn_sealed_of(timeline, idx).unwrap();
         // The stored sealed is the migrated result (same content, may be new Arc).
@@ -879,10 +924,14 @@ mod tests {
             Arc::new(vec![]),
             identity_migrate,
             Arc::new(vec![1u32, 2, 3]),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(sub.section_sealed_of(section).is_some());
-        assert_eq!(sub.sections.get(&section).unwrap().tokens.as_slice(), &[1u32, 2, 3]);
+        assert_eq!(
+            sub.sections.get(&section).unwrap().tokens.as_slice(),
+            &[1u32, 2, 3]
+        );
     }
 
     /// After `reset()`, the substrate is empty.
@@ -900,7 +949,8 @@ mod tests {
             0,
             Arc::new(vec![]),
             identity_migrate,
-        ).unwrap();
+        )
+        .unwrap();
 
         sub.reset();
         assert_eq!(sub.turn_count(timeline), 0);
@@ -912,10 +962,32 @@ mod tests {
     fn multiple_appends_independent() {
         let (_, _, timeline, mut sub) = make_timeline();
 
-        let idx0 = sub.append_full(timeline, Role::User, String::new(), TokenBuffer::default(),
-            0, 0, 0, Arc::new(vec![]), identity_migrate).unwrap();
-        let idx1 = sub.append_full(timeline, Role::Assistant, String::new(), TokenBuffer::default(),
-            0, 0, 0, Arc::new(vec![]), identity_migrate).unwrap();
+        let idx0 = sub
+            .append_full(
+                timeline,
+                Role::User,
+                String::new(),
+                TokenBuffer::default(),
+                0,
+                0,
+                0,
+                Arc::new(vec![]),
+                identity_migrate,
+            )
+            .unwrap();
+        let idx1 = sub
+            .append_full(
+                timeline,
+                Role::Assistant,
+                String::new(),
+                TokenBuffer::default(),
+                0,
+                0,
+                0,
+                Arc::new(vec![]),
+                identity_migrate,
+            )
+            .unwrap();
 
         assert!(sub.turn_sealed_of(timeline, idx0).is_some());
         assert!(sub.turn_sealed_of(timeline, idx1).is_some());

@@ -67,6 +67,20 @@ Qwen3 thresholds are model-specific and must be re-derived for each variant. Whe
 
 ---
 
+## Code Conventions & Engineering Principles
+
+These apply repo-wide. They are deliberate standing decisions, not suggestions.
+
+- **No backward compatibility.** This is a pre-publication research codebase. It is fine — expected — to break everything before you. Do not write compatibility shims, dual code paths, or `Option`-typed feature flags that exist only to keep an old path alive. Replace the real thing. (Genuine `Option`s — a real hit/miss, a value that is legitimately absent — are fine; optionality-as-a-feature-flag is not.)
+- **No `TODO`s, no stubs.** Never commit `TODO` / `FIXME` / `unimplemented!()` / `todo!()` / placeholder stubs. Implement the task fully or do not commit it. "Fail forward" means solve the hard thing and move on — it never means leaving a placeholder.
+- **Imports, not fully-qualified paths.** Never write a fully-qualified type path inline (`crate::foo::Bar`). `use`-import every type at the top of the file and refer to it by its short name.
+- **One concern per file.** Split modules into a subfolder with a file per concern rather than growing one large file. Prefer small, independently-testable units.
+- **TDD, extensive unit tests.** Build tests alongside the code, as the code is written — not after. Every building block must be testable in isolation. For serialization / quantization / codec code, assert against **raw expected bytes**, never error-tolerance thresholds.
+- **Design docs are authoritative.** When a design document exists for the work (e.g. `docs/*.md`), it takes precedence over discrepancies with the code. If the document is itself wrong, fix the document in the same change.
+- **Persistence is mandatory.** The conversation substrate is always backed by its on-disk persistence layer (`candle-conversation/src/persistence/`, redo log at `.substrate/substrate.log`). There is no in-memory-only substrate mode. See `docs/kv_tier_migration.md`.
+
+---
+
 ## Build Commands
 
 ```bash
@@ -128,15 +142,22 @@ The most complex part of the codebase. Key files:
 | `mod.rs` | Public API, `KvFormat`, `QuantFormat`, `PagedKvArenas` trait |
 | `cache.rs` | `Cache`, `KvCache` (contiguous, simple baseline) |
 | `rotating.rs` | `RotatingKvCache`, `ScatteredKvCache` |
-| `arena_table.rs` | `ArenaTable`, `PerHeadTable`, palette indexing |
-| `chunked/mod.rs` | `ChunkedKvBacking`, exports, constants |
-| `chunked/arena.rs` | `Arena` enum (Float/Quantized), `StoragePolicy` |
+| `arena_table.rs` | `ArenaTable`, `PerHeadTable`, `ArenaLocation`, palette indexing |
+| `chunked/mod.rs` | Exports, constants |
+| `chunked/backing.rs` | `ChunkedKvBacking` — core cache state |
+| `chunked/arena.rs` | `Arena` enum (Float/Quantized), `ArenaKey`, `StoragePolicy` |
+| `chunked/gid_pool.rs` | `GidPool`, `ChunkGid` — free-list chunk allocator |
+| `chunked/head_gids.rs` | `HeadGids` — per-head/palette chunk GID collection |
 | `chunked/compress.rs` | Per-block format selection, quantization kernel calls |
 | `chunked/compression_policy.rs` | `CompressionPolicy`, level→candidate tables, production thresholds |
-| `chunked/eviction.rs` | `EvictionManager`, warm/cold tier decisions |
-| `chunked/alloc.rs` | `GidPool`, free-list chunk allocator |
-| `chunked/warm_pool.rs` | RAM-tier dense packing |
-| `chunked/gpu_chunks.rs` | GPU-side arena storage |
+| `chunked/sequence_ops.rs` | Sequence injection / sealing operations |
+| `chunked/io.rs` | Contiguous read/write, raw sealed-chunk extraction |
+| `chunked/gpu_chunks.rs` | GPU-side arena storage, kernel table builders |
+| `chunked/types.rs` | `SealedSequence`, `SealedChunk`, `ChunkMeta` |
+
+> **Tiering status:** the KV cache is currently **GPU-only**. The RAM-warm /
+> NVMe-cold tiers from the project vision are not yet built — see
+> `docs/kv_tier_migration.md` for the VRAM↔RAM migration design.
 
 **`KvFormat`**: `Float(DType)` or `Quantized(QuantFormat)`. All quant blocks = 32 elements.
 

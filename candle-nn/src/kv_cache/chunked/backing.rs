@@ -1,4 +1,4 @@
-﻿//! BackingInner and ChunkedKvBacking implementation.
+//! BackingInner and ChunkedKvBacking implementation.
 //!
 //! This module contains:
 //! - `BackingInner` - The inner shared state
@@ -285,15 +285,16 @@ impl BackingInner {
             // so a per-arena cache lets the inner loop be pure pointer math.
             self.storage.read(|state| {
                 let mut arena_span: ahash::HashMap<usize, (u64, u32)> = ahash::HashMap::new();
-                let resolve_span =
-                    |ai: usize, cache: &mut ahash::HashMap<usize, (u64, u32)>| -> Option<(u64, u32)> {
-                        if let Some(&v) = cache.get(&ai) {
-                            return Some(v);
-                        }
-                        let span = state.arena(ai).and_then(|a| a.chunk_copy_span(0))?;
-                        cache.insert(ai, span);
-                        Some(span)
-                    };
+                let resolve_span = |ai: usize,
+                                    cache: &mut ahash::HashMap<usize, (u64, u32)>|
+                 -> Option<(u64, u32)> {
+                    if let Some(&v) = cache.get(&ai) {
+                        return Some(v);
+                    }
+                    let span = state.arena(ai).and_then(|a| a.chunk_copy_span(0))?;
+                    cache.insert(ai, span);
+                    Some(span)
+                };
 
                 for key in self.pool.format_keys() {
                     if self.pool.defragmentable_ratio_for(&key) <= fragmentation_threshold {
@@ -536,7 +537,6 @@ impl ChunkedKvBacking {
         )
     }
 
-
     /// Create a new chunked backing with float storage.
     ///
     /// This is the legacy API for backward compatibility.
@@ -645,46 +645,54 @@ impl ChunkedKvBacking {
         #[cfg(feature = "cuda")]
         let bg_quantizer_err: std::cell::RefCell<Option<candle::Error>> =
             std::cell::RefCell::new(None);
-        let inner = Arc::new_cyclic(|#[cfg(feature = "cuda")] weak_self, #[cfg(not(feature = "cuda"))] _weak_self| BackingInner {
-            storage,
-            state_registry: RwLock::new(ahash::HashMap::new()),
-            pool,
-            device: device.clone(),
-            n_kv_head,
-            head_dim,
-            identity_pal: {
-                use crate::kv_cache::arena_table::N_PALETTE;
-                let pal_bytes = (head_dim / 4).max(1);
-                let sub_hd = (head_dim / N_PALETTE).max(1);
-                let mut buf = vec![0u8; n_kv_head * pal_bytes];
-                for h in 0..n_kv_head {
-                    let slice = &mut buf[h * pal_bytes..(h + 1) * pal_bytes];
-                    for d in 0..head_dim {
-                        let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
-                        slice[d / 4] |= pal_idx << ((d % 4) * 2);
-                    }
-                }
-                Arc::new(buf)
-            },
-            identity_scale: {
-                use crate::kv_cache::arena_table::N_PALETTE;
-                Arc::new(vec![1.0f32; n_kv_head * N_PALETTE])
-            },
-            pinned_stager,
-            #[cfg(feature = "cuda")]
-            bg_quantizer: match device {
-                Device::Cuda(_) => {
-                    match BackgroundQuantizer::new(device, compression.clone(), weak_self.clone()) {
-                        Ok(bq) => bq,
-                        Err(e) => {
-                            *bg_quantizer_err.borrow_mut() = Some(e);
-                            BackgroundQuantizer::noop()
+        let inner = Arc::new_cyclic(
+            |#[cfg(feature = "cuda")] weak_self, #[cfg(not(feature = "cuda"))] _weak_self| {
+                BackingInner {
+                    storage,
+                    state_registry: RwLock::new(ahash::HashMap::new()),
+                    pool,
+                    device: device.clone(),
+                    n_kv_head,
+                    head_dim,
+                    identity_pal: {
+                        use crate::kv_cache::arena_table::N_PALETTE;
+                        let pal_bytes = (head_dim / 4).max(1);
+                        let sub_hd = (head_dim / N_PALETTE).max(1);
+                        let mut buf = vec![0u8; n_kv_head * pal_bytes];
+                        for h in 0..n_kv_head {
+                            let slice = &mut buf[h * pal_bytes..(h + 1) * pal_bytes];
+                            for d in 0..head_dim {
+                                let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
+                                slice[d / 4] |= pal_idx << ((d % 4) * 2);
+                            }
                         }
-                    }
+                        Arc::new(buf)
+                    },
+                    identity_scale: {
+                        use crate::kv_cache::arena_table::N_PALETTE;
+                        Arc::new(vec![1.0f32; n_kv_head * N_PALETTE])
+                    },
+                    pinned_stager,
+                    #[cfg(feature = "cuda")]
+                    bg_quantizer: match device {
+                        Device::Cuda(_) => {
+                            match BackgroundQuantizer::new(
+                                device,
+                                compression.clone(),
+                                weak_self.clone(),
+                            ) {
+                                Ok(bq) => bq,
+                                Err(e) => {
+                                    *bg_quantizer_err.borrow_mut() = Some(e);
+                                    BackgroundQuantizer::noop()
+                                }
+                            }
+                        }
+                        _ => BackgroundQuantizer::noop(),
+                    },
                 }
-                _ => BackgroundQuantizer::noop(),
             },
-        });
+        );
         #[cfg(feature = "cuda")]
         if let Some(e) = bg_quantizer_err.into_inner() {
             return Err(e);
@@ -1845,7 +1853,12 @@ impl ChunkedKvBacking {
                             (0..N_PALETTE).map(move |p| {
                                 let kg = cw.gids.k_gid_pal(h, p);
                                 let vg = cw.gids.v_gid_pal(h, p);
-                                (kg.arena_idx(), kg.chunk_idx(), vg.arena_idx(), vg.chunk_idx())
+                                (
+                                    kg.arena_idx(),
+                                    kg.chunk_idx(),
+                                    vg.arena_idx(),
+                                    vg.chunk_idx(),
+                                )
                             })
                         })
                         .collect();
@@ -1904,14 +1917,8 @@ impl ChunkedKvBacking {
             for &(k_ai, k_ci, v_ai, v_ci) in head_gids.iter() {
                 let k_arena = &arena_info[k_ai];
                 let v_arena = &arena_info[v_ai];
-                k_ptrs.push(
-                    k_arena.base_ptr as i64
-                        + k_ci as i64 * k_arena.chunk_byte_stride,
-                );
-                v_ptrs.push(
-                    v_arena.base_ptr as i64
-                        + v_ci as i64 * v_arena.chunk_byte_stride,
-                );
+                k_ptrs.push(k_arena.base_ptr as i64 + k_ci as i64 * k_arena.chunk_byte_stride);
+                v_ptrs.push(v_arena.base_ptr as i64 + v_ci as i64 * v_arena.chunk_byte_stride);
             }
         }
         let mut result: Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)> =

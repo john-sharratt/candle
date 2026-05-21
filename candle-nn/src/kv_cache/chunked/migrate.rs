@@ -1,0 +1,253 @@
+//! KV tier-migration primitive — the Rust side of the `kv_pack` /
+//! `kv_unpack` scatter/gather kernel (`docs/kv_tier_migration.md` §9).
+//!
+//! A migration plan is a flat list of `(src, dst, byte_len)` records, each
+//! carrying device addresses the caller has already resolved. [`kv_migrate`]
+//! executes the whole plan in a single kernel launch — it serves both
+//! directions:
+//!
+//! - **kv_pack** (evict / gather) — `src` are scattered arena chunks,
+//!   `dst` offsets into a contiguous staging buffer.
+//! - **kv_unpack** (load / scatter) — `src` is the contiguous staging
+//!   buffer, `dst` are freshly-allocated arena chunks.
+//!
+//! The kernel itself is `candle-kernels` `simple/kv_migrate.cu`.
+
+/// One copy in a migration plan: `byte_len` bytes from `src_ptr` to
+/// `dst_ptr`, both raw device addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrationRecord {
+    pub src_ptr: i64,
+    pub dst_ptr: i64,
+    pub byte_len: i64,
+}
+
+/// A migration plan — the flat record list spanning every sub-chunk of a
+/// migration batch. One [`kv_migrate`] launch covers the whole plan.
+#[derive(Clone, Debug, Default)]
+pub struct MigrationPlan {
+    pub records: Vec<MigrationRecord>,
+}
+
+impl MigrationPlan {
+    /// An empty plan.
+    pub fn new() -> MigrationPlan {
+        MigrationPlan {
+            records: Vec::new(),
+        }
+    }
+
+    /// Append one copy record.
+    pub fn push(&mut self, src_ptr: i64, dst_ptr: i64, byte_len: i64) {
+        self.records.push(MigrationRecord {
+            src_ptr,
+            dst_ptr,
+            byte_len,
+        });
+    }
+
+    /// Number of copy records.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the plan has no records.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Total bytes the plan moves.
+    pub fn total_bytes(&self) -> i64 {
+        self.records.iter().map(|r| r.byte_len).sum()
+    }
+}
+
+/// Execute a migration plan: launch the scatter/gather kernel once over the
+/// whole plan and synchronise. After this returns, every record's bytes
+/// have been copied.
+#[cfg(feature = "cuda")]
+pub fn kv_migrate(device: &candle::Device, plan: &MigrationPlan) -> candle::Result<()> {
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::cuda_backend::kernels;
+
+    let dev = match device {
+        candle::Device::Cuda(d) => d,
+        _ => {
+            return Err(candle::Error::Msg(
+                "kv_migrate requires a CUDA device".into(),
+            ))
+        }
+    };
+    if plan.records.is_empty() {
+        return Ok(());
+    }
+
+    let src: Vec<i64> = plan.records.iter().map(|r| r.src_ptr).collect();
+    let dst: Vec<i64> = plan.records.iter().map(|r| r.dst_ptr).collect();
+    let lens: Vec<i64> = plan.records.iter().map(|r| r.byte_len).collect();
+
+    let src_gpu = dev
+        .memcpy_stod(&src)
+        .map_err(|e| candle::Error::Msg(format!("kv_migrate: src plan HtoD: {e}")))?;
+    let dst_gpu = dev
+        .memcpy_stod(&dst)
+        .map_err(|e| candle::Error::Msg(format!("kv_migrate: dst plan HtoD: {e}")))?;
+    let len_gpu = dev
+        .memcpy_stod(&lens)
+        .map_err(|e| candle::Error::Msg(format!("kv_migrate: len plan HtoD: {e}")))?;
+
+    let stream = dev.cuda_stream();
+    let (sp, _sg) = src_gpu.device_ptr(&stream);
+    let (dp, _dg) = dst_gpu.device_ptr(&stream);
+    let (lp, _lg) = len_gpu.device_ptr(&stream);
+    unsafe {
+        kernels::simple::kv_migrate::run_kv_migrate_copy(
+            sp as *const i64,
+            dp as *const i64,
+            lp as *const i64,
+            plan.records.len() as i32,
+            stream.cu_stream() as *mut std::ffi::c_void,
+        );
+    }
+    stream
+        .synchronize()
+        .map_err(|e| candle::Error::Msg(format!("kv_migrate: stream sync: {e}")))?;
+    Ok(())
+}
+
+/// Host-side migration plan-builder (`docs/kv_tier_migration.md` §8).
+#[cfg(feature = "cuda")]
+impl super::ChunkedKvBacking {
+    /// Resolve every unique physical sub-chunk of a sealed sequence to its
+    /// device address and byte length.
+    ///
+    /// Returns `(device_ptr, byte_len)` per unique `(arena, chunk)` pair, in
+    /// chunk order — the input from which `transfer.rs` builds the gather /
+    /// scatter [`MigrationPlan`]s. Errors if a chunk's arena is not
+    /// GPU-resident.
+    pub fn resolve_sealed_chunk_ptrs(
+        &self,
+        seq: &super::SealedSequence,
+    ) -> candle::Result<Vec<(i64, i64)>> {
+        let arena_info = self.resolve_arena_info()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for chunk in &seq.chunks {
+            for gid in chunk.gids.0.iter() {
+                let arena_idx = gid.arena_idx();
+                let chunk_idx = gid.chunk_idx();
+                if !seen.insert((arena_idx, chunk_idx)) {
+                    continue;
+                }
+                let arena = arena_info.get(arena_idx).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "resolve_sealed_chunk_ptrs: arena index {arena_idx} out of range"
+                    ))
+                })?;
+                if arena.base_ptr == 0 {
+                    return Err(candle::Error::Msg(
+                        "resolve_sealed_chunk_ptrs: chunk arena is not GPU-resident".into(),
+                    ));
+                }
+                let ptr = arena.base_ptr as i64 + chunk_idx as i64 * arena.chunk_byte_stride;
+                out.push((ptr, arena.chunk_byte_stride));
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_accumulates_records_and_totals() {
+        let mut plan = MigrationPlan::new();
+        assert!(plan.is_empty());
+        plan.push(0x1000, 0x2000, 256);
+        plan.push(0x4000, 0x2100, 512);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.total_bytes(), 768);
+        assert_eq!(
+            plan.records[1],
+            MigrationRecord {
+                src_ptr: 0x4000,
+                dst_ptr: 0x2100,
+                byte_len: 512,
+            }
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn kv_migrate_gather_then_scatter_is_byte_identical() {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+
+        let device = match candle::Device::cuda_if_available(0) {
+            Ok(d @ candle::Device::Cuda(_)) => d,
+            _ => return, // no GPU — skip
+        };
+        let dev = match &device {
+            candle::Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+
+        // Three scattered source chunks with distinct byte patterns.
+        let chunks: Vec<Vec<u8>> = vec![
+            (0..256u32).map(|i| (i % 256) as u8).collect(),
+            (0..512u32).map(|i| ((i * 7 + 3) % 256) as u8).collect(),
+            (0..176u32).map(|i| ((i * 13 + 1) % 256) as u8).collect(),
+        ];
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+
+        let src_gpus: Vec<_> = chunks.iter().map(|c| dev.memcpy_stod(c).unwrap()).collect();
+        let staging = unsafe { dev.alloc::<u8>(total).unwrap() };
+
+        let stream = dev.cuda_stream();
+        let staging_base = staging.device_ptr(&stream).0 as i64;
+        let src_ptrs: Vec<i64> = src_gpus
+            .iter()
+            .map(|g| g.device_ptr(&stream).0 as i64)
+            .collect();
+        drop(stream);
+
+        // kv_pack: gather the scattered chunks into the contiguous staging buffer.
+        let mut gather = MigrationPlan::new();
+        let mut offset = 0i64;
+        for (i, c) in chunks.iter().enumerate() {
+            gather.push(src_ptrs[i], staging_base + offset, c.len() as i64);
+            offset += c.len() as i64;
+        }
+        kv_migrate(&device, &gather).unwrap();
+
+        let staging_cpu = dev.memcpy_dtov(&staging).unwrap();
+        let concatenated: Vec<u8> = chunks.iter().flatten().copied().collect();
+        assert_eq!(staging_cpu, concatenated, "gather concatenates the chunks");
+
+        // kv_unpack: scatter the staging buffer back into fresh chunks.
+        let dst_gpus: Vec<_> = chunks
+            .iter()
+            .map(|c| unsafe { dev.alloc::<u8>(c.len()).unwrap() })
+            .collect();
+        let stream = dev.cuda_stream();
+        let dst_ptrs: Vec<i64> = dst_gpus
+            .iter()
+            .map(|g| g.device_ptr(&stream).0 as i64)
+            .collect();
+        drop(stream);
+
+        let mut scatter = MigrationPlan::new();
+        let mut offset = 0i64;
+        for (i, c) in chunks.iter().enumerate() {
+            scatter.push(staging_base + offset, dst_ptrs[i], c.len() as i64);
+            offset += c.len() as i64;
+        }
+        kv_migrate(&device, &scatter).unwrap();
+
+        for (i, c) in chunks.iter().enumerate() {
+            let back = dev.memcpy_dtov(&dst_gpus[i]).unwrap();
+            assert_eq!(&back, c, "chunk {i} round-trips byte-identical");
+        }
+    }
+}

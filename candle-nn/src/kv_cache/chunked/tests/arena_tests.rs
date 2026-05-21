@@ -1,4 +1,4 @@
-﻿//! Tests for arena types: Arena, ArenaKey, ArenaStorage, StoragePolicy.
+//! Tests for arena types: Arena, ArenaKey, ArenaStorage, StoragePolicy.
 
 use candle::{DType, Device, Tensor};
 
@@ -223,7 +223,11 @@ mod tests {
 
         #[test]
         fn test_arena_storage_new_float() {
-            let storage = ArenaStorage::new(KvFormat::Float(DType::BF16), KvFormat::Float(DType::BF16), ArenaLocation::Gpu);
+            let storage = ArenaStorage::new(
+                KvFormat::Float(DType::BF16),
+                KvFormat::Float(DType::BF16),
+                ArenaLocation::Gpu,
+            );
 
             assert_eq!(storage.k_format(), KvFormat::Float(DType::BF16));
             assert!(!storage.is_quantized());
@@ -247,31 +251,45 @@ mod tests {
 
         #[test]
         fn test_arena_storage_arena_count() {
-            let storage = ArenaStorage::new(KvFormat::Float(DType::BF16), KvFormat::Float(DType::BF16), ArenaLocation::Gpu);
+            let storage = ArenaStorage::new(
+                KvFormat::Float(DType::BF16),
+                KvFormat::Float(DType::BF16),
+                ArenaLocation::Gpu,
+            );
 
             assert_eq!(storage.arena_count().unwrap(), 0);
         }
 
         #[test]
         fn test_arena_storage_truncate() {
-            let storage = ArenaStorage::new(KvFormat::Float(DType::BF16), KvFormat::Float(DType::BF16), ArenaLocation::Cpu);
+            let storage = ArenaStorage::new(
+                KvFormat::Float(DType::BF16),
+                KvFormat::Float(DType::BF16),
+                ArenaLocation::Cpu,
+            );
 
             // Add some arenas manually for test using write closure
             storage
                 .write(|s| {
                     let data = Tensor::zeros((64, 8, 16, 64), DType::BF16, &Device::Cpu).unwrap();
-                    s.arenas_mut().insert(0, Arena::Float {
-                        data: data.clone(),
-                        dtype: DType::BF16,
-                        location: ArenaLocation::Cpu,
-                        index: 0,
-                    });
-                    s.arenas_mut().insert(1, Arena::Float {
-                        data,
-                        dtype: DType::BF16,
-                        location: ArenaLocation::Cpu,
-                        index: 1,
-                    });
+                    s.arenas_mut().insert(
+                        0,
+                        Arena::Float {
+                            data: data.clone(),
+                            dtype: DType::BF16,
+                            location: ArenaLocation::Cpu,
+                            index: 0,
+                        },
+                    );
+                    s.arenas_mut().insert(
+                        1,
+                        Arena::Float {
+                            data,
+                            dtype: DType::BF16,
+                            location: ArenaLocation::Cpu,
+                            index: 1,
+                        },
+                    );
                 })
                 .unwrap();
 

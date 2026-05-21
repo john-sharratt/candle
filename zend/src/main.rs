@@ -93,8 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .add_directive(format!("zend={level}").parse()?)
         .add_directive(format!("candle_conversation={level}").parse()?);
 
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_filter(filter.clone());
+    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter.clone());
 
     let ws_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
@@ -122,11 +121,11 @@ async fn main() -> anyhow::Result<()> {
 
     let session = Arc::new(ZendSession::new(config.clone(), Arc::clone(&log)));
     session.start_loading();
-    let router  = api::router(Arc::clone(&session));
+    let router = api::router(Arc::clone(&session));
 
     // ── Bind ──────────────────────────────────────────────────────────────────
 
-    let addr     = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!(
@@ -145,8 +144,58 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("scan complete");
     });
 
-    axum::serve(listener, router).await?;
+    // ── Serve, with graceful shutdown ─────────────────────────────────────────
+    //
+    // On Ctrl-C / SIGTERM the server stops accepting connections and drains
+    // in-flight requests; then the substrate redo log is checkpointed so the
+    // last turn — including a partial in-flight tail — is durable on disk.
+    let shutdown_session = Arc::clone(&session);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    tracing::info!("draining complete — flushing substrate…");
+    shutdown_session.shutdown().await;
+    tracing::info!("zend stopped");
     Ok(())
+}
+
+// ── Shutdown signal ───────────────────────────────────────────────────────────
+
+/// Resolves when the process receives `Ctrl-C` (or `SIGTERM` on Unix),
+/// triggering axum's graceful drain. A *second* `Ctrl-C` aborts immediately
+/// — the escape hatch if draining wedges.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::warn!(
+        "shutdown signal received — draining in-flight work; press Ctrl-C again to abort",
+    );
+
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::error!("second Ctrl-C — aborting immediately");
+            std::process::exit(130);
+        }
+    });
 }
 
 // ── Workspace scan ────────────────────────────────────────────────────────────

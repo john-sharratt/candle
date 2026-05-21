@@ -1,4 +1,4 @@
-﻿//! Chunk migration and format conversion operations.
+//! Chunk migration and format conversion operations.
 //!
 //! This module provides operations for moving and converting KV cache chunks
 //! between different storage formats (float/quantized) and locations (GPU/CPU):
@@ -1016,21 +1016,12 @@ impl ChunkedKvBacking {
         let head_dim = self.inner.head_dim;
         let device = self.inner.device.clone();
 
-        let location = self.inner.storage.default_location();
         let k_format = self.inner.storage.k_format();
         let v_format = self.inner.storage.v_format();
-
-        let target_key = ArenaKey::uniform(k_format, location);
-        let value_key = ArenaKey::uniform(v_format, location);
 
         // Palette4: each chunk = chunk_size * sub_head_dim (one palette sub-band)
         let sub_head_dim = head_dim / N_PALETTE;
         let elems_per_head = chunk_size * sub_head_dim;
-
-        // Ensure the block table has room for this block index and materialize the
-        // destination sequence slot before we attach the freshly allocated GIDs.
-        self.ensure_max_blocks(block_idx + 1)?;
-        self.ensure_for_offset(batch_idx, block_idx * chunk_size, chunk_size)?;
 
         // k_bytes/v_bytes contain ALL n_kv_head * N_PALETTE palette sub-chunks
         // concatenated: [h0p0, h0p1, h0p2, h0p3, h1p0, ...].
@@ -1068,22 +1059,11 @@ impl ChunkedKvBacking {
             );
         }
 
-        // Allocate GIDS_PER_HEAD * n_kv_head destination chunks.
-        let mut gid_vec: Vec<ChunkGid> = Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
-        {
-            let _state = self
-                .state
-                .write()
-                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-            for _h in 0..n_kv_head {
-                for _p in 0..N_PALETTE {
-                    let k_gid = self.alloc_chunk_for_key(target_key.clone())?;
-                    let v_gid = self.alloc_chunk_for_key(value_key.clone())?;
-                    gid_vec.push(k_gid);
-                    gid_vec.push(v_gid);
-                }
-            }
-        }
+        // Allocate the block's GIDs through the single allocation keystone —
+        // it also registers them on the block table with the palettes/scales.
+        let gids = self.alloc_sealed_block(
+            batch_idx, block_idx, k_format, v_format, k_pal, v_pal, k_scale, v_scale,
+        )?;
 
         // Upload per-(head, palette) byte slices and scatter into flat arena chunks.
         for h in 0..n_kv_head {
@@ -1095,8 +1075,8 @@ impl ChunkedKvBacking {
                 let v_slice = &v_bytes[v_start..v_start + v_head_bytes];
 
                 let gid_offset = h * GIDS_PER_HEAD + p * 2;
-                let k_gid = &gid_vec[gid_offset];
-                let v_gid = &gid_vec[gid_offset + 1];
+                let k_gid = &gids.0[gid_offset];
+                let v_gid = &gids.0[gid_offset + 1];
 
                 self.inner.storage.try_write(|s| {
                     let k_ai = k_gid.arena_idx();
@@ -1320,22 +1300,101 @@ impl ChunkedKvBacking {
             }
         }
 
-        // Update block table with per-head GIDs, palette maps, and outer scales,
-        // then refresh the live decode slot.
+        Ok(())
+    }
+
+    /// Allocate one sealed block's GIDs — the **allocation keystone** (§16.12).
+    ///
+    /// This is the allocation half of [`Self::write_raw_sealed_chunk`], with
+    /// no byte I/O: it materialises the destination slot, allocates the
+    /// per-`(head, palette)` chunk GIDs in arenas of `k_format` / `v_format`,
+    /// and registers them on the block table with the chunk's palettes and
+    /// scales. It is the **single source of truth** for the GID shape a chunk
+    /// of a given `KvFormat` needs.
+    ///
+    /// The returned [`HeadGids`] addresses freshly-allocated, uninitialised
+    /// chunks. Fill them either by uploading raw bytes
+    /// (`write_raw_sealed_chunk`) or by snapshotting the slot with
+    /// [`Self::record_turn`] and scattering bytes through the
+    /// `resolve_sealed_chunk_ptrs` migration path (resume / cold-load).
+    #[allow(clippy::too_many_arguments)]
+    pub fn alloc_sealed_block(
+        &self,
+        batch_idx: usize,
+        block_idx: usize,
+        k_format: KvFormat,
+        v_format: KvFormat,
+        k_pal: std::sync::Arc<Vec<u8>>,
+        v_pal: std::sync::Arc<Vec<u8>>,
+        k_scale: std::sync::Arc<Vec<f32>>,
+        v_scale: std::sync::Arc<Vec<f32>>,
+    ) -> Result<HeadGids> {
+        let n_kv_head = self.inner.n_kv_head;
+        let location = self.inner.storage.default_location();
+        let target_key = ArenaKey::uniform(k_format, location);
+        let value_key = ArenaKey::uniform(v_format, location);
+
+        // Ensure the block table has room for this block index and materialize
+        // the destination sequence slot before attaching the fresh GIDs.
+        self.ensure_max_blocks(block_idx + 1)?;
+        self.ensure_for_offset(batch_idx, block_idx * CHUNK_SIZE, CHUNK_SIZE)?;
+
+        // Allocate GIDS_PER_HEAD * n_kv_head destination chunks.
+        let mut gid_vec: Vec<ChunkGid> = Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
+        {
+            let _state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for _h in 0..n_kv_head {
+                for _p in 0..N_PALETTE {
+                    let k_gid = self.alloc_chunk_for_key(target_key.clone())?;
+                    let v_gid = self.alloc_chunk_for_key(value_key.clone())?;
+                    gid_vec.push(k_gid);
+                    gid_vec.push(v_gid);
+                }
+            }
+        }
+
+        // Register per-head GIDs, palette maps, and outer scales on the block
+        // table, then refresh the live decode slot.
         let gids = HeadGids::from_vec(gid_vec);
         let arena_info = self.resolve_arena_info()?;
         self.set_block_gids_sharded_and_update_gpu(
             batch_idx,
             block_idx,
-            gids,
+            gids.clone(),
             k_pal,
             v_pal,
             k_scale,
             v_scale,
             &arena_info,
         )?;
+        Ok(gids)
+    }
 
-        Ok(())
+    /// The `(k_format, v_format)` a sealed chunk's bytes are stored in —
+    /// read from the arenas its head-0 K/V GIDs resolve to.
+    ///
+    /// Adaptive quantization picks K and V formats independently per block,
+    /// so persistence must record both. Used by the seal-time gather path.
+    pub fn sealed_chunk_kv_formats(
+        &self,
+        chunk: &SealedChunk,
+    ) -> candle::Result<(crate::kv_cache::KvFormat, crate::kv_cache::KvFormat)> {
+        let k_arena = chunk.gids.k_gid(0).arena_idx();
+        let v_arena = chunk.gids.v_gid(0).arena_idx();
+        self.inner.storage.read(|s| {
+            let k = s
+                .arena_key(k_arena)
+                .map(|key| key.format)
+                .ok_or_else(|| candle::Error::Msg(format!("k arena {k_arena} not found")))?;
+            let v = s
+                .arena_key(v_arena)
+                .map(|key| key.format)
+                .ok_or_else(|| candle::Error::Msg(format!("v arena {v_arena} not found")))?;
+            Ok((k, v))
+        })?
     }
 
     // ── Tiered-storage sealed-sequence migration ──────────────────────────────
@@ -1359,19 +1418,32 @@ impl ChunkedKvBacking {
     /// Future work: route through a dedicated copy stream + pinned host buffers
     /// so GPU compute and PCIe transfer overlap fully.
     pub fn migrate_sealed_to_cpu(&self, sealed: &SealedSequence) -> candle::Result<SealedSequence> {
-        let cpu_chunks: candle::Result<Vec<SealedChunk>> = sealed.chunks.iter().map(|chunk| {
-            let new_gids = chunk.gids.map_unique(|gid| {
-                let cpu_key = self.inner.storage.read(|s| {
-                    s.arena_key(gid.arena_idx())
-                        .map(|k| ArenaKey { format: k.format, location: ArenaLocation::Cpu })
-                        .ok_or_else(|| candle::Error::Msg(format!(
-                            "migrate_sealed_to_cpu: arena {} not found", gid.arena_idx()
-                        )))
-                })??;
-                self.migrate_chunk(gid.raw(), cpu_key)
-            })?;
-            Ok(SealedChunk { gids: new_gids, ..chunk.clone() })
-        }).collect();
+        let cpu_chunks: candle::Result<Vec<SealedChunk>> = sealed
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let new_gids = chunk.gids.map_unique(|gid| {
+                    let cpu_key = self.inner.storage.read(|s| {
+                        s.arena_key(gid.arena_idx())
+                            .map(|k| ArenaKey {
+                                format: k.format,
+                                location: ArenaLocation::Cpu,
+                            })
+                            .ok_or_else(|| {
+                                candle::Error::Msg(format!(
+                                    "migrate_sealed_to_cpu: arena {} not found",
+                                    gid.arena_idx()
+                                ))
+                            })
+                    })??;
+                    self.migrate_chunk(gid.raw(), cpu_key)
+                })?;
+                Ok(SealedChunk {
+                    gids: new_gids,
+                    ..chunk.clone()
+                })
+            })
+            .collect();
         Ok(SealedSequence {
             chunks: cpu_chunks?,
             token_count: sealed.token_count,
@@ -1385,19 +1457,32 @@ impl ChunkedKvBacking {
     /// Symmetric inverse of [`migrate_sealed_to_cpu`].  Sharing structure is
     /// preserved by [`HeadGids::map_unique`].
     pub fn migrate_sealed_to_gpu(&self, sealed: &SealedSequence) -> candle::Result<SealedSequence> {
-        let gpu_chunks: candle::Result<Vec<SealedChunk>> = sealed.chunks.iter().map(|chunk| {
-            let new_gids = chunk.gids.map_unique(|gid| {
-                let gpu_key = self.inner.storage.read(|s| {
-                    s.arena_key(gid.arena_idx())
-                        .map(|k| ArenaKey { format: k.format, location: ArenaLocation::Gpu })
-                        .ok_or_else(|| candle::Error::Msg(format!(
-                            "migrate_sealed_to_gpu: arena {} not found", gid.arena_idx()
-                        )))
-                })??;
-                self.migrate_chunk(gid.raw(), gpu_key)
-            })?;
-            Ok(SealedChunk { gids: new_gids, ..chunk.clone() })
-        }).collect();
+        let gpu_chunks: candle::Result<Vec<SealedChunk>> = sealed
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let new_gids = chunk.gids.map_unique(|gid| {
+                    let gpu_key = self.inner.storage.read(|s| {
+                        s.arena_key(gid.arena_idx())
+                            .map(|k| ArenaKey {
+                                format: k.format,
+                                location: ArenaLocation::Gpu,
+                            })
+                            .ok_or_else(|| {
+                                candle::Error::Msg(format!(
+                                    "migrate_sealed_to_gpu: arena {} not found",
+                                    gid.arena_idx()
+                                ))
+                            })
+                    })??;
+                    self.migrate_chunk(gid.raw(), gpu_key)
+                })?;
+                Ok(SealedChunk {
+                    gids: new_gids,
+                    ..chunk.clone()
+                })
+            })
+            .collect();
         Ok(SealedSequence {
             chunks: gpu_chunks?,
             token_count: sealed.token_count,
@@ -1429,7 +1514,12 @@ mod tests {
     ) -> SealedSequence {
         let slot = backing.alloc_sequence().unwrap();
         backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
-        let k = Tensor::ones((1, n_kv_head, n_tokens, head_dim), DType::BF16, &Device::Cpu).unwrap();
+        let k = Tensor::ones(
+            (1, n_kv_head, n_tokens, head_dim),
+            DType::BF16,
+            &Device::Cpu,
+        )
+        .unwrap();
         let v = k.clone();
         backing.write_contiguous(slot, 0, &k, &v).unwrap();
         backing.set_len(slot, n_tokens);
@@ -1480,7 +1570,10 @@ mod tests {
         // At least one GID slot must differ from the original.
         let orig_gids: Vec<i64> = sealed.chunks[0].gids.iter().map(|g| g.raw()).collect();
         let mig_gids: Vec<i64> = cpu.chunks[0].gids.iter().map(|g| g.raw()).collect();
-        assert_ne!(orig_gids, mig_gids, "migrated chunks must be new physical allocations");
+        assert_ne!(
+            orig_gids, mig_gids,
+            "migrated chunks must be new physical allocations"
+        );
     }
 
     /// Migration preserves the GID-sharing structure of the source HeadGids.
@@ -1588,7 +1681,7 @@ mod tests {
     fn float_to_quant_roundtrip_sub_head_dim() {
         let n_kv_head = 2;
         let head_dim = 128; // sub_head_dim = head_dim / N_PALETTE = 32 (= CHUNK_SIZE)
-        let n_tokens = 64;  // two full chunks
+        let n_tokens = 64; // two full chunks
         let backing = cpu_backing(n_kv_head, head_dim);
         let sealed = seed_and_seal(&backing, n_kv_head, head_dim, n_tokens);
         assert_eq!(sealed.chunks.len(), 2);
@@ -1598,9 +1691,11 @@ mod tests {
 
         for chunk in &sealed.chunks {
             let k_gid = chunk.gids.k_gid(0);
-            let qgid = backing.migrate_chunk(k_gid.raw(), qkey.clone())
+            let qgid = backing
+                .migrate_chunk(k_gid.raw(), qkey.clone())
                 .expect("Float → Q8_0 must succeed");
-            backing.migrate_chunk(qgid.raw(), fkey.clone())
+            backing
+                .migrate_chunk(qgid.raw(), fkey.clone())
                 .expect("Q8_0 → Float round-trip failed (shape mismatch = wrong sub_head_dim)");
         }
     }
@@ -1617,7 +1712,7 @@ mod tests {
     fn quant_to_quant_copy_nonzero_chunk_index() {
         let n_kv_head = 2;
         let head_dim = 128; // sub_head_dim = 32 (= CHUNK_SIZE, exact Q8_0 block fit)
-        let n_tokens = 96;  // three full chunks
+        let n_tokens = 96; // three full chunks
         let backing = cpu_backing(n_kv_head, head_dim);
         let sealed = seed_and_seal(&backing, n_kv_head, head_dim, n_tokens);
         assert_eq!(sealed.chunks.len(), 3);
@@ -1626,18 +1721,25 @@ mod tests {
         let fkey = cpu_float_key();
 
         // Populate Q8_0 arena slots 0, 1, 2 from three sequential float chunks.
-        let mut quant_gids: Vec<_> = sealed.chunks.iter().map(|chunk| {
-            backing.migrate_chunk(chunk.gids.k_gid(0).raw(), qkey.clone())
-                .expect("Float → Q8_0 for chunk seeding")
-        }).collect();
+        let mut quant_gids: Vec<_> = sealed
+            .chunks
+            .iter()
+            .map(|chunk| {
+                backing
+                    .migrate_chunk(chunk.gids.k_gid(0).raw(), qkey.clone())
+                    .expect("Float → Q8_0 for chunk seeding")
+            })
+            .collect();
 
         // Copy the 3rd Q8_0 slot (chunk_idx ≥ 2) to a new slot.
         let src_gid = quant_gids.pop().unwrap();
-        let copy_gid = backing.migrate_chunk(src_gid.raw(), qkey.clone())
+        let copy_gid = backing
+            .migrate_chunk(src_gid.raw(), qkey.clone())
             .expect("Q8_0 → Q8_0 copy with non-zero chunk_idx must succeed");
 
         // Verify the copy can be dequantized back without shape errors.
-        backing.migrate_chunk(copy_gid.raw(), fkey.clone())
+        backing
+            .migrate_chunk(copy_gid.raw(), fkey.clone())
             .expect("Q8_0 → Float after copy must succeed (shape error = wrong sub_head_dim)");
     }
 }

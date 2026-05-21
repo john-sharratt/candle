@@ -136,11 +136,7 @@ impl Scheduler {
             let seq_id = s.sequence_id;
             let off = s.offset;
             let chunk_tokens = s.tokens[off..off + chunk_len].to_vec();
-            super::Scheduler::record_slot_tokens(
-                &mut self.slot_tokens,
-                seq_id,
-                &chunk_tokens,
-            );
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
             s.offset += chunk_len;
         }
     }
@@ -164,7 +160,12 @@ impl Scheduler {
                 let _ = s.response_tx.send(Err(e));
                 continue;
             }
-            let result = self.finalize_section_ingest(s.sequence_id, s.section_id, s.seal_block_from, std::sync::Arc::new(s.tokens.to_vec()));
+            let result = self.finalize_section_ingest(
+                s.sequence_id,
+                s.section_id,
+                s.seal_block_from,
+                std::sync::Arc::new(s.tokens.to_vec()),
+            );
             let _ = s.response_tx.send(result);
             // swap_remove pulled the last element into i; don't increment.
         }
@@ -183,9 +184,7 @@ impl Scheduler {
         let active: Vec<usize> = (0..self.active_prefills.len())
             .filter(|&i| {
                 let p = &self.active_prefills[i];
-                p.error.is_none()
-                    && p.final_logits.is_none()
-                    && p.offset < p.work.tokens.len()
+                p.error.is_none() && p.final_logits.is_none() && p.offset < p.work.tokens.len()
             })
             .collect();
         if active.is_empty() {
@@ -246,8 +245,7 @@ impl Scheduler {
             Err(e) => {
                 let msg = format!("batched prefill forward failed: {e}");
                 for &i in &group_idxs {
-                    self.active_prefills[i].error =
-                        Some(ConversationError::Channel(msg.clone()));
+                    self.active_prefills[i].error = Some(ConversationError::Channel(msg.clone()));
                 }
                 return;
             }
@@ -255,7 +253,10 @@ impl Scheduler {
 
         for (logits, &i) in logits_vec.into_iter().zip(group_idxs.iter()) {
             let p = &mut self.active_prefills[i];
-            if let Err(e) = self.session.advance_sequence(p.work.sequence_id.0, chunk_len) {
+            if let Err(e) = self
+                .session
+                .advance_sequence(p.work.sequence_id.0, chunk_len)
+            {
                 p.error = Some(ConversationError::Model(e));
                 continue;
             }
@@ -267,11 +268,7 @@ impl Scheduler {
             let seq_id = p.work.sequence_id;
             let off = p.offset;
             let chunk_tokens = p.work.tokens[off..off + chunk_len].to_vec();
-            super::Scheduler::record_slot_tokens(
-                &mut self.slot_tokens,
-                seq_id,
-                &chunk_tokens,
-            );
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
             p.offset += chunk_len;
             let total = p.work.tokens.len();
             let _ = p.work.event_tx.send(TurnEvent::PrefillProgress {
@@ -294,8 +291,7 @@ impl Scheduler {
         while i < self.active_prefills.len() {
             let done = {
                 let p = &self.active_prefills[i];
-                p.error.is_some()
-                    || (p.final_logits.is_some() && p.offset >= p.work.tokens.len())
+                p.error.is_some() || (p.final_logits.is_some() && p.offset >= p.work.tokens.len())
             };
             if !done {
                 i += 1;
@@ -316,9 +312,11 @@ impl Scheduler {
             let logits = match final_logits {
                 Some(l) => l,
                 None => {
-                    let _ = work.event_tx.send(TurnEvent::Error(ConversationError::Channel(
-                        "prefill produced no final logits".into(),
-                    )));
+                    let _ = work
+                        .event_tx
+                        .send(TurnEvent::Error(ConversationError::Channel(
+                            "prefill produced no final logits".into(),
+                        )));
                     continue;
                 }
             };
@@ -547,11 +545,7 @@ impl Scheduler {
                 self.session
                     .advance_sequence(sequence_id.0, chunk.len())
                     .map_err(ConversationError::Model)?;
-                super::Scheduler::record_slot_tokens(
-                    &mut self.slot_tokens,
-                    sequence_id,
-                    chunk,
-                );
+                super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, chunk);
                 last_logits = logits_vec.into_iter().next();
             }
             return last_logits.ok_or_else(|| {

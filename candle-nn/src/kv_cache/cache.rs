@@ -55,7 +55,10 @@ impl ChunkedCache {
     }
 
     /// Execute a read operation on the arena storage.
-    pub(crate) fn with_arenas<R>(&self, f: impl FnOnce(&ahash::AHashMap<usize, super::Arena>) -> R) -> Result<R> {
+    pub(crate) fn with_arenas<R>(
+        &self,
+        f: impl FnOnce(&ahash::AHashMap<usize, super::Arena>) -> R,
+    ) -> Result<R> {
         self.backing.with_arenas(f)
     }
 
@@ -1057,7 +1060,9 @@ impl KvCache {
         let backing = caches
             .iter()
             .find_map(|kv| kv.k.chunked_backing())
-            .ok_or_else(|| candle::Error::Msg("reconcile_sealed_batch: no chunked caches".into()))?;
+            .ok_or_else(|| {
+                candle::Error::Msg("reconcile_sealed_batch: no chunked caches".into())
+            })?;
 
         // Build the layer slice and hand it to reconcile_all_layers for one
         // batch enqueue + one join — no loop at the call site.
@@ -1082,7 +1087,7 @@ impl KvCache {
     }
 
     /// Finalize sequences after generation completes.
-/// Get the current K cache data (narrowed to current_seq_len).
+    /// Get the current K cache data (narrowed to current_seq_len).
     pub fn k(&self) -> Result<Option<Tensor>> {
         self.k.current_data()
     }

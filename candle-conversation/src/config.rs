@@ -628,11 +628,11 @@ impl SamplingConfig {
             return self;
         }
         let scale = max_response_tokens as f32 / self.forced_eos_after as f32;
-        self.forced_eos_after   = max_response_tokens as i32;
+        self.forced_eos_after = max_response_tokens as i32;
         self.graceful_eos_after = ((self.graceful_eos_after as f32 * scale) as i32).max(1);
         if self.dynamic_eos_boost {
             self.eos_ramp_start = ((self.eos_ramp_start as f32 * scale) as i32).max(0);
-            self.eos_ramp_len   = ((self.eos_ramp_len   as f32 * scale) as i32).max(1);
+            self.eos_ramp_len = ((self.eos_ramp_len as f32 * scale) as i32).max(1);
         }
         self
     }
@@ -1120,13 +1120,9 @@ pub struct EngineConfig {
     /// `health.enabled == true`. Safe to set unconditionally.
     pub health: DecodeHealthConfig,
 
-    /// Optional path to the workspace's on-disk substrate store.
-    ///
-    /// **Currently unused** — the persistence layer is being
-    /// redesigned.  The field is retained on `EngineConfig` so callers
-    /// (zend, examples) can keep their plumbing in place; the engine
-    /// silently ignores the value until the new persistence layer
-    /// lands.
+    /// Workspace root whose `.substrate/` directory backs the persistence
+    /// redo log. When `None`, the engine opens the substrate under the
+    /// process working directory (`SubstratePersistence::open`).
     pub workspace_path: Option<std::path::PathBuf>,
 
     /// Free VRAM available for the hot-tier KV cache, measured **after** model

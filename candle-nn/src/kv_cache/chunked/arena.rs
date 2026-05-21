@@ -944,7 +944,6 @@ impl ArenaStorage {
         ArenaKey::new(self.default_v_format, self.default_location)
     }
 
-
     /// Get the DType for default format, or None if quantized (lock-free).
     #[allow(dead_code)]
     pub(super) fn dtype(&self) -> Option<DType> {

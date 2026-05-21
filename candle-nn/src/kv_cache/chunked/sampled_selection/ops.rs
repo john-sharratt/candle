@@ -45,7 +45,9 @@ pub fn select_smallest_passing(
                 let mut least_error_bpe = f32::INFINITY;
                 for qidx in 0..surface.n_quant {
                     let err = surface.get(b, d, qidx, h);
-                    let bpe = candidates.get(qidx).map_or(qidx as f32, |f| f.bits_per_elem());
+                    let bpe = candidates
+                        .get(qidx)
+                        .map_or(qidx as f32, |f| f.bits_per_elem());
                     if err < least_error || (err == least_error && bpe < least_error_bpe) {
                         least_error = err;
                         least_error_idx = qidx;
@@ -625,7 +627,11 @@ pub fn cpu_palette4_reduce(
     let elems_per_block = SELECT_BLOCK as f64;
     let palette_overhead_bits = (blocks_per_head * 2 + 4 * 8) as f64;
     let max_quant_ti = SampleFormat::Q8KS.table_index();
-    let num_heads = if blocks_per_head > 0 { fmts.len() / blocks_per_head } else { 0 };
+    let num_heads = if blocks_per_head > 0 {
+        fmts.len() / blocks_per_head
+    } else {
+        0
+    };
 
     let mut total_bits = 0.0f64;
     let mut total_elems = 0.0f64;
@@ -664,27 +670,42 @@ pub fn cpu_palette4_reduce(
             if remaining == 0 {
                 continue;
             }
-            let slot_target = if slot == 3 { remaining } else { target_per_palette };
+            let slot_target = if slot == 3 {
+                remaining
+            } else {
+                target_per_palette
+            };
 
             let slot_ti = loop {
                 let mut counts = [0usize; 23];
                 let mut min_ti = usize::MAX;
                 let mut max_ti = 0usize;
                 for (i, &ti) in active_ti.iter().enumerate() {
-                    if claimed[i] { continue; }
+                    if claimed[i] {
+                        continue;
+                    }
                     counts[ti] += 1;
                     min_ti = min_ti.min(ti);
                     max_ti = max_ti.max(ti);
                 }
-                if min_ti == usize::MAX { break worst_ti; }
-                if slot == 3 { break max_ti; }
-                if let Some(found_ti) = (min_ti..counts.len()).find(|&ti| counts[ti] >= slot_target) {
+                if min_ti == usize::MAX {
+                    break worst_ti;
+                }
+                if slot == 3 {
+                    break max_ti;
+                }
+                if let Some(found_ti) = (min_ti..counts.len()).find(|&ti| counts[ti] >= slot_target)
+                {
                     break found_ti;
                 }
                 let promote_ti = next_valid_ti(min_ti);
-                if promote_ti == min_ti || promote_ti > max_quant_ti { break max_ti; }
+                if promote_ti == min_ti || promote_ti > max_quant_ti {
+                    break max_ti;
+                }
                 for (i, ti) in active_ti.iter_mut().enumerate() {
-                    if !claimed[i] && *ti == min_ti { *ti = promote_ti; }
+                    if !claimed[i] && *ti == min_ti {
+                        *ti = promote_ti;
+                    }
                 }
             };
 
@@ -724,7 +745,9 @@ pub fn cpu_palette4_reduce(
                     }
                 }
                 for &i in &eligible {
-                    if taken >= slot_target { break; }
+                    if taken >= slot_target {
+                        break;
+                    }
                     if !claimed[i] {
                         claimed[i] = true;
                         assigned_ti[i] = slot_ti;
@@ -735,7 +758,9 @@ pub fn cpu_palette4_reduce(
             let promote_ti = next_valid_ti(slot_ti);
             if promote_ti != slot_ti && promote_ti <= max_quant_ti {
                 for (i, ti) in active_ti.iter_mut().enumerate() {
-                    if !claimed[i] && *ti == slot_ti { *ti = promote_ti; }
+                    if !claimed[i] && *ti == slot_ti {
+                        *ti = promote_ti;
+                    }
                 }
             }
             claimed_total += taken;
@@ -751,7 +776,11 @@ pub fn cpu_palette4_reduce(
         total_bits += head_bits;
     }
 
-    let bpe = if total_elems > 0.0 { total_bits / total_elems } else { 16.0 };
+    let bpe = if total_elems > 0.0 {
+        total_bits / total_elems
+    } else {
+        16.0
+    };
     (bpe, effective)
 }
 
@@ -760,7 +789,11 @@ pub(super) fn compute_head_amax(values: &[f32]) -> f32 {
 }
 
 pub(super) fn safe_head_scale(amax: f32) -> f32 {
-    if amax < 1.0e-8 { 1.0 } else { amax }
+    if amax < 1.0e-8 {
+        1.0
+    } else {
+        amax
+    }
 }
 
 fn max_abs_error(orig: &[f32; SELECT_BLOCK], recon: &[f32; SELECT_BLOCK]) -> f32 {
@@ -770,7 +803,11 @@ fn max_abs_error(orig: &[f32; SELECT_BLOCK], recon: &[f32; SELECT_BLOCK]) -> f32
         .fold(0.0f32, f32::max)
 }
 
-pub(super) fn normalised_error(orig: &[f32; SELECT_BLOCK], recon: &[f32; SELECT_BLOCK], head_scale: f32) -> f32 {
+pub(super) fn normalised_error(
+    orig: &[f32; SELECT_BLOCK],
+    recon: &[f32; SELECT_BLOCK],
+    head_scale: f32,
+) -> f32 {
     max_abs_error(orig, recon) / head_scale
 }
 
@@ -1117,7 +1154,7 @@ fn q0_split_centroid(block: &[f32; SELECT_BLOCK], start: usize, end: usize) -> f
 ///
 /// Reconstruction:  recon[lane] = centroid + scale × curve[lane]
 pub(super) fn round_trip_q0_v(block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOCK] {
-    use candle::quantized::k_quants::{encode_block_q0_v, decode_blocks_q0_v};
+    use candle::quantized::k_quants::{decode_blocks_q0_v, encode_block_q0_v};
     // V-side default for the round-trip test harness.
     let encoded = encode_block_q0_v::<false>(block);
     let mut out = [0.0f32; SELECT_BLOCK];
@@ -1154,16 +1191,30 @@ pub(super) fn round_trip_q0_m2(block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOC
         let (mut s0, mut n0, mut s1, mut n1) = (0.0f32, 0, 0.0f32, 0);
         for i in 0..SELECT_BLOCK {
             let x = block[i];
-            if (x - c0).abs() <= (x - c1).abs() { s0 += x; n0 += 1; } else { s1 += x; n1 += 1; }
+            if (x - c0).abs() <= (x - c1).abs() {
+                s0 += x;
+                n0 += 1;
+            } else {
+                s1 += x;
+                n1 += 1;
+            }
         }
-        if n0 > 0 { c0 = decode_e4m3(encode_e4m3(s0 / n0 as f32)); }
-        if n1 > 0 { c1 = decode_e4m3(encode_e4m3(s1 / n1 as f32)); }
+        if n0 > 0 {
+            c0 = decode_e4m3(encode_e4m3(s0 / n0 as f32));
+        }
+        if n1 > 0 {
+            c1 = decode_e4m3(encode_e4m3(s1 / n1 as f32));
+        }
     }
     let mut out = [0.0f32; SELECT_BLOCK];
     for i in 0..SELECT_BLOCK {
         let quartet = i / 4;
         let x = block[quartet * 4];
-        out[i] = if (x - c0).abs() <= (x - c1).abs() { c0 } else { c1 };
+        out[i] = if (x - c0).abs() <= (x - c1).abs() {
+            c0
+        } else {
+            c1
+        };
     }
     out
 }
@@ -1182,17 +1233,24 @@ pub(super) fn round_trip_q0_m4(block: &[f32; SELECT_BLOCK]) -> [f32; SELECT_BLOC
         let (mut s, mut n) = ([0.0f32; 4], [0usize; 4]);
         for i in 0..SELECT_BLOCK {
             let x = block[i];
-            let best = (0..4).min_by(|&a, &b| (x - c[a]).abs().partial_cmp(&(x - c[b]).abs()).unwrap()).unwrap();
-            s[best] += x; n[best] += 1;
+            let best = (0..4)
+                .min_by(|&a, &b| (x - c[a]).abs().partial_cmp(&(x - c[b]).abs()).unwrap())
+                .unwrap();
+            s[best] += x;
+            n[best] += 1;
         }
         for k in 0..4 {
-            if n[k] > 0 { c[k] = decode_e4m3(encode_e4m3(s[k] / n[k] as f32)); }
+            if n[k] > 0 {
+                c[k] = decode_e4m3(encode_e4m3(s[k] / n[k] as f32));
+            }
         }
     }
     let mut out = [0.0f32; SELECT_BLOCK];
     for i in 0..SELECT_BLOCK {
         let x = block[i / 4 * 4];
-        let best = (0..4).min_by(|&a, &b| (x - c[a]).abs().partial_cmp(&(x - c[b]).abs()).unwrap()).unwrap();
+        let best = (0..4)
+            .min_by(|&a, &b| (x - c[a]).abs().partial_cmp(&(x - c[b]).abs()).unwrap())
+            .unwrap();
         out[i] = c[best];
     }
     out

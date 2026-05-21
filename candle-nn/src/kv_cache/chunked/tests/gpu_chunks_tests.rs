@@ -5,11 +5,11 @@
 
 #[cfg(feature = "cuda")]
 mod tests {
+    use crate::kv_cache::chunked::gid_pool::ChunkGid;
     use crate::kv_cache::chunked::gpu_chunks::{
         kv_head_serialized_size, serialize_chunk_window, token_slice_serialized_size,
         write_identity_pal_map,
     };
-    use crate::kv_cache::chunked::gid_pool::ChunkGid;
     use crate::kv_cache::chunked::head_gids::HeadGids;
     use crate::kv_cache::chunked::types::ChunkWindow;
     /// head_dim=8, N_PALETTE=4 → sub_hd=2
@@ -64,8 +64,20 @@ mod tests {
         let sz = token_slice_serialized_size(N, HD);
         let mut buf = vec![0u8; sz];
         serialize_chunk_window(&chunk, N, HD, 0xDEAD_BEEF, &[], &mut buf);
-        assert_eq!(u16::from_le_bytes(buf[0..2].try_into().unwrap()), 3,          "offset");
-        assert_eq!(u16::from_le_bytes(buf[2..4].try_into().unwrap()), 20,         "usage");
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 0xDEAD_BEEF, "rope");
+        assert_eq!(
+            u16::from_le_bytes(buf[0..2].try_into().unwrap()),
+            3,
+            "offset"
+        );
+        assert_eq!(
+            u16::from_le_bytes(buf[2..4].try_into().unwrap()),
+            20,
+            "usage"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            0xDEAD_BEEF,
+            "rope"
+        );
     }
 }

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone)]
 pub struct ProfileEntry {
@@ -62,7 +65,8 @@ impl SampledSelectionBenchmarkResult {
                 0.0
             };
             let share = profile_share_percent(entry.name, total_ms, &total_ms_by_name);
-            let short = entry.name
+            let short = entry
+                .name
                 .strip_prefix("benchmark.")
                 .or_else(|| entry.name.strip_prefix("quantization."))
                 .unwrap_or(entry.name);
@@ -83,11 +87,15 @@ impl SampledSelectionBenchmarkResult {
         // the indent (leaves at column 0, outer totals more indented) means each summary line
         // visually "closes" the block above it rather than appearing shallower than its children.
         let max_depth = rows.iter().map(|(_, _, d, ..)| *d).max().unwrap_or(0);
-        let display_names: Vec<String> = rows.iter().map(|(_, short, depth, ..)| {
-            let indent = "  ".repeat(max_depth.saturating_sub(*depth));
-            format!("{indent}{short}")
-        }).collect();
-        let scope_width = display_names.iter()
+        let display_names: Vec<String> = rows
+            .iter()
+            .map(|(_, short, depth, ..)| {
+                let indent = "  ".repeat(max_depth.saturating_sub(*depth));
+                format!("{indent}{short}")
+            })
+            .collect();
+        let scope_width = display_names
+            .iter()
             .map(|s| s.chars().count())
             .chain(std::iter::once("Scope".len()))
             .chain(std::iter::once(28))
@@ -104,7 +112,9 @@ impl SampledSelectionBenchmarkResult {
             "Parent %",
             scope_width = scope_width
         ));
-        for ((_, _, _, total_ms, count, avg_ms, share), display_name) in rows.iter().zip(display_names.iter()) {
+        for ((_, _, _, total_ms, count, avg_ms, share), display_name) in
+            rows.iter().zip(display_names.iter())
+        {
             rendered_rows.push(format!(
                 "{:<scope_width$} {:>9.2}ms {:>8} {:>9.2}ms {:>8.1}%",
                 display_name,
@@ -131,8 +141,16 @@ impl SampledSelectionBenchmarkResult {
         let mut out = String::new();
         out.push('\n');
         out.push_str(&format!("╔{}╗\n", "═".repeat(inner_width + 2)));
-        out.push_str(&format!("║ {:<inner_width$} ║\n", title, inner_width = inner_width));
-        out.push_str(&format!("║ {:<inner_width$} ║\n", legend, inner_width = inner_width));
+        out.push_str(&format!(
+            "║ {:<inner_width$} ║\n",
+            title,
+            inner_width = inner_width
+        ));
+        out.push_str(&format!(
+            "║ {:<inner_width$} ║\n",
+            legend,
+            inner_width = inner_width
+        ));
         out.push_str(&format!("╠{}╣\n", "═".repeat(inner_width + 2)));
         out.push_str(&format!(
             "║ {:<inner_width$} ║\n",
@@ -145,11 +163,19 @@ impl SampledSelectionBenchmarkResult {
             if last_root != Some(root.as_str()) {
                 if let Some(label) = profile_section_label(root) {
                     let section = format!("-- {label} --");
-                    out.push_str(&format!("║ {:<inner_width$} ║\n", section, inner_width = inner_width));
+                    out.push_str(&format!(
+                        "║ {:<inner_width$} ║\n",
+                        section,
+                        inner_width = inner_width
+                    ));
                 }
                 last_root = Some(root.as_str());
             }
-            out.push_str(&format!("║ {:<inner_width$} ║\n", row, inner_width = inner_width));
+            out.push_str(&format!(
+                "║ {:<inner_width$} ║\n",
+                row,
+                inner_width = inner_width
+            ));
         }
         out.push_str(&format!("╚{}╝\n", "═".repeat(inner_width + 2)));
         out
@@ -194,7 +220,10 @@ fn profile_share_percent(
     }
 }
 
-fn profile_parent_total_ms(name: &str, total_ms_by_name: &HashMap<&'static str, f64>) -> Option<f64> {
+fn profile_parent_total_ms(
+    name: &str,
+    total_ms_by_name: &HashMap<&'static str, f64>,
+) -> Option<f64> {
     let mut parts = name.split('.').collect::<Vec<_>>();
     parts.pop()?;
     while parts.len() > 1 {
@@ -209,7 +238,10 @@ fn profile_parent_total_ms(name: &str, total_ms_by_name: &HashMap<&'static str, 
     None
 }
 
-fn profile_section_total_ms(name: &str, total_ms_by_name: &HashMap<&'static str, f64>) -> Option<f64> {
+fn profile_section_total_ms(
+    name: &str,
+    total_ms_by_name: &HashMap<&'static str, f64>,
+) -> Option<f64> {
     let root = profile_root(name);
     let explicit_total = format!("{root}.total");
     if let Some(total_ms) = total_ms_by_name.get(explicit_total.as_str()) {
@@ -244,7 +276,11 @@ mod tests {
     #[test]
     fn sampled_profile_report_rows_align() {
         let mut result = SampledSelectionBenchmarkResult::default();
-        result.record_duration("quantization.key.select.total", Duration::from_millis(17), 616);
+        result.record_duration(
+            "quantization.key.select.total",
+            Duration::from_millis(17),
+            616,
+        );
         result.record_duration("benchmark.total", Duration::from_millis(336), 1);
 
         let report = result.report("Sampled-Selection Full Workflow Profile");
@@ -266,10 +302,26 @@ mod tests {
         let mut result = SampledSelectionBenchmarkResult::default();
         result.record_duration("benchmark.io.load_dump", Duration::from_millis(3), 1);
         result.record_duration("benchmark.batch.k.flatten", Duration::from_millis(2), 1);
-        result.record_duration("quantization.key.surface.dispatch.probe.cuda", Duration::from_millis(1), 1);
-        result.record_duration("quantization.key.surface.gpu.prepare_inputs", Duration::from_millis(1), 1);
-        result.record_duration("quantization.key.surface.gpu.total", Duration::from_millis(4), 1);
-        result.record_duration("quantization.key.surface.total", Duration::from_millis(5), 1);
+        result.record_duration(
+            "quantization.key.surface.dispatch.probe.cuda",
+            Duration::from_millis(1),
+            1,
+        );
+        result.record_duration(
+            "quantization.key.surface.gpu.prepare_inputs",
+            Duration::from_millis(1),
+            1,
+        );
+        result.record_duration(
+            "quantization.key.surface.gpu.total",
+            Duration::from_millis(4),
+            1,
+        );
+        result.record_duration(
+            "quantization.key.surface.total",
+            Duration::from_millis(5),
+            1,
+        );
         result.record_duration("benchmark.batch.total", Duration::from_millis(6), 1);
         result.record_duration("benchmark.total", Duration::from_millis(7), 1);
 
@@ -287,23 +339,51 @@ mod tests {
             report.rfind(" total ").unwrap(),
         ];
 
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "wrong order:\n{report}");
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "wrong order:\n{report}"
+        );
     }
 
     #[test]
     fn sampled_profile_report_uses_parent_level_shares() {
         let mut result = SampledSelectionBenchmarkResult::default();
-        result.record_duration("quantization.key.surface.gpu.prepare_inputs", Duration::from_millis(25), 1);
-        result.record_duration("quantization.key.surface.gpu.kernel", Duration::from_millis(75), 1);
-        result.record_duration("quantization.key.surface.gpu.total", Duration::from_millis(100), 1);
-        result.record_duration("quantization.key.surface.total", Duration::from_millis(100), 1);
+        result.record_duration(
+            "quantization.key.surface.gpu.prepare_inputs",
+            Duration::from_millis(25),
+            1,
+        );
+        result.record_duration(
+            "quantization.key.surface.gpu.kernel",
+            Duration::from_millis(75),
+            1,
+        );
+        result.record_duration(
+            "quantization.key.surface.gpu.total",
+            Duration::from_millis(100),
+            1,
+        );
+        result.record_duration(
+            "quantization.key.surface.total",
+            Duration::from_millis(100),
+            1,
+        );
         result.record_duration("quantization.key.total", Duration::from_millis(100), 1);
 
         let report = result.report("Sampled-Selection Full Workflow Profile");
 
-        let prepare_line = report.lines().find(|line| line.contains("prepare_inputs")).unwrap();
-        let kernel_line = report.lines().find(|line| line.contains("gpu.kernel")).unwrap();
-        let total_line = report.lines().find(|line| line.contains("gpu.total")).unwrap();
+        let prepare_line = report
+            .lines()
+            .find(|line| line.contains("prepare_inputs"))
+            .unwrap();
+        let kernel_line = report
+            .lines()
+            .find(|line| line.contains("gpu.kernel"))
+            .unwrap();
+        let total_line = report
+            .lines()
+            .find(|line| line.contains("gpu.total"))
+            .unwrap();
 
         assert!(prepare_line.contains("25.0%"), "wrong share:\n{report}");
         assert!(kernel_line.contains("75.0%"), "wrong share:\n{report}");

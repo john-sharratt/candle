@@ -1,4 +1,4 @@
-﻿//! Internal allocation methods for ChunkedKvBacking.
+//! Internal allocation methods for ChunkedKvBacking.
 //!
 //! This module contains methods for:
 //! - Ensuring max block capacity
@@ -145,7 +145,6 @@ impl ChunkedKvBacking {
         self.inner
             .create_arena(shape, format, location, index, retry_after_compact)
     }
-
 }
 
 impl BackingInner {
@@ -392,7 +391,6 @@ impl ChunkedKvBacking {
     ) -> Result<()> {
         self.inner.ensure_arena_exists(arena_idx, key)
     }
-
 }
 
 impl BackingInner {
@@ -629,10 +627,7 @@ impl ChunkedKvBacking {
             slot.push_chunk(cw);
             slot.invalidate_gpu_chunks();
         } else {
-            candle::bail!(
-                "push_empty_writer_chunk: slot {} not allocated",
-                batch_idx
-            )
+            candle::bail!("push_empty_writer_chunk: slot {} not allocated", batch_idx)
         }
         Ok(())
     }
@@ -678,33 +673,27 @@ impl ChunkedKvBacking {
                 .read()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
             for &(batch_idx, _off) in entries.iter() {
-                let (current_chunks, available) = match state
-                    .sequences
-                    .get(batch_idx)
-                    .and_then(|s| s.as_ref())
-                {
-                    Some(slot) => {
-                        let chunks = slot.chunks_slice();
-                        if chunks.is_empty() {
-                            (0usize, 0usize)
-                        } else {
-                            // Writer-owned region starts at
-                            // `writer_start_idx` (set by the host).
-                            // Available capacity = remaining slots in
-                            // each chunk from that index onward.
-                            let start = slot.writer_start_idx().min(chunks.len() - 1);
-                            let avail: usize = chunks[start..]
-                                .iter()
-                                .map(|c| {
-                                    chunk_size
-                                        - (c.offset as usize + c.usage as usize)
-                                })
-                                .sum();
-                            (chunks.len(), avail)
+                let (current_chunks, available) =
+                    match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
+                        Some(slot) => {
+                            let chunks = slot.chunks_slice();
+                            if chunks.is_empty() {
+                                (0usize, 0usize)
+                            } else {
+                                // Writer-owned region starts at
+                                // `writer_start_idx` (set by the host).
+                                // Available capacity = remaining slots in
+                                // each chunk from that index onward.
+                                let start = slot.writer_start_idx().min(chunks.len() - 1);
+                                let avail: usize = chunks[start..]
+                                    .iter()
+                                    .map(|c| chunk_size - (c.offset as usize + c.usage as usize))
+                                    .sum();
+                                (chunks.len(), avail)
+                            }
                         }
-                    }
-                    None => (0usize, 0usize),
-                };
+                        None => (0usize, 0usize),
+                    };
                 let needed_extra = add.saturating_sub(available);
                 let additional_chunks = (needed_extra + chunk_size - 1) / chunk_size;
                 let new_total_chunks = current_chunks + additional_chunks;

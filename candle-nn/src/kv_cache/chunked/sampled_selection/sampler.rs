@@ -9,8 +9,8 @@ use super::params::SELECT_BLOCK;
 use super::profile::sampled_profile_record_duration;
 use super::workflow::{SampleQuantizationResult, SampleQuantizationSweepResult};
 use super::{
-    batch_select_and_summarize, sample_error_surface_cpu,
-    CompressionSummary, ErrorSurface, SampleFormat, SampleSide, SampledSelectionBenchmarkResult,
+    batch_select_and_summarize, sample_error_surface_cpu, CompressionSummary, ErrorSurface,
+    SampleFormat, SampleSide, SampledSelectionBenchmarkResult,
 };
 use crate::kv_cache::ChunkedKvBacking;
 use candle::Result;
@@ -72,7 +72,11 @@ impl KvSampler {
     }
 
     /// Construct for CPU-only use — no GPU uploads.  Available on all feature combinations.
-    pub fn new_cpu(candidates: &[SampleFormat], k_thresholds: &[f32], v_thresholds: &[f32]) -> Self {
+    pub fn new_cpu(
+        candidates: &[SampleFormat],
+        k_thresholds: &[f32],
+        v_thresholds: &[f32],
+    ) -> Self {
         Self {
             candidates: candidates.to_vec(),
             k_thresholds: k_thresholds.to_vec(),
@@ -147,7 +151,6 @@ impl KvSampler {
     pub fn v_thresholds(&self) -> &[f32] {
         &self.v_thresholds
     }
-
 
     /// Run a full KV quantization sweep and return per-threshold summaries.
     ///
@@ -225,7 +228,14 @@ impl KvSampler {
             v_summaries.into_iter().map(|s| (vec![], s)).collect();
         Ok((
             make_sweep_result(n_batch, n_head, head_dim, n_quant, SampleSide::Key, k_pairs),
-            make_sweep_result(n_batch, n_head, head_dim, n_quant, SampleSide::Value, v_pairs),
+            make_sweep_result(
+                n_batch,
+                n_head,
+                head_dim,
+                n_quant,
+                SampleSide::Value,
+                v_pairs,
+            ),
         ))
     }
 
@@ -307,7 +317,8 @@ impl KvSampler {
         }
 
         let select_k_start = benchmark_result.as_ref().map(|_| std::time::Instant::now());
-        let k_levels = batch_select_and_summarize(&k_surface, &self.k_thresholds, &self.candidates, None)?;
+        let k_levels =
+            batch_select_and_summarize(&k_surface, &self.k_thresholds, &self.candidates, None)?;
         if let Some(start) = select_k_start {
             sampled_profile_record_duration(
                 benchmark_result.as_deref_mut(),
@@ -318,7 +329,8 @@ impl KvSampler {
         }
 
         let select_v_start = benchmark_result.as_ref().map(|_| std::time::Instant::now());
-        let v_levels = batch_select_and_summarize(&v_surface, &self.v_thresholds, &self.candidates, None)?;
+        let v_levels =
+            batch_select_and_summarize(&v_surface, &self.v_thresholds, &self.candidates, None)?;
         if let Some(start) = select_v_start {
             sampled_profile_record_duration(
                 benchmark_result.as_deref_mut(),
@@ -339,8 +351,22 @@ impl KvSampler {
 
         let n_quant = self.candidates.len();
         Ok((
-            make_sweep_result(n_batch, n_head, head_dim, n_quant, SampleSide::Key, k_levels),
-            make_sweep_result(n_batch, n_head, head_dim, n_quant, SampleSide::Value, v_levels),
+            make_sweep_result(
+                n_batch,
+                n_head,
+                head_dim,
+                n_quant,
+                SampleSide::Key,
+                k_levels,
+            ),
+            make_sweep_result(
+                n_batch,
+                n_head,
+                head_dim,
+                n_quant,
+                SampleSide::Value,
+                v_levels,
+            ),
         ))
     }
 }
@@ -373,4 +399,3 @@ fn make_sweep_result(
         levels,
     }
 }
-

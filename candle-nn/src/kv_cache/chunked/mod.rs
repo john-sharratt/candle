@@ -34,6 +34,7 @@ mod gpu_chunks;
 mod gpu_chunks;
 mod head_gids;
 mod io;
+pub mod migrate;
 pub mod sampled_selection;
 mod sequence_ops;
 mod types;

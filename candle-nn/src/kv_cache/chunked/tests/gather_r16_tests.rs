@@ -50,9 +50,9 @@ mod tests {
                 let blk_off = d * 128;
                 let [k0, k1] = k_val.to_le_bytes();
                 let [q0, q1] = q_val.to_le_bytes();
-                k_data[blk_off + t * 2]      = k0;
-                k_data[blk_off + t * 2 + 1]  = k1;
-                k_data[blk_off + 64 + t * 2]     = q0;
+                k_data[blk_off + t * 2] = k0;
+                k_data[blk_off + t * 2 + 1] = k1;
+                k_data[blk_off + 64 + t * 2] = q0;
                 k_data[blk_off + 64 + t * 2 + 1] = q1;
             }
         }
@@ -64,7 +64,7 @@ mod tests {
                 let v_val = half::f16::from_f32((t * 10 + d) as f32);
                 let [b0, b1] = v_val.to_le_bytes();
                 let idx = (t * sub_head_dim + d) * 2;
-                v_data[idx]     = b0;
+                v_data[idx] = b0;
                 v_data[idx + 1] = b1;
             }
         }
@@ -89,8 +89,8 @@ mod tests {
 
         let stream = cuda_dev.cuda_stream();
         {
-            let (kp, _kg)   = k_ptrs_gpu.device_ptr(&stream);
-            let (vp, _vg)   = v_ptrs_gpu.device_ptr(&stream);
+            let (kp, _kg) = k_ptrs_gpu.device_ptr(&stream);
+            let (vp, _vg) = v_ptrs_gpu.device_ptr(&stream);
             let (okqv, _og) = out_kqv.device_ptr(&stream);
             unsafe {
                 kernels::simple::gather_r16_kv::run_gather_r16_kv_f16(
@@ -157,9 +157,9 @@ mod tests {
                     let blk_off = d * 128;
                     let [k0, k1] = k_val.to_le_bytes();
                     let [q0, q1] = q_val.to_le_bytes();
-                    buf[blk_off + t * 2]          = k0;
-                    buf[blk_off + t * 2 + 1]      = k1;
-                    buf[blk_off + 64 + t * 2]     = q0;
+                    buf[blk_off + t * 2] = k0;
+                    buf[blk_off + t * 2 + 1] = k1;
+                    buf[blk_off + 64 + t * 2] = q0;
                     buf[blk_off + 64 + t * 2 + 1] = q1;
                 }
             }
@@ -173,7 +173,7 @@ mod tests {
                     let v_val = half::f16::from_f32(offset + (t * 10 + d) as f32);
                     let [b0, b1] = v_val.to_le_bytes();
                     let idx = (t * sub_head_dim + d) * 2;
-                    buf[idx]     = b0;
+                    buf[idx] = b0;
                     buf[idx + 1] = b1;
                 }
             }
@@ -210,8 +210,8 @@ mod tests {
 
         let stream = cuda_dev.cuda_stream();
         {
-            let (kp, _kg)   = k_ptrs_gpu.device_ptr(&stream);
-            let (vp, _vg)   = v_ptrs_gpu.device_ptr(&stream);
+            let (kp, _kg) = k_ptrs_gpu.device_ptr(&stream);
+            let (vp, _vg) = v_ptrs_gpu.device_ptr(&stream);
             let (okqv, _og) = out_kqv.device_ptr(&stream);
             unsafe {
                 kernels::simple::gather_r16_kv::run_gather_r16_kv_f16(

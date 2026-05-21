@@ -104,14 +104,17 @@ pub fn load_dump(path: &Path) -> Option<(DumpHeader, Vec<ChunkData>)> {
 
     let version = read_u32_le(&bytes, &mut pos)?;
     if version != 1 && version != 2 && version != 3 && version != 4 {
-        eprintln!("dump_reader: unsupported dump version {} in {:?}", version, path);
+        eprintln!(
+            "dump_reader: unsupported dump version {} in {:?}",
+            version, path
+        );
         return None;
     }
 
     let num_layers = read_u32_le(&bytes, &mut pos)? as usize;
-    let n_kv_head  = read_u32_le(&bytes, &mut pos)? as usize;
+    let n_kv_head = read_u32_le(&bytes, &mut pos)? as usize;
     let chunk_size = read_u32_le(&bytes, &mut pos)? as usize;
-    let head_dim   = read_u32_le(&bytes, &mut pos)? as usize;
+    let head_dim = read_u32_le(&bytes, &mut pos)? as usize;
 
     // v2: read token sequence
     let tokens = if version >= 2 {
@@ -125,7 +128,13 @@ pub fn load_dump(path: &Path) -> Option<(DumpHeader, Vec<ChunkData>)> {
         Vec::new()
     };
 
-    let header = DumpHeader { num_layers, n_kv_head, chunk_size, head_dim, tokens };
+    let header = DumpHeader {
+        num_layers,
+        n_kv_head,
+        chunk_size,
+        head_dim,
+        tokens,
+    };
     let elems_per_chunk = n_kv_head * chunk_size * head_dim;
 
     let mut chunks = Vec::new();
@@ -157,7 +166,14 @@ pub fn load_dump(path: &Path) -> Option<(DumpHeader, Vec<ChunkData>)> {
             } else {
                 None
             };
-            chunks.push(ChunkData { layer_idx, block_idx, token_start, k, v, q });
+            chunks.push(ChunkData {
+                layer_idx,
+                block_idx,
+                token_start,
+                k,
+                v,
+                q,
+            });
         }
     }
 

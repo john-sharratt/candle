@@ -29,6 +29,7 @@ mod error;
 mod handle;
 pub mod models;
 pub mod narrator;
+pub mod persistence;
 pub mod prompts;
 mod scheduler;
 mod sequence_handle;

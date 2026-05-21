@@ -903,11 +903,11 @@ impl Scheduler {
                     let conversation = match self.slot_conversations.get(&parent_id) {
                         Some(c) => c.clone(),
                         None => {
-                            let _ =
-                                event_tx
-                                    .send(TurnEvent::Error(ConversationError::Channel(format!(
+                            let _ = event_tx.send(TurnEvent::Error(ConversationError::Channel(
+                                format!(
                                     "submit_turn: no conversation registered for slot {parent_id}"
-                                ))));
+                                ),
+                            )));
                             return true;
                         }
                     };
@@ -2106,6 +2106,11 @@ impl Scheduler {
                     token_ids,
                 } = turn_content.unwrap_or_default();
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+                // Snapshot what the resume path needs before the substrate
+                // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
+                let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
+                #[cfg(feature = "cuda")]
+                let persist_layers = self.gather_turn_layers(&delta_gpu)?;
                 let idx = conversation
                     .record_turn(
                         target.timeline,
@@ -2123,6 +2128,20 @@ impl Scheduler {
                     let mut view = conversation.write();
                     view.set_sig_entries(target.timeline, idx, new_sig_entries.clone());
                 }
+                // Persist the turn's per-layer KV grid to the redo log so it
+                // can be cold-loaded on a daemon restart (§16.12).
+                #[cfg(feature = "cuda")]
+                {
+                    use crate::persistence::content_hash::turn_stream_id;
+                    let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
+                    if let Err(e) =
+                        conversation.persist_turn_kv(stream_id, &persist_layers, &persist_token_ids)
+                    {
+                        tracing::warn!("persist turn kv failed: {e}");
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                let _ = persist_token_ids;
             }
             SealAction::Section { section_id, tokens } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
@@ -2149,6 +2168,68 @@ impl Scheduler {
             chunk_size,
             sig_blocks_processed: new_processed,
         }))
+    }
+
+    /// Gather a just-sealed turn's per-layer KV off the GPU into the
+    /// `ChunkImage` grid the redo log persists (§16.12 seal-time gather).
+    ///
+    /// For each layer's `SealedSequence`, `resolve_sealed_chunk_ptrs` +
+    /// `gather_chunks` copy the chunks into one opaque host blob; the blob
+    /// is split per chunk by `SealedChunk.byte_size` and paired with the
+    /// chunk's persisted metadata (offset, K/V formats, palettes, scales).
+    #[cfg(feature = "cuda")]
+    fn gather_turn_layers(
+        &self,
+        delta_gpu: &[SealedSequence],
+    ) -> Result<Vec<Vec<crate::persistence::resume::ChunkImage>>, ConversationError> {
+        use crate::persistence::transfer::seal_to_chunk_images;
+
+        let device = self.session.device().clone();
+        let mut layers = Vec::with_capacity(delta_gpu.len());
+        for (layer_idx, seq) in delta_gpu.iter().enumerate() {
+            let backing = self.session.backing(layer_idx).ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "gather_turn_layers: no KV backing for layer {layer_idx}"
+                ))
+            })?;
+            let chunks =
+                seal_to_chunk_images(backing, &device, seq).map_err(ConversationError::Model)?;
+            layers.push(chunks);
+        }
+        Ok(layers)
+    }
+
+    /// Rebuild the workspace substrate from the persistence redo log on
+    /// daemon startup (§16.12 substrate reload). For every persisted turn,
+    /// each layer's chunk grid is cold-loaded back into VRAM via
+    /// `transfer::load_stream` and the turn is re-appended to the substrate.
+    #[cfg(feature = "cuda")]
+    pub fn reconstruct_substrate(&self, conversation: &Conversation) {
+        use crate::persistence::resume::ChunkImage;
+        use crate::persistence::transfer::load_stream;
+
+        let n_layers = self.session.backings().len();
+        if n_layers == 0 {
+            return;
+        }
+        let device = self.session.device().clone();
+        let load = |layers: &[Vec<ChunkImage>]| -> candle::Result<Vec<SealedSequence>> {
+            let mut out = Vec::with_capacity(layers.len());
+            for (layer_idx, chunks) in layers.iter().enumerate() {
+                let backing = self.session.backing(layer_idx).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "reconstruct_substrate: no KV backing for layer {layer_idx}"
+                    ))
+                })?;
+                out.push(load_stream(backing, &device, chunks)?);
+            }
+            Ok(out)
+        };
+        match conversation.reconstruct_from_log(n_layers, load) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("substrate reload: {n} turns restored from redo log"),
+            Err(e) => tracing::error!("substrate reload failed: {e}"),
+        }
     }
 
     // ── Raw KVQ extraction ────────────────────────────────────────────

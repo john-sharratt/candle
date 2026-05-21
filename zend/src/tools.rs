@@ -105,9 +105,7 @@ pub fn install_tool_catalog(
                 &json_line,
                 100.0,
             )
-            .map_err(|e| {
-                anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e)
-            })?;
+            .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e))?;
         out.push((tool.name.to_string(), id, json_line));
     }
     Ok(out)
@@ -170,9 +168,8 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     // doesn't contain any other `<` (which would suggest it crosses
     // another tag boundary).
     static LENIENT_RE: OnceLock<Regex> = OnceLock::new();
-    let lenient_re = LENIENT_RE.get_or_init(|| {
-        Regex::new(r"(?s)(\{[^<]*?\})\s*</tool_call>").expect("static regex")
-    });
+    let lenient_re = LENIENT_RE
+        .get_or_init(|| Regex::new(r"(?s)(\{[^<]*?\})\s*</tool_call>").expect("static regex"));
 
     let mut out = Vec::new();
     let mut consumed_ends: Vec<usize> = Vec::new();
@@ -267,7 +264,10 @@ pub fn run_tool_calls(ctx: &ToolContext, calls: Vec<ToolCall>) -> Vec<ToolResult
         .into_iter()
         .map(|c| {
             let resp = run_tool(ctx, &c);
-            ToolResult { call: c, response: resp }
+            ToolResult {
+                call: c,
+                response: resp,
+            }
         })
         .collect()
 }
@@ -407,7 +407,11 @@ some text
         // re-match the same close-tag.
         let text = r#"<tool_call>{"name": "datetime", "arguments": {}}</tool_call>"#;
         let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1, "well-formed block double-counted: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            1,
+            "well-formed block double-counted: {calls:?}"
+        );
     }
 
     #[test]
@@ -428,7 +432,10 @@ some text
         };
         let resp = run_tool(&ctx, &call);
         assert_eq!(resp["error"], "unknown_tool");
-        assert!(resp["detail"].as_str().unwrap().contains("tool_that_does_not_exist"));
+        assert!(resp["detail"]
+            .as_str()
+            .unwrap()
+            .contains("tool_that_does_not_exist"));
     }
 
     #[test]
@@ -441,7 +448,10 @@ some text
         };
         let resp = run_tool(&ctx, &call);
         // Should be a successful response (not an error shape).
-        assert!(resp.get("error").is_none(), "datetime call returned error: {resp:?}");
+        assert!(
+            resp.get("error").is_none(),
+            "datetime call returned error: {resp:?}"
+        );
     }
 
     #[test]

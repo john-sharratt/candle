@@ -290,7 +290,7 @@ impl IndicesAndMask {
     pub fn mask(&self) -> &Tensor {
         &self.mask
     }
-    
+
     /// Get the indices tensor.
     pub fn indices(&self) -> &Tensor {
         &self.indices

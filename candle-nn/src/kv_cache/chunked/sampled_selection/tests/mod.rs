@@ -22,12 +22,20 @@ pub(super) const CHUNK_SIZE: usize = 32;
 
 pub(super) fn dump_path() -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(DUMP_REL_PATH);
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 pub(super) fn r16_dump_path() -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(R16_DUMP_REL_PATH);
-    if p.exists() { Some(p) } else { None }
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 pub(super) fn make_synthetic_batch(n_batch: usize, n_head: usize, head_dim: usize) -> Vec<f32> {
@@ -95,10 +103,10 @@ pub(super) fn pack_f16(data: &[f32]) -> Vec<u8> {
     buf
 }
 
-pub(super) mod helpers;
-mod gpu_vs_cpu;
-mod calibration;
-mod projection;
-mod model;
 mod benchmark;
+mod calibration;
+mod gpu_vs_cpu;
+pub(super) mod helpers;
+mod model;
+mod projection;
 pub(super) mod test_data;

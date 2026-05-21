@@ -44,7 +44,7 @@
 use super::dump_reader::load_dump;
 use std::io::Write;
 
-const DUMP_REL_PATH:  &str = "src/kv_cache/chunked/tests/data/qwen3-kv-data.bin";
+const DUMP_REL_PATH: &str = "src/kv_cache/chunked/tests/data/qwen3-kv-data.bin";
 const QWEN3_DUMP_REL_PATH: &str = "src/kv_cache/chunked/tests/data/qwen3-kv-data.bin";
 const LLAMA_DUMP_REL_PATH: &str = "src/kv_cache/chunked/tests/data/llama-kv-data.bin";
 const STATS_BIN_PATH: &str = "src/kv_cache/chunked/tests/data/kv_cache_stats.bin";
@@ -60,27 +60,33 @@ const BLOCK: usize = 32;
 /// Per-chunk statistics for one component (K or V).
 #[derive(Debug, Clone, Copy)]
 struct ChunkStats {
-    amax:         f32,
-    rms:          f32,
-    mean_abs:     f32,
-    std:          f32,
-    kurtosis:     f32,
+    amax: f32,
+    rms: f32,
+    mean_abs: f32,
+    std: f32,
+    kurtosis: f32,
     sparsity_pct: f32,
-    q8_cos_mean:  f32,
-    q8_cos_max:   f32,
-    q4_cos_mean:  f32,
-    q4_cos_max:   f32,
-    q3_cos_mean:  f32,
-    q2_cos_mean:  f32,
+    q8_cos_mean: f32,
+    q8_cos_max: f32,
+    q4_cos_mean: f32,
+    q4_cos_max: f32,
+    q3_cos_mean: f32,
+    q2_cos_mean: f32,
 }
 
 impl ChunkStats {
     fn as_f32_array(&self) -> [f32; 12] {
         [
-            self.amax, self.rms, self.mean_abs, self.std, self.kurtosis,
+            self.amax,
+            self.rms,
+            self.mean_abs,
+            self.std,
+            self.kurtosis,
             self.sparsity_pct,
-            self.q8_cos_mean, self.q8_cos_max,
-            self.q4_cos_mean, self.q4_cos_max,
+            self.q8_cos_mean,
+            self.q8_cos_max,
+            self.q4_cos_mean,
+            self.q4_cos_max,
             self.q3_cos_mean,
             self.q2_cos_mean,
         ]
@@ -92,20 +98,22 @@ impl ChunkStats {
     }
 
     fn to_csv_with_token_start(&self, token_start: usize) -> String {
-        format!(
-            "{},{}",
-            token_start,
-            self.to_csv(),
-        )
+        format!("{},{}", token_start, self.to_csv(),)
     }
 
     fn to_csv(&self) -> String {
         format!(
             "{:.6},{:.6},{:.6},{:.6},{:.4},{:.2},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8}",
-            self.amax, self.rms, self.mean_abs, self.std, self.kurtosis,
+            self.amax,
+            self.rms,
+            self.mean_abs,
+            self.std,
+            self.kurtosis,
             self.sparsity_pct,
-            self.q8_cos_mean, self.q8_cos_max,
-            self.q4_cos_mean, self.q4_cos_max,
+            self.q8_cos_mean,
+            self.q8_cos_max,
+            self.q4_cos_mean,
+            self.q4_cos_max,
             self.q3_cos_mean,
             self.q2_cos_mean,
         )
@@ -118,7 +126,9 @@ impl ChunkStats {
 
 fn round_trip_q8_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
     let amax = b.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-    if amax == 0.0 { return [0.0; BLOCK]; }
+    if amax == 0.0 {
+        return [0.0; BLOCK];
+    }
     let s = amax / 127.0;
     let mut o = [0.0f32; BLOCK];
     for (i, &x) in b.iter().enumerate() {
@@ -129,7 +139,9 @@ fn round_trip_q8_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
 
 fn round_trip_q4_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
     let amax = b.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-    if amax == 0.0 { return [0.0; BLOCK]; }
+    if amax == 0.0 {
+        return [0.0; BLOCK];
+    }
     let s = amax / 7.0;
     let mut o = [0.0f32; BLOCK];
     for (i, &x) in b.iter().enumerate() {
@@ -140,7 +152,9 @@ fn round_trip_q4_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
 
 fn round_trip_q3_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
     let amax = b.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-    if amax == 0.0 { return [0.0; BLOCK]; }
+    if amax == 0.0 {
+        return [0.0; BLOCK];
+    }
     let s = amax / 3.0;
     let mut o = [0.0f32; BLOCK];
     for (i, &x) in b.iter().enumerate() {
@@ -151,7 +165,9 @@ fn round_trip_q3_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
 
 fn round_trip_q2_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
     let amax = b.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-    if amax == 0.0 { return [0.0; BLOCK]; }
+    if amax == 0.0 {
+        return [0.0; BLOCK];
+    }
     let s = amax;
     let mut o = [0.0f32; BLOCK];
     for (i, &x) in b.iter().enumerate() {
@@ -163,10 +179,14 @@ fn round_trip_q2_0(b: &[f32; BLOCK]) -> [f32; BLOCK] {
 fn cosine_distance(a: &[f32; BLOCK], b: &[f32; BLOCK]) -> f32 {
     let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
     for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y; na += x * x; nb += y * y;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
     }
     let denom = (na * nb).sqrt();
-    if denom < 1e-12 { return 0.0; }
+    if denom < 1e-12 {
+        return 0.0;
+    }
     (1.0 - dot / denom).max(0.0)
 }
 
@@ -178,42 +198,66 @@ fn compute_stats(data: &[f32]) -> ChunkStats {
     let n = data.len() as f64;
     if n == 0.0 {
         return ChunkStats {
-            amax: 0.0, rms: 0.0, mean_abs: 0.0, std: 0.0, kurtosis: 0.0,
+            amax: 0.0,
+            rms: 0.0,
+            mean_abs: 0.0,
+            std: 0.0,
+            kurtosis: 0.0,
             sparsity_pct: 100.0,
-            q8_cos_mean: 0.0, q8_cos_max: 0.0,
-            q4_cos_mean: 0.0, q4_cos_max: 0.0,
-            q3_cos_mean: 0.0, q2_cos_mean: 0.0,
+            q8_cos_mean: 0.0,
+            q8_cos_max: 0.0,
+            q4_cos_mean: 0.0,
+            q4_cos_max: 0.0,
+            q3_cos_mean: 0.0,
+            q2_cos_mean: 0.0,
         };
     }
 
     // Scalar stats
-    let amax         = data.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-    let sum_sq: f64  = data.iter().map(|&x| (x as f64) * (x as f64)).sum();
-    let sum:    f64  = data.iter().map(|&x| x as f64).sum();
+    let amax = data.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+    let sum_sq: f64 = data.iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let sum: f64 = data.iter().map(|&x| x as f64).sum();
     let sum_abs: f64 = data.iter().map(|&x| (x as f64).abs()).sum();
-    let rms          = (sum_sq / n).sqrt() as f32;
-    let mean_abs     = (sum_abs / n) as f32;
-    let mean         = sum / n;
-    let variance: f64 = data.iter().map(|&x| { let d = x as f64 - mean; d * d }).sum::<f64>() / n;
-    let std          = variance.sqrt() as f32;
+    let rms = (sum_sq / n).sqrt() as f32;
+    let mean_abs = (sum_abs / n) as f32;
+    let mean = sum / n;
+    let variance: f64 = data
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n;
+    let std = variance.sqrt() as f32;
 
     let kurtosis = if variance > 1e-30 {
-        let m4: f64 = data.iter()
-            .map(|&x| { let d = x as f64 - mean; d * d * d * d })
-            .sum::<f64>() / n;
-        (m4 / (variance * variance) - 3.0) as f32  // excess kurtosis
+        let m4: f64 = data
+            .iter()
+            .map(|&x| {
+                let d = x as f64 - mean;
+                d * d * d * d
+            })
+            .sum::<f64>()
+            / n;
+        (m4 / (variance * variance) - 3.0) as f32 // excess kurtosis
     } else {
         0.0
     };
 
     let near_zero_thresh = amax * 0.01;
-    let near_zero = data.iter().filter(|&&x| x.abs() <= near_zero_thresh).count();
+    let near_zero = data
+        .iter()
+        .filter(|&&x| x.abs() <= near_zero_thresh)
+        .count();
     let sparsity_pct = near_zero as f32 / data.len() as f32 * 100.0;
 
     // Per sub-block quantisation distances
     let num_blocks = data.len() / BLOCK;
-    let mut q8_sum = 0.0f32; let mut q8_max = 0.0f32;
-    let mut q4_sum = 0.0f32; let mut q4_max = 0.0f32;
+    let mut q8_sum = 0.0f32;
+    let mut q8_max = 0.0f32;
+    let mut q4_sum = 0.0f32;
+    let mut q4_max = 0.0f32;
     let mut q3_sum = 0.0f32;
     let mut q2_sum = 0.0f32;
 
@@ -221,10 +265,12 @@ fn compute_stats(data: &[f32]) -> ChunkStats {
         let blk: [f32; BLOCK] = data[b * BLOCK..(b + 1) * BLOCK].try_into().unwrap();
 
         let d8 = cosine_distance(&blk, &round_trip_q8_0(&blk));
-        q8_sum += d8; q8_max = q8_max.max(d8);
+        q8_sum += d8;
+        q8_max = q8_max.max(d8);
 
         let d4 = cosine_distance(&blk, &round_trip_q4_0(&blk));
-        q4_sum += d4; q4_max = q4_max.max(d4);
+        q4_sum += d4;
+        q4_max = q4_max.max(d4);
 
         let d3 = cosine_distance(&blk, &round_trip_q3_0(&blk));
         q3_sum += d3;
@@ -242,9 +288,9 @@ fn compute_stats(data: &[f32]) -> ChunkStats {
         kurtosis,
         sparsity_pct,
         q8_cos_mean: q8_sum / cnt,
-        q8_cos_max:  q8_max,
+        q8_cos_max: q8_max,
         q4_cos_mean: q4_sum / cnt,
-        q4_cos_max:  q4_max,
+        q4_cos_max: q4_max,
         q3_cos_mean: q3_sum / cnt,
         q2_cos_mean: q2_sum / cnt,
     }
@@ -274,7 +320,10 @@ fn test_generate_kv_stats() {
     let (header, chunks) = load_dump(&dump_path).expect("failed to parse dump file");
     println!(
         "Loaded dump v2: {} layers, {} kv-heads, chunk_size={}, head_dim={}, {} tokens",
-        header.num_layers, header.n_kv_head, header.chunk_size, header.head_dim,
+        header.num_layers,
+        header.n_kv_head,
+        header.chunk_size,
+        header.head_dim,
         header.tokens.len()
     );
     println!("Total chunks: {}", chunks.len());
@@ -283,8 +332,8 @@ fn test_generate_kv_stats() {
     // Compute stats for every chunk
     // -----------------------------------------------------------------------
     struct Row {
-        layer_idx:   usize,
-        block_idx:   usize,
+        layer_idx: usize,
+        block_idx: usize,
         token_start: usize,
         k: ChunkStats,
         v: ChunkStats,
@@ -295,8 +344,8 @@ fn test_generate_kv_stats() {
         let k = compute_stats(&chunk.k);
         let v = compute_stats(&chunk.v);
         rows.push(Row {
-            layer_idx:   chunk.layer_idx,
-            block_idx:   chunk.block_idx,
+            layer_idx: chunk.layer_idx,
+            block_idx: chunk.block_idx,
             token_start: chunk.token_start,
             k,
             v,
@@ -308,15 +357,25 @@ fn test_generate_kv_stats() {
     // -----------------------------------------------------------------------
     let csv_path = data_path(STATS_CSV_PATH);
     {
-        let mut f = std::fs::File::create(&csv_path)
-            .expect("cannot create kv_cache_stats.csv");
-        writeln!(f, "layer,block_idx,component,{}", ChunkStats::csv_headers())
-            .unwrap();
+        let mut f = std::fs::File::create(&csv_path).expect("cannot create kv_cache_stats.csv");
+        writeln!(f, "layer,block_idx,component,{}", ChunkStats::csv_headers()).unwrap();
         for row in &rows {
-            writeln!(f, "{},{},K,{}", row.layer_idx, row.block_idx,
-                row.k.to_csv_with_token_start(row.token_start)).unwrap();
-            writeln!(f, "{},{},V,{}", row.layer_idx, row.block_idx,
-                row.v.to_csv_with_token_start(row.token_start)).unwrap();
+            writeln!(
+                f,
+                "{},{},K,{}",
+                row.layer_idx,
+                row.block_idx,
+                row.k.to_csv_with_token_start(row.token_start)
+            )
+            .unwrap();
+            writeln!(
+                f,
+                "{},{},V,{}",
+                row.layer_idx,
+                row.block_idx,
+                row.v.to_csv_with_token_start(row.token_start)
+            )
+            .unwrap();
         }
     }
     println!("Written CSV  -> {:?}", csv_path);
@@ -326,17 +385,21 @@ fn test_generate_kv_stats() {
     // -----------------------------------------------------------------------
     let bin_path = data_path(STATS_BIN_PATH);
     {
-        let mut f = std::fs::File::create(&bin_path)
-            .expect("cannot create kv_cache_stats.bin");
+        let mut f = std::fs::File::create(&bin_path).expect("cannot create kv_cache_stats.bin");
 
         // Header
         f.write_all(b"KVSTATS\0").unwrap();
-        f.write_all(&2u32.to_le_bytes()).unwrap();   // version
-        f.write_all(&(header.num_layers as u32).to_le_bytes()).unwrap();
-        f.write_all(&(header.n_kv_head  as u32).to_le_bytes()).unwrap();
-        f.write_all(&(header.chunk_size as u32).to_le_bytes()).unwrap();
-        f.write_all(&(header.head_dim   as u32).to_le_bytes()).unwrap();
-        f.write_all(&(header.tokens.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&2u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&(header.num_layers as u32).to_le_bytes())
+            .unwrap();
+        f.write_all(&(header.n_kv_head as u32).to_le_bytes())
+            .unwrap();
+        f.write_all(&(header.chunk_size as u32).to_le_bytes())
+            .unwrap();
+        f.write_all(&(header.head_dim as u32).to_le_bytes())
+            .unwrap();
+        f.write_all(&(header.tokens.len() as u32).to_le_bytes())
+            .unwrap();
         for &t in &header.tokens {
             f.write_all(&t.to_le_bytes()).unwrap();
         }
@@ -344,10 +407,12 @@ fn test_generate_kv_stats() {
         // Group rows by layer, preserving order
         for layer_idx in 0..header.num_layers {
             let layer_rows: Vec<&Row> = rows.iter().filter(|r| r.layer_idx == layer_idx).collect();
-            f.write_all(&(layer_rows.len() as u32).to_le_bytes()).unwrap();
+            f.write_all(&(layer_rows.len() as u32).to_le_bytes())
+                .unwrap();
             for row in &layer_rows {
                 f.write_all(&(row.block_idx as u32).to_le_bytes()).unwrap();
-                f.write_all(&(row.token_start as u32).to_le_bytes()).unwrap();
+                f.write_all(&(row.token_start as u32).to_le_bytes())
+                    .unwrap();
                 for &s in &row.k.as_f32_array() {
                     f.write_all(&s.to_le_bytes()).unwrap();
                 }
@@ -366,9 +431,17 @@ fn test_generate_kv_stats() {
     println!("\n{:-<97}", "");
     println!(
         "{:>6}  {:>5}  {:>6}  {:>7}  {:>8}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
-        "Layer", "Block", "Comp", "TokStart",
-        "amax", "rms", "std",
-        "kurt", "q8_mean", "q4_mean", "q2_mean"
+        "Layer",
+        "Block",
+        "Comp",
+        "TokStart",
+        "amax",
+        "rms",
+        "std",
+        "kurt",
+        "q8_mean",
+        "q4_mean",
+        "q2_mean"
     );
     println!("{:-<97}", "");
 
@@ -392,7 +465,7 @@ fn test_generate_kv_stats() {
     let mean_of = |vals: &[&ChunkStats], f: fn(&ChunkStats) -> f32| -> f32 {
         vals.iter().map(|s| f(s)).sum::<f32>() / vals.len() as f32
     };
-    let max_of  = |vals: &[&ChunkStats], f: fn(&ChunkStats) -> f32| -> f32 {
+    let max_of = |vals: &[&ChunkStats], f: fn(&ChunkStats) -> f32| -> f32 {
         vals.iter().map(|s| f(s)).fold(0.0f32, f32::max)
     };
 
@@ -463,7 +536,7 @@ fn print_amax_histogram(label: &str, values: &[f32], num_buckets: usize, bar_wid
         return;
     }
     let pcts = percentiles(values, &[50.0, 90.0, 99.0, 100.0]);
-    let cap = pcts[2].max(1e-6);  // p99 — use as bucket range cap
+    let cap = pcts[2].max(1e-6); // p99 — use as bucket range cap
     let mut buckets = vec![0usize; num_buckets];
     let mut overflow = 0usize;
     for &v in values {
@@ -480,7 +553,13 @@ fn print_amax_histogram(label: &str, values: &[f32], num_buckets: usize, bar_wid
 
     println!(
         "{}  n={}  p50={:.4}  p90={:.4}  p99={:.4}  max={:.4}  overflow_past_p99={}",
-        label, values.len(), pcts[0], pcts[1], pcts[2], pcts[3], overflow
+        label,
+        values.len(),
+        pcts[0],
+        pcts[1],
+        pcts[2],
+        pcts[3],
+        overflow
     );
     let bucket_w = cap / num_buckets as f32;
     for (i, &c) in buckets.iter().enumerate() {
@@ -505,14 +584,18 @@ fn test_kv_amax_channel_distribution() {
     }
 
     let (header, chunks) = load_dump(&dump_path).expect("failed to parse dump file");
-    let n_kv_head  = header.n_kv_head;
+    let n_kv_head = header.n_kv_head;
     let chunk_size = header.chunk_size;
-    let head_dim   = header.head_dim;
+    let head_dim = header.head_dim;
     let num_layers = header.num_layers;
 
     println!(
         "Loaded dump: {} layers, {} kv-heads, chunk_size={}, head_dim={}, {} chunks total",
-        num_layers, n_kv_head, chunk_size, head_dim, chunks.len()
+        num_layers,
+        n_kv_head,
+        chunk_size,
+        head_dim,
+        chunks.len()
     );
 
     // amaxes[layer][head] = Vec<f32> of channel-amaxes (one per chunk * channel)
@@ -554,8 +637,16 @@ fn test_kv_amax_channel_distribution() {
                 let p = percentiles(vals, &[10.0, 25.0, 50.0, 75.0, 90.0, 99.0]);
                 println!(
                     "{:>6} {:>5} {:>4}  {:>6}  {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4}",
-                    layer, h, label, vals.len(),
-                    p[0], p[1], p[2], p[3], p[4], p[5]
+                    layer,
+                    h,
+                    label,
+                    vals.len(),
+                    p[0],
+                    p[1],
+                    p[2],
+                    p[3],
+                    p[4],
+                    p[5]
                 );
             }
         }
@@ -621,8 +712,7 @@ fn test_kv_amax_channel_distribution() {
 //                  the 8-lane edge runs already at idx 3 and 5.
 #[allow(dead_code)]
 const Q0V_SIGN_TABLE: [u32; 16] = [
-    0x00000000, 0xFFFFFFFF, 0x0000000F, 0x000000FF,
-    0xF0000000, 0xFF000000, 0x0000FFFF, 0xFFFF0000,
+    0x00000000, 0xFFFFFFFF, 0x0000000F, 0x000000FF, 0xF0000000, 0xFF000000, 0x0000FFFF, 0xFFFF0000,
     0xFF00FF00, 0x00FF00FF, 0x80FFFFFF, 0x7FFFFFFF, // byte-stripe + edge-flip
     0xFFFFFF00, 0x00FFFFFF, 0x00FFFF00, 0xFF0000FF, // 24/8 edge-runs (was nibble-stripe)
 ];
@@ -641,12 +731,21 @@ fn print_distribution(label: &str, values: &[f32], num_buckets: usize) {
     for &v in values {
         let b = if hi > lo {
             (((v - lo) / (hi - lo)) * num_buckets as f32) as usize
-        } else { 0 };
+        } else {
+            0
+        };
         buckets[b.min(num_buckets - 1)] += 1;
     }
     let max_count = *buckets.iter().max().unwrap_or(&1).max(&1);
-    println!("{}  n={}  p1={:.4}  p50={:.4}  p90={:.4}  p99={:.4}",
-        label, values.len(), pcts[0], pcts[1], pcts[2], pcts[3]);
+    println!(
+        "{}  n={}  p1={:.4}  p50={:.4}  p90={:.4}  p99={:.4}",
+        label,
+        values.len(),
+        pcts[0],
+        pcts[1],
+        pcts[2],
+        pcts[3]
+    );
     let bw = (hi - lo) / num_buckets as f32;
     for (i, &c) in buckets.iter().enumerate() {
         let blo = lo + bw * i as f32;
@@ -733,14 +832,13 @@ fn kernel_drop_cheap_format_blocks(
         let base = ((h * N_PALETTE) + p) * elems_per_band;
         std::array::from_fn(|t| chunk[base + t * sub_head_dim + c])
     }
-    let to_dim_major =
-        |chunk: &[f32], n_kv_head: usize, blocks_per_chunk: usize| -> Vec<f32> {
-            let mut out = Vec::with_capacity(blocks_per_chunk * SELECT_BLOCK);
-            for b in 0..blocks_per_chunk {
-                out.extend_from_slice(&dim_major_block(chunk, b, n_kv_head, blocks_per_chunk));
-            }
-            out
-        };
+    let to_dim_major = |chunk: &[f32], n_kv_head: usize, blocks_per_chunk: usize| -> Vec<f32> {
+        let mut out = Vec::with_capacity(blocks_per_chunk * SELECT_BLOCK);
+        for b in 0..blocks_per_chunk {
+            out.extend_from_slice(&dim_major_block(chunk, b, n_kv_head, blocks_per_chunk));
+        }
+        out
+    };
     let pack_r16 = |k_data: &[f32], q_data: &[f32]| -> Vec<u8> {
         debug_assert_eq!(k_data.len(), q_data.len());
         let n = k_data.len() / SELECT_BLOCK;
@@ -751,8 +849,7 @@ fn kernel_drop_cheap_format_blocks(
                 let kf = half::f16::from_f32(k_data[b * SELECT_BLOCK + i]);
                 let qf = half::f16::from_f32(q_data[b * SELECT_BLOCK + i]);
                 buf[off + i * 2..off + i * 2 + 2].copy_from_slice(&kf.to_le_bytes());
-                buf[off + 64 + i * 2..off + 64 + i * 2 + 2]
-                    .copy_from_slice(&qf.to_le_bytes());
+                buf[off + 64 + i * 2..off + 64 + i * 2 + 2].copy_from_slice(&qf.to_le_bytes());
             }
         }
         buf
@@ -822,8 +919,7 @@ fn kernel_drop_cheap_format_blocks(
         // 1..3 zeroed. metadata = K=R16 (3<<16), V=F32.
         let outer_one_bits = 1.0_f32.to_bits() as i64;
         let metadata_kr16_vf32: i64 = (3i64 << 16) | (0i64 << 8);
-        let mut per_head_table: Vec<i64> =
-            Vec::with_capacity(n_chunks * src_n_kv_head * 36);
+        let mut per_head_table: Vec<i64> = Vec::with_capacity(n_chunks * src_n_kv_head * 36);
         for cg in &chunk_gpus {
             let (kp, _g1) = cg.k_gpu.device_ptr(&stream);
             let (vp, _g2) = cg.v_gpu.device_ptr(&stream);
@@ -959,17 +1055,10 @@ fn kernel_drop_cheap_format_blocks(
         }
     }
 
-    println!(
-        "\n========================================================================"
-    );
-    println!(
-        "  Kernel-driven calibration filter (candidates = [Q0, Q0_X, Q8_0] @ C9)"
-    );
-    println!(
-        "========================================================================"
-    );
-    let pct =
-        |n: usize, d: usize| -> f64 { 100.0 * n as f64 / d.max(1) as f64 };
+    println!("\n========================================================================");
+    println!("  Kernel-driven calibration filter (candidates = [Q0, Q0_X, Q8_0] @ C9)");
+    println!("========================================================================");
+    let pct = |n: usize, d: usize| -> f64 { 100.0 * n as f64 / d.max(1) as f64 };
     println!(
         "  K: {} blocks → kept {} ({:.2}%)  |  dropped Q0={} ({:.2}%)  Q0_X={} ({:.2}%)",
         total_k_seen,
@@ -1029,8 +1118,7 @@ fn load_kv_blocks_for_q0_v_tests() -> Option<LoadedKvBlocks> {
         (llama_path.clone(), "llama-kv-data.bin")
     };
     let (header, mut chunks) = load_dump(&primary_path)?;
-    let mut source_ranges: Vec<(usize, usize, usize)> =
-        vec![(0, chunks.len(), header.n_kv_head)];
+    let mut source_ranges: Vec<(usize, usize, usize)> = vec![(0, chunks.len(), header.n_kv_head)];
     if qwen3_path.exists() && llama_path.exists() {
         if let Some((other_header, other_chunks)) = load_dump(&llama_path) {
             if other_header.head_dim == header.head_dim
@@ -1193,10 +1281,7 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
         let sign = if x < 0.0 { -1.0 } else { 1.0 };
         let x = x.abs();
         let t = 1.0 / (1.0 + p * x);
-        let y = 1.0
-            - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1)
-                * t
-                * (-x * x).exp();
+        let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
         sign * y
     }
     fn phi(x: f32) -> f32 {
@@ -1204,17 +1289,13 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
     }
 
     let run_side = |side_label: &str, blocks: &[[f32; 32]], head_amax: &[f32]| {
-        println!(
-            "\n========================================================================"
-        );
+        println!("\n========================================================================");
         println!(
             "  Q0_V CUDA-kernel round-trip: side = {} ({} blocks)",
             side_label.to_uppercase(),
             blocks.len()
         );
-        println!(
-            "========================================================================"
-        );
+        println!("========================================================================");
 
         // Build a flat f32 buffer of N*32 elements, normalising each block
         // by 1/head_amax so values lie in [-1, +1] (the range Q0_V's codebook
@@ -1271,12 +1352,9 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             .map(|b| {
                 let off = b * 32;
                 if side_label == "k" {
-                    let mut errs: [f32; 32] = std::array::from_fn(|i| {
-                        (flat[off + i] - recon[off + i]).abs()
-                    });
-                    errs.sort_by(|a, b| {
-                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    let mut errs: [f32; 32] =
+                        std::array::from_fn(|i| (flat[off + i] - recon[off + i]).abs());
+                    errs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                     (errs[0] + errs[1] + errs[2] + errs[3]) * 0.25
                 } else {
                     let mse: f32 = (0..32)
@@ -1315,9 +1393,9 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
 
         // Pass rates with kernel's interpolation formula, both factor sets.
         use crate::kv_cache::chunked::sampled_selection::{
-            LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS,
-            PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
-            PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_MOE_KV_FACTORS,
+            LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS,
+            PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS,
+            QWEN3_MOE_KV_FACTORS,
         };
         let (thr_hi_base, thr_lo_base): (&[f32; 11], &[f32; 11]) = if side_label == "k" {
             (
@@ -1383,11 +1461,7 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
         // block kthresh interpolation tighten things.
         let calib_pass = |hi: f32, lo: f32| -> f64 {
             let thr = (hi * lo).sqrt();
-            metrics
-                .par_iter()
-                .filter(|&&m| m <= thr)
-                .count() as f64
-                / n as f64
+            metrics.par_iter().filter(|&&m| m <= thr).count() as f64 / n as f64
         };
 
         println!(
@@ -1401,12 +1475,8 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             "      Llama factors: hi×{:.3}, lo×{:.3}     Qwen3 factors: hi×{:.3}, lo×{:.3}",
             f_hi_l, f_lo_l, f_hi_q, f_lo_q
         );
-        println!(
-            "    C   |  Calib (det.) |  Llama (interp)  |  Qwen3 (interp)  | min      max"
-        );
-        println!(
-            "    --- |  -----------  |  --------------  |  --------------  | ------   ------"
-        );
+        println!("    C   |  Calib (det.) |  Llama (interp)  |  Qwen3 (interp)  | min      max");
+        println!("    --- |  -----------  |  --------------  |  --------------  | ------   ------");
         for c in 0..11 {
             let hi_raw = thr_hi_base[c];
             let lo_raw = thr_lo_base[c];
@@ -1451,21 +1521,16 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
     // The kernel processes whole chunks (32 tokens × n_kv_head heads ×
     // head_dim channels per chunk), so we feed the dump's raw chunks
     // directly rather than the 32-element blocks we extracted earlier.
+    use crate::kv_cache::chunked::sampled_selection::{
+        LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS,
+        PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_MOE_KV_FACTORS,
+    };
     use candle::quantized::cuda::select_kv_format_paged_batched_raw;
     use candle::quantized::GgmlDType;
-    use crate::kv_cache::chunked::sampled_selection::{
-        LLAMA_KV_FACTORS, PRODUCTION_K_QREL_HIGH_THRESHOLDS,
-        PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_V_QREL_HIGH_THRESHOLDS,
-        PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_MOE_KV_FACTORS,
-    };
 
-    println!(
-        "\n========================================================================"
-    );
+    println!("\n========================================================================");
     println!("  Selection kernel head-to-head: candidates = [Q0_V, Q8_1]");
-    println!(
-        "========================================================================"
-    );
+    println!("========================================================================");
 
     // Run the selector for each (dump, factor-set) pair separately so that
     // Llama factors are evaluated against Llama data and Qwen3 factors
@@ -1496,365 +1561,382 @@ fn test_q0_v_kernel_roundtrip_pass_rates() {
             this_model_name,
             this_dump_path.file_name().unwrap_or_default()
         );
-        let (header, chunks) =
-            super::dump_reader::load_dump(this_dump_path).expect("load dump");
+        let (header, chunks) = super::dump_reader::load_dump(this_dump_path).expect("load dump");
         let n_kv_head = header.n_kv_head;
         let chunk_size = header.chunk_size;
         let head_dim = header.head_dim;
         assert_eq!(chunk_size, 32);
 
-    // Each chunk's f32 layout: [n_kv_head, chunk_size, head_dim].
-    // For the selector kernel we treat each dump chunk as its own arena.
-    // blocks_per_head = head_dim → one 32-element block per channel of one head.
-    // Each (arena, head) pair gets its own per_head_table row pointing at
-    // that head's slice of the chunk; multi-head dumps use byte_offset to
-    // pick the head within the chunk.
-    let blocks_per_head = head_dim;
-    // K is uploaded as R16 (K f16 + Q f16, 128 bytes/block). V is uploaded as
-    // F32 (32 × 4 = 128 bytes/block). Both arenas have the same per-block byte
-    // size for 32-element blocks, so per-head byte offsets / strides are
-    // identical between K and V.
-    let single_head_bytes = (head_dim * 128) as i64; // head_dim blocks × 128 bytes/block
-    let single_head_chunk_stride = single_head_bytes; // one chunk per arena → stride irrelevant
+        // Each chunk's f32 layout: [n_kv_head, chunk_size, head_dim].
+        // For the selector kernel we treat each dump chunk as its own arena.
+        // blocks_per_head = head_dim → one 32-element block per channel of one head.
+        // Each (arena, head) pair gets its own per_head_table row pointing at
+        // that head's slice of the chunk; multi-head dumps use byte_offset to
+        // pick the head within the chunk.
+        let blocks_per_head = head_dim;
+        // K is uploaded as R16 (K f16 + Q f16, 128 bytes/block). V is uploaded as
+        // F32 (32 × 4 = 128 bytes/block). Both arenas have the same per-block byte
+        // size for 32-element blocks, so per-head byte offsets / strides are
+        // identical between K and V.
+        let single_head_bytes = (head_dim * 128) as i64; // head_dim blocks × 128 bytes/block
+        let single_head_chunk_stride = single_head_bytes; // one chunk per arena → stride irrelevant
 
-    // Layout note: the dump stores chunks token-major (`[head, token, dim]`),
-    // but the selection kernel sees each block as 32 tokens of one channel
-    // within a (head, palette) sub-band. Reading the dump verbatim gives the
-    // kernel the *transposed* view (32 channels of one token), which makes
-    // every block look near-constant and biases the picker toward Q0. We
-    // transpose to dim-major before uploading using the same helper that
-    // `test_candidate_list_compression_curve` validates. The result for each
-    // chunk is `blocks_per_chunk = n_kv_head * head_dim` consecutive
-    // 32-element blocks in dim-major iteration order: head, palette, channel.
-    //
-    // K-side additionally packs Q into the back half of each R16 block so the
-    // kernel can compute real per-block q_relevance (and the IQR-standardised
-    // exp(-z) per-block kthresh) instead of falling back to the lenient
-    // geometric-mean threshold. v4 dumps include Q vectors; pre-v4 dumps
-    // (chunk.q == None) fall back to zero-Q which collapses to geometric-mean
-    // thresholds — same regime the F32-K path was previously hitting.
-    let blocks_per_chunk = n_kv_head * head_dim;
-    fn dim_major_block_from_token_major(
-        chunk: &[f32],
-        b: usize,
-        n_kv_head: usize,
-        blocks_per_chunk: usize,
-    ) -> [f32; 32] {
-        const SELECT_BLOCK: usize = 32;
-        const N_PALETTE: usize = 4;
-        debug_assert!(n_kv_head > 0);
-        let blocks_per_head = blocks_per_chunk / n_kv_head; // = head_dim
-        let head_dim = blocks_per_head;
-        let sub_head_dim = head_dim / N_PALETTE;
-        let h = b / blocks_per_head;
-        let in_head = b % blocks_per_head;
-        let p = in_head / sub_head_dim;
-        let c = in_head % sub_head_dim;
-        let elems_per_band = SELECT_BLOCK * sub_head_dim;
-        let base = ((h * N_PALETTE) + p) * elems_per_band;
-        let mut blk = [0f32; SELECT_BLOCK];
-        for t in 0..SELECT_BLOCK {
-            blk[t] = chunk[base + t * sub_head_dim + c];
-        }
-        blk
-    }
-    let to_dim_major = |chunk: &[f32]| -> Vec<f32> {
-        let mut out = Vec::with_capacity(blocks_per_chunk * 32);
-        for b in 0..blocks_per_chunk {
-            out.extend_from_slice(&dim_major_block_from_token_major(
-                chunk,
-                b,
-                n_kv_head,
-                blocks_per_chunk,
-            ));
-        }
-        out
-    };
-
-    // R16 block layout (128 bytes / 32-element block):
-    //   d[0..32]: K values as F16 (offset  0, 64 bytes)
-    //   q[0..32]: Q values as F16 (offset 64, 64 bytes)
-    let pack_r16_blocks = |k_data: &[f32], q_data: &[f32]| -> Vec<u8> {
-        debug_assert_eq!(k_data.len(), q_data.len());
-        debug_assert!(k_data.len() % 32 == 0);
-        let n_blocks = k_data.len() / 32;
-        let mut buf = vec![0u8; n_blocks * 128];
-        for b in 0..n_blocks {
-            let block_start = b * 128;
-            for i in 0..32 {
-                let kf = half::f16::from_f32(k_data[b * 32 + i]);
-                let qf = half::f16::from_f32(q_data[b * 32 + i]);
-                buf[block_start + i * 2..block_start + i * 2 + 2]
-                    .copy_from_slice(&kf.to_le_bytes());
-                buf[block_start + 64 + i * 2..block_start + 64 + i * 2 + 2]
-                    .copy_from_slice(&qf.to_le_bytes());
+        // Layout note: the dump stores chunks token-major (`[head, token, dim]`),
+        // but the selection kernel sees each block as 32 tokens of one channel
+        // within a (head, palette) sub-band. Reading the dump verbatim gives the
+        // kernel the *transposed* view (32 channels of one token), which makes
+        // every block look near-constant and biases the picker toward Q0. We
+        // transpose to dim-major before uploading using the same helper that
+        // `test_candidate_list_compression_curve` validates. The result for each
+        // chunk is `blocks_per_chunk = n_kv_head * head_dim` consecutive
+        // 32-element blocks in dim-major iteration order: head, palette, channel.
+        //
+        // K-side additionally packs Q into the back half of each R16 block so the
+        // kernel can compute real per-block q_relevance (and the IQR-standardised
+        // exp(-z) per-block kthresh) instead of falling back to the lenient
+        // geometric-mean threshold. v4 dumps include Q vectors; pre-v4 dumps
+        // (chunk.q == None) fall back to zero-Q which collapses to geometric-mean
+        // thresholds — same regime the F32-K path was previously hitting.
+        let blocks_per_chunk = n_kv_head * head_dim;
+        fn dim_major_block_from_token_major(
+            chunk: &[f32],
+            b: usize,
+            n_kv_head: usize,
+            blocks_per_chunk: usize,
+        ) -> [f32; 32] {
+            const SELECT_BLOCK: usize = 32;
+            const N_PALETTE: usize = 4;
+            debug_assert!(n_kv_head > 0);
+            let blocks_per_head = blocks_per_chunk / n_kv_head; // = head_dim
+            let head_dim = blocks_per_head;
+            let sub_head_dim = head_dim / N_PALETTE;
+            let h = b / blocks_per_head;
+            let in_head = b % blocks_per_head;
+            let p = in_head / sub_head_dim;
+            let c = in_head % sub_head_dim;
+            let elems_per_band = SELECT_BLOCK * sub_head_dim;
+            let base = ((h * N_PALETTE) + p) * elems_per_band;
+            let mut blk = [0f32; SELECT_BLOCK];
+            for t in 0..SELECT_BLOCK {
+                blk[t] = chunk[base + t * sub_head_dim + c];
             }
+            blk
         }
-        buf
-    };
-
-    let mut q_present_chunks: usize = 0;
-    let mut q_missing_chunks: usize = 0;
-
-    struct ChunkGpu {
-        k_gpu: candle::cuda_backend::cudarc::driver::CudaSlice<u8>,
-        v_gpu: candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
-    }
-    let upload_start = std::time::Instant::now();
-    let zero_q: Vec<f32> = vec![0.0; blocks_per_chunk * 32];
-    let chunk_gpus: Vec<ChunkGpu> = chunks
-        .iter()
-        .map(|c| {
-            let k_dim_major = to_dim_major(&c.k);
-            let v_dim_major = to_dim_major(&c.v);
-            let q_dim_major = match &c.q {
-                Some(q) => {
-                    q_present_chunks += 1;
-                    to_dim_major(q)
-                }
-                None => {
-                    q_missing_chunks += 1;
-                    zero_q.clone()
-                }
-            };
-            let k_r16_bytes = pack_r16_blocks(&k_dim_major, &q_dim_major);
-            ChunkGpu {
-                k_gpu: dev.memcpy_stod(&k_r16_bytes).expect("upload k r16"),
-                v_gpu: dev.memcpy_stod(&v_dim_major).expect("upload v"),
+        let to_dim_major = |chunk: &[f32]| -> Vec<f32> {
+            let mut out = Vec::with_capacity(blocks_per_chunk * 32);
+            for b in 0..blocks_per_chunk {
+                out.extend_from_slice(&dim_major_block_from_token_major(
+                    chunk,
+                    b,
+                    n_kv_head,
+                    blocks_per_chunk,
+                ));
             }
-        })
-        .collect();
-    println!(
-        "  Uploaded {} chunks (dim-major: {} kv-heads × {} head_dim × 32 tokens) in {:.2}s",
-        chunk_gpus.len(),
-        n_kv_head,
-        head_dim,
-        upload_start.elapsed().as_secs_f64()
-    );
-    println!(
+            out
+        };
+
+        // R16 block layout (128 bytes / 32-element block):
+        //   d[0..32]: K values as F16 (offset  0, 64 bytes)
+        //   q[0..32]: Q values as F16 (offset 64, 64 bytes)
+        let pack_r16_blocks = |k_data: &[f32], q_data: &[f32]| -> Vec<u8> {
+            debug_assert_eq!(k_data.len(), q_data.len());
+            debug_assert!(k_data.len() % 32 == 0);
+            let n_blocks = k_data.len() / 32;
+            let mut buf = vec![0u8; n_blocks * 128];
+            for b in 0..n_blocks {
+                let block_start = b * 128;
+                for i in 0..32 {
+                    let kf = half::f16::from_f32(k_data[b * 32 + i]);
+                    let qf = half::f16::from_f32(q_data[b * 32 + i]);
+                    buf[block_start + i * 2..block_start + i * 2 + 2]
+                        .copy_from_slice(&kf.to_le_bytes());
+                    buf[block_start + 64 + i * 2..block_start + 64 + i * 2 + 2]
+                        .copy_from_slice(&qf.to_le_bytes());
+                }
+            }
+            buf
+        };
+
+        let mut q_present_chunks: usize = 0;
+        let mut q_missing_chunks: usize = 0;
+
+        struct ChunkGpu {
+            k_gpu: candle::cuda_backend::cudarc::driver::CudaSlice<u8>,
+            v_gpu: candle::cuda_backend::cudarc::driver::CudaSlice<f32>,
+        }
+        let upload_start = std::time::Instant::now();
+        let zero_q: Vec<f32> = vec![0.0; blocks_per_chunk * 32];
+        let chunk_gpus: Vec<ChunkGpu> = chunks
+            .iter()
+            .map(|c| {
+                let k_dim_major = to_dim_major(&c.k);
+                let v_dim_major = to_dim_major(&c.v);
+                let q_dim_major = match &c.q {
+                    Some(q) => {
+                        q_present_chunks += 1;
+                        to_dim_major(q)
+                    }
+                    None => {
+                        q_missing_chunks += 1;
+                        zero_q.clone()
+                    }
+                };
+                let k_r16_bytes = pack_r16_blocks(&k_dim_major, &q_dim_major);
+                ChunkGpu {
+                    k_gpu: dev.memcpy_stod(&k_r16_bytes).expect("upload k r16"),
+                    v_gpu: dev.memcpy_stod(&v_dim_major).expect("upload v"),
+                }
+            })
+            .collect();
+        println!(
+            "  Uploaded {} chunks (dim-major: {} kv-heads × {} head_dim × 32 tokens) in {:.2}s",
+            chunk_gpus.len(),
+            n_kv_head,
+            head_dim,
+            upload_start.elapsed().as_secs_f64()
+        );
+        println!(
         "  K = R16 (K[32] f16 + Q[32] f16 / block), V = F32. Q-capture: {} present, {} missing.",
         q_present_chunks, q_missing_chunks
     );
 
-    // per_head_table layout: 36 i64 per (arena, head) row =
-    // 4 palettes × 9 i64 per palette sub-entry. We populate palette[0] with
-    // real data and zero the other palettes (only palette[0] is read by the
-    // 2-candidate test path).
-    //   palette sub-entry (9 i64): [k_ptr, v_ptr, k_byte_offset, v_byte_offset,
-    //                               k_chunk_byte_stride, v_chunk_byte_stride,
-    //                               metadata, k_outer_scale_bits, v_outer_scale_bits]
-    //   metadata = (k_format_tag << 16) | (v_format_tag << 8) | location
-    //   K = R16 (ArenaFormatTag::R16 = 3), V = F32 (= 0), location = GPU (= 0)
-    //   → metadata = (3 << 16) | (0 << 8) | 0 = 0x30000
-    let outer_one_bits = 1.0_f32.to_bits() as i64;
-    let metadata_kr16_vf32: i64 = (3i64 << 16) | (0i64 << 8) | 0i64;
-    let mut per_head_table_host: Vec<i64> =
-        Vec::with_capacity(chunk_gpus.len() * n_kv_head * 36);
-    for cg in &chunk_gpus {
-        let (kp, _) = cg.k_gpu.device_ptr(&stream);
-        let (vp, _) = cg.v_gpu.device_ptr(&stream);
-        for h in 0..n_kv_head {
-            let head_off = (h as i64) * single_head_bytes;
-            // palette[0]: real entry pointing at this head's slice.
-            per_head_table_host.extend_from_slice(&[
-                kp as i64,
-                vp as i64,
-                head_off,
-                head_off,
-                single_head_chunk_stride,
-                single_head_chunk_stride,
-                metadata_kr16_vf32,
-                outer_one_bits,
-                outer_one_bits,
-            ]);
-            // palette[1..3]: zeroed (unused by the 2-candidate path).
-            per_head_table_host.extend_from_slice(&[0i64; 27]);
+        // per_head_table layout: 36 i64 per (arena, head) row =
+        // 4 palettes × 9 i64 per palette sub-entry. We populate palette[0] with
+        // real data and zero the other palettes (only palette[0] is read by the
+        // 2-candidate test path).
+        //   palette sub-entry (9 i64): [k_ptr, v_ptr, k_byte_offset, v_byte_offset,
+        //                               k_chunk_byte_stride, v_chunk_byte_stride,
+        //                               metadata, k_outer_scale_bits, v_outer_scale_bits]
+        //   metadata = (k_format_tag << 16) | (v_format_tag << 8) | location
+        //   K = R16 (ArenaFormatTag::R16 = 3), V = F32 (= 0), location = GPU (= 0)
+        //   → metadata = (3 << 16) | (0 << 8) | 0 = 0x30000
+        let outer_one_bits = 1.0_f32.to_bits() as i64;
+        let metadata_kr16_vf32: i64 = (3i64 << 16) | (0i64 << 8) | 0i64;
+        let mut per_head_table_host: Vec<i64> =
+            Vec::with_capacity(chunk_gpus.len() * n_kv_head * 36);
+        for cg in &chunk_gpus {
+            let (kp, _) = cg.k_gpu.device_ptr(&stream);
+            let (vp, _) = cg.v_gpu.device_ptr(&stream);
+            for h in 0..n_kv_head {
+                let head_off = (h as i64) * single_head_bytes;
+                // palette[0]: real entry pointing at this head's slice.
+                per_head_table_host.extend_from_slice(&[
+                    kp as i64,
+                    vp as i64,
+                    head_off,
+                    head_off,
+                    single_head_chunk_stride,
+                    single_head_chunk_stride,
+                    metadata_kr16_vf32,
+                    outer_one_bits,
+                    outer_one_bits,
+                ]);
+                // palette[1..3]: zeroed (unused by the 2-candidate path).
+                per_head_table_host.extend_from_slice(&[0i64; 27]);
+            }
         }
-    }
-    let per_head_table_gpu = dev
-        .memcpy_stod(&per_head_table_host)
-        .expect("per_head upload");
+        let per_head_table_gpu = dev
+            .memcpy_stod(&per_head_table_host)
+            .expect("per_head upload");
 
-    // head_gids: 2 entries per (chunk, head): K_GID, V_GID. We use
-    // arena_idx = chunk_idx, chunk_idx = 0, ARENA_CHUNKS = 8192.
-    const TEST_ARENA_CHUNKS: i64 = 8192;
-    let mut head_gids: Vec<i64> =
-        Vec::with_capacity(chunks.len() * n_kv_head * 2);
-    for ci in 0..chunks.len() {
-        for _h in 0..n_kv_head {
-            head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // K
-            head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // V
+        // head_gids: 2 entries per (chunk, head): K_GID, V_GID. We use
+        // arena_idx = chunk_idx, chunk_idx = 0, ARENA_CHUNKS = 8192.
+        const TEST_ARENA_CHUNKS: i64 = 8192;
+        let mut head_gids: Vec<i64> = Vec::with_capacity(chunks.len() * n_kv_head * 2);
+        for ci in 0..chunks.len() {
+            for _h in 0..n_kv_head {
+                head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // K
+                head_gids.push(ci as i64 * TEST_ARENA_CHUNKS); // V
+            }
         }
-    }
 
-    // ----- Pass 1: 2-candidate ladder [Q0_V, Q8_1] -----
-    // Q0_V (most aggressive, 0.5 bpe) then Q8_1 (high quality, 8.5 bpe) as
-    // the fallback. The selector tries Q0_V first; if it can't claim a
-    // slot, it falls back to Q8_1.
-    let candidates_two = vec![GgmlDType::Q0_V, GgmlDType::Q8_1];
-    let levels_to_run: [usize; 4] = [5, 7, 9, 10];
+        // ----- Pass 1: 2-candidate ladder [Q0_V, Q8_1] -----
+        // Q0_V (most aggressive, 0.5 bpe) then Q8_1 (high quality, 8.5 bpe) as
+        // the fallback. The selector tries Q0_V first; if it can't claim a
+        // slot, it falls back to Q8_1.
+        let candidates_two = vec![GgmlDType::Q0_V, GgmlDType::Q8_1];
+        let levels_to_run: [usize; 4] = [5, 7, 9, 10];
 
-    println!("\n    ── Pass 1: candidate ladder = [Q0_V, Q8_1] (clean head-to-head) ──");
-    println!("      Model      C    side     Q0_V%     Q8_1%   total_blocks");
-    println!("      --------   --   ----    ------    ------   ------------");
+        println!("\n    ── Pass 1: candidate ladder = [Q0_V, Q8_1] (clean head-to-head) ──");
+        println!("      Model      C    side     Q0_V%     Q8_1%   total_blocks");
+        println!("      --------   --   ----    ------    ------   ------------");
 
-    {
-        let model_name = *this_model_name;
-        let factors = *this_factors;
-        for &level in &levels_to_run {
-            let k_hi_eff = PRODUCTION_K_QREL_HIGH_THRESHOLDS[level] * factors.k_hi;
-            let k_lo_eff = PRODUCTION_K_QREL_LOW_THRESHOLDS[level] * factors.k_low;
-            let v_hi_eff = PRODUCTION_V_QREL_HIGH_THRESHOLDS[level] * factors.v_hi;
-            let v_lo_eff = PRODUCTION_V_QREL_LOW_THRESHOLDS[level] * factors.v_low;
+        {
+            let model_name = *this_model_name;
+            let factors = *this_factors;
+            for &level in &levels_to_run {
+                let k_hi_eff = PRODUCTION_K_QREL_HIGH_THRESHOLDS[level] * factors.k_hi;
+                let k_lo_eff = PRODUCTION_K_QREL_LOW_THRESHOLDS[level] * factors.k_low;
+                let v_hi_eff = PRODUCTION_V_QREL_HIGH_THRESHOLDS[level] * factors.v_hi;
+                let v_lo_eff = PRODUCTION_V_QREL_LOW_THRESHOLDS[level] * factors.v_low;
 
-            let (k_tags_gpu, v_tags_gpu) = select_kv_format_paged_batched_raw(
-                &per_head_table_gpu,
-                &head_gids,
-                &candidates_two,
-                &candidates_two,
-                k_hi_eff,
-                k_lo_eff,
-                v_hi_eff,
-                v_lo_eff,
-                blocks_per_head,
-                n_kv_head,
-                TEST_ARENA_CHUNKS as usize,
-                &dev,
-            )
-            .expect("selector launch");
-            let k_tags: Vec<i32> = dev.memcpy_dtov(&k_tags_gpu).expect("dl k");
-            let v_tags: Vec<i32> = dev.memcpy_dtov(&v_tags_gpu).expect("dl v");
-
-            // Kernel emits SELECT_FMT_* codes (Q0_V = 28, Q8_1 = 8).
-            let q0v_tag: i32 = 28;
-            let q81_tag: i32 = 8;
-            let count_pct = |tags: &[i32]| -> (f64, f64, usize) {
-                let total = tags.len();
-                let q0v = tags.iter().filter(|&&t| t == q0v_tag).count();
-                let q81 = tags.iter().filter(|&&t| t == q81_tag).count();
-                (
-                    100.0 * q0v as f64 / total.max(1) as f64,
-                    100.0 * q81 as f64 / total.max(1) as f64,
-                    total,
+                let (k_tags_gpu, v_tags_gpu) = select_kv_format_paged_batched_raw(
+                    &per_head_table_gpu,
+                    &head_gids,
+                    &candidates_two,
+                    &candidates_two,
+                    k_hi_eff,
+                    k_lo_eff,
+                    v_hi_eff,
+                    v_lo_eff,
+                    blocks_per_head,
+                    n_kv_head,
+                    TEST_ARENA_CHUNKS as usize,
+                    &dev,
                 )
-            };
-            let (k_q0v_pct, k_q81_pct, k_total) = count_pct(&k_tags);
-            let (v_q0v_pct, v_q81_pct, v_total) = count_pct(&v_tags);
-            println!(
-                "    {:<8}  C{:>2}    K     {:>5.2}%   {:>5.2}%   {:>10}",
-                model_name, level, k_q0v_pct, k_q81_pct, k_total
-            );
-            println!(
-                "    {:<8}  C{:>2}    V     {:>5.2}%   {:>5.2}%   {:>10}",
-                model_name, level, v_q0v_pct, v_q81_pct, v_total
-            );
+                .expect("selector launch");
+                let k_tags: Vec<i32> = dev.memcpy_dtov(&k_tags_gpu).expect("dl k");
+                let v_tags: Vec<i32> = dev.memcpy_dtov(&v_tags_gpu).expect("dl v");
+
+                // Kernel emits SELECT_FMT_* codes (Q0_V = 28, Q8_1 = 8).
+                let q0v_tag: i32 = 28;
+                let q81_tag: i32 = 8;
+                let count_pct = |tags: &[i32]| -> (f64, f64, usize) {
+                    let total = tags.len();
+                    let q0v = tags.iter().filter(|&&t| t == q0v_tag).count();
+                    let q81 = tags.iter().filter(|&&t| t == q81_tag).count();
+                    (
+                        100.0 * q0v as f64 / total.max(1) as f64,
+                        100.0 * q81 as f64 / total.max(1) as f64,
+                        total,
+                    )
+                };
+                let (k_q0v_pct, k_q81_pct, k_total) = count_pct(&k_tags);
+                let (v_q0v_pct, v_q81_pct, v_total) = count_pct(&v_tags);
+                println!(
+                    "    {:<8}  C{:>2}    K     {:>5.2}%   {:>5.2}%   {:>10}",
+                    model_name, level, k_q0v_pct, k_q81_pct, k_total
+                );
+                println!(
+                    "    {:<8}  C{:>2}    V     {:>5.2}%   {:>5.2}%   {:>10}",
+                    model_name, level, v_q0v_pct, v_q81_pct, v_total
+                );
+            }
         }
-    }
 
-    // ----- Pass 2: full production ladder -----
-    // Run the production candidate list (16 K formats / 14 V formats) at
-    // each level for both factor sets and tabulate the format share. This
-    // is the apples-to-apples comparison against the empirical distribution
-    // table from `test_candidate_list_compression_curve`. If Q0_V's share
-    // here is comparable to that table (≈ 0%), the wiring matches; if
-    // it's higher here, the discrepancy is coming from elsewhere in the
-    // production path (palette-4 reduction, head-tag promotion, etc.).
-    println!("\n    ── Pass 2: candidate ladder = full production list ──");
+        // ----- Pass 2: full production ladder -----
+        // Run the production candidate list (16 K formats / 14 V formats) at
+        // each level for both factor sets and tabulate the format share. This
+        // is the apples-to-apples comparison against the empirical distribution
+        // table from `test_candidate_list_compression_curve`. If Q0_V's share
+        // here is comparable to that table (≈ 0%), the wiring matches; if
+        // it's higher here, the discrepancy is coming from elsewhere in the
+        // production path (palette-4 reduction, head-tag promotion, etc.).
+        println!("\n    ── Pass 2: candidate ladder = full production list ──");
 
-    {
-        let model_name = *this_model_name;
-        let factors = *this_factors;
-        for &level in &levels_to_run {
-            let k_hi_eff = PRODUCTION_K_QREL_HIGH_THRESHOLDS[level] * factors.k_hi;
-            let k_lo_eff = PRODUCTION_K_QREL_LOW_THRESHOLDS[level] * factors.k_low;
-            let v_hi_eff = PRODUCTION_V_QREL_HIGH_THRESHOLDS[level] * factors.v_hi;
-            let v_lo_eff = PRODUCTION_V_QREL_LOW_THRESHOLDS[level] * factors.v_low;
+        {
+            let model_name = *this_model_name;
+            let factors = *this_factors;
+            for &level in &levels_to_run {
+                let k_hi_eff = PRODUCTION_K_QREL_HIGH_THRESHOLDS[level] * factors.k_hi;
+                let k_lo_eff = PRODUCTION_K_QREL_LOW_THRESHOLDS[level] * factors.k_low;
+                let v_hi_eff = PRODUCTION_V_QREL_HIGH_THRESHOLDS[level] * factors.v_hi;
+                let v_lo_eff = PRODUCTION_V_QREL_LOW_THRESHOLDS[level] * factors.v_low;
 
-            let (k_kv_cands, v_kv_cands) = production_adaptive_candidates(level as u8);
-            let k_cands: Vec<GgmlDType> = k_kv_cands
-                .iter()
-                .filter_map(|f| match f {
-                    KvFormat::Quantized(qf) => Some(qf.to_ggml_dtype()),
-                    _ => None,
-                })
-                .collect();
-            let v_cands: Vec<GgmlDType> = v_kv_cands
-                .iter()
-                .filter_map(|f| match f {
-                    KvFormat::Quantized(qf) => Some(qf.to_ggml_dtype()),
-                    _ => None,
-                })
-                .collect();
-
-            let (k_tags_gpu, v_tags_gpu) = select_kv_format_paged_batched_raw(
-                &per_head_table_gpu,
-                &head_gids,
-                &k_cands,
-                &v_cands,
-                k_hi_eff,
-                k_lo_eff,
-                v_hi_eff,
-                v_lo_eff,
-                blocks_per_head,
-                n_kv_head,
-                TEST_ARENA_CHUNKS as usize,
-                &dev,
-            )
-            .expect("selector launch");
-            let k_tags: Vec<i32> = dev.memcpy_dtov(&k_tags_gpu).expect("dl k");
-            let v_tags: Vec<i32> = dev.memcpy_dtov(&v_tags_gpu).expect("dl v");
-
-            // Per-tag count summary, using the same SELECT_FMT_* mapping the
-            // kernel emits. Names match `SampleFormat::try_from_cuda_tag`.
-            let tag_name = |t: i32| -> &'static str {
-                match t {
-                    1 => "F16", 2 => "BF16", 7 => "Q8_0", 8 => "Q8_1",
-                    10 => "Q8KS", 12 => "Q5_0", 13 => "Q5_1", 15 => "Q4_0",
-                    16 => "Q4_1", 18 => "Q4KS", 19 => "Q3_0", 20 => "Q3_1",
-                    22 => "Q2_0", 23 => "Q2_1", 25 => "Q2_S", 26 => "Q2_A",
-                    27 => "Q1_S", 28 => "Q0_V", 29 => "Q1_A", 30 => "Q0_X",
-                    31 => "Q0_M2", 32 => "Q0_M4", 33 => "Q0",
-                    99 => "FALLBACK", _ => "OTHER",
-                }
-            };
-            let format_share = |tags: &[i32]| -> Vec<(&'static str, f64)> {
-                let total = tags.len() as f64;
-                let mut counts: std::collections::BTreeMap<&'static str, usize> =
-                    std::collections::BTreeMap::new();
-                for &t in tags {
-                    *counts.entry(tag_name(t)).or_insert(0) += 1;
-                }
-                let mut out: Vec<(&'static str, f64)> = counts
-                    .into_iter()
-                    .map(|(name, c)| (name, 100.0 * c as f64 / total))
-                    .collect();
-                out.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                out
-            };
-
-            let k_share = format_share(&k_tags);
-            let v_share = format_share(&v_tags);
-            let render = |share: &[(&'static str, f64)]| -> String {
-                share
+                let (k_kv_cands, v_kv_cands) = production_adaptive_candidates(level as u8);
+                let k_cands: Vec<GgmlDType> = k_kv_cands
                     .iter()
-                    .filter(|(_, p)| *p >= 0.05)
-                    .map(|(n, p)| format!("{}={:.1}%", n, p))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            };
-            println!(
-                "    {:<8}  C{:>2}    K     [{}]",
-                model_name, level, render(&k_share)
-            );
-            println!(
-                "    {:<8}  C{:>2}    V     [{}]",
-                model_name, level, render(&v_share)
-            );
+                    .filter_map(|f| match f {
+                        KvFormat::Quantized(qf) => Some(qf.to_ggml_dtype()),
+                        _ => None,
+                    })
+                    .collect();
+                let v_cands: Vec<GgmlDType> = v_kv_cands
+                    .iter()
+                    .filter_map(|f| match f {
+                        KvFormat::Quantized(qf) => Some(qf.to_ggml_dtype()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let (k_tags_gpu, v_tags_gpu) = select_kv_format_paged_batched_raw(
+                    &per_head_table_gpu,
+                    &head_gids,
+                    &k_cands,
+                    &v_cands,
+                    k_hi_eff,
+                    k_lo_eff,
+                    v_hi_eff,
+                    v_lo_eff,
+                    blocks_per_head,
+                    n_kv_head,
+                    TEST_ARENA_CHUNKS as usize,
+                    &dev,
+                )
+                .expect("selector launch");
+                let k_tags: Vec<i32> = dev.memcpy_dtov(&k_tags_gpu).expect("dl k");
+                let v_tags: Vec<i32> = dev.memcpy_dtov(&v_tags_gpu).expect("dl v");
+
+                // Per-tag count summary, using the same SELECT_FMT_* mapping the
+                // kernel emits. Names match `SampleFormat::try_from_cuda_tag`.
+                let tag_name = |t: i32| -> &'static str {
+                    match t {
+                        1 => "F16",
+                        2 => "BF16",
+                        7 => "Q8_0",
+                        8 => "Q8_1",
+                        10 => "Q8KS",
+                        12 => "Q5_0",
+                        13 => "Q5_1",
+                        15 => "Q4_0",
+                        16 => "Q4_1",
+                        18 => "Q4KS",
+                        19 => "Q3_0",
+                        20 => "Q3_1",
+                        22 => "Q2_0",
+                        23 => "Q2_1",
+                        25 => "Q2_S",
+                        26 => "Q2_A",
+                        27 => "Q1_S",
+                        28 => "Q0_V",
+                        29 => "Q1_A",
+                        30 => "Q0_X",
+                        31 => "Q0_M2",
+                        32 => "Q0_M4",
+                        33 => "Q0",
+                        99 => "FALLBACK",
+                        _ => "OTHER",
+                    }
+                };
+                let format_share = |tags: &[i32]| -> Vec<(&'static str, f64)> {
+                    let total = tags.len() as f64;
+                    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+                        std::collections::BTreeMap::new();
+                    for &t in tags {
+                        *counts.entry(tag_name(t)).or_insert(0) += 1;
+                    }
+                    let mut out: Vec<(&'static str, f64)> = counts
+                        .into_iter()
+                        .map(|(name, c)| (name, 100.0 * c as f64 / total))
+                        .collect();
+                    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    out
+                };
+
+                let k_share = format_share(&k_tags);
+                let v_share = format_share(&v_tags);
+                let render = |share: &[(&'static str, f64)]| -> String {
+                    share
+                        .iter()
+                        .filter(|(_, p)| *p >= 0.05)
+                        .map(|(n, p)| format!("{}={:.1}%", n, p))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                };
+                println!(
+                    "    {:<8}  C{:>2}    K     [{}]",
+                    model_name,
+                    level,
+                    render(&k_share)
+                );
+                println!(
+                    "    {:<8}  C{:>2}    V     [{}]",
+                    model_name,
+                    level,
+                    render(&v_share)
+                );
+            }
         }
-    }
     } // end for (this_model_name, this_dump_path, this_factors) in &datasets
 }
 
@@ -1993,11 +2075,7 @@ fn test_q0_v_iterative_curve_selection() {
             peak[slot] = best_l;
         }
         let mut order: Vec<u8> = (0u16..128).map(|x| x as u8).collect();
-        order.sort_by(|&a, &b| {
-            peak[a as usize]
-                .cmp(&peak[b as usize])
-                .then(a.cmp(&b))
-        });
+        order.sort_by(|&a, &b| peak[a as usize].cmp(&peak[b as usize]).then(a.cmp(&b)));
         let mut hist = [0u32; 32];
         for &p in peak.iter() {
             hist[p as usize] += 1;
@@ -2020,11 +2098,8 @@ fn test_q0_v_iterative_curve_selection() {
     let pass_metric = |side: &SideMetric, orig: &[f32; 32], recon: &[f32; 32]| -> f32 {
         match side {
             SideMetric::K => {
-                let mut errs: [f32; 32] =
-                    std::array::from_fn(|i| (orig[i] - recon[i]).abs());
-                errs.sort_by(|a, b| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                let mut errs: [f32; 32] = std::array::from_fn(|i| (orig[i] - recon[i]).abs());
+                errs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 (errs[0] + errs[1] + errs[2] + errs[3]) * 0.25
             }
             SideMetric::V => {
@@ -2111,18 +2186,17 @@ fn test_q0_v_iterative_curve_selection() {
             })
             .collect()
     };
-    let make_family_runtime_tables = |phase_tables: &[Vec<[i8; 32]>]|
-        -> Vec<(Vec<i8>, Vec<u8>, Vec<u16>)>
-    {
-        phase_tables
-            .par_iter()
-            .map(|phases| {
-                let curves = build_replicated_curve_table(phases.as_slice());
-                let (peak_idx, peak_off) = build_peak_tables(&curves);
-                (curves, peak_idx, peak_off)
-            })
-            .collect()
-    };
+    let make_family_runtime_tables =
+        |phase_tables: &[Vec<[i8; 32]>]| -> Vec<(Vec<i8>, Vec<u8>, Vec<u16>)> {
+            phase_tables
+                .par_iter()
+                .map(|phases| {
+                    let curves = build_replicated_curve_table(phases.as_slice());
+                    let (peak_idx, peak_off) = build_peak_tables(&curves);
+                    (curves, peak_idx, peak_off)
+                })
+                .collect()
+        };
     let family_phase_tables_k = make_family_phase_tables(16);
     let _family_phase_tables_v = make_family_phase_tables(8);
     let family_runtime_tables_k = make_family_runtime_tables(&family_phase_tables_k);
@@ -2149,9 +2223,7 @@ fn test_q0_v_iterative_curve_selection() {
                     sign_canonicalize: bool,
                     kmeans_skip_lane0: bool,
                     strata_by_second_peak: bool| {
-        println!(
-            "\n========================================================================"
-        );
+        println!("\n========================================================================");
         println!(
             "  Iterative curve selection — side = {} ({} blocks, {} families × 32 lane-shift phases, picking 8)",
             side_label.to_uppercase(),
@@ -2161,11 +2233,12 @@ fn test_q0_v_iterative_curve_selection() {
         println!(
             "  Pass metric ≤ {:.5} ({} threshold @ filter operating point)",
             pass_threshold,
-            match side { SideMetric::K => "K", SideMetric::V => "V" }
+            match side {
+                SideMetric::K => "K",
+                SideMetric::V => "V",
+            }
         );
-        println!(
-            "========================================================================"
-        );
+        println!("========================================================================");
 
         // ────────────────────────────────────────────────────────────────
         // Step 1: head-amax-normalise + collect per-block (actual_scale,
@@ -2184,10 +2257,7 @@ fn test_q0_v_iterative_curve_selection() {
             let inv = 1.0 / ha;
             let hn: [f32; 32] = std::array::from_fn(|j| blk[j] * inv);
             let mean: f32 = hn.iter().sum::<f32>() / 32.0;
-            let scale: f32 = hn
-                .iter()
-                .map(|x| (x - mean).abs())
-                .fold(0.0f32, f32::max);
+            let scale: f32 = hn.iter().map(|x| (x - mean).abs()).fold(0.0f32, f32::max);
             head_norm_blocks.push(hn);
             block_scale.push(scale);
             block_centroid.push(mean);
@@ -2279,7 +2349,10 @@ fn test_q0_v_iterative_curve_selection() {
         println!("\n  ]");
         println!("  cal_centroid_table[32][16]:");
         for (b, row) in cal_centroid_table.iter().enumerate() {
-            print!("    s={:>2}  scale_q={:>8.5}  centroids=[", b, cal_scale_table[b]);
+            print!(
+                "    s={:>2}  scale_q={:>8.5}  centroids=[",
+                b, cal_scale_table[b]
+            );
             for (k, &c) in row.iter().enumerate() {
                 print!("{:>+8.5}", c);
                 if k < 15 {
@@ -2377,9 +2450,7 @@ fn test_q0_v_iterative_curve_selection() {
             let mut best_wins: usize = 0;
             let mut all_results: Vec<(usize, usize)> = Vec::with_capacity(n_families);
 
-            for (fi, (curves, peak_idx, peak_off)) in
-                family_runtime_tables.iter().enumerate()
-            {
+            for (fi, (curves, peak_idx, peak_off)) in family_runtime_tables.iter().enumerate() {
                 if family_used[fi] {
                     continue;
                 }
@@ -2420,10 +2491,8 @@ fn test_q0_v_iterative_curve_selection() {
                     .par_iter()
                     .filter(|&&w| {
                         let off = w * 32;
-                        let orig: [f32; 32] =
-                            std::array::from_fn(|j| normalised[off + j]);
-                        let recon: [f32; 32] =
-                            std::array::from_fn(|j| recon_host[off + j]);
+                        let orig: [f32; 32] = std::array::from_fn(|j| normalised[off + j]);
+                        let recon: [f32; 32] = std::array::from_fn(|j| recon_host[off + j]);
                         pass_metric(&side, &orig, &recon) <= pass_threshold
                     })
                     .count();
@@ -2436,19 +2505,14 @@ fn test_q0_v_iterative_curve_selection() {
                         .par_iter()
                         .map(|&w| {
                             let off = w * 32;
-                            let orig: [f32; 32] =
-                                std::array::from_fn(|j| normalised[off + j]);
-                            let recon: [f32; 32] =
-                                std::array::from_fn(|j| recon_host[off + j]);
+                            let orig: [f32; 32] = std::array::from_fn(|j| normalised[off + j]);
+                            let recon: [f32; 32] = std::array::from_fn(|j| recon_host[off + j]);
                             pass_metric(&side, &orig, &recon)
                         })
                         .collect();
-                    residuals.sort_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    residuals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let n = residuals.len();
-                    let pct =
-                        |q: f32| residuals[((q * (n - 1) as f32) as usize).min(n - 1)];
+                    let pct = |q: f32| residuals[((q * (n - 1) as f32) as usize).min(n - 1)];
                     println!(
                         "    [diag iter 0 family[{:>3}]] residual quantiles: \
                          p05={:.4} p25={:.4} p50={:.4} p75={:.4} p90={:.4} p99={:.4}  threshold={:.5}",
@@ -2492,11 +2556,7 @@ fn test_q0_v_iterative_curve_selection() {
             println!();
             // Best of each shape.
             print!("    best-by-shape: ");
-            let all_shapes = [
-                ShapeChar::Sine,
-                ShapeChar::Triangle,
-                ShapeChar::Sharp,
-            ];
+            let all_shapes = [ShapeChar::Sine, ShapeChar::Triangle, ShapeChar::Sharp];
             let mut first = true;
             for &sh in &all_shapes {
                 if let Some((fi, wins)) = sorted
@@ -2508,12 +2568,7 @@ fn test_q0_v_iterative_curve_selection() {
                         print!(", ");
                     }
                     first = false;
-                    print!(
-                        "{}@{:.2}={:>5.2}%",
-                        sh.label(),
-                        freq,
-                        pct_of(*wins)
-                    );
+                    print!("{}@{:.2}={:>5.2}%", sh.label(), freq, pct_of(*wins));
                 }
             }
             println!();
@@ -2546,12 +2601,8 @@ fn test_q0_v_iterative_curve_selection() {
                     working_set.len(),
                     side_label.to_uppercase()
                 );
-                println!(
-                    "    Plot: blocks are already per-block normalised (block / block_amax)."
-                );
-                println!(
-                    "    Top→bottom = +1.0→−1.0, lanes 0..31 left→right.\n"
-                );
+                println!("    Plot: blocks are already per-block normalised (block / block_amax).");
+                println!("    Top→bottom = +1.0→−1.0, lanes 0..31 left→right.\n");
 
                 // Deterministic LCG seeded from side label + iter so re-runs
                 // are reproducible.
@@ -2611,11 +2662,8 @@ fn test_q0_v_iterative_curve_selection() {
                         }
                     }
                     let centroid_q = row[best_c];
-                    let inv_s =
-                        if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
-                    std::array::from_fn(|j| {
-                        (normalised[off + j] - centroid_q) * inv_s
-                    })
+                    let inv_s = if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
+                    std::array::from_fn(|j| (normalised[off + j] - centroid_q) * inv_s)
                 };
 
                 let n_samples = dump_n_samples.min(working_set.len());
@@ -2623,9 +2671,7 @@ fn test_q0_v_iterative_curve_selection() {
                 let mut retries: usize = 0;
                 let max_retries = 16 * n_samples; // cap so we exit even if pool is mostly noise
                 let mut filtered_out: usize = 0;
-                while sample_block_indices.len() < n_samples
-                    && retries < max_retries
-                {
+                while sample_block_indices.len() < n_samples && retries < max_retries {
                     let pick = (next_u64() as usize) % working_set.len();
                     let bidx = working_set[pick];
                     if sample_block_indices.contains(&bidx) {
@@ -2665,9 +2711,7 @@ fn test_q0_v_iterative_curve_selection() {
                     for lane in 0..32 {
                         let v = curve[lane].clamp(-1.0, 1.0);
                         let r_f = (1.0 - v) * 0.5 * (plot_height - 1) as f32;
-                        let r = (r_f.round() as isize)
-                            .clamp(0, plot_height as isize - 1)
-                            as usize;
+                        let r = (r_f.round() as isize).clamp(0, plot_height as isize - 1) as usize;
                         for (ri, row) in rows.iter_mut().enumerate() {
                             if ri == r {
                                 row.push('●');
@@ -2692,8 +2736,7 @@ fn test_q0_v_iterative_curve_selection() {
                 for (k, &w) in sample_block_indices.iter().enumerate() {
                     // Head-amax-normalised block (kernel input domain).
                     let off = w * 32;
-                    let block_head: [f32; 32] =
-                        std::array::from_fn(|j| normalised[off + j]);
+                    let block_head: [f32; 32] = std::array::from_fn(|j| normalised[off + j]);
 
                     // Look up this block's calibrated (scale_idx, centroid_idx)
                     // and produce the curve-fit residual the kernel implicitly
@@ -2712,11 +2755,9 @@ fn test_q0_v_iterative_curve_selection() {
                         }
                     }
                     let centroid_q = row[best_c];
-                    let inv_s =
-                        if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
-                    let xi_norm_raw: [f32; 32] = std::array::from_fn(|j| {
-                        (block_head[j] - centroid_q) * inv_s
-                    });
+                    let inv_s = if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
+                    let xi_norm_raw: [f32; 32] =
+                        std::array::from_fn(|j| (block_head[j] - centroid_q) * inv_s);
 
                     // Peak-center: cyclically rotate so the lane with max
                     // |xi_norm| lands at position 0. This aligns shapes
@@ -2732,9 +2773,8 @@ fn test_q0_v_iterative_curve_selection() {
                             peak_lane = j;
                         }
                     }
-                    let xi_norm: [f32; 32] = std::array::from_fn(|j| {
-                        xi_norm_raw[(j + peak_lane) % 32]
-                    });
+                    let xi_norm: [f32; 32] =
+                        std::array::from_fn(|j| xi_norm_raw[(j + peak_lane) % 32]);
                     let xi_norm_i8 = quantise_i8(&xi_norm);
 
                     let rho1 = lag1_autocorr(&xi_norm);
@@ -2787,10 +2827,8 @@ fn test_q0_v_iterative_curve_selection() {
                 const POLY_NCOEF: usize = POLY_DEGREE + 1;
 
                 // Basis: T_n(x_lane) where x_lane = 2k/31 - 1 ∈ [-1, +1].
-                let x_lane: [f32; 32] =
-                    std::array::from_fn(|k| 2.0 * (k as f32) / 31.0 - 1.0);
-                let mut basis: [[f32; POLY_NCOEF]; 32] =
-                    [[0.0; POLY_NCOEF]; 32];
+                let x_lane: [f32; 32] = std::array::from_fn(|k| 2.0 * (k as f32) / 31.0 - 1.0);
+                let mut basis: [[f32; POLY_NCOEF]; 32] = [[0.0; POLY_NCOEF]; 32];
                 for k in 0..32 {
                     let x = x_lane[k];
                     basis[k][0] = 1.0;
@@ -2798,8 +2836,7 @@ fn test_q0_v_iterative_curve_selection() {
                         basis[k][1] = x;
                     }
                     for n in 2..POLY_NCOEF {
-                        basis[k][n] =
-                            2.0 * x * basis[k][n - 1] - basis[k][n - 2];
+                        basis[k][n] = 2.0 * x * basis[k][n - 1] - basis[k][n - 2];
                     }
                 }
 
@@ -2888,11 +2925,9 @@ fn test_q0_v_iterative_curve_selection() {
                             }
                         }
                         let centroid_q = row[best_c];
-                        let inv_s =
-                            if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
-                        let xi_norm: [f32; 32] = std::array::from_fn(|j| {
-                            (normalised[off + j] - centroid_q) * inv_s
-                        });
+                        let inv_s = if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
+                        let xi_norm: [f32; 32] =
+                            std::array::from_fn(|j| (normalised[off + j] - centroid_q) * inv_s);
                         let mut coefs = [0.0f32; POLY_NCOEF];
                         for i in 0..POLY_NCOEF {
                             let mut s = 0.0f32;
@@ -2921,34 +2956,23 @@ fn test_q0_v_iterative_curve_selection() {
                 const N_BINS: usize = 50;
                 const BAR_MAX_W: usize = 50;
                 for n in 0..POLY_NCOEF {
-                    let mut vals: Vec<f32> =
-                        coefs_per_block.iter().map(|c| c[n]).collect();
-                    vals.sort_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    let mut vals: Vec<f32> = coefs_per_block.iter().map(|c| c[n]).collect();
+                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let nv = vals.len();
-                    let pq = |q: f32| {
-                        vals[((q * (nv - 1) as f32) as usize).min(nv - 1)]
-                    };
+                    let pq = |q: f32| vals[((q * (nv - 1) as f32) as usize).min(nv - 1)];
                     let lo = pq(0.01);
                     let hi = pq(0.99);
                     let median = pq(0.50);
-                    let mean: f32 =
-                        vals.iter().copied().sum::<f32>() / (nv as f32);
+                    let mean: f32 = vals.iter().copied().sum::<f32>() / (nv as f32);
                     let span = hi - lo;
                     if span <= 0.0 {
-                        println!(
-                            "    T_{}  (range collapsed; all values ≈ {:.4})",
-                            n, lo
-                        );
+                        println!("    T_{}  (range collapsed; all values ≈ {:.4})", n, lo);
                         continue;
                     }
                     let mut bins = vec![0usize; N_BINS];
                     for &v in &vals {
-                        let idx =
-                            (((v - lo) / span) * N_BINS as f32) as i32;
-                        let idx =
-                            idx.clamp(0, N_BINS as i32 - 1) as usize;
+                        let idx = (((v - lo) / span) * N_BINS as f32) as i32;
+                        let idx = idx.clamp(0, N_BINS as i32 - 1) as usize;
                         bins[idx] += 1;
                     }
                     let max_bin = bins.iter().max().copied().unwrap_or(1);
@@ -2958,23 +2982,15 @@ fn test_q0_v_iterative_curve_selection() {
                     );
                     for (b_idx, &c) in bins.iter().enumerate() {
                         let bin_lo = lo + (b_idx as f32) * span / N_BINS as f32;
-                        let bar_w = ((c as f32 / max_bin as f32)
-                            * BAR_MAX_W as f32) as usize;
+                        let bar_w = ((c as f32 / max_bin as f32) * BAR_MAX_W as f32) as usize;
                         let bar = "█".repeat(bar_w);
                         // Mark the zero crossing visibly.
-                        let mark = if bin_lo <= 0.0
-                            && (bin_lo
-                                + span / N_BINS as f32)
-                                > 0.0
-                        {
+                        let mark = if bin_lo <= 0.0 && (bin_lo + span / N_BINS as f32) > 0.0 {
                             "│0"
                         } else {
                             "  "
                         };
-                        println!(
-                            "      {:>+7.3} {}: {} {}",
-                            bin_lo, mark, bar, c
-                        );
+                        println!("      {:>+7.3} {}: {} {}", bin_lo, mark, bar, c);
                     }
                     println!();
                 }
@@ -3036,9 +3052,8 @@ fn test_q0_v_iterative_curve_selection() {
                     }
                     let centroid_q = row[bc];
                     let inv_s = if scale_q > 0.0 { 1.0 / scale_q } else { 0.0 };
-                    let raw: [f32; 32] = std::array::from_fn(|j| {
-                        (normalised[off + j] - centroid_q) * inv_s
-                    });
+                    let raw: [f32; 32] =
+                        std::array::from_fn(|j| (normalised[off + j] - centroid_q) * inv_s);
                     let mut peak = 0usize;
                     let mut pmax = 0.0f32;
                     for (j, &v) in raw.iter().enumerate() {
@@ -3082,8 +3097,7 @@ fn test_q0_v_iterative_curve_selection() {
                         xi_full
                             .par_iter()
                             .filter(|(x, _)| {
-                                let mean: f32 =
-                                    x.iter().sum::<f32>() / 32.0;
+                                let mean: f32 = x.iter().sum::<f32>() / 32.0;
                                 let mut num = 0.0f32;
                                 let mut den = 0.0f32;
                                 for i in 0..32 {
@@ -3113,7 +3127,10 @@ fn test_q0_v_iterative_curve_selection() {
                         );
                     }
                     if n_kept == 0 {
-                        println!("    R2 iter {}: no structured blocks left after filter — stopping.", r2_iter);
+                        println!(
+                            "    R2 iter {}: no structured blocks left after filter — stopping.",
+                            r2_iter
+                        );
                         break;
                     }
 
@@ -3213,13 +3230,16 @@ fn test_q0_v_iterative_curve_selection() {
                     };
                     if n_strata > 1 {
                         let mut counts = vec![0usize; n_strata];
-                        for &b in &strata_assignments { counts[b] += 1; }
+                        for &b in &strata_assignments {
+                            counts[b] += 1;
+                        }
                         print!("    strata by scale_idx ({} buckets, k=", n_strata);
                         let per_stratum = N_NEW_CURVES / n_strata;
                         print!("{} per stratum):", per_stratum);
                         for (i, c) in counts.iter().enumerate() {
                             // Show range of scale_idx in each bucket.
-                            let mut lo = u8::MAX; let mut hi = 0u8;
+                            let mut lo = u8::MAX;
+                            let mut hi = 0u8;
                             for (j, b) in strata_assignments.iter().enumerate() {
                                 if *b == i {
                                     lo = lo.min(xi_filtered[j].1);
@@ -3235,9 +3255,9 @@ fn test_q0_v_iterative_curve_selection() {
                     // per iter so we don't re-pick identical centroids).
                     let mut k_seed: u64 = 0xDEAD_BEEF_CAFE_BABE
                         ^ (r2_iter as u64).wrapping_mul(0x100_0000_01B3)
-                        ^ side_label.bytes().fold(0u64, |a, b| {
-                            a.wrapping_mul(131).wrapping_add(b as u64)
-                        });
+                        ^ side_label
+                            .bytes()
+                            .fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
                     let mut k_next = || {
                         k_seed = k_seed
                             .wrapping_mul(6364136223846793005)
@@ -3247,8 +3267,7 @@ fn test_q0_v_iterative_curve_selection() {
                     // Run k-means independently per stratum. Stratum s gets
                     // `k_per` clusters from blocks where strata_assignments[i]==s.
                     let k_per_stratum = N_NEW_CURVES / n_strata;
-                    let mut centroids: Vec<[f32; 32]> =
-                        Vec::with_capacity(N_NEW_CURVES);
+                    let mut centroids: Vec<[f32; 32]> = Vec::with_capacity(N_NEW_CURVES);
 
                     for stratum in 0..n_strata {
                         // Gather this stratum's xi vectors.
@@ -3269,8 +3288,7 @@ fn test_q0_v_iterative_curve_selection() {
                         // from clusters being naturally well-separated by
                         // the scale_idx stratification).
                         let n_init = k_per_stratum.min(stratum_xi.len());
-                        let mut s_centroids: Vec<[f32; 32]> =
-                            Vec::with_capacity(k_per_stratum);
+                        let mut s_centroids: Vec<[f32; 32]> = Vec::with_capacity(k_per_stratum);
                         let mut taken: Vec<usize> = Vec::with_capacity(k_per_stratum);
                         while s_centroids.len() < n_init {
                             let p = (k_next() as usize) % stratum_xi.len();
@@ -3350,7 +3368,9 @@ fn test_q0_v_iterative_curve_selection() {
                         let positives = centroids.clone();
                         for c in positives.iter() {
                             let mut neg = [0.0f32; 32];
-                            for k in 0..32 { neg[k] = -c[k]; }
+                            for k in 0..32 {
+                                neg[k] = -c[k];
+                            }
                             centroids.push(neg);
                         }
                     }
@@ -3383,14 +3403,11 @@ fn test_q0_v_iterative_curve_selection() {
                     let derived_curves_i8: Vec<[i8; 32]> = cum_centroids
                         .iter()
                         .map(|c| {
-                            let amax =
-                                c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                            let amax = c.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
                             let inv = if amax > 0.0 { 1.0 / amax } else { 0.0 };
                             let mut out = [0i8; 32];
                             for k in 0..32 {
-                                let q = ((c[k] * inv).clamp(-1.0, 1.0) * 127.0)
-                                    .round()
-                                    as i32;
+                                let q = ((c[k] * inv).clamp(-1.0, 1.0) * 127.0).round() as i32;
                                 out[k] = q.clamp(-127, 127) as i8;
                             }
                             out
@@ -3400,29 +3417,26 @@ fn test_q0_v_iterative_curve_selection() {
                     // Side-specific phase resolution for derived curves
                     // (matches the parametric family phase count).
                     let stride_local = 32 / n_phases;
-                    let derived_phase_tables: Vec<Vec<[i8; 32]>> =
-                        derived_curves_i8
-                            .iter()
-                            .map(|phase0| {
-                                let mut out: Vec<[i8; 32]> =
-                                    Vec::with_capacity(n_phases);
-                                for p in 0..n_phases {
-                                    let mut v = [0i8; 32];
-                                    for lane in 0..32 {
-                                        v[lane] = phase0[(lane + stride_local * p) % 32];
-                                    }
-                                    out.push(v);
+                    let derived_phase_tables: Vec<Vec<[i8; 32]>> = derived_curves_i8
+                        .iter()
+                        .map(|phase0| {
+                            let mut out: Vec<[i8; 32]> = Vec::with_capacity(n_phases);
+                            for p in 0..n_phases {
+                                let mut v = [0i8; 32];
+                                for lane in 0..32 {
+                                    v[lane] = phase0[(lane + stride_local * p) % 32];
                                 }
-                                out
-                            })
-                            .collect();
+                                out.push(v);
+                            }
+                            out
+                        })
+                        .collect();
                     let derived_runtime_tables: Vec<(Vec<i8>, Vec<u8>, Vec<u16>)> =
                         derived_phase_tables
                             .par_iter()
                             .map(|phases| {
                                 let curves = build_replicated_curve_table(phases.as_slice());
-                                let (peak_idx, peak_off) =
-                                    build_peak_tables(&curves);
+                                let (peak_idx, peak_off) = build_peak_tables(&curves);
                                 (curves, peak_idx, peak_off)
                             })
                             .collect();
@@ -3438,20 +3452,14 @@ fn test_q0_v_iterative_curve_selection() {
                             continue;
                         }
                         n_scored += 1;
-                        let curves_gpu =
-                            dev.memcpy_stod(curves).expect("curves upload");
-                        let peak_idx_gpu = dev
-                            .memcpy_stod(peak_idx)
-                            .expect("peak_idx upload");
-                        let peak_off_gpu = dev
-                            .memcpy_stod(peak_off)
-                            .expect("peak_off upload");
+                        let curves_gpu = dev.memcpy_stod(curves).expect("curves upload");
+                        let peak_idx_gpu = dev.memcpy_stod(peak_idx).expect("peak_idx upload");
+                        let peak_off_gpu = dev.memcpy_stod(peak_off).expect("peak_off upload");
                         let (src_p, _g1) = normalised_gpu.device_ptr(&stream);
                         let (recon_p, _g2) = recon_gpu.device_ptr(&stream);
                         let (curves_p, _g3) = curves_gpu.device_ptr(&stream);
                         let (scale_p, _g4) = scale_bits_gpu.device_ptr(&stream);
-                        let (cent_p, _g5) =
-                            centroid_bits_gpu.device_ptr(&stream);
+                        let (cent_p, _g5) = centroid_bits_gpu.device_ptr(&stream);
                         let (pi_p, _g6) = peak_idx_gpu.device_ptr(&stream);
                         let (po_p, _g7) = peak_off_gpu.device_ptr(&stream);
                         unsafe {
@@ -3468,19 +3476,14 @@ fn test_q0_v_iterative_curve_selection() {
                             );
                         }
                         stream.synchronize().expect("sync");
-                        recon_host = dev
-                            .memcpy_dtov(&recon_gpu)
-                            .expect("recon download");
+                        recon_host = dev.memcpy_dtov(&recon_gpu).expect("recon download");
                         let wins: usize = r2_set
                             .par_iter()
                             .filter(|&&w| {
                                 let off = w * 32;
-                                let orig: [f32; 32] =
-                                    std::array::from_fn(|j| normalised[off + j]);
-                                let recon: [f32; 32] =
-                                    std::array::from_fn(|j| recon_host[off + j]);
-                                pass_metric(&side, &orig, &recon)
-                                    <= pass_threshold
+                                let orig: [f32; 32] = std::array::from_fn(|j| normalised[off + j]);
+                                let recon: [f32; 32] = std::array::from_fn(|j| recon_host[off + j]);
+                                pass_metric(&side, &orig, &recon) <= pass_threshold
                             })
                             .count();
                         if wins > best_wins {
@@ -3497,9 +3500,7 @@ fn test_q0_v_iterative_curve_selection() {
                     let chosen = best_curve.unwrap_or(0);
                     let chosen_curves = &derived_runtime_tables[chosen].0;
                     {
-                        let curves_gpu = dev
-                            .memcpy_stod(chosen_curves)
-                            .expect("curves upload");
+                        let curves_gpu = dev.memcpy_stod(chosen_curves).expect("curves upload");
                         let peak_idx_gpu = dev
                             .memcpy_stod(&derived_runtime_tables[chosen].1)
                             .expect("peak_idx upload");
@@ -3509,10 +3510,8 @@ fn test_q0_v_iterative_curve_selection() {
                         let (src_p, _g1) = normalised_gpu.device_ptr(&stream);
                         let (recon_p, _g2) = recon_gpu.device_ptr(&stream);
                         let (curves_p, _g3) = curves_gpu.device_ptr(&stream);
-                        let (scale_p, _g4) =
-                            scale_bits_gpu.device_ptr(&stream);
-                        let (cent_p, _g5) =
-                            centroid_bits_gpu.device_ptr(&stream);
+                        let (scale_p, _g4) = scale_bits_gpu.device_ptr(&stream);
+                        let (cent_p, _g5) = centroid_bits_gpu.device_ptr(&stream);
                         let (pi_p, _g6) = peak_idx_gpu.device_ptr(&stream);
                         let (po_p, _g7) = peak_off_gpu.device_ptr(&stream);
                         unsafe {
@@ -3529,19 +3528,15 @@ fn test_q0_v_iterative_curve_selection() {
                             );
                         }
                         stream.synchronize().expect("sync");
-                        recon_host = dev
-                            .memcpy_dtov(&recon_gpu)
-                            .expect("recon download");
+                        recon_host = dev.memcpy_dtov(&recon_gpu).expect("recon download");
                     }
                     let new_set: Vec<usize> = r2_set
                         .par_iter()
                         .copied()
                         .filter(|&w| {
                             let off = w * 32;
-                            let orig: [f32; 32] =
-                                std::array::from_fn(|j| normalised[off + j]);
-                            let recon: [f32; 32] =
-                                std::array::from_fn(|j| recon_host[off + j]);
+                            let orig: [f32; 32] = std::array::from_fn(|j| normalised[off + j]);
+                            let recon: [f32; 32] = std::array::from_fn(|j| recon_host[off + j]);
                             pass_metric(&side, &orig, &recon) > pass_threshold
                         })
                         .collect();
@@ -3550,8 +3545,7 @@ fn test_q0_v_iterative_curve_selection() {
                     cum_used[chosen] = true;
                     r2_picks.push((r2_iter, removed, derived_curves_i8[chosen]));
 
-                    let cov_pct_d =
-                        100.0 * best_wins as f64 / n_normalised as f64;
+                    let cov_pct_d = 100.0 * best_wins as f64 / n_normalised as f64;
                     println!(
                         "      → chose curve[{:>3}]  wins={:>7} ({:.3}% of orig)  removed={:>6} ({:.3}% of r2-set)  remaining={:>9}  [{:.2}s]",
                         chosen,
@@ -3581,12 +3575,7 @@ fn test_q0_v_iterative_curve_selection() {
                 for (it, freq, shape, wins) in &selected_families {
                     let f = generate_curve(*freq, 0.0, *shape);
                     combined.push(FinalPick {
-                        source: format!(
-                            "R1[iter {}] f={:.2} {}",
-                            it,
-                            freq,
-                            shape.label()
-                        ),
+                        source: format!("R1[iter {}] f={:.2} {}", it, freq, shape.label()),
                         wins: *wins,
                         curve_i8: quantise_i8(&f),
                     });
@@ -3602,17 +3591,13 @@ fn test_q0_v_iterative_curve_selection() {
                 combined.truncate(r2_max_picks);
 
                 println!();
-                println!(
-                    "  ╔═══════════════════════════════════════════════════════════════╗"
-                );
+                println!("  ╔═══════════════════════════════════════════════════════════════╗");
                 println!(
                     "  ║  FINAL TOP {} ({}-side) — best of R1 (parametric) + R2 (data)  ║",
                     r2_max_picks,
                     side_label.to_uppercase()
                 );
-                println!(
-                    "  ╚═══════════════════════════════════════════════════════════════╝"
-                );
+                println!("  ╚═══════════════════════════════════════════════════════════════╝");
                 let total_final: usize = combined.iter().map(|p| p.wins).sum();
                 println!(
                     "  R1 picks (parametric, kept): {}  |  R2 picks (data-derived, kept): {}  |  combined-pool: {}  →  top {}",
@@ -3638,9 +3623,8 @@ fn test_q0_v_iterative_curve_selection() {
                         p.wins,
                         100.0 * (p.wins as f64) / n_normalised as f64
                     );
-                    let curve_f32: [f32; 32] = std::array::from_fn(|i| {
-                        p.curve_i8[i] as f32 / 127.0
-                    });
+                    let curve_f32: [f32; 32] =
+                        std::array::from_fn(|i| p.curve_i8[i] as f32 / 127.0);
                     let plot = plot_block(&curve_f32);
                     for line in plot.iter() {
                         println!("      {}", line);
@@ -3704,10 +3688,8 @@ fn test_q0_v_iterative_curve_selection() {
                 .copied()
                 .filter(|&w| {
                     let off = w * 32;
-                    let orig: [f32; 32] =
-                        std::array::from_fn(|j| normalised[off + j]);
-                    let recon: [f32; 32] =
-                        std::array::from_fn(|j| recon_host[off + j]);
+                    let orig: [f32; 32] = std::array::from_fn(|j| normalised[off + j]);
+                    let recon: [f32; 32] = std::array::from_fn(|j| recon_host[off + j]);
                     pass_metric(&side, &orig, &recon) > pass_threshold
                 })
                 .collect();
@@ -3728,7 +3710,10 @@ fn test_q0_v_iterative_curve_selection() {
         }
 
         // Final summary.
-        println!("\n  Selected 8 families ({}-side):", side_label.to_uppercase());
+        println!(
+            "\n  Selected 8 families ({}-side):",
+            side_label.to_uppercase()
+        );
         println!("    iter  freq    shape     wins     %coverage");
         println!("    ----  ------  --------  -------  ---------");
         let total_won: usize = selected_families.iter().map(|x| x.3).sum();
@@ -3783,9 +3768,8 @@ fn test_q0_v_iterative_curve_selection() {
             let mut rows = vec![String::new(); plot_height];
             for lane in 0..32 {
                 let v = curve[lane] as f32 / 127.0; // [-1, +1]
-                // Row 0 = +1.0, row plot_height-1 = -1.0.
-                let r_f =
-                    (1.0 - v) * 0.5 * (plot_height - 1) as f32;
+                                                    // Row 0 = +1.0, row plot_height-1 = -1.0.
+                let r_f = (1.0 - v) * 0.5 * (plot_height - 1) as f32;
                 let r = (r_f.round() as isize).clamp(0, plot_height as isize - 1) as usize;
                 for (ri, row) in rows.iter_mut().enumerate() {
                     if ri == r {
@@ -3917,14 +3901,14 @@ fn test_q0_v_iterative_curve_selection() {
         &q0v_tables::SCALE_TABLE_BITS_K,
         &q0v_tables::CENTROID_TABLE_BITS_K,
         k_thr,
-        16,  // K: 16 phases (stride-2 lane shifts)
-        4,   // K: 4 final picks
+        16, // K: 16 phases (stride-2 lane shifts)
+        4,  // K: 4 final picks
         &family_runtime_tables_k,
-        16,  // K: 16 dump samples (well-clustered residual)
-        0.0, // K: no k-means structuredness filter
-        0,   // K: no k-means pre-smoothing
-        1,   // K: single stratum (no stratification)
-        64,  // K: 64 candidate curves
+        16,    // K: 16 dump samples (well-clustered residual)
+        0.0,   // K: no k-means structuredness filter
+        0,     // K: no k-means pre-smoothing
+        1,     // K: single stratum (no stratification)
+        64,    // K: 64 candidate curves
         false, // K: no sign canonicalization
         false, // K: don't skip lane 0
         false, // K: stratify by scale_idx (default)
@@ -3937,14 +3921,14 @@ fn test_q0_v_iterative_curve_selection() {
         &q0v_tables::SCALE_TABLE_BITS_V,
         &q0v_tables::CENTROID_TABLE_BITS_V,
         v_thr,
-        16,  // V: 16 phases (stride-2 lane shifts) — same as K
-        4,   // V: 4 final picks
+        16,                       // V: 16 phases (stride-2 lane shifts) — same as K
+        4,                        // V: 4 final picks
         &family_runtime_tables_k, // both sides share the 16-phase tables now
-        64,  // V: 64 dump samples — wider view of noise-dominated residual
-        0.20,// V: drop |ρ₁|<0.20 from k-means input (filter random noise)
-        0,   // V: no pre-smoothing (3-tap dampened the discriminative spike)
-        8,   // V: 8 scale_idx strata
-        64,  // V: 64 base k-means candidates → 8 per stratum
+        64,                       // V: 64 dump samples — wider view of noise-dominated residual
+        0.20,                     // V: drop |ρ₁|<0.20 from k-means input (filter random noise)
+        0,                        // V: no pre-smoothing (3-tap dampened the discriminative spike)
+        8,                        // V: 8 scale_idx strata
+        64,                       // V: 64 base k-means candidates → 8 per stratum
         true,  // V: emit mirror curves (centroid + negation) — doubles candidate pool
         false, // V: don't skip lane 0
         false, // V: stratify by scale_idx
@@ -3964,7 +3948,7 @@ fn test_print_stats_by_layer() {
         return;
     }
 
-    use super::dump_reader::{read_u32_le, read_f32_le};
+    use super::dump_reader::{read_f32_le, read_u32_le};
     let bytes = std::fs::read(&bin_path).expect("cannot read stats file");
     let mut pos: usize;
 
@@ -3972,41 +3956,52 @@ fn test_print_stats_by_layer() {
         panic!("bad magic in stats file");
     }
     pos = 8;
-    let version    = read_u32_le(&bytes, &mut pos).unwrap();
-    assert!(version == 1 || version == 2, "unsupported stats version {}", version);
+    let version = read_u32_le(&bytes, &mut pos).unwrap();
+    assert!(
+        version == 1 || version == 2,
+        "unsupported stats version {}",
+        version
+    );
     let num_layers = read_u32_le(&bytes, &mut pos).unwrap() as usize;
     let _n_kv_head = read_u32_le(&bytes, &mut pos).unwrap();
     let chunk_size = read_u32_le(&bytes, &mut pos).unwrap();
-    let _head_dim  = read_u32_le(&bytes, &mut pos).unwrap();
+    let _head_dim = read_u32_le(&bytes, &mut pos).unwrap();
     let num_tokens = read_u32_le(&bytes, &mut pos).unwrap() as usize;
     let mut tokens = Vec::with_capacity(num_tokens);
-    for _ in 0..num_tokens { tokens.push(read_u32_le(&bytes, &mut pos).unwrap()); }
+    for _ in 0..num_tokens {
+        tokens.push(read_u32_le(&bytes, &mut pos).unwrap());
+    }
 
     println!("\n=== KV stats from binary file ===");
-    println!("Layers: {}  Tokens: {:?}", num_layers, &tokens[..tokens.len().min(16)]);
+    println!(
+        "Layers: {}  Tokens: {:?}",
+        num_layers,
+        &tokens[..tokens.len().min(16)]
+    );
     println!(
         "\n{:>6}  {:>5}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}",
-        "Layer", "Block", "TokSt",
-        "K_q8", "K_q4", "V_q8", "V_q4"
+        "Layer", "Block", "TokSt", "K_q8", "K_q4", "V_q8", "V_q4"
     );
 
     for layer_idx in 0..num_layers {
         let num_chunks = read_u32_le(&bytes, &mut pos).unwrap() as usize;
         for _ in 0..num_chunks {
-            let block_idx   = read_u32_le(&bytes, &mut pos).unwrap() as usize;
+            let block_idx = read_u32_le(&bytes, &mut pos).unwrap() as usize;
             let token_start = if version >= 2 {
                 read_u32_le(&bytes, &mut pos).unwrap() as usize
             } else {
                 block_idx * chunk_size as usize
             };
-            let k_arr: Vec<f32> = (0..12).map(|_| read_f32_le(&bytes, &mut pos).unwrap()).collect();
-            let v_arr: Vec<f32> = (0..12).map(|_| read_f32_le(&bytes, &mut pos).unwrap()).collect();
+            let k_arr: Vec<f32> = (0..12)
+                .map(|_| read_f32_le(&bytes, &mut pos).unwrap())
+                .collect();
+            let v_arr: Vec<f32> = (0..12)
+                .map(|_| read_f32_le(&bytes, &mut pos).unwrap())
+                .collect();
             // k_arr[6] = q8_cos_mean, k_arr[8] = q4_cos_mean
             println!(
                 "{:>6}  {:>5}  {:>7}  {:>10.6}  {:>10.6}  {:>10.6}  {:>10.6}",
-                layer_idx, block_idx, token_start,
-                k_arr[6], k_arr[8],
-                v_arr[6], v_arr[8],
+                layer_idx, block_idx, token_start, k_arr[6], k_arr[8], v_arr[6], v_arr[8],
             );
         }
     }
@@ -4047,7 +4042,9 @@ fn precompute_block(block: &[f32; 32]) -> ([f32; 32], u32, f32) {
         let a = block[i].abs();
         abs_block[i] = a;
         total += a;
-        if block[i] < 0.0 { sign_mask |= 1 << i; }
+        if block[i] < 0.0 {
+            sign_mask |= 1 << i;
+        }
     }
     (abs_block, sign_mask, total)
 }
@@ -4059,7 +4056,11 @@ fn precompute_block(block: &[f32; 32]) -> ([f32; 32], u32, f32) {
 // ---------------------------------------------------------------------------
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ShapeChar { Sine, Triangle, Sharp }
+enum ShapeChar {
+    Sine,
+    Triangle,
+    Sharp,
+}
 
 impl ShapeChar {
     fn label(self) -> &'static str {
@@ -4128,4 +4129,3 @@ fn l2_sq_curve(a: &[f32; 32], b: &[f32; 32]) -> f32 {
     }
     s
 }
-

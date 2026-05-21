@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 
-use candle_conversation::{ConversationEngine, TokenDecoder, TurnEvent};
 use candle_conversation::models::Model;
+use candle_conversation::persistence::content_hash;
 use candle_conversation::projection;
+use candle_conversation::{ConversationEngine, TokenDecoder, TurnEvent};
 
 use crate::config::DaemonConfig;
 use crate::log_broadcast::LogBus;
@@ -39,9 +40,9 @@ struct ConvState {
 
 struct InferenceState {
     decoder: TokenDecoder,
-    /// Kept alive so its Drop impl doesn't shut down the scheduler thread.
-    /// Conversations hold cloned scheduler_tx senders; the engine owns the JoinHandle.
-    #[allow(dead_code)]
+    /// Owns the scheduler `JoinHandle` (conversations hold cloned
+    /// `scheduler_tx` senders) and the substrate persistence handle —
+    /// locked for the per-turn group-commit and for shutdown checkpointing.
     engine: std::sync::Mutex<ConversationEngine>,
     /// Per-conversation state, keyed by the client-supplied conv_id string.
     conversations: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConvState>>>>,
@@ -58,6 +59,7 @@ impl InferenceState {
         mut proj_builder: projection::Builder,
         model_path: PathBuf,
         tokenizer_path: PathBuf,
+        workspace: PathBuf,
     ) -> anyhow::Result<Arc<Self>> {
         let device = candle::Device::cuda_if_available(0)
             .map_err(|e| anyhow::anyhow!("device init: {e}"))?;
@@ -69,7 +71,9 @@ impl InferenceState {
             .ok_or_else(|| anyhow::anyhow!("projection schema missing 'dialogue' layer"))?;
         let primary_group = proj_builder
             .id_for_group("primary_conversation")
-            .ok_or_else(|| anyhow::anyhow!("projection schema missing 'primary_conversation' group"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("projection schema missing 'primary_conversation' group")
+            })?;
         // (layer, group) are passed through to
         // `new_conversation_with_projection`, which mints a fresh
         // `TimelineId` internally.
@@ -99,6 +103,7 @@ impl InferenceState {
             .system_prompt(&before_text)
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
+            .workspace_path(workspace)
             .thinking(false);
         let engine = builder
             .engine(&device)
@@ -177,10 +182,16 @@ fn run_inference_stream(
                 Arc::clone(existing)
             } else {
                 tracing::info!(conv_id = %conv_id, "forking new conv from base");
-                // The substrate-as-parent model assigns sequence ids
-                // from the scheduler's slot allocator, so callers no
-                // longer pass an external `new_id` into `fork`.
-                let conv = match state.base_conv.lock().unwrap().fork() {
+                // Fork onto the timeline derived from `conv_id` — a stable
+                // hash, so a daemon restart reconnects the client to the
+                // turns the substrate reload recovered for this conversation
+                // (§16.12). An unknown conv_id simply forks empty.
+                let conv = match state
+                    .base_conv
+                    .lock()
+                    .unwrap()
+                    .fork_resuming(timeline_for(&conv_id))
+                {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(conv_id = %conv_id, "fork failed: {e}");
@@ -321,6 +332,12 @@ fn run_inference_stream(
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
             }
 
+            // Group-commit the substrate redo log: the just-sealed turn is
+            // now durable on disk, so a crash or restart resumes it intact.
+            if let Err(e) = state.engine.lock().unwrap().commit_persistence() {
+                tracing::warn!(conv_id = %conv_id, "persistence commit error: {e}");
+            }
+
             if is_final {
                 break;
             }
@@ -349,7 +366,6 @@ fn run_inference_stream(
 // ── Session ───────────────────────────────────────────────────────────────────
 
 pub struct ZendSession {
-    #[allow(dead_code)]
     config: DaemonConfig,
     projection_builder: projection::Builder,
     #[allow(dead_code)] // read by api/ws_logs.rs in the bin target
@@ -383,6 +399,7 @@ impl ZendSession {
         let proj_builder = self.projection_builder.clone();
         let ready_tx = self.ready_tx.clone();
         let status_tx = self.status_tx.clone();
+        let workspace = self.config.workspace.clone();
         tokio::spawn(async move {
             status_tx.send("Checking for model…".into()).ok();
             let (model_path, tok_path) = match crate::download::ensure_model(&status_tx).await {
@@ -398,7 +415,7 @@ impl ZendSession {
             status_tx.send("Loading model…".into()).ok();
             tracing::info!("loading inference engine (Qwen3-30B-A3B) …");
             match tokio::task::spawn_blocking(move || {
-                InferenceState::load(proj_builder, model_path, tok_path)
+                InferenceState::load(proj_builder, model_path, tok_path, workspace)
             })
             .await
             {
@@ -420,6 +437,30 @@ impl ZendSession {
         });
     }
 
+    /// Graceful shutdown: durably checkpoint the substrate redo log, then
+    /// stop the scheduler thread. Idempotent — safe to call when the model
+    /// never finished loading (nothing to flush). Runs on the blocking pool
+    /// since `checkpoint_persistence` does synchronous `fsync` I/O.
+    pub async fn shutdown(&self) {
+        let state: Option<Arc<InferenceState>> =
+            { self.inference.read().unwrap().as_ref().map(Arc::clone) };
+        let Some(state) = state else {
+            tracing::info!("shutdown: model never loaded — nothing to persist");
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            let engine = state.engine.lock().unwrap();
+            match engine.checkpoint_persistence() {
+                Ok(()) => tracing::info!("shutdown: substrate checkpointed"),
+                Err(e) => tracing::error!("shutdown: checkpoint failed: {e}"),
+            }
+            if let Err(e) = engine.shutdown() {
+                tracing::error!("shutdown: scheduler stop failed: {e}");
+            }
+        })
+        .await;
+    }
+
     /// Submit the latest user message and return a stream of status + token items.
     pub async fn submit(
         &self,
@@ -427,7 +468,8 @@ impl ZendSession {
         max_tokens: Option<usize>,
         conv_id: String,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
-        self.submit_with_sampling(messages, max_tokens, conv_id, None).await
+        self.submit_with_sampling(messages, max_tokens, conv_id, None)
+            .await
     }
 
     /// Same as [`Self::submit`] but accepts an explicit
@@ -481,7 +523,11 @@ impl ZendSession {
                     }
                 }
 
-                if tx.send(Ok(StreamItem::Status("Processing…".into()))).await.is_err() {
+                if tx
+                    .send(Ok(StreamItem::Status("Processing…".into())))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -490,8 +536,7 @@ impl ZendSession {
             let state: Option<Arc<InferenceState>> =
                 { inference.read().unwrap().as_ref().map(Arc::clone) };
             if let Some(state) = state {
-                let mut ts =
-                    run_inference_stream(state, conv_id, last_user, max_tokens, sampling);
+                let mut ts = run_inference_stream(state, conv_id, last_user, max_tokens, sampling);
                 while let Some(item) = ts.next().await {
                     if tx.send(item.map(StreamItem::Token)).await.is_err() {
                         break;
@@ -509,6 +554,14 @@ impl ZendSession {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
+/// of the id. Deterministic across daemon restarts, so a reconnecting client
+/// resolves to the same timeline the substrate reload recovered (§16.12).
+fn timeline_for(conv_id: &str) -> projection::TimelineId {
+    let h = content_hash::hash_bytes(conv_id.as_bytes());
+    projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
+}
 
 fn build_projection_builder(workspace: &Path) -> projection::Builder {
     let name = workspace

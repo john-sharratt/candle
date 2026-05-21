@@ -40,6 +40,9 @@ pub use arena_table::{
     ResolvedArenaInfo, N_PALETTE,
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
+#[cfg(feature = "cuda")]
+pub use chunked::migrate::kv_migrate;
+pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 pub(crate) use chunked::Arena; // Internal use only
 #[cfg(feature = "cuda")]
@@ -337,6 +340,32 @@ impl KvFormat {
             Self::Quantized(qf) => Some(*qf),
             Self::Float(_) => None,
         }
+    }
+
+    /// Stable `u8` tag for on-disk persistence — the [`ArenaFormatTag`]
+    /// discriminant. Round-trips through [`Self::from_tag`].
+    pub fn to_tag(self) -> u8 {
+        use crate::kv_cache::arena_table::ArenaFormatTag;
+        ArenaFormatTag::from_kv_format(self).as_u8()
+    }
+
+    /// Decode a persisted [`Self::to_tag`] byte. `None` for an unrecognised
+    /// or unsupported tag.
+    ///
+    /// Implemented as the search-inverse of [`Self::to_tag`]: it scans the
+    /// formats `ArenaFormatTag::from_kv_format` accepts and returns the one
+    /// whose tag matches. There is **no** second hand-written byte→format
+    /// table to drift from the forward mapping — the round trip stays exact
+    /// even if `from_kv_format` / the tag discriminants change.
+    pub fn from_tag(tag: u8) -> Option<KvFormat> {
+        use strum::IntoEnumIterator;
+        const FLOAT_DTYPES: [DType; 4] =
+            [DType::F32, DType::F16, DType::BF16, DType::F8E4M3];
+        FLOAT_DTYPES
+            .into_iter()
+            .map(KvFormat::Float)
+            .chain(QuantFormat::iter().map(KvFormat::Quantized))
+            .find(|fmt| fmt.to_tag() == tag)
     }
 }
 

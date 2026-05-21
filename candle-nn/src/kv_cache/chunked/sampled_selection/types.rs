@@ -63,14 +63,29 @@ impl SampleFormat {
     /// All variants in declaration order. Keep in sync with the enum — adding a
     /// variant without updating ALL causes `sample_format_coverage` to fail.
     pub const ALL: &'static [Self] = &[
-        Self::F16, Self::BF16,
-        Self::Q8KS, Self::Q8_1, Self::Q8_0,
-        Self::Q5_1, Self::Q5_0,
-        Self::Q4KS, Self::Q4_1, Self::Q4_0,
-        Self::Q3_1, Self::Q3_0,
-        Self::Q2_1, Self::Q2A, Self::Q2S, Self::Q2_0,
+        Self::F16,
+        Self::BF16,
+        Self::Q8KS,
+        Self::Q8_1,
+        Self::Q8_0,
+        Self::Q5_1,
+        Self::Q5_0,
+        Self::Q4KS,
+        Self::Q4_1,
+        Self::Q4_0,
+        Self::Q3_1,
+        Self::Q3_0,
+        Self::Q2_1,
+        Self::Q2A,
+        Self::Q2S,
+        Self::Q2_0,
         Self::Q1S,
-        Self::Q0, Self::Q0_V, Self::Q1_A, Self::Q0_X, Self::Q0_M2, Self::Q0_M4,
+        Self::Q0,
+        Self::Q0_V,
+        Self::Q1_A,
+        Self::Q0_X,
+        Self::Q0_M2,
+        Self::Q0_M4,
     ];
 
     pub fn is_float(self) -> bool {
@@ -269,44 +284,44 @@ impl SampleFormat {
     /// Total 23 entries (indices 0-22).
     pub fn table_index(self) -> usize {
         match self {
-            Self::Q0     => 0,   // 0.25 bpe
-            Self::Q0_X   => 1,   // 0.5  bpe
-            Self::Q0_V   => 2,   // 0.5  bpe
-            Self::Q0_M2  => 3,   // 0.75 bpe
-            Self::Q1S    => 4,   // 1.25 bpe
-            Self::Q1_A   => 5,   // 1.5  bpe (6 bytes / 32 elem)
-            Self::Q0_M4  => 6,   // 2.0  bpe (8 bytes / 32 elem)
-            Self::Q2S    => 7,   // 2.25 bpe
-            Self::Q2_0   => 8,   // 2.5  bpe
+            Self::Q0 => 0,    // 0.25 bpe
+            Self::Q0_X => 1,  // 0.5  bpe
+            Self::Q0_V => 2,  // 0.5  bpe
+            Self::Q0_M2 => 3, // 0.75 bpe
+            Self::Q1S => 4,   // 1.25 bpe
+            Self::Q1_A => 5,  // 1.5  bpe (6 bytes / 32 elem)
+            Self::Q0_M4 => 6, // 2.0  bpe (8 bytes / 32 elem)
+            Self::Q2S => 7,   // 2.25 bpe
+            Self::Q2_0 => 8,  // 2.5  bpe
             Self::Q2A => 9,   // 2.5  bpe
-            Self::Q2_1   => 10,  // 3.0  bpe
-            Self::Q3_0   => 11,  // 3.5  bpe
-            Self::Q3_1   => 12,  // 4.0  bpe
-            Self::Q4_0   => 13,  // 4.5  bpe
-            Self::Q4_1   => 14,  // 5.0  bpe
-            Self::Q4KS   => 15,  // 5.0  bpe
-            Self::Q5_0   => 16,  // 5.5  bpe
-            Self::Q5_1   => 17,  // 6.0  bpe
-            Self::Q8_0   => 18,  // 8.5  bpe
-            Self::Q8_1   => 19,  // 9.0  bpe
-            Self::Q8KS   => 20,  // 9.0  bpe
-            Self::F16    => 21,  // 16.0 bpe
-            Self::BF16   => 22,  // 16.0 bpe
+            Self::Q2_1 => 10, // 3.0  bpe
+            Self::Q3_0 => 11, // 3.5  bpe
+            Self::Q3_1 => 12, // 4.0  bpe
+            Self::Q4_0 => 13, // 4.5  bpe
+            Self::Q4_1 => 14, // 5.0  bpe
+            Self::Q4KS => 15, // 5.0  bpe
+            Self::Q5_0 => 16, // 5.5  bpe
+            Self::Q5_1 => 17, // 6.0  bpe
+            Self::Q8_0 => 18, // 8.5  bpe
+            Self::Q8_1 => 19, // 9.0  bpe
+            Self::Q8KS => 20, // 9.0  bpe
+            Self::F16 => 21,  // 16.0 bpe
+            Self::BF16 => 22, // 16.0 bpe
         }
     }
 
     pub fn from_table_index(idx: usize) -> Self {
         match idx {
-            0  => Self::Q0,
-            1  => Self::Q0_X,
-            2  => Self::Q0_V,
-            3  => Self::Q0_M2,
-            4  => Self::Q1S,
-            5  => Self::Q1_A,
-            6  => Self::Q0_M4,
-            7  => Self::Q2S,
-            8  => Self::Q2_0,
-            9  => Self::Q2A,
+            0 => Self::Q0,
+            1 => Self::Q0_X,
+            2 => Self::Q0_V,
+            3 => Self::Q0_M2,
+            4 => Self::Q1S,
+            5 => Self::Q1_A,
+            6 => Self::Q0_M4,
+            7 => Self::Q2S,
+            8 => Self::Q2_0,
+            9 => Self::Q2A,
             10 => Self::Q2_1,
             11 => Self::Q3_0,
             12 => Self::Q3_1,
@@ -320,7 +335,7 @@ impl SampleFormat {
             20 => Self::Q8KS,
             21 => Self::F16,
             22 => Self::BF16,
-            _  => Self::F16,
+            _ => Self::F16,
         }
     }
 
@@ -420,10 +435,10 @@ mod tests {
     // select_kv_format.cuh.  If a new format is added there, add it here too —
     // the count assertion below will catch the mismatch at test time.
     const KNOWN_KV_TAGS: &[(i32, SampleFormat)] = &[
-        (1,  SampleFormat::F16),
-        (2,  SampleFormat::BF16),
-        (7,  SampleFormat::Q8_0),
-        (8,  SampleFormat::Q8_1),
+        (1, SampleFormat::F16),
+        (2, SampleFormat::BF16),
+        (7, SampleFormat::Q8_0),
+        (8, SampleFormat::Q8_1),
         (10, SampleFormat::Q8KS),
         (12, SampleFormat::Q5_0),
         (13, SampleFormat::Q5_1),

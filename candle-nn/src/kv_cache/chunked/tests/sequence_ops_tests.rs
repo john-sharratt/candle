@@ -85,9 +85,21 @@ mod tests {
 
             let state = backing.state.read().expect("lock");
             let seq = state.sequences[0].as_ref().expect("allocated sequence");
-            assert_eq!(seq.block_count(), 2, "physically full tail must rotate before decode");
-            assert_eq!(seq.chunks_slice()[0].usage, 5, "sealed partial usage should be preserved");
-            assert_eq!(seq.chunks_slice()[1].usage, 0, "new write tail starts empty");
+            assert_eq!(
+                seq.block_count(),
+                2,
+                "physically full tail must rotate before decode"
+            );
+            assert_eq!(
+                seq.chunks_slice()[0].usage,
+                5,
+                "sealed partial usage should be preserved"
+            );
+            assert_eq!(
+                seq.chunks_slice()[1].usage,
+                0,
+                "new write tail starts empty"
+            );
         }
     }
 
@@ -1713,11 +1725,13 @@ mod tests {
 
             // Inject into a fresh sequence and verify chunk count.
             let dst = backing.alloc_sequence().expect("alloc dst");
-            let (start, end) = backing
-                .inject_sealed_at_tail(dst, &sealed)
-                .expect("inject");
+            let (start, end) = backing.inject_sealed_at_tail(dst, &sealed).expect("inject");
             assert_eq!(start, 0, "fresh sequence should start at block 0");
-            assert_eq!(end, sealed.chunks.len(), "should have one block per sealed chunk");
+            assert_eq!(
+                end,
+                sealed.chunks.len(),
+                "should have one block per sealed chunk"
+            );
 
             // Verify the dst sequence's chunks match the sealed metadata.
             let state = backing.state.read().expect("lock");
@@ -1764,9 +1778,7 @@ mod tests {
 
             let sealed = backing.record_turn(0, n_tokens).expect("record_turn");
             let dst = backing.alloc_sequence().expect("alloc dst");
-            let (_, end) = backing
-                .inject_sealed_at_tail(dst, &sealed)
-                .expect("inject");
+            let (_, end) = backing.inject_sealed_at_tail(dst, &sealed).expect("inject");
             assert_eq!(end, sealed.chunks.len());
 
             // re-record on dst and check window metadata matches.  RoPE

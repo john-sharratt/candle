@@ -201,71 +201,71 @@ impl Scheduler {
                         let is_interval_check =
                             (check_interval > 0 && step % check_interval == 0) || on_page_pre_probe;
                         if !state.health.skip_entropy_checks {
-                        match crate::decode_health::check_entropy(
-                            &logits_vec[i],
-                            &mut state.health,
-                            self.health_config.entropy_hard_threshold_nats,
-                            self.health_config.entropy_hard_min_consec,
-                            self.health_config.entropy_trend_window,
-                            self.health_config.entropy_trend_threshold_nats,
-                            self.health_config.entropy_interval_floor_threshold_nats,
-                            self.health_config.entropy_interval_floor_consec,
-                            self.health_config.interval_argmax_dominance_window,
-                            self.health_config.interval_argmax_dominance_fraction,
-                            self.health_config.entropy_trend_recent_veto_window,
-                            self.health_config.entropy_trend_recent_veto_factor,
-                            &self.health_config.structural_token_ids,
-                            step,
-                            is_interval_check,
-                        ) {
-                            Ok(Some(evt)) => {
-                                tracing::warn!(
+                            match crate::decode_health::check_entropy(
+                                &logits_vec[i],
+                                &mut state.health,
+                                self.health_config.entropy_hard_threshold_nats,
+                                self.health_config.entropy_hard_min_consec,
+                                self.health_config.entropy_trend_window,
+                                self.health_config.entropy_trend_threshold_nats,
+                                self.health_config.entropy_interval_floor_threshold_nats,
+                                self.health_config.entropy_interval_floor_consec,
+                                self.health_config.interval_argmax_dominance_window,
+                                self.health_config.interval_argmax_dominance_fraction,
+                                self.health_config.entropy_trend_recent_veto_window,
+                                self.health_config.entropy_trend_recent_veto_factor,
+                                &self.health_config.structural_token_ids,
+                                step,
+                                is_interval_check,
+                            ) {
+                                Ok(Some(evt)) => {
+                                    tracing::warn!(
+                                        target: "candle_conversation::decode_health",
+                                        seq_id = seq_id.0, %evt,
+                                        "decode health abort: aborting sequence"
+                                    );
+                                    let top_tokens = match &evt {
+                                        crate::decode_health::HealthEvent::EntropyCollapse {
+                                            ref top_tokens,
+                                            ..
+                                        } => top_tokens.as_slice(),
+                                        crate::decode_health::HealthEvent::ArgmaxDominance {
+                                            ref top_tokens,
+                                            ..
+                                        } => top_tokens.as_slice(),
+                                        _ => &[],
+                                    };
+                                    let dump = crate::decode_health::render_health_dump(
+                                        &state.health.health_log,
+                                        step,
+                                        self.health_config.entropy_hard_threshold_nats,
+                                        state.health.entropy_effective_trend_threshold,
+                                        self.health_config.logit_check_interval,
+                                        state.prefill_token_count,
+                                        state.sampling_config.temperature,
+                                        state.sampling_config.top_k,
+                                        state.sampling_config.top_p,
+                                        state.sampling_config.repeat_penalty,
+                                        &state.health.recent_tokens,
+                                        top_tokens,
+                                    );
+                                    tracing::warn!(
+                                        target: "candle_conversation::decode_health",
+                                        "{}",
+                                        dump
+                                    );
+                                    let _ = state
+                                        .event_tx
+                                        .send(TurnEvent::HealthWarning(evt.to_string()));
+                                    state.finished = true;
+                                    continue;
+                                }
+                                Err(e) => tracing::debug!(
                                     target: "candle_conversation::decode_health",
-                                    seq_id = seq_id.0, %evt,
-                                    "decode health abort: aborting sequence"
-                                );
-                                let top_tokens = match &evt {
-                                    crate::decode_health::HealthEvent::EntropyCollapse {
-                                        ref top_tokens,
-                                        ..
-                                    } => top_tokens.as_slice(),
-                                    crate::decode_health::HealthEvent::ArgmaxDominance {
-                                        ref top_tokens,
-                                        ..
-                                    } => top_tokens.as_slice(),
-                                    _ => &[],
-                                };
-                                let dump = crate::decode_health::render_health_dump(
-                                    &state.health.health_log,
-                                    step,
-                                    self.health_config.entropy_hard_threshold_nats,
-                                    state.health.entropy_effective_trend_threshold,
-                                    self.health_config.logit_check_interval,
-                                    state.prefill_token_count,
-                                    state.sampling_config.temperature,
-                                    state.sampling_config.top_k,
-                                    state.sampling_config.top_p,
-                                    state.sampling_config.repeat_penalty,
-                                    &state.health.recent_tokens,
-                                    top_tokens,
-                                );
-                                tracing::warn!(
-                                    target: "candle_conversation::decode_health",
-                                    "{}",
-                                    dump
-                                );
-                                let _ = state
-                                    .event_tx
-                                    .send(TurnEvent::HealthWarning(evt.to_string()));
-                                state.finished = true;
-                                continue;
+                                    "entropy health check error (non-fatal): {e}"
+                                ),
+                                Ok(None) => {}
                             }
-                            Err(e) => tracing::debug!(
-                                target: "candle_conversation::decode_health",
-                                "entropy health check error (non-fatal): {e}"
-                            ),
-                            Ok(None) => {}
-                        }
                         } // if !skip_entropy_checks
                     }
 

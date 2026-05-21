@@ -1,12 +1,10 @@
 use super::profile::sampled_profile_record_duration;
 use super::{
-    batch_select_and_summarize, sample_error_surface,
-    CompressionSummary, ErrorSurface, SampleFormat, SampleSide, SampledSelectionBenchmarkResult,
+    batch_select_and_summarize, sample_error_surface, CompressionSummary, ErrorSurface,
+    SampleFormat, SampleSide, SampledSelectionBenchmarkResult,
 };
 #[cfg(feature = "cuda")]
-use super::{
-    sample_error_surface_gpu_paged, KvSampler, KvSamplerInputs, PagedSelectionGpuInputs,
-};
+use super::{sample_error_surface_gpu_paged, KvSampler, KvSamplerInputs, PagedSelectionGpuInputs};
 
 #[derive(Debug, Clone)]
 pub struct SampleQuantizationResult {
@@ -88,30 +86,25 @@ pub fn sample_quantization_sweep_paged(
             SampleSide::Key => "quantization.key.surface.total",
             SampleSide::Value => "quantization.value.surface.total",
         };
-        sampled_profile_record_duration(
-            benchmark_result.as_deref_mut(),
-            scope,
-            start.elapsed(),
-            1,
-        );
+        sampled_profile_record_duration(benchmark_result.as_deref_mut(), scope, start.elapsed(), 1);
     }
 
-    let levels = batch_select_and_summarize(&surface, thresholds, candidates, benchmark_result.as_deref_mut())?
-        .into_iter()
-        .map(|(winners, summary)| SampleQuantizationResult { winners, summary })
-        .collect::<Vec<_>>();
+    let levels = batch_select_and_summarize(
+        &surface,
+        thresholds,
+        candidates,
+        benchmark_result.as_deref_mut(),
+    )?
+    .into_iter()
+    .map(|(winners, summary)| SampleQuantizationResult { winners, summary })
+    .collect::<Vec<_>>();
 
     if let Some(start) = workflow_start {
         let scope = match side {
             SampleSide::Key => "quantization.key.total",
             SampleSide::Value => "quantization.value.total",
         };
-        sampled_profile_record_duration(
-            benchmark_result.as_deref_mut(),
-            scope,
-            start.elapsed(),
-            1,
-        );
+        sampled_profile_record_duration(benchmark_result.as_deref_mut(), scope, start.elapsed(), 1);
     }
 
     Ok(SampleQuantizationSweepResult { surface, levels })
@@ -204,30 +197,25 @@ pub fn sample_quantization_sweep(
             SampleSide::Key => "quantization.key.surface.total",
             SampleSide::Value => "quantization.value.surface.total",
         };
-        sampled_profile_record_duration(
-            benchmark_result.as_deref_mut(),
-            scope,
-            start.elapsed(),
-            1,
-        );
+        sampled_profile_record_duration(benchmark_result.as_deref_mut(), scope, start.elapsed(), 1);
     }
 
-    let levels = batch_select_and_summarize(&surface, thresholds, candidates, benchmark_result.as_deref_mut())?
-        .into_iter()
-        .map(|(winners, summary)| SampleQuantizationResult { winners, summary })
-        .collect::<Vec<_>>();
+    let levels = batch_select_and_summarize(
+        &surface,
+        thresholds,
+        candidates,
+        benchmark_result.as_deref_mut(),
+    )?
+    .into_iter()
+    .map(|(winners, summary)| SampleQuantizationResult { winners, summary })
+    .collect::<Vec<_>>();
 
     if let Some(start) = workflow_start {
         let scope = match side {
             SampleSide::Key => "quantization.key.total",
             SampleSide::Value => "quantization.value.total",
         };
-        sampled_profile_record_duration(
-            benchmark_result.as_deref_mut(),
-            scope,
-            start.elapsed(),
-            1,
-        );
+        sampled_profile_record_duration(benchmark_result.as_deref_mut(), scope, start.elapsed(), 1);
     }
 
     Ok(SampleQuantizationSweepResult { surface, levels })

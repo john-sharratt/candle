@@ -3,8 +3,8 @@
 //! Provides the same public surface as `gpu_chunks.rs` but all operations
 //! are no-ops.  Selected at compile time when the `cuda` feature is absent.
 
-use crate::kv_cache::arena_table::ResolvedArenaInfo;
 use super::types::ChunkWindow;
+use crate::kv_cache::arena_table::ResolvedArenaInfo;
 
 /// Serialised byte-size of one `TokenSlice` entry (mirrors the real implementation).
 #[allow(dead_code)]
@@ -51,7 +51,6 @@ impl GpuChunks {
     pub(crate) fn n_chunks(&self) -> usize {
         0
     }
-
 }
 
 pub(crate) struct GpuChunksGuard<'a> {

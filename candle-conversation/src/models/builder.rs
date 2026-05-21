@@ -102,6 +102,9 @@ pub struct ModelBuilder {
     /// Maximum Hot-tier turns before triggering Hot → Warm eviction.
     /// `0` = auto-compute from arena geometry in [`engine()`](Self::engine).
     max_hot_turns: usize,
+    /// Workspace root whose `.substrate/` directory backs the persistence
+    /// redo log. `None` falls back to the process working directory.
+    workspace_path: Option<PathBuf>,
 }
 
 impl ModelBuilder {
@@ -125,8 +128,16 @@ impl ModelBuilder {
             penalty_log_path: None,
             health_config: DecodeHealthConfig::default(),
             max_hot_turns: 0,
+            workspace_path: None,
             spec,
         }
+    }
+
+    /// Set the workspace root whose `.substrate/` directory backs the
+    /// persistence redo log.
+    pub fn workspace_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.workspace_path = Some(path.into());
+        self
     }
 
     // ── File overrides ─────────────────────────────────────────────────
@@ -406,7 +417,6 @@ impl ModelBuilder {
         self.max_hot_turns = n;
         self
     }
-
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -537,6 +547,7 @@ impl ModelBuilder {
         ret.show_special_tokens = self.show_special_tokens;
         ret.penalty_log_path = self.penalty_log_path.clone();
         ret.health = self.health_config.clone();
+        ret.workspace_path = self.workspace_path.clone();
         ret
     }
 

@@ -5,12 +5,12 @@
 //! on the [`GpuChunksGuard`]; on drop the guard coalesces adjacent indices
 //! into contiguous byte ranges and issues one `stream.memcpy_htod` per run.
 
-use std::sync::Arc;
-use candle::cuda_backend::WrapErr;
-use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-use candle::quantized::pinned_staging::PinnedBuf;
-use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
 use super::types::ChunkWindow;
+use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
+use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use candle::cuda_backend::WrapErr;
+use candle::quantized::pinned_staging::PinnedBuf;
+use std::sync::Arc;
 
 /// Cached pinned-host + device-side serialised slot-state for one sequence.
 pub(crate) struct GpuChunks {
@@ -49,7 +49,10 @@ impl GpuChunks {
     }
 
     pub(crate) fn as_mut(&mut self) -> GpuChunksGuard<'_> {
-        GpuChunksGuard { inner: self, dirty_chunks: Vec::new() }
+        GpuChunksGuard {
+            inner: self,
+            dirty_chunks: Vec::new(),
+        }
     }
 
     /// Returns the raw GPU device pointer for this sequence's slot-state buffer.
@@ -72,7 +75,6 @@ impl GpuChunks {
             0
         }
     }
-
 }
 
 /// Mutable accessor for [`GpuChunks`].
@@ -190,8 +192,14 @@ impl GpuChunksGuard<'_> {
         for (i, chunk) in chunks.iter().enumerate() {
             let bs = i * chunk_byte_size;
             let slot = &mut self.inner.buf.as_mut_slice()[bs..bs + chunk_byte_size];
-            let len = if i + 1 == chunks.len() { write_len } else { chunk.usage as u16 };
-            serialize_chunk_window_with_len(chunk, n_kv_head, head_dim, rope_base, len, arena_info, slot);
+            let len = if i + 1 == chunks.len() {
+                write_len
+            } else {
+                chunk.usage as u16
+            };
+            serialize_chunk_window_with_len(
+                chunk, n_kv_head, head_dim, rope_base, len, arena_info, slot,
+            );
             self.dirty_chunks.push(i);
             rope_base += chunk.usage;
         }
@@ -213,8 +221,7 @@ impl GpuChunksGuard<'_> {
                 }
             }
         }
-        self.inner.buf =
-            PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail");
+        self.inner.buf = PinnedBuf::alloc_owned(0).expect("zero-len PinnedBuf alloc cannot fail");
         self.inner.gpu = None;
         self.inner.chunk_byte_size = 0;
     }
@@ -233,7 +240,12 @@ impl Drop for GpuChunksGuard<'_> {
         self.dirty_chunks.dedup();
 
         // Split the borrow so we can hold &[u8] from buf alongside &mut gpu.
-        let GpuChunks { buf, gpu, stream, chunk_byte_size } = &mut *self.inner;
+        let GpuChunks {
+            buf,
+            gpu,
+            stream,
+            chunk_byte_size,
+        } = &mut *self.inner;
         let chunk_byte_size = *chunk_byte_size;
         if chunk_byte_size == 0 {
             return;
@@ -363,7 +375,10 @@ pub(crate) fn serialize_chunk_window_with_len(
     arena_info: &[ResolvedArenaInfo],
     dst: &mut [u8],
 ) {
-    debug_assert!(head_dim >= 4, "head_dim must be >= 4 for 2-bit pal_map packing");
+    debug_assert!(
+        head_dim >= 4,
+        "head_dim must be >= 4 for 2-bit pal_map packing"
+    );
     let pal_total = n_kv_head * (head_dim / 4);
     let scale_total = n_kv_head * N_PALETTE;
     debug_assert!(
@@ -417,13 +432,11 @@ pub(crate) fn serialize_chunk_window_with_len(
             let k_gid = chunk.gids.k_gid_pal(h, p);
             let v_gid = chunk.gids.v_gid_pal(h, p);
             if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
-                k_ptr[p] =
-                    ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
                 k_fmt[p] = ai.k_format_tag.as_u8();
             }
             if let Some(ai) = arena_info.get(v_gid.arena_idx()) {
-                v_ptr[p] =
-                    ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
                 v_fmt[p] = ai.v_format_tag.as_u8();
             }
         }
@@ -473,7 +486,10 @@ pub(crate) fn serialize_chunk_window(
     arena_info: &[ResolvedArenaInfo],
     dst: &mut [u8],
 ) {
-    debug_assert!(head_dim >= 4, "head_dim must be >= 4 for 2-bit pal_map packing");
+    debug_assert!(
+        head_dim >= 4,
+        "head_dim must be >= 4 for 2-bit pal_map packing"
+    );
     let pal_total = n_kv_head * (head_dim / 4);
     let scale_total = n_kv_head * N_PALETTE;
     debug_assert!(
@@ -527,13 +543,11 @@ pub(crate) fn serialize_chunk_window(
             let k_gid = chunk.gids.k_gid_pal(h, p);
             let v_gid = chunk.gids.v_gid_pal(h, p);
             if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
-                k_ptr[p] =
-                    ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
                 k_fmt[p] = ai.k_format_tag.as_u8();
             }
             if let Some(ai) = arena_info.get(v_gid.arena_idx()) {
-                v_ptr[p] =
-                    ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
+                v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
                 v_fmt[p] = ai.v_format_tag.as_u8();
             }
         }

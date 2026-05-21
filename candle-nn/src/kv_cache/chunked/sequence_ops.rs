@@ -1,4 +1,4 @@
-﻿//! Sequence allocation and management operations for ChunkedKvBacking.
+//! Sequence allocation and management operations for ChunkedKvBacking.
 //!
 //! This module contains methods for:
 //! - Allocating and freeing sequences (slots)
@@ -167,11 +167,7 @@ impl ChunkedKvBacking {
                 // position_map and `ensure_for_batch_entries` use.
                 // Chunks at index < writer_start_idx are Arc-shared
                 // with substrate/parent and MUST NOT be modified.
-                let prior_total: usize = seq
-                    .chunks_slice()
-                    .iter()
-                    .map(|c| c.usage as usize)
-                    .sum();
+                let prior_total: usize = seq.chunks_slice().iter().map(|c| c.usage as usize).sum();
                 if len <= prior_total {
                     return;
                 }
@@ -202,6 +198,41 @@ impl ChunkedKvBacking {
                 // `buf` manually in sync here is both redundant and unsafe.
             }
         }
+    }
+
+    /// Set one block's window geometry — its skip `offset` and valid token
+    /// `usage` — directly.
+    ///
+    /// Used by the resume / cold-load path: after [`Self::alloc_sealed_block`]
+    /// allocates a chunk's GIDs, the persisted `offset` / `token_count` must
+    /// be stamped onto the `ChunkWindow` so [`Self::record_turn`] snapshots
+    /// the correct window. Errors if the slot or block is not allocated.
+    pub fn set_block_window(
+        &self,
+        batch_idx: usize,
+        block_idx: usize,
+        offset: u16,
+        usage: u32,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let seq = state
+            .sequences
+            .get_mut(batch_idx)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!("set_block_window: slot {batch_idx} not allocated"))
+            })?;
+        let cw = seq.chunk_at_mut(block_idx).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "set_block_window: block {block_idx} not allocated in slot {batch_idx}"
+            ))
+        })?;
+        cw.offset = offset;
+        cw.usage = usage;
+        Ok(())
     }
 
     /// Append borrowed chunk references to an existing sequence's block table.
@@ -891,10 +922,7 @@ impl ChunkedKvBacking {
                 // Pass 1 (immutable): clone Quantized source arenas once per unique
                 // arena index.  This frees the immutable borrow so pass 2 can call
                 // arenas_mut() even when src and dst land in the same arena.
-                let quant_clones: std::collections::HashMap<
-                    usize,
-                    candle::quantized::QTensor,
-                > = {
+                let quant_clones: std::collections::HashMap<usize, candle::quantized::QTensor> = {
                     let arenas = arena_state.arenas();
                     let mut map = std::collections::HashMap::new();
                     for src_gid in source_gids.iter() {
@@ -926,7 +954,10 @@ impl ChunkedKvBacking {
                             Some(Arena::Quantized { data: dst_q, .. }) => {
                                 if src_dtype == dst_q.dtype() {
                                     dst_q.slice_range_copy(
-                                        src_clone, src_off, dst_off, elems_per_chunk,
+                                        src_clone,
+                                        src_off,
+                                        dst_off,
+                                        elems_per_chunk,
                                     )?;
                                 } else {
                                     candle::bail!(
@@ -1488,7 +1519,10 @@ impl ChunkedKvBacking {
                                     Some(Arena::Quantized { data: dst_q, .. }) => {
                                         if src_dtype == dst_q.dtype() {
                                             dst_q.slice_range_copy(
-                                                src_clone, src_off, dst_off, elems_per_chunk,
+                                                src_clone,
+                                                src_off,
+                                                dst_off,
+                                                elems_per_chunk,
                                             )?;
                                         } else {
                                             candle::bail!(
@@ -1869,7 +1903,6 @@ impl ChunkedKvBacking {
 
         Ok(true)
     }
-
 
     /// Truncate the sequence at `batch_idx` to keep only the first
     /// `block_count` chunks; everything beyond is dropped (their

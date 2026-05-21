@@ -21,8 +21,8 @@ static WEB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/web");
 pub fn router(session: Arc<ZendSession>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat::completions))
-        .route("/v1/models",           get(models::list))
-        .route("/ws/logs",             get(ws_logs::handler))
+        .route("/v1/models", get(models::list))
+        .route("/ws/logs", get(ws_logs::handler))
         .with_state(session)
         .fallback(embedded_asset)
 }
@@ -34,11 +34,7 @@ async fn embedded_asset(req: Request<Body>) -> Response {
     match WEB.get_file(path) {
         Some(f) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            (
-                [(header::CONTENT_TYPE, mime.as_ref())],
-                f.contents(),
-            )
-                .into_response()
+            ([(header::CONTENT_TYPE, mime.as_ref())], f.contents()).into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }

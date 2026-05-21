@@ -8,8 +8,7 @@ use crate::config::{SequenceConfig, SamplingConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::projection::{
-    Builder, Conversation, ProjectionTarget, SectionId,
-    SystemPromptItem, TurnIndex,
+    Builder, Conversation, ProjectionTarget, SectionId, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::ProvenanceFile;
 use candle_transformers::models::batched_inference::ModelCoreProperties;
@@ -1062,6 +1061,27 @@ impl Sequence {
         let fork_timeline = self
             .substrate
             .mint_timeline(self.target.layer, self.target.group);
+        self.fork_onto(fork_timeline)
+    }
+
+    /// Fork onto a **specific** timeline rather than a freshly minted one —
+    /// the daemon resume path (§16.12 of `docs/kv_tier_migration.md`).
+    ///
+    /// `timeline` is registered against the parent's `(layer, group)`
+    /// (idempotent). If the workspace substrate already holds turns under
+    /// `timeline` — reconstructed from the redo log on startup — the next
+    /// `submit_turn` materialises that recovered history onto the fork's
+    /// slot, exactly as an in-process fork inherits its parent's turns.
+    /// For an unknown `timeline` the fork simply starts empty.
+    pub fn fork_resuming(&self, timeline: TimelineId) -> crate::Result<Sequence> {
+        self.substrate
+            .register_timeline(timeline, self.target.layer, self.target.group);
+        self.fork_onto(timeline)
+    }
+
+    /// Shared body of [`Self::fork`] / [`Self::fork_resuming`]: allocate a
+    /// fresh scheduler slot bound to the workspace substrate and `timeline`.
+    fn fork_onto(&self, fork_timeline: TimelineId) -> crate::Result<Sequence> {
         let fork_target = ProjectionTarget {
             layer: self.target.layer,
             group: self.target.group,
@@ -1069,7 +1089,7 @@ impl Sequence {
         };
 
         // Allocate a fresh slot bound to the same workspace handle and
-        // the fork's freshly-minted target.
+        // the fork's target.
         let (tx, rx) = crossbeam::channel::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::NewSequence {

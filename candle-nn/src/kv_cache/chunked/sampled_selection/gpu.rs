@@ -820,9 +820,11 @@ impl PagedSelectionGpuInputs {
     ) -> Result<Self> {
         let mut chunk_gids_keepalive = Vec::with_capacity(batch_indices.len());
         for &batch_idx in batch_indices {
-            let sealed = backing.live_chunks_as_sealed(batch_idx, &[]).ok_or_else(|| {
-                candle::Error::Msg(format!("missing live chunks for batch slot {batch_idx}"))
-            })?;
+            let sealed = backing
+                .live_chunks_as_sealed(batch_idx, &[])
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!("missing live chunks for batch slot {batch_idx}"))
+                })?;
             let chunk = sealed.first().ok_or_else(|| {
                 candle::Error::Msg(format!(
                     "no paged chunk recorded for batch slot {batch_idx}"
@@ -831,7 +833,12 @@ impl PagedSelectionGpuInputs {
             chunk_gids_keepalive.push(chunk.gids.clone());
         }
 
-        Self::from_head_gids(std::sync::Arc::clone(&backing.inner), &chunk_gids_keepalive, generation, dev)
+        Self::from_head_gids(
+            std::sync::Arc::clone(&backing.inner),
+            &chunk_gids_keepalive,
+            generation,
+            dev,
+        )
     }
 
     pub fn from_backing(

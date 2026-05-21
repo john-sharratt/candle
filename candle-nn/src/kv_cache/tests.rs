@@ -2164,3 +2164,38 @@ fn test_quantized_roundtrip_accuracy_q3_0() -> Result<()> {
     assert!(v_diff < 0.5, "V MSE too high for Q3_0: {}", v_diff);
     Ok(())
 }
+
+// ==================== KvFormat tag round-trip ====================
+
+/// `to_tag` / `from_tag` must round-trip for every format
+/// `ArenaFormatTag::from_kv_format` accepts — the persistence codec relies on
+/// it. `from_tag` derives its answer from `to_tag`, so this also guards the
+/// forward mapping against silently producing colliding tags.
+#[test]
+fn kv_format_tag_round_trips() {
+    use crate::kv_cache::{KvFormat, QuantFormat};
+    use strum::IntoEnumIterator;
+
+    let mut formats: Vec<KvFormat> =
+        [DType::F32, DType::F16, DType::BF16, DType::F8E4M3]
+            .into_iter()
+            .map(KvFormat::Float)
+            .collect();
+    formats.extend(QuantFormat::iter().map(KvFormat::Quantized));
+
+    let mut seen_tags = std::collections::HashSet::new();
+    for fmt in formats {
+        let tag = fmt.to_tag();
+        assert!(
+            seen_tags.insert(tag),
+            "duplicate tag {tag} for {fmt:?} — from_kv_format is not injective"
+        );
+        assert_eq!(
+            KvFormat::from_tag(tag),
+            Some(fmt),
+            "tag {tag} did not round-trip back to {fmt:?}"
+        );
+    }
+    // An unknown tag decodes to None, not a wrong format.
+    assert_eq!(KvFormat::from_tag(254), None);
+}

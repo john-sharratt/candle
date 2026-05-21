@@ -59,6 +59,12 @@ impl LayerId {
     pub fn raw(self) -> u32 {
         self.0.get()
     }
+
+    /// Rebuild a `LayerId` from a persisted [`Self::raw`] value — the resume
+    /// path. `None` for the reserved `0` sentinel.
+    pub fn from_raw(n: u32) -> Option<Self> {
+        NonZeroU32::new(n).map(Self)
+    }
 }
 
 /// Opaque identifier for a group. **Globally unique** across all layers in a
@@ -79,6 +85,12 @@ impl GroupId {
 
     pub fn raw(self) -> u32 {
         self.0.get()
+    }
+
+    /// Rebuild a `GroupId` from a persisted [`Self::raw`] value — the resume
+    /// path. `None` for the reserved `0` sentinel.
+    pub fn from_raw(n: u32) -> Option<Self> {
+        NonZeroU32::new(n).map(Self)
     }
 }
 
@@ -172,6 +184,12 @@ impl TimelineId {
     pub fn raw(self) -> u64 {
         self.0.get()
     }
+
+    /// Rebuild a `TimelineId` from a persisted [`Self::raw`] value — the
+    /// on-disk substrate-reload path. `None` for the reserved `0` sentinel.
+    pub fn from_raw(n: u64) -> Option<Self> {
+        NonZeroU64::new(n).map(Self)
+    }
 }
 
 impl std::fmt::Display for TimelineId {
@@ -230,12 +248,10 @@ impl TimelineAllocator {
         let mut last = self.last.load(Ordering::Relaxed);
         loop {
             let next = now_us.max(last.saturating_add(1));
-            match self.last.compare_exchange_weak(
-                last,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .last
+                .compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => {
                     let nz = NonZeroU64::new(next).unwrap_or_else(|| {
                         // Only reachable if `now_us == 0` AND last was 0,

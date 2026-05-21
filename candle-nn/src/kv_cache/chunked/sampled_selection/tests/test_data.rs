@@ -74,9 +74,7 @@ pub(super) fn load_cpu_arena(
                 (hdr, ch)
             }
             None => {
-                println!(
-                    "SKIP: no usable dump found at {R16_DUMP_REL_PATH} or {DUMP_REL_PATH}"
-                );
+                println!("SKIP: no usable dump found at {R16_DUMP_REL_PATH} or {DUMP_REL_PATH}");
                 return None;
             }
         }
@@ -101,8 +99,13 @@ pub(super) fn load_cpu_arena(
     println!(
         "CPU arena test data: {} / {} KV blocks, {} chunks (1:{} sample), \
          {} heads, head_dim={} ({} batches)",
-        effective_blocks, available_blocks, n_chunks, CPU_SAMPLE_STRIDE,
-        header.n_kv_head, header.head_dim, total_batches
+        effective_blocks,
+        available_blocks,
+        n_chunks,
+        CPU_SAMPLE_STRIDE,
+        header.n_kv_head,
+        header.head_dim,
+        total_batches
     );
 
     let cpu_device = Device::Cpu;
@@ -201,9 +204,7 @@ pub(super) fn load_gpu_arena(
                 (hdr, ch)
             }
             None => {
-                println!(
-                    "SKIP: no usable dump found at {R16_DUMP_REL_PATH} or {DUMP_REL_PATH}"
-                );
+                println!("SKIP: no usable dump found at {R16_DUMP_REL_PATH} or {DUMP_REL_PATH}");
                 return None;
             }
         }
@@ -223,7 +224,11 @@ pub(super) fn load_gpu_arena(
             return None;
         }
     };
-    benchmark_result.record_duration("benchmark.io.init_cuda_device", cuda_init_start.elapsed(), 1);
+    benchmark_result.record_duration(
+        "benchmark.io.init_cuda_device",
+        cuda_init_start.elapsed(),
+        1,
+    );
 
     let blocks_per_chunk = header.n_kv_head * header.head_dim;
     let n_chunks = chunks.len();
@@ -277,15 +282,14 @@ pub(super) fn load_gpu_arena(
     }
 
     let all_slots = (0..n_chunks).collect::<Vec<_>>();
-    let paged_inputs_all =
-        PagedSelectionGpuInputs::from_backing(&backing, &all_slots, None, &dev)
-            .expect("bind staged paged KV backing");
+    let paged_inputs_all = PagedSelectionGpuInputs::from_backing(&backing, &all_slots, None, &dev)
+        .expect("bind staged paged KV backing");
     benchmark_result.record_duration("benchmark.io.stage_kv_arenas", stage_start.elapsed(), 1);
 
     let candidates = candidate_formats();
     let sampler_init_start = Instant::now();
-    let sampler = KvSampler::new_for_level(5, &candidates, &dev)
-        .expect("upload sampler constants to GPU");
+    let sampler =
+        KvSampler::new_for_level(5, &candidates, &dev).expect("upload sampler constants to GPU");
     benchmark_result.record_duration("benchmark.io.init_sampler", sampler_init_start.elapsed(), 1);
 
     Some(StagedArena {

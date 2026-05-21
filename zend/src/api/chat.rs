@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -13,8 +13,8 @@ use futures::StreamExt;
 
 use crate::session::{StreamItem, ZendSession};
 use crate::types::{
-    AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest,
-    ChunkChoice, CompletionChoice, Delta,
+    AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice,
+    CompletionChoice, Delta,
 };
 
 /// `POST /v1/chat/completions`
@@ -27,13 +27,18 @@ pub async fn completions(
     let created = unix_secs();
 
     let n_messages = req.messages.len();
-    let last_preview: String = req.messages.iter().rev()
+    let last_preview: String = req
+        .messages
+        .iter()
+        .rev()
         .find(|m| m.role == crate::types::Role::User)
         .map(|m| m.content.chars().take(80).collect())
         .unwrap_or_default();
 
     tracing::debug!(
-        model, stream = req.stream, messages = n_messages,
+        model,
+        stream = req.stream,
+        messages = n_messages,
         "chat request  \"{}{}\"",
         last_preview,
         if last_preview.len() == 80 { "…" } else { "" },
@@ -42,9 +47,27 @@ pub async fn completions(
     let max_tokens = req.max_tokens.map(|n| n as usize);
     let conv_id = req.conv_id.unwrap_or_else(|| "default".to_string());
     if req.stream {
-        stream_sse(session, req.messages, max_tokens, conv_id, model, id, created).await
+        stream_sse(
+            session,
+            req.messages,
+            max_tokens,
+            conv_id,
+            model,
+            id,
+            created,
+        )
+        .await
     } else {
-        collect_completion(session, req.messages, max_tokens, conv_id, model, id, created).await
+        collect_completion(
+            session,
+            req.messages,
+            max_tokens,
+            conv_id,
+            model,
+            id,
+            created,
+        )
+        .await
     }
 }
 
@@ -61,7 +84,7 @@ async fn stream_sse(
 ) -> Response {
     let token_stream = session.submit(messages, max_tokens, conv_id).await;
 
-    let id_c    = id.clone();
+    let id_c = id.clone();
     let model_c = model.clone();
 
     // Track when the first actual token (not a status event) has been sent.
@@ -79,7 +102,9 @@ async fn stream_sse(
 
             Ok(StreamItem::Token(text)) => {
                 let is_first = !saw_token_c.swap(true, Ordering::Relaxed);
-                if is_first { tracing::debug!("streaming first token"); }
+                if is_first {
+                    tracing::debug!("streaming first token");
+                }
                 let chunk = ChatCompletionChunk {
                     id: id_c.clone(),
                     object: "chat.completion.chunk",
@@ -107,15 +132,18 @@ async fn stream_sse(
         model,
         choices: vec![ChunkChoice {
             index: 0,
-            delta: Delta { role: None, content: None },
+            delta: Delta {
+                role: None,
+                content: None,
+            },
             finish_reason: Some("stop"),
         }],
     };
     let stop_data = serde_json::to_string(&stop_chunk).unwrap_or_default();
 
-    let stop_event = futures::stream::once(futures::future::ready(
-        Ok::<Event, anyhow::Error>(Event::default().data(stop_data)),
-    ));
+    let stop_event = futures::stream::once(futures::future::ready(Ok::<Event, anyhow::Error>(
+        Event::default().data(stop_data),
+    )));
     let done_event = futures::stream::once(async {
         tracing::debug!("stream complete");
         Ok::<Event, anyhow::Error>(Event::default().data("[DONE]"))
@@ -138,11 +166,14 @@ async fn collect_completion(
     created: u64,
 ) -> Response {
     let mut token_stream = session.submit(messages, max_tokens, conv_id).await;
-    let mut full   = String::new();
+    let mut full = String::new();
     let mut tokens = 0usize;
     while let Some(result) = token_stream.next().await {
         match result {
-            Ok(StreamItem::Token(chunk)) => { tokens += 1; full.push_str(&chunk); }
+            Ok(StreamItem::Token(chunk)) => {
+                tokens += 1;
+                full.push_str(&chunk);
+            }
             Ok(StreamItem::Status(_)) => {} // status events are display-only
             Err(_) => {}
         }
@@ -155,7 +186,10 @@ async fn collect_completion(
         model,
         choices: vec![CompletionChoice {
             index: 0,
-            message: AssistantMessage { role: "assistant", content: full },
+            message: AssistantMessage {
+                role: "assistant",
+                content: full,
+            },
             finish_reason: "stop",
         }],
     })

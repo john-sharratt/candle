@@ -1,12 +1,12 @@
 //! The conversation engine: entry point, spawns the scheduler thread.
 
-use crate::config::{SequenceConfig, EngineConfig};
+use crate::config::{EngineConfig, SequenceConfig};
 use crate::conversation::Sequence;
 use crate::error::ConversationError;
 use crate::projection::{Builder, Conversation, ProjectionTarget};
 use crate::provenance::ProvenanceFile;
-use crate::substrate_cache::SubstrateCache;
 use crate::scheduler::{Scheduler, SchedulerRequest};
+use crate::substrate_cache::SubstrateCache;
 use crate::token_buffer::TokenBuffer;
 
 use candle_nn::CHUNK_SIZE;
@@ -111,10 +111,17 @@ impl ConversationEngine {
         // Workspace-shared `Conversation`: holds per-turn metadata
         // (the substrate handle).  Every `Sequence` we hand out gets a
         // clone of this handle, so they all attach to the same shared
-        // substrate.  `config.workspace_path` is currently unused —
-        // persistence is being redesigned and will be wired back to
-        // this field in a follow-up.
-        let _ = config.workspace_path.as_ref();
+        // substrate.
+        //
+        // Mandatory substrate persistence — the redo log under the
+        // workspace's `.substrate/` directory (or the process CWD).
+        let persistence = match config.workspace_path.as_ref() {
+            Some(dir) => crate::persistence::SubstratePersistence::open_in(dir.as_ref()),
+            None => crate::persistence::SubstratePersistence::open(),
+        }
+        .map_err(|e| {
+            ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
+        })?;
         // Shared hot-tier cache.  Budget is derived from `config` if the caller
         // provided a post-load free-VRAM figure; otherwise unlimited.
         let substrate_cache = match config.hot_cache_free_vram_bytes {
@@ -125,19 +132,20 @@ impl ConversationEngine {
             ),
             None => SubstrateCache::unbounded(),
         };
-        let conversation = Conversation::with_cache(substrate_cache.clone());
+        let conversation = Conversation::with_cache(substrate_cache.clone(), persistence);
 
         // Workspace-shared `ProvenanceFile`: created up-front so the
         // scheduler can append to it inline during `cleanup_finished`'s
         // post-Done seal step.
-        let provenance = Arc::new(
-            ProvenanceFile::new().map_err(ConversationError::from)?,
-        );
+        let provenance = Arc::new(ProvenanceFile::new().map_err(ConversationError::from)?);
         let scheduler_provenance = Arc::clone(&provenance);
 
         // Spawn the scheduler thread.
         let penalty_log = config.penalty_log_path.clone();
         let health_config = config.health.clone();
+        // A clone of the workspace conversation for the scheduler thread —
+        // used on startup to rebuild the substrate from the redo log.
+        let scheduler_conversation = conversation.clone();
         let handle = std::thread::Builder::new()
             .name("conversation-scheduler".into())
             .spawn(move || {
@@ -156,6 +164,12 @@ impl ConversationEngine {
                     scheduler_provenance,
                     model_core,
                 );
+                // §16.12 — reload any persisted turns into the substrate
+                // before serving requests.
+                #[cfg(feature = "cuda")]
+                scheduler.reconstruct_substrate(&scheduler_conversation);
+                #[cfg(not(feature = "cuda"))]
+                let _ = scheduler_conversation;
                 scheduler.run();
             })
             .map_err(|e| {
@@ -228,13 +242,7 @@ impl ConversationEngine {
             let layer = &builder.schema().layers[0];
             (layer.id, layer.groups[0].id)
         };
-        self.new_conversation_with_projection(
-            system_prompt,
-            builder,
-            layer_id,
-            group_id,
-            config,
-        )
+        self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
     }
 
     /// Create a new conversation backed by a full projection [`Builder`].
@@ -409,6 +417,19 @@ impl ConversationEngine {
     /// The decoder is cheap to clone and can be used across threads.
     pub fn token_decoder(&self) -> crate::handle::TokenDecoder {
         crate::handle::TokenDecoder::new(Arc::clone(&self.tokenizer))
+    }
+
+    /// Durably flush the substrate redo log — the group-commit point.
+    /// Call after a turn completes so an in-flight turn survives a crash.
+    pub fn commit_persistence(&self) -> crate::Result<()> {
+        Ok(self.conversation.commit_persistence()?)
+    }
+
+    /// Flush, optionally compact, and checkpoint the substrate redo log —
+    /// the fast-recovery snapshot. Call on the daemon's checkpoint cadence
+    /// and as part of graceful shutdown.
+    pub fn checkpoint_persistence(&self) -> crate::Result<()> {
+        Ok(self.conversation.checkpoint_persistence()?)
     }
 
     /// Shut down the scheduler, releasing all GPU resources.

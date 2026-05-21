@@ -1,15 +1,19 @@
 //! [`Conversation`] — the workspace-shared substrate handle, and
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
-use candle_nn::kv_cache::SealedSequence;
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex};
 use super::schema::{DepthWeights, ScoreFormula};
+use crate::persistence::resume::ChunkImage as ResumeChunkImage;
+use crate::persistence::streams::{PerDepthScores, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::SubstratePersistence;
 use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
 use crate::substrate_cache::SubstrateCache;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
+use candle_nn::kv_cache::SealedSequence;
 
 // ── Conversation ──────────────────────────────────────────────────────────────
 
@@ -35,31 +39,54 @@ use crate::turn::Role;
 pub struct Conversation {
     inner: Arc<RwLock<Substrate>>,
     allocator: Arc<TimelineAllocator>,
+    /// The mandatory persistence layer — every turn is recorded into its
+    /// redo log (`docs/kv_tier_migration.md` §13.6).
+    persistence: Arc<Mutex<SubstratePersistence>>,
 }
 
 impl Default for Conversation {
+    /// An ephemeral conversation — see [`Conversation::ephemeral`].
     fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Substrate::new())),
-            allocator: Arc::new(TimelineAllocator::new()),
-        }
+        Self::ephemeral()
     }
 }
 
 impl Conversation {
-    /// Create a fresh empty in-memory substrate.
+    /// Create a fresh ephemeral conversation (throwaway temp-dir log).
     pub fn new() -> Self {
-        Self::default()
+        Self::ephemeral()
     }
 
-    /// Create a conversation backed by a shared [`SubstrateCache`].
+    /// An ephemeral conversation: its persistence layer is backed by a
+    /// throwaway log in a unique temp directory. Used by tests and by
+    /// transient helper conversations (e.g. summarisation).
+    pub fn ephemeral() -> Self {
+        static EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("zend_ephemeral_{nanos}_{seq}"));
+        let persistence =
+            SubstratePersistence::open_in(&dir).expect("ephemeral SubstratePersistence");
+        Self {
+            inner: Arc::new(RwLock::new(Substrate::new())),
+            allocator: Arc::new(TimelineAllocator::new()),
+            persistence: Arc::new(Mutex::new(persistence)),
+        }
+    }
+
+    /// Create a conversation backed by a shared [`SubstrateCache`] and a
+    /// real [`SubstratePersistence`].
     ///
     /// Pass a clone of the engine-level cache so VRAM accounting and the
     /// eviction budget are shared across all sessions.
-    pub fn with_cache(cache: SubstrateCache) -> Self {
+    pub fn with_cache(cache: SubstrateCache, persistence: SubstratePersistence) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Substrate::with_cache(cache))),
             allocator: Arc::new(TimelineAllocator::new()),
+            persistence: Arc::new(Mutex::new(persistence)),
         }
     }
 
@@ -73,6 +100,16 @@ impl Conversation {
     /// Look up `(layer, group)` for a previously-minted timeline.
     pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
         self.inner.read().unwrap().timeline_target(timeline)
+    }
+
+    /// Register a specific [`TimelineId`] against `(layer, group)` —
+    /// idempotent. Used by the resume path to bind a conversation to a
+    /// timeline recovered from the redo log instead of minting a fresh one.
+    pub fn register_timeline(&self, timeline: TimelineId, layer: LayerId, group: GroupId) {
+        self.inner
+            .write()
+            .unwrap()
+            .register_timeline(timeline, layer, group);
     }
 
     /// Acquire a read guard.  The returned guard implements [`ContentResolver`]
@@ -115,18 +152,152 @@ impl Conversation {
         sealed_gpu: Arc<Vec<SealedSequence>>,
         migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
     ) -> candle::Result<TurnIndex> {
-        let mut view = self.inner.write().unwrap();
-        view.append_full(
-            timeline,
-            role,
-            text,
-            token_ids,
-            token_count,
+        let idx = {
+            let mut view = self.inner.write().unwrap();
+            view.append_full(
+                timeline,
+                role,
+                text,
+                token_ids,
+                token_count,
+                block_start,
+                block_end,
+                sealed_gpu,
+                migrate_to_cpu,
+            )?
+        };
+        // Record the turn's structure into the redo log.
+        let (layer_id, group_id) = self
+            .timeline_target(timeline)
+            .map(|(l, g)| (l.raw(), g.raw()))
+            .unwrap_or((0, 0));
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: timeline.raw(),
+            turn_index: idx.0,
+            turn_id_day: 0,
+            turn_id_seq: idx.0 + 1,
+            role: match role {
+                Role::System => 0,
+                Role::User => 1,
+                Role::Assistant => 2,
+            },
             block_start,
             block_end,
-            sealed_gpu,
-            migrate_to_cpu,
-        )
+            layer_id,
+            group_id,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            scores: PerDepthScores::default(),
+        });
+        self.persistence
+            .lock()
+            .unwrap()
+            .declare_stream(&decl)
+            .map_err(|e| candle::Error::Msg(format!("persist turn: {e}")))?;
+        Ok(idx)
+    }
+
+    /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
+    /// §5.6 / §16.12 substrate-reload path run on daemon restart.
+    ///
+    /// Every persisted turn stream is recovered in `(timeline, turn_index)`
+    /// order; `load_layers` cold-loads each turn's per-layer chunk grid back
+    /// into VRAM as `Vec<SealedSequence>` (the caller supplies this since it
+    /// owns the per-layer KV backings). The turn's timeline is re-registered
+    /// and the turn appended to the substrate. Returns the number of turns
+    /// restored.
+    pub fn reconstruct_from_log(
+        &self,
+        n_layers: usize,
+        load_layers: impl Fn(&[Vec<ResumeChunkImage>]) -> candle::Result<Vec<SealedSequence>>,
+    ) -> candle::Result<usize> {
+        let decls = {
+            let p = self.persistence.lock().unwrap();
+            crate::persistence::resume::recovered_turn_decls(&p)
+        };
+        let mut restored = 0usize;
+        for decl in decls {
+            let recovered = {
+                let mut p = self.persistence.lock().unwrap();
+                crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
+                    .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?
+            };
+            let sealed = load_layers(&recovered.layers)?;
+            let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
+                candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
+            })?;
+            let role = match decl.role {
+                0 => Role::System,
+                1 => Role::User,
+                _ => Role::Assistant,
+            };
+            let token_count: usize = recovered
+                .layers
+                .first()
+                .map(|l| l.iter().map(|c| c.token_count as usize).sum())
+                .unwrap_or(0);
+            let mut view = self.write();
+            if let (Some(layer), Some(group)) = (
+                LayerId::from_raw(decl.layer_id),
+                GroupId::from_raw(decl.group_id),
+            ) {
+                view.register_timeline(timeline, layer, group);
+            }
+            view.restore_turn(
+                timeline,
+                role,
+                String::new(),
+                TokenBuffer::from(recovered.token_ids),
+                token_count,
+                decl.block_start,
+                decl.block_end,
+                std::sync::Arc::new(sealed),
+            );
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
+    /// Persist a sealed turn's per-layer KV grid + token ids to the redo log
+    /// — the seal-time half of the resume path (§16.12). `layers[layer]` is
+    /// that layer's ordered [`ChunkImage`] list; all layers share one
+    /// chunk count.
+    pub fn persist_turn_kv(
+        &self,
+        stream_id: StreamId,
+        layers: &[Vec<ResumeChunkImage>],
+        token_ids: &[u32],
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        crate::persistence::resume::persist_turn_kv(&mut p, stream_id, layers, token_ids)
+            .map_err(|e| candle::Error::Msg(format!("persist turn kv: {e}")))
+    }
+
+    /// Durably flush the persistence redo log — the group-commit point.
+    /// `fsync`s every staged record so an in-flight turn survives a crash.
+    pub fn commit_persistence(&self) -> candle::Result<()> {
+        self.persistence
+            .lock()
+            .unwrap()
+            .commit()
+            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))
+    }
+
+    /// Flush and write a `Checkpoint` over the substrate manifest — the
+    /// fast-recovery snapshot. Compacts the log first when it has accrued
+    /// enough dead weight (§5.8).
+    pub fn checkpoint_persistence(&self) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.commit()
+            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
+        if p.should_compact()
+            .map_err(|e| candle::Error::Msg(format!("persist compaction check: {e}")))?
+        {
+            p.compact()
+                .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
+        }
+        p.checkpoint()
+            .map_err(|e| candle::Error::Msg(format!("persist checkpoint: {e}")))
     }
 }
 

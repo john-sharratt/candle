@@ -164,7 +164,9 @@ impl HeadGids {
                     seen[seen_len] = ai;
                     seen_len += 1;
                 }
-                total += arena_infos.get(ai).map_or(0, |i| i.chunk_byte_stride as u64);
+                total += arena_infos
+                    .get(ai)
+                    .map_or(0, |i| i.chunk_byte_stride as u64);
             }
         }
         total
@@ -258,16 +260,21 @@ mod tests {
         let gid_a = ChunkGid::detached(1);
         let gid_b = ChunkGid::detached(2);
         let gids = HeadGids::from_vec(vec![
-            gid_a.clone(), gid_b.clone(),
-            gid_a.clone(), gid_b.clone(),
-            gid_a.clone(), gid_b.clone(),
+            gid_a.clone(),
+            gid_b.clone(),
+            gid_a.clone(),
+            gid_b.clone(),
+            gid_a.clone(),
+            gid_b.clone(),
         ]);
 
         let mut call_count = 0usize;
-        let result = gids.map_unique(|gid| {
-            call_count += 1;
-            Ok(ChunkGid::detached(gid.raw() + 100))
-        }).unwrap();
+        let result = gids
+            .map_unique(|gid| {
+                call_count += 1;
+                Ok(ChunkGid::detached(gid.raw() + 100))
+            })
+            .unwrap();
 
         assert_eq!(call_count, 2, "f must be called once per unique raw id");
         let out_raws: Vec<i64> = result.iter().map(|g| g.raw()).collect();
@@ -277,16 +284,15 @@ mod tests {
     /// Sentinel GIDs (raw < 0) pass through without calling `f`.
     #[test]
     fn map_unique_passes_through_sentinels() {
-        let gids = HeadGids::from_vec(vec![
-            ChunkGid::detached(-1),
-            ChunkGid::detached(-1),
-        ]);
+        let gids = HeadGids::from_vec(vec![ChunkGid::detached(-1), ChunkGid::detached(-1)]);
 
         let mut call_count = 0usize;
-        let result = gids.map_unique(|_| {
-            call_count += 1;
-            Ok(ChunkGid::detached(99))
-        }).unwrap();
+        let result = gids
+            .map_unique(|_| {
+                call_count += 1;
+                Ok(ChunkGid::detached(99))
+            })
+            .unwrap();
 
         assert_eq!(call_count, 0, "f must not be called for sentinel GIDs");
         assert!(result.iter().all(|g| g.raw() == -1));
@@ -300,11 +306,16 @@ mod tests {
         let v = ChunkGid::detached(20);
         let gids = HeadGids::from_kv(k, v, 4); // N_PALETTE=4, 4 heads → 32 slots, 2 unique
 
-        let result = gids.map_unique(|gid| Ok(ChunkGid::detached(gid.raw() + 1000))).unwrap();
+        let result = gids
+            .map_unique(|gid| Ok(ChunkGid::detached(gid.raw() + 1000)))
+            .unwrap();
 
-        let unique_out: std::collections::HashSet<i64> =
-            result.iter().map(|g| g.raw()).collect();
-        assert_eq!(unique_out.len(), 2, "2 unique source ids → 2 unique output ids");
+        let unique_out: std::collections::HashSet<i64> = result.iter().map(|g| g.raw()).collect();
+        assert_eq!(
+            unique_out.len(),
+            2,
+            "2 unique source ids → 2 unique output ids"
+        );
         assert!(unique_out.contains(&1010));
         assert!(unique_out.contains(&1020));
     }

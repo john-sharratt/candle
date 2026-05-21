@@ -1,4 +1,4 @@
-﻿//! Tests for chunk operations: migrate, copy, convert, prepare, reconcile.
+//! Tests for chunk operations: migrate, copy, convert, prepare, reconcile.
 
 use candle::{DType, Device, Tensor};
 
@@ -10,15 +10,19 @@ use crate::kv_cache::KvFormat;
 fn k_gid_snapshot(backing: &ChunkedKvBacking) -> Vec<Vec<i64>> {
     let state = backing.state.read().expect("lock");
     let mb = state.max_blocks;
-    state.sequences.iter().map(|slot| {
-        let mut row = vec![-1i64; mb];
-        if let Some(s) = slot {
-            for (i, cw) in s.chunks_slice().iter().enumerate() {
-                row[i] = cw.gids.k_gid(0).raw();
+    state
+        .sequences
+        .iter()
+        .map(|slot| {
+            let mut row = vec![-1i64; mb];
+            if let Some(s) = slot {
+                for (i, cw) in s.chunks_slice().iter().enumerate() {
+                    row[i] = cw.gids.k_gid(0).raw();
+                }
             }
-        }
-        row
-    }).collect()
+            row
+        })
+        .collect()
 }
 
 #[cfg(test)]

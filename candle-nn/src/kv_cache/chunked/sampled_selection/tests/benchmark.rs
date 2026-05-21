@@ -1,14 +1,12 @@
-use super::*;
 use super::test_data::load_cpu_arena;
 #[cfg(feature = "cuda")]
 use super::test_data::load_gpu_arena;
-use crate::kv_cache::chunked::sampled_selection::{
-    KvSamplerInputs, PagedSelectionCpuInputs,
-};
+use super::*;
 #[cfg(feature = "cuda")]
 use crate::kv_cache::chunked::sampled_selection::{
     sample_quantization_sweep_kv_paged, PagedSelectionGpuInputs,
 };
+use crate::kv_cache::chunked::sampled_selection::{KvSamplerInputs, PagedSelectionCpuInputs};
 use std::time::Instant;
 
 // ─── inner loops ─────────────────────────────────────────────────────────────
@@ -25,7 +23,10 @@ fn run_cpu_benchmark(
     let all_slots: Vec<usize> = (0..n_chunks).collect();
     for batch_slots in all_slots.chunks(batch_chunk_count) {
         let batch_start = Instant::now();
-        let cpu_inputs = PagedSelectionCpuInputs { backing, batch_slots };
+        let cpu_inputs = PagedSelectionCpuInputs {
+            backing,
+            batch_slots,
+        };
         let (k_results, v_results) = sampler
             .run_sweep(
                 &KvSamplerInputs::Cpu(cpu_inputs),
@@ -99,7 +100,10 @@ fn cpu_arena_benchmark_full_run() {
     );
 
     benchmark_result.record_duration("benchmark.total", workflow_start.elapsed(), 1);
-    println!("{}", benchmark_result.report("CPU Arena Sampled-Selection Profile"));
+    println!(
+        "{}",
+        benchmark_result.report("CPU Arena Sampled-Selection Profile")
+    );
 }
 
 // ─── GPU benchmark ───────────────────────────────────────────────────────────
@@ -123,7 +127,8 @@ fn gpu_kernel_benchmark_full_run_impl() {
         None => return,
     };
 
-    let paged_inputs_all = data.paged_inputs_all
+    let paged_inputs_all = data
+        .paged_inputs_all
         .as_ref()
         .expect("GPU arena must have paged_inputs_all");
     run_gpu_benchmark(
@@ -137,6 +142,8 @@ fn gpu_kernel_benchmark_full_run_impl() {
     );
 
     benchmark_result.record_duration("benchmark.total", workflow_start.elapsed(), 1);
-    println!("{}", benchmark_result.report("GPU Sampled-Selection Full Workflow Profile"));
+    println!(
+        "{}",
+        benchmark_result.report("GPU Sampled-Selection Full Workflow Profile")
+    );
 }
-

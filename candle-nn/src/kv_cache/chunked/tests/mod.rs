@@ -10,14 +10,14 @@
 //! - `sequence_ops_tests` - Tests for alloc/free/share/fork operations
 //! - `chunk_ops_tests` - Tests for migrate, copy, convert, prepare, reconcile
 
-mod types_tests;
+mod alloc_tests;
 mod arena_tests;
 mod backing_tests;
-mod alloc_tests;
-mod io_tests;
-mod sequence_ops_tests;
 mod chunk_ops_tests;
 pub mod dump_reader;
-mod kv_stats_tests;
-mod gpu_chunks_tests;
 mod gather_r16_tests;
+mod gpu_chunks_tests;
+mod io_tests;
+mod kv_stats_tests;
+mod sequence_ops_tests;
+mod types_tests;

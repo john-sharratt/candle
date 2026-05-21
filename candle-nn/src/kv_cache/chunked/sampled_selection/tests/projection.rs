@@ -5139,29 +5139,28 @@ fn test_candidate_list_compression_curve() {
 
         let palette4_start = Instant::now();
         #[cfg(feature = "cuda")]
-        let (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts) = if let Some(gpu_agg) =
-            gpu_quality_agg.as_ref()
-        {
-            let k_p4_fmts: Vec<BlockFormat> = gpu_agg
-                .k_palette4_formats
-                .iter()
-                .copied()
-                .map(block_format_from_sample)
-                .collect();
-            let v_p4_fmts: Vec<BlockFormat> = gpu_agg
-                .v_palette4_formats
-                .iter()
-                .copied()
-                .map(block_format_from_sample)
-                .collect();
-            let k_pal4_bpe = palette4_effective_bpe(&k_p4_fmts, blocks_per_head);
-            let v_pal4_bpe = palette4_effective_bpe(&v_p4_fmts, blocks_per_head);
-            (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
-        } else {
-            let (k_pal4_bpe, k_p4_fmts) = cpu_palette4_reduce(&k_fmts, blocks_per_head);
-            let (v_pal4_bpe, v_p4_fmts) = cpu_palette4_reduce(&v_fmts, blocks_per_head);
-            (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
-        };
+        let (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts) =
+            if let Some(gpu_agg) = gpu_quality_agg.as_ref() {
+                let k_p4_fmts: Vec<BlockFormat> = gpu_agg
+                    .k_palette4_formats
+                    .iter()
+                    .copied()
+                    .map(block_format_from_sample)
+                    .collect();
+                let v_p4_fmts: Vec<BlockFormat> = gpu_agg
+                    .v_palette4_formats
+                    .iter()
+                    .copied()
+                    .map(block_format_from_sample)
+                    .collect();
+                let k_pal4_bpe = palette4_effective_bpe(&k_p4_fmts, blocks_per_head);
+                let v_pal4_bpe = palette4_effective_bpe(&v_p4_fmts, blocks_per_head);
+                (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
+            } else {
+                let (k_pal4_bpe, k_p4_fmts) = cpu_palette4_reduce(&k_fmts, blocks_per_head);
+                let (v_pal4_bpe, v_p4_fmts) = cpu_palette4_reduce(&v_fmts, blocks_per_head);
+                (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts)
+            };
 
         #[cfg(not(feature = "cuda"))]
         let (k_pal4_bpe, v_pal4_bpe, k_p4_fmts, v_p4_fmts) = {
@@ -5216,8 +5215,12 @@ fn test_candidate_list_compression_curve() {
                 cpu_palette4_reduce(&ll_v_fmts, llama_blocks_per_head);
             let mut kd = [0usize; 23];
             let mut vd = [0usize; 23];
-            for fmt in &k_ll_p4_fmts { kd[fmt.table_index()] += 1; }
-            for fmt in &v_ll_p4_fmts { vd[fmt.table_index()] += 1; }
+            for fmt in &k_ll_p4_fmts {
+                kd[fmt.table_index()] += 1;
+            }
+            for fmt in &v_ll_p4_fmts {
+                vd[fmt.table_index()] += 1;
+            }
             ll_k_pal4_dist = Some(kd);
             ll_v_pal4_dist = Some(vd);
             ll_k_total_pal4_blocks = k_ll_p4_fmts.len();
@@ -5487,7 +5490,9 @@ fn test_candidate_list_compression_curve() {
                 fmt_db(levels[i].k_snr_lo),
                 cr,
             );
-            if let (Some(dist), total) = (&levels[i].k_pal4_dist_ll, levels[i].k_total_pal4_blocks_ll) {
+            if let (Some(dist), total) =
+                (&levels[i].k_pal4_dist_ll, levels[i].k_total_pal4_blocks_ll)
+            {
                 for fmt in &k_grid_formats {
                     line.push_str(&format!(" {}", fmt_pct(dist, total, *fmt)));
                 }
@@ -5525,7 +5530,9 @@ fn test_candidate_list_compression_curve() {
                 fmt_db(levels[i].v_snr_lo),
                 cr,
             );
-            if let (Some(dist), total) = (&levels[i].v_pal4_dist_ll, levels[i].v_total_pal4_blocks_ll) {
+            if let (Some(dist), total) =
+                (&levels[i].v_pal4_dist_ll, levels[i].v_total_pal4_blocks_ll)
+            {
                 for fmt in &v_grid_formats {
                     line.push_str(&format!(" {}", fmt_pct(dist, total, *fmt)));
                 }
