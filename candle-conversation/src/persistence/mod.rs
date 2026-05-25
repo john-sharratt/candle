@@ -339,6 +339,32 @@ impl SubstratePersistence {
         Ok(None)
     }
 
+    /// Read a stream's latest `Signatures` record payload — from the active
+    /// log, else any inherited log. `None` if the stream has no `Signatures`.
+    pub fn read_signatures(&mut self, stream_id: StreamId) -> Result<Option<Vec<u8>>> {
+        if let Some(loc) = self
+            .manifest
+            .streams
+            .get(&stream_id)
+            .and_then(|s| s.signatures)
+        {
+            let record = read_record_at(&mut self.log, loc.offset)?;
+            return Ok(Some(record.payload));
+        }
+        for inherited in &self.inherited {
+            if let Some(loc) = inherited
+                .manifest()
+                .streams
+                .get(&stream_id)
+                .and_then(|s| s.signatures)
+            {
+                let record = inherited.read_record(loc.offset)?;
+                return Ok(Some(record.payload));
+            }
+        }
+        Ok(None)
+    }
+
     /// Flush and `fsync` the active log — the group-commit durability point.
     pub fn commit(&mut self) -> Result<()> {
         self.log.commit()

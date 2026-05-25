@@ -2125,19 +2125,58 @@ impl Scheduler {
                     )
                     .map_err(ConversationError::Model)?;
                 if !new_sig_entries.is_empty() {
-                    let mut view = conversation.write();
-                    view.set_sig_entries(target.timeline, idx, new_sig_entries.clone());
+                    {
+                        let mut view = conversation.write();
+                        view.set_sig_entries(target.timeline, idx, new_sig_entries.clone());
+                    }
+                    // Persist the BDP provenance signatures to the redo log
+                    // so attentional retrieval survives a restart. SigEntry
+                    // only references the (ephemeral) provenance file, so
+                    // read each entry's bytes and embed them in a
+                    // `Signatures` record.
+                    let stream_id =
+                        crate::persistence::content_hash::turn_stream_id(target.timeline.raw(), idx.0);
+                    let mut sig_bytes = Vec::with_capacity(new_sig_entries.len());
+                    for e in &new_sig_entries {
+                        match self.provenance.read_entry(*e) {
+                            Ok((syn, sem, prag)) => {
+                                let mut bytes = Vec::with_capacity(e.byte_len());
+                                for s in syn.iter().chain(sem.iter()).chain(prag.iter()) {
+                                    bytes.extend_from_slice(s.as_bytes());
+                                }
+                                sig_bytes.push((e.token_count, bytes));
+                            }
+                            Err(err) => {
+                                tracing::warn!("read provenance entry for persistence: {err}")
+                            }
+                        }
+                    }
+                    let payload = crate::persistence::resume::encode_signatures(&sig_bytes);
+                    if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
+                        tracing::warn!("persist signatures failed: {e}");
+                    }
                 }
-                // Persist the turn's per-layer KV grid to the redo log so it
-                // can be cold-loaded on a daemon restart (§16.12).
+                // Persist the turn's per-layer KV grid + tokens to the redo
+                // log so it can be cold-loaded on a daemon restart (§16.12).
+                // Slice 6 split: `persist_turn_chunks` writes the heavy
+                // `Chunks` records, `persist_turn_tokens` writes the
+                // structural `Tokens` + `Commit`. Both run synchronously
+                // here — slice 7 will move `persist_turn_chunks` onto the
+                // bg-quantizer's FIFO queue once the migration timing
+                // ordering is in place.
                 #[cfg(feature = "cuda")]
                 {
                     use crate::persistence::content_hash::turn_stream_id;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    if let Err(e) =
-                        conversation.persist_turn_kv(stream_id, &persist_layers, &persist_token_ids)
-                    {
-                        tracing::warn!("persist turn kv failed: {e}");
+                    if let Err(e) = conversation.persist_turn_chunks(stream_id, &persist_layers) {
+                        tracing::warn!("persist turn chunks failed: {e}");
+                    }
+                    if let Err(e) = conversation.persist_turn_tokens(
+                        stream_id,
+                        &persist_token_ids,
+                        &persist_layers,
+                    ) {
+                        tracing::warn!("persist turn tokens failed: {e}");
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -2207,6 +2246,7 @@ impl Scheduler {
     pub fn reconstruct_substrate(&self, conversation: &Conversation) {
         use crate::persistence::resume::ChunkImage;
         use crate::persistence::transfer::load_stream;
+        use crate::provenance::{SigEntry, TokenSignature};
 
         let n_layers = self.session.backings().len();
         if n_layers == 0 {
@@ -2225,7 +2265,40 @@ impl Scheduler {
             }
             Ok(out)
         };
-        match conversation.reconstruct_from_log(n_layers, load) {
+        // Re-append each persisted chunk's signatures into the fresh
+        // provenance file; `(token_count, syn‖sem‖prag bytes)` → a
+        // SigEntry at the new offset, so attentional retrieval works
+        // after the reload.
+        let restore_sigs = |sigs: &[(u16, Vec<u8>)]| -> candle::Result<Vec<SigEntry>> {
+            let n_bytes = TokenSignature::BYTE_LEN;
+            let mut out = Vec::with_capacity(sigs.len());
+            for (token_count, bytes) in sigs {
+                let tc = *token_count as usize;
+                let want = tc * n_bytes * 3;
+                if bytes.len() != want {
+                    candle::bail!(
+                        "restore_sigs: chunk has {} sig bytes, expected {want}",
+                        bytes.len()
+                    );
+                }
+                let depth = |d: usize| -> Vec<TokenSignature> {
+                    bytes[d * tc * n_bytes..(d + 1) * tc * n_bytes]
+                        .chunks_exact(n_bytes)
+                        .map(|c| {
+                            let arr: [u8; TokenSignature::BYTE_LEN] = c.try_into().unwrap();
+                            TokenSignature::from_bytes(&arr)
+                        })
+                        .collect()
+                };
+                out.push(
+                    self.provenance
+                        .append(&depth(0), &depth(1), &depth(2))
+                        .map_err(|e| candle::Error::Msg(format!("restore sig: {e}")))?,
+                );
+            }
+            Ok(out)
+        };
+        match conversation.reconstruct_from_log(n_layers, load, restore_sigs) {
             Ok(0) => {}
             Ok(n) => tracing::info!("substrate reload: {n} turns restored from redo log"),
             Err(e) => tracing::error!("substrate reload failed: {e}"),

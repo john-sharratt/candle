@@ -38,13 +38,20 @@ pub struct ChunkImage {
 }
 
 /// A turn fully recovered from the redo log — its declaration, token ids,
-/// and the per-layer sealed-chunk grid (`layers[layer][chunk]`).
+/// the per-layer sealed-chunk grid (`layers[layer][chunk]`), and the
+/// per-chunk BDP provenance signatures.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveredTurn {
     pub decl: TurnDecl,
     pub token_ids: Vec<u32>,
     /// `layers[layer]` is that layer's ordered chunk list (length `C`).
+    /// Empty when the turn's `Chunks` records never landed (crash between
+    /// the sync structural commit and the async chunk persist) — the
+    /// substrate reload path treats an empty grid as a turn skeleton.
     pub layers: Vec<Vec<ChunkImage>>,
+    /// Per-chunk BDP provenance signatures `(token_count, syn‖sem‖prag bytes)`,
+    /// in chunk order — empty if the turn has no `Signatures` record.
+    pub signatures: Vec<(u16, Vec<u8>)>,
 }
 
 /// Flat 1-D chunk index for `(layer, chunk)` under the Option A layout.
@@ -61,6 +68,52 @@ pub fn encode_token_ids(ids: &[u32]) -> Vec<u8> {
         out.extend_from_slice(&id.to_le_bytes());
     }
     out
+}
+
+/// Encode a turn's per-chunk BDP signatures as the `Signatures` record
+/// payload. Each entry is `(token_count, raw bytes)` — the bytes are the
+/// concatenated syn/sem/prag `TokenSignature`s read from the provenance
+/// file (`token_count * 48` bytes). Inverse of [`decode_signatures`].
+pub fn encode_signatures(entries: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (token_count, bytes) in entries {
+        out.extend_from_slice(&token_count.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+/// Decode a `Signatures` record payload into `(token_count, raw bytes)`
+/// entries — one per sealed chunk, in chunk order.
+pub fn decode_signatures(payload: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
+    let mut pos = 0usize;
+    let take = |p: &mut usize, n: usize| -> Result<&[u8]> {
+        if *p + n > payload.len() {
+            return Err(PersistenceError::Truncated {
+                need: n,
+                have: payload.len().saturating_sub(*p),
+            });
+        }
+        let s = &payload[*p..*p + n];
+        *p += n;
+        Ok(s)
+    };
+    let n_entries = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(n_entries);
+    for _ in 0..n_entries {
+        let token_count = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap());
+        let n_bytes = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+        out.push((token_count, take(&mut pos, n_bytes)?.to_vec()));
+    }
+    if pos != payload.len() {
+        return Err(PersistenceError::Corrupt(format!(
+            "Signatures payload has {} trailing bytes",
+            payload.len() - pos
+        )));
+    }
+    Ok(out)
 }
 
 /// Decode a `Tokens` record payload back into token ids.
@@ -83,11 +136,30 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>> {
 ///
 /// `layers` is `layers[layer][chunk]`; every layer must have the same chunk
 /// count (`C`) — the architecture seals all layers in lockstep.
+///
+/// Composes [`persist_turn_chunks`] + [`persist_turn_tokens`]. Callers
+/// driving the async seal/persist chain (heavy `Chunks` writes deferred to
+/// a bg-quantizer callback) use the two functions directly so the sync
+/// path can write only the substrate-critical structural records.
 pub fn persist_turn_kv(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
     layers: &[Vec<ChunkImage>],
     token_ids: &[u32],
+) -> Result<()> {
+    persist_turn_chunks(p, stream_id, layers)?;
+    persist_turn_tokens(p, stream_id, token_ids, layers)?;
+    Ok(())
+}
+
+/// Persist only a turn's `Chunks` records — the post-quantization half of
+/// the seal/persist chain (§16.12). Always callable synchronously; the
+/// async path simply defers the call onto a bg-quantizer callback once
+/// the turn's float→quant migrations have landed.
+pub fn persist_turn_chunks(
+    p: &mut SubstratePersistence,
+    stream_id: StreamId,
+    layers: &[Vec<ChunkImage>],
 ) -> Result<()> {
     let chunks_per_layer = layers.first().map_or(0, |l| l.len());
     for (layer_idx, layer) in layers.iter().enumerate() {
@@ -110,11 +182,27 @@ pub fn persist_turn_kv(
             )?;
         }
     }
+    Ok(())
+}
+
+/// Persist a turn's `Tokens` record and the trailing `Commit`. Always
+/// called synchronously on seal — tokens are substrate-critical
+/// reconstruction data regardless of compression policy. The `layers`
+/// argument is used solely to compute the highest committed chunk index;
+/// pass an empty slice when no chunks have been persisted yet (the
+/// async path will re-commit at the true highest index when the
+/// `Chunks` records land).
+pub fn persist_turn_tokens(
+    p: &mut SubstratePersistence,
+    stream_id: StreamId,
+    token_ids: &[u32],
+    layers: &[Vec<ChunkImage>],
+) -> Result<()> {
     p.append_tokens(stream_id, &encode_token_ids(token_ids))?;
+    let chunks_per_layer = layers.first().map_or(0, |l| l.len());
     let total = layers.len() * chunks_per_layer;
-    if total > 0 {
-        p.commit_stream(stream_id, total as u64 - 1)?;
-    }
+    let through = if total > 0 { total as u64 - 1 } else { 0 };
+    p.commit_stream(stream_id, through)?;
     Ok(())
 }
 
@@ -201,10 +289,25 @@ pub fn recover_turn(
             },
         ));
     }
-    let layers = demux_layers(flat, n_layers, chunks_per_layer)?;
+    // A turn whose chunks haven't landed yet — either because the
+    // bg-quantizer persist callback hadn't fired before a crash, or
+    // because the run was configured with `compression_policy = None`
+    // — is still valid: its tokens and signatures are preserved and the
+    // layer grid is reconstructed empty. The substrate's reload path
+    // treats an empty sealed-sequence grid as a turn skeleton.
+    let layers = if flat.is_empty() {
+        vec![Vec::new(); n_layers]
+    } else {
+        demux_layers(flat, n_layers, chunks_per_layer)?
+    };
 
     let token_ids = match p.read_tokens(stream_id)? {
         Some(bytes) => decode_token_ids(&bytes)?,
+        None => Vec::new(),
+    };
+
+    let signatures = match p.read_signatures(stream_id)? {
+        Some(bytes) => decode_signatures(&bytes)?,
         None => Vec::new(),
     };
 
@@ -212,6 +315,7 @@ pub fn recover_turn(
         decl: decl.clone(),
         token_ids,
         layers,
+        signatures,
     })
 }
 

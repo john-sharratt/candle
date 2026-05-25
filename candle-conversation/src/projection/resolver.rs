@@ -9,6 +9,7 @@ use super::schema::{DepthWeights, ScoreFormula};
 use crate::persistence::resume::ChunkImage as ResumeChunkImage;
 use crate::persistence::streams::{PerDepthScores, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
+use crate::provenance::SigEntry;
 use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
 use crate::substrate_cache::SubstrateCache;
 use crate::token_buffer::TokenBuffer;
@@ -210,6 +211,7 @@ impl Conversation {
         &self,
         n_layers: usize,
         load_layers: impl Fn(&[Vec<ResumeChunkImage>]) -> candle::Result<Vec<SealedSequence>>,
+        restore_sigs: impl Fn(&[(u16, Vec<u8>)]) -> candle::Result<Vec<SigEntry>>,
     ) -> candle::Result<usize> {
         let decls = {
             let p = self.persistence.lock().unwrap();
@@ -223,6 +225,13 @@ impl Conversation {
                     .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?
             };
             let sealed = load_layers(&recovered.layers)?;
+            // Re-append the BDP signatures into the (fresh) provenance file,
+            // yielding entries that point at the rebuilt offsets.
+            let sig_entries = if recovered.signatures.is_empty() {
+                Vec::new()
+            } else {
+                restore_sigs(&recovered.signatures)?
+            };
             let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
                 candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
             })?;
@@ -243,7 +252,7 @@ impl Conversation {
             ) {
                 view.register_timeline(timeline, layer, group);
             }
-            view.restore_turn(
+            let idx = view.restore_turn(
                 timeline,
                 role,
                 String::new(),
@@ -253,6 +262,9 @@ impl Conversation {
                 decl.block_end,
                 std::sync::Arc::new(sealed),
             );
+            if !sig_entries.is_empty() {
+                view.set_sig_entries(timeline, idx, sig_entries);
+            }
             restored += 1;
         }
         Ok(restored)
@@ -271,6 +283,59 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         crate::persistence::resume::persist_turn_kv(&mut p, stream_id, layers, token_ids)
             .map_err(|e| candle::Error::Msg(format!("persist turn kv: {e}")))
+    }
+
+    /// Persist only a turn's per-layer chunk records — the heavy half of the
+    /// async seal/persist chain. Called from inside the bg-quantizer callback
+    /// once float→quant migrations have landed (slice 7); also callable
+    /// directly for sync use.
+    pub fn persist_turn_chunks(
+        &self,
+        stream_id: StreamId,
+        layers: &[Vec<ResumeChunkImage>],
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        crate::persistence::resume::persist_turn_chunks(&mut p, stream_id, layers)
+            .map_err(|e| candle::Error::Msg(format!("persist turn chunks: {e}")))
+    }
+
+    /// Persist a turn's `Tokens` record and the trailing `Commit` — always
+    /// called synchronously on seal, regardless of compression policy.
+    /// `layers` is only used to compute the highest chunk index; pass an
+    /// empty slice when no chunks were persisted (compression `None` path,
+    /// or async chains that re-commit later).
+    pub fn persist_turn_tokens(
+        &self,
+        stream_id: StreamId,
+        token_ids: &[u32],
+        layers: &[Vec<ResumeChunkImage>],
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        crate::persistence::resume::persist_turn_tokens(&mut p, stream_id, token_ids, layers)
+            .map_err(|e| candle::Error::Msg(format!("persist turn tokens: {e}")))
+    }
+
+    /// Append a stream-level `Commit` record at the given chunk index — the
+    /// post-chunks re-commit used by the async seal/persist chain to upgrade
+    /// the manifest's `committed_through` once the heavy `Chunks` records
+    /// have been written.
+    pub fn commit_stream_through(
+        &self,
+        stream_id: StreamId,
+        through_index: u64,
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.commit_stream(stream_id, through_index)
+            .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))
+    }
+
+    /// Persist a turn's BDP provenance signatures to the redo log — the
+    /// `Signatures` record. `sigs` is the
+    /// [`crate::persistence::resume::encode_signatures`] payload.
+    pub fn persist_signatures(&self, stream_id: StreamId, sigs: &[u8]) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.append_signatures(stream_id, sigs)
+            .map_err(|e| candle::Error::Msg(format!("persist signatures: {e}")))
     }
 
     /// Persist the projection schema/template into the substrate's
