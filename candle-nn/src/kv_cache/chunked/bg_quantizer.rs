@@ -40,9 +40,20 @@ pub(crate) struct WorkItem {
     pub migrations: Vec<ChunkMigration>,
 }
 
+/// An item on the bg-quantizer's FIFO queue.
+///
+/// A `Callback` fires inline on the bg-quantizer thread after all `Work`
+/// items enqueued *before* it have been quantized. The bg-quantizer's queue
+/// ordering is the synchronization — no separate join is needed.
+#[cfg(feature = "cuda")]
+pub(crate) enum BgItem {
+    Work(WorkItem),
+    Callback(Box<dyn FnOnce() + Send + 'static>),
+}
+
 #[cfg(feature = "cuda")]
 struct QuantizerState {
-    pending: Vec<WorkItem>,
+    pending: Vec<BgItem>,
     waiters: Vec<Waiter>,
 }
 
@@ -155,12 +166,13 @@ impl BackgroundQuantizer {
         let thread = std::thread::Builder::new()
             .name("bg-quantizer-noop".into())
             .spawn(move || loop {
-                let waiters: Vec<Waiter> = {
+                let (items, waiters): (Vec<BgItem>, Vec<Waiter>) = {
                     let mut guard = thread_shared.state.lock().unwrap();
                     loop {
                         if !guard.pending.is_empty() || !guard.waiters.is_empty() {
-                            guard.pending.clear();
-                            break guard.waiters.drain(..).collect();
+                            let items = guard.pending.drain(..).collect();
+                            let waiters = guard.waiters.drain(..).collect();
+                            break (items, waiters);
                         }
                         guard = match thread_shared.condvar.wait(guard) {
                             Ok(g) => g,
@@ -168,6 +180,14 @@ impl BackgroundQuantizer {
                         };
                     }
                 };
+                // The noop variant has no CUDA work to do, but it must still
+                // honor callbacks in FIFO order — the persist chain relies on
+                // them firing for CPU-only tests.
+                for item in items {
+                    if let BgItem::Callback(cb) = item {
+                        cb();
+                    }
+                }
                 for waiter in waiters {
                     let (lock, cvar) = &*waiter;
                     *lock.lock().unwrap() = true;
@@ -205,7 +225,7 @@ impl BackgroundQuantizer {
     /// Enqueue a pre-resolved work item for background quantization.
     pub(crate) fn enqueue_work_item(&self, item: WorkItem) {
         let mut guard = self.0.shared.state.lock().unwrap();
-        guard.pending.push(item);
+        guard.pending.push(BgItem::Work(item));
         drop(guard);
         self.0.shared.condvar.notify_one();
     }
@@ -217,9 +237,31 @@ impl BackgroundQuantizer {
             return;
         }
         let mut guard = self.0.shared.state.lock().unwrap();
-        guard.pending.extend(items);
+        guard.pending.extend(items.into_iter().map(BgItem::Work));
         drop(guard);
         self.0.shared.condvar.notify_one();
+    }
+
+    /// Enqueue a callback that fires on the bg-quantizer thread after every
+    /// work item currently in the queue (and any enqueued before this call)
+    /// has been quantized.
+    ///
+    /// FIFO ordering of the bg-quantizer's own queue is the synchronization —
+    /// the callback observes the quantized state of every work item that
+    /// preceded it. No explicit join required.
+    pub(crate) fn enqueue_callback(&self, cb: Box<dyn FnOnce() + Send + 'static>) {
+        let mut guard = self.0.shared.state.lock().unwrap();
+        guard.pending.push(BgItem::Callback(cb));
+        drop(guard);
+        self.0.shared.condvar.notify_one();
+    }
+
+    /// Whether this quantizer is wired with an adaptive compression policy.
+    /// `false` for the CPU/noop variant and for backings constructed without
+    /// a policy — the seal/persist chain uses this to decide whether to
+    /// defer `Chunks` records onto the callback queue (§16.12).
+    pub fn has_compression_policy(&self) -> bool {
+        self.0.compression.is_some()
     }
 
     fn run_loop(
@@ -248,7 +290,7 @@ impl BackgroundQuantizer {
         };
 
         loop {
-            let (items, waiters): (Vec<WorkItem>, Vec<Waiter>) = {
+            let (items, waiters): (Vec<BgItem>, Vec<Waiter>) = {
                 let mut guard = shared.state.lock().unwrap();
                 loop {
                     if !guard.pending.is_empty() || !guard.waiters.is_empty() {
@@ -263,8 +305,6 @@ impl BackgroundQuantizer {
                 }
             };
 
-            let generation = stager.begin_generation();
-
             let arc_backing = match backing_weak.upgrade() {
                 Some(b) => b,
                 None => {
@@ -273,16 +313,25 @@ impl BackgroundQuantizer {
                 }
             };
 
-            let migrations = items
-                .into_iter()
-                .flat_map(|item| item.migrations.into_iter())
-                .collect::<Vec<_>>();
-            if !migrations.is_empty() {
-                let n = migrations.len();
+            // Split into runs separated by callbacks: each run's work is
+            // quantized as a single batch, then the trailing callback fires
+            // on this thread before the next run begins. A trailing tail
+            // of work items with no callback is flushed at the end. This
+            // is the synchronization point the persist chain relies on:
+            // a callback observes the post-quant slot state of every
+            // work item enqueued before it.
+            let mut pending_migrations: Vec<ChunkMigration> = Vec::new();
+            let flush_migrations = |migrations: &mut Vec<ChunkMigration>| {
+                if migrations.is_empty() {
+                    return;
+                }
+                let generation = stager.begin_generation();
+                let drained: Vec<ChunkMigration> = std::mem::take(migrations);
+                let n = drained.len();
                 tracing::debug!("bg_quantizer: reconcile start n={n}");
                 let result = arc_backing.reconcile_batch_float_to_quant_v2(
                     &arc_backing,
-                    migrations,
+                    drained,
                     compression.as_ref(),
                     &generation,
                     &bg_stream,
@@ -296,9 +345,27 @@ impl BackgroundQuantizer {
                         tracing::warn!("bg_quantizer: reconcile failed n={n} err={e:?}")
                     }
                 }
+                drop(generation);
+            };
+            let mut n_work = 0usize;
+            let mut n_cb = 0usize;
+            for item in items {
+                match item {
+                    BgItem::Work(w) => {
+                        n_work += 1;
+                        pending_migrations.extend(w.migrations);
+                    }
+                    BgItem::Callback(cb) => {
+                        n_cb += 1;
+                        flush_migrations(&mut pending_migrations);
+                        tracing::debug!(
+                            "bg_quantizer: firing callback (work_so_far={n_work} cb_so_far={n_cb})"
+                        );
+                        cb();
+                    }
+                }
             }
-
-            drop(generation);
+            flush_migrations(&mut pending_migrations);
 
             // Signal all callers blocked in `join()` — always, even when no items
             // were present, so join() never deadlocks.

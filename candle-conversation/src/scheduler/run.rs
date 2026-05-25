@@ -112,6 +112,15 @@ impl Scheduler {
             }
         }
 
+        // Drain the bg-quantizer queue before the scheduler exits so any
+        // pending persist callbacks fire — without this, an in-flight
+        // turn's `Chunks` records can be lost on a clean shutdown
+        // (§16.12).
+        #[cfg(feature = "cuda")]
+        if let Some(backing) = self.session.backing(0) {
+            backing.join_bg_quantizer();
+        }
+
         tracing::info!("scheduler shut down");
     }
 }

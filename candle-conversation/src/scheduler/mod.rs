@@ -24,6 +24,8 @@ use crate::token_buffer::TokenBuffer;
 use crate::{ProvenanceFile, TurnStats};
 
 use candle::{Device, IndexOp, Tensor};
+#[cfg(feature = "cuda")]
+use candle_nn::kv_cache::ChunkedKvBacking;
 #[cfg(feature = "sig-trace")]
 use candle_nn::kv_cache::SealedChunk;
 use candle_nn::kv_cache::SealedSequence;
@@ -2109,8 +2111,6 @@ impl Scheduler {
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
-                #[cfg(feature = "cuda")]
-                let persist_layers = self.gather_turn_layers(&delta_gpu)?;
                 let idx = conversation
                     .record_turn(
                         target.timeline,
@@ -2156,27 +2156,131 @@ impl Scheduler {
                         tracing::warn!("persist signatures failed: {e}");
                     }
                 }
-                // Persist the turn's per-layer KV grid + tokens to the redo
-                // log so it can be cold-loaded on a daemon restart (§16.12).
-                // Slice 6 split: `persist_turn_chunks` writes the heavy
-                // `Chunks` records, `persist_turn_tokens` writes the
-                // structural `Tokens` + `Commit`. Both run synchronously
-                // here — slice 7 will move `persist_turn_chunks` onto the
-                // bg-quantizer's FIFO queue once the migration timing
-                // ordering is in place.
+                // Persist the turn's structural records to the redo log so it
+                // can be cold-loaded on a daemon restart (§16.12). The
+                // substrate-critical reconstruction data — `Tokens` + the
+                // trailing `Commit` — are written synchronously here.
+                //
+                // When the layer backings have an adaptive compression
+                // policy the heavy `Chunks` records are enqueued as a
+                // callback on the bg-quantizer's FIFO queue. The callback
+                // fires after every float→quant migration enqueued so far
+                // has landed, so it observes the policy-selected K/V
+                // formats rather than the pre-bg-quant uniform-float
+                // state. Once the chunks are durable, it re-commits at
+                // the true highest index — the manifest takes the last
+                // `Commit` record's index as authoritative.
                 #[cfg(feature = "cuda")]
                 {
                     use crate::persistence::content_hash::turn_stream_id;
+                    use crate::persistence::resume::ChunkImage;
+                    use crate::persistence::transfer::seal_to_chunk_images;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    if let Err(e) = conversation.persist_turn_chunks(stream_id, &persist_layers) {
-                        tracing::warn!("persist turn chunks failed: {e}");
-                    }
-                    if let Err(e) = conversation.persist_turn_tokens(
-                        stream_id,
-                        &persist_token_ids,
-                        &persist_layers,
-                    ) {
+                    let compression_active = self
+                        .session
+                        .backings()
+                        .iter()
+                        .any(|b| b.has_compression_policy());
+                    // Sync: Tokens + Commit. `layers` is empty because no
+                    // chunks have been persisted yet — the callback's own
+                    // commit (with a higher index) supersedes this one in
+                    // the manifest when the chunks land.
+                    if let Err(e) =
+                        conversation.persist_turn_tokens(stream_id, &persist_token_ids, &[])
+                    {
                         tracing::warn!("persist turn tokens failed: {e}");
+                    }
+                    if compression_active {
+                        let device = self.session.device().clone();
+                        let backings: Vec<ChunkedKvBacking> =
+                            self.session.backings().to_vec();
+                        let conversation_for_cb = conversation.clone();
+                        // Re-snapshot the slot inside the callback so we
+                        // observe the *post-quant* GIDs. The bg-quantizer's
+                        // float→quant migration rewrites the slot's chunk
+                        // GIDs in place at the same block indices (see
+                        // `set_block_gids_sharded_and_update_gpu`), so any
+                        // SealedSequence captured at seal time references
+                        // the now-stale float GIDs. By snapshotting inside
+                        // the callback — after every migration enqueued
+                        // before it has landed — `seal_to_chunk_images`
+                        // resolves the policy-selected arenas.
+                        let slot_idx = seal_slot.0;
+                        let block_from_u64 = block_from as u64;
+                        let block_to_u64 = block_to as u64;
+                        let callback = move || {
+                            tracing::debug!(
+                                "bg_quantizer: persist callback fired stream={:x} slot={slot_idx} range=[{block_from_u64},{block_to_u64})",
+                                stream_id.0
+                            );
+                            let mut layers: Vec<Vec<ChunkImage>> =
+                                Vec::with_capacity(backings.len());
+                            for (layer_idx, backing) in backings.iter().enumerate() {
+                                let full_seq = match backing.record_turn(slot_idx, 0) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "persist callback: re-snapshot layer {layer_idx} failed: {e}"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let from = block_from_u64 as usize;
+                                let to = block_to_u64 as usize;
+                                if to > full_seq.chunks.len() {
+                                    tracing::warn!(
+                                        "persist callback: slot {slot_idx} layer {layer_idx} \
+                                         no longer covers turn range [{from},{to})"
+                                    );
+                                    return;
+                                }
+                                let chunks = full_seq.chunks[from..to].to_vec();
+                                let token_count =
+                                    chunks.iter().map(|c| c.token_count as usize).sum();
+                                let turn_seq = SealedSequence {
+                                    chunks,
+                                    token_count,
+                                    chunk_size: full_seq.chunk_size,
+                                    location: full_seq.location,
+                                };
+                                match seal_to_chunk_images(backing, &device, &turn_seq) {
+                                    Ok(images) => layers.push(images),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "persist callback: gather layer {layer_idx} failed: {e}"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            if let Err(e) =
+                                conversation_for_cb.persist_turn_chunks(stream_id, &layers)
+                            {
+                                tracing::warn!("persist turn chunks failed: {e}");
+                                return;
+                            }
+                            // Re-commit at the true highest index now that
+                            // the chunks are durable. The manifest takes
+                            // the last `Commit` record's index as
+                            // authoritative — so this supersedes the sync
+                            // Commit(0) written alongside the `Tokens`
+                            // record.
+                            let chunks_per_layer = layers.first().map_or(0, |l| l.len());
+                            let total = layers.len() * chunks_per_layer;
+                            if total > 0 {
+                                if let Err(e) = conversation_for_cb
+                                    .commit_stream_through(stream_id, total as u64 - 1)
+                                {
+                                    tracing::warn!("commit stream (post-chunks) failed: {e}");
+                                }
+                            }
+                        };
+                        // The callback only needs to land on one
+                        // bg-quantizer queue — every layer's backing
+                        // shares the same worker, so layer 0 is canonical.
+                        if let Some(backing) = self.session.backing(0) {
+                            backing.enqueue_persist_callback(Box::new(callback));
+                        }
                     }
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -2207,35 +2311,6 @@ impl Scheduler {
             chunk_size,
             sig_blocks_processed: new_processed,
         }))
-    }
-
-    /// Gather a just-sealed turn's per-layer KV off the GPU into the
-    /// `ChunkImage` grid the redo log persists (§16.12 seal-time gather).
-    ///
-    /// For each layer's `SealedSequence`, `resolve_sealed_chunk_ptrs` +
-    /// `gather_chunks` copy the chunks into one opaque host blob; the blob
-    /// is split per chunk by `SealedChunk.byte_size` and paired with the
-    /// chunk's persisted metadata (offset, K/V formats, palettes, scales).
-    #[cfg(feature = "cuda")]
-    fn gather_turn_layers(
-        &self,
-        delta_gpu: &[SealedSequence],
-    ) -> Result<Vec<Vec<crate::persistence::resume::ChunkImage>>, ConversationError> {
-        use crate::persistence::transfer::seal_to_chunk_images;
-
-        let device = self.session.device().clone();
-        let mut layers = Vec::with_capacity(delta_gpu.len());
-        for (layer_idx, seq) in delta_gpu.iter().enumerate() {
-            let backing = self.session.backing(layer_idx).ok_or_else(|| {
-                ConversationError::Channel(format!(
-                    "gather_turn_layers: no KV backing for layer {layer_idx}"
-                ))
-            })?;
-            let chunks =
-                seal_to_chunk_images(backing, &device, seq).map_err(ConversationError::Model)?;
-            layers.push(chunks);
-        }
-        Ok(layers)
     }
 
     /// Rebuild the workspace substrate from the persistence redo log on

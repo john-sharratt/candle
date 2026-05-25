@@ -769,6 +769,34 @@ impl ChunkedKvBacking {
         self.inner.pinned_stager.clone()
     }
 
+    /// Enqueue a callback to fire on the bg-quantizer thread after every
+    /// work item already in its queue has been quantized.
+    ///
+    /// The bg-quantizer queue is FIFO: a callback enqueued after a turn's
+    /// quantization work items observes the fully-quantized state of those
+    /// chunks. This is the synchronization point for the seal→persist chain
+    /// (§16.12 of `docs/kv_tier_migration.md`) — no explicit join required.
+    #[cfg(feature = "cuda")]
+    pub fn enqueue_persist_callback(&self, cb: Box<dyn FnOnce() + Send + 'static>) {
+        self.bg_quantizer.enqueue_callback(cb);
+    }
+
+    /// Whether this backing's bg-quantizer was constructed with an adaptive
+    /// compression policy. Scheduler uses this to gate whether to persist
+    /// per-chunk `Chunks` records at all (§16.12).
+    #[cfg(feature = "cuda")]
+    pub fn has_compression_policy(&self) -> bool {
+        self.bg_quantizer.has_compression_policy()
+    }
+
+    /// Block the calling thread until every bg-quantizer work item and
+    /// callback enqueued so far has finished. Used on graceful shutdown so
+    /// pending persist callbacks land before the daemon exits.
+    #[cfg(feature = "cuda")]
+    pub fn join_bg_quantizer(&self) {
+        self.bg_quantizer.join();
+    }
+
     /// Returns true if this backing has enough reclaimable/tombstoned work to
     /// justify a compaction pass.
     pub fn needs_compaction(&self) -> Result<bool> {
