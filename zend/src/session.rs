@@ -82,33 +82,47 @@ impl InferenceState {
         // base conversation.  Each tool gets a section in dialogue's
         // system_prompt; the layer's section selection switches to
         // TopK so only the K most relevant survive into projection.
-        let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
-            .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
-        tracing::info!(
-            n_tools = tool_sections.len(),
-            "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
-        );
-
-        // The dialogue layer's `system_prompt.items` start with a static
-        // prelude (mode/frame/history_stance/grounding/tools_intro) →
-        // then the `tools` collection (90+ tool sections, top_k=3) →
-        // then `tools_outro`.  The pre-collection prelude is what we
-        // pass as the engine's `system_prompt` so it gets ChatML-wrapped
-        // for the dialect; everything after the first Collection is
-        // expanded by `preemptive_prefill` itself.
-        let before_text: String = pre_collection_prelude(&proj_builder);
+        //
+        // Disabled for iteration speed. Safe now because the projection
+        // YAML pairs the `tools` collection with `tools_open` /
+        // `tools_close` sections gated by `depends_on: tools`. When the
+        // catalog is empty, both `<tools>` and `</tools>` markers also
+        // skip — no empty `<tools></tools>` block, no dangling tool
+        // protocol structure. Re-enable to restore tool calling.
+        // let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
+        //     .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
+        // tracing::info!(
+        //     n_tools = tool_sections.len(),
+        //     "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
+        // );
+        let tool_sections: Vec<()> = Vec::new();
 
         let mut builder = Model::Qwen3_30B_A3B_Q4
             .builder()
-            .system_prompt(&before_text)
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace)
             .thinking(false);
+        let conv_config = builder.conversation_config();
+
+        // Install the dialect's system-block open / close bytes as
+        // synthetic structural sections on the dialogue layer. They
+        // emit unconditionally at projection time as the system block's
+        // outer envelope, regardless of which collection members or
+        // `depends_on`-gated sections materialise. See
+        // `Builder::set_system_markers` and the ingest path in
+        // `Conversation::new_with_projection`.
+        proj_builder
+            .set_system_markers(
+                dialogue_layer,
+                conv_config.dialect.system_start,
+                conv_config.dialect.system_end,
+            )
+            .map_err(|e| anyhow::anyhow!("set_system_markers: {e}"))?;
+
         let engine = builder
             .engine(&device)
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
-        let conv_config = builder.conversation_config();
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();
 

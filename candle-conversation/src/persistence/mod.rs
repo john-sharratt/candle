@@ -89,9 +89,21 @@ pub struct SubstratePersistence {
     inherited: Vec<Arc<InheritedSubstrate>>,
     model_spec: Option<Vec<u8>>,
     template: Option<Vec<u8>>,
+    /// SHA-256 of the on-disk `Tokenizer` record's bytes — kept (32 bytes)
+    /// instead of the full ~11 MB so [`SubstratePersistence::set_tokenizer`]
+    /// can decide whether to re-embed by comparing hashes.
+    tokenizer_sha256: Option<[u8; 32]>,
     /// Filesystem path of the active log — the rename target of a
     /// compaction swap (§5.8).
     active_path: PathBuf,
+}
+
+/// SHA-256 of `bytes` — the tokenizer change-detection digest.
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 /// Dead-record ratio at which [`SubstratePersistence::should_compact`] fires
@@ -141,6 +153,10 @@ impl SubstratePersistence {
             .template
             .map(|loc| read_record_at(&mut log, loc.offset).map(|r| r.payload))
             .transpose()?;
+        let tokenizer_sha256 = manifest
+            .tokenizer
+            .map(|loc| read_record_at(&mut log, loc.offset).map(|r| sha256(&r.payload)))
+            .transpose()?;
 
         Ok(SubstratePersistence {
             log,
@@ -148,6 +164,7 @@ impl SubstratePersistence {
             inherited: inherited_subs,
             model_spec,
             template,
+            tokenizer_sha256,
             active_path: active.to_path_buf(),
         })
     }
@@ -360,6 +377,20 @@ impl SubstratePersistence {
         Ok(true)
     }
 
+    /// Set the model's `tokenizer.json` bytes — last-writer-wins, like
+    /// [`SubstratePersistence::set_model_spec`]. Appends only when the bytes
+    /// differ from the latest on file, so the (large) tokenizer is written
+    /// at most once per distinct model.
+    pub fn set_tokenizer(&mut self, tokenizer: &[u8]) -> Result<bool> {
+        let hash = sha256(tokenizer);
+        if self.tokenizer_sha256 == Some(hash) {
+            return Ok(false);
+        }
+        self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, tokenizer)?;
+        self.tokenizer_sha256 = Some(hash);
+        Ok(true)
+    }
+
     /// The latest model spec payload, if any.
     pub fn model_spec(&self) -> Option<&[u8]> {
         self.model_spec.as_deref()
@@ -368,6 +399,11 @@ impl SubstratePersistence {
     /// The latest projection template payload, if any.
     pub fn template(&self) -> Option<&[u8]> {
         self.template.as_deref()
+    }
+
+    /// SHA-256 of the embedded tokenizer, if a `Tokenizer` record is present.
+    pub fn tokenizer_sha256(&self) -> Option<[u8; 32]> {
+        self.tokenizer_sha256
     }
 
     /// Resolve a content-addressed prompt section across the active log and
@@ -436,6 +472,11 @@ impl SubstratePersistence {
             .manifest
             .template
             .map(|loc| read_record_at(&mut self.log, loc.offset).map(|r| r.payload))
+            .transpose()?;
+        self.tokenizer_sha256 = self
+            .manifest
+            .tokenizer
+            .map(|loc| read_record_at(&mut self.log, loc.offset).map(|r| sha256(&r.payload)))
             .transpose()?;
         Ok(())
     }

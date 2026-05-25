@@ -25,6 +25,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
@@ -86,6 +87,9 @@ required-features = ["cuda", "hub"]
 
 [[example]]
 name = "dump_provenance_samples"
+
+[[example]]
+name = "substrate_inspect"
 
 [[test]]
 name = "projection_harness"

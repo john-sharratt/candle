@@ -711,11 +711,22 @@ impl BackingInner {
         for (block_i, pending, k_scale_arc, v_scale_arc) in completed.into_iter() {
             let k_pal = std::sync::Arc::new(k_head_palette_maps[block_i].clone());
             let v_pal = std::sync::Arc::new(v_head_palette_maps[block_i].clone());
+            let new_gids = HeadGids::from_vec(pending.new_gids);
+            if pending.layer_idx == 0 {
+                let k_ai0 = new_gids.k_gid(0).arena_idx();
+                let v_ai0 = new_gids.v_gid(0).arena_idx();
+                tracing::debug!(
+                    "bg_quantizer: set_block_gids layer={l} batch={b} blk={blk} k_arena={k_ai0} v_arena={v_ai0}",
+                    l = pending.layer_idx,
+                    b = pending.batch_idx,
+                    blk = pending.block_idx
+                );
+            }
             self.set_block_gids_sharded_and_update_gpu(
                 pending.layer_idx,
                 pending.batch_idx,
                 pending.block_idx,
-                HeadGids::from_vec(pending.new_gids),
+                new_gids,
                 k_pal,
                 v_pal,
                 k_scale_arc,

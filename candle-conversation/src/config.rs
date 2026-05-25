@@ -1125,6 +1125,18 @@ pub struct EngineConfig {
     /// process working directory (`SubstratePersistence::open`).
     pub workspace_path: Option<std::path::PathBuf>,
 
+    /// Serialized model identity (HF repo / filename / arch / context length).
+    /// Written to the substrate's `ModelSpec` record at engine startup via
+    /// compare-and-insert, so the log is a self-contained, reloadable image.
+    /// `None` skips the write.
+    pub model_spec: Option<Vec<u8>>,
+
+    /// The model's `tokenizer.json` bytes. Written to the substrate's
+    /// `Tokenizer` record at engine startup via compare-and-insert so the log
+    /// can detokenize offline without a separate tokenizer file. `None` skips
+    /// the write.
+    pub tokenizer: Option<Vec<u8>>,
+
     /// Free VRAM available for the hot-tier KV cache, measured **after** model
     /// weights and session arenas are resident.  Query with `cuMemGetInfo` (or
     /// equivalent) post-load and set this before constructing
@@ -1165,6 +1177,8 @@ impl EngineConfig {
             penalty_log_path: None,
             health: DecodeHealthConfig::default(),
             workspace_path: None,
+            model_spec: None,
+            tokenizer: None,
             hot_cache_free_vram_bytes: None,
             hot_cache_abs_reserve_bytes: 512 * 1024 * 1024, // 512 MiB
             hot_cache_rel_reserve_frac: 0.05,

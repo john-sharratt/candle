@@ -226,6 +226,11 @@ pub struct Builder {
     /// Reverse maps from YAML string names to ids. Empty when constructed
     /// via [`Builder::from_schema`].
     pub(super) name_maps: NameMaps,
+    /// The resolved YAML this builder was parsed from, retained so the
+    /// substrate can persist it as the `Template` record (the projection
+    /// schema is reconstructable via [`Builder::from_yaml`]). `None` for
+    /// programmatic [`Builder::from_schema`] construction.
+    source_yaml: Option<String>,
 }
 
 impl Builder {
@@ -290,6 +295,7 @@ impl Builder {
         Ok(Self {
             schema,
             name_maps: maps,
+            source_yaml: Some(resolved),
         })
     }
 
@@ -303,10 +309,18 @@ impl Builder {
         Ok(Self {
             schema,
             name_maps: NameMaps::default(),
+            source_yaml: None,
         })
     }
 
     // ── Schema accessors ──────────────────────────────────────────────────────
+
+    /// The resolved YAML this builder was parsed from, if any — the
+    /// projection `Template` the substrate persists. `None` for
+    /// programmatically-built schemas.
+    pub fn source_yaml(&self) -> Option<&str> {
+        self.source_yaml.as_deref()
+    }
 
     /// Direct access to the underlying [`Schema`].
     pub fn schema(&self) -> &Schema {
@@ -440,6 +454,7 @@ impl Builder {
                 name: name.clone(),
                 content,
                 priority,
+                depends_on: None,
             }));
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
@@ -544,9 +559,64 @@ impl Builder {
             name: name.clone(),
             content,
             priority,
+            depends_on: None,
         });
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
+    }
+
+    /// Install the dialect-specific structural markers — the bytes that
+    /// open and close the system block — as two synthetic sections on
+    /// `layer`. They live outside `system_prompt.items` (so they are not
+    /// subject to selection rules), get fresh [`SectionId`]s, and register
+    /// in `name_maps` under reserved names (`__system_start`,
+    /// `__system_end`).
+    ///
+    /// Called by the dialect-aware caller (e.g. zend) after the schema
+    /// has been built from YAML but before the conversation is created.
+    /// Idempotent per layer — calling twice is an error.
+    pub fn set_system_markers(
+        &mut self,
+        layer: LayerId,
+        start_content: impl Into<String>,
+        end_content: impl Into<String>,
+    ) -> Result<(SectionId, SectionId), ConstructionError> {
+        let layer_idx = self.layer_idx(layer)?;
+        if self.schema.layers[layer_idx].system_start_section.is_some()
+            || self.schema.layers[layer_idx].system_end_section.is_some()
+        {
+            return Err(ConstructionError::DuplicateSectionName(
+                "__system_start/__system_end already set on this layer".to_string(),
+            ));
+        }
+        const START_NAME: &str = "__system_start";
+        const END_NAME: &str = "__system_end";
+        self.assert_section_name_free(layer_idx, START_NAME)?;
+        self.assert_section_name_free(layer_idx, END_NAME)?;
+
+        let start_id = SectionId::new(self.next_section_id_raw());
+        let end_id = SectionId::new(self.next_section_id_raw() + 1);
+        self.schema.layers[layer_idx].system_start_section = Some(SectionSchema {
+            id: start_id,
+            name: START_NAME.to_string(),
+            content: start_content.into(),
+            priority: 100.0,
+            depends_on: None,
+        });
+        self.schema.layers[layer_idx].system_end_section = Some(SectionSchema {
+            id: end_id,
+            name: END_NAME.to_string(),
+            content: end_content.into(),
+            priority: 100.0,
+            depends_on: None,
+        });
+        self.name_maps
+            .section_names
+            .insert((layer, START_NAME.to_string()), start_id);
+        self.name_maps
+            .section_names
+            .insert((layer, END_NAME.to_string()), end_id);
+        Ok((start_id, end_id))
     }
 
     /// Look up a layer's index in `self.schema.layers` by id, returning
@@ -590,7 +660,12 @@ impl Builder {
             .schema
             .layers
             .iter()
-            .flat_map(|l| l.system_prompt.all_sections())
+            .flat_map(|l| {
+                l.system_prompt
+                    .all_sections()
+                    .chain(l.system_start_section.iter())
+                    .chain(l.system_end_section.iter())
+            })
             .map(|s| s.id.raw())
             .max()
             .unwrap_or(0);
@@ -685,6 +760,7 @@ impl Builder {
                         name: "frame".to_string(),
                         content: system_prompt_text.to_string(),
                         priority: 50.0,
+                        depends_on: None,
                     })],
                 },
                 groups: vec![GroupSchema {
@@ -695,6 +771,8 @@ impl Builder {
                     budget: Budget { priority: 100.0, min_percent: None, max_percent: None },
                 }],
                 depth_weights: DepthWeights::default(),
+                system_start_section: None,
+                system_end_section: None,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");
@@ -706,7 +784,12 @@ impl Builder {
         name_maps.group_names.insert("primary_conversation".to_string(), group_id);
         name_maps.section_names.insert((layer_id, "frame".to_string()), section_id);
 
-        Self { schema, name_maps }
+        // A synthetic single-section schema, not parsed from YAML.
+        Self {
+            schema,
+            name_maps,
+            source_yaml: None,
+        }
     }
 }
 

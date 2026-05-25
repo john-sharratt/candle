@@ -26,7 +26,7 @@ pub const HEADER_SIZE: usize = 64;
 /// of this so it begins on a sector boundary for unbuffered I/O.
 pub const ALIGN: usize = 4096;
 
-/// The eight record types (§5.3).
+/// The nine record types (§5.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RecordType {
@@ -38,6 +38,9 @@ pub enum RecordType {
     Signatures = 6,
     Commit = 7,
     Checkpoint = 8,
+    /// The model's `tokenizer.json` bytes — a workspace singleton, written
+    /// once via compare-and-insert so the log can detokenize offline.
+    Tokenizer = 9,
 }
 
 impl RecordType {
@@ -51,6 +54,7 @@ impl RecordType {
             6 => RecordType::Signatures,
             7 => RecordType::Commit,
             8 => RecordType::Checkpoint,
+            9 => RecordType::Tokenizer,
             other => return Err(PersistenceError::UnknownRecordType(other)),
         })
     }

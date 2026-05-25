@@ -241,76 +241,54 @@ impl Sequence {
         // composed from these schema items — no separate monolithic
         // "system_section_id" pre-pinning, which used to double the
         // system content with an unwrapped fragment copy.
-        let layer_items: Vec<SystemPromptItem> = conv
+        let (layer_items, system_start, system_end): (
+            Vec<SystemPromptItem>,
+            Option<crate::projection::SectionSchema>,
+            Option<crate::projection::SectionSchema>,
+        ) = conv
             .projection
             .schema()
             .layers
             .iter()
             .find(|l| l.id == target.layer)
-            .map(|l| l.system_prompt.items.clone())
-            .unwrap_or_default();
+            .map(|l| {
+                (
+                    l.system_prompt.items.clone(),
+                    l.system_start_section.clone(),
+                    l.system_end_section.clone(),
+                )
+            })
+            .unwrap_or_else(|| (Vec::new(), None, None));
 
         // The ChatML / dialect role wrappers around the system block
-        // (`<|im_start|>system\n` … `<|im_end|>\n` in Qwen3's dialect,
-        // analogous markers for other models) are *not* expressed in
-        // the YAML schema because they're model-specific strings —
-        // the schema is dialect-agnostic.  We attach them at ingest
-        // time by prepending `dialect.system_start` to the first
-        // `Section`-kind item and appending `dialect.system_end` to
-        // the last `Section`-kind item.  Mutating the *substrate*
-        // content (not the schema items themselves) keeps the
-        // schema-driven projection path intact: the projection still
-        // emits these sections by ID in declared order, and the
-        // wrapped bytes ride along inside the substrate's pinned
-        // SealedSequences.
-        // Build ONE batched section list covering every Section + every
-        // Collection's sections, then fire them all into a single
-        // `insert_section_collection` call.  The collection method
-        // allocates scratch slots up-front and fires every
-        // `IngestSection` request in a tight burst so the scheduler
-        // batches their prefills together — orders of magnitude faster
-        // than the previous one-by-one path.
-        let first_section_id: Option<SectionId> =
-            layer_items.iter().find_map(|item| match item {
-                SystemPromptItem::Section(s) => Some(s.id),
-                _ => None,
-            });
-        let last_section_id: Option<SectionId> =
-            layer_items.iter().rev().find_map(|item| match item {
-                SystemPromptItem::Section(s) => Some(s.id),
-                _ => None,
-            });
-        let sys_start = conv.config.dialect.system_start;
-        let sys_end = conv.config.dialect.system_end;
+        // (`<|im_start|>system\n` and `<|im_end|>\n` in Qwen3's dialect)
+        // live as two synthetic sections on the layer schema, installed
+        // by the dialect-aware caller via [`Builder::set_system_markers`].
+        // Their K/V is set up by the cumulative ingest below; emission
+        // is unconditional structural envelope (see
+        // `project::emit_system_prompt_items`).
+        //
+        // The end-marker is special: it's prefilled with a
+        // `linear_prefix` that excludes every Collection's members and
+        // every Section with `depends_on` set, so its K/V represents
+        // "the system block closes after the FIXED framing" and is
+        // coherent regardless of which collection members materialise
+        // at any given turn. The tools collection thereby becomes
+        // pure RAG — context that slides in between two structurally
+        // invariant anchors.
+        let mut linear_prefix: Vec<SectionId> = Vec::new();
+        // The list mirroring `linear_prefix` but excluding Collection
+        // members and `depends_on`-gated sections — feeds into the
+        // end-marker's ingest below.
+        let mut fixed_prefix: Vec<SectionId> = Vec::new();
 
-        // Pre-compute the wrapped content for first/last sections.
-        // Owned `String`s live in `wrapped_storage` so the &str
-        // borrows passed to `insert_section_collection` stay valid
-        // for the duration of that call.
-        let mut wrapped_storage: Vec<(SectionId, String)> = Vec::new();
-        for item in &layer_items {
-            if let SystemPromptItem::Section(s) = item {
-                let needs_open = Some(s.id) == first_section_id && !sys_start.is_empty();
-                let needs_close = Some(s.id) == last_section_id && !sys_end.is_empty();
-                if needs_open || needs_close {
-                    let mut wrapped = String::with_capacity(
-                        sys_start.len() + s.content.len() + sys_end.len(),
-                    );
-                    if needs_open {
-                        wrapped.push_str(sys_start);
-                    }
-                    wrapped.push_str(&s.content);
-                    if needs_close {
-                        wrapped.push_str(sys_end);
-                    }
-                    wrapped_storage.push((s.id, wrapped));
-                }
-            }
+        // Ingest the system-start marker first so every subsequent
+        // section attends to its bytes.
+        if let Some(start) = &system_start {
+            conv.insert_section_with_prefix(start.id, start.content.as_str(), &linear_prefix)?;
+            linear_prefix.push(start.id);
+            fixed_prefix.push(start.id);
         }
-        let wrapped_map: std::collections::HashMap<SectionId, &str> = wrapped_storage
-            .iter()
-            .map(|(id, s)| (*id, s.as_str()))
-            .collect();
 
         // Cumulative ingest: walk schema items in declaration order,
         // ingesting each `Section`-kind item with all previously-
@@ -320,48 +298,35 @@ impl Sequence {
         // at projection time, producing K_raw values conditioned
         // on the real preceding context.
         //
-        // `Collection` items (e.g. the tools catalog): every section
-        // in the collection is ingested with the *same* pre-
-        // collection prefix.  Collection members are mutually
-        // exclusive candidates — `top_k` (or another selection rule)
-        // picks a subset at projection time, so they're conceptually
-        // parallel and should NOT be cumulative with each other.
-        // Crucially, the collection's sections do not extend
-        // `linear_prefix`: sections that come after the collection
-        // (e.g. `tools_outro`) get their prefix from the pre-
-        // collection framing only, since which collection members
-        // survive projection is not knowable at ingest time.
-        let mut linear_prefix: Vec<SectionId> = Vec::new();
+        // `Collection` items: every member ingests in parallel with
+        // the *same* pre-collection prefix (members do not attend to
+        // each other). Sections declared after a Collection attend to
+        // the full set of members during ingest — the maximal-context
+        // approximation for runtime selection.
         for item in &layer_items {
             match item {
                 SystemPromptItem::Section(s) => {
-                    let content = wrapped_map
-                        .get(&s.id)
-                        .copied()
-                        .unwrap_or_else(|| s.content.as_str());
-                    conv.insert_section_with_prefix(s.id, content, &linear_prefix)?;
+                    conv.insert_section_with_prefix(s.id, s.content.as_str(), &linear_prefix)?;
                     linear_prefix.push(s.id);
+                    // Sections with `depends_on` are conditional — they
+                    // only emit when the named collection materialises
+                    // — so they must NOT contribute to the end-marker's
+                    // `fixed_prefix`.
+                    if s.depends_on.is_none() {
+                        fixed_prefix.push(s.id);
+                    }
                 }
                 SystemPromptItem::Collection(coll) => {
                     let batch: Vec<(SectionId, &str)> = coll
                         .sections
                         .iter()
-                        .map(|sec| {
-                            let content = wrapped_map
-                                .get(&sec.id)
-                                .copied()
-                                .unwrap_or_else(|| sec.content.as_str());
-                            (sec.id, content)
-                        })
+                        .map(|sec| (sec.id, sec.content.as_str()))
                         .collect();
                     conv.insert_section_collection(&batch, &linear_prefix)?;
-                    // Extend the prefix with every collection member in
-                    // declaration order.  Collection members are parallel
-                    // candidates (they did NOT attend to each other during
-                    // ingest), but sections declared AFTER the collection
-                    // must attend to the full tool context — as if all
-                    // members are present — so their K/V is conditioned
-                    // on the real cumulative context at projection time.
+                    // Extend the live linear_prefix with every member
+                    // so subsequent sections see them at ingest, but
+                    // do NOT add them to fixed_prefix — the end-marker
+                    // must be coherent for the empty-collection case.
                     for sec in &coll.sections {
                         linear_prefix.push(sec.id);
                     }
@@ -369,16 +334,32 @@ impl Sequence {
             }
         }
 
+        // Ingest the system-end marker last with the curated
+        // `fixed_prefix` so its K/V is conditioned on framing only —
+        // collections-as-empty.
+        if let Some(end) = &system_end {
+            conv.insert_section_with_prefix(end.id, end.content.as_str(), &fixed_prefix)?;
+            fixed_prefix.push(end.id);
+        }
+
         // Pre-warm the slot: inject all system-prompt sections now so the
         // first `submit_turn` sees an already-populated slot and skips
         // `apply_projection` entirely, removing that injection from the
         // first-turn critical path.
-        if !linear_prefix.is_empty() {
+        //
+        // Priming uses `fixed_prefix` — the collections-as-empty
+        // projection — so the slot's starting state mirrors what
+        // `emit_system_prompt_items` would produce when no collection
+        // members are selected and no `depends_on`-gated sections fire.
+        // Any per-turn projection that selects ≥ 1 collection member
+        // will materialise those (and the gated sections) via
+        // `apply_projection` at submit_turn time.
+        if !fixed_prefix.is_empty() {
             let (tx, rx) = crossbeam::channel::bounded(1);
             conv.scheduler_tx
                 .send(crate::scheduler::SchedulerRequest::PrimingProjection {
                     sequence_id: conv.id,
-                    section_ids: linear_prefix,
+                    section_ids: fixed_prefix,
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;

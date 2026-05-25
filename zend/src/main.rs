@@ -91,7 +91,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let filter = EnvFilter::from_default_env()
         .add_directive(format!("zend={level}").parse()?)
-        .add_directive(format!("candle_conversation={level}").parse()?);
+        .add_directive(format!("candle_conversation={level}").parse()?)
+        .add_directive(format!("candle_nn::kv_cache::chunked={level}").parse()?)
+        .add_directive(format!("candle_transformers::models::batched_model={level}").parse()?);
 
     let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter.clone());
 

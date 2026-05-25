@@ -273,6 +273,22 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist turn kv: {e}")))
     }
 
+    /// Persist the projection schema/template into the substrate's
+    /// `Template` record — compare-and-insert (only appends when it differs
+    /// from what the log already holds), then commit if written. Lets the
+    /// log carry the projection needed to reconstruct the substrate.
+    pub fn set_template(&self, template: &[u8]) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        let wrote = p
+            .set_template(template)
+            .map_err(|e| candle::Error::Msg(format!("persist template: {e}")))?;
+        if wrote {
+            p.commit()
+                .map_err(|e| candle::Error::Msg(format!("commit template: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Durably flush the persistence redo log — the group-commit point.
     /// `fsync`s every staged record so an in-flight turn survives a crash.
     pub fn commit_persistence(&self) -> candle::Result<()> {

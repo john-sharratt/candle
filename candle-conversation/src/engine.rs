@@ -115,13 +115,39 @@ impl ConversationEngine {
         //
         // Mandatory substrate persistence — the redo log under the
         // workspace's `.substrate/` directory (or the process CWD).
-        let persistence = match config.workspace_path.as_ref() {
+        let mut persistence = match config.workspace_path.as_ref() {
             Some(dir) => crate::persistence::SubstratePersistence::open_in(dir.as_ref()),
             None => crate::persistence::SubstratePersistence::open(),
         }
         .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
         })?;
+        // Persist the model identity into the substrate's `ModelSpec` record —
+        // compare-and-insert, so it only appends when the model differs from
+        // what the log already records. Makes the log a self-contained image.
+        if let Some(spec) = &config.model_spec {
+            let wrote = persistence.set_model_spec(spec).map_err(|e| {
+                ConversationError::from(candle::Error::Msg(format!("persist model spec: {e}")))
+            })?;
+            if wrote {
+                persistence.commit().map_err(|e| {
+                    ConversationError::from(candle::Error::Msg(format!("commit model spec: {e}")))
+                })?;
+            }
+        }
+        // Embed the tokenizer.json (compare-and-insert) so the log can
+        // detokenize offline. ~11 MB for Qwen3, but written at most once per
+        // distinct model since identical bytes are a no-op.
+        if let Some(tok) = &config.tokenizer {
+            let wrote = persistence.set_tokenizer(tok).map_err(|e| {
+                ConversationError::from(candle::Error::Msg(format!("persist tokenizer: {e}")))
+            })?;
+            if wrote {
+                persistence.commit().map_err(|e| {
+                    ConversationError::from(candle::Error::Msg(format!("commit tokenizer: {e}")))
+                })?;
+            }
+        }
         // Shared hot-tier cache.  Budget is derived from `config` if the caller
         // provided a post-load free-VRAM figure; otherwise unlimited.
         let substrate_cache = match config.hot_cache_free_vram_bytes {
@@ -263,6 +289,15 @@ impl ConversationEngine {
         group: crate::projection::GroupId,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
+        // Persist the projection schema as the substrate's `Template` record
+        // (compare-and-insert) so the log carries the projection it was built
+        // with. Programmatic schemas (no source YAML) are skipped.
+        if let Some(yaml) = builder.source_yaml() {
+            if let Err(e) = self.conversation.set_template(yaml.as_bytes()) {
+                tracing::warn!("persist projection template failed: {e}");
+            }
+        }
+
         // Mint a fresh `TimelineId` for this conversation before
         // allocating a slot — the substrate registers it against
         // `(layer, group)` so the seal path can write turns into the

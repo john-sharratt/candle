@@ -178,6 +178,11 @@ enum YamlSystemPromptItem {
         content: String,
         #[serde(default)]
         priority: Option<f32>,
+        /// Conditional emission: this section only emits at projection
+        /// time if the named sibling Collection materialised ≥ 1 of its
+        /// members. Ingested unconditionally either way.
+        #[serde(default)]
+        depends_on: Option<String>,
     },
     Collection {
         name: String,
@@ -305,13 +310,40 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                 name: s.id.clone(),
                 content: s.content.clone(),
                 priority,
+                depends_on: None,
             }));
         }
 
-        // Modern `items:` — interleaved sections and collections.
+        // Two-pass over `items:` so a Section's `depends_on: <collection>`
+        // can reference a Collection declared later in the same layer.
+        //
+        // First pass — pre-allocate every Collection's id and stash its
+        // name in `layer_collections` so the second pass can resolve
+        // forward references. Duplicates are caught here.
+        let mut layer_collections: std::collections::HashMap<String, super::ids::CollectionId> =
+            std::collections::HashMap::new();
+        for entry in &yl.system_prompt.items {
+            if let YamlSystemPromptItem::Collection { name, .. } = entry {
+                if !layer_collection_names.insert(name.clone()) {
+                    return Err(ConstructionError::DuplicateCollectionName(name.clone()));
+                }
+                let cid = collection_alloc.next();
+                layer_collections.insert(name.clone(), cid);
+                maps.collection_names.insert((lid, name.clone()), cid);
+            }
+        }
+
+        // Second pass — actually build the schema items, resolving
+        // every `depends_on` string against the pre-allocated
+        // collection-name map.
         for entry in &yl.system_prompt.items {
             match entry {
-                YamlSystemPromptItem::Section { id, content, priority } => {
+                YamlSystemPromptItem::Section {
+                    id,
+                    content,
+                    priority,
+                    depends_on,
+                } => {
                     if !layer_section_names.insert(id.clone()) {
                         return Err(ConstructionError::DuplicateSectionName(id.clone()));
                     }
@@ -319,11 +351,21 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                     maps.section_names.insert((lid, id.clone()), sid);
                     let pri = priority.unwrap_or(50.0);
                     validate_priority(&format!("{}/{}", yl.name, id), pri)?;
+                    let depends_on_cid = match depends_on {
+                        Some(name) => Some(*layer_collections.get(name).ok_or_else(|| {
+                            ConstructionError::UnknownCollection(format!(
+                                "{}: section '{}' depends_on unknown collection '{}'",
+                                yl.name, id, name,
+                            ))
+                        })?),
+                        None => None,
+                    };
                     items.push(SystemPromptItem::Section(SectionSchema {
                         id: sid,
                         name: id.clone(),
                         content: content.clone(),
                         priority: pri,
+                        depends_on: depends_on_cid,
                     }));
                 }
                 YamlSystemPromptItem::Collection {
@@ -333,10 +375,9 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                     depth_weights: coll_depth_weights_yaml,
                     sections,
                 } => {
-                    if !layer_collection_names.insert(name.clone()) {
-                        return Err(ConstructionError::DuplicateCollectionName(name.clone()));
-                    }
-                    let cid = collection_alloc.next();
+                    let cid = *layer_collections
+                        .get(name)
+                        .expect("first-pass pre-allocated every collection id");
                     let label = format!("{}/{}", yl.name, name);
                     let coll_selection = parse_selection(&label, selection)?;
                     if *score_threshold < 0.0 {
@@ -360,6 +401,7 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                             name: s.id.clone(),
                             content: s.content.clone(),
                             priority: pri,
+                            depends_on: None,
                         });
                     }
 
@@ -377,7 +419,6 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                         score_threshold: *score_threshold,
                         depth_weights: coll_dw_opt,
                     }));
-                    maps.collection_names.insert((lid, name.clone()), cid);
                 }
             }
         }
@@ -430,6 +471,12 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
             system_prompt: SystemPromptSchema { items },
             groups,
             depth_weights,
+            // The synthetic structural markers stay `None` here — the
+            // dialect-aware caller installs them via
+            // [`super::Builder::set_system_markers`] before the
+            // conversation is created.
+            system_start_section: None,
+            system_end_section: None,
         });
     }
 

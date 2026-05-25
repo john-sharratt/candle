@@ -450,6 +450,11 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 .and_then(|c| c.k_cache().chunked_storage_policy())
                 .map(|p| p.to_arena_key().is_quantized())
                 .unwrap_or(false);
+            tracing::debug!(
+                "bg_quantizer: batched_model stage={} seq_len={seq_len} needs_reconcile={needs_reconcile} n_contexts={}",
+                if stage_is_decode { "decode" } else { "prefill" },
+                contexts.len()
+            );
 
             if needs_reconcile {
                 let t_recon = profile_now();

@@ -548,7 +548,25 @@ impl ModelBuilder {
         ret.penalty_log_path = self.penalty_log_path.clone();
         ret.health = self.health_config.clone();
         ret.workspace_path = self.workspace_path.clone();
+        ret.model_spec = Some(self.model_spec_blob());
         ret
+    }
+
+    /// A stable serialized identity for the substrate's `ModelSpec` record —
+    /// enough to re-load the same weights and tokenizer from HuggingFace.
+    fn model_spec_blob(&self) -> Vec<u8> {
+        let s = &self.spec;
+        format!(
+            "candle-conversation model-spec v1\n\
+             arch={:?}\n\
+             chat_format={:?}\n\
+             model_repo={}\n\
+             model_filename={}\n\
+             tokenizer_repo={}\n\
+             max_seq_len={}\n",
+            s.arch, s.chat_format, s.model_repo, s.model_filename, s.tokenizer_repo, s.max_seq_len,
+        )
+        .into_bytes()
     }
 
     /// Load quantised model weights from a local GGUF file.
@@ -719,6 +737,17 @@ impl ModelBuilder {
         self.health_config.resolve_structural_tokens(&tokenizer);
 
         let mut config = self.engine_config(&tokenizer);
+
+        // Embed the raw `tokenizer.json` so the substrate log is a
+        // self-contained, offline-detokenizable image. Written once per
+        // distinct model via compare-and-insert at engine startup.
+        match std::fs::read(&tokenizer_path) {
+            Ok(bytes) => config.tokenizer = Some(bytes),
+            Err(e) => tracing::warn!(
+                "could not read tokenizer.json ({}) for persistence: {e}",
+                tokenizer_path.display()
+            ),
+        }
 
         // Override vocab_size with the authoritative value from GGUF metadata
         // if available.  Models often pad vocab to a power-of-2 / multiple of

@@ -603,13 +603,24 @@ impl ChunkedKvBacking {
         lookback_tokens: usize,
     ) -> Result<Option<Vec<super::bg_quantizer::ChunkMigration>>> {
         if lookback_tokens == 0 || batch_indices.is_empty() {
+            tracing::debug!(
+                "bg_quantizer: collect_gpu_migrations early-out (lookback={lookback_tokens} batch_indices_len={})",
+                batch_indices.len()
+            );
             return Ok(None);
         }
-        if !batch_indices.iter().any(|&(_, seq_len)| {
+        let any_eligible = batch_indices.iter().any(|&(_, seq_len)| {
             let n_sealed = seq_len / CHUNK_SIZE;
             let start_blk = seq_len.saturating_sub(lookback_tokens) / CHUNK_SIZE;
             n_sealed > 0 && start_blk < n_sealed
-        }) {
+        });
+        if self.layer_idx == 0 {
+            tracing::debug!(
+                "bg_quantizer: collect_gpu_migrations layer=0 lookback={lookback_tokens} batch_indices={:?} any_eligible={any_eligible}",
+                batch_indices
+            );
+        }
+        if !any_eligible {
             return Ok(None);
         }
 
@@ -837,6 +848,12 @@ impl ChunkedKvBacking {
                 }
             }
 
+            tracing::debug!(
+                "bg_quantizer: reconcile_all_layers layers={} work_items={} total_migrations={}",
+                layers.len(),
+                work_items.len(),
+                total
+            );
             if !work_items.is_empty() {
                 self.bg_quantizer.enqueue_work_items_batch(work_items);
                 //self.bg_quantizer.join();

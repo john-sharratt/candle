@@ -183,6 +183,16 @@ pub struct SectionSchema {
     /// Static fallback priority used as a score-tie breaker inside a
     /// collection's selection.  Higher = preferred.  Default `50.0`.
     pub priority: f32,
+    /// Conditional emission gate: when `Some(cid)`, this section only
+    /// emits at projection time if the named [`SectionCollection`] in
+    /// the same layer materialised ≥ 1 of its members. Ingested
+    /// unconditionally — the substrate always has its bytes — so the
+    /// emission check is purely a projection-time predicate.
+    ///
+    /// Used by the YAML schema to wrap collections in structural
+    /// markers (e.g. `<tools>` / `</tools>`) that should only appear
+    /// when the collection itself emits anything.
+    pub depends_on: Option<CollectionId>,
 }
 
 /// Per-layer weighting for the three Binary Directional Provenance depths.
@@ -278,6 +288,22 @@ pub struct LayerSchema {
     /// Weights for combining per-depth BDP scores into a single per-turn
     /// score.  Default is equal weighting across all three depths.
     pub depth_weights: DepthWeights,
+    /// Synthetic structural section emitted **before** every other
+    /// system-prompt item — carries the dialect's system-block open
+    /// marker (e.g. `<|im_start|>system\n`). Built programmatically
+    /// outside YAML so the schema stays dialect-agnostic at parse
+    /// time; the dialect-aware caller installs it via the builder
+    /// before the conversation is created.
+    pub system_start_section: Option<SectionSchema>,
+    /// Synthetic structural section emitted **after** every other
+    /// system-prompt item — carries the dialect's system-block close
+    /// marker (e.g. `<|im_end|>\n`). Ingested with a `linear_prefix`
+    /// that **excludes** every Collection's members and every section
+    /// with [`SectionSchema::depends_on`] set, so its K/V represents
+    /// "the system block closes after the fixed framing" — coherent
+    /// regardless of which collection members materialise at any
+    /// given turn.
+    pub system_end_section: Option<SectionSchema>,
 }
 
 /// Schema for one group within a layer.

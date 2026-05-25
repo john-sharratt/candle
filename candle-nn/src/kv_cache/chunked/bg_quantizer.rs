@@ -278,6 +278,8 @@ impl BackgroundQuantizer {
                 .flat_map(|item| item.migrations.into_iter())
                 .collect::<Vec<_>>();
             if !migrations.is_empty() {
+                let n = migrations.len();
+                tracing::debug!("bg_quantizer: reconcile start n={n}");
                 let result = arc_backing.reconcile_batch_float_to_quant_v2(
                     &arc_backing,
                     migrations,
@@ -286,8 +288,13 @@ impl BackgroundQuantizer {
                     &bg_stream,
                     true,
                 );
-                if let Err(e) = result {
-                    eprintln!("bg_quantizer: reconcile failed: {e:?}");
+                match &result {
+                    Ok(processed) => {
+                        tracing::debug!("bg_quantizer: reconcile done n={n} processed={processed}")
+                    }
+                    Err(e) => {
+                        tracing::warn!("bg_quantizer: reconcile failed n={n} err={e:?}")
+                    }
                 }
             }
 

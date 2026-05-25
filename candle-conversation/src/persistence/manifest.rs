@@ -53,6 +53,8 @@ pub struct Manifest {
     pub model_spec: Option<RecordLoc>,
     /// Latest `Template` record.
     pub template: Option<RecordLoc>,
+    /// Latest `Tokenizer` record (the model's `tokenizer.json` bytes).
+    pub tokenizer: Option<RecordLoc>,
     /// Per-stream index, ordered by id for deterministic serialisation.
     pub streams: BTreeMap<StreamId, StreamEntry>,
     /// Offset of the most recent `Checkpoint` record seen.
@@ -75,6 +77,7 @@ impl Manifest {
         match h.record_type {
             RecordType::ModelSpec => self.model_spec = Some(loc),
             RecordType::Template => self.template = Some(loc),
+            RecordType::Tokenizer => self.tokenizer = Some(loc),
             RecordType::StreamDecl => {
                 let decl = StreamDecl::decode(&entry.record.payload)?;
                 self.streams.entry(StreamId(h.stream_id)).or_default().decl = Some(decl);
@@ -143,6 +146,7 @@ impl Manifest {
         let mut w = ByteWriter::new();
         put_opt_loc(&mut w, self.model_spec);
         put_opt_loc(&mut w, self.template);
+        put_opt_loc(&mut w, self.tokenizer);
         match self.last_checkpoint_offset {
             Some(o) => {
                 w.put_u8(1);
@@ -186,6 +190,7 @@ impl Manifest {
         let mut r = ByteReader::new(payload);
         let model_spec = get_opt_loc(&mut r)?;
         let template = get_opt_loc(&mut r)?;
+        let tokenizer = get_opt_loc(&mut r)?;
         let last_checkpoint_offset = if r.get_u8()? == 1 {
             Some(r.get_u64()?)
         } else {
@@ -239,6 +244,7 @@ impl Manifest {
         Ok(Manifest {
             model_spec,
             template,
+            tokenizer,
             streams,
             last_checkpoint_offset,
         })

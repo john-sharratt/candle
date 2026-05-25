@@ -61,3 +61,6 @@ candle-kernels/build_tool/
 
 # Raw R16 KV tensor dumps (large; signatures.prov and MANIFEST.json are tracked)
 **/raw_kvq.prov
+
+# Substrate persistence redo log — created at runtime under any workspace root
+.substrate/

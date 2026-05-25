@@ -540,8 +540,21 @@ pub fn run<R: ContentResolver>(
 
 /// Walk a layer's `system_prompt.items` in declaration order, emitting
 /// either each plain section verbatim or each collection's surviving
-/// subset (after applying its selection rule).  Result is the
-/// `Vec<ResolvedSection>` that goes into the final [`Projection`].
+/// subset (after applying its selection rule).
+///
+/// Three additional rules layered on top:
+/// 1. `layer.system_start_section`, if installed, emits first — before
+///    every authored item.
+/// 2. A [`SectionSchema`] with `depends_on = Some(cid)` only emits if
+///    the named collection materialised ≥ 1 section in *this same*
+///    emission pass.
+/// 3. `layer.system_end_section`, if installed, emits last — after
+///    every authored item.
+///
+/// The synthetic markers are unconditional structural envelopes; the
+/// `depends_on` mechanism is for authored content (e.g. `<tools>` /
+/// `</tools>` markers) that should only appear when its collection
+/// emitted something.
 fn emit_system_prompt_items<R: ContentResolver>(
     layer: &LayerSchema,
     resolver: &R,
@@ -549,15 +562,48 @@ fn emit_system_prompt_items<R: ContentResolver>(
 ) -> Vec<ResolvedSection> {
     let scoring = mode.collection_scoring();
     let mut out: Vec<ResolvedSection> = Vec::new();
+    if let Some(s) = &layer.system_start_section {
+        out.push(ResolvedSection { id: s.id });
+    }
+    // First pass: resolve every Collection in declaration order so
+    // their materialised section sets are known when we walk the
+    // items for emission. Cached by CollectionId.
+    let mut collection_results: std::collections::HashMap<
+        super::ids::CollectionId,
+        Vec<ResolvedSection>,
+    > = std::collections::HashMap::new();
+    for item in &layer.system_prompt.items {
+        if let SystemPromptItem::Collection(coll) = item {
+            let selected = select_collection_sections(coll, layer, resolver, &scoring);
+            collection_results.insert(coll.id, selected);
+        }
+    }
+    // Second pass: walk items in declaration order, applying the
+    // `depends_on` predicate to Sections and using the cached
+    // collection results for Collections.
     for item in &layer.system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => {
-                out.push(ResolvedSection { id: s.id });
+                let should_emit = match s.depends_on {
+                    None => true,
+                    Some(cid) => collection_results
+                        .get(&cid)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false),
+                };
+                if should_emit {
+                    out.push(ResolvedSection { id: s.id });
+                }
             }
             SystemPromptItem::Collection(coll) => {
-                out.extend(select_collection_sections(coll, layer, resolver, &scoring));
+                if let Some(selected) = collection_results.remove(&coll.id) {
+                    out.extend(selected);
+                }
             }
         }
+    }
+    if let Some(s) = &layer.system_end_section {
+        out.push(ResolvedSection { id: s.id });
     }
     out
 }
