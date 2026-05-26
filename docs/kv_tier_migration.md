@@ -51,10 +51,12 @@ The design rests on three pillars:
 
 3. **An asymmetric tier flow.** The **write path is `VRAM → RAM → disk`** —
    the RAM copy serves double duty as both the warm cache and the
-   group-commit write buffer. The **cold-load path is `disk → VRAM`**
-   through a transient pinned host staging buffer (not the warm pool, so
-   the warm tier keeps a single writer); the warm tier is re-populated as a
-   side effect of normal eviction.
+   group-commit write buffer. The **cold-load path is `disk → VRAM`
+   directly via GPUDirect Storage (cuFile)** — the CPU and host RAM are
+   not on the data path; `cuFileRead` DMAs from the NVMe redo log straight
+   into the VRAM staging scratch through the GPU's BAR, bypassing the
+   host bounce buffer entirely. The warm tier is re-populated as a side
+   effect of normal eviction, not by cold loads.
 
 **Goals:** (1) durable KV persistence — conversations survive process
 restarts; (2) very fast cold-load of a stored conversation straight into
@@ -122,10 +124,16 @@ directly:
 ### 2.3 Asymmetries the design accounts for
 
 - **Bandwidth.** NVMe RAID ≈ 45 GB/s; host→VRAM PCIe 5.0 ≈ 55–64 GB/s.
-  These are *separate buses*. Both the write path and the cold-load path
-  pipeline the NVMe leg against the PCIe leg through a double-buffered
-  staging region, so the slower NVMe leg sets the throughput (~45 GB/s) and
-  the PCIe leg is fully hidden.
+  These are *separate buses*. **Cold load uses GPUDirect Storage
+  (`cuFileRead`)**: the NVMe controller DMAs straight through the GPU's
+  PCIe BAR into VRAM, the host bounce buffer is eliminated, and the
+  effective throughput is the NVMe rate (~45 GB/s) over a single bus
+  hop. The **eviction write path** (VRAM → RAM → log) keeps the pinned
+  host buffer — that buffer doubles as the warm tier (a real RAM cache,
+  not a transient staging region) so eliminating it is not a useful
+  simplification. Eviction writes can move to `cuFileWrite` once the
+  warm tier no longer needs the same bytes; until then the host pinned
+  copy serves a second purpose and stays on the path.
 - **Capacity.** VRAM is evicted aggressively every tick; RAM is an LRU
   working set; disk grows append-only between compaction passes (§5.8).
 
@@ -224,13 +232,15 @@ A sequence not resident in VRAM is loaded on demand. Two cases:
   RAM→VRAM path: one HtoD from the warm pinned buffer into the VRAM staging
   scratch, then `kv_unpack`. No disk touch. This is the common case and the
   reason the warm tier exists.
-- **Cold load** — the sequence is on disk only. Its chunk records are read
-  NVMe → a **transient pinned host staging buffer** → HtoD into the VRAM
-  staging scratch → `kv_unpack`. The pinned host buffer is *transient
-  scratch*, **not the warm pool** — so a cold load does not populate the
-  warm tier, which keeps that tier with exactly one writer (eviction) and a
-  precise meaning ("recently hot"). The warm tier re-populates naturally
-  later, when the now-hot sequence is evicted VRAM→RAM.
+- **Cold load** — the sequence is on disk only. Its chunk records are
+  streamed **NVMe → VRAM directly via GPUDirect Storage** (`cuFileRead`):
+  the NVMe controller DMAs straight through the GPU's PCIe BAR into the
+  VRAM staging scratch, then `kv_unpack` scatters. The CPU sees only
+  metadata (record headers, the small ChunkPayload prefix); the bulky
+  `kv_bytes` blob never lands in host RAM at all. **Nothing is added to
+  the warm tier on a cold load** — the warm tier still has exactly one
+  writer (eviction), and re-populates naturally later when the now-hot
+  sequence is evicted VRAM → RAM.
 
 **Resuming a conversation loads a DAG of streams (§5.2).** A conversation is
 an ordered set of turn streams anchored to the prompt-section streams that
@@ -243,22 +253,39 @@ RoPE applied from recomputed positions — no re-RoPE, no byte rewrite.
 
 A cold load of a single stream proceeds:
 
-1. **Manifest lookup.** The in-RAM index gives the `(offset, length)` byte
-   ranges of the stream's chunk records. Contiguous ranges are coalesced
-   into larger reads.
-2. **NVMe read.** Those ranges are read into the **transient pinned host
-   staging buffer**; an async HtoD copies them onward to the VRAM staging
-   scratch. Both the staging buffer and the VRAM scratch are
-   **double-buffered**: while `kv_unpack` scatters batch *n*, the NVMe read
-   of batch *n+1* and the HtoD of batch *n* are already in flight — the
-   NVMe leg and the PCIe leg overlap, so cold load runs at the NVMe-bound
-   rate (§2.3).
+1. **Manifest lookup.** The in-RAM index gives the `(kv_bytes_offset,
+   kv_bytes_len)` ranges of every chunk's bulk payload — the K/V byte
+   blob, not the ChunkPayload prefix (formats / palettes / scales). That
+   prefix is small and read host-side through the usual buffered I/O so
+   the loader knows how to lay the bytes out; the prefix offset/length
+   are pre-computed at append time and live in the manifest's
+   `ChunkLoc`. Contiguous `kv_bytes` ranges are coalesced into larger
+   DMAs.
+2. **GPUDirect read.** The coalesced ranges are issued as `cuFileRead`
+   calls against a `CUfileHandle_t` registered for the log file
+   (`cuFileHandleRegister`). The NVMe controller DMAs through the GPU's
+   PCIe BAR straight into a `cuFileBufRegister`'d region of the VRAM
+   staging scratch — no host bounce buffer, no copy stream, no HtoD.
+   Reads are issued on the bg copy stream via `cuFileReadAsync` so the
+   NVMe leg overlaps the previous batch's `kv_unpack`; the slower NVMe
+   leg sets the throughput (~45 GB/s, §2.3).
 3. **Scatter (`kv_unpack`).** Freshly-allocated arena GIDs receive the
-   chunks; the kernel scatters the contiguous staging blob into them.
+   chunks; the kernel scatters the contiguous VRAM staging blob into
+   them.
 4. **Provenance-driven streaming.** A cold load does not fetch the whole
    conversation — it fetches the chunks **provenance selects** first and
    streams the remainder. The working set off disk is far smaller than the
    full corpus; this is the §9.12 load-many path.
+
+**Setup once at substrate open.** The cuFile driver is initialised
+(`cuFileDriverOpen`), the active log file is registered
+(`cuFileHandleRegister`), and the VRAM staging scratch is registered
+(`cuFileBufRegister`) so the driver can program the GPU's BAR without
+per-read BAR setup. Compaction replaces the log file underneath; the new
+file is re-registered after the rename swap (§5.8). On a config without
+the `nvidia-fs` kernel module (e.g. local dev on Windows), cuFile falls
+back to its compatibility mode — the API is unchanged but the driver
+synthesises a host bounce buffer internally. Code stays one path.
 
 The sequence's **partial tail chunk** (if any) loads through the same path:
 `kv_unpack` scatters its float bytes into a fresh GPU-float active writer
@@ -268,22 +295,19 @@ no prefill, no recompute. The load path stays pure data movement.
 ```
    ┌──────────────────────────────────────────────────────────┐
    │  NVMe · cold tier — redo log                               │
-   │     manifest ──▶ (offset, len) ranges for the sequence     │
+   │     manifest ──▶ (kv_bytes_offset, len) ranges per chunk  │
    │   ┌──────┬──────┬────────┬──────┬──────┐                   │
    │   │chunk │ ···  │ chunk  │ ···  │chunk │                   │
    │   └──┬───┴──────┴───┬────┴──────┴──┬───┘                   │
    └──────┼──────────────┼──────────────┼──────────────────────┘
           │              │              │
           └──────────────┴──────────────┘
-                         │  NVMe read (coalesced ranges)
+                         │  cuFileReadAsync  (GPUDirect Storage —
+                         │  NVMe → GPU BAR → VRAM, no host bounce)
                          ▼
               ┌───────────────────────────┐
-              │  transient pinned host buf │  double-buffered
-              └───────────────────────────┘
-                         │  async HtoD (copy stream)
-                         ▼
-              ┌───────────────────────────┐
-              │  VRAM staging scratch      │  double-buffered, pipelined
+              │  VRAM staging scratch      │  cuFileBufRegister'd
+              │  double-buffered, pipelined │  with prior kv_unpack
               └───────────────────────────┘
                          │  kv_unpack
                          │  scatter contiguous ─▶ arena chunks
@@ -438,7 +462,7 @@ The header is the key to skip-loading:
 | `format`       | `Chunk` only — quantized (sealed) or float (tail)   |
 | `checksum`     | covers header + payload; torn-write detection      |
 
-There are **eight record types**. Three are *singletons / metadata*, the
+There are **nine record types**. Four are *singletons / metadata*, the
 rest are *per-stream*:
 
 - **`ModelSpec`** (singleton, last-writer-wins) — the model and its
@@ -452,6 +476,10 @@ rest are *per-stream*:
   `Schema`: layers, groups, `SelectionRule`s, `SystemPromptSchema`
   (sections + collections), `DepthWeights`, `Budget`s, `ScoreFormula`s.
   Loaded today from `projection.yaml`.
+- **`Tokenizer`** (singleton, last-writer-wins) — the model's raw
+  `tokenizer.json` bytes, embedded so the log can detokenize offline with no
+  companion file. Large (~11 MB for Qwen3) but written at most once per
+  distinct model via compare-and-insert; identical bytes are a no-op.
 - **`StreamDecl`** — declares a stream and carries its structural metadata.
   For a **`PromptSection`**: the `(prefix_hash, section_hash)` content
   address + a debug name. For a **`Turn`**: `timeline_id`, `turn_index`,
@@ -579,6 +607,7 @@ state to a record:
 |---|---|
 | Model + properties (to re-load weights from HF) | `ModelSpec` |
 | Projection schema / template | `Template` |
+| Model `tokenizer.json` (offline detokenize) | `Tokenizer` |
 | Stream DAG; per-turn `role`, `timeline_id`, `turn_index`, `TurnId`, `block_range`, `view`, `PerDepthScores` | `StreamDecl` |
 | KV bytes + quantization metadata (`offset`, `k_pal`/`v_pal`/`k_scale`/`v_scale`) | `Chunk` |
 | Token IDs (turn text = `detokenize`) | `Tokens` |
@@ -840,9 +869,10 @@ sequences as a **single batched kernel launch**:
 
 - **Step 2 (evict):** one plan over every evicted chunk → one `kv_pack`
   launch → one DtoH.
-- **Step 3 (load):** one plan over everything loaded → one HtoD into the
-  staging scratch (the host side is the warm pinned buffer, or an NVMe read
-  into transient pinned scratch for a cold load) → one `kv_unpack` launch.
+- **Step 3 (load):** one plan over everything loaded → either one HtoD
+  from the warm pinned buffer into the staging scratch (warm hit), or
+  one `cuFileRead` from NVMe directly into the staging scratch (cold
+  load, no host bounce) → one `kv_unpack` launch.
 
 Per tick: **2 kernel launches + 2 DMAs**, independent of sequence count.
 
@@ -958,7 +988,7 @@ unit-testable**, most with no GPU. One concern per file:
 ```
 candle-conversation/src/persistence/
   mod.rs           public API — `SubstratePersistence`
-  record.rs        the 8 record types + header; encode/decode codec
+  record.rs        the 9 record types + header; encode/decode codec
   log_file.rs      append-only file: create / pre-grow extents,
                    buffered append, fsync durability, group commit
   walker.rs        skip-load header walk (§5.4)
@@ -1029,8 +1059,9 @@ impl SubstratePersistence {
     /// section must be prefilled and appended.
     pub fn lookup_section(&self, addr: ContentAddress) -> Option<StreamRef>;
 
-    /// Load a stream's chunks into VRAM — cold (disk → pinned host → VRAM)
-    /// or warm (warm pinned buffer → VRAM).
+    /// Load a stream's chunks into VRAM — cold (GPUDirect Storage:
+    /// `cuFileRead` from NVMe straight into VRAM, no host bounce) or
+    /// warm (warm pinned buffer → VRAM).
     pub fn load_stream(&self, stream: StreamId) -> Result<SealedSequence>;
 
     /// Model spec / template — last-writer-wins records. The setters append
@@ -1179,13 +1210,18 @@ deferred.
    no `ChunkRef` indirection. Stale records left by supersession are
    reclaimed by compaction (§5.8).
 
-4. **Cold-load transport → pinned host staging, no GPUDirect.** The
-   cold-load path is a single implemented path: a buffered NVMe read into a
-   transient pinned host staging buffer, then async HtoD into the VRAM
-   staging scratch (§4). GPUDirect Storage / DirectStorage / cuFile are
-   *not* used — they are an external-SDK dependency, and the pinned-staging
-   path is NVMe-bound either way (§2.3), so it costs no throughput. One
-   path, fully buildable with existing dependencies.
+4. **Cold-load transport → GPUDirect Storage (`cuFile`).** The cold-load
+   path is `cuFileRead` from the NVMe redo log straight into the VRAM
+   staging scratch — the NVMe controller DMAs through the GPU's PCIe BAR
+   without a host bounce buffer, no CPU memcpy, no copy-stream HtoD (§4).
+   The setup is amortised: `cuFileDriverOpen` once at substrate open,
+   `cuFileHandleRegister` on the active log, `cuFileBufRegister` on the
+   VRAM staging arena. Compaction re-registers the new file across the
+   rename swap (§5.8). On a host without the `nvidia-fs` kernel module
+   (e.g. the Windows dev box) cuFile falls back to compatibility mode
+   transparently — same API, host bounce buffer synthesised by the
+   driver — so we ship one path that's GDS-fast on the production Linux
+   box and merely correct on the dev box.
 
 5. **Per-head table for the warm tier → host-side only.** A CPU-located
    arena needs no `PerHeadTableEntry`. The kernels only ever dereference
@@ -1471,10 +1507,11 @@ cold load disk→VRAM; inheritance wired end-to-end.
    partial-tail rule (§3, force-flush on eviction); and the **snapshot
    variant** (§3 — persist a still-hot sequence: the same `kv_pack` → DtoH
    → append path, but the VRAM `ChunkGid`s are retained, not dropped).
-3. Cold load (§4, §15 q4): manifest → coalesced byte ranges → NVMe file
-   read into a transient pinned host staging buffer → async HtoD into
-   the VRAM staging scratch → `kv_unpack`. Both staging buffers are
-   double-buffered so the NVMe leg and the HtoD leg pipeline;
+3. Cold load (§4, §15 q4): manifest → coalesced
+   `(kv_bytes_offset, kv_bytes_len)` ranges → `cuFileReadAsync` into
+   the VRAM staging scratch (GPUDirect Storage; no host bounce buffer,
+   no copy-stream HtoD) → `kv_unpack`. The VRAM staging scratch is
+   double-buffered so the NVMe leg and `kv_unpack` pipeline;
    provenance-driven ordering loads the selected chunks first.
 4. `inherit.rs` — cold-load a stream resident only in an inherited log;
    resolve a conversation's full stream DAG across active + inherited logs.
@@ -1584,7 +1621,7 @@ across two daemon working directories; a compaction pass mid-session.
 
 After P8 the three-tier KV persistence system is **complete and live
 end-to-end**: every component this document specifies — the migration
-kernels, the warm tier, the eight-record redo log of content-addressed
+kernels, the warm tier, the nine-record redo log of content-addressed
 streams, cold load, multi-log inheritance, compaction, mandatory substrate
 integration, and the `zend` daemon — is implemented and tested. Nothing is
 deferred and nothing is stubbed; the design carries no out-of-scope

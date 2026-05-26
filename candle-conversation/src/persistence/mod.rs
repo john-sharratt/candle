@@ -106,6 +106,58 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Sidecar path for a given active log path:
+/// `<log_dir>/tokenizer.json` (siblings of the redo log).
+fn tokenizer_sidecar_for(active_path: &Path) -> PathBuf {
+    active_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tokenizer.json")
+}
+
+/// Decode a `Tokenizer` record payload into the 32-byte SHA-256 digest it
+/// always carries.
+fn hash_from_tokenizer_payload(payload: &[u8]) -> Result<[u8; 32]> {
+    if payload.len() != 32 {
+        return Err(PersistenceError::Corrupt(format!(
+            "Tokenizer record payload must be a 32-byte SHA-256 digest, got {} bytes",
+            payload.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(payload);
+    Ok(out)
+}
+
+/// Write `bytes` to the tokenizer sidecar atomically:
+/// write to `<path>.tmp`, fsync, rename over `<path>`. Renaming an existing
+/// file is sound on Windows (Rust opens with `FILE_SHARE_DELETE`) and POSIX.
+fn write_tokenizer_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Short hex prefix for diagnostics — first 8 bytes (`16` hex chars) is
+/// already unique enough to spot a hash mismatch in logs without dumping
+/// the full digest.
+fn hex_short(h: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(16);
+    for &b in &h[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
 /// Dead-record ratio at which [`SubstratePersistence::should_compact`] fires
 /// — half the log being dead weight is enough to justify a rewrite (§5.8).
 pub const COMPACTION_DEAD_RATIO_THRESHOLD: f32 = 0.5;
@@ -155,7 +207,10 @@ impl SubstratePersistence {
             .transpose()?;
         let tokenizer_sha256 = manifest
             .tokenizer
-            .map(|loc| read_record_at(&mut log, loc.offset).map(|r| sha256(&r.payload)))
+            .map(|loc| {
+                let r = read_record_at(&mut log, loc.offset)?;
+                hash_from_tokenizer_payload(&r.payload)
+            })
             .transpose()?;
 
         Ok(SubstratePersistence {
@@ -405,16 +460,79 @@ impl SubstratePersistence {
 
     /// Set the model's `tokenizer.json` bytes — last-writer-wins, like
     /// [`SubstratePersistence::set_model_spec`]. Appends only when the bytes
-    /// differ from the latest on file, so the (large) tokenizer is written
-    /// at most once per distinct model.
+    /// differ from the latest on file.
+    ///
+    /// The bytes themselves live in a **sidecar file** at
+    /// `<log_dir>/tokenizer.json` (written atomically via a `.tmp` rename);
+    /// the `Tokenizer` record in the log stores only the 32-byte SHA-256
+    /// digest of those bytes. Keeping the ~11 MB tokenizer JSON out of the
+    /// append-only log shrinks every log dramatically — see
+    /// [`SubstratePersistence::tokenizer_sidecar_path`] /
+    /// [`SubstratePersistence::read_tokenizer_bytes`].
     pub fn set_tokenizer(&mut self, tokenizer: &[u8]) -> Result<bool> {
         let hash = sha256(tokenizer);
-        if self.tokenizer_sha256 == Some(hash) {
+        let sidecar = self.tokenizer_sidecar_path();
+        let hash_matches_log = self.tokenizer_sha256 == Some(hash);
+        let sidecar_missing = !sidecar.exists();
+        if hash_matches_log && !sidecar_missing {
             return Ok(false);
         }
-        self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, tokenizer)?;
-        self.tokenizer_sha256 = Some(hash);
+        // Sidecar write first (durably), so a crash between sidecar write
+        // and record append leaves us with a recoverable hash → bytes
+        // mapping at the next open: read_tokenizer_bytes verifies the
+        // sidecar's hash against the record's payload, so a stale sidecar
+        // is detected, not silently trusted.
+        //
+        // When the hash already matches the log but the sidecar is gone
+        // (e.g. it was deleted out from under us), we restore the sidecar
+        // without re-appending the Tokenizer record — graceful sidecar
+        // recovery, no log churn.
+        write_tokenizer_sidecar(&sidecar, tokenizer)?;
+        if !hash_matches_log {
+            self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, &hash)?;
+            self.tokenizer_sha256 = Some(hash);
+        }
         Ok(true)
+    }
+
+    /// Filesystem path of the tokenizer sidecar that pairs with this log.
+    /// Lives next to the active log as `<log_dir>/tokenizer.json`.
+    pub fn tokenizer_sidecar_path(&self) -> PathBuf {
+        tokenizer_sidecar_for(&self.active_path)
+    }
+
+    /// Read the tokenizer bytes from the sidecar file, verifying the
+    /// SHA-256 matches the digest recorded in the active log.
+    ///
+    /// Returns `Ok(None)` when:
+    /// - the log has no [`RecordType::Tokenizer`] record yet (no model has
+    ///   ever called `set_tokenizer` against this substrate), or
+    /// - the sidecar file is missing (e.g. a fresh log that's about to be
+    ///   populated, or the sidecar was deleted out from under us).
+    ///
+    /// Returns `Err` only when the sidecar exists but its hash disagrees
+    /// with the recorded digest — a torn or tampered sidecar.
+    pub fn read_tokenizer_bytes(&self) -> Result<Option<Vec<u8>>> {
+        let Some(expected) = self.tokenizer_sha256 else {
+            return Ok(None);
+        };
+        let path = self.tokenizer_sidecar_path();
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let got = sha256(&bytes);
+                if got != expected {
+                    return Err(PersistenceError::Corrupt(format!(
+                        "tokenizer sidecar {} hash mismatch (expected {} got {})",
+                        path.display(),
+                        hex_short(&expected),
+                        hex_short(&got),
+                    )));
+                }
+                Ok(Some(bytes))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PersistenceError::Io(e)),
+        }
     }
 
     /// The latest model spec payload, if any.
@@ -502,7 +620,10 @@ impl SubstratePersistence {
         self.tokenizer_sha256 = self
             .manifest
             .tokenizer
-            .map(|loc| read_record_at(&mut self.log, loc.offset).map(|r| sha256(&r.payload)))
+            .map(|loc| {
+                let r = read_record_at(&mut self.log, loc.offset)?;
+                hash_from_tokenizer_payload(&r.payload)
+            })
             .transpose()?;
         Ok(())
     }
@@ -610,6 +731,74 @@ mod tests {
         assert_eq!(sp.model_spec(), Some(b"qwen3-235b".as_slice()));
 
         sp.commit().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tokenizer_bytes_live_in_sidecar_not_the_log() {
+        let dir = tmp_dir("tok_sidecar");
+        let bytes = (0..8192u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let log_path = ensure_active_path(&dir).unwrap();
+        let sidecar_path = tokenizer_sidecar_for(&log_path);
+        assert!(
+            !sidecar_path.exists(),
+            "sidecar must not exist before set_tokenizer"
+        );
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert!(sp.set_tokenizer(&bytes).unwrap());
+            sp.commit().unwrap();
+            // The sidecar holds the bytes; the on-disk log carries only the
+            // 32-byte hash payload.
+            let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+            assert_eq!(sidecar_bytes, bytes, "sidecar matches input bytes");
+            let tok_loc = sp.manifest().tokenizer.expect("manifest has tokenizer loc");
+            assert_eq!(
+                tok_loc.payload_len, 32,
+                "Tokenizer record payload must be the 32-byte SHA-256 digest, \
+                 not the full tokenizer bytes"
+            );
+            let read_back = sp.read_tokenizer_bytes().unwrap().unwrap();
+            assert_eq!(read_back, bytes);
+        }
+
+        // The sidecar persists across reopens; the log only stores the hash.
+        {
+            let sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&bytes)));
+            assert_eq!(sp.read_tokenizer_bytes().unwrap(), Some(bytes.clone()));
+        }
+
+        // A missing sidecar after a hash-bearing log opens cleanly and
+        // reports `Ok(None)` — the substrate is "optional": absent sidecar
+        // is not an error, it just means the bytes will be re-supplied
+        // by the next `set_tokenizer` call.
+        std::fs::remove_file(&sidecar_path).unwrap();
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert_eq!(
+                sp.read_tokenizer_bytes().unwrap(),
+                None,
+                "missing sidecar yields Ok(None), not an error"
+            );
+            sp.set_tokenizer(&bytes).unwrap();
+            assert!(sidecar_path.exists(), "sidecar restored on next set");
+        }
+
+        // A tampered sidecar (hash mismatch) is a hard error so we never
+        // silently feed wrong bytes back to the daemon.
+        std::fs::write(&sidecar_path, b"not the same tokenizer").unwrap();
+        {
+            let sp = SubstratePersistence::open_in(&dir).unwrap();
+            let err = sp.read_tokenizer_bytes().unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("hash mismatch"),
+                "tampered sidecar must surface a hash-mismatch corruption error, got: {msg}"
+            );
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

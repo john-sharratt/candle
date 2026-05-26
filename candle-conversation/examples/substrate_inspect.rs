@@ -105,8 +105,10 @@ fn main() -> Result<()> {
         Cmd::Headers => headers(&mut log)?,
         Cmd::Streams => streams(&mut log)?,
         Cmd::Chunks { stream_id, preview } => chunks(&mut log, parse_stream_id(&stream_id)?, preview)?,
-        Cmd::Tokens { stream_id, ids } => tokens(&mut log, parse_stream_id(&stream_id)?, ids)?,
-        Cmd::Meta => meta(&mut log)?,
+        Cmd::Tokens { stream_id, ids } => {
+            tokens(&mut log, &log_path, parse_stream_id(&stream_id)?, ids)?
+        }
+        Cmd::Meta => meta(&mut log, &log_path)?,
         Cmd::Checkpoint => checkpoint_view(&mut log)?,
     }
     Ok(())
@@ -159,10 +161,23 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     println!(
         "tokenizer         {}",
         match manifest.tokenizer {
-            Some(l) => format!("yes ({:.1} MB)", l.payload_len as f64 / 1_048_576.0),
+            Some(_) => "hash-only (32 bytes — sidecar holds the JSON)".to_string(),
             None => "no".to_string(),
         }
     );
+    let sidecar_path = path
+        .parent()
+        .map(|p| p.join("tokenizer.json"))
+        .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
+    let sidecar_status = match std::fs::metadata(&sidecar_path) {
+        Ok(m) => format!(
+            "{} ({:.1} MB)",
+            sidecar_path.display(),
+            m.len() as f64 / 1_048_576.0
+        ),
+        Err(_) => format!("{} (missing)", sidecar_path.display()),
+    };
+    println!("tokenizer sidecar {sidecar_status}");
     println!("dead-record ratio {:.1}% {}", dead * 100.0, compaction_hint(dead));
     Ok(())
 }
@@ -322,7 +337,12 @@ fn print_fmt_distribution(label: &str, dist: &std::collections::HashMap<u8, usiz
     }
 }
 
-fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
+fn tokens(
+    log: &mut LogFile,
+    log_path: &std::path::Path,
+    stream_id: StreamId,
+    as_ids: bool,
+) -> Result<()> {
     let manifest = build_manifest(log)?;
     let loc = manifest
         .streams
@@ -338,10 +358,11 @@ fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Default: decode to text using the tokenizer embedded in the log.
+    // Default: decode to text using the tokenizer sidecar next to the log.
     // Special tokens are kept so chat-format markers (`<|im_start|>` …) stay
     // visible — useful for inspecting a turn.
-    match load_log_tokenizer(log, &manifest)? {
+    let _ = &manifest; // manifest unused now that the tokenizer lives in a sidecar
+    match load_log_tokenizer(log_path)? {
         Some(tok) => {
             let text = tok
                 .decode(&ids, false)
@@ -350,8 +371,8 @@ fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
         }
         None => {
             eprintln!(
-                "note: this log has no embedded Tokenizer record (written by newer \
-                 daemon runs) — showing raw ids. Use --ids to silence this."
+                "note: no `tokenizer.json` sidecar next to the log — showing raw ids. \
+                 Use --ids to silence this."
             );
             println!("{ids:?}");
         }
@@ -359,29 +380,49 @@ fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
     Ok(())
 }
 
-/// Load the tokenizer embedded in the log's `Tokenizer` record, if present.
-fn load_log_tokenizer(log: &mut LogFile, manifest: &Manifest) -> Result<Option<Tokenizer>> {
-    let Some(loc) = manifest.tokenizer else {
-        return Ok(None);
+/// Load the tokenizer from the sidecar file next to the active log
+/// (`<log_dir>/tokenizer.json`). Returns `Ok(None)` when the sidecar is
+/// missing — the substrate is then opaque to text decoding and the
+/// caller should fall back to `--ids`.
+fn load_log_tokenizer(log_path: &std::path::Path) -> Result<Option<Tokenizer>> {
+    let sidecar = log_path
+        .parent()
+        .map(|p| p.join("tokenizer.json"))
+        .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
+    let bytes = match std::fs::read(&sidecar) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context(format!("read tokenizer sidecar {}", sidecar.display())),
     };
-    let rec = read_record_at(log, loc.offset)?;
-    let tok = Tokenizer::from_bytes(&rec.payload)
-        .map_err(|e| anyhow::anyhow!("load embedded tokenizer: {e}"))?;
+    let tok = Tokenizer::from_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("load tokenizer from {}: {e}", sidecar.display()))?;
     Ok(Some(tok))
 }
 
-fn meta(log: &mut LogFile) -> Result<()> {
+fn meta(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
     let manifest = build_manifest(log)?;
     print_singleton(log, "model spec", manifest.model_spec.map(|l| l.offset))?;
     print_singleton(log, "template", manifest.template.map(|l| l.offset))?;
-    // The tokenizer is large (~11 MB) — report its size, don't dump it.
+    // Tokenizer bytes live in a sidecar; the record itself is just the
+    // 32-byte SHA-256 digest.
     match manifest.tokenizer {
         None => println!("tokenizer   (none)"),
-        Some(l) => println!(
-            "tokenizer   {} bytes ({:.1} MB) — embedded tokenizer.json",
-            l.payload_len,
-            l.payload_len as f64 / 1_048_576.0
-        ),
+        Some(l) => {
+            let sidecar = log_path
+                .parent()
+                .map(|p| p.join("tokenizer.json"))
+                .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
+            let sidecar_size = std::fs::metadata(&sidecar)
+                .ok()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            println!(
+                "tokenizer   record {} bytes (hash-only) ;  sidecar {} ({} bytes)",
+                l.payload_len,
+                sidecar.display(),
+                sidecar_size,
+            );
+        }
     }
     Ok(())
 }
