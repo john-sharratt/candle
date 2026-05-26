@@ -439,38 +439,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             t_layers,
         );
 
-        // Unified post-pass reconcile: runs for both prefill and decode.
-        // lookback_tokens = seq_len: for decode (seq_len=1) this gives the O(1)
-        // boundary-check fast-path; for prefill it covers all newly-sealed blocks.
-        // All GPU compute finishes before any quantization kernel launches.
-        {
-            let needs_reconcile = contexts
-                .first()
-                .and_then(|ctx| ctx.kv_caches.caches.first())
-                .and_then(|c| c.k_cache().chunked_storage_policy())
-                .map(|p| p.to_arena_key().is_quantized())
-                .unwrap_or(false);
-            tracing::debug!(
-                "bg_quantizer: batched_model stage={} seq_len={seq_len} needs_reconcile={needs_reconcile} n_contexts={}",
-                if stage_is_decode { "decode" } else { "prefill" },
-                contexts.len()
-            );
-
-            if needs_reconcile {
-                let t_recon = profile_now();
-                let mut all_cache_refs: Vec<&mut KvCache> = contexts
-                    .iter_mut()
-                    .flat_map(|ctx| ctx.kv_caches.caches.iter_mut())
-                    .collect();
-                KvCache::reconcile_sealed_batch(&mut all_cache_refs, seq_len, generation)?;
-                profile_sync(embedded.device());
-                pipeline_record(
-                    if stage_is_decode { "decode:reconcile" } else { "prefill:reconcile" },
-                    t_recon,
-                );
-            }
-        }
-
         let t_proj = profile_now();
         // Apply final normalization
         let x_tensor = x.to_tensor();

@@ -33,6 +33,7 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+half = { workspace = true }
 hf-hub = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }

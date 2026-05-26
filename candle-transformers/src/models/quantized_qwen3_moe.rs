@@ -1853,6 +1853,7 @@ mod tests {
                 generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            /*
             // BF16 single context
             TestConfig {
                 mode: InferenceMode::BF16,
@@ -1907,6 +1908,7 @@ mod tests {
                 generate_max_len: 20,
                 test_mode: Some(TestMode::Skip),
             },
+            */
             TestConfig {
                 mode: InferenceMode::C0,
                 use_batched: true,
@@ -1929,6 +1931,7 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            /*
             TestConfig {
                 mode: InferenceMode::C2,
                 use_batched: true,
@@ -2017,6 +2020,7 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            */
             TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,

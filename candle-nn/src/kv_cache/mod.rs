@@ -45,8 +45,6 @@ pub use chunked::migrate::kv_migrate;
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 pub(crate) use chunked::Arena; // Internal use only
-#[cfg(feature = "cuda")]
-pub use chunked::BackgroundQuantizer;
 pub use chunked::StoragePolicy;
 pub use chunked::{
     arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, CHUNK_SIZE,

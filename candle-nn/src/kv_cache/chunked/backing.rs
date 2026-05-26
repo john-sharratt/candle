@@ -20,10 +20,6 @@ use super::{
     SealedChunk, StoragePolicy,
 };
 use crate::kv_cache::arena_table::{ArenaLocation, PerHeadEntry};
-#[cfg(feature = "cuda")]
-use crate::kv_cache::chunked::bg_quantizer::ChunkMigration;
-#[cfg(feature = "cuda")]
-use crate::kv_cache::BackgroundQuantizer;
 use crate::kv_cache::{HeadGids, KvFormat, ResolvedArenaInfo};
 use crate::{arena_gid_stride, CHUNK_SIZE};
 
@@ -91,9 +87,6 @@ pub(crate) struct BackingInner {
     pub(crate) identity_scale: Arc<Vec<f32>>,
     /// Reusable pinned-memory stager for async H2D metadata uploads.
     pub(crate) pinned_stager: PinnedStager,
-    /// Background quantization worker shared across all layers.
-    #[cfg(feature = "cuda")]
-    pub(crate) bg_quantizer: BackgroundQuantizer,
 }
 
 impl BackingInner {
@@ -459,9 +452,6 @@ pub struct ChunkedKvBacking {
     pub(crate) layer_idx: usize,
     /// Per-layer block table state (sequences, max_blocks).
     pub(crate) state: Arc<RwLock<BlockTableState>>,
-    /// Background quantizer shared across all layers (same underlying worker as inner).
-    #[cfg(feature = "cuda")]
-    pub(crate) bg_quantizer: BackgroundQuantizer,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -642,61 +632,33 @@ impl ChunkedKvBacking {
             _ => PinnedStager::new_from_device(device),
         };
 
-        #[cfg(feature = "cuda")]
-        let bg_quantizer_err: std::cell::RefCell<Option<candle::Error>> =
-            std::cell::RefCell::new(None);
-        let inner = Arc::new_cyclic(
-            |#[cfg(feature = "cuda")] weak_self, #[cfg(not(feature = "cuda"))] _weak_self| {
-                BackingInner {
-                    storage,
-                    state_registry: RwLock::new(ahash::HashMap::new()),
-                    pool,
-                    device: device.clone(),
-                    n_kv_head,
-                    head_dim,
-                    identity_pal: {
-                        use crate::kv_cache::arena_table::N_PALETTE;
-                        let pal_bytes = (head_dim / 4).max(1);
-                        let sub_hd = (head_dim / N_PALETTE).max(1);
-                        let mut buf = vec![0u8; n_kv_head * pal_bytes];
-                        for h in 0..n_kv_head {
-                            let slice = &mut buf[h * pal_bytes..(h + 1) * pal_bytes];
-                            for d in 0..head_dim {
-                                let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
-                                slice[d / 4] |= pal_idx << ((d % 4) * 2);
-                            }
-                        }
-                        Arc::new(buf)
-                    },
-                    identity_scale: {
-                        use crate::kv_cache::arena_table::N_PALETTE;
-                        Arc::new(vec![1.0f32; n_kv_head * N_PALETTE])
-                    },
-                    pinned_stager,
-                    #[cfg(feature = "cuda")]
-                    bg_quantizer: match device {
-                        Device::Cuda(_) => {
-                            match BackgroundQuantizer::new(
-                                device,
-                                compression.clone(),
-                                weak_self.clone(),
-                            ) {
-                                Ok(bq) => bq,
-                                Err(e) => {
-                                    *bg_quantizer_err.borrow_mut() = Some(e);
-                                    BackgroundQuantizer::noop()
-                                }
-                            }
-                        }
-                        _ => BackgroundQuantizer::noop(),
-                    },
+        let inner = Arc::new(BackingInner {
+            storage,
+            state_registry: RwLock::new(ahash::HashMap::new()),
+            pool,
+            device: device.clone(),
+            n_kv_head,
+            head_dim,
+            identity_pal: {
+                use crate::kv_cache::arena_table::N_PALETTE;
+                let pal_bytes = (head_dim / 4).max(1);
+                let sub_hd = (head_dim / N_PALETTE).max(1);
+                let mut buf = vec![0u8; n_kv_head * pal_bytes];
+                for h in 0..n_kv_head {
+                    let slice = &mut buf[h * pal_bytes..(h + 1) * pal_bytes];
+                    for d in 0..head_dim {
+                        let pal_idx = ((d / sub_hd).min(N_PALETTE - 1)) as u8;
+                        slice[d / 4] |= pal_idx << ((d % 4) * 2);
+                    }
                 }
+                Arc::new(buf)
             },
-        );
-        #[cfg(feature = "cuda")]
-        if let Some(e) = bg_quantizer_err.into_inner() {
-            return Err(e);
-        }
+            identity_scale: {
+                use crate::kv_cache::arena_table::N_PALETTE;
+                Arc::new(vec![1.0f32; n_kv_head * N_PALETTE])
+            },
+            pinned_stager,
+        });
 
         // Register for cooperative compaction
         register_backing(&inner);
@@ -709,8 +671,6 @@ impl ChunkedKvBacking {
         register_state(&inner, &state);
 
         let backing = Self {
-            #[cfg(feature = "cuda")]
-            bg_quantizer: inner.bg_quantizer.clone(),
             inner,
             layer_idx: 0,
             state,
@@ -740,61 +700,13 @@ impl ChunkedKvBacking {
             inner: Arc::clone(&self.inner),
             state,
             layer_idx,
-            #[cfg(feature = "cuda")]
-            bg_quantizer: self.bg_quantizer.clone(),
         }
     }
 
     /// Wait for all previously-enqueued background quantization work to complete.
-    /// Entry point for float→quant conversions.
-    ///
-    /// Hands the work off to the background quantizer thread and joins
-    /// (blocks) until it completes, keeping CUDA work on the bg stream.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn enqueue_reconcile_batch(
-        &self,
-        migrations: Vec<ChunkMigration>,
-        _generation: &Generation,
-    ) -> candle::Result<usize> {
-        use crate::kv_cache::chunked::bg_quantizer::WorkItem;
-
-        let count = migrations.len();
-        self.bg_quantizer.enqueue_work_item(WorkItem { migrations });
-        //self.bg_quantizer.join();
-        Ok(count)
-    }
-
-    /// Clone the pinned stager for use by a sibling worker (e.g. the bg quantizer).
+    /// Clone the pinned stager for use by a sibling worker.
     pub fn pinned_stager(&self) -> candle::quantized::pinned_staging::PinnedStager {
         self.inner.pinned_stager.clone()
-    }
-
-    /// Enqueue a callback to fire on the bg-quantizer thread after every
-    /// work item already in its queue has been quantized.
-    ///
-    /// The bg-quantizer queue is FIFO: a callback enqueued after a turn's
-    /// quantization work items observes the fully-quantized state of those
-    /// chunks. This is the synchronization point for the seal→persist chain
-    /// (§16.12 of `docs/kv_tier_migration.md`) — no explicit join required.
-    #[cfg(feature = "cuda")]
-    pub fn enqueue_persist_callback(&self, cb: Box<dyn FnOnce() + Send + 'static>) {
-        self.bg_quantizer.enqueue_callback(cb);
-    }
-
-    /// Whether this backing's bg-quantizer was constructed with an adaptive
-    /// compression policy. Scheduler uses this to gate whether to persist
-    /// per-chunk `Chunks` records at all (§16.12).
-    #[cfg(feature = "cuda")]
-    pub fn has_compression_policy(&self) -> bool {
-        self.bg_quantizer.has_compression_policy()
-    }
-
-    /// Block the calling thread until every bg-quantizer work item and
-    /// callback enqueued so far has finished. Used on graceful shutdown so
-    /// pending persist callbacks land before the daemon exits.
-    #[cfg(feature = "cuda")]
-    pub fn join_bg_quantizer(&self) {
-        self.bg_quantizer.join();
     }
 
     /// Returns true if this backing has enough reclaimable/tombstoned work to
@@ -2222,8 +2134,6 @@ pub fn global_arena_memory_report() -> Vec<(usize, String, usize, usize)> {
         for (layer_idx, weak) in registry.iter().enumerate() {
             if let Some(backing) = weak.upgrade() {
                 let backing = ChunkedKvBacking {
-                    #[cfg(feature = "cuda")]
-                    bg_quantizer: backing.bg_quantizer.clone(),
                     inner: backing,
                     layer_idx,
                     state: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2248,8 +2158,6 @@ pub fn global_arena_gpu_bytes() -> usize {
         for (layer_idx, weak) in registry.iter().enumerate() {
             if let Some(backing) = weak.upgrade() {
                 let backing = ChunkedKvBacking {
-                    #[cfg(feature = "cuda")]
-                    bg_quantizer: backing.bg_quantizer.clone(),
                     inner: backing,
                     layer_idx,
                     state: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2284,8 +2192,6 @@ pub fn global_print_arena_table() {
             if let Some(inner) = weak.upgrade() {
                 live_backings += 1;
                 let backing = ChunkedKvBacking {
-                    #[cfg(feature = "cuda")]
-                    bg_quantizer: inner.bg_quantizer.clone(),
                     inner,
                     layer_idx,
                     state: std::sync::Arc::new(std::sync::RwLock::new(

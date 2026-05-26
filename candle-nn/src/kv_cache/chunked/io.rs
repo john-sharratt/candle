@@ -332,8 +332,7 @@ impl ChunkedKvBacking {
     /// what the kernel reads when attending to sealed blocks.
     ///
     /// # Errors
-    /// Returns an error if the chunk at `block_idx` is still in a float arena
-    /// (call `reconcile_sealed_batch` before evicting).
+    /// Returns an error if the chunk at `block_idx` is still in a float arena.
     pub fn read_raw_sealed_chunk(
         &self,
         batch_idx: usize,

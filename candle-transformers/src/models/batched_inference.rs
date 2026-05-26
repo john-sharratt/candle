@@ -1276,7 +1276,14 @@ impl BatchedInferenceSession {
             }
         };
 
-        let chunks = match backing.live_chunks_as_sealed(seq_idx) {
+        let arena_infos = match backing.resolve_arena_info() {
+            Ok(a) => a,
+            Err(e) => {
+                println!("[pal4] seq={seq_idx}: resolve_arena_info failed: {e}");
+                return;
+            }
+        };
+        let chunks = match backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
             Some(c) => c,
             None => {
                 println!("[pal4] seq={seq_idx}: not allocated");

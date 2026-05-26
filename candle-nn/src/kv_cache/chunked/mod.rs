@@ -22,7 +22,6 @@
 mod alloc;
 mod arena;
 mod backing;
-pub mod bg_quantizer;
 mod chunk_ops;
 mod compress;
 mod compression_policy;
@@ -45,8 +44,6 @@ mod tests;
 // Re-export public types
 pub use backing::ChunkedKvBacking;
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
-#[cfg(feature = "cuda")]
-pub use bg_quantizer::BackgroundQuantizer;
 pub use compression_policy::{
     production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,

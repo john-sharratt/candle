@@ -932,7 +932,10 @@ impl TestParams {
         // Note: empty k_pal / v_pal is valid and means "use the shared identity palette".
         for &seq_idx in &sequence_indices {
             if let Some(backing) = session.backings().first() {
-                if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx) {
+                let arena_infos = backing
+                    .resolve_arena_info()
+                    .expect("resolve_arena_info");
+                if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
                     for (ci, chunk) in chunks.iter().enumerate() {
                         if !chunk.k_pal.is_empty() && chunk.k_pal.iter().all(|&b| b == 0) {
                             panic!(
