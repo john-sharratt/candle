@@ -50,17 +50,171 @@ use std::sync::{OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
 use candle_nn::kv_cache::SealedSequence;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, LinkedList};
 use std::sync::Arc;
 
 use crate::projection::{DepthWeights, ScoreFormula};
 use crate::projection::{
     GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
-use crate::substrate_cache::{SubstrateCache, SubstrateKey};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::SigEntry;
+
+// ── Substrate ─────────────────────────────────────────────────────────────────
+
+/// Per-session turn / section store and the single source of truth for KV
+/// residence across hot (VRAM), warm (RAM), and cold (disk) tiers.
+///
+/// The substrate is the workspace-shared directory of *what* turns exist —
+/// timelines, indices, role/text/tokens/sigs — plus the per-turn
+/// [`SequenceResidence`] that records *where* each turn's KV bytes live
+/// right now. Sections are pinned (no LRU) and held in their own table.
+///
+/// # Residence layout
+///
+/// [`Self::residence`] is a `Vec<SequenceResidence>` slab. Each
+/// [`TurnEntryData`] and [`SectionEntryData`] carries a
+/// [`ResidenceIndex`] into that slab — there is exactly one slot per
+/// turn / per section, allocated at append time and never moved.
+///
+/// LRU is tracked by two [`std::collections::LinkedList`] of
+/// [`ResidenceIndex`] values — [`Self::hot_lru`] and
+/// [`Self::warm_lru`]. MRU is at the front; eviction pops the back.
+/// A residence appears on the hot list iff `hot.is_some()`, ditto
+/// warm. Position in the list **is** the recency information — no
+/// timestamps, no clock.
+#[derive(Debug, Default)]
+pub struct Substrate {
+    /// Per-turn KV residence slab. Indexed by [`ResidenceIndex`];
+    /// [`TurnEntryData::residence`] and [`SectionEntryData::residence`]
+    /// hold the index for their owning entity. Slots are never moved
+    /// or removed from the middle so indices stay stable for the
+    /// lifetime of the substrate (between [`Self::reset`] calls).
+    residence: Vec<SequenceResidence>,
+
+    /// Per-timeline directory — projection target, sidebar label,
+    /// conv_id, and per-turn metadata (token counts, sig entries,
+    /// role, text, token ids). Does **not** hold KV bytes; those live
+    /// in [`Self::residence`] addressed by [`TurnEntryData::residence`].
+    timelines: HashMap<TimelineId, TimelineEntry>,
+
+    /// Inverse index: every timeline registered against a given group.
+    /// Maintained in lockstep with [`Self::timelines`].
+    timelines_by_group: HashMap<GroupId, Vec<TimelineId>>,
+
+    /// Pinned section entries (system prompts, tool catalogs). Sections
+    /// do not pass through LRU eviction — once ingested they stay hot
+    /// for the session.
+    sections: AHashMap<SectionId, SectionEntryData>,
+
+    /// Hot-tier LRU list, most-recently-used at the front.
+    /// `front()` = MRU, `back()` = next eviction victim. Membership
+    /// mirrors `residence[idx].hot.is_some()` for every index in the
+    /// list; the list and the `Option<Vec<…>>` flag are maintained
+    /// together on every tier transition.
+    hot_lru: LinkedList<ResidenceIndex>,
+
+    /// Warm-tier LRU list, most-recently-used at the front. Same
+    /// membership invariant as [`Self::hot_lru`] but tracking
+    /// `residence[idx].warm`.
+    warm_lru: LinkedList<ResidenceIndex>,
+}
+
+// ── Tier residence ────────────────────────────────────────────────────────────
+
+/// Index into [`Substrate::residence`]. Strongly typed so it can't be
+/// confused with [`TurnIndex`] or any other `usize`.
+///
+/// A residence slot is allocated when a turn or section is first
+/// appended and stays at that index for the lifetime of the substrate
+/// (until [`Substrate::reset`]). The hot- and warm-tier LRU lists store
+/// `ResidenceIndex` values as their node identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResidenceIndex(pub usize);
+
+/// A turn's KV residence across hot (VRAM), warm (RAM), and cold (disk).
+///
+/// A turn can live in **multiple tiers simultaneously** during promotion
+/// windows — e.g. a turn just promoted warm→hot retains its warm copy
+/// until pressure forces it out, so the next demotion is free (no copy).
+///
+/// [`Vec<SealedSequence>`] is the canonical KV shape for both hot and
+/// warm copies. The difference between them is purely the device backing
+/// of the chunks: `hot` chunks point into GPU arenas, `warm` chunks into
+/// host (CPU-resident) memory. The type is device-agnostic; callers
+/// maintain the invariant via the tier they place the bytes in.
+///
+/// [`Vec<StoredSequence>`] is the canonical cold (on-disk) shape — one
+/// `StoredSequence` per layer, mirroring the per-layer shape of `hot`
+/// and `warm`. Each chunk inside it is a reference into the redo log,
+/// not arena GIDs. `cold` is `Option<…>` because the redo-log write
+/// is **asynchronous**: a freshly-sealed turn is hot immediately but
+/// `cold = None` until the persistence callback confirms its chunks
+/// are durably appended and fills in the per-layer references.
+///
+/// # LRU membership
+///
+/// The hot/warm LRU position is **not** stored on the residence — it
+/// lives in [`Substrate::hot_lru`] / [`Substrate::warm_lru`]. A
+/// residence appears in the hot list iff `hot.is_some()`, and in the
+/// warm list iff `warm.is_some()`. Tier transition methods on
+/// `Substrate` enforce that invariant.
+#[derive(Debug)]
+pub struct SequenceResidence {
+    /// VRAM-resident sealed chunks. `None` ⇒ not in VRAM.
+    pub hot: Option<Vec<SealedSequence>>,
+    /// RAM-resident sealed chunks. `None` ⇒ not in RAM.
+    pub warm: Option<Vec<SealedSequence>>,
+    /// Cold-tier references — one [`StoredSequence`] per layer. `None`
+    /// until the async redo-log write for this turn lands.
+    pub cold: Option<Vec<StoredSequence>>,
+    /// Byte size of this sequence's sealed KV payload — the per-tier
+    /// memory cost of holding it hot or warm (a turn resident in both
+    /// pays the cost twice, once per tier). Set when the first bytes
+    /// arrive (`install_hot` / `install_section_hot`) and stays constant
+    /// across tier transitions since the payload itself doesn't change.
+    /// `0` for a freshly-allocated residence with no bytes anywhere.
+    pub byte_size: u64,
+}
+
+/// One layer's KV sequence as it lives in the redo log. Mirrors
+/// [`SealedSequence`] (the VRAM/RAM form) but each chunk carries a
+/// redo-log reference instead of GPU arena GIDs.
+///
+/// Promoting a `StoredSequence` back into VRAM goes through the cold-
+/// load path ([`crate::persistence::transfer::load_stream`]): read each
+/// chunk's bytes at its `log_offset`, decode the [`ChunkPayload`],
+/// allocate arena slots, scatter the bytes, and produce a fresh
+/// [`SealedSequence`].
+///
+/// [`ChunkPayload`]: crate::persistence::record::ChunkPayload
+#[derive(Debug, Clone)]
+pub struct StoredSequence {
+    /// Ordered per-chunk references into the redo log, in token
+    /// order. Length equals the number of sealed chunks this layer
+    /// contributed when the turn was persisted.
+    pub chunks: Vec<StoredChunk>,
+    /// Sum of `chunks[i].token_count`. Cached so the cold-load path
+    /// can size its pinned-staging buffer without re-walking chunks.
+    pub token_count: usize,
+}
+
+/// One chunk's pointer into the redo log. The redo log holds a
+/// [`crate::persistence::record::ChunkPayload`] encoded inside a
+/// record of length `record_len` starting at `log_offset`; decoding
+/// it yields the quantization metadata + arena bytes needed to
+/// rebuild a [`candle_nn::kv_cache::chunked::SealedChunk`] in VRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredChunk {
+    /// Byte offset of the chunk's full record in the redo log.
+    pub log_offset: u64,
+    /// Length of the chunk's record on disk (read with
+    /// `read_record_at(log_offset)` and then decode the payload).
+    pub record_len: u64,
+    /// Valid token count within this chunk (≤ `CHUNK_SIZE`).
+    pub token_count: u16,
+}
 
 // ── Per-turn statistics ───────────────────────────────────────────────────────
 
@@ -221,8 +375,10 @@ pub struct SectionEntryData {
     token_count: usize,
     block_range: (u64, u64),
     sig_entries: Vec<SigEntry>,
-    sealed: Vec<SealedSequence>,
     tokens: Arc<Vec<u32>>,
+    /// Slot in [`Substrate::residence`] holding this section's
+    /// hot/warm/cold KV state. Sealed bytes live there.
+    residence: ResidenceIndex,
 }
 
 // ── Per-turn record ───────────────────────────────────────────────────────────
@@ -232,10 +388,12 @@ pub struct TurnEntryData {
     token_count: usize,
     block_range: (u64, u64),
     sig_entries: Vec<SigEntry>,
-    sealed: Vec<SealedSequence>,
     role: Role,
     text: String,
     token_ids: TokenBuffer,
+    /// Slot in [`Substrate::residence`] holding this turn's
+    /// hot/warm/cold KV state. Sealed bytes live there.
+    residence: ResidenceIndex,
 }
 
 /// Total VRAM byte footprint of a sealed Arc — sums `byte_size`
@@ -383,33 +541,76 @@ impl TimelineEntry {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct Substrate {
-    /// Per-timeline state — projection target, label, conv_id, turns.
-    /// One entry per registered timeline.
-    timelines: HashMap<TimelineId, TimelineEntry>,
-    /// Inverse index: every timeline registered against a given group.
-    /// Maintained in lockstep with `timelines`.
-    timelines_by_group: HashMap<GroupId, Vec<TimelineId>>,
-    sections: AHashMap<SectionId, SectionEntryData>,
-    /// Hot-tier index and warm-tier accounting (byte totals, LRU stamps).
-    cache: SubstrateCache,
-}
-
 impl Substrate {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a substrate backed by a shared [`SubstrateCache`].
+    /// Allocate a fresh slot in the residence slab. Used by every
+    /// turn/section insert path so each owning entry has a stable
+    /// [`ResidenceIndex`] to address its KV state.
     ///
-    /// Pass a clone of the engine-level cache so VRAM accounting and the
-    /// eviction budget are shared across all sessions.
-    pub fn with_cache(cache: SubstrateCache) -> Self {
-        Self {
-            cache,
-            ..Self::default()
+    /// The new slot starts with `hot = None`, `warm = None`, and
+    /// `cold = None`. The cold reference is filled in later by the
+    /// persistence callback once the turn's chunks are durably on
+    /// disk; until then any cold-load attempt errors out. The LRU
+    /// lists ignore the slot until the tier-transition methods put
+    /// bytes into hot or warm.
+    fn alloc_residence(&mut self) -> ResidenceIndex {
+        let idx = ResidenceIndex(self.residence.len());
+        self.residence.push(SequenceResidence {
+            hot: None,
+            warm: None,
+            cold: None,
+            byte_size: 0,
+        });
+        idx
+    }
+
+    /// Place `sealed` into the residence slot's hot tier and push the
+    /// slot onto the hot-LRU front (MRU). Used by every code path that
+    /// brings KV bytes into VRAM — fresh seal, cold→hot promotion,
+    /// post-cold-load materialisation.
+    ///
+    /// Caller invariant: `sealed` is non-empty. An empty `Vec` would
+    /// represent a "cold marker" — under the new design that's the
+    /// `hot = None` state, reached by [`Self::clear_hot`], not by
+    /// installing an empty Vec.
+    fn install_hot(&mut self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) {
+        debug_assert!(!sealed.is_empty(), "install_hot called with empty Vec");
+        let bytes = sealed_bytes(&sealed) as u64;
+        let slot = &mut self.residence[residence.0];
+        slot.byte_size = bytes;
+        slot.hot = Some(sealed);
+        self.hot_lru.push_front(residence);
+    }
+
+    /// Section variant of [`Self::install_hot`]. Sections are pinned —
+    /// once installed they stay hot and do **not** appear in
+    /// [`Self::hot_lru`], so eviction never touches them.
+    fn install_section_hot(
+        &mut self,
+        residence: ResidenceIndex,
+        sealed: Vec<SealedSequence>,
+    ) {
+        debug_assert!(!sealed.is_empty(), "install_section_hot called with empty Vec");
+        let bytes = sealed_bytes(&sealed) as u64;
+        let slot = &mut self.residence[residence.0];
+        slot.byte_size = bytes;
+        slot.hot = Some(sealed);
+    }
+
+    /// Remove `target` from the hot LRU list. O(n) — for our scale
+    /// (hundreds of entries) the rebuild is cheaper than the unstable
+    /// `cursor_front_mut` API would buy us.
+    fn remove_from_hot_lru(&mut self, target: ResidenceIndex) {
+        let mut rebuilt: LinkedList<ResidenceIndex> = LinkedList::new();
+        while let Some(v) = self.hot_lru.pop_front() {
+            if v != target {
+                rebuilt.push_back(v);
+            }
         }
+        self.hot_lru = rebuilt;
     }
 
     // ── Timeline registry ────────────────────────────────────────────────────
@@ -508,21 +709,27 @@ impl Substrate {
         block_start: u64,
         block_end: u64,
     ) -> TurnIndex {
-        let tl = self
+        let idx = self
             .timelines
-            .get_mut(&timeline)
-            .expect("append_with_blocks: timeline not registered");
-        let idx = tl.next_turn_index();
+            .get(&timeline)
+            .expect("append_with_blocks: timeline not registered")
+            .next_turn_index();
+        let residence = self.alloc_residence();
+        // `append_with_blocks` declares a turn's existence and block
+        // range, but holds no sealed KV — the residence stays cold
+        // (`hot = None`) until a later `materialize_turn_sealed` /
+        // `append_full` puts bytes in.
+        let tl = self.timelines.get_mut(&timeline).unwrap();
         tl.turns.insert(
             idx,
             TurnEntryData {
                 token_count,
                 block_range: (block_start, block_end),
                 sig_entries: Vec::new(),
-                sealed: Vec::new(),
                 role: Role::Assistant,
                 text: String::new(),
                 token_ids: TokenBuffer::default(),
+                residence,
             },
         );
         idx
@@ -550,23 +757,32 @@ impl Substrate {
     ) -> candle::Result<TurnIndex> {
         let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
         // GPU chunks are freed as soon as the caller drops `sealed_gpu`.
-        let tl = self
+        let idx = self
             .timelines
-            .get_mut(&timeline)
-            .expect("append_full: timeline not registered");
-        let idx = tl.next_turn_index();
-        tl.turns.insert(
-            idx,
-            TurnEntryData {
-                token_count,
-                block_range: (block_start, block_end),
-                sig_entries: Vec::new(),
-                sealed: sealed_cpu,
-                role,
-                text,
-                token_ids,
-            },
-        );
+            .get(&timeline)
+            .expect("append_full: timeline not registered")
+            .next_turn_index();
+        let residence = self.alloc_residence();
+        {
+            let tl = self.timelines.get_mut(&timeline).unwrap();
+            tl.turns.insert(
+                idx,
+                TurnEntryData {
+                    token_count,
+                    block_range: (block_start, block_end),
+                    sig_entries: Vec::new(),
+                    role,
+                    text,
+                    token_ids,
+                    residence,
+                },
+            );
+        }
+        // Bytes are CPU-resident here — install them as the turn's hot
+        // residence and put it at the front of the hot LRU.
+        if !sealed_cpu.is_empty() {
+            self.install_hot(residence, sealed_cpu);
+        }
         Ok(idx)
     }
 
@@ -591,23 +807,30 @@ impl Substrate {
         block_end: u64,
         sealed: Vec<SealedSequence>,
     ) -> TurnIndex {
-        let tl = self
+        let idx = self
             .timelines
-            .get_mut(&timeline)
-            .expect("restore_turn: timeline must be registered first");
-        let idx = tl.next_turn_index();
-        tl.turns.insert(
-            idx,
-            TurnEntryData {
-                token_count,
-                block_range: (block_start, block_end),
-                sig_entries: Vec::new(),
-                sealed,
-                role,
-                text,
-                token_ids,
-            },
-        );
+            .get(&timeline)
+            .expect("restore_turn: timeline must be registered first")
+            .next_turn_index();
+        let residence = self.alloc_residence();
+        {
+            let tl = self.timelines.get_mut(&timeline).unwrap();
+            tl.turns.insert(
+                idx,
+                TurnEntryData {
+                    token_count,
+                    block_range: (block_start, block_end),
+                    sig_entries: Vec::new(),
+                    role,
+                    text,
+                    token_ids,
+                    residence,
+                },
+            );
+        }
+        if !sealed.is_empty() {
+            self.install_hot(residence, sealed);
+        }
         idx
     }
 
@@ -626,14 +849,11 @@ impl Substrate {
         }
     }
 
-    /// Replace a turn's cold `sealed` marker (empty `Vec<SealedSequence>`)
-    /// with a freshly-materialized hot set. Called by the engine's
+    /// Install a freshly-materialized hot KV set for a turn that
+    /// currently has none (cold marker). Called by the engine's
     /// `ensure_turn_hot` orchestrator after a cold-load from NVMe.
     ///
-    /// No-ops if the turn isn't tracked (deleted between recovery and
-    /// materialization, e.g. via compaction) or if `sealed` is empty
-    /// (write-empty would re-cold an entry, which the engine never asks
-    /// for — eviction would call a separate `evict_turn_sealed` instead).
+    /// No-ops if the turn isn't tracked or if `sealed` is empty.
     pub fn materialize_turn_sealed(
         &mut self,
         timeline: TimelineId,
@@ -643,12 +863,15 @@ impl Substrate {
         if sealed.is_empty() {
             return;
         }
-        if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.sealed = sealed;
-        }
+        let Some(residence) = self.turn(timeline, index).map(|e| e.residence) else {
+            return;
+        };
+        self.install_hot(residence, sealed);
     }
 
     /// Section-side counterpart of [`Self::materialize_turn_sealed`].
+    /// Section residences don't enter [`Self::hot_lru`] — sections are
+    /// pinned for the session.
     pub fn materialize_section_sealed(
         &mut self,
         section: SectionId,
@@ -657,73 +880,68 @@ impl Substrate {
         if sealed.is_empty() {
             return;
         }
-        if let Some(entry) = self.sections.get_mut(&section) {
-            entry.sealed = sealed;
-        }
+        let Some(residence) = self.sections.get(&section).map(|e| e.residence) else {
+            return;
+        };
+        self.install_section_hot(residence, sealed);
     }
 
-    /// Reset a turn's `sealed` field to the empty cold-marker, dropping
-    /// the substrate's hold on the underlying VRAM arena chunks. The
-    /// `Arc<ChunkGid>`s drop here too (unless still borrowed by a live
-    /// view), which is how VRAM is actually released by the engine's
-    /// hot-tier eviction.
+    /// Drop a turn's hot residence, freeing its VRAM arena chunks
+    /// (the inner `Arc<ChunkGid>`s reach refcount 0 once any live
+    /// borrowers release them). Removes the slot from the hot LRU.
     ///
-    /// Returns the previous `sealed` Arc so the caller can take final
-    /// ownership before it drops (e.g. to gather chunks into the warm
-    /// pool first via `seal_to_chunk_images`). `None` if the turn was
-    /// not tracked or was already cold.
+    /// Returns the previous hot bytes so the caller can take final
+    /// ownership before they drop (e.g. to gather them into the warm
+    /// pool first). `None` if the turn was not tracked or was already
+    /// cold.
     pub fn clear_turn_sealed(
         &mut self,
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<Vec<SealedSequence>> {
-        let entry = self.turn_mut(timeline, index)?;
-        if entry.sealed.is_empty() {
-            return None;
-        }
-        let prev = std::mem::replace(&mut entry.sealed, Vec::new());
+        let residence = self.turn(timeline, index)?.residence;
+        let prev = self.residence[residence.0].hot.take()?;
+        self.remove_from_hot_lru(residence);
         Some(prev)
     }
 
-    /// Sum of `SealedChunk.byte_size` across every hot-resident turn
-    /// (i.e. those whose `sealed` carries an actual chunk grid, not the
-    /// empty cold marker). Iteration is over a few dozen entries in
-    /// steady state — cheap enough to call inline on each
-    /// `ensure_turn_hot` pre-flight.
+    /// Sum of bytes across every hot-resident turn. Walks
+    /// [`Self::hot_lru`] directly — exactly the set of turns whose
+    /// residence carries hot bytes — and reads each residence's cached
+    /// `byte_size`. O(N_hot) integer sum, no chunk-walking.
     pub fn hot_turn_bytes(&self) -> usize {
-        self.timelines
-            .values()
-            .flat_map(|t| t.turns.values())
-            .filter(|e| !e.sealed.is_empty())
-            .map(|e| sealed_bytes(&e.sealed))
+        self.hot_lru
+            .iter()
+            .map(|idx| self.residence[idx.0].byte_size as usize)
             .sum()
     }
 
     /// Sum of bytes across all pinned sections — the system-prompt /
     /// catalog KV the substrate never evicts. Counts toward the same
-    /// VRAM budget the engine's hot-tier eviction uses.
+    /// VRAM budget hot-tier eviction uses.
     pub fn section_bytes(&self) -> usize {
         self.sections
             .values()
-            .map(|e| sealed_bytes(&e.sealed))
+            .filter(|e| self.residence[e.residence.0].hot.is_some())
+            .map(|e| self.residence[e.residence.0].byte_size as usize)
             .sum()
     }
 
     /// Bytes a single hot-resident turn currently holds in VRAM. `None`
     /// for unknown / cold turns.
     pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
-        let entry = self.turn(timeline, index)?;
-        if entry.sealed.is_empty() {
-            return None;
-        }
-        Some(sealed_bytes(&entry.sealed))
+        let residence = self.turn(timeline, index)?.residence;
+        let slot = &self.residence[residence.0];
+        slot.hot.as_ref()?;
+        Some(slot.byte_size as usize)
     }
 
     /// FIFO-oldest hot-resident turn, skipping `except`. "FIFO" =
     /// insertion order within each timeline's tail; timelines are
     /// scanned in registration order. Adequate eviction heuristic
     /// (oldest persisted turn = least likely to be re-touched);
-    /// upgradeable to true LRU later with a `last_touched` stamp.
+    /// upgradeable to true LRU later by walking [`Self::hot_lru`]
+    /// from the back instead.
     pub fn oldest_hot_turn_except(&self, except: TurnKey) -> Option<TurnKey> {
         for (&timeline, tl) in self.timelines.iter() {
             for (&index, entry) in tl.turns.iter() {
@@ -731,7 +949,7 @@ impl Substrate {
                 if key == except {
                     continue;
                 }
-                if !entry.sealed.is_empty() {
+                if self.residence[entry.residence.0].hot.is_some() {
                     return Some(key);
                 }
             }
@@ -820,8 +1038,9 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
-        self.turn(timeline, index)
-            .map(|e| Arc::new(e.sealed.clone()))
+        let residence = self.turn(timeline, index)?.residence;
+        let hot = self.residence[residence.0].hot.as_ref()?;
+        Some(Arc::new(hot.clone()))
     }
 
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
@@ -925,47 +1144,12 @@ impl Substrate {
             .count()
     }
 
-    /// Test/eviction helper: access to the hot-tier cache.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn cache(&self) -> &crate::substrate_cache::SubstrateCache {
-        &self.cache
-    }
-
-    // ── Warm-tier accounting ─────────────────────────────────────────────────
-
-    /// Compute and set the VRAM budget for hot-tier entries.
-    ///
-    /// Call this after model weights are loaded and resident, passing the
-    /// post-load free-VRAM figure from a CUDA memory query so model weight
-    /// consumption is automatically excluded.  See
-    /// [`SubstrateCache::activate_budget`] for parameter semantics.
-    pub fn init_hot_budget(
-        &mut self,
-        free_vram_bytes: u64,
-        abs_reserve_bytes: u64,
-        rel_reserve_frac: f64,
-    ) {
-        self.cache
-            .activate_budget(free_vram_bytes, abs_reserve_bytes, rel_reserve_frac);
-    }
-
-    /// Total VRAM currently occupied by all GPU-resident (hot-tier) entries.
-    pub fn hot_bytes(&self) -> u64 {
-        self.cache.hot_bytes()
-    }
-
-    /// Return the `n` least-recently-used substrate keys.
-    pub fn lru_entries(&self, n: usize) -> Vec<SubstrateKey> {
-        self.cache.lru_entries(n)
-    }
-
     pub fn reset(&mut self) {
         // `timelines` owns the per-turn store now, so clearing it
         // drops every turn alongside its parent timeline entry.
         self.timelines.clear();
         self.timelines_by_group.clear();
         self.sections.clear();
-        self.cache.clear();
     }
 
     // ── Section accessors ────────────────────────────────────────────────────
@@ -989,14 +1173,20 @@ impl Substrate {
         tokens: Arc<Vec<u32>>,
     ) -> candle::Result<()> {
         let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
+        // Sections don't go through the cold tier today (they're pinned
+        // at conversation setup), so `cold` simply stays `None`.
+        let residence = self.alloc_residence();
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
             sig_entries,
-            sealed: sealed_cpu,
             tokens,
+            residence,
         };
         self.sections.insert(section, entry);
+        if !sealed_cpu.is_empty() {
+            self.install_section_hot(residence, sealed_cpu);
+        }
         Ok(())
     }
 
@@ -1012,9 +1202,9 @@ impl Substrate {
     }
 
     pub fn section_sealed_of(&self, section: SectionId) -> Option<Arc<Vec<SealedSequence>>> {
-        self.sections
-            .get(&section)
-            .map(|e| Arc::new(e.sealed.clone()))
+        let residence = self.sections.get(&section)?.residence;
+        let hot = self.residence[residence.0].hot.as_ref()?;
+        Some(Arc::new(hot.clone()))
     }
 
     pub fn section_tokens_of(&self, section: SectionId) -> Arc<Vec<u32>> {

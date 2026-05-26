@@ -12,7 +12,6 @@ use crate::provenance::SigEntry;
 use crate::substrate::{
     ContentResolver, ProjectionScores, Substrate, SubstrateRead, SubstrateWrite,
 };
-use crate::substrate_cache::SubstrateCache;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use candle_nn::kv_cache::SealedSequence;
@@ -79,14 +78,10 @@ impl Conversation {
         }
     }
 
-    /// Create a conversation backed by a shared [`SubstrateCache`] and a
-    /// real [`SubstratePersistence`].
-    ///
-    /// Pass a clone of the engine-level cache so VRAM accounting and the
-    /// eviction budget are shared across all sessions.
-    pub fn with_cache(cache: SubstrateCache, persistence: SubstratePersistence) -> Self {
+    /// Create a conversation backed by a real [`SubstratePersistence`].
+    pub fn with_persistence(persistence: SubstratePersistence) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Substrate::with_cache(cache))),
+            inner: Arc::new(RwLock::new(Substrate::new())),
             allocator: Arc::new(TimelineAllocator::new()),
             persistence: Arc::new(Mutex::new(persistence)),
         }

@@ -6,7 +6,6 @@ use crate::error::ConversationError;
 use crate::projection::{Builder, Conversation, ProjectionTarget};
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
-use crate::substrate_cache::SubstrateCache;
 use crate::token_buffer::TokenBuffer;
 
 use candle_nn::CHUNK_SIZE;
@@ -51,15 +50,6 @@ pub struct ConversationEngine {
     /// handles) across every `Sequence` allocated from this engine.
     /// Each `Sequence` receives a clone.
     conversation: Conversation,
-
-    /// Shared hot-tier KV cache — one instance per engine, cloned into every
-    /// [`Substrate`](crate::substrate::Substrate).  VRAM byte accounting and
-    /// the eviction budget are therefore global across all sessions.
-    ///
-    /// Budget is set via [`ConversationEngine::init_hot_budget`] after model
-    /// weights are fully resident and a post-load CUDA free-memory query is
-    /// available.
-    substrate_cache: SubstrateCache,
 
     /// Shared provenance signature file (anonymous temp, deleted on process exit).
     ///
@@ -148,17 +138,7 @@ impl ConversationEngine {
                 })?;
             }
         }
-        // Shared hot-tier cache.  Budget is derived from `config` if the caller
-        // provided a post-load free-VRAM figure; otherwise unlimited.
-        let substrate_cache = match config.hot_cache_free_vram_bytes {
-            Some(free_vram) => SubstrateCache::new(
-                free_vram,
-                config.hot_cache_abs_reserve_bytes,
-                config.hot_cache_rel_reserve_frac,
-            ),
-            None => SubstrateCache::unbounded(),
-        };
-        let conversation = Conversation::with_cache(substrate_cache.clone(), persistence);
+        let conversation = Conversation::with_persistence(persistence);
 
         // Workspace-shared `ProvenanceFile`: created up-front so the
         // scheduler can append to it inline during `cleanup_finished`'s
@@ -207,28 +187,7 @@ impl ConversationEngine {
             provenance,
             model_core,
             conversation,
-            substrate_cache,
         })
-    }
-
-    /// Activate the shared hot-tier VRAM budget.
-    ///
-    /// Call this after model weights are fully resident.  Pass the free-VRAM
-    /// figure from a post-load CUDA memory query (`cuMemGetInfo` or equivalent)
-    /// so model weight consumption is automatically excluded from the budget.
-    ///
-    /// `abs_reserve_bytes` is a fixed floor held back for decode activations
-    /// and attention scratch space.  `rel_reserve_frac` (e.g. `0.05`) is an
-    /// additional fractional reserve.  Both are subtracted from
-    /// `free_vram_bytes`; the result becomes the cap shared across all sessions.
-    pub fn init_hot_budget(
-        &self,
-        free_vram_bytes: u64,
-        abs_reserve_bytes: u64,
-        rel_reserve_frac: f64,
-    ) {
-        self.substrate_cache
-            .activate_budget(free_vram_bytes, abs_reserve_bytes, rel_reserve_frac);
     }
 
     /// Create a new conversation.

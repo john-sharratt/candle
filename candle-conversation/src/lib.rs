@@ -34,7 +34,6 @@ pub mod prompts;
 mod scheduler;
 mod sequence_handle;
 pub mod substrate;
-pub mod substrate_cache;
 mod stats;
 pub mod store;
 pub mod think_strip;

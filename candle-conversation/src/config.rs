@@ -1136,24 +1136,6 @@ pub struct EngineConfig {
     /// can detokenize offline without a separate tokenizer file. `None` skips
     /// the write.
     pub tokenizer: Option<Vec<u8>>,
-
-    /// Free VRAM available for the hot-tier KV cache, measured **after** model
-    /// weights and session arenas are resident.  Query with `cuMemGetInfo` (or
-    /// equivalent) post-load and set this before constructing
-    /// [`ConversationEngine`](crate::ConversationEngine).
-    ///
-    /// `None` = no budget (unlimited, default).  Should only be `None` during
-    /// testing or on CPU-only builds where VRAM pressure is irrelevant.
-    pub hot_cache_free_vram_bytes: Option<u64>,
-
-    /// Fixed byte floor subtracted from `hot_cache_free_vram_bytes` to
-    /// reserve space for decode activations, attention scratch, and OS overhead.
-    /// Defaults to 512 MiB.
-    pub hot_cache_abs_reserve_bytes: u64,
-
-    /// Fractional reserve subtracted from `hot_cache_free_vram_bytes` as
-    /// proportional headroom (e.g. `0.05` = 5 %).  Defaults to `0.05`.
-    pub hot_cache_rel_reserve_frac: f64,
 }
 
 impl EngineConfig {
@@ -1179,9 +1161,6 @@ impl EngineConfig {
             workspace_path: None,
             model_spec: None,
             tokenizer: None,
-            hot_cache_free_vram_bytes: None,
-            hot_cache_abs_reserve_bytes: 512 * 1024 * 1024, // 512 MiB
-            hot_cache_rel_reserve_frac: 0.05,
         }
     }
 }
