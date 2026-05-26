@@ -41,7 +41,7 @@ pub use arena_table::{
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
 #[cfg(feature = "cuda")]
-pub use chunked::migrate::kv_migrate;
+pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 pub(crate) use chunked::Arena; // Internal use only

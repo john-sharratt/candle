@@ -764,7 +764,10 @@ impl ZendSession {
                     *slot.write().unwrap() = Some(Arc::clone(&state));
                     tracing::info!("inference engine ready");
                     status_tx.send(String::new()).ok();
-                    spawn_periodic_flush(state);
+                    // Substrate persistence runs in the engine's own
+                    // thread (`PersistenceThread`) — 5 s tick + per-turn
+                    // trigger from the scheduler — so no periodic-flush
+                    // task is needed at the daemon level here.
 
                     // Steps 4 + 5 are stubbed for now — we walk through
                     // them so the frontend sees the full state-machine
@@ -917,58 +920,6 @@ impl ZendSession {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Cap on the periodic substrate flush — the bg-quantizer's persist
-/// callback writes Chunk records asynchronously after a turn completes,
-/// so without this tick they'd sit un-`fsync`'d until shutdown. Five
-/// seconds is the maximum window of data loss in a crash.
-const PERIODIC_FLUSH_SECS: u64 = 5;
-
-/// Background `fsync` heartbeat. Every [`PERIODIC_FLUSH_SECS`] seconds,
-/// asks the engine to flush iff there's staged data — a no-op when
-/// idle. Covers two cases the per-turn commit misses:
-///
-/// - **Async chunk writes.** The bg-quantizer's persist callback fires
-///   *after* a turn's `commit_persistence`, so its Chunk records and
-///   post-quant `Commit` are staged but un-`fsync`'d until the next
-///   call. This tick catches them.
-/// - **Mid-conversation idleness.** A workspace that sits quiet between
-///   turns gets its tail durabilised within the 5-second window instead
-///   of waiting for shutdown.
-fn spawn_periodic_flush(state: Arc<InferenceState>) {
-    use std::time::Duration;
-    use tokio::time::{interval, MissedTickBehavior};
-
-    tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(PERIODIC_FLUSH_SECS));
-        // If the runtime is starved (a long blocking task on the worker
-        // pool, say), skip catch-up ticks — one flush is as durable as
-        // several.
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // First tick fires immediately by default — discard it so we
-        // don't flush at engine-ready time when nothing has been
-        // written yet.
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            let state = Arc::clone(&state);
-            let flushed = tokio::task::spawn_blocking(move || {
-                state
-                    .engine
-                    .lock()
-                    .unwrap()
-                    .commit_persistence_if_pending()
-            })
-            .await;
-            match flushed {
-                Ok(Ok(true)) => tracing::debug!("periodic flush: substrate fsynced"),
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => tracing::warn!("periodic flush failed: {e}"),
-                Err(e) => tracing::warn!("periodic flush task panicked: {e}"),
-            }
-        }
-    });
-}
 
 /// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
 /// of the id. Deterministic across daemon restarts, so a reconnecting client

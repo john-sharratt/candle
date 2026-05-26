@@ -13,6 +13,9 @@
 //!
 //! The kernel itself is `candle-kernels` `simple/kv_migrate.cu`.
 
+#[cfg(feature = "cuda")]
+use candle::cuda::cudarc::driver::CudaStream;
+
 /// One copy in a migration plan: `byte_len` bytes from `src_ptr` to
 /// `dst_ptr`, both raw device addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,11 +65,29 @@ impl MigrationPlan {
     }
 }
 
-/// Execute a migration plan: launch the scatter/gather kernel once over the
-/// whole plan and synchronise. After this returns, every record's bytes
-/// have been copied.
+/// Execute a migration plan on the device's default stream and
+/// synchronise before returning. Equivalent to
+/// `kv_migrate_on(device, plan, None)`.
 #[cfg(feature = "cuda")]
 pub fn kv_migrate(device: &candle::Device, plan: &MigrationPlan) -> candle::Result<()> {
+    kv_migrate_on(device, plan, None)
+}
+
+/// Execute a migration plan on a caller-chosen stream. After this
+/// returns, the stream has been synchronised — every record's bytes
+/// have been copied and visible to subsequent work on that stream.
+///
+/// `stream = None` uses the device's default stream (same as
+/// [`kv_migrate`]). Passing a dedicated copy stream lets the caller
+/// overlap migration DMAs with compute submitted to other streams —
+/// the persistence thread uses this to keep its hot→warm gather off
+/// the default decode stream.
+#[cfg(feature = "cuda")]
+pub fn kv_migrate_on(
+    device: &candle::Device,
+    plan: &MigrationPlan,
+    stream: Option<&CudaStream>,
+) -> candle::Result<()> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::cuda_backend::kernels;
 
@@ -96,20 +117,21 @@ pub fn kv_migrate(device: &candle::Device, plan: &MigrationPlan) -> candle::Resu
         .memcpy_stod(&lens)
         .map_err(|e| candle::Error::Msg(format!("kv_migrate: len plan HtoD: {e}")))?;
 
-    let stream = dev.cuda_stream();
-    let (sp, _sg) = src_gpu.device_ptr(&stream);
-    let (dp, _dg) = dst_gpu.device_ptr(&stream);
-    let (lp, _lg) = len_gpu.device_ptr(&stream);
+    let default_stream = dev.cuda_stream();
+    let used_stream = stream.unwrap_or(&default_stream);
+    let (sp, _sg) = src_gpu.device_ptr(used_stream);
+    let (dp, _dg) = dst_gpu.device_ptr(used_stream);
+    let (lp, _lg) = len_gpu.device_ptr(used_stream);
     unsafe {
         kernels::simple::kv_migrate::run_kv_migrate_copy(
             sp as *const i64,
             dp as *const i64,
             lp as *const i64,
             plan.records.len() as i32,
-            stream.cu_stream() as *mut std::ffi::c_void,
+            used_stream.cu_stream() as *mut std::ffi::c_void,
         );
     }
-    stream
+    used_stream
         .synchronize()
         .map_err(|e| candle::Error::Msg(format!("kv_migrate: stream sync: {e}")))?;
     Ok(())

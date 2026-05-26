@@ -23,9 +23,10 @@
 //! non-CUDA half.
 
 use super::manifest::ChunkLoc;
-use super::record::ChunkPayload;
+use super::record::{padded_record_len, ChunkPayload, RecordType, HEADER_SIZE};
 use super::streams::{StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
+use crate::substrate::{StoredChunk, StoredSequence};
 
 /// One sealed chunk staged for the log: the `Chunk` record's `token_count`
 /// header field paired with its decoded [`ChunkPayload`] (which carries the
@@ -259,6 +260,61 @@ pub fn persist_turn_chunks(
     Ok(())
 }
 
+/// Persist a turn's chunks **and** return the per-layer cold references
+/// the substrate's residence slab needs to wire `cold = Some(...)`.
+///
+/// Mirrors [`persist_turn_chunks`] (same on-disk effect) but captures the
+/// `log_offset` returned by each `append_record` call so the
+/// [`StoredChunk`] reference is exact. Used by the persistence thread's
+/// warm→cold phase.
+pub fn persist_turn_chunks_capture(
+    p: &mut SubstratePersistence,
+    stream_id: StreamId,
+    layers: &TurnChunkGrid,
+) -> Result<Vec<StoredSequence>> {
+    let chunks_per_layer = layers.chunks_per_layer();
+    let mut out = Vec::with_capacity(layers.n_layers());
+    for (layer_idx, layer) in layers.iter_layers().enumerate() {
+        if layer.len() != chunks_per_layer {
+            return Err(PersistenceError::Corrupt(format!(
+                "layer {layer_idx} has {} chunks, expected {chunks_per_layer}",
+                layer.len()
+            )));
+        }
+        let mut stored = Vec::with_capacity(layer.len());
+        let mut layer_token_count = 0usize;
+        for (chunk_idx, image) in layer.iter().enumerate() {
+            let flat = flat_chunk_index(layer_idx, chunk_idx, chunks_per_layer);
+            let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
+            let encoded = image.payload.encode();
+            let payload_len = encoded.len() as u64;
+            let log_offset = p.append_record(
+                RecordType::Chunk,
+                header_fmt,
+                stream_id.0,
+                flat,
+                image.token_count as u64,
+                &encoded,
+            )?;
+            let record_len = padded_record_len(payload_len) as u64;
+            // Sanity: `padded_record_len` includes the header so we can
+            // reconstruct the record's full footprint from this field.
+            debug_assert!(record_len >= HEADER_SIZE as u64);
+            stored.push(StoredChunk {
+                log_offset,
+                record_len,
+                token_count: image.token_count,
+            });
+            layer_token_count += image.token_count as usize;
+        }
+        out.push(StoredSequence {
+            chunks: stored,
+            token_count: layer_token_count,
+        });
+    }
+    Ok(out)
+}
+
 /// Persist a turn's `Tokens` record and the trailing `Commit`. Always called
 /// synchronously on seal — tokens are substrate-critical reconstruction data
 /// regardless of compression policy. The `layers` argument is used solely to
@@ -274,6 +330,20 @@ pub fn persist_turn_tokens(
     let total = layers.n_layers() * layers.chunks_per_layer();
     let through = if total > 0 { total as u64 - 1 } else { 0 };
     p.commit_stream(stream_id, through)?;
+    Ok(())
+}
+
+/// Write **only** a turn's `Tokens` record — no trailing `Commit`. Used
+/// by the synchronous seal path when chunks (and the matching `Commit`)
+/// are deferred to the persistence thread. Tokens are tiny and load-
+/// bearing for reconstruction, so they stay on the hot path even when
+/// chunks don't.
+pub fn persist_tokens_only(
+    p: &mut SubstratePersistence,
+    stream_id: StreamId,
+    token_ids: &[u32],
+) -> Result<()> {
+    p.append_tokens(stream_id, &encode_token_ids(token_ids))?;
     Ok(())
 }
 

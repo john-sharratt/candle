@@ -549,6 +549,20 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist turn chunks: {e}")))
     }
 
+    /// Persist a turn's chunks and return the per-layer [`StoredSequence`]
+    /// references — the warm→cold leg of the persistence thread's
+    /// `run_pass`. The returned references go straight into the
+    /// substrate via `Substrate::install_cold`.
+    pub fn persist_turn_chunks_capture(
+        &self,
+        stream_id: StreamId,
+        layers: &crate::persistence::resume::TurnChunkGrid,
+    ) -> candle::Result<Vec<crate::substrate::StoredSequence>> {
+        let mut p = self.persistence.lock().unwrap();
+        crate::persistence::resume::persist_turn_chunks_capture(&mut p, stream_id, layers)
+            .map_err(|e| candle::Error::Msg(format!("persist turn chunks capture: {e}")))
+    }
+
     /// Persist a turn's `Tokens` record and the trailing `Commit` — always
     /// called synchronously on seal, regardless of compression policy.
     /// `layers` is only used to compute the highest chunk index; pass an
@@ -562,6 +576,19 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         crate::persistence::resume::persist_turn_tokens(&mut p, stream_id, token_ids, layers)
             .map_err(|e| candle::Error::Msg(format!("persist turn tokens: {e}")))
+    }
+
+    /// Persist a turn's `Tokens` record only — no trailing `Commit`.
+    /// Used by the seal path now that chunks (and the matching Commit)
+    /// are written asynchronously by the persistence thread.
+    pub fn persist_tokens_only(
+        &self,
+        stream_id: StreamId,
+        token_ids: &[u32],
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        crate::persistence::resume::persist_tokens_only(&mut p, stream_id, token_ids)
+            .map_err(|e| candle::Error::Msg(format!("persist tokens: {e}")))
     }
 
     /// Append a stream-level `Commit` record at the given chunk index — the

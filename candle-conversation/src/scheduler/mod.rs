@@ -14,9 +14,11 @@ use crate::decode_health::DecodeHealthState;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::persistence::cold_load::ColdLoadStager;
+use crate::persistence::elevate::{elevate_to_hot, evict_from_hot};
+use crate::persistence::thread::PersistenceTrigger;
 use crate::persistence::warm_pool::WarmPool;
 use crate::projection::{
-    Builder, Conversation, GroupId, ProjectionMode, ProjectionTarget, SectionId, TurnIndex,
+    Builder, Conversation, GroupId, ProjectionMode, ProjectionTarget, SectionId, TurnIndex, TurnKey,
 };
 #[cfg(feature = "sig-trace")]
 use crate::provenance::TokenSignature;
@@ -25,6 +27,7 @@ use crate::think_strip::strip_think_blocks;
 use crate::token_buffer::TokenBuffer;
 use crate::{ProvenanceFile, TurnStats};
 
+use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, IndexOp, Tensor};
 use candle_nn::kv_cache::ChunkedKvBacking;
 #[cfg(feature = "sig-trace")]
@@ -691,6 +694,24 @@ pub(crate) struct Scheduler {
     /// (`cuMemHostAlloc`'d once, grown on demand). Shared across every
     /// turn × layer in `ensure_turn_hot`.
     cold_load_stager: ColdLoadStager,
+
+    /// Trigger handle for the substrate persistence thread. Fired
+    /// after every turn-seal so the thread runs its hot→warm→cold
+    /// drain promptly instead of waiting up to 5 s on its tick.
+    persist_trigger: PersistenceTrigger,
+
+    /// Re-used pinned host scratch for the cold→hot leg inside
+    /// `elevate_to_hot`. Grows on demand across submits; stays
+    /// allocated for the scheduler's lifetime.
+    ///
+    /// The elevate path itself runs on the device's **main inference
+    /// stream** (`dev.cuda_stream()`) — the scheduler thread is
+    /// single-owner and is blocking on the result before
+    /// `apply_projection` runs prefill/decode, so a dedicated stream
+    /// would only add a stream-sync without buying any overlap.
+    /// Scattering on the main stream lets the subsequent prefill
+    /// kernels see the writes for free (same-stream serialisation).
+    elevate_pinned_scratch: Option<PinnedBuf>,
 }
 
 /// Per-chunk debug trace of the BDP signatures emitted at seal time.
@@ -760,6 +781,7 @@ impl Scheduler {
         max_prefill_chunk: usize,
         provenance: Arc<ProvenanceFile>,
         model_core: ModelCoreProperties,
+        persist_trigger: PersistenceTrigger,
     ) -> Self {
         let device = model.device().clone();
         let sampler = BatchedSampler::new(
@@ -801,6 +823,8 @@ impl Scheduler {
             // pauses. LRU-reclaims clean entries under pressure.
             warm_pool: WarmPool::new(4 * 1024 * 1024 * 1024),
             cold_load_stager: ColdLoadStager::new(),
+            persist_trigger,
+            elevate_pinned_scratch: None,
         }
     }
 
@@ -918,6 +942,13 @@ impl Scheduler {
                 // — reset `parent_id` to empty and write the
                 // projected sections + projected turns from the
                 // substrate onto it.
+                //
+                // `turn_keys_for_elevate` is the parallel
+                // `Vec<TurnKey>` we feed to `elevate_to_hot` before
+                // `apply_projection`. Built inside the same closure
+                // so the resolved `timeline` for each `(g, t)` pair
+                // doesn't get thrown away.
+                let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
                 let (projected_sections, projected_turns) = if let (Some(inputs), Some(target)) =
                     (projection_inputs.as_ref(), slot_target)
                 {
@@ -980,13 +1011,93 @@ impl Scheduler {
                             let g = resolved.group();
                             let t = resolved.index();
                             let timeline = resolve_timeline(g)?;
-                            view.turn_sealed_of(timeline, t).map(|_| (g, t))
+                            view.turn_sealed_of(timeline, t)?;
+                            turn_keys_for_elevate.push(TurnKey::new(timeline, t));
+                            Some((g, t))
                         })
                         .collect();
                     (sections, turns)
                 } else {
                     (Vec::new(), Vec::new())
                 };
+
+                // Step 1.5: select-promote (cold → warm → hot).
+                //
+                // Batched warm→hot scatter (one `kv_migrate_on` per
+                // layer on `elevate_copy_stream`) + per-item
+                // cold→hot recover for any turn whose sealed bytes
+                // live in the redo log. After this returns,
+                // `apply_projection`'s per-unit `ensure_*_hot`
+                // calls hit the hot branch immediately.
+                //
+                // Skipped when nothing was projected — `elevate_to_hot`
+                // would no-op anyway, but the substrate read-lock
+                // snapshot is cheap to avoid.
+                if !projected_sections.is_empty() || !turn_keys_for_elevate.is_empty() {
+                    if let Some(conversation) = self.slot_conversations.get(&parent_id).cloned() {
+                        let backings = self.session.backings().to_vec();
+                        let device = self.session.device().clone();
+                        // Run on the device's main inference stream:
+                        // the scheduler thread blocks on the result
+                        // before `apply_projection` schedules prefill,
+                        // so a dedicated copy stream would only force
+                        // an extra sync. Same-stream serialisation is
+                        // free.
+                        let main_stream = match &device {
+                            Device::Cuda(d) => d.cuda_stream(),
+                            _ => panic!("scheduler: requires a CUDA device"),
+                        };
+                        // Free VRAM held by yesterday's working set
+                        // (warm-backed hot residences NOT in the
+                        // incoming projection) before the scatter
+                        // runs. Items that are about to be re-elevated
+                        // are excluded so we don't churn bytes
+                        // through DMA for no reason.
+                        let evicted = evict_from_hot(
+                            &conversation,
+                            &projected_sections,
+                            &turn_keys_for_elevate,
+                        );
+                        if evicted.count > 0 {
+                            tracing::debug!(
+                                target: "candle_conversation::persistence::tier",
+                                count = evicted.count,
+                                bytes = evicted.bytes,
+                                "select-evict complete (submit)"
+                            );
+                        }
+                        match elevate_to_hot(
+                            &conversation,
+                            &backings,
+                            &device,
+                            &main_stream,
+                            &mut self.elevate_pinned_scratch,
+                            &mut self.cold_load_stager,
+                            &projected_sections,
+                            &turn_keys_for_elevate,
+                        ) {
+                            Ok(report) => {
+                                tracing::debug!(
+                                    target: "candle_conversation::persistence::tier",
+                                    already_hot = report.already_hot,
+                                    warm_to_hot = report.warm_to_hot,
+                                    cold_to_hot = report.cold_to_hot,
+                                    missing = report.missing,
+                                    failed = report.failed,
+                                    bytes_warm_to_hot = report.bytes_warm_to_hot,
+                                    bytes_cold_to_hot = report.bytes_cold_to_hot,
+                                    "select-promote complete (submit)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "select-promote failed for slot {parent_id}: {e} — \
+                                     apply_projection will fall back to per-unit ensure_*_hot"
+                                );
+                            }
+                        }
+                    }
+                }
 
                 if let Err(e) = self.apply_projection(
                     parent_id,
@@ -2235,83 +2346,24 @@ impl Scheduler {
                         tracing::warn!("persist signatures failed: {e}");
                     }
                 }
-                // Persist the turn to the redo log so it can be
-                // cold-loaded on a daemon restart (§16.12). With the
-                // live bg-quantizer removed, chunks stay in their
-                // decode-time R16/F16 format throughout the substrate;
-                // we gather them directly from the just-finalised
-                // parent slot and write the heavy `Chunks` records
-                // followed by `Tokens` + `Commit` — all synchronously
-                // on the scheduler thread.
-                //
-                // Future change: move quantization to the persistence
-                // boundary so chunks compress at log-write time and
-                // dequantise at log-read time. For now everything is
-                // uncompressed end-to-end.
+                // Synchronously persist the turn's `Tokens` record —
+                // tiny and load-bearing for substrate reconstruction.
+                // The heavy `Chunks` records + the matching `Commit`
+                // are deferred to the persistence thread; we fire its
+                // trigger below.
                 {
                     use crate::persistence::content_hash::turn_stream_id;
-                    use crate::persistence::resume::{ChunkImage, TurnChunkGrid};
-                    use crate::persistence::transfer::seal_to_chunk_images;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    let device = self.session.device().clone();
-                    let backings = self.session.backings();
-                    let slot_idx = seal_slot.0;
-                    let from = block_from;
-                    let to = block_to;
-                    let mut layers: Vec<Vec<ChunkImage>> =
-                        Vec::with_capacity(backings.len());
-                    let mut ok = true;
-                    for (layer_idx, backing) in backings.iter().enumerate() {
-                        let full_seq = match backing.record_turn(slot_idx, 0) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "persist: snapshot layer {layer_idx} failed: {e}"
-                                );
-                                ok = false;
-                                break;
-                            }
-                        };
-                        if to > full_seq.chunks.len() {
-                            tracing::warn!(
-                                "persist: slot {slot_idx} layer {layer_idx} does \
-                                 not cover turn range [{from},{to})"
-                            );
-                            ok = false;
-                            break;
-                        }
-                        let chunks = full_seq.chunks[from..to].to_vec();
-                        let token_count =
-                            chunks.iter().map(|c| c.token_count as usize).sum();
-                        let turn_seq = SealedSequence {
-                            chunks,
-                            token_count,
-                            chunk_size: full_seq.chunk_size,
-                            location: full_seq.location,
-                        };
-                        match seal_to_chunk_images(backing, &device, &turn_seq) {
-                            Ok(images) => layers.push(images),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "persist: gather layer {layer_idx} failed: {e}"
-                                );
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if ok {
-                        let grid = TurnChunkGrid::new(layers);
-                        if let Err(e) = conversation.persist_turn_chunks(stream_id, &grid) {
-                            tracing::warn!("persist turn chunks failed: {e}");
-                        }
-                        if let Err(e) =
-                            conversation.persist_turn_tokens(stream_id, &persist_token_ids, &grid)
-                        {
-                            tracing::warn!("persist turn tokens failed: {e}");
-                        }
+                    if let Err(e) =
+                        conversation.persist_tokens_only(stream_id, &persist_token_ids)
+                    {
+                        tracing::warn!("persist tokens failed: {e}");
                     }
                 }
+                // Wake the persistence thread so it drains the new
+                // turn (hot→warm migrate, warm→cold redo-log write,
+                // group fsync) without waiting for its 5 s tick.
+                self.persist_trigger.fire();
             }
             SealAction::Section { section_id, tokens } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
@@ -3166,6 +3218,7 @@ impl Scheduler {
             ConversationError::Channel(format!("reproject: missing view state {view_id}"))
         })?;
         let parent_id = view_state.parent_id;
+        let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
         let (projected_sections, projected_turns): (Vec<SectionId>, Vec<(GroupId, TurnIndex)>) = {
             let view = policy.substrate.read_for_scored(policy.target, &projection_scores);
             // Prefill mode: the section corpus is prefill-Q of tool
@@ -3188,7 +3241,9 @@ impl Scheduler {
                     let g = resolved.group();
                     let t = resolved.index();
                     let timeline = view.timelines_for_group(g).next()?;
-                    view.turn_sealed_of(timeline, t).map(|_| (g, t))
+                    view.turn_sealed_of(timeline, t)?;
+                    turn_keys_for_elevate.push(TurnKey::new(timeline, t));
+                    Some((g, t))
                 })
                 .collect();
             (sections, turns)
@@ -3341,6 +3396,70 @@ impl Scheduler {
         if let Some(toks) = self.slot_tokens.get_mut(&parent_id) {
             toks.clear();
         }
+        // Select-promote (cold → warm → hot) the new working set
+        // before re-applying. Same shape as the SubmitTurn path: a
+        // single batched scatter per layer + per-item cold-recover
+        // turns the per-unit `ensure_*_hot` calls inside
+        // `apply_projection` into hot-hit no-ops.
+        if !projected_sections.is_empty() || !turn_keys_for_elevate.is_empty() {
+            let backings = self.session.backings().to_vec();
+            let device = self.session.device().clone();
+            // Same rationale as the SubmitTurn path: scheduler is
+            // single-owner and blocks here before re-applying, so
+            // the main inference stream is the right place for the
+            // scatter — no extra sync, subsequent prefill kernels
+            // serialise behind it for free.
+            let main_stream = match &device {
+                Device::Cuda(d) => d.cuda_stream(),
+                _ => panic!("scheduler: requires a CUDA device"),
+            };
+            // Working-set-aware evict before elevate (see SubmitTurn
+            // site for rationale).
+            let evicted = evict_from_hot(
+                &policy.substrate,
+                &projected_sections,
+                &turn_keys_for_elevate,
+            );
+            if evicted.count > 0 {
+                tracing::debug!(
+                    target: "candle_conversation::persistence::tier",
+                    count = evicted.count,
+                    bytes = evicted.bytes,
+                    "select-evict complete (reproject)"
+                );
+            }
+            match elevate_to_hot(
+                &policy.substrate,
+                &backings,
+                &device,
+                &main_stream,
+                &mut self.elevate_pinned_scratch,
+                &mut self.cold_load_stager,
+                &projected_sections,
+                &turn_keys_for_elevate,
+            ) {
+                Ok(report) => {
+                    tracing::debug!(
+                        target: "candle_conversation::persistence::tier",
+                        already_hot = report.already_hot,
+                        warm_to_hot = report.warm_to_hot,
+                        cold_to_hot = report.cold_to_hot,
+                        missing = report.missing,
+                        failed = report.failed,
+                        bytes_warm_to_hot = report.bytes_warm_to_hot,
+                        bytes_cold_to_hot = report.bytes_cold_to_hot,
+                        "select-promote complete (reproject)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "select-promote (reproject) failed for parent {parent_id}: {e} — \
+                         apply_projection will fall back to per-unit ensure_*_hot"
+                    );
+                }
+            }
+        }
+
         self.apply_projection(
             parent_id,
             BlockCount(0),
@@ -3672,6 +3791,7 @@ mod tests {
                 v_hi_error_threshold_factor: 1.0,
                 v_low_error_threshold_factor: 1.0,
             },
+            PersistenceTrigger::noop(),
         );
         (scheduler, tx)
     }
@@ -3790,6 +3910,7 @@ mod tests {
                 v_hi_error_threshold_factor: 1.0,
                 v_low_error_threshold_factor: 1.0,
             },
+            PersistenceTrigger::noop(),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -3856,6 +3977,7 @@ mod tests {
                 v_hi_error_threshold_factor: 1.0,
                 v_low_error_threshold_factor: 1.0,
             },
+            PersistenceTrigger::noop(),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();

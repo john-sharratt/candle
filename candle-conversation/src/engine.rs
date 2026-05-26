@@ -3,6 +3,7 @@
 use crate::config::{EngineConfig, SequenceConfig};
 use crate::conversation::Sequence;
 use crate::error::ConversationError;
+use crate::persistence::thread::PersistenceThread;
 use crate::projection::{Builder, Conversation, ProjectionTarget};
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
@@ -50,6 +51,13 @@ pub struct ConversationEngine {
     /// handles) across every `Sequence` allocated from this engine.
     /// Each `Sequence` receives a clone.
     conversation: Conversation,
+
+    /// Substrate persistence thread — owns the redo-log write path.
+    /// Wakes on a 5-second tick or on triggers from the scheduler;
+    /// joined on engine drop (or via [`Self::shutdown`]) after a final
+    /// drain pass. `PersistenceThread::shutdown` is `&self`-callable —
+    /// no `Option`/`Mutex` shuffle at this layer.
+    persist_thread: PersistenceThread,
 
     /// Shared provenance signature file (anonymous temp, deleted on process exit).
     ///
@@ -146,6 +154,20 @@ impl ConversationEngine {
         let provenance = Arc::new(ProvenanceFile::new().map_err(ConversationError::from)?);
         let scheduler_provenance = Arc::clone(&provenance);
 
+        // Spawn the substrate persistence thread (§5s heartbeat + per-
+        // seal trigger). Owns the redo-log write path; needs backings +
+        // device for hot→warm migration and warm→cold gather. Spawn it
+        // **before** the scheduler thread so the trigger handle can be
+        // handed in.
+        let backings: Arc<Vec<candle_nn::kv_cache::ChunkedKvBacking>> =
+            Arc::new(session.backings().to_vec());
+        let persist_thread = crate::persistence::thread::PersistenceThread::spawn(
+            conversation.clone(),
+            Arc::clone(&backings),
+            session.device().clone(),
+        );
+        let persist_trigger = persist_thread.trigger_handle();
+
         // Spawn the scheduler thread.
         let penalty_log = config.penalty_log_path.clone();
         let health_config = config.health.clone();
@@ -169,6 +191,7 @@ impl ConversationEngine {
                     config.scheduler.large_prefill_max_tokens,
                     scheduler_provenance,
                     model_core,
+                    persist_trigger,
                 );
                 // §16.12 — reload any persisted turns into the substrate
                 // before serving requests.
@@ -187,6 +210,7 @@ impl ConversationEngine {
             provenance,
             model_core,
             conversation,
+            persist_thread,
         })
     }
 
@@ -232,19 +256,14 @@ impl ConversationEngine {
     /// Read the workspace substrate's sidebar label for `timeline`, or
     /// `None` if none has been recorded. Useful for "should we still run
     /// the titler?" checks at submit time.
-    pub fn conversation_label_of(
-        &self,
-        timeline: crate::projection::TimelineId,
-    ) -> Option<String> {
+    pub fn conversation_label_of(&self, timeline: crate::projection::TimelineId) -> Option<String> {
         self.conversation.label_of(timeline)
     }
 
     /// Every conversation the workspace substrate knows about —
     /// `(timeline, conv_id, label)` triples. Drives the daemon's
     /// `GET /v1/conversations` sidebar listing directly.
-    pub fn known_conversations(
-        &self,
-    ) -> Vec<(crate::projection::TimelineId, String, String)> {
+    pub fn known_conversations(&self) -> Vec<(crate::projection::TimelineId, String, String)> {
         self.conversation.known_conversations()
     }
 
@@ -547,6 +566,12 @@ impl ConversationEngine {
             h.join()
                 .map_err(|_| ConversationError::Channel("scheduler thread panicked".into()))?;
         }
+        // Tear down the persistence thread after the scheduler has
+        // joined — by then no more turn-seals will fire triggers, so
+        // the thread's final drain pass captures the last work. The
+        // call is idempotent, so a redundant invocation from `Drop`
+        // after this is a no-op.
+        self.persist_thread.shutdown();
         Ok(())
     }
 }

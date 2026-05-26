@@ -1110,6 +1110,178 @@ impl QTensor {
         &mut self.storage
     }
 
+    /// Symmetric read counterpart of [`Self::write_bytes_at`]. Copy
+    /// `dst.len()` bytes from this QTensor's CPU storage at
+    /// `byte_offset` into `dst`. The warm→hot batched-async path uses
+    /// this to gather warm-resident arena bytes into pinned host
+    /// scratch ahead of the HtoD scatter.
+    pub fn read_bytes_at(&self, byte_offset: usize, dst: &mut [u8]) -> Result<()> {
+        let src_size = self.storage.size_in_bytes();
+        if byte_offset + dst.len() > src_size {
+            crate::bail!(
+                "read_bytes_at: range {}..{} exceeds storage size {src_size}",
+                byte_offset,
+                byte_offset + dst.len()
+            )
+        }
+        match &self.storage {
+            QStorage::Cpu(storage) => {
+                let src_ptr = storage.as_ptr();
+                // SAFETY: `src_ptr` is valid for `src_size` bytes;
+                // `byte_offset + dst.len()` is bounds-checked above;
+                // source and dest don't overlap (dst is caller-owned).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(byte_offset),
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                    );
+                }
+                Ok(())
+            }
+            _ => crate::bail!(
+                "read_bytes_at: only CPU storage supported (got {:?})",
+                self.storage.device()
+            ),
+        }
+    }
+
+    /// Async HtoD byte-write counterpart of [`Self::write_bytes_at`]:
+    /// memcpy `bytes` into this QTensor's CUDA storage at
+    /// `byte_offset`, enqueued on `stream`. **CUDA storage only.**
+    ///
+    /// Does **not** synchronise — the caller is responsible for
+    /// calling `stream.synchronize()` (or fencing through subsequent
+    /// stream work) before assuming the bytes have landed. For the
+    /// transfer to be truly async on the GPU (rather than the driver
+    /// inserting a hidden bounce buffer), `bytes` should live in
+    /// `cuMemHostAlloc`'d pinned host memory.
+    ///
+    /// Mirrors the byte-write half of `QStorage::slice_scatter` for
+    /// the Cuda case, but takes a raw `&[u8]` source — useful when
+    /// the host bytes come from outside the QTensor type system (e.g.
+    /// a pinned scratch buffer fed by NVMe / GPU-gather).
+    #[cfg(feature = "cuda")]
+    pub fn write_bytes_at_async(
+        &mut self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        byte_offset: usize,
+        bytes: &[u8],
+    ) -> Result<()> {
+        use crate::cuda_backend::WrapErr;
+        let dst_size = self.storage.size_in_bytes();
+        if byte_offset + bytes.len() > dst_size {
+            crate::bail!(
+                "write_bytes_at_async: range {}..{} exceeds storage size {dst_size}",
+                byte_offset,
+                byte_offset + bytes.len()
+            )
+        }
+        match &mut self.storage {
+            QStorage::Cuda(storage) => {
+                let mut dst_view = storage
+                    .bytes_mut()
+                    .slice_mut(byte_offset..byte_offset + bytes.len());
+                stream.memcpy_htod(bytes, &mut dst_view).w()?;
+                Ok(())
+            }
+            QStorage::Cpu(_) => crate::bail!(
+                "write_bytes_at_async: CPU storage — use the sync `write_bytes_at`"
+            ),
+            _ => crate::bail!(
+                "write_bytes_at_async: only CUDA storage supported (got {:?})",
+                self.storage.device()
+            ),
+        }
+    }
+
+    /// Async DtoH byte-read counterpart of [`Self::read_bytes_at`]:
+    /// memcpy `dst.len()` bytes from this QTensor's CUDA storage at
+    /// `byte_offset` into `dst`, enqueued on `stream`. **CUDA storage
+    /// only.**
+    ///
+    /// Does **not** synchronise — caller must `stream.synchronize()`
+    /// (or otherwise fence) before reading `dst`. Pinned `dst` (via
+    /// `cuMemHostAlloc`) is required for a true async DMA; pageable
+    /// `dst` triggers a hidden driver-side bounce buffer.
+    #[cfg(feature = "cuda")]
+    pub fn read_bytes_at_async(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        byte_offset: usize,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        use crate::cuda_backend::WrapErr;
+        let src_size = self.storage.size_in_bytes();
+        if byte_offset + dst.len() > src_size {
+            crate::bail!(
+                "read_bytes_at_async: range {}..{} exceeds storage size {src_size}",
+                byte_offset,
+                byte_offset + dst.len()
+            )
+        }
+        match &self.storage {
+            QStorage::Cuda(storage) => {
+                let src_view = storage
+                    .bytes()
+                    .slice(byte_offset..byte_offset + dst.len());
+                stream.memcpy_dtoh(&src_view, dst).w()?;
+                Ok(())
+            }
+            QStorage::Cpu(_) => crate::bail!(
+                "read_bytes_at_async: CPU storage — use the sync `read_bytes_at`"
+            ),
+            _ => crate::bail!(
+                "read_bytes_at_async: only CUDA storage supported (got {:?})",
+                self.storage.device()
+            ),
+        }
+    }
+
+    /// Memcpy `bytes` into this QTensor's underlying byte slab at
+    /// `byte_offset`. **CPU storage only.** The arena KV-cache code in
+    /// `candle-nn` treats `QTensor` as a flat slab of quantized bytes
+    /// — `slice_scatter` / `slice_range_copy` ultimately do exactly
+    /// this same `ptr::copy_nonoverlapping`, just with a `QStorage`
+    /// source instead of a raw byte slice. This is the bytes-from-host
+    /// entry point the hot→warm batched-async path needs after
+    /// pulling a chunk's bytes off the GPU into pinned host scratch.
+    ///
+    /// No format awareness: the caller is responsible for ensuring
+    /// `bytes` is a valid quantized blob (right block count × right
+    /// `type_size`).
+    pub fn write_bytes_at(&mut self, byte_offset: usize, bytes: &[u8]) -> Result<()> {
+        let dst_size = self.storage.size_in_bytes();
+        if byte_offset + bytes.len() > dst_size {
+            crate::bail!(
+                "write_bytes_at: range {}..{} exceeds storage size {dst_size}",
+                byte_offset,
+                byte_offset + bytes.len()
+            )
+        }
+        match &mut self.storage {
+            QStorage::Cpu(storage) => {
+                let dst_ptr = storage.as_ptr() as *mut u8;
+                // SAFETY: `dst_ptr` is the CPU storage's owned allocation,
+                // valid for `dst_size` bytes; `byte_offset + bytes.len()`
+                // is bounds-checked above; `bytes` and the destination
+                // don't overlap (caller owns `bytes`).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        dst_ptr.add(byte_offset),
+                        bytes.len(),
+                    );
+                }
+                Ok(())
+            }
+            _ => crate::bail!(
+                "write_bytes_at: only CPU storage supported (got {:?})",
+                self.storage.device()
+            ),
+        }
+    }
+
     /// Get a shared reference to the underlying storage.
     pub fn storage(&self) -> &QStorage {
         &self.storage

@@ -39,6 +39,122 @@ fn needs_reconcile_source_format(format: KvFormat) -> bool {
     )
 }
 
+/// Byte size of one chunk slot in an arena — the unit
+/// [`super::migrate::kv_migrate_on`] uses for its DMA stride, and the
+/// chunk_byte_stride [`super::backing::BackingInner::resolve_arena_info`]
+/// reports.
+///
+/// For Float arenas: `prod(per_chunk_dims) × dtype.size_in_bytes`.
+/// For Quantized arenas: `(elems_per_chunk / block_size) × type_size`,
+/// inferred from the arena's total element count divided by its
+/// arena_chunks (so it handles any head_dim, not just the canonical
+/// 128).
+fn chunk_byte_size_of(arena: &Arena) -> Result<usize> {
+    match arena {
+        Arena::Float { data, dtype, .. } => {
+            let dims = data.dims();
+            if dims.is_empty() {
+                return Err(candle::Error::Msg(
+                    "chunk_byte_size_of: arena tensor has zero dims".into(),
+                ));
+            }
+            let n_elems: usize = dims[1..].iter().product();
+            Ok(n_elems * dtype.size_in_bytes())
+        }
+        Arena::Quantized { format, data, .. } => {
+            let kv_fmt = crate::kv_cache::KvFormat::Quantized(*format);
+            let arena_chunks = super::arena_chunks_for_format(kv_fmt);
+            let total_elems = data.shape().elem_count();
+            if arena_chunks == 0 || total_elems == 0 {
+                return Err(candle::Error::Msg(
+                    "chunk_byte_size_of: quantized arena has zero elements or chunks".into(),
+                ));
+            }
+            let elems_per_chunk = total_elems / arena_chunks;
+            let ggml = format.to_ggml_dtype();
+            Ok((elems_per_chunk / ggml.block_size()) * ggml.type_size())
+        }
+    }
+}
+
+/// Read one chunk-slot's bytes from a CPU `Arena::Float` at
+/// `(arena, chunk_idx)` into `dst`. The reverse of
+/// [`ChunkedKvBacking::write_chunk_from_pinned_bytes`]; same dtype
+/// dispatch (`bf16` / `f16` / `f32`).
+fn read_chunk_into_pinned_bytes(
+    arena: &Arena,
+    chunk_idx: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    match arena {
+        Arena::Float { data, dtype, .. } => {
+            let dims = data.dims();
+            if dims.is_empty() {
+                return Err(candle::Error::Msg(
+                    "read_chunk_into_pinned_bytes: arena tensor has zero dims".into(),
+                ));
+            }
+            let n_elems: usize = dims[1..].iter().product();
+            let expected_bytes = n_elems * dtype.size_in_bytes();
+            if dst.len() != expected_bytes {
+                return Err(candle::Error::Msg(format!(
+                    "read_chunk_into_pinned_bytes: expected {expected_bytes} bytes, got {}",
+                    dst.len()
+                )));
+            }
+            // Narrow → flatten → to_vec is the only stable path to a
+            // contiguous byte read of a CPU Tensor in candle today. The
+            // Vec allocation is one extra copy on top of the pinned
+            // memcpy; acceptable for the warm→hot path (rare, eviction-
+            // driven). A direct `&[u8]` view into CpuStorage would need
+            // a candle-core API change.
+            let view = data.narrow(0, chunk_idx, 1)?;
+            let flat = view.flatten_all()?;
+            match dtype {
+                DType::BF16 => {
+                    let v: Vec<half::bf16> = flat.to_vec1::<half::bf16>()?;
+                    // SAFETY: bf16 is 2-byte POD; v.len() == n_elems
+                    // (validated via expected_bytes above).
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
+                    };
+                    dst.copy_from_slice(bytes);
+                }
+                DType::F16 => {
+                    let v: Vec<half::f16> = flat.to_vec1::<half::f16>()?;
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
+                    };
+                    dst.copy_from_slice(bytes);
+                }
+                DType::F32 => {
+                    let v: Vec<f32> = flat.to_vec1::<f32>()?;
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(v.as_ptr() as *const u8, expected_bytes)
+                    };
+                    dst.copy_from_slice(bytes);
+                }
+                other => {
+                    return Err(candle::Error::Msg(format!(
+                        "read_chunk_into_pinned_bytes: unsupported Float dtype {other:?}"
+                    )))
+                }
+            }
+            Ok(())
+        }
+        Arena::Quantized { data, .. } => {
+            // Same flat-slab story as `write_chunk_from_pinned_bytes`:
+            // one `chunk_byte_stride` of bytes starting at
+            // `chunk_idx * dst.len()`. The HtoD scatter on the next
+            // phase rebuilds the GPU arena chunk-for-chunk from this
+            // pinned scratch.
+            let byte_offset = chunk_idx * dst.len();
+            data.read_bytes_at(byte_offset, dst)?;
+            Ok(())
+        }
+    }
+}
+
 impl ChunkedKvBacking {
     /// Migrate a chunk from one arena type to another.
     ///
@@ -1182,6 +1298,701 @@ impl ChunkedKvBacking {
         })
     }
 
+    /// Batched VRAM→RAM migration for many sealed sequences at once.
+    ///
+    /// Functionally equivalent to calling [`Self::migrate_sealed_to_cpu`]
+    /// once per sequence, but amortises the heavy locking:
+    ///
+    /// - The per-layer `state.write()` is acquired **once** for the
+    ///   whole batch instead of once per migrated chunk.
+    /// - The cross-layer `inner.storage.try_write()` is acquired **once**
+    ///   for the whole batch instead of once per migrated chunk.
+    ///
+    /// For a hot→warm pass over N residences × C chunks × G GIDs-per-chunk,
+    /// this drops `O(N·C·G)` lock acquisitions to `O(1)` on the data-copy
+    /// path — the dominant cost on small chunks where the DMA itself is
+    /// already pipelined on the default stream.
+    ///
+    /// The per-chunk data copy still uses the existing
+    /// [`Self::copy_chunk_data_static`] / [`Self::convert_chunk_data_static`]
+    /// path under that single storage write lock. The bytes flow through
+    /// `Tensor::copy` (DtoH on the current stream) per chunk; the driver
+    /// pipelines them, so they overlap naturally. Future revisions can
+    /// route the gather through a single [`super::migrate::kv_migrate_on`]
+    /// call on a dedicated copy stream once a bytes-into-CPU-arena ingest
+    /// API exists.
+    pub fn migrate_sealed_to_cpu_batch(
+        &self,
+        sequences: &[&SealedSequence],
+    ) -> candle::Result<Vec<SealedSequence>> {
+        if sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Walk every chunk in every sequence, collecting unique source
+        // GIDs. `HeadGids` already dedups within one chunk via
+        // `map_unique`, but the same GID can appear in multiple chunks
+        // (and the same chunk can appear in multiple sequences when the
+        // caller is migrating overlapping work — unusual but legal).
+        let mut unique_raws: Vec<i64> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for seq in sequences {
+            for chunk in &seq.chunks {
+                for gid in chunk.gids.0.iter() {
+                    if seen.insert(gid.raw()) {
+                        unique_raws.push(gid.raw());
+                    }
+                }
+            }
+        }
+
+        let arena_chunks = arena_gid_stride();
+
+        // Phase 1: one `state.write()` for the batch — resolve every
+        // source's arena key (the CPU dest just swaps location) and
+        // allocate every destination GID up front.
+        let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
+            std::collections::HashMap::new();
+        let mut src_keys: std::collections::HashMap<i64, ArenaKey> =
+            std::collections::HashMap::new();
+        {
+            let _state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for &raw in &unique_raws {
+                let arena_idx = (raw as usize) / arena_chunks;
+                let key = self
+                    .inner
+                    .storage
+                    .read(|s| s.arena_key(arena_idx))?
+                    .ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "migrate_sealed_to_cpu_batch: arena {arena_idx} not found"
+                        ))
+                    })?;
+                let cpu_key = ArenaKey {
+                    format: key.format,
+                    location: ArenaLocation::Cpu,
+                };
+                src_keys.insert(raw, key);
+                new_gids.insert(raw, self.alloc_chunk_for_key(cpu_key)?);
+            }
+        }
+
+        // Phase 2: one `storage.try_write()` for the batch — every
+        // per-chunk data copy runs back-to-back with no relock.
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        self.inner.storage.try_write(|s| -> candle::Result<()> {
+            for &raw in &unique_raws {
+                let src_arena_idx = (raw as usize) / arena_chunks;
+                let src_chunk_idx = (raw as usize) % arena_chunks;
+                if src_arena_idx >= s.arena_count() {
+                    // Tombstoned between phases — leave the dest GID
+                    // freshly-allocated and skip the copy.
+                    continue;
+                }
+                let src_key = src_keys[&raw].clone();
+                let cpu_key = ArenaKey {
+                    format: src_key.format,
+                    location: ArenaLocation::Cpu,
+                };
+                let new_gid = new_gids[&raw].clone();
+                if src_key == cpu_key {
+                    Self::copy_chunk_data_static(
+                        s.arenas_mut(),
+                        src_arena_idx,
+                        src_chunk_idx,
+                        new_gid.arena_idx(),
+                        new_gid.chunk_idx(),
+                        n_kv_head,
+                        CHUNK_SIZE,
+                        head_dim,
+                    )?;
+                } else {
+                    Self::convert_chunk_data_static(
+                        s.arenas_mut(),
+                        src_arena_idx,
+                        src_chunk_idx,
+                        src_key,
+                        new_gid.arena_idx(),
+                        new_gid.chunk_idx(),
+                        cpu_key,
+                        n_kv_head,
+                        CHUNK_SIZE,
+                        head_dim,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+
+        // Phase 3: rebuild each `SealedSequence` with mapped GIDs. The
+        // shape (per-chunk metadata, head-gid topology) is preserved
+        // verbatim; only the GIDs themselves change.
+        sequences
+            .iter()
+            .map(|seq| -> candle::Result<SealedSequence> {
+                let new_chunks: candle::Result<Vec<SealedChunk>> = seq
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        let mapped =
+                            chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                        Ok(SealedChunk {
+                            gids: mapped,
+                            ..chunk.clone()
+                        })
+                    })
+                    .collect();
+                Ok(SealedSequence {
+                    chunks: new_chunks?,
+                    token_count: seq.token_count,
+                    chunk_size: seq.chunk_size,
+                    location: ArenaLocation::Cpu,
+                })
+            })
+            .collect()
+    }
+
+    /// **Fully-batched** VRAM→RAM migration for many sealed sequences on
+    /// a dedicated CUDA copy stream with a pinned host staging buffer.
+    ///
+    /// This is the production hot→warm path. It replaces the per-chunk
+    /// [`Tensor::copy`] / `slice_set` pipeline (which serialises N
+    /// individual `cudaMemcpyDtoH` calls on the default stream) with a
+    /// single batched device-side gather followed by a single
+    /// `cudaMemcpyDtoHAsync` on `copy_stream`:
+    ///
+    /// ```text
+    ///   GPU arena chunks ──kv_migrate_on──▶ device staging ──memcpy_dtoh──▶ pinned host scratch
+    ///                       (copy stream)                    (copy stream)
+    ///                          ┃                                 ┃
+    ///                          └───────  one stream sync ────────┘
+    ///                                                            │
+    ///                                                            ▼
+    ///                                       Tensor::from_slice + slice_set
+    ///                                       (CPU-only, under one lock)
+    /// ```
+    ///
+    /// Compared with [`Self::migrate_sealed_to_cpu`] called per
+    /// sequence:
+    ///
+    /// - **One** kernel launch (gather) and **one** `cudaMemcpy`
+    ///   (DtoH) total, instead of N per sequence.
+    /// - **Dedicated copy stream**: GPU compute on the main stream
+    ///   overlaps with this thread's DMA. The driver's copy engine
+    ///   pipelines transfers without blocking decode.
+    /// - **Pinned host staging**: write-combined `cuMemHostAlloc`'d
+    ///   memory, no pageable bounce buffer inside the driver.
+    /// - **One** state-lock + **one** storage-lock acquisition for
+    ///   the whole batch.
+    ///
+    /// `pinned_scratch` is grown on demand: pass an `&mut Option<…>`
+    /// that the persistence thread owns and re-uses across passes.
+    ///
+    /// **Format support:** Float arenas (BF16/F16/F32) only on this
+    /// fast path. Quantized arenas have no raw-bytes ingest API on
+    /// CPU `QTensor`; callers needing them must fall back to
+    /// [`Self::migrate_sealed_to_cpu_batch`] (lock-batched, on the
+    /// default stream).
+    #[cfg(feature = "cuda")]
+    pub fn migrate_sealed_to_cpu_batch_async(
+        &self,
+        device: &Device,
+        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
+        sequences: &[&SealedSequence],
+    ) -> candle::Result<Vec<SealedSequence>> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::WrapErr;
+        use candle::quantized::pinned_staging::PinnedBuf;
+
+        use super::migrate::{kv_migrate_on, MigrationPlan};
+
+        if sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cuda_dev = match device {
+            candle::Device::Cuda(d) => d,
+            _ => {
+                return Err(candle::Error::Msg(
+                    "migrate_sealed_to_cpu_batch_async requires a CUDA device".into(),
+                ))
+            }
+        };
+        let _ = cuda_dev; // referenced only when allocating the staging slice below.
+
+        // ── Resolve sources + dedup ─────────────────────────────────────
+        let arena_chunks = arena_gid_stride();
+        let arena_info = self.resolve_arena_info()?;
+        let mut unique_raws: Vec<i64> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut src_ptrs: Vec<(i64, i64)> = Vec::new();
+        let mut gid_byte_range: std::collections::HashMap<i64, (usize, usize)> =
+            std::collections::HashMap::new();
+        let mut src_keys: std::collections::HashMap<i64, ArenaKey> =
+            std::collections::HashMap::new();
+        let mut total_bytes: usize = 0;
+
+        for seq in sequences {
+            for chunk in &seq.chunks {
+                for gid in chunk.gids.0.iter() {
+                    let raw = gid.raw();
+                    if !seen.insert(raw) {
+                        continue;
+                    }
+                    let arena_idx = (raw as usize) / arena_chunks;
+                    let chunk_idx = (raw as usize) % arena_chunks;
+                    let info = arena_info.get(arena_idx).ok_or_else(|| {
+                        candle::Error::Msg(format!(
+                            "migrate_sealed_to_cpu_batch_async: arena {arena_idx} out of range"
+                        ))
+                    })?;
+                    if info.base_ptr == 0 {
+                        return Err(candle::Error::Msg(
+                            "migrate_sealed_to_cpu_batch_async: source arena not GPU-resident"
+                                .into(),
+                        ));
+                    }
+                    let len = info.chunk_byte_stride as usize;
+                    let ptr = info.base_ptr as i64 + chunk_idx as i64 * info.chunk_byte_stride;
+                    src_ptrs.push((ptr, info.chunk_byte_stride));
+                    gid_byte_range.insert(raw, (total_bytes, len));
+                    total_bytes += len;
+                    unique_raws.push(raw);
+                    let key = self
+                        .inner
+                        .storage
+                        .read(|s| s.arena_key(arena_idx))?
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "migrate_sealed_to_cpu_batch_async: arena key {arena_idx} not found"
+                            ))
+                        })?;
+                    src_keys.insert(raw, key);
+                }
+            }
+        }
+
+        if total_bytes == 0 {
+            return sequences.iter().map(|seq| Ok((*seq).clone())).collect();
+        }
+
+        // ── Ensure pinned scratch capacity ──────────────────────────────
+        let need_grow = pinned_scratch
+            .as_ref()
+            .map(|b| b.len() < total_bytes)
+            .unwrap_or(true);
+        if need_grow {
+            *pinned_scratch = Some(match PinnedBuf::alloc_owned(total_bytes) {
+                Ok(b) => b,
+                Err(_) => PinnedBuf::Host {
+                    data: vec![0u8; total_bytes],
+                },
+            });
+        }
+
+        // ── Phase 1: device-side gather on the copy stream ─────────────
+        let staging: candle::cuda_backend::cudarc::driver::CudaSlice<u8> =
+            unsafe { copy_stream.alloc::<u8>(total_bytes).w()? };
+        let staging_base = {
+            let (p, _g) = staging.device_ptr(copy_stream);
+            p as i64
+        };
+        let mut plan = MigrationPlan::new();
+        let mut off = 0i64;
+        for &(ptr, len) in &src_ptrs {
+            plan.push(ptr, staging_base + off, len);
+            off += len;
+        }
+        kv_migrate_on(device, &plan, Some(copy_stream))?;
+        // ── Phase 2: single DtoH staging → pinned host scratch ─────────
+        {
+            let scratch = pinned_scratch
+                .as_mut()
+                .expect("pinned scratch allocated above");
+            let dst = &mut scratch.as_mut_slice()[..total_bytes];
+            copy_stream.memcpy_dtoh(&staging, dst).w()?;
+            copy_stream.synchronize().w()?;
+        }
+        drop(staging);
+
+        // ── Phase 3: allocate dest CPU GIDs (one state.write) ──────────
+        let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
+            std::collections::HashMap::new();
+        {
+            let _state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for &raw in &unique_raws {
+                let src_key = &src_keys[&raw];
+                let cpu_key = ArenaKey {
+                    format: src_key.format,
+                    location: ArenaLocation::Cpu,
+                };
+                new_gids.insert(raw, self.alloc_chunk_for_key(cpu_key)?);
+            }
+        }
+
+        // ── Phase 4: write bytes pinned → CPU arena (one storage.write) ─
+        let scratch_ref = pinned_scratch
+            .as_ref()
+            .expect("pinned scratch allocated above");
+        self.inner.storage.try_write(|s| -> candle::Result<()> {
+            for &raw in &unique_raws {
+                let (off, len) = gid_byte_range[&raw];
+                let bytes = &scratch_ref.as_slice()[off..off + len];
+                let new_gid = new_gids[&raw].clone();
+                Self::write_chunk_from_pinned_bytes(
+                    s.arenas_mut(),
+                    new_gid.arena_idx(),
+                    new_gid.chunk_idx(),
+                    bytes,
+                )?;
+            }
+            Ok(())
+        })?;
+
+        // ── Phase 5: rebuild SealedSequences with mapped GIDs ──────────
+        sequences
+            .iter()
+            .map(|seq| -> candle::Result<SealedSequence> {
+                let new_chunks: candle::Result<Vec<SealedChunk>> = seq
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        let mapped = chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                        Ok(SealedChunk {
+                            gids: mapped,
+                            ..chunk.clone()
+                        })
+                    })
+                    .collect();
+                Ok(SealedSequence {
+                    chunks: new_chunks?,
+                    token_count: seq.token_count,
+                    chunk_size: seq.chunk_size,
+                    location: ArenaLocation::Cpu,
+                })
+            })
+            .collect()
+    }
+
+    /// Write one chunk-slot's worth of raw bytes into a CPU `Arena::Float`
+    /// at `(arena_idx, chunk_idx)`. The bytes are interpreted as the
+    /// arena's element dtype; a temp CPU [`Tensor`] is constructed over
+    /// them and `slice_set` writes it into the dest chunk slot.
+    ///
+    /// `Arena::Quantized` is not supported here — see the module-level
+    /// caveat on [`Self::migrate_sealed_to_cpu_batch_async`].
+    fn write_chunk_from_pinned_bytes(
+        arenas: &mut ahash::AHashMap<usize, Arena>,
+        arena_idx: usize,
+        chunk_idx: usize,
+        bytes: &[u8],
+    ) -> candle::Result<()> {
+        let arena = arenas.get_mut(&arena_idx).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "write_chunk_from_pinned_bytes: arena {arena_idx} missing"
+            ))
+        })?;
+        match arena {
+            Arena::Float { data, dtype, .. } => {
+                let dims = data.dims();
+                if dims.is_empty() {
+                    return Err(candle::Error::Msg(
+                        "write_chunk_from_pinned_bytes: arena tensor has zero dims".into(),
+                    ));
+                }
+                // Per-chunk shape = (1, ...remaining dims of the arena tensor)
+                let per_chunk: Vec<usize> = std::iter::once(1usize)
+                    .chain(dims[1..].iter().copied())
+                    .collect();
+                let n_elems: usize = dims[1..].iter().product();
+                let expected_bytes = n_elems * dtype.size_in_bytes();
+                if bytes.len() != expected_bytes {
+                    return Err(candle::Error::Msg(format!(
+                        "write_chunk_from_pinned_bytes: arena {arena_idx} expects {expected_bytes} \
+                         bytes per chunk, got {}",
+                        bytes.len()
+                    )));
+                }
+                let temp = match dtype {
+                    DType::BF16 => {
+                        // SAFETY: bytes is at least 2-byte aligned (pinned host pages
+                        // are page-aligned), length validated above.
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(
+                                bytes.as_ptr() as *const half::bf16,
+                                n_elems,
+                            )
+                        };
+                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
+                    }
+                    DType::F16 => {
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(
+                                bytes.as_ptr() as *const half::f16,
+                                n_elems,
+                            )
+                        };
+                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
+                    }
+                    DType::F32 => {
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_elems)
+                        };
+                        Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
+                    }
+                    other => {
+                        return Err(candle::Error::Msg(format!(
+                            "write_chunk_from_pinned_bytes: unsupported Float dtype {other:?}"
+                        )));
+                    }
+                };
+                data.slice_set(&temp, 0, chunk_idx)?;
+                Ok(())
+            }
+            Arena::Quantized { data, .. } => {
+                // Quantized arenas are a flat byte slab — `slice_scatter`
+                // / `slice_range_copy` already do `ptr::copy_nonoverlapping`
+                // under the hood, parameterised on byte offsets. The
+                // gather pulled exactly one `chunk_byte_stride` of bytes
+                // per chunk slot into pinned scratch, so the destination
+                // offset is simply `chunk_idx * bytes.len()`.
+                let byte_offset = chunk_idx * bytes.len();
+                data.write_bytes_at(byte_offset, bytes)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// **Fully-batched** RAM→VRAM migration — the symmetric inverse of
+    /// [`Self::migrate_sealed_to_cpu_batch_async`]. Uses the same
+    /// dedicated copy stream, the same pinned host scratch, and the
+    /// same [`super::migrate::kv_migrate_on`] scatter kernel.
+    ///
+    /// ```text
+    ///   CPU arena chunks ──read_chunk_into_pinned────▶ pinned host scratch
+    ///                                                      ┃
+    ///                                                      ▼
+    ///                                          memcpy_htod (copy stream)
+    ///                                                      ┃
+    ///                                                      ▼
+    ///                                          device staging buffer
+    ///                                                      ┃
+    ///                                          kv_migrate_on scatter
+    ///                                                      ┃
+    ///                                                      ▼
+    ///                                          fresh GPU arena chunks
+    /// ```
+    ///
+    /// Same locking discipline: one `state.write()` for dest GID
+    /// allocation, one `storage.read()` for source byte extraction
+    /// (CPU arenas → pinned scratch). The CPU-side extraction is a
+    /// dtype-dispatched `Tensor::to_vec` + memcpy — symmetric to the
+    /// downward path's `Tensor::from_slice` + `slice_set`.
+    ///
+    /// Float arenas (BF16/F16/F32) only on this fast path.
+    #[cfg(feature = "cuda")]
+    pub fn migrate_sealed_to_gpu_batch_async(
+        &self,
+        device: &Device,
+        copy_stream: &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        pinned_scratch: &mut Option<candle::quantized::pinned_staging::PinnedBuf>,
+        sequences: &[&SealedSequence],
+    ) -> candle::Result<Vec<SealedSequence>> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        use candle::cuda_backend::WrapErr;
+        use candle::quantized::pinned_staging::PinnedBuf;
+
+        use super::migrate::{kv_migrate_on, MigrationPlan};
+
+        if sequences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cuda_dev = match device {
+            candle::Device::Cuda(d) => d,
+            _ => {
+                return Err(candle::Error::Msg(
+                    "migrate_sealed_to_gpu_batch_async requires a CUDA device".into(),
+                ))
+            }
+        };
+        let _ = cuda_dev;
+
+        // ── Resolve sources + dedup ─────────────────────────────────────
+        // Source arenas live on CPU; we record each unique source GID's
+        // byte size by reading the arena's per-chunk shape × element size.
+        let arena_chunks = arena_gid_stride();
+        let mut unique_raws: Vec<i64> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut src_keys: std::collections::HashMap<i64, ArenaKey> =
+            std::collections::HashMap::new();
+        let mut gid_byte_range: std::collections::HashMap<i64, (usize, usize)> =
+            std::collections::HashMap::new();
+        let mut total_bytes: usize = 0;
+
+        self.inner.storage.read(|s| -> candle::Result<()> {
+            for seq in sequences {
+                for chunk in &seq.chunks {
+                    for gid in chunk.gids.0.iter() {
+                        let raw = gid.raw();
+                        if !seen.insert(raw) {
+                            continue;
+                        }
+                        let arena_idx = (raw as usize) / arena_chunks;
+                        let key = s.arena_key(arena_idx).ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "migrate_sealed_to_gpu_batch_async: arena {arena_idx} not found"
+                            ))
+                        })?;
+                        if key.location != ArenaLocation::Cpu {
+                            return Err(candle::Error::Msg(
+                                "migrate_sealed_to_gpu_batch_async: source arena is not \
+                                 CPU-resident"
+                                    .into(),
+                            ));
+                        }
+                        let arena = s.arenas().get(&arena_idx).ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "migrate_sealed_to_gpu_batch_async: arena {arena_idx} missing"
+                            ))
+                        })?;
+                        let len = chunk_byte_size_of(arena)?;
+                        src_keys.insert(raw, key);
+                        gid_byte_range.insert(raw, (total_bytes, len));
+                        total_bytes += len;
+                        unique_raws.push(raw);
+                    }
+                }
+            }
+            Ok(())
+        })??;
+
+        if total_bytes == 0 {
+            return sequences.iter().map(|seq| Ok((*seq).clone())).collect();
+        }
+
+        // ── Ensure pinned scratch capacity ──────────────────────────────
+        let need_grow = pinned_scratch
+            .as_ref()
+            .map(|b| b.len() < total_bytes)
+            .unwrap_or(true);
+        if need_grow {
+            *pinned_scratch = Some(match PinnedBuf::alloc_owned(total_bytes) {
+                Ok(b) => b,
+                Err(_) => PinnedBuf::Host {
+                    data: vec![0u8; total_bytes],
+                },
+            });
+        }
+
+        // ── Phase 1: read CPU arena bytes into pinned scratch ──────────
+        // One storage.read() across all chunks. Per-chunk we do
+        // dtype-dispatched Tensor::to_vec + memcpy — symmetric to the
+        // downward path's per-chunk Tensor::from_slice + slice_set.
+        let scratch = pinned_scratch
+            .as_mut()
+            .expect("pinned scratch allocated above");
+        self.inner.storage.read(|s| -> candle::Result<()> {
+            let dst_all = scratch.as_mut_slice();
+            for &raw in &unique_raws {
+                let arena_idx = (raw as usize) / arena_chunks;
+                let chunk_idx = (raw as usize) % arena_chunks;
+                let (off, len) = gid_byte_range[&raw];
+                let arena = s.arenas().get(&arena_idx).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "migrate_sealed_to_gpu_batch_async: arena {arena_idx} missing"
+                    ))
+                })?;
+                read_chunk_into_pinned_bytes(arena, chunk_idx, &mut dst_all[off..off + len])?;
+            }
+            Ok(())
+        })??;
+
+        // ── Phase 2: HtoD pinned → device staging on the copy stream ───
+        let src_bytes = &scratch.as_slice()[..total_bytes];
+        let mut staging: candle::cuda_backend::cudarc::driver::CudaSlice<u8> =
+            unsafe { copy_stream.alloc::<u8>(total_bytes).w()? };
+        copy_stream.memcpy_htod(src_bytes, &mut staging).w()?;
+        let staging_base = {
+            let (p, _g) = staging.device_ptr(copy_stream);
+            p as i64
+        };
+
+        // ── Phase 3: allocate dest GPU GIDs (one state.write) ──────────
+        let mut new_gids: std::collections::HashMap<i64, ChunkGid> =
+            std::collections::HashMap::new();
+        {
+            let _state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            for &raw in &unique_raws {
+                let src_key = &src_keys[&raw];
+                let gpu_key = ArenaKey {
+                    format: src_key.format,
+                    location: ArenaLocation::Gpu,
+                };
+                new_gids.insert(raw, self.alloc_chunk_for_key(gpu_key)?);
+            }
+        }
+
+        // ── Phase 4: build scatter plan staging → dest GPU arenas ──────
+        let gpu_arena_info = self.resolve_arena_info()?;
+        let mut plan = MigrationPlan::new();
+        for &raw in &unique_raws {
+            let new_gid = new_gids[&raw].clone();
+            let dst_arena_idx = new_gid.arena_idx();
+            let dst_chunk_idx = new_gid.chunk_idx();
+            let info = gpu_arena_info.get(dst_arena_idx).ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "migrate_sealed_to_gpu_batch_async: dest arena {dst_arena_idx} out of range"
+                ))
+            })?;
+            if info.base_ptr == 0 {
+                return Err(candle::Error::Msg(
+                    "migrate_sealed_to_gpu_batch_async: dest arena not GPU-resident".into(),
+                ));
+            }
+            let dst_ptr = info.base_ptr as i64 + dst_chunk_idx as i64 * info.chunk_byte_stride;
+            let (off, len) = gid_byte_range[&raw];
+            plan.push(staging_base + off as i64, dst_ptr, len as i64);
+        }
+
+        // ── Phase 5: device-side scatter on the copy stream ────────────
+        kv_migrate_on(device, &plan, Some(copy_stream))?;
+        drop(staging);
+
+        // ── Phase 6: rebuild SealedSequences with mapped GIDs ──────────
+        sequences
+            .iter()
+            .map(|seq| -> candle::Result<SealedSequence> {
+                let new_chunks: candle::Result<Vec<SealedChunk>> = seq
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        let mapped = chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                        Ok(SealedChunk {
+                            gids: mapped,
+                            ..chunk.clone()
+                        })
+                    })
+                    .collect();
+                Ok(SealedSequence {
+                    chunks: new_chunks?,
+                    token_count: seq.token_count,
+                    chunk_size: seq.chunk_size,
+                    location: ArenaLocation::Gpu,
+                })
+            })
+            .collect()
+    }
+
     /// Migrate one sealed sequence from the CPU (warm) tier back to the GPU (hot) tier.
     ///
     /// Symmetric inverse of [`migrate_sealed_to_cpu`].  Sharing structure is
@@ -1471,5 +2282,682 @@ mod tests {
         backing
             .migrate_chunk(copy_gid.raw(), fkey.clone())
             .expect("Q8_0 → Float after copy must succeed (shape error = wrong sub_head_dim)");
+    }
+
+    // ── Batched-async migrate tests (GPU-only) ──────────────────────────────
+    //
+    // These exercise `migrate_sealed_to_cpu_batch_async` and
+    // `migrate_sealed_to_gpu_batch_async` — the production hot↔warm path
+    // used by the substrate persistence thread. They require a CUDA
+    // device and a working `kv_migrate_on` kernel; on a CPU-only build
+    // each test silently returns early.
+    //
+    // Byte-identity is checked end-to-end: a known pattern is seeded on
+    // GPU, migrated to RAM, then back to VRAM, and the round-tripped
+    // bytes must equal the original.
+
+    #[cfg(feature = "cuda")]
+    fn cuda_device_or_skip() -> Option<Device> {
+        match Device::cuda_if_available(0) {
+            Ok(d @ Device::Cuda(_)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Build a CUDA-backed `ChunkedKvBacking` with a BF16 float arena.
+    #[cfg(feature = "cuda")]
+    fn cuda_backing(device: &Device, n_kv_head: usize, head_dim: usize) -> ChunkedKvBacking {
+        ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::BF16, device, 256).unwrap()
+    }
+
+    /// Seed `n_tokens` of a deterministic BF16 pattern starting at
+    /// `pattern_base` and return a sealed snapshot. The pattern is
+    /// `bf16::from_f32((pattern_base + i) as f32 * 0.001)` per element,
+    /// which gives each element a distinct value so byte-identity
+    /// checks catch any chunk-swap or offset bug.
+    #[cfg(feature = "cuda")]
+    fn seed_and_seal_pattern(
+        backing: &ChunkedKvBacking,
+        device: &Device,
+        n_kv_head: usize,
+        head_dim: usize,
+        n_tokens: usize,
+        pattern_base: u32,
+    ) -> SealedSequence {
+        use half::bf16;
+        let slot = backing.alloc_sequence().unwrap();
+        backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+        let total = n_kv_head * n_tokens * head_dim;
+        let data: Vec<bf16> = (0..total)
+            .map(|i| bf16::from_f32(((pattern_base as usize + i) as f32) * 0.001))
+            .collect();
+        let k = Tensor::from_vec(data.clone(), (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let v = k.clone();
+        backing.write_contiguous(slot, 0, &k, &v).unwrap();
+        backing.set_len(slot, n_tokens);
+        backing.record_turn(slot, n_tokens).unwrap()
+    }
+
+    /// Walk every unique GID in `sealed` (which must be CPU-resident),
+    /// extract the chunk slot's bytes via `read_chunk_into_pinned_bytes`,
+    /// and concatenate in iteration order. Used to compare bytes
+    /// before/after a round-trip.
+    #[cfg(feature = "cuda")]
+    fn bytes_of_cpu_sealed(backing: &ChunkedKvBacking, sealed: &SealedSequence) -> Vec<u8> {
+        let arena_chunks = arena_gid_stride();
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        backing
+            .inner
+            .storage
+            .read(|s| -> candle::Result<()> {
+                for chunk in &sealed.chunks {
+                    for gid in chunk.gids.0.iter() {
+                        let raw = gid.raw();
+                        if !seen.insert(raw) {
+                            continue;
+                        }
+                        let arena_idx = (raw as usize) / arena_chunks;
+                        let chunk_idx = (raw as usize) % arena_chunks;
+                        let arena = s.arenas().get(&arena_idx).unwrap();
+                        let len = chunk_byte_size_of(arena).unwrap();
+                        let mut buf = vec![0u8; len];
+                        read_chunk_into_pinned_bytes(arena, chunk_idx, &mut buf).unwrap();
+                        out.extend(buf);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        out
+    }
+
+    /// `migrate_sealed_to_cpu_batch_async` on a single sequence must
+    /// produce a CPU-located sealed with the same chunk count, token
+    /// count, and per-chunk metadata as the source.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn batched_async_single_sequence_preserves_structure() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let n_kv_head = 4;
+        let head_dim = 32;
+        let n_tokens = 40; // 1 full chunk (32) + 1 partial (8)
+        let backing = cuda_backing(&device, n_kv_head, head_dim);
+        let sealed = seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 0);
+
+        assert_eq!(sealed.token_count, n_tokens);
+        assert_eq!(sealed.chunks.len(), 2);
+        assert_eq!(sealed.location, ArenaLocation::Gpu);
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        let cpu_batch = backing
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&sealed])
+            .expect("batched async migrate must succeed");
+
+        assert_eq!(cpu_batch.len(), 1, "one sequence in → one out");
+        let cpu = &cpu_batch[0];
+        assert_eq!(cpu.location, ArenaLocation::Cpu);
+        assert_eq!(cpu.token_count, n_tokens);
+        assert_eq!(cpu.chunks.len(), sealed.chunks.len());
+        for (orig, mig) in sealed.chunks.iter().zip(cpu.chunks.iter()) {
+            assert_eq!(mig.token_count, orig.token_count);
+            assert_eq!(mig.offset, orig.offset);
+        }
+    }
+
+    /// `migrate_sealed_to_cpu_batch_async` on multiple sequences must
+    /// migrate each to its own CPU slots — distinct GIDs across results,
+    /// per-sequence structure preserved.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn batched_async_multiple_sequences_get_distinct_destinations() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let n_kv_head = 2;
+        let head_dim = 16;
+        let n_tokens = 32; // exactly one full chunk per sequence
+        let backing = cuda_backing(&device, n_kv_head, head_dim);
+
+        let s0 = seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 0);
+        let s1 = seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 1000);
+        let s2 = seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 2000);
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        let migrated = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&s0, &s1, &s2],
+            )
+            .expect("multi-sequence batched async migrate must succeed");
+
+        assert_eq!(migrated.len(), 3);
+        // Every migrated sequence is CPU-located.
+        for m in &migrated {
+            assert_eq!(m.location, ArenaLocation::Cpu);
+            assert_eq!(m.token_count, n_tokens);
+            assert_eq!(m.chunks.len(), 1);
+        }
+        // All destination GIDs across the three sequences must be
+        // distinct — no two migrated chunks share a physical CPU slot.
+        let mut all_gids: Vec<i64> = Vec::new();
+        for m in &migrated {
+            for g in m.chunks[0].gids.iter() {
+                all_gids.push(g.raw());
+            }
+        }
+        all_gids.sort();
+        let unique: std::collections::HashSet<i64> = all_gids.iter().copied().collect();
+        assert_eq!(unique.len(), all_gids.len(), "GIDs must be globally unique");
+    }
+
+    /// `migrate_sealed_to_gpu_batch_async` on a CPU sequence must produce
+    /// a GPU-located sealed with the same per-chunk metadata.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn batched_async_to_gpu_preserves_structure() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let n_kv_head = 4;
+        let head_dim = 32;
+        let n_tokens = 40;
+        let backing = cuda_backing(&device, n_kv_head, head_dim);
+        let gpu_orig =
+            seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 0);
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        // First migrate GPU → CPU, then CPU → GPU.
+        let cpu = backing
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_orig])
+            .unwrap();
+        let gpu_back = backing
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu[0]])
+            .expect("batched async to_gpu must succeed");
+
+        assert_eq!(gpu_back.len(), 1);
+        let r = &gpu_back[0];
+        assert_eq!(r.location, ArenaLocation::Gpu);
+        assert_eq!(r.token_count, n_tokens);
+        assert_eq!(r.chunks.len(), gpu_orig.chunks.len());
+        for (orig, mig) in gpu_orig.chunks.iter().zip(r.chunks.iter()) {
+            assert_eq!(mig.token_count, orig.token_count);
+            assert_eq!(mig.offset, orig.offset);
+        }
+    }
+
+    /// **End-to-end byte identity** through the production hot↔warm
+    /// path: a known pattern seeded on GPU, migrated to RAM via
+    /// `migrate_sealed_to_cpu_batch_async` (kv_migrate_on gather + DtoH
+    /// on the copy stream + pinned scratch → Tensor::from_slice +
+    /// slice_set), then back to VRAM via
+    /// `migrate_sealed_to_gpu_batch_async` (Tensor::to_vec + HtoD on
+    /// the copy stream + kv_migrate_on scatter). After the round-trip,
+    /// the CPU bytes of the final form must be byte-identical to the
+    /// CPU bytes of the first migration.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cpu_gpu_round_trip_is_byte_identical() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let n_kv_head = 4;
+        let head_dim = 32;
+        let n_tokens = 40; // 2 chunks: one full, one partial
+        let backing = cuda_backing(&device, n_kv_head, head_dim);
+        let gpu_orig =
+            seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 12345);
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        // GPU → CPU (the bytes the production hot→warm path produces).
+        let cpu_first = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&gpu_orig],
+            )
+            .unwrap();
+        let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
+        assert!(
+            !first_bytes.is_empty(),
+            "CPU sealed must have non-empty bytes"
+        );
+
+        // CPU → GPU (the production warm→hot path).
+        let gpu_back = backing
+            .migrate_sealed_to_gpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&cpu_first[0]],
+            )
+            .unwrap();
+
+        // GPU → CPU again so we can read bytes to compare.
+        let cpu_second = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&gpu_back[0]],
+            )
+            .unwrap();
+        let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
+
+        assert_eq!(
+            first_bytes.len(),
+            second_bytes.len(),
+            "round-trip must preserve byte length"
+        );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "round-trip must be byte-identical — any difference means a chunk got swapped, \
+             dropped, or had its bytes corrupted by the gather/scatter pipeline"
+        );
+    }
+
+    /// **F16 end-to-end byte identity.** Same shape as the BF16
+    /// round-trip but with `DType::F16` backing — exercises the
+    /// `Tensor::from_slice` + `slice_set` write path with `half::f16`
+    /// element casts on the way back to CPU arena slots.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cpu_gpu_round_trip_f16_is_byte_identical() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use half::f16;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let n_kv_head = 4;
+        let head_dim = 32;
+        let n_tokens = 40; // two chunks: one full, one partial
+        let backing =
+            ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::F16, &device, 256).unwrap();
+
+        // F16 seed pattern — distinct per-element value, deterministic.
+        let slot = backing.alloc_sequence().unwrap();
+        backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+        let total = n_kv_head * n_tokens * head_dim;
+        let data: Vec<f16> = (0..total)
+            .map(|i| f16::from_f32(((12345 + i) as f32) * 0.001))
+            .collect();
+        let k = Tensor::from_vec(data, (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+        let v = k.clone();
+        backing.write_contiguous(slot, 0, &k, &v).unwrap();
+        backing.set_len(slot, n_tokens);
+        let gpu_orig = backing.record_turn(slot, n_tokens).unwrap();
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        let cpu_first = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&gpu_orig],
+            )
+            .unwrap();
+        let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
+        assert!(!first_bytes.is_empty());
+
+        let gpu_back = backing
+            .migrate_sealed_to_gpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&cpu_first[0]],
+            )
+            .unwrap();
+        let cpu_second = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&gpu_back[0]],
+            )
+            .unwrap();
+        let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
+
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        assert_eq!(
+            first_bytes, second_bytes,
+            "F16 round-trip must be byte-identical"
+        );
+    }
+
+    /// **R16 end-to-end byte identity.** R16 is the production-default
+    /// KV format on Qwen3 (per `CLAUDE.md` — "R16 throughout"). It's
+    /// classified as `KvFormat::Quantized(QuantFormat::R16)` in the
+    /// type system, so it goes through the same `QTensor::write_bytes_at`
+    /// / `read_bytes_at` route as Q8_0 — but with a much simpler
+    /// internal byte layout (essentially `f16` storage in
+    /// token-oriented `[D, T]` order).
+    ///
+    /// Seeds via an F16 backing (R16's storage element type), migrates
+    /// each chunk to a GPU R16 arena via the existing per-chunk
+    /// `migrate_chunk` (which routes through `quantize_into` for
+    /// non-fused formats), then runs the batched-async round-trip.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cpu_gpu_round_trip_r16_is_byte_identical() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use half::f16;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        // R16's storage element is F16, and the transpose-then-quantize
+        // path in `convert_chunk_data_static` expects matching dtypes.
+        // head_dim = 128 → sub_head_dim = 32, n_tokens = 64 → two full
+        // chunks (no partial-block padding to reason about).
+        let n_kv_head = 2;
+        let head_dim = 128;
+        let n_tokens = 64;
+        let backing =
+            ChunkedKvBacking::new(4, n_kv_head, head_dim, DType::F16, &device, 256).unwrap();
+
+        let slot = backing.alloc_sequence().unwrap();
+        backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+        let total = n_kv_head * n_tokens * head_dim;
+        let data: Vec<f16> = (0..total)
+            .map(|i| f16::from_f32(((54321 + i) as f32) * 0.0001))
+            .collect();
+        let k = Tensor::from_vec(data, (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+        let v = k.clone();
+        backing.write_contiguous(slot, 0, &k, &v).unwrap();
+        backing.set_len(slot, n_tokens);
+        let float_sealed = backing.record_turn(slot, n_tokens).unwrap();
+
+        // Re-route every chunk's GIDs into a GPU R16 arena. R16 isn't
+        // in the fused `can_fuse` set in `convert_chunk_data_static`,
+        // so this goes through `transpose → quantize_into` — the same
+        // path the production code uses for R16 (modulo the production
+        // path going through `write_raw_sealed_chunk` rather than
+        // `migrate_chunk`).
+        let gpu_r16_key = ArenaKey::uniform(
+            crate::kv_cache::KvFormat::Quantized(crate::kv_cache::QuantFormat::R16),
+            ArenaLocation::Gpu,
+        );
+        let mut r16_chunks: Vec<SealedChunk> = Vec::with_capacity(float_sealed.chunks.len());
+        for chunk in &float_sealed.chunks {
+            let new_gids = chunk
+                .gids
+                .map_unique(|gid| backing.migrate_chunk(gid.raw(), gpu_r16_key.clone()))
+                .expect("F16 → GPU R16 migrate must succeed");
+            r16_chunks.push(SealedChunk {
+                gids: new_gids,
+                ..chunk.clone()
+            });
+        }
+        let r16_sealed = SealedSequence {
+            chunks: r16_chunks,
+            token_count: float_sealed.token_count,
+            chunk_size: float_sealed.chunk_size,
+            location: ArenaLocation::Gpu,
+        };
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        // GPU R16 → CPU R16 (exercises QTensor::write_bytes_at).
+        let cpu_first = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&r16_sealed],
+            )
+            .unwrap();
+        let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
+        assert!(!first_bytes.is_empty(), "CPU R16 sealed must have bytes");
+        assert_eq!(cpu_first[0].location, ArenaLocation::Cpu);
+
+        // CPU R16 → GPU R16 (exercises QTensor::read_bytes_at).
+        let gpu_back = backing
+            .migrate_sealed_to_gpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&cpu_first[0]],
+            )
+            .unwrap();
+        assert_eq!(gpu_back[0].location, ArenaLocation::Gpu);
+
+        // GPU R16 → CPU R16 again, compare bytes.
+        let cpu_second = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&gpu_back[0]],
+            )
+            .unwrap();
+        let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
+
+        assert_eq!(
+            first_bytes.len(),
+            second_bytes.len(),
+            "R16 round-trip must preserve byte length"
+        );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "R16 round-trip must be byte-identical — this is the production hot↔warm \
+             path's exact byte-level guarantee"
+        );
+    }
+
+    /// **Quantized end-to-end byte identity.** Same shape as
+    /// `gpu_cpu_gpu_round_trip_is_byte_identical` but the SealedSequence
+    /// points into a GPU **Q8_0** arena instead of a Float arena, so
+    /// the batched-async path goes through `write_bytes_at` /
+    /// `read_bytes_at` on `QTensor` rather than through the
+    /// `Tensor::from_slice` + `slice_set` route.
+    ///
+    /// Seeds Float bytes, migrates each chunk to a GPU Q8_0 arena via
+    /// `migrate_chunk` (the existing per-chunk fused-quantize kernel),
+    /// then runs the batched-async migrate GPU→CPU→GPU→CPU. The two
+    /// CPU byte vectors must be identical — any difference means the
+    /// Quantized branch of `write_chunk_from_pinned_bytes` or
+    /// `read_chunk_into_pinned_bytes` corrupted, swapped, or dropped a
+    /// chunk.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cpu_gpu_round_trip_quantized_is_byte_identical() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        // head_dim = 128 → sub_head_dim = 32 → matches the Q8_0
+        // fused-quantize fast path in convert_chunk_data_static. Two
+        // full chunks (n_tokens = 64) keeps every chunk's element
+        // count a multiple of Q8_0's block_size (32).
+        let n_kv_head = 2;
+        let head_dim = 128;
+        let n_tokens = 64;
+        let backing = cuda_backing(&device, n_kv_head, head_dim);
+        let float_sealed =
+            seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 4242);
+
+        // Re-route every chunk's GIDs through a GPU Q8_0 arena via
+        // the existing fused Float→Quant migrate_chunk path.
+        let gpu_q8_key = ArenaKey::uniform(
+            crate::kv_cache::KvFormat::Quantized(crate::kv_cache::QuantFormat::Q8_0),
+            ArenaLocation::Gpu,
+        );
+        let mut quant_chunks: Vec<SealedChunk> = Vec::with_capacity(float_sealed.chunks.len());
+        for chunk in &float_sealed.chunks {
+            let new_gids = chunk
+                .gids
+                .map_unique(|gid| backing.migrate_chunk(gid.raw(), gpu_q8_key.clone()))
+                .expect("Float → GPU Q8_0 migrate must succeed for fused path");
+            quant_chunks.push(SealedChunk {
+                gids: new_gids,
+                ..chunk.clone()
+            });
+        }
+        let quant_sealed = SealedSequence {
+            chunks: quant_chunks,
+            token_count: float_sealed.token_count,
+            chunk_size: float_sealed.chunk_size,
+            location: ArenaLocation::Gpu,
+        };
+
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        // GPU Q8_0 → CPU Q8_0 (write_bytes_at path on the dest side).
+        let cpu_first = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&quant_sealed],
+            )
+            .unwrap();
+        let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
+        assert!(!first_bytes.is_empty(), "CPU Q8_0 sealed must have bytes");
+        assert_eq!(cpu_first[0].location, ArenaLocation::Cpu);
+
+        // CPU Q8_0 → GPU Q8_0 (read_bytes_at path on the source side).
+        let gpu_back = backing
+            .migrate_sealed_to_gpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&cpu_first[0]],
+            )
+            .unwrap();
+        assert_eq!(gpu_back[0].location, ArenaLocation::Gpu);
+
+        // GPU Q8_0 → CPU Q8_0 again so we can compare bytes.
+        let cpu_second = backing
+            .migrate_sealed_to_cpu_batch_async(
+                &device,
+                &copy_stream,
+                &mut pinned,
+                &[&gpu_back[0]],
+            )
+            .unwrap();
+        let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
+
+        assert_eq!(
+            first_bytes.len(),
+            second_bytes.len(),
+            "Q8_0 round-trip must preserve byte length"
+        );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "Q8_0 round-trip must be byte-identical — any difference means the \
+             Quantized branch of write_bytes_at / read_bytes_at corrupted, swapped, \
+             or dropped a chunk"
+        );
+    }
+
+    /// Empty input to the batched-async paths is a no-op: returns an
+    /// empty Vec without touching the device or the pinned scratch.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn batched_async_empty_input_is_noop() {
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let backing = cuda_backing(&device, 2, 16);
+        let cuda_dev = match &device {
+            Device::Cuda(d) => d,
+            _ => unreachable!(),
+        };
+        let copy_stream: Arc<CudaStream> = cuda_dev.cuda_context().new_stream().unwrap();
+        let mut pinned: Option<PinnedBuf> = None;
+
+        let out = backing
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[])
+            .unwrap();
+        assert!(out.is_empty());
+        assert!(pinned.is_none(), "no scratch allocation on empty input");
+
+        let out_gpu = backing
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[])
+            .unwrap();
+        assert!(out_gpu.is_empty());
     }
 }
