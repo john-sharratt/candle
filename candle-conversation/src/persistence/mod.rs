@@ -20,6 +20,7 @@
 //! [`SubstratePersistence`] is the public API tying them together.
 
 pub mod checkpoint;
+pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
 pub mod inherit;
@@ -96,6 +97,12 @@ pub struct SubstratePersistence {
     /// Filesystem path of the active log — the rename target of a
     /// compaction swap (§5.8).
     active_path: PathBuf,
+    /// Reusable pinned host scratch for the cold-load bridge path
+    /// (`NVMe → pinned host → HtoD → VRAM staging`). Allocated lazily on
+    /// the first cold-load that needs it; persists across loads so each
+    /// cold-load doesn't re-allocate `cuMemHostAlloc`. See
+    /// [`crate::persistence::cold_load`] for the bridge-vs-GDS context.
+    cold_load_stager: cold_load::ColdLoadStager,
 }
 
 /// SHA-256 of `bytes` — the tokenizer change-detection digest.
@@ -221,7 +228,14 @@ impl SubstratePersistence {
             template,
             tokenizer_sha256,
             active_path: active.to_path_buf(),
+            cold_load_stager: cold_load::ColdLoadStager::new(),
         })
+    }
+
+    /// Borrow the cold-load scratch (mutably; growing or first-allocating
+    /// happens through `pack`). Used by [`crate::persistence::transfer::cold_load_stream`].
+    pub fn cold_load_stager(&mut self) -> &mut cold_load::ColdLoadStager {
+        &mut self.cold_load_stager
     }
 
     /// The active log's manifest.

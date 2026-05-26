@@ -174,10 +174,23 @@ mod cuda_impl {
         load_stream(backing, device, warm_images)
     }
 
-    /// Cold-load a stream from the redo log into a sequence's VRAM chunks:
-    /// read the stream's `Chunk` records (from the active log or any
-    /// inherited log), concatenate their KV bytes in chunk order, and
-    /// scatter into `seq`.
+    /// Cold-load a stream from the redo log into a sequence's VRAM chunks.
+    ///
+    /// **Bridge implementation** (§4 of `docs/kv_tier_migration.md`):
+    ///
+    /// ```text
+    ///   Chunk records ─decode─▶ pinned host scratch ─cuMemcpyHtoDAsync─▶ device staging ─kv_migrate─▶ arena chunks
+    /// ```
+    ///
+    /// The host scratch is the persistence layer's reusable
+    /// [`ColdLoadStager`](crate::persistence::cold_load::ColdLoadStager),
+    /// so the next cold load skips the `cuMemHostAlloc`. The source of
+    /// the HtoD is pinned memory, so the driver does not need to
+    /// synthesise an internal pageable bounce.
+    ///
+    /// The **target shape** is GDS (`cuFileReadAsync` straight from NVMe
+    /// into VRAM staging, no host hop); this bridge is what's running
+    /// until the Linux production box arrives.
     pub fn cold_load_stream(
         persistence: &mut SubstratePersistence,
         backing: &ChunkedKvBacking,
@@ -185,15 +198,46 @@ mod cuda_impl {
         device: &Device,
         stream_id: StreamId,
     ) -> Result<()> {
+        let dev = cuda_device(device)?;
         let chunks = persistence
             .read_stream_chunks(stream_id)
             .map_err(|e| candle::Error::Msg(format!("cold load: read stream: {e}")))?;
-        let mut bytes = Vec::new();
-        for (_, payload) in &chunks {
-            bytes.extend_from_slice(&payload.kv_bytes);
+        let total_bytes: usize = chunks.iter().map(|(_, p)| p.kv_bytes.len()).sum();
+        if total_bytes == 0 {
+            return Ok(());
         }
+
         let chunk_ptrs = backing.resolve_sealed_chunk_ptrs(seq)?;
-        scatter_chunks(device, &chunk_ptrs, &bytes)
+        let ptrs_total: i64 = chunk_ptrs.iter().map(|&(_, len)| len).sum();
+        if ptrs_total as usize != total_bytes {
+            return Err(candle::Error::Msg(format!(
+                "cold load: stream {stream_id:?} has {total_bytes} bytes in records but \
+                 sequence resolves to {ptrs_total} bytes of scattered chunks",
+                stream_id = stream_id.0
+            )));
+        }
+
+        // Pack into the pinned scratch in chunk order, then HtoD once.
+        let stager = persistence.cold_load_stager();
+        let _packed_len = {
+            let packed = stager.pack(chunks.iter().map(|(_, p)| p.kv_bytes.as_slice()))?;
+            packed.len()
+        };
+        let stream = dev.cuda_stream();
+        let staging = stager.upload_async(dev, &stream, total_bytes)?;
+
+        let mut plan = MigrationPlan::new();
+        let mut offset = 0i64;
+        for &(ptr, len) in &chunk_ptrs {
+            plan.push(staging.base_ptr + offset, ptr, len);
+            offset += len;
+        }
+        kv_migrate(device, &plan)?;
+        // `staging.slice` drops here, freeing the device allocation
+        // *after* `kv_migrate` returns (which currently sync-launches
+        // its kernel; the migration plan is consumed before this drop).
+        drop(staging);
+        Ok(())
     }
 
     /// Reconstruct one layer's [`SealedSequence`] from its recovered
@@ -330,6 +374,81 @@ mod cuda_impl {
             // A plan that wants 256 bytes, handed 100.
             let chunks = [(0x1000i64, 256i64)];
             assert!(scatter_chunks(&device, &chunks, &[0u8; 100]).is_err());
+        }
+
+        /// End-to-end byte-identity check for the cold-load bridge:
+        /// `ColdLoadStager::pack` → `upload_async` (real pinned host →
+        /// HtoD on the CUDA stream) → `kv_migrate` (scatter to
+        /// VRAM-resident chunks) → `memcpy_dtov` (read back) →
+        /// `assert_eq!` against the originals. If pinned alloc or the
+        /// HtoD path is broken this fires.
+        #[test]
+        fn cold_load_stager_upload_and_scatter_round_trip_is_byte_identical() {
+            use crate::persistence::cold_load::ColdLoadStager;
+            use candle::cuda_backend::cudarc::driver::DevicePtr;
+            use candle_nn::kv_cache::{kv_migrate, MigrationPlan};
+
+            let device = match candle::Device::cuda_if_available(0) {
+                Ok(d @ candle::Device::Cuda(_)) => d,
+                _ => return, // no GPU — skip
+            };
+            let dev = cuda_device(&device).unwrap();
+
+            // Three distinct-pattern "chunks" that get packed contiguously
+            // through the stager and then scattered into three separately-
+            // allocated VRAM regions — the exact shape of a cold load.
+            let chunks: Vec<Vec<u8>> = vec![
+                (0..512u32).map(|i| (i % 256) as u8).collect(),
+                (0..256u32).map(|i| ((i * 7 + 13) % 256) as u8).collect(),
+                (0..128u32).map(|i| ((i * 17 + 3) % 256) as u8).collect(),
+            ];
+            let total: usize = chunks.iter().map(|c| c.len()).sum();
+
+            // Allocate destination VRAM chunks (the "arena chunks" the
+            // cold-load path scatters into).
+            let dst_gpus: Vec<_> = chunks
+                .iter()
+                .map(|c| unsafe { dev.alloc::<u8>(c.len()).unwrap() })
+                .collect();
+            let dst_ptrs: Vec<(i64, i64)> = {
+                let stream = dev.cuda_stream();
+                dst_gpus
+                    .iter()
+                    .zip(&chunks)
+                    .map(|(g, c)| (g.device_ptr(&stream).0 as i64, c.len() as i64))
+                    .collect()
+            };
+
+            // Pack → upload via the bridge primitive.
+            let mut stager = ColdLoadStager::new();
+            {
+                let packed = stager
+                    .pack(chunks.iter().map(|c| c.as_slice()))
+                    .expect("pack into pinned scratch");
+                assert_eq!(packed.len(), total);
+            }
+            let stream = dev.cuda_stream();
+            let staging = stager
+                .upload_async(dev, &stream, total)
+                .expect("upload_async to device");
+
+            // Scatter the contiguous staging blob into the dst chunks.
+            let mut plan = MigrationPlan::new();
+            let mut offset = 0i64;
+            for &(ptr, len) in &dst_ptrs {
+                plan.push(staging.base_ptr + offset, ptr, len);
+                offset += len;
+            }
+            kv_migrate(&device, &plan).expect("kv_migrate scatter");
+            drop(staging);
+
+            for (i, c) in chunks.iter().enumerate() {
+                let back = dev.memcpy_dtov(&dst_gpus[i]).unwrap();
+                assert_eq!(
+                    &back, c,
+                    "chunk {i} bytes survive the pinned-host → HtoD → scatter chain"
+                );
+            }
         }
     }
 }
