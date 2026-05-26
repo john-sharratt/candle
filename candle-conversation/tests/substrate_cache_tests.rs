@@ -1,6 +1,6 @@
 //! Integration tests for the hot-tier [`SubstrateCache`].
 
-use candle_conversation::projection::{SectionId, TimelineAllocator, TurnIndex};
+use candle_conversation::projection::{SectionId, TimelineAllocator, TurnIndex, TurnKey};
 use candle_conversation::substrate_cache::{SubstrateCache, SubstrateKey};
 
 #[allow(dead_code)]
@@ -10,7 +10,7 @@ fn timeline_key(n: u64, idx: u32) -> SubstrateKey {
     for _ in 0..n {
         let _ = alloc.next();
     }
-    SubstrateKey::Turn(alloc.next(), TurnIndex(idx))
+    SubstrateKey::Turn(TurnKey::new(alloc.next(), TurnIndex(idx)))
 }
 
 fn section_key(id: u32) -> SubstrateKey {

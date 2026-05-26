@@ -41,7 +41,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::projection::{SectionId, TimelineId, TurnIndex};
+use crate::projection::{SectionId, TurnKey};
 
 // ── SubstrateKey ──────────────────────────────────────────────────────────────
 
@@ -49,7 +49,7 @@ use crate::projection::{SectionId, TimelineId, TurnIndex};
 /// to address turns and sections without knowing which map they live in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubstrateKey {
-    Turn(TimelineId, TurnIndex),
+    Turn(TurnKey),
     Section(SectionId),
 }
 

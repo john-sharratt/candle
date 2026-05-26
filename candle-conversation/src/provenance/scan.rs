@@ -51,7 +51,7 @@ use super::store::{
     NUM_DEPTHS,
 };
 use super::{ProvenanceFile, SigEntry, TokenSignature};
-use crate::projection::{PerDepthScores, SectionId, TimelineId, TurnIndex, TurnScores};
+use crate::projection::{PerDepthScores, SectionId, TurnKey, TurnScores};
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -209,7 +209,7 @@ pub struct TokenHit {
 
 /// Persistent per-conversation BDP scanner.
 ///
-/// Holds an `ahash::AHashMap` keyed by `(TimelineId, TurnIndex)`.  Each
+/// Holds an `ahash::AHashMap` keyed by [`TurnKey`].  Each
 /// [`Self::scan`] call refreshes that map: the existing keys are cleared,
 /// then repopulated from a fresh scan of the supplied corpus entries against
 /// the supplied probe signatures.  Reusing the map's internal storage
@@ -219,7 +219,7 @@ pub const DEFAULT_SPAN_ALPHA: f32 = 2.0;
 
 #[derive(Default)]
 pub struct BdpScanner {
-    scores: AHashMap<(TimelineId, TurnIndex), PerDepthScores>,
+    scores: AHashMap<TurnKey, PerDepthScores>,
     section_scores: AHashMap<SectionId, PerDepthScores>,
     section_hit_log: AHashMap<SectionId, Vec<TokenHit>>,
     hit_threshold: u32,
@@ -274,7 +274,7 @@ impl BdpScanner {
     }
 
     /// Read the score map produced by the most recent `scan`.
-    pub fn scores(&self) -> &AHashMap<(TimelineId, TurnIndex), PerDepthScores> {
+    pub fn scores(&self) -> &AHashMap<TurnKey, PerDepthScores> {
         &self.scores
     }
 
@@ -282,6 +282,22 @@ impl BdpScanner {
     /// [`Self::scan_sections`].
     pub fn section_scores(&self) -> &AHashMap<SectionId, PerDepthScores> {
         &self.section_scores
+    }
+
+    /// Materialize the scanner's accumulated turn + section scores into a
+    /// fresh [`crate::substrate::ProjectionScores`] suitable for
+    /// [`crate::projection::resolver::Conversation::read_scored`]. The
+    /// scanner retains its own copy; this clone-out is for callers that
+    /// want a self-contained, owned scores value.
+    pub fn to_projection_scores(&self) -> crate::substrate::ProjectionScores {
+        let mut out = crate::substrate::ProjectionScores::new();
+        for (&key, scores) in &self.scores {
+            out.set_turn(key.timeline, key.index, *scores);
+        }
+        for (&section_id, scores) in &self.section_scores {
+            out.set_section(section_id, *scores);
+        }
+        out
     }
 
     /// Read the per-section hit log populated by the most recent
@@ -301,17 +317,16 @@ impl BdpScanner {
     /// signatures.  The map is cleared first; each turn touched by the scan
     /// produces a fresh [`PerDepthScores`].
     ///
-    /// `corpus` is `Vec<(TimelineId, TurnIndex, Vec<SigEntry>)>` — a
-    /// single turn may contribute multiple entries (one per sealed
-    /// 32-token chunk), and all of them aggregate into the same
-    /// per-turn stat record.
+    /// `corpus` is `&[(TurnKey, Vec<SigEntry>)]` — a single turn may
+    /// contribute multiple entries (one per sealed 32-token chunk), and
+    /// all of them aggregate into the same per-turn stat record.
     pub fn scan(
         &mut self,
         provenance: &ProvenanceFile,
         probe_syn: &[TokenSignature],
         probe_sem: &[TokenSignature],
         probe_prag: &[TokenSignature],
-        corpus: &[(TimelineId, TurnIndex, Vec<SigEntry>)],
+        corpus: &[(TurnKey, Vec<SigEntry>)],
     ) -> crate::Result<()> {
         self.scores.clear();
         if corpus.is_empty() {
@@ -319,7 +334,7 @@ impl BdpScanner {
         }
 
         let entries_per_item: Vec<&[SigEntry]> =
-            corpus.iter().map(|(_, _, e)| e.as_slice()).collect();
+            corpus.iter().map(|(_, e)| e.as_slice()).collect();
         let (aggs, _) = scan_core(
             provenance,
             &entries_per_item,
@@ -332,9 +347,9 @@ impl BdpScanner {
             false,
         )?;
 
-        for ((timeline, idx, _), [syn_a, sem_a, prag_a]) in corpus.iter().zip(aggs) {
+        for ((key, _), [syn_a, sem_a, prag_a]) in corpus.iter().zip(aggs) {
             self.scores.insert(
-                (*timeline, *idx),
+                *key,
                 PerDepthScores {
                     syn: syn_a.finish(),
                     sem: sem_a.finish(),
@@ -352,7 +367,7 @@ impl BdpScanner {
     /// access, accumulate per-(section, depth) Hamming agreements
     /// against the probes, finalise into [`PerDepthScores`].  The only
     /// difference is the corpus shape: keys are
-    /// [`crate::projection::SectionId`] not `(TimelineId, TurnIndex)`.
+    /// [`crate::projection::SectionId`] not [`TurnKey`].
     /// Results land in [`Self::section_scores`].
     ///
     /// Section scoring runs on the same probe as a turn scan; callers
@@ -660,11 +675,11 @@ fn popcount_xnor(a: &[u8], b: &[u8; TokenSignature::BYTE_LEN]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{TimelineId, TurnIndex, TurnScores};
+    use crate::projection::{TimelineId, TurnIndex, TurnKey, TurnScores};
 
     /// Test fixture: synthesise a deterministic [`TimelineId`].  The
     /// scanner doesn't care which timeline a corpus entry belongs to —
-    /// it just keys per-(timeline, idx).
+    /// it just keys per-[`TurnKey`].
     fn timeline_id() -> TimelineId {
         TimelineId::for_test(1)
     }
@@ -748,6 +763,7 @@ mod tests {
             .unwrap();
         let t = timeline_id();
         let i = TurnIndex(0);
+        let key = TurnKey::new(t, i);
 
         let mut scanner = BdpScanner::new();
         scanner
@@ -756,7 +772,7 @@ mod tests {
                 &[probe],
                 &[probe],
                 &[probe],
-                &[(t, i, vec![entry])],
+                &[(key, vec![entry])],
             )
             .unwrap();
         assert_eq!(scanner.scores().len(), 1);
@@ -773,6 +789,7 @@ mod tests {
         let entry = provenance.append(&[s, s, s], &[s, s, s], &[s, s, s]).unwrap();
         let t = timeline_id();
         let i = TurnIndex(0);
+        let key = TurnKey::new(t, i);
 
         let mut scanner = BdpScanner::new().with_hit_threshold(120);
         scanner
@@ -781,11 +798,11 @@ mod tests {
                 &[s],
                 &[s],
                 &[s],
-                &[(t, i, vec![entry])],
+                &[(key, vec![entry])],
             )
             .unwrap();
 
-        let scores = scanner.scores().get(&(t, i)).unwrap();
+        let scores = scanner.scores().get(&key).unwrap();
         // 3 corpus tokens × 1 probe token = 3 pairs, each agreement = 128
         assert_eq!(scores.syn.max, 128.0);
         assert_eq!(scores.sem.max, 128.0);
@@ -941,8 +958,8 @@ mod tests {
             .unwrap();
 
         let t = timeline_id();
-        let i_match = TurnIndex(0);
-        let i_mismatch = TurnIndex(1);
+        let k_match = TurnKey::new(t, TurnIndex(0));
+        let k_mismatch = TurnKey::new(t, TurnIndex(1));
 
         let mut scanner = BdpScanner::new();
         scanner
@@ -952,14 +969,14 @@ mod tests {
                 &[s_match],
                 &[s_match],
                 &[
-                    (t, i_match, vec![entry_match]),
-                    (t, i_mismatch, vec![entry_mismatch]),
+                    (k_match, vec![entry_match]),
+                    (k_mismatch, vec![entry_mismatch]),
                 ],
             )
             .unwrap();
 
-        let m = scanner.scores().get(&(t, i_match)).unwrap();
-        let mm = scanner.scores().get(&(t, i_mismatch)).unwrap();
+        let m = scanner.scores().get(&k_match).unwrap();
+        let mm = scanner.scores().get(&k_mismatch).unwrap();
         assert_eq!(m.syn.max, 128.0);
         assert_eq!(mm.syn.max, 0.0);
     }

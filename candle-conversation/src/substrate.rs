@@ -46,7 +46,7 @@
 //!
 //! Scores default to all-zeroes until the first BDP scan refreshes them.
 
-use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
 use candle_nn::kv_cache::SealedSequence;
@@ -54,7 +54,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::projection::{DepthWeights, ScoreFormula};
-use crate::projection::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex};
+use crate::projection::{
+    GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
+};
 use crate::substrate_cache::{SubstrateCache, SubstrateKey};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
@@ -119,6 +121,95 @@ pub struct PerDepthScores {
     pub prag: TurnScores,
 }
 
+/// Transient per-projection BDP score cache.
+///
+/// **Not part of the persistent substrate state.** Built by the BDP
+/// scanner during one projection pass, consumed by the projection
+/// emitter during that same pass, then discarded. Conversation
+/// identity does not include this — reload from log starts with an
+/// empty `ProjectionScores`, and the next BDP scan repopulates it.
+///
+/// Lives separately from `TurnEntryData` / `SectionEntryData` so
+/// reads of those types don't surface stale-or-not-yet-scored
+/// projection scratch as if it were canonical conversation state.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionScores {
+    turns: AHashMap<TurnKey, PerDepthScores>,
+    sections: AHashMap<SectionId, PerDepthScores>,
+}
+
+impl ProjectionScores {
+    /// An empty score cache — every lookup defaults to zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the BDP scores for one turn.
+    pub fn set_turn(
+        &mut self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        scores: PerDepthScores,
+    ) {
+        self.turns.insert(TurnKey::new(timeline, index), scores);
+    }
+
+    /// Record the BDP scores for one system-prompt section.
+    pub fn set_section(&mut self, section: SectionId, scores: PerDepthScores) {
+        self.sections.insert(section, scores);
+    }
+
+    /// Look up a turn's scores. Defaults to zero when the BDP scanner
+    /// did not score this turn in the current projection (e.g. the turn
+    /// was outside the recent window).
+    pub fn turn(&self, timeline: TimelineId, index: TurnIndex) -> PerDepthScores {
+        self.turns
+            .get(&TurnKey::new(timeline, index))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Look up a section's scores. Defaults to zero when not scored.
+    pub fn section(&self, section: SectionId) -> PerDepthScores {
+        self.sections.get(&section).copied().unwrap_or_default()
+    }
+
+    /// Number of scored turns.
+    pub fn turn_count(&self) -> usize {
+        self.turns.len()
+    }
+
+    /// Number of scored sections.
+    pub fn section_count(&self) -> usize {
+        self.sections.len()
+    }
+
+    /// Discard every score, leaving the cache empty.
+    pub fn clear(&mut self) {
+        self.turns.clear();
+        self.sections.clear();
+    }
+
+    /// Test helper: resolve `group`'s first registered timeline against
+    /// `substrate`, then record `scores` for `(timeline, index)`.
+    /// No-op when `group` has no registered timeline.
+    ///
+    /// Mirrors the old `Substrate::set_scores_for_test`, but operates on
+    /// this transient cache rather than on substrate state.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_for_group_test(
+        &mut self,
+        substrate: &Substrate,
+        group: GroupId,
+        index: TurnIndex,
+        scores: PerDepthScores,
+    ) {
+        if let Some(timeline) = substrate.timelines_for_group(group).next() {
+            self.set_turn(timeline, index, scores);
+        }
+    }
+}
+
 // ── Per-section record ────────────────────────────────────────────────────────
 
 /// Per-section state stored in the substrate.  Mirrors [`TurnEntryData`]
@@ -129,9 +220,8 @@ pub struct PerDepthScores {
 pub struct SectionEntryData {
     token_count: usize,
     block_range: (u64, u64),
-    scores: PerDepthScores,
     sig_entries: Vec<SigEntry>,
-    pub sealed: Arc<Vec<SealedSequence>>,
+    sealed: Vec<SealedSequence>,
     tokens: Arc<Vec<u32>>,
 }
 
@@ -141,9 +231,8 @@ pub struct SectionEntryData {
 pub struct TurnEntryData {
     token_count: usize,
     block_range: (u64, u64),
-    scores: PerDepthScores,
     sig_entries: Vec<SigEntry>,
-    pub sealed: Arc<Vec<SealedSequence>>,
+    sealed: Vec<SealedSequence>,
     role: Role,
     text: String,
     token_ids: TokenBuffer,
@@ -412,19 +501,6 @@ impl Substrate {
         self.append_with_blocks(timeline, token_count, block_start, block_end)
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn set_scores_for_test(
-        &mut self,
-        group: GroupId,
-        index: TurnIndex,
-        scores: PerDepthScores,
-    ) {
-        let timeline = self.timelines_for_group(group).next();
-        if let Some(timeline) = timeline {
-            self.set_scores(timeline, index, scores);
-        }
-    }
-
     pub fn append_with_blocks(
         &mut self,
         timeline: TimelineId,
@@ -442,9 +518,8 @@ impl Substrate {
             TurnEntryData {
                 token_count,
                 block_range: (block_start, block_end),
-                scores: PerDepthScores::default(),
                 sig_entries: Vec::new(),
-                sealed: Arc::new(vec![]),
+                sealed: Vec::new(),
                 role: Role::Assistant,
                 text: String::new(),
                 token_ids: TokenBuffer::default(),
@@ -473,7 +548,7 @@ impl Substrate {
         sealed_gpu: Arc<Vec<SealedSequence>>,
         migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
     ) -> candle::Result<TurnIndex> {
-        let sealed_cpu = Arc::new(migrate_to_cpu(&sealed_gpu)?);
+        let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
         // GPU chunks are freed as soon as the caller drops `sealed_gpu`.
         let tl = self
             .timelines
@@ -485,7 +560,6 @@ impl Substrate {
             TurnEntryData {
                 token_count,
                 block_range: (block_start, block_end),
-                scores: PerDepthScores::default(),
                 sig_entries: Vec::new(),
                 sealed: sealed_cpu,
                 role,
@@ -515,7 +589,7 @@ impl Substrate {
         token_count: usize,
         block_start: u64,
         block_end: u64,
-        sealed: Arc<Vec<SealedSequence>>,
+        sealed: Vec<SealedSequence>,
     ) -> TurnIndex {
         let tl = self
             .timelines
@@ -527,7 +601,6 @@ impl Substrate {
             TurnEntryData {
                 token_count,
                 block_range: (block_start, block_end),
-                scores: PerDepthScores::default(),
                 sig_entries: Vec::new(),
                 sealed,
                 role,
@@ -565,7 +638,7 @@ impl Substrate {
         &mut self,
         timeline: TimelineId,
         index: TurnIndex,
-        sealed: Arc<Vec<SealedSequence>>,
+        sealed: Vec<SealedSequence>,
     ) {
         if sealed.is_empty() {
             return;
@@ -579,7 +652,7 @@ impl Substrate {
     pub fn materialize_section_sealed(
         &mut self,
         section: SectionId,
-        sealed: Arc<Vec<SealedSequence>>,
+        sealed: Vec<SealedSequence>,
     ) {
         if sealed.is_empty() {
             return;
@@ -603,12 +676,12 @@ impl Substrate {
         &mut self,
         timeline: TimelineId,
         index: TurnIndex,
-    ) -> Option<Arc<Vec<SealedSequence>>> {
+    ) -> Option<Vec<SealedSequence>> {
         let entry = self.turn_mut(timeline, index)?;
         if entry.sealed.is_empty() {
             return None;
         }
-        let prev = std::mem::replace(&mut entry.sealed, Arc::new(Vec::new()));
+        let prev = std::mem::replace(&mut entry.sealed, Vec::new());
         Some(prev)
     }
 
@@ -651,17 +724,15 @@ impl Substrate {
     /// scanned in registration order. Adequate eviction heuristic
     /// (oldest persisted turn = least likely to be re-touched);
     /// upgradeable to true LRU later with a `last_touched` stamp.
-    pub fn oldest_hot_turn_except(
-        &self,
-        except: (TimelineId, TurnIndex),
-    ) -> Option<(TimelineId, TurnIndex)> {
+    pub fn oldest_hot_turn_except(&self, except: TurnKey) -> Option<TurnKey> {
         for (&timeline, tl) in self.timelines.iter() {
-            for (&idx, entry) in tl.turns.iter() {
-                if (timeline, idx) == except {
+            for (&index, entry) in tl.turns.iter() {
+                let key = TurnKey::new(timeline, index);
+                if key == except {
                     continue;
                 }
                 if !entry.sealed.is_empty() {
-                    return Some((timeline, idx));
+                    return Some(key);
                 }
             }
         }
@@ -708,12 +779,6 @@ impl Substrate {
         }
     }
 
-    pub fn set_scores(&mut self, timeline: TimelineId, index: TurnIndex, scores: PerDepthScores) {
-        if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.scores = scores;
-        }
-    }
-
     pub fn block_range_of(&self, timeline: TimelineId, index: TurnIndex) -> (u64, u64) {
         self.turn(timeline, index)
             .map_or((0, 0), |e| e.block_range)
@@ -756,34 +821,12 @@ impl Substrate {
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
         self.turn(timeline, index)
-            .map(|e| Arc::clone(&e.sealed))
-    }
-
-    pub fn scores_of(&self, timeline: TimelineId, index: TurnIndex) -> PerDepthScores {
-        self.turn(timeline, index)
-            .map_or(PerDepthScores::default(), |e| e.scores)
+            .map(|e| Arc::new(e.sealed.clone()))
     }
 
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
         self.turn(timeline, index)
             .map_or(0, |e| e.token_count)
-    }
-
-    pub fn turn_score_of(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
-        let Some(entry) = self.turn(timeline, index) else {
-            return 0.0;
-        };
-        weights.combine(
-            entry.scores.syn.pick(formula),
-            entry.scores.sem.pick(formula),
-            entry.scores.prag.pick(formula),
-        )
     }
 
     pub fn turn_count(&self, timeline: TimelineId) -> u32 {
@@ -799,10 +842,10 @@ impl Substrate {
             .flat_map(|t| t.turns.keys().copied())
     }
 
-    pub fn all_turns(&self) -> impl Iterator<Item = (TimelineId, TurnIndex)> + '_ {
+    pub fn all_turns(&self) -> impl Iterator<Item = TurnKey> + '_ {
         self.timelines
             .iter()
-            .flat_map(|(tl, t)| t.turns.keys().map(move |idx| (*tl, *idx)))
+            .flat_map(|(tl, t)| t.turns.keys().map(move |idx| TurnKey::new(*tl, *idx)))
     }
 
     /// The conversation's sidebar label, or `None` if none has been
@@ -945,11 +988,10 @@ impl Substrate {
         migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
         tokens: Arc<Vec<u32>>,
     ) -> candle::Result<()> {
-        let sealed_cpu = Arc::new(migrate_to_cpu(&sealed_gpu)?);
+        let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
-            scores: PerDepthScores::default(),
             sig_entries,
             sealed: sealed_cpu,
             tokens,
@@ -970,7 +1012,9 @@ impl Substrate {
     }
 
     pub fn section_sealed_of(&self, section: SectionId) -> Option<Arc<Vec<SealedSequence>>> {
-        self.sections.get(&section).map(|e| Arc::clone(&e.sealed))
+        self.sections
+            .get(&section)
+            .map(|e| Arc::new(e.sealed.clone()))
     }
 
     pub fn section_tokens_of(&self, section: SectionId) -> Arc<Vec<u32>> {
@@ -986,12 +1030,6 @@ impl Substrate {
             .map_or((0, 0), |e| e.block_range)
     }
 
-    pub fn set_section_scores(&mut self, section: SectionId, scores: PerDepthScores) {
-        if let Some(e) = self.sections.get_mut(&section) {
-            e.scores = scores;
-        }
-    }
-
     pub fn section_sig_entries(&self, section: SectionId) -> &[crate::provenance::SigEntry] {
         self.sections
             .get(&section)
@@ -1002,18 +1040,21 @@ impl Substrate {
         self.sections.keys().copied()
     }
 
-    pub fn section_scores_of(&self, section: SectionId) -> PerDepthScores {
-        self.sections
-            .get(&section)
-            .map_or(PerDepthScores::default(), |e| e.scores)
-    }
 }
 
-/// Group-keyed [`ContentResolver`] impl over [`Substrate`].
+/// Group-keyed [`ContentResolver`] over a bare [`Substrate`].
 ///
-/// **Phase 1 caveat**: when a group has multiple timelines, this impl reads
-/// from the *first registered* timeline only.  Phase 3 replaces this with
-/// `TargetedRead` which filters by `target.timeline` within the target group.
+/// **The substrate owns no scoring state** — it is a directory of turns,
+/// sections and timelines, not a score table. Without an attached
+/// [`ProjectionScores`], every score lookup returns zero. Production
+/// code attaches scores via [`SubstrateRead::scores`]; this impl exists
+/// so structural-only callers (e.g. tests reading only turn counts and
+/// sealed pointers) can still pass `&substrate` to `Builder::project`.
+///
+/// **Phase 1 caveat**: when a group has multiple timelines, this impl
+/// reads from the *first registered* timeline only.  Phase 3 replaces
+/// this with `TargetedRead` which filters by `target.timeline` within
+/// the target group.
 impl ContentResolver for Substrate {
     fn turn_count(&self, group: GroupId) -> u32 {
         let Some(timeline) = self.timelines_for_group(group).next() else {
@@ -1026,28 +1067,19 @@ impl ContentResolver for Substrate {
         let Some(timeline) = self.timelines_for_group(group).next() else {
             return 0;
         };
-        self.turn(timeline, index)
-            .map_or(0, |e| e.token_count)
+        self.turn(timeline, index).map_or(0, |e| e.token_count)
     }
 
     fn turn_score(
         &self,
-        group: GroupId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
+        _group: GroupId,
+        _index: TurnIndex,
+        _formula: ScoreFormula,
+        _weights: &DepthWeights,
     ) -> f32 {
-        let Some(timeline) = self.timelines_for_group(group).next() else {
-            return 0.0;
-        };
-        let Some(entry) = self.turn(timeline, index) else {
-            return 0.0;
-        };
-        weights.combine(
-            entry.scores.syn.pick(formula),
-            entry.scores.sem.pick(formula),
-            entry.scores.prag.pick(formula),
-        )
+        // Bare substrate has no attached scores; pair via ScoredSubstrate
+        // or read through Conversation::read_scored to see non-zero values.
+        0.0
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
@@ -1062,28 +1094,163 @@ impl ContentResolver for Substrate {
 
     fn section_score(
         &self,
+        _section: SectionId,
+        _formula: ScoreFormula,
+        _weights: &DepthWeights,
+    ) -> f32 {
+        0.0
+    }
+}
+
+/// Pairing of a [`Substrate`] with a transient [`ProjectionScores`] cache.
+///
+/// Used by tests operating on a bare [`Substrate`] that want scoring
+/// without going through a [`super::projection::resolver::Conversation`]
+/// read guard. Production code does the same thing via
+/// [`super::projection::resolver::Conversation::read_scored`].
+pub struct ScoredSubstrate<'a> {
+    substrate: &'a Substrate,
+    scores: &'a ProjectionScores,
+}
+
+impl<'a> ScoredSubstrate<'a> {
+    pub fn new(substrate: &'a Substrate, scores: &'a ProjectionScores) -> Self {
+        Self { substrate, scores }
+    }
+}
+
+impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
+    type Target = Substrate;
+    fn deref(&self) -> &Substrate {
+        self.substrate
+    }
+}
+
+/// Combine the three per-depth statistics for a (formula, weights) pair.
+/// Shared between every scored ContentResolver impl so a substrate-side
+/// shape change can't drift the formula across them.
+#[inline]
+fn combine_per_depth(
+    s: PerDepthScores,
+    formula: ScoreFormula,
+    weights: &DepthWeights,
+) -> f32 {
+    weights.combine(
+        s.syn.pick(formula),
+        s.sem.pick(formula),
+        s.prag.pick(formula),
+    )
+}
+
+/// Group-keyed [`ContentResolver`] impl over a `(Substrate, ProjectionScores)`
+/// pair.
+///
+/// **Phase 1 caveat**: when a group has multiple timelines, this impl reads
+/// from the *first registered* timeline only.  Phase 3 replaces this with
+/// `TargetedRead` which filters by `target.timeline` within the target group.
+impl<'a> ContentResolver for ScoredSubstrate<'a> {
+    fn turn_count(&self, group: GroupId) -> u32 {
+        let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
+            return 0;
+        };
+        Substrate::turn_count(self.substrate, timeline)
+    }
+
+    fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
+        let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
+            return 0;
+        };
+        self.substrate.turn(timeline, index).map_or(0, |e| e.token_count)
+    }
+
+    fn turn_score(
+        &self,
+        group: GroupId,
+        index: TurnIndex,
+        formula: ScoreFormula,
+        weights: &DepthWeights,
+    ) -> f32 {
+        let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
+            return 0.0;
+        };
+        if self.substrate.turn(timeline, index).is_none() {
+            return 0.0;
+        }
+        combine_per_depth(self.scores.turn(timeline, index), formula, weights)
+    }
+
+    fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
+        let timeline = self.substrate.timelines_for_group(group).next()?;
+        let (layer, _) = self.substrate.timeline_target(timeline)?;
+        Some(layer)
+    }
+
+    fn section_token_count(&self, section: SectionId) -> usize {
+        self.substrate
+            .sections
+            .get(&section)
+            .map_or(0, |e| e.token_count)
+    }
+
+    fn section_score(
+        &self,
         section: SectionId,
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        let Some(entry) = self.sections.get(&section) else {
+        if !self.substrate.sections.contains_key(&section) {
             return 0.0;
-        };
-        weights.combine(
-            entry.scores.syn.pick(formula),
-            entry.scores.sem.pick(formula),
-            entry.scores.prag.pick(formula),
-        )
+        }
+        combine_per_depth(self.scores.section(section), formula, weights)
     }
 }
 
 // ── Guards ────────────────────────────────────────────────────────────────────
 
 /// Read guard over a [`Substrate`] inside a [`super::resolver::Conversation`].
-/// Implements [`ContentResolver`] so it can be passed directly to
-/// `Builder::project`.
+///
+/// Carries an optional [`ProjectionScores`] reference: when `Some`, the
+/// read implements [`ContentResolver`] using those scores; when `None`,
+/// scoring methods return zero (correct default for non-projection
+/// callers reading structural fields like turn counts or sealed pointers).
+///
+/// Construct scored variants via
+/// [`super::resolver::Conversation::read_scored`]; the bare
+/// [`super::resolver::Conversation::read`] returns the unscored variant.
 pub struct SubstrateRead<'a> {
     pub(super) guard: RwLockReadGuard<'a, Substrate>,
+    pub(super) scores: Option<&'a ProjectionScores>,
+}
+
+impl<'a> SubstrateRead<'a> {
+    /// Lookup helper: returns the attached scores, or an empty default
+    /// when this is an unscored read.
+    fn scores_or_empty(&self) -> &ProjectionScores {
+        static EMPTY_SCORES: OnceLock<ProjectionScores> = OnceLock::new();
+        self.scores
+            .unwrap_or_else(|| EMPTY_SCORES.get_or_init(ProjectionScores::default))
+    }
+
+    /// Per-`TimelineId` variant of [`ContentResolver::turn_score`]. Used
+    /// by [`super::projection::resolver::TargetedRead`] which already
+    /// knows the target-corrected `TimelineId` for the queried group.
+    /// Returns `0.0` when the turn is unknown.
+    pub fn turn_score_for_timeline(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        formula: ScoreFormula,
+        weights: &DepthWeights,
+    ) -> f32 {
+        if self.guard.turn(timeline, index).is_none() {
+            return 0.0;
+        }
+        combine_per_depth(
+            self.scores_or_empty().turn(timeline, index),
+            formula,
+            weights,
+        )
+    }
 }
 
 impl<'a> std::ops::Deref for SubstrateRead<'a> {
@@ -1095,11 +1262,21 @@ impl<'a> std::ops::Deref for SubstrateRead<'a> {
 
 impl<'a> ContentResolver for SubstrateRead<'a> {
     fn turn_count(&self, group: GroupId) -> u32 {
-        ContentResolver::turn_count(&*self.guard, group)
+        let Some(timeline) = self.guard.timelines_for_group(group).next() else {
+            return 0;
+        };
+        Substrate::turn_count(&self.guard, timeline)
     }
+
     fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        ContentResolver::turn_token_count(&*self.guard, group, index)
+        let Some(timeline) = self.guard.timelines_for_group(group).next() else {
+            return 0;
+        };
+        self.guard
+            .turn(timeline, index)
+            .map_or(0, |e| e.token_count)
     }
+
     fn turn_score(
         &self,
         group: GroupId,
@@ -1107,21 +1284,42 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        ContentResolver::turn_score(&*self.guard, group, index, formula, weights)
+        let Some(timeline) = self.guard.timelines_for_group(group).next() else {
+            return 0.0;
+        };
+        if self.guard.turn(timeline, index).is_none() {
+            return 0.0;
+        }
+        combine_per_depth(
+            self.scores_or_empty().turn(timeline, index),
+            formula,
+            weights,
+        )
     }
-    fn turn_origin(&self, group: GroupId, index: TurnIndex) -> Option<LayerId> {
-        ContentResolver::turn_origin(&*self.guard, group, index)
+
+    fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
+        let timeline = self.guard.timelines_for_group(group).next()?;
+        let (layer, _) = self.guard.timeline_target(timeline)?;
+        Some(layer)
     }
+
     fn section_token_count(&self, section: SectionId) -> usize {
-        ContentResolver::section_token_count(&*self.guard, section)
+        self.guard
+            .sections
+            .get(&section)
+            .map_or(0, |e| e.token_count)
     }
+
     fn section_score(
         &self,
         section: SectionId,
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        ContentResolver::section_score(&*self.guard, section, formula, weights)
+        if !self.guard.sections.contains_key(&section) {
+            return 0.0;
+        }
+        combine_per_depth(self.scores_or_empty().section(section), formula, weights)
     }
 }
 

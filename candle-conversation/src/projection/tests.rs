@@ -2122,7 +2122,7 @@ layers:
 
 #[test]
 fn session_resolver_picks_correct_metric_per_score_formula() {
-    use crate::substrate::{PerDepthScores, Substrate, TurnScores};
+    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
     use super::schema::{DepthWeights, ScoreFormula};
     use super::ContentResolver;
 
@@ -2143,7 +2143,9 @@ layers:
     let g = b.id_for_group("g").unwrap();
 
     let idx = r.append_with_blocks_for_test(l, g, 10, 0, 1);
-    r.set_scores_for_test(
+    let mut scores = ProjectionScores::new();
+    scores.set_for_group_test(
+        &r,
         g,
         idx,
         PerDepthScores {
@@ -2152,6 +2154,7 @@ layers:
             prag: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
         },
     );
+    let r = ScoredSubstrate::new(&r, &scores);
 
     let w = DepthWeights::default();
     assert_eq!(r.turn_score(g, idx, ScoreFormula::Max, &w), 1.0);
@@ -2163,7 +2166,7 @@ layers:
 
 #[test]
 fn session_resolver_combines_depths_with_weights() {
-    use crate::substrate::{PerDepthScores, Substrate, TurnScores};
+    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
     use super::schema::{DepthWeights, ScoreFormula};
     use super::ContentResolver;
 
@@ -2186,7 +2189,9 @@ layers:
     let idx = r.append_with_blocks_for_test(l, g, 10, 0, 1);
 
     // Distinct max values per depth so the combine weighting is observable.
-    r.set_scores_for_test(
+    let mut scores = ProjectionScores::new();
+    scores.set_for_group_test(
+        &r,
         g,
         idx,
         PerDepthScores {
@@ -2195,6 +2200,7 @@ layers:
             prag: TurnScores { max: 100.0, ..Default::default() },
         },
     );
+    let r = ScoredSubstrate::new(&r, &scores);
 
     // Equal weights: (10 + 50 + 100) / 3 = 53.333...
     let equal = DepthWeights { syntactic: 1.0, semantic: 1.0, pragmatic: 1.0 };
@@ -2220,7 +2226,7 @@ layers:
 
 #[test]
 fn projection_uses_bdp_scores_to_pick_top_k() {
-    use crate::substrate::{PerDepthScores, Substrate, TurnScores};
+    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
 
     // Five turns, top_k=2 by score.  Without BDP scores all are tied; we
     // set distinct max values to force a stable ordering.
@@ -2242,11 +2248,13 @@ layers:
     let g = b.id_for_group("g").unwrap();
 
     let mut r = Substrate::new();
+    let mut bdp_scores = ProjectionScores::new();
     // Distinct scores; turn 2 (idx=2) and turn 4 (idx=4) should win.
     let scores = [10.0_f32, 20.0, 50.0, 30.0, 100.0];
     for (i, &s) in scores.iter().enumerate() {
         let idx = r.append_with_blocks_for_test(layer, g, 10, i as u64, (i + 1) as u64);
-        r.set_scores_for_test(
+        bdp_scores.set_for_group_test(
+            &r,
             g,
             idx,
             PerDepthScores {
@@ -2256,6 +2264,7 @@ layers:
             },
         );
     }
+    let r = ScoredSubstrate::new(&r, &bdp_scores);
 
     let proj = b.project(ProjectionTarget { layer, group: g, timeline: TimelineId::for_test(1) }, &r);
     let picked: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
@@ -2266,7 +2275,7 @@ layers:
 
 #[test]
 fn projection_per_layer_depth_weights_alter_ranking() {
-    use crate::substrate::{PerDepthScores, Substrate, TurnScores};
+    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
 
     // Two turns; turn A has high syn but low prag, turn B has low syn but
     // high prag.  By tilting depth_weights toward one or the other, we
@@ -2300,7 +2309,9 @@ layers:
     let mut r = Substrate::new();
     let a = r.append_with_blocks_for_test(layer, g, 10, 0, 1);
     let bturn = r.append_with_blocks_for_test(layer, g, 10, 1, 2);
-    r.set_scores_for_test(
+    let mut bdp = ProjectionScores::new();
+    bdp.set_for_group_test(
+        &r,
         g,
         a,
         PerDepthScores {
@@ -2309,7 +2320,8 @@ layers:
             prag: TurnScores { span: 1.0, ..Default::default() },
         },
     );
-    r.set_scores_for_test(
+    bdp.set_for_group_test(
+        &r,
         g,
         bturn,
         PerDepthScores {
@@ -2318,9 +2330,10 @@ layers:
             prag: TurnScores { span: 100.0, ..Default::default() },
         },
     );
+    let r_view = ScoredSubstrate::new(&r, &bdp);
 
     // Syn-heavy weights: turn A wins.
-    let proj = b_syn.project(ProjectionTarget { layer, group: g, timeline: TimelineId::for_test(1) }, &r);
+    let proj = b_syn.project(ProjectionTarget { layer, group: g, timeline: TimelineId::for_test(1) }, &r_view);
     assert_eq!(proj.turns.len(), 1);
     assert_eq!(proj.turns[0].index(), a);
 
@@ -2333,7 +2346,9 @@ layers:
     let mut r2 = Substrate::new();
     let a2 = r2.append_with_blocks_for_test(layer2, g2, 10, 0, 1);
     let b2 = r2.append_with_blocks_for_test(layer2, g2, 10, 1, 2);
-    r2.set_scores_for_test(
+    let mut bdp2 = ProjectionScores::new();
+    bdp2.set_for_group_test(
+        &r2,
         g2,
         a2,
         PerDepthScores {
@@ -2342,7 +2357,8 @@ layers:
             prag: TurnScores { span: 1.0, ..Default::default() },
         },
     );
-    r2.set_scores_for_test(
+    bdp2.set_for_group_test(
+        &r2,
         g2,
         b2,
         PerDepthScores {
@@ -2351,7 +2367,8 @@ layers:
             prag: TurnScores { span: 100.0, ..Default::default() },
         },
     );
-    let proj = b_prag.project(ProjectionTarget { layer: layer2, group: g2, timeline: TimelineId::for_test(1) }, &r2);
+    let r2_view = ScoredSubstrate::new(&r2, &bdp2);
+    let proj = b_prag.project(ProjectionTarget { layer: layer2, group: g2, timeline: TimelineId::for_test(1) }, &r2_view);
     assert_eq!(proj.turns.len(), 1);
     assert_eq!(proj.turns[0].index(), b2);
 }

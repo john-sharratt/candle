@@ -215,7 +215,7 @@ pub use builder::Builder;
 pub use error::ConstructionError;
 pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
-    TurnIndex,
+    TurnIndex, TurnKey,
 };
 pub use project::{Projection, ProjectionMode, ProjectionTarget, ResolvedSection, ResolvedTurn};
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};

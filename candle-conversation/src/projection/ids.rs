@@ -201,6 +201,25 @@ impl TurnIndex {
     }
 }
 
+/// Fully-qualified address of one turn in the workspace — the `(timeline,
+/// index)` pair as a strongly-typed key.
+///
+/// Use [`TurnKey`] anywhere two-arg `(TimelineId, TurnIndex)` would
+/// otherwise be passed as an anonymous tuple: HashMap keys, iterator
+/// items, function returns, eviction candidate handles. Keeps call sites
+/// self-documenting and rules out the silent positional-swap bug.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct TurnKey {
+    pub timeline: TimelineId,
+    pub index: TurnIndex,
+}
+
+impl TurnKey {
+    pub fn new(timeline: TimelineId, index: TurnIndex) -> Self {
+        Self { timeline, index }
+    }
+}
+
 /// Workspace-stable identifier for one *instance* of a group's shape — i.e.
 /// one conversation timeline within a (layer, group) pair.
 ///

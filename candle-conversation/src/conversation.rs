@@ -1279,8 +1279,8 @@ impl Sequence {
         let read = self.substrate.read();
         let mut counts: std::collections::HashMap<TimelineId, u32> =
             std::collections::HashMap::new();
-        for (tl, _idx) in read.all_turns() {
-            *counts.entry(tl).or_insert(0) += 1;
+        for key in read.all_turns() {
+            *counts.entry(key.timeline).or_insert(0) += 1;
         }
         counts.into_iter().collect()
     }
@@ -1569,15 +1569,12 @@ impl Sequence {
         // Snapshot probe + corpus under a single read lock, then drop the
         // guard before doing the (CPU-heavy) BDP scan and the write phase.
         //
-        // BdpScanner is keyed by `(TimelineId, TurnIndex)` natively
-        // (Phase 3) — no group/timeline translation needed.
+        // BdpScanner is keyed by `TurnKey` natively — no group/timeline
+        // translation needed.
+        let probe_key = crate::projection::TurnKey::new(probe_timeline, probe_index);
         let (probe_entries, turn_corpus, section_corpus): (
             Vec<crate::provenance::SigEntry>,
-            Vec<(
-                crate::projection::TimelineId,
-                TurnIndex,
-                Vec<crate::provenance::SigEntry>,
-            )>,
+            Vec<(crate::projection::TurnKey, Vec<crate::provenance::SigEntry>)>,
             Vec<(SectionId, Vec<crate::provenance::SigEntry>)>,
         ) = {
             let view = self.substrate.read();
@@ -1589,15 +1586,15 @@ impl Sequence {
             }
             let turn_corpus: Vec<_> = view
                 .all_turns()
-                .filter_map(|(timeline, idx)| {
-                    if timeline == probe_timeline && idx == probe_index {
+                .filter_map(|key| {
+                    if key == probe_key {
                         return None;
                     }
-                    let entries = view.sig_entries_of(timeline, idx).to_vec();
+                    let entries = view.sig_entries_of(key.timeline, key.index).to_vec();
                     if entries.is_empty() {
                         None
                     } else {
-                        Some((timeline, idx, entries))
+                        Some((key, entries))
                     }
                 })
                 .collect();
@@ -1636,18 +1633,14 @@ impl Sequence {
             &section_corpus,
         )?;
 
-        // Push the freshly-computed scores into the substrate so the
-        // next projection picks them up via the resolver's
-        // `turn_score` / `section_score`.  Scanner keys are already
-        // timeline-native so the write-back is a direct copy.
-        let mut view = self.substrate.write();
-        for (&(timeline, idx), scores) in self.bdp_scanner.scores() {
-            view.set_scores(timeline, idx, *scores);
-        }
-        for (&section_id, scores) in self.bdp_scanner.section_scores() {
-            view.set_section_scores(section_id, *scores);
-        }
-
+        // Scanner output stays on `self.bdp_scanner` — it is **not**
+        // pushed into the substrate. Scores are transient, per-projection
+        // state: a downstream consumer wanting scored projection on this
+        // Sequence's substrate view builds a [`ProjectionScores`] from
+        // `self.bdp_scanner.scores()` / `.section_scores()` at the call
+        // site (see `BdpScanner::to_projection_scores`) and reads with
+        // [`Conversation::read_scored`]. The substrate's persistent
+        // identity does not include scoring state.
         Ok(())
     }
 

@@ -2495,11 +2495,12 @@ impl Scheduler {
         let incoming = warm_grid.bytes();
         let mut in_use = conversation.section_bytes() + conversation.hot_turn_bytes();
         while in_use + incoming > budget {
-            let Some((vt, vi)) = conversation.oldest_hot_turn_except((timeline, index)) else {
+            let except = crate::projection::TurnKey::new(timeline, index);
+            let Some(victim) = conversation.oldest_hot_turn_except(except) else {
                 break;
             };
-            let bytes = conversation.turn_hot_bytes(vt, vi).unwrap_or(0);
-            if conversation.clear_turn_sealed(vt, vi).is_some() {
+            let bytes = conversation.turn_hot_bytes(victim.timeline, victim.index).unwrap_or(0);
+            if conversation.clear_turn_sealed(victim.timeline, victim.index).is_some() {
                 in_use = in_use.saturating_sub(bytes);
             } else {
                 break;
@@ -2511,9 +2512,8 @@ impl Scheduler {
         let backings: Vec<ChunkedKvBacking> = self.session.backings().to_vec();
         let sealed_per_layer =
             load_to_hot(&backings, &device, &warm_grid, &mut self.cold_load_stager)?;
-        let arc = Arc::new(sealed_per_layer);
-        conversation.materialize_turn_sealed(timeline, index, arc.clone());
-        Ok(Some(arc))
+        conversation.materialize_turn_sealed(timeline, index, sealed_per_layer.clone());
+        Ok(Some(Arc::new(sealed_per_layer)))
     }
 
     /// Section-side counterpart of [`Self::ensure_turn_hot`]. Sections
@@ -3039,24 +3039,20 @@ impl Scheduler {
         //    surfaces a previously-asked computation turn.
         let t_scan = Instant::now();
         let (turn_corpus, section_corpus): (
-            Vec<(
-                crate::projection::TimelineId,
-                TurnIndex,
-                Vec<crate::provenance::SigEntry>,
-            )>,
+            Vec<(crate::projection::TurnKey, Vec<crate::provenance::SigEntry>)>,
             Vec<(SectionId, Vec<crate::provenance::SigEntry>)>,
         ) = {
             let view = policy.substrate.read();
-            // BdpScanner is keyed by `(TimelineId, TurnIndex)` natively
-            // (Phase 3) — no group/timeline translation at the boundary.
+            // BdpScanner is keyed by `TurnKey` natively — no group/timeline
+            // translation at the boundary.
             let turns: Vec<_> = view
                 .all_turns()
-                .filter_map(|(timeline, idx)| {
-                    let entries = view.sig_entries_of(timeline, idx).to_vec();
+                .filter_map(|key| {
+                    let entries = view.sig_entries_of(key.timeline, key.index).to_vec();
                     if entries.is_empty() {
                         None
                     } else {
-                        Some((timeline, idx, entries))
+                        Some((key, entries))
                     }
                 })
                 .collect();
@@ -3151,16 +3147,11 @@ impl Scheduler {
             &section_corpus,
         )?;
 
-        {
-            let mut view = policy.substrate.write();
-            // Scanner keys are timeline-native; direct copy.
-            for (&(timeline, idx), scores) in scanner.scores() {
-                view.set_scores(timeline, idx, *scores);
-            }
-            for (&section_id, scores) in scanner.section_scores() {
-                view.set_section_scores(section_id, *scores);
-            }
-        }
+        // Build a transient per-projection scores cache from the scanner
+        // output. This lives on the stack for the duration of the
+        // re-projection; it is never stored in the substrate (§Phase-3
+        // BDP: scores are projection-local, not session-persistent).
+        let projection_scores = scanner.to_projection_scores();
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_bdp_scan");
 
@@ -3176,7 +3167,7 @@ impl Scheduler {
         })?;
         let parent_id = view_state.parent_id;
         let (projected_sections, projected_turns): (Vec<SectionId>, Vec<(GroupId, TurnIndex)>) = {
-            let view = policy.substrate.read_for(policy.target);
+            let view = policy.substrate.read_for_scored(policy.target, &projection_scores);
             // Prefill mode: the section corpus is prefill-Q of tool
             // descriptions, so reprojection scores it with the calibrated
             // prefill profile (Max / semantic, no threshold gate).

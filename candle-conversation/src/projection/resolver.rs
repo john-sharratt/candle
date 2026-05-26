@@ -4,12 +4,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex};
+use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::schema::{DepthWeights, ScoreFormula};
 use crate::persistence::streams::{PerDepthScores, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
 use crate::provenance::SigEntry;
-use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateWrite};
+use crate::substrate::{
+    ContentResolver, ProjectionScores, Substrate, SubstrateRead, SubstrateWrite,
+};
 use crate::substrate_cache::SubstrateCache;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
@@ -112,20 +114,46 @@ impl Conversation {
             .register_timeline(timeline, layer, group);
     }
 
-    /// Acquire a read guard.  The returned guard implements [`ContentResolver`]
-    /// but is **not target-aware** — use [`Self::read_for`] when a
-    /// [`super::project::ProjectionTarget`] is available.
+    /// Acquire an unscored read guard.  The returned guard implements
+    /// [`ContentResolver`] but every score lookup returns zero —
+    /// appropriate for callers reading structural fields (turn counts,
+    /// sealed pointers) without projection.
+    ///
+    /// Use [`Self::read_scored`] when projecting against a freshly-built
+    /// [`ProjectionScores`] from a BDP scan.
     pub fn read(&self) -> SubstrateRead<'_> {
         SubstrateRead {
             guard: self.inner.read().unwrap(),
+            scores: None,
+        }
+    }
+
+    /// Acquire a read guard bound to an externally-owned
+    /// [`ProjectionScores`]. The scores are transient per-projection
+    /// state — typically populated by the BDP scanner on the call site's
+    /// stack and dropped at end of scope. They are **not** held by the
+    /// substrate.
+    pub fn read_scored<'a>(&'a self, scores: &'a ProjectionScores) -> SubstrateRead<'a> {
+        SubstrateRead {
+            guard: self.inner.read().unwrap(),
+            scores: Some(scores),
         }
     }
 
     /// Acquire a target-aware read guard.  The returned [`TargetedRead`]
     /// implements [`ContentResolver`] with proper sibling-timeline masking
-    /// for `target.group`.
+    /// for `target.group`, with score lookups returning zero (unscored).
     pub fn read_for(&self, target: super::project::ProjectionTarget) -> TargetedRead<'_> {
         TargetedRead::new(self.read(), target)
+    }
+
+    /// Target-aware variant of [`Self::read_scored`].
+    pub fn read_for_scored<'a>(
+        &'a self,
+        target: super::project::ProjectionTarget,
+        scores: &'a ProjectionScores,
+    ) -> TargetedRead<'a> {
+        TargetedRead::new(self.read_scored(scores), target)
     }
 
     /// Acquire a write guard for mutating operations (append, set_*).
@@ -281,7 +309,7 @@ impl Conversation {
                 token_count,
                 decl.block_start,
                 decl.block_end,
-                std::sync::Arc::new(Vec::new()),
+                Vec::new(),
             );
             if !sig_entries.is_empty() {
                 view.set_sig_entries(timeline, idx, sig_entries);
@@ -383,7 +411,7 @@ impl Conversation {
         &self,
         timeline: TimelineId,
         index: TurnIndex,
-        sealed: std::sync::Arc<Vec<SealedSequence>>,
+        sealed: Vec<SealedSequence>,
     ) {
         self.write().materialize_turn_sealed(timeline, index, sealed);
     }
@@ -392,19 +420,20 @@ impl Conversation {
     pub fn materialize_section_sealed(
         &self,
         section: SectionId,
-        sealed: std::sync::Arc<Vec<SealedSequence>>,
+        sealed: Vec<SealedSequence>,
     ) {
         self.write().materialize_section_sealed(section, sealed);
     }
 
-    /// Clear a turn's hot Arc, releasing VRAM arena chunks. Returns
-    /// the previously-held Arc so the caller can gather it into warm
-    /// before it drops (see `Substrate::clear_turn_sealed`).
+    /// Clear a turn's hot sealed grid, releasing VRAM arena chunks via
+    /// dropping its ChunkGid Arcs. Returns the previously-held grid so
+    /// the caller can gather it into warm before it drops
+    /// (see `Substrate::clear_turn_sealed`).
     pub fn clear_turn_sealed(
         &self,
         timeline: TimelineId,
         index: TurnIndex,
-    ) -> Option<std::sync::Arc<Vec<SealedSequence>>> {
+    ) -> Option<Vec<SealedSequence>> {
         self.write().clear_turn_sealed(timeline, index)
     }
 
@@ -426,10 +455,7 @@ impl Conversation {
     }
 
     /// FIFO-oldest hot-resident turn excluding `except`.
-    pub fn oldest_hot_turn_except(
-        &self,
-        except: (TimelineId, TurnIndex),
-    ) -> Option<(TimelineId, TurnIndex)> {
+    pub fn oldest_hot_turn_except(&self, except: TurnKey) -> Option<TurnKey> {
         self.read().oldest_hot_turn_except(except)
     }
 
@@ -681,7 +707,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         let Some(timeline) = self.timeline_for(group) else {
             return 0.0;
         };
-        self.read.turn_score_of(timeline, index, formula, weights)
+        self.read
+            .turn_score_for_timeline(timeline, index, formula, weights)
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
@@ -691,7 +718,7 @@ impl<'a> ContentResolver for TargetedRead<'a> {
     }
 
     fn section_token_count(&self, section: SectionId) -> usize {
-        ContentResolver::section_token_count(&*self.read, section)
+        ContentResolver::section_token_count(&self.read, section)
     }
 
     fn section_score(
@@ -700,6 +727,6 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        ContentResolver::section_score(&*self.read, section, formula, weights)
+        ContentResolver::section_score(&self.read, section, formula, weights)
     }
 }
