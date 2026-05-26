@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex};
 use super::schema::{DepthWeights, ScoreFormula};
-use crate::persistence::resume::ChunkImage as ResumeChunkImage;
 use crate::persistence::streams::{PerDepthScores, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
 use crate::provenance::SigEntry;
@@ -201,16 +200,28 @@ impl Conversation {
     /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
     /// §5.6 / §16.12 substrate-reload path run on daemon restart.
     ///
-    /// Every persisted turn stream is recovered in `(timeline, turn_index)`
-    /// order; `load_layers` cold-loads each turn's per-layer chunk grid back
-    /// into VRAM as `Vec<SealedSequence>` (the caller supplies this since it
-    /// owns the per-layer KV backings). The turn's timeline is re-registered
-    /// and the turn appended to the substrate. Returns the number of turns
-    /// restored.
+    /// **Cold-only restart.** The substrate is, by design, the on-disk redo
+    /// log; warm (RAM) and hot (VRAM) tiers belong to the inference engine
+    /// and are demand-populated. Reload therefore:
+    /// - Walks every persisted turn stream in `(timeline, turn_index)`
+    ///   order.
+    /// - Replays **tokens** (for text history) and **BDP signatures** (for
+    ///   provenance retrieval over the full persisted corpus) into the
+    ///   in-RAM substrate. Sigs are small (RAM-resident) and load-bearing
+    ///   for the next BDP scan; tokens are small (RAM-resident) and
+    ///   load-bearing for text display.
+    /// - Records each turn's stream metadata (`block_start`/`block_end`,
+    ///   role, timeline) so projection knows the turn exists and where its
+    ///   KV lives on disk.
+    /// - **Does not materialize KV into VRAM.** Each restored turn's
+    ///   `sealed` is an empty `Vec<SealedSequence>` — a "cold" marker. The
+    ///   inject path materializes through the warm pool on demand (see
+    ///   the engine's `ensure_hot` orchestrator).
+    ///
+    /// Returns the number of turns restored.
     pub fn reconstruct_from_log(
         &self,
         n_layers: usize,
-        load_layers: impl Fn(&[Vec<ResumeChunkImage>]) -> candle::Result<Vec<SealedSequence>>,
         restore_sigs: impl Fn(&[(u16, Vec<u8>)]) -> candle::Result<Vec<SigEntry>>,
     ) -> candle::Result<usize> {
         let decls = {
@@ -224,9 +235,9 @@ impl Conversation {
                 crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
                     .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?
             };
-            let sealed = load_layers(&recovered.layers)?;
             // Re-append the BDP signatures into the (fresh) provenance file,
-            // yielding entries that point at the rebuilt offsets.
+            // yielding entries that point at the rebuilt offsets. Sigs are
+            // load-bearing — the BDP scan operates on signatures, not KV.
             let sig_entries = if recovered.signatures.is_empty() {
                 Vec::new()
             } else {
@@ -240,11 +251,16 @@ impl Conversation {
                 1 => Role::User,
                 _ => Role::Assistant,
             };
-            let token_count: usize = recovered
-                .layers
-                .first()
-                .map(|l| l.iter().map(|c| c.token_count as usize).sum())
-                .unwrap_or(0);
+            let token_count: usize = if recovered.layers.n_layers() == 0 {
+                0
+            } else {
+                recovered
+                    .layers
+                    .layer(0)
+                    .iter()
+                    .map(|c| c.token_count as usize)
+                    .sum()
+            };
             let mut view = self.write();
             if let (Some(layer), Some(group)) = (
                 LayerId::from_raw(decl.layer_id),
@@ -252,6 +268,11 @@ impl Conversation {
             ) {
                 view.register_timeline(timeline, layer, group);
             }
+            // Cold-marker sealed: an empty `Vec<SealedSequence>` flags the
+            // turn as on-disk-only. The runtime inject path detects the
+            // empty sealed and routes through the engine's `ensure_hot`
+            // orchestrator (cold → warm → hot) before borrowing into a
+            // view slot.
             let idx = view.restore_turn(
                 timeline,
                 role,
@@ -260,7 +281,7 @@ impl Conversation {
                 token_count,
                 decl.block_start,
                 decl.block_end,
-                std::sync::Arc::new(sealed),
+                std::sync::Arc::new(Vec::new()),
             );
             if !sig_entries.is_empty() {
                 view.set_sig_entries(timeline, idx, sig_entries);
@@ -270,14 +291,109 @@ impl Conversation {
         Ok(restored)
     }
 
+    /// Read a cold turn's per-layer chunk grid from the redo log so the
+    /// caller can run the warm→hot leg (`load_stream` per layer) and write
+    /// the resulting `Vec<SealedSequence>` back via
+    /// [`Self::materialize_turn_sealed`].
+    ///
+    /// Returns `Ok(None)` when the turn doesn't have a recoverable chunk
+    /// grid — e.g. its `Tokens` record is durable but `Chunks` records
+    /// haven't yet landed (the async persist callback was still pending
+    /// when the daemon shut down).
+    pub fn recover_turn_chunks(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        n_layers: usize,
+    ) -> candle::Result<Option<crate::persistence::resume::TurnChunkGrid>> {
+        use crate::persistence::resume::{recover_turn, recovered_turn_decls};
+        let stream_id =
+            crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
+        let mut p = self.persistence.lock().unwrap();
+        // We need the turn's `StreamDecl` to drive `recover_turn`. Walk
+        // the manifest's persisted decls and pick the one matching this
+        // (timeline, index). The decl set is small and rebuilt once at
+        // restart, so a linear scan is fine.
+        let decls = recovered_turn_decls(&p);
+        let decl = match decls.into_iter().find(|d| {
+            d.timeline_id == timeline.raw() && d.turn_index == index.0
+        }) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let recovered = recover_turn(&mut p, &decl, n_layers)
+            .map_err(|e| candle::Error::Msg(format!("recover_turn_chunks: {e}")))?;
+        if recovered.layers.is_empty() {
+            return Ok(None);
+        }
+        let _ = stream_id; // (computed for diagnostics if needed later)
+        Ok(Some(recovered.layers))
+    }
+
+    /// Cache a freshly-materialized hot `SealedSequence` set back into the
+    /// substrate's turn entry. Called by the engine's `ensure_turn_hot`
+    /// orchestrator after running `load_stream` per layer.
+    pub fn materialize_turn_sealed(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        sealed: std::sync::Arc<Vec<SealedSequence>>,
+    ) {
+        self.write().materialize_turn_sealed(timeline, index, sealed);
+    }
+
+    /// Section-side counterpart of [`Self::materialize_turn_sealed`].
+    pub fn materialize_section_sealed(
+        &self,
+        section: SectionId,
+        sealed: std::sync::Arc<Vec<SealedSequence>>,
+    ) {
+        self.write().materialize_section_sealed(section, sealed);
+    }
+
+    /// Clear a turn's hot Arc, releasing VRAM arena chunks. Returns
+    /// the previously-held Arc so the caller can gather it into warm
+    /// before it drops (see `Substrate::clear_turn_sealed`).
+    pub fn clear_turn_sealed(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<std::sync::Arc<Vec<SealedSequence>>> {
+        self.write().clear_turn_sealed(timeline, index)
+    }
+
+    /// Hot-tier VRAM byte snapshot (sum across every turn whose `sealed`
+    /// carries an actual chunk grid).
+    pub fn hot_turn_bytes(&self) -> usize {
+        self.read().hot_turn_bytes()
+    }
+
+    /// Pinned-section byte snapshot.
+    pub fn section_bytes(&self) -> usize {
+        self.read().section_bytes()
+    }
+
+    /// Byte size of a single hot turn (for the pre-flight evict
+    /// accounting). `None` if cold or unknown.
+    pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
+        self.read().turn_hot_bytes(timeline, index)
+    }
+
+    /// FIFO-oldest hot-resident turn excluding `except`.
+    pub fn oldest_hot_turn_except(
+        &self,
+        except: (TimelineId, TurnIndex),
+    ) -> Option<(TimelineId, TurnIndex)> {
+        self.read().oldest_hot_turn_except(except)
+    }
+
     /// Persist a sealed turn's per-layer KV grid + token ids to the redo log
-    /// — the seal-time half of the resume path (§16.12). `layers[layer]` is
-    /// that layer's ordered [`ChunkImage`] list; all layers share one
-    /// chunk count.
+    /// — the seal-time half of the resume path (§16.12). All layers share
+    /// one chunk count.
     pub fn persist_turn_kv(
         &self,
         stream_id: StreamId,
-        layers: &[Vec<ResumeChunkImage>],
+        layers: &crate::persistence::resume::TurnChunkGrid,
         token_ids: &[u32],
     ) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
@@ -285,14 +401,13 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist turn kv: {e}")))
     }
 
-    /// Persist only a turn's per-layer chunk records — the heavy half of the
-    /// async seal/persist chain. Called from inside the bg-quantizer callback
-    /// once float→quant migrations have landed (slice 7); also callable
-    /// directly for sync use.
+    /// Persist only a turn's per-layer chunk records — the post-quantization
+    /// half of the async seal/persist chain. Called from inside the
+    /// bg-quantizer callback once float→quant migrations have landed.
     pub fn persist_turn_chunks(
         &self,
         stream_id: StreamId,
-        layers: &[Vec<ResumeChunkImage>],
+        layers: &crate::persistence::resume::TurnChunkGrid,
     ) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         crate::persistence::resume::persist_turn_chunks(&mut p, stream_id, layers)
@@ -302,13 +417,12 @@ impl Conversation {
     /// Persist a turn's `Tokens` record and the trailing `Commit` — always
     /// called synchronously on seal, regardless of compression policy.
     /// `layers` is only used to compute the highest chunk index; pass an
-    /// empty slice when no chunks were persisted (compression `None` path,
-    /// or async chains that re-commit later).
+    /// empty grid when no chunks were persisted (compression `None` path).
     pub fn persist_turn_tokens(
         &self,
         stream_id: StreamId,
         token_ids: &[u32],
-        layers: &[Vec<ResumeChunkImage>],
+        layers: &crate::persistence::resume::TurnChunkGrid,
     ) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         crate::persistence::resume::persist_turn_tokens(&mut p, stream_id, token_ids, layers)
@@ -329,15 +443,6 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("commit stream: {e}")))
     }
 
-    /// Persist a turn's BDP provenance signatures to the redo log — the
-    /// `Signatures` record. `sigs` is the
-    /// [`crate::persistence::resume::encode_signatures`] payload.
-    pub fn persist_signatures(&self, stream_id: StreamId, sigs: &[u8]) -> candle::Result<()> {
-        let mut p = self.persistence.lock().unwrap();
-        p.append_signatures(stream_id, sigs)
-            .map_err(|e| candle::Error::Msg(format!("persist signatures: {e}")))
-    }
-
     /// Persist the projection schema/template into the substrate's
     /// `Template` record — compare-and-insert (only appends when it differs
     /// from what the log already holds), then commit if written. Lets the
@@ -352,6 +457,15 @@ impl Conversation {
                 .map_err(|e| candle::Error::Msg(format!("commit template: {e}")))?;
         }
         Ok(())
+    }
+
+    /// Persist a turn's BDP provenance signatures to the redo log — the
+    /// `Signatures` record. `sigs` is the [`crate::persistence::resume::encode_signatures`]
+    /// payload.
+    pub fn persist_signatures(&self, stream_id: StreamId, sigs: &[u8]) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.append_signatures(stream_id, sigs)
+            .map_err(|e| candle::Error::Msg(format!("persist signatures: {e}")))
     }
 
     /// Durably flush the persistence redo log — the group-commit point.

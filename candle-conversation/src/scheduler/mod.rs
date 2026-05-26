@@ -13,6 +13,8 @@ use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
+use crate::persistence::cold_load::ColdLoadStager;
+use crate::persistence::warm_pool::WarmPool;
 use crate::projection::{
     Builder, Conversation, GroupId, ProjectionMode, ProjectionTarget, SectionId, TurnIndex,
 };
@@ -24,6 +26,7 @@ use crate::token_buffer::TokenBuffer;
 use crate::{ProvenanceFile, TurnStats};
 
 use candle::{Device, IndexOp, Tensor};
+use candle_nn::kv_cache::ChunkedKvBacking;
 #[cfg(feature = "sig-trace")]
 use candle_nn::kv_cache::SealedChunk;
 use candle_nn::kv_cache::SealedSequence;
@@ -675,6 +678,19 @@ pub(crate) struct Scheduler {
 
     /// Static model properties captured at engine construction.
     model_core: ModelCoreProperties,
+
+    /// The engine's RAM cache of KV chunks — the **warm tier**. Owned
+    /// by the scheduler (not the substrate); both the eviction path
+    /// (VRAM → warm) and the cold-load path (NVMe → warm) feed this
+    /// pool. `ensure_turn_hot` does its three-arm descent against it:
+    /// hot hit → return; warm hit → `load_to_hot`; cold miss →
+    /// `cold_into_warm` then `load_to_hot`.
+    warm_pool: WarmPool,
+
+    /// Reusable pinned host scratch for the warm→hot HtoD leg
+    /// (`cuMemHostAlloc`'d once, grown on demand). Shared across every
+    /// turn × layer in `ensure_turn_hot`.
+    cold_load_stager: ColdLoadStager,
 }
 
 /// Per-chunk debug trace of the BDP signatures emitted at seal time.
@@ -780,6 +796,11 @@ impl Scheduler {
             turn_views: HashMap::new(),
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
+            // 4 GB warm-pool budget by default — keeps several
+            // recently-touched turns hot for free across user-visible
+            // pauses. LRU-reclaims clean entries under pressure.
+            warm_pool: WarmPool::new(4 * 1024 * 1024 * 1024),
+            cold_load_stager: ColdLoadStager::new(),
         }
     }
 
@@ -1348,13 +1369,21 @@ impl Scheduler {
         // is a vector of windowed `SealedChunk`s (any may be partial
         // — sharing the underlying physical chunk with the writer is
         // safe because windows assert only the bytes they cover).
-        let units: Vec<(InjectedUnit, Arc<Vec<SealedSequence>>)> = {
+        // The materialization goes through the engine's `ensure_*_hot`
+        // orchestrators: a hot hit returns immediately; a cold turn
+        // (restart-restored, empty-sealed marker) triggers an
+        // NVMe → VRAM cold-load via `load_stream` and caches the
+        // result back into the substrate. Pre-walk under a read lock
+        // to collect the list, then release before materializing —
+        // `ensure_turn_hot` takes a write lock to cache its result.
+        let mut section_list: Vec<SectionId> = Vec::with_capacity(projected_sections.len());
+        let mut turn_list: Vec<(GroupId, TurnIndex, crate::projection::TimelineId)> =
+            Vec::with_capacity(projected_turns.len());
+        {
             let view = conversation.read();
-            let mut out: Vec<(InjectedUnit, Arc<Vec<SealedSequence>>)> =
-                Vec::with_capacity(projected_sections.len() + projected_turns.len());
             for &sid in projected_sections {
-                if let Some(s) = view.section_sealed_of(sid) {
-                    out.push((InjectedUnit::Section(sid), s));
+                if view.section_sealed_of(sid).is_some() {
+                    section_list.push(sid);
                 }
             }
             for &(g, t) in projected_turns {
@@ -1362,13 +1391,30 @@ impl Scheduler {
                 // single-timeline-per-group; Phase 3 will use
                 // target.timeline when g matches target.group).
                 if let Some(timeline) = view.timelines_for_group(g).next() {
-                    if let Some(s) = view.turn_sealed_of(timeline, t) {
-                        out.push((InjectedUnit::Turn(g, t), s));
+                    if view.turn_sealed_of(timeline, t).is_some() {
+                        turn_list.push((g, t, timeline));
                     }
                 }
             }
-            out
-        };
+        }
+        let mut units: Vec<(InjectedUnit, Arc<Vec<SealedSequence>>)> =
+            Vec::with_capacity(section_list.len() + turn_list.len());
+        for sid in section_list {
+            if let Some(s) = self
+                .ensure_section_hot(&conversation, sid)
+                .map_err(ConversationError::Model)?
+            {
+                units.push((InjectedUnit::Section(sid), s));
+            }
+        }
+        for (g, t, timeline) in turn_list {
+            if let Some(s) = self
+                .ensure_turn_hot(&conversation, timeline, t)
+                .map_err(ConversationError::Model)?
+            {
+                units.push((InjectedUnit::Turn(g, t), s));
+            }
+        }
         if units.is_empty() {
             return Ok(());
         }
@@ -1517,16 +1563,26 @@ impl Scheduler {
         let n_layers = self.session.num_layers();
 
         // 1. Read substrate; collect per-turn per-layer sealed sequences.
-        let per_turn_sealed: Vec<Arc<Vec<SealedSequence>>> = {
+        // Cold (restored-but-not-materialized) turns are routed through
+        // `ensure_turn_hot`, which NVMe-loads them on first borrow and
+        // caches the result back into the substrate.
+        let turn_keys: Vec<(GroupId, TurnIndex, crate::projection::TimelineId)> = {
             let view = conversation.read();
             projected_turns
                 .iter()
-                .filter_map(|&(g, t)| {
-                    let timeline = view.timelines_for_group(g).next()?;
-                    view.turn_sealed_of(timeline, t)
-                })
+                .filter_map(|&(g, t)| view.timelines_for_group(g).next().map(|tl| (g, t, tl)))
                 .collect()
         };
+        let mut per_turn_sealed: Vec<Arc<Vec<SealedSequence>>> =
+            Vec::with_capacity(turn_keys.len());
+        for (_g, t, timeline) in turn_keys {
+            if let Some(s) = self
+                .ensure_turn_hot(conversation, timeline, t)
+                .map_err(ConversationError::Model)?
+            {
+                per_turn_sealed.push(s);
+            }
+        }
 
         // 2. Concatenate per-layer.  Result: Vec<Arc<SealedSequence>>
         // of length `n_layers`, where each SealedSequence's chunks are
@@ -2171,7 +2227,7 @@ impl Scheduler {
                 // uncompressed end-to-end.
                 {
                     use crate::persistence::content_hash::turn_stream_id;
-                    use crate::persistence::resume::ChunkImage;
+                    use crate::persistence::resume::{ChunkImage, TurnChunkGrid};
                     use crate::persistence::transfer::seal_to_chunk_images;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
                     let device = self.session.device().clone();
@@ -2222,11 +2278,12 @@ impl Scheduler {
                         }
                     }
                     if ok {
-                        if let Err(e) = conversation.persist_turn_chunks(stream_id, &layers) {
+                        let grid = TurnChunkGrid::new(layers);
+                        if let Err(e) = conversation.persist_turn_chunks(stream_id, &grid) {
                             tracing::warn!("persist turn chunks failed: {e}");
                         }
                         if let Err(e) =
-                            conversation.persist_turn_tokens(stream_id, &persist_token_ids, &layers)
+                            conversation.persist_turn_tokens(stream_id, &persist_token_ids, &grid)
                         {
                             tracing::warn!("persist turn tokens failed: {e}");
                         }
@@ -2261,44 +2318,21 @@ impl Scheduler {
     }
 
     /// Rebuild the workspace substrate from the persistence redo log on
-    /// daemon startup (§16.12 substrate reload). For every persisted turn,
-    /// each layer's chunk grid is cold-loaded back into VRAM via
-    /// `transfer::load_stream` and the turn is re-appended to the substrate.
+    /// daemon startup (§16.12 substrate reload).
     ///
-    /// The cold-load path routes through the bridge `ColdLoadStager`
-    /// (pinned host → HtoD → kv_migrate), so the per-layer HtoD sources
-    /// from real pinned memory rather than the driver's pageable bounce.
-    /// The stager is allocated once for the whole replay and reused
-    /// across every turn × every layer.
+    /// **Cold-only restart.** Every persisted turn stream is recovered in
+    /// `(timeline, turn_index)` order; for each, tokens + BDP signatures
+    /// are replayed into the in-RAM substrate and the turn is registered
+    /// with empty `sealed` (a cold-marker). The KV bytes stay on disk
+    /// until the runtime inject path demand-materialises them via the
+    /// engine's `ensure_hot` orchestrator (cold → warm → hot).
     pub fn reconstruct_substrate(&self, conversation: &Conversation) {
-        use crate::persistence::cold_load::ColdLoadStager;
-        use crate::persistence::resume::ChunkImage;
-        use crate::persistence::transfer::load_stream;
         use crate::provenance::{SigEntry, TokenSignature};
-        use std::cell::RefCell;
 
         let n_layers = self.session.backings().len();
         if n_layers == 0 {
             return;
         }
-        let device = self.session.device().clone();
-        // Replay-local stager: allocated once, reused across every turn ×
-        // every layer. `RefCell` so the closure can borrow_mut without
-        // having to make `reconstruct_from_log` take `FnMut`.
-        let stager = RefCell::new(ColdLoadStager::new());
-        let load = |layers: &[Vec<ChunkImage>]| -> candle::Result<Vec<SealedSequence>> {
-            let mut out = Vec::with_capacity(layers.len());
-            let mut stager = stager.borrow_mut();
-            for (layer_idx, chunks) in layers.iter().enumerate() {
-                let backing = self.session.backing(layer_idx).ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                        "reconstruct_substrate: no KV backing for layer {layer_idx}"
-                    ))
-                })?;
-                out.push(load_stream(backing, &device, chunks, &mut stager)?);
-            }
-            Ok(out)
-        };
         // Re-append each persisted chunk's signatures into the fresh
         // provenance file; `(token_count, syn‖sem‖prag bytes)` → a
         // SigEntry at the new offset, so attentional retrieval works
@@ -2332,11 +2366,154 @@ impl Scheduler {
             }
             Ok(out)
         };
-        match conversation.reconstruct_from_log(n_layers, load, restore_sigs) {
+        match conversation.reconstruct_from_log(n_layers, restore_sigs) {
             Ok(0) => {}
             Ok(n) => tracing::info!("substrate reload: {n} turns restored from redo log"),
             Err(e) => tracing::error!("substrate reload failed: {e}"),
         }
+    }
+
+    /// Total VRAM budget available for KV chunk arenas, minus a safety
+    /// headroom expressed as a percent of total device memory. Computed
+    /// per pre-flight; no config field.
+    ///
+    /// `arena_held` is what KV arenas currently hold (`global_arena_gpu_bytes`).
+    /// `free` is whatever the device still reports unused
+    /// (`mem_get_info().0`). Their sum is the ceiling we could grow to if
+    /// every other allocation stayed put. We subtract `headroom_pct` of
+    /// total device memory to leave a margin for activations / KV chunks
+    /// that are about to be allocated for the next decode.
+    fn hot_vram_budget(&self, headroom_pct: u32) -> candle::Result<usize> {
+        let device = self.session.device();
+        let (free, total) = device.mem_get_info()?;
+        let arena_held = candle_nn::kv_cache::global_arena_gpu_bytes();
+        let headroom = total
+            .saturating_mul(headroom_pct as usize)
+            .saturating_div(100);
+        Ok(arena_held.saturating_add(free).saturating_sub(headroom))
+    }
+
+    /// Engine-owned tier orchestrator — ensure a turn's KV is hot (VRAM-
+    /// resident as a `Vec<SealedSequence>`).
+    ///
+    /// Three-arm descent matches `docs/kv_tier_migration.md` §4. **Cold
+    /// goes through warm** — there is exactly one warm→hot leg, used by
+    /// both cases that need to materialise into VRAM:
+    ///
+    /// - **Hot hit.** Substrate's `turn_sealed_of` returns a non-empty
+    ///   `Arc<Vec<SealedSequence>>`; the chunks are already in VRAM
+    ///   arenas (held alive by that Arc). Return immediately.
+    /// - **Warm hit.** The warm pool has the turn's per-layer
+    ///   `ChunkImage` grid (most recently evicted *or* most recently
+    ///   cold-loaded). Run `load_to_hot` to materialise it back into
+    ///   VRAM, cache the result on the substrate.
+    /// - **Cold miss.** Read the per-layer `ChunkImage` grid back from
+    ///   the redo log via `recover_turn_chunks`, park it in the warm
+    ///   pool via `cold_into_warm` (clean — it's already durable), then
+    ///   take the same `load_to_hot` path the warm-hit case takes.
+    /// - **No-such-turn.** `Ok(None)` — caller decides whether that's a
+    ///   bail or a silent skip.
+    fn ensure_turn_hot(
+        &mut self,
+        conversation: &Conversation,
+        timeline: crate::projection::TimelineId,
+        index: crate::projection::TurnIndex,
+    ) -> candle::Result<Option<Arc<Vec<SealedSequence>>>> {
+        use crate::persistence::content_hash::turn_stream_id;
+        use crate::persistence::resume::TurnChunkGrid;
+        use crate::persistence::transfer::{cold_into_warm, load_to_hot};
+        // Hot hit?
+        match conversation.read().turn_sealed_of(timeline, index) {
+            Some(sealed) if !sealed.is_empty() => return Ok(Some(sealed)),
+            Some(_) => { /* cold marker — descend */ }
+            None => return Ok(None),
+        }
+        let n_layers = self.session.backings().len();
+        if n_layers == 0 {
+            return Ok(None);
+        }
+        let stream_id = turn_stream_id(timeline.raw(), index.0);
+        // Warm hit? If not, recover from cold and park in warm. Both
+        // arms converge on the same `load_to_hot` call below.
+        if !self.warm_pool.contains(stream_id) {
+            let grid = match conversation.recover_turn_chunks(timeline, index, n_layers)? {
+                Some(g) => g,
+                None => {
+                    // Tokens / signatures may still be recoverable but no
+                    // `Chunks` records exist for this turn. Treat as "no
+                    // KV"; caller will skip the inject borrow.
+                    return Ok(None);
+                }
+            };
+            cold_into_warm(&mut self.warm_pool, stream_id, grid);
+            // Clean cold-load entries are reclaimable; drop the LRU
+            // ones if the warm pool is now over its byte budget.
+            self.warm_pool.reclaim();
+        }
+        // Snapshot the warm grid we're about to materialise. The pool
+        // owns the canonical copy; we clone here so the borrow on
+        // `self.warm_pool` doesn't outlive the substrate mutations below.
+        let warm_grid: TurnChunkGrid = self
+            .warm_pool
+            .get(stream_id)
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "ensure_turn_hot: warm pool missing stream {:x} after cold_into_warm",
+                    stream_id.0
+                ))
+            })?
+            .clone();
+        // Pre-flight VRAM eviction. Add `incoming` to the substrate's
+        // current hot footprint and shed oldest hot turns (cold-marker
+        // their sealed slot) until we fit under `hot_vram_budget`. We
+        // never touch the section pool — sections are configured
+        // up-front and must stay hot.
+        let budget = self.hot_vram_budget(10)?;
+        let incoming = warm_grid.bytes();
+        let mut in_use = conversation.section_bytes() + conversation.hot_turn_bytes();
+        while in_use + incoming > budget {
+            let Some((vt, vi)) = conversation.oldest_hot_turn_except((timeline, index)) else {
+                break;
+            };
+            let bytes = conversation.turn_hot_bytes(vt, vi).unwrap_or(0);
+            if conversation.clear_turn_sealed(vt, vi).is_some() {
+                in_use = in_use.saturating_sub(bytes);
+            } else {
+                break;
+            }
+        }
+        // Warm → hot. Use the same shared leg whether we just arrived
+        // from cold or hit warm directly.
+        let device = self.session.device().clone();
+        let backings: Vec<ChunkedKvBacking> = self.session.backings().to_vec();
+        let sealed_per_layer =
+            load_to_hot(&backings, &device, &warm_grid, &mut self.cold_load_stager)?;
+        let arc = Arc::new(sealed_per_layer);
+        conversation.materialize_turn_sealed(timeline, index, arc.clone());
+        Ok(Some(arc))
+    }
+
+    /// Section-side counterpart of [`Self::ensure_turn_hot`]. Sections
+    /// are populated by the live seal/section-ingest path at conversation
+    /// setup; a cold-marker section after restart would be a bug.
+    fn ensure_section_hot(
+        &self,
+        conversation: &Conversation,
+        section: crate::projection::SectionId,
+    ) -> candle::Result<Option<Arc<Vec<SealedSequence>>>> {
+        let sealed = match conversation.read().section_sealed_of(section) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if sealed.is_empty() {
+            tracing::warn!(
+                "ensure_section_hot: section {section:?} is cold — sections are not currently \
+                 covered by the cold-load path (sections are pinned at conversation setup); \
+                 returning None"
+            );
+            return Ok(None);
+        }
+        Ok(Some(sealed))
     }
 
     // ── Raw KVQ extraction ────────────────────────────────────────────

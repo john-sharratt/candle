@@ -149,6 +149,18 @@ pub struct TurnEntryData {
     token_ids: TokenBuffer,
 }
 
+/// Total VRAM byte footprint of a sealed Arc — sums `byte_size`
+/// across every layer's chunks. `SealedChunk.byte_size` is cached at
+/// snapshot time (see `record_turn` in `candle-nn`), so this is pure
+/// iteration with no per-call computation.
+fn sealed_bytes(sealed: &[SealedSequence]) -> usize {
+    sealed
+        .iter()
+        .flat_map(|seq| seq.chunks.iter())
+        .map(|c| c.byte_size as usize)
+        .sum()
+}
+
 // ── ContentResolver trait ─────────────────────────────────────────────────────
 
 /// Supplies dynamic content metadata to the projection engine.
@@ -450,6 +462,122 @@ impl Substrate {
             entry.text = text;
             entry.token_ids = token_ids;
         }
+    }
+
+    /// Replace a turn's cold `sealed` marker (empty `Vec<SealedSequence>`)
+    /// with a freshly-materialized hot set. Called by the engine's
+    /// `ensure_turn_hot` orchestrator after a cold-load from NVMe.
+    ///
+    /// No-ops if the turn isn't tracked (deleted between recovery and
+    /// materialization, e.g. via compaction) or if `sealed` is empty
+    /// (write-empty would re-cold an entry, which the engine never asks
+    /// for — eviction would call a separate `evict_turn_sealed` instead).
+    pub fn materialize_turn_sealed(
+        &mut self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        sealed: Arc<Vec<SealedSequence>>,
+    ) {
+        if sealed.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+            entry.sealed = sealed;
+        }
+    }
+
+    /// Section-side counterpart of [`Self::materialize_turn_sealed`].
+    pub fn materialize_section_sealed(
+        &mut self,
+        section: SectionId,
+        sealed: Arc<Vec<SealedSequence>>,
+    ) {
+        if sealed.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.sections.get_mut(&section) {
+            entry.sealed = sealed;
+        }
+    }
+
+    /// Reset a turn's `sealed` field to the empty cold-marker, dropping
+    /// the substrate's hold on the underlying VRAM arena chunks. The
+    /// `Arc<ChunkGid>`s drop here too (unless still borrowed by a live
+    /// view), which is how VRAM is actually released by the engine's
+    /// hot-tier eviction.
+    ///
+    /// Returns the previous `sealed` Arc so the caller can take final
+    /// ownership before it drops (e.g. to gather chunks into the warm
+    /// pool first via `seal_to_chunk_images`). `None` if the turn was
+    /// not tracked or was already cold.
+    pub fn clear_turn_sealed(
+        &mut self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<Arc<Vec<SealedSequence>>> {
+        let entry = self.turns.get_mut(&(timeline, index))?;
+        if entry.sealed.is_empty() {
+            return None;
+        }
+        let prev = std::mem::replace(&mut entry.sealed, Arc::new(Vec::new()));
+        Some(prev)
+    }
+
+    /// Sum of `SealedChunk.byte_size` across every hot-resident turn
+    /// (i.e. those whose `sealed` carries an actual chunk grid, not the
+    /// empty cold marker). Iteration is over a few dozen entries in
+    /// steady state — cheap enough to call inline on each
+    /// `ensure_turn_hot` pre-flight.
+    pub fn hot_turn_bytes(&self) -> usize {
+        self.turns
+            .values()
+            .filter(|e| !e.sealed.is_empty())
+            .map(|e| sealed_bytes(&e.sealed))
+            .sum()
+    }
+
+    /// Sum of bytes across all pinned sections — the system-prompt /
+    /// catalog KV the substrate never evicts. Counts toward the same
+    /// VRAM budget the engine's hot-tier eviction uses.
+    pub fn section_bytes(&self) -> usize {
+        self.sections
+            .values()
+            .map(|e| sealed_bytes(&e.sealed))
+            .sum()
+    }
+
+    /// Bytes a single hot-resident turn currently holds in VRAM. `None`
+    /// for unknown / cold turns.
+    pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
+        let entry = self.turns.get(&(timeline, index))?;
+        if entry.sealed.is_empty() {
+            return None;
+        }
+        Some(sealed_bytes(&entry.sealed))
+    }
+
+    /// FIFO-oldest hot-resident turn, skipping `except`. "FIFO" =
+    /// insertion order within each timeline's tail; timelines are
+    /// scanned in registration order. Adequate eviction heuristic
+    /// (oldest persisted turn = least likely to be re-touched);
+    /// upgradeable to true LRU later with a `last_touched` stamp.
+    pub fn oldest_hot_turn_except(
+        &self,
+        except: (TimelineId, TurnIndex),
+    ) -> Option<(TimelineId, TurnIndex)> {
+        for (&timeline, tail) in self.tails.iter() {
+            for &idx in tail {
+                if (timeline, idx) == except {
+                    continue;
+                }
+                if let Some(entry) = self.turns.get(&(timeline, idx)) {
+                    if !entry.sealed.is_empty() {
+                        return Some((timeline, idx));
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn role_of(&self, timeline: TimelineId, index: TurnIndex) -> Role {

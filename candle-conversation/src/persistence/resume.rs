@@ -38,14 +38,94 @@ pub struct ChunkImage {
     pub payload: ChunkPayload,
 }
 
+/// A turn's KV chunks laid out as a per-layer grid.
+///
+/// `grid.layer(L)[c]` is the c-th chunk of layer L. All layers share one
+/// chunk count — sealing is in lockstep across layers. The empty grid
+/// (zero layers, or all layers empty) is a legal "no chunks recovered"
+/// sentinel returned by [`recover_turn`] when a turn's `Tokens` are
+/// durable but no `Chunks` records exist yet (e.g. the bg-quantizer
+/// persist callback hadn't fired before shutdown).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TurnChunkGrid {
+    layers: Vec<Vec<ChunkImage>>,
+}
+
+impl TurnChunkGrid {
+    /// Wrap an existing per-layer chunk list.
+    pub fn new(layers: Vec<Vec<ChunkImage>>) -> Self {
+        Self { layers }
+    }
+
+    /// Empty grid, with capacity for `n_layers` layers but no chunks yet —
+    /// matches the seal-callback build-up loop (`push_layer` per backing).
+    pub fn with_capacity(n_layers: usize) -> Self {
+        Self {
+            layers: Vec::with_capacity(n_layers),
+        }
+    }
+
+    /// `n_layers` empty layers — the "no chunk records" sentinel a cold
+    /// reload uses when `Tokens` are durable but `Chunks` are not.
+    pub fn empty_grid(n_layers: usize) -> Self {
+        Self {
+            layers: vec![Vec::new(); n_layers],
+        }
+    }
+
+    /// Number of layers in the grid.
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Chunk count per layer (all layers share one count under
+    /// lockstep sealing). Zero for an empty grid.
+    pub fn chunks_per_layer(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.len())
+    }
+
+    /// True when every layer has zero chunks (the cold-marker case).
+    pub fn is_empty(&self) -> bool {
+        self.layers.iter().all(|l| l.is_empty())
+    }
+
+    /// Borrow the c-th layer's chunk list.
+    pub fn layer(&self, idx: usize) -> &[ChunkImage] {
+        &self.layers[idx]
+    }
+
+    /// Iterate `&[ChunkImage]` per layer — the form `load_to_hot` zips
+    /// against the per-layer `ChunkedKvBacking`s.
+    pub fn iter_layers(&self) -> impl ExactSizeIterator<Item = &[ChunkImage]> {
+        self.layers.iter().map(|v| v.as_slice())
+    }
+
+    /// Append a layer's chunks to the grid. Used by the seal callback to
+    /// build the grid one backing at a time.
+    pub fn push_layer(&mut self, chunks: Vec<ChunkImage>) {
+        self.layers.push(chunks);
+    }
+
+    /// Total KV byte footprint — sum of every chunk's `kv_bytes`. This is
+    /// the warm-pool LRU budget unit and the cold-load pre-flight's
+    /// `incoming` size.
+    pub fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|l| l.iter())
+            .map(|i| i.payload.kv_bytes.len())
+            .sum()
+    }
+}
+
 /// A turn fully recovered from the redo log — its declaration, token ids,
-/// and the per-layer sealed-chunk grid (`layers[layer][chunk]`).
+/// and the per-layer sealed-chunk grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveredTurn {
     pub decl: TurnDecl,
     pub token_ids: Vec<u32>,
-    /// `layers[layer]` is that layer's ordered chunk list (length `C`).
-    pub layers: Vec<Vec<ChunkImage>>,
+    /// Per-layer ordered chunks for the turn. See [`TurnChunkGrid`].
+    pub layers: TurnChunkGrid,
     /// Per-chunk BDP provenance signatures `(token_count, syn‖sem‖prag bytes)`,
     /// in chunk order — empty if the turn has no `Signatures` record.
     pub signatures: Vec<(u16, Vec<u8>)>,
@@ -131,12 +211,12 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>> {
 /// chunk as a `Chunk` record at its flat index, the turn's token ids as a
 /// `Tokens` record, then a `Commit` marking the stream durable.
 ///
-/// `layers` is `layers[layer][chunk]`; every layer must have the same chunk
-/// count (`C`) — the architecture seals all layers in lockstep.
+/// Every layer must have the same chunk count — the architecture seals
+/// all layers in lockstep.
 pub fn persist_turn_kv(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
-    layers: &[Vec<ChunkImage>],
+    layers: &TurnChunkGrid,
     token_ids: &[u32],
 ) -> Result<()> {
     persist_turn_chunks(p, stream_id, layers)?;
@@ -151,10 +231,10 @@ pub fn persist_turn_kv(
 pub fn persist_turn_chunks(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
-    layers: &[Vec<ChunkImage>],
+    layers: &TurnChunkGrid,
 ) -> Result<()> {
-    let chunks_per_layer = layers.first().map_or(0, |l| l.len());
-    for (layer_idx, layer) in layers.iter().enumerate() {
+    let chunks_per_layer = layers.chunks_per_layer();
+    for (layer_idx, layer) in layers.iter_layers().enumerate() {
         if layer.len() != chunks_per_layer {
             return Err(PersistenceError::Corrupt(format!(
                 "layer {layer_idx} has {} chunks, expected {chunks_per_layer}",
@@ -182,17 +262,16 @@ pub fn persist_turn_chunks(
 /// Persist a turn's `Tokens` record and the trailing `Commit`. Always called
 /// synchronously on seal — tokens are substrate-critical reconstruction data
 /// regardless of compression policy. The `layers` argument is used solely to
-/// compute the highest committed chunk index; pass an empty slice when no
+/// compute the highest committed chunk index; pass an empty grid when no
 /// chunks were persisted (e.g. `compression_policy = None`).
 pub fn persist_turn_tokens(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
     token_ids: &[u32],
-    layers: &[Vec<ChunkImage>],
+    layers: &TurnChunkGrid,
 ) -> Result<()> {
     p.append_tokens(stream_id, &encode_token_ids(token_ids))?;
-    let chunks_per_layer = layers.first().map_or(0, |l| l.len());
-    let total = layers.len() * chunks_per_layer;
+    let total = layers.n_layers() * layers.chunks_per_layer();
     let through = if total > 0 { total as u64 - 1 } else { 0 };
     p.commit_stream(stream_id, through)?;
     Ok(())
@@ -207,7 +286,7 @@ pub fn demux_layers(
     flat: Vec<(u64, ChunkImage)>,
     n_layers: usize,
     chunks_per_layer: usize,
-) -> Result<Vec<Vec<ChunkImage>>> {
+) -> Result<TurnChunkGrid> {
     let expected = n_layers * chunks_per_layer;
     if flat.len() != expected {
         return Err(PersistenceError::Corrupt(format!(
@@ -232,7 +311,7 @@ pub fn demux_layers(
         }
         layers[layer][chunk] = Some(image);
     }
-    layers
+    let materialised: Result<Vec<Vec<ChunkImage>>> = layers
         .into_iter()
         .enumerate()
         .map(|(layer, row)| {
@@ -247,7 +326,8 @@ pub fn demux_layers(
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    Ok(TurnChunkGrid::new(materialised?))
 }
 
 /// Recover a single turn fully from the log: its `Tokens` and the demuxed
@@ -287,7 +367,7 @@ pub fn recover_turn(
     // tokens and signatures are preserved and the layer grid is reconstructed
     // empty. The substrate's reload path handles empty sealed sequences.
     let layers = if flat.is_empty() {
-        vec![Vec::new(); n_layers]
+        TurnChunkGrid::empty_grid(n_layers)
     } else {
         demux_layers(flat, n_layers, chunks_per_layer)?
     };
@@ -392,8 +472,8 @@ mod tests {
             }
         }
         let layers = demux_layers(flat, n_layers, c).unwrap();
-        assert_eq!(layers.len(), n_layers);
-        for (layer, row) in layers.iter().enumerate() {
+        assert_eq!(layers.n_layers(), n_layers);
+        for (layer, row) in layers.iter_layers().enumerate() {
             assert_eq!(row.len(), c);
             for (chunk, image) in row.iter().enumerate() {
                 assert_eq!(image, &chunk_image((layer * c + chunk) as u8, 32));
@@ -444,13 +524,15 @@ mod tests {
         let token_ids = vec![10u32, 20, 30, 40];
 
         // Build an L×C grid with unique per-(layer,chunk) seeds.
-        let layers: Vec<Vec<ChunkImage>> = (0..n_layers)
-            .map(|l| {
-                (0..2)
-                    .map(|c| chunk_image((l * 10 + c) as u8, if c == 1 { 12 } else { 32 }))
-                    .collect()
-            })
-            .collect();
+        let layers = TurnChunkGrid::new(
+            (0..n_layers)
+                .map(|l| {
+                    (0..2)
+                        .map(|c| chunk_image((l * 10 + c) as u8, if c == 1 { 12 } else { 32 }))
+                        .collect()
+                })
+                .collect(),
+        );
 
         let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
         {
@@ -479,9 +561,11 @@ mod tests {
         let dir = tmp_dir("wrong_layers");
         let decl = turn_decl(9, 0, 2);
         let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
-        let layers: Vec<Vec<ChunkImage>> = (0..3)
-            .map(|l| (0..2).map(|c| chunk_image((l * 5 + c) as u8, 32)).collect())
-            .collect();
+        let layers = TurnChunkGrid::new(
+            (0..3)
+                .map(|l| (0..2).map(|c| chunk_image((l * 5 + c) as u8, 32)).collect())
+                .collect(),
+        );
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();

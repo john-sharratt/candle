@@ -22,7 +22,8 @@ mod cuda_impl {
         kv_migrate, ChunkedKvBacking, KvFormat, MigrationPlan, SealedSequence,
     };
 
-    use crate::persistence::resume::ChunkImage;
+    use crate::persistence::cold_load::ColdLoadStager;
+    use crate::persistence::resume::{ChunkImage, TurnChunkGrid};
     use crate::persistence::streams::StreamId;
     use crate::persistence::warm_pool::WarmPool;
 
@@ -146,36 +147,79 @@ mod cuda_impl {
         Ok(images)
     }
 
-    /// Evict a sealed sequence VRAM→RAM: gather its chunks into the warm
-    /// pool as [`ChunkImage`]s, marked dirty (not yet durable on disk).
+    /// Evict a sealed turn VRAM→RAM: gather every layer's chunks into
+    /// the warm pool as a [`TurnChunkGrid`], marked dirty (not yet
+    /// durable on disk). The group-commit append flushes them to the
+    /// redo log; the entry is then `mark_clean`'d.
+    ///
+    /// All layers' chunks live under one `StreamId` (the per-turn id).
     pub fn evict_to_warm(
-        backing: &ChunkedKvBacking,
-        seq: &SealedSequence,
+        backings: &[ChunkedKvBacking],
+        seqs: &[SealedSequence],
         device: &Device,
         stream_id: StreamId,
         warm_pool: &mut WarmPool,
     ) -> Result<()> {
-        let images = seal_to_chunk_images(backing, device, seq)?;
-        warm_pool.insert(stream_id, images, true);
+        if backings.len() != seqs.len() {
+            return Err(candle::Error::Msg(format!(
+                "evict_to_warm: {} backings vs {} sealed sequences",
+                backings.len(),
+                seqs.len()
+            )));
+        }
+        let mut grid = TurnChunkGrid::with_capacity(seqs.len());
+        for (backing, seq) in backings.iter().zip(seqs) {
+            grid.push_layer(seal_to_chunk_images(backing, device, seq)?);
+        }
+        warm_pool.insert(stream_id, grid, true);
         Ok(())
     }
 
-    /// Load a stream's warm chunks back into VRAM — the warm→hot reload.
+    /// Park a freshly-recovered cold turn's per-layer chunk grid in the
+    /// warm pool — the **read-side mirror** of [`evict_to_warm`]. Both
+    /// functions write into the warm pool in the same [`TurnChunkGrid`]
+    /// form, so the warm→hot leg ([`load_to_hot`]) is shared between
+    /// "recently-evicted" and "just-lifted-off-NVMe" cases.
     ///
-    /// Built on [`load_stream`] / the allocation keystone, so it rebuilds a
-    /// fresh `SealedSequence` (new GIDs) rather than scattering into stale,
-    /// freed chunks. This is what makes a warm eviction that *frees* VRAM
-    /// reloadable. Threads the caller's reusable
-    /// [`ColdLoadStager`](crate::persistence::cold_load::ColdLoadStager)
-    /// through so the warm→hot HtoD goes through pinned host memory, not
-    /// the driver's pageable bounce.
+    /// Cold inserts are marked **clean** — the bytes were just
+    /// recovered from a durable redo log; no flush owed. Pure host
+    /// memcpy; no CUDA work.
+    ///
+    /// `grid` is what `Conversation::recover_turn_chunks` returns; this
+    /// function takes ownership and inserts it.
+    pub fn cold_into_warm(warm_pool: &mut WarmPool, stream_id: StreamId, grid: TurnChunkGrid) {
+        warm_pool.insert(stream_id, grid, false);
+    }
+
+    /// Materialize a warm-resident turn into VRAM — the **shared
+    /// warm→hot leg** used by both warm hits (recently-evicted turn)
+    /// and cold-after-warming (turn just lifted off NVMe via
+    /// `cold_into_warm`).
+    ///
+    /// Per layer: allocates fresh sealed blocks in the policy-selected
+    /// per-(h,p) Q-format arenas, packs the `kv_bytes` into the pinned
+    /// host scratch, `cuMemcpyHtoDAsync`s into a fresh device staging
+    /// slice, and `kv_migrate`-scatters into the new arena chunks. The
+    /// returned `SealedSequence`s own the chunks via `Arc<ChunkGid>`,
+    /// so dropping them frees the chunks back to the pool.
     pub fn load_to_hot(
-        backing: &ChunkedKvBacking,
+        backings: &[ChunkedKvBacking],
         device: &Device,
-        warm_images: &[ChunkImage],
-        stager: &mut crate::persistence::cold_load::ColdLoadStager,
-    ) -> Result<SealedSequence> {
-        load_stream(backing, device, warm_images, stager)
+        grid: &TurnChunkGrid,
+        stager: &mut ColdLoadStager,
+    ) -> Result<Vec<SealedSequence>> {
+        if backings.len() != grid.n_layers() {
+            return Err(candle::Error::Msg(format!(
+                "load_to_hot: {} backings vs {} layers in warm grid",
+                backings.len(),
+                grid.n_layers()
+            )));
+        }
+        let mut out = Vec::with_capacity(grid.n_layers());
+        for (backing, chunks) in backings.iter().zip(grid.iter_layers()) {
+            out.push(load_stream(backing, device, chunks, stager)?);
+        }
+        Ok(out)
     }
 
     /// Reconstruct one layer's [`SealedSequence`] from its recovered
@@ -419,5 +463,6 @@ mod cuda_impl {
 }
 
 pub use cuda_impl::{
-    evict_to_warm, gather_chunks, load_stream, load_to_hot, scatter_chunks, seal_to_chunk_images,
+    cold_into_warm, evict_to_warm, gather_chunks, load_stream, load_to_hot, scatter_chunks,
+    seal_to_chunk_images,
 };
