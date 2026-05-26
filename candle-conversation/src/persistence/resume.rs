@@ -171,13 +171,16 @@ pub fn persist_turn_chunks(
         }
         for (chunk_idx, image) in layer.iter().enumerate() {
             let flat = flat_chunk_index(layer_idx, chunk_idx, chunks_per_layer);
-            // The `Chunk` record's `format` header field mirrors the K-side
-            // format; the authoritative K/V pair lives in the `ChunkPayload`.
+            // The `Chunk` record's `format` header field carries a single
+            // representative K format (sub-band 0) for quick inspection;
+            // the authoritative per-sub-band K/V maps live in the
+            // `ChunkPayload`.
+            let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
             p.write_chunk(
                 stream_id,
                 flat,
                 image.token_count as u64,
-                image.payload.k_format,
+                header_fmt,
                 &image.payload,
             )?;
         }
@@ -360,8 +363,8 @@ mod tests {
             token_count,
             payload: ChunkPayload {
                 offset: 0,
-                k_format: 4,
-                v_format: 5,
+                k_formats: vec![4, 4, 4, 4],
+                v_formats: vec![5, 5, 5, 5],
                 k_pal: vec![seed; 3],
                 v_pal: vec![seed ^ 0xFF; 3],
                 k_scale: vec![seed as f32, seed as f32 + 0.5],

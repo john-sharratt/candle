@@ -736,8 +736,8 @@ mod tests {
     fn chunk_payload(seed: u32) -> ChunkPayload {
         ChunkPayload {
             offset: seed as u16,
-            k_format: 4,
-            v_format: 5,
+            k_formats: vec![4, 4, 4, 4],
+            v_formats: vec![5, 5, 5, 5],
             k_pal: vec![seed as u8; 4],
             v_pal: vec![(seed + 1) as u8; 2],
             k_scale: vec![seed as f32, seed as f32 * 0.5],

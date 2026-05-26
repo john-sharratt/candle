@@ -128,13 +128,13 @@ mod cuda_impl {
             }
             let kv_bytes = blob[cursor..cursor + n].to_vec();
             cursor += n;
-            let (k_format, v_format) = backing.sealed_chunk_kv_formats(sc)?;
+            let (k_formats, v_formats) = backing.sealed_chunk_kv_formats(sc)?;
             images.push(ChunkImage {
                 token_count: sc.token_count,
                 payload: ChunkPayload {
                     offset: sc.offset,
-                    k_format: k_format.to_tag(),
-                    v_format: v_format.to_tag(),
+                    k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
+                    v_formats: v_formats.iter().map(|f| f.to_tag()).collect(),
                     k_pal: (*sc.k_pal).clone(),
                     v_pal: (*sc.v_pal).clone(),
                     k_scale: (*sc.k_scale).clone(),
@@ -219,26 +219,25 @@ mod cuda_impl {
         use std::sync::Arc;
 
         let slot = backing.alloc_sequence()?;
+        let decode_formats = |tags: &[u8], side: &str| -> Result<Vec<KvFormat>> {
+            tags.iter()
+                .map(|&t| {
+                    KvFormat::from_tag(t).ok_or_else(|| {
+                        candle::Error::Msg(format!("load_stream: unrecognised {side} format tag {t}"))
+                    })
+                })
+                .collect()
+        };
         let build = || -> Result<SealedSequence> {
             let mut total_tokens = 0usize;
             for (block_idx, image) in chunks.iter().enumerate() {
-                let k_format = KvFormat::from_tag(image.payload.k_format).ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                        "load_stream: unrecognised k_format tag {}",
-                        image.payload.k_format
-                    ))
-                })?;
-                let v_format = KvFormat::from_tag(image.payload.v_format).ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                        "load_stream: unrecognised v_format tag {}",
-                        image.payload.v_format
-                    ))
-                })?;
+                let k_formats = decode_formats(&image.payload.k_formats, "k")?;
+                let v_formats = decode_formats(&image.payload.v_formats, "v")?;
                 backing.alloc_sealed_block(
                     slot,
                     block_idx,
-                    k_format,
-                    v_format,
+                    &k_formats,
+                    &v_formats,
                     Arc::new(image.payload.k_pal.clone()),
                     Arc::new(image.payload.v_pal.clone()),
                     Arc::new(image.payload.k_scale.clone()),

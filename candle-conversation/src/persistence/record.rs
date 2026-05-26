@@ -205,11 +205,13 @@ pub fn decode_record(buf: &[u8]) -> Result<(Record, usize)> {
 pub struct ChunkPayload {
     /// The `SealedChunk` window skip-count (start of valid data).
     pub offset: u16,
-    /// `KvFormat` tag of the K side — adaptive quantization picks K and V
-    /// formats independently per block, so both must be persisted.
-    pub k_format: u8,
-    /// `KvFormat` tag of the V side.
-    pub v_format: u8,
+    /// `KvFormat` tag of every K palette sub-band, in `[h*N_PALETTE + p]`
+    /// order (`n_kv_head × N_PALETTE` entries). Adaptive quantization picks a
+    /// format independently per `(head, palette sub-band)`, so the whole map
+    /// must be persisted to reallocate the chunk's arenas faithfully.
+    pub k_formats: Vec<u8>,
+    /// `KvFormat` tag of every V palette sub-band, same layout as `k_formats`.
+    pub v_formats: Vec<u8>,
     /// Packed K palette maps.
     pub k_pal: Vec<u8>,
     /// Packed V palette maps.
@@ -227,8 +229,8 @@ impl ChunkPayload {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = ByteWriter::new();
         w.put_u16(self.offset);
-        w.put_u8(self.k_format);
-        w.put_u8(self.v_format);
+        w.put_blob(&self.k_formats);
+        w.put_blob(&self.v_formats);
         w.put_blob(&self.k_pal);
         w.put_blob(&self.v_pal);
         w.put_u32(self.k_scale.len() as u32);
@@ -247,8 +249,8 @@ impl ChunkPayload {
     pub fn decode(payload: &[u8]) -> Result<ChunkPayload> {
         let mut r = ByteReader::new(payload);
         let offset = r.get_u16()?;
-        let k_format = r.get_u8()?;
-        let v_format = r.get_u8()?;
+        let k_formats = r.get_blob()?.to_vec();
+        let v_formats = r.get_blob()?.to_vec();
         let k_pal = r.get_blob()?.to_vec();
         let v_pal = r.get_blob()?.to_vec();
         let n_k = r.get_u32()? as usize;
@@ -270,8 +272,8 @@ impl ChunkPayload {
         }
         Ok(ChunkPayload {
             offset,
-            k_format,
-            v_format,
+            k_formats,
+            v_formats,
             k_pal,
             v_pal,
             k_scale,
@@ -661,8 +663,8 @@ mod tests {
     fn chunk_payload_roundtrip() {
         let payload = ChunkPayload {
             offset: 4,
-            k_format: 2,
-            v_format: 7,
+            k_formats: vec![2, 7, 2, 7],
+            v_formats: vec![7, 7, 7, 7],
             k_pal: vec![1, 2, 3, 4, 5],
             v_pal: vec![9, 8, 7],
             k_scale: vec![0.5, 1.0, 2.0],
@@ -678,8 +680,8 @@ mod tests {
         // A float partial chunk: identity palette, no outer scales.
         let payload = ChunkPayload {
             offset: 0,
-            k_format: 0,
-            v_format: 0,
+            k_formats: Vec::new(),
+            v_formats: Vec::new(),
             k_pal: Vec::new(),
             v_pal: Vec::new(),
             k_scale: Vec::new(),
@@ -693,8 +695,8 @@ mod tests {
     fn chunk_payload_rejects_trailing_bytes() {
         let payload = ChunkPayload {
             offset: 1,
-            k_format: 1,
-            v_format: 1,
+            k_formats: vec![1, 1, 1, 1],
+            v_formats: vec![1, 1, 1, 1],
             k_pal: vec![1],
             v_pal: vec![2],
             k_scale: vec![1.0],

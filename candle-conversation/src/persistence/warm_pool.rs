@@ -179,8 +179,8 @@ mod tests {
             token_count: 32,
             payload: ChunkPayload {
                 offset: 0,
-                k_format: 0,
-                v_format: 0,
+                k_formats: Vec::new(),
+                v_formats: Vec::new(),
                 k_pal: Vec::new(),
                 v_pal: Vec::new(),
                 k_scale: Vec::new(),

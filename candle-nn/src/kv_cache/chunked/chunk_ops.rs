@@ -1078,8 +1078,18 @@ impl ChunkedKvBacking {
 
         // Allocate the block's GIDs through the single allocation keystone —
         // it also registers them on the block table with the palettes/scales.
+        // This restore path is uniform-format, so every sub-band uses the
+        // same K/V format.
+        let n_sub = n_kv_head * N_PALETTE;
         let gids = self.alloc_sealed_block(
-            batch_idx, block_idx, k_format, v_format, k_pal, v_pal, k_scale, v_scale,
+            batch_idx,
+            block_idx,
+            &vec![k_format; n_sub],
+            &vec![v_format; n_sub],
+            k_pal,
+            v_pal,
+            k_scale,
+            v_scale,
         )?;
 
         // Upload per-(head, palette) byte slices and scatter into flat arena chunks.
@@ -1339,34 +1349,44 @@ impl ChunkedKvBacking {
         &self,
         batch_idx: usize,
         block_idx: usize,
-        k_format: KvFormat,
-        v_format: KvFormat,
+        k_formats: &[KvFormat],
+        v_formats: &[KvFormat],
         k_pal: std::sync::Arc<Vec<u8>>,
         v_pal: std::sync::Arc<Vec<u8>>,
         k_scale: std::sync::Arc<Vec<f32>>,
         v_scale: std::sync::Arc<Vec<f32>>,
     ) -> Result<HeadGids> {
         let n_kv_head = self.inner.n_kv_head;
+        let want = n_kv_head * N_PALETTE;
+        if k_formats.len() != want || v_formats.len() != want {
+            candle::bail!(
+                "alloc_sealed_block: expected {want} per-sub-band formats, got k={} v={}",
+                k_formats.len(),
+                v_formats.len()
+            );
+        }
         let location = self.inner.storage.default_location();
-        let target_key = ArenaKey::uniform(k_format, location);
-        let value_key = ArenaKey::uniform(v_format, location);
 
         // Ensure the block table has room for this block index and materialize
         // the destination sequence slot before attaching the fresh GIDs.
         self.ensure_max_blocks(block_idx + 1)?;
         self.ensure_for_offset(batch_idx, block_idx * CHUNK_SIZE, CHUNK_SIZE)?;
 
-        // Allocate GIDS_PER_HEAD * n_kv_head destination chunks.
+        // Allocate GIDS_PER_HEAD * n_kv_head destination chunks, each
+        // `(head, palette sub-band)` in its own adaptive `KvFormat`.
         let mut gid_vec: Vec<ChunkGid> = Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
         {
             let _state = self
                 .state
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-            for _h in 0..n_kv_head {
-                for _p in 0..N_PALETTE {
-                    let k_gid = self.alloc_chunk_for_key(target_key.clone())?;
-                    let v_gid = self.alloc_chunk_for_key(value_key.clone())?;
+            for h in 0..n_kv_head {
+                for p in 0..N_PALETTE {
+                    let sub = h * N_PALETTE + p;
+                    let k_gid =
+                        self.alloc_chunk_for_key(ArenaKey::uniform(k_formats[sub], location))?;
+                    let v_gid =
+                        self.alloc_chunk_for_key(ArenaKey::uniform(v_formats[sub], location))?;
                     gid_vec.push(k_gid);
                     gid_vec.push(v_gid);
                 }
@@ -1390,27 +1410,36 @@ impl ChunkedKvBacking {
         Ok(gids)
     }
 
-    /// The `(k_format, v_format)` a sealed chunk's bytes are stored in —
-    /// read from the arenas its head-0 K/V GIDs resolve to.
+    /// The per-`(head, palette sub-band)` `KvFormat`s a sealed chunk's bytes
+    /// are stored in — `(k_formats, v_formats)`, each `n_kv_head × N_PALETTE`
+    /// entries in `[h*N_PALETTE + p]` order.
     ///
-    /// Adaptive quantization picks K and V formats independently per block,
-    /// so persistence must record both. Used by the seal-time gather path.
+    /// Adaptive quantization picks a format independently per sub-band, so
+    /// persistence must record the whole map (not just head-0) to reallocate
+    /// the chunk's arenas faithfully. Used by the seal-time gather path.
     pub fn sealed_chunk_kv_formats(
         &self,
         chunk: &SealedChunk,
-    ) -> candle::Result<(crate::kv_cache::KvFormat, crate::kv_cache::KvFormat)> {
-        let k_arena = chunk.gids.k_gid(0).arena_idx();
-        let v_arena = chunk.gids.v_gid(0).arena_idx();
+    ) -> candle::Result<(
+        Vec<crate::kv_cache::KvFormat>,
+        Vec<crate::kv_cache::KvFormat>,
+    )> {
+        let n_kv_head = self.inner.n_kv_head;
         self.inner.storage.read(|s| {
-            let k = s
-                .arena_key(k_arena)
-                .map(|key| key.format)
-                .ok_or_else(|| candle::Error::Msg(format!("k arena {k_arena} not found")))?;
-            let v = s
-                .arena_key(v_arena)
-                .map(|key| key.format)
-                .ok_or_else(|| candle::Error::Msg(format!("v arena {v_arena} not found")))?;
-            Ok((k, v))
+            let fmt = |arena_idx: usize, side: &str| {
+                s.arena_key(arena_idx)
+                    .map(|key| key.format)
+                    .ok_or_else(|| candle::Error::Msg(format!("{side} arena {arena_idx} not found")))
+            };
+            let mut k_formats = Vec::with_capacity(n_kv_head * N_PALETTE);
+            let mut v_formats = Vec::with_capacity(n_kv_head * N_PALETTE);
+            for h in 0..n_kv_head {
+                for p in 0..N_PALETTE {
+                    k_formats.push(fmt(chunk.gids.k_gid_pal(h, p).arena_idx(), "k")?);
+                    v_formats.push(fmt(chunk.gids.v_gid_pal(h, p).arena_idx(), "v")?);
+                }
+            }
+            Ok((k_formats, v_formats))
         })?
     }
 
