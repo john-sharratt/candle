@@ -97,12 +97,6 @@ pub struct SubstratePersistence {
     /// Filesystem path of the active log — the rename target of a
     /// compaction swap (§5.8).
     active_path: PathBuf,
-    /// Reusable pinned host scratch for the cold-load bridge path
-    /// (`NVMe → pinned host → HtoD → VRAM staging`). Allocated lazily on
-    /// the first cold-load that needs it; persists across loads so each
-    /// cold-load doesn't re-allocate `cuMemHostAlloc`. See
-    /// [`crate::persistence::cold_load`] for the bridge-vs-GDS context.
-    cold_load_stager: cold_load::ColdLoadStager,
 }
 
 /// SHA-256 of `bytes` — the tokenizer change-detection digest.
@@ -225,17 +219,10 @@ impl SubstratePersistence {
             manifest,
             inherited: inherited_subs,
             model_spec,
-            template,
             tokenizer_sha256,
+            template,
             active_path: active.to_path_buf(),
-            cold_load_stager: cold_load::ColdLoadStager::new(),
         })
-    }
-
-    /// Borrow the cold-load scratch (mutably; growing or first-allocating
-    /// happens through `pack`). Used by [`crate::persistence::transfer::cold_load_stream`].
-    pub fn cold_load_stager(&mut self) -> &mut cold_load::ColdLoadStager {
-        &mut self.cold_load_stager
     }
 
     /// The active log's manifest.
@@ -749,6 +736,39 @@ mod tests {
     }
 
     #[test]
+    fn tokenizer_embedded_once_by_hash() {
+        let dir = tmp_dir("tok_hash");
+        let v1 = vec![1u8; 4096];
+        let v2 = vec![2u8; 4096];
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert!(sp.set_tokenizer(&v1).unwrap(), "first tokenizer is written");
+            assert!(
+                !sp.set_tokenizer(&v1).unwrap(),
+                "identical bytes are a hash-match no-op"
+            );
+            assert!(
+                sp.set_tokenizer(&v2).unwrap(),
+                "changed bytes are re-embedded"
+            );
+            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
+            sp.commit().unwrap();
+            sp.checkpoint().unwrap();
+        }
+        {
+            // The hash is recovered from disk, so an unchanged tokenizer on a
+            // fresh open does not re-embed.
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
+            assert!(
+                !sp.set_tokenizer(&v2).unwrap(),
+                "reopened log recognises the unchanged tokenizer by hash"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn tokenizer_bytes_live_in_sidecar_not_the_log() {
         let dir = tmp_dir("tok_sidecar");
         let bytes = (0..8192u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
@@ -767,12 +787,15 @@ mod tests {
             // 32-byte hash payload.
             let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
             assert_eq!(sidecar_bytes, bytes, "sidecar matches input bytes");
+            // The Tokenizer record payload is exactly 32 bytes — the
+            // SHA-256 digest — regardless of how big the tokenizer is.
             let tok_loc = sp.manifest().tokenizer.expect("manifest has tokenizer loc");
             assert_eq!(
                 tok_loc.payload_len, 32,
                 "Tokenizer record payload must be the 32-byte SHA-256 digest, \
                  not the full tokenizer bytes"
             );
+            // Reader returns the verified sidecar bytes.
             let read_back = sp.read_tokenizer_bytes().unwrap().unwrap();
             assert_eq!(read_back, bytes);
         }
@@ -796,6 +819,10 @@ mod tests {
                 None,
                 "missing sidecar yields Ok(None), not an error"
             );
+            // Re-supplying the same bytes is a hash-match no-op against the
+            // log — but the sidecar has to be re-written, so we don't gate
+            // sidecar restoration on the hash. This matters for graceful
+            // recovery from accidental sidecar deletion.
             sp.set_tokenizer(&bytes).unwrap();
             assert!(sidecar_path.exists(), "sidecar restored on next set");
         }

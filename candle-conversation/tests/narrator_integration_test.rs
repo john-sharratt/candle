@@ -6,7 +6,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test -p candle-conversation --features "cuda,hub" \
+//! cargo test -p candle-conversation --features hub \
 //!     --test narrator_integration_test -- --nocapture --ignored --test-threads=1
 //! ```
 //!

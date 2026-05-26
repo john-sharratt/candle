@@ -12,12 +12,12 @@
 //!
 //! # Generate real signatures for all content types:
 //! cargo run -p candle-conversation --example gen_real_layer_provenance_data \
-//!   --release --features "cuda,hub" -- \
+//!   --release --features hub -- \
 //!   --all --force
 //!
 //! # Or one type at a time:
 //! cargo run -p candle-conversation --example gen_real_layer_provenance_data \
-//!   --release --features "cuda,hub" -- \
+//!   --release --features hub -- \
 //!   --content-type bug-analysis --force
 //! ```
 

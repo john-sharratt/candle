@@ -30,7 +30,7 @@ mime_guess   = { version = "2" }
 reqwest      = { version = "0.12", features = ["stream"] }
 
 candle              = { workspace = true, features = ["cuda"] }
-candle-conversation = { path = "../candle-conversation", features = ["hub", "cuda"] }
+candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 zend-tools          = { path = "../zend-tools" }
 regex               = "1"
 

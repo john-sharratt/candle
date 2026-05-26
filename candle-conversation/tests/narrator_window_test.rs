@@ -7,7 +7,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test -p candle-conversation --features "cuda,hub,test-helpers" \
+//! cargo test -p candle-conversation --features "hub,test-helpers" \
 //!     --test narrator_window_test -- --nocapture --ignored --test-threads=1
 //! ```
 

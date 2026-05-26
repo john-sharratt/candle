@@ -48,7 +48,7 @@
 //!
 //! ```bash
 //! cargo run --example tree_gen -p candle-conversation --release \
-//!   --features "cuda,hub" -- \
+//!   --features hub -- \
 //!   --input candle-conversation/src/characters/bramble-timeline.md \
 //!   --output bramble_tree.yaml \
 //!   --days 3 \

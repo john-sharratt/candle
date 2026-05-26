@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test -p candle-conversation --features "cuda,hub" --test conversation_tests -- --nocapture
+//! cargo test -p candle-conversation --features hub --test conversation_tests -- --nocapture
 //! ```
 
 use candle_conversation::{
@@ -1281,7 +1281,7 @@ For each tool call, output a single JSON object inside <tool_call></tool_call>:
 ///
 /// Run with:
 /// ```
-/// cargo test -p candle-conversation --features "cuda,hub" \
+/// cargo test -p candle-conversation --features hub \
 ///     --test conversation_tests -- test_tool_call_weather_pos1 --nocapture --ignored
 /// ```
 #[test]

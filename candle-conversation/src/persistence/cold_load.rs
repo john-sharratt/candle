@@ -41,8 +41,8 @@
 //! - **No pageable bounce.** The host source of the HtoD is real pinned
 //!   memory, so the driver does not need to synthesise a hidden
 //!   `cudaMallocHost` + memcpy step before the DMA.
-//! - **Reused scratch.** The pinned scratch is allocated once at
-//!   substrate open and grown on demand, not allocated per cold load.
+//! - **Reused scratch.** The pinned scratch is allocated once and grown
+//!   on demand, not allocated per cold load.
 //!
 //! Explicitly *not* in the bridge:
 //! - **`pread`-directly-into-pinned.** Today the chunk records are
@@ -59,29 +59,22 @@
 //!   it leaves perf on the table. Double-buffering is straightforward
 //!   to add but is moot once we have GDS.
 
+use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use candle::cuda_backend::WrapErr;
+use candle::quantized::pinned_staging::PinnedBuf;
+use candle::CudaDevice;
 use candle::Result;
 
-#[cfg(feature = "cuda")]
-use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
-#[cfg(feature = "cuda")]
-use candle::cuda_backend::WrapErr;
-#[cfg(feature = "cuda")]
-use candle::quantized::pinned_staging::PinnedBuf;
-#[cfg(feature = "cuda")]
-use candle::CudaDevice;
-
-/// A reusable host-side cold-load scratch: pinned on CUDA, plain
-/// `Vec<u8>` otherwise. The scratch is grown on demand and persists
-/// across cold loads, so a steady-state daemon allocates `cuMemHostAlloc`
-/// at most a handful of times in its life.
-///
-/// Owned by [`SubstratePersistence`](super::SubstratePersistence) so the
-/// allocation is amortised across every cold load of every stream.
+/// A reusable host-side cold-load scratch: pinned-via-`cuMemHostAlloc`
+/// when a CUDA context is initialised, plain `Vec<u8>` otherwise (the
+/// fallback path is unit-test-only — `cuMemHostAlloc` fails with
+/// `CUDA_ERROR_NOT_INITIALIZED` when no GPU has been touched, and we
+/// transparently fall back so the pack/upload logic stays testable
+/// without spinning up a CUDA device). The scratch is grown on demand
+/// and persists across cold loads, so a steady-state daemon allocates at
+/// most a handful of times in its life.
 pub struct ColdLoadStager {
-    #[cfg(feature = "cuda")]
     buf: Option<PinnedBuf>,
-    #[cfg(not(feature = "cuda"))]
-    buf: Vec<u8>,
     /// High-water mark: the number of bytes we last *used* (not the buffer
     /// capacity). Diagnostic only — useful for the inspector.
     high_water_bytes: usize,
@@ -100,24 +93,14 @@ impl ColdLoadStager {
     /// mark).
     pub fn new() -> Self {
         Self {
-            #[cfg(feature = "cuda")]
             buf: None,
-            #[cfg(not(feature = "cuda"))]
-            buf: Vec::new(),
             high_water_bytes: 0,
         }
     }
 
-    /// Bytes the stager has reserved (pinned or otherwise).
+    /// Bytes the stager has reserved.
     pub fn capacity(&self) -> usize {
-        #[cfg(feature = "cuda")]
-        {
-            self.buf.as_ref().map(|b| b.len()).unwrap_or(0)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            self.buf.capacity()
-        }
+        self.buf.as_ref().map(|b| b.len()).unwrap_or(0)
     }
 
     /// Largest amount of data ever packed in a single call — a stable
@@ -146,7 +129,11 @@ impl ColdLoadStager {
         self.ensure_capacity(total)?;
         self.high_water_bytes = self.high_water_bytes.max(total);
 
-        let dst = self.as_mut_slice();
+        let dst = self
+            .buf
+            .as_mut()
+            .expect("ensure_capacity allocated before pack")
+            .as_mut_slice();
         let mut off = 0usize;
         for c in chunks {
             let end = off + c.len();
@@ -160,64 +147,33 @@ impl ColdLoadStager {
     /// length is the most recent `high_water_bytes` value, which after
     /// `pack` equals the packed length.
     pub fn as_slice(&self) -> &[u8] {
-        #[cfg(feature = "cuda")]
-        {
-            match &self.buf {
-                Some(b) => b.as_slice(),
-                None => &[],
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            &self.buf
-        }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        #[cfg(feature = "cuda")]
-        {
-            self.buf
-                .as_mut()
-                .expect("ensure_capacity allocated before pack")
-                .as_mut_slice()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            &mut self.buf
+        match &self.buf {
+            Some(b) => b.as_slice(),
+            None => &[],
         }
     }
 
     fn ensure_capacity(&mut self, len: usize) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            let need_grow = match &self.buf {
-                Some(b) => b.len() < len,
-                None => true,
-            };
-            if need_grow {
-                // `cuMemHostAlloc` needs an initialised CUDA context — in
-                // unit tests (no GPU touched) it returns
-                // `CUDA_ERROR_NOT_INITIALIZED`. Fall back to a plain
-                // `Vec<u8>`-backed `PinnedBuf::Host` in that case so the
-                // pack/upload logic is exercisable in unit tests; the real
-                // pinned path is exercised by the integration test that
-                // actually allocates a CUDA device first.
-                self.buf = Some(match PinnedBuf::alloc_owned(len) {
-                    Ok(b) => b,
-                    Err(_) => PinnedBuf::Host {
-                        data: vec![0u8; len],
-                    },
-                });
-            }
-            Ok(())
+        let need_grow = match &self.buf {
+            Some(b) => b.len() < len,
+            None => true,
+        };
+        if need_grow {
+            // `cuMemHostAlloc` needs an initialised CUDA context — in
+            // unit tests (no GPU touched) it returns
+            // `CUDA_ERROR_NOT_INITIALIZED`. Fall back to a plain
+            // `Vec<u8>`-backed `PinnedBuf::Host` in that case so the
+            // pack/upload logic is exercisable in unit tests; the real
+            // pinned path is exercised by the integration test that
+            // actually allocates a CUDA device first.
+            self.buf = Some(match PinnedBuf::alloc_owned(len) {
+                Ok(b) => b,
+                Err(_) => PinnedBuf::Host {
+                    data: vec![0u8; len],
+                },
+            });
         }
-        #[cfg(not(feature = "cuda"))]
-        {
-            if self.buf.len() < len {
-                self.buf.resize(len, 0);
-            }
-            Ok(())
-        }
+        Ok(())
     }
 
     /// Asynchronously upload the *first `len` bytes* of the scratch to a
@@ -229,7 +185,6 @@ impl ColdLoadStager {
     /// Returns a device slice and the `i64` device base pointer (the
     /// shape `kv_migrate` expects). The returned device slice must
     /// outlive the kernel that reads from it.
-    #[cfg(feature = "cuda")]
     pub fn upload_async(
         &self,
         dev: &CudaDevice,
@@ -260,7 +215,6 @@ impl ColdLoadStager {
 
 /// Result of [`ColdLoadStager::upload_async`] — a freshly-allocated device
 /// slice plus its base pointer ready to feed to a scatter kernel.
-#[cfg(feature = "cuda")]
 pub struct UploadedScratch {
     /// Owns the device allocation. Drop frees the device memory; keep
     /// alive until the consuming kernel completes.

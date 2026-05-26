@@ -4,7 +4,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example chat -p candle-conversation --release --features "cuda,hub"
+//! cargo run --example chat -p candle-conversation --release --features hub
 //! mradermacher/Qwen3-30B-A3B-abliterated-erotic-i1-GGUF
 //! ```
 

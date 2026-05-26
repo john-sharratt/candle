@@ -8,18 +8,9 @@
 
 use crate::config::SamplingConfig;
 use crate::token_buffer::TokenBuffer;
-use candle::{Device, IndexOp, Tensor};
-
-#[cfg(feature = "cuda")]
-use candle::DType;
-
-#[cfg(feature = "cuda")]
-use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
-
-#[cfg(feature = "cuda")]
 use candle::cuda_backend::CudaStorageSlice;
-
-#[cfg(feature = "cuda")]
+use candle::{DType, Device, IndexOp, Tensor};
+use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 /// Per-sequence sampling state.
@@ -197,11 +188,9 @@ pub struct BatchedSampler {
     max_recent_len: usize,
 
     /// EOS token ID.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     eos_tokens: TokenBuffer,
 
     /// Optional path to write penalty state during decoding.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     penalty_log_path: Option<std::path::PathBuf>,
 }
 
@@ -253,7 +242,6 @@ impl BatchedSampler {
             return Ok(Vec::new());
         }
 
-        #[cfg(feature = "cuda")]
         if matches!(self.device, Device::Cuda(_)) {
             return self.sample_batch_cuda(logits, states, configs);
         }
@@ -367,7 +355,6 @@ impl BatchedSampler {
     }
 
     /// CUDA kernel implementation.
-    #[cfg(feature = "cuda")]
     fn sample_batch_cuda(
         &self,
         logits: &Tensor,
@@ -588,7 +575,6 @@ impl BatchedSampler {
     }
 
     /// Build penalty buffers from states.
-    #[cfg(feature = "cuda")]
     fn build_penalty_buffers_from_states(
         &self,
         states: &[&mut SequenceSamplingState],
@@ -663,7 +649,6 @@ impl BatchedSampler {
         ))
     }
 
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn write_penalty_log(
         &self,
         log_path: &std::path::Path,
@@ -723,7 +708,6 @@ impl BatchedSampler {
     }
 
     /// Invoke the CUDA kernel with the given parameters.
-    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     fn invoke_cuda_kernel(
         &self,

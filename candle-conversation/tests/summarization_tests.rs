@@ -12,7 +12,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test -p candle-conversation --features "cuda,hub" \
+//! cargo test -p candle-conversation --features hub \
 //!     --test summarization_tests -- --nocapture
 //! ```
 

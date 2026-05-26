@@ -18,8 +18,9 @@
 //!
 //! This module is the **device-free** half of resume: the record layout,
 //! the flat-grid demux, and the `Tokens` codec. Gathering the KV bytes off
-//! the GPU at seal time and scattering them back into VRAM on resume is the
-//! `#[cfg(feature = "cuda")]` half — see `resume_gpu.rs`.
+//! the GPU at seal time and scattering them back into VRAM on resume lives
+//! in `transfer.rs` — `candle-conversation` is CUDA-only so there is no
+//! non-CUDA half.
 
 use super::manifest::ChunkLoc;
 use super::record::ChunkPayload;
@@ -38,16 +39,12 @@ pub struct ChunkImage {
 }
 
 /// A turn fully recovered from the redo log — its declaration, token ids,
-/// the per-layer sealed-chunk grid (`layers[layer][chunk]`), and the
-/// per-chunk BDP provenance signatures.
+/// and the per-layer sealed-chunk grid (`layers[layer][chunk]`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoveredTurn {
     pub decl: TurnDecl,
     pub token_ids: Vec<u32>,
     /// `layers[layer]` is that layer's ordered chunk list (length `C`).
-    /// Empty when the turn's `Chunks` records never landed (crash between
-    /// the sync structural commit and the async chunk persist) — the
-    /// substrate reload path treats an empty grid as a turn skeleton.
     pub layers: Vec<Vec<ChunkImage>>,
     /// Per-chunk BDP provenance signatures `(token_count, syn‖sem‖prag bytes)`,
     /// in chunk order — empty if the turn has no `Signatures` record.
@@ -136,11 +133,6 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>> {
 ///
 /// `layers` is `layers[layer][chunk]`; every layer must have the same chunk
 /// count (`C`) — the architecture seals all layers in lockstep.
-///
-/// Composes [`persist_turn_chunks`] + [`persist_turn_tokens`]. Callers
-/// driving the async seal/persist chain (heavy `Chunks` writes deferred to
-/// a bg-quantizer callback) use the two functions directly so the sync
-/// path can write only the substrate-critical structural records.
 pub fn persist_turn_kv(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
@@ -152,10 +144,10 @@ pub fn persist_turn_kv(
     Ok(())
 }
 
-/// Persist only a turn's `Chunks` records — the post-quantization half of
-/// the seal/persist chain (§16.12). Always callable synchronously; the
-/// async path simply defers the call onto a bg-quantizer callback once
-/// the turn's float→quant migrations have landed.
+/// Persist only a turn's `Chunks` records — the post-quantization half of the
+/// seal/persist chain (§16.12). Called from inside a bg-quantizer callback
+/// once the turn's float→quant migrations have landed, so the bytes captured
+/// here reflect the policy-selected K/V formats.
 pub fn persist_turn_chunks(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
@@ -172,9 +164,8 @@ pub fn persist_turn_chunks(
         for (chunk_idx, image) in layer.iter().enumerate() {
             let flat = flat_chunk_index(layer_idx, chunk_idx, chunks_per_layer);
             // The `Chunk` record's `format` header field carries a single
-            // representative K format (sub-band 0) for quick inspection;
-            // the authoritative per-sub-band K/V maps live in the
-            // `ChunkPayload`.
+            // representative K format (sub-band 0) for quick inspection; the
+            // authoritative per-sub-band K/V maps live in the `ChunkPayload`.
             let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
             p.write_chunk(
                 stream_id,
@@ -188,13 +179,11 @@ pub fn persist_turn_chunks(
     Ok(())
 }
 
-/// Persist a turn's `Tokens` record and the trailing `Commit`. Always
-/// called synchronously on seal — tokens are substrate-critical
-/// reconstruction data regardless of compression policy. The `layers`
-/// argument is used solely to compute the highest committed chunk index;
-/// pass an empty slice when no chunks have been persisted yet (the
-/// async path will re-commit at the true highest index when the
-/// `Chunks` records land).
+/// Persist a turn's `Tokens` record and the trailing `Commit`. Always called
+/// synchronously on seal — tokens are substrate-critical reconstruction data
+/// regardless of compression policy. The `layers` argument is used solely to
+/// compute the highest committed chunk index; pass an empty slice when no
+/// chunks were persisted (e.g. `compression_policy = None`).
 pub fn persist_turn_tokens(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
@@ -292,12 +281,11 @@ pub fn recover_turn(
             },
         ));
     }
-    // A turn whose chunks haven't landed yet — either because the
-    // bg-quantizer persist callback hadn't fired before a crash, or
-    // because the run was configured with `compression_policy = None`
-    // — is still valid: its tokens and signatures are preserved and the
-    // layer grid is reconstructed empty. The substrate's reload path
-    // treats an empty sealed-sequence grid as a turn skeleton.
+    // A turn whose chunks haven't landed yet — either because the bg-quantizer
+    // persist callback hadn't fired before a crash, or because the run was
+    // configured with `compression_policy = None` — is still valid: its
+    // tokens and signatures are preserved and the layer grid is reconstructed
+    // empty. The substrate's reload path handles empty sealed sequences.
     let layers = if flat.is_empty() {
         vec![Vec::new(); n_layers]
     } else {
@@ -429,6 +417,23 @@ mod tests {
     #[test]
     fn decode_token_ids_rejects_a_ragged_payload() {
         assert!(decode_token_ids(&[0u8, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn signatures_round_trip() {
+        let entries = vec![
+            (32u16, (0..32u32 * 48).map(|i| i as u8).collect::<Vec<u8>>()),
+            (12u16, vec![0xABu8; 12 * 48]),
+            (0u16, Vec::new()),
+        ];
+        let bytes = encode_signatures(&entries);
+        assert_eq!(decode_signatures(&bytes).unwrap(), entries);
+    }
+
+    #[test]
+    fn decode_signatures_rejects_truncation() {
+        let bytes = encode_signatures(&[(4u16, vec![1u8; 4 * 48])]);
+        assert!(decode_signatures(&bytes[..bytes.len() - 3]).is_err());
     }
 
     #[test]

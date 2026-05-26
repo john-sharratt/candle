@@ -28,7 +28,7 @@
 //!
 //! # Generate real signatures:
 //! cargo run -p candle-conversation --example gen_real_provenance_data \
-//!   --release --features "cuda,hub" -- \
+//!   --release --features hub -- \
 //!   --model-dir /path/to/Qwen3-30B-A3B-Q4_K_M
 //! ```
 //!

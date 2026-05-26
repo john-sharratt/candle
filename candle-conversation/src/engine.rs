@@ -192,10 +192,7 @@ impl ConversationEngine {
                 );
                 // §16.12 — reload any persisted turns into the substrate
                 // before serving requests.
-                #[cfg(feature = "cuda")]
                 scheduler.reconstruct_substrate(&scheduler_conversation);
-                #[cfg(not(feature = "cuda"))]
-                let _ = scheduler_conversation;
                 scheduler.run();
             })
             .map_err(|e| {

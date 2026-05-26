@@ -9,14 +9,18 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
+# candle-conversation is **CUDA-only**: the substrate, the bg-quantizer,
+# the cold-load bridge, and the scheduler all assume a CUDA device.
+# The candle stack is forced into cuda mode through these dep features;
+# there is no longer a `cuda` Cargo feature on this crate.
 ahash = { workspace = true }
 base64 = { workspace = true }
-candle = { workspace = true }
-candle-kernels = { workspace = true, optional = true }
-candle-nn = { workspace = true }
-candle-transformers = { workspace = true, features = ["ruler-bench"] }
+candle = { workspace = true, features = ["cuda"] }
+candle-kernels = { workspace = true }
+candle-nn = { workspace = true, features = ["cuda"] }
+candle-transformers = { workspace = true, features = ["cuda", "ruler-bench"] }
 crossbeam = { workspace = true }
-cudarc = { workspace = true, optional = true }
+cudarc = { workspace = true }
 fs2 = { workspace = true }
 memmap2 = { workspace = true }
 tempfile = { workspace = true }
@@ -53,15 +57,7 @@ sig-trace = []   # enables per-chunk BDP signature tracing (TRACE level, high vo
 # diagnosing prompt/format/role-marker bugs; off by default because
 # the per-token recording allocates and the dump itself is large.
 context-dump = []
-cuda = [
-    "candle/cuda",
-    "candle-nn/cuda",
-    "candle-transformers/cuda",
-    "dep:candle-kernels",
-    "dep:cudarc",
-]
 hub = ["dep:hf-hub"]
-metal = ["candle/metal", "candle-nn/metal", "candle-transformers/metal"]
 # Exposes test-introspection methods (warm_pool, warm_turn_slots,
 # hot/warm_turn_ids_sorted, tiered_store()) that are otherwise hidden from the
 # public API.  Enable with --features test-helpers in integration-test runs.
@@ -69,22 +65,22 @@ test-helpers = []
 
 [[example]]
 name = "chat"
-required-features = ["cuda", "hub"]
+required-features = ["hub"]
 
 [[example]]
 name = "tree_gen"
-required-features = ["cuda", "hub"]
+required-features = ["hub"]
 
 [[example]]
 name = "ruler_stream"
-required-features = ["cuda", "hub"]
+required-features = ["hub"]
 
 [[example]]
 name = "gen_tool_provenance_data"
 
 [[example]]
 name = "gen_real_provenance_data"
-required-features = ["cuda", "hub"]
+required-features = ["hub"]
 
 [[example]]
 name = "dump_provenance_samples"

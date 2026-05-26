@@ -8,7 +8,7 @@
 //! # Run (benchmark)
 //!
 //! ```powershell
-//! cargo run --example ruler_stream -p candle-conversation --release --features "cuda,hub" `
+//! cargo run --example ruler_stream -p candle-conversation --release --features hub `
 //!     -- --mode C8 --log ruler_stream_C8.jsonl
 //! ```
 //!

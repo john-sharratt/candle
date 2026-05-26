@@ -2169,7 +2169,6 @@ impl Scheduler {
                 // boundary so chunks compress at log-write time and
                 // dequantise at log-read time. For now everything is
                 // uncompressed end-to-end.
-                #[cfg(feature = "cuda")]
                 {
                     use crate::persistence::content_hash::turn_stream_id;
                     use crate::persistence::resume::ChunkImage;
@@ -2233,8 +2232,6 @@ impl Scheduler {
                         }
                     }
                 }
-                #[cfg(not(feature = "cuda"))]
-                let _ = persist_token_ids;
             }
             SealAction::Section { section_id, tokens } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
@@ -2267,26 +2264,38 @@ impl Scheduler {
     /// daemon startup (§16.12 substrate reload). For every persisted turn,
     /// each layer's chunk grid is cold-loaded back into VRAM via
     /// `transfer::load_stream` and the turn is re-appended to the substrate.
-    #[cfg(feature = "cuda")]
+    ///
+    /// The cold-load path routes through the bridge `ColdLoadStager`
+    /// (pinned host → HtoD → kv_migrate), so the per-layer HtoD sources
+    /// from real pinned memory rather than the driver's pageable bounce.
+    /// The stager is allocated once for the whole replay and reused
+    /// across every turn × every layer.
     pub fn reconstruct_substrate(&self, conversation: &Conversation) {
+        use crate::persistence::cold_load::ColdLoadStager;
         use crate::persistence::resume::ChunkImage;
         use crate::persistence::transfer::load_stream;
         use crate::provenance::{SigEntry, TokenSignature};
+        use std::cell::RefCell;
 
         let n_layers = self.session.backings().len();
         if n_layers == 0 {
             return;
         }
         let device = self.session.device().clone();
+        // Replay-local stager: allocated once, reused across every turn ×
+        // every layer. `RefCell` so the closure can borrow_mut without
+        // having to make `reconstruct_from_log` take `FnMut`.
+        let stager = RefCell::new(ColdLoadStager::new());
         let load = |layers: &[Vec<ChunkImage>]| -> candle::Result<Vec<SealedSequence>> {
             let mut out = Vec::with_capacity(layers.len());
+            let mut stager = stager.borrow_mut();
             for (layer_idx, chunks) in layers.iter().enumerate() {
                 let backing = self.session.backing(layer_idx).ok_or_else(|| {
                     candle::Error::Msg(format!(
                         "reconstruct_substrate: no KV backing for layer {layer_idx}"
                     ))
                 })?;
-                out.push(load_stream(backing, &device, chunks)?);
+                out.push(load_stream(backing, &device, chunks, &mut stager)?);
             }
             Ok(out)
         };
@@ -2346,15 +2355,9 @@ impl Scheduler {
         layer_indices
             .iter()
             .map(|&layer_idx| {
-                #[cfg(feature = "cuda")]
                 let blocks = self
                     .session
                     .gather_r16_kv_for_provenance(seq_idx, layer_idx, block_range)
-                    .map_err(ConversationError::Model)?;
-                #[cfg(not(feature = "cuda"))]
-                let blocks = self
-                    .session
-                    .dump_r16_kv_for_provenance(seq_idx, layer_idx, block_range)
                     .map_err(ConversationError::Model)?;
                 Ok((layer_idx, blocks))
             })
@@ -2376,7 +2379,6 @@ impl Scheduler {
         layer_b: usize,
         block_range: Option<(usize, usize)>,
     ) -> Result<Vec<crate::provenance::TurnSignatures>, ConversationError> {
-        #[cfg(feature = "cuda")]
         let (blocks_a, blocks_b) = {
             let mut layers = self
                 .session
@@ -2385,18 +2387,6 @@ impl Scheduler {
                 .into_iter();
             let a = layers.next().unwrap_or_default();
             let b = layers.next().unwrap_or_default();
-            (a, b)
-        };
-        #[cfg(not(feature = "cuda"))]
-        let (blocks_a, blocks_b) = {
-            let a = self
-                .session
-                .dump_r16_kv_for_provenance(seq_idx, layer_a, block_range)
-                .map_err(ConversationError::Model)?;
-            let b = self
-                .session
-                .dump_r16_kv_for_provenance(seq_idx, layer_b, block_range)
-                .map_err(ConversationError::Model)?;
             (a, b)
         };
 
@@ -2734,7 +2724,6 @@ impl Scheduler {
         let block_hi = probe_hi.div_ceil(self.chunk_size);
         let range = Some((block_lo, block_hi));
 
-        #[cfg(feature = "cuda")]
         let raw_layers = {
             let mut layers = self
                 .session
@@ -2758,23 +2747,6 @@ impl Scheduler {
                 raw_sem_l4,
                 raw_prag_l0,
                 raw_prag_l4,
-            )
-        };
-        #[cfg(not(feature = "cuda"))]
-        let raw_layers = {
-            let li = policy.provenance_layer_indices;
-            let dump = |layer| {
-                self.session
-                    .dump_r16_kv_for_provenance(view_id.0, layer, range)
-                    .map_err(ConversationError::Model)
-            };
-            (
-                dump(li.syn_l0)?,
-                dump(li.syn_l4)?,
-                dump(li.sem_l0)?,
-                dump(li.sem_l4)?,
-                dump(li.prag_l0)?,
-                dump(li.prag_l4)?,
             )
         };
         let (raw_syn_l0, raw_syn_l4, raw_sem_l0, raw_sem_l4, raw_prag_l0, raw_prag_l4) = raw_layers;
