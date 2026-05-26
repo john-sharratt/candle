@@ -57,8 +57,26 @@ pub struct Manifest {
     pub tokenizer: Option<RecordLoc>,
     /// Per-stream index, ordered by id for deterministic serialisation.
     pub streams: BTreeMap<StreamId, StreamEntry>,
+    /// Per-timeline conversation metadata — the daemon's client-side
+    /// `conv_id` string paired with the sidebar title. Keyed by
+    /// `timeline_id`, decoded inline. Written as `RecordType::Label`
+    /// records, **last-write-wins** on replay so the conv_id can be
+    /// established immediately at first submit and the title can be
+    /// filled in later by the titler.
+    pub labels: BTreeMap<u64, ConvMeta>,
     /// Offset of the most recent `Checkpoint` record seen.
     pub last_checkpoint_offset: Option<u64>,
+}
+
+/// Per-timeline conversation metadata persisted in `RecordType::Label`.
+/// `conv_id` is the client-supplied identifier (e.g. the frontend's
+/// `Date.now()` string) used as the sidebar's stable id; `label` is the
+/// human-readable title, possibly empty during the brief window between
+/// first-submit and titler-completion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConvMeta {
+    pub conv_id: String,
+    pub label: String,
 }
 
 impl Manifest {
@@ -114,6 +132,14 @@ impl Manifest {
             }
             RecordType::Checkpoint => {
                 self.last_checkpoint_offset = Some(entry.offset);
+            }
+            RecordType::Label => {
+                let meta = decode_label_payload(&entry.record.payload)?;
+                // Last-write-wins: the conv_id is written at first
+                // submit; the title may be filled in later by the
+                // titler. Subsequent writes overwrite (e.g. a user
+                // rename would land here).
+                self.labels.insert(meta.0, meta.1);
             }
         }
         Ok(())
@@ -182,6 +208,12 @@ impl Manifest {
                 None => w.put_u8(0),
             }
         }
+        w.put_u32(self.labels.len() as u32);
+        for (timeline_id, meta) in &self.labels {
+            w.put_u64(*timeline_id);
+            w.put_str(&meta.conv_id);
+            w.put_str(&meta.label);
+        }
         w.into_bytes()
     }
 
@@ -235,6 +267,14 @@ impl Manifest {
                 },
             );
         }
+        let n_labels = r.get_u32()? as usize;
+        let mut labels = BTreeMap::new();
+        for _ in 0..n_labels {
+            let timeline_id = r.get_u64()?;
+            let conv_id = r.get_str()?;
+            let label = r.get_str()?;
+            labels.insert(timeline_id, ConvMeta { conv_id, label });
+        }
         if !r.is_done() {
             return Err(PersistenceError::Corrupt(format!(
                 "manifest payload has {} trailing bytes",
@@ -246,9 +286,35 @@ impl Manifest {
             template,
             tokenizer,
             streams,
+            labels,
             last_checkpoint_offset,
         })
     }
+}
+
+/// Encode a `Label` record's payload — `{u64 timeline_id, str conv_id, str label}`.
+pub fn encode_label_payload(timeline_id: u64, conv_id: &str, label: &str) -> Vec<u8> {
+    let mut w = ByteWriter::new();
+    w.put_u64(timeline_id);
+    w.put_str(conv_id);
+    w.put_str(label);
+    w.into_bytes()
+}
+
+/// Decode a `Label` record's payload — see [`encode_label_payload`].
+/// Returns `(timeline_id, ConvMeta)`.
+pub fn decode_label_payload(payload: &[u8]) -> Result<(u64, ConvMeta)> {
+    let mut r = ByteReader::new(payload);
+    let timeline_id = r.get_u64()?;
+    let conv_id = r.get_str()?;
+    let label = r.get_str()?;
+    if !r.is_done() {
+        return Err(PersistenceError::Corrupt(format!(
+            "Label payload has {} trailing bytes",
+            r.remaining()
+        )));
+    }
+    Ok((timeline_id, ConvMeta { conv_id, label }))
 }
 
 fn put_opt_loc(w: &mut ByteWriter, loc: Option<RecordLoc>) {

@@ -177,7 +177,11 @@ impl Sequence {
         provenance: Arc<ProvenanceFile>,
         model_core: ModelCoreProperties,
         substrate: Conversation,
+        section_progress: Option<&dyn Fn(u64, u64)>,
     ) -> crate::Result<Self> {
+        // Mark `section_progress` as observable across nested closures
+        // (per-section callbacks may fire during the ingest loop).
+        let _ = &section_progress;
         // Persistence is now a property of the workspace `Conversation`
         // (the substrate handle), wired in by the engine via
         // `Conversation::open(path)`.  The Sequence has nothing to do
@@ -1253,6 +1257,50 @@ impl Sequence {
     /// The raw system prompt text (with any temporal marker suffix, or empty).
     pub fn system_prompt(&self) -> &str {
         self.tree.system_prompt_text()
+    }
+
+    /// Every recovered turn in the given timeline, paired with its role
+    /// and raw token ids — for re-populating a sidebar after restart.
+    pub fn recovered_history(&self, timeline: TimelineId) -> Vec<(Role, Vec<u32>)> {
+        let read = self.substrate.read();
+        read.turn_indices(timeline)
+            .map(|idx| {
+                (
+                    read.role_of(timeline, idx),
+                    read.token_ids_of(timeline, idx).to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every timeline with at least one recovered turn, paired with the
+    /// turn count.
+    pub fn recovered_timelines(&self) -> Vec<(TimelineId, u32)> {
+        let read = self.substrate.read();
+        let mut counts: std::collections::HashMap<TimelineId, u32> =
+            std::collections::HashMap::new();
+        for (tl, _idx) in read.all_turns() {
+            *counts.entry(tl).or_insert(0) += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    /// The substrate-backed sidebar label for `timeline`, or `None`.
+    pub fn conversation_label_of(&self, timeline: TimelineId) -> Option<String> {
+        self.substrate.label_of(timeline)
+    }
+
+    /// This sequence's timeline id.
+    pub fn timeline_id(&self) -> TimelineId {
+        self.target.timeline
+    }
+
+    /// Set this conversation's sidebar label, persisting it to the redo
+    /// log. First-write-wins.
+    pub fn set_conversation_label(&self, label: &str) -> crate::Result<()> {
+        self.substrate
+            .set_conversation_label(self.target.timeline, label)
+            .map_err(ConversationError::Model)
     }
 
     /// Whether a turn is currently in flight.

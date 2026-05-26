@@ -961,16 +961,25 @@ impl Scheduler {
                     }
                     // Translate each projected (group, idx) to its
                     // owning timeline before checking for sealed
-                    // bytes.  Phase 1 single-timeline-per-group
-                    // makes this lookup unambiguous; Phase 3 will
-                    // route via target.timeline for target.group.
+                    // bytes. For the target's own group route via
+                    // `target.timeline`; for other groups fall back
+                    // to first-of-group (a Phase-1 single-timeline
+                    // assumption that holds for cross-group
+                    // references in our current schema).
+                    let resolve_timeline = |g: GroupId| -> Option<crate::projection::TimelineId> {
+                        if g == target.group {
+                            Some(target.timeline)
+                        } else {
+                            view.timelines_for_group(g).next()
+                        }
+                    };
                     let turns: Vec<(GroupId, TurnIndex)> = projection
                         .turns
                         .iter()
                         .filter_map(|resolved| {
                             let g = resolved.group();
                             let t = resolved.index();
-                            let timeline = view.timelines_for_group(g).next()?;
+                            let timeline = resolve_timeline(g)?;
                             view.turn_sealed_of(timeline, t).map(|_| (g, t))
                         })
                         .collect();
@@ -1376,6 +1385,11 @@ impl Scheduler {
         // result back into the substrate. Pre-walk under a read lock
         // to collect the list, then release before materializing —
         // `ensure_turn_hot` takes a write lock to cache its result.
+        // Pull the slot's target so we resolve `g == target.group` to
+        // `target.timeline` rather than the first-registered timeline
+        // (which is base_conv's empty timeline and would silently drop
+        // every projected turn).
+        let slot_target = self.slot_targets.get(&parent_id).copied();
         let mut section_list: Vec<SectionId> = Vec::with_capacity(projected_sections.len());
         let mut turn_list: Vec<(GroupId, TurnIndex, crate::projection::TimelineId)> =
             Vec::with_capacity(projected_turns.len());
@@ -1387,16 +1401,25 @@ impl Scheduler {
                 }
             }
             for &(g, t) in projected_turns {
-                // Translate `g` → its owning timeline (Phase 1
-                // single-timeline-per-group; Phase 3 will use
-                // target.timeline when g matches target.group).
-                if let Some(timeline) = view.timelines_for_group(g).next() {
+                // Same target-aware lookup as the SubmitTurn handler
+                // uses when assembling `projected_turns`.
+                let timeline = match slot_target {
+                    Some(tgt) if g == tgt.group => Some(tgt.timeline),
+                    _ => view.timelines_for_group(g).next(),
+                };
+                if let Some(timeline) = timeline {
                     if view.turn_sealed_of(timeline, t).is_some() {
                         turn_list.push((g, t, timeline));
                     }
                 }
             }
         }
+        tracing::debug!(
+            slot = parent_id.0,
+            section_list = section_list.len(),
+            turn_list = turn_list.len(),
+            "apply_projection materialisation list",
+        );
         let mut units: Vec<(InjectedUnit, Arc<Vec<SealedSequence>>)> =
             Vec::with_capacity(section_list.len() + turn_list.len());
         for sid in section_list {

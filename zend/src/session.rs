@@ -11,6 +11,7 @@ use candle_conversation::projection;
 use candle_conversation::{ConversationEngine, TokenDecoder, TurnEvent};
 
 use crate::config::DaemonConfig;
+use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
@@ -48,11 +49,30 @@ struct InferenceState {
     conversations: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConvState>>>>,
     /// System-prompt already prefilled; all new conversations fork from this.
     base_conv: std::sync::Mutex<candle_conversation::Sequence>,
+    /// Dedicated tiny-system-prompt conversation that turns the user's
+    /// first message into a short sidebar title. Shared across all main
+    /// conversations; serialised by the mutex but each call is fast
+    /// (~30 ms — prefill is bounded by `head_tail_truncate`).
+    titler: std::sync::Mutex<candle_conversation::Sequence>,
+    /// The titler's timeline id — excluded from `list_conversations` so
+    /// it doesn't show up in the user-facing sidebar.
+    titler_timeline: candle_conversation::projection::TimelineId,
+    /// Tokenizer shared with the engine — used by `head_tail_truncate`
+    /// to bound the titler's prefill at first 50 + last 50 tokens.
+    tokenizer: Arc<tokenizers::Tokenizer>,
     /// Shared tool execution context (notes / credentials / sessions /
     /// VFS stores).  Cloned per-conversation if scoping is later
     /// needed; for now it's workspace-wide.
     tool_host: ToolHost,
 }
+
+const TITLER_SYSTEM_PROMPT: &str = "You write short conversation titles. \
+Given the user's first message, reply with a 3-6 word title that captures its topic. \
+No quotes, no period, no preamble — just the title.";
+
+const TITLER_HEAD_TOKENS: usize = 50;
+const TITLER_TAIL_TOKENS: usize = 50;
+const TITLER_MAX_TOKENS: usize = 16;
 
 impl InferenceState {
     fn load(
@@ -60,7 +80,13 @@ impl InferenceState {
         model_path: PathBuf,
         tokenizer_path: PathBuf,
         workspace: PathBuf,
+        progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Arc<Self>> {
+        // Step 1: model. Engine ctor also reloads the substrate
+        // internally, so the visible boundary between Model and
+        // Substrate steps below is best-effort — the substrate has
+        // actually already loaded by the time we announce its step.
+        progress.set_step(LoadStep::Model);
         let device = candle::Device::cuda_if_available(0)
             .map_err(|e| anyhow::anyhow!("device init: {e}"))?;
 
@@ -83,12 +109,10 @@ impl InferenceState {
         // system_prompt; the layer's section selection switches to
         // TopK so only the K most relevant survive into projection.
         //
-        // Disabled for iteration speed. Safe now because the projection
-        // YAML pairs the `tools` collection with `tools_open` /
-        // `tools_close` sections gated by `depends_on: tools`. When the
-        // catalog is empty, both `<tools>` and `</tools>` markers also
-        // skip — no empty `<tools></tools>` block, no dangling tool
-        // protocol structure. Re-enable to restore tool calling.
+        // Temporarily disabled while we debug the bg-quantizer / persist
+        // chain: the tool catalog adds ~90 sections of bulky JSON to the
+        // base conversation which crowds the persisted-chunk inspector
+        // output and slows down iteration. Re-enable when ready.
         // let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
         //     .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
         // tracing::info!(
@@ -96,9 +120,20 @@ impl InferenceState {
         //     "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
         // );
         let tool_sections: Vec<()> = Vec::new();
+        let _ = dialogue_layer;
+
+        // The dialogue layer's `system_prompt.items` start with a static
+        // prelude (mode/frame/history_stance/grounding/tools_intro) →
+        // then the `tools` collection (90+ tool sections, top_k=3) →
+        // then `tools_outro`.  The pre-collection prelude is what we
+        // pass as the engine's `system_prompt` so it gets ChatML-wrapped
+        // for the dialect; everything after the first Collection is
+        // expanded by `preemptive_prefill` itself.
+        let before_text: String = pre_collection_prelude(&proj_builder);
 
         let mut builder = Model::Qwen3_30B_A3B_Q4
             .builder()
+            .system_prompt(&before_text)
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace)
@@ -120,19 +155,40 @@ impl InferenceState {
             )
             .map_err(|e| anyhow::anyhow!("set_system_markers: {e}"))?;
 
+        // Per-layer progress callback — the library reports
+        // `(layers_loaded, total_layers)` after each transformer block
+        // is mounted. We translate that into the LoadProgress fraction
+        // without coupling the library to our state machine.
+        let model_progress = Arc::clone(&progress);
+        let model_hook = move |done: usize, total: usize| {
+            model_progress.set_step_progress(done as u64, total as u64);
+        };
         let engine = builder
-            .engine(&device)
+            .engine_with_progress(&device, Some(&model_hook))
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
+        // Substrate reload happened inside the engine ctor. Announce it
+        // as the active step briefly so the frontend can render the
+        // checkmark transition, then move on to sections.
+        progress.set_step(LoadStep::Substrate);
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();
 
+        progress.set_step(LoadStep::Sections);
+        // Per-section progress callback — bytes ingested out of total
+        // section bytes (cheap proxy for tokens, smooth across uneven
+        // sections without a pre-tokenise pass).
+        let section_progress = Arc::clone(&progress);
+        let section_hook = move |done: u64, total: u64| {
+            section_progress.set_step_progress(done, total);
+        };
         let base_conv = engine
-            .new_conversation_with_projection(
+            .new_conversation_with_projection_progress(
                 &formatted_prompt,
                 proj_builder,
                 dialogue_layer,
                 primary_group,
                 conv_config.clone(),
+                Some(&section_hook),
             )
             .map_err(|e| anyhow::anyhow!("base conv create: {e}"))?;
 
@@ -151,11 +207,39 @@ impl InferenceState {
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
 
+        // Dedicated titler conversation. Lives on the `Reserved::Titler`
+        // id range (at the top of the u32 space) so its layer/group/section
+        // can't collide with the user schema's YAML-allocated ids — even
+        // though they share the same workspace substrate, the titler's
+        // turns never enter a user conversation's projection.
+        //
+        // Its KV cache for the (tiny) system prompt is prefilled once here;
+        // every title-generation reuses it.
+        let titler_formatted = conv_config
+            .dialect
+            .format_system_prompt(TITLER_SYSTEM_PROMPT);
+        let titler = engine
+            .new_reserved_conversation(
+                &titler_formatted,
+                projection::Reserved::Titler,
+                conv_config.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("titler create: {e}"))?;
+        let titler_timeline = titler.timeline_id();
+        let tokenizer = Arc::new(engine.tokenizer().clone());
+        tracing::info!(
+            titler_timeline = ?titler_timeline,
+            "titler conversation ready",
+        );
+
         Ok(Arc::new(Self {
             decoder,
             engine: std::sync::Mutex::new(engine),
             conversations: std::sync::Mutex::new(HashMap::new()),
             base_conv: std::sync::Mutex::new(base_conv),
+            titler: std::sync::Mutex::new(titler),
+            titler_timeline,
+            tokenizer,
             tool_host: ToolHost::new(),
         }))
     }
@@ -189,6 +273,7 @@ fn run_inference_stream(
             if user_message.len() > 60 { "…" } else { "" },
         );
 
+        let timeline = timeline_for(&conv_id);
         let conv_arc: Arc<std::sync::Mutex<ConvState>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
@@ -200,12 +285,7 @@ fn run_inference_stream(
                 // hash, so a daemon restart reconnects the client to the
                 // turns the substrate reload recovered for this conversation
                 // (§16.12). An unknown conv_id simply forks empty.
-                let conv = match state
-                    .base_conv
-                    .lock()
-                    .unwrap()
-                    .fork_resuming(timeline_for(&conv_id))
-                {
+                let conv = match state.base_conv.lock().unwrap().fork_resuming(timeline) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(conv_id = %conv_id, "fork failed: {e}");
@@ -219,7 +299,40 @@ fn run_inference_stream(
             }
         };
 
+        // Persist the conv_id ↔ timeline mapping *after* `fork_resuming`
+        // has registered the timeline in the substrate — otherwise
+        // `set_conv_id` no-ops in-RAM and the sidebar wouldn't see this
+        // conversation until the next daemon restart. Idempotent on
+        // repeat calls (no-op when the substrate already has it).
+        if let Err(e) = state
+            .engine
+            .lock()
+            .unwrap()
+            .set_conversation_conv_id(timeline, &conv_id)
+        {
+            tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
+        }
+
+        // Fire the titler in parallel with the main decode, now that
+        // the timeline is registered and the conv_id is in-RAM (so the
+        // titler's `set_conversation_label` write composes correctly
+        // with the conv_id field of the same Label record).
+        let already_labelled = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation_label_of(timeline)
+            .is_some();
+        if !already_labelled && !user_message.is_empty() {
+            let state_for_titler = Arc::clone(&state);
+            let user_msg_for_titler = user_message.clone();
+            std::thread::spawn(move || {
+                generate_and_set_title(state_for_titler, timeline, user_msg_for_titler);
+            });
+        }
+
         let mut cs = conv_arc.lock().unwrap();
+        let original_user_message = user_message.clone();
         let mut current_message = user_message;
 
         for iteration in 0..=MAX_TOOL_ITERATIONS {
@@ -372,9 +485,94 @@ fn run_inference_stream(
             let results = run_tool_calls(&state.tool_host.ctx, calls);
             current_message = format_tool_responses(&results);
         }
+
+        // Title generation has already been fired in parallel from
+        // `submit_with_sampling` — it doesn't depend on the main
+        // convo's state, so we don't repeat it here.
+        let _ = original_user_message;
     });
 
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Run the titler conversation against `user_message` and write the result
+/// as the main conversation's sidebar label. Runs on a detached thread so
+/// the user-facing SSE stream isn't blocked. Errors are logged and dropped
+/// — the worst case is a missing sidebar label, never a failed response.
+fn generate_and_set_title(
+    state: Arc<InferenceState>,
+    timeline: candle_conversation::projection::TimelineId,
+    user_message: String,
+) {
+    use candle_conversation::{TurnEvent, TurnOptions};
+
+    let truncated = head_tail_truncate(
+        &user_message,
+        &state.tokenizer,
+        TITLER_HEAD_TOKENS,
+        TITLER_TAIL_TOKENS,
+    );
+
+    let title = {
+        let mut titler = state.titler.lock().unwrap();
+        // Clear the titler's in-memory turn tree so each title-gen
+        // starts from just the system prompt (no accumulated history).
+        if let Err(e) = titler.reset() {
+            tracing::warn!("titler reset failed: {e}");
+            return;
+        }
+        let opts = TurnOptions {
+            max_tokens: Some(TITLER_MAX_TOKENS),
+            ..Default::default()
+        };
+        let handle = match titler.submit_turn_with_options(&truncated, opts) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("titler submit failed: {e}");
+                return;
+            }
+        };
+        let mut done = None;
+        for event in handle.stream() {
+            match event {
+                TurnEvent::Done(r) => {
+                    done = Some(r);
+                    break;
+                }
+                TurnEvent::Error(e) => {
+                    tracing::warn!("titler scheduler error: {e}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(resp) = done else {
+            tracing::warn!("titler ended without a response");
+            return;
+        };
+        let title_text = clean_title(&resp.text);
+        if let Err(e) = titler.finish_turn(handle, &resp) {
+            tracing::warn!("titler finish_turn failed: {e}");
+        }
+        title_text
+    };
+
+    if title.is_empty() {
+        tracing::warn!("titler produced an empty title — skipping label write");
+        return;
+    }
+
+    // Write the label via the engine's substrate-shared handle — no
+    // need for a Sequence (and therefore no lock on the user's ConvState).
+    let result = state
+        .engine
+        .lock()
+        .unwrap()
+        .set_conversation_label(timeline, &title);
+    match result {
+        Ok(()) => tracing::info!("conversation labelled: \"{title}\""),
+        Err(e) => tracing::warn!("set_conversation_label failed: {e}"),
+    }
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────
@@ -384,12 +582,50 @@ pub struct ZendSession {
     projection_builder: projection::Builder,
     #[allow(dead_code)] // read by api/ws_logs.rs in the bin target
     pub(crate) log: Arc<LogBus>,
-    /// Fires `true` once the model finishes loading (success or failure).
+    /// Fires `true` once the daemon transitions to fully-ready (every
+    /// load step complete). Used by submit-flow tasks waiting for the
+    /// engine to come up.
     ready_tx: tokio::sync::watch::Sender<bool>,
-    /// Current human-readable loading status, published at key milestones.
+    /// Current human-readable detail string for the active load step
+    /// (e.g. `"Downloading shard 3/8"`). Surfaced as the loading
+    /// section's `detail` field in `GET /v1/status`.
     pub(crate) status_tx: tokio::sync::watch::Sender<String>,
+    /// Structured load-state machine — drives the frontend's loading
+    /// overlay (current step + progress + completed list).
+    load_progress: Arc<LoadProgress>,
+    /// Wall-clock time (ms since Unix epoch) when this `ZendSession` was
+    /// constructed — i.e. when the daemon process started. Surfaced via
+    /// `GET /v1/status` so the frontend can detect daemon restarts and
+    /// re-fetch the conversations list.
+    started_at_ms: u64,
     /// Populated in the background after construction; None until model loads.
     inference: Arc<std::sync::RwLock<Option<Arc<InferenceState>>>>,
+}
+
+/// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
+/// daemon is fully ready (chat unlocked); `Some` while any startup step
+/// is still in flight. `started_at_ms` changes only across daemon
+/// restarts — the frontend uses it to detect a restart and re-fetch.
+pub struct StatusSnapshot {
+    pub loading: Option<LoadingSnapshot>,
+    pub detail: String,
+    pub started_at_ms: u64,
+}
+
+/// Sidebar entry surfaced by `GET /v1/conversations`. Built directly from
+/// the substrate — the `RecordType::Label` records carry the `conv_id`
+/// string and the human label, and that's the whole sidebar contract.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConvEntry {
+    /// Client-supplied `conv_id` string — stable across daemon restarts,
+    /// used as the sidebar's `id` and echoed back in chat requests.
+    pub id: String,
+    /// Human-readable title. Empty during the brief window between
+    /// first-submit and titler-completion.
+    pub label: String,
+    /// Number of recovered turns for this conversation, from the
+    /// substrate. Advisory display field.
+    pub turn_count: u32,
 }
 
 impl ZendSession {
@@ -398,6 +634,10 @@ impl ZendSession {
         tracing::info!(workspace = %config.workspace.display(), "session initialised");
         let (ready_tx, _) = tokio::sync::watch::channel(false);
         let (status_tx, _) = tokio::sync::watch::channel(String::new());
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         Self {
             inference: Arc::new(std::sync::RwLock::new(None)),
             config,
@@ -405,7 +645,80 @@ impl ZendSession {
             log,
             ready_tx,
             status_tx,
+            load_progress: Arc::new(LoadProgress::new()),
+            started_at_ms,
         }
+    }
+
+    /// Snapshot for `GET /v1/status`. `loading=None` once every startup
+    /// step is complete (chat unlocked); `Some` while any step is still
+    /// in flight. `detail` is the active step's free-form sub-status
+    /// (e.g. download progress). `started_at_ms` is fixed for the
+    /// lifetime of this `ZendSession` and changes only across daemon
+    /// restarts.
+    pub fn status_snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot {
+            loading: self.load_progress.snapshot(),
+            detail: self.status_tx.subscribe().borrow().clone(),
+            started_at_ms: self.started_at_ms,
+        }
+    }
+
+    /// Sidebar entries for `GET /v1/conversations`. Built **directly from
+    /// the substrate** — the `RecordType::Label` records carry every
+    /// conversation's `(conv_id, label)` pair, and the substrate's
+    /// `recovered_timelines()` supplies turn counts.
+    ///
+    /// Sorted newest-first by `conv_id` string descending (the frontend
+    /// supplies `Date.now()` ids, so lexicographic-descending == newest).
+    /// The titler's internal timeline is excluded.
+    pub fn list_conversations(&self) -> Vec<ConvEntry> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return Vec::new();
+        };
+        let engine = state.engine.lock().unwrap();
+        let titler_timeline = state.titler_timeline;
+        let turn_counts: std::collections::HashMap<projection::TimelineId, u32> = {
+            let base = state.base_conv.lock().unwrap();
+            base.recovered_timelines().into_iter().collect()
+        };
+        let mut entries: Vec<ConvEntry> = engine
+            .known_conversations()
+            .into_iter()
+            .filter(|(tl, _, _)| *tl != titler_timeline)
+            .map(|(tl, conv_id, label)| ConvEntry {
+                id: conv_id,
+                label,
+                turn_count: turn_counts.get(&tl).copied().unwrap_or(0),
+            })
+            .collect();
+        entries.sort_by(|a, b| b.id.cmp(&a.id));
+        entries
+    }
+
+    /// Decoded turn history for a single recovered conversation — backs
+    /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
+    /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
+    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String)>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = timeline_for(conv_id);
+        let raw = {
+            let base = state.base_conv.lock().unwrap();
+            base.recovered_history(timeline)
+        };
+        let decoded = raw
+            .into_iter()
+            .map(|(role, tokens)| {
+                let text = state.decoder.decode(&tokens);
+                let role = match role {
+                    candle_conversation::Role::User => Role::User,
+                    candle_conversation::Role::Assistant => Role::Assistant,
+                    candle_conversation::Role::System => Role::System,
+                };
+                (role, text)
+            })
+            .collect();
+        Some(decoded)
     }
 
     pub fn start_loading(self: &Arc<Self>) {
@@ -413,14 +726,21 @@ impl ZendSession {
         let proj_builder = self.projection_builder.clone();
         let ready_tx = self.ready_tx.clone();
         let status_tx = self.status_tx.clone();
+        let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
         tokio::spawn(async move {
+            load_progress.set_step(LoadStep::Model);
             status_tx.send("Checking for model…".into()).ok();
             let (model_path, tok_path) = match crate::download::ensure_model(&status_tx).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("model download failed: {e:#}");
                     status_tx.send(format!("Download failed: {e}")).ok();
+                    // Surface the error to anyone waiting on ready by
+                    // flipping into the ready state with the error
+                    // detail still visible — the chat will fail loudly
+                    // when the user actually submits.
+                    load_progress.mark_ready();
                     ready_tx.send(true).ok();
                     return;
                 }
@@ -428,15 +748,32 @@ impl ZendSession {
 
             status_tx.send("Loading model…".into()).ok();
             tracing::info!("loading inference engine (Qwen3-30B-A3B) …");
+            let load_progress_for_blocking = Arc::clone(&load_progress);
             match tokio::task::spawn_blocking(move || {
-                InferenceState::load(proj_builder, model_path, tok_path, workspace)
+                InferenceState::load(
+                    proj_builder,
+                    model_path,
+                    tok_path,
+                    workspace,
+                    load_progress_for_blocking,
+                )
             })
             .await
             {
                 Ok(Ok(state)) => {
-                    *slot.write().unwrap() = Some(state);
+                    *slot.write().unwrap() = Some(Arc::clone(&state));
                     tracing::info!("inference engine ready");
                     status_tx.send(String::new()).ok();
+                    spawn_periodic_flush(state);
+
+                    // Steps 4 + 5 are stubbed for now — we walk through
+                    // them so the frontend sees the full state-machine
+                    // progression. When the workspace scan / per-file
+                    // prefill paths land, the real work goes here.
+                    load_progress.set_step(LoadStep::RepoScan);
+                    // (no work yet)
+                    load_progress.set_step(LoadStep::CodeRead);
+                    // (no work yet)
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("inference engine failed to load: {e:#}");
@@ -447,6 +784,7 @@ impl ZendSession {
                     status_tx.send("Model load panicked.".into()).ok();
                 }
             }
+            load_progress.mark_ready();
             ready_tx.send(true).ok();
         });
     }
@@ -546,11 +884,22 @@ impl ZendSession {
                 }
             }
 
-            // Phase 2 — generate tokens.
+            // Phase 2 — generate tokens. `run_inference_stream` handles
+            // the fork (which registers the timeline in the substrate),
+            // then persists the conv_id and spawns the titler in
+            // parallel — all in the right order so the in-RAM substrate
+            // sees both the timeline registration and the conv_id by
+            // the time the next sidebar refresh runs.
             let state: Option<Arc<InferenceState>> =
                 { inference.read().unwrap().as_ref().map(Arc::clone) };
             if let Some(state) = state {
-                let mut ts = run_inference_stream(state, conv_id, last_user, max_tokens, sampling);
+                let mut ts = run_inference_stream(
+                    state,
+                    conv_id.clone(),
+                    last_user.clone(),
+                    max_tokens,
+                    sampling,
+                );
                 while let Some(item) = ts.next().await {
                     if tx.send(item.map(StreamItem::Token)).await.is_err() {
                         break;
@@ -569,12 +918,102 @@ impl ZendSession {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Cap on the periodic substrate flush — the bg-quantizer's persist
+/// callback writes Chunk records asynchronously after a turn completes,
+/// so without this tick they'd sit un-`fsync`'d until shutdown. Five
+/// seconds is the maximum window of data loss in a crash.
+const PERIODIC_FLUSH_SECS: u64 = 5;
+
+/// Background `fsync` heartbeat. Every [`PERIODIC_FLUSH_SECS`] seconds,
+/// asks the engine to flush iff there's staged data — a no-op when
+/// idle. Covers two cases the per-turn commit misses:
+///
+/// - **Async chunk writes.** The bg-quantizer's persist callback fires
+///   *after* a turn's `commit_persistence`, so its Chunk records and
+///   post-quant `Commit` are staged but un-`fsync`'d until the next
+///   call. This tick catches them.
+/// - **Mid-conversation idleness.** A workspace that sits quiet between
+///   turns gets its tail durabilised within the 5-second window instead
+///   of waiting for shutdown.
+fn spawn_periodic_flush(state: Arc<InferenceState>) {
+    use std::time::Duration;
+    use tokio::time::{interval, MissedTickBehavior};
+
+    tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(PERIODIC_FLUSH_SECS));
+        // If the runtime is starved (a long blocking task on the worker
+        // pool, say), skip catch-up ticks — one flush is as durable as
+        // several.
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // First tick fires immediately by default — discard it so we
+        // don't flush at engine-ready time when nothing has been
+        // written yet.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let state = Arc::clone(&state);
+            let flushed = tokio::task::spawn_blocking(move || {
+                state
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .commit_persistence_if_pending()
+            })
+            .await;
+            match flushed {
+                Ok(Ok(true)) => tracing::debug!("periodic flush: substrate fsynced"),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => tracing::warn!("periodic flush failed: {e}"),
+                Err(e) => tracing::warn!("periodic flush task panicked: {e}"),
+            }
+        }
+    });
+}
+
 /// The [`projection::TimelineId`] a client `conv_id` maps to — a stable hash
 /// of the id. Deterministic across daemon restarts, so a reconnecting client
 /// resolves to the same timeline the substrate reload recovered (§16.12).
 fn timeline_for(conv_id: &str) -> projection::TimelineId {
     let h = content_hash::hash_bytes(conv_id.as_bytes());
     projection::TimelineId::from_raw(h.lo.max(1)).expect("timeline id is non-zero")
+}
+
+/// Cap the titler's prefill at `head + tail` tokens. For short messages
+/// (≤ head+tail) the text is returned verbatim; for long ones the head and
+/// tail token windows are decoded back to text and joined with `" … "`.
+/// This bounds title-generation latency regardless of how much the user
+/// pasted into their first message.
+fn head_tail_truncate(
+    text: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    head: usize,
+    tail: usize,
+) -> String {
+    let Ok(encoded) = tokenizer.encode(text, false) else {
+        return text.to_string();
+    };
+    let ids = encoded.get_ids();
+    if ids.len() <= head + tail {
+        return text.to_string();
+    }
+    let head_text = tokenizer
+        .decode(&ids[..head], false)
+        .unwrap_or_default();
+    let tail_text = tokenizer
+        .decode(&ids[ids.len() - tail..], false)
+        .unwrap_or_default();
+    format!("{head_text} … {tail_text}")
+}
+
+/// Clean a model-generated title: strip wrapping quotes, trailing
+/// punctuation, and any leading "Title:" prefix the model might add.
+fn clean_title(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s.strip_prefix("Title:").unwrap_or(s).trim();
+    let s = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(s);
+    let s = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')).unwrap_or(s);
+    let s = s.trim_end_matches(|c: char| c == '.' || c == '!' || c == '?');
+    s.trim().to_string()
 }
 
 fn build_projection_builder(workspace: &Path) -> projection::Builder {

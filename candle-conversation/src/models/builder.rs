@@ -576,11 +576,16 @@ impl ModelBuilder {
         &self,
         model_path: &Path,
         device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
     ) -> crate::Result<Box<dyn crate::ManagedBatchedModel + Send>> {
         let max_seq = self.max_seq_len;
         match self.spec.arch {
             ModelArch::Qwen3 => {
                 use candle_transformers::models::quantized_qwen3::ModelWeights;
+                // Per-layer progress not yet wired for this arch — the
+                // callback simply doesn't fire. Add `progress` to the
+                // arch's loader to enable it.
+                let _ = progress;
                 let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
                 let inv = raw.rope_inv_freq().ok_or_else(|| {
                     ConversationError::Model(candle::Error::Msg(
@@ -593,7 +598,7 @@ impl ModelBuilder {
             }
             ModelArch::Qwen3Moe => {
                 use candle_transformers::models::quantized_qwen3_moe::ModelWeights;
-                let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
+                let raw = ModelWeights::from_gguf_by_path(model_path, device, progress)?;
                 let inv = raw.rope_inv_freq().ok_or_else(|| {
                     ConversationError::Model(candle::Error::Msg(
                         "model missing rope inv_freq".into(),
@@ -605,6 +610,8 @@ impl ModelBuilder {
             }
             ModelArch::Qwen2 => {
                 use candle_transformers::models::quantized_qwen2::ModelWeights;
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
                 let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
                 let inv = raw.rope_inv_freq().ok_or_else(|| {
                     ConversationError::Model(candle::Error::Msg(
@@ -617,6 +624,8 @@ impl ModelBuilder {
             }
             ModelArch::Llama => {
                 use candle_transformers::models::quantized_llama::ModelWeights;
+                // Per-layer progress not yet wired for this arch.
+                let _ = progress;
                 let raw = ModelWeights::from_gguf_by_path(model_path, device)?;
                 let inv = raw.rope_inv_freq().ok_or_else(|| {
                     ConversationError::Model(candle::Error::Msg(
@@ -637,6 +646,19 @@ impl ModelBuilder {
     /// are used. Otherwise, the files are downloaded from HuggingFace
     /// (requires the `hub` crate feature).
     pub fn engine(&mut self, device: &Device) -> crate::Result<crate::ConversationEngine> {
+        self.engine_with_progress(device, None)
+    }
+
+    /// Same as [`Self::engine`] but accepts an optional per-layer
+    /// progress callback. The callback is invoked as
+    /// `(layers_loaded, total_layers)` after each transformer block's
+    /// weights are mounted — enables a UI progress bar without
+    /// coupling this builder to the daemon's progress type.
+    pub fn engine_with_progress(
+        &mut self,
+        device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<crate::ConversationEngine> {
         let (model_path, tokenizer_path) = self.resolve_paths()?;
 
         // ── Read GGUF metadata ──────────────────────────────────────────
@@ -788,7 +810,7 @@ impl ModelBuilder {
             tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
-        let model = self.load_model(&model_path, device)?;
+        let model = self.load_model(&model_path, device, progress)?;
 
         // Auto-derive max_hot_turns from arena geometry unless the caller
         // overrode it. Must happen before conversation_config() is called below.

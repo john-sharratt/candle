@@ -136,6 +136,7 @@ pub(crate) fn startup_two_tier(
     mmap: &[u8],
     host_refs: &[Vec<MmapExpertRef>],
     cuda_dev: &candle::CudaDevice,
+    progress: Option<&dyn Fn(usize, usize)>,
 ) {
     let num_moe_layers = host_refs.len();
     let num_experts = if num_moe_layers > 0 {
@@ -148,6 +149,7 @@ pub(crate) fn startup_two_tier(
     if total_slots == 0 || num_moe_layers == 0 || num_experts == 0 {
         return;
     }
+    let total_experts = num_moe_layers * num_experts;
 
     tracing::info!(
         "startup: repacking {}×{} experts → {} VRAM + {} pinned slots …",
@@ -220,6 +222,9 @@ pub(crate) fn startup_two_tier(
                     tracing::warn!("startup: repack failed L{moe_idx}E{expert_idx}: {e}");
                     errors += 1;
                 }
+            }
+            if let Some(cb) = progress {
+                cb(moe_idx * num_experts + expert_idx + 1, total_experts);
             }
         }
         // Progress every 8 layers.

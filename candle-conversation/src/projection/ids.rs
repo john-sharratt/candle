@@ -39,6 +39,42 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Names an *engine-internal* projection-id category — a "well-known" kind
+/// of conversation the engine builds on its own (not user-defined YAML).
+///
+/// Reserved ids occupy slots at the top of the [`u32`] range so they can
+/// never collide with the `1..n` ids allocated to user schemas by YAML
+/// parsing. The compiler is the only thing that can construct one — there
+/// is no public way to fabricate a reserved id from a magic integer.
+///
+/// Adding a new internal kind is one new variant plus one [`Self::slot`]
+/// arm. Each kind reuses the same slot across all three of
+/// [`LayerId`] / [`GroupId`] / [`SectionId`] — they're disjoint newtypes
+/// so cross-type collisions can't happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reserved {
+    /// The daemon's titler conversation — generates sidebar labels from
+    /// the first user message of each main conversation. Lives on its
+    /// own layer/group/section so its turns never enter a user
+    /// conversation's projection.
+    Titler,
+}
+
+impl Reserved {
+    /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
+    /// slot 1 = `u32::MAX - 1`, etc.
+    const fn slot(self) -> u32 {
+        match self {
+            Reserved::Titler => 0,
+        }
+    }
+
+    /// Raw numeric value used by every reserved id of this kind.
+    const fn raw(self) -> u32 {
+        u32::MAX - self.slot()
+    }
+}
+
 /// Opaque identifier for a layer. Assigned in declaration order at construction
 /// (first layer = `LayerId(1)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -48,6 +84,17 @@ impl LayerId {
     /// Constructor restricted to the projection module.
     pub(super) fn new(n: u32) -> Self {
         Self(NonZeroU32::new(n).expect("LayerId must be non-zero"))
+    }
+
+    /// The reserved layer id for an engine-internal kind. Disjoint from
+    /// the `1..n` range YAML allocates.
+    pub const fn reserved(kind: Reserved) -> Self {
+        // Safety: every `Reserved::*` slot maps to a value in
+        // `(0, u32::MAX]`, all of which are non-zero.
+        match NonZeroU32::new(kind.raw()) {
+            Some(nz) => Self(nz),
+            None => panic!("Reserved::raw produced zero"),
+        }
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -78,6 +125,15 @@ impl GroupId {
         Self(NonZeroU32::new(n).expect("GroupId must be non-zero"))
     }
 
+    /// The reserved group id for an engine-internal kind. Disjoint from
+    /// the `1..n` range YAML allocates.
+    pub const fn reserved(kind: Reserved) -> Self {
+        match NonZeroU32::new(kind.raw()) {
+            Some(nz) => Self(nz),
+            None => panic!("Reserved::raw produced zero"),
+        }
+    }
+
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn for_test(n: u32) -> Self {
         Self(NonZeroU32::new(n.max(1)).unwrap())
@@ -102,6 +158,15 @@ pub struct SectionId(pub(super) NonZeroU32);
 impl SectionId {
     pub fn new(n: u32) -> Self {
         Self(NonZeroU32::new(n).expect("SectionId must be non-zero"))
+    }
+
+    /// The reserved section id for an engine-internal kind. Disjoint from
+    /// the `1..n` range YAML allocates.
+    pub const fn reserved(kind: Reserved) -> Self {
+        match NonZeroU32::new(kind.raw()) {
+            Some(nz) => Self(nz),
+            None => panic!("Reserved::raw produced zero"),
+        }
     }
 
     pub fn raw(self) -> u32 {

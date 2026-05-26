@@ -151,6 +151,7 @@ impl ExpertCache {
     /// After startup the GGUF mmap is no longer needed.
     ///
     /// **Non-CUDA path:** fills VRAM from mmap (legacy GGML path).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mmap: Arc<memmap2::Mmap>,
         host_refs: Vec<Vec<MmapExpertRef>>,
@@ -158,6 +159,7 @@ impl ExpertCache {
         device: &Device,
         experts_per_layer: usize,
         _gguf_path: Option<&std::path::Path>,
+        progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
         let num_moe_layers = host_refs.len();
         let mut inner = ExpertCacheInner::new(num_slots, num_moe_layers, experts_per_layer);
@@ -305,6 +307,7 @@ impl ExpertCache {
                     &mmap,
                     &host_refs,
                     cuda_dev,
+                    progress,
                 );
 
                 (pool, locations, geoms, all_resident)
@@ -319,7 +322,10 @@ impl ExpertCache {
 
         // ── Non-CUDA prewarm path ──
         #[cfg(not(feature = "cuda"))]
-        prewarm_expert_cache(&mut inner, &mmap, &host_refs, device);
+        {
+            let _ = progress; // not yet wired into the legacy prewarm path
+            prewarm_expert_cache(&mut inner, &mmap, &host_refs, device);
+        }
 
         // Non-CUDA: all_resident is always false (no VRAM cache to fill).
         #[cfg(not(feature = "cuda"))]

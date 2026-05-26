@@ -214,7 +214,8 @@ mod tests;
 pub use builder::Builder;
 pub use error::ConstructionError;
 pub use ids::{
-    CollectionId, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnId, TurnIndex,
+    CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
+    TurnIndex,
 };
 pub use project::{Projection, ProjectionMode, ProjectionTarget, ResolvedSection, ResolvedTurn};
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};

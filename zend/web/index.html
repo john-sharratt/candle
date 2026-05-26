@@ -166,6 +166,7 @@
       flex: 1; min-height: 0;
       display: flex; flex-direction: column;
       width: 100%;
+      position: relative;
     }
 
     /* ── Empty state ───────────────────────────────────────────────────────── */
@@ -199,6 +200,72 @@
     .card-sub   { font-size: 0.76rem; color: var(--text-dim); line-height: 1.4; }
 
     /* ── Chat view ─────────────────────────────────────────────────────────── */
+
+    /* ── Loading overlay ──────────────────────────────────────────────────── */
+    #loading-overlay {
+      position: absolute; inset: 0; z-index: 50;
+      display: none;
+      align-items: center; justify-content: center;
+      /* Semi-opaque dark layer over whatever was behind (chat view of
+         the selected conversation, empty state, etc.) — dims the content
+         so the loading card stands out but you can still glimpse the
+         chrome behind it. */
+      background: rgba(15, 13, 12, 0.55);
+      backdrop-filter: blur(2px);
+    }
+    #loading-overlay.active { display: flex; }
+
+    /* While the daemon is loading, hide the chrome that doesn't make
+       sense yet — sidebar, its resizer, the welcome card behind the
+       overlay, and the chat input. The log pane stays visible since
+       it's the easiest way to see what the daemon is doing. */
+    body.loading #sidebar,
+    body.loading #resizer-l,
+    body.loading #empty-state,
+    body.loading #input-bar { display: none; }
+    .loading-card {
+      width: min(520px, 90%);
+      padding: 2rem 2.25rem;
+      background: #1c1a18;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 10px 32px rgba(0,0,0,0.45);
+    }
+    .loading-title {
+      font-size: 0.78rem; font-weight: 650;
+      color: #8a7b6a; letter-spacing: 0.08em; text-transform: uppercase;
+      margin: 0 0 1.2rem 0;
+    }
+    .loading-current-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.85rem; }
+    .loading-spinner {
+      width: 14px; height: 14px; border-radius: 50%;
+      border: 2px solid #c98a3e; border-top-color: transparent;
+      animation: spin 0.9s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-current { font-size: 1.05rem; font-weight: 500; color: var(--text); }
+    .loading-progress-track {
+      height: 6px; background: #2a2724; border-radius: 3px; overflow: hidden;
+      margin-bottom: 1.1rem;
+    }
+    .loading-progress-bar {
+      height: 100%; background: linear-gradient(90deg, #c98a3e, #e0a85a);
+      width: 0%;
+      transition: width 0.25s ease-out;
+    }
+    .loading-completed-list { list-style: none; padding: 0; margin: 0 0 0.9rem 0; }
+    .loading-completed-list li {
+      font-size: 0.88rem; color: #7c736a; padding: 0.2rem 0;
+      display: flex; align-items: center; gap: 0.6rem;
+    }
+    .loading-completed-list li::before {
+      content: '✓'; color: #34d399; font-weight: 700;
+    }
+    .loading-detail {
+      font-size: 0.82rem; color: #5e554c; margin-top: 0.6rem;
+      min-height: 1.2em; font-variant-numeric: tabular-nums;
+    }
 
     #chat-view {
       display: none; flex-direction: column;
@@ -460,6 +527,20 @@
   <!-- ── Middle column — chat ───────────────────────────────────────────── -->
   <div id="main">
     <div id="app">
+      <div id="loading-overlay">
+        <div class="loading-card">
+          <h2 class="loading-title">Starting up</h2>
+          <div class="loading-current-row">
+            <div class="loading-spinner"></div>
+            <span class="loading-current" id="loading-current">Loading model</span>
+          </div>
+          <div class="loading-progress-track">
+            <div class="loading-progress-bar" id="loading-progress"></div>
+          </div>
+          <ul class="loading-completed-list" id="loading-completed"></ul>
+          <div class="loading-detail" id="loading-detail"></div>
+        </div>
+      </div>
       <div id="empty-state">
         <div class="logo-area">
           <svg width="52" height="52" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" style="display:block">
@@ -627,6 +708,180 @@ document.getElementById('new-chat-btn').addEventListener('click', newConversatio
 document.querySelectorAll('.card').forEach(c =>
   c.addEventListener('click', () => { send(c.dataset.prompt); promptEl.focus(); }));
 newConversation();
+
+// ── Recovered conversations sidebar ────────────────────────────────────────────
+//
+// Once the daemon finishes loading its substrate redo log it can list the
+// conversations it recovered. We poll `/v1/status` until ready, then fetch
+// `/v1/conversations` and merge those entries into the sidebar. Clicking a
+// recovered entry lazily lifts its turns off disk via
+// `/v1/conversations/{id}` and renders them like any in-memory conversation.
+
+// Conv IDs we have already pulled history for — keyed by string form of id.
+const loadedRemote = new Set();
+
+// Last daemon boot timestamp we've observed via `/v1/status`. When the
+// daemon restarts this changes, which is the trigger to re-fetch the
+// conversations sidebar. `null` until the first successful status call.
+let lastDaemonStartedAt = null;
+
+async function refreshRecoveredConversations() {
+  let body;
+  try {
+    const res = await fetch('/v1/conversations');
+    if (!res.ok) return;
+    body = await res.json();
+  } catch (_) { return; }
+  if (!body || !Array.isArray(body.conversations)) return;
+  let added = 0;
+  for (const entry of body.conversations) {
+    if (conversations.some(c => String(c.id) === entry.id)) continue;
+    conversations.push({
+      id: entry.id,
+      title: entry.label || 'Conversation',
+      history: [],
+      remote: true,           // hydrate from server on first switchTo
+      updated_ms: entry.updated_ms ?? 0,
+    });
+    added++;
+  }
+  if (added > 0) {
+    // Newest-first by updated_ms; the unsaved local "New conversation" has
+    // no updated_ms and stays at the top.
+    conversations.sort((a, b) => {
+      const aTime = a.updated_ms ?? Number.MAX_SAFE_INTEGER;
+      const bTime = b.updated_ms ?? Number.MAX_SAFE_INTEGER;
+      return bTime - aTime;
+    });
+    renderSidebar();
+  }
+}
+
+async function hydrateConversation(conv) {
+  if (!conv.remote || loadedRemote.has(String(conv.id))) return;
+  loadedRemote.add(String(conv.id));
+  try {
+    const res = await fetch(`/v1/conversations/${encodeURIComponent(conv.id)}`);
+    if (!res.ok) return;
+    const body = await res.json();
+    if (!body || !Array.isArray(body.messages)) return;
+    // Each substrate "turn" stores one iteration's full ChatML stream
+    // (`<|im_start|>user\n…<|im_end|><|im_start|>assistant\n…`). The
+    // tokenizer's decoder strips the special tokens, leaving literal
+    // `user\n` / `assistant\n` role markers on their own lines. Split
+    // each fetched message on those markers so each role becomes its
+    // own bubble.
+    conv.history = body.messages
+      .flatMap(m => splitChatMLTurn(m.role, m.content))
+      .filter(m => m.role === 'user' || m.role === 'assistant');
+    if (activeId === conv.id) rebuildChatView(conv);
+  } catch (_) { /* leave history empty — user can still send a new turn */ }
+}
+
+// Split a single substrate-stored turn's content into role-attributed
+// sub-messages. Lines that are exactly `user`, `assistant`, or
+// `system` (no other text) mark role boundaries. Within a user
+// segment, strip the `/no_think` dialect prefix; drop the segment
+// entirely if it's just a `<tool_response>…</tool_response>` wrapper
+// (those are tool-loop scaffolding, not human content). Assistant
+// segments pass through untouched — `renderContent` already turns
+// `<tool_call>…</tool_call>` into the inline tool-call card.
+function splitChatMLTurn(fallbackRole, content) {
+  const lines = content.split('\n');
+  const segments = [];
+  let role = fallbackRole;
+  let buf = [];
+
+  const flush = () => {
+    let text = buf.join('\n').trim();
+    if (role === 'user') {
+      text = text.replace(/^\/no_think\s*/, '').trim();
+      if (text.startsWith('<tool_response>') && text.endsWith('</tool_response>')) {
+        buf = [];
+        return;
+      }
+    }
+    if (text) segments.push({ role, content: text });
+    buf = [];
+  };
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (t === 'user' || t === 'assistant' || t === 'system') {
+      flush();
+      role = t;
+    } else {
+      buf.push(line);
+    }
+  }
+  flush();
+  return segments;
+}
+
+// Hook switchTo: when the user picks a remote conv, hydrate it on demand.
+{
+  const origSwitchTo = switchTo;
+  switchTo = function(id) {
+    const conv = conversations.find(c => c.id === id);
+    origSwitchTo(id);
+    if (conv && conv.remote && !loadedRemote.has(String(conv.id))) {
+      hydrateConversation(conv).then(() => {
+        if (activeId === conv.id) rebuildChatView(conv);
+      });
+    }
+  };
+}
+
+// Loading overlay elements.
+const loadingOverlay  = document.getElementById('loading-overlay');
+const loadingCurrent  = document.getElementById('loading-current');
+const loadingProgress = document.getElementById('loading-progress');
+const loadingComplete = document.getElementById('loading-completed');
+const loadingDetail   = document.getElementById('loading-detail');
+
+function renderLoadingState(body) {
+  if (body.state === 'ready') {
+    loadingOverlay.classList.remove('active');
+    document.body.classList.remove('loading');
+    return;
+  }
+  // body.state === 'loading'
+  loadingOverlay.classList.add('active');
+  document.body.classList.add('loading');
+  const info = body.loading || { current: '', progress: 0, completed: [] };
+  loadingCurrent.textContent  = info.current || 'Starting…';
+  loadingProgress.style.width = Math.round((info.progress || 0) * 100) + '%';
+  loadingDetail.textContent   = body.detail || '';
+  // Render completed list (idempotent — we just rewrite it).
+  loadingComplete.innerHTML = '';
+  for (const label of info.completed || []) {
+    const li = document.createElement('li');
+    li.textContent = label;
+    loadingComplete.appendChild(li);
+  }
+}
+
+// Continuous status poll. Drives both the loading overlay (during
+// startup) and the daemon-restart detector (whenever `started_at_ms`
+// changes, we re-fetch the conversations sidebar).
+(async function pollDaemonStatus() {
+  while (true) {
+    try {
+      const res = await fetch('/v1/status');
+      if (res.ok) {
+        const body = await res.json();
+        renderLoadingState(body);
+        const startedAt = body.started_at_ms;
+        const isReady = body.state === 'ready';
+        if (isReady && startedAt !== lastDaemonStartedAt) {
+          lastDaemonStartedAt = startedAt;
+          await refreshRecoveredConversations();
+        }
+      }
+    } catch (_) { /* network blip — retry */ }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+})();
 
 function updateSendBtn() {
   const conv  = conversations.find(c => c.id === activeId);
@@ -914,6 +1169,34 @@ async function send(text) {
   if (activeId === convId) {
     updateSendBtn();
     promptEl.focus();
+  }
+
+  // After a successful turn, the daemon's titler may have written a
+  // substrate-backed sidebar label by now (or it's about to). Pull the
+  // server's view and update this conv's title in place if it changed.
+  // The titler runs in parallel with decode so the label often lands
+  // before [DONE]; the few cases where it's still in flight get caught
+  // by a short retry.
+  if (!failed) {
+    refreshTitleForConv(conv);
+  }
+}
+
+async function refreshTitleForConv(conv) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch('/v1/conversations');
+      if (res.ok) {
+        const body = await res.json();
+        const remote = (body.conversations || []).find(c => c.id === String(conv.id));
+        if (remote && remote.label && remote.label !== conv.title) {
+          conv.title = remote.label;
+          renderSidebar();
+          return;
+        }
+      }
+    } catch (_) { /* network blip — retry */ }
+    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
   }
 }
 

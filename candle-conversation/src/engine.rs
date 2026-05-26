@@ -242,6 +242,76 @@ impl ConversationEngine {
     ///
     /// * `system_prompt` — The formatted system prompt text. Pass `""` for none.
     /// * `config` — Per-conversation configuration (role markers, sampling, etc.).
+    /// Persist a sidebar label for `timeline` to the workspace substrate.
+    /// Last-write-wins; preserves whatever `conv_id` is already known
+    /// for this timeline. The daemon's titler is the typical caller.
+    pub fn set_conversation_label(
+        &self,
+        timeline: crate::projection::TimelineId,
+        label: &str,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_label(timeline, label)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Persist the client-supplied `conv_id` for `timeline`. Idempotent;
+    /// callers can invoke on every submit. Preserves any existing label.
+    /// This is the "substrate-as-single-source-of-truth" replacement for
+    /// the old daemon-side `conv_labels.json` sidecar — the conv_id ↔
+    /// timeline mapping now lives in the redo log.
+    pub fn set_conversation_conv_id(
+        &self,
+        timeline: crate::projection::TimelineId,
+        conv_id: &str,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_conv_id(timeline, conv_id)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Read the workspace substrate's sidebar label for `timeline`, or
+    /// `None` if none has been recorded. Useful for "should we still run
+    /// the titler?" checks at submit time.
+    pub fn conversation_label_of(
+        &self,
+        timeline: crate::projection::TimelineId,
+    ) -> Option<String> {
+        self.conversation.label_of(timeline)
+    }
+
+    /// Every conversation the workspace substrate knows about —
+    /// `(timeline, conv_id, label)` triples. Drives the daemon's
+    /// `GET /v1/conversations` sidebar listing directly.
+    pub fn known_conversations(
+        &self,
+    ) -> Vec<(crate::projection::TimelineId, String, String)> {
+        self.conversation.known_conversations()
+    }
+
+    /// Build an **engine-internal** conversation that lives on the reserved
+    /// id range for `kind` — disjoint from any YAML-allocated user schema.
+    ///
+    /// This is the right entry point for synthetic helper conversations
+    /// (the daemon's titler, future label-summarisers, etc.) that share
+    /// the same workspace substrate as user conversations but must never
+    /// have their turns enter user-projection retrieval.
+    ///
+    /// `system_prompt` may be either pre-formatted with dialect markers
+    /// or raw text — `new_conversation_with_projection` handles wrapping
+    /// the same way it does for user prompts.
+    pub fn new_reserved_conversation(
+        &self,
+        system_prompt: &str,
+        kind: crate::projection::Reserved,
+        config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
+        let layer_id = crate::projection::LayerId::reserved(kind);
+        let group_id = crate::projection::GroupId::reserved(kind);
+        self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
+    }
+
     pub fn new_conversation(
         &self,
         system_prompt: &str,
@@ -285,6 +355,32 @@ impl ConversationEngine {
         layer: crate::projection::LayerId,
         group: crate::projection::GroupId,
         config: SequenceConfig,
+    ) -> crate::Result<Sequence> {
+        self.new_conversation_with_projection_progress(
+            system_prompt,
+            builder,
+            layer,
+            group,
+            config,
+            None,
+        )
+    }
+
+    /// Same as [`Self::new_conversation_with_projection`] but accepts an
+    /// optional progress callback fired as the schema's pinned sections
+    /// are prefilled. The callback receives
+    /// `(chars_done, total_chars)` — total content-bytes across every
+    /// schema-declared section (including collection members). Used by
+    /// the daemon's loading overlay; library callers pass `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_conversation_with_projection_progress(
+        &self,
+        system_prompt: &str,
+        builder: Builder,
+        layer: crate::projection::LayerId,
+        group: crate::projection::GroupId,
+        config: SequenceConfig,
+        section_progress: Option<&dyn Fn(u64, u64)>,
     ) -> crate::Result<Sequence> {
         // Persist the projection schema as the substrate's `Template` record
         // (compare-and-insert) so the log carries the projection it was built
@@ -332,6 +428,7 @@ impl ConversationEngine {
             provenance,
             self.model_core,
             self.conversation.clone(),
+            section_progress,
         )?;
 
         Ok(conv)
@@ -455,6 +552,15 @@ impl ConversationEngine {
     /// Call after a turn completes so an in-flight turn survives a crash.
     pub fn commit_persistence(&self) -> crate::Result<()> {
         Ok(self.conversation.commit_persistence()?)
+    }
+
+    /// Like [`Self::commit_persistence`] but skipped when nothing is staged.
+    /// Returns `Ok(true)` when an `fsync` actually happened. The daemon's
+    /// periodic flush task uses this so an idle workspace doesn't issue
+    /// pointless syscalls — and so writes produced asynchronously by the
+    /// bg-quantizer's persist callback aren't left stranded between turns.
+    pub fn commit_persistence_if_pending(&self) -> crate::Result<bool> {
+        Ok(self.conversation.commit_persistence_if_pending()?)
     }
 
     /// Flush, optionally compact, and checkpoint the substrate redo log —

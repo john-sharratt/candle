@@ -300,6 +300,50 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Write a conversation-metadata record for `timeline_id`. The record
+    /// carries both the client-supplied `conv_id` string (used by the
+    /// daemon as the sidebar id) and the human-readable `label`.
+    ///
+    /// Last-write-wins on replay: the conv_id is written at first-submit
+    /// time with an empty label, then re-written with the title once the
+    /// titler finishes. This call is a no-op when the manifest already
+    /// holds the same `(conv_id, label)` tuple — cheap to invoke on
+    /// every submit.
+    pub fn write_conv_meta(
+        &mut self,
+        timeline_id: u64,
+        conv_id: &str,
+        label: &str,
+    ) -> Result<()> {
+        if let Some(existing) = self.manifest.labels.get(&timeline_id) {
+            if existing.conv_id == conv_id && existing.label == label {
+                return Ok(());
+            }
+        }
+        let payload = manifest::encode_label_payload(timeline_id, conv_id, label);
+        self.append_record(RecordType::Label, 0, 0, 0, 0, &payload)?;
+        Ok(())
+    }
+
+    /// Every recovered `(timeline_id, ConvMeta)` pair from the active
+    /// manifest and any inherited substrates. The substrate-reload path
+    /// uses this to repopulate the in-RAM `Substrate::labels` /
+    /// `Substrate::conv_ids` maps after the TurnDecl walk.
+    pub fn collected_conv_metas(&self) -> Vec<(u64, manifest::ConvMeta)> {
+        let mut out: std::collections::BTreeMap<u64, manifest::ConvMeta> = self
+            .manifest
+            .labels
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for inherited in &self.inherited {
+            for (k, v) in &inherited.manifest().labels {
+                out.entry(*k).or_insert_with(|| v.clone());
+            }
+        }
+        out.into_iter().collect()
+    }
+
     /// Append a `Chunk` record — one sealed or partial KV chunk's bytes and
     /// quantization metadata. `token_count` is 32 for a sealed chunk, less
     /// for a partial tail; `format` is the `KvFormat` tag.
@@ -424,6 +468,24 @@ impl SubstratePersistence {
     /// Flush and `fsync` the active log — the group-commit durability point.
     pub fn commit(&mut self) -> Result<()> {
         self.log.commit()
+    }
+
+    /// Bytes staged but not yet flushed to the active log. Returns 0 when
+    /// there is nothing to write. The periodic flush task uses this to
+    /// avoid pointless `fsync` calls on an idle workspace.
+    pub fn pending_bytes(&self) -> usize {
+        self.log.pending_len()
+    }
+
+    /// Group-commit if (and only if) there are staged records. Returns
+    /// `Ok(true)` when a flush+fsync actually happened, `Ok(false)` for the
+    /// no-op idle path. Cheap to call on a tight timer.
+    pub fn commit_if_pending(&mut self) -> Result<bool> {
+        if self.log.pending_len() == 0 {
+            return Ok(false);
+        }
+        self.log.commit()?;
+        Ok(true)
     }
 
     /// Write a `Checkpoint` record snapshotting the manifest, commit it

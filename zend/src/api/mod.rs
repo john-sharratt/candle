@@ -12,7 +12,9 @@ use include_dir::{include_dir, Dir};
 use crate::session::ZendSession;
 
 pub mod chat;
+pub mod conversations;
 pub mod models;
+pub mod status;
 pub mod ws_logs;
 
 static WEB: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/web");
@@ -22,6 +24,9 @@ pub fn router(session: Arc<ZendSession>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat::completions))
         .route("/v1/models", get(models::list))
+        .route("/v1/status", get(status::status))
+        .route("/v1/conversations", get(conversations::list))
+        .route("/v1/conversations/:id", get(conversations::get))
         .route("/ws/logs", get(ws_logs::handler))
         .with_state(session)
         .fallback(embedded_asset)

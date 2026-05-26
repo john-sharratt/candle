@@ -736,15 +736,47 @@ impl Builder {
     /// IDs are fixed at 1 each; there is no name map.
     ///
     pub fn for_plain_prompt(system_prompt_text: &str) -> Self {
-        use super::ids::{GroupId, LayerId, SectionId};
+        Self::synthetic_single_section(
+            system_prompt_text,
+            super::ids::LayerId::new(1),
+            super::ids::GroupId::new(1),
+            super::ids::SectionId::new(1),
+        )
+    }
+
+    /// Same as [`Self::for_plain_prompt`] but allocates the synthetic
+    /// schema's ids from the [`Reserved`] kind's slot at the top of the
+    /// u32 range. Use this for engine-internal conversations (the
+    /// daemon's titler) that must coexist in the same substrate as a
+    /// YAML schema without colliding.
+    ///
+    /// [`Reserved`]: super::Reserved
+    pub fn for_plain_prompt_reserved(
+        system_prompt_text: &str,
+        kind: super::ids::Reserved,
+    ) -> Self {
+        Self::synthetic_single_section(
+            system_prompt_text,
+            super::ids::LayerId::reserved(kind),
+            super::ids::GroupId::reserved(kind),
+            super::ids::SectionId::reserved(kind),
+        )
+    }
+
+    /// Shared body of [`Self::for_plain_prompt`] /
+    /// [`Self::for_plain_prompt_reserved`] — a single-layer / single-group
+    /// schema with one `"frame"` section in the system prompt, using
+    /// caller-supplied ids.
+    fn synthetic_single_section(
+        system_prompt_text: &str,
+        layer_id: super::ids::LayerId,
+        group_id: super::ids::GroupId,
+        section_id: super::ids::SectionId,
+    ) -> Self {
         use super::schema::{
             Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionSchema,
             SelectionRule, SystemPromptSchema,
         };
-
-        let layer_id = LayerId::new(1);
-        let group_id = GroupId::new(1);
-        let section_id = SectionId::new(1);
 
         let schema = Schema {
             layers: vec![LayerSchema {

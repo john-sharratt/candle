@@ -16,6 +16,7 @@
 mod api;
 mod config;
 mod download;
+mod loading;
 mod log_broadcast;
 mod session;
 mod tools;

@@ -42,6 +42,10 @@ pub fn collect_live_records(
         let r = read_record_at(log, loc.offset)?;
         out.push((r.header, r.payload));
     }
+    if let Some(loc) = manifest.tokenizer {
+        let r = read_record_at(log, loc.offset)?;
+        out.push((r.header, r.payload));
+    }
 
     for (stream_id, entry) in &manifest.streams {
         if let Some(decl) = &entry.decl {
@@ -83,6 +87,24 @@ pub fn collect_live_records(
                 Vec::new(),
             ));
         }
+    }
+    // Synthesised — per-timeline conv metadata the manifest holds decoded.
+    // One record per surviving entry; last-write-wins semantics mean the
+    // manifest already holds the canonical winner per timeline.
+    for (timeline_id, meta) in &manifest.labels {
+        let payload =
+            super::manifest::encode_label_payload(*timeline_id, &meta.conv_id, &meta.label);
+        out.push((
+            RecordHeader {
+                record_type: RecordType::Label,
+                format: 0,
+                payload_len: payload.len() as u64,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
+        ));
     }
     Ok(out)
 }
@@ -143,11 +165,16 @@ pub fn dead_record_ratio(log: &mut dyn LogSource, manifest: &Manifest) -> Result
         return Ok(0.0);
     }
     // Live on-disk records: read-back records (model/template/chunk/tokens/
-    // signatures) — the StreamDecl/Commit entries collect_live_records
+    // signatures) — the StreamDecl/Commit/Label entries collect_live_records
     // synthesises are excluded from the "live on disk" count.
     let live_on_disk = collect_live_records(log, manifest)?
         .iter()
-        .filter(|(h, _)| !matches!(h.record_type, RecordType::StreamDecl | RecordType::Commit))
+        .filter(|(h, _)| {
+            !matches!(
+                h.record_type,
+                RecordType::StreamDecl | RecordType::Commit | RecordType::Label
+            )
+        })
         .count()
         + manifest
             .streams
@@ -158,7 +185,8 @@ pub fn dead_record_ratio(log: &mut dyn LogSource, manifest: &Manifest) -> Result
             .streams
             .values()
             .filter(|s| s.committed_through.is_some())
-            .count();
+            .count()
+        + manifest.labels.len();
     let dead = total.saturating_sub(live_on_disk.min(total));
     Ok(dead as f32 / total as f32)
 }

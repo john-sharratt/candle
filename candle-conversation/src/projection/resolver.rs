@@ -288,6 +288,52 @@ impl Conversation {
             }
             restored += 1;
         }
+        // Conversation metadata lives in its own `RecordType::Label`
+        // records — `(timeline, conv_id, label)` triples, last-write-wins.
+        // Replay them after the TurnDecl pass so the in-RAM
+        // `substrate.labels` and `substrate.conv_ids` maps are populated
+        // for every recovered timeline.
+        let metas = {
+            let p = self.persistence.lock().unwrap();
+            p.collected_conv_metas()
+        };
+        let n_meta_records = metas.len();
+        let mut n_meta_applied = 0usize;
+        let mut n_meta_dropped_unregistered = 0usize;
+        {
+            let mut view = self.write();
+            for (timeline_raw, meta) in metas {
+                let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
+                    continue;
+                };
+                // `set_conv_id` / `set_label` no-op when the timeline
+                // isn't registered. Count any drops here so the reload
+                // summary can flag "Label record without matching
+                // TurnDecl" — a state we expect to be rare.
+                if view.timeline_target(timeline).is_none() {
+                    n_meta_dropped_unregistered += 1;
+                    continue;
+                }
+                view.set_conv_id(timeline, &meta.conv_id);
+                view.set_label(timeline, &meta.label);
+                n_meta_applied += 1;
+            }
+        }
+        let read = self.read();
+        let n_sections = read.section_count();
+        let n_timelines = read.timeline_count();
+        let n_conversations = read.conversation_count();
+        drop(read);
+        tracing::info!(
+            sections = n_sections,
+            timelines = n_timelines,
+            conversations = n_conversations,
+            turns = restored,
+            label_records = n_meta_records,
+            label_records_applied = n_meta_applied,
+            label_records_dropped = n_meta_dropped_unregistered,
+            "substrate reload complete",
+        );
         Ok(restored)
     }
 
@@ -387,6 +433,74 @@ impl Conversation {
         self.read().oldest_hot_turn_except(except)
     }
 
+    /// The sidebar label for `timeline`, or `None` if no label has been
+    /// recorded — either the conversation hasn't had its first user turn
+    /// yet, or the recovered redo log carries no label for it.
+    pub fn label_of(&self, timeline: TimelineId) -> Option<String> {
+        self.read().label_of(timeline).map(|s| s.to_string())
+    }
+
+    /// The client-supplied `conv_id` string for `timeline`, or `None` if
+    /// no submit has been recorded yet. Recovered from the redo log on
+    /// substrate reload — drives the daemon's sidebar id field.
+    pub fn conv_id_of(&self, timeline: TimelineId) -> Option<String> {
+        self.read().conv_id_of(timeline).map(|s| s.to_string())
+    }
+
+    /// Persist a sidebar label for `timeline`. Last-write-wins on the
+    /// underlying `RecordType::Label`; this writes the same record the
+    /// titler writes, preserving whatever `conv_id` is already known
+    /// for this timeline.
+    pub fn set_conversation_label(
+        &self,
+        timeline: TimelineId,
+        label: &str,
+    ) -> candle::Result<()> {
+        if label.is_empty() {
+            return Ok(());
+        }
+        let conv_id = self.conv_id_of(timeline).unwrap_or_default();
+        {
+            let mut p = self.persistence.lock().unwrap();
+            p.write_conv_meta(timeline.raw(), &conv_id, label)
+                .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
+        }
+        self.write().set_label(timeline, label);
+        Ok(())
+    }
+
+    /// Persist the client-supplied `conv_id` for `timeline`. Idempotent;
+    /// the typical caller is the daemon's chat handler, invoking this on
+    /// every submit so the conv_id reaches the redo log immediately
+    /// (well before the titler completes). The current `label` is
+    /// preserved, so this can be called freely at any point in the
+    /// conversation's lifecycle.
+    pub fn set_conversation_conv_id(
+        &self,
+        timeline: TimelineId,
+        conv_id: &str,
+    ) -> candle::Result<()> {
+        if conv_id.is_empty() {
+            return Ok(());
+        }
+        let label = self.read().label_of(timeline).unwrap_or("").to_string();
+        {
+            let mut p = self.persistence.lock().unwrap();
+            p.write_conv_meta(timeline.raw(), conv_id, &label)
+                .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
+        }
+        self.write().set_conv_id(timeline, conv_id);
+        Ok(())
+    }
+
+    /// Every conversation the workspace substrate knows about —
+    /// `(timeline, conv_id, label)` triples drawn from the in-RAM
+    /// `Substrate::labels` / `Substrate::conv_ids` maps. Drives
+    /// `GET /v1/conversations` directly; no sidecar involved.
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String)> {
+        self.read().known_conversations()
+    }
+
     /// Persist a sealed turn's per-layer KV grid + token ids to the redo log
     /// — the seal-time half of the resume path (§16.12). All layers share
     /// one chunk count.
@@ -476,6 +590,18 @@ impl Conversation {
             .unwrap()
             .commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))
+    }
+
+    /// Like [`Self::commit_persistence`] but a no-op when nothing is
+    /// staged. Returns `Ok(true)` when an `fsync` actually happened.
+    /// Used by the daemon's 5-second flush task so a quiescent
+    /// workspace doesn't issue pointless syscalls.
+    pub fn commit_persistence_if_pending(&self) -> candle::Result<bool> {
+        self.persistence
+            .lock()
+            .unwrap()
+            .commit_if_pending()
+            .map_err(|e| candle::Error::Msg(format!("persist commit_if_pending: {e}")))
     }
 
     /// Flush and write a `Checkpoint` over the substrate manifest — the

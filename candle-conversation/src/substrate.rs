@@ -50,7 +50,7 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
 use candle_nn::kv_cache::SealedSequence;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::projection::{DepthWeights, ScoreFormula};
@@ -252,11 +252,55 @@ pub trait ContentResolver {
 ///        ├── reset()
 ///        └── .clone()   ← fork support
 /// ```
+/// Per-timeline state — projection target, sidebar metadata, and the
+/// ordered turn store. One struct, one HashMap lookup — replaces what
+/// used to be four parallel maps keyed by `TimelineId` (target / label
+/// / conv_id / turns) plus a `tails` Vec for ordered indices.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    /// Projection target this timeline is registered against. Required —
+    /// set by [`Substrate::register_timeline`].
+    pub layer: LayerId,
+    pub group: GroupId,
+    /// Sidebar title written by the daemon's titler after the first user
+    /// turn. `None` until the titler completes (the substrate is the
+    /// single source of truth — there is no sidecar).
+    pub label: Option<String>,
+    /// Client-supplied `conv_id` string — the daemon's stable id for
+    /// this conversation, persisted at first-submit time alongside any
+    /// label as a `RecordType::Label` record.
+    pub conv_id: Option<String>,
+    /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
+    /// in index order — naturally matches the append-monotonic semantic
+    /// the old `tails: Vec<TurnIndex>` field used to encode separately.
+    pub turns: BTreeMap<TurnIndex, TurnEntryData>,
+}
+
+impl TimelineEntry {
+    fn new(layer: LayerId, group: GroupId) -> Self {
+        Self {
+            layer,
+            group,
+            label: None,
+            conv_id: None,
+            turns: BTreeMap::new(),
+        }
+    }
+
+    /// Index the next appended turn will take — `turns.len()` since
+    /// indices are monotonically allocated.
+    fn next_turn_index(&self) -> TurnIndex {
+        TurnIndex(self.turns.len() as u32)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Substrate {
-    turns: AHashMap<(TimelineId, TurnIndex), TurnEntryData>,
-    tails: HashMap<TimelineId, Vec<TurnIndex>>,
-    timelines: HashMap<TimelineId, (LayerId, GroupId)>,
+    /// Per-timeline state — projection target, label, conv_id, turns.
+    /// One entry per registered timeline.
+    timelines: HashMap<TimelineId, TimelineEntry>,
+    /// Inverse index: every timeline registered against a given group.
+    /// Maintained in lockstep with `timelines`.
     timelines_by_group: HashMap<GroupId, Vec<TimelineId>>,
     sections: AHashMap<SectionId, SectionEntryData>,
     /// Hot-tier index and warm-tier accounting (byte totals, LRU stamps).
@@ -282,12 +326,19 @@ impl Substrate {
     // ── Timeline registry ────────────────────────────────────────────────────
 
     pub fn register_timeline(&mut self, timeline: TimelineId, layer: LayerId, group: GroupId) {
-        if self.timelines.insert(timeline, (layer, group)).is_none() {
-            self.timelines_by_group
-                .entry(group)
-                .or_default()
-                .push(timeline);
+        // Idempotent — `HashMap::insert` *replaces*, so calling it on
+        // an already-registered timeline would wipe its `turns` map (a
+        // real data-loss bug on substrate replay, which calls
+        // `register_timeline` once per recovered TurnDecl).
+        if self.timelines.contains_key(&timeline) {
+            return;
         }
+        self.timelines
+            .insert(timeline, TimelineEntry::new(layer, group));
+        self.timelines_by_group
+            .entry(group)
+            .or_default()
+            .push(timeline);
     }
 
     pub fn mint_timeline(
@@ -302,7 +353,33 @@ impl Substrate {
     }
 
     pub fn timeline_target(&self, timeline: TimelineId) -> Option<(LayerId, GroupId)> {
-        self.timelines.get(&timeline).copied()
+        self.timelines.get(&timeline).map(|e| (e.layer, e.group))
+    }
+
+    /// Borrow a timeline's full entry — projection target plus optional
+    /// sidebar metadata. Used by the daemon's sidebar listing.
+    pub fn timeline_entry(&self, timeline: TimelineId) -> Option<&TimelineEntry> {
+        self.timelines.get(&timeline)
+    }
+
+    /// Borrow a single turn by `(timeline, index)`. Two HashMap/BTreeMap
+    /// hops since turns now live inside their owning [`TimelineEntry`] —
+    /// both O(1) and the second is a tiny BTreeMap (one turn per index
+    /// in the timeline), so the hot path is not measurably slower than
+    /// the old flat AHashMap keyed by `(TimelineId, TurnIndex)`.
+    fn turn(&self, timeline: TimelineId, index: TurnIndex) -> Option<&TurnEntryData> {
+        self.timelines.get(&timeline).and_then(|t| t.turns.get(&index))
+    }
+
+    /// Mutable variant of [`Self::turn`].
+    fn turn_mut(
+        &mut self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<&mut TurnEntryData> {
+        self.timelines
+            .get_mut(&timeline)
+            .and_then(|t| t.turns.get_mut(&index))
     }
 
     pub fn timelines_for_group(&self, group: GroupId) -> impl Iterator<Item = TimelineId> + '_ {
@@ -355,20 +432,24 @@ impl Substrate {
         block_start: u64,
         block_end: u64,
     ) -> TurnIndex {
-        let tail = self.tails.entry(timeline).or_default();
-        let idx = TurnIndex(tail.len() as u32);
-        tail.push(idx);
-        let entry = TurnEntryData {
-            token_count,
-            block_range: (block_start, block_end),
-            scores: PerDepthScores::default(),
-            sig_entries: Vec::new(),
-            sealed: Arc::new(vec![]),
-            role: Role::Assistant,
-            text: String::new(),
-            token_ids: TokenBuffer::default(),
-        };
-        self.turns.insert((timeline, idx), entry);
+        let tl = self
+            .timelines
+            .get_mut(&timeline)
+            .expect("append_with_blocks: timeline not registered");
+        let idx = tl.next_turn_index();
+        tl.turns.insert(
+            idx,
+            TurnEntryData {
+                token_count,
+                block_range: (block_start, block_end),
+                scores: PerDepthScores::default(),
+                sig_entries: Vec::new(),
+                sealed: Arc::new(vec![]),
+                role: Role::Assistant,
+                text: String::new(),
+                token_ids: TokenBuffer::default(),
+            },
+        );
         idx
     }
 
@@ -394,20 +475,24 @@ impl Substrate {
     ) -> candle::Result<TurnIndex> {
         let sealed_cpu = Arc::new(migrate_to_cpu(&sealed_gpu)?);
         // GPU chunks are freed as soon as the caller drops `sealed_gpu`.
-        let tail = self.tails.entry(timeline).or_default();
-        let idx = TurnIndex(tail.len() as u32);
-        tail.push(idx);
-        let entry = TurnEntryData {
-            token_count,
-            block_range: (block_start, block_end),
-            scores: PerDepthScores::default(),
-            sig_entries: Vec::new(),
-            sealed: sealed_cpu,
-            role,
-            text,
-            token_ids,
-        };
-        self.turns.insert((timeline, idx), entry);
+        let tl = self
+            .timelines
+            .get_mut(&timeline)
+            .expect("append_full: timeline not registered");
+        let idx = tl.next_turn_index();
+        tl.turns.insert(
+            idx,
+            TurnEntryData {
+                token_count,
+                block_range: (block_start, block_end),
+                scores: PerDepthScores::default(),
+                sig_entries: Vec::new(),
+                sealed: sealed_cpu,
+                role,
+                text,
+                token_ids,
+            },
+        );
         Ok(idx)
     }
 
@@ -432,20 +517,24 @@ impl Substrate {
         block_end: u64,
         sealed: Arc<Vec<SealedSequence>>,
     ) -> TurnIndex {
-        let tail = self.tails.entry(timeline).or_default();
-        let idx = TurnIndex(tail.len() as u32);
-        tail.push(idx);
-        let entry = TurnEntryData {
-            token_count,
-            block_range: (block_start, block_end),
-            scores: PerDepthScores::default(),
-            sig_entries: Vec::new(),
-            sealed,
-            role,
-            text,
-            token_ids,
-        };
-        self.turns.insert((timeline, idx), entry);
+        let tl = self
+            .timelines
+            .get_mut(&timeline)
+            .expect("restore_turn: timeline must be registered first");
+        let idx = tl.next_turn_index();
+        tl.turns.insert(
+            idx,
+            TurnEntryData {
+                token_count,
+                block_range: (block_start, block_end),
+                scores: PerDepthScores::default(),
+                sig_entries: Vec::new(),
+                sealed,
+                role,
+                text,
+                token_ids,
+            },
+        );
         idx
     }
 
@@ -457,7 +546,7 @@ impl Substrate {
         text: String,
         token_ids: TokenBuffer,
     ) {
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.role = role;
             entry.text = text;
             entry.token_ids = token_ids;
@@ -481,7 +570,7 @@ impl Substrate {
         if sealed.is_empty() {
             return;
         }
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.sealed = sealed;
         }
     }
@@ -515,7 +604,7 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
-        let entry = self.turns.get_mut(&(timeline, index))?;
+        let entry = self.turn_mut(timeline, index)?;
         if entry.sealed.is_empty() {
             return None;
         }
@@ -529,8 +618,9 @@ impl Substrate {
     /// steady state — cheap enough to call inline on each
     /// `ensure_turn_hot` pre-flight.
     pub fn hot_turn_bytes(&self) -> usize {
-        self.turns
+        self.timelines
             .values()
+            .flat_map(|t| t.turns.values())
             .filter(|e| !e.sealed.is_empty())
             .map(|e| sealed_bytes(&e.sealed))
             .sum()
@@ -549,7 +639,7 @@ impl Substrate {
     /// Bytes a single hot-resident turn currently holds in VRAM. `None`
     /// for unknown / cold turns.
     pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
-        let entry = self.turns.get(&(timeline, index))?;
+        let entry = self.turn(timeline, index)?;
         if entry.sealed.is_empty() {
             return None;
         }
@@ -565,15 +655,13 @@ impl Substrate {
         &self,
         except: (TimelineId, TurnIndex),
     ) -> Option<(TimelineId, TurnIndex)> {
-        for (&timeline, tail) in self.tails.iter() {
-            for &idx in tail {
+        for (&timeline, tl) in self.timelines.iter() {
+            for (&idx, entry) in tl.turns.iter() {
                 if (timeline, idx) == except {
                     continue;
                 }
-                if let Some(entry) = self.turns.get(&(timeline, idx)) {
-                    if !entry.sealed.is_empty() {
-                        return Some((timeline, idx));
-                    }
+                if !entry.sealed.is_empty() {
+                    return Some((timeline, idx));
                 }
             }
         }
@@ -581,20 +669,17 @@ impl Substrate {
     }
 
     pub fn role_of(&self, timeline: TimelineId, index: TurnIndex) -> Role {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or(Role::Assistant, |e| e.role)
     }
 
     pub fn text_of(&self, timeline: TimelineId, index: TurnIndex) -> &str {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or("", |e| e.text.as_str())
     }
 
     pub fn token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> &[u32] {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or(&[][..], |e| &e.token_ids[..])
     }
 
@@ -605,7 +690,7 @@ impl Substrate {
         block_start: u64,
         block_end: u64,
     ) {
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.block_range = (block_start, block_end);
         }
     }
@@ -617,21 +702,20 @@ impl Substrate {
         additional_tokens: usize,
         new_block_end: u64,
     ) {
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.token_count = entry.token_count.saturating_add(additional_tokens);
             entry.block_range.1 = new_block_end;
         }
     }
 
     pub fn set_scores(&mut self, timeline: TimelineId, index: TurnIndex, scores: PerDepthScores) {
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.scores = scores;
         }
     }
 
     pub fn block_range_of(&self, timeline: TimelineId, index: TurnIndex) -> (u64, u64) {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or((0, 0), |e| e.block_range)
     }
 
@@ -641,7 +725,7 @@ impl Substrate {
         index: TurnIndex,
         entries: Vec<crate::provenance::SigEntry>,
     ) {
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.sig_entries = entries;
         }
     }
@@ -652,7 +736,7 @@ impl Substrate {
         index: TurnIndex,
         entries: impl IntoIterator<Item = crate::provenance::SigEntry>,
     ) {
-        if let Some(entry) = self.turns.get_mut(&(timeline, index)) {
+        if let Some(entry) = self.turn_mut(timeline, index) {
             entry.sig_entries.extend(entries);
         }
     }
@@ -662,8 +746,7 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> &[crate::provenance::SigEntry] {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or(&[][..], |e| &e.sig_entries)
     }
 
@@ -672,20 +755,17 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map(|e| Arc::clone(&e.sealed))
     }
 
     pub fn scores_of(&self, timeline: TimelineId, index: TurnIndex) -> PerDepthScores {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or(PerDepthScores::default(), |e| e.scores)
     }
 
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or(0, |e| e.token_count)
     }
 
@@ -696,7 +776,7 @@ impl Substrate {
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        let Some(entry) = self.turns.get(&(timeline, index)) else {
+        let Some(entry) = self.turn(timeline, index) else {
             return 0.0;
         };
         weights.combine(
@@ -707,18 +787,99 @@ impl Substrate {
     }
 
     pub fn turn_count(&self, timeline: TimelineId) -> u32 {
-        self.tails.get(&timeline).map_or(0, |v| v.len() as u32)
+        self.timelines
+            .get(&timeline)
+            .map_or(0, |t| t.turns.len() as u32)
     }
 
     pub fn turn_indices(&self, timeline: TimelineId) -> impl Iterator<Item = TurnIndex> + '_ {
-        self.tails
+        self.timelines
             .get(&timeline)
             .into_iter()
-            .flat_map(|v| v.iter().copied())
+            .flat_map(|t| t.turns.keys().copied())
     }
 
     pub fn all_turns(&self) -> impl Iterator<Item = (TimelineId, TurnIndex)> + '_ {
-        self.turns.keys().copied()
+        self.timelines
+            .iter()
+            .flat_map(|(tl, t)| t.turns.keys().map(move |idx| (*tl, *idx)))
+    }
+
+    /// The conversation's sidebar label, or `None` if none has been
+    /// recorded yet (the titler writes it after the first user turn).
+    pub fn label_of(&self, timeline: TimelineId) -> Option<&str> {
+        self.timelines
+            .get(&timeline)
+            .and_then(|e| e.label.as_deref())
+    }
+
+    /// Set a timeline's sidebar label. Empty values are ignored (so the
+    /// first-submit placeholder doesn't clobber a real title written
+    /// earlier). No-op if the timeline isn't registered.
+    pub fn set_label(&mut self, timeline: TimelineId, label: &str) {
+        if label.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            entry.label = Some(label.to_string());
+        }
+    }
+
+    /// The client-supplied `conv_id` string for `timeline`, or `None`
+    /// if no submit has been recorded yet.
+    pub fn conv_id_of(&self, timeline: TimelineId) -> Option<&str> {
+        self.timelines
+            .get(&timeline)
+            .and_then(|e| e.conv_id.as_deref())
+    }
+
+    /// Set a timeline's `conv_id`. Empty values are ignored. No-op if
+    /// the timeline isn't registered. Distinct from [`Self::set_label`]
+    /// only because the two fields are written at different points in
+    /// the conversation lifecycle.
+    pub fn set_conv_id(&mut self, timeline: TimelineId, conv_id: &str) {
+        if conv_id.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            entry.conv_id = Some(conv_id.to_string());
+        }
+    }
+
+    /// Every recovered timeline that has a `conv_id` recorded, paired
+    /// with `(conv_id, label)`. Drives the daemon's sidebar — `label`
+    /// is empty during the brief window between first-submit and
+    /// titler-completion.
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String)> {
+        self.timelines
+            .iter()
+            .filter_map(|(tl, entry)| {
+                let conv_id = entry.conv_id.clone()?;
+                let label = entry.label.clone().unwrap_or_default();
+                Some((*tl, conv_id, label))
+            })
+            .collect()
+    }
+
+    /// Number of pinned sections — used by the substrate-reload summary log.
+    pub fn section_count(&self) -> usize {
+        self.sections.len()
+    }
+
+    /// Number of registered timelines — every timeline that has at least
+    /// one TurnDecl (or was registered via `register_timeline` even
+    /// without turns).
+    pub fn timeline_count(&self) -> usize {
+        self.timelines.len()
+    }
+
+    /// Number of timelines that have a `conv_id` set — i.e. the size of
+    /// the daemon's sidebar list.
+    pub fn conversation_count(&self) -> usize {
+        self.timelines
+            .values()
+            .filter(|e| e.conv_id.is_some())
+            .count()
     }
 
     /// Test/eviction helper: access to the hot-tier cache.
@@ -756,8 +917,8 @@ impl Substrate {
     }
 
     pub fn reset(&mut self) {
-        self.turns.clear();
-        self.tails.clear();
+        // `timelines` owns the per-turn store now, so clearing it
+        // drops every turn alongside its parent timeline entry.
         self.timelines.clear();
         self.timelines_by_group.clear();
         self.sections.clear();
@@ -858,15 +1019,14 @@ impl ContentResolver for Substrate {
         let Some(timeline) = self.timelines_for_group(group).next() else {
             return 0;
         };
-        self.tails.get(&timeline).map_or(0, |v| v.len() as u32)
+        Substrate::turn_count(self, timeline)
     }
 
     fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
         let Some(timeline) = self.timelines_for_group(group).next() else {
             return 0;
         };
-        self.turns
-            .get(&(timeline, index))
+        self.turn(timeline, index)
             .map_or(0, |e| e.token_count)
     }
 
@@ -880,7 +1040,7 @@ impl ContentResolver for Substrate {
         let Some(timeline) = self.timelines_for_group(group).next() else {
             return 0.0;
         };
-        let Some(entry) = self.turns.get(&(timeline, index)) else {
+        let Some(entry) = self.turn(timeline, index) else {
             return 0.0;
         };
         weights.combine(
@@ -1005,6 +1165,35 @@ mod tests {
     /// Identity migration: returns the input unchanged (simulates CPU == GPU in tests).
     fn identity_migrate(seqs: &[SealedSequence]) -> candle::Result<Vec<SealedSequence>> {
         Ok(seqs.to_vec())
+    }
+
+    /// `register_timeline` is data-idempotent — calling it again on a
+    /// timeline that already has turns must NOT wipe those turns. This
+    /// is the regression test for a real bug where substrate replay
+    /// (`reconstruct_from_log`) destroyed every turn but the last,
+    /// because each per-decl `register_timeline` call clobbered the
+    /// previous `TimelineEntry`.
+    #[test]
+    fn re_registering_a_timeline_preserves_its_turns() {
+        let (layer, group, timeline, mut sub) = make_timeline();
+
+        // Land two turns under this timeline.
+        sub.append_with_blocks(timeline, 3, 0, 1);
+        sub.append_with_blocks(timeline, 5, 1, 2);
+        assert_eq!(sub.turn_count(timeline), 2);
+
+        // Re-register the same timeline. Used to wipe the turns map.
+        sub.register_timeline(timeline, layer, group);
+        assert_eq!(
+            sub.turn_count(timeline),
+            2,
+            "re-registering a timeline must preserve its existing turns",
+        );
+
+        // Inverse index must still have exactly one entry — not two —
+        // confirming we didn't double-push on re-registration.
+        let listed: Vec<_> = sub.timelines_for_group(group).collect();
+        assert_eq!(listed, vec![timeline]);
     }
 
     /// `append_full` calls the migration closure and stores the result in the

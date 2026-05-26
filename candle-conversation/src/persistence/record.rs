@@ -26,7 +26,7 @@ pub const HEADER_SIZE: usize = 64;
 /// of this so it begins on a sector boundary for unbuffered I/O.
 pub const ALIGN: usize = 4096;
 
-/// The nine record types (§5.3).
+/// The redo-log record types (§5.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RecordType {
@@ -41,6 +41,11 @@ pub enum RecordType {
     /// The model's `tokenizer.json` bytes — a workspace singleton, written
     /// once via compare-and-insert so the log can detokenize offline.
     Tokenizer = 9,
+    /// Per-timeline conversation display label (sidebar title). Written
+    /// once per timeline as a one-shot record; the `stream_id` header
+    /// field is unused (set to 0), the `timeline_id` lives in the payload.
+    /// First-write-wins on replay.
+    Label = 10,
 }
 
 impl RecordType {
@@ -55,6 +60,7 @@ impl RecordType {
             7 => RecordType::Commit,
             8 => RecordType::Checkpoint,
             9 => RecordType::Tokenizer,
+            10 => RecordType::Label,
             other => return Err(PersistenceError::UnknownRecordType(other)),
         })
     }

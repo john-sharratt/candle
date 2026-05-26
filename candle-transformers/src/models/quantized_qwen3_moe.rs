@@ -1167,7 +1167,15 @@ impl ModelWeights {
     /// - Non-expert weights: loaded directly to VRAM (small relative to expert weights)
     /// - Expert weights: LRU cache in VRAM (dynamic budget based on free VRAM)
     /// - 3D merged expert tensors as primary, 2D per-expert as fallback
-    pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
+    ///
+    /// `progress`, when supplied, is called with `(layers_loaded, num_layers)`
+    /// after each layer's weights have been mounted — drives a UI progress
+    /// bar without coupling this loader to the daemon's progress type.
+    pub fn from_gguf_by_path(
+        file_path: &std::path::Path,
+        device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<Self> {
         use memmap2::MmapOptions;
 
         let file = std::fs::File::open(file_path)?;
@@ -1412,6 +1420,15 @@ impl ModelWeights {
             }
         }
 
+        // Combined progress denominator for the `from_gguf_by_path`
+        // outer callback: expert cache uploads (`num_moe_layers ×
+        // n_expert`) followed by the per-layer attention loop
+        // (`num_layers`). The bar then advances continuously through
+        // both phases, instead of sitting at 0% until the cache
+        // finishes.
+        let total_expert_ticks = num_moe_layers * n_expert;
+        let total_units = total_expert_ticks + num_layers;
+
         // ── Build Expert Cache ──
         let expert_cache = if !all_host_refs.is_empty() && n_expert > 0 {
             // Determine per-expert shapes from the first layer's first expert
@@ -1464,6 +1481,14 @@ impl ModelWeights {
                 max_expert_size as f64 / 1e3,
             );
 
+            // Wrap the outer callback so the cache's per-expert
+            // `(done, total_experts)` ticks land on the combined
+            // denominator computed above.
+            let cache_wrapper = progress
+                .map(|cb| move |done: usize, _total: usize| cb(done, total_units));
+            let cache_progress: Option<&dyn Fn(usize, usize)> = cache_wrapper
+                .as_ref()
+                .map(|f| f as &dyn Fn(usize, usize));
             let cache = ExpertCache::new(
                 mmap.clone(),
                 all_host_refs,
@@ -1471,6 +1496,7 @@ impl ModelWeights {
                 device,
                 n_expert,
                 Some(file_path),
+                cache_progress,
             )?;
             Some(Arc::new(cache))
         } else {
@@ -1631,6 +1657,13 @@ impl ModelWeights {
 
             if (i + 1) % 8 == 0 || i == num_layers - 1 {
                 tracing::debug!("Layer {}/{} loaded", i + 1, num_layers);
+            }
+            // Continue the bar from where the expert cache left off, on
+            // the same combined denominator (`total_units`). Each layer
+            // is one tick — the layers run far faster than experts but
+            // they're a small fraction of the total either way.
+            if let Some(cb) = progress {
+                cb(total_expert_ticks + i + 1, total_units);
             }
         }
 
@@ -1853,7 +1886,6 @@ mod tests {
                 generate_max_len: 20,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            /*
             // BF16 single context
             TestConfig {
                 mode: InferenceMode::BF16,
@@ -1908,7 +1940,6 @@ mod tests {
                 generate_max_len: 20,
                 test_mode: Some(TestMode::Skip),
             },
-            */
             TestConfig {
                 mode: InferenceMode::C0,
                 use_batched: true,
@@ -1931,7 +1962,6 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            /*
             TestConfig {
                 mode: InferenceMode::C2,
                 use_batched: true,
@@ -2020,7 +2050,6 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            */
             TestConfig {
                 mode: InferenceMode::C10,
                 use_batched: true,
@@ -2056,7 +2085,7 @@ mod tests {
         };
 
         let load_model = || {
-            let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+            let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
             println!("✓ Model loaded\n");
             let inv_freq = model
                 .rope_inv_freq()
@@ -2141,7 +2170,7 @@ mod tests {
                 .map_err(|e| candle::Error::Msg(format!("Failed to download model: {}", e)))?;
             println!("Model path: {:?}", model_path);
 
-            let raw = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+            let raw = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
             let inv_freq = raw
                 .rope_inv_freq()
                 .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
@@ -2308,7 +2337,7 @@ mod tests {
             "main",
         )?;
         println!("Model path: {model_path:?}");
-        let weights = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+        let weights = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
         let inv_freq = weights
             .rope_inv_freq()
             .ok_or_else(|| candle::Error::Msg("no inv_freq".into()))?;

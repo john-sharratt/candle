@@ -33,9 +33,9 @@ candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
 zend-tools          = { path = "../zend-tools" }
 regex               = "1"
+tokenizers          = { workspace = true }
 
 [dev-dependencies]
-tokenizers = { workspace = true }
 
 [features]
 default = []
