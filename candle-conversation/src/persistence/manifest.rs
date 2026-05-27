@@ -64,6 +64,12 @@ pub struct Manifest {
     /// established immediately at first submit and the title can be
     /// filled in later by the titler.
     pub labels: BTreeMap<u64, ConvMeta>,
+    /// Per-timeline lifecycle state (`archived` flag today; reserves
+    /// room for more flags via a versioned 1-byte payload). Keyed by
+    /// `timeline_id`. Written as `RecordType::ConvState` records,
+    /// **last-write-wins** on replay so toggling archive↔unarchive
+    /// each appends a small record and the latest wins.
+    pub conv_states: BTreeMap<u64, ConvState>,
     /// Offset of the most recent `Checkpoint` record seen.
     pub last_checkpoint_offset: Option<u64>,
 }
@@ -78,6 +84,21 @@ pub struct ConvMeta {
     pub conv_id: String,
     pub label: String,
 }
+
+/// Per-timeline lifecycle flags persisted in `RecordType::ConvState`.
+/// Today: just the `archived` flag (hide-from-sidebar without losing
+/// the conversation). Encoded as `{u8 version, u8 flags}` so future
+/// flags (pinned, unread, …) can slot in without a new record type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConvState {
+    pub archived: bool,
+}
+
+/// Wire-format version of the `ConvState` payload. Bumped if a
+/// breaking change to the flag-byte layout becomes necessary.
+pub const CONV_STATE_VERSION: u8 = 1;
+
+const CONV_STATE_FLAG_ARCHIVED: u8 = 1 << 0;
 
 impl Manifest {
     /// An empty manifest.
@@ -140,6 +161,12 @@ impl Manifest {
                 // titler. Subsequent writes overwrite (e.g. a user
                 // rename would land here).
                 self.labels.insert(meta.0, meta.1);
+            }
+            RecordType::ConvState => {
+                let (timeline_id, state) = decode_conv_state_payload(&entry.record.payload)?;
+                // Last-write-wins: every archive / unarchive append
+                // supersedes the previous state.
+                self.conv_states.insert(timeline_id, state);
             }
         }
         Ok(())
@@ -214,6 +241,19 @@ impl Manifest {
             w.put_str(&meta.conv_id);
             w.put_str(&meta.label);
         }
+        w.put_u32(self.conv_states.len() as u32);
+        for (timeline_id, state) in &self.conv_states {
+            w.put_u64(*timeline_id);
+            // Serialise the same way the on-disk record encodes —
+            // version byte + flag byte — so the checkpoint is
+            // forward-compatible with future flag bits.
+            w.put_u8(CONV_STATE_VERSION);
+            let mut flags: u8 = 0;
+            if state.archived {
+                flags |= CONV_STATE_FLAG_ARCHIVED;
+            }
+            w.put_u8(flags);
+        }
         w.into_bytes()
     }
 
@@ -275,6 +315,30 @@ impl Manifest {
             let label = r.get_str()?;
             labels.insert(timeline_id, ConvMeta { conv_id, label });
         }
+        // ConvStates were added after the original checkpoint format —
+        // tolerate a manifest payload that ends here (older
+        // checkpoint, no ConvState entries) by treating EOF here as
+        // "zero conv_states" rather than a corruption error.
+        let mut conv_states = BTreeMap::new();
+        if !r.is_done() {
+            let n_states = r.get_u32()? as usize;
+            for _ in 0..n_states {
+                let timeline_id = r.get_u64()?;
+                let version = r.get_u8()?;
+                if version != CONV_STATE_VERSION {
+                    return Err(PersistenceError::Corrupt(format!(
+                        "manifest ConvState version {version}, expected {CONV_STATE_VERSION}"
+                    )));
+                }
+                let flags = r.get_u8()?;
+                conv_states.insert(
+                    timeline_id,
+                    ConvState {
+                        archived: flags & CONV_STATE_FLAG_ARCHIVED != 0,
+                    },
+                );
+            }
+        }
         if !r.is_done() {
             return Err(PersistenceError::Corrupt(format!(
                 "manifest payload has {} trailing bytes",
@@ -287,6 +351,7 @@ impl Manifest {
             tokenizer,
             streams,
             labels,
+            conv_states,
             last_checkpoint_offset,
         })
     }
@@ -315,6 +380,48 @@ pub fn decode_label_payload(payload: &[u8]) -> Result<(u64, ConvMeta)> {
         )));
     }
     Ok((timeline_id, ConvMeta { conv_id, label }))
+}
+
+/// Encode a `ConvState` record's payload — `{u64 timeline_id, u8 version,
+/// u8 flags}`. The flag byte is a bitfield (`CONV_STATE_FLAG_*`); the
+/// version lets us evolve to wider flag fields without changing the
+/// record type.
+pub fn encode_conv_state_payload(timeline_id: u64, state: ConvState) -> Vec<u8> {
+    let mut w = ByteWriter::new();
+    w.put_u64(timeline_id);
+    w.put_u8(CONV_STATE_VERSION);
+    let mut flags: u8 = 0;
+    if state.archived {
+        flags |= CONV_STATE_FLAG_ARCHIVED;
+    }
+    w.put_u8(flags);
+    w.into_bytes()
+}
+
+/// Decode a `ConvState` record's payload — see
+/// [`encode_conv_state_payload`]. Returns `(timeline_id, ConvState)`.
+/// Unknown flag bits in the byte are silently ignored so a future
+/// pinned/unread/etc. bit doesn't fail-load on an older daemon.
+pub fn decode_conv_state_payload(payload: &[u8]) -> Result<(u64, ConvState)> {
+    let mut r = ByteReader::new(payload);
+    let timeline_id = r.get_u64()?;
+    let version = r.get_u8()?;
+    if version != CONV_STATE_VERSION {
+        return Err(PersistenceError::Corrupt(format!(
+            "ConvState payload version {version}, expected {CONV_STATE_VERSION}"
+        )));
+    }
+    let flags = r.get_u8()?;
+    if !r.is_done() {
+        return Err(PersistenceError::Corrupt(format!(
+            "ConvState payload has {} trailing bytes",
+            r.remaining()
+        )));
+    }
+    let state = ConvState {
+        archived: flags & CONV_STATE_FLAG_ARCHIVED != 0,
+    };
+    Ok((timeline_id, state))
 }
 
 fn put_opt_loc(w: &mut ByteWriter, loc: Option<RecordLoc>) {
@@ -434,5 +541,65 @@ mod tests {
     fn empty_manifest_roundtrips() {
         let m = Manifest::new();
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
+    }
+
+    /// `ConvState` payload encodes / decodes byte-identical with the
+    /// `archived` flag both set and clear.
+    #[test]
+    fn conv_state_payload_round_trip() {
+        let archived = encode_conv_state_payload(42, ConvState { archived: true });
+        let (tl, st) = decode_conv_state_payload(&archived).unwrap();
+        assert_eq!(tl, 42);
+        assert!(st.archived);
+
+        let unarchived = encode_conv_state_payload(7, ConvState { archived: false });
+        let (tl, st) = decode_conv_state_payload(&unarchived).unwrap();
+        assert_eq!(tl, 7);
+        assert!(!st.archived);
+    }
+
+    /// Multiple `ConvState` records for the same timeline collapse
+    /// to the latest one in the manifest — last-writer-wins,
+    /// matching the contract Label records have.
+    #[test]
+    fn conv_state_last_writer_wins_in_manifest() {
+        let mut blob = Vec::new();
+        // Three writes on the same timeline: archive, unarchive,
+        // archive again. Final state must be archived.
+        blob.extend_from_slice(&record(
+            RecordType::ConvState,
+            0,
+            0,
+            &encode_conv_state_payload(99, ConvState { archived: true }),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::ConvState,
+            0,
+            0,
+            &encode_conv_state_payload(99, ConvState { archived: false }),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::ConvState,
+            0,
+            0,
+            &encode_conv_state_payload(99, ConvState { archived: true }),
+        ));
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert_eq!(manifest.conv_states.len(), 1);
+        assert!(manifest.conv_states.get(&99).unwrap().archived);
+    }
+
+    /// ConvState entries survive a checkpoint encode/decode cycle —
+    /// the manifest carries them through `encode` / `decode` along
+    /// with labels.
+    #[test]
+    fn conv_state_survives_checkpoint_roundtrip() {
+        let mut m = Manifest::new();
+        m.conv_states.insert(1, ConvState { archived: true });
+        m.conv_states.insert(2, ConvState { archived: false });
+        let bytes = m.encode();
+        let decoded = Manifest::decode(&bytes).unwrap();
+        assert_eq!(decoded, m);
     }
 }

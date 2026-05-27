@@ -46,6 +46,16 @@ pub enum RecordType {
     /// field is unused (set to 0), the `timeline_id` lives in the payload.
     /// First-write-wins on replay.
     Label = 10,
+    /// Per-timeline conversation lifecycle state (currently: archived
+    /// flag, room for more flags via a 1-byte version + flags byte).
+    /// Written each time the user toggles archive/unarchive (or any
+    /// other future lifecycle action). Last-writer-wins on replay —
+    /// the manifest tracks the latest record per timeline_id and the
+    /// substrate reload applies that state.
+    ///
+    /// `stream_id` header field is unused (set to 0); `timeline_id`
+    /// lives in the payload.
+    ConvState = 11,
 }
 
 impl RecordType {
@@ -61,6 +71,7 @@ impl RecordType {
             8 => RecordType::Checkpoint,
             9 => RecordType::Tokenizer,
             10 => RecordType::Label,
+            11 => RecordType::ConvState,
             other => return Err(PersistenceError::UnknownRecordType(other)),
         })
     }

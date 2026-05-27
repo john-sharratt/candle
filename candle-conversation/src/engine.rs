@@ -261,10 +261,26 @@ impl ConversationEngine {
     }
 
     /// Every conversation the workspace substrate knows about —
-    /// `(timeline, conv_id, label)` triples. Drives the daemon's
-    /// `GET /v1/conversations` sidebar listing directly.
-    pub fn known_conversations(&self) -> Vec<(crate::projection::TimelineId, String, String)> {
+    /// `(timeline, conv_id, label, archived)` quads. Drives the
+    /// daemon's `GET /v1/conversations` sidebar listing directly.
+    pub fn known_conversations(
+        &self,
+    ) -> Vec<(crate::projection::TimelineId, String, String, bool)> {
         self.conversation.known_conversations()
+    }
+
+    /// Toggle the archived lifecycle flag for a conversation. Persists
+    /// to the redo log as `RecordType::ConvState` (last-writer-wins)
+    /// and updates the in-RAM substrate. Drives the daemon's
+    /// `POST /v1/conversations/{id}/archive` and `/unarchive`.
+    pub fn set_conversation_archived(
+        &self,
+        timeline: crate::projection::TimelineId,
+        archived: bool,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_archived(timeline, archived)
+            .map_err(crate::error::ConversationError::Model)
     }
 
     /// Build an **engine-internal** conversation that lives on the reserved

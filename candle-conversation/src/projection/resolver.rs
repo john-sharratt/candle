@@ -332,13 +332,15 @@ impl Conversation {
         // Replay them after the TurnDecl pass so the in-RAM
         // `substrate.labels` and `substrate.conv_ids` maps are populated
         // for every recovered timeline.
-        let metas = {
+        let (metas, conv_states) = {
             let p = self.persistence.lock().unwrap();
-            p.collected_conv_metas()
+            (p.collected_conv_metas(), p.collected_conv_states())
         };
         let n_meta_records = metas.len();
+        let n_state_records = conv_states.len();
         let mut n_meta_applied = 0usize;
         let mut n_meta_dropped_unregistered = 0usize;
+        let mut n_state_applied = 0usize;
         {
             let mut view = self.write();
             for (timeline_raw, meta) in metas {
@@ -357,6 +359,20 @@ impl Conversation {
                 view.set_label(timeline, &meta.label);
                 n_meta_applied += 1;
             }
+            // ConvState records — last-write-wins archive flag. Same
+            // "registered-timeline-only" rule; the no-op `set_archived`
+            // returns false for unknown timelines and we just count
+            // those as applied=0.
+            for (timeline_raw, state) in conv_states {
+                let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
+                    continue;
+                };
+                if view.timeline_target(timeline).is_none() {
+                    continue;
+                }
+                view.set_archived(timeline, state.archived);
+                n_state_applied += 1;
+            }
         }
         let read = self.read();
         let n_sections = read.section_count();
@@ -371,6 +387,8 @@ impl Conversation {
             label_records = n_meta_records,
             label_records_applied = n_meta_applied,
             label_records_dropped = n_meta_dropped_unregistered,
+            conv_state_records = n_state_records,
+            conv_state_records_applied = n_state_applied,
             "substrate reload complete",
         );
         Ok(restored)
@@ -505,11 +523,43 @@ impl Conversation {
     }
 
     /// Every conversation the workspace substrate knows about —
-    /// `(timeline, conv_id, label)` triples drawn from the in-RAM
-    /// `Substrate::labels` / `Substrate::conv_ids` maps. Drives
+    /// `(timeline, conv_id, label, archived)` quads drawn from the
+    /// in-RAM `Substrate::timelines` map. Drives
     /// `GET /v1/conversations` directly; no sidecar involved.
-    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String)> {
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool)> {
         self.read().known_conversations()
+    }
+
+    /// Set a conversation's `archived` lifecycle flag and persist it
+    /// as a `RecordType::ConvState` record. Idempotent: if the
+    /// substrate already holds the requested state, the record is
+    /// not written and the call returns `Ok(())` without touching the
+    /// log.
+    ///
+    /// Last-write-wins on replay — toggling archive↔unarchive each
+    /// appends one small record (~ 16 bytes payload + framing); a
+    /// subsequent compaction collapses the chain to one record per
+    /// timeline.
+    pub fn set_conversation_archived(
+        &self,
+        timeline: TimelineId,
+        archived: bool,
+    ) -> candle::Result<()> {
+        let changed = self.write().set_archived(timeline, archived);
+        if !changed {
+            return Ok(());
+        }
+        let state = crate::persistence::manifest::ConvState { archived };
+        let mut p = self.persistence.lock().unwrap();
+        p.write_conv_state(timeline.raw(), state)
+            .map_err(|e| candle::Error::Msg(format!("write_conv_state: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether `timeline` is currently archived. Untouched / unknown
+    /// timelines return `false`.
+    pub fn is_conversation_archived(&self, timeline: TimelineId) -> bool {
+        self.read().is_archived(timeline)
     }
 
     /// Persist a sealed turn's per-layer KV grid + token ids to the redo log

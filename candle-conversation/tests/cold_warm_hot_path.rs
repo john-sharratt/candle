@@ -1465,3 +1465,88 @@ fn multi_chunk_turn_round_trip() {
         "multi-chunk cold→hot drift — demux of {chunks_per_layer} chunks/layer broken"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Archive lifecycle: ConvState records survive a restart
+// ════════════════════════════════════════════════════════════════════════════
+
+/// End-to-end archive lifecycle through the real persistence layer.
+/// Seeds a turn, sets the conversation's `archived` flag, drops the
+/// in-RAM substrate, reopens from the same tempdir, runs the reload,
+/// and asserts the archive state survived. Then unarchives and
+/// verifies that survives a second restart too.
+///
+/// Pins the contract that the daemon's `POST /v1/conversations/
+/// {id}/archive` and `/unarchive` endpoints rely on — without this
+/// the X button would set the in-RAM flag and the next refresh
+/// (which goes through the reload) would forget it.
+#[test]
+fn archive_state_survives_restart() {
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dir = tmpdir.path().to_path_buf();
+
+    let layer_id = LayerId::from_raw(50).unwrap();
+    let group_id = GroupId::from_raw(50).unwrap();
+    let timeline = TimelineAllocator::new().next();
+
+    // ── Phase 1: seed a turn + persist + mark archived ─────────────────
+    {
+        let persistence = SubstratePersistence::open_in(&dir).unwrap();
+        let conv = Conversation::with_persistence(persistence);
+        let backings = make_backings(&device);
+        conv.register_timeline(timeline, layer_id, group_id);
+        let _ = seed_turn(&conv, &backings, &device, timeline, 100_001);
+
+        // Drive the persistence thread once so the turn's records
+        // are durable before we test reload.
+        let persist =
+            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone());
+        persist.shutdown();
+
+        // Initially the conversation is not archived.
+        assert!(!conv.is_conversation_archived(timeline));
+
+        // Archive it — writes a ConvState record + updates in-RAM.
+        // The write goes through `append_record` which only stages
+        // bytes; we need to commit before the conv drops or the
+        // reload will not see it. (Production has the persistence
+        // thread's tick + per-turn-seal trigger to take care of this
+        // routinely — here we drive it explicitly.)
+        conv.set_conversation_archived(timeline, true).unwrap();
+        conv.commit_persistence().unwrap();
+        assert!(conv.is_conversation_archived(timeline));
+    }
+
+    // ── Phase 2: reopen, reload, archive state survives ────────────────
+    {
+        let persistence = SubstratePersistence::open_in(&dir).unwrap();
+        let conv = Conversation::with_persistence(persistence);
+        conv.register_timeline(timeline, layer_id, group_id);
+        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new())).unwrap();
+        assert!(
+            conv.is_conversation_archived(timeline),
+            "archived flag must survive the restart-reload"
+        );
+
+        // Unarchive — last-writer-wins on the next reload.
+        conv.set_conversation_archived(timeline, false).unwrap();
+        conv.commit_persistence().unwrap();
+        assert!(!conv.is_conversation_archived(timeline));
+    }
+
+    // ── Phase 3: second restart — unarchive survives ──────────────────
+    {
+        let persistence = SubstratePersistence::open_in(&dir).unwrap();
+        let conv = Conversation::with_persistence(persistence);
+        conv.register_timeline(timeline, layer_id, group_id);
+        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new())).unwrap();
+        assert!(
+            !conv.is_conversation_archived(timeline),
+            "unarchive must also survive — last-writer-wins on ConvState"
+        );
+    }
+}
+

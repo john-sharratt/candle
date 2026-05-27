@@ -613,8 +613,10 @@ pub struct StatusSnapshot {
 }
 
 /// Sidebar entry surfaced by `GET /v1/conversations`. Built directly from
-/// the substrate — the `RecordType::Label` records carry the `conv_id`
-/// string and the human label, and that's the whole sidebar contract.
+/// the substrate — `RecordType::Label` records carry the `conv_id`
+/// string and the human label; `RecordType::ConvState` carries the
+/// `archived` lifecycle flag. Together they're the whole sidebar
+/// contract.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConvEntry {
     /// Client-supplied `conv_id` string — stable across daemon restarts,
@@ -626,6 +628,10 @@ pub struct ConvEntry {
     /// Number of recovered turns for this conversation, from the
     /// substrate. Advisory display field.
     pub turn_count: u32,
+    /// Whether the user has archived (closed) this conversation. The
+    /// sidebar hides archived entries by default; the "show archived"
+    /// checkbox toggles them back in via `?include_archived=true`.
+    pub archived: bool,
 }
 
 impl ZendSession {
@@ -679,8 +685,11 @@ impl ZendSession {
     ///
     /// Sorted newest-first by `conv_id` string descending (the frontend
     /// supplies `Date.now()` ids, so lexicographic-descending == newest).
-    /// The titler's internal timeline is excluded.
-    pub fn list_conversations(&self) -> Vec<ConvEntry> {
+    /// The titler's internal timeline is excluded. Archived
+    /// conversations are filtered out unless `include_archived` is
+    /// set — that's the "show archived" checkbox at the bottom of
+    /// the sidebar.
+    pub fn list_conversations(&self, include_archived: bool) -> Vec<ConvEntry> {
         // On-disk gate: if the workspace's redo log is gone, return
         // empty regardless of the in-RAM cache. The daemon will keep
         // running and any new turn will rebuild the log file.
@@ -705,15 +714,33 @@ impl ZendSession {
         let mut entries: Vec<ConvEntry> = engine
             .known_conversations()
             .into_iter()
-            .filter(|(tl, _, _)| *tl != titler_timeline)
-            .map(|(tl, conv_id, label)| ConvEntry {
+            .filter(|(tl, _, _, _)| *tl != titler_timeline)
+            .filter(|(_, _, _, archived)| include_archived || !*archived)
+            .map(|(tl, conv_id, label, archived)| ConvEntry {
                 id: conv_id,
                 label,
                 turn_count: turn_counts.get(&tl).copied().unwrap_or(0),
+                archived,
             })
             .collect();
         entries.sort_by(|a, b| b.id.cmp(&a.id));
         entries
+    }
+
+    /// Set the archived lifecycle flag for `conv_id`. Persists to the
+    /// redo log (last-writer-wins on `RecordType::ConvState`) and
+    /// updates the in-RAM substrate. Backs `POST /v1/conversations/
+    /// {id}/archive` and `/unarchive`. Returns `None` when the model
+    /// isn't loaded yet (no engine to drive the write through).
+    pub fn set_conversation_archived(
+        &self,
+        conv_id: &str,
+        archived: bool,
+    ) -> Option<candle_conversation::Result<()>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = timeline_for(conv_id);
+        let engine = state.engine.lock().unwrap();
+        Some(engine.set_conversation_archived(timeline, archived))
     }
 
     /// Decoded turn history for a single recovered conversation — backs

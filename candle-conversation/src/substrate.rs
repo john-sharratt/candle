@@ -644,6 +644,12 @@ pub struct TimelineEntry {
     /// this conversation, persisted at first-submit time alongside any
     /// label as a `RecordType::Label` record.
     pub conv_id: Option<String>,
+    /// Conversation lifecycle: `true` once the user has closed
+    /// (archived) the conversation. The sidebar filters archived
+    /// entries out by default; the "show archived" checkbox toggles
+    /// them back in. Persisted as `RecordType::ConvState`,
+    /// last-write-wins.
+    pub archived: bool,
     /// Per-turn data, keyed by [`TurnIndex`]. `BTreeMap` iteration is
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
@@ -657,6 +663,7 @@ impl TimelineEntry {
             group,
             label: None,
             conv_id: None,
+            archived: false,
             turns: BTreeMap::new(),
         }
     }
@@ -1620,17 +1627,43 @@ impl Substrate {
         }
     }
 
+    /// Whether `timeline` has been archived by the user. Untouched
+    /// timelines default to `false`. Returns `false` for unknown
+    /// timelines (matches "not archived" since the conversation
+    /// doesn't exist as far as the sidebar is concerned).
+    pub fn is_archived(&self, timeline: TimelineId) -> bool {
+        self.timelines
+            .get(&timeline)
+            .is_some_and(|e| e.archived)
+    }
+
+    /// Set a timeline's archived flag. No-op when the timeline isn't
+    /// registered. Returns `true` when the flag actually changed —
+    /// the daemon uses this to skip the persistence write when the
+    /// caller is just re-asserting the current state.
+    pub fn set_archived(&mut self, timeline: TimelineId, archived: bool) -> bool {
+        let Some(entry) = self.timelines.get_mut(&timeline) else {
+            return false;
+        };
+        if entry.archived == archived {
+            return false;
+        }
+        entry.archived = archived;
+        true
+    }
+
     /// Every recovered timeline that has a `conv_id` recorded, paired
-    /// with `(conv_id, label)`. Drives the daemon's sidebar — `label`
-    /// is empty during the brief window between first-submit and
-    /// titler-completion.
-    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String)> {
+    /// with `(conv_id, label, archived)`. Drives the daemon's sidebar:
+    /// `label` is empty during the brief window between first-submit
+    /// and titler-completion, `archived` is the lifecycle filter the
+    /// sidebar applies before rendering.
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool)> {
         self.timelines
             .iter()
             .filter_map(|(tl, entry)| {
                 let conv_id = entry.conv_id.clone()?;
                 let label = entry.label.clone().unwrap_or_default();
-                Some((*tl, conv_id, label))
+                Some((*tl, conv_id, label, entry.archived))
             })
             .collect()
     }
@@ -2428,5 +2461,52 @@ mod tests {
         assert!(sub.residence[r2.0].cold.is_none());
         assert!(sub.residence[r2.0].hot.is_none());
         assert!(sub.residence[r2.0].warm.is_none());
+    }
+
+    /// Archive flag defaults to `false`, can be toggled, and the
+    /// idempotency contract holds (setting the same value twice
+    /// returns `false` so the caller can short-circuit the
+    /// persistence write).
+    #[test]
+    fn archive_flag_toggles_with_idempotency() {
+        let (layer, group, timeline, mut sub) = make_timeline();
+        let _ = (layer, group);
+        // Untouched: archived defaults to false.
+        assert!(!sub.is_archived(timeline));
+
+        // First write: state actually changed, returns true.
+        assert!(sub.set_archived(timeline, true));
+        assert!(sub.is_archived(timeline));
+
+        // Second write of the same value: idempotent, returns false.
+        assert!(!sub.set_archived(timeline, true));
+        assert!(sub.is_archived(timeline));
+
+        // Unarchive: state changes, returns true.
+        assert!(sub.set_archived(timeline, false));
+        assert!(!sub.is_archived(timeline));
+
+        // Setting on an unknown timeline: returns false (and no-op).
+        let bogus = TimelineId::from_raw(999).unwrap();
+        assert!(!sub.set_archived(bogus, true));
+        assert!(!sub.is_archived(bogus));
+    }
+
+    /// `known_conversations` exposes the archived flag — the daemon
+    /// uses this to drive the sidebar filter.
+    #[test]
+    fn known_conversations_exposes_archived_flag() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        sub.set_conv_id(timeline, "abc");
+        sub.set_label(timeline, "tour");
+        sub.set_archived(timeline, true);
+
+        let convs = sub.known_conversations();
+        assert_eq!(convs.len(), 1);
+        let (tl, conv_id, label, archived) = &convs[0];
+        assert_eq!(*tl, timeline);
+        assert_eq!(conv_id, "abc");
+        assert_eq!(label, "tour");
+        assert!(*archived);
     }
 }

@@ -106,6 +106,25 @@ pub fn collect_live_records(
             payload,
         ));
     }
+    // Per-timeline lifecycle state — same last-write-wins shape as
+    // Label. One record per timeline whose archive state has ever
+    // been touched; default-false states aren't written (the
+    // `write_conv_state` no-op gate plus the default `archived=false`
+    // mean an untouched timeline carries no ConvState record at all).
+    for (timeline_id, state) in &manifest.conv_states {
+        let payload = super::manifest::encode_conv_state_payload(*timeline_id, *state);
+        out.push((
+            RecordHeader {
+                record_type: RecordType::ConvState,
+                format: 0,
+                payload_len: payload.len() as u64,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
+        ));
+    }
     Ok(out)
 }
 
@@ -172,7 +191,10 @@ pub fn dead_record_ratio(log: &mut dyn LogSource, manifest: &Manifest) -> Result
         .filter(|(h, _)| {
             !matches!(
                 h.record_type,
-                RecordType::StreamDecl | RecordType::Commit | RecordType::Label
+                RecordType::StreamDecl
+                    | RecordType::Commit
+                    | RecordType::Label
+                    | RecordType::ConvState
             )
         })
         .count()
@@ -186,7 +208,8 @@ pub fn dead_record_ratio(log: &mut dyn LogSource, manifest: &Manifest) -> Result
             .values()
             .filter(|s| s.committed_through.is_some())
             .count()
-        + manifest.labels.len();
+        + manifest.labels.len()
+        + manifest.conv_states.len();
     let dead = total.saturating_sub(live_on_disk.min(total));
     Ok(dead as f32 / total as f32)
 }

@@ -146,7 +146,33 @@
     .conv-item.active .conv-close { display: flex; }
     .conv-close:hover { color: #e07070; background: rgba(220,80,80,0.12); }
 
+    /* Archived rows are visually muted so they read as "tucked away" rather
+       than active — only ever visible when "show archived" is on. */
+    .conv-item.archived .conv-title { color: #5a7088; font-style: italic; }
+    .conv-item.archived:hover .conv-title { color: #c0ccd8; font-style: normal; }
+
     #sidebar-empty { padding: 1rem 0.9rem; font-size: 0.775rem; color: #4a6278; line-height: 1.6; }
+
+    /* ── Sidebar footer — show-archived toggle ─────────────────────────────── */
+
+    #sidebar-footer {
+      flex-shrink: 0;
+      padding: 0.55rem 0.85rem 0.65rem;
+      border-top: 1px solid #2a3848;
+      background: #19222f;
+    }
+    #show-archived-label {
+      display: flex; align-items: center; gap: 0.45rem;
+      font-size: 0.72rem; color: #6a8098; cursor: pointer;
+      user-select: none;
+      transition: color 0.12s;
+    }
+    #show-archived-label:hover { color: #c0ccd8; }
+    #show-archived {
+      width: 13px; height: 13px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
 
     /* ── Resizer contrast overrides ────────────────────────────────────────── */
 
@@ -356,6 +382,14 @@
 
     #input-bar { flex-shrink: 0; position: relative; padding: 0 2rem 1.5rem; background: var(--bg); }
     #input-bar::before { content: ""; position: absolute; top: -3rem; left: 0; right: 0; height: 3rem; background: linear-gradient(to bottom, transparent, var(--bg)); pointer-events: none; }
+    #input-bar.archived .input-wrap { display: none; }
+    #archived-notice {
+      display: none; text-align: center; color: var(--text-muted);
+      font-size: 0.85rem; font-style: italic; padding: 0.9rem 1rem;
+      border: 1px dashed var(--border); border-radius: 14px;
+      background: color-mix(in srgb, var(--bg-input) 60%, transparent);
+    }
+    #input-bar.archived #archived-notice { display: block; }
 
     .input-wrap {
       display: flex; align-items: flex-end; gap: 0.55rem;
@@ -520,6 +554,12 @@
     <div id="conv-list">
       <div id="sidebar-empty">No conversations yet.</div>
     </div>
+    <div id="sidebar-footer">
+      <label id="show-archived-label" for="show-archived">
+        <input type="checkbox" id="show-archived" />
+        Show archived
+      </label>
+    </div>
   </div>
 
   <div class="col-resizer" id="resizer-l"></div>
@@ -584,6 +624,7 @@
             <svg viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
+        <div id="archived-notice">This conversation is archived.</div>
       </div>
     </div>
   </div>
@@ -622,6 +663,7 @@ const emptyState   = document.getElementById('empty-state');
 const chatView     = document.getElementById('chat-view');
 const promptEl     = document.getElementById('prompt');
 const sendBtn      = document.getElementById('send-btn');
+const inputBar     = document.getElementById('input-bar');
 const convList     = document.getElementById('conv-list');
 const sidebarEmpty = document.getElementById('sidebar-empty');
 
@@ -631,12 +673,36 @@ const sidebarEmpty = document.getElementById('sidebar-empty');
     `Good ${h < 12 ? 'Morning' : h < 17 ? 'Afternoon' : 'Evening'}.`;
 }
 
+// When false the sidebar filters archived rows out. Toggled by the
+// "Show archived" checkbox at the bottom of the sidebar; persisted
+// across page loads via localStorage so a refresh keeps the user's
+// chosen view.
+let showArchived = (() => {
+  try { return localStorage.getItem('zend.showArchived') === '1'; }
+  catch (_) { return false; }
+})();
+
+// Drafts (local conv with no history yet) are hidden from the
+// sidebar until the user actually sends a message; only then does
+// the row appear. Archived rows are hidden unless "Show archived"
+// is on.
+function isDraft(conv) {
+  return !conv.remote && conv.history.length === 0 && !conv.pending;
+}
+function visibleConversations() {
+  return conversations.filter(c => !isDraft(c) && (showArchived || !c.archived));
+}
+
 function renderSidebar() {
-  sidebarEmpty.style.display = conversations.length ? 'none' : '';
+  const visible = visibleConversations();
+  sidebarEmpty.style.display = visible.length ? 'none' : '';
   convList.querySelectorAll('.conv-item').forEach(el => el.remove());
-  for (const conv of conversations) {
+  for (const conv of visible) {
     const btn = document.createElement('button');
-    btn.className = 'conv-item' + (conv.id === activeId ? ' active' : '');
+    const cls = ['conv-item'];
+    if (conv.id === activeId) cls.push('active');
+    if (conv.archived) cls.push('archived');
+    btn.className = cls.join(' ');
     btn.innerHTML = `<span class="conv-title">${esc(conv.title)}</span>
       <span class="conv-close" title="Close">✕</span>`;
     btn.addEventListener('click', () => switchTo(conv.id));
@@ -648,17 +714,39 @@ function renderSidebar() {
   }
 }
 
-function closeConversation(id) {
+// Archive a conversation: POST the archive endpoint and mark
+// archived locally. Any conv visible in the sidebar has at least
+// one message (drafts are filtered out by `isDraft`) and therefore
+// exists on the daemon, regardless of whether `conv.remote` was
+// set — that flag means "needs hydration from server" and is only
+// set on conversations recovered via the list endpoint, NOT on
+// ones created during this session. If the archive request fails
+// (daemon unreachable, model not loaded) leave the local state
+// alone so the user can retry.
+async function closeConversation(id) {
   const idx = conversations.findIndex(c => c.id === id);
   if (idx === -1) return;
-  conversations.splice(idx, 1);
-  if (conversations.length === 0) {
-    activeId = null;
-    newConversation();
-    return;
-  }
+  const conv = conversations[idx];
+
+  try {
+    const res = await fetch(
+      `/v1/conversations/${encodeURIComponent(conv.id)}/archive`,
+      { method: 'POST' },
+    );
+    if (!res.ok) return;
+  } catch (_) { return; }
+  conv.archived = true;
+
+  // If we just hid the active conv, switch to the next visible one
+  // (or open a fresh local one if nothing's visible).
   if (activeId === id) {
-    switchTo(conversations[Math.min(idx, conversations.length - 1)].id);
+    const visible = visibleConversations();
+    if (visible.length === 0) {
+      activeId = null;
+      newConversation();
+      return;
+    }
+    switchTo(visible[Math.min(idx, visible.length - 1)].id);
   } else {
     renderSidebar();
   }
@@ -670,8 +758,9 @@ function switchTo(id) {
   if (!conv) return;
   renderSidebar();
   rebuildChatView(conv);
+  updateInputBarForActive();
   updateSendBtn();
-  promptEl.focus();
+  if (!conv.archived) promptEl.focus();
 }
 
 function rebuildChatView(conv) {
@@ -698,16 +787,57 @@ function rebuildChatView(conv) {
   }
 }
 
+// Reset to the home view (greeting + four prompt cards). No draft
+// row is created in the sidebar — a conversation only materialises
+// there once the user actually sends a first message via send().
 function newConversation() {
-  const id = Date.now();
-  conversations.unshift({ id, title: 'New conversation', history: [] });
-  switchTo(id);
+  activeId = null;
+  emptyState.style.display = '';
+  chatView.classList.remove('active');
+  chatView.innerHTML = '';
+  promptEl.value = '';
+  promptEl.style.height = 'auto';
+  inputBar.classList.remove('archived');
+  renderSidebar();
+  updateSendBtn();
+  promptEl.focus();
 }
 
 document.getElementById('new-chat-btn').addEventListener('click', newConversation);
 document.querySelectorAll('.card').forEach(c =>
   c.addEventListener('click', () => { send(c.dataset.prompt); promptEl.focus(); }));
 newConversation();
+
+// "Show archived" checkbox — toggles whether archived conversations
+// appear in the sidebar. Local-only filter; the conversations array
+// already holds both kinds (we always fetch with include_archived=
+// true). Choice persists in localStorage so a refresh keeps the
+// user's view.
+{
+  const cb = document.getElementById('show-archived');
+  cb.checked = showArchived;
+  cb.addEventListener('change', () => {
+    showArchived = cb.checked;
+    try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); }
+    catch (_) { /* localStorage disabled — accept the loss */ }
+    // If the currently-active conversation just became hidden,
+    // switch to the first visible one (or open a fresh local one).
+    if (activeId !== null) {
+      const active = conversations.find(c => c.id === activeId);
+      if (active && active.archived && !showArchived) {
+        const visible = visibleConversations();
+        if (visible.length === 0) {
+          activeId = null;
+          newConversation();
+          return;
+        }
+        switchTo(visible[0].id);
+        return;
+      }
+    }
+    renderSidebar();
+  });
+}
 
 // ── Recovered conversations sidebar ────────────────────────────────────────────
 //
@@ -727,25 +857,40 @@ let lastDaemonStartedAt = null;
 
 async function refreshRecoveredConversations() {
   let body;
+  // Always ask the daemon for archived rows too — we keep both
+  // archived and non-archived in the local store and filter at
+  // render time via `showArchived`. This lets the checkbox toggle
+  // be instant (no extra round-trip) and lets the archive POST
+  // flow update local state without re-fetching.
   try {
-    const res = await fetch('/v1/conversations');
+    const res = await fetch('/v1/conversations?include_archived=true');
     if (!res.ok) return;
     body = await res.json();
   } catch (_) { return; }
   if (!body || !Array.isArray(body.conversations)) return;
-  let added = 0;
+  let mutated = false;
   for (const entry of body.conversations) {
-    if (conversations.some(c => String(c.id) === entry.id)) continue;
+    const existing = conversations.find(c => String(c.id) === entry.id);
+    if (existing) {
+      // Keep the local copy in sync with server state — archive
+      // status can change from another client / a manual API call.
+      if (existing.archived !== !!entry.archived) {
+        existing.archived = !!entry.archived;
+        mutated = true;
+      }
+      continue;
+    }
     conversations.push({
       id: entry.id,
       title: entry.label || 'Conversation',
       history: [],
       remote: true,           // hydrate from server on first switchTo
       updated_ms: entry.updated_ms ?? 0,
+      archived: !!entry.archived,
     });
-    added++;
+    mutated = true;
   }
-  if (added > 0) {
+  if (mutated) {
     // Newest-first by updated_ms; the unsaved local "New conversation" has
     // no updated_ms and stays at the top.
     conversations.sort((a, b) => {
@@ -754,6 +899,7 @@ async function refreshRecoveredConversations() {
       return bTime - aTime;
     });
     renderSidebar();
+    updateInputBarForActive();
   }
 }
 
@@ -888,6 +1034,14 @@ function updateSendBtn() {
   const ready = promptEl.value.trim().length > 0 && !conv?.streaming;
   sendBtn.disabled = !ready;
   sendBtn.classList.toggle('ready', ready);
+}
+
+// Hide the message textarea + send button for archived conversations
+// so the user can't extend them. The history still renders; only the
+// input affordance is suppressed.
+function updateInputBarForActive() {
+  const conv = conversations.find(c => c.id === activeId);
+  inputBar.classList.toggle('archived', !!conv?.archived);
 }
 
 promptEl.addEventListener('input', () => {
@@ -1059,17 +1213,21 @@ function appendAssistantTurn() {
 
 async function send(text) {
   if (!text) return;
-  if (activeId === null) newConversation();
+  if (activeId === null) {
+    const id = Date.now();
+    conversations.unshift({ id, title: 'New conversation', history: [] });
+    activeId = id;
+  }
   const conv = conversations.find(c => c.id === activeId);
   if (!conv || conv.streaming) return;
 
   const convId = conv.id;
 
-  if (conv.history.length === 0) {
+  const firstMessage = conv.history.length === 0;
+  if (firstMessage) {
     conv.title = text.length > 44 ? text.slice(0, 42) + '…' : text;
     emptyState.style.display = 'none';
     chatView.classList.add('active');
-    renderSidebar();
   }
 
   promptEl.value = '';
@@ -1078,6 +1236,10 @@ async function send(text) {
   chatAutoScroll = true;
   updateSendBtn();
   conv.history.push({ role: 'user', content: text });
+  // After the push the conv is no longer a draft and should now
+  // appear in the sidebar (the empty-history filter would have
+  // hidden it before the push).
+  if (firstMessage) renderSidebar();
   appendUserTurn(text);
   if (activeId === convId) chatScrollToBottom();
 

@@ -27,6 +27,8 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/status", get(status::status))
         .route("/v1/conversations", get(conversations::list))
         .route("/v1/conversations/:id", get(conversations::get))
+        .route("/v1/conversations/:id/archive", post(conversations::archive))
+        .route("/v1/conversations/:id/unarchive", post(conversations::unarchive))
         .route("/ws/logs", get(ws_logs::handler))
         .with_state(session)
         .fallback(embedded_asset)

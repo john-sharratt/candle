@@ -326,6 +326,46 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Append a `ConvState` record for `timeline_id`, idempotent on
+    /// the manifest's current value. Last-write-wins on replay.
+    ///
+    /// Caller invariant: `timeline_id` should refer to a registered
+    /// timeline (otherwise the state is orphaned on disk and the
+    /// reload path's `set_archived` no-op will drop it on the floor).
+    pub fn write_conv_state(
+        &mut self,
+        timeline_id: u64,
+        state: manifest::ConvState,
+    ) -> Result<()> {
+        if let Some(existing) = self.manifest.conv_states.get(&timeline_id) {
+            if *existing == state {
+                return Ok(());
+            }
+        }
+        let payload = manifest::encode_conv_state_payload(timeline_id, state);
+        self.append_record(RecordType::ConvState, 0, 0, 0, 0, &payload)?;
+        Ok(())
+    }
+
+    /// Every recovered `(timeline_id, ConvState)` pair from the active
+    /// manifest and any inherited substrates. Mirrors
+    /// [`Self::collected_conv_metas`]; the reload path applies these
+    /// alongside the labels.
+    pub fn collected_conv_states(&self) -> Vec<(u64, manifest::ConvState)> {
+        let mut out: std::collections::BTreeMap<u64, manifest::ConvState> = self
+            .manifest
+            .conv_states
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        for inherited in &self.inherited {
+            for (k, v) in &inherited.manifest().conv_states {
+                out.entry(*k).or_insert(*v);
+            }
+        }
+        out.into_iter().collect()
+    }
+
     /// Every recovered `(timeline_id, ConvMeta)` pair from the active
     /// manifest and any inherited substrates. The substrate-reload path
     /// uses this to repopulate the in-RAM `Substrate::labels` /
