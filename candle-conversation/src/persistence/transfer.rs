@@ -7,9 +7,9 @@
 //!   contiguous host buffer (the core of eviction).
 //! - [`scatter_chunks`] — write a contiguous host buffer back into a set of
 //!   VRAM chunks (the core of a load).
-//! - [`evict_to_warm`] / [`load_to_hot`] — the `SealedSequence`-level evict
-//!   and load paths, thin glue over the two primitives plus the
-//!   [`WarmPool`](super::warm_pool::WarmPool).
+//! - [`load_to_hot`] — the `SealedSequence`-level load path: thin glue
+//!   over the two primitives that materialises a recovered chunk grid
+//!   into a fresh per-layer `SealedSequence` set in VRAM.
 //!
 //! `candle-conversation` is CUDA-only, so this module is unconditionally
 //! compiled — the gather/scatter helpers and `kv_migrate` plan it builds
@@ -24,8 +24,6 @@ mod cuda_impl {
 
     use crate::persistence::cold_load::ColdLoadStager;
     use crate::persistence::resume::{ChunkImage, TurnChunkGrid};
-    use crate::persistence::streams::StreamId;
-    use crate::persistence::warm_pool::WarmPool;
 
     fn cuda_device(device: &Device) -> Result<&candle::CudaDevice> {
         match device {
@@ -147,54 +145,8 @@ mod cuda_impl {
         Ok(images)
     }
 
-    /// Evict a sealed turn VRAM→RAM: gather every layer's chunks into
-    /// the warm pool as a [`TurnChunkGrid`], marked dirty (not yet
-    /// durable on disk). The group-commit append flushes them to the
-    /// redo log; the entry is then `mark_clean`'d.
-    ///
-    /// All layers' chunks live under one `StreamId` (the per-turn id).
-    pub fn evict_to_warm(
-        backings: &[ChunkedKvBacking],
-        seqs: &[SealedSequence],
-        device: &Device,
-        stream_id: StreamId,
-        warm_pool: &mut WarmPool,
-    ) -> Result<()> {
-        if backings.len() != seqs.len() {
-            return Err(candle::Error::Msg(format!(
-                "evict_to_warm: {} backings vs {} sealed sequences",
-                backings.len(),
-                seqs.len()
-            )));
-        }
-        let mut grid = TurnChunkGrid::with_capacity(seqs.len());
-        for (backing, seq) in backings.iter().zip(seqs) {
-            grid.push_layer(seal_to_chunk_images(backing, device, seq)?);
-        }
-        warm_pool.insert(stream_id, grid, true);
-        Ok(())
-    }
-
-    /// Park a freshly-recovered cold turn's per-layer chunk grid in the
-    /// warm pool — the **read-side mirror** of [`evict_to_warm`]. Both
-    /// functions write into the warm pool in the same [`TurnChunkGrid`]
-    /// form, so the warm→hot leg ([`load_to_hot`]) is shared between
-    /// "recently-evicted" and "just-lifted-off-NVMe" cases.
-    ///
-    /// Cold inserts are marked **clean** — the bytes were just
-    /// recovered from a durable redo log; no flush owed. Pure host
-    /// memcpy; no CUDA work.
-    ///
-    /// `grid` is what `Conversation::recover_turn_chunks` returns; this
-    /// function takes ownership and inserts it.
-    pub fn cold_into_warm(warm_pool: &mut WarmPool, stream_id: StreamId, grid: TurnChunkGrid) {
-        warm_pool.insert(stream_id, grid, false);
-    }
-
-    /// Materialize a warm-resident turn into VRAM — the **shared
-    /// warm→hot leg** used by both warm hits (recently-evicted turn)
-    /// and cold-after-warming (turn just lifted off NVMe via
-    /// `cold_into_warm`).
+    /// Materialize a recovered chunk grid into VRAM — the warm→hot
+    /// leg shared by every cold-load orchestrator.
     ///
     /// Per layer: allocates fresh sealed blocks in the policy-selected
     /// per-(h,p) Q-format arenas, packs the `kv_bytes` into the pinned
@@ -291,8 +243,34 @@ mod cuda_impl {
             // `crate::persistence::cold_load` for the bridge-vs-GDS
             // rationale.
             let total_bytes: usize = chunks.iter().map(|c| c.payload.kv_bytes.len()).sum();
+            let expected_bytes: i64 = ptrs.iter().map(|&(_, len)| len).sum();
             if total_bytes == 0 {
                 return Ok(seq);
+            }
+            // Detect under-persisted data — kv_bytes was written with a
+            // smaller per-chunk size than the rebuilt arena slots
+            // expect. This happens for any turn that was persisted by
+            // a pre-fix daemon (the `arena_byte_size` dedup-by-arena
+            // -idx bug capped `SealedChunk.byte_size` at one stride).
+            // The scatter will run regardless, but the OOB-read sub-
+            // bands beyond the persisted slice will contain undefined
+            // memory and the model's attention against this turn will
+            // be broken. Log loudly so the operator can correlate
+            // sidebar entries against the "this turn won't have
+            // useful KV" outcome.
+            if (total_bytes as i64) < expected_bytes {
+                tracing::warn!(
+                    target: "candle_conversation::persistence::tier",
+                    persisted_bytes = total_bytes,
+                    expected_bytes,
+                    n_chunks = chunks.len(),
+                    n_ptrs = ptrs.len(),
+                    ratio = (total_bytes as f64) / (expected_bytes as f64),
+                    "cold-load: persisted kv_bytes shorter than fresh arena footprint — \
+                     turn was written by a pre-fix daemon and is permanently corrupt \
+                     (sub-bands beyond the first will contain undefined memory). \
+                     Start a fresh conversation to recover."
+                );
             }
             let _packed_len = {
                 let packed = stager.pack(chunks.iter().map(|c| c.payload.kv_bytes.as_slice()))?;
@@ -463,6 +441,5 @@ mod cuda_impl {
 }
 
 pub use cuda_impl::{
-    cold_into_warm, evict_to_warm, gather_chunks, load_stream, load_to_hot, scatter_chunks,
-    seal_to_chunk_images,
+    gather_chunks, load_stream, load_to_hot, scatter_chunks, seal_to_chunk_images,
 };

@@ -664,15 +664,35 @@ impl ZendSession {
         }
     }
 
-    /// Sidebar entries for `GET /v1/conversations`. Built **directly from
-    /// the substrate** — the `RecordType::Label` records carry every
-    /// conversation's `(conv_id, label)` pair, and the substrate's
-    /// `recovered_timelines()` supplies turn counts.
+    /// Sidebar entries for `GET /v1/conversations`. Built from the
+    /// in-RAM substrate (the `RecordType::Label` records carry every
+    /// conversation's `(conv_id, label)` pair), but **gated on the
+    /// on-disk redo log still existing**.
+    ///
+    /// The gate exists because the dev workflow of wiping the
+    /// `.substrate/` dir behind a running daemon used to leave ghost
+    /// conversations in the sidebar: the daemon's in-RAM substrate
+    /// kept the old `known_conversations` snapshot even though disk
+    /// was empty. With the gate, deleting the log forces the next
+    /// refresh to return an empty list — matching what the user
+    /// observes on disk.
     ///
     /// Sorted newest-first by `conv_id` string descending (the frontend
     /// supplies `Date.now()` ids, so lexicographic-descending == newest).
     /// The titler's internal timeline is excluded.
     pub fn list_conversations(&self) -> Vec<ConvEntry> {
+        // On-disk gate: if the workspace's redo log is gone, return
+        // empty regardless of the in-RAM cache. The daemon will keep
+        // running and any new turn will rebuild the log file.
+        let log_path = self
+            .config
+            .workspace
+            .join(candle_conversation::persistence::SUBSTRATE_DIR)
+            .join(candle_conversation::persistence::ACTIVE_LOG_NAME);
+        if !log_path.exists() {
+            return Vec::new();
+        }
+
         let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
             return Vec::new();
         };

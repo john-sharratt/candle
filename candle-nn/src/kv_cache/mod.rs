@@ -45,7 +45,7 @@ pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 pub use chunked::sampled_selection::SampleFormat;
 pub(crate) use chunked::Arena; // Internal use only
-pub use chunked::StoragePolicy;
+pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{
     arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, CHUNK_SIZE,
 };

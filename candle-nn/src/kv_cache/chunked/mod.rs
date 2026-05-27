@@ -57,7 +57,8 @@ pub use types::{SealedChunk, SealedSequence};
 
 // Re-export for use within submodules and tests
 pub use arena::StoragePolicy;
-pub(crate) use arena::{Arena, ArenaKey, ArenaStorage, ArenaStorageState};
+pub use arena::ArenaKey;
+pub(crate) use arena::{Arena, ArenaStorage, ArenaStorageState};
 #[allow(unused_imports)]
 pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
 

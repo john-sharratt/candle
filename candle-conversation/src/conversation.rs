@@ -4,14 +4,13 @@
 //! to the scheduler via channel. All CPU work (tokenization, formatting)
 //! happens here; the scheduler only does GPU work.
 
-use crate::config::{SequenceConfig, SamplingConfig};
+use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::projection::{
     Builder, Conversation, ProjectionTarget, SectionId, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::ProvenanceFile;
-use candle_transformers::models::batched_inference::ModelCoreProperties;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
@@ -19,6 +18,7 @@ use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
 use candle_nn::kv_cache::SealedSequence;
+use candle_transformers::models::batched_inference::ModelCoreProperties;
 
 /// Slice a per-layer sealing down to the chunk range `[from..to)`.
 ///
@@ -179,9 +179,6 @@ impl Sequence {
         substrate: Conversation,
         section_progress: Option<&dyn Fn(u64, u64)>,
     ) -> crate::Result<Self> {
-        // Mark `section_progress` as observable across nested closures
-        // (per-section callbacks may fire during the ingest loop).
-        let _ = &section_progress;
         // Persistence is now a property of the workspace `Conversation`
         // (the substrate handle), wired in by the engine via
         // `Conversation::open(path)`.  The Sequence has nothing to do
@@ -286,12 +283,50 @@ impl Sequence {
         // end-marker's ingest below.
         let mut fixed_prefix: Vec<SectionId> = Vec::new();
 
+        // ── Progress accounting ────────────────────────────────────────
+        // Byte totals across every section we're about to ingest. The
+        // frontend's "Sections" step progress fills as we walk the
+        // ingest loop below, so the load screen actually moves between
+        // 0 % and 100 % instead of sitting at 0 % until the final
+        // `set_step` transition.
+        let total_bytes: u64 = system_start
+            .as_ref()
+            .map(|s| s.content.len() as u64)
+            .unwrap_or(0)
+            + layer_items
+                .iter()
+                .map(|item| match item {
+                    SystemPromptItem::Section(s) => s.content.len() as u64,
+                    SystemPromptItem::Collection(c) => c
+                        .sections
+                        .iter()
+                        .map(|s| s.content.len() as u64)
+                        .sum::<u64>(),
+                })
+                .sum::<u64>()
+            + system_end
+                .as_ref()
+                .map(|s| s.content.len() as u64)
+                .unwrap_or(0);
+        let mut done_bytes: u64 = 0;
+        let report = |done: u64| {
+            if let Some(cb) = section_progress {
+                cb(done, total_bytes);
+            }
+        };
+        // Initial 0 / total tick so the bar appears immediately —
+        // otherwise the UI shows nothing until the first section
+        // finishes, which can be seconds for a heavy schema.
+        report(0);
+
         // Ingest the system-start marker first so every subsequent
         // section attends to its bytes.
         if let Some(start) = &system_start {
             conv.insert_section_with_prefix(start.id, start.content.as_str(), &linear_prefix)?;
             linear_prefix.push(start.id);
             fixed_prefix.push(start.id);
+            done_bytes += start.content.len() as u64;
+            report(done_bytes);
         }
 
         // Cumulative ingest: walk schema items in declaration order,
@@ -319,6 +354,8 @@ impl Sequence {
                     if s.depends_on.is_none() {
                         fixed_prefix.push(s.id);
                     }
+                    done_bytes += s.content.len() as u64;
+                    report(done_bytes);
                 }
                 SystemPromptItem::Collection(coll) => {
                     let batch: Vec<(SectionId, &str)> = coll
@@ -333,7 +370,12 @@ impl Sequence {
                     // must be coherent for the empty-collection case.
                     for sec in &coll.sections {
                         linear_prefix.push(sec.id);
+                        done_bytes += sec.content.len() as u64;
                     }
+                    // Collection members ingest in parallel — emit one
+                    // tick after the whole batch lands rather than
+                    // per-member.
+                    report(done_bytes);
                 }
             }
         }
@@ -344,6 +386,8 @@ impl Sequence {
         if let Some(end) = &system_end {
             conv.insert_section_with_prefix(end.id, end.content.as_str(), &fixed_prefix)?;
             fixed_prefix.push(end.id);
+            done_bytes += end.content.len() as u64;
+            report(done_bytes);
         }
 
         // Pre-warm the slot: inject all system-prompt sections now so the
@@ -367,8 +411,7 @@ impl Sequence {
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
-            rx.recv()
-                .map_err(|_| ConversationError::SchedulerGone)??;
+            rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
         }
 
         Ok(conv)
@@ -388,8 +431,7 @@ impl Sequence {
         self.tree.task_event_observer = tx;
     }
 
-
-/// Ingest one system-prompt section into the substrate.
+    /// Ingest one system-prompt section into the substrate.
     ///
     /// Forks the conversation, prefills the section's content onto
     /// the fork (no decode), seals the fork to CPU, and pins the
@@ -417,16 +459,11 @@ impl Sequence {
     /// scheduler_tx / tokenizer / provenance / chunk_size off the
     /// Sequence; lifting it to a workspace method requires threading
     /// those dependencies through and restructuring callers.
-    pub fn insert_section(
-        &mut self,
-        section: SectionId,
-        content: &str,
-    ) -> crate::Result<()> {
+    pub fn insert_section(&mut self, section: SectionId, content: &str) -> crate::Result<()> {
         if content.is_empty() {
             return Ok(());
         }
-        let mut results =
-            self.insert_section_collection(&[(section, content)], &[])?;
+        let mut results = self.insert_section_collection(&[(section, content)], &[])?;
         results.pop();
         Ok(())
     }
@@ -446,10 +483,8 @@ impl Sequence {
         if content.is_empty() {
             return Ok(());
         }
-        let mut results = self.insert_section_collection(
-            &[(section, content)],
-            prefix_section_ids,
-        )?;
+        let mut results =
+            self.insert_section_collection(&[(section, content)], prefix_section_ids)?;
         results.pop();
         Ok(())
     }
@@ -556,9 +591,7 @@ impl Sequence {
 
         let mut out: Vec<(SectionId, usize)> = Vec::with_capacity(pending.len());
         for (slot_id, section_id, rx) in pending {
-            let seal = rx
-                .recv()
-                .map_err(|_| ConversationError::SchedulerGone)??;
+            let seal = rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
             let block_count = seal.block_to.saturating_sub(seal.block_from);
             let _ = self.scheduler_tx.send(SchedulerRequest::FreeSequence {
                 sequence_id: slot_id,
@@ -613,10 +646,7 @@ impl Sequence {
     /// vectors from representative user prompts so they can be compared
     /// against decode-phase vectors to measure the information gain of
     /// running a full decode probe.
-    pub fn prefill_sigs_for(
-        &self,
-        text: &str,
-    ) -> crate::Result<Vec<crate::provenance::SigEntry>> {
+    pub fn prefill_sigs_for(&self, text: &str) -> crate::Result<Vec<crate::provenance::SigEntry>> {
         let tokens = self.tokenize(text)?;
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -837,7 +867,6 @@ impl Sequence {
             });
         }
 
-
         // Format the full exchange (user + assistant_start prefix +
         // assistant_text) and tokenize as a single prefill payload.
         let no_think_prefix = if self.config.suppress_thinking {
@@ -996,10 +1025,7 @@ impl Sequence {
             // chunk-group as probe.  The substrate already has the
             // turn (the scheduler wrote it before sending Done), so
             // the new turn's index is the current timeline tail minus 1.
-            let timeline_count = self
-                .substrate
-                .read()
-                .turn_count(self.target.timeline);
+            let timeline_count = self.substrate.read().turn_count(self.target.timeline);
             if timeline_count > 0 {
                 let last_idx = TurnIndex(timeline_count - 1);
                 if let Err(e) = self.run_bdp_scan(self.target.timeline, last_idx) {
@@ -1117,7 +1143,7 @@ impl Sequence {
         Ok(fork_conv)
     }
 
-/// Reset this conversation to its initial state.
+    /// Reset this conversation to its initial state.
     ///
     /// Clears the GPU KV cache and resets client-side state.  The next
     /// `submit_turn` will re-seed the system into the substrate via
@@ -1509,8 +1535,8 @@ impl Sequence {
         // JSON structure — pure BDP noise.  Both bare forms and the BPE
         // merges a tokenizer emits inside compact JSON are added.
         for s in [
-            "{", "}", "[", "]", ":", ",", "\"",
-            "{\"", "\"}", "\"}}", "\":\"", "\",\"", "\":", "\",", "[{", "}]",
+            "{", "}", "[", "]", ":", ",", "\"", "{\"", "\"}", "\"}}", "\":\"", "\",\"", "\":",
+            "\",", "[{", "}]",
         ] {
             add(&mut ids, s);
         }
@@ -1539,7 +1565,7 @@ impl Sequence {
         ids
     }
 
-/// Drain all pending cognitive tasks from the tree to completion,
+    /// Drain all pending cognitive tasks from the tree to completion,
     /// re-draining after each batch to handle recursive tasks queued by
     /// segment-of-segments summarization.
     fn drain_cognitive_tasks(&mut self) {
@@ -1555,7 +1581,7 @@ impl Sequence {
         }
     }
 
-/// Run a BDP scan using the sig entries of `(probe_group, probe_index)`
+    /// Run a BDP scan using the sig entries of `(probe_group, probe_index)`
     /// as the probe and every other tracked `(group, idx)` as the corpus.
     /// Updates the session resolver's per-turn `PerDepthScores` in place.
     ///
@@ -1578,9 +1604,7 @@ impl Sequence {
             Vec<(SectionId, Vec<crate::provenance::SigEntry>)>,
         ) = {
             let view = self.substrate.read();
-            let probe = view
-                .sig_entries_of(probe_timeline, probe_index)
-                .to_vec();
+            let probe = view.sig_entries_of(probe_timeline, probe_index).to_vec();
             if probe.is_empty() {
                 return Ok(()); // nothing to probe with
             }
@@ -1643,7 +1667,6 @@ impl Sequence {
         // identity does not include scoring state.
         Ok(())
     }
-
 }
 
 impl Drop for Sequence {

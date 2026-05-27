@@ -33,7 +33,6 @@ pub mod streams;
 pub mod thread;
 pub mod transfer;
 pub mod walker;
-pub mod warm_pool;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

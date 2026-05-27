@@ -460,6 +460,86 @@ pub fn recover_turn(
     })
 }
 
+/// Resolve a turn's per-chunk redo-log locations into per-layer
+/// [`StoredSequence`] refs — the substrate's cold tier representation.
+///
+/// Reads the manifest only (no chunk-payload disk I/O), so this is
+/// cheap to call during reload alongside [`recover_turn`]. The pair
+/// of calls yields everything the substrate needs to land a restored
+/// turn as cold-marker (`hot = None, warm = None, cold = Some(...)`)
+/// — classifier-ready for the next `elevate_to_hot` to lift it.
+///
+/// Returns `None` if the stream has no `Chunk` records (the
+/// bg-quantizer crashed before its callback persisted them, or
+/// compression was disabled at run time). The reload path treats
+/// these as `cold = None` and the substrate leaves the turn empty.
+pub fn recover_turn_cold_refs(
+    p: &SubstratePersistence,
+    decl: &TurnDecl,
+    n_layers: usize,
+) -> Result<Option<Vec<StoredSequence>>> {
+    let stream_id = super::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
+    let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
+    if chunks_per_layer == 0 {
+        return Ok(None);
+    }
+
+    let Some(stream) = p.manifest().streams.get(&stream_id) else {
+        return Ok(None);
+    };
+    if stream.chunks.is_empty() {
+        return Ok(None);
+    }
+    let expected = n_layers * chunks_per_layer;
+    if stream.chunks.len() != expected {
+        return Err(PersistenceError::Corrupt(format!(
+            "recover_turn_cold_refs: stream {stream_id:?} has {} chunks, expected \
+             {n_layers} layers × {chunks_per_layer} chunks = {expected}",
+            stream.chunks.len()
+        )));
+    }
+
+    // Demux flat chunk_index = layer * chunks_per_layer + chunk into
+    // per-layer ordered `StoredSequence`s. Matches the layout
+    // documented in `flat_chunk_index`.
+    let mut per_layer: Vec<Vec<StoredChunk>> = (0..n_layers)
+        .map(|_| Vec::with_capacity(chunks_per_layer))
+        .collect();
+    let mut tokens_per_layer: Vec<usize> = vec![0; n_layers];
+    for (&flat_idx, loc) in &stream.chunks {
+        let layer = (flat_idx as usize) / chunks_per_layer;
+        let chunk = (flat_idx as usize) % chunks_per_layer;
+        if layer >= n_layers || chunk >= chunks_per_layer {
+            return Err(PersistenceError::Corrupt(format!(
+                "recover_turn_cold_refs: chunk_index {flat_idx} out of range \
+                 ({n_layers}×{chunks_per_layer})"
+            )));
+        }
+        // Pad to `chunk` index with placeholder, then overwrite.
+        let lane = &mut per_layer[layer];
+        while lane.len() <= chunk {
+            lane.push(StoredChunk {
+                log_offset: 0,
+                record_len: 0,
+                token_count: 0,
+            });
+        }
+        lane[chunk] = StoredChunk {
+            log_offset: loc.offset,
+            record_len: padded_record_len(loc.payload_len) as u64,
+            token_count: loc.token_count as u16,
+        };
+        tokens_per_layer[layer] += loc.token_count as usize;
+    }
+
+    let stored: Vec<StoredSequence> = per_layer
+        .into_iter()
+        .zip(tokens_per_layer)
+        .map(|(chunks, token_count)| StoredSequence { chunks, token_count })
+        .collect();
+    Ok(Some(stored))
+}
+
 /// Every turn stream in the recovered manifest, in `(timeline_id, turn_index)`
 /// order — the deterministic replay order a substrate reload walks.
 pub fn recovered_turn_decls(p: &SubstratePersistence) -> Vec<TurnDecl> {
@@ -656,6 +736,83 @@ mod tests {
         let dir = tmp_dir("dir_check");
         SubstratePersistence::open_in(&dir).unwrap();
         assert!(dir.join(SUBSTRATE_DIR).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After a persist+reopen, `recover_turn_cold_refs` returns one
+    /// `StoredSequence` per layer with the per-chunk `log_offset` /
+    /// `record_len` / `token_count` populated from the on-disk
+    /// manifest entries — the data the substrate's reload path needs
+    /// to install the cold tier without reading any chunk payloads.
+    #[test]
+    fn recover_cold_refs_demuxes_manifest_chunks_per_layer() {
+        let dir = tmp_dir("cold_refs");
+        let n_layers = 3usize;
+        let chunks_per_layer = 2usize;
+        let decl = turn_decl(11, 0, chunks_per_layer as u64);
+        let layers = TurnChunkGrid::new(
+            (0..n_layers)
+                .map(|l| {
+                    (0..chunks_per_layer)
+                        .map(|c| chunk_image((l * 10 + c) as u8, if c == 1 { 12 } else { 32 }))
+                        .collect()
+                })
+                .collect(),
+        );
+
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            persist_turn_kv(&mut sp, stream_id, &layers, &[1, 2, 3]).unwrap();
+            sp.commit().unwrap();
+            sp.checkpoint().unwrap();
+        }
+        {
+            let sp = SubstratePersistence::open_in(&dir).unwrap();
+            let cold = recover_turn_cold_refs(&sp, &decl, n_layers)
+                .unwrap()
+                .expect("Some(...) when chunks exist");
+            assert_eq!(cold.len(), n_layers, "one StoredSequence per layer");
+            for (layer, seq) in cold.iter().enumerate() {
+                assert_eq!(seq.chunks.len(), chunks_per_layer);
+                // Token counts demuxed back into the right layer slots.
+                assert_eq!(seq.chunks[0].token_count, 32);
+                assert_eq!(seq.chunks[1].token_count, 12);
+                assert_eq!(seq.token_count, 32 + 12);
+                // `log_offset` must be the actual on-disk record
+                // offset — past zero (header lands at the start of
+                // the file) and monotonically increasing within the
+                // layer.
+                let _ = layer;
+                assert!(seq.chunks[0].log_offset > 0, "log_offset populated");
+                assert!(seq.chunks[1].record_len > 0, "record_len populated");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A turn with no `Chunk` records (e.g. crash before bg-quantizer
+    /// callback persisted them) returns `None` — the reload path uses
+    /// this to leave `cold = None` on the residence so the classifier
+    /// reports it `missing` instead of attempting a bogus cold→hot.
+    #[test]
+    fn recover_cold_refs_returns_none_when_no_chunks() {
+        let dir = tmp_dir("cold_refs_empty");
+        let decl = turn_decl(13, 0, 0);
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            // No persist_turn_kv — stream declared but no Chunk records.
+            persist_tokens_only(&mut sp, stream_id, &[7, 8]).unwrap();
+            sp.commit().unwrap();
+        }
+        {
+            let sp = SubstratePersistence::open_in(&dir).unwrap();
+            let cold = recover_turn_cold_refs(&sp, &decl, 2).unwrap();
+            assert!(cold.is_none(), "no chunks → None");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

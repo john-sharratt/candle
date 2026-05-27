@@ -1,7 +1,7 @@
 //! Bulk hot-tier promotion — bring a batch of sections + turns into
 //! VRAM in one orchestrated pass.
 //!
-//! Pairs with [`Substrate::evict_hot_with_warm_backup`] (bulk eviction):
+//! Pairs with [`Substrate::evict_hot_except`] (working-set eviction):
 //! together they form the workspace's tier-management hot path. The
 //! scheduler calls `elevate_to_hot` ahead of a projection that needs
 //! a working set of turns ready for decode; the persistence thread
@@ -33,9 +33,11 @@ use super::cold_load::ColdLoadStager;
 use super::transfer::load_to_hot;
 use crate::projection::{Conversation, SectionId, TurnKey};
 use crate::substrate::{
-    EvictionReport, PromotionInstall, PromotionItemKind, PromotionPlan, WarmToHotEntry,
+    ColdRecall, EvictionReport, PromotionItemKind, PromotionPlan, PurgeReport, WarmLift,
+    WarmToHotEntry,
 };
 use candle_nn::kv_cache::SealedSequence;
+use sysinfo::System;
 
 /// Sum of `SealedChunk.byte_size` across every chunk of every layer
 /// in a per-layer `Vec<SealedSequence>` — the per-tier memory cost
@@ -70,6 +72,12 @@ pub struct ElevationReport {
     /// Total bytes moved cold → hot. Same accounting unit as
     /// `bytes_warm_to_hot`.
     pub bytes_cold_to_hot: u64,
+    /// Warm-tier residences whose warm copy was dropped to make
+    /// headroom for the upcoming cold→warm install (phase 2a purge).
+    pub warm_purged: usize,
+    /// RAM bytes freed by the phase 2a purge (sum of per-residence
+    /// `byte_size`).
+    pub bytes_warm_purged: u64,
 }
 
 impl ElevationReport {
@@ -118,15 +126,65 @@ pub fn elevate_to_hot(
         tracing::warn!("elevate_to_hot: item not found in substrate: {kind:?}");
     }
 
-    let mut installs: Vec<PromotionInstall> = Vec::new();
-
-    // ── Phase 2: cold → hot (NVMe-bound, per-item) ─────────────────────
-    //
-    // Each cold item does: recover_turn_chunks (or section equivalent)
-    // → TurnChunkGrid → load_to_hot. Section cold-load isn't wired up
-    // today (see ensure_section_hot in scheduler/mod.rs); cold sections
-    // are warned and dropped on the floor.
+    let mut recalls: Vec<ColdRecall> = Vec::new();
+    let mut lifts: Vec<WarmLift> = Vec::new();
     let n_layers = backings.len();
+
+    // ── Phase 2a: warm purge (single batch, ahead of every cold→warm) ──
+    //
+    // Cold→hot pre-populates a fresh warm copy alongside the hot
+    // install (see phase 2b), so each cold item adds RAM pressure
+    // equal to its `byte_size`. Before doing any of that work, sum
+    // the incoming RAM cost once and ask the substrate to drop LRU
+    // warm residences until the OS would still have at least
+    // `max(2 GiB, 5% × total_ram)` available after the upcoming
+    // allocation lands. Section cold-load isn't wired up; only turns
+    // contribute to the incoming budget.
+    if !plan.cold_to_hot.is_empty() {
+        let incoming_bytes: u64 = plan
+            .cold_to_hot
+            .iter()
+            .filter(|c| matches!(c.kind, PromotionItemKind::Turn(_)))
+            .flat_map(|c| c.cold.iter())
+            .flat_map(|s| s.chunks.iter())
+            .map(|c| c.record_len)
+            .sum();
+        if incoming_bytes > 0 {
+            let mut sys = System::new();
+            sys.refresh_memory();
+            let total_ram = sys.total_memory();
+            let available_ram = sys.available_memory();
+            let purged: PurgeReport = conversation.write().purge_warm_to_target(
+                incoming_bytes,
+                available_ram,
+                total_ram,
+            );
+            report.warm_purged = purged.count;
+            report.bytes_warm_purged = purged.bytes;
+        }
+    }
+
+    // ── Phase 2b.i: per-turn recover + load_to_hot (NVMe + GPU scatter)
+    //
+    // Walk every cold turn once: pull its chunk grid off disk via
+    // `recover_turn_chunks`, then scatter into fresh GPU arena slots
+    // via `load_to_hot`. Failures here are isolated to the failing
+    // turn (it's accounted in the report and skipped from the rest
+    // of the phase); the per-turn work can't be batched across turns
+    // because each turn allocates its own scratch slot inside
+    // load_stream.
+    //
+    // Section cold-load isn't wired up (see hot_section_or_skip in
+    // scheduler/mod.rs); cold sections are warned and dropped.
+    struct PendingRecall {
+        kind: PromotionItemKind,
+        residence: crate::substrate::ResidenceIndex,
+        hot_sealed: Vec<SealedSequence>,
+        bytes_for_item: u64,
+        timeline_raw: u64,
+        turn_index: u32,
+    }
+    let mut pending: Vec<PendingRecall> = Vec::with_capacity(plan.cold_to_hot.len());
     for cold_entry in plan.cold_to_hot {
         match cold_entry.kind {
             PromotionItemKind::Turn(key) => {
@@ -150,30 +208,22 @@ pub fn elevate_to_hot(
                     }
                 };
                 let bytes_for_item: u64 = grid.bytes() as u64;
-                match load_to_hot(backings, device, &grid, cold_stager) {
-                    Ok(sealed) => {
-                        tracing::debug!(
-                            target: "candle_conversation::persistence::tier",
-                            timeline = key.timeline.raw(),
-                            turn = key.index.0,
-                            residence = cold_entry.residence.0,
-                            bytes = bytes_for_item,
-                            "promoted cold → hot (turn)"
-                        );
-                        installs.push(PromotionInstall {
-                            kind: cold_entry.kind,
-                            residence: cold_entry.residence,
-                            hot: sealed,
-                        });
-                        report.cold_to_hot += 1;
-                        report.bytes_cold_to_hot =
-                            report.bytes_cold_to_hot.saturating_add(bytes_for_item);
-                    }
+                let hot_sealed = match load_to_hot(backings, device, &grid, cold_stager) {
+                    Ok(s) => s,
                     Err(e) => {
                         tracing::warn!("elevate_to_hot: load_to_hot {key:?}: {e}");
                         report.failed += 1;
+                        continue;
                     }
-                }
+                };
+                pending.push(PendingRecall {
+                    kind: cold_entry.kind,
+                    residence: cold_entry.residence,
+                    hot_sealed,
+                    bytes_for_item,
+                    timeline_raw: key.timeline.raw(),
+                    turn_index: key.index.0,
+                });
             }
             PromotionItemKind::Section(sid) => {
                 tracing::warn!(
@@ -183,6 +233,90 @@ pub fn elevate_to_hot(
                 report.failed += 1;
             }
         }
+    }
+
+    // ── Phase 2b.ii: batched cold→warm migrate (per layer, all turns) ──
+    //
+    // Cold→warm materialises the CPU-arena copy alongside hot so the
+    // next hot eviction is no-DMA (warm already there). We batch
+    // ACROSS turns per layer — one `migrate_sealed_to_cpu_batch_async`
+    // call per layer handles every pending turn's layer-`L` sequence
+    // in a single gather kernel + DtoH. Without this batching, a
+    // fresh-restart submit with N cold turns × L layers paid N×L
+    // sync overheads instead of L. For 16 cold turns × 30 layers
+    // that's ~480 sync points vs ~30 — same memory volume, far less
+    // launch + sync overhead.
+    //
+    // Best-effort: a layer-batch failure drops warm for **all** turns
+    // (graceful fallback to hot-only across the batch). The per-turn
+    // robustness of the old loop is sacrificed for the batching win;
+    // the failure mode is rare and the hot tier is still correct.
+    let mut warm_per_turn: Vec<Vec<SealedSequence>> = (0..pending.len())
+        .map(|_| Vec::with_capacity(n_layers))
+        .collect();
+    let mut batch_ok = !pending.is_empty();
+    if batch_ok {
+        for layer in 0..n_layers {
+            let inputs: Vec<&SealedSequence> =
+                pending.iter().map(|p| &p.hot_sealed[layer]).collect();
+            match backings[layer].migrate_sealed_to_cpu_batch_async(
+                device,
+                copy_stream,
+                pinned_scratch,
+                &inputs,
+            ) {
+                Ok(layer_warm) => {
+                    if layer_warm.len() != pending.len() {
+                        tracing::warn!(
+                            "elevate_to_hot: cold→warm migrate layer {layer} returned \
+                             {} sequences for {} inputs — landing hot-only for the \
+                             whole cold batch",
+                            layer_warm.len(),
+                            pending.len()
+                        );
+                        batch_ok = false;
+                        break;
+                    }
+                    for (i, seq) in layer_warm.into_iter().enumerate() {
+                        warm_per_turn[i].push(seq);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "elevate_to_hot: cold→warm migrate layer {layer} batched failed: \
+                         {e} — landing hot-only for the whole cold batch"
+                    );
+                    batch_ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── Phase 2b.iii: assemble ColdRecall installs ─────────────────────
+    for (i, p) in pending.into_iter().enumerate() {
+        let warm = if batch_ok {
+            std::mem::take(&mut warm_per_turn[i])
+        } else {
+            Vec::new()
+        };
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            timeline = p.timeline_raw,
+            turn = p.turn_index,
+            residence = p.residence.0,
+            bytes = p.bytes_for_item,
+            warm_landed = !warm.is_empty(),
+            "cold recall (hot + warm) (turn)"
+        );
+        recalls.push(ColdRecall {
+            kind: p.kind,
+            residence: p.residence,
+            hot: p.hot_sealed,
+            warm,
+        });
+        report.cold_to_hot += 1;
+        report.bytes_cold_to_hot = report.bytes_cold_to_hot.saturating_add(p.bytes_for_item);
     }
 
     // ── Phase 3: warm → hot (PCIe-bound, batched per layer) ────────────
@@ -254,7 +388,7 @@ pub fn elevate_to_hot(
                                 turn = key.index.0,
                                 residence = w.residence.0,
                                 bytes = bytes_for_item,
-                                "promoted warm → hot (turn)"
+                                "warm lift (turn)"
                             );
                         }
                         PromotionItemKind::Section(sid) => {
@@ -263,11 +397,11 @@ pub fn elevate_to_hot(
                                 section = sid.raw(),
                                 residence = w.residence.0,
                                 bytes = bytes_for_item,
-                                "promoted warm → hot (section)"
+                                "warm lift (section)"
                             );
                         }
                     }
-                    installs.push(PromotionInstall {
+                    lifts.push(WarmLift {
                         kind: w.kind,
                         residence: w.residence,
                         hot,
@@ -287,8 +421,12 @@ pub fn elevate_to_hot(
     }
 
     // ── Phase 4: install (one substrate write) ─────────────────────────
-    if !installs.is_empty() {
-        conversation.write().install_promoted_hot(installs);
+    //
+    // Both elevation legs land under a single write lock. `recalls`
+    // installs warm + hot per item; `lifts` installs hot only (warm
+    // was already present on the residence pre-promotion).
+    if !recalls.is_empty() || !lifts.is_empty() {
+        conversation.write().install_promoted(recalls, lifts);
     }
 
     // Aggregate summary — RUST_LOG=substrate::tier=info catches just
@@ -550,7 +688,7 @@ mod tests {
         conv.write().install_warm(residence, warm);
 
         // Drop hot — turn is now warm-only.
-        let evicted = conv.write().evict_hot_with_warm_backup();
+        let evicted = conv.write().evict_hot_except(&[], &[]);
         assert_eq!(evicted.count, 1);
         assert!(evicted.bytes > 0, "evicted bytes must be non-zero");
         assert!(
@@ -617,11 +755,10 @@ mod tests {
 
         // Evict hot just for turn 1 — install_warm only made it
         // dual-resident; eviction drops hot since warm is present.
-        // Note: this also evicts turn 0 because its warm is None, so
-        // ... actually no, evict_hot_with_warm_backup only evicts
-        // entries where BOTH hot is some AND warm is some. Turn 0
-        // has warm=None, so it stays hot.
-        let evicted = conv.write().evict_hot_with_warm_backup();
+        // `evict_hot_except(&[], &[])` is the unfiltered case: only
+        // entries where BOTH hot is some AND warm is some are
+        // eligible. Turn 0 has warm=None, so it stays hot.
+        let evicted = conv.write().evict_hot_except(&[], &[]);
         assert_eq!(evicted.count, 1, "only warm-backed turn 1 should evict");
 
         let report = elevate_to_hot(
@@ -716,8 +853,8 @@ mod tests {
         assert!(conv.read().turn_sealed_of(timeline, b).is_some());
     }
 
-    /// Empty keep set → behaves like `evict_hot_with_warm_backup`:
-    /// every warm-backed hot residence is dropped.
+    /// Empty keep set → unfiltered eviction: every warm-backed hot
+    /// residence is dropped.
     #[test]
     fn empty_keep_set_evicts_every_warm_backed_residence() {
         let Some(device) = cuda_device_or_skip() else {
@@ -795,5 +932,72 @@ mod tests {
         );
         // Warm-backed turn evicted.
         assert!(conv.read().turn_sealed_of(timeline, warm_backed).is_none());
+    }
+
+    /// A `ColdRecall` install lands the residence as dual-tier (hot
+    /// + warm). Subsequent hot eviction confirms warm was actually
+    /// installed (otherwise the eviction couldn't preserve any
+    /// backup).
+    ///
+    /// We exercise the substrate-side install directly rather than
+    /// driving a real cold-load: `seed_turn` writes `block_end=0`
+    /// into the persisted StreamDecl, so `recover_turn_chunks`
+    /// returns None on the resulting log. The cold-load round-trip
+    /// itself is covered by the candle-nn batched-async test suite;
+    /// here we're verifying the install structure does what its
+    /// type name says.
+    #[test]
+    fn cold_recall_install_lands_dual_tier_residence() {
+        use crate::substrate::{ColdRecall, PromotionItemKind};
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let (conv, backings, timeline) = fresh_setup(&device, 2);
+        let mut r = cuda_resources(&device);
+
+        // Seed hot, capture hot, evict hot — residence ends with
+        // hot = None, warm = None. (We don't install cold here; the
+        // test only cares about the install-side behaviour.)
+        let idx = seed_turn(&conv, &backings, &device, timeline, 2, 16, 32, 99);
+        let residence = conv.read().turn_residence(timeline, idx).unwrap();
+        let hot_arc = conv.read().turn_sealed_of(timeline, idx).unwrap();
+        let hot_clone: Vec<SealedSequence> = hot_arc.iter().cloned().collect();
+        let warm_clone = migrate_layers_to_cpu(
+            &backings,
+            &device,
+            &r.copy_stream,
+            &mut r.pinned,
+            &hot_arc,
+        );
+        drop(hot_arc);
+        conv.write().clear_turn_sealed(timeline, idx);
+        assert!(conv.read().turn_sealed_of(timeline, idx).is_none());
+
+        // What phase 2b produces: one `ColdRecall` carrying both
+        // hot and the fresh CPU-arena warm copy.
+        let recall = ColdRecall {
+            kind: PromotionItemKind::Turn(TurnKey::new(timeline, idx)),
+            residence,
+            hot: hot_clone,
+            warm: warm_clone,
+        };
+        conv.write().install_promoted(vec![recall], Vec::new());
+
+        // Both tiers populated. Confirm via the observable behaviour:
+        // a subsequent unfiltered hot eviction drops hot because warm
+        // exists, leaving the turn cold-marker.
+        assert!(
+            conv.read().turn_sealed_of(timeline, idx).is_some(),
+            "hot installed"
+        );
+        let evicted = conv.write().evict_hot_except(&[], &[]);
+        assert_eq!(
+            evicted.count, 1,
+            "warm backup present → eviction drops hot for one residence"
+        );
+        assert!(
+            conv.read().turn_sealed_of(timeline, idx).is_none(),
+            "post-eviction the turn is warm-only / cold-marker"
+        );
     }
 }

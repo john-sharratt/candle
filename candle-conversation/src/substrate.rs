@@ -277,21 +277,68 @@ pub struct PromotionPlan {
     pub missing: Vec<PromotionItemKind>,
 }
 
-/// One ready-to-install hot residence handed back by the elevation
-/// orchestrator after the GPU side completes. Consumed by
-/// [`Substrate::install_promoted_hot`] under a single write lock.
+/// A full rehydration from cold (disk-only) state.
+///
+/// The elevation orchestrator produces one of these per turn that was
+/// pulled out of the redo log: `load_to_hot` writes the bytes into
+/// VRAM, then `migrate_sealed_to_cpu_batch_async` materialises a
+/// fresh CPU-arena copy. The residence lands dual-tier (hot + warm)
+/// in a single install so future hot evictions are no-DMA — the warm
+/// copy is already there.
+///
+/// Conceptually a *recall*: reaching back into durable storage and
+/// reactivating a turn fully into the working set. Pairs with
+/// [`WarmLift`] (the faster RAM-cached hop) and is consumed
+/// alongside it by [`Substrate::install_promoted`].
 #[derive(Debug)]
-pub struct PromotionInstall {
+pub struct ColdRecall {
+    pub kind: PromotionItemKind,
+    pub residence: ResidenceIndex,
+    pub hot: Vec<SealedSequence>,
+    pub warm: Vec<SealedSequence>,
+}
+
+/// A fast promotion from warm (RAM-cached) state into hot.
+///
+/// The elevation orchestrator produces one of these per turn already
+/// resident in the warm tier: `migrate_sealed_to_gpu_batch_async`
+/// scatters the warm payload into fresh VRAM arena chunks. Only hot
+/// is installed — the warm copy stays in place under its existing
+/// `warm_lru` entry, so the residence stays dual-tier without any
+/// extra substrate writes.
+///
+/// Conceptually a *lift*: a short PCIe hop from the RAM cache to
+/// VRAM, paying nothing on NVMe. Pairs with [`ColdRecall`].
+#[derive(Debug)]
+pub struct WarmLift {
     pub kind: PromotionItemKind,
     pub residence: ResidenceIndex,
     pub hot: Vec<SealedSequence>,
 }
 
-/// Per-call summary from [`Substrate::evict_hot_with_warm_backup`].
+/// Per-call summary from [`Substrate::evict_hot_except`].
 /// `count` is the number of residences evicted, `bytes` is the total
 /// VRAM freed (sum of each residence's cached `byte_size`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EvictionReport {
+    pub count: usize,
+    pub bytes: u64,
+}
+
+/// Which tiers a residence currently occupies. Returned by
+/// [`Substrate::turn_tier_state`] / [`Substrate::section_tier_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierState {
+    pub hot: bool,
+    pub warm: bool,
+    pub cold: bool,
+}
+
+/// Per-call summary from [`Substrate::purge_warm_until_headroom`].
+/// `count` warm-tier residences had their warm copy dropped; `bytes`
+/// is the sum of their `byte_size` (RAM freed).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeReport {
     pub count: usize,
     pub bytes: u64,
 }
@@ -840,25 +887,55 @@ impl Substrate {
         plan.missing.push(kind);
     }
 
-    /// Bulk install of freshly-promoted hot bytes. Each entry's
-    /// `hot` is non-empty `Vec<SealedSequence>` ready to live in
-    /// `residence[idx].hot`.
+    /// Bulk install of freshly-promoted bytes — both elevation legs
+    /// together under a single write lock.
     ///
-    /// Section installs do **not** enter `hot_lru` (pinned). Turn
-    /// installs push to the front of `hot_lru` (MRU). One method
-    /// call per batch keeps lock churn at the substrate write-lock
-    /// boundary down.
-    pub fn install_promoted_hot(&mut self, installs: Vec<PromotionInstall>) {
-        for install in installs {
-            if install.hot.is_empty() {
+    /// `recalls` lands turns pulled out of cold storage (full
+    /// rehydration): warm goes in first, then hot. `lifts` lands
+    /// turns lifted from the warm cache: hot only, warm is already
+    /// in place. Section installs do **not** enter `hot_lru`
+    /// (pinned); turn installs push to the front (MRU).
+    ///
+    /// One method call per batch keeps lock churn at the substrate
+    /// write-lock boundary down. Empty `hot` payloads are skipped
+    /// (defensive: a phase that produced nothing usable shouldn't
+    /// leave a half-populated residence).
+    pub fn install_promoted(&mut self, recalls: Vec<ColdRecall>, lifts: Vec<WarmLift>) {
+        for recall in recalls {
+            if recall.hot.is_empty() {
                 continue;
             }
-            match install.kind {
+            // Warm goes first: the cold→hot leg produces a fresh
+            // warm payload as part of the recall, and the residence
+            // is guaranteed `warm = None` pre-recall (otherwise it'd
+            // have classified as a WarmLift). install_hot then
+            // transitions hot+warm dual-residency.
+            if !recall.warm.is_empty()
+                && self.residence[recall.residence.0].warm.is_none()
+            {
+                self.install_warm(recall.residence, recall.warm);
+            }
+            match recall.kind {
                 PromotionItemKind::Section(_) => {
-                    self.install_section_hot(install.residence, install.hot);
+                    self.install_section_hot(recall.residence, recall.hot);
                 }
                 PromotionItemKind::Turn(_) => {
-                    self.install_hot(install.residence, install.hot);
+                    self.install_hot(recall.residence, recall.hot);
+                }
+            }
+        }
+        for lift in lifts {
+            if lift.hot.is_empty() {
+                continue;
+            }
+            // Warm already exists on the residence (that's what made
+            // this a lift, not a recall) — just install hot.
+            match lift.kind {
+                PromotionItemKind::Section(_) => {
+                    self.install_section_hot(lift.residence, lift.hot);
+                }
+                PromotionItemKind::Turn(_) => {
+                    self.install_hot(lift.residence, lift.hot);
                 }
             }
         }
@@ -866,8 +943,8 @@ impl Substrate {
 
     /// Test/integration helper: the residence-slab index that a turn
     /// addresses. Needed by tests that drive the tier transitions
-    /// (`install_warm`, `install_cold`, `evict_hot_with_warm_backup`)
-    /// from outside the substrate's own write methods. Returns `None`
+    /// (`install_warm`, `install_cold`, `evict_hot_except`) from
+    /// outside the substrate's own write methods. Returns `None`
     /// when the turn isn't tracked.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn turn_residence(
@@ -885,57 +962,105 @@ impl Substrate {
         self.sections.get(&section).map(|e| e.residence)
     }
 
-    /// Drop hot (VRAM) bytes from every turn-residence that has a warm
-    /// (RAM) backup. Returns an [`EvictionReport`] with the count and
-    /// total bytes freed. Sections are pinned and untouched.
-    ///
-    /// Used to free VRAM in bulk while preserving the ability to
-    /// promote back to hot on demand — warm holds the canonical copy,
-    /// so the eviction is loss-free. Residences whose `warm` is `None`
-    /// are skipped (dropping hot would force a cold-load on re-read).
-    ///
-    /// The eviction order doesn't matter — every selected residence is
-    /// dropped together — but the underlying `Arc<ChunkGid>`s release
-    /// their arena slots immediately, which is when the VRAM is
-    /// actually freed (assuming no other live borrow of those chunks).
-    ///
-    /// Emits a per-residence `tracing::debug!` event on the
-    /// `candle_conversation::persistence::tier` target for each
-    /// eviction (residence index + bytes freed) plus an aggregate
-    /// `tracing::info!` at the end.
-    pub fn evict_hot_with_warm_backup(&mut self) -> EvictionReport {
-        // Snapshot the indices + their byte_size before mutating.
-        let victims: Vec<(ResidenceIndex, u64)> = self
-            .hot_lru
-            .iter()
-            .copied()
-            .filter_map(|idx| {
-                let slot = &self.residence[idx.0];
-                (slot.hot.is_some() && slot.warm.is_some()).then(|| (idx, slot.byte_size))
-            })
-            .collect();
+    /// Which tiers a turn residence currently occupies. Returns `None`
+    /// when the turn isn't tracked. Load-bearing in production: the
+    /// SubmitTurn handler uses this as a tier-agnostic existence
+    /// check before adding a turn to the projection's elevate list,
+    /// so cold-marker turns (post-restart, before any elevation has
+    /// fired) still survive the filter and reach `elevate_to_hot`.
+    pub fn turn_tier_state(&self, timeline: TimelineId, index: TurnIndex) -> Option<TierState> {
+        let residence = self.turn(timeline, index).map(|e| e.residence)?;
+        let slot = &self.residence[residence.0];
+        Some(TierState {
+            hot: slot.hot.is_some(),
+            warm: slot.warm.is_some(),
+            cold: slot.cold.is_some(),
+        })
+    }
 
-        let count = victims.len();
-        let bytes: u64 = victims.iter().map(|(_, b)| *b).sum();
-        for (idx, b) in &victims {
-            tracing::debug!(
-                target: "candle_conversation::persistence::tier",
-                residence = idx.0,
-                bytes = *b,
-                "evicted hot (warm backup present)"
-            );
-            self.residence[idx.0].hot = None;
-            Self::remove_from_lru(&mut self.hot_lru, *idx);
+    /// Section counterpart of [`Self::turn_tier_state`]. Sections only
+    /// occupy hot today (no warm/cold equivalent), so `warm` and `cold`
+    /// will always be `false`.
+    pub fn section_tier_state(&self, section: SectionId) -> Option<TierState> {
+        let residence = self.sections.get(&section).map(|e| e.residence)?;
+        let slot = &self.residence[residence.0];
+        Some(TierState {
+            hot: slot.hot.is_some(),
+            warm: slot.warm.is_some(),
+            cold: slot.cold.is_some(),
+        })
+    }
+
+    /// Drop warm-tier residences from the LRU tail until the system
+    /// has at least `headroom_target` bytes of available RAM after
+    /// the upcoming `incoming_bytes` allocation lands.
+    ///
+    /// Threshold per the design: `max(2 GiB, 5% × total_ram)`. The
+    /// caller passes the OS-reported `(total_ram, available_ram)` —
+    /// keeping the OS query at the orchestrator level so the substrate
+    /// stays sysinfo-free and unit-testable without mocking.
+    ///
+    /// **Invariants:**
+    /// - Only warm bytes are freed (`residence.warm = None`); hot and
+    ///   cold are untouched. A purged residence that's also hot stays
+    ///   in `hot_lru`; its next hot eviction will need a fresh
+    ///   hot→warm DMA.
+    /// - LRU-ordered: pops from the back of `warm_lru`.
+    /// - Single batch: no intermediate work between victims.
+    ///
+    /// Returns a [`PurgeReport`] with `count` victims and `bytes`
+    /// freed (sum of `residence.byte_size`).
+    pub fn purge_warm_to_target(
+        &mut self,
+        incoming_bytes: u64,
+        available_ram: u64,
+        total_ram: u64,
+    ) -> PurgeReport {
+        let threshold: u64 = std::cmp::max(2 * 1024 * 1024 * 1024, total_ram / 20);
+        let mut freed_bytes: u64 = 0;
+        let mut count: usize = 0;
+        loop {
+            // available + freed - incoming >= threshold ?
+            let projected = available_ram
+                .saturating_add(freed_bytes)
+                .saturating_sub(incoming_bytes);
+            if projected >= threshold {
+                break;
+            }
+            // Pop LRU off the back of the warm list.
+            let Some(idx) = self.warm_lru.pop_back() else {
+                break;
+            };
+            let slot = &mut self.residence[idx.0];
+            if slot.warm.take().is_some() {
+                freed_bytes = freed_bytes.saturating_add(slot.byte_size);
+                count += 1;
+                tracing::debug!(
+                    target: "candle_conversation::persistence::tier",
+                    residence = idx.0,
+                    bytes = slot.byte_size,
+                    "purged warm (RAM headroom)"
+                );
+            }
+            // If warm was None, the slot was stale in the LRU; just
+            // discard the index and keep looking.
         }
         if count > 0 {
             tracing::info!(
                 target: "candle_conversation::persistence::tier",
                 count,
-                bytes,
-                "hot eviction batch complete"
+                bytes = freed_bytes,
+                threshold,
+                incoming_bytes,
+                available_ram,
+                total_ram,
+                "warm purge batch complete"
             );
         }
-        EvictionReport { count, bytes }
+        PurgeReport {
+            count,
+            bytes: freed_bytes,
+        }
     }
 
     /// Drop hot bytes from every warm-backed hot residence **except**
@@ -951,7 +1076,7 @@ impl Substrate {
     /// items in the keep set are silently ignored (they can't match a
     /// real residence anyway).
     ///
-    /// Same invariants as [`Self::evict_hot_with_warm_backup`]:
+    /// Invariants:
     /// - Only `hot.is_some() && warm.is_some()` slots are eligible.
     /// - Sections are pinned and never appear on `hot_lru`, so this
     ///   only ever touches turn residences.
@@ -1122,8 +1247,8 @@ impl Substrate {
         let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
         // `append_with_blocks` declares a turn's existence and block
         // range, but holds no sealed KV — the residence stays cold
-        // (`hot = None`) until a later `materialize_turn_sealed` /
-        // `append_full` puts bytes in.
+        // (`hot = None`) until `append_full` or an elevate install
+        // puts bytes in.
         let tl = self.timelines.get_mut(&timeline).unwrap();
         tl.turns.insert(
             idx,
@@ -1194,12 +1319,18 @@ impl Substrate {
     /// Insert a turn reconstructed from the redo log — the substrate-reload
     /// path (§16.12 of `docs/kv_tier_migration.md`).
     ///
-    /// Unlike [`Self::append_full`], the per-layer [`SealedSequence`]s are
-    /// already built (cold-loaded from disk via `load_stream`), so no
-    /// GPU→CPU migration closure runs. The caller must
-    /// [`Self::register_timeline`] first. Turns must be restored in
-    /// `turn_index` order so the appended `TurnIndex` matches the persisted
-    /// one.
+    /// The caller must [`Self::register_timeline`] first. Turns must be
+    /// restored in `turn_index` order so the appended `TurnIndex` matches
+    /// the persisted one.
+    ///
+    /// `cold` carries the per-layer `StoredSequence` references the
+    /// classifier needs to route the turn through `cold_to_hot` on the
+    /// next `elevate_to_hot`. Pass `None` only for turns that have no
+    /// persisted chunks (e.g. a turn that crashed before the
+    /// bg-quantizer callback fired); those land cold-marker with all
+    /// three tiers empty, and the classifier reports them `missing`
+    /// on elevation. The reload path never installs hot — that's
+    /// always demand-driven via `elevate_to_hot`.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_turn(
         &mut self,
@@ -1210,7 +1341,7 @@ impl Substrate {
         token_count: usize,
         block_start: u64,
         block_end: u64,
-        sealed: Vec<SealedSequence>,
+        cold: Option<Vec<StoredSequence>>,
     ) -> TurnIndex {
         let idx = self
             .timelines
@@ -1233,8 +1364,19 @@ impl Substrate {
                 },
             );
         }
-        if !sealed.is_empty() {
-            self.install_hot(residence, sealed);
+        if let Some(cold_seqs) = cold {
+            if !cold_seqs.is_empty() {
+                // Sum cold record bytes into residence.byte_size so
+                // the purge accounting + telemetry has a real number
+                // before any hot/warm elevate fires.
+                let total_bytes: u64 = cold_seqs
+                    .iter()
+                    .flat_map(|s| s.chunks.iter())
+                    .map(|c| c.record_len)
+                    .sum();
+                self.residence[residence.0].byte_size = total_bytes;
+                self.install_cold(residence, cold_seqs);
+            }
         }
         idx
     }
@@ -1254,60 +1396,25 @@ impl Substrate {
         }
     }
 
-    /// Install a freshly-materialized hot KV set for a turn that
-    /// currently has none (cold marker). Called by the engine's
-    /// `ensure_turn_hot` orchestrator after a cold-load from NVMe.
-    ///
-    /// No-ops if the turn isn't tracked or if `sealed` is empty.
-    pub fn materialize_turn_sealed(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        sealed: Vec<SealedSequence>,
-    ) {
-        if sealed.is_empty() {
-            return;
-        }
-        let Some(residence) = self.turn(timeline, index).map(|e| e.residence) else {
-            return;
-        };
-        self.install_hot(residence, sealed);
-    }
-
-    /// Section-side counterpart of [`Self::materialize_turn_sealed`].
-    /// Section residences don't enter [`Self::hot_lru`] — sections are
-    /// pinned for the session.
-    pub fn materialize_section_sealed(
-        &mut self,
-        section: SectionId,
-        sealed: Vec<SealedSequence>,
-    ) {
-        if sealed.is_empty() {
-            return;
-        }
-        let Some(residence) = self.sections.get(&section).map(|e| e.residence) else {
-            return;
-        };
-        self.install_section_hot(residence, sealed);
-    }
-
     /// Drop a turn's hot residence, freeing its VRAM arena chunks
     /// (the inner `Arc<ChunkGid>`s reach refcount 0 once any live
     /// borrowers release them). Removes the slot from the hot LRU.
     ///
-    /// Returns the previous hot bytes so the caller can take final
-    /// ownership before they drop (e.g. to gather them into the warm
-    /// pool first). `None` if the turn was not tracked or was already
-    /// cold.
-    pub fn clear_turn_sealed(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<Vec<SealedSequence>> {
-        let residence = self.turn(timeline, index)?.residence;
-        let prev = self.residence[residence.0].hot.take()?;
+    /// Returns `true` if the residence had hot bytes that were
+    /// dropped; `false` when the turn isn't tracked or was already
+    /// cold-marker. Callers use the boolean to decide whether to
+    /// charge eviction accounting — they never need the dropped
+    /// bytes themselves (the residence's warm/cold tiers hold the
+    /// canonical copies if any future re-elevation needs them).
+    pub fn clear_turn_sealed(&mut self, timeline: TimelineId, index: TurnIndex) -> bool {
+        let Some(residence) = self.turn(timeline, index).map(|e| e.residence) else {
+            return false;
+        };
+        if self.residence[residence.0].hot.take().is_none() {
+            return false;
+        }
         Self::remove_from_lru(&mut self.hot_lru, residence);
-        Some(prev)
+        true
     }
 
     /// Sum of bytes across every hot-resident turn. Walks
@@ -1962,6 +2069,23 @@ mod tests {
         Ok(seqs.to_vec())
     }
 
+    /// Structurally-minimal `SealedSequence` suitable for migration-
+    /// closure tests that don't care about chunk contents. The
+    /// substrate's residence model treats a `Vec<SealedSequence>`
+    /// containing zero elements as cold-marker (`hot = None`), so
+    /// tests that want `turn_sealed_of` / `section_sealed_of` to
+    /// return `Some` must pass at least one element. The empty
+    /// `chunks` field is fine — it just means "this layer's sequence
+    /// has no chunks", which is structurally valid.
+    fn minimal_sealed_layer() -> SealedSequence {
+        SealedSequence {
+            chunks: Vec::new(),
+            token_count: 0,
+            chunk_size: 32,
+            location: candle_nn::kv_cache::ArenaLocation::Cpu,
+        }
+    }
+
     /// `register_timeline` is data-idempotent — calling it again on a
     /// timeline that already has turns must NOT wipe those turns. This
     /// is the regression test for a real bug where substrate replay
@@ -1991,16 +2115,19 @@ mod tests {
         assert_eq!(listed, vec![timeline]);
     }
 
-    /// `append_full` calls the migration closure and stores the result in the
-    /// main map; `turn_sealed_of` returns it.
+    /// `append_full` calls the migration closure and installs the
+    /// result into the residence's hot tier — `turn_sealed_of`
+    /// returns it.
     #[test]
     fn append_full_stores_migrated_result() {
         let (_, _, timeline, mut sub) = make_timeline();
 
-        // Use a migration that tags the result with a known pointer.
-        let migrated = Arc::new(vec![]);
-        let migrated_ptr = Arc::as_ptr(&migrated);
-        let migrated_clone = Arc::clone(&migrated);
+        // Migration that returns a 2-layer minimal sealed sequence
+        // (non-empty so it crosses install_hot's `!is_empty()` gate
+        // and the residence lands hot).
+        let migrate = |_input: &[SealedSequence]| -> candle::Result<Vec<SealedSequence>> {
+            Ok(vec![minimal_sealed_layer(), minimal_sealed_layer()])
+        };
 
         let idx = sub
             .append_full(
@@ -2012,34 +2139,34 @@ mod tests {
                 0,
                 1,
                 Arc::new(vec![]),
-                move |_| Ok((*migrated_clone).clone()),
+                migrate,
             )
             .unwrap();
 
         let stored = sub.turn_sealed_of(timeline, idx).unwrap();
-        // The stored sealed is the migrated result (same content, may be new Arc).
-        let _ = migrated_ptr;
-        assert!(sub.turn_sealed_of(timeline, idx).is_some());
-        drop(stored);
+        assert_eq!(stored.len(), 2, "two layers installed");
     }
 
-    /// `set_section_full` calls the migration closure and stores the result.
+    /// `set_section_full` calls the migration closure and installs
+    /// the result into the section residence's hot tier.
     #[test]
     fn set_section_full_stores_migrated_result() {
         let mut sub = Substrate::new();
         let section = SectionId::new(42);
 
+        let sealed_gpu = Arc::new(vec![minimal_sealed_layer(), minimal_sealed_layer()]);
         sub.set_section_full(
             section,
             10,
             vec![],
-            Arc::new(vec![]),
+            sealed_gpu,
             identity_migrate,
             Arc::new(vec![1u32, 2, 3]),
         )
         .unwrap();
 
-        assert!(sub.section_sealed_of(section).is_some());
+        let stored = sub.section_sealed_of(section).expect("hot installed");
+        assert_eq!(stored.len(), 2, "two layers installed");
         assert_eq!(
             sub.sections.get(&section).unwrap().tokens.as_slice(),
             &[1u32, 2, 3]
@@ -2074,6 +2201,10 @@ mod tests {
     fn multiple_appends_independent() {
         let (_, _, timeline, mut sub) = make_timeline();
 
+        let migrate = |_: &[SealedSequence]| -> candle::Result<Vec<SealedSequence>> {
+            Ok(vec![minimal_sealed_layer()])
+        };
+
         let idx0 = sub
             .append_full(
                 timeline,
@@ -2084,7 +2215,7 @@ mod tests {
                 0,
                 0,
                 Arc::new(vec![]),
-                identity_migrate,
+                migrate,
             )
             .unwrap();
         let idx1 = sub
@@ -2097,12 +2228,205 @@ mod tests {
                 0,
                 0,
                 Arc::new(vec![]),
-                identity_migrate,
+                migrate,
             )
             .unwrap();
 
         assert!(sub.turn_sealed_of(timeline, idx0).is_some());
         assert!(sub.turn_sealed_of(timeline, idx1).is_some());
         assert_ne!(idx0, idx1);
+    }
+
+    /// Helper: install a warm-only residence with a known byte_size.
+    /// Returns the residence index. Used by the purge tests below to
+    /// drive the warm LRU without going through the (CUDA-only)
+    /// migrate path.
+    fn install_warm_only(
+        sub: &mut Substrate,
+        timeline: TimelineId,
+        bytes: u64,
+    ) -> ResidenceIndex {
+        let idx = sub
+            .append_full(
+                timeline,
+                Role::User,
+                String::new(),
+                TokenBuffer::default(),
+                0,
+                0,
+                0,
+                Arc::new(vec![]),
+                identity_migrate,
+            )
+            .unwrap();
+        let residence = sub.turn_residence(timeline, idx).unwrap();
+        // Drop hot, install a marker warm payload, set byte_size for
+        // accounting. The actual SealedSequence content doesn't matter
+        // for the purge — purge_warm_to_target counts `residence.
+        // byte_size`, not the warm vec's bytes.
+        sub.residence[residence.0].hot = None;
+        sub.residence[residence.0].byte_size = bytes;
+        // A non-empty placeholder so the warm slot is `Some`.
+        let placeholder = vec![SealedSequence {
+            chunks: Vec::new(),
+            token_count: 0,
+            chunk_size: 32,
+            location: candle_nn::kv_cache::ArenaLocation::Cpu,
+        }];
+        sub.install_warm(residence, placeholder);
+        residence
+    }
+
+    /// Ample headroom → purge is a no-op even with warm-resident slots.
+    #[test]
+    fn purge_with_ample_headroom_is_noop() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        install_warm_only(&mut sub, timeline, 1_000_000);
+        install_warm_only(&mut sub, timeline, 1_000_000);
+
+        // 64 GB total, 32 GB available, incoming 1 MB. Threshold is
+        // max(2 GiB, 5% * 64 GB) = 3.2 GB. 32 GB - 1 MB >> 3.2 GB.
+        let r = sub.purge_warm_to_target(
+            1_000_000,
+            32 * 1024 * 1024 * 1024,
+            64 * 1024 * 1024 * 1024,
+        );
+        assert_eq!(r.count, 0);
+        assert_eq!(r.bytes, 0);
+    }
+
+    /// Tight headroom → keep popping LRU until projected available
+    /// covers the threshold.
+    #[test]
+    fn purge_drops_lru_until_threshold_met() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // Order matters: a is LRU (installed first → pushed to front,
+        // then b → b is at front, a slides toward back). pop_back
+        // returns a first.
+        let a = install_warm_only(&mut sub, timeline, 500_000_000);
+        let b = install_warm_only(&mut sub, timeline, 500_000_000);
+
+        // 8 GB total, 2 GB available, incoming 1 GB. Threshold is
+        // max(2 GiB = 2_147_483_648, 8 GB / 20 = 400 MB) = 2 GiB.
+        // projected = 2 GB - 1 GB = 1 GB < 2 GiB → must purge.
+        // After dropping a (500 MB): projected = 1 GB + 500 MB = 1.5 GB
+        //   still < 2 GiB → drop b.
+        // After dropping b: projected = 1 GB + 1 GB = 2 GB. 2 GB <
+        //   2 GiB (2 GiB = 2.147 GB) → still under, but warm_lru is
+        //   now empty, so loop exits.
+        let r = sub.purge_warm_to_target(
+            1_000_000_000,
+            2 * 1000 * 1000 * 1000,
+            8 * 1000 * 1000 * 1000,
+        );
+        assert_eq!(r.count, 2, "both warm residences should be popped");
+        assert_eq!(r.bytes, 1_000_000_000);
+        assert!(sub.residence[a.0].warm.is_none(), "a (LRU) dropped first");
+        assert!(sub.residence[b.0].warm.is_none(), "b also dropped");
+    }
+
+    /// Empty warm LRU → purge exits gracefully without panicking even
+    /// when the threshold can't be met.
+    #[test]
+    fn purge_handles_empty_warm_lru() {
+        let mut sub = Substrate::new();
+        // No warm residences exist; the loop should exit on the first
+        // `pop_back` returning None.
+        let r = sub.purge_warm_to_target(
+            10 * 1024 * 1024 * 1024,
+            1 * 1024 * 1024 * 1024, // 1 GiB available
+            64 * 1024 * 1024 * 1024, // 64 GiB total
+        );
+        assert_eq!(r.count, 0);
+        assert_eq!(r.bytes, 0);
+    }
+
+    /// 5% rule fires when 5% × total_ram > 2 GiB. With 256 GB total
+    /// the threshold is 12.8 GB, not 2 GiB.
+    #[test]
+    fn purge_threshold_is_max_of_2gib_and_5_percent() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // One LRU warm victim of 2 GB.
+        install_warm_only(&mut sub, timeline, 2_000_000_000);
+
+        // 256 GB total, 14 GB available, incoming 0. Threshold =
+        // max(2 GiB, 256 GB * 0.05 = 12.8 GB) = 12.8 GB.
+        // projected = 14 GB > 12.8 GB → no purge.
+        let r = sub.purge_warm_to_target(
+            0,
+            14 * 1000 * 1000 * 1000,
+            256 * 1000 * 1000 * 1000,
+        );
+        assert_eq!(r.count, 0, "14 GB available > 5% × 256 GB threshold");
+
+        // Now 13 GB available, threshold still 12.8 GB. projected =
+        // 13 GB > 12.8 GB → still no purge.
+        let r = sub.purge_warm_to_target(
+            0,
+            13 * 1000 * 1000 * 1000,
+            256 * 1000 * 1000 * 1000,
+        );
+        assert_eq!(r.count, 0);
+
+        // 12 GB available → projected < threshold → purge fires.
+        let r = sub.purge_warm_to_target(
+            0,
+            12 * 1000 * 1000 * 1000,
+            256 * 1000 * 1000 * 1000,
+        );
+        assert_eq!(r.count, 1);
+        assert_eq!(r.bytes, 2_000_000_000);
+    }
+
+    /// `restore_turn` with `cold = Some(...)` lands the residence as
+    /// cold-marker — classifier-ready for cold→hot promotion. With
+    /// `cold = None`, the residence is left empty (legitimately
+    /// recoverable but missing chunks).
+    #[test]
+    fn restore_turn_populates_cold_tier_when_provided() {
+        let (_, _, timeline, mut sub) = make_timeline();
+
+        let cold_payload = vec![StoredSequence {
+            chunks: vec![StoredChunk {
+                log_offset: 4096,
+                record_len: 1024,
+                token_count: 32,
+            }],
+            token_count: 32,
+        }];
+        let idx = sub.restore_turn(
+            timeline,
+            Role::User,
+            String::new(),
+            TokenBuffer::default(),
+            32,
+            0,
+            1,
+            Some(cold_payload),
+        );
+        let residence = sub.turn_residence(timeline, idx).unwrap();
+        assert!(sub.residence[residence.0].cold.is_some(), "cold installed");
+        assert!(sub.residence[residence.0].hot.is_none(), "hot empty (cold-marker)");
+        assert!(sub.residence[residence.0].warm.is_none(), "warm empty");
+        assert_eq!(
+            sub.residence[residence.0].byte_size, 1024,
+            "byte_size summed from cold record_len"
+        );
+
+        // None branch — residence stays all-empty.
+        let idx2 = sub.restore_turn(
+            timeline,
+            Role::Assistant,
+            String::new(),
+            TokenBuffer::default(),
+            0,
+            0,
+            0,
+            None,
+        );
+        let r2 = sub.turn_residence(timeline, idx2).unwrap();
+        assert!(sub.residence[r2.0].cold.is_none());
+        assert!(sub.residence[r2.0].hot.is_none());
+        assert!(sub.residence[r2.0].warm.is_none());
     }
 }

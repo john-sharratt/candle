@@ -253,10 +253,16 @@ impl Conversation {
         };
         let mut restored = 0usize;
         for decl in decls {
-            let recovered = {
+            let (recovered, cold_refs) = {
                 let mut p = self.persistence.lock().unwrap();
-                crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
-                    .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?
+                let recovered =
+                    crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
+                        .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?;
+                let cold_refs = crate::persistence::resume::recover_turn_cold_refs(
+                    &p, &decl, n_layers,
+                )
+                .map_err(|e| candle::Error::Msg(format!("recover cold refs: {e}")))?;
+                (recovered, cold_refs)
             };
             // Re-append the BDP signatures into the (fresh) provenance file,
             // yielding entries that point at the rebuilt offsets. Sigs are
@@ -296,6 +302,16 @@ impl Conversation {
             // empty sealed and routes through the engine's `ensure_hot`
             // orchestrator (cold → warm → hot) before borrowing into a
             // view slot.
+            //
+            // `cold_refs = Some(...)` lights up the residence's cold
+            // tier so the new bulk `elevate_to_hot` classifier routes
+            // the turn through cold_to_hot. Without it the residence
+            // would be `(hot, warm, cold) = (None, None, None)` and
+            // the classifier would tag the turn `missing` on the very
+            // first projection that needs it. `cold_refs = None` is
+            // a recoverable-token-only turn (no persisted chunks) —
+            // the substrate keeps it discoverable but it stays unable
+            // to materialise KV.
             let idx = view.restore_turn(
                 timeline,
                 role,
@@ -304,7 +320,7 @@ impl Conversation {
                 token_count,
                 decl.block_start,
                 decl.block_end,
-                Vec::new(),
+                cold_refs,
             );
             if !sig_entries.is_empty() {
                 view.set_sig_entries(timeline, idx, sig_entries);
@@ -361,9 +377,9 @@ impl Conversation {
     }
 
     /// Read a cold turn's per-layer chunk grid from the redo log so the
-    /// caller can run the warm→hot leg (`load_stream` per layer) and write
-    /// the resulting `Vec<SealedSequence>` back via
-    /// [`Self::materialize_turn_sealed`].
+    /// caller can run the warm→hot leg (`load_stream` per layer) and
+    /// install the resulting `Vec<SealedSequence>`s on the substrate
+    /// via the `elevate_to_hot` orchestrator (`ColdRecall`).
     ///
     /// Returns `Ok(None)` when the turn doesn't have a recoverable chunk
     /// grid — e.g. its `Tokens` record is durable but `Chunks` records
@@ -399,36 +415,10 @@ impl Conversation {
         Ok(Some(recovered.layers))
     }
 
-    /// Cache a freshly-materialized hot `SealedSequence` set back into the
-    /// substrate's turn entry. Called by the engine's `ensure_turn_hot`
-    /// orchestrator after running `load_stream` per layer.
-    pub fn materialize_turn_sealed(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        sealed: Vec<SealedSequence>,
-    ) {
-        self.write().materialize_turn_sealed(timeline, index, sealed);
-    }
-
-    /// Section-side counterpart of [`Self::materialize_turn_sealed`].
-    pub fn materialize_section_sealed(
-        &self,
-        section: SectionId,
-        sealed: Vec<SealedSequence>,
-    ) {
-        self.write().materialize_section_sealed(section, sealed);
-    }
-
     /// Clear a turn's hot sealed grid, releasing VRAM arena chunks via
-    /// dropping its ChunkGid Arcs. Returns the previously-held grid so
-    /// the caller can gather it into warm before it drops
-    /// (see `Substrate::clear_turn_sealed`).
-    pub fn clear_turn_sealed(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<Vec<SealedSequence>> {
+    /// dropping its ChunkGid Arcs. Returns `true` if hot bytes were
+    /// dropped (see [`Substrate::clear_turn_sealed`]).
+    pub fn clear_turn_sealed(&self, timeline: TimelineId, index: TurnIndex) -> bool {
         self.write().clear_turn_sealed(timeline, index)
     }
 
