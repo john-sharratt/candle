@@ -1,61 +1,95 @@
-//! The in-RAM manifest — the index a walk reconstructs (§5.5–§5.6 of
-//! `docs/kv_tier_migration.md`).
+//! The in-RAM manifest — the index a walk reconstructs.
 //!
-//! The manifest resolves the live state of the log under **last-writer-wins**:
-//! ingesting records in append order, a later record for the same key simply
-//! overwrites an earlier one. It indexes the stream DAG, every chunk's
-//! location, and the latest singleton records, and it serialises into a
-//! `Checkpoint` record so a restart need not re-walk the whole log.
+//! The manifest resolves the live state of the log under
+//! **last-writer-wins**: ingesting records in append order, a later
+//! record for the same key simply overwrites an earlier one. It
+//! indexes the stream DAG, every chunk's location, and the latest
+//! singleton records, and it serialises into a `Checkpoint` record so
+//! a restart need not re-walk the whole log.
+//!
+//! All structured metadata payloads in this module are encoded as
+//! UTF-8 JSON via serde, with `#[serde(default)]` on every field so
+//! older writers can omit fields and newer writers can add new ones
+//! without breaking either side. This is the field-level forward
+//! compatibility lever; the type-level lever lives in `record.rs`.
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::log_file::LogSource;
-use super::record::{ByteReader, ByteWriter, RecordType};
+use super::record::RecordType;
 use super::streams::{StreamDecl, StreamId};
 use super::walker::{self, WalkEntry, WalkOutcome};
 use super::{PersistenceError, Result};
 
 /// Location of a whole record in the log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordLoc {
     pub offset: u64,
     pub payload_len: u64,
+    /// Padded on-disk size of the record (header + payload + sector
+    /// padding). Captured at write time; with the NDJSON header
+    /// framing the padded size depends on the header's serialized
+    /// length and can't be recomputed from `payload_len` alone.
+    #[serde(default)]
+    pub record_size: u64,
 }
 
 /// Location and shape of one chunk record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkLoc {
     pub offset: u64,
     pub payload_len: u64,
+    /// Padded on-disk size of the record — see [`RecordLoc::record_size`].
+    #[serde(default)]
+    pub record_size: u64,
     pub token_count: u64,
     pub format: u8,
 }
 
 /// The indexed state of one stream.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct StreamEntry {
     /// The decoded stream declaration, once a `StreamDecl` record is seen.
+    #[serde(default)]
     pub decl: Option<StreamDecl>,
     /// Live chunk locations by local chunk index — last-writer-wins.
+    /// Serialised as a `Vec<(idx, loc)>` so the JSON map-key constraint
+    /// (keys are strings) doesn't force stringified u64s on disk.
+    #[serde(default, with = "u64_btreemap_as_pairs")]
     pub chunks: BTreeMap<u64, ChunkLoc>,
     /// Latest `Tokens` record for the stream.
+    #[serde(default)]
     pub tokens: Option<RecordLoc>,
     /// Latest `Signatures` record for the stream.
+    #[serde(default)]
     pub signatures: Option<RecordLoc>,
     /// Highest chunk index the stream is durably committed through.
+    #[serde(default)]
     pub committed_through: Option<u64>,
 }
 
 /// The whole-log index.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// Serialised as the `Checkpoint` record payload, in JSON, so any
+/// future field can be added or removed without breaking older
+/// readers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     /// Latest `ModelSpec` record.
+    #[serde(default)]
     pub model_spec: Option<RecordLoc>,
     /// Latest `Template` record.
+    #[serde(default)]
     pub template: Option<RecordLoc>,
-    /// Latest `Tokenizer` record (the model's `tokenizer.json` bytes).
+    /// Latest `Tokenizer` record.
+    #[serde(default)]
     pub tokenizer: Option<RecordLoc>,
     /// Per-stream index, ordered by id for deterministic serialisation.
+    /// Serialised as `Vec<(id, entry)>` so JSON map-key string
+    /// stringification doesn't force StreamId-as-string on disk.
+    #[serde(default, with = "stream_btreemap_as_pairs")]
     pub streams: BTreeMap<StreamId, StreamEntry>,
     /// Per-timeline conversation metadata — the daemon's client-side
     /// `conv_id` string paired with the sidebar title. Keyed by
@@ -63,42 +97,61 @@ pub struct Manifest {
     /// records, **last-write-wins** on replay so the conv_id can be
     /// established immediately at first submit and the title can be
     /// filled in later by the titler.
+    #[serde(default, with = "u64_btreemap_as_pairs")]
     pub labels: BTreeMap<u64, ConvMeta>,
-    /// Per-timeline lifecycle state (`archived` flag today; reserves
-    /// room for more flags via a versioned 1-byte payload). Keyed by
-    /// `timeline_id`. Written as `RecordType::ConvState` records,
-    /// **last-write-wins** on replay so toggling archive↔unarchive
-    /// each appends a small record and the latest wins.
+    /// Per-timeline lifecycle state. Keyed by `timeline_id`. Written
+    /// as `RecordType::ConvState` records, **last-write-wins** on
+    /// replay so toggling archive↔unarchive each appends a small
+    /// record and the latest wins.
+    #[serde(default, with = "u64_btreemap_as_pairs")]
     pub conv_states: BTreeMap<u64, ConvState>,
     /// Offset of the most recent `Checkpoint` record seen.
+    #[serde(default)]
     pub last_checkpoint_offset: Option<u64>,
 }
 
 /// Per-timeline conversation metadata persisted in `RecordType::Label`.
 /// `conv_id` is the client-supplied identifier (e.g. the frontend's
-/// `Date.now()` string) used as the sidebar's stable id; `label` is the
-/// human-readable title, possibly empty during the brief window between
-/// first-submit and titler-completion.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `Date.now()` string) used as the sidebar's stable id; `label` is
+/// the human-readable title, possibly empty during the brief window
+/// between first-submit and titler-completion.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvMeta {
+    #[serde(default)]
     pub conv_id: String,
+    #[serde(default)]
     pub label: String,
 }
 
 /// Per-timeline lifecycle flags persisted in `RecordType::ConvState`.
 /// Today: just the `archived` flag (hide-from-sidebar without losing
-/// the conversation). Encoded as `{u8 version, u8 flags}` so future
-/// flags (pinned, unread, …) can slot in without a new record type.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// the conversation). Future fields slot in alongside — serde's
+/// `#[serde(default)]` covers both omit-on-write and ignore-on-read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvState {
+    #[serde(default)]
     pub archived: bool,
 }
 
-/// Wire-format version of the `ConvState` payload. Bumped if a
-/// breaking change to the flag-byte layout becomes necessary.
-pub const CONV_STATE_VERSION: u8 = 1;
+/// Wire-format `Label` payload: `{timeline_id, conv_id, label}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct LabelPayload {
+    #[serde(default)]
+    timeline_id: u64,
+    #[serde(default)]
+    conv_id: String,
+    #[serde(default)]
+    label: String,
+}
 
-const CONV_STATE_FLAG_ARCHIVED: u8 = 1 << 0;
+/// Wire-format `ConvState` payload: `{timeline_id, archived}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ConvStatePayload {
+    #[serde(default)]
+    timeline_id: u64,
+    #[serde(default)]
+    archived: bool,
+}
 
 impl Manifest {
     /// An empty manifest.
@@ -112,6 +165,7 @@ impl Manifest {
         let loc = RecordLoc {
             offset: entry.offset,
             payload_len: h.payload_len,
+            record_size: entry.size,
         };
         match h.record_type {
             RecordType::ModelSpec => self.model_spec = Some(loc),
@@ -128,6 +182,7 @@ impl Manifest {
                     ChunkLoc {
                         offset: entry.offset,
                         payload_len: h.payload_len,
+                        record_size: entry.size,
                         token_count: h.token_count,
                         format: h.format,
                     },
@@ -155,18 +210,16 @@ impl Manifest {
                 self.last_checkpoint_offset = Some(entry.offset);
             }
             RecordType::Label => {
-                let meta = decode_label_payload(&entry.record.payload)?;
-                // Last-write-wins: the conv_id is written at first
-                // submit; the title may be filled in later by the
-                // titler. Subsequent writes overwrite (e.g. a user
-                // rename would land here).
-                self.labels.insert(meta.0, meta.1);
+                let (timeline_id, meta) = decode_label_payload(&entry.record.payload)?;
+                self.labels.insert(timeline_id, meta);
             }
             RecordType::ConvState => {
                 let (timeline_id, state) = decode_conv_state_payload(&entry.record.payload)?;
-                // Last-write-wins: every archive / unarchive append
-                // supersedes the previous state.
                 self.conv_states.insert(timeline_id, state);
+            }
+            RecordType::Unknown => {
+                // Skipped by the walker before reaching here; the
+                // arm is present for exhaustiveness.
             }
         }
         Ok(())
@@ -194,255 +247,117 @@ impl Manifest {
         self.streams.values().map(|s| s.chunks.len()).sum()
     }
 
-    /// Serialise to the `Checkpoint` record payload bytes.
+    /// Serialise to the `Checkpoint` record payload bytes — UTF-8
+    /// JSON. Forward-compatible: adding fields is a no-op for older
+    /// readers (they ignore unknown keys), removing fields decodes
+    /// to defaults.
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = ByteWriter::new();
-        put_opt_loc(&mut w, self.model_spec);
-        put_opt_loc(&mut w, self.template);
-        put_opt_loc(&mut w, self.tokenizer);
-        match self.last_checkpoint_offset {
-            Some(o) => {
-                w.put_u8(1);
-                w.put_u64(o);
-            }
-            None => w.put_u8(0),
-        }
-        w.put_u32(self.streams.len() as u32);
-        for (id, entry) in &self.streams {
-            w.put_u64(id.0);
-            match &entry.decl {
-                Some(d) => {
-                    w.put_u8(1);
-                    w.put_blob(&d.encode());
-                }
-                None => w.put_u8(0),
-            }
-            w.put_u32(entry.chunks.len() as u32);
-            for (idx, loc) in &entry.chunks {
-                w.put_u64(*idx);
-                w.put_u64(loc.offset);
-                w.put_u64(loc.payload_len);
-                w.put_u64(loc.token_count);
-                w.put_u8(loc.format);
-            }
-            put_opt_loc(&mut w, entry.tokens);
-            put_opt_loc(&mut w, entry.signatures);
-            match entry.committed_through {
-                Some(c) => {
-                    w.put_u8(1);
-                    w.put_u64(c);
-                }
-                None => w.put_u8(0),
-            }
-        }
-        w.put_u32(self.labels.len() as u32);
-        for (timeline_id, meta) in &self.labels {
-            w.put_u64(*timeline_id);
-            w.put_str(&meta.conv_id);
-            w.put_str(&meta.label);
-        }
-        w.put_u32(self.conv_states.len() as u32);
-        for (timeline_id, state) in &self.conv_states {
-            w.put_u64(*timeline_id);
-            // Serialise the same way the on-disk record encodes —
-            // version byte + flag byte — so the checkpoint is
-            // forward-compatible with future flag bits.
-            w.put_u8(CONV_STATE_VERSION);
-            let mut flags: u8 = 0;
-            if state.archived {
-                flags |= CONV_STATE_FLAG_ARCHIVED;
-            }
-            w.put_u8(flags);
-        }
-        w.into_bytes()
+        serde_json::to_vec(self).expect("Manifest JSON encoding is infallible")
     }
 
     /// Reconstruct from `Checkpoint` record payload bytes.
     pub fn decode(payload: &[u8]) -> Result<Manifest> {
-        let mut r = ByteReader::new(payload);
-        let model_spec = get_opt_loc(&mut r)?;
-        let template = get_opt_loc(&mut r)?;
-        let tokenizer = get_opt_loc(&mut r)?;
-        let last_checkpoint_offset = if r.get_u8()? == 1 {
-            Some(r.get_u64()?)
-        } else {
-            None
-        };
-        let n_streams = r.get_u32()? as usize;
-        let mut streams = BTreeMap::new();
-        for _ in 0..n_streams {
-            let id = StreamId(r.get_u64()?);
-            let decl = if r.get_u8()? == 1 {
-                Some(StreamDecl::decode(r.get_blob()?)?)
-            } else {
-                None
-            };
-            let n_chunks = r.get_u32()? as usize;
-            let mut chunks = BTreeMap::new();
-            for _ in 0..n_chunks {
-                let idx = r.get_u64()?;
-                let loc = ChunkLoc {
-                    offset: r.get_u64()?,
-                    payload_len: r.get_u64()?,
-                    token_count: r.get_u64()?,
-                    format: r.get_u8()?,
-                };
-                chunks.insert(idx, loc);
-            }
-            let tokens = get_opt_loc(&mut r)?;
-            let signatures = get_opt_loc(&mut r)?;
-            let committed_through = if r.get_u8()? == 1 {
-                Some(r.get_u64()?)
-            } else {
-                None
-            };
-            streams.insert(
-                id,
-                StreamEntry {
-                    decl,
-                    chunks,
-                    tokens,
-                    signatures,
-                    committed_through,
-                },
-            );
-        }
-        let n_labels = r.get_u32()? as usize;
-        let mut labels = BTreeMap::new();
-        for _ in 0..n_labels {
-            let timeline_id = r.get_u64()?;
-            let conv_id = r.get_str()?;
-            let label = r.get_str()?;
-            labels.insert(timeline_id, ConvMeta { conv_id, label });
-        }
-        // ConvStates were added after the original checkpoint format —
-        // tolerate a manifest payload that ends here (older
-        // checkpoint, no ConvState entries) by treating EOF here as
-        // "zero conv_states" rather than a corruption error.
-        let mut conv_states = BTreeMap::new();
-        if !r.is_done() {
-            let n_states = r.get_u32()? as usize;
-            for _ in 0..n_states {
-                let timeline_id = r.get_u64()?;
-                let version = r.get_u8()?;
-                if version != CONV_STATE_VERSION {
-                    return Err(PersistenceError::Corrupt(format!(
-                        "manifest ConvState version {version}, expected {CONV_STATE_VERSION}"
-                    )));
-                }
-                let flags = r.get_u8()?;
-                conv_states.insert(
-                    timeline_id,
-                    ConvState {
-                        archived: flags & CONV_STATE_FLAG_ARCHIVED != 0,
-                    },
-                );
-            }
-        }
-        if !r.is_done() {
-            return Err(PersistenceError::Corrupt(format!(
-                "manifest payload has {} trailing bytes",
-                r.remaining()
-            )));
-        }
-        Ok(Manifest {
-            model_spec,
-            template,
-            tokenizer,
-            streams,
-            labels,
-            conv_states,
-            last_checkpoint_offset,
-        })
+        serde_json::from_slice(payload)
+            .map_err(|e| PersistenceError::Corrupt(format!("Manifest JSON decode: {e}")))
     }
 }
 
-/// Encode a `Label` record's payload — `{u64 timeline_id, str conv_id, str label}`.
+/// Encode a `Label` record's payload — JSON.
 pub fn encode_label_payload(timeline_id: u64, conv_id: &str, label: &str) -> Vec<u8> {
-    let mut w = ByteWriter::new();
-    w.put_u64(timeline_id);
-    w.put_str(conv_id);
-    w.put_str(label);
-    w.into_bytes()
+    let p = LabelPayload {
+        timeline_id,
+        conv_id: conv_id.to_string(),
+        label: label.to_string(),
+    };
+    serde_json::to_vec(&p).expect("Label payload JSON encoding is infallible")
 }
 
 /// Decode a `Label` record's payload — see [`encode_label_payload`].
 /// Returns `(timeline_id, ConvMeta)`.
 pub fn decode_label_payload(payload: &[u8]) -> Result<(u64, ConvMeta)> {
-    let mut r = ByteReader::new(payload);
-    let timeline_id = r.get_u64()?;
-    let conv_id = r.get_str()?;
-    let label = r.get_str()?;
-    if !r.is_done() {
-        return Err(PersistenceError::Corrupt(format!(
-            "Label payload has {} trailing bytes",
-            r.remaining()
-        )));
-    }
-    Ok((timeline_id, ConvMeta { conv_id, label }))
+    let p: LabelPayload = serde_json::from_slice(payload)
+        .map_err(|e| PersistenceError::Corrupt(format!("Label payload JSON decode: {e}")))?;
+    Ok((
+        p.timeline_id,
+        ConvMeta {
+            conv_id: p.conv_id,
+            label: p.label,
+        },
+    ))
 }
 
-/// Encode a `ConvState` record's payload — `{u64 timeline_id, u8 version,
-/// u8 flags}`. The flag byte is a bitfield (`CONV_STATE_FLAG_*`); the
-/// version lets us evolve to wider flag fields without changing the
-/// record type.
+/// Encode a `ConvState` record's payload — JSON.
 pub fn encode_conv_state_payload(timeline_id: u64, state: ConvState) -> Vec<u8> {
-    let mut w = ByteWriter::new();
-    w.put_u64(timeline_id);
-    w.put_u8(CONV_STATE_VERSION);
-    let mut flags: u8 = 0;
-    if state.archived {
-        flags |= CONV_STATE_FLAG_ARCHIVED;
-    }
-    w.put_u8(flags);
-    w.into_bytes()
-}
-
-/// Decode a `ConvState` record's payload — see
-/// [`encode_conv_state_payload`]. Returns `(timeline_id, ConvState)`.
-/// Unknown flag bits in the byte are silently ignored so a future
-/// pinned/unread/etc. bit doesn't fail-load on an older daemon.
-pub fn decode_conv_state_payload(payload: &[u8]) -> Result<(u64, ConvState)> {
-    let mut r = ByteReader::new(payload);
-    let timeline_id = r.get_u64()?;
-    let version = r.get_u8()?;
-    if version != CONV_STATE_VERSION {
-        return Err(PersistenceError::Corrupt(format!(
-            "ConvState payload version {version}, expected {CONV_STATE_VERSION}"
-        )));
-    }
-    let flags = r.get_u8()?;
-    if !r.is_done() {
-        return Err(PersistenceError::Corrupt(format!(
-            "ConvState payload has {} trailing bytes",
-            r.remaining()
-        )));
-    }
-    let state = ConvState {
-        archived: flags & CONV_STATE_FLAG_ARCHIVED != 0,
+    let p = ConvStatePayload {
+        timeline_id,
+        archived: state.archived,
     };
-    Ok((timeline_id, state))
+    serde_json::to_vec(&p).expect("ConvState payload JSON encoding is infallible")
 }
 
-fn put_opt_loc(w: &mut ByteWriter, loc: Option<RecordLoc>) {
-    match loc {
-        Some(l) => {
-            w.put_u8(1);
-            w.put_u64(l.offset);
-            w.put_u64(l.payload_len);
-        }
-        None => w.put_u8(0),
+/// Decode a `ConvState` record's payload — see [`encode_conv_state_payload`].
+/// Returns `(timeline_id, ConvState)`. Unknown JSON keys are ignored
+/// so a future flag (`pinned`, `unread`, …) doesn't fail-load on an
+/// older daemon — that's the field-level forward-compat property.
+pub fn decode_conv_state_payload(payload: &[u8]) -> Result<(u64, ConvState)> {
+    let p: ConvStatePayload = serde_json::from_slice(payload)
+        .map_err(|e| PersistenceError::Corrupt(format!("ConvState payload JSON decode: {e}")))?;
+    Ok((
+        p.timeline_id,
+        ConvState {
+            archived: p.archived,
+        },
+    ))
+}
+
+/// Serde shim: serialise a `BTreeMap<u64, V>` as a `Vec<(u64, V)>`
+/// pair list, since JSON object keys are strings. Round-trips
+/// preserve ordering (BTreeMap iterates by key).
+mod u64_btreemap_as_pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<V, S>(map: &BTreeMap<u64, V>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        V: Serialize,
+        S: Serializer,
+    {
+        let pairs: Vec<(u64, &V)> = map.iter().map(|(k, v)| (*k, v)).collect();
+        pairs.serialize(ser)
+    }
+
+    pub fn deserialize<'de, V, D>(de: D) -> Result<BTreeMap<u64, V>, D::Error>
+    where
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let pairs: Vec<(u64, V)> = Vec::deserialize(de)?;
+        Ok(pairs.into_iter().collect())
     }
 }
 
-fn get_opt_loc(r: &mut ByteReader) -> Result<Option<RecordLoc>> {
-    if r.get_u8()? == 1 {
-        Ok(Some(RecordLoc {
-            offset: r.get_u64()?,
-            payload_len: r.get_u64()?,
-        }))
-    } else {
-        Ok(None)
+/// Same shape as [`u64_btreemap_as_pairs`] but for `StreamId` keys.
+mod stream_btreemap_as_pairs {
+    use super::StreamId;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<V, S>(map: &BTreeMap<StreamId, V>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        V: Serialize,
+        S: Serializer,
+    {
+        let pairs: Vec<(StreamId, &V)> = map.iter().map(|(k, v)| (*k, v)).collect();
+        pairs.serialize(ser)
+    }
+
+    pub fn deserialize<'de, V, D>(de: D) -> Result<BTreeMap<StreamId, V>, D::Error>
+    where
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let pairs: Vec<(StreamId, V)> = Vec::deserialize(de)?;
+        Ok(pairs.into_iter().collect())
     }
 }
 
@@ -459,6 +374,7 @@ mod tests {
                 record_type: rt,
                 format: 0,
                 payload_len: payload.len() as u64,
+                crc: 0, // overwritten by encode_record
                 stream_id,
                 chunk_index,
                 token_count: if rt == RecordType::Chunk { 32 } else { 0 },
@@ -543,7 +459,7 @@ mod tests {
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
     }
 
-    /// `ConvState` payload encodes / decodes byte-identical with the
+    /// `ConvState` payload encodes / decodes correctly with the
     /// `archived` flag both set and clear.
     #[test]
     fn conv_state_payload_round_trip() {
@@ -559,13 +475,10 @@ mod tests {
     }
 
     /// Multiple `ConvState` records for the same timeline collapse
-    /// to the latest one in the manifest — last-writer-wins,
-    /// matching the contract Label records have.
+    /// to the latest one in the manifest — last-writer-wins.
     #[test]
     fn conv_state_last_writer_wins_in_manifest() {
         let mut blob = Vec::new();
-        // Three writes on the same timeline: archive, unarchive,
-        // archive again. Final state must be archived.
         blob.extend_from_slice(&record(
             RecordType::ConvState,
             0,
@@ -590,9 +503,7 @@ mod tests {
         assert!(manifest.conv_states.get(&99).unwrap().archived);
     }
 
-    /// ConvState entries survive a checkpoint encode/decode cycle —
-    /// the manifest carries them through `encode` / `decode` along
-    /// with labels.
+    /// ConvState entries survive a checkpoint encode/decode cycle.
     #[test]
     fn conv_state_survives_checkpoint_roundtrip() {
         let mut m = Manifest::new();
@@ -601,5 +512,58 @@ mod tests {
         let bytes = m.encode();
         let decoded = Manifest::decode(&bytes).unwrap();
         assert_eq!(decoded, m);
+    }
+
+    /// A future-version writer adds a JSON field we don't model. The
+    /// older reader must ignore it and decode the rest normally —
+    /// the field-level forward-compatibility property.
+    #[test]
+    fn conv_state_payload_ignores_unknown_fields() {
+        let payload =
+            br#"{"timeline_id":12,"archived":true,"pinned":true,"reminder":"someday"}"#.to_vec();
+        let (tl, st) = decode_conv_state_payload(&payload).unwrap();
+        assert_eq!(tl, 12);
+        assert!(st.archived);
+    }
+
+    /// An older writer omitted a field (`archived` not present). The
+    /// newer reader must use the default rather than fail.
+    #[test]
+    fn conv_state_payload_defaults_missing_fields() {
+        let payload = br#"{"timeline_id":5}"#.to_vec();
+        let (tl, st) = decode_conv_state_payload(&payload).unwrap();
+        assert_eq!(tl, 5);
+        assert!(!st.archived, "missing archived must default to false");
+    }
+
+    /// Same forward-compat properties for the Label payload.
+    #[test]
+    fn label_payload_ignores_unknown_fields() {
+        let payload =
+            br#"{"timeline_id":3,"conv_id":"abc","label":"My chat","future_field":"x"}"#.to_vec();
+        let (tl, meta) = decode_label_payload(&payload).unwrap();
+        assert_eq!(tl, 3);
+        assert_eq!(meta.conv_id, "abc");
+        assert_eq!(meta.label, "My chat");
+    }
+
+    #[test]
+    fn label_payload_defaults_missing_fields() {
+        // No conv_id, no label.
+        let payload = br#"{"timeline_id":9}"#.to_vec();
+        let (tl, meta) = decode_label_payload(&payload).unwrap();
+        assert_eq!(tl, 9);
+        assert!(meta.conv_id.is_empty());
+        assert!(meta.label.is_empty());
+    }
+
+    /// The Manifest itself must tolerate added/removed top-level
+    /// JSON fields — a future field doesn't fail-load, a missing
+    /// field decodes to its `Default` value.
+    #[test]
+    fn manifest_ignores_unknown_top_level_fields() {
+        let payload = br#"{"streams":[],"labels":[],"conv_states":[],"future_top_level":42}"#;
+        let decoded = Manifest::decode(payload).unwrap();
+        assert!(decoded.streams.is_empty());
     }
 }

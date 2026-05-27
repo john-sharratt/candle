@@ -242,7 +242,9 @@ impl SubstratePersistence {
     }
 
     /// Append one record to the active log, updating the in-RAM manifest.
-    /// Returns the file offset the record occupies.
+    /// Returns the file offset the record occupies **and** its padded
+    /// on-disk size — useful for callers (cold-load, etc.) that need to
+    /// know the bytes-on-disk footprint at write time.
     pub fn append_record(
         &mut self,
         record_type: RecordType,
@@ -251,27 +253,29 @@ impl SubstratePersistence {
         chunk_index: u64,
         token_count: u64,
         payload: &[u8],
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         let header = RecordHeader {
             record_type,
             format,
             payload_len: payload.len() as u64,
+            crc: 0, // overwritten by encode_record
             stream_id,
             chunk_index,
             token_count,
         };
         let bytes = encode_record(&header, payload);
         let offset = self.log.stage(&bytes);
+        let size = bytes.len() as u64;
         let entry = WalkEntry {
             offset,
             record: Record {
                 header,
                 payload: payload.to_vec(),
             },
-            size: bytes.len() as u64,
+            size,
         };
         self.manifest.ingest(&entry)?;
-        Ok(offset)
+        Ok((offset, size))
     }
 
     /// Declare a stream — append its `StreamDecl` record. Returns the
@@ -387,7 +391,8 @@ impl SubstratePersistence {
 
     /// Append a `Chunk` record — one sealed or partial KV chunk's bytes and
     /// quantization metadata. `token_count` is 32 for a sealed chunk, less
-    /// for a partial tail; `format` is the `KvFormat` tag.
+    /// for a partial tail; `format` is the `KvFormat` tag. Returns the
+    /// file offset of the record.
     pub fn write_chunk(
         &mut self,
         stream_id: StreamId,
@@ -396,14 +401,15 @@ impl SubstratePersistence {
         format: u8,
         payload: &ChunkPayload,
     ) -> Result<u64> {
-        self.append_record(
+        let (offset, _) = self.append_record(
             RecordType::Chunk,
             format,
             stream_id.0,
             chunk_index,
             token_count,
             &payload.encode(),
-        )
+        )?;
+        Ok(offset)
     }
 
     /// Read one chunk's payload — from the active log, else any inherited
@@ -533,7 +539,7 @@ impl SubstratePersistence {
     /// durably, and update the superblock's latest-checkpoint hint.
     pub fn checkpoint(&mut self) -> Result<()> {
         let payload = checkpoint::encode_checkpoint(&self.manifest);
-        let offset = self.append_record(RecordType::Checkpoint, 0, 0, 0, 0, &payload)?;
+        let (offset, _) = self.append_record(RecordType::Checkpoint, 0, 0, 0, 0, &payload)?;
         self.log.commit()?;
         self.log.set_latest_checkpoint(offset)?;
         Ok(())

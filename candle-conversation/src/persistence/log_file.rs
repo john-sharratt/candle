@@ -12,7 +12,6 @@ use std::path::Path;
 
 use super::record::{
     crc32, decode_header, decode_record, padded_record_len, Record, RecordHeader, ALIGN,
-    HEADER_SIZE,
 };
 use super::{PersistenceError, Result};
 
@@ -329,18 +328,34 @@ impl LogSource for MemLog {
 }
 
 /// Read and decode the record header at `offset` from any [`LogSource`].
+/// Returns the decoded header. The number of bytes the header occupies
+/// (including its trailing newline) is not exposed — callers that need
+/// it should call [`read_record_at`] for the full record.
 pub fn read_header_at(src: &mut dyn LogSource, offset: u64) -> Result<RecordHeader> {
-    let bytes = src.read_at(offset, HEADER_SIZE)?;
-    decode_header(&bytes)
+    let size = src.size()?;
+    let remaining = size.saturating_sub(offset);
+    let probe_len = remaining.min(ALIGN as u64) as usize;
+    let probe = src.read_at(offset, probe_len)?;
+    let (header, _) = decode_header(&probe)?;
+    Ok(header)
 }
 
-/// Read and decode (checksum-verify) the whole record at `offset` from any
-/// [`LogSource`].
+/// Read and decode (checksum-verify) the whole record at `offset` from
+/// any [`LogSource`]. Reads the first sector to learn the record's
+/// padded size, then reads any additional sectors the payload requires.
 pub fn read_record_at(src: &mut dyn LogSource, offset: u64) -> Result<Record> {
-    let header_bytes = src.read_at(offset, HEADER_SIZE)?;
-    let header = decode_header(&header_bytes)?;
-    let total = padded_record_len(header.payload_len);
-    let record_bytes = src.read_at(offset, total)?;
+    let size = src.size()?;
+    let remaining = size.saturating_sub(offset);
+    let probe_len = remaining.min(ALIGN as u64) as usize;
+    let probe = src.read_at(offset, probe_len)?;
+    let (header, header_bytes) = decode_header(&probe)?;
+    let total = padded_record_len(header_bytes - 1, header.payload_len);
+    let record_bytes = if total <= probe.len() {
+        // The record fit entirely in the probe — reuse it.
+        probe[..total].to_vec()
+    } else {
+        src.read_at(offset, total)?
+    };
     let (record, _) = decode_record(&record_bytes)?;
     Ok(record)
 }
@@ -365,6 +380,7 @@ mod tests {
             record_type: RecordType::Chunk,
             format: 0,
             payload_len: payload.len() as u64,
+            crc: 0, // overwritten by encode_record
             stream_id,
             chunk_index,
             token_count: 32,

@@ -7,7 +7,7 @@
 
 use super::log_file::{LogSource, SUPERBLOCK_SIZE};
 use super::manifest::Manifest;
-use super::record::{decode_header, decode_record, padded_record_len, RecordType, HEADER_SIZE};
+use super::record::{decode_header, decode_record, padded_record_len, RecordType, ALIGN};
 use super::walker;
 use super::{PersistenceError, Result};
 
@@ -31,16 +31,23 @@ pub fn encode_checkpoint(manifest: &Manifest) -> Vec<u8> {
 /// Load and decode the `Checkpoint` record at `offset`. Returns the manifest
 /// snapshot and the offset immediately past the checkpoint record.
 fn load_checkpoint(src: &mut dyn LogSource, offset: u64) -> Result<(Manifest, u64)> {
-    let header_bytes = src.read_at(offset, HEADER_SIZE)?;
-    let header = decode_header(&header_bytes)?;
+    let size = src.size()?;
+    let remaining = size.saturating_sub(offset);
+    let probe_len = remaining.min(ALIGN as u64) as usize;
+    let probe = src.read_at(offset, probe_len)?;
+    let (header, header_bytes) = decode_header(&probe)?;
     if header.record_type != RecordType::Checkpoint {
         return Err(PersistenceError::Corrupt(format!(
             "expected a Checkpoint record at offset {offset}, found {:?}",
             header.record_type
         )));
     }
-    let total = padded_record_len(header.payload_len);
-    let record_bytes = src.read_at(offset, total)?;
+    let total = padded_record_len(header_bytes - 1, header.payload_len);
+    let record_bytes = if total <= probe.len() {
+        probe[..total].to_vec()
+    } else {
+        src.read_at(offset, total)?
+    };
     let (record, _) = decode_record(&record_bytes)?;
     let manifest = Manifest::decode(&record.payload)?;
     Ok((manifest, offset + total as u64))
@@ -97,6 +104,7 @@ mod tests {
                 record_type: rt,
                 format: 0,
                 payload_len: payload.len() as u64,
+                crc: 0, // overwritten by encode_record
                 stream_id,
                 chunk_index,
                 token_count: if rt == RecordType::Chunk { 32 } else { 0 },
@@ -185,13 +193,26 @@ mod tests {
             log.commit().unwrap();
             let _ = off;
         }
-        // Corrupt the third record's payload on disk — a torn write. The
-        // "gamma" payload is at offset [64, 69) within the record; byte 66
-        // is inside it and inside the checksummed range.
+        // Corrupt the third record's payload on disk — a torn write.
+        // Find the third record's header newline (it starts at
+        // `good_records`) and flip a byte just after it (i.e. inside
+        // the payload). The CRC check will catch it.
         {
-            use std::io::{Seek, SeekFrom, Write};
-            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            f.seek(SeekFrom::Start(good_records + 66)).unwrap();
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            // Read the first sector of the third record so we can find
+            // its newline (the JSON header has variable length).
+            f.seek(SeekFrom::Start(good_records)).unwrap();
+            let mut sector = [0u8; 4096];
+            f.read_exact(&mut sector).unwrap();
+            let newline_pos = sector.iter().position(|&b| b == b'\n').unwrap();
+            // Flip the first payload byte and the two that follow.
+            f.seek(SeekFrom::Start(good_records + newline_pos as u64 + 1))
+                .unwrap();
             f.write_all(&[0x9E, 0x9E, 0x9E]).unwrap();
         }
         {

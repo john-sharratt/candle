@@ -126,6 +126,7 @@ mod tests {
             record_type: RecordType::StreamDecl,
             format: 0,
             payload_len: decl.encode().len() as u64,
+            crc: 0,
             stream_id: sid.0,
             chunk_index: 0,
             token_count: 0,

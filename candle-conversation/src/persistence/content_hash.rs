@@ -10,12 +10,16 @@
 //! needs collision resistance for non-adversarial token streams, not
 //! preimage resistance.
 
+use serde::{Deserialize, Serialize};
+
 use super::streams::{ContentAddress, StreamId};
 
 /// A 128-bit content hash. Two little-endian `u64` lanes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub struct ContentHash {
+    #[serde(default)]
     pub lo: u64,
+    #[serde(default)]
     pub hi: u64,
 }
 

@@ -868,7 +868,27 @@ async function refreshRecoveredConversations() {
     body = await res.json();
   } catch (_) { return; }
   if (!body || !Array.isArray(body.conversations)) return;
+
+  // The server is authoritative on daemon restart — anything the
+  // server no longer knows about (e.g. a wiped redo log) must be
+  // dropped locally too, including archived rows. Without this the
+  // sidebar accumulates stale entries that only F5 can clear.
+  const serverIds = new Set(body.conversations.map(e => String(e.id)));
   let mutated = false;
+  for (let i = conversations.length - 1; i >= 0; i--) {
+    const c = conversations[i];
+    // Keep fresh local drafts (no history yet) — the daemon doesn't
+    // know about them until the first send, but the user is still
+    // composing.
+    if (isDraft(c)) continue;
+    if (!serverIds.has(String(c.id))) {
+      conversations.splice(i, 1);
+      loadedRemote.delete(String(c.id));
+      if (activeId === c.id) activeId = null;
+      mutated = true;
+    }
+  }
+
   for (const entry of body.conversations) {
     const existing = conversations.find(c => String(c.id) === entry.id);
     if (existing) {
@@ -898,6 +918,9 @@ async function refreshRecoveredConversations() {
       const bTime = b.updated_ms ?? Number.MAX_SAFE_INTEGER;
       return bTime - aTime;
     });
+    // If the previously-active conv was dropped, drop the chat view
+    // back to home so the user isn't staring at orphan history.
+    if (activeId === null) newConversation();
     renderSidebar();
     updateInputBarForActive();
   }

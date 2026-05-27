@@ -23,7 +23,7 @@
 //! non-CUDA half.
 
 use super::manifest::ChunkLoc;
-use super::record::{padded_record_len, ChunkPayload, RecordType, HEADER_SIZE};
+use super::record::{ChunkPayload, RecordType};
 use super::streams::{StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
 use crate::substrate::{StoredChunk, StoredSequence};
@@ -287,8 +287,7 @@ pub fn persist_turn_chunks_capture(
             let flat = flat_chunk_index(layer_idx, chunk_idx, chunks_per_layer);
             let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
             let encoded = image.payload.encode();
-            let payload_len = encoded.len() as u64;
-            let log_offset = p.append_record(
+            let (log_offset, record_len) = p.append_record(
                 RecordType::Chunk,
                 header_fmt,
                 stream_id.0,
@@ -296,10 +295,6 @@ pub fn persist_turn_chunks_capture(
                 image.token_count as u64,
                 &encoded,
             )?;
-            let record_len = padded_record_len(payload_len) as u64;
-            // Sanity: `padded_record_len` includes the header so we can
-            // reconstruct the record's full footprint from this field.
-            debug_assert!(record_len >= HEADER_SIZE as u64);
             stored.push(StoredChunk {
                 log_offset,
                 record_len,
@@ -526,7 +521,7 @@ pub fn recover_turn_cold_refs(
         }
         lane[chunk] = StoredChunk {
             log_offset: loc.offset,
-            record_len: padded_record_len(loc.payload_len) as u64,
+            record_len: loc.record_size,
             token_count: loc.token_count as u16,
         };
         tokens_per_layer[layer] += loc.token_count as usize;
