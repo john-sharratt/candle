@@ -1411,7 +1411,7 @@ mod tests {
 
             // ── Step 3: Create view borrowing all 31 parent blocks ────────────────
             let view = backing.alloc_sequence().unwrap();
-            let (borrowed_blocks, borrowed_tokens, _) = backing
+            let (borrowed_blocks, borrowed_tokens) = backing
                 .create_view_sequence(view, parent, &[(0, parent_blocks)])
                 .unwrap();
 
@@ -1585,7 +1585,7 @@ mod tests {
             // ── Step 2: Create a view ──────────────────────────────────────────
             let parent_block_count = 2; // ceil(40/32) = 2
             let view = backing.alloc_sequence().unwrap();
-            let (borrowed_blocks, borrowed_tokens, _) = backing
+            let (borrowed_blocks, borrowed_tokens) = backing
                 .create_view_sequence(view, parent, &[(0, parent_block_count)])
                 .unwrap();
             // Flat-chunks: partial tail excluded from borrowed_blocks,

@@ -280,7 +280,8 @@ impl ChunkedKvBacking {
 
         if let Some(gid) = self.inner.pool.allocate_for(key.clone()) {
             let arena_idx = gid.arena_idx();
-            if !arena_state.has_arena(arena_idx) {
+            let arena_was_fresh = !arena_state.has_arena(arena_idx);
+            if arena_was_fresh {
                 let arena = self.create_arena(
                     (arena_chunks, CHUNK_SIZE, sub_head_dim),
                     key.format,
@@ -289,6 +290,14 @@ impl ChunkedKvBacking {
                     true,
                 )?;
                 arena_state.push_arena(arena, arena_idx, arena_chunks);
+            } else {
+                // Free-list reuse on an existing arena: the chunk's bytes are
+                // whatever the prior tenant left. Zero them so the new tenant
+                // (and any persist quantize pass that reads past token_count)
+                // sees clean storage. Fresh arenas are already zero from
+                // Tensor::zeros / QTensor::zeros at creation, so the
+                // arena_was_fresh branch above skips the work.
+                self.zero_recycled_chunk(arena_state, arena_idx, gid.chunk_idx())?;
             }
             return Ok(gid);
         }
@@ -311,6 +320,33 @@ impl ChunkedKvBacking {
             .allocate_for(key)
             .expect("just registered arena, must have capacity");
         Ok(gid)
+    }
+
+    /// Zero one recycled chunk's bytes. Asynchronous on CUDA — the work
+    /// is enqueued on the device's primary stream and the call returns
+    /// once queued. Same-stream FIFO ordering guarantees the next reader
+    /// of this chunk sees the zeros without an explicit fence.
+    fn zero_recycled_chunk(
+        &self,
+        arena_state: &mut ArenaStorageState,
+        arena_idx: usize,
+        chunk_idx: usize,
+    ) -> Result<()> {
+        let Some(arena) = arena_state.arenas_mut().get_mut(&arena_idx) else {
+            return Ok(());
+        };
+        #[cfg(feature = "cuda")]
+        {
+            let stream_owned = match &self.inner.device {
+                candle::Device::Cuda(cuda_dev) => Some(cuda_dev.cuda_stream()),
+                _ => None,
+            };
+            arena.zero_chunk_at(chunk_idx, stream_owned.as_ref())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            arena.zero_chunk_at(chunk_idx)
+        }
     }
 
     /// ArenaKey for active (unfilled) K chunks.
@@ -526,19 +562,18 @@ impl ChunkedKvBacking {
             }
         }
 
-        // Writable-tail pass: for each allocated slot, ensure the last block is a
-        // uniquely-owned float block.  Fork paths (fork_sequence, create_view_sequence)
-        // copy partial tails at fork time, so shared tails should never reach this point.
+        // Writable-tail pass: for each allocated slot, ensure the last block
+        // can accept new writes. Under the read-only projection model the
+        // tail is unshared by construction (projection pushes a fresh active
+        // chunk; closed-quant chunks force a fresh push on the first write),
+        // so we never have to COW here — we just allocate a new block when
+        // the current tail is full or in a closed-off quant arena.
         for b in 0..batch {
             if state.sequences[b].is_none() {
                 continue;
             }
             let needs_new_block: Option<bool> = state.sequences[b].as_ref().and_then(|s| {
                 let cw = s.last_chunk()?;
-                debug_assert!(
-                    cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
-                    "tail block must not be shared — fork should have copied it"
-                );
                 let is_full = (cw.offset as usize + cw.usage as usize) >= CHUNK_SIZE;
                 if is_full {
                     Some(true)

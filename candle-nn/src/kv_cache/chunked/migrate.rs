@@ -123,6 +123,7 @@ pub fn kv_migrate_on(
     let (dp, _dg) = dst_gpu.device_ptr(used_stream);
     let (lp, _lg) = len_gpu.device_ptr(used_stream);
     unsafe {
+        candle::set_kernel_breadcrumb("run_kv_migrate_copy", file!(), line!());
         kernels::simple::kv_migrate::run_kv_migrate_copy(
             sp as *const i64,
             dp as *const i64,

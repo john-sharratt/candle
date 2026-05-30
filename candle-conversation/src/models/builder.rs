@@ -542,6 +542,12 @@ impl ModelBuilder {
 
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.batched_config.compression_level = Some(self.kv_compression_level);
+        // Until decode's K-side honors non-identity pal_map with non-unit
+        // outer scales, force K storage to uniform Q4_KS with identity
+        // pal_map and unit scales for every conversation consumer. V keeps
+        // full selection adaptivity. Drop the override once the decode
+        // kernel's K-path is fixed.
+        ret.batched_config.override_k_quant = Some(candle_nn::kv_cache::QuantFormat::Q4_KS);
         ret.vocab_size = vocab_size;
         ret.max_concurrent_conversations = self.max_concurrent;
         ret.show_special_tokens = self.show_special_tokens;

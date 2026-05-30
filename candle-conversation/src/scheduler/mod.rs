@@ -448,17 +448,6 @@ struct ViewState {
     /// range — the just-decoded blocks at parent indices
     /// `[turn_start_parent_blocks, current_parent_blocks)`.
     turn_start_parent_blocks: usize,
-    /// Source partial chunk's `usage` at view-carve time (0 when the
-    /// parent's last borrowed block was full).  When non-zero,
-    /// `view.chunks[original_borrowed]` is a COW chunk whose first
-    /// `borrowed_partial_usage` bytes are a verbatim copy of the
-    /// parent's last partial chunk — duplicating the substrate-pinned
-    /// partial's content.  Zero-copy reproject uses this to know it
-    /// must truncate the freshly-injected partial chunk before
-    /// inject_sealed_at_tail places the captured tail, otherwise the
-    /// partial's content would appear in the destination slot twice
-    /// (once from the substrate re-inject, once from the COW prefix).
-    borrowed_partial_usage: u32,
 }
 
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
@@ -1131,7 +1120,7 @@ impl Scheduler {
                 };
 
                 // Step 3: carve the view sequence.
-                let (view_id, borrowed, borrowed_partial_usage) =
+                let (view_id, borrowed) =
                     match self.create_view(parent_id, &effective_ranges) {
                         Ok(t) => t,
                         Err(e) => {
@@ -1143,27 +1132,12 @@ impl Scheduler {
                 // Step 4: anchor the active turn's start index in the
                 // view's chunk list.
                 //
-                // When the parent's last block is partial,
-                // `create_view_sequence` CoW-copied it into a fresh
-                // view-owned chunk at view index `borrowed` (=
-                // `parent_block_count - 1`).  All turn writes begin
-                // in that COW chunk — extending its `usage` past the
-                // copied source partial bytes.  The CoW chunk is
-                // therefore the *first* chunk that holds active-turn
-                // K/V, and `borrowed` is the right anchor for
-                // mid-turn captures (zero-copy reproject) and final
-                // seals.
-                //
-                // When parent has no partial tail, `borrowed ==
-                // parent_block_count`; turn writes go into a fresh
-                // chunk pushed by `ensure_writable_tail` at view
-                // index `borrowed`, so `borrowed` is again the right
-                // anchor.
-                //
-                // Using `parent_block_count` here (one past the
-                // partial when one exists) would skip the COW chunk
-                // and lose the bytes the writer extended past the
-                // section's K_section initial usage.
+                // Under the read-only projection model, all borrowed
+                // chunks (including any partial tail) are shared Arc
+                // clones; the view's writable tail is a fresh active
+                // chunk pushed at view index `borrowed.0` by
+                // `create_view_sequence`. So `borrowed.0` is the
+                // anchor for mid-turn captures and final seals.
                 let turn_start_parent_blocks = borrowed.0;
 
                 // Step 5: register the view so cleanup_finished can auto-finalize.
@@ -1173,7 +1147,6 @@ impl Scheduler {
                         parent_id,
                         original_borrowed: borrowed,
                         turn_start_parent_blocks,
-                        borrowed_partial_usage,
                     },
                 );
 
@@ -1434,24 +1407,48 @@ impl Scheduler {
         projected_sections: &[SectionId],
         projected_turns: &[(GroupId, TurnIndex)],
     ) -> Result<(), ConversationError> {
-        // Append-only model: the slot is the persistent KV-cache for
-        // its conversation.  For the FIRST submit on a slot the
-        // slot is empty, so we inject the conversation's pinned
-        // system section + projected turns ahead of the user
-        // message.  For subsequent submits the slot already
-        // carries the conversation's accumulated history; we leave
-        // it alone and let the user message append at the tail.
-        let slot_already_populated = self.session.sequence_offset(parent_id.0).unwrap_or(0) > 0;
-        if slot_already_populated {
-            return Ok(());
-        }
-
-        // First turn — only act on the system_block_count baseline if
-        // there's actually content to inject.  Truncation is left as a
-        // no-op when the slot is fresh (offset=0 already).
+        // Stateless rebuild model: the slot's prefix is always the
+        // current projection — `[projected_sections ++ projected_turns]`
+        // — re-fetched from substrate residences on every call. Any
+        // in-flight decode chunks ([writer_start_idx..end)) are
+        // preserved across the rebuild so a mid-turn reprojection
+        // doesn't drop the user's tokens. The substrate residence is
+        // the single source of truth for the prefix's contents and
+        // format; the slot's chunks are a transient view of it.
         let _ = system_block_count;
 
+        // Snapshot any writer-owned tail (work-in-progress decode
+        // chunks). At turn-submit boundaries this is empty; mid-turn
+        // reprojection paths have a non-empty tail that must survive
+        // the prefix rewrite. The snapshot holds RAII refs that keep
+        // the underlying arena chunks alive across the truncate.
+        let tail_per_layer: Vec<candle_nn::kv_cache::WriterTail> = {
+            let mut out: Vec<candle_nn::kv_cache::WriterTail> =
+                Vec::with_capacity(self.session.backings().len());
+            for backing in self.session.backings() {
+                out.push(
+                    backing
+                        .split_off_writer_tail(parent_id.0)
+                        .map_err(ConversationError::Model)?,
+                );
+            }
+            out
+        };
+
+        // Reset the slot to empty. Borrowed prefix chunks drop their
+        // Arc refs (residence keeps them alive); the tail snapshot
+        // above keeps its chunks alive independently.
+        self.session
+            .truncate_sequence_to_blocks(parent_id.0, 0)
+            .map_err(ConversationError::Model)?;
+
         if projected_sections.is_empty() && projected_turns.is_empty() {
+            // Nothing to inject — just restore the tail (if any) and return.
+            for (backing, tail) in self.session.backings().iter().zip(tail_per_layer) {
+                backing
+                    .extend_writer_tail(parent_id.0, tail)
+                    .map_err(ConversationError::Model)?;
+            }
             return Ok(());
         }
 
@@ -1687,6 +1684,19 @@ impl Scheduler {
             );
         }
         Self::record_slot_tokens(&mut self.slot_tokens, parent_id, &injected_tokens);
+
+        // Restore the writer-owned tail snapshot taken at the top of
+        // this function. The prefix is now the new projection; the
+        // tail picks up where it left off. RoPE is derived from
+        // cumulative usage at decode-sync time, so the kernel will
+        // re-rotate the tail's tokens against their new absolute
+        // positions automatically — no byte copy or re-encoding
+        // needed (see `SealedChunk`'s position-agnostic doc).
+        for (backing, tail) in self.session.backings().iter().zip(tail_per_layer) {
+            backing
+                .extend_writer_tail(parent_id.0, tail)
+                .map_err(ConversationError::Model)?;
+        }
 
         Ok(())
     }
@@ -1966,6 +1976,23 @@ impl Scheduler {
                         })
                     }
                 };
+
+                // Stateless-slot housekeeping: drop the slot's chunks
+                // now that `perform_seal_and_write` has captured them
+                // into the substrate residence. The next turn's
+                // `apply_projection` rebuilds the slot from substrate
+                // anyway, so holding onto these `Arc<ChunkGid>`s
+                // between turns just pins arena slots that nothing
+                // reads. Truncating to 0 drops the slot's Arc refs;
+                // the residence keeps the chunks alive for the next
+                // projection inject.
+                if let Err(e) = self.session.truncate_sequence_to_blocks(seal_slot.0, 0) {
+                    tracing::warn!(
+                        "post-seal slot truncate failed for slot {}: {}",
+                        seal_slot,
+                        e
+                    );
+                }
 
                 let _ = state.event_tx.send(TurnEvent::Done(TurnResponse {
                     text,
@@ -2302,6 +2329,7 @@ impl Scheduler {
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
+
                 let idx = conversation
                     .record_turn(
                         target.timeline,
@@ -2669,7 +2697,7 @@ impl Scheduler {
         &mut self,
         parent_id: SequenceId,
         visible_block_ranges: &[BlockRange],
-    ) -> Result<(SequenceId, BlockCount, u32), ConversationError> {
+    ) -> Result<(SequenceId, BlockCount), ConversationError> {
         // Empty range list = sentinel "use all blocks of the parent".
         // Use `sequence_block_count` rather than `offset / CHUNK_SIZE`
         // — chunks with `usage < CHUNK_SIZE` from back-to-back section
@@ -2692,7 +2720,6 @@ impl Scheduler {
             .map_err(ConversationError::Model)?;
         let view_id = SequenceId(vs.view_idx);
         let borrowed = BlockCount(vs.borrowed_block_count);
-        let borrowed_partial_usage = vs.borrowed_partial_usage;
 
         // Seed sampling state for the view (clone parent's state so
         // the DRY window survives the carve).
@@ -2708,7 +2735,7 @@ impl Scheduler {
             );
         }
 
-        Ok((view_id, borrowed, borrowed_partial_usage))
+        Ok((view_id, borrowed))
     }
 
     /// Run BDP scan + projection for the active view's policy, then
@@ -3355,47 +3382,15 @@ impl Scheduler {
             &projected_sections,
             &projected_turns,
         )?;
-        let mut new_prefix_block_count =
+        let new_prefix_block_count =
             self.session.sequence_block_count(parent_id.0).unwrap_or(0);
 
-        // ── Critical: discard parent's tail partial when the
-        //    captured COW chunk will duplicate it.
-        //
-        // When the view was carved, `create_view_sequence` CoW-copied
-        // the parent's last partial chunk into a writer-owned chunk
-        // on the view (so the view's writer could extend it
-        // without aliasing the substrate's pinned partial).  The COW
-        // chunk's first `borrowed_partial_usage` bytes are a verbatim
-        // copy of the source partial.  The writer then extended the
-        // chunk from byte `borrowed_partial_usage` onwards with user
-        // prefill / decoded K/V.
-        //
-        // We're about to inject that COW chunk back via
-        // `inject_sealed_at_tail` on top of a freshly re-projected
-        // parent — and `apply_projection` just placed the *same
-        // substrate partial* (always-emit framing sections like
-        // `tools_outro` survive every BDP reshuffle) as the tail
-        // chunk of the new prefix.  If we injected the tail as-is,
-        // those `borrowed_partial_usage` bytes would appear in the
-        // destination slot twice: once in the substrate-re-injected
-        // partial, once in the COW chunk's leading bytes.  The
-        // model would see the section's last few tokens duplicated
-        // immediately after they were emitted — confusing the
-        // attention pattern enough to derail generation.
-        //
-        // Truncate parent's freshly-injected last partial chunk
-        // (one chunk drop, zero-copy — substrate retains its Arc
-        // refs to the chunk's GIDs).  The captured COW chunk then
-        // slots into the partial's former position and its first
-        // `borrowed_partial_usage` bytes correctly represent that
-        // partial's content.  No duplication.
-        let borrowed_partial_usage = view_state.borrowed_partial_usage;
-        if borrowed_partial_usage > 0 && new_prefix_block_count > 0 {
-            self.session
-                .truncate_sequence_to_blocks(parent_id.0, new_prefix_block_count - 1)
-                .map_err(ConversationError::Model)?;
-            new_prefix_block_count -= 1;
-        }
+        // Under the read-only projection model there's no COW prefix
+        // duplication to guard against: the view never copied bytes from
+        // the parent's partial — it borrowed the partial read-only and
+        // wrote new K/V into a fresh active chunk. So the captured tail
+        // can be re-injected directly on top of the freshly-projected
+        // parent with no truncate dance.
 
         // Append the captured tail to parent (metadata-only Arc clone).
         let tail_token_count: usize = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
@@ -3428,7 +3423,7 @@ impl Scheduler {
         } else {
             vec![BlockRange::new(0, parent_block_count)]
         };
-        let (new_view_id, new_borrowed, _new_borrowed_partial_usage) =
+        let (new_view_id, new_borrowed) =
             self.create_view(parent_id, &effective_ranges)?;
         // Diagnostic log: the new view's slot index may have been
         // recycled from the freed old view's slot; drop any stale
@@ -3446,25 +3441,6 @@ impl Scheduler {
                 // exclude the freshly-injected sections / turns and
                 // include the tail.
                 turn_start_parent_blocks: new_prefix_block_count,
-                // Preserve the *first* view's section-derived partial
-                // usage across every reproject in the turn.
-                //
-                // `borrowed_partial_usage` is the truncate guard for
-                // the COW-prefix duplication that arises when the
-                // captured tail's first chunk has its leading
-                // K_section bytes verbatim-copied from a section's
-                // partial chunk (see step (e) above).  The original
-                // section-derived COW from the first view of the
-                // turn is Arc'd through every subsequent reproject —
-                // it's always the first chunk in the captured tail —
-                // so what matters is the *first* view's
-                // `borrowed_partial_usage`, not the new view's
-                // (which would be the previous tail's last writer
-                // chunk usage — writer-derived, NOT section-derived,
-                // and using it as the truncate guard would clobber
-                // a real section-partial chunk on the new prefix
-                // without anything to replace its bytes).
-                borrowed_partial_usage: view_state.borrowed_partial_usage,
             },
         );
 

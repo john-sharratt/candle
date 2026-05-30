@@ -12,7 +12,7 @@ pub use super::sampled_selection::params::{
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,
 };
-use crate::kv_cache::KvFormat;
+use crate::kv_cache::{KvFormat, QuantFormat};
 
 /// Policy controlling adaptive per-block quantization format selection.
 ///
@@ -32,6 +32,26 @@ pub struct CompressionPolicy {
     pub v_hi_error_threshold_factor: f32,
     /// Per-model multiplier for the V low (lenient) adaptive threshold.
     pub v_low_error_threshold_factor: f32,
+    /// When set, force K storage to the given uniform quant format with
+    /// identity pal_map and unit (1.0) outer scales — bypassing the
+    /// selection kernel's K-side choices entirely. V is unaffected (still
+    /// fully adaptive per selection).
+    ///
+    /// This is the path that exercises decode's known-correct K-side
+    /// invariants: identity layout + unit scales + a single uniform format.
+    /// Non-identity K pal_map combined with non-unit K outer scales is a
+    /// decode-kernel bug surface; the override sidesteps it while still
+    /// preserving full V adaptivity.
+    ///
+    /// `None` propagates selection's full per-(chunk, head, palette) K
+    /// state to storage — currently fails recall and is preserved as the
+    /// default for diagnostic work.
+    pub override_k_quant: Option<QuantFormat>,
+    /// Symmetric V counterpart to [`Self::override_k_quant`]. Defaults to
+    /// `None` because the V-side decode path correctly honors selection's
+    /// per-(chunk, head, palette) pal_maps + scales; the override exists
+    /// only for symmetry with K (e.g., diagnostic isolation, future use).
+    pub override_v_quant: Option<QuantFormat>,
 }
 
 impl Default for CompressionPolicy {
@@ -42,6 +62,8 @@ impl Default for CompressionPolicy {
             k_low_error_threshold_factor: 1.0,
             v_hi_error_threshold_factor: 1.0,
             v_low_error_threshold_factor: 1.0,
+            override_k_quant: None,
+            override_v_quant: None,
         }
     }
 }
@@ -67,7 +89,26 @@ impl CompressionPolicy {
             k_low_error_threshold_factor: k_low_error_threshold_factor.max(0.0),
             v_hi_error_threshold_factor: v_hi_error_threshold_factor.max(0.0),
             v_low_error_threshold_factor: v_low_error_threshold_factor.max(0.0),
+            override_k_quant: None,
+            override_v_quant: None,
         }
+    }
+
+    /// Builder-style setter for the K quantization override.
+    /// `Some(fmt)` forces K storage to uniform `fmt` with identity pal_map
+    /// and unit outer scales; `None` lets selection's per-(chunk, head,
+    /// palette) K choices propagate to storage.
+    pub fn with_override_k_quant(mut self, fmt: Option<QuantFormat>) -> Self {
+        self.override_k_quant = fmt;
+        self
+    }
+
+    /// Builder-style setter for the V quantization override (symmetric to
+    /// [`Self::with_override_k_quant`]). Defaults to `None` — V's decode
+    /// path already handles selection's full adaptive state correctly.
+    pub fn with_override_v_quant(mut self, fmt: Option<QuantFormat>) -> Self {
+        self.override_v_quant = fmt;
+        self
     }
 
     /// K cache candidate formats from the shared production profile.

@@ -15,7 +15,7 @@ use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
 use super::types::{SealedChunk, SealedSequence};
 use super::{arena_gid_stride, CHUNK_SIZE};
-use super::{Arena, ArenaKey, ChunkedKvBacking, CompressionPolicy, StoragePolicy};
+use super::{Arena, ArenaKey, ChunkedKvBacking};
 // Import from kv_cache module (grandparent)
 use crate::kv_cache::arena_table::{ArenaLocation, N_PALETTE};
 use crate::kv_cache::KvFormat;
@@ -23,16 +23,19 @@ use crate::kv_cache::KvFormat;
 use crate::kv_cache::QuantFormat;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::SELECT_FMT_F16;
-use candle::quantized::pinned_staging::Generation;
 use candle::quantized::QTensor;
 use candle::{DType, Device, Result, Tensor};
 
 // Shared production thresholds are defined in compression_policy.rs and are
 // consumed here directly so the runtime and table harness stay in sync.
 
+/// Source formats the quantize-on-evict kernel can ingest directly:
+/// GPU `Float` (any dtype) or `Quantized(R16)`. Anything else has to
+/// take the format-preserving migration path because the selection /
+/// conversion kernels are only compiled for these source layouts.
 #[cfg(feature = "cuda")]
 #[inline]
-fn needs_reconcile_source_format(format: KvFormat) -> bool {
+pub(super) fn needs_reconcile_source_format(format: KvFormat) -> bool {
     matches!(
         format,
         KvFormat::Float(_) | KvFormat::Quantized(QuantFormat::R16)
@@ -156,6 +159,26 @@ fn read_chunk_into_pinned_bytes(
 }
 
 impl ChunkedKvBacking {
+    /// Read the raw bytes of one chunk slot into `dst`. Works for both
+    /// `Arena::Float` (any supported dtype) and `Arena::Quantized`
+    /// (CPU or GPU). The destination buffer must be exactly the
+    /// arena's `chunk_byte_stride` bytes — call sites use
+    /// [`crate::kv_cache::arena_table::ResolvedArenaInfo::chunk_byte_stride`]
+    /// to size it.
+    pub fn read_chunk_into_bytes(
+        &self,
+        arena_idx: usize,
+        chunk_idx: usize,
+        dst: &mut [u8],
+    ) -> candle::Result<()> {
+        self.inner.storage.read(|s| {
+            let arena = s.arenas().get(&arena_idx).ok_or_else(|| {
+                candle::Error::Msg(format!("read_chunk_into_bytes: arena {arena_idx} missing"))
+            })?;
+            read_chunk_into_pinned_bytes(arena, chunk_idx, dst)
+        })?
+    }
+
     /// Migrate a chunk from one arena type to another.
     ///
     /// This is the central operation for moving data between formats (float/quant)
@@ -1210,16 +1233,19 @@ impl ChunkedKvBacking {
         Ok(gids)
     }
 
-    /// The per-`(head, palette sub-band)` `KvFormat`s a sealed chunk's bytes
-    /// are stored in — `(k_formats, v_formats)`, each `n_kv_head × N_PALETTE`
+    /// Walk a [`HeadGids`] and produce the per-`(head, palette)` K/V
+    /// format pair — `(k_formats, v_formats)`, each `n_kv_head × N_PALETTE`
     /// entries in `[h*N_PALETTE + p]` order.
     ///
     /// Adaptive quantization picks a format independently per sub-band, so
     /// persistence must record the whole map (not just head-0) to reallocate
-    /// the chunk's arenas faithfully. Used by the seal-time gather path.
-    pub fn sealed_chunk_kv_formats(
+    /// the chunk's arenas faithfully. This is called at seal time to
+    /// populate the `k_formats` / `v_formats` snapshot stored on
+    /// [`SealedChunk`] — the persist path then reads those directly rather
+    /// than re-walking arena state.
+    pub fn kv_formats_for_gids(
         &self,
-        chunk: &SealedChunk,
+        gids: &super::head_gids::HeadGids,
     ) -> candle::Result<(
         Vec<crate::kv_cache::KvFormat>,
         Vec<crate::kv_cache::KvFormat>,
@@ -1235,8 +1261,8 @@ impl ChunkedKvBacking {
             let mut v_formats = Vec::with_capacity(n_kv_head * N_PALETTE);
             for h in 0..n_kv_head {
                 for p in 0..N_PALETTE {
-                    k_formats.push(fmt(chunk.gids.k_gid_pal(h, p).arena_idx(), "k")?);
-                    v_formats.push(fmt(chunk.gids.v_gid_pal(h, p).arena_idx(), "v")?);
+                    k_formats.push(fmt(gids.k_gid_pal(h, p).arena_idx(), "k")?);
+                    v_formats.push(fmt(gids.v_gid_pal(h, p).arena_idx(), "v")?);
                 }
             }
             Ok((k_formats, v_formats))
@@ -2031,6 +2057,7 @@ impl ChunkedKvBacking {
             location: ArenaLocation::Gpu,
         })
     }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

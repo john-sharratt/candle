@@ -84,17 +84,34 @@ impl ConversationEngine {
     pub fn new(
         model: Box<dyn ManagedBatchedModel + Send>,
         tokenizer: tokenizers::Tokenizer,
-        config: EngineConfig,
+        mut config: EngineConfig,
     ) -> crate::Result<Self> {
+        // Capture model metadata before the model moves to the scheduler thread.
+        let model_core = model.model_core_properties();
+
+        // Plumb the model's tuned K/V error threshold factors into the
+        // batched config so the persistence thread's `compression_policy()`
+        // (built from `config.batched_config`) uses them. Without this the
+        // policy falls back to identity factors (1.0) regardless of which
+        // model is loaded — the 24-iter Qwen3 tuning would never reach the
+        // selection kernel. The model impl is the single source of truth;
+        // `BatchedModelCore::*_error_threshold_factor()` returns the per-model
+        // constant (e.g. `QWEN3_MOE_KV_FACTORS`).
+        config.batched_config.k_hi_error_threshold_factor =
+            model_core.k_hi_error_threshold_factor;
+        config.batched_config.k_low_error_threshold_factor =
+            model_core.k_low_error_threshold_factor;
+        config.batched_config.v_hi_error_threshold_factor =
+            model_core.v_hi_error_threshold_factor;
+        config.batched_config.v_low_error_threshold_factor =
+            model_core.v_low_error_threshold_factor;
+
         // Create the batched inference session on this thread, then move
         // it to the scheduler thread. Session creation touches the GPU
         // (arena allocation) but is a one-time cost.
         let session = model
             .create_batched_session(config.batched_config.clone())
             .map_err(ConversationError::Model)?;
-
-        // Capture model metadata before the model moves to the scheduler thread.
-        let model_core = model.model_core_properties();
 
         let eos_tokens = config.eos_tokens.clone();
         let vocab_size = config.vocab_size;
@@ -165,6 +182,7 @@ impl ConversationEngine {
             conversation.clone(),
             Arc::clone(&backings),
             session.device().clone(),
+            config.batched_config.compression_policy(),
         );
         let persist_trigger = persist_thread.trigger_handle();
 

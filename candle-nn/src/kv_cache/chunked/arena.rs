@@ -425,6 +425,62 @@ impl Arena {
         ArenaKey::new(self.format(), self.location())
     }
 
+    /// Zero the chunk at `chunk_idx`. Called on the alloc-from-free-list path
+    /// so the chunk's bytes are clean before the new tenant writes only the
+    /// slots it cares about — the persist quantize pass then sees zero past
+    /// `token_count` instead of stale garbage from the prior tenant.
+    ///
+    /// Asynchronous when `stream` is supplied: the work is enqueued on that
+    /// stream and the call returns once queued. Same-stream FIFO ordering
+    /// then guarantees any subsequent kernel reading this chunk sees zeros
+    /// without an explicit fence. When `stream` is `None` (CPU arena or a
+    /// CPU device under a `cuda`-built binary) the work runs synchronously.
+    pub(super) fn zero_chunk_at(
+        &mut self,
+        chunk_idx: usize,
+        #[cfg(feature = "cuda")] stream: Option<
+            &std::sync::Arc<candle::cuda_backend::cudarc::driver::CudaStream>,
+        >,
+    ) -> Result<()> {
+        match self {
+            Self::Float { data, dtype, .. } => {
+                let dims = data.dims();
+                if dims.len() != 3 {
+                    candle::bail!(
+                        "zero_chunk_at: expected (arena_chunks, chunk_size, sub_head_dim), got {:?}",
+                        dims
+                    );
+                }
+                if chunk_idx >= dims[0] {
+                    candle::bail!(
+                        "zero_chunk_at: chunk {chunk_idx} out of range (arena holds {})",
+                        dims[0]
+                    );
+                }
+                // Tensor::zeros + slice_set are kernel-launch ops; on CUDA
+                // they enqueue on the tensor's stream and return without
+                // blocking. On CPU they run inline.
+                let zeros = Tensor::zeros((1, dims[1], dims[2]), *dtype, data.device())?;
+                data.slice_set(&zeros, 0, chunk_idx)?;
+                Ok(())
+            }
+            Self::Quantized { data, format, .. } => {
+                let (byte_offset, chunk_byte_stride) =
+                    quant_chunk_byte_range(data, *format, chunk_idx)?;
+                let zeros = vec![0u8; chunk_byte_stride];
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(s) = stream {
+                        data.write_bytes_at_async(s, byte_offset, &zeros)?;
+                        return Ok(());
+                    }
+                }
+                data.write_bytes_at(byte_offset, &zeros)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Estimate the GPU memory usage of this arena in bytes.
     ///
     /// Returns the total bytes for both K and V tensors.
@@ -461,6 +517,44 @@ impl Arena {
             Self::Quantized { format, .. } => format!("{:?}", format),
         }
     }
+}
+
+/// Resolve `(byte_offset, chunk_byte_stride)` for a Quantized arena chunk.
+/// Used by [`Arena::zero_chunk_at`] to address one logical chunk's bytes.
+fn quant_chunk_byte_range(
+    data: &QTensor,
+    format: QuantFormat,
+    chunk_idx: usize,
+) -> Result<(usize, usize)> {
+    let q_ggml = format.to_ggml_dtype();
+    let total_elems = data.shape().elem_count();
+    if total_elems % q_ggml.block_size() != 0 {
+        candle::bail!(
+            "quant_chunk_byte_range: total elems {total_elems} not divisible by block_size {}",
+            q_ggml.block_size()
+        );
+    }
+    let total_bytes = (total_elems / q_ggml.block_size()) * q_ggml.type_size();
+    let arena_chunks = arena_chunks_for_format(KvFormat::Quantized(format));
+    if arena_chunks == 0 {
+        candle::bail!(
+            "quant_chunk_byte_range: arena_chunks_for_format returned 0 for {:?}",
+            format
+        );
+    }
+    let chunk_byte_stride = total_bytes / arena_chunks;
+    if chunk_idx >= arena_chunks {
+        candle::bail!(
+            "quant_chunk_byte_range: chunk {chunk_idx} out of range (arena holds {arena_chunks})"
+        );
+    }
+    Ok((chunk_idx * chunk_byte_stride, chunk_byte_stride))
+}
+
+#[allow(dead_code)]
+struct _ArenaImplContinues; // syntactic anchor: more `impl Arena` items follow below.
+
+impl Arena {
 
     /// Return the raw device pointer and byte stride for one logical chunk in
     /// this arena. Returns `None` for CPU-backed or tombstoned arenas.
@@ -931,17 +1025,6 @@ impl ArenaStorage {
     /// Get the default location for new arenas (lock-free).
     pub(super) fn default_location(&self) -> ArenaLocation {
         self.default_location
-    }
-
-    /// Get the default ArenaKey for K (lock-free).
-    #[allow(dead_code)] // Used for default arena allocation path
-    pub(super) fn default_key(&self) -> ArenaKey {
-        ArenaKey::new(self.default_format, self.default_location)
-    }
-
-    #[cfg(feature = "cuda")]
-    pub(super) fn default_v_key(&self) -> ArenaKey {
-        ArenaKey::new(self.default_v_format, self.default_location)
     }
 
     /// Get the DType for default format, or None if quantized (lock-free).

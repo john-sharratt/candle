@@ -339,6 +339,32 @@ pub(crate) struct ChunkWindow {
 
 impl ChunkWindow {}
 
+/// Opaque snapshot of a slot's writer-owned chunks, taken by
+/// [`super::ChunkedKvBacking::split_off_writer_tail`] and restored by
+/// [`super::ChunkedKvBacking::extend_writer_tail`].
+///
+/// Used by the stateless-slot rebuild path: the scheduler snapshots
+/// the in-flight decode chunks before truncating the slot, re-injects
+/// the projected prefix from substrate, and restores the tail in the
+/// same call. RAII on the contained `ChunkGid`s keeps the underlying
+/// arena chunks alive across the truncate — the bytes never move.
+pub struct WriterTail {
+    pub(super) chunks: Vec<ChunkWindow>,
+}
+
+impl WriterTail {
+    /// `true` when the snapshot contains no chunks (the common
+    /// turn-boundary case where decode hasn't started yet).
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// Number of chunks in the snapshot.
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodeGpuChunksSyncKind {
     Empty,

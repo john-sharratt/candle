@@ -1023,7 +1023,7 @@ impl PagedSelectionGpuInputs {
                 self.n_kv_head,
                 self.arena_chunks,
                 &self.dev,
-                &self.dev.cuda_bg_stream(),
+                &self.dev.cuda_stream(),
             )?
         };
 
@@ -1223,7 +1223,7 @@ impl PagedSelectionGpuInputs {
                 self.n_kv_head,
                 self.arena_chunks,
                 &self.dev,
-                &self.dev.cuda_bg_stream(),
+                &self.dev.cuda_stream(),
             )?
         };
 

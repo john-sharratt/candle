@@ -1137,34 +1137,29 @@ impl BackingInner {
         let sub_head_dim = (self.head_dim / N_PALETTE).max(1);
         let device = &self.device;
 
-        // Scan all active sequence blocks to find the highest arena index in use.
-        // The kernel indexes the table as `table[arena_idx * n_kv_head + h]`, so
-        // the table must be dense over [0, num_arenas).
-        let num_arenas = {
-            let states: Vec<Arc<RwLock<BlockTableState>>> = {
-                let registry = self
-                    .state_registry
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner());
-                registry.values().filter_map(|w| w.upgrade()).collect()
-            };
-            states
-                .iter()
-                .filter_map(|state| {
-                    let guard = state.read().ok()?;
-                    guard
-                        .sequences
-                        .iter()
-                        .flatten()
-                        .flat_map(|seq| seq.chunks_slice().iter())
-                        .flat_map(|cw| cw.gids.iter())
-                        .map(|gid| gid.arena_idx())
-                        .max()
-                })
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0)
-        };
+        // Size the table to cover every arena in storage, not just those
+        // referenced by live slots. The kernel indexes the table as
+        // `table[arena_idx * n_kv_head + h]`, so the table must be dense
+        // over [0, num_arenas) for every arena_idx that any caller's
+        // input gid might reference.
+        //
+        // Previously this used the state_registry scan (max arena_idx
+        // among live slots), which is incorrect for the persist path:
+        // the persist thread feeds in gids from substrate-pinned
+        // SealedSequences whose arenas may not be referenced by any
+        // active slot (especially after a post-turn slot truncate
+        // drops the slot's Arc refs). The substrate residence still
+        // keeps those arenas alive via Arc refs, but the live-slot
+        // scan misses them → table too small → kernel reads OOB →
+        // CUDA_ERROR_ILLEGAL_ADDRESS in `run_select_kv_format_palette4_paged`.
+        //
+        // Sizing from `storage.arenas()` directly covers every arena
+        // that physically exists in this backing, which is the right
+        // invariant: any gid valid against this backing has
+        // `arena_idx ∈ [0, max_arena_idx]`.
+        let num_arenas = self
+            .storage
+            .read(|s| s.arenas().keys().max().copied().map(|m| m + 1).unwrap_or(0))?;
 
         if num_arenas == 0 {
             return Tensor::zeros((1, PerHeadEntry::COLS), candle::DType::I64, device);
@@ -2080,6 +2075,13 @@ impl ChunkedKvBacking {
             .read()
             .expect("chunked state lock poisoned")
             .max_blocks
+    }
+
+    /// Borrow the backing's device. Used by call sites that need to
+    /// hand a `&Device` to one of the kernel-driving helpers without
+    /// threading it down from the caller.
+    pub fn device(&self) -> &Device {
+        &self.inner.device
     }
 
     /// Report GPU memory usage broken down by arena format.

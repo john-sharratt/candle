@@ -1,4 +1,4 @@
-﻿//! Batched transformer layer processing for continuous batching.
+//! Batched transformer layer processing for continuous batching.
 //!
 //! This module provides traits and utilities for processing transformer layers
 //! in batched mode, enabling efficient continuous batching across multiple sequences.
@@ -921,6 +921,7 @@ fn paged_decode_attention(
     // After writing each decode token, eagerly quantize any newly-sealed chunk.
     Ok(out)
 }
+
 
 /// Standard (non-paged) batched attention fallback.
 fn standard_batched_attention(

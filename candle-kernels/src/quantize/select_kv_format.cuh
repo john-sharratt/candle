@@ -2197,8 +2197,21 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
         }
 
         if (lane == 0) {
-            amax_k[blk] = k_abs;
-            amax_v[blk] = v_abs;
+            // Per-block hash jitter (~6e-8) added to the amax values to
+            // break sort ties on tied amax. Partial-tail chunks zero-pad
+            // positions past `token_count`, producing many near-equal
+            // small amax that — under the bitonic sort's tie behaviour —
+            // drift toward near-monotonic block-index order; the claim
+            // phase then assigns long contiguous dim ranges to a single
+            // palette (tail-chunk clustering). The jitter sits well
+            // below any real activation amax (≥ 1e-2 typical), so the
+            // format-search and threshold paths on real data are
+            // unaffected. Must match the Rust mirror's
+            // `amax_tie_jitter` in `cpu_selection.rs` byte-for-byte.
+            const unsigned int j_h = ((unsigned int)blk * 2654435761u) ^ 0x9e3779b9u;
+            const float j_v = __int_as_float((int)((j_h & 0x007fffffu) | 0x33800000u));
+            amax_k[blk] = k_abs + j_v;
+            amax_v[blk] = v_abs + j_v;
             qrel_k[blk] = __float2half(qr);
             kidx  [blk] = (uint16_t)blk;
             vidx  [blk] = (uint16_t)blk;

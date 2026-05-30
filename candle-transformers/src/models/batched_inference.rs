@@ -314,6 +314,19 @@ pub struct BatchedConfig {
     pub v_hi_error_threshold_factor: f32,
     /// Per-model multiplier for the V low (lenient) adaptive threshold.
     pub v_low_error_threshold_factor: f32,
+    /// When `Some(fmt)`, the persist-time quantizer forces K storage to
+    /// uniform `fmt` with identity pal_map and unit outer scales, bypassing
+    /// the selection kernel's K-side choices. V remains fully adaptive per
+    /// selection. `None` lets selection's per-(chunk, head, palette) K
+    /// state propagate to storage as designed.
+    ///
+    /// Set via `with_override_k_quant`. Propagates into the
+    /// [`CompressionPolicy`] built by [`Self::compression_policy`].
+    pub override_k_quant: Option<QuantFormat>,
+    /// Symmetric V counterpart to [`Self::override_k_quant`]. Defaults to
+    /// `None` because V's decode path already honors selection's full
+    /// adaptive state correctly; provided for symmetry / diagnostic use.
+    pub override_v_quant: Option<QuantFormat>,
 }
 
 impl Default for BatchedConfig {
@@ -327,6 +340,8 @@ impl Default for BatchedConfig {
             k_low_error_threshold_factor: 1.0,
             v_hi_error_threshold_factor: 1.0,
             v_low_error_threshold_factor: 1.0,
+            override_k_quant: None,
+            override_v_quant: None,
         }
     }
 }
@@ -369,6 +384,22 @@ impl BatchedConfig {
         self
     }
 
+    /// Force K storage to a uniform quant format with identity pal_map and
+    /// unit outer scales, ignoring selection's K choices. V remains fully
+    /// adaptive. `None` propagates selection's K state to storage.
+    pub fn with_override_k_quant(mut self, fmt: Option<QuantFormat>) -> Self {
+        self.override_k_quant = fmt;
+        self
+    }
+
+    /// Symmetric V counterpart to [`Self::with_override_k_quant`].
+    /// Defaults to `None` — V's decode path already honors selection's
+    /// full adaptive state correctly; provided for symmetry / diagnostic use.
+    pub fn with_override_v_quant(mut self, fmt: Option<QuantFormat>) -> Self {
+        self.override_v_quant = fmt;
+        self
+    }
+
     /// Build a [`CompressionPolicy`] from this config's level (if set).
     /// Returns `None` for uniform/non-compression modes.
     pub fn compression_policy(&self) -> Option<CompressionPolicy> {
@@ -380,6 +411,8 @@ impl BatchedConfig {
                 self.v_hi_error_threshold_factor,
                 self.v_low_error_threshold_factor,
             )
+            .with_override_k_quant(self.override_k_quant)
+            .with_override_v_quant(self.override_v_quant)
         })
     }
 }
@@ -922,15 +955,13 @@ impl BatchedInferenceSession {
         let view_idx = self.create_sequence()?;
         let mut borrowed_block_count = 0;
         let mut borrowed_token_count = 0;
-        let mut borrowed_partial_usage: u32 = 0;
         let mut first = true;
         for backing in &self.backings {
-            let (n_blks, n_toks, partial) =
+            let (n_blks, n_toks) =
                 backing.create_view_sequence(view_idx, parent_idx, visible_block_ranges)?;
             if first {
                 borrowed_block_count = n_blks;
                 borrowed_token_count = n_toks;
-                borrowed_partial_usage = partial;
                 first = false;
             }
         }
@@ -942,7 +973,6 @@ impl BatchedInferenceSession {
         Ok(ViewSequence {
             view_idx,
             borrowed_block_count,
-            borrowed_partial_usage,
         })
     }
 
@@ -2028,22 +2058,9 @@ pub struct ViewSequence {
     /// Sequence index of the newly created view.
     pub view_idx: usize,
     /// Number of KV blocks borrowed from the parent into this view.
+    /// All borrowed blocks are read-only Arc clones; the view's writable
+    /// tail is a fresh chunk pushed past index `borrowed_block_count`.
     pub borrowed_block_count: usize,
-    /// Source partial chunk's `usage` at view-carve time (0 when the
-    /// last borrowed block was full).
-    ///
-    /// When non-zero, the view's COW chunk at index
-    /// `borrowed_block_count` has its first `borrowed_partial_usage`
-    /// bytes copied verbatim from the source partial — they're a
-    /// snapshot of the section/turn tail at the moment the view was
-    /// carved.  Mid-decode zero-copy reproject uses this to detect
-    /// (and avoid) double-injecting those bytes when the substrate's
-    /// pinned partial gets re-injected into a fresh parent: the
-    /// captured COW chunk's first `borrowed_partial_usage` bytes
-    /// would otherwise appear in the destination slot twice
-    /// (once from the re-injected substrate partial, once from the
-    /// COW prefix).  See `Scheduler::reproject_view`.
-    pub borrowed_partial_usage: u32,
 }
 
 // ============================================================================

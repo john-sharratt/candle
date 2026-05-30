@@ -25,6 +25,7 @@ mod backing;
 mod chunk_ops;
 mod compress;
 mod compression_policy;
+pub(super) mod cpu_selection;
 mod gid_pool;
 #[cfg(feature = "cuda")]
 mod gpu_chunks;
@@ -43,6 +44,8 @@ mod tests;
 
 // Re-export public types
 pub use backing::ChunkedKvBacking;
+#[cfg(feature = "cuda")]
+pub use compress::quantize_sealed_in_place;
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use compression_policy::{
     production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
@@ -53,7 +56,7 @@ pub use compression_policy::{
 pub use gid_pool::{ChunkGid, ChunkGidPool};
 pub use head_gids::HeadGids;
 pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE};
-pub use types::{SealedChunk, SealedSequence};
+pub use types::{SealedChunk, SealedSequence, WriterTail};
 
 // Re-export for use within submodules and tests
 pub use arena::StoragePolicy;

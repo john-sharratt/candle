@@ -968,16 +968,26 @@ impl ChunkedKvBacking {
                                 }
                             }
                             Some(Arena::Float { data: dst_data, .. }) => {
+                                // Quantized source → Float dst: layouts differ.
+                                // Quant/R16 arenas store blocks in DIM-MAJOR
+                                // order within each chunk (block `d` holds
+                                // 32 tokens of dim `d`); `dequantize_f16`
+                                // walks blocks in storage order so its flat
+                                // output per chunk is (dim, token). Float
+                                // arenas expect (chunk, token, dim). Reshape
+                                // in the native (chunk, dim, token) order,
+                                // then transpose dim↔token before writing.
                                 let device = dst_data.device().clone();
                                 let dst_dtype = dst_data.dtype();
                                 let kv_float = src_clone.dequantize_f16(&device)?;
                                 let s_hdim = dst_data.dim(2)?;
                                 let t = kv_float.elem_count() / (CHUNK_SIZE * s_hdim);
-                                let kv_r = kv_float.reshape((t, CHUNK_SIZE, s_hdim))?;
+                                let kv_r = kv_float.reshape((t, s_hdim, CHUNK_SIZE))?;
                                 let hd = kv_r
                                     .narrow(0, src_chunk_idx, 1)?
-                                    .to_dtype(dst_dtype)?
-                                    .copy()?;
+                                    .transpose(1, 2)?
+                                    .contiguous()?
+                                    .to_dtype(dst_dtype)?;
                                 dst_data.slice_set(&hd, 0, dst_chunk_idx)?;
                             }
                             None => candle::bail!(
@@ -1199,50 +1209,30 @@ impl ChunkedKvBacking {
             .chunk_at(block_idx)
             .ok_or_else(|| candle::Error::Msg("block not allocated".into()))?;
 
-        debug_assert!(
-            cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
-            "block {} is shared â€” writes to shared blocks are not allowed; \
-             fork should have copied it",
-            block_idx
-        );
+        // The read-only projection model guarantees structurally that any
+        // block reached by a writer is unshared: projection borrows parent
+        // chunks read-only and pushes a fresh active chunk for writes, so
+        // the tail's gids always have strong_count = 1.
 
         Ok(cw.gids.clone())
     }
 
-    /// Internal: ensure all blocks in range are writable (COW if shared).
-    /// Called with arenas already locked.
-    /// Returns true if any COW operations were performed (block table changed).
+    /// Internal: writable-range gate. Under the read-only projection model
+    /// the tail (and any newly-allocated block past it) is unshared by
+    /// construction, so no COW is ever required here. The function remains
+    /// as a hook in case future paths want a writability re-check; today it
+    /// always reports "no COW occurred."
     pub(super) fn ensure_blocks_writable_locked(
         &self,
         state: &mut BlockTableState,
         batch_idx: usize,
-        start_block: usize,
-        end_block: usize,
+        _start_block: usize,
+        _end_block: usize,
     ) -> Result<bool> {
-        // Fork paths (fork_sequence, create_view_sequence, share_prefix) ensure
-        // partial tails are copied at fork time and full blocks are never written
-        // to after sharing.  So no block in the write range should be shared.
-        let slot = match state.sequences[batch_idx].as_ref() {
-            Some(s) => s,
-            None => return Ok(false),
-        };
-        let block_count = slot.block_count();
-
-        for blk in start_block..end_block {
-            if blk >= block_count {
-                continue;
-            }
-            if let Some(cw) = slot.chunk_at(blk) {
-                debug_assert!(
-                    cw.gids.iter().all(|g| g.strong_count() <= cw.gids.len()),
-                    "block {} is shared â€” writes to shared blocks are not allowed; \
-                     fork should have copied it",
-                    blk
-                );
-            }
+        if state.sequences[batch_idx].is_none() {
+            return Ok(false);
         }
-
-        Ok(false) // no COW occurred (by design)
+        Ok(false)
     }
 
     /// Create a view sequence that borrows blocks from a parent sequence.
@@ -1255,31 +1245,23 @@ impl ChunkedKvBacking {
     /// `view_batch` must already be an allocated slot (via `alloc_sequence`).
     /// `parent_batch` must be an allocated slot.
     ///
-    /// Returns `(borrowed_block_count, borrowed_token_count,
-    /// borrowed_partial_usage)`:
-    /// - `borrowed_block_count` must be passed unchanged to
-    ///   [`finalize_view`].
-    /// - `borrowed_partial_usage` is the source partial chunk's
-    ///   usage at carve time (0 when the parent's last borrowed
-    ///   block was full).  When non-zero, the view's COW chunk at
-    ///   index `borrowed_block_count` is *prefixed* by exactly that
-    ///   many bytes copied verbatim from the source partial; mid-
-    ///   decode zero-copy rebuild paths use this to slice out the
-    ///   COW prefix that would otherwise duplicate a re-injected
-    ///   substrate partial.
+    /// Returns `(borrowed_block_count, borrowed_token_count)`. All borrowed
+    /// chunks are read-only Arc clones of parent's chunks; writes land in a
+    /// fresh active chunk pushed after the borrow loop. `borrowed_block_count`
+    /// must be passed unchanged to [`finalize_view`].
     pub fn create_view_sequence(
         &self,
         view_batch: usize,
         parent_batch: usize,
         visible_block_ranges: &[(usize, usize)],
-    ) -> Result<(usize, usize, u32)> {
+    ) -> Result<(usize, usize)> {
         let parent_blocks: Vec<usize> = visible_block_ranges
             .iter()
             .flat_map(|&(start, end)| start..end)
             .collect();
         let total_parent_blocks = parent_blocks.len();
         if total_parent_blocks == 0 {
-            return Ok((0, 0, 0));
+            return Ok((0, 0));
         }
 
         let chunk_size = CHUNK_SIZE;
@@ -1395,40 +1377,14 @@ impl ChunkedKvBacking {
             .map(|(_, usage, ..)| *usage as usize)
             .sum();
 
-        // If the last parent block is partial (usage < CHUNK_SIZE) the writable-tail pass
-        // will COW-copy it in place so new tokens extend it at the same logical block index.
-        // finalize_view must REPLACE that block on the parent (not append after it), so
-        // borrowed_count excludes the partial tail â€” only full blocks are treated as the
-        // stable borrowed prefix.
-        let last_is_partial = borrowed_meta
-            .last()
-            .map(|(_, usage, ..)| (*usage as usize) < CHUNK_SIZE)
-            .unwrap_or(false);
-        let borrowed_count = if last_is_partial {
-            parent_blocks.len().saturating_sub(1)
-        } else {
-            parent_blocks.len()
-        };
-        // When `last_is_partial`, the COW'd partial chunk pushed onto
-        // the view below has its first `borrowed_partial_usage` bytes
-        // copied verbatim from the source partial — they're a snapshot
-        // of the section/turn tail at view-carve time.  Callers doing
-        // a zero-copy slot rebuild (mid-decode re-projection) need
-        // this number to know how many bytes at the head of the
-        // view's COW chunk are a *duplicate* of the source partial:
-        // when the source partial is later re-injected into a fresh
-        // parent (via the substrate's pinned SealedSequence), the
-        // captured COW chunk's first `borrowed_partial_usage` bytes
-        // would otherwise appear in the destination slot twice.  See
-        // `Scheduler::reproject_view`.
-        let borrowed_partial_usage: u32 = if last_is_partial {
-            borrowed_meta
-                .last()
-                .map(|(_, usage, ..)| *usage)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // All projected chunks are read-only. The view borrows EVERY parent
+        // block (including a partial tail) via Arc clone — no COW. New tokens
+        // never extend a borrowed chunk; they always land in a fresh active
+        // chunk pushed at the end of the borrow loop. This collapses two
+        // older concerns at once:
+        //   - no Q→R16 elevation needed for closed-quant partials,
+        //   - the tail-is-shared debug class becomes structurally impossible.
+        let borrowed_count = parent_blocks.len();
 
         // Free any blocks currently in the view slot (if solely owned)
         {
@@ -1437,202 +1393,56 @@ impl ChunkedKvBacking {
             vs.clear_chunks();
         }
 
-        // Clone parent blocks into the view's flat chunks vec.
-        // Full blocks are shared (Arc clone) â€” they will never be written to.
-        // If the last block is partial, we copy its physical data so the view
-        // owns the tail exclusively and never needs COW.
+        // Clone parent blocks (Arc shared, read-only) and push one fresh
+        // empty active chunk so the next write has somewhere unshared to land.
         {
             let vs = state.sequences[view_batch].as_mut().unwrap();
-            let n_kv_head = self.inner.n_kv_head;
-            let _head_dim = self.inner.head_dim;
-            let sub_head_dim = self.inner.head_dim / N_PALETTE;
-            let meta_len = borrowed_meta.len();
             for (
-                i,
-                (
-                    source_gids,
+                source_gids,
+                usage,
+                offset,
+                _rope_base,
+                source_k_pal,
+                source_v_pal,
+                source_k_scale,
+                source_v_scale,
+            ) in borrowed_meta.into_iter()
+            {
+                vs.push_chunk(ChunkWindow {
+                    gids: source_gids,
                     usage,
                     offset,
-                    _rope_base,
-                    source_k_pal,
-                    source_v_pal,
-                    source_k_scale,
-                    source_v_scale,
-                ),
-            ) in borrowed_meta.into_iter().enumerate()
-            {
-                let is_last = i == meta_len - 1;
-                if is_last && last_is_partial {
-                    // Copy the partial tail's physical data into new chunks using
-                    // active_k_arena_key (R16 on GPU) so the decode kernel can
-                    // write directly into them.
-                    let k_key2 = self.active_k_arena_key();
-                    let v_key2 = self.active_v_arena_key();
-                    let new_gids = self.inner.storage.write(|arena_state| {
-                        let mut gid_vec: Vec<ChunkGid> =
-                            Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
-                        for i in 0..(GIDS_PER_HEAD * n_kv_head) {
-                            let key = if i % 2 == 0 {
-                                k_key2.clone()
-                            } else {
-                                v_key2.clone()
-                            };
-                            let gid = self.alloc_chunk_with_arenas(arena_state, key)?;
-                            gid_vec.push(gid);
-                        }
-
-                        // Pass 1 (immutable): clone Quantized source arenas once per
-                        // unique arena index so pass 2 can mutably access dst even when
-                        // src and dst share the same arena.
-                        let quant_clones: std::collections::HashMap<
-                            usize,
-                            candle::quantized::QTensor,
-                        > = {
-                            let arenas = arena_state.arenas();
-                            let mut map = std::collections::HashMap::new();
-                            for src_gid in source_gids.iter() {
-                                let ai = src_gid.arena_idx();
-                                if let Some(Arena::Quantized { data, .. }) = arenas.get(&ai) {
-                                    map.entry(ai).or_insert_with(|| data.clone());
-                                }
-                            }
-                            map
-                        };
-
-                        // Pass 2 (mutable): copy each GID's chunk to its destination.
-                        let elems_per_chunk = CHUNK_SIZE * sub_head_dim;
-                        let arenas = arena_state.arenas_mut();
-                        for (i, src_gid) in source_gids.iter().enumerate() {
-                            let src_arena_idx = src_gid.arena_idx();
-                            let src_chunk_idx = src_gid.chunk_idx();
-                            let dst_gid = &gid_vec[i];
-                            let dst_arena_idx = dst_gid.arena_idx();
-                            let dst_chunk_idx = dst_gid.chunk_idx();
-
-                            if let Some(src_clone) = quant_clones.get(&src_arena_idx) {
-                                // Quantized source (R16 on GPU): byte-level same-format copy,
-                                // or dequantize if dst is Float (CPU / format-transition).
-                                let src_dtype = src_clone.dtype();
-                                let src_off = src_chunk_idx * elems_per_chunk;
-                                let dst_off = dst_chunk_idx * elems_per_chunk;
-                                match arenas.get_mut(&dst_arena_idx) {
-                                    Some(Arena::Quantized { data: dst_q, .. }) => {
-                                        if src_dtype == dst_q.dtype() {
-                                            dst_q.slice_range_copy(
-                                                src_clone,
-                                                src_off,
-                                                dst_off,
-                                                elems_per_chunk,
-                                            )?;
-                                        } else {
-                                            candle::bail!(
-                                                "create_view_sequence: quant dtype mismatch \
-                                                 ({:?} vs {:?})",
-                                                src_dtype,
-                                                dst_q.dtype()
-                                            );
-                                        }
-                                    }
-                                    Some(Arena::Float { data: dst_data, .. }) => {
-                                        let device = dst_data.device().clone();
-                                        let dst_dtype = dst_data.dtype();
-                                        let kv_float = src_clone.dequantize_f16(&device)?;
-                                        let s_hdim = dst_data.dim(2)?;
-                                        let t = kv_float.elem_count() / (CHUNK_SIZE * s_hdim);
-                                        let kv_r = kv_float.reshape((t, CHUNK_SIZE, s_hdim))?;
-                                        let hd = kv_r
-                                            .narrow(0, src_chunk_idx, 1)?
-                                            .to_dtype(dst_dtype)?
-                                            .copy()?;
-                                        dst_data.slice_set(&hd, 0, dst_chunk_idx)?;
-                                    }
-                                    None => candle::bail!(
-                                        "create_view_sequence: dst arena {} not found",
-                                        dst_arena_idx
-                                    ),
-                                }
-                            } else {
-                                // Float source: extract owned slice (NLL ends the immutable
-                                // arenas borrow), then mutably access the destination.
-                                let head_data = match arenas.get(&src_arena_idx) {
-                                    Some(Arena::Float { data, .. }) => {
-                                        data.narrow(0, src_chunk_idx, 1)?.copy()?
-                                    }
-                                    None => candle::bail!(
-                                        "create_view_sequence: src arena {} not found",
-                                        src_arena_idx
-                                    ),
-                                    _ => candle::bail!(
-                                        "create_view_sequence: unexpected arena type at {}",
-                                        src_arena_idx
-                                    ),
-                                };
-                                match arenas.get_mut(&dst_arena_idx) {
-                                    Some(Arena::Float { data, .. }) => {
-                                        data.slice_set(&head_data, 0, dst_chunk_idx)?
-                                    }
-                                    _ => candle::bail!(
-                                        "create_view_sequence: Float src but non-Float dst"
-                                    ),
-                                }
-                            }
-                        }
-
-                        Ok(gid_vec)
-                    })??;
-                    drop(source_gids);
-                    let gids = HeadGids::from_vec(new_gids);
-                    // The partial copy preserves source byte content verbatim
-                    // (Float source) or via `dequantize_f16` (Quantized source,
-                    // which un-applies the format's *inner* d-scale but leaves
-                    // the *outer* scale baked into the float values). Either
-                    // way the destination needs the source's pal_map and outer
-                    // scale to decode correctly.
-                    vs.push_chunk(ChunkWindow {
-                        gids,
-                        usage,
-                        offset,
-                        k_pal: source_k_pal,
-                        v_pal: source_v_pal,
-                        k_scale: source_k_scale,
-                        v_scale: source_v_scale,
-                    });
-                } else {
-                    // Full block (or non-partial last): share via Arc clone,
-                    // preserving the original per-head GID assignments. Pal_map
-                    // and outer scale must come from the source so the view's
-                    // slot KvHead matches how the parent's encoder laid out
-                    // the bytes the view is now sharing.
-                    vs.push_chunk(ChunkWindow {
-                        gids: source_gids,
-                        usage,
-                        offset,
-                        k_pal: source_k_pal,
-                        v_pal: source_v_pal,
-                        k_scale: source_k_scale,
-                        v_scale: source_v_scale,
-                    });
-                }
+                    k_pal: source_k_pal,
+                    v_pal: source_v_pal,
+                    k_scale: source_k_scale,
+                    v_scale: source_v_scale,
+                });
             }
         }
 
-        // Mark the writer boundary on the view: when the last block
-        // was CoW-copied it's writer-owned; otherwise writes will start
-        // past all borrowed chunks.
+        // Push the fresh active chunk that writes will land in. Allocated in
+        // the active K/V arena keys (R16 K + F16 V on GPU) so decode/prefill
+        // kernels can write directly. Its gids have strong_count = 1, so the
+        // tail of the slot is unshared by construction — no COW step needed.
+        {
+            let active_cw = self.alloc_block_chunks(0, 0)?;
+            let vs = state.sequences[view_batch].as_mut().unwrap();
+            vs.push_chunk(active_cw);
+        }
+
+        // Writes start at the fresh active chunk (one past the borrowed prefix).
         {
             let vs = state.sequences[view_batch].as_mut().unwrap();
             let view_block_count = vs.block_count();
-            let writer_start = if last_is_partial {
-                view_block_count.saturating_sub(1)
-            } else {
-                view_block_count
-            };
-            vs.set_writer_start_idx(writer_start);
+            // borrowed_count blocks borrowed read-only, then one fresh active.
+            // The active chunk is at index `borrowed_count` and is where new
+            // tokens land.
+            vs.set_writer_start_idx(view_block_count.saturating_sub(1));
         }
 
         drop(state);
 
-        Ok((borrowed_count, borrowed_token_count, borrowed_partial_usage))
+        Ok((borrowed_count, borrowed_token_count))
     }
 
     /// Finish a view sequence and transfer its newly-written blocks to the parent.
@@ -1914,6 +1724,94 @@ impl ChunkedKvBacking {
     /// to reset a persistent conversation sequence to its
     /// system-prompt baseline before injecting the next turn's
     /// projection.
+    /// Snapshot the slot's writer-owned tail chunks (`[writer_start_idx..end)`)
+    /// and remove them from the slot.
+    ///
+    /// Used by the stateless-slot rebuild path: the scheduler takes
+    /// this snapshot before calling [`Self::truncate_sequence_to_blocks`]
+    /// + [`Self::inject_sealed_at_tail`] to refresh the prefix, then
+    /// restores the tail via [`Self::extend_writer_tail`]. The returned
+    /// [`WriterTail`] holds RAII refs that keep the underlying arena
+    /// chunks alive across the truncate, so no bytes are copied.
+    ///
+    /// At turn-boundary projection (the common case) the tail is empty
+    /// and this is effectively a no-op.
+    pub fn split_off_writer_tail(
+        &self,
+        batch_idx: usize,
+    ) -> Result<super::types::WriterTail> {
+        let batch = self.batch_capacity();
+        if batch_idx >= batch {
+            candle::bail!(
+                "batch_idx {} out of range for chunked backing (capacity {})",
+                batch_idx,
+                batch
+            )
+        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let slot = state.sequences[batch_idx].as_mut().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "split_off_writer_tail: slot {} not allocated",
+                batch_idx
+            ))
+        })?;
+        let writer_start = slot.writer_start_idx();
+        let chunks = slot.split_off_chunks(writer_start);
+        Ok(super::types::WriterTail { chunks })
+    }
+
+    /// Restore the writer-owned tail chunks captured by
+    /// [`Self::split_off_writer_tail`]. Appends them to the slot's
+    /// chunk list after whatever prefix has been re-injected; the
+    /// writer boundary stays where the prefix's
+    /// [`Self::inject_sealed_at_tail`] left it.
+    pub fn extend_writer_tail(
+        &self,
+        batch_idx: usize,
+        tail: super::types::WriterTail,
+    ) -> Result<()> {
+        if tail.is_empty() {
+            return Ok(());
+        }
+        let batch = self.batch_capacity();
+        if batch_idx >= batch {
+            candle::bail!(
+                "batch_idx {} out of range for chunked backing (capacity {})",
+                batch_idx,
+                batch
+            )
+        }
+        let new_total = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            let slot = state.sequences[batch_idx].as_ref().ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "extend_writer_tail: slot {} not allocated",
+                    batch_idx
+                ))
+            })?;
+            slot.block_count() + tail.chunks.len()
+        };
+        self.ensure_max_blocks(new_total)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let slot = state.sequences[batch_idx].as_mut().ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "extend_writer_tail: slot {} not allocated",
+                batch_idx
+            ))
+        })?;
+        slot.extend_chunks(tail.chunks);
+        Ok(())
+    }
+
     pub fn truncate_sequence_to_blocks(
         &self,
         batch_idx: usize,

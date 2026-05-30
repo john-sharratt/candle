@@ -770,6 +770,76 @@ impl Substrate {
         self.warm_lru.push_front(residence);
     }
 
+    /// Install warm AND atomically drop hot — the production
+    /// persistence-thread path. Once warm holds the compressed
+    /// canonical copy of the turn there is no reason to keep the
+    /// uncompressed hot reference around: it just pins VRAM the
+    /// arena pool could reclaim. The next decode that touches this
+    /// residence re-elevates warm→hot, landing quantized GPU chunks
+    /// (bit-identical to what a daemon restart would reconstruct
+    /// from cold) so the in-session attention path exercises the
+    /// same compressed bytes that survive a restart — fidelity bugs
+    /// surface immediately instead of being masked by the
+    /// uncompressed hot copy until the next reload.
+    ///
+    /// Tests that need the "hot + warm coexist" intermediate state
+    /// should call [`Self::install_warm`] directly.
+    pub fn install_warm_and_evict_hot(
+        &mut self,
+        residence: ResidenceIndex,
+        warm: Vec<SealedSequence>,
+    ) {
+        self.install_warm(residence, warm);
+        if self.residence[residence.0].hot.take().is_some() {
+            Self::remove_from_lru(&mut self.hot_lru, residence);
+        }
+    }
+
+    /// Atomic dual install: replace the residence's hot AND install
+    /// warm at the same time. Used by the persistence thread after a
+    /// quantize-in-place pass produces new GPU Q-format chunks (hot)
+    /// alongside a format-preserving copy of those chunks on CPU
+    /// (warm).
+    ///
+    /// Replaces — not adds — `residence.hot`. The previous hot
+    /// SealedSequences (which the in-session reconcile fed in as
+    /// R16/F16 chunks captured at `record_turn`) drop their Arc refs
+    /// here; if no other holder remains (the slot was truncated
+    /// post-seal, so this is normal), the underlying arena chunks
+    /// return to the pool.
+    ///
+    /// The crucial property: when `apply_projection` runs for the
+    /// next turn, it pulls `residence.hot` and Arc-clones those
+    /// gids onto the slot. Because we installed the new GPU Q chunks
+    /// directly here, decode reads **the exact bytes the convert
+    /// kernel wrote** with no intervening `kv_migrate` scatter — the
+    /// same invariant the perf test relies on.
+    pub fn install_warm_and_hot(
+        &mut self,
+        residence: ResidenceIndex,
+        hot: Vec<SealedSequence>,
+        warm: Vec<SealedSequence>,
+    ) {
+        debug_assert!(!hot.is_empty(), "install_warm_and_hot called with empty hot");
+        debug_assert!(!warm.is_empty(), "install_warm_and_hot called with empty warm");
+        // Replace hot. The LRU entry stays (residence is still hot).
+        self.residence[residence.0].hot = Some(hot);
+        if !self.hot_lru.contains(&residence) {
+            self.hot_lru.push_front(residence);
+        }
+        // Install warm. Mirror install_warm's invariant — caller is
+        // expected to call this when warm is currently None (first
+        // persist of this turn). A second persist pass on the same
+        // residence would be a redo-log duplication bug; we don't
+        // guard against it here.
+        debug_assert!(
+            self.residence[residence.0].warm.is_none(),
+            "install_warm_and_hot on already-warm residence"
+        );
+        self.residence[residence.0].warm = Some(warm);
+        self.warm_lru.push_front(residence);
+    }
+
     /// Install the cold-tier references for a residence slot — called
     /// by the persistence thread after writing the turn's chunks to
     /// the redo log. Cold has no LRU (it's already the cheapest tier).
@@ -811,6 +881,14 @@ impl Substrate {
     pub fn snapshot_pending_cold(
         &self,
     ) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
+        // We persist the **warm** tier, not hot. In the legacy
+        // format-preserving migration path warm and hot carry the
+        // same bytes, so this doesn't change behavior. In the
+        // quantize-on-evict path warm holds the compressed chunks
+        // and hot still holds the source floats; reading warm is
+        // the only way the redo log captures the actual stored
+        // form. `warm_lru` only contains residences with warm
+        // installed, so unwrapping `slot.warm` is sound here.
         self.warm_lru
             .iter()
             .filter_map(|&idx| {
@@ -818,9 +896,9 @@ impl Substrate {
                 if slot.cold.is_some() {
                     return None;
                 }
-                slot.hot
+                slot.warm
                     .as_ref()
-                    .map(|hot| (idx, slot.stream_id, hot.clone()))
+                    .map(|warm| (idx, slot.stream_id, warm.clone()))
             })
             .collect()
     }

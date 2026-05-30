@@ -19,7 +19,7 @@ mod cuda_impl {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{Device, Result};
     use candle_nn::kv_cache::{
-        kv_migrate, ChunkedKvBacking, KvFormat, MigrationPlan, SealedSequence,
+        kv_migrate, ArenaLocation, ChunkedKvBacking, KvFormat, MigrationPlan, SealedSequence,
     };
 
     use crate::persistence::cold_load::ColdLoadStager;
@@ -111,6 +111,19 @@ mod cuda_impl {
         device: &Device,
         seq: &SealedSequence,
     ) -> Result<Vec<ChunkImage>> {
+        match seq.location {
+            ArenaLocation::Gpu => seal_to_chunk_images_gpu(backing, device, seq),
+            ArenaLocation::Cpu => seal_to_chunk_images_cpu(backing, seq),
+        }
+    }
+
+    /// GPU gather — the fast path. One `kv_migrate_on` gather + one
+    /// `cudaMemcpyDtoH` for the whole sealed sequence.
+    fn seal_to_chunk_images_gpu(
+        backing: &ChunkedKvBacking,
+        device: &Device,
+        seq: &SealedSequence,
+    ) -> Result<Vec<ChunkImage>> {
         use crate::persistence::record::ChunkPayload;
 
         let ptrs = backing.resolve_sealed_chunk_ptrs(seq)?;
@@ -127,7 +140,78 @@ mod cuda_impl {
             }
             let kv_bytes = blob[cursor..cursor + n].to_vec();
             cursor += n;
-            let (k_formats, v_formats) = backing.sealed_chunk_kv_formats(sc)?;
+            let (k_formats, v_formats) = backing.kv_formats_for_gids(&sc.gids)?;
+            images.push(ChunkImage {
+                token_count: sc.token_count,
+                payload: ChunkPayload {
+                    offset: sc.offset,
+                    k_formats: k_formats.iter().map(|f| f.to_tag()).collect(),
+                    v_formats: v_formats.iter().map(|f| f.to_tag()).collect(),
+                    k_pal: (*sc.k_pal).clone(),
+                    v_pal: (*sc.v_pal).clone(),
+                    k_scale: (*sc.k_scale).clone(),
+                    v_scale: (*sc.v_scale).clone(),
+                    kv_bytes,
+                },
+            });
+        }
+        Ok(images)
+    }
+
+    /// CPU gather — reads each chunk's bytes directly out of the
+    /// CPU arena via `read_chunk_into_bytes`. Used when warm holds
+    /// quantize-on-evict outputs that must be persisted to cold.
+    /// Slower per-byte than the GPU gather (no batched DMA) but the
+    /// persist path is off the hot loop.
+    fn seal_to_chunk_images_cpu(
+        backing: &ChunkedKvBacking,
+        seq: &SealedSequence,
+    ) -> Result<Vec<ChunkImage>> {
+        use candle_nn::kv_cache::arena_gid_stride;
+
+        use crate::persistence::record::ChunkPayload;
+
+        let arena_chunks = arena_gid_stride();
+        let arena_info = backing.resolve_arena_info()?;
+        // Pull each unique (arena, chunk) slot's bytes into a single
+        // blob, then split per `sc.byte_size` like the GPU path. This
+        // preserves the SealedChunk's per-chunk byte_size accounting
+        // exactly, including the per-(h, p) GID dedup that
+        // `arena_byte_size` already computed.
+        let mut seen = std::collections::HashSet::new();
+        let mut blob: Vec<u8> = Vec::new();
+        for chunk in &seq.chunks {
+            for gid in chunk.gids.as_slice() {
+                let raw = gid.raw();
+                if !seen.insert(raw) {
+                    continue;
+                }
+                let arena_idx = (raw as usize) / arena_chunks;
+                let chunk_idx = (raw as usize) % arena_chunks;
+                let info = arena_info.get(arena_idx).ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "seal_to_chunk_images_cpu: arena_idx {arena_idx} out of range"
+                    ))
+                })?;
+                let stride = info.chunk_byte_stride as usize;
+                let start = blob.len();
+                blob.resize(start + stride, 0);
+                backing.read_chunk_into_bytes(arena_idx, chunk_idx, &mut blob[start..start + stride])?;
+            }
+        }
+        let mut cursor = 0usize;
+        let mut images = Vec::with_capacity(seq.chunks.len());
+        for sc in &seq.chunks {
+            let n = sc.byte_size as usize;
+            if cursor + n > blob.len() {
+                return Err(candle::Error::Msg(format!(
+                    "seal_to_chunk_images_cpu: blob underrun (need {n} at {cursor}, have {})",
+                    blob.len()
+                )));
+            }
+            let kv_bytes = blob[cursor..cursor + n].to_vec();
+            cursor += n;
+            let (k_formats, v_formats) = backing.kv_formats_for_gids(&sc.gids)?;
             images.push(ChunkImage {
                 token_count: sc.token_count,
                 payload: ChunkPayload {

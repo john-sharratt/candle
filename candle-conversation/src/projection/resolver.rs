@@ -708,6 +708,18 @@ impl Conversation {
         p.checkpoint()
             .map_err(|e| candle::Error::Msg(format!("persist checkpoint: {e}")))
     }
+
+    /// Run `f` against the persistence layer's current manifest snapshot.
+    /// Read-only accessor for callers that need to inspect the redo
+    /// log's stream/chunk locations (sizes, formats, offsets) without
+    /// rebuilding the whole substrate boundary.
+    pub fn with_persistence_manifest<R>(
+        &self,
+        f: impl FnOnce(&crate::persistence::manifest::Manifest) -> R,
+    ) -> R {
+        let p = self.persistence.lock().unwrap();
+        f(p.manifest())
+    }
 }
 
 // ── TargetedRead ──────────────────────────────────────────────────────────────

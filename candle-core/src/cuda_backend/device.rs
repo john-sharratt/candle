@@ -31,9 +31,6 @@ pub struct CudaDevice {
     context: Arc<cudarc::driver::CudaContext>,
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
-    /// Dedicated background stream for quantize/compact kernels so they can
-    /// overlap with main-stream decode work.
-    bg_stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     curand: Arc<Mutex<CudaRng>>,
 }
@@ -142,12 +139,6 @@ impl CudaDevice {
         self.stream.clone()
     }
 
-    /// Returns the background stream used for quantize/compact kernels.
-    /// Separate from the main stream so these operations can overlap with decode.
-    pub fn cuda_bg_stream(&self) -> Arc<cudarc::driver::CudaStream> {
-        self.bg_stream.clone()
-    }
-
     /// Returns the underlying CUDA context.
     ///
     /// Useful for creating secondary streams ([`CudaContext::new_stream`]) or
@@ -251,14 +242,12 @@ impl CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
         let stream = context.new_stream().w()?;
-        let bg_stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         Ok(Self {
             id: DeviceId::new(),
             context,
             stream,
-            bg_stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -313,14 +302,12 @@ impl BackendDevice for CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         Self::validate_compute_capability(&context)?;
         let stream = context.default_stream();
-        let bg_stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         Ok(Self {
             id: DeviceId::new(),
             context,
             stream,
-            bg_stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),

@@ -5,7 +5,6 @@
 
 use super::chunked::{arena_gid_stride, ChunkedKvBacking, CompressionPolicy, CHUNK_SIZE};
 use ahash::HashMap;
-use candle::quantized::pinned_staging::Generation;
 use candle::quantized::GgmlDType;
 use candle::{DType, Result, Tensor};
 
@@ -983,6 +982,7 @@ impl KvCache {
         let _ = backing.sync_decode_gpu_chunks(&entries, &arena_info)?;
         Ok(())
     }
+
 
     /// Finalize sequences after generation completes.
     /// Get the current K cache data (narrowed to current_seq_len).

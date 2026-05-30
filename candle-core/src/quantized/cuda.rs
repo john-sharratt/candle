@@ -658,6 +658,15 @@ pub fn quantize_palette4_convert(
     let (base_ptr, _guard) = heads_base.device_ptr(&stream);
 
     unsafe {
+        crate::set_kernel_breadcrumb(
+            if is_k {
+                "run_quantize_palette4_convert (K, single)"
+            } else {
+                "run_quantize_palette4_convert (V, single)"
+            },
+            file!(),
+            line!(),
+        );
         run_quantize_palette4_convert(
             base_ptr as *const u8,
             num_heads as i32,
@@ -1188,6 +1197,11 @@ pub fn quantize_palette4_convert_buffered(
     let base_ptr = gpu_buf.dev_ptr();
     let raw_stream = stream.cu_stream() as *mut _;
     unsafe {
+        crate::set_kernel_breadcrumb(
+            "run_quantize_palette4_convert (K)",
+            file!(),
+            line!(),
+        );
         run_quantize_palette4_convert(
             base_ptr as *const u8,
             n as i32,
@@ -1197,6 +1211,11 @@ pub fn quantize_palette4_convert_buffered(
             1, // K
             KVHEAD_HD as i32,
             raw_stream,
+        );
+        crate::set_kernel_breadcrumb(
+            "run_quantize_palette4_convert (V)",
+            file!(),
+            line!(),
         );
         run_quantize_palette4_convert(
             base_ptr as *const u8,
@@ -1253,6 +1272,11 @@ pub unsafe fn select_kv_format_palette4_paged(
     q_relevance_out_ptr: u64,
     stream: *mut std::ffi::c_void,
 ) {
+    crate::set_kernel_breadcrumb(
+        "run_select_kv_format_palette4_paged",
+        file!(),
+        line!(),
+    );
     run_select_kv_format_palette4_paged(
         per_head_table_ptr as *const i64,
         head_gids_ptr as *const i64,
@@ -1429,8 +1453,6 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
     k_codes.sort_by_key(|c| select_qtype_bpe_x4(*c));
     v_codes.sort_by_key(|c| select_qtype_bpe_x4(*c));
 
-    // Candidate codes and output buffers are all allocated/uploaded on bg_stream
-    // so they are ordered before the kernel launch on the same stream.
     let k_cand_gpu = stream.memcpy_stod(&k_codes).w()?;
     let v_cand_gpu = stream.memcpy_stod(&v_codes).w()?;
 
@@ -1451,14 +1473,6 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
     let mut k_head_tags_out = stream.alloc_zeros::<i32>(total_heads).w()?;
     let mut v_head_tags_out = stream.alloc_zeros::<i32>(total_heads).w()?;
     let mut q_rel_out = stream.alloc_zeros::<f32>(total_blocks).w()?;
-    // per_head_table_ptr and head_gids_ptr were written by the primary stream
-    // (decode / prefill / H→D uploads). Record a fence so bg_stream sees those
-    // writes before the kernel reads them.
-    {
-        let primary_stream = dev.cuda_stream();
-        let input_fence = primary_stream.record_event(None).map_err(crate::Error::wrap)?;
-        stream.wait(&input_fence).map_err(crate::Error::wrap)?;
-    }
     // Source outer scales: 1.0 when source is R16/float (no outer scale).
     // For re-compression from already-quantized data these must be supplied by
     // the caller; passing 1.0 here is correct for the initial R16→quant path.
@@ -1567,6 +1581,7 @@ pub fn reduce_head_format_stats(
         let (v_eff_ptr, _ve_guard) = v_eff_out.device_ptr_mut(&stream);
 
         unsafe {
+            crate::set_kernel_breadcrumb("run_reduce_head_stats_format", file!(), line!());
             run_reduce_head_stats_format(
                 k_blk_ptr as *const i32,
                 v_blk_ptr as *const i32,
@@ -1689,6 +1704,7 @@ pub fn sample_quant_errors_paged(
         let (qrel_ptr, _qrel_guard) = q_relevance_out.device_ptr_mut(&stream);
 
         unsafe {
+            crate::set_kernel_breadcrumb("run_sample_quant_errors_paged", file!(), line!());
             run_sample_quant_errors_paged(
                 pht_ptr as *const i64,
                 head_gids_dev_ptr as *const i64,
@@ -1759,6 +1775,11 @@ pub fn sample_quant_errors_kv_paged(
         let (v_out_ptr, _v_out_guard) = v_error_out.device_ptr_mut(&stream);
 
         unsafe {
+            crate::set_kernel_breadcrumb(
+                "run_sample_quant_errors_kv_paged (uniform)",
+                file!(),
+                line!(),
+            );
             run_sample_quant_errors_kv_paged(
                 pht_ptr as *const i64,
                 head_gids_dev_ptr as *const i64,
@@ -1821,6 +1842,11 @@ pub fn sample_quant_errors_kv_paged_staged(
         let (v_out_ptr, _v_out_guard) = v_error_out.device_ptr_mut(&stream);
 
         unsafe {
+            crate::set_kernel_breadcrumb(
+                "run_sample_quant_errors_kv_paged (raw)",
+                file!(),
+                line!(),
+            );
             run_sample_quant_errors_kv_paged(
                 per_head_table_dev_ptr as *const i64,
                 head_gids_dev_ptr as *const i64,
@@ -1893,6 +1919,11 @@ pub fn select_kv_winners_paged(
         let (v_win_ptr, _vw_guard) = v_winners.device_ptr_mut(&stream);
 
         unsafe {
+            crate::set_kernel_breadcrumb(
+                "run_select_winners_kv_paged (per-head-amax)",
+                file!(),
+                line!(),
+            );
             run_select_winners_kv_paged(
                 k_err_ptr as *const f32,
                 v_err_ptr as *const f32,
@@ -1954,6 +1985,11 @@ pub fn select_kv_winners_paged_staged(
         let (v_win_ptr, _vw_guard) = v_winners.device_ptr_mut(&stream);
 
         unsafe {
+            crate::set_kernel_breadcrumb(
+                "run_select_winners_kv_paged (uniform-threshold)",
+                file!(),
+                line!(),
+            );
             run_select_winners_kv_paged(
                 k_err_ptr as *const f32,
                 v_err_ptr as *const f32,
@@ -2066,6 +2102,11 @@ pub fn select_and_summarize_kv_winners_paged_staged(
 
         unsafe {
             // 1. Select winners into on-device scratch buffers (never downloaded).
+            crate::set_kernel_breadcrumb(
+                "run_select_winners_kv_paged (fused-sweep)",
+                file!(),
+                line!(),
+            );
             run_select_winners_kv_paged(
                 k_err_ptr as *const f32,
                 v_err_ptr as *const f32,
@@ -2082,6 +2123,11 @@ pub fn select_and_summarize_kv_winners_paged_staged(
             );
 
             // 2. Summarize K winners → kv_sums[0 .. n_k_thresholds*3].
+            crate::set_kernel_breadcrumb(
+                "run_summarize_winners_side_paged (K)",
+                file!(),
+                line!(),
+            );
             run_summarize_winners_side_paged(
                 k_win_ptr as *const u8,
                 candidates_bpe_dev_ptr as *const f32,
@@ -2096,6 +2142,11 @@ pub fn select_and_summarize_kv_winners_paged_staged(
             );
 
             // 3. Summarize V winners → kv_sums[n_k_thresholds*3 ..].
+            crate::set_kernel_breadcrumb(
+                "run_summarize_winners_side_paged (V)",
+                file!(),
+                line!(),
+            );
             run_summarize_winners_side_paged(
                 v_win_ptr as *const u8,
                 candidates_bpe_dev_ptr as *const f32,
