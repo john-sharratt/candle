@@ -394,10 +394,18 @@ pub fn read_header_at(src: &mut dyn LogSource, offset: u64) -> Result<RecordHead
 /// `record_size` is the exact padded on-disk size from the manifest's
 /// `RecordLoc` / `ChunkLoc` — captured at walk time, persisted through
 /// checkpoints. Single read, no probe.
+///
+/// Returns an owned [`Record`] — the on-disk bytes go out of scope at
+/// return time. Callers on the hot path that want to read the payload
+/// in place should use the borrowed [`decode_record`] against their
+/// own buffer instead of going through this convenience wrapper.
 pub fn read_record_at(src: &mut dyn LogSource, offset: u64, record_size: u64) -> Result<Record> {
     let bytes = src.read_at(offset, record_size as usize)?;
-    let (record, _) = decode_record(&bytes)?;
-    Ok(record)
+    let (header, payload, _) = decode_record(&bytes)?;
+    Ok(Record {
+        header,
+        payload: payload.to_vec(),
+    })
 }
 
 #[cfg(test)]

@@ -1334,18 +1334,29 @@ mod tests {
         /// Integration reproducer for the model-degradation bug:
         ///   Qwen3-30B-A3B (Q4_K_M) producing gibberish output after a system prompt.
         ///
-        /// Scenario (flat-chunks model):
+        /// Scenario (Arc-share-everything model — current live design):
         ///   1. System prompt of 985 tokens → parent.chunks = [block0..block29(32), block30(25)].
-        ///   2. `create_view_sequence` borrows all 31 parent blocks (including partial).
-        ///   3. `ensure_for_offset` detects shared tail (block30) and pushes block31_float.
-        ///   4. User message of 5 tokens is prefilled into block31.
-        ///   5. `set_len(view, 991)` simulates the first decode step.
+        ///   2. `create_view_sequence` Arc-borrows every parent block (full and
+        ///      partial) read-only and pushes a fresh empty active block —
+        ///      `view.chunks = [parent.b0..parent.b30 (Arc), fresh_active(0)]`.
+        ///      `borrowed_blocks == parent_blocks` (all 31). The fresh active
+        ///      at index 31 is uniquely owned and is where the next turn's
+        ///      writes land — no COW of the partial is needed because the
+        ///      Arc-shared partial is never written to.
+        ///   3. User message of 5 tokens is prefilled into block31 at logical
+        ///      offset 985.
+        ///   4. `set_len(view, 991)` simulates the first decode step (block31
+        ///      usage advances by one).
         ///
         /// Covers:
         ///   - D1: `borrowed_token_count == sys_tokens` (view offset is correct).
-        ///   - B3/A3: `rope_base[i] == sum(usage[0..i])` and `offset[i] == 0` at every step.
-        ///   - B1 (regression): partial blocks stored with correct usage, not rounded up.
-        ///   - Decode: after `set_len(view, 991)` block31.usage == 6 (5 user + 1 decode).
+        ///   - B3/A3: `rope_base[i] == sum(usage[0..i])` and `offset[i] == 0`
+        ///     at every step — including across the mid-sequence partial at
+        ///     block 30.
+        ///   - B1 (regression): partial blocks stored with correct usage, not
+        ///     rounded up.
+        ///   - Decode: after `set_len(view, 991)` block31.usage == 6 (5 user +
+        ///     1 decode).
         #[test]
         fn test_system_prompt_view_user_message_rope_invariants() {
             const CHUNK_SIZE: usize = 32;
@@ -1415,21 +1426,44 @@ mod tests {
                 .create_view_sequence(view, parent, &[(0, parent_blocks)])
                 .unwrap();
 
-            // D1: view offset must equal the actual number of borrowed tokens.
-            //
-            // Flat-chunks COW fix: the partial tail is excluded from borrowed_blocks so
-            // finalize_view replaces (rather than appends) it.
-            // borrowed_blocks = n_full_sys_blocks = 30.
+            // Arc-share-everything: every parent block (including the
+            // partial tail) is Arc-borrowed into the view. The view also
+            // gains a fresh empty active block at index `parent_blocks`
+            // so the next turn's writes have somewhere unshared to land
+            // — `borrowed_blocks` therefore equals the full source count.
             assert_eq!(
-                borrowed_blocks, n_full_sys_blocks,
-                "flat-chunks: borrowed_blocks must equal n_full_sys_blocks = {n_full_sys_blocks}"
+                borrowed_blocks, parent_blocks,
+                "Arc-share: borrowed_blocks must equal parent_blocks = {parent_blocks}"
             );
+            // D1: view offset must equal the actual number of borrowed tokens.
             assert_eq!(
                 borrowed_tokens, sys_tokens,
                 "D1: borrowed_token_count must equal sys_tokens = {sys_tokens}"
             );
 
+            // The view's structural shape: `parent_blocks` Arc-shared + 1
+            // fresh active.
+            let writer_block_idx = parent_blocks; // 31 (the fresh active)
+            let total_blocks = parent_blocks + 1; // 32 chunks
+            {
+                let state = backing.state.read().unwrap();
+                let vs = state.sequences[view].as_ref().unwrap();
+                assert_eq!(
+                    vs.chunks_slice().len(),
+                    total_blocks,
+                    "view must have parent_blocks + 1 chunks (Arc-share + fresh active)"
+                );
+                assert_eq!(
+                    vs.chunks_slice()[writer_block_idx].usage,
+                    0,
+                    "fresh active block starts empty"
+                );
+            }
+
             // ── Step 4: Verify view chunk_meta immediately after creation ──────────
+            // chunk_meta_row(view, sys_tokens) covers the first
+            // `parent_blocks` blocks (the fresh active at index 31 is
+            // empty so it doesn't contribute until writes land in it).
             let view_meta_init = backing.chunk_meta_row(view, sys_tokens);
             check_rope_and_offset_invariant(&view_meta_init, parent_blocks);
 
@@ -1475,19 +1509,17 @@ mod tests {
             backing.set_len(view, total_prefill);
 
             // ── Step 6: Verify view chunk_meta after user-message prefill ──────────
-            // ensure_for_offset detected block30 is shared AND partial → COW-copies it
-            // in place. No new block is pushed. Total: 31 blocks (parent_blocks).
-            // Block30 (now private COW) holds partial_sys + user_tokens = 30 tokens.
-            let total_blocks = parent_blocks; // 31 (COW: no new block)
+            // Arc-share: the user tokens land in the fresh active block
+            // at `writer_block_idx`. The partial parent block at
+            // `n_full_sys_blocks` stays Arc-shared and unchanged.
             let view_meta_prefill = backing.chunk_meta_row(view, total_prefill);
             check_rope_and_offset_invariant(&view_meta_prefill, total_blocks);
 
-            // Block 30 (COW copy) holds partial_sys (25) + user_tokens (5) = 30.
-            let expected_tail_prefill = partial_sys + user_tokens; // 30
+            // Block 30 (Arc-shared partial) keeps its original usage.
             assert_eq!(
                 view_meta_prefill[n_full_sys_blocks].usage(),
-                expected_tail_prefill as u32,
-                "after user prefill, block 30 usage must be partial_sys + user_tokens = {expected_tail_prefill}"
+                partial_sys as u32,
+                "Arc-shared partial block 30 usage stays at partial_sys = {partial_sys}"
             );
             assert_eq!(
                 view_meta_prefill[n_full_sys_blocks].rope_base(),
@@ -1495,46 +1527,72 @@ mod tests {
                 "block 30 rope_base must be n_full_sys_blocks * CHUNK_SIZE = {}",
                 n_full_sys_blocks * CHUNK_SIZE
             );
+            // Block 31 (fresh active) holds the prefill bytes.
+            assert_eq!(
+                view_meta_prefill[writer_block_idx].usage(),
+                user_tokens as u32,
+                "fresh active (block 31) holds user_tokens = {user_tokens}"
+            );
+            assert_eq!(
+                view_meta_prefill[writer_block_idx].rope_base(),
+                sys_tokens as i32,
+                "block 31 rope_base must equal sys_tokens = {sys_tokens}",
+            );
 
             // ── Step 7: First decode step — set_len to total_prefill + 1 = 991 ───
-            // set_len(view, 991) advances block30's usage to 31.
+            // set_len(view, 991) advances block 31's usage to user_tokens + 1.
             let decode_seq_len = total_prefill + 1; // 991
             backing.set_len(view, decode_seq_len);
             let view_meta_decode = backing.chunk_meta_row(view, decode_seq_len);
             check_rope_and_offset_invariant(&view_meta_decode, total_blocks);
 
-            // Block 30 now holds partial_sys + user_tokens + 1 = 31 tokens.
-            let expected_decode_usage = partial_sys + user_tokens + 1; // 31
+            // Block 30 still unchanged.
             assert_eq!(
                 view_meta_decode[n_full_sys_blocks].usage(),
+                partial_sys as u32,
+                "decode step: Arc-shared block 30 still at partial_sys = {partial_sys}"
+            );
+            // Block 31 advances by one decode token.
+            let expected_decode_usage = user_tokens + 1; // 6
+            assert_eq!(
+                view_meta_decode[writer_block_idx].usage(),
                 expected_decode_usage as u32,
-                "decode step 1: block 30 usage must be {expected_decode_usage}"
+                "decode step 1: block 31 usage must be user_tokens + 1 = {expected_decode_usage}"
             );
             assert_eq!(
-                view_meta_decode[n_full_sys_blocks].rope_base(),
-                (n_full_sys_blocks * CHUNK_SIZE) as i32,
-                "block 30 rope_base must still be n_full_sys_blocks * CHUNK_SIZE"
+                view_meta_decode[writer_block_idx].rope_base(),
+                sys_tokens as i32,
+                "block 31 rope_base unchanged across the decode step"
             );
         }
 
         /// Regression test for block isolation across view/parent turns.
         ///
-        /// In the flat-chunks model ALL blocks — including partial tails — are
-        /// stored in `chunks`.  When a view borrows N blocks from the parent, all
-        /// N are present in `view.chunks` as COW-shared entries.  Before the first
-        /// kernel write, `ensure_for_offset` detects the shared tail and pushes a
-        /// fresh float block so new tokens are written into a private block, never
-        /// corrupting the shared parent data.
+        /// Arc-share-everything model: when a view borrows N blocks from the
+        /// parent, all N (including any trailing partial) are present in
+        /// `view.chunks` as Arc-shared read-only entries. A fresh empty
+        /// active block is pushed at index N at view-creation time so new
+        /// writes never touch the Arc-shared parent data. The partial parent
+        /// block is left at its original usage; the view's writes land in
+        /// the fresh block instead. (The previous COW-the-partial design
+        /// was reverted because it required cross-format quant elevation
+        /// — Q4_KS → R16 — that isn't implemented; cold-loaded parents
+        /// would fail at runtime.)
         ///
         /// Scenario (CHUNK_SIZE = 32):
         ///   1. Parent has 40 tokens: chunks = [block0(32), block1(8)].
         ///   2. `record_turn` snapshots the state; chunks unchanged.
-        ///   3. Create a view borrowing all 2 parent blocks: borrowed = 2.
-        ///   4. `ensure_for_offset` detects shared tail and pushes block2_float.
-        ///   5. Write 10 tokens into the view's block2.
-        ///   6. `finalize_view(view, parent, 2)` → parent.chunks =
+        ///   3. Create a view borrowing all 2 parent blocks: borrowed = 2,
+        ///      view.chunks = [block0 Arc, block1 Arc(8), block2_fresh(0)].
+        ///   4. Write 10 tokens into the view at logical offset 40 — they
+        ///      land in block2_fresh, leaving block1's Arc-shared partial
+        ///      untouched.
+        ///   5. `finalize_view(view, parent, 2)` → parent.chunks =
         ///      [block0(32), block1(8), block2(10)].
-        ///   7. Parent has exactly 3 blocks; no duplicate rope positions.
+        ///   6. Parent ends up with 3 blocks. There is exactly one trailing
+        ///      partial (block2) and one mid-sequence partial (block1) —
+        ///      "no duplicate" here means a single block per logical
+        ///      position, not the absence of mid-sequence partials.
         #[test]
         fn test_finalize_view_no_duplicate_partial_block() {
             const CHUNK_SIZE: usize = 32;
@@ -1588,32 +1646,44 @@ mod tests {
             let (borrowed_blocks, borrowed_tokens) = backing
                 .create_view_sequence(view, parent, &[(0, parent_block_count)])
                 .unwrap();
-            // Flat-chunks: partial tail excluded from borrowed_blocks,
-            // so finalize_view replaces parent's partial rather than appending.
-            assert_eq!(borrowed_blocks, 1, "borrowed_blocks must be N_full = 1");
+            // Arc-share-everything: every parent block (including the
+            // partial) is Arc-borrowed; the view also gains a fresh
+            // empty active block at index `parent_block_count` for the
+            // next turn's writes.
+            assert_eq!(
+                borrowed_blocks, parent_block_count,
+                "Arc-share: borrowed_blocks must equal parent_block_count"
+            );
             assert_eq!(
                 borrowed_tokens, turn1_tokens,
                 "borrowed_tokens must equal turn1_tokens"
             );
 
             // ── Step 3: Write turn2_tokens into the view ──────────────────────────
-            // The partial tail was already copied at view-creation time, so
-            // ensure_for_offset just confirms the tail is writable (no COW needed).
+            // Writes land in the fresh active block at index
+            // `parent_block_count` — the Arc-shared partial at index 1
+            // is never written to (it stays at usage = partial_tokens).
             backing
                 .ensure_for_offset(view, borrowed_tokens, turn2_tokens)
                 .unwrap();
+            let writer_block_idx = parent_block_count; // 2 — the fresh active
             {
                 let state = backing.state.read().unwrap();
                 let vs = state.sequences[view].as_ref().unwrap();
                 assert_eq!(
                     vs.chunks_slice().len(),
-                    2,
-                    "view must still have 2 chunks (partial tail owned from creation)"
+                    parent_block_count + 1,
+                    "view must have parent_block_count + 1 chunks (Arc-share + fresh active)"
                 );
                 assert_eq!(
                     vs.chunks_slice()[1].usage as usize,
                     partial_tokens,
-                    "tail retains original usage = partial_tokens"
+                    "Arc-shared partial keeps its original usage"
+                );
+                assert_eq!(
+                    vs.chunks_slice()[writer_block_idx].usage,
+                    0,
+                    "fresh active starts at usage 0"
                 );
             }
             let k2 = Tensor::zeros(
@@ -1635,15 +1705,18 @@ mod tests {
                 let vs = state.sequences[view].as_ref().unwrap();
                 assert_eq!(
                     vs.chunks_slice().len(),
-                    2,
-                    "view must still have exactly 2 chunks"
+                    parent_block_count + 1,
+                    "view must still have exactly parent_block_count + 1 chunks"
                 );
-                // set_len(50): prior = chunks[0].usage = 32. chunks[1].usage = 50-32 = 18.
-                let expected_tail_usage = partial_tokens + turn2_tokens; // 18
                 assert_eq!(
                     vs.chunks_slice()[1].usage as usize,
-                    expected_tail_usage,
-                    "view.chunks[1].usage must equal partial_tokens + turn2_tokens = {expected_tail_usage}"
+                    partial_tokens,
+                    "Arc-shared partial (block 1) unchanged after write"
+                );
+                assert_eq!(
+                    vs.chunks_slice()[writer_block_idx].usage as usize,
+                    turn2_tokens,
+                    "fresh active (block 2) holds turn2_tokens = {turn2_tokens}"
                 );
             }
 
@@ -1653,16 +1726,16 @@ mod tests {
                 .unwrap();
 
             // ── Step 5: Assert parent has the right blocks ───────────────────────────
+            // finalize_view truncates parent to borrowed_blocks = 2 (no-op,
+            // parent already has 2) and extends with view.chunks[2..] =
+            // [block2_with_writes]. Parent ends with 3 blocks total.
             {
                 let state = backing.state.read().unwrap();
                 let ps = state.sequences[parent].as_ref().unwrap();
-                // finalize_view truncated parent to borrowed_blocks=1, then extended
-                // with view.chunks[1..] = [block_cow(18)]. Parent now has 2 blocks.
-                let expected_tail_usage = partial_tokens + turn2_tokens; // 18
                 assert_eq!(
                     ps.chunks_slice().len(),
-                    2,
-                    "parent must have 2 chunks after finalize_view: 1 full + 1 COW-extended"
+                    parent_block_count + 1,
+                    "parent must have parent_block_count + 1 chunks after finalize_view"
                 );
                 assert_eq!(
                     ps.chunks_slice()[0].usage as usize,
@@ -1670,17 +1743,22 @@ mod tests {
                     "parent chunks[0] (full block) must have usage = CHUNK_SIZE"
                 );
                 assert_eq!(
-                    ps.chunks_slice()[1].usage as usize, expected_tail_usage,
-                    "parent chunks[1] (COW-extended) must have usage = partial + turn2 = {expected_tail_usage}"
+                    ps.chunks_slice()[1].usage as usize, partial_tokens,
+                    "parent chunks[1] (Arc-shared partial — preserved) must have usage = partial_tokens"
+                );
+                assert_eq!(
+                    ps.chunks_slice()[2].usage as usize, turn2_tokens,
+                    "parent chunks[2] (view's new block) must have usage = turn2_tokens"
                 );
             }
 
             // ── Step 6: Verify chunk_meta for a subsequent token ─────────────────────
             let parent_offset_after = total_view_tokens; // 50
             let meta = backing.chunk_meta_row(parent, parent_offset_after);
-            // Expected: 2 blocks — 1 full + 1 COW-extended (usage = 18).
-            let expected_tail_usage = partial_tokens + turn2_tokens; // 18
-            let n_blocks = 2usize;
+            // Expected: 3 blocks — 1 full + 1 mid-sequence partial + 1
+            // trailing partial. The rope_base invariant still holds:
+            // each block's rope_base == sum of preceding usages.
+            let n_blocks = parent_block_count + 1; // 3
             check_rope_and_offset_invariant(&meta, n_blocks);
             assert_eq!(
                 meta[0].usage(),
@@ -1690,13 +1768,24 @@ mod tests {
             assert_eq!(meta[0].rope_base(), 0, "meta block 0 rope_base must be 0");
             assert_eq!(
                 meta[1].usage(),
-                expected_tail_usage as u32,
-                "meta block 1 usage must be partial + turn2 = {expected_tail_usage}"
+                partial_tokens as u32,
+                "meta block 1 usage must be partial_tokens = {partial_tokens}"
             );
             assert_eq!(
                 meta[1].rope_base(),
                 CHUNK_SIZE as i32,
                 "meta block 1 rope_base must be CHUNK_SIZE = {CHUNK_SIZE}"
+            );
+            assert_eq!(
+                meta[2].usage(),
+                turn2_tokens as u32,
+                "meta block 2 usage must be turn2_tokens = {turn2_tokens}"
+            );
+            assert_eq!(
+                meta[2].rope_base(),
+                (CHUNK_SIZE + partial_tokens) as i32,
+                "meta block 2 rope_base must be CHUNK_SIZE + partial_tokens = {}",
+                CHUNK_SIZE + partial_tokens
             );
         }
     }

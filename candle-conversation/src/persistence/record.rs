@@ -223,28 +223,24 @@ pub fn decode_header(probe: &[u8]) -> Result<(RecordHeader, usize)> {
     Ok((header, newline_pos + 1))
 }
 
-/// Decode one full record from the start of `buf` — header, payload,
-/// and CRC-verify. Returns the record and the number of bytes it
-/// occupies on disk (its padded length, so a walker can advance).
-pub fn decode_record(buf: &[u8]) -> Result<(Record, usize)> {
+/// Decode one full record from the start of `buf` — header + payload
+/// slice + padded total. Returns `(header, payload, total_bytes)`
+/// where `payload` is a **borrowed** view into `buf` (zero-copy) and
+/// `total_bytes` is the record's padded on-disk size so a walker can
+/// advance.
+///
+/// **Does not CRC-verify the payload.** Verification is a separate
+/// concern handled by [`verify_record_crc`] — the cold-load hot path
+/// skips it entirely (the background validator catches latent bit rot
+/// out-of-band), and the walker only verifies on demand for torn-write
+/// detection at recovery time.
+///
+/// Cold-load uses the payload slice in place against the pinned
+/// scratch buffer; callers that need owned bytes — typically
+/// random-access reads like [`super::log_file::read_record_at`] —
+/// `.to_vec()` at the boundary where ownership starts.
+pub fn decode_record(buf: &[u8]) -> Result<(RecordHeader, &[u8], usize)> {
     let (header, header_bytes) = decode_header(buf)?;
-    if header.record_type == RecordType::Unknown {
-        // The caller may want to skip — return the padded size so
-        // they can advance past us, but still construct a Record.
-        let total = padded_record_len(header_bytes - 1, header.payload_len);
-        if buf.len() < total {
-            return Err(PersistenceError::Truncated {
-                need: total,
-                have: buf.len(),
-            });
-        }
-        // We do not CRC-verify an Unknown record: the payload might
-        // not be readable in our world view, but the walker has
-        // already decided to skip it.
-        let payload_end = header_bytes + header.payload_len as usize;
-        let payload = buf[header_bytes..payload_end].to_vec();
-        return Ok((Record { header, payload }, total));
-    }
     let total = padded_record_len(header_bytes - 1, header.payload_len);
     if buf.len() < total {
         return Err(PersistenceError::Truncated {
@@ -254,6 +250,20 @@ pub fn decode_record(buf: &[u8]) -> Result<(Record, usize)> {
     }
     let payload_end = header_bytes + header.payload_len as usize;
     let payload = &buf[header_bytes..payload_end];
+    Ok((header, payload, total))
+}
+
+/// CRC-verify the payload of a record against the header's stored CRC.
+///
+/// Used by the **background validator thread** to catch latent bit rot
+/// after startup, and by the walker only when explicitly asked (e.g.
+/// torn-write probes during recovery). `RecordType::Unknown` records
+/// are skipped — the payload format may not be readable in our world
+/// view and the walker has already decided to advance past them.
+pub fn verify_record_crc(header: &RecordHeader, payload: &[u8]) -> Result<()> {
+    if header.record_type == RecordType::Unknown {
+        return Ok(());
+    }
     let computed = crc32(payload);
     if computed != header.crc {
         return Err(PersistenceError::BadChecksum {
@@ -261,13 +271,7 @@ pub fn decode_record(buf: &[u8]) -> Result<(Record, usize)> {
             computed,
         });
     }
-    Ok((
-        Record {
-            header,
-            payload: payload.to_vec(),
-        },
-        total,
-    ))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -704,10 +708,10 @@ mod tests {
         let header = sample_header(payload.len() as u64, &payload);
         let bytes = encode_record(&header, &payload);
 
-        let (record, consumed) = decode_record(&bytes).unwrap();
+        let (got_header, got_payload, consumed) = decode_record(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
-        assert_eq!(record.header, header);
-        assert_eq!(record.payload, payload);
+        assert_eq!(got_header, header);
+        assert_eq!(got_payload, payload.as_slice());
     }
 
     #[test]
@@ -722,10 +726,10 @@ mod tests {
             token_count: 0,
         };
         let bytes = encode_record(&header, &[]);
-        let (record, consumed) = decode_record(&bytes).unwrap();
+        let (got_header, got_payload, consumed) = decode_record(&bytes).unwrap();
         assert_eq!(consumed, ALIGN);
-        assert_eq!(record.header, header);
-        assert!(record.payload.is_empty());
+        assert_eq!(got_header, header);
+        assert!(got_payload.is_empty());
     }
 
     #[test]
@@ -748,13 +752,13 @@ mod tests {
         bytes[header_len] = b'\n';
         bytes[header_len + 1..header_len + 1 + payload.len()].copy_from_slice(payload);
 
-        let (record, consumed) = decode_record(&bytes).unwrap();
+        let (header, got_payload, consumed) = decode_record(&bytes).unwrap();
         assert_eq!(consumed, total);
-        assert_eq!(record.header.record_type, RecordType::Unknown);
+        assert_eq!(header.record_type, RecordType::Unknown);
         // The payload survived even though we don't know how to
         // interpret it — useful for diagnostics and round-trip in
         // tests.
-        assert_eq!(record.payload, payload);
+        assert_eq!(got_payload, payload);
     }
 
     #[test]
@@ -776,9 +780,9 @@ mod tests {
         bytes[header_len] = b'\n';
         bytes[header_len + 1..header_len + 1 + payload.len()].copy_from_slice(payload);
 
-        let (record, _) = decode_record(&bytes).unwrap();
-        assert_eq!(record.header.record_type, RecordType::Commit);
-        assert_eq!(record.payload, payload);
+        let (header, got_payload, _) = decode_record(&bytes).unwrap();
+        assert_eq!(header.record_type, RecordType::Commit);
+        assert_eq!(got_payload, payload);
     }
 
     #[test]
@@ -794,13 +798,13 @@ mod tests {
         bytes[..header_len].copy_from_slice(header_line.as_bytes());
         bytes[header_len] = b'\n';
 
-        let (record, _) = decode_record(&bytes).unwrap();
-        assert_eq!(record.header.record_type, RecordType::Commit);
-        assert_eq!(record.header.format, 0);
-        assert_eq!(record.header.stream_id, 0);
-        assert_eq!(record.header.chunk_index, 0);
-        assert_eq!(record.header.token_count, 0);
-        assert_eq!(record.payload, payload);
+        let (header, got_payload, _) = decode_record(&bytes).unwrap();
+        assert_eq!(header.record_type, RecordType::Commit);
+        assert_eq!(header.format, 0);
+        assert_eq!(header.stream_id, 0);
+        assert_eq!(header.chunk_index, 0);
+        assert_eq!(header.token_count, 0);
+        assert_eq!(got_payload, payload);
     }
 
     #[test]
@@ -815,32 +819,45 @@ mod tests {
     }
 
     #[test]
-    fn flipped_payload_byte_caught_by_checksum() {
+    fn flipped_payload_byte_caught_by_verify_record_crc() {
         let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let mut bytes = encode_record(&sample_header(payload.len() as u64, &payload), &payload);
         // Flip a byte inside the payload — find it just after the
         // header newline.
         let newline_pos = bytes.iter().position(|&b| b == b'\n').unwrap();
         bytes[newline_pos + 2] ^= 0x01;
+        // decode_record itself no longer CRC-verifies; the parse succeeds.
+        let (header, payload_slice, _) = decode_record(&bytes).unwrap();
+        // The dedicated verifier surfaces the bit rot.
         assert!(matches!(
-            decode_record(&bytes),
+            verify_record_crc(&header, payload_slice),
             Err(PersistenceError::BadChecksum { .. })
         ));
     }
 
     #[test]
-    fn flipped_header_byte_caught_by_json_parse() {
-        // Mutating a digit inside the header line breaks JSON
-        // parsing (or, if it happens to still parse, surfaces a
-        // CRC mismatch). Both are caught as torn writes.
-        let mut bytes = encode_record(&sample_header(0, &[]), &[]);
-        // Find a digit somewhere in the header line and flip it.
+    fn flipped_header_byte_caught_by_json_or_crc() {
+        // Mutating a byte inside the header line either breaks JSON
+        // parsing or — if the JSON still parses — leaves a stale
+        // `crc` value in the header that no longer matches the
+        // payload. The fast path catches the first case; the
+        // background validator catches the second.
+        let payload = [1u8, 2, 3, 4];
+        let mut bytes = encode_record(&sample_header(payload.len() as u64, &payload), &payload);
         let newline_pos = bytes.iter().position(|&b| b == b'\n').unwrap();
         let target = (0..newline_pos)
             .find(|&i| bytes[i].is_ascii_digit())
             .expect("the encoded header contains at least one digit");
         bytes[target] = if bytes[target] == b'0' { b'9' } else { b'0' };
-        assert!(decode_record(&bytes).is_err());
+
+        let caught = match decode_record(&bytes) {
+            Err(_) => true,
+            Ok((header, payload_slice, _)) => verify_record_crc(&header, payload_slice).is_err(),
+        };
+        assert!(
+            caught,
+            "either parse failure or CRC mismatch must surface the header bit-flip"
+        );
     }
 
     #[test]

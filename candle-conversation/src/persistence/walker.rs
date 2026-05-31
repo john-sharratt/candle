@@ -116,7 +116,7 @@ pub fn walk(
             continue;
         }
         let record_bytes = src.read_at(offset, total as usize)?;
-        let (record, consumed) = match decode_record(&record_bytes) {
+        let (header, payload, consumed) = match decode_record(&record_bytes) {
             Ok(decoded) => decoded,
             Err(_) => {
                 return Ok(WalkOutcome {
@@ -130,7 +130,10 @@ pub fn walk(
         debug_assert_eq!(consumed as u64, total);
         let entry = WalkEntry {
             offset,
-            record,
+            record: Record {
+                header,
+                payload: payload.to_vec(),
+            },
             size: total,
         };
         visit(&entry);
@@ -211,19 +214,20 @@ mod tests {
         assert_eq!(outcome.tail_offset, SUPERBLOCK_SIZE + real_len as u64);
     }
 
-    /// A second record whose payload has a flipped byte fails the CRC
-    /// check and stops the walk as torn.
+    /// Header corruption stops the walk as torn — the new boundary
+    /// for synchronous recovery now that walker no longer CRCs
+    /// payloads inline. (Payload bit-rot is caught out-of-band by the
+    /// background CRC validator.)
     #[test]
-    fn torn_tail_record_stops_the_walk() {
+    fn torn_tail_header_stops_the_walk() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&chunk(1, 0, b"good"));
         let good_len = blob.len();
-        let bad = chunk(1, 1, b"corrupt-me");
-        // Find the byte right after the header newline (the first
-        // payload byte) and flip it.
-        let newline_pos = bad.iter().position(|&b| b == b'\n').unwrap();
-        let mut bad = bad.clone();
-        bad[newline_pos + 1] ^= 0x5A;
+        let mut bad = chunk(1, 1, b"second");
+        // Replace the first byte (the opening `{`) so JSON parse fails
+        // immediately — `decode_header` rejects anything not starting
+        // with `{`.
+        bad[0] = b'X';
         blob.extend_from_slice(&bad);
         let mut mem = MemLog::with_records(&blob);
 
@@ -231,6 +235,27 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(outcome.torn);
         assert_eq!(outcome.tail_offset, SUPERBLOCK_SIZE + good_len as u64);
+    }
+
+    /// Payload bit-rot is **not** a synchronous torn write — the walker
+    /// passes it through. The background CRC validator surfaces it
+    /// later via [`verify_record_crc`].
+    #[test]
+    fn payload_bit_rot_passes_walker_silently() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&chunk(1, 0, b"good"));
+        let mut bad = chunk(1, 1, b"corrupt-me");
+        let newline_pos = bad.iter().position(|&b| b == b'\n').unwrap();
+        bad[newline_pos + 1] ^= 0x5A;
+        blob.extend_from_slice(&bad);
+        let mut mem = MemLog::with_records(&blob);
+
+        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert_eq!(entries.len(), 2, "walker accepts both records");
+        assert!(
+            !outcome.torn,
+            "walker does not stop on payload CRC mismatch"
+        );
     }
 
     #[test]

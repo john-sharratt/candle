@@ -162,11 +162,7 @@ pub struct PerBlockStats {
 /// relevance signal and the per-block kthresh collapses toward the
 /// geometric mean `sqrt(lo·hi)` (no z-scoring kicks in because
 /// `q_relevance_quantiles` returns spread = 0 when no block has Q).
-pub fn per_block_amax_qrel(
-    k_block: &[f32],
-    v_block: &[f32],
-    q_block_f16: &[u16],
-) -> PerBlockStats {
+pub fn per_block_amax_qrel(k_block: &[f32], v_block: &[f32], q_block_f16: &[u16]) -> PerBlockStats {
     debug_assert_eq!(k_block.len(), HEAD_DIM * CHUNK_SIZE);
     debug_assert_eq!(v_block.len(), HEAD_DIM * CHUNK_SIZE);
     debug_assert_eq!(q_block_f16.len(), HEAD_DIM * CHUNK_SIZE);
@@ -243,10 +239,7 @@ pub fn per_block_amax_qrel(
 /// (any non-zero Q lane). Spread = 2 · 1.4426950408889634 · IQR. When fewer
 /// than 2 samples or zero range, both outputs are 0 — exactly matching the
 /// kernel's early-out path (later code substitutes `sqrt(lo·hi)`).
-pub fn q_relevance_quantiles(
-    k_block: &[f32],
-    q_block_f16: &[u16],
-) -> (f32, f32) {
+pub fn q_relevance_quantiles(k_block: &[f32], q_block_f16: &[u16]) -> (f32, f32) {
     debug_assert_eq!(k_block.len(), HEAD_DIM * CHUNK_SIZE);
     debug_assert_eq!(q_block_f16.len(), HEAD_DIM * CHUNK_SIZE);
 
@@ -436,13 +429,7 @@ pub fn k_threshold_per_block(
     let usable = q_spread > 1.0e-8;
     for b in 0..HEAD_DIM {
         out[b] = if usable {
-            k_threshold_scaled(
-                k_threshold_lo,
-                k_threshold_hi,
-                qrel_k[b],
-                q_med,
-                q_spread,
-            )
+            k_threshold_scaled(k_threshold_lo, k_threshold_hi, qrel_k[b], q_med, q_spread)
         } else {
             fallback
         };
@@ -452,10 +439,12 @@ pub fn k_threshold_per_block(
 
 /// Per-block K threshold formula.
 ///
-///     z          = (qrel − q_median) / max(q_spread, 1e-8)
-///     multiplier = exp(−z)
-///     scaled     = sqrt(lo · hi) · multiplier
-///     out        = clamp(scaled, hi, lo)
+/// ```text
+/// z          = (qrel − q_median) / max(q_spread, 1e-8)
+/// multiplier = exp(−z)
+/// scaled     = sqrt(lo · hi) · multiplier
+/// out        = clamp(scaled, hi, lo)
+/// ```
 ///
 /// If `q_relevance` or `q_median` is NaN the result would be NaN under
 /// pure IEEE arithmetic; we substitute the geometric-mean fallback so
@@ -525,10 +514,7 @@ pub struct SlotStats {
 /// indexed by sort position; `idx_compact` lists alive block IDs in sort
 /// order. Matches the CUDA single-thread stat walk exactly (same target
 /// formulae, same fallback to slot_amax_raw when target isn't hit).
-pub fn slot_stats(
-    amax: &[f32; HEAD_DIM],
-    idx_compact: &[u16],
-) -> SlotStats {
+pub fn slot_stats(amax: &[f32; HEAD_DIM], idx_compact: &[u16]) -> SlotStats {
     let lc = idx_compact.len();
     if lc == 0 {
         return SlotStats {
@@ -939,8 +925,13 @@ fn select_one_head(
     let sink = sink_threshold(k_block, &stats.q_mean, v_threshold_lo, v_threshold_hi);
     let kidx = sort_amax_desc(&stats.amax_k);
     let vidx = sort_amax_desc(&stats.amax_v);
-    let kthresh =
-        k_threshold_per_block(&stats.qrel_k, q_med, q_spread, k_threshold_lo, k_threshold_hi);
+    let kthresh = k_threshold_per_block(
+        &stats.qrel_k,
+        q_med,
+        q_spread,
+        k_threshold_lo,
+        k_threshold_hi,
+    );
 
     let (k_pal_format, k_pal_scale, k_assignments) = process_side(
         k_block,
@@ -996,7 +987,9 @@ mod tests {
     }
 
     fn deterministic_uniform(seed: u64, idx: usize) -> f32 {
-        let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(idx as u64);
+        let mut x = seed
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(idx as u64);
         x ^= x >> 30;
         x = x.wrapping_mul(0xBF58476D1CE4E5B9);
         x ^= x >> 27;
@@ -1038,8 +1031,15 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for d in 0..HEAD_DIM {
             assert!(stats.amax_v[d] > 0.0, "jitter zero at d={d}");
-            assert!(stats.amax_v[d] < 1e-6, "jitter too large at d={d}: {}", stats.amax_v[d]);
-            assert!(seen.insert(stats.amax_v[d].to_bits()), "duplicate jitter at d={d}");
+            assert!(
+                stats.amax_v[d] < 1e-6,
+                "jitter too large at d={d}: {}",
+                stats.amax_v[d]
+            );
+            assert!(
+                seen.insert(stats.amax_v[d].to_bits()),
+                "duplicate jitter at d={d}"
+            );
         }
         let order = sort_amax_desc(&stats.amax_v);
         // The sorted indices must not be the identity permutation (which
@@ -1211,41 +1211,77 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_q4_1() { run_roundtrip(QuantFormat::Q4_1); }
+    fn roundtrip_q4_1() {
+        run_roundtrip(QuantFormat::Q4_1);
+    }
     #[test]
-    fn roundtrip_q5_0() { run_roundtrip(QuantFormat::Q5_0); }
+    fn roundtrip_q5_0() {
+        run_roundtrip(QuantFormat::Q5_0);
+    }
     #[test]
-    fn roundtrip_q5_1() { run_roundtrip(QuantFormat::Q5_1); }
+    fn roundtrip_q5_1() {
+        run_roundtrip(QuantFormat::Q5_1);
+    }
     #[test]
-    fn roundtrip_q4_ks() { run_roundtrip(QuantFormat::Q4_KS); }
+    fn roundtrip_q4_ks() {
+        run_roundtrip(QuantFormat::Q4_KS);
+    }
     #[test]
-    fn roundtrip_q8_ks() { run_roundtrip(QuantFormat::Q8_KS); }
+    fn roundtrip_q8_ks() {
+        run_roundtrip(QuantFormat::Q8_KS);
+    }
     #[test]
-    fn roundtrip_q2_0() { run_roundtrip(QuantFormat::Q2_0); }
+    fn roundtrip_q2_0() {
+        run_roundtrip(QuantFormat::Q2_0);
+    }
     #[test]
-    fn roundtrip_q3_0() { run_roundtrip(QuantFormat::Q3_0); }
+    fn roundtrip_q3_0() {
+        run_roundtrip(QuantFormat::Q3_0);
+    }
     #[test]
-    fn roundtrip_q2_1() { run_roundtrip(QuantFormat::Q2_1); }
+    fn roundtrip_q2_1() {
+        run_roundtrip(QuantFormat::Q2_1);
+    }
     #[test]
-    fn roundtrip_q3_1() { run_roundtrip(QuantFormat::Q3_1); }
+    fn roundtrip_q3_1() {
+        run_roundtrip(QuantFormat::Q3_1);
+    }
     #[test]
-    fn roundtrip_q0() { run_roundtrip(QuantFormat::Q0); }
+    fn roundtrip_q0() {
+        run_roundtrip(QuantFormat::Q0);
+    }
     #[test]
-    fn roundtrip_q1_s() { run_roundtrip(QuantFormat::Q1_S); }
+    fn roundtrip_q1_s() {
+        run_roundtrip(QuantFormat::Q1_S);
+    }
     #[test]
-    fn roundtrip_q2_s() { run_roundtrip(QuantFormat::Q2_S); }
+    fn roundtrip_q2_s() {
+        run_roundtrip(QuantFormat::Q2_S);
+    }
     #[test]
-    fn roundtrip_q2_a() { run_roundtrip(QuantFormat::Q2_A); }
+    fn roundtrip_q2_a() {
+        run_roundtrip(QuantFormat::Q2_A);
+    }
     #[test]
-    fn roundtrip_q0_v() { run_roundtrip(QuantFormat::Q0_V); }
+    fn roundtrip_q0_v() {
+        run_roundtrip(QuantFormat::Q0_V);
+    }
     #[test]
-    fn roundtrip_q1_a() { run_roundtrip(QuantFormat::Q1_A); }
+    fn roundtrip_q1_a() {
+        run_roundtrip(QuantFormat::Q1_A);
+    }
     #[test]
-    fn roundtrip_q0_x() { run_roundtrip(QuantFormat::Q0_X); }
+    fn roundtrip_q0_x() {
+        run_roundtrip(QuantFormat::Q0_X);
+    }
     #[test]
-    fn roundtrip_q0_m2() { run_roundtrip(QuantFormat::Q0_M2); }
+    fn roundtrip_q0_m2() {
+        run_roundtrip(QuantFormat::Q0_M2);
+    }
     #[test]
-    fn roundtrip_q0_m4() { run_roundtrip(QuantFormat::Q0_M4); }
+    fn roundtrip_q0_m4() {
+        run_roundtrip(QuantFormat::Q0_M4);
+    }
 
     #[test]
     fn roundtrip_unsupported_format_returns_none() {
@@ -1322,10 +1358,7 @@ mod tests {
         // Ground truth median ≈ 0.5; q1 ≈ 0.25; q3 ≈ 0.75; iqr ≈ 0.5;
         // spread ≈ 0.5 * 2 * 1.4427 ≈ 1.4427. Bin resolution = 1/63 ≈ 0.016.
         // f16 quantization adds a few % on top — slack 0.05 captures both.
-        assert!(
-            (median - 0.5).abs() < 0.05,
-            "median {median} not near 0.5"
-        );
+        assert!((median - 0.5).abs() < 0.05, "median {median} not near 0.5");
         let expected_spread = 0.5f32 * 2.0 * 1.4426950408889634;
         assert!(
             (spread - expected_spread).abs() < 0.1,
@@ -1377,7 +1410,8 @@ mod tests {
         let expected_sq = expected_eff * expected_eff;
         assert!(
             (stats.v_thr_sq - expected_sq).abs() < 1e-9,
-            "v_thr_sq {} not the lerp", stats.v_thr_sq
+            "v_thr_sq {} not the lerp",
+            stats.v_thr_sq
         );
         // v_thr_eff should have lerped much closer to hi than to lo.
         assert!(
@@ -1507,9 +1541,8 @@ mod tests {
         // normalized by head_amax² is tiny.
         for d in 0..HEAD_DIM {
             for t in 0..CHUNK_SIZE {
-                v[d * CHUNK_SIZE + t] =
-                    0.5 * ((d as f32 * 0.03 + t as f32 * 0.1).sin())
-                        + 0.1 * deterministic_uniform(0x1234, d * 32 + t);
+                v[d * CHUNK_SIZE + t] = 0.5 * ((d as f32 * 0.03 + t as f32 * 0.1).sin())
+                    + 0.1 * deterministic_uniform(0x1234, d * 32 + t);
             }
         }
         let stats = per_block_amax_qrel(&v, &v, &vec![0u16; total]);

@@ -631,6 +631,47 @@ impl SequenceState {
         )
     }
 
+    /// Bulk variant of [`Self::update_gpu_chunk`] — serialises every
+    /// block in `block_indices` under a **single** `GpuChunksGuard`,
+    /// so the guard drop coalesces adjacent indices into one
+    /// `memcpy_htod` per contiguous run (instead of one per block).
+    ///
+    /// Used by the cold-load `alloc_sealed_blocks_bulk` path to push
+    /// the per-layer chunk metadata to the GPU as a single batched
+    /// HtoD where possible.
+    pub(super) fn update_gpu_chunks_bulk(
+        &mut self,
+        block_indices: &[usize],
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) -> candle::Result<()> {
+        if block_indices.is_empty() || self.gpu_chunks.n_chunks() == 0 {
+            return Ok(());
+        }
+        let SequenceState {
+            ref chunks,
+            ref mut gpu_chunks,
+            ..
+        } = *self;
+        // One guard, scoped over the whole loop — its drop coalesces
+        // every dirty chunk into the fewest contiguous memcpy_htod
+        // runs the index set allows.
+        let mut guard = gpu_chunks.as_mut();
+        for &blk in block_indices {
+            let rope_base: u32 = chunks[..blk].iter().map(|c| c.usage).sum();
+            guard.update_chunk(
+                blk,
+                &chunks[blk],
+                n_kv_head,
+                head_dim,
+                rope_base,
+                arena_info,
+            )?;
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Chunk-only mutation primitives (no GPU params required)
     //

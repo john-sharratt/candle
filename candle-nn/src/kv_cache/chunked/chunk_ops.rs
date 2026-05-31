@@ -1,4 +1,4 @@
-﻿//! Chunk migration and format conversion operations.
+//! Chunk migration and format conversion operations.
 //!
 //! This module provides operations for moving and converting KV cache chunks
 //! between different storage formats (float/quantized) and locations (GPU/CPU):
@@ -84,11 +84,7 @@ fn chunk_byte_size_of(arena: &Arena) -> Result<usize> {
 /// `(arena, chunk_idx)` into `dst`. The reverse of
 /// [`ChunkedKvBacking::write_chunk_from_pinned_bytes`]; same dtype
 /// dispatch (`bf16` / `f16` / `f32`).
-fn read_chunk_into_pinned_bytes(
-    arena: &Arena,
-    chunk_idx: usize,
-    dst: &mut [u8],
-) -> Result<()> {
+fn read_chunk_into_pinned_bytes(arena: &Arena, chunk_idx: usize, dst: &mut [u8]) -> Result<()> {
     match arena {
         Arena::Float { data, dtype, .. } => {
             let dims = data.dims();
@@ -711,7 +707,6 @@ impl ChunkedKvBacking {
         }
     }
 
-
     /// Get raw GPU pointer for a tensor at a given element offset.
     #[cfg(feature = "cuda")]
     pub(super) fn tensor_ptr_at_offset(tensor: &Tensor, elem_offset: usize) -> Result<u64> {
@@ -1318,8 +1313,13 @@ impl ChunkedKvBacking {
         let arena_info = self.resolve_arena_info()?;
 
         // Single critical section covering: pool allocs, block_gid
-        // registration, GPU chunk metadata update, and window stamping.
+        // registration, window stamping, then a **single batched**
+        // GPU chunk-metadata push at the end (one guard for the
+        // whole layer's blocks, so the drop coalesces adjacent
+        // indices into a few `memcpy_htod` runs instead of one per
+        // block).
         let mut hgids_per_block: Vec<HeadGids> = Vec::with_capacity(specs.len());
+        let mut updated_blocks: Vec<usize> = Vec::with_capacity(specs.len());
         {
             let mut state = self
                 .state
@@ -1333,19 +1333,24 @@ impl ChunkedKvBacking {
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
                         let sub = h * N_PALETTE + p;
-                        let k_gid = self
-                            .alloc_chunk_for_key(ArenaKey::uniform(spec.k_formats[sub], location))?;
-                        let v_gid = self
-                            .alloc_chunk_for_key(ArenaKey::uniform(spec.v_formats[sub], location))?;
+                        let k_gid = self.alloc_chunk_for_key(ArenaKey::uniform(
+                            spec.k_formats[sub],
+                            location,
+                        ))?;
+                        let v_gid = self.alloc_chunk_for_key(ArenaKey::uniform(
+                            spec.v_formats[sub],
+                            location,
+                        ))?;
                         gid_vec.push(k_gid);
                         gid_vec.push(v_gid);
                     }
                 }
                 let gids = HeadGids::from_vec(gid_vec);
 
-                // Register on the block table + refresh the GPU slot
-                // metadata + stamp the window — all under the same
-                // already-held write lock.
+                // Register on the block table + stamp the window.
+                // GPU chunk-metadata push is deferred until all
+                // blocks have been registered (see batched call
+                // below).
                 if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
                     slot.set_block_gids(
                         spec.block_idx,
@@ -1355,13 +1360,19 @@ impl ChunkedKvBacking {
                         std::sync::Arc::clone(&spec.k_scale),
                         std::sync::Arc::clone(&spec.v_scale),
                     );
-                    slot.update_gpu_chunk(spec.block_idx, n_kv_head, head_dim, &arena_info)?;
                     if let Some(cw) = slot.chunk_at_mut(spec.block_idx) {
                         cw.offset = spec.offset;
                         cw.usage = spec.usage;
                     }
+                    updated_blocks.push(spec.block_idx);
                 }
                 hgids_per_block.push(gids);
+            }
+
+            // One bulk push for the whole layer — see
+            // `SequenceState::update_gpu_chunks_bulk`.
+            if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
+                slot.update_gpu_chunks_bulk(&updated_blocks, n_kv_head, head_dim, &arena_info)?;
             }
         }
         Ok(hgids_per_block)
@@ -1598,8 +1609,9 @@ impl ChunkedKvBacking {
                     .chunks
                     .iter()
                     .map(|chunk| {
-                        let mapped =
-                            chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                        let mapped = chunk
+                            .gids
+                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
                         Ok(SealedChunk {
                             gids: mapped,
                             ..chunk.clone()
@@ -1832,7 +1844,9 @@ impl ChunkedKvBacking {
                     .chunks
                     .iter()
                     .map(|chunk| {
-                        let mapped = chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                        let mapped = chunk
+                            .gids
+                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
                         Ok(SealedChunk {
                             gids: mapped,
                             ..chunk.clone()
@@ -1893,19 +1907,13 @@ impl ChunkedKvBacking {
                         // SAFETY: bytes is at least 2-byte aligned (pinned host pages
                         // are page-aligned), length validated above.
                         let slice = unsafe {
-                            std::slice::from_raw_parts(
-                                bytes.as_ptr() as *const half::bf16,
-                                n_elems,
-                            )
+                            std::slice::from_raw_parts(bytes.as_ptr() as *const half::bf16, n_elems)
                         };
                         Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
                     }
                     DType::F16 => {
                         let slice = unsafe {
-                            std::slice::from_raw_parts(
-                                bytes.as_ptr() as *const half::f16,
-                                n_elems,
-                            )
+                            std::slice::from_raw_parts(bytes.as_ptr() as *const half::f16, n_elems)
                         };
                         Tensor::from_slice(slice, per_chunk.as_slice(), &Device::Cpu)?
                     }
@@ -2144,7 +2152,9 @@ impl ChunkedKvBacking {
                     .chunks
                     .iter()
                     .map(|chunk| {
-                        let mapped = chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
+                        let mapped = chunk
+                            .gids
+                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
                         Ok(SealedChunk {
                             gids: mapped,
                             ..chunk.clone()
@@ -2199,7 +2209,6 @@ impl ChunkedKvBacking {
             location: ArenaLocation::Gpu,
         })
     }
-
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2500,10 +2509,14 @@ mod tests {
         let data: Vec<bf16> = (0..total)
             .map(|i| bf16::from_f32(((pattern_base as usize + i) as f32) * 0.001))
             .collect();
-        let k = Tensor::from_vec(data.clone(), (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
-            .unwrap()
-            .to_device(device)
-            .unwrap();
+        let k = Tensor::from_vec(
+            data.clone(),
+            (1, n_kv_head, n_tokens, head_dim),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_device(device)
+        .unwrap();
         let v = k.clone();
         backing.write_contiguous(slot, 0, &k, &v).unwrap();
         backing.set_len(slot, n_tokens);
@@ -2620,12 +2633,7 @@ mod tests {
         let mut pinned: Option<PinnedBuf> = None;
 
         let migrated = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&s0, &s1, &s2],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&s0, &s1, &s2])
             .expect("multi-sequence batched async migrate must succeed");
 
         assert_eq!(migrated.len(), 3);
@@ -2664,8 +2672,7 @@ mod tests {
         let head_dim = 32;
         let n_tokens = 40;
         let backing = cuda_backing(&device, n_kv_head, head_dim);
-        let gpu_orig =
-            seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 0);
+        let gpu_orig = seed_and_seal_pattern(&backing, &device, n_kv_head, head_dim, n_tokens, 0);
 
         let cuda_dev = match &device {
             Device::Cuda(d) => d,
@@ -2728,12 +2735,7 @@ mod tests {
 
         // GPU → CPU (the bytes the production hot→warm path produces).
         let cpu_first = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&gpu_orig],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_orig])
             .unwrap();
         let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
         assert!(
@@ -2743,22 +2745,12 @@ mod tests {
 
         // CPU → GPU (the production warm→hot path).
         let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&cpu_first[0]],
-            )
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
             .unwrap();
 
         // GPU → CPU again so we can read bytes to compare.
         let cpu_second = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&gpu_back[0]],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
             .unwrap();
         let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
 
@@ -2819,31 +2811,16 @@ mod tests {
         let mut pinned: Option<PinnedBuf> = None;
 
         let cpu_first = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&gpu_orig],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_orig])
             .unwrap();
         let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
         assert!(!first_bytes.is_empty());
 
         let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&cpu_first[0]],
-            )
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
             .unwrap();
         let cpu_second = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&gpu_back[0]],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
             .unwrap();
         let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
 
@@ -2939,12 +2916,7 @@ mod tests {
 
         // GPU R16 → CPU R16 (exercises QTensor::write_bytes_at).
         let cpu_first = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&r16_sealed],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&r16_sealed])
             .unwrap();
         let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
         assert!(!first_bytes.is_empty(), "CPU R16 sealed must have bytes");
@@ -2952,23 +2924,13 @@ mod tests {
 
         // CPU R16 → GPU R16 (exercises QTensor::read_bytes_at).
         let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&cpu_first[0]],
-            )
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
             .unwrap();
         assert_eq!(gpu_back[0].location, ArenaLocation::Gpu);
 
         // GPU R16 → CPU R16 again, compare bytes.
         let cpu_second = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&gpu_back[0]],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
             .unwrap();
         let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
 
@@ -3052,12 +3014,7 @@ mod tests {
 
         // GPU Q8_0 → CPU Q8_0 (write_bytes_at path on the dest side).
         let cpu_first = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&quant_sealed],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&quant_sealed])
             .unwrap();
         let first_bytes = bytes_of_cpu_sealed(&backing, &cpu_first[0]);
         assert!(!first_bytes.is_empty(), "CPU Q8_0 sealed must have bytes");
@@ -3065,23 +3022,13 @@ mod tests {
 
         // CPU Q8_0 → GPU Q8_0 (read_bytes_at path on the source side).
         let gpu_back = backing
-            .migrate_sealed_to_gpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&cpu_first[0]],
-            )
+            .migrate_sealed_to_gpu_batch_async(&device, &copy_stream, &mut pinned, &[&cpu_first[0]])
             .unwrap();
         assert_eq!(gpu_back[0].location, ArenaLocation::Gpu);
 
         // GPU Q8_0 → CPU Q8_0 again so we can compare bytes.
         let cpu_second = backing
-            .migrate_sealed_to_cpu_batch_async(
-                &device,
-                &copy_stream,
-                &mut pinned,
-                &[&gpu_back[0]],
-            )
+            .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&gpu_back[0]])
             .unwrap();
         let second_bytes = bytes_of_cpu_sealed(&backing, &cpu_second[0]);
 

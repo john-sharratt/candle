@@ -24,6 +24,7 @@ pub mod chunk_plan;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
+pub mod crc_validator;
 pub mod direct_io;
 pub mod elevate;
 pub mod inherit;
@@ -102,6 +103,13 @@ pub struct SubstratePersistence {
     /// Filesystem path of the active log — the rename target of a
     /// compaction swap (§5.8).
     active_path: PathBuf,
+    /// Chunks whose payload CRC failed the background validator's
+    /// sweep — filtered out of every cold-load plan. Shared with the
+    /// `crc_validator` thread.
+    bad_chunks: crc_validator::BadChunkRegistry,
+    /// Handle on the background CRC validator. Stop-on-drop, so the
+    /// thread exits cleanly when the substrate closes.
+    _crc_validator: crc_validator::CrcValidator,
 }
 
 /// SHA-256 of `bytes` — the tokenizer change-detection digest.
@@ -219,6 +227,16 @@ impl SubstratePersistence {
             })
             .transpose()?;
 
+        let bad_chunks = crc_validator::BadChunkRegistry::new();
+        let inherited_paths: Vec<PathBuf> = inherited_subs
+            .iter()
+            .map(|i| i.path().to_path_buf())
+            .collect();
+        let crc_validator_handle = crc_validator::CrcValidator::spawn(
+            active.to_path_buf(),
+            inherited_paths,
+            bad_chunks.clone(),
+        );
         Ok(SubstratePersistence {
             log,
             manifest,
@@ -227,7 +245,22 @@ impl SubstratePersistence {
             tokenizer_sha256,
             template,
             active_path: active.to_path_buf(),
+            bad_chunks,
+            _crc_validator: crc_validator_handle,
         })
+    }
+
+    /// Snapshot of the chunks the background validator has flagged
+    /// as CRC-corrupt. Exposed for diagnostics and tests; the cold-load
+    /// planner uses [`Self::is_bad_chunk`] directly.
+    pub fn bad_chunks(&self) -> Vec<crc_validator::BadChunkKey> {
+        self.bad_chunks.snapshot()
+    }
+
+    /// `true` if the validator has flagged this chunk as CRC-corrupt
+    /// since the substrate opened.
+    pub fn is_bad_chunk(&self, stream_id: StreamId, chunk_index: u64) -> bool {
+        self.bad_chunks.is_bad((stream_id, chunk_index))
     }
 
     /// The active log's manifest.
@@ -592,8 +625,8 @@ impl SubstratePersistence {
                     let within = (c.file_offset - stripe.file_offset) as usize;
                     let start = buf_cur + within;
                     let end = start + c.record_size as usize;
-                    let (record, _) = decode_record(&buf[start..end])?;
-                    let payload = ChunkPayload::decode(&record.payload)?;
+                    let (_header, payload_bytes, _) = decode_record(&buf[start..end])?;
+                    let payload = ChunkPayload::decode(payload_bytes)?;
                     out.push((c.chunk_idx, payload));
                     chunk_iter.next();
                 }
@@ -616,8 +649,8 @@ impl SubstratePersistence {
                     let within = (c.file_offset - stripe.file_offset) as usize;
                     let start = buf_cur + within;
                     let end = start + c.record_size as usize;
-                    let (record, _) = decode_record(&buf[start..end])?;
-                    let payload = ChunkPayload::decode(&record.payload)?;
+                    let (_header, payload_bytes, _) = decode_record(&buf[start..end])?;
+                    let payload = ChunkPayload::decode(payload_bytes)?;
                     out.push((c.chunk_idx, payload));
                     chunk_iter.next();
                 }
@@ -633,10 +666,20 @@ impl SubstratePersistence {
     /// chunk's bytes fit within `buffer_size`. Used by the cold-load
     /// orchestrator to stream a turn through a fixed-size pinned
     /// scratch — see [`chunk_plan`] for the partition semantics.
+    ///
+    /// Chunks flagged by the background CRC validator are filtered
+    /// out of the plan — they would fail to load anyway and the
+    /// validator has already warned about them via `tracing`.
     pub fn plan_chunked_read(&self, stream_id: StreamId, buffer_size: usize) -> ChunkedReadPlan {
         let inherited_manifests: Vec<&Manifest> =
             self.inherited.iter().map(|i| i.manifest()).collect();
-        chunk_plan::plan_chunked_read(&self.manifest, &inherited_manifests, stream_id, buffer_size)
+        chunk_plan::plan_chunked_read(
+            &self.manifest,
+            &inherited_manifests,
+            stream_id,
+            buffer_size,
+            &self.bad_chunks,
+        )
     }
 
     /// Read a stream's latest `Tokens` record payload — from the active log,

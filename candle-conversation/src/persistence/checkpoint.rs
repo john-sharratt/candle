@@ -48,8 +48,8 @@ fn load_checkpoint(src: &mut dyn LogSource, offset: u64) -> Result<(Manifest, u6
     } else {
         src.read_at(offset, total)?
     };
-    let (record, _) = decode_record(&record_bytes)?;
-    let manifest = Manifest::decode(&record.payload)?;
+    let (_header, payload, _) = decode_record(&record_bytes)?;
+    let manifest = Manifest::decode(payload)?;
     Ok((manifest, offset + total as u64))
 }
 
@@ -187,39 +187,27 @@ mod tests {
             log.stage(&record(RecordType::Chunk, 1, 1, b"beta"));
             log.commit().unwrap();
             good_records = log.write_offset();
-            // Append a third record, then simulate a crash mid-write by
-            // corrupting its payload.
-            let off = log.stage(&record(RecordType::Chunk, 1, 2, b"gamma"));
+            // Append a third record, then simulate a real crash by
+            // **physically truncating** the file partway through it.
+            log.stage(&record(RecordType::Chunk, 1, 2, b"gamma"));
             log.commit().unwrap();
-            let _ = off;
         }
-        // Corrupt the third record's payload on disk — a torn write.
-        // Find the third record's header newline (it starts at
-        // `good_records`) and flip a byte just after it (i.e. inside
-        // the payload). The CRC check will catch it.
+        // Drop the file back to `good_records + 64` bytes — the third
+        // record's header is partially on disk but the payload isn't.
+        // The walker stops here because the (parseable) header
+        // promises a record the file doesn't fully hold. Payload
+        // bit-rot of an otherwise-complete record is now caught
+        // **out-of-band** by the background CRC validator rather than
+        // at recovery time, so we use a true crash scenario here.
         {
-            use std::io::{Read, Seek, SeekFrom, Write};
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
-            // Read the first sector of the third record so we can find
-            // its newline (the JSON header has variable length).
-            f.seek(SeekFrom::Start(good_records)).unwrap();
-            let mut sector = [0u8; 4096];
-            f.read_exact(&mut sector).unwrap();
-            let newline_pos = sector.iter().position(|&b| b == b'\n').unwrap();
-            // Flip the first payload byte and the two that follow.
-            f.seek(SeekFrom::Start(good_records + newline_pos as u64 + 1))
-                .unwrap();
-            f.write_all(&[0x9E, 0x9E, 0x9E]).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(good_records + 64).unwrap();
         }
         {
             let mut log = LogFile::open(&path).unwrap();
             let hint = log.superblock().latest_checkpoint_offset;
             let rec = recover(&mut log, hint).unwrap();
-            assert!(rec.torn, "the corrupted third record must be detected");
+            assert!(rec.torn, "the truncated third record must be detected");
             assert_eq!(rec.tail_offset, good_records);
             assert_eq!(rec.manifest.live_chunk_count(), 2);
             // Applying the recovery: truncate to the good tail.
