@@ -255,13 +255,11 @@ impl Conversation {
         for decl in decls {
             let (recovered, cold_refs) = {
                 let mut p = self.persistence.lock().unwrap();
-                let recovered =
-                    crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
-                        .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?;
-                let cold_refs = crate::persistence::resume::recover_turn_cold_refs(
-                    &p, &decl, n_layers,
-                )
-                .map_err(|e| candle::Error::Msg(format!("recover cold refs: {e}")))?;
+                let recovered = crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
+                    .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?;
+                let cold_refs =
+                    crate::persistence::resume::recover_turn_cold_refs(&p, &decl, n_layers)
+                        .map_err(|e| candle::Error::Msg(format!("recover cold refs: {e}")))?;
                 (recovered, cold_refs)
             };
             // Re-append the BDP signatures into the (fresh) provenance file,
@@ -410,17 +408,17 @@ impl Conversation {
         n_layers: usize,
     ) -> candle::Result<Option<crate::persistence::resume::TurnChunkGrid>> {
         use crate::persistence::resume::{recover_turn, recovered_turn_decls};
-        let stream_id =
-            crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
+        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
         let mut p = self.persistence.lock().unwrap();
         // We need the turn's `StreamDecl` to drive `recover_turn`. Walk
         // the manifest's persisted decls and pick the one matching this
         // (timeline, index). The decl set is small and rebuilt once at
         // restart, so a linear scan is fine.
         let decls = recovered_turn_decls(&p);
-        let decl = match decls.into_iter().find(|d| {
-            d.timeline_id == timeline.raw() && d.turn_index == index.0
-        }) {
+        let decl = match decls
+            .into_iter()
+            .find(|d| d.timeline_id == timeline.raw() && d.turn_index == index.0)
+        {
             Some(d) => d,
             None => return Ok(None),
         };
@@ -466,8 +464,7 @@ impl Conversation {
         // Accounting bytes: sum of every chunk's `kv_bytes` size across
         // every layer in the manifest snapshot — matches the previous
         // `TurnChunkGrid::bytes()` semantics.
-        let stream_id =
-            crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
+        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
         let kv_bytes_total: u64 = p
             .manifest()
             .streams
@@ -536,11 +533,7 @@ impl Conversation {
     /// underlying `RecordType::Label`; this writes the same record the
     /// titler writes, preserving whatever `conv_id` is already known
     /// for this timeline.
-    pub fn set_conversation_label(
-        &self,
-        timeline: TimelineId,
-        label: &str,
-    ) -> candle::Result<()> {
+    pub fn set_conversation_label(&self, timeline: TimelineId, label: &str) -> candle::Result<()> {
         if label.is_empty() {
             return Ok(());
         }

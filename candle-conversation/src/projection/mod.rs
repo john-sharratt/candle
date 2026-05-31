@@ -211,18 +211,21 @@ mod tests;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
+pub use crate::substrate::{
+    ContentResolver, PerDepthScores, Substrate, SubstrateRead, SubstrateWrite, TurnScores,
+};
 pub use builder::Builder;
 pub use error::ConstructionError;
 pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,
     TurnIndex, TurnKey,
 };
-pub use project::{Projection, ProjectionMode, ProjectionTarget, ResolvedSection, ResolvedTurn};
+pub use project::{
+    GeneratedIdentity, Projection, ProjectionMode, ProjectionSegment, ProjectionTarget,
+    ResolvedSection, ResolvedTurn, SealedKind,
+};
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};
-pub use crate::substrate::{
-    ContentResolver, PerDepthScores, Substrate, SubstrateRead, SubstrateWrite, TurnScores,
-};
 pub use schema::{
     Budget, DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection,
     SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema,

@@ -97,12 +97,12 @@ use std::collections::HashMap;
 
 use super::ids::{GroupId, LayerId, SectionId, TurnId, TurnIndex};
 use super::reconcile::{flexbox_distribute, FlexItem};
-use crate::substrate::ContentResolver;
 use super::schema::{
-    DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema, ScoreFormula,
+    DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem,
 };
 use super::selection::apply_selection;
+use crate::substrate::ContentResolver;
 
 /// Fixed scoring formula used for all turn scoring and section selection.
 /// Calibrated against real Qwen3-30B-A3B Q-vector data; span α=2.0 with
@@ -198,15 +198,93 @@ impl ResolvedTurn {
     }
 }
 
+/// One position in the projection.
+///
+/// Three shapes — sealed (substrate-pinned), generated (live-prefilled
+/// structural template), and new-user-message (this turn's user input
+/// captured into the slot's pending-user-part buffer).  The assembler
+/// walks a `Vec<ProjectionSegment>` in declaration order and routes
+/// each variant to its inject path.
+///
+/// All three carry their token payloads behind an [`Arc`] so the
+/// segment list is cheap to clone across the LCP comparison + rebuild
+/// path the assembler performs on every reprojection.
+#[derive(Debug, Clone)]
+pub enum ProjectionSegment {
+    /// Substrate-pinned K/V — Arc-cloned onto the slot.
+    Sealed(SealedKind),
+    /// Live-prefilled structural template tokens (role markers, block
+    /// envelopes) whose K/V is computed under the current runtime left
+    /// context and cached on the slot rather than stored in the
+    /// substrate.
+    Generated {
+        tokens: std::sync::Arc<Vec<u32>>,
+        identity: GeneratedIdentity,
+    },
+    /// The user message being submitted this turn.  Prefilled onto the
+    /// slot and captured into the slot's pending-user-part buffer;
+    /// committed to the substrate at seal time as one half of the
+    /// resulting turn record.
+    NewUserMessage { tokens: std::sync::Arc<Vec<u32>> },
+}
+
+/// Discriminator under [`ProjectionSegment::Sealed`] — distinguishes a
+/// system-prompt section from a turn entry.  Reuses the existing
+/// [`ResolvedSection`] / [`ResolvedTurn`] payloads so this is a
+/// representation rebracket, not a parallel id family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealedKind {
+    Section(ResolvedSection),
+    Turn(ResolvedTurn),
+}
+
+/// Diagnostic identity for a [`ProjectionSegment::Generated`] run.
+///
+/// Not part of the live-prefill cache key (the rolling-hash plus
+/// run-tokens carries that); used only for log messages and progress
+/// traces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedIdentity {
+    /// Schema-level name for logs (e.g. `"system_open"`,
+    /// `"tools_close"`).
+    pub name: String,
+    /// Monotonic position in the projection's segment list, assigned
+    /// at emit time.  Stable across same-shape reprojections so it can
+    /// serve as an LCP tie-breaker even when two runs happen to share
+    /// the same surface text.
+    pub position: usize,
+}
+
 /// Result of a [`super::Builder::project`] call.
 ///
-/// `system_prompt` is in declaration order. `turns` is in (layer order ×
-/// ascending-group-score × turn insertion order) — see step 12 of the
-/// pipeline above.
-#[derive(Debug, Clone)]
+/// Segments emit in (system-prompt items, declaration order) followed
+/// by (turns: layer order × ascending-group-score × turn insertion
+/// order).  Sealed segments interleave with Generated runs around
+/// every turn-boundary template and around any structural template
+/// items declared in the system prompt.
+#[derive(Debug, Clone, Default)]
 pub struct Projection {
-    pub system_prompt: Vec<ResolvedSection>,
-    pub turns: Vec<ResolvedTurn>,
+    pub segments: Vec<ProjectionSegment>,
+}
+
+impl Projection {
+    /// Iter over only the sealed-section payloads, in emission order.
+    /// Convenience over walking [`Self::segments`] manually; skips
+    /// generated runs and new-user-message segments.
+    pub fn sealed_sections(&self) -> impl Iterator<Item = &ResolvedSection> + '_ {
+        self.segments.iter().filter_map(|seg| match seg {
+            ProjectionSegment::Sealed(SealedKind::Section(s)) => Some(s),
+            _ => None,
+        })
+    }
+
+    /// Iter over only the sealed-turn payloads, in emission order.
+    pub fn sealed_turns(&self) -> impl Iterator<Item = &ResolvedTurn> + '_ {
+        self.segments.iter().filter_map(|seg| match seg {
+            ProjectionSegment::Sealed(SealedKind::Turn(t)) => Some(t),
+            _ => None,
+        })
+    }
 }
 
 /// Identifies which layer and which group inside that layer the projection
@@ -300,8 +378,13 @@ pub fn run<R: ContentResolver>(
             let tc = |idx: TurnIndex| resolver.turn_token_count(group.id, idx);
 
             // Unbounded selection (no budget constraint yet).
-            let selected_indices =
-                apply_selection(&group.selection, group.score_threshold, &all_turns, None, &tc);
+            let selected_indices = apply_selection(
+                &group.selection,
+                group.score_threshold,
+                &all_turns,
+                None,
+                &tc,
+            );
 
             let selected: Vec<(TurnIndex, f32)> = selected_indices
                 .iter()
@@ -382,8 +465,10 @@ pub fn run<R: ContentResolver>(
 
     if group_states.is_empty() {
         return Projection {
-            system_prompt: system_prompt_sections,
-            turns: vec![],
+            segments: system_prompt_sections
+                .into_iter()
+                .map(|s| ProjectionSegment::Sealed(SealedKind::Section(s)))
+                .collect(),
         };
     }
 
@@ -510,7 +595,13 @@ pub fn run<R: ContentResolver>(
             // Turns for this group in insertion order.
             let mut group_turns: Vec<TurnIndex> = final_selected
                 .iter()
-                .filter_map(|(gid, idx)| if *gid == gs.schema.id { Some(*idx) } else { None })
+                .filter_map(|(gid, idx)| {
+                    if *gid == gs.schema.id {
+                        Some(*idx)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             group_turns.sort();
 
@@ -532,10 +623,19 @@ pub fn run<R: ContentResolver>(
         }
     }
 
-    Projection {
-        system_prompt: system_prompt_sections,
-        turns,
-    }
+    let mut segments: Vec<ProjectionSegment> =
+        Vec::with_capacity(system_prompt_sections.len() + turns.len());
+    segments.extend(
+        system_prompt_sections
+            .into_iter()
+            .map(|s| ProjectionSegment::Sealed(SealedKind::Section(s))),
+    );
+    segments.extend(
+        turns
+            .into_iter()
+            .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t))),
+    );
+    Projection { segments }
 }
 
 /// Walk a layer's `system_prompt.items` in declaration order, emitting
@@ -648,7 +748,9 @@ fn select_collection_sections<R: ContentResolver>(
                 .collect();
             if tracing::enabled!(tracing::Level::TRACE) {
                 let mut by_score = all_scored.clone();
-                by_score.sort_by(|(_, _, a), (_, _, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                by_score.sort_by(|(_, _, a), (_, _, b)| {
+                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let scores_str = by_score
                     .iter()
                     .map(|(_, s, sc)| format!("{}={:.1}", s.name, sc))
@@ -663,14 +765,16 @@ fn select_collection_sections<R: ContentResolver>(
             }
             let mut scored: Vec<(usize, &SectionSchema, f32)> = all_scored
                 .into_iter()
-                .filter(|(_, _, score)| {
-                    !scoring.apply_threshold || *score >= coll.score_threshold
-                })
+                .filter(|(_, _, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
                 .collect();
             scored.sort_by(|(ai, a, asc), (bi, b, bsc)| {
                 bsc.partial_cmp(asc)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(b.priority.partial_cmp(&a.priority).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(
+                        b.priority
+                            .partial_cmp(&a.priority)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
                     .then(ai.cmp(bi))
             });
             scored.truncate(*k);
@@ -698,7 +802,11 @@ fn select_collection_sections<R: ContentResolver>(
             .max_by(|(a, asc), (b, bsc)| {
                 asc.partial_cmp(bsc)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.priority.partial_cmp(&b.priority).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(
+                        a.priority
+                            .partial_cmp(&b.priority)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
             })
             .map(|(s, _)| vec![ResolvedSection { id: s.id }])
             .unwrap_or_default(),
@@ -712,4 +820,3 @@ fn select_collection_sections<R: ContentResolver>(
         }
     }
 }
-

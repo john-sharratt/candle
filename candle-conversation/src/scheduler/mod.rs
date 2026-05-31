@@ -4,6 +4,7 @@
 //! Phase 1 uses single-mode prefill (no small/large split).
 mod decode;
 mod prefill;
+mod projection_assembler;
 mod run;
 mod sample;
 
@@ -43,9 +44,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-// ────────────────────────────────────────────────────────────────────────────
+// ————————————————————————————————————————————————————————————————————————————
 // Scheduler request types (sent from caller threads)
-// ────────────────────────────────────────────────────────────────────────────
+// ————————————————————————————————————————————————————————————————————————————
 
 /// Requests sent from caller threads to the scheduler.
 pub(crate) enum SchedulerRequest {
@@ -348,7 +349,7 @@ pub(crate) struct ReprojectionPolicy {
     /// re-orients at semantic transition points rather than waiting
     /// for the next fixed-cadence trigger.
     pub(crate) trigger_token_ids: Arc<Vec<u32>>,
-    /// Span α for the BDP scanner.  Must match the α in `FIXED_FORMULA` so
+    /// Span Î± for the BDP scanner.  Must match the Î± in `FIXED_FORMULA` so
     /// scores produced during reprojection are consistent with the scores the
     /// projection engine reads when computing group scores.
     pub(crate) span_alpha: f32,
@@ -365,9 +366,9 @@ pub(crate) struct ProjectionInputs {
     pub projection: Arc<Builder>,
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ————————————————————————————————————————————————————————————————————————————
 // Internal state
-// ────────────────────────────────────────────────────────────────────────────
+// ————————————————————————————————————————————————————————————————————————————
 
 /// Per-sequence state while actively generating tokens.
 struct DecodeState {
@@ -543,9 +544,9 @@ pub(super) struct ActiveSectionIngest {
     pub(super) error: Option<ConversationError>,
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ————————————————————————————————————————————————————————————————————————————
 // Scheduler
-// ────────────────────────────────────────────────────────────────────────────
+// ————————————————————————————————————————————————————————————————————————————
 
 /// The scheduler: single thread that owns all GPU resources.
 ///
@@ -663,6 +664,13 @@ pub(crate) struct Scheduler {
     /// emit is compiled out — recording cost is zero in production
     /// builds.
     slot_tokens: HashMap<SequenceId, Vec<u32>>,
+
+    /// Per-slot projection-assembler state — the last applied segment
+    /// list + per-segment block count.  Consulted by
+    /// [`Self::apply_projection`]'s LCP-truncate path so successive
+    /// reprojections only inject the diverging suffix.  Cleared on
+    /// `FreeSequence`.
+    slot_projection_state: HashMap<SequenceId, projection_assembler::SlotProjectionState>,
 
     /// Workspace-shared provenance signature file.  All seals across
     /// all slots append into this same mmap-backed file.
@@ -812,6 +820,7 @@ impl Scheduler {
             turn_views: HashMap::new(),
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
+            slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
             persist_trigger,
             elevate_pinned_scratch: preallocate_pinned_scratch(
@@ -846,7 +855,7 @@ impl Scheduler {
         }
     }
 
-    // ── Submission handling ─────────────────────────────────────────────
+    // —— Submission handling —————————————————————————————————————————————
 
     /// Drain all pending submissions. Returns `false` if shutdown requested.
     fn drain_submissions(&mut self) -> bool {
@@ -942,7 +951,7 @@ impl Scheduler {
                 // so the resolved `timeline` for each `(g, t)` pair
                 // doesn't get thrown away.
                 let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
-                let (projected_sections, projected_turns) = if let (Some(inputs), Some(target)) =
+                let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) =
                     (projection_inputs.as_ref(), slot_target)
                 {
                     let conversation = match self.slot_conversations.get(&parent_id) {
@@ -976,20 +985,18 @@ impl Scheduler {
                     // the schema fragments) has been removed; the
                     // schema items now compose the full system
                     // prompt on their own.
-                    let mut sections: Vec<SectionId> =
-                        Vec::with_capacity(projection.system_prompt.len());
-                    for sec in &projection.system_prompt {
-                        if view.section_sealed_of(sec.id).is_some() {
-                            sections.push(sec.id);
-                        }
-                    }
-                    // Translate each projected (group, idx) to its
-                    // owning timeline before checking for sealed
-                    // bytes. For the target's own group route via
-                    // `target.timeline`; for other groups fall back
-                    // to first-of-group (a Phase-1 single-timeline
-                    // assumption that holds for cross-group
-                    // references in our current schema).
+                    // Single walk of `projection.segments` builds three
+                    // outputs:
+                    //   - `projected_sections` / `turn_keys_for_elevate`
+                    //     feed `elevate_to_hot` (per-id form expected
+                    //     by the persistence API).
+                    //   - `segments` carries the same items in
+                    //     declaration order for `apply_projection`.
+                    // For the target's own group route via
+                    // `target.timeline`; for other groups fall back to
+                    // first-of-group (a Phase-1 single-timeline
+                    // assumption that holds for cross-group references
+                    // in our current schema).
                     let resolve_timeline = |g: GroupId| -> Option<crate::projection::TimelineId> {
                         if g == target.group {
                             Some(target.timeline)
@@ -997,29 +1004,44 @@ impl Scheduler {
                             view.timelines_for_group(g).next()
                         }
                     };
-                    let turns: Vec<(GroupId, TurnIndex)> = projection
-                        .turns
-                        .iter()
-                        .filter_map(|resolved| {
-                            let g = resolved.group();
-                            let t = resolved.index();
-                            let timeline = resolve_timeline(g)?;
-                            // Include any tracked turn, regardless of
-                            // which tier holds its KV right now. Cold-
-                            // marker turns (post-restart, before this
-                            // submit's elevate_to_hot runs) must
-                            // survive the filter — `elevate_to_hot`
-                            // below is precisely what brings them into
-                            // hot. Filtering on `turn_sealed_of` here
-                            // would silently drop every resumed-from-
-                            // disk turn from the projection because
-                            // `hot` is None until elevation lands.
-                            view.turn_tier_state(timeline, t)?;
-                            turn_keys_for_elevate.push(TurnKey::new(timeline, t));
-                            Some((g, t))
-                        })
-                        .collect();
-                    (sections, turns)
+                    let mut sections: Vec<SectionId> = Vec::new();
+                    let mut segments: Vec<crate::projection::ProjectionSegment> = Vec::new();
+                    use crate::projection::{ProjectionSegment, SealedKind};
+                    for seg in &projection.segments {
+                        match seg {
+                            ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                                if view.section_sealed_of(rs.id).is_some() {
+                                    sections.push(rs.id);
+                                    segments.push(seg.clone());
+                                }
+                            }
+                            ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+                                let g = rt.group();
+                                let t = rt.index();
+                                let Some(timeline) = resolve_timeline(g) else {
+                                    continue;
+                                };
+                                // Include any tracked turn regardless
+                                // of tier — cold-marker turns must
+                                // survive this filter; `elevate_to_hot`
+                                // below brings them into hot before
+                                // apply_projection runs.
+                                if view.turn_tier_state(timeline, t).is_some() {
+                                    turn_keys_for_elevate.push(TurnKey::new(timeline, t));
+                                    segments.push(seg.clone());
+                                }
+                            }
+                            ProjectionSegment::Generated { .. }
+                            | ProjectionSegment::NewUserMessage { .. } => {
+                                // Live-prefill runs and new-user-message
+                                // captures don't need an elevate side-list
+                                // entry — their K/V is produced on the
+                                // slot, not loaded from the substrate.
+                                segments.push(seg.clone());
+                            }
+                        }
+                    }
+                    (sections, segments)
                 } else {
                     (Vec::new(), Vec::new())
                 };
@@ -1102,12 +1124,8 @@ impl Scheduler {
                     }
                 }
 
-                if let Err(e) = self.apply_projection(
-                    parent_id,
-                    BlockCount(0),
-                    &projected_sections,
-                    &projected_turns,
-                ) {
+                if let Err(e) = self.apply_projection(parent_id, BlockCount(0), &projected_segments)
+                {
                     let _ = event_tx.send(TurnEvent::Error(e));
                     return true;
                 }
@@ -1197,6 +1215,7 @@ impl Scheduler {
                 self.slot_conversations.remove(&sequence_id);
                 self.slot_targets.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
+                self.slot_projection_state.remove(&sequence_id);
                 self.slot_sig_blocks_processed.remove(&sequence_id);
                 true
             }
@@ -1283,7 +1302,14 @@ impl Scheduler {
                 let result = if section_ids.is_empty() {
                     Ok(())
                 } else {
-                    self.apply_projection(sequence_id, BlockCount(0), &section_ids, &[])
+                    use crate::projection::{ProjectionSegment, ResolvedSection, SealedKind};
+                    let segments: Vec<ProjectionSegment> = section_ids
+                        .iter()
+                        .map(|&id| {
+                            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }))
+                        })
+                        .collect();
+                    self.apply_projection(sequence_id, BlockCount(0), &segments)
                 };
                 let _ = response_tx.send(result);
                 true
@@ -1305,7 +1331,7 @@ impl Scheduler {
         }
     }
 
-    // ── Sequence creation ──────────────────────────────────────────
+    // —— Sequence creation ——————————————————————————————————————————
 
     /// Allocate a fresh empty GPU slot bound to a `Conversation`
     /// (workspace) and an optional projection target.
@@ -1385,7 +1411,7 @@ impl Scheduler {
         }));
     }
 
-    // ── Projection helpers ───────────────────────────────────────────
+    // —— Projection helpers ———————————————————————————————————————————
 
     /// Write the per-turn projection onto `parent_id`.
     ///
@@ -1422,68 +1448,10 @@ impl Scheduler {
         &mut self,
         parent_id: SequenceId,
         system_block_count: BlockCount,
-        projected_sections: &[SectionId],
-        projected_turns: &[(GroupId, TurnIndex)],
+        segments: &[crate::projection::ProjectionSegment],
     ) -> Result<(), ConversationError> {
-        // Stateless rebuild model: the slot's prefix is always the
-        // current projection — `[projected_sections ++ projected_turns]`
-        // — re-fetched from substrate residences on every call. Any
-        // in-flight decode chunks ([writer_start_idx..end)) are
-        // preserved across the rebuild so a mid-turn reprojection
-        // doesn't drop the user's tokens. The substrate residence is
-        // the single source of truth for the prefix's contents and
-        // format; the slot's chunks are a transient view of it.
         let _ = system_block_count;
 
-        // Snapshot any writer-owned tail (work-in-progress decode
-        // chunks). At turn-submit boundaries this is empty; mid-turn
-        // reprojection paths have a non-empty tail that must survive
-        // the prefix rewrite. The snapshot holds RAII refs that keep
-        // the underlying arena chunks alive across the truncate.
-        let tail_per_layer: Vec<candle_nn::kv_cache::WriterTail> = {
-            let mut out: Vec<candle_nn::kv_cache::WriterTail> =
-                Vec::with_capacity(self.session.backings().len());
-            for backing in self.session.backings() {
-                out.push(
-                    backing
-                        .split_off_writer_tail(parent_id.0)
-                        .map_err(ConversationError::Model)?,
-                );
-            }
-            out
-        };
-
-        // Reset the slot to empty. Borrowed prefix chunks drop their
-        // Arc refs (residence keeps them alive); the tail snapshot
-        // above keeps its chunks alive independently.
-        self.session
-            .truncate_sequence_to_blocks(parent_id.0, 0)
-            .map_err(ConversationError::Model)?;
-
-        if projected_sections.is_empty() && projected_turns.is_empty() {
-            // Nothing to inject — just restore the tail (if any) and return.
-            for (backing, tail) in self.session.backings().iter().zip(tail_per_layer) {
-                backing
-                    .extend_writer_tail(parent_id.0, tail)
-                    .map_err(ConversationError::Model)?;
-            }
-            return Ok(());
-        }
-
-        let n_layers = self.session.num_layers();
-
-        // Identifies which substrate entry contributed each unit's
-        // chunks to the concatenated injection — used to patch
-        // `block_range` in the substrate after inject so
-        // `reproject_view`'s lookups resolve to the new parent layout.
-        enum InjectedUnit {
-            Section(SectionId),
-            Turn(GroupId, TurnIndex),
-        }
-
-        // Resolve the conversation handle bound to this slot — every
-        // substrate read in this method goes through it so multi-
-        // workspace setups read from the right store.
         let conversation = self
             .slot_conversations
             .get(&parent_id)
@@ -1493,230 +1461,25 @@ impl Scheduler {
                     "apply_projection: no conversation registered for slot {parent_id}"
                 ))
             })?;
-
-        // Gather per-unit per-layer sealed sequences in injection
-        // order: sections first, then turns. Each `SealedSequence`
-        // is a vector of windowed `SealedChunk`s (any may be partial
-        // — sharing the underlying physical chunk with the writer is
-        // safe because windows assert only the bytes they cover).
-        //
-        // The working set has already been brought into VRAM by
-        // `elevate_to_hot` ahead of this call (§Step 1.5 in the
-        // SubmitTurn handler); these lookups just pull the
-        // residence's hot bytes out of the substrate. Any item the
-        // elevator missed will surface as `None` here and gets
-        // skipped — the elevate report's `missing` / `failed`
-        // counters are where to look if turns silently drop.
-        //
-        // Pull the slot's target so we resolve `g == target.group` to
-        // `target.timeline` rather than the first-registered timeline
-        // (which is base_conv's empty timeline and would silently drop
-        // every projected turn).
         let slot_target = self.slot_targets.get(&parent_id).copied();
-        let mut section_list: Vec<SectionId> = Vec::with_capacity(projected_sections.len());
-        let mut turn_list: Vec<(GroupId, TurnIndex, crate::projection::TimelineId)> =
-            Vec::with_capacity(projected_turns.len());
-        {
-            let view = conversation.read();
-            for &sid in projected_sections {
-                if view.section_sealed_of(sid).is_some() {
-                    section_list.push(sid);
-                }
-            }
-            for &(g, t) in projected_turns {
-                // Same target-aware lookup as the SubmitTurn handler
-                // uses when assembling `projected_turns`.
-                let timeline = match slot_target {
-                    Some(tgt) if g == tgt.group => Some(tgt.timeline),
-                    _ => view.timelines_for_group(g).next(),
-                };
-                if let Some(timeline) = timeline {
-                    if view.turn_sealed_of(timeline, t).is_some() {
-                        turn_list.push((g, t, timeline));
-                    }
-                }
-            }
-        }
-        tracing::debug!(
-            slot = parent_id.0,
-            section_list = section_list.len(),
-            turn_list = turn_list.len(),
-            "apply_projection materialisation list",
-        );
-        let mut units: Vec<(InjectedUnit, Arc<Vec<SealedSequence>>)> =
-            Vec::with_capacity(section_list.len() + turn_list.len());
-        for sid in section_list {
-            if let Some(s) = Self::hot_section_or_skip(&conversation, sid) {
-                units.push((InjectedUnit::Section(sid), s));
-            } else {
-                tracing::warn!(
-                    target: "candle_conversation::persistence::tier",
-                    section = sid.raw(),
-                    slot = parent_id.0,
-                    "apply_projection: section not hot — elevate missed it; skipping borrow"
-                );
-            }
-        }
-        for (g, t, timeline) in turn_list {
-            if let Some(s) = Self::hot_turn_or_skip(&conversation, timeline, t) {
-                units.push((InjectedUnit::Turn(g, t), s));
-            } else {
-                tracing::warn!(
-                    target: "candle_conversation::persistence::tier",
-                    timeline = timeline.raw(),
-                    turn = t.0,
-                    slot = parent_id.0,
-                    "apply_projection: turn not hot — elevate missed it; skipping borrow"
-                );
-            }
-        }
-        if units.is_empty() {
-            return Ok(());
-        }
+        let state = self
+            .slot_projection_state
+            .entry(parent_id)
+            .or_insert_with(projection_assembler::SlotProjectionState::new);
 
-        // Concatenate per-layer + remember each unit's block extent
-        // so we can patch substrate `block_range` entries after
-        // inject.
-        let chunk_size = self.chunk_size;
-        let mut per_layer_chunks: Vec<Vec<candle_nn::kv_cache::SealedChunk>> =
-            (0..n_layers).map(|_| Vec::new()).collect();
-        let mut per_layer_token_count: Vec<usize> = vec![0; n_layers];
-        let mut unit_extents: Vec<(InjectedUnit, usize)> = Vec::with_capacity(units.len());
-        for (unit, sealed) in units {
-            if sealed.len() != n_layers {
-                tracing::warn!(
-                    "apply_projection: unit has {} layers, expected {}; skipping",
-                    sealed.len(),
-                    n_layers
-                );
-                continue;
-            }
-            // Layer 0's block count is the canonical extent (every
-            // layer's chunk count matches for a well-formed sealed
-            // entry).
-            let block_count = sealed[0].chunks.len();
-            for layer_idx in 0..n_layers {
-                let layer_seq = &sealed[layer_idx];
-                per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
-                per_layer_token_count[layer_idx] += layer_seq.token_count;
-            }
-            unit_extents.push((unit, block_count));
-        }
-        let gpu_per_layer: Vec<SealedSequence> = per_layer_chunks
-            .into_iter()
-            .zip(per_layer_token_count.into_iter())
-            .map(|(chunks, tokens)| SealedSequence {
-                chunks,
-                token_count: tokens,
-                chunk_size,
-                location: candle_nn::kv_cache::ArenaLocation::Gpu,
-            })
-            .collect();
-
-        let (start_block, _end_block) = self
-            .session
-            .inject_sealed_at_tail(parent_id.0, &gpu_per_layer)
-            .map_err(ConversationError::Model)?;
-
-        // Record each injected unit's `(start, end)` block range in
-        // the substrate so `reproject_view`'s `block_range_of`
-        // lookups resolve against the current parent layout.  Also
-        // mirror each unit's token IDs into the slot's diagnostic
-        // log so the turn-complete dump can reconstruct the exact
-        // context the kernel saw.
-        let mut injected_tokens: Vec<u32> = Vec::new();
-        // Per-unit injection log (unit description + decoded text +
-        // token count).  Built inside the same view borrow so we get
-        // a consistent snapshot of what projection actually picked,
-        // and emitted afterwards so the trace fires whether or not
-        // any single decode succeeds.
-        {
-            let mut view = conversation.write();
-            let mut cursor = start_block;
-            for (unit, block_count) in unit_extents {
-                let next = cursor + block_count;
-                match unit {
-                    InjectedUnit::Section(sid) => {
-                        view.set_section_block_range(sid, cursor as u64, next as u64);
-                        let toks = view.section_tokens_of(sid);
-                        #[cfg(feature = "context-dump")]
-                        if tracing::enabled!(
-                            target: "candle_conversation::scheduler::projection_dump",
-                            tracing::Level::INFO,
-                        ) {
-                            let decoded = self
-                                .tokenizer
-                                .decode(&toks, false)
-                                .unwrap_or_else(|e| format!("<decode error: {e}>"));
-                            tracing::info!(
-                                target: "candle_conversation::scheduler::projection_dump",
-                                slot = parent_id.0,
-                                label = %format!("Section({sid:?})"),
-                                token_count = toks.len(),
-                                "{decoded}\n---"
-                            );
-                        }
-                        injected_tokens.extend_from_slice(&toks);
-                    }
-                    InjectedUnit::Turn(g, t) => {
-                        // Resolve the timeline before reborrowing `view`
-                        // mutably for `set_block_range`.
-                        let timeline = view.timelines_for_group(g).next();
-                        if let Some(timeline) = timeline {
-                            view.set_block_range(timeline, t, cursor as u64, next as u64);
-                            let toks = view.token_ids_of(timeline, t).to_vec();
-                            #[cfg(feature = "context-dump")]
-                            if tracing::enabled!(
-                                target: "candle_conversation::scheduler::projection_dump",
-                                tracing::Level::INFO,
-                            ) {
-                                let decoded = self
-                                    .tokenizer
-                                    .decode(&toks, false)
-                                    .unwrap_or_else(|e| format!("<decode error: {e}>"));
-                                tracing::info!(
-                                    target: "candle_conversation::scheduler::projection_dump",
-                                    slot = parent_id.0,
-                                    label = %format!("Turn(group={g:?}, index={t:?})"),
-                                    token_count = toks.len(),
-                                    "{decoded}\n---"
-                                );
-                            }
-                            injected_tokens.extend_from_slice(&toks);
-                        }
-                    }
-                }
-                cursor = next;
-            }
-        }
-        #[cfg(feature = "context-dump")]
-        if tracing::enabled!(
-            target: "candle_conversation::scheduler::projection_dump",
-            tracing::Level::INFO,
-        ) {
-            tracing::info!(
-                target: "candle_conversation::scheduler::projection_dump",
-                slot = parent_id.0,
-                total_tokens = injected_tokens.len(),
-                "=== apply_projection injection order complete ==="
-            );
-        }
-        Self::record_slot_tokens(&mut self.slot_tokens, parent_id, &injected_tokens);
-
-        // Restore the writer-owned tail snapshot taken at the top of
-        // this function. The prefix is now the new projection; the
-        // tail picks up where it left off. RoPE is derived from
-        // cumulative usage at decode-sync time, so the kernel will
-        // re-rotate the tail's tokens against their new absolute
-        // positions automatically — no byte copy or re-encoding
-        // needed (see `SealedChunk`'s position-agnostic doc).
-        for (backing, tail) in self.session.backings().iter().zip(tail_per_layer) {
-            backing
-                .extend_writer_tail(parent_id.0, tail)
-                .map_err(ConversationError::Model)?;
-        }
-
-        Ok(())
+        projection_assembler::apply_segments(
+            state,
+            projection_assembler::ApplyContext {
+                session: &mut self.session,
+                conversation: &conversation,
+                slot_target,
+                parent_id,
+                chunk_size: self.chunk_size,
+                tokenizer: &self.tokenizer,
+                slot_tokens: &mut self.slot_tokens,
+            },
+            segments,
+        )
     }
 
     /// (Dead code, retained for future use; rewritten to take a
@@ -1799,7 +1562,7 @@ impl Scheduler {
         Ok(new_seq_id)
     }
 
-    // ── Cleanup ────────────────────────────────────────────────────────
+    // —— Cleanup ————————————————————————————————————————————————————————
 
     /// Remove finished sequences and send `Done` events.
     fn cleanup_finished(&mut self) {
@@ -2345,7 +2108,7 @@ impl Scheduler {
                 } = turn_content.unwrap_or_default();
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
                 // Snapshot what the resume path needs before the substrate
-                // consumes `delta_gpu` / `token_ids` (§16.12 seal-time gather).
+                // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
 
                 let idx = conversation
@@ -2455,19 +2218,8 @@ impl Scheduler {
         conversation.read().turn_sealed_of(timeline, index)
     }
 
-    /// Section-side counterpart. Sections are pinned at conversation
-    /// setup and the elevate path keeps them hot; a `None` return
-    /// means either the section isn't registered or elevation hasn't
-    /// run yet for this slot.
-    fn hot_section_or_skip(
-        conversation: &Conversation,
-        section: crate::projection::SectionId,
-    ) -> Option<Arc<Vec<SealedSequence>>> {
-        conversation.read().section_sealed_of(section)
-    }
-
     /// Rebuild the workspace substrate from the persistence redo log on
-    /// daemon startup (§16.12 substrate reload).
+    /// daemon startup (Â§16.12 substrate reload).
     ///
     /// **Cold-only restart.** Every persisted turn stream is recovered in
     /// `(timeline, turn_index)` order; for each, tokens + BDP signatures
@@ -2522,7 +2274,7 @@ impl Scheduler {
         }
     }
 
-    // ── Raw KVQ extraction ────────────────────────────────────────────
+    // —— Raw KVQ extraction ————————————————————————————————————————————
 
     /// Extract raw K/V/Q float data for multiple layer indices.
     ///
@@ -2547,7 +2299,7 @@ impl Scheduler {
             .collect()
     }
 
-    // ── Provenance signature extraction ───────────────────────────────
+    // —— Provenance signature extraction ———————————————————————————————
 
     /// Dual-layer multi-head variant for MH_XOR_QQ_l0xl4.
     ///
@@ -2900,7 +2652,7 @@ impl Scheduler {
 
         // 2. Gather live Q from a NARROW block range covering only the probe window.
         //    The fast path (CUDA) launches one kernel per layer and does a single
-        //    DtoH copy, replacing O(n_head × N_PALETTE × n_blocks) memcpy_dtov stalls.
+        //    DtoH copy, replacing O(n_head Ã— N_PALETTE Ã— n_blocks) memcpy_dtov stalls.
         let t_probe = Instant::now();
         let block_lo = probe_lo / self.chunk_size;
         let block_hi = probe_hi.div_ceil(self.chunk_size);
@@ -3050,7 +2802,7 @@ impl Scheduler {
             return Ok(view_id);
         }
 
-        // ── Trace-only validation: probe health + section corpus health ────────
+        // —— Trace-only validation: probe health + section corpus health ————————
         if tracing::enabled!(tracing::Level::TRACE) {
             // Probe stats
             let probe_n = probe_syn.len();
@@ -3131,7 +2883,7 @@ impl Scheduler {
 
         // Build a transient per-projection scores cache from the scanner
         // output. This lives on the stack for the duration of the
-        // re-projection; it is never stored in the substrate (§Phase-3
+        // re-projection; it is never stored in the substrate (Â§Phase-3
         // BDP: scores are projection-local, not session-persistent).
         let projection_scores = scanner.to_projection_scores();
         let scan_ms = t_scan.elapsed().as_millis() as u64;
@@ -3149,7 +2901,7 @@ impl Scheduler {
         })?;
         let parent_id = view_state.parent_id;
         let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
-        let (projected_sections, projected_turns): (Vec<SectionId>, Vec<(GroupId, TurnIndex)>) = {
+        let (projected_sections, projected_segments) = {
             let view = policy
                 .substrate
                 .read_for_scored(policy.target, &projection_scores);
@@ -3160,28 +2912,36 @@ impl Scheduler {
                 policy
                     .projection
                     .project_with_mode(policy.target, &view, ProjectionMode::Prefill);
-            let mut sections: Vec<SectionId> = Vec::with_capacity(projection.system_prompt.len());
-            for sec in &projection.system_prompt {
-                if view.section_sealed_of(sec.id).is_some() {
-                    sections.push(sec.id);
+            // Walk segments once, populating both the elevate side-lists
+            // and the segment list `apply_projection` will diff against
+            // the slot's previous projection.
+            use crate::projection::{ProjectionSegment, SealedKind};
+            let mut sections: Vec<SectionId> = Vec::new();
+            let mut segments: Vec<ProjectionSegment> = Vec::new();
+            for seg in &projection.segments {
+                match seg {
+                    ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                        if view.section_sealed_of(rs.id).is_some() {
+                            sections.push(rs.id);
+                            segments.push(seg.clone());
+                        }
+                    }
+                    ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+                        let g = rt.group();
+                        let t = rt.index();
+                        let Some(timeline) = view.timelines_for_group(g).next() else {
+                            continue;
+                        };
+                        if view.turn_tier_state(timeline, t).is_some() {
+                            turn_keys_for_elevate.push(TurnKey::new(timeline, t));
+                            segments.push(seg.clone());
+                        }
+                    }
+                    ProjectionSegment::Generated { .. }
+                    | ProjectionSegment::NewUserMessage { .. } => {}
                 }
             }
-            let turns: Vec<(GroupId, TurnIndex)> = projection
-                .turns
-                .iter()
-                .filter_map(|resolved| {
-                    let g = resolved.group();
-                    let t = resolved.index();
-                    let timeline = view.timelines_for_group(g).next()?;
-                    // Tier-agnostic existence check (see comment at
-                    // the SubmitTurn site). Cold-marker turns must
-                    // pass — elevate_to_hot below will pull them up.
-                    view.turn_tier_state(timeline, t)?;
-                    turn_keys_for_elevate.push(TurnKey::new(timeline, t));
-                    Some((g, t))
-                })
-                .collect();
-            (sections, turns)
+            (sections, segments)
         };
         let project_ms = t_project.elapsed().as_millis() as u64;
         record_phase(t_project, "reproject_project");
@@ -3395,12 +3155,7 @@ impl Scheduler {
             }
         }
 
-        self.apply_projection(
-            parent_id,
-            BlockCount(0),
-            &projected_sections,
-            &projected_turns,
-        )?;
+        self.apply_projection(parent_id, BlockCount(0), &projected_segments)?;
         let new_prefix_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
 
         // Under the read-only projection model there's no COW prefix
@@ -3486,7 +3241,7 @@ impl Scheduler {
             project_ms,
             swap_ms,
             sections = projected_sections.len(),
-            turns = projected_turns.len(),
+            segments = projected_segments.len(),
             "reproject (zero-copy rebuild)",
         );
 
@@ -3494,9 +3249,9 @@ impl Scheduler {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// •••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
 // Scheduler dispatch unit tests
-// ═══════════════════════════════════════════════════════════════════════════
+// •••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
 //
 // These tests verify that `run_prefill_with_shift` dispatches to
 // `forward_batched_with_write_shifts` when shift ≠ 0, and to plain
@@ -3522,7 +3277,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
 
-    // ── Recording model ──────────────────────────────────────────────────────
+    // —— Recording model ——————————————————————————————————————————————————————
 
     #[derive(Clone)]
     struct RecordingModel {
@@ -3608,7 +3363,7 @@ mod tests {
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // —— Helpers ——————————————————————————————————————————————————————————————
 
     /// Minimal CPU-backed session: 1 layer, 1 KV head, head_dim=16.
     fn make_test_session() -> BatchedInferenceSession {
@@ -3678,7 +3433,7 @@ mod tests {
         (scheduler, tx)
     }
 
-    // ── Tests ────────────────────────────────────────────────────────────────
+    // —— Tests ————————————————————————————————————————————————————————————————
 
     /// `run_prefill_with_shift` with a non-zero shift must dispatch to
     /// `forward_batched_with_write_shifts` and carry the exact shift value.
@@ -3752,7 +3507,7 @@ mod tests {
         );
     }
 
-    // ── view-creation tests ─────────────────────────────────────────────────
+    // —— view-creation tests —————————————————————————————————————————————————
 
     /// Explicit `visible_block_ranges` over a populated parent must create a valid view.
     #[test]
@@ -3873,7 +3628,7 @@ mod tests {
         );
     }
 
-    // ── View swap tests ──────────────────────────────────────────────────────
+    // —— View swap tests ——————————————————————————————————————————————————————
     //
     // The previous `swap_view_with_new_ranges` mid-decode view-swap path
     // has been replaced by the zero-copy reproject rebuild in

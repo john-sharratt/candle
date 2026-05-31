@@ -195,11 +195,11 @@ enum YamlSystemPromptItem {
         #[serde(default)]
         depends_on: Option<String>,
     },
-    /// References a [`DialectTemplate`] catalog entry by snake-case name.
-    /// Resolves to the dialect's string at build time. At Phase 1 of the
-    /// generated-segments rollout the resolved content lands in a
-    /// `SectionSchema` with `is_template = true`; downstream behaviour is
-    /// identical to a `kind: section` item.
+    /// References a [`DialectTemplate`] catalog entry by snake-case
+    /// name.  Resolves to the dialect's string at build time and lands
+    /// in a `SectionSchema` with `is_template = true`, which the
+    /// projection assembler routes through live prefill rather than
+    /// the substrate-backed sealed path.
     Template {
         id: String,
         /// Catalog reference, e.g. `system_start`, `tool_block_open`,

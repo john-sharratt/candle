@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use candle_conversation::projection::{
-    Builder, GroupId, LayerId, ProjectionTarget, Projection, SectionId,
+    Builder, GroupId, LayerId, Projection, ProjectionTarget, SectionId,
 };
 use candle_conversation::provenance::{
     BdpScanner, ProvenanceFile, RawFileHeader, RawProvenanceFile, RawSigEntry, SigEntry, TokenHit,
     TokenSignature,
 };
 
-use crate::corpus::{CaseType, Manifest, RawManifest, TOOLS, projection_yaml_text, tool_stub};
+use crate::corpus::{projection_yaml_text, tool_stub, CaseType, Manifest, RawManifest, TOOLS};
 use crate::resolver::HarnessResolver;
 
 // ── SignatureStrategy ─────────────────────────────────────────────────────────
@@ -65,24 +65,34 @@ pub enum SignatureStrategy {
     /// which reduces single-token noise and better approximates sustained
     /// attention — a run of semantically similar queries averaging together
     /// strengthens the directional signal toward the relevant corpus token.
-    WindowMeanQ { window: usize, layer: usize, head: usize },
+    WindowMeanQ {
+        window: usize,
+        layer: usize,
+        head: usize,
+    },
 }
 
 impl SignatureStrategy {
     pub fn name(&self) -> String {
         match self {
-            Self::QQ { layer, head }         => format!("QQ_l{layer}_h{head}"),
-            Self::QK { layer, head }         => format!("QK_l{layer}_h{head}"),
-            Self::KK { layer, head }         => format!("KK_l{layer}_h{head}"),
-            Self::MultiHeadXorQQ { layer }               => format!("MH_XOR_QQ_l{layer}"),
-            Self::MultiHeadXorQQDual { layer_a, layer_b } => format!("MH_XOR_QQ_l{layer_a}xl{layer_b}"),
-            Self::MultiHeadXorQK { layer }               => format!("MH_XOR_QK_l{layer}"),
-            Self::FloatSimHash { layer, head }  => format!("SimHash_l{layer}_h{head}"),
-            Self::BandMeanQQ { head }            => format!("BandMeanQQ_h{head}"),
-            Self::BandMeanQK { head }            => format!("BandMeanQK_h{head}"),
-            Self::MultiHeadMeanQQ { layer }      => format!("MH_Mean_QQ_l{layer}"),
-            Self::MultiHeadMeanQK { layer }      => format!("MH_Mean_QK_l{layer}"),
-            Self::WindowMeanQ { window, layer, head } => format!("WinQ_w{window}_l{layer}_h{head}"),
+            Self::QQ { layer, head } => format!("QQ_l{layer}_h{head}"),
+            Self::QK { layer, head } => format!("QK_l{layer}_h{head}"),
+            Self::KK { layer, head } => format!("KK_l{layer}_h{head}"),
+            Self::MultiHeadXorQQ { layer } => format!("MH_XOR_QQ_l{layer}"),
+            Self::MultiHeadXorQQDual { layer_a, layer_b } => {
+                format!("MH_XOR_QQ_l{layer_a}xl{layer_b}")
+            }
+            Self::MultiHeadXorQK { layer } => format!("MH_XOR_QK_l{layer}"),
+            Self::FloatSimHash { layer, head } => format!("SimHash_l{layer}_h{head}"),
+            Self::BandMeanQQ { head } => format!("BandMeanQQ_h{head}"),
+            Self::BandMeanQK { head } => format!("BandMeanQK_h{head}"),
+            Self::MultiHeadMeanQQ { layer } => format!("MH_Mean_QQ_l{layer}"),
+            Self::MultiHeadMeanQK { layer } => format!("MH_Mean_QK_l{layer}"),
+            Self::WindowMeanQ {
+                window,
+                layer,
+                head,
+            } => format!("WinQ_w{window}_l{layer}_h{head}"),
         }
     }
 }
@@ -103,7 +113,11 @@ fn simhash_proj(n: usize) -> &'static [f32] {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
-                if state & 1 == 0 { 1.0f32 } else { -1.0f32 }
+                if state & 1 == 0 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
             })
             .collect()
     })
@@ -178,10 +192,12 @@ fn sig_for_token(
             TokenSignature::from_q_flat(buf)
         }
         SignatureStrategy::MultiHeadXorQQ { layer } => {
-            let vecs: Vec<Vec<f32>> = (0..n_heads).map(|h| {
-                read_kq_from_blob(header, blob, t, band, *layer, h, true, buf);
-                buf.clone()
-            }).collect();
+            let vecs: Vec<Vec<f32>> = (0..n_heads)
+                .map(|h| {
+                    read_kq_from_blob(header, blob, t, band, *layer, h, true, buf);
+                    buf.clone()
+                })
+                .collect();
             let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
             TokenSignature::from_q_multi(&refs)
         }
@@ -198,10 +214,12 @@ fn sig_for_token(
             TokenSignature::from_q_multi(&refs)
         }
         SignatureStrategy::MultiHeadXorQK { layer } => {
-            let vecs: Vec<Vec<f32>> = (0..n_heads).map(|h| {
-                read_kq_from_blob(header, blob, t, band, *layer, h, is_probe, buf);
-                buf.clone()
-            }).collect();
+            let vecs: Vec<Vec<f32>> = (0..n_heads)
+                .map(|h| {
+                    read_kq_from_blob(header, blob, t, band, *layer, h, is_probe, buf);
+                    buf.clone()
+                })
+                .collect();
             let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
             TokenSignature::from_q_multi(&refs)
         }
@@ -216,7 +234,10 @@ fn sig_for_token(
             buf.resize(hd, 0.0);
             for l in 0..nl {
                 let off = header.entry_offset(t, band, l, *head, true);
-                for d in 0..hd { buf[d] += f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap()); }
+                for d in 0..hd {
+                    buf[d] +=
+                        f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap());
+                }
             }
             TokenSignature::from_q_flat(buf)
         }
@@ -227,7 +248,10 @@ fn sig_for_token(
             buf.resize(hd, 0.0);
             for l in 0..nl {
                 let off = header.entry_offset(t, band, l, *head, is_probe);
-                for d in 0..hd { buf[d] += f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap()); }
+                for d in 0..hd {
+                    buf[d] +=
+                        f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap());
+                }
             }
             TokenSignature::from_q_flat(buf)
         }
@@ -237,7 +261,10 @@ fn sig_for_token(
             buf.resize(hd, 0.0);
             for h in 0..n_heads {
                 let off = header.entry_offset(t, band, *layer, h, true);
-                for d in 0..hd { buf[d] += f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap()); }
+                for d in 0..hd {
+                    buf[d] +=
+                        f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap());
+                }
             }
             TokenSignature::from_q_flat(buf)
         }
@@ -247,11 +274,18 @@ fn sig_for_token(
             buf.resize(hd, 0.0);
             for h in 0..n_heads {
                 let off = header.entry_offset(t, band, *layer, h, is_probe);
-                for d in 0..hd { buf[d] += f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap()); }
+                for d in 0..hd {
+                    buf[d] +=
+                        f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap());
+                }
             }
             TokenSignature::from_q_flat(buf)
         }
-        SignatureStrategy::WindowMeanQ { window, layer, head } => {
+        SignatureStrategy::WindowMeanQ {
+            window,
+            layer,
+            head,
+        } => {
             let hd = header.head_dim as usize;
             if is_probe {
                 let t_start = t.saturating_sub(*window);
@@ -260,7 +294,11 @@ fn sig_for_token(
                 buf.resize(hd, 0.0);
                 for ti in t_start..t_end {
                     let off = header.entry_offset(ti, band, *layer, *head, true);
-                    for d in 0..hd { buf[d] += f32::from_le_bytes(blob[off + d * 4..off + d * 4 + 4].try_into().unwrap()); }
+                    for d in 0..hd {
+                        buf[d] += f32::from_le_bytes(
+                            blob[off + d * 4..off + d * 4 + 4].try_into().unwrap(),
+                        );
+                    }
                 }
                 TokenSignature::from_q_flat(buf)
             } else {
@@ -299,7 +337,11 @@ fn compute_sigs(
     let mut buf = Vec::with_capacity(header.head_dim as usize);
     [0usize, 1, 2].map(|band| {
         (0..n_tok)
-            .map(|t| sig_for_token(header, blob, strategy, is_probe, t, n_tok, band, n_heads, &mut buf))
+            .map(|t| {
+                sig_for_token(
+                    header, blob, strategy, is_probe, t, n_tok, band, n_heads, &mut buf,
+                )
+            })
             .collect()
     })
 }
@@ -397,18 +439,17 @@ impl Harness {
         let mut tool_section_ids = HashMap::new();
         for &tool in TOOLS {
             let sid = builder
-                .add_section_to_collection(
-                    dialogue_layer,
-                    tools_coll,
-                    tool,
-                    tool_stub(tool),
-                    1.0,
-                )
+                .add_section_to_collection(dialogue_layer, tools_coll, tool, tool_stub(tool), 1.0)
                 .unwrap_or_else(|e| panic!("add_section_to_collection({tool}): {e}"));
             tool_section_ids.insert(tool.to_string(), sid);
         }
 
-        Self { builder, tool_section_ids, dialogue_layer, conv_group }
+        Self {
+            builder,
+            tool_section_ids,
+            dialogue_layer,
+            conv_group,
+        }
     }
 
     /// Build a `ProjectionTarget` for the dialogue / primary_conversation group.
@@ -445,7 +486,10 @@ impl Harness {
             .unwrap_or_else(|| panic!("probe scenario not found: {probe_id}"));
 
         let (probe_syn, probe_sem, probe_prag) = pf
-            .read_entry(SigEntry { byte_offset: probe.byte_offset, token_count: probe.token_count })
+            .read_entry(SigEntry {
+                byte_offset: probe.byte_offset,
+                token_count: probe.token_count,
+            })
             .expect("read probe sigs failed");
 
         let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS
@@ -460,7 +504,10 @@ impl Harness {
                             && s.case_type == CaseType::Positive
                             && s.id != probe_id
                     })
-                    .map(|s| SigEntry { byte_offset: s.byte_offset, token_count: s.token_count })
+                    .map(|s| SigEntry {
+                        byte_offset: s.byte_offset,
+                        token_count: s.token_count,
+                    })
                     .collect();
                 (sid, entries)
             })
@@ -496,10 +543,12 @@ impl Harness {
         resolver
             .section_scores
             .get(&sid)
-            .map(|s| if use_max {
-                (s.syn.max + s.sem.max + s.prag.max) / 3.0
-            } else {
-                (s.syn.mean + s.sem.mean + s.prag.mean) / 3.0
+            .map(|s| {
+                if use_max {
+                    (s.syn.max + s.sem.max + s.prag.max) / 3.0
+                } else {
+                    (s.syn.mean + s.sem.mean + s.prag.mean) / 3.0
+                }
             })
             .unwrap_or(0.0)
     }
@@ -514,8 +563,7 @@ impl Harness {
     /// Names of the tool sections that survived projection, sorted.
     pub fn emitted_tools<'a>(&'a self, projection: &Projection) -> Vec<&'a str> {
         let mut out: Vec<&str> = projection
-            .system_prompt
-            .iter()
+            .sealed_sections()
             .filter_map(|rs| {
                 self.tool_section_ids
                     .iter()
@@ -542,7 +590,10 @@ impl Harness {
             .unwrap_or_else(|| panic!("probe scenario not found: {probe_id}"));
 
         let (probe_syn, probe_sem, probe_prag) = pf
-            .read_entry(SigEntry { byte_offset: probe.byte_offset, token_count: probe.token_count })
+            .read_entry(SigEntry {
+                byte_offset: probe.byte_offset,
+                token_count: probe.token_count,
+            })
             .expect("read probe sigs failed");
 
         let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS
@@ -557,7 +608,10 @@ impl Harness {
                             && s.case_type == CaseType::Positive
                             && s.id != probe_id
                     })
-                    .map(|s| SigEntry { byte_offset: s.byte_offset, token_count: s.token_count })
+                    .map(|s| SigEntry {
+                        byte_offset: s.byte_offset,
+                        token_count: s.token_count,
+                    })
                     .collect();
                 (sid, entries)
             })
@@ -603,16 +657,26 @@ impl Harness {
             TOOLS.iter().map(|&t| (t.to_string(), Vec::new())).collect();
 
         for scen in &raw_manifest.scenarios {
-            if scen.case_type != CaseType::Positive { continue; }
-            let tool = match scen.tool.as_deref() { Some(t) => t, None => continue };
-            if !tool_entries.contains_key(tool) { continue; }
+            if scen.case_type != CaseType::Positive {
+                continue;
+            }
+            let tool = match scen.tool.as_deref() {
+                Some(t) => t,
+                None => continue,
+            };
+            if !tool_entries.contains_key(tool) {
+                continue;
+            }
             let raw_entry = RawSigEntry {
                 byte_offset: scen.raw_byte_offset,
                 token_count: scen.raw_token_count,
             };
             let [syn, sem, prag] = compute_sigs(raw_pf, raw_entry, strategy, false);
             let sig_entry = pf.append(&syn, &sem, &prag).expect("append failed");
-            tool_entries.get_mut(tool).unwrap().push((scen.id.clone(), sig_entry));
+            tool_entries
+                .get_mut(tool)
+                .unwrap()
+                .push((scen.id.clone(), sig_entry));
         }
         RawCorpusCache { pf, tool_entries }
     }
@@ -627,29 +691,38 @@ impl Harness {
         strategy: &SignatureStrategy,
         cache: &RawCorpusCache,
     ) -> HarnessResolver {
-        let probe_scen = raw_manifest.scenarios.iter()
+        let probe_scen = raw_manifest
+            .scenarios
+            .iter()
             .find(|s| s.id == probe_id)
             .unwrap_or_else(|| panic!("probe not found in raw manifest: {probe_id}"));
         let probe_entry = RawSigEntry {
             byte_offset: probe_scen.raw_byte_offset,
             token_count: probe_scen.raw_token_count,
         };
-        let [probe_syn, probe_sem, probe_prag] =
-            compute_sigs(raw_pf, probe_entry, strategy, true);
+        let [probe_syn, probe_sem, probe_prag] = compute_sigs(raw_pf, probe_entry, strategy, true);
 
-        let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS.iter().map(|&tool| {
-            let sid = self.tool_section_ids[tool];
-            let entries = cache.tool_entries.get(tool)
-                .map(|v| v.iter()
-                    .filter(|(id, _)| id.as_str() != probe_id)
-                    .map(|(_, e)| *e)
-                    .collect::<Vec<_>>())
-                .unwrap_or_default();
-            (sid, entries)
-        }).collect();
+        let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS
+            .iter()
+            .map(|&tool| {
+                let sid = self.tool_section_ids[tool];
+                let entries = cache
+                    .tool_entries
+                    .get(tool)
+                    .map(|v| {
+                        v.iter()
+                            .filter(|(id, _)| id.as_str() != probe_id)
+                            .map(|(_, e)| *e)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                (sid, entries)
+            })
+            .collect();
 
         let mut scanner = BdpScanner::new();
-        scanner.scan_sections(&cache.pf, &probe_syn, &probe_sem, &probe_prag, &corpus)
+        scanner
+            .scan_sections(&cache.pf, &probe_syn, &probe_sem, &probe_prag, &corpus)
             .expect("scan_sections failed");
         let mut resolver = HarnessResolver::new();
         for (&sid, &scores) in scanner.section_scores() {
@@ -667,35 +740,46 @@ impl Harness {
         strategy: &SignatureStrategy,
         cache: &RawCorpusCache,
     ) -> (HarnessResolver, HashMap<SectionId, Vec<TokenHit>>) {
-        let probe_scen = raw_manifest.scenarios.iter()
+        let probe_scen = raw_manifest
+            .scenarios
+            .iter()
             .find(|s| s.id == probe_id)
             .unwrap_or_else(|| panic!("probe not found in raw manifest: {probe_id}"));
         let probe_entry = RawSigEntry {
             byte_offset: probe_scen.raw_byte_offset,
             token_count: probe_scen.raw_token_count,
         };
-        let [probe_syn, probe_sem, probe_prag] =
-            compute_sigs(raw_pf, probe_entry, strategy, true);
+        let [probe_syn, probe_sem, probe_prag] = compute_sigs(raw_pf, probe_entry, strategy, true);
 
-        let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS.iter().map(|&tool| {
-            let sid = self.tool_section_ids[tool];
-            let entries = cache.tool_entries.get(tool)
-                .map(|v| v.iter()
-                    .filter(|(id, _)| id.as_str() != probe_id)
-                    .map(|(_, e)| *e)
-                    .collect::<Vec<_>>())
-                .unwrap_or_default();
-            (sid, entries)
-        }).collect();
+        let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS
+            .iter()
+            .map(|&tool| {
+                let sid = self.tool_section_ids[tool];
+                let entries = cache
+                    .tool_entries
+                    .get(tool)
+                    .map(|v| {
+                        v.iter()
+                            .filter(|(id, _)| id.as_str() != probe_id)
+                            .map(|(_, e)| *e)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                (sid, entries)
+            })
+            .collect();
 
         let mut scanner = BdpScanner::new().with_record_hits(true);
-        scanner.scan_sections(&cache.pf, &probe_syn, &probe_sem, &probe_prag, &corpus)
+        scanner
+            .scan_sections(&cache.pf, &probe_syn, &probe_sem, &probe_prag, &corpus)
             .expect("scan_sections failed");
         let mut resolver = HarnessResolver::new();
         for (&sid, &scores) in scanner.section_scores() {
             resolver.section_scores.insert(sid, scores);
         }
-        let hit_log = scanner.section_hit_log().iter()
+        let hit_log = scanner
+            .section_hit_log()
+            .iter()
             .map(|(&sid, hits)| (sid, hits.clone()))
             .collect();
         (resolver, hit_log)
@@ -742,8 +826,7 @@ impl Harness {
             token_count: probe_scenario.raw_token_count,
         };
 
-        let [probe_syn, probe_sem, probe_prag] =
-            compute_sigs(raw_pf, probe_entry, strategy, true);
+        let [probe_syn, probe_sem, probe_prag] = compute_sigs(raw_pf, probe_entry, strategy, true);
 
         let tmp_pf = ProvenanceFile::new().expect("temporary ProvenanceFile failed");
 
@@ -809,8 +892,7 @@ impl Harness {
             token_count: probe_scenario.raw_token_count,
         };
 
-        let [probe_syn, probe_sem, probe_prag] =
-            compute_sigs(raw_pf, probe_entry, strategy, true);
+        let [probe_syn, probe_sem, probe_prag] = compute_sigs(raw_pf, probe_entry, strategy, true);
 
         let tmp_pf = ProvenanceFile::new().expect("temporary ProvenanceFile failed");
 
@@ -858,5 +940,4 @@ impl Harness {
             .collect();
         (resolver, hit_log)
     }
-
 }

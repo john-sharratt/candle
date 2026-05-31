@@ -180,8 +180,7 @@ pub fn flexbox_distribute(items: &[FlexItem], budget: usize) -> Vec<usize> {
         let mut newly_freed = 0usize;
 
         for &i in &unsaturated {
-            let share =
-                ((items[i].priority / total_priority) * remaining as f32).floor() as usize;
+            let share = ((items[i].priority / total_priority) * remaining as f32).floor() as usize;
             let candidate = allocations[i] + share;
             if let Some(max) = items[i].max_tokens {
                 if candidate >= max {

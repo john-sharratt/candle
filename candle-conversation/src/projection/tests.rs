@@ -12,7 +12,7 @@ use super::ids::{GroupId, SectionId, TimelineId, TurnIndex};
 use super::project::ProjectionTarget;
 use crate::substrate::ContentResolver;
 
-// ── Mock resolver ─────────────────────────────────────────────────────────────
+// —— Mock resolver —————————————————————————————————————————————————————————————
 
 /// Simple mock: explicit per-turn scores/tokens plus uniform defaults.
 /// Owns turn counts so the projection engine can enumerate turns.
@@ -113,13 +113,18 @@ impl ContentResolver for MockResolver {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// —— Helpers ———————————————————————————————————————————————————————————————————
 
-fn group_turn_count(groups: &[super::project::ResolvedTurn], gid: GroupId) -> usize {
-    groups.iter().filter(|t| t.group() == gid).count()
+fn group_turn_count<'a>(
+    turns: impl IntoIterator<Item = &'a super::project::ResolvedTurn>,
+    gid: GroupId,
+) -> usize {
+    turns.into_iter().filter(|t| t.group() == gid).count()
 }
 
-fn groups_in_order(turns: &[super::project::ResolvedTurn]) -> Vec<GroupId> {
+fn groups_in_order<'a>(
+    turns: impl IntoIterator<Item = &'a super::project::ResolvedTurn>,
+) -> Vec<GroupId> {
     let mut seen = Vec::new();
     for t in turns {
         if !seen.contains(&t.group()) {
@@ -129,7 +134,7 @@ fn groups_in_order(turns: &[super::project::ResolvedTurn]) -> Vec<GroupId> {
     seen
 }
 
-// ── YAML round-trip and id assignment ─────────────────────────────────────────
+// —— YAML round-trip and id assignment —————————————————————————————————————————
 
 const SIMPLE_YAML: &str = r#"
 layers:
@@ -212,7 +217,7 @@ fn schema_accessors_work() {
     assert_eq!(section.name, "frame");
 }
 
-// ── Append + turn_count (now on resolver) ─────────────────────────────────────
+// —— Append + turn_count (now on resolver) —————————————————————————————————————
 
 #[test]
 fn append_increments_correctly() {
@@ -238,7 +243,7 @@ fn turn_count_zero_for_empty_group() {
     assert_eq!(resolver.turn_count(facts), 0);
 }
 
-// ── Projection: basic visibility ──────────────────────────────────────────────
+// —— Projection: basic visibility ——————————————————————————————————————————————
 
 #[test]
 fn empty_builder_projection_has_no_turns() {
@@ -255,7 +260,7 @@ fn empty_builder_projection_has_no_turns() {
         },
         &resolver,
     );
-    assert!(proj.turns.is_empty());
+    assert!(proj.sealed_turns().next().is_none());
 }
 
 #[test]
@@ -273,7 +278,7 @@ fn system_prompt_sections_always_emitted() {
         },
         &resolver,
     );
-    assert_eq!(proj.system_prompt.len(), 2);
+    assert_eq!(proj.sealed_sections().count(), 2);
 }
 
 #[test]
@@ -295,10 +300,10 @@ fn turns_appear_after_append() {
         },
         &resolver,
     );
-    assert_eq!(proj.turns.len(), 3);
+    assert_eq!(proj.sealed_turns().count(), 3);
 }
 
-// ── Masking ───────────────────────────────────────────────────────────────────
+// —— Masking ———————————————————————————————————————————————————————————————————
 
 #[test]
 fn lower_layers_visible_for_dialogue_target() {
@@ -322,7 +327,7 @@ fn lower_layers_visible_for_dialogue_target() {
         &resolver,
     );
 
-    let groups: Vec<GroupId> = groups_in_order(&proj.turns);
+    let groups: Vec<GroupId> = groups_in_order(proj.sealed_turns());
     assert!(groups.contains(&facts), "ground/facts should be visible");
     assert!(groups.contains(&conv), "target conv should be visible");
     let _ = ground;
@@ -348,7 +353,7 @@ fn higher_layer_not_visible_for_lower_target() {
         &resolver,
     );
 
-    let groups: Vec<GroupId> = groups_in_order(&proj.turns);
+    let groups: Vec<GroupId> = groups_in_order(proj.sealed_turns());
     assert!(
         !groups.contains(&conv),
         "dialogue group must NOT be visible from ground target"
@@ -390,7 +395,7 @@ layers:
         &resolver,
     );
 
-    let groups = groups_in_order(&proj.turns);
+    let groups = groups_in_order(proj.sealed_turns());
     assert!(groups.contains(&g1));
     assert!(
         !groups.contains(&g2),
@@ -398,7 +403,7 @@ layers:
     );
 }
 
-// ── Score threshold ───────────────────────────────────────────────────────────
+// —— Score threshold ———————————————————————————————————————————————————————————
 
 #[test]
 fn turns_below_score_threshold_filtered() {
@@ -437,7 +442,7 @@ layers:
         },
         &resolver,
     );
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert!(indices.contains(&0));
     assert!(
         !indices.contains(&1),
@@ -495,7 +500,7 @@ layers:
         },
         &resolver,
     );
-    let groups = groups_in_order(&proj.turns);
+    let groups = groups_in_order(proj.sealed_turns());
     assert!(
         !groups.contains(&low_grp),
         "low_grp should be dropped by layer threshold"
@@ -504,7 +509,7 @@ layers:
     let _ = low_layer;
 }
 
-// ── Selection rules ───────────────────────────────────────────────────────────
+// —— Selection rules ———————————————————————————————————————————————————————————
 
 #[test]
 fn top_k_limits_turns() {
@@ -545,9 +550,9 @@ layers:
         &resolver,
     );
     // top-2: i0 (0.9) and i2 (0.7), emitted in insertion order
-    assert_eq!(proj.turns.len(), 2);
-    assert_eq!(proj.turns[0].index().0, 0);
-    assert_eq!(proj.turns[1].index().0, 2);
+    assert_eq!(proj.sealed_turns().count(), 2);
+    assert_eq!(proj.sealed_turns().nth(0).unwrap().index().0, 0);
+    assert_eq!(proj.sealed_turns().nth(1).unwrap().index().0, 2);
 }
 
 #[test]
@@ -586,8 +591,8 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(proj.turns.len(), 1);
-    assert_eq!(proj.turns[0].index().0, 1);
+    assert_eq!(proj.sealed_turns().count(), 1);
+    assert_eq!(proj.sealed_turns().nth(0).unwrap().index().0, 1);
 }
 
 #[test]
@@ -627,8 +632,8 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(proj.turns.len(), 2);
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    assert_eq!(proj.sealed_turns().count(), 2);
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert_eq!(indices, vec![0, 2]);
 }
 
@@ -677,7 +682,7 @@ layers:
         },
         &resolver,
     );
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
 
     // Expected: i0 (historical top-1), i3, i4, i5 (inviolate), in insertion order.
     assert!(indices.contains(&0), "high-score old turn expected");
@@ -690,7 +695,7 @@ layers:
     assert!(indices[0] < indices[1]);
 }
 
-// ── Budget constraints ────────────────────────────────────────────────────────
+// —— Budget constraints ————————————————————————————————————————————————————————
 
 #[test]
 fn budget_overflow_drops_lowest_scored_turns() {
@@ -733,8 +738,8 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(proj.turns.len(), 2);
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    assert_eq!(proj.sealed_turns().count(), 2);
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert!(indices.contains(&0));
     assert!(indices.contains(&1));
     assert!(!indices.contains(&2));
@@ -775,12 +780,12 @@ layers:
         &resolver,
     );
     assert!(
-        proj.turns.is_empty(),
+        proj.sealed_turns().next().is_none(),
         "oversized single turn should be dropped"
     );
 }
 
-// ── Emission ordering ─────────────────────────────────────────────────────────
+// —— Emission ordering —————————————————————————————————————————————————————————
 
 #[test]
 fn turns_emitted_in_insertion_order_within_group() {
@@ -814,7 +819,7 @@ layers:
         },
         &resolver,
     );
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     for w in indices.windows(2) {
         assert!(w[0] < w[1], "turns must be in insertion order");
     }
@@ -822,7 +827,7 @@ layers:
 
 #[test]
 fn higher_scored_group_emitted_last_within_layer() {
-    // Doc §7: "Higher-scored groups appear *later* in the emitted list within
+    // Doc Â§7: "Higher-scored groups appear *later* in the emitted list within
     // their layer — closer to the bottom of the LLM's input."
     let yaml = r#"
 layers:
@@ -872,7 +877,7 @@ layers:
         },
         &resolver,
     );
-    let order = groups_in_order(&proj.turns);
+    let order = groups_in_order(proj.sealed_turns());
     // data_layer groups should both appear. high_grp (score 0.9) must be last within data_layer.
     let data_order: Vec<GroupId> = order
         .iter()
@@ -883,7 +888,7 @@ layers:
     assert_eq!(data_order[1], high_grp, "higher-scored group must be last");
 }
 
-// ── Multi-layer projection ────────────────────────────────────────────────────
+// —— Multi-layer projection ————————————————————————————————————————————————————
 
 const MULTI_LAYER_YAML: &str = r#"
 layers:
@@ -979,7 +984,7 @@ fn multi_layer_full_masking() {
         &resolver,
     );
 
-    let groups = groups_in_order(&proj.turns);
+    let groups = groups_in_order(proj.sealed_turns());
     assert!(groups.contains(&ts), "type_specialist must be visible");
     assert!(groups.contains(&ss), "structure_specialist must be visible");
     assert!(groups.contains(&am), "active_mission must be visible");
@@ -1021,7 +1026,7 @@ fn multi_layer_motivational_target_hides_dialogue() {
         &resolver,
     );
 
-    let groups = groups_in_order(&proj.turns);
+    let groups = groups_in_order(proj.sealed_turns());
     assert!(groups.contains(&ts));
     assert!(groups.contains(&am)); // target
     assert!(
@@ -1059,14 +1064,14 @@ fn multi_layer_ground_target_sees_only_ground() {
         &resolver,
     );
 
-    let groups = groups_in_order(&proj.turns);
+    let groups = groups_in_order(proj.sealed_turns());
     assert!(groups.contains(&ts));
     assert!(!groups.contains(&ss)); // sibling, masked
     assert!(!groups.contains(&am)); // higher layer
     assert!(!groups.contains(&pc)); // higher layer
 }
 
-// ── System prompt emission ────────────────────────────────────────────────────
+// —— System prompt emission ————————————————————————————————————————————————————
 
 #[test]
 fn sections_always_emit_regardless_of_size() {
@@ -1100,7 +1105,7 @@ layers:
         },
         &resolver,
     );
-    let section_ids: Vec<u32> = proj.system_prompt.iter().map(|s| s.id.raw()).collect();
+    let section_ids: Vec<u32> = proj.sealed_sections().map(|s| s.id.raw()).collect();
     assert_eq!(section_ids, vec![small.raw(), big.raw()]);
 }
 
@@ -1122,13 +1127,13 @@ fn system_prompt_sections_in_declaration_order() {
         },
         &resolver,
     );
-    assert_eq!(proj.system_prompt.len(), 3);
-    assert_eq!(proj.system_prompt[0].id, frame);
-    assert_eq!(proj.system_prompt[1].id, values);
-    assert_eq!(proj.system_prompt[2].id, guidance);
+    assert_eq!(proj.sealed_sections().count(), 3);
+    assert_eq!(proj.sealed_sections().nth(0).unwrap().id, frame);
+    assert_eq!(proj.sealed_sections().nth(1).unwrap().id, values);
+    assert_eq!(proj.sealed_sections().nth(2).unwrap().id, guidance);
 }
 
-// ── YAML validation errors ────────────────────────────────────────────────────
+// —— YAML validation errors ————————————————————————————————————————————————————
 
 #[test]
 fn yaml_duplicate_group_name_is_error() {
@@ -1255,7 +1260,7 @@ layers:
     ));
 }
 
-// ── Construction validation errors ───────────────────────────────────────────
+// —— Construction validation errors ———————————————————————————————————————————
 
 #[test]
 fn construction_sibling_min_percent_exceeds_100_is_error() {
@@ -1376,7 +1381,7 @@ layers:
     ));
 }
 
-// ── Score formula variants ────────────────────────────────────────────────────
+// —— Score formula variants ————————————————————————————————————————————————————
 
 #[test]
 fn score_formula_sum_determines_group_score() {
@@ -1432,7 +1437,7 @@ layers:
         },
         &resolver,
     );
-    let order = groups_in_order(&proj.turns);
+    let order = groups_in_order(proj.sealed_turns());
     let data_order: Vec<GroupId> = order
         .iter()
         .copied()
@@ -1489,7 +1494,7 @@ layers:
         },
         &resolver,
     );
-    let order = groups_in_order(&proj.turns);
+    let order = groups_in_order(proj.sealed_turns());
     let data_order: Vec<GroupId> = order
         .iter()
         .copied()
@@ -1502,7 +1507,7 @@ layers:
     );
 }
 
-// ── Budget redistribution ─────────────────────────────────────────────────────
+// —— Budget redistribution —————————————————————————————————————————————————————
 
 #[test]
 fn freed_budget_redistributes_to_other_layers() {
@@ -1543,9 +1548,9 @@ layers:
             .with_default_tokens(100)
             .with_tokens(sparse_grp, TurnIndex(0), 10);
 
-    // sparse: 1 turn × 10 tokens = 10 (far less than its ~4750 share).
+    // sparse: 1 turn Ã— 10 tokens = 10 (far less than its ~4750 share).
     resolver.append(sparse_grp);
-    // dense: 20 turns × 100 tokens = 2000.
+    // dense: 20 turns Ã— 100 tokens = 2000.
     for _ in 0..20 {
         resolver.append(dense_grp);
     }
@@ -1561,14 +1566,14 @@ layers:
 
     // With redistribution, dense should get more than half of 9500 tokens
     // and include all 20 turns (20 * 100 = 2000 ≤ 9500).
-    let dense_count = group_turn_count(&proj.turns, dense_grp);
+    let dense_count = group_turn_count(proj.sealed_turns(), dense_grp);
     assert_eq!(
         dense_count, 20,
         "freed budget from sparse should let dense include all 20 turns"
     );
 }
 
-// ── Edge cases ────────────────────────────────────────────────────────────────
+// —— Edge cases ————————————————————————————————————————————————————————————————
 
 #[test]
 fn no_layers_in_schema_is_valid() {
@@ -1617,7 +1622,7 @@ layers:
         &resolver,
     );
 
-    let full_count = group_turn_count(&proj.turns, full_grp);
+    let full_count = group_turn_count(proj.sealed_turns(), full_grp);
     assert_eq!(full_count, 5, "full_grp should have all 5 turns");
 }
 
@@ -1654,7 +1659,7 @@ layers:
         },
         &resolver,
     );
-    assert!(proj.turns.is_empty());
+    assert!(proj.sealed_turns().next().is_none());
 }
 
 #[test]
@@ -1676,7 +1681,7 @@ layers:
     let layer = b.id_for_layer("layer").unwrap();
     let grp = b.id_for_group("grp").unwrap();
 
-    // 100 turns × 100 tokens each = 10000, far exceeds 4500 budget.
+    // 100 turns Ã— 100 tokens each = 10000, far exceeds 4500 budget.
     let mut resolver = MockResolver::new().with_default_tokens(100);
     for _ in 0..100 {
         resolver.append(grp);
@@ -1692,8 +1697,7 @@ layers:
     );
 
     let total_tokens: usize = proj
-        .turns
-        .iter()
+        .sealed_turns()
         .map(|t| resolver.turn_token_count(t.group(), t.index()))
         .sum();
     assert!(
@@ -1744,8 +1748,8 @@ layers:
         &resolver,
     );
 
-    let priority_count = group_turn_count(&proj.turns, priority_grp);
-    let other_count = group_turn_count(&proj.turns, other_grp);
+    let priority_count = group_turn_count(proj.sealed_turns(), priority_grp);
+    let other_count = group_turn_count(proj.sealed_turns(), other_grp);
 
     // priority_grp min is 60% of 9000 = 5400 tokens → at least 54 turns at 100 tokens each
     // (capped at 50 available, so just check priority > other).
@@ -1805,7 +1809,7 @@ layers:
         &resolver,
     );
     // grp2 has higher top-2-mean → should be emitted last.
-    let order = groups_in_order(&proj.turns);
+    let order = groups_in_order(proj.sealed_turns());
     if order.len() == 2 {
         assert_eq!(order.last().copied(), Some(grp2));
     }
@@ -1853,8 +1857,7 @@ layers:
     );
 
     let capped_tokens: usize = proj
-        .turns
-        .iter()
+        .sealed_turns()
         .filter(|t| t.group() == capped)
         .map(|t| resolver.turn_token_count(t.group(), t.index()))
         .sum();
@@ -1903,8 +1906,8 @@ layers:
     );
 
     // Only last 3 should appear.
-    assert_eq!(proj.turns.len(), 3);
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    assert_eq!(proj.sealed_turns().count(), 3);
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert_eq!(indices, vec![3, 4, 5]);
 }
 
@@ -1949,8 +1952,8 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(proj.turns.len(), 2);
-    let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    assert_eq!(proj.sealed_turns().count(), 2);
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     // top-2 historical: i0 (0.9) and i2 (0.7), insertion order
     assert_eq!(indices, vec![0, 2]);
 }
@@ -2014,7 +2017,7 @@ layers:
 
 #[test]
 fn empty_target_group_does_not_emit_target_layer() {
-    // Doc §9.7: "Filter out empty groups and empty layers." No exception for
+    // Doc Â§9.7: "Filter out empty groups and empty layers." No exception for
     // the target group. If the target group has no turns, its layer should not
     // emit any turns (lower-layer groups still appear).
     let yaml = r#"
@@ -2057,7 +2060,7 @@ layers:
         &resolver,
     );
 
-    let groups = groups_in_order(&proj.turns);
+    let groups = groups_in_order(proj.sealed_turns());
     assert!(groups.contains(&data_grp), "lower layer must still emit");
     assert!(
         !groups.contains(&empty_target),
@@ -2065,7 +2068,7 @@ layers:
     );
 }
 
-// ── Variable substitution ────────────────────────────────────────────────────
+// —— Variable substitution ————————————————————————————————————————————————————
 
 const SUBST_YAML: &str = r#"
 layers:
@@ -2251,10 +2254,14 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(proj.turns.len(), 5, "default selection includes all turns");
+    assert_eq!(
+        proj.sealed_turns().count(),
+        5,
+        "default selection includes all turns"
+    );
 }
 
-// ── DepthWeights ──────────────────────────────────────────────────────────────
+// —— DepthWeights ——————————————————————————————————————————————————————————————
 
 #[test]
 fn depth_weights_default_is_universal_optimum() {
@@ -2396,7 +2403,7 @@ layers:
     }
 }
 
-// ── End-to-end: Substrate + BDP scores + projection ─────────────────────
+// —— End-to-end: Substrate + BDP scores + projection —————————————————————
 
 #[test]
 fn session_resolver_picks_correct_metric_per_score_formula() {
@@ -2607,7 +2614,7 @@ layers:
         },
         &r,
     );
-    let picked: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
+    let picked: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     // The top-2 by max score are idx 4 (100.0) and idx 2 (50.0); they emit
     // in insertion order regardless of selection order.
     assert_eq!(picked, vec![2, 4]);
@@ -2695,8 +2702,8 @@ layers:
         },
         &r_view,
     );
-    assert_eq!(proj.turns.len(), 1);
-    assert_eq!(proj.turns[0].index(), a);
+    assert_eq!(proj.sealed_turns().count(), 1);
+    assert_eq!(proj.sealed_turns().nth(0).unwrap().index(), a);
 
     // Prag-heavy weights: turn B wins.
     let b_prag = Builder::from_yaml(&yaml_prag_heavy).unwrap();
@@ -2749,8 +2756,8 @@ layers:
         },
         &r2_view,
     );
-    assert_eq!(proj.turns.len(), 1);
-    assert_eq!(proj.turns[0].index(), b2);
+    assert_eq!(proj.sealed_turns().count(), 1);
+    assert_eq!(proj.sealed_turns().nth(0).unwrap().index(), b2);
 }
 
 #[test]
@@ -2779,7 +2786,7 @@ layers:
     }
 }
 
-// ── Section + collection emission tests ──────────────────────────────────────
+// —— Section + collection emission tests ——————————————————————————————————————
 //
 // These tests cover the `SystemPromptItem` model: the layer's
 // `system_prompt` is an ordered list of items, each either a single
@@ -2830,10 +2837,10 @@ fn flat_sections_yaml_emits_all_in_declaration_order() {
         &resolver,
     );
 
-    assert_eq!(p.system_prompt.len(), 3);
-    assert_eq!(p.system_prompt[0].id, alpha);
-    assert_eq!(p.system_prompt[1].id, beta);
-    assert_eq!(p.system_prompt[2].id, gamma);
+    assert_eq!(p.sealed_sections().count(), 3);
+    assert_eq!(p.sealed_sections().nth(0).unwrap().id, alpha);
+    assert_eq!(p.sealed_sections().nth(1).unwrap().id, beta);
+    assert_eq!(p.sealed_sections().nth(2).unwrap().id, gamma);
 }
 
 const COLLECTION_YAML: &str = r#"
@@ -2901,7 +2908,7 @@ fn collection_top_k_keeps_highest_scored_in_declaration_order() {
         &resolver,
     );
 
-    let ids: Vec<SectionId> = p.system_prompt.iter().map(|s| s.id).collect();
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
     assert_eq!(
         ids,
         vec![framing, tools_intro, tool_b, tool_d, tools_outro],
@@ -2936,8 +2943,7 @@ fn collection_top_k_with_priority_tiebreak() {
         &resolver,
     );
     let tool_ids: Vec<SectionId> = p
-        .system_prompt
-        .iter()
+        .sealed_sections()
         .map(|s| s.id)
         .filter(|&id| id == tool_a || id == tool_b || id == tool_c || id == tool_d)
         .collect();
@@ -2989,7 +2995,7 @@ fn collection_score_threshold_filters_below_floor() {
         },
         &resolver,
     );
-    let ids: Vec<SectionId> = p.system_prompt.iter().map(|s| s.id).collect();
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
     assert_eq!(ids, vec![mid, high], "low filtered by 0.4 threshold");
 }
 
@@ -3035,8 +3041,8 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(p.system_prompt.len(), 1);
-    assert_eq!(p.system_prompt[0].id, b_id);
+    assert_eq!(p.sealed_sections().count(), 1);
+    assert_eq!(p.sealed_sections().nth(0).unwrap().id, b_id);
 }
 
 #[test]
@@ -3074,7 +3080,7 @@ layers:
         &resolver,
     );
     assert_eq!(
-        p.system_prompt.len(),
+        p.sealed_sections().count(),
         2,
         "AlwaysVisible collection emits all"
     );
@@ -3118,8 +3124,8 @@ layers:
         },
         &resolver,
     );
-    assert_eq!(p.system_prompt.len(), 1);
-    assert_eq!(p.system_prompt[0].id, high);
+    assert_eq!(p.sealed_sections().count(), 1);
+    assert_eq!(p.sealed_sections().nth(0).unwrap().id, high);
 }
 
 #[test]
@@ -3166,11 +3172,11 @@ layers:
         &resolver,
     );
     // Static framing still emits — only the collection drops everything.
-    let ids: Vec<SectionId> = p.system_prompt.iter().map(|s| s.id).collect();
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
     assert_eq!(ids, vec![framing]);
 }
 
-// ── Builder runtime mutation ─────────────────────────────────────────────────
+// —— Builder runtime mutation —————————————————————————————————————————————————
 
 #[test]
 fn add_section_appends_at_end_with_unique_id() {
@@ -3254,7 +3260,7 @@ fn add_section_to_collection_appends_in_collection() {
     );
     // Static `alpha`/`beta`/`gamma` from SECTIONS_YAML_FLAT plus the
     // top-2 tools (t2, t3) from the collection.
-    let ids: Vec<SectionId> = p.system_prompt.iter().map(|s| s.id).collect();
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
     assert!(ids.contains(&t2), "t2 (score 0.9) must survive top-2");
     assert!(ids.contains(&t3), "t3 (score 0.5) must survive top-2");
     assert!(!ids.contains(&t1), "t1 (score 0.1) must be filtered");
@@ -3307,12 +3313,13 @@ fn add_section_invalid_priority_fails() {
     ));
 }
 
-// ── Dialect-template parsing (Phase 1) ────────────────────────────────────────
+// ── Dialect-template parsing ─────────────────────────────────────────────────
 //
-// These tests cover the new `kind: template` system-prompt item that
-// references a [`DialectTemplate`] catalog entry by snake-case name. The
-// resolved string lands in a `SectionSchema` with `is_template = true`;
-// downstream behaviour is identical to a `kind: section` item.
+// These tests cover the `kind: template` system-prompt item that references
+// a [`DialectTemplate`] catalog entry by snake-case name.  The resolved
+// string lands in a `SectionSchema` with `is_template = true`; the
+// projection assembler routes those items through live prefill so their
+// K/V stays attention-correct under the runtime left context.
 
 mod dialect_templates {
     use super::*;

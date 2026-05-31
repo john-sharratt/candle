@@ -223,10 +223,7 @@ fn select_conversation(
 
     // Budget pass: trim historical (lowest-scored first), inviolate is never dropped.
     if let Some(budget) = budget_tokens {
-        let inviolate_tokens: usize = inviolate
-            .iter()
-            .map(|(idx, _)| token_counts(*idx))
-            .sum();
+        let inviolate_tokens: usize = inviolate.iter().map(|(idx, _)| token_counts(*idx)).sum();
         let remaining = budget.saturating_sub(inviolate_tokens);
         trim_to_budget_low_score_first(&mut historical, remaining, token_counts);
     }

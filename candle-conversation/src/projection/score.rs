@@ -37,10 +37,7 @@ impl ScoreFormula {
             return 0.0;
         }
         match self {
-            ScoreFormula::Max => scores
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max),
+            ScoreFormula::Max => scores.iter().copied().fold(f32::NEG_INFINITY, f32::max),
             ScoreFormula::Sum => scores.iter().copied().sum(),
             ScoreFormula::Mean => scores.iter().copied().sum::<f32>() / scores.len() as f32,
             ScoreFormula::TopKMean { k } => {
@@ -53,16 +50,12 @@ impl ScoreFormula {
             // At the group level, span of a turn list = max per-turn span score.
             // The actual span computation happens inside the Aggregator per turn;
             // here we just pick the most span-relevant turn to represent the group.
-            ScoreFormula::Span { .. } => scores
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max),
+            ScoreFormula::Span { .. } => scores.iter().copied().fold(f32::NEG_INFINITY, f32::max),
             // Like Span: the per-turn pertok_excess is computed in the
             // Aggregator; the group is represented by its strongest turn.
-            ScoreFormula::PerTokenExcess => scores
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max),
+            ScoreFormula::PerTokenExcess => {
+                scores.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            }
         }
     }
 }

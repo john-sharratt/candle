@@ -195,12 +195,12 @@ pub struct SectionSchema {
     pub depends_on: Option<CollectionId>,
     /// Marks this section as resolved from a dialect template (a
     /// `kind: template` YAML item that referenced a `DialectTemplate`
-    /// catalog entry, e.g. `system_start`).  At Phase 1 of the
-    /// generated-segments rollout this is purely an annotation —
-    /// downstream code ingests, pins and Arc-clones the section
-    /// identically to a `kind: section` item.  Later phases pivot on
-    /// this flag to route template-kind items through live prefill
-    /// rather than the substrate-backed sealed path.
+    /// catalog entry, e.g. `system_start`).  The scheduler's
+    /// projection assembler routes template-kind items through live
+    /// prefill against the current runtime left context rather than
+    /// the substrate-backed sealed path, so structural envelope K/V
+    /// stays attention-correct under whatever prefix the projection
+    /// selected this turn.
     pub is_template: bool,
 }
 
