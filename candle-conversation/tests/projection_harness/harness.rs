@@ -423,8 +423,17 @@ pub struct Harness {
 impl Harness {
     pub fn build() -> Self {
         let yaml = projection_yaml_text();
-        let mut builder = Builder::from_yaml_with_vars(&yaml, &[("workspace", "candle")])
-            .expect("Builder::from_yaml_with_vars failed");
+        // zend's projection.yaml uses `kind: template` items
+        // referencing ChatML dialect tokens; the harness must supply
+        // the dialect at parse time.  Qwen3-30B-A3B (the production
+        // target this corpus was calibrated against) is ChatML.
+        let dialect = candle_transformers::models::dialect::Dialect::chat_ml();
+        let mut builder = Builder::from_yaml_with_vars_and_dialect(
+            &yaml,
+            &[("workspace", "candle")],
+            Some(&dialect),
+        )
+        .expect("Builder::from_yaml_with_vars_and_dialect failed");
 
         let dialogue_layer = builder
             .id_for_layer("dialogue")

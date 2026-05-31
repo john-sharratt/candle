@@ -510,17 +510,54 @@ pub struct SectionEntryData {
 
 // ── Per-turn record ───────────────────────────────────────────────────────────
 
+/// One half of a [`TurnEntryData`] — the user-input half or the
+/// assistant-response half.  Carries its own text, token IDs, BDP
+/// signatures, and KV residence so the two halves can be elevated /
+/// evicted / scored independently when needed.
+#[derive(Debug, Clone)]
+pub struct TurnPart {
+    pub text: String,
+    pub token_count: usize,
+    pub token_ids: TokenBuffer,
+    pub sig_entries: Vec<SigEntry>,
+    /// Slot in [`Substrate::residence`] holding this part's
+    /// hot/warm/cold KV state.  An empty `TurnPart` (e.g. the user
+    /// half of a turn restored from a pre-split persisted log) still
+    /// owns a residence — it just stays cold and empty.
+    pub residence: ResidenceIndex,
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnEntryData {
-    token_count: usize,
+    /// Overall block extent across both parts: `(start, end)` where
+    /// `start` is the user part's first block and `end` is the
+    /// assistant part's last block.  When the user part is empty,
+    /// `start` equals the assistant part's first block.
     block_range: (u64, u64),
-    sig_entries: Vec<SigEntry>,
-    role: Role,
-    text: String,
-    token_ids: TokenBuffer,
-    /// Slot in [`Substrate::residence`] holding this turn's
-    /// hot/warm/cold KV state. Sealed bytes live there.
-    residence: ResidenceIndex,
+    user: TurnPart,
+    assistant: TurnPart,
+}
+
+/// Caller-supplied content for one half of a turn at append / restore
+/// time.  An empty half (token_count = 0, no sealed bytes) is allowed
+/// — the in-memory record will still allocate a residence for it but
+/// nothing will land in the cache.
+#[derive(Debug, Clone, Default)]
+pub struct TurnPartWrite {
+    pub text: String,
+    pub token_ids: TokenBuffer,
+    pub token_count: usize,
+    pub block_start: u64,
+    pub block_end: u64,
+    pub sealed_gpu: Option<Arc<Vec<SealedSequence>>>,
+}
+
+impl TurnPartWrite {
+    pub fn is_empty(&self) -> bool {
+        self.token_count == 0
+            && self.block_start == self.block_end
+            && self.sealed_gpu.as_deref().is_none_or(|v| v.is_empty())
+    }
 }
 
 /// Total VRAM byte footprint of a sealed Arc — sums `byte_size`
@@ -933,7 +970,16 @@ impl Substrate {
                 plan.missing.push(PromotionItemKind::Turn(key));
                 continue;
             };
-            self.classify_one(PromotionItemKind::Turn(key), entry.residence, &mut plan);
+            // Classify the assistant residence — the one carrying the
+            // turn's K/V under today's seal path.  The user residence
+            // is reserved for the Phase 5 `NewUserMessage` capture and
+            // is empty here; classifying it would have it land in
+            // `missing` and the elevate path would chase a no-op.
+            self.classify_one(
+                PromotionItemKind::Turn(key),
+                entry.assistant.residence,
+                &mut plan,
+            );
         }
         plan
     }
@@ -1037,7 +1083,10 @@ impl Substrate {
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<ResidenceIndex> {
-        self.turn(timeline, index).map(|e| e.residence)
+        // Returns the assistant residence — the bytes-bearing half at
+        // this phase.  Callers that need the user-half residence use
+        // `turn_residence_of_part`.
+        self.turn(timeline, index).map(|e| e.assistant.residence)
     }
 
     /// Test/integration counterpart of [`Self::turn_residence`] for
@@ -1054,7 +1103,9 @@ impl Substrate {
     /// so cold-marker turns (post-restart, before any elevation has
     /// fired) still survive the filter and reach `elevate_to_hot`.
     pub fn turn_tier_state(&self, timeline: TimelineId, index: TurnIndex) -> Option<TierState> {
-        let residence = self.turn(timeline, index).map(|e| e.residence)?;
+        let residence = self
+            .turn(timeline, index)
+            .map(|e| e.assistant.residence)?;
         let slot = &self.residence[residence.0];
         Some(TierState {
             hot: slot.hot.is_some(),
@@ -1187,7 +1238,8 @@ impl Substrate {
         }
         for &key in keep_turns {
             if let Some(e) = self.turn(key.timeline, key.index) {
-                keep.insert(e.residence);
+                keep.insert(e.user.residence);
+                keep.insert(e.assistant.residence);
             }
         }
 
@@ -1329,74 +1381,119 @@ impl Substrate {
             .get(&timeline)
             .expect("append_with_blocks: timeline not registered")
             .next_turn_index();
-        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let user_residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let assistant_residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
         // `append_with_blocks` declares a turn's existence and block
-        // range, but holds no sealed KV — the residence stays cold
-        // (`hot = None`) until `append_full` or an elevate install
-        // puts bytes in.
+        // range, but holds no sealed KV — both residences stay cold
+        // (`hot = None`) until an elevate / restore_turn install
+        // puts bytes in.  The whole `token_count` lands in the
+        // assistant half (the user half is empty at this codepath).
         let tl = self.timelines.get_mut(&timeline).unwrap();
         tl.turns.insert(
             idx,
             TurnEntryData {
-                token_count,
                 block_range: (block_start, block_end),
-                sig_entries: Vec::new(),
-                role: Role::Assistant,
-                text: String::new(),
-                token_ids: TokenBuffer::default(),
-                residence,
+                user: TurnPart {
+                    text: String::new(),
+                    token_count: 0,
+                    token_ids: TokenBuffer::default(),
+                    sig_entries: Vec::new(),
+                    residence: user_residence,
+                },
+                assistant: TurnPart {
+                    text: String::new(),
+                    token_count,
+                    token_ids: TokenBuffer::default(),
+                    sig_entries: Vec::new(),
+                    residence: assistant_residence,
+                },
             },
         );
         idx
     }
 
-    /// Append a turn with its sealed KV data.
+    /// Append a turn with its sealed KV data, split into the user and
+    /// assistant halves.
     ///
-    /// `sealed_gpu` is the GPU-resident snapshot produced at seal time.
-    /// `migrate_to_cpu` is called **inside** this function to convert it to
-    /// CPU (warm tier) — the GPU chunks are released as soon as the caller's
-    /// `sealed_gpu` Arc goes out of scope; no GPU arena slots are held by the
-    /// substrate after this call returns.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_full(
+    /// Each [`TurnPartWrite`] carries the half's text, token IDs, block
+    /// range, and a GPU-resident `Arc<Vec<SealedSequence>>` snapshot
+    /// (`None` when the half is empty — e.g. the user half before the
+    /// `NewUserMessage` capture path is wired up).  `migrate_to_cpu`
+    /// is called **inside** this function for each non-empty half to
+    /// move the bytes to the warm tier; the GPU chunks are freed as
+    /// soon as the caller drops the `sealed_gpu` Arcs, so no GPU
+    /// arena slots are held by the substrate after this call returns.
+    ///
+    /// The `block_range` field on the resulting `TurnEntryData` is the
+    /// outer span `(user.block_start, assistant.block_end)`, or
+    /// `(assistant.block_start, assistant.block_end)` when the user
+    /// half is empty.
+    pub fn append_complete(
         &mut self,
         timeline: TimelineId,
-        role: Role,
-        text: String,
-        token_ids: TokenBuffer,
-        token_count: usize,
-        block_start: u64,
-        block_end: u64,
-        sealed_gpu: Arc<Vec<SealedSequence>>,
-        migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
+        user: TurnPartWrite,
+        assistant: TurnPartWrite,
+        mut migrate_to_cpu: impl FnMut(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
     ) -> candle::Result<TurnIndex> {
-        let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
-        // GPU chunks are freed as soon as the caller drops `sealed_gpu`.
+        // `Some(_)` (even an empty vec) means "this half claims sealed
+        // bytes — run the migration to get the CPU side."  `None`
+        // means "no bytes at all."  Empty input to migrate is
+        // legitimate: callers in the GPU-less test paths pass an
+        // empty `sealed_gpu` and rely on the migration closure to
+        // produce the canonical CPU content.
+        let user_sealed_cpu = match user.sealed_gpu.as_ref() {
+            Some(g) => migrate_to_cpu(g)?,
+            None => Vec::new(),
+        };
+        let assistant_sealed_cpu = match assistant.sealed_gpu.as_ref() {
+            Some(g) => migrate_to_cpu(g)?,
+            None => Vec::new(),
+        };
         let idx = self
             .timelines
             .get(&timeline)
-            .expect("append_full: timeline not registered")
+            .expect("append_complete: timeline not registered")
             .next_turn_index();
-        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let user_residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let assistant_residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let block_start = if user.is_empty() {
+            assistant.block_start
+        } else {
+            user.block_start
+        };
+        let block_end = if assistant.is_empty() {
+            user.block_end
+        } else {
+            assistant.block_end
+        };
         {
             let tl = self.timelines.get_mut(&timeline).unwrap();
             tl.turns.insert(
                 idx,
                 TurnEntryData {
-                    token_count,
                     block_range: (block_start, block_end),
-                    sig_entries: Vec::new(),
-                    role,
-                    text,
-                    token_ids,
-                    residence,
+                    user: TurnPart {
+                        text: user.text,
+                        token_count: user.token_count,
+                        token_ids: user.token_ids,
+                        sig_entries: Vec::new(),
+                        residence: user_residence,
+                    },
+                    assistant: TurnPart {
+                        text: assistant.text,
+                        token_count: assistant.token_count,
+                        token_ids: assistant.token_ids,
+                        sig_entries: Vec::new(),
+                        residence: assistant_residence,
+                    },
                 },
             );
         }
-        // Bytes are CPU-resident here — install them as the turn's hot
-        // residence and put it at the front of the hot LRU.
-        if !sealed_cpu.is_empty() {
-            self.install_hot(residence, sealed_cpu);
+        if !user_sealed_cpu.is_empty() {
+            self.install_hot(user_residence, user_sealed_cpu);
+        }
+        if !assistant_sealed_cpu.is_empty() {
+            self.install_hot(assistant_residence, assistant_sealed_cpu);
         }
         Ok(idx)
     }
@@ -1408,76 +1505,94 @@ impl Substrate {
     /// restored in `turn_index` order so the appended `TurnIndex` matches
     /// the persisted one.
     ///
-    /// `cold` carries the per-layer `StoredSequence` references the
-    /// classifier needs to route the turn through `cold_to_hot` on the
-    /// next `elevate_to_hot`. Pass `None` only for turns that have no
-    /// persisted chunks (e.g. a turn that crashed before the
-    /// bg-quantizer callback fired); those land cold-marker with all
-    /// three tiers empty, and the classifier reports them `missing`
-    /// on elevation. The reload path never installs hot — that's
-    /// always demand-driven via `elevate_to_hot`.
+    /// `user_cold` / `assistant_cold` carry the per-layer
+    /// `StoredSequence` references the classifier needs to route the
+    /// respective halves through `cold_to_hot` on the next
+    /// `elevate_to_hot`.  Pass `None` for empty halves.  The reload
+    /// path never installs hot — that's always demand-driven via
+    /// `elevate_to_hot`.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_turn(
         &mut self,
         timeline: TimelineId,
-        role: Role,
-        text: String,
-        token_ids: TokenBuffer,
-        token_count: usize,
+        user_text: String,
+        user_token_ids: TokenBuffer,
+        user_token_count: usize,
+        user_cold: Option<Vec<StoredSequence>>,
+        assistant_text: String,
+        assistant_token_ids: TokenBuffer,
+        assistant_token_count: usize,
+        assistant_cold: Option<Vec<StoredSequence>>,
         block_start: u64,
         block_end: u64,
-        cold: Option<Vec<StoredSequence>>,
     ) -> TurnIndex {
         let idx = self
             .timelines
             .get(&timeline)
             .expect("restore_turn: timeline must be registered first")
             .next_turn_index();
-        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let user_residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let assistant_residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
         {
             let tl = self.timelines.get_mut(&timeline).unwrap();
             tl.turns.insert(
                 idx,
                 TurnEntryData {
-                    token_count,
                     block_range: (block_start, block_end),
-                    sig_entries: Vec::new(),
-                    role,
-                    text,
-                    token_ids,
-                    residence,
+                    user: TurnPart {
+                        text: user_text,
+                        token_count: user_token_count,
+                        token_ids: user_token_ids,
+                        sig_entries: Vec::new(),
+                        residence: user_residence,
+                    },
+                    assistant: TurnPart {
+                        text: assistant_text,
+                        token_count: assistant_token_count,
+                        token_ids: assistant_token_ids,
+                        sig_entries: Vec::new(),
+                        residence: assistant_residence,
+                    },
                 },
             );
         }
-        if let Some(cold_seqs) = cold {
-            if !cold_seqs.is_empty() {
-                // Sum cold record bytes into residence.byte_size so
-                // the purge accounting + telemetry has a real number
-                // before any hot/warm elevate fires.
-                let total_bytes: u64 = cold_seqs
-                    .iter()
-                    .flat_map(|s| s.chunks.iter())
-                    .map(|c| c.record_len)
-                    .sum();
-                self.residence[residence.0].byte_size = total_bytes;
-                self.install_cold(residence, cold_seqs);
+        for (residence, cold) in [
+            (user_residence, user_cold),
+            (assistant_residence, assistant_cold),
+        ] {
+            let Some(cold_seqs) = cold else { continue };
+            if cold_seqs.is_empty() {
+                continue;
             }
+            // Sum cold record bytes into residence.byte_size so the
+            // purge accounting + telemetry has a real number before any
+            // hot/warm elevate fires.
+            let total_bytes: u64 = cold_seqs
+                .iter()
+                .flat_map(|s| s.chunks.iter())
+                .map(|c| c.record_len)
+                .sum();
+            self.residence[residence.0].byte_size = total_bytes;
+            self.install_cold(residence, cold_seqs);
         }
         idx
     }
 
+    /// Set the turn's assistant-half text + token IDs.  The `role`
+    /// argument is ignored — every turn's content lives in the
+    /// `assistant` half until the user-half capture path is wired up
+    /// in a later phase.
     pub fn set_turn_content(
         &mut self,
         timeline: TimelineId,
         index: TurnIndex,
-        role: Role,
+        _role: Role,
         text: String,
         token_ids: TokenBuffer,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.role = role;
-            entry.text = text;
-            entry.token_ids = token_ids;
+            entry.assistant.text = text;
+            entry.assistant.token_ids = token_ids;
         }
     }
 
@@ -1491,15 +1606,23 @@ impl Substrate {
     /// charge eviction accounting — they never need the dropped
     /// bytes themselves (the residence's warm/cold tiers hold the
     /// canonical copies if any future re-elevation needs them).
+    /// Drop the hot residences of both halves of the turn.  Returns
+    /// `true` if either half had hot bytes to drop.
     pub fn clear_turn_sealed(&mut self, timeline: TimelineId, index: TurnIndex) -> bool {
-        let Some(residence) = self.turn(timeline, index).map(|e| e.residence) else {
+        let Some((user_res, assistant_res)) = self
+            .turn(timeline, index)
+            .map(|e| (e.user.residence, e.assistant.residence))
+        else {
             return false;
         };
-        if self.residence[residence.0].hot.take().is_none() {
-            return false;
+        let mut any = false;
+        for res in [user_res, assistant_res] {
+            if self.residence[res.0].hot.take().is_some() {
+                Self::remove_from_lru(&mut self.hot_lru, res);
+                any = true;
+            }
         }
-        Self::remove_from_lru(&mut self.hot_lru, residence);
-        true
+        any
     }
 
     /// Sum of bytes across every hot-resident turn. Walks
@@ -1525,12 +1648,24 @@ impl Substrate {
     }
 
     /// Bytes a single hot-resident turn currently holds in VRAM. `None`
-    /// for unknown / cold turns.
+    /// for unknown turns or turns with neither half hot.  Sum across
+    /// both halves; reports the assistant-half byte_size when only
+    /// the assistant half is hot (typical at this phase).
     pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
-        let residence = self.turn(timeline, index)?.residence;
-        let slot = &self.residence[residence.0];
-        slot.hot.as_ref()?;
-        Some(slot.byte_size as usize)
+        let entry = self.turn(timeline, index)?;
+        let user = &self.residence[entry.user.residence.0];
+        let assistant = &self.residence[entry.assistant.residence.0];
+        let mut total = 0usize;
+        let mut any = false;
+        if user.hot.is_some() {
+            total += user.byte_size as usize;
+            any = true;
+        }
+        if assistant.hot.is_some() {
+            total += assistant.byte_size as usize;
+            any = true;
+        }
+        any.then_some(total)
     }
 
     /// FIFO-oldest hot-resident turn, skipping `except`. "FIFO" =
@@ -1546,7 +1681,9 @@ impl Substrate {
                 if key == except {
                     continue;
                 }
-                if self.residence[entry.residence.0].hot.is_some() {
+                if self.residence[entry.user.residence.0].hot.is_some()
+                    || self.residence[entry.assistant.residence.0].hot.is_some()
+                {
                     return Some(key);
                 }
             }
@@ -1554,19 +1691,57 @@ impl Substrate {
         None
     }
 
-    pub fn role_of(&self, timeline: TimelineId, index: TurnIndex) -> Role {
-        self.turn(timeline, index)
-            .map_or(Role::Assistant, |e| e.role)
+    /// Logical role of the turn — always `Role::Assistant` under the
+    /// per-half model, where each turn carries both a user half and an
+    /// assistant half.  Kept for back-compat with diagnostic callers
+    /// that expect a single role per turn.
+    pub fn role_of(&self, _timeline: TimelineId, _index: TurnIndex) -> Role {
+        Role::Assistant
     }
 
-    pub fn text_of(&self, timeline: TimelineId, index: TurnIndex) -> &str {
-        self.turn(timeline, index)
-            .map_or("", |e| e.text.as_str())
+    /// Concatenated turn text: `user.text + assistant.text`.  At Phase
+    /// 4 entry the user half is empty so this reduces to the assistant
+    /// text, preserving today's semantics.
+    pub fn text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {
+        match self.turn(timeline, index) {
+            None => String::new(),
+            Some(e) => {
+                if e.user.text.is_empty() {
+                    e.assistant.text.clone()
+                } else {
+                    let mut s = String::with_capacity(e.user.text.len() + e.assistant.text.len());
+                    s.push_str(&e.user.text);
+                    s.push_str(&e.assistant.text);
+                    s
+                }
+            }
+        }
     }
 
-    pub fn token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> &[u32] {
+    /// Concatenated token IDs: `user.token_ids ++ assistant.token_ids`.
+    /// At Phase 4 entry the user half is empty so this reduces to the
+    /// assistant token IDs, preserving today's semantics.
+    pub fn token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> Vec<u32> {
+        match self.turn(timeline, index) {
+            None => Vec::new(),
+            Some(e) => {
+                if e.user.token_ids.is_empty() {
+                    e.assistant.token_ids[..].to_vec()
+                } else {
+                    let mut out = Vec::with_capacity(e.user.token_ids.len() + e.assistant.token_ids.len());
+                    out.extend_from_slice(&e.user.token_ids[..]);
+                    out.extend_from_slice(&e.assistant.token_ids[..]);
+                    out
+                }
+            }
+        }
+    }
+
+    /// Assistant-half token IDs as a borrowed slice (zero-copy).  Used
+    /// where the caller knows it only wants the assistant content.
+    pub fn assistant_token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> &[u32] {
         self.turn(timeline, index)
-            .map_or(&[][..], |e| &e.token_ids[..])
+            .map_or(&[][..], |e| &e.assistant.token_ids[..])
     }
 
     pub fn set_block_range(
@@ -1589,7 +1764,8 @@ impl Substrate {
         new_block_end: u64,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.token_count = entry.token_count.saturating_add(additional_tokens);
+            entry.assistant.token_count =
+                entry.assistant.token_count.saturating_add(additional_tokens);
             entry.block_range.1 = new_block_end;
         }
     }
@@ -1599,6 +1775,9 @@ impl Substrate {
             .map_or((0, 0), |e| e.block_range)
     }
 
+    /// Set sig entries on the assistant half.  The Phase 5 user-half
+    /// sigs (captured from the `NewUserMessage` prefill) come in via a
+    /// separate path.
     pub fn set_sig_entries(
         &mut self,
         timeline: TimelineId,
@@ -1606,7 +1785,7 @@ impl Substrate {
         entries: Vec<crate::provenance::SigEntry>,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.sig_entries = entries;
+            entry.assistant.sig_entries = entries;
         }
     }
 
@@ -1617,32 +1796,73 @@ impl Substrate {
         entries: impl IntoIterator<Item = crate::provenance::SigEntry>,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.sig_entries.extend(entries);
+            entry.assistant.sig_entries.extend(entries);
         }
     }
 
+    /// Concatenated BDP sig entries across both halves: user first,
+    /// then assistant.  Phase-aware scoring code (BDP `turn_score`)
+    /// runs on this combined view so the assistant half's sigs land at
+    /// their slot-relative positions even after the user-half capture
+    /// path adds entries to the user half.
     pub fn sig_entries_of(
         &self,
         timeline: TimelineId,
         index: TurnIndex,
-    ) -> &[crate::provenance::SigEntry] {
-        self.turn(timeline, index)
-            .map_or(&[][..], |e| &e.sig_entries)
+    ) -> Vec<crate::provenance::SigEntry> {
+        match self.turn(timeline, index) {
+            None => Vec::new(),
+            Some(e) => {
+                if e.user.sig_entries.is_empty() {
+                    e.assistant.sig_entries.clone()
+                } else {
+                    let mut out = Vec::with_capacity(
+                        e.user.sig_entries.len() + e.assistant.sig_entries.len(),
+                    );
+                    out.extend(e.user.sig_entries.iter().cloned());
+                    out.extend(e.assistant.sig_entries.iter().cloned());
+                    out
+                }
+            }
+        }
     }
 
+    /// Sealed K/V for the assistant half — the only half holding bytes
+    /// under today's seal path.  Phase 5 wires a part-aware variant.
     pub fn turn_sealed_of(
         &self,
         timeline: TimelineId,
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
-        let residence = self.turn(timeline, index)?.residence;
+        let residence = self.turn(timeline, index)?.assistant.residence;
         let hot = self.residence[residence.0].hot.as_ref()?;
         Some(Arc::new(hot.clone()))
     }
 
+    /// Sealed K/V for the specified half (user or assistant) of the turn.
+    /// Used by the projection assembler when emitting a
+    /// `SealedKind::Turn { part, .. }` segment.
+    pub fn turn_sealed_of_part(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        part: Role,
+    ) -> Option<Arc<Vec<SealedSequence>>> {
+        let entry = self.turn(timeline, index)?;
+        let residence = match part {
+            Role::User => entry.user.residence,
+            _ => entry.assistant.residence,
+        };
+        let hot = self.residence[residence.0].hot.as_ref()?;
+        Some(Arc::new(hot.clone()))
+    }
+
+    /// Total token count across both halves.  Today's seal path puts
+    /// everything in the assistant half so this equals
+    /// `assistant.token_count` for freshly-written turns.
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
         self.turn(timeline, index)
-            .map_or(0, |e| e.token_count)
+            .map_or(0, |e| e.user.token_count + e.assistant.token_count)
     }
 
     pub fn turn_count(&self, timeline: TimelineId) -> u32 {
@@ -1882,7 +2102,8 @@ impl ContentResolver for Substrate {
         let Some(timeline) = self.timelines_for_group(group).next() else {
             return 0;
         };
-        self.turn(timeline, index).map_or(0, |e| e.token_count)
+        self.turn(timeline, index)
+            .map_or(0, |e| e.user.token_count + e.assistant.token_count)
     }
 
     fn turn_score(
@@ -1975,7 +2196,9 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
             return 0;
         };
-        self.substrate.turn(timeline, index).map_or(0, |e| e.token_count)
+        self.substrate
+            .turn(timeline, index)
+            .map_or(0, |e| e.user.token_count + e.assistant.token_count)
     }
 
     fn turn_score(
@@ -2089,7 +2312,7 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         };
         self.guard
             .turn(timeline, index)
-            .map_or(0, |e| e.token_count)
+            .map_or(0, |e| e.user.token_count + e.assistant.token_count)
     }
 
     fn turn_score(
@@ -2226,11 +2449,11 @@ mod tests {
         assert_eq!(listed, vec![timeline]);
     }
 
-    /// `append_full` calls the migration closure and installs the
-    /// result into the residence's hot tier — `turn_sealed_of`
+    /// `append_complete` calls the migration closure and installs the
+    /// result into the assistant residence's hot tier — `turn_sealed_of`
     /// returns it.
     #[test]
-    fn append_full_stores_migrated_result() {
+    fn append_complete_stores_migrated_result() {
         let (_, _, timeline, mut sub) = make_timeline();
 
         // Migration that returns a 2-layer minimal sealed sequence
@@ -2241,15 +2464,16 @@ mod tests {
         };
 
         let idx = sub
-            .append_full(
+            .append_complete(
                 timeline,
-                Role::User,
-                "hello".to_string(),
-                TokenBuffer::default(),
-                3,
-                0,
-                1,
-                Arc::new(vec![]),
+                TurnPartWrite::default(),
+                TurnPartWrite {
+                    text: "hello".to_string(),
+                    token_count: 3,
+                    block_end: 1,
+                    sealed_gpu: Some(Arc::new(vec![])),
+                    ..Default::default()
+                },
                 migrate,
             )
             .unwrap();
@@ -2289,15 +2513,13 @@ mod tests {
     fn reset_clears_substrate() {
         let (_, _, timeline, mut sub) = make_timeline();
 
-        sub.append_full(
+        sub.append_complete(
             timeline,
-            Role::Assistant,
-            String::new(),
-            TokenBuffer::default(),
-            0,
-            0,
-            0,
-            Arc::new(vec![]),
+            TurnPartWrite::default(),
+            TurnPartWrite {
+                sealed_gpu: Some(Arc::new(vec![])),
+                ..Default::default()
+            },
             identity_migrate,
         )
         .unwrap();
@@ -2317,28 +2539,24 @@ mod tests {
         };
 
         let idx0 = sub
-            .append_full(
+            .append_complete(
                 timeline,
-                Role::User,
-                String::new(),
-                TokenBuffer::default(),
-                0,
-                0,
-                0,
-                Arc::new(vec![]),
+                TurnPartWrite::default(),
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![])),
+                    ..Default::default()
+                },
                 migrate,
             )
             .unwrap();
         let idx1 = sub
-            .append_full(
+            .append_complete(
                 timeline,
-                Role::Assistant,
-                String::new(),
-                TokenBuffer::default(),
-                0,
-                0,
-                0,
-                Arc::new(vec![]),
+                TurnPartWrite::default(),
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![])),
+                    ..Default::default()
+                },
                 migrate,
             )
             .unwrap();
@@ -2358,15 +2576,13 @@ mod tests {
         bytes: u64,
     ) -> ResidenceIndex {
         let idx = sub
-            .append_full(
+            .append_complete(
                 timeline,
-                Role::User,
-                String::new(),
-                TokenBuffer::default(),
-                0,
-                0,
-                0,
-                Arc::new(vec![]),
+                TurnPartWrite::default(),
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![])),
+                    ..Default::default()
+                },
                 identity_migrate,
             )
             .unwrap();
@@ -2507,14 +2723,21 @@ mod tests {
         }];
         let idx = sub.restore_turn(
             timeline,
-            Role::User,
+            // user half empty
+            String::new(),
+            TokenBuffer::default(),
+            0,
+            None,
+            // assistant half carries the cold payload
             String::new(),
             TokenBuffer::default(),
             32,
+            Some(cold_payload),
             0,
             1,
-            Some(cold_payload),
         );
+        // The assistant residence (second of the two allocated for
+        // this turn) is the one that received the cold install.
         let residence = sub.turn_residence(timeline, idx).unwrap();
         assert!(sub.residence[residence.0].cold.is_some(), "cold installed");
         assert!(sub.residence[residence.0].hot.is_none(), "hot empty (cold-marker)");
@@ -2524,16 +2747,19 @@ mod tests {
             "byte_size summed from cold record_len"
         );
 
-        // None branch — residence stays all-empty.
+        // None branch — both halves all-empty.
         let idx2 = sub.restore_turn(
             timeline,
-            Role::Assistant,
             String::new(),
             TokenBuffer::default(),
             0,
-            0,
+            None,
+            String::new(),
+            TokenBuffer::default(),
             0,
             None,
+            0,
+            0,
         );
         let r2 = sub.turn_residence(timeline, idx2).unwrap();
         assert!(sub.residence[r2.0].cold.is_none());

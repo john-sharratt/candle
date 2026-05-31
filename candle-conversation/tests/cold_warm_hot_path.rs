@@ -133,12 +133,13 @@ fn seed_turn(
     conv.record_turn(
         timeline,
         Role::User,
-        String::new(),
-        TokenBuffer::default(),
-        N_TOKENS_PER_TURN,
-        0,
-        block_end,
-        Arc::new(sealed_per_layer),
+        candle_conversation::substrate::TurnPartWrite::default(),
+        candle_conversation::substrate::TurnPartWrite {
+            token_count: N_TOKENS_PER_TURN,
+            block_end,
+            sealed_gpu: Some(Arc::new(sealed_per_layer)),
+            ..Default::default()
+        },
         |seqs| Ok(seqs.to_vec()),
     )
     .unwrap()
@@ -600,12 +601,13 @@ fn seed_turn_with_format(
     conv.record_turn(
         timeline,
         Role::User,
-        String::new(),
-        TokenBuffer::default(),
-        n_tokens,
-        0,
-        block_end,
-        Arc::new(sealed_per_layer),
+        candle_conversation::substrate::TurnPartWrite::default(),
+        candle_conversation::substrate::TurnPartWrite {
+            token_count: n_tokens,
+            block_end,
+            sealed_gpu: Some(Arc::new(sealed_per_layer)),
+            ..Default::default()
+        },
         |seqs| Ok(seqs.to_vec()),
     )
     .unwrap()
@@ -2230,12 +2232,13 @@ fn seed_turn_varied_per_sub_band(
     conv.record_turn(
         timeline,
         Role::User,
-        String::new(),
-        TokenBuffer::default(),
-        n_tokens,
-        0,
-        block_end,
-        Arc::new(sealed_per_layer),
+        candle_conversation::substrate::TurnPartWrite::default(),
+        candle_conversation::substrate::TurnPartWrite {
+            token_count: n_tokens,
+            block_end,
+            sealed_gpu: Some(Arc::new(sealed_per_layer)),
+            ..Default::default()
+        },
         |seqs| Ok(seqs.to_vec()),
     )
     .unwrap()

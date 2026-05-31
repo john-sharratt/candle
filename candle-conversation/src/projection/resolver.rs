@@ -158,36 +158,36 @@ impl Conversation {
         }
     }
 
-    /// Atomically append a turn to the substrate.
+    /// Atomically append a turn to the substrate as a `(user, assistant)`
+    /// pair.
     ///
-    /// `sealed_gpu` is the GPU-resident snapshot; `migrate_to_cpu` is called
-    /// inside the lock to convert it to the warm (CPU) tier before storing.
-    #[allow(clippy::too_many_arguments)]
+    /// Each [`crate::substrate::TurnPartWrite`] carries its own block
+    /// range and sealed-GPU snapshot.  `migrate_to_cpu` is called for
+    /// each non-empty half to move its bytes to the warm (CPU) tier
+    /// before storing.  Empty halves (e.g. the user half under the
+    /// pre-`NewUserMessage` seal path) skip the migration and own a
+    /// residence that stays cold.
     pub fn record_turn(
         &self,
         timeline: TimelineId,
         role: Role,
-        text: String,
-        token_ids: TokenBuffer,
-        token_count: usize,
-        block_start: u64,
-        block_end: u64,
-        sealed_gpu: Arc<Vec<SealedSequence>>,
-        migrate_to_cpu: impl FnOnce(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
+        user: crate::substrate::TurnPartWrite,
+        assistant: crate::substrate::TurnPartWrite,
+        migrate_to_cpu: impl FnMut(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
     ) -> candle::Result<TurnIndex> {
+        let block_start = if user.is_empty() {
+            assistant.block_start
+        } else {
+            user.block_start
+        };
+        let block_end = if assistant.is_empty() {
+            user.block_end
+        } else {
+            assistant.block_end
+        };
         let idx = {
             let mut view = self.inner.write().unwrap();
-            view.append_full(
-                timeline,
-                role,
-                text,
-                token_ids,
-                token_count,
-                block_start,
-                block_end,
-                sealed_gpu,
-                migrate_to_cpu,
-            )?
+            view.append_complete(timeline, user, assistant, migrate_to_cpu)?
         };
         // Record the turn's structure into the redo log.
         let (layer_id, group_id) = self
@@ -211,6 +211,14 @@ impl Conversation {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
+            // Today's seal path puts the entire payload in the
+            // assistant half, so the user-side partition counts are
+            // all zero.  The Phase 5 capture path populates these
+            // with the user message's chunk / token / sig sizes so
+            // reload can split the streams correctly.
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
         });
         self.persistence
             .lock()
@@ -310,15 +318,24 @@ impl Conversation {
             // a recoverable-token-only turn (no persisted chunks) —
             // the substrate keeps it discoverable but it stays unable
             // to materialise KV.
+            // Pre-Phase-5 redo logs store all content in one stream;
+            // route it into the assistant half.  The user half stays
+            // empty.
+            let _ = role;
             let idx = view.restore_turn(
                 timeline,
-                role,
+                // user half empty
+                String::new(),
+                TokenBuffer::default(),
+                0,
+                None,
+                // assistant half carries the recovered content
                 String::new(),
                 TokenBuffer::from(recovered.token_ids),
                 token_count,
+                cold_refs,
                 decl.block_start,
                 decl.block_end,
-                cold_refs,
             );
             if !sig_entries.is_empty() {
                 view.set_sig_entries(timeline, idx, sig_entries);

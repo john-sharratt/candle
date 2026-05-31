@@ -188,9 +188,16 @@ pub(super) fn apply_segments(
                 walker.flush_run(state, &mut ctx)?;
                 inject_sealed_section(state, &mut ctx, &mut walker, rs.id)?;
             }
-            ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+            ProjectionSegment::Sealed(SealedKind::Turn(rt, part)) => {
                 walker.flush_run(state, &mut ctx)?;
-                inject_sealed_turn(state, &mut ctx, &mut walker, rt.group(), rt.index())?;
+                inject_sealed_turn(
+                    state,
+                    &mut ctx,
+                    &mut walker,
+                    rt.group(),
+                    rt.index(),
+                    *part,
+                )?;
             }
             ProjectionSegment::NewUserMessage { tokens } => {
                 walker.flush_run(state, &mut ctx)?;
@@ -295,6 +302,7 @@ fn inject_sealed_turn(
     walker: &mut SegmentWalker,
     group: GroupId,
     index: TurnIndex,
+    part: crate::Role,
 ) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
 
@@ -306,24 +314,43 @@ fn inject_sealed_turn(
         return Ok(());
     };
 
-    let sealed = match ctx.conversation.read().turn_sealed_of(timeline, index) {
+    let sealed = match ctx
+        .conversation
+        .read()
+        .turn_sealed_of_part(timeline, index, part)
+    {
         Some(s) => s,
         None => {
-            tracing::warn!(
-                target: "candle_conversation::persistence::tier",
-                timeline = timeline.raw(),
-                turn = index.0,
-                slot = parent_id.0,
-                "apply_projection: turn not hot — elevate missed it; skipping borrow"
-            );
+            // Empty half: the user half under today's seal path
+            // legitimately has no bytes.  Fold a zero-token
+            // contribution into the rolling hash and move on.
             return Ok(());
         }
     };
+    if sealed.is_empty() {
+        return Ok(());
+    }
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
 
-    let toks = ctx.conversation.read().token_ids_of(timeline, index).to_vec();
+    // Pull the per-half tokens; under today's seal path everything
+    // lives in the assistant half so the user half is empty.
+    let toks: Vec<u32> = match part {
+        crate::Role::User => Vec::new(),
+        _ => ctx
+            .conversation
+            .read()
+            .assistant_token_ids_of(timeline, index)
+            .to_vec(),
+    };
     let start_block = ctx
-        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?
+        .session
+        .sequence_block_count(parent_id.0)
+        .ok_or_else(|| {
+            ConversationError::Channel(format!(
+                "apply_projection: slot {} not in session",
+                parent_id
+            ))
+        })?
         .saturating_sub(sealed[0].chunks.len());
     let end_block = start_block + sealed[0].chunks.len();
     ctx.conversation
@@ -494,13 +521,16 @@ mod tests {
     }
 
     fn turn_seg(layer: u32, group: u32, index: u32) -> ProjectionSegment {
-        ProjectionSegment::Sealed(SealedKind::Turn(ResolvedTurn {
-            id: TurnId {
-                layer_id: LayerId::for_test(layer),
-                group_id: GroupId::for_test(group),
-                index: TurnIndex(index),
+        ProjectionSegment::Sealed(SealedKind::Turn(
+            ResolvedTurn {
+                id: TurnId {
+                    layer_id: LayerId::for_test(layer),
+                    group_id: GroupId::for_test(group),
+                    index: TurnIndex(index),
+                },
             },
-        }))
+            crate::Role::Assistant,
+        ))
     }
 
     fn generated_seg(name: &str, position: usize, tokens: &[u32]) -> ProjectionSegment {
@@ -573,9 +603,10 @@ mod tests {
             _ => panic!("expected Sealed(Section)"),
         }
         match turn_seg(1, 2, 3) {
-            ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+            ProjectionSegment::Sealed(SealedKind::Turn(rt, part)) => {
                 assert_eq!(rt.group(), GroupId::for_test(2));
                 assert_eq!(rt.index(), TurnIndex(3));
+                assert_eq!(part, crate::Role::Assistant);
             }
             _ => panic!("expected Sealed(Turn)"),
         }

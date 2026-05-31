@@ -93,7 +93,10 @@ pub struct TurnDecl {
     /// `turn::Role` tag (System / User / Assistant).
     #[serde(default)]
     pub role: u8,
-    /// KV block span `(start, end)` this turn occupies.
+    /// KV block span `(start, end)` this turn occupies overall —
+    /// from the first block of the user half (or the assistant half
+    /// when the user half is empty) through the last block of the
+    /// assistant half.
     #[serde(default)]
     pub block_start: u64,
     #[serde(default)]
@@ -111,6 +114,21 @@ pub struct TurnDecl {
     pub view: Vec<u32>,
     #[serde(default)]
     pub scores: PerDepthScores,
+    /// Per-half partition counts that disambiguate where the user
+    /// half ends and the assistant half begins inside the turn's
+    /// Chunks / Tokens / Signatures streams.  The user half occupies
+    /// `[0..user_chunk_count)` of the per-layer chunk grid, the first
+    /// `user_token_count` tokens of the Tokens record, and the first
+    /// `user_sig_count` sig entries of the Signatures record.  The
+    /// remainder belongs to the assistant half.  When the user half
+    /// is empty (today's seal path), all three are zero and the
+    /// entire payload reduces to the assistant half.
+    ///
+    /// Required for v2 logs (no `#[serde(default)]` here on purpose):
+    /// a record missing any of these is malformed and decode fails.
+    pub user_chunk_count: u32,
+    pub user_token_count: u32,
+    pub user_sig_count: u32,
 }
 
 /// The payload of a `StreamDecl` record — declares a stream and
@@ -195,6 +213,9 @@ mod tests {
             anchored_prefix: vec![StreamId(7), StreamId(8), StreamId(123)],
             view: vec![0, 2, 5],
             scores: PerDepthScores(lanes),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
         });
         let bytes = decl.encode();
         let decoded = StreamDecl::decode(&bytes).unwrap();
@@ -217,6 +238,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
         });
         assert_eq!(StreamDecl::decode(&decl.encode()).unwrap(), decl);
     }
@@ -227,8 +251,19 @@ mod tests {
     #[test]
     fn stream_decl_ignores_unknown_field() {
         // A Turn with an extra `future_field`. serde drops unknown keys.
-        let payload =
-            br#"{"kind":"turn","timeline_id":1,"turn_index":0,"role":1,"future_field":"opaque"}"#;
+        // All mandatory fields (including the partition counts) must
+        // still be present — only the unknown `future_field` is the
+        // forward-compat surface this test exercises.
+        let payload = br#"{
+            "kind":"turn",
+            "timeline_id":1,
+            "turn_index":0,
+            "role":1,
+            "user_chunk_count":0,
+            "user_token_count":0,
+            "user_sig_count":0,
+            "future_field":"opaque"
+        }"#;
         let decoded = StreamDecl::decode(payload).unwrap();
         match decoded {
             StreamDecl::Turn(t) => {

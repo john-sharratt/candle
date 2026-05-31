@@ -1206,6 +1206,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: streams::PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
         });
         let turn_id;
         {
@@ -1266,6 +1269,9 @@ mod tests {
             anchored_prefix: vec![sec.stream_id()],
             view: Vec::new(),
             scores: streams::PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
         });
         child.declare_stream(&child_turn).unwrap();
         child.commit().unwrap();

@@ -1016,7 +1016,7 @@ impl Scheduler {
                                     segments.push(seg.clone());
                                 }
                             }
-                            ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+                            ProjectionSegment::Sealed(SealedKind::Turn(rt, _part)) => {
                                 let g = rt.group();
                                 let t = rt.index();
                                 let Some(timeline) = resolve_timeline(g) else {
@@ -2115,16 +2115,28 @@ impl Scheduler {
                 // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
 
+                // Phase 4 seal: the entire turn content lands in the
+                // assistant half.  Phase 5 will populate the user half
+                // from the slot's `pending_user_part`.
+                let user_part = crate::substrate::TurnPartWrite {
+                    block_start: block_from as u64,
+                    block_end: block_from as u64,
+                    ..Default::default()
+                };
+                let assistant_part = crate::substrate::TurnPartWrite {
+                    text,
+                    token_ids,
+                    token_count: turn_token_count,
+                    block_start: block_from as u64,
+                    block_end: block_to as u64,
+                    sealed_gpu: Some(Arc::new(delta_gpu)),
+                };
                 let idx = conversation
                     .record_turn(
                         target.timeline,
                         role,
-                        text,
-                        token_ids,
-                        turn_token_count,
-                        block_from as u64,
-                        block_to as u64,
-                        Arc::new(delta_gpu),
+                        user_part,
+                        assistant_part,
                         |seqs| Ok(seqs.to_vec()),
                     )
                     .map_err(ConversationError::Model)?;
@@ -2930,7 +2942,7 @@ impl Scheduler {
                             segments.push(seg.clone());
                         }
                     }
-                    ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+                    ProjectionSegment::Sealed(SealedKind::Turn(rt, _part)) => {
                         let g = rt.group();
                         let t = rt.index();
                         let Some(timeline) = view.timelines_for_group(g).next() else {

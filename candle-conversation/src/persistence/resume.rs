@@ -612,6 +612,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
         }
     }
 

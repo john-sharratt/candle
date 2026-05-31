@@ -520,12 +520,12 @@ mod tests {
         conv.record_turn(
             timeline,
             Role::User,
-            String::new(),
-            TokenBuffer::default(),
-            n_tokens,
-            0,
-            0,
-            Arc::new(sealed_per_layer),
+            crate::substrate::TurnPartWrite::default(),
+            crate::substrate::TurnPartWrite {
+                token_count: n_tokens,
+                sealed_gpu: Some(Arc::new(sealed_per_layer)),
+                ..Default::default()
+            },
             |seqs| Ok(seqs.to_vec()),
         )
         .unwrap()

@@ -229,13 +229,18 @@ pub enum ProjectionSegment {
 }
 
 /// Discriminator under [`ProjectionSegment::Sealed`] — distinguishes a
-/// system-prompt section from a turn entry.  Reuses the existing
-/// [`ResolvedSection`] / [`ResolvedTurn`] payloads so this is a
-/// representation rebracket, not a parallel id family.
+/// system-prompt section from a turn-half entry.  Each turn carries a
+/// `user` half and an `assistant` half in the substrate; a `Turn`
+/// segment names which half to inject.  Under today's seal path the
+/// user half is empty and the assistant half holds all content, so
+/// the projection engine emits `part: Role::Assistant`; once the
+/// `NewUserMessage` capture path lights up both halves are real and
+/// each turn projects as a `User` segment followed by an `Assistant`
+/// segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealedKind {
     Section(ResolvedSection),
-    Turn(ResolvedTurn),
+    Turn(ResolvedTurn, crate::Role),
 }
 
 /// Diagnostic identity for a [`ProjectionSegment::Generated`] run.
@@ -279,9 +284,27 @@ impl Projection {
     }
 
     /// Iter over only the sealed-turn payloads, in emission order.
+    /// Yields `&ResolvedTurn` — the `Role` discriminator under
+    /// `SealedKind::Turn` is dropped here so callers that only care
+    /// about which `(group, index)` pair was selected don't have to
+    /// destructure the part.  Callers that need the part too use
+    /// [`Self::sealed_turn_segments`].
     pub fn sealed_turns(&self) -> impl Iterator<Item = &ResolvedTurn> + '_ {
         self.segments.iter().filter_map(|seg| match seg {
-            ProjectionSegment::Sealed(SealedKind::Turn(t)) => Some(t),
+            ProjectionSegment::Sealed(SealedKind::Turn(t, _)) => Some(t),
+            _ => None,
+        })
+    }
+
+    /// Iter over each sealed-turn segment as `(ResolvedTurn, Role)` so
+    /// callers can distinguish the user half from the assistant half
+    /// of the same turn.  Used by the projection assembler when
+    /// injecting per-part residence bytes.
+    pub fn sealed_turn_segments(
+        &self,
+    ) -> impl Iterator<Item = (&ResolvedTurn, crate::Role)> + '_ {
+        self.segments.iter().filter_map(|seg| match seg {
+            ProjectionSegment::Sealed(SealedKind::Turn(t, role)) => Some((t, *role)),
             _ => None,
         })
     }
@@ -623,11 +646,14 @@ pub fn run<R: ContentResolver>(
     let mut segments: Vec<ProjectionSegment> =
         Vec::with_capacity(system_prompt_segments.len() + turns.len());
     segments.extend(system_prompt_segments);
-    segments.extend(
-        turns
-            .into_iter()
-            .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t))),
-    );
+    // At this phase every turn projects as a single Sealed(Turn,
+    // Assistant) segment — the user half is empty in substrate and
+    // would inject zero bytes if emitted.  Phase 5 expands this to a
+    // user half + assistant half pair around live-prefilled role
+    // markers.
+    segments.extend(turns.into_iter().map(|t| {
+        ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant))
+    }));
     Projection { segments }
 }
 
