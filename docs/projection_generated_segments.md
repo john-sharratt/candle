@@ -110,20 +110,28 @@ runtime context.
 
 A run of generated template tokens — `[Generated_A, Generated_B,
 Generated_C]` between two sealed segments — gets one cache key:
-`hash(preceding_tokens ++ A.tokens ++ B.tokens ++ C.tokens)`. Two
-consecutive projections with the same selected sections produce the same
-key for every run → all hits → zero prefill. Projections that differ
-only in their tail produce hits up to the divergence point and one cache
-miss for each remaining run. The token cost of a miss is the number of
-template tokens in that run, which is tiny (single-digit tokens per
-boundary, dozens per projection at most).
+`hash(preceding_tokens ++ A.tokens ++ B.tokens ++ C.tokens)`.  Two
+consecutive projections with the same selected sections produce the
+same rolling hash at every run boundary, so every run's key matches an
+existing cache entry → all hits → zero prefill work on the GPU.
+Projections that differ produce hits up to the first divergent token
+and cache misses for every run downstream of it; the token cost of a
+miss is the number of template tokens in that run, which is tiny
+(single-digit tokens per boundary, dozens per projection at most).
 
-Across slots, prefill runs batch into one `forward_batched` call. Within a
-slot, runs execute in order. The scheduler already does this for
-user-prefills and decode steps; generated-run prefills become first-class
-participants in the same pipeline.
+Sealed segments are still re-resolved from substrate on every apply.
+That cost is metadata-only — Arc-clone the per-layer sealed sequences
+and patch `block_range` entries — measured in microseconds for a
+typical projection.  The GPU forward pass for live-prefilled templates
+is the cost that scales badly without the cache; the metadata cost
+isn't.
 
-Steady-state cost: ~zero (all cache hits). Worst case (cold slot, full
+Across slots, prefill runs batch into one `forward_batched` call.
+Within a slot, runs execute in order.  The scheduler already does this
+for user-prefills and decode steps; generated-run prefills become
+first-class participants in the same pipeline.
+
+Steady-state cost: ~zero (all cache hits).  Worst case (cold slot, full
 projection change): a couple dozen tokens of batched prefill, on the
 order of a single decode step.
 
@@ -433,9 +441,7 @@ free of no-op entries.
 
 ## 5. `ProjectionAssembler`
 
-Lives in `candle-conversation/src/scheduler/projection_assembler.rs`,
-extracted out of `Scheduler::apply_projection`'s current ~300-line
-inline implementation.
+Lives in `candle-conversation/src/scheduler/projection_assembler.rs`.
 
 ### 5.1 Inputs
 
@@ -444,8 +450,7 @@ pub struct ProjectionAssembler<'s> {
     sequence_id: SequenceId,
     conversation: &'s Conversation,
     session: &'s mut BatchedInferenceSession,
-    slot_state: &'s mut SlotState,    // includes SlotProjectionCache,
-                                       // pending_user_part, previous segments
+    slot_state: &'s mut SlotState,    // SlotProjectionCache + pending_user_part
     prefill_queue: &'s mut PrefillQueue,
 }
 
@@ -460,38 +465,36 @@ impl ProjectionAssembler<'_> {
 
 ### 5.2 Walk
 
+Every apply is a full rebuild from substrate.  The slot is truncated
+to zero, every segment is resolved and injected in declaration order,
+and the writer tail is re-attached at the end.  The performance
+optimisation lives inside the `Generated` arm: a rolling hash committed
+over every emitted token serves as a content-addressed cache key, so
+runs of structural template tokens that have been live-prefilled before
+reuse their captured K/V instead of running a fresh forward pass.
+
 ```text
 1.  Snapshot the slot's writer tail (in-flight decode chunks) as a
-    `WriterTail`. The tail is preserved across LCP truncate and
-    re-attached at the end.
+    `WriterTail`.  Re-attached at the end so mid-decode reprojections
+    don't drop already-generated tokens.
 
-2.  Compute LCP between `slot_state.previous_segments` and
-    `new_segments` by segment-identity equality:
-      - Sealed(SealedKind) → equal iff SealedKind equal.
-      - Generated { tokens, identity } → equal iff identity equal AND
-        rolling-hash-at-this-position equal between old and new walks.
-      - (Both halves of the rolling hash agree iff every preceding
-        segment was identical, which the LCP comparison enforces by
-        construction.)
-    LCP = N means the first N segments of the new projection are
-    already on the slot in the right form.
+2.  Truncate the slot to zero blocks.  Drops Arc refs to whatever the
+    slot previously held; arenas reclaim asynchronously.
 
-3.  Truncate slot to the block boundary at end-of-LCP. Drops Arc refs
-    for everything past N; residence chunks beyond LCP return to the
-    pool.
-
-4.  Walk new_segments[N..]:
-      rolling_hash = (cached at end-of-LCP from previous walk)
+3.  Walk new_segments:
+      rolling_hash = 0
       current_run = empty
-      for segment in new_segments[N..]:
+      for segment in new_segments:
           match segment:
               Sealed(kind):
-                  flush_current_run()      // see below
+                  flush_current_run()
                   resolve sealed bytes from substrate; inject onto slot
                   fold segment.tokens (looked up from substrate) into
                       rolling_hash
               Generated { tokens, identity }:
-                  fold tokens into rolling_hash
+                  // Don't fold yet — the cache key covers the WHOLE
+                  // run, not the partial prefix at this segment's
+                  // start.
                   current_run.tokens.extend(tokens)
                   current_run.identities.push(identity)
               NewUserMessage { tokens }:
@@ -508,25 +511,45 @@ impl ProjectionAssembler<'_> {
 
     flush_current_run():
         if current_run is empty: return
-        key = rolling_hash               // includes the run's tokens (just folded)
+        // Cache key = preceding context + the run's full token
+        // concatenation.  Both halves are load-bearing:
+        //   - rolling_hash captures the attention prefix the K/V was
+        //     computed under;
+        //   - run_tokens commits to the exact batched forward pass
+        //     that produced it.  A run [A,B,C] captured together is
+        //     not interchangeable with [A,B,D] even though they share
+        //     A,B at the head — B's K/V was computed in a batch that
+        //     also contained C, with a different padding/position
+        //     layout from the [A,B,D] batch.
+        run_tokens = concat(current_run.tokens)
+        key = fold(rolling_hash, run_tokens)
         if slot_state.cache.contains_key(key):
-            inject cache[key] onto slot
+            inject cache[key] onto slot                  // Arc-clone, no GPU
         else:
             enqueue PrefillRun {
                 sequence_id: self.sequence_id,
-                tokens: current_run.tokens,
+                tokens: run_tokens,
                 write_offset: slot.current_block_count,
                 capture: SlotCache { key },
             }
-            advance slot.current_block_count
+        advance slot.current_block_count by ceil(len(run_tokens) / CHUNK_SIZE)
+        rolling_hash = key       // committed; next segment sees post-run hash
         current_run = empty
 
-5.  Restore writer tail at slot.current_block_count + queued-prefill-blocks.
-    (The writer tail attaches AFTER all pending prefills resolve; the
-    scheduler's prefill-batcher handles the ordering.)
-
-6.  Update slot_state.previous_segments = new_segments.
+4.  Restore writer tail at slot.current_block_count + queued-prefill-blocks.
+    The writer tail attaches AFTER all pending prefills resolve; the
+    scheduler's prefill-batcher handles the ordering.
 ```
+
+The assembler does not maintain a "previous projection" record.  The
+cache is content-addressed and persists across reprojections under the
+slot — that is the only state carried forward.  A reproject with an
+identical projection produces identical run-hash keys, hits every
+cached entry, and finishes without enqueuing any prefill work.  A
+reproject that diverges at a sealed boundary re-resolves the diverging
+sealed entries from substrate (cheap, metadata-only) and re-keys every
+generated run downstream of the divergence — those see cache misses
+and prefill fresh.
 
 ### 5.3 Prefill-run capture targets
 
@@ -647,24 +670,25 @@ expansion.
 pub struct SlotState {
     pub cache: SlotProjectionCache,
     pub pending_user_part: Option<Vec<SealedSequence>>,
-    pub previous_segments: Vec<ProjectionSegment>,
-    pub previous_segment_hashes: Vec<u64>,    // rolling hash at end of each segment
 }
 ```
 
-`previous_segment_hashes[i]` is the rolling hash at the end of segment
-`i`. Stored so LCP comparison can validate that two segments at the same
-position have the same preceding context — i.e., the same effective K/V
-input — without re-walking from scratch.
+`cache` is the content-addressed memo of captured live-prefill runs.
+Keyed by `hash(rolling_hash_at_run_start ++ concat(run_tokens))`, valued
+as the per-layer `Vec<SealedSequence>` captured from the slot after the
+prefill that produced it.  Populated on cache miss after the prefill
+completes; queried on every run-flush during the assembler walk.  No
+eviction policy; lives until the slot is freed.
 
 `pending_user_part` is populated by a `NewUserMessage` capture and
 cleared at seal time when the resulting bytes are written to the
-substrate. If the turn is aborted (decode error, EOS forced before seal,
-slot freed mid-flight), the buffer drops without persistence.
-
-`previous_segments` is the assembler's record of the slot's current
-shape. Replaces the implicit "the slot has system blocks 0..N, then
-turn-injected blocks N..M" tracking today.
+substrate.  If the turn is aborted (decode error, EOS forced before
+seal, slot freed mid-flight), the buffer drops without persistence.
+Mid-decode reprojection drops the prior slot contents along with
+everything else; the captured `Vec<SealedSequence>` survives the
+rebuild because it lives on `SlotState`, not on the slot, and the
+assembler re-injects it as the `NewUserMessage`'s K/V when it walks
+that segment.
 
 ---
 
@@ -852,8 +876,8 @@ Module-level diff summary:
 | `candle-conversation/src/projection/yaml.rs` | Parse `kind: template`, resolve `dialect:` refs at build. |
 | `candle-conversation/src/projection/project.rs` | Emit `Vec<ProjectionSegment>`, turn expansion, depends_on unchanged. |
 | `candle-conversation/src/projection/builder.rs` | `Builder::set_system_markers` deleted; helper for dialect-aware caller to inject template items. |
-| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` becomes thin wrapper around `ProjectionAssembler`. `SlotState` gains `cache`, `pending_user_part`, `previous_segments`. |
-| `candle-conversation/src/scheduler/projection_assembler.rs` | **NEW.** Walk logic, LCP, rolling hash, prefill-run emission. |
+| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` becomes thin wrapper around `ProjectionAssembler`. `SlotState` gains `cache` and `pending_user_part`. |
+| `candle-conversation/src/scheduler/projection_assembler.rs` | **NEW.** Walk logic, rolling-hash cache lookup, prefill-run emission. |
 | `candle-conversation/src/scheduler/prefill.rs` | `PrefillRun` peer to `ActivePrefill`. Combined-run forward-pass logic. Capture hook. |
 | `candle-conversation/src/substrate.rs` | `TurnEntryData` split, `TurnPart`, `append_complete`. |
 | `candle-conversation/src/persistence/record.rs`, `streams.rs`, `resume.rs` | `TurnDecl` two-range layout, `Chunks`/`Tokens`/`Signatures` split. |
@@ -895,51 +919,53 @@ Tests:
 
 Risk: **low.** Additive. Existing tests stay green.
 
-### Phase 2 — `ProjectionSegment` + `ProjectionAssembler` + LCP
+### Phase 2 — `ProjectionSegment` + `ProjectionAssembler`
 
-**Behaviour-preserving refactor. Bit-identical K/V on slot. Measurable
-reproject perf gain.**
+**Behaviour-preserving refactor.  Bit-identical K/V on slot.**
 
 Deliverables:
-- `ProjectionSegment` enum added (`Sealed` and `Generated` variants;
-  `NewUserMessage` added but unused until Phase 5).
-- `Builder::project` returns `Projection { segments: Vec<ProjectionSegment>
-  }`. All segments emit as `Sealed` at this phase, including template
-  items (still routed through substrate ingest).
+- `ProjectionSegment` enum added (`Sealed`, `Generated`, and
+  `NewUserMessage` variants; only `Sealed` is emitted by the projection
+  engine at this phase).
+- `Builder::project` returns `Projection { segments:
+  Vec<ProjectionSegment> }`.  All segments emit as `Sealed`, including
+  template items (still routed through substrate ingest).
 - `ProjectionAssembler` module extracted from
-  `Scheduler::apply_projection`.
-- LCP comparison + truncate-to-divergence-point. Behaviour identical
-  when LCP = 0 (truncate-to-zero, full rebuild).
-- `SlotState::previous_segments` and `previous_segment_hashes` added,
-  populated, consulted.
+  `Scheduler::apply_projection`.  Always-rebuild semantics: snapshot
+  writer tail, truncate slot to zero, resolve every segment from
+  substrate, inject in declaration order, re-attach tail.  Equivalent
+  to the prior inline implementation, factored into one module.
 
 Tests:
-- Bit-identical: scripted conversation transcript, run with full-rebuild
-  vs LCP path, per-layer SealedSequence bytes match.
-- LCP coverage: no-change, prefix-only-change, mid-change cases.
-- Performance: `apply_projection` time on same-projection reproject
-  should drop from O(slot blocks) to O(LCP comparison).
 - All existing scheduler tests pass.
+- Unit-level fixture tests for the new segment types and helpers.
 
-Risk: **medium.** Output-shape change touches many callsites. LCP
-correctness needs coverage. No quality-impact risk yet.
+Risk: **medium.**  Output-shape change touches many callsites.  No
+quality-impact risk.
 
 ### Phase 3 — Slot cache + `Generated` for system-prompt + `PrefillRun`
 
 **Behaviour change. System-prompt boundary K/V becomes attention-correct.**
 
 Deliverables:
-- `SlotProjectionCache` added to `SlotState`.
+- `SlotProjectionCache` added to `SlotState` — `AHashMap<u64,
+  Vec<SealedSequence>>` keyed by `hash(rolling_hash ++ run_tokens)`.
+- Rolling-hash machinery inside the assembler walk — fold sealed
+  segments' tokens into `rolling_hash` as they're injected; on a
+  generated-run flush, compute the cache key over `rolling_hash` and
+  the run's full token concatenation.
 - `PrefillRun` added to scheduler, integrated into the prefill batcher.
-- Adjacent runs on the same slot concatenate into one forward pass.
+- Adjacent generated segments on the same slot collect into one
+  `PrefillRun` and run as one forward pass.
 - Cross-slot batching as today.
-- Capture hook: completed `PrefillRun` deposits captured K/V into
-  `SlotProjectionCache` under `key`.
+- Capture hook: a completed `PrefillRun` extracts the captured per-layer
+  `Vec<SealedSequence>` from the slot and inserts it into
+  `SlotProjectionCache` under the key the run was enqueued with.
 - `Builder::project` emits `Generated` segments for `kind: template`
-  items. `Sealed` for `kind: section` (and turn) items.
+  items.  `Sealed` for `kind: section` (and turn) items.
 - Template items NO LONGER ingested as sections at session setup.
-- `conversation.rs` ingest loop drops template handling for system-prompt
-  templates (content sections still ingest cumulatively).
+- `conversation.rs` ingest loop drops template handling for
+  system-prompt templates (content sections still ingest cumulatively).
 - `__system_start` / `__system_end` synthetic-section mechanism retired.
   Dialect-aware caller (zend) installs them as `kind: template` items
   via a builder helper.
@@ -1010,9 +1036,10 @@ Deliverables:
   Generated(AssistantEnd)]`.
 - Seal flow: `pending_user_part` + decoded slot range →
   `Substrate::append_complete` with both `TurnPart`s populated.
-- Mid-decode reproject: `pending_user_part` survives LCP truncate;
-  assembler re-injects it like a sealed segment after the new prefix is
-  assembled.
+- Mid-decode reproject: `pending_user_part` lives on `SlotState`, not
+  on the slot, so the truncate-to-zero rebuild doesn't drop it; the
+  assembler re-injects it like a sealed segment when it walks the
+  `NewUserMessage` segment.
 - `conversation.rs` `submit_turn` formatting reduced to user-message
   tokens only (role markers move to projection).
 
@@ -1069,11 +1096,12 @@ None blocking. Detail-level questions to settle during implementation:
   partial chunks; reuse that. Concrete mechanism worked out in Phase 4.
 
 - **Reproject and pending_user_part.** When reprojection mid-decode
-  rebuilds the prefix, `pending_user_part` must be re-injected after the
-  new prefix is assembled. It sits **outside** the segment list (it's
-  slot-attached state). The assembler's `apply` method takes both
-  `new_segments` and a flag indicating whether to re-inject the pending
-  user part. Worked out in Phase 5.
+  truncates and rebuilds the slot, `pending_user_part` must land back at
+  the position the projection's `NewUserMessage` segment occupies.  It
+  sits on `SlotState`, not on the slot, so it survives the truncate;
+  the assembler treats the `NewUserMessage` segment as "inject from
+  `pending_user_part` rather than enqueue a fresh prefill" when the
+  buffer is populated.  Worked out in Phase 5.
 
 - **PrefillRun granularity for batch-throughput.** The single-slot
   concatenation rule says "adjacent runs on the same slot combine into
