@@ -8,7 +8,8 @@
 //! N_PALETTE = 4 palette sub-bands split HEAD_DIM into 4 equal parts.
 //! Backward-compat accessors `k_gid(h)` / `v_gid(h)` return palette 0's GID.
 
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use super::gid_pool::ChunkGid;
 use crate::kv_cache::arena_table::N_PALETTE;
@@ -25,14 +26,22 @@ pub const GIDS_PER_HEAD: usize = N_PALETTE * 2;
 ///   (is_value: 0 = K, 1 = V)
 ///
 /// Backward-compat aliases `k_gid(h)` / `v_gid(h)` return palette-0 slots.
+///
+/// The inner gid array sits behind an `Arc` so `HeadGids::clone` is
+/// **O(1)** (one Arc ref-count bump) instead of cloning every
+/// `ChunkGid`. Cold-load registers each block's gids into both the
+/// slot's chunk window and the per-call return Vec; the old per-gid
+/// clone showed up as ~580 µs/cold-load in `register_us`. Mutating
+/// HeadGids after construction is not supported (no `DerefMut`, no
+/// `into_inner`) — every existing call-site treats it as immutable.
 #[derive(Debug, Clone)]
-pub struct HeadGids(pub(crate) Vec<ChunkGid>);
+pub struct HeadGids(pub(crate) Arc<Vec<ChunkGid>>);
 
 impl HeadGids {
     /// Construct where every head × {palette} × {K, V} slot shares the same GID.
     #[inline]
     pub fn uniform(gid: ChunkGid, n_kv_head: usize) -> Self {
-        Self(vec![gid; GIDS_PER_HEAD * n_kv_head])
+        Self(Arc::new(vec![gid; GIDS_PER_HEAD * n_kv_head]))
     }
 
     /// Construct where all K palette slots share one GID and all V palette slots share another.
@@ -47,19 +56,13 @@ impl HeadGids {
                 gids.push(v_gid.clone());
             }
         }
-        Self(gids)
+        Self(Arc::new(gids))
     }
 
     /// Construct from a pre-built per-head GID vector.
     #[inline]
     pub fn from_vec(gids: Vec<ChunkGid>) -> Self {
-        Self(gids)
-    }
-
-    /// Consume and return the inner vector.
-    #[inline]
-    pub fn into_inner(self) -> Vec<ChunkGid> {
-        self.0
+        Self(Arc::new(gids))
     }
 
     // Direct access to the slice for advanced use-cases. Call-sites should prefer the more specific accessors below.
@@ -105,7 +108,7 @@ impl HeadGids {
     /// Collect the deduplicated set of arena indices referenced by any slot.
     pub fn unique_arena_indices(&self) -> Vec<usize> {
         let mut seen = Vec::with_capacity(GIDS_PER_HEAD);
-        for g in &self.0 {
+        for g in self.0.iter() {
             let ai = g.arena_idx();
             if !seen.contains(&ai) {
                 seen.push(ai);
@@ -170,7 +173,7 @@ impl HeadGids {
         let mut seen: [(usize, usize); MAX_UNIQUE] = [(usize::MAX, usize::MAX); MAX_UNIQUE];
         let mut seen_len = 0usize;
         let mut total = 0u64;
-        for g in &self.0 {
+        for g in self.0.iter() {
             let key = (g.arena_idx(), g.chunk_idx());
             if !seen[..seen_len].contains(&key) {
                 if seen_len < MAX_UNIQUE {
@@ -204,7 +207,7 @@ impl HeadGids {
     {
         let mut cache: ahash::AHashMap<i64, ChunkGid> = ahash::AHashMap::new();
         let mut out = Vec::with_capacity(self.0.len());
-        for gid in &self.0 {
+        for gid in self.0.iter() {
             let raw = gid.raw();
             if raw < 0 {
                 out.push(ChunkGid::detached(raw));
@@ -220,7 +223,7 @@ impl HeadGids {
             };
             out.push(new_gid);
         }
-        Ok(HeadGids(out))
+        Ok(HeadGids(Arc::new(out)))
     }
 
     /// Whether all slots point to the same `(arena_idx, chunk_idx)`.
@@ -244,13 +247,6 @@ impl Deref for HeadGids {
     #[inline]
     fn deref(&self) -> &[ChunkGid] {
         &self.0
-    }
-}
-
-impl DerefMut for HeadGids {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [ChunkGid] {
-        &mut self.0
     }
 }
 

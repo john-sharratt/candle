@@ -157,25 +157,34 @@ impl BackingInner {
                     // same arena format). The encoded byte semantics are
                     // unchanged, so pal/scale must be preserved verbatim.
                     let replacement = seq.chunk_at(blk).and_then(|cw| {
-                        let mut new_gids = cw.gids.clone();
-                        let mut changed = false;
-                        for gid in new_gids.iter_mut() {
-                            if let Some(new_gid) = remap.get(&gid.raw()) {
-                                *gid = new_gid.clone();
-                                changed = true;
-                            }
+                        // HeadGids' inner Vec sits behind an Arc — scan
+                        // first and only allocate a remapped copy when
+                        // a change is actually needed. The unchanged
+                        // path is the common case and is now zero-cost.
+                        if !cw
+                            .gids
+                            .iter()
+                            .any(|gid| remap.contains_key(&gid.raw()))
+                        {
+                            return None;
                         }
-                        if changed {
-                            Some((
-                                new_gids,
-                                cw.k_pal.clone(),
-                                cw.v_pal.clone(),
-                                cw.k_scale.clone(),
-                                cw.v_scale.clone(),
-                            ))
-                        } else {
-                            None
-                        }
+                        let new_inner: Vec<super::gid_pool::ChunkGid> = cw
+                            .gids
+                            .iter()
+                            .map(|gid| {
+                                remap
+                                    .get(&gid.raw())
+                                    .cloned()
+                                    .unwrap_or_else(|| gid.clone())
+                            })
+                            .collect();
+                        Some((
+                            super::head_gids::HeadGids::from_vec(new_inner),
+                            cw.k_pal.clone(),
+                            cw.v_pal.clone(),
+                            cw.k_scale.clone(),
+                            cw.v_scale.clone(),
+                        ))
                     });
                     if let Some((new_gids, k_pal, v_pal, k_scale, v_scale)) = replacement {
                         seq.set_block_gids(blk, new_gids, k_pal, v_pal, k_scale, v_scale);

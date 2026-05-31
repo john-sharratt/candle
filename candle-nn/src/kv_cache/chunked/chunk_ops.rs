@@ -1299,9 +1299,9 @@ impl ChunkedKvBacking {
 
     /// Returns the alloc'd `HeadGids` alongside the **freshly-resolved**
     /// `arena_info` snapshot used for the GPU metadata push. The caller
-    /// can hand the same `arena_info` to a follow-up
-    /// [`Self::resolve_block_ptrs_in_slot`] call on the same backing
-    /// to skip a redundant `storage.read()` arena walk — the data is
+    /// can hand both directly to
+    /// [`Self::resolve_block_ptrs_from_hgids`] on the same backing —
+    /// no `state.read()` lock, no per-block dedup. The arena_info is
     /// valid as long as no arena-mutating call runs in between (true
     /// for the cold-load pipeline's per-unit, per-layer pair).
     pub fn alloc_sealed_blocks_bulk(
@@ -1358,40 +1358,80 @@ impl ChunkedKvBacking {
         // whole layer's blocks, so the drop coalesces adjacent
         // indices into a few `memcpy_htod` runs instead of one per
         // block).
-        // ── Phase 1: batched GID alloc, outside the state lock ───────
+        // ── Phase 1: batched GID alloc + scatter into per-spec slots ─
         //
-        // Group every (sub-band, K|V) GID need across all specs by
-        // `ArenaKey`, then allocate per-key in **one** call. That
-        // pays the per-format pool mutex and storage write lock once
-        // per unique key instead of once per GID. For the cold-load
-        // shape (~600 GIDs/spec × ~22 specs/call, mostly the same
-        // few formats) this collapses ~10,000 pool/storage lock
-        // acquires into a few dozen.
+        // For each (spec, sub-band, K|V) gid, record its **destination**
+        // (s_idx, gid_idx) under its `ArenaKey`. Then allocate per-key
+        // in one batched call and scatter the freshly-claimed gids
+        // straight into per-spec `MaybeUninit<ChunkGid>` buffers.
+        //
+        // Phase 2 below just hands each filled buffer to
+        // `HeadGids::from_vec` — **no inner stitch loop, no HashMap
+        // lookups in the locked section**. The cold-load shape (~600
+        // gids/spec × ~22 specs/call) used to spend ~1,400 HashMap
+        // lookups + IntoIter::next per call inside `state.write()`.
+        //
+        // Layout per spec: K(h, p) → gid_idx = sub*2, V(h, p) → sub*2+1,
+        // where sub = h*N_PALETTE + p (matches the historical inner
+        // push order).
+        use std::mem::MaybeUninit;
         let t_pool = std::time::Instant::now();
         let gids_per_spec = GIDS_PER_HEAD * n_kv_head;
-        let mut needs_per_key: ahash::HashMap<ArenaKey, usize> =
+        let mut positions_per_key: ahash::HashMap<ArenaKey, Vec<(usize, usize)>> =
             ahash::HashMap::with_capacity_and_hasher(8, ahash::RandomState::new());
-        for spec in specs {
+        for (s_idx, spec) in specs.iter().enumerate() {
             for h in 0..n_kv_head {
                 for p in 0..N_PALETTE {
                     let sub = h * N_PALETTE + p;
-                    *needs_per_key
+                    positions_per_key
                         .entry(ArenaKey::uniform(spec.k_formats[sub], location))
-                        .or_insert(0) += 1;
-                    *needs_per_key
+                        .or_default()
+                        .push((s_idx, sub * 2));
+                    positions_per_key
                         .entry(ArenaKey::uniform(spec.v_formats[sub], location))
-                        .or_insert(0) += 1;
+                        .or_default()
+                        .push((s_idx, sub * 2 + 1));
                 }
             }
         }
-        // Allocate each key's worth in one batched call, then drain
-        // back into per-spec GID layouts in the next pass.
-        let mut per_key_gids: ahash::HashMap<ArenaKey, std::vec::IntoIter<super::gid_pool::ChunkGid>> =
-            ahash::HashMap::with_capacity_and_hasher(needs_per_key.len(), ahash::RandomState::new());
-        for (key, count) in needs_per_key {
-            let gids = self.alloc_chunks_for_key_bulk(key.clone(), count)?;
-            per_key_gids.insert(key, gids.into_iter());
+        // Per-spec uninitialised buffers — `set_len` is free (no
+        // per-element init), and every slot is written by the
+        // scatter below.
+        let mut spec_buffers: Vec<Vec<MaybeUninit<super::gid_pool::ChunkGid>>> = (0..specs
+            .len())
+            .map(|_| {
+                let mut v: Vec<MaybeUninit<super::gid_pool::ChunkGid>> =
+                    Vec::with_capacity(gids_per_spec);
+                // SAFETY: every slot is written by the per-key scatter
+                // below before any read. The Vec is consumed into an
+                // initialised `Vec<ChunkGid>` once the scatter is
+                // complete.
+                unsafe { v.set_len(gids_per_spec) };
+                v
+            })
+            .collect();
+        for (key, positions) in positions_per_key {
+            let gids = self.alloc_chunks_for_key_bulk(key, positions.len())?;
+            for (gid, (s_idx, gid_idx)) in gids.into_iter().zip(positions) {
+                spec_buffers[s_idx][gid_idx].write(gid);
+            }
         }
+        // Phase 1 wrote every position in every spec buffer (the
+        // position lists were built to cover exactly one slot per
+        // (spec, sub, K|V) tuple). Reinterpret each buffer as a
+        // fully-initialised `Vec<ChunkGid>`.
+        let per_spec_gids: Vec<Vec<super::gid_pool::ChunkGid>> = spec_buffers
+            .into_iter()
+            .map(|buf| {
+                let mut buf = std::mem::ManuallyDrop::new(buf);
+                let ptr = buf.as_mut_ptr() as *mut super::gid_pool::ChunkGid;
+                let len = buf.len();
+                let cap = buf.capacity();
+                // SAFETY: every position in `buf` was written in
+                // Phase 1; the layout of `MaybeUninit<T>` matches `T`.
+                unsafe { Vec::from_raw_parts(ptr, len, cap) }
+            })
+            .collect();
         *pool_us_out += t_pool.elapsed().as_micros() as u64;
 
         // ── Phase 2: register blocks under the state write lock ──────
@@ -1399,8 +1439,9 @@ impl ChunkedKvBacking {
         let mut updated_blocks: Vec<usize> = Vec::with_capacity(specs.len());
         // Declared outside the `state.write()` scope so we can return
         // it to the caller (immediately reused by
-        // `resolve_block_ptrs_in_slot` to skip its own arena walk).
+        // `resolve_block_ptrs_from_hgids` to skip its own arena walk).
         let arena_info: Vec<crate::kv_cache::arena_table::ResolvedArenaInfo>;
+        let mut per_spec_iter = per_spec_gids.into_iter();
         {
             let mut state = self
                 .state
@@ -1409,24 +1450,9 @@ impl ChunkedKvBacking {
 
             let t_register = std::time::Instant::now();
             for spec in specs {
-                // Pull this block's per-(head, palette, K|V) chunks
-                // from the pre-allocated per-key streams. Order
-                // matches the loop in Phase 1 exactly, so the GIDs
-                // line up with their sub-band slots.
-                let mut gid_vec: Vec<super::gid_pool::ChunkGid> = Vec::with_capacity(gids_per_spec);
-                for h in 0..n_kv_head {
-                    for p in 0..N_PALETTE {
-                        let sub = h * N_PALETTE + p;
-                        let k_iter = per_key_gids
-                            .get_mut(&ArenaKey::uniform(spec.k_formats[sub], location))
-                            .expect("phase 1 allocated this key");
-                        gid_vec.push(k_iter.next().expect("phase 1 allocated enough"));
-                        let v_iter = per_key_gids
-                            .get_mut(&ArenaKey::uniform(spec.v_formats[sub], location))
-                            .expect("phase 1 allocated this key");
-                        gid_vec.push(v_iter.next().expect("phase 1 allocated enough"));
-                    }
-                }
+                let gid_vec = per_spec_iter
+                    .next()
+                    .expect("per_spec_gids has one entry per spec");
                 let gids = HeadGids::from_vec(gid_vec);
 
                 // Register on the block table + stamp the window.

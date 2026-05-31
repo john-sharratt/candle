@@ -179,78 +179,41 @@ impl super::ChunkedKvBacking {
         Ok(out)
     }
 
-    /// Resolve device pointers for specific block positions in a
-    /// scratch slot, without materialising a [`super::SealedSequence`].
+    /// Resolve device `(ptr, byte_stride)` pairs per block, walking
+    /// the supplied [`HeadGids`] directly.
     ///
-    /// For each `block_idx` in `block_indices`, returns the
-    /// `(device_ptr, byte_len)` list for that block's unique sub-band
-    /// arena chunks (deduped by `(arena_idx, chunk_idx)` *within the
-    /// block*, matching what `kv_migrate` needs as scatter
-    /// destinations). The returned outer Vec is in `block_indices`
-    /// order; the inner Vec is in GID-walk order.
+    /// The cold-load pipeline calls this immediately after
+    /// [`super::ChunkedKvBacking::alloc_sealed_blocks_bulk`] using the
+    /// `hgids` and `arena_info` that call just produced — no
+    /// `state.read()` lock, no slot lookup. Fresh CAS-claimed gids are
+    /// unique by construction, so there is no per-block `(arena_idx,
+    /// chunk_idx)` dedup either (the legacy `resolve_block_ptrs_in_slot`
+    /// did that with a `HashSet` per block — pure overhead on freshly
+    /// allocated chunks).
     ///
-    /// This is the cold-load chunked path's fast equivalent of
-    /// `record_turn` + `resolve_sealed_chunk_ptrs`: it skips the
-    /// allocation and clone-per-chunk overhead of building a
-    /// `SealedSequence` snapshot when the caller only needs the
-    /// device pointers for a known subset of blocks.
-    /// Caller is responsible for providing a `arena_info` that covers
-    /// every arena_idx referenced by the requested blocks. The
-    /// canonical source is the value returned by
-    /// [`super::ChunkedKvBacking::alloc_sealed_blocks_bulk`] on the
-    /// same backing — captured **after** that call's allocs, so it
-    /// reflects every arena the freshly-allocated chunks point into.
-    /// Reusing it here avoids a redundant `storage.read()` walk per
-    /// call (~50 µs × 82 calls ≈ 4 ms on the 1824-chunk turn).
-    ///
-    /// If the caller doesn't have a fresh `arena_info` handy, pass
-    /// `&self.resolve_arena_info()?`.
-    pub fn resolve_block_ptrs_in_slot(
+    /// The outer Vec is in `hgids` order; the inner Vec is in GID-walk
+    /// order. `arena_info` must cover every arena_idx referenced — pass
+    /// the snapshot returned by `alloc_sealed_blocks_bulk` (still valid
+    /// as long as no arena-mutating call runs between the two).
+    pub fn resolve_block_ptrs_from_hgids(
         &self,
-        slot: usize,
-        block_indices: &[usize],
+        hgids: &[super::head_gids::HeadGids],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> candle::Result<Vec<Vec<(i64, i64)>>> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
-        let slot_state = state
-            .sequences
-            .get(slot)
-            .and_then(|s| s.as_ref())
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "resolve_block_ptrs_in_slot: slot {slot} is not allocated"
-                ))
-            })?;
-        let chunks = slot_state.chunks_slice();
-
-        let mut out: Vec<Vec<(i64, i64)>> = Vec::with_capacity(block_indices.len());
-        for &block_idx in block_indices {
-            let chunk = chunks.get(block_idx).ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "resolve_block_ptrs_in_slot: block_idx {block_idx} out of range \
-                     (slot has {} chunks)",
-                    chunks.len()
-                ))
-            })?;
-            let mut seen = std::collections::HashSet::new();
-            let mut block_ptrs: Vec<(i64, i64)> = Vec::new();
-            for gid in chunk.gids.0.iter() {
+        let mut out: Vec<Vec<(i64, i64)>> = Vec::with_capacity(hgids.len());
+        for block in hgids {
+            let mut block_ptrs: Vec<(i64, i64)> = Vec::with_capacity(block.0.len());
+            for gid in block.0.iter() {
                 let arena_idx = gid.arena_idx();
                 let chunk_idx = gid.chunk_idx();
-                if !seen.insert((arena_idx, chunk_idx)) {
-                    continue;
-                }
                 let arena = arena_info.get(arena_idx).ok_or_else(|| {
                     candle::Error::Msg(format!(
-                        "resolve_block_ptrs_in_slot: arena index {arena_idx} out of range"
+                        "resolve_block_ptrs_from_hgids: arena index {arena_idx} out of range"
                     ))
                 })?;
                 if arena.base_ptr == 0 {
                     return Err(candle::Error::Msg(
-                        "resolve_block_ptrs_in_slot: chunk arena is not GPU-resident".into(),
+                        "resolve_block_ptrs_from_hgids: chunk arena is not GPU-resident".into(),
                     ));
                 }
                 let ptr = arena.base_ptr as i64 + chunk_idx as i64 * arena.chunk_byte_stride;

@@ -11,7 +11,7 @@
 //! - **Allocator** (1 thread) — receives unit-completion events,
 //!   decodes records whose bytes are now fully landed, batches their
 //!   `BlockAllocSpec`s per layer for `alloc_sealed_blocks_bulk` and
-//!   resolves their dest pointers via `resolve_block_ptrs_in_slot`.
+//!   resolves their dest pointers via `resolve_block_ptrs_from_hgids`.
 //! - **GPU dispatcher** (main thread, owns the CUDA context) — receives
 //!   per-unit [`UnitWork`] messages, queues `memcpy_htod` for the
 //!   unit on the CUDA stream, accumulates the migrate plan, and fires
@@ -157,7 +157,7 @@ pub struct PipelineStats {
     pub reads_ms: u64,
     /// Sum of CPU time spent inside the allocator thread doing
     /// per-unit decode + `alloc_sealed_blocks_bulk` +
-    /// `resolve_block_ptrs_in_slot`. Independent of when the
+    /// `resolve_block_ptrs_from_hgids`. Independent of when the
     /// dispatcher consumes the resulting `UnitWork`s. This is
     /// effectively the allocator's wall-clock since it works
     /// sequentially.
@@ -183,12 +183,12 @@ pub struct PipelineStats {
     /// Time inside `alloc_sealed_blocks_bulk` summed across every
     /// per-unit, per-layer dispatch. Microseconds.
     pub bulk_alloc_us: u64,
-    /// Time inside `resolve_block_ptrs_in_slot` summed similarly.
+    /// Time inside `resolve_block_ptrs_from_hgids` summed similarly.
     /// Microseconds.
     pub resolve_ptrs_us: u64,
     /// Number of `alloc_sealed_blocks_bulk` invocations.
     pub n_bulk_calls: u32,
-    /// Number of `resolve_block_ptrs_in_slot` invocations.
+    /// Number of `resolve_block_ptrs_from_hgids` invocations.
     pub n_resolve_calls: u32,
     /// Sub-sub-timer of `bulk_alloc_us`: Phase 1, batched per-key gid
     /// alloc outside the state lock.
@@ -536,11 +536,9 @@ fn allocator_worker(
                 }
                 let specs: Vec<BlockAllocSpec> =
                     layer_recs.iter().map(|(_, s, _)| s.clone()).collect();
-                let target_block_idxs: Vec<usize> =
-                    layer_recs.iter().map(|(_, s, _)| s.block_idx).collect();
 
                 let t_bulk = Instant::now();
-                let (_hgids, arena_info) = backings[li].alloc_sealed_blocks_bulk(
+                let (hgids, arena_info) = backings[li].alloc_sealed_blocks_bulk(
                     slots[li],
                     &specs,
                     &mut pool_us,
@@ -550,16 +548,13 @@ fn allocator_worker(
                 bulk_alloc_us += t_bulk.elapsed().as_micros() as u64;
                 n_bulk_calls += 1;
 
-                // Reuse the arena_info that `alloc_sealed_blocks_bulk`
-                // just freshly resolved — no arena-mutating call runs
-                // between this and the resolve below on the same
-                // backing, so the data is still authoritative.
+                // Resolve dst ptrs from the freshly-allocated hgids and
+                // the arena_info snapshot — no `state.read()`, no per-
+                // block dedup. Fresh CAS-claimed gids are unique by
+                // construction.
                 let t_resolve = Instant::now();
-                let dst_ptrs_per_rec = backings[li].resolve_block_ptrs_in_slot(
-                    slots[li],
-                    &target_block_idxs,
-                    &arena_info,
-                )?;
+                let dst_ptrs_per_rec =
+                    backings[li].resolve_block_ptrs_from_hgids(&hgids, &arena_info)?;
                 resolve_ptrs_us += t_resolve.elapsed().as_micros() as u64;
                 n_resolve_calls += 1;
 
