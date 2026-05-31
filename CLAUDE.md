@@ -78,6 +78,7 @@ These apply repo-wide. They are deliberate standing decisions, not suggestions.
 - **TDD, extensive unit tests.** Build tests alongside the code, as the code is written — not after. Every building block must be testable in isolation. For serialization / quantization / codec code, assert against **raw expected bytes**, never error-tolerance thresholds.
 - **Design docs are authoritative.** When a design document exists for the work (e.g. `docs/*.md`), it takes precedence over discrepancies with the code. If the document is itself wrong, fix the document in the same change.
 - **Persistence is mandatory.** The conversation substrate is always backed by its on-disk persistence layer (`candle-conversation/src/persistence/`, redo log at `.substrate/substrate.log`). There is no in-memory-only substrate mode. See `docs/kv_tier_migration.md`.
+- **Never `git commit` without explicit permission.** Show the diff (or summarize what will be staged + propose the message) and wait for the user to say go. Authorization for one commit does not carry forward to subsequent commits — every commit requires its own approval. This is non-negotiable.
 
 ---
 
