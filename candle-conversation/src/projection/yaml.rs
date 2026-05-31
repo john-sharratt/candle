@@ -1,4 +1,4 @@
-//! YAML deserialisation for [`super::Schema`].
+﻿//! YAML deserialisation for [`super::Schema`].
 //!
 //! # Pipeline
 //!
@@ -341,6 +341,7 @@ fn build(
                 priority,
                 depends_on: None,
                 is_template: false,
+                        template_tokens: None,
             }));
         }
 
@@ -397,6 +398,7 @@ fn build(
                         priority: pri,
                         depends_on: depends_on_cid,
                         is_template: false,
+                        template_tokens: None,
                     }));
                 }
                 YamlSystemPromptItem::Template {
@@ -445,6 +447,7 @@ fn build(
                         priority: 50.0,
                         depends_on: depends_on_cid,
                         is_template: true,
+                        template_tokens: None,
                     }));
                 }
                 YamlSystemPromptItem::Collection {
@@ -482,6 +485,7 @@ fn build(
                             priority: pri,
                             depends_on: None,
                             is_template: false,
+                        template_tokens: None,
                         });
                     }
 
@@ -551,12 +555,6 @@ fn build(
             system_prompt: SystemPromptSchema { items },
             groups,
             depth_weights,
-            // The synthetic structural markers stay `None` here — the
-            // dialect-aware caller installs them via
-            // [`super::Builder::set_system_markers`] before the
-            // conversation is created.
-            system_start_section: None,
-            system_end_section: None,
         });
     }
 

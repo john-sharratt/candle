@@ -140,21 +140,6 @@ impl InferenceState {
             .thinking(false);
         let conv_config = builder.conversation_config();
 
-        // Install the dialect's system-block open / close bytes as
-        // synthetic structural sections on the dialogue layer. They
-        // emit unconditionally at projection time as the system block's
-        // outer envelope, regardless of which collection members or
-        // `depends_on`-gated sections materialise. See
-        // `Builder::set_system_markers` and the ingest path in
-        // `Conversation::new_with_projection`.
-        proj_builder
-            .set_system_markers(
-                dialogue_layer,
-                conv_config.dialect.system_start,
-                conv_config.dialect.system_end,
-            )
-            .map_err(|e| anyhow::anyhow!("set_system_markers: {e}"))?;
-
         // Per-layer progress callback — the library reports
         // `(layers_loaded, total_layers)` after each transformer block
         // is mounted. We translate that into the LoadProgress fraction
@@ -172,6 +157,20 @@ impl InferenceState {
         progress.set_step(LoadStep::Substrate);
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();
+
+        // Tokenise every `kind: template` item in the projection schema
+        // using the engine's tokenizer.  The projection engine emits a
+        // `Generated` segment for each template at apply time carrying
+        // these tokens; the assembler then runs (or caches) a live
+        // prefill against them under the current runtime left context.
+        let tokenizer = engine.tokenizer();
+        proj_builder
+            .tokenize_templates::<anyhow::Error, _>(|s| {
+                let encoded = tokenizer
+                    .encode(s, false)
+                    .map_err(|e| anyhow::anyhow!("template tokenise: {e}"))?;
+                Ok(encoded.get_ids().to_vec())
+            })?;
 
         progress.set_step(LoadStep::Sections);
         // Per-section progress callback — bytes ingested out of total
@@ -1019,8 +1018,17 @@ fn build_projection_builder(workspace: &Path) -> projection::Builder {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("this project");
-    projection::Builder::from_yaml_with_vars(PROJECTION_SCHEMA_TEMPLATE, &[("workspace", name)])
-        .expect("projection.yaml failed to parse — check YAML syntax and {workspace} placeholder")
+    // Qwen3-30B-A3B is a ChatML-family model; the dialect is required
+    // so the schema's `kind: template` items (system_open / system_close,
+    // tool_block_open/close, no_think_prefix) resolve to the right
+    // structural-token strings at parse time.
+    let dialect = candle_conversation::models::Dialect::chat_ml();
+    projection::Builder::from_yaml_with_vars_and_dialect(
+        PROJECTION_SCHEMA_TEMPLATE,
+        &[("workspace", name)],
+        Some(&dialect),
+    )
+    .expect("projection.yaml failed to parse — check YAML syntax and {workspace} placeholder")
 }
 
 /// Concatenate the content of every top-level Section that appears

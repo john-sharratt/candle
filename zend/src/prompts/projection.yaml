@@ -479,10 +479,13 @@ layers:
       # between the intro and the first tool JSON, no blank line
       # between the last tool JSON and the outro.
       items:
-        - kind: section
+        - kind: template
+          id: system_open
+          dialect: system_start
+
+        - kind: template
           id: mode
-          content: |+
-            /no_think
+          dialect: no_think_prefix
 
         - kind: section
           id: frame
@@ -515,16 +518,17 @@ layers:
             "description", and a "parameters" schema.
 
         # `tools_open` and `tools_close` carry the `<tools>` / `</tools>`
-        # structural markers. Both are gated by `depends_on: tools` —
-        # they emit at projection time only when the `tools` collection
-        # materialises ≥ 1 selected member. With zero selected tools,
-        # no `<tools>...</tools>` block appears at all, and the system
-        # prompt's structural envelope (built from the synthetic
-        # `__system_start` / `__system_end` markers installed by the
-        # dialect-aware caller) remains coherent.
-        - kind: section
+        # structural markers, sourced from the dialect catalog and live-
+        # prefilled at apply time so their K/V is conditioned on whatever
+        # runtime context precedes them.  Both are gated by
+        # `depends_on: tools` — they emit at projection time only when
+        # the `tools` collection materialises ≥ 1 selected member.  With
+        # zero selected tools, neither template emits and the system
+        # prompt's structural envelope (`system_open` / `system_close`)
+        # remains coherent.
+        - kind: template
           id: tools_open
-          content: "<tools>\n"
+          dialect: tool_block_open
           depends_on: tools
 
         - kind: collection
@@ -537,10 +541,14 @@ layers:
             pragmatic: 1.0
           sections: []
 
-        - kind: section
+        - kind: template
           id: tools_close
-          content: "</tools>\n"
+          dialect: tool_block_close
           depends_on: tools
+
+        - kind: template
+          id: system_close
+          dialect: system_end
 
     groups:
       - id: primary_conversation

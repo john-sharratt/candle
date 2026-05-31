@@ -456,7 +456,7 @@ pub fn run<R: ContentResolver>(
     // system prompt mix always-emit framing (role, grounding,
     // dialect markers) with dynamic catalogs (tool definitions,
     // retrieval candidates) at well-defined positions.
-    let system_prompt_sections: Vec<ResolvedSection> = schema
+    let system_prompt_segments: Vec<ProjectionSegment> = schema
         .layers
         .iter()
         .find(|l| l.id == target.layer)
@@ -465,10 +465,7 @@ pub fn run<R: ContentResolver>(
 
     if group_states.is_empty() {
         return Projection {
-            segments: system_prompt_sections
-                .into_iter()
-                .map(|s| ProjectionSegment::Sealed(SealedKind::Section(s)))
-                .collect(),
+            segments: system_prompt_segments,
         };
     }
 
@@ -624,12 +621,8 @@ pub fn run<R: ContentResolver>(
     }
 
     let mut segments: Vec<ProjectionSegment> =
-        Vec::with_capacity(system_prompt_sections.len() + turns.len());
-    segments.extend(
-        system_prompt_sections
-            .into_iter()
-            .map(|s| ProjectionSegment::Sealed(SealedKind::Section(s))),
-    );
+        Vec::with_capacity(system_prompt_segments.len() + turns.len());
+    segments.extend(system_prompt_segments);
     segments.extend(
         turns
             .into_iter()
@@ -642,35 +635,21 @@ pub fn run<R: ContentResolver>(
 /// either each plain section verbatim or each collection's surviving
 /// subset (after applying its selection rule).
 ///
-/// Three additional rules layered on top:
-/// 1. `layer.system_start_section`, if installed, emits first — before
-///    every authored item.
-/// 2. A [`SectionSchema`] with `depends_on = Some(cid)` only emits if
-///    the named collection materialised ≥ 1 section in *this same*
-///    emission pass.
-/// 3. `layer.system_end_section`, if installed, emits last — after
-///    every authored item.
-///
-/// The synthetic markers are unconditional structural envelopes; the
-/// `depends_on` mechanism is for authored content (e.g. `<tools>` /
-/// `</tools>` markers) that should only appear when its collection
-/// emitted something.
+/// A [`SectionSchema`] with `depends_on = Some(cid)` only emits if the
+/// named collection materialised ≥ 1 section in this same emission pass.
 fn emit_system_prompt_items<R: ContentResolver>(
     layer: &LayerSchema,
     resolver: &R,
     mode: ProjectionMode,
-) -> Vec<ResolvedSection> {
+) -> Vec<ProjectionSegment> {
     let scoring = mode.collection_scoring();
-    let mut out: Vec<ResolvedSection> = Vec::new();
-    if let Some(s) = &layer.system_start_section {
-        out.push(ResolvedSection { id: s.id });
-    }
+    let mut out: Vec<ProjectionSegment> = Vec::new();
     // First pass: resolve every Collection in declaration order so
     // their materialised section sets are known when we walk the
     // items for emission. Cached by CollectionId.
     let mut collection_results: std::collections::HashMap<
         super::ids::CollectionId,
-        Vec<ResolvedSection>,
+        Vec<ProjectionSegment>,
     > = std::collections::HashMap::new();
     for item in &layer.system_prompt.items {
         if let SystemPromptItem::Collection(coll) = item {
@@ -692,7 +671,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                         .unwrap_or(false),
                 };
                 if should_emit {
-                    out.push(ResolvedSection { id: s.id });
+                    push_section_segment(&mut out, s);
                 }
             }
             SystemPromptItem::Collection(coll) => {
@@ -702,10 +681,39 @@ fn emit_system_prompt_items<R: ContentResolver>(
             }
         }
     }
-    if let Some(s) = &layer.system_end_section {
-        out.push(ResolvedSection { id: s.id });
-    }
     out
+}
+
+/// Emit a single [`SectionSchema`] as either a [`ProjectionSegment::Sealed`]
+/// (content section — K/V comes from substrate) or a
+/// [`ProjectionSegment::Generated`] (template section — K/V is
+/// live-prefilled at apply time under the runtime left context).
+///
+/// Panics if a template section has not been tokenised — the schema
+/// must run through [`super::Builder::tokenize_templates`] before
+/// `project()` is called on a schema containing template items.
+fn push_section_segment(out: &mut Vec<ProjectionSegment>, s: &SectionSchema) {
+    if s.is_template {
+        let tokens = s.template_tokens.clone().unwrap_or_else(|| {
+            panic!(
+                "projection: template section {:?} (id {}) has no pre-tokenised tokens — \
+                 call Builder::tokenize_templates before project()",
+                s.name,
+                s.id.raw(),
+            )
+        });
+        out.push(ProjectionSegment::Generated {
+            tokens,
+            identity: GeneratedIdentity {
+                name: s.name.clone(),
+                position: out.len(),
+            },
+        });
+    } else {
+        out.push(ProjectionSegment::Sealed(SealedKind::Section(
+            ResolvedSection { id: s.id },
+        )));
+    }
 }
 
 /// Apply a collection's selection rule, returning the surviving
@@ -719,7 +727,7 @@ fn select_collection_sections<R: ContentResolver>(
     layer: &LayerSchema,
     resolver: &R,
     scoring: &CollectionScoring,
-) -> Vec<ResolvedSection> {
+) -> Vec<ProjectionSegment> {
     if coll.sections.is_empty() {
         return Vec::new();
     }
@@ -731,11 +739,13 @@ fn select_collection_sections<R: ContentResolver>(
         .or(coll.depth_weights.as_ref())
         .unwrap_or(&layer.depth_weights);
     match &coll.selection {
-        SelectionRule::AlwaysVisible => coll
-            .sections
-            .iter()
-            .map(|s| ResolvedSection { id: s.id })
-            .collect(),
+        SelectionRule::AlwaysVisible => {
+            let mut out = Vec::with_capacity(coll.sections.len());
+            for s in &coll.sections {
+                push_section_segment(&mut out, s);
+            }
+            out
+        }
         SelectionRule::TopK { k } => {
             let all_scored: Vec<(usize, &SectionSchema, f32)> = coll
                 .sections
@@ -779,44 +789,51 @@ fn select_collection_sections<R: ContentResolver>(
             });
             scored.truncate(*k);
             scored.sort_by_key(|(i, _, _)| *i);
-            let selected: Vec<ResolvedSection> = scored
-                .iter()
-                .map(|(_, s, _)| ResolvedSection { id: s.id })
-                .collect();
+            let n = scored.len();
             tracing::trace!(
                 collection = %coll.name,
-                selected = format!("{}/{}", selected.len(), coll.sections.len()),
+                selected = format!("{}/{}", n, coll.sections.len()),
                 sections = ?scored.iter().map(|(_, s, _)| s.name.as_str()).collect::<Vec<_>>(),
                 "projection"
             );
-            selected
+            let mut out = Vec::with_capacity(n);
+            for (_, s, _) in &scored {
+                push_section_segment(&mut out, s);
+            }
+            out
         }
-        SelectionRule::Single => coll
-            .sections
-            .iter()
-            .map(|s| {
-                let score = resolver.section_score(s.id, scoring.formula, dw);
-                (s, score)
-            })
-            .filter(|(_, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
-            .max_by(|(a, asc), (b, bsc)| {
-                asc.partial_cmp(bsc)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(
-                        a.priority
-                            .partial_cmp(&b.priority)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-            })
-            .map(|(s, _)| vec![ResolvedSection { id: s.id }])
-            .unwrap_or_default(),
+        SelectionRule::Single => {
+            let best = coll
+                .sections
+                .iter()
+                .map(|s| {
+                    let score = resolver.section_score(s.id, scoring.formula, dw);
+                    (s, score)
+                })
+                .filter(|(_, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
+                .max_by(|(a, asc), (b, bsc)| {
+                    asc.partial_cmp(bsc)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(
+                            a.priority
+                                .partial_cmp(&b.priority)
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                });
+            let mut out = Vec::new();
+            if let Some((s, _)) = best {
+                push_section_segment(&mut out, s);
+            }
+            out
+        }
         SelectionRule::Sequence { .. } => {
             // No sensible "recent" semantics for sections.  Fall back
             // to AlwaysVisible.
-            coll.sections
-                .iter()
-                .map(|s| ResolvedSection { id: s.id })
-                .collect()
+            let mut out = Vec::with_capacity(coll.sections.len());
+            for s in &coll.sections {
+                push_section_segment(&mut out, s);
+            }
+            out
         }
     }
 }

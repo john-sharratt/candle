@@ -665,12 +665,13 @@ pub(crate) struct Scheduler {
     /// builds.
     slot_tokens: HashMap<SequenceId, Vec<u32>>,
 
-    /// Per-slot projection-assembler state — the last applied segment
-    /// list + per-segment block count.  Consulted by
-    /// [`Self::apply_projection`]'s LCP-truncate path so successive
-    /// reprojections only inject the diverging suffix.  Cleared on
-    /// `FreeSequence`.
-    slot_projection_state: HashMap<SequenceId, projection_assembler::SlotProjectionState>,
+    /// Per-slot projection-assembler state — content-addressed cache
+    /// of captured live-prefill runs, plus the in-flight turn's
+    /// `pending_user_part` once `NewUserMessage` segments are emitted.
+    /// Consulted by [`Self::apply_projection`] on every reprojection
+    /// so structural template runs reuse their captured K/V instead
+    /// of re-running the forward pass.  Cleared on `FreeSequence`.
+    slot_projection_state: HashMap<SequenceId, projection_assembler::SlotState>,
 
     /// Workspace-shared provenance signature file.  All seals across
     /// all slots append into this same mmap-backed file.
@@ -1465,16 +1466,19 @@ impl Scheduler {
         let state = self
             .slot_projection_state
             .entry(parent_id)
-            .or_insert_with(projection_assembler::SlotProjectionState::new);
+            .or_insert_with(projection_assembler::SlotState::new);
 
         projection_assembler::apply_segments(
             state,
             projection_assembler::ApplyContext {
                 session: &mut self.session,
+                model: &mut self.model,
+                device: &self.device,
                 conversation: &conversation,
                 slot_target,
                 parent_id,
                 chunk_size: self.chunk_size,
+                max_prefill_chunk: self.max_prefill_chunk,
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
             },

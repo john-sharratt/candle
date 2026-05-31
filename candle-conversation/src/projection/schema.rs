@@ -202,6 +202,14 @@ pub struct SectionSchema {
     /// stays attention-correct under whatever prefix the projection
     /// selected this turn.
     pub is_template: bool,
+    /// Pre-tokenised template content, populated by
+    /// [`super::Builder::tokenize_templates`] before the first
+    /// projection.  `Some` only when `is_template == true`; the
+    /// projection engine emits a [`super::ProjectionSegment::Generated`]
+    /// carrying these tokens for the assembler to inject as a live-
+    /// prefilled run.  `None` for `is_template == false` sections —
+    /// their K/V comes from the substrate-pinned sealed path.
+    pub template_tokens: Option<std::sync::Arc<Vec<u32>>>,
 }
 
 /// Per-layer weighting for the three Binary Directional Provenance depths.
@@ -297,22 +305,6 @@ pub struct LayerSchema {
     /// Weights for combining per-depth BDP scores into a single per-turn
     /// score.  Default is equal weighting across all three depths.
     pub depth_weights: DepthWeights,
-    /// Synthetic structural section emitted **before** every other
-    /// system-prompt item — carries the dialect's system-block open
-    /// marker (e.g. `<|im_start|>system\n`). Built programmatically
-    /// outside YAML so the schema stays dialect-agnostic at parse
-    /// time; the dialect-aware caller installs it via the builder
-    /// before the conversation is created.
-    pub system_start_section: Option<SectionSchema>,
-    /// Synthetic structural section emitted **after** every other
-    /// system-prompt item — carries the dialect's system-block close
-    /// marker (e.g. `<|im_end|>\n`). Ingested with a `linear_prefix`
-    /// that **excludes** every Collection's members and every section
-    /// with [`SectionSchema::depends_on`] set, so its K/V represents
-    /// "the system block closes after the fixed framing" — coherent
-    /// regardless of which collection members materialise at any
-    /// given turn.
-    pub system_end_section: Option<SectionSchema>,
 }
 
 /// Schema for one group within a layer.

@@ -242,45 +242,25 @@ impl Sequence {
         // composed from these schema items — no separate monolithic
         // "system_section_id" pre-pinning, which used to double the
         // system content with an unwrapped fragment copy.
-        let (layer_items, system_start, system_end): (
-            Vec<SystemPromptItem>,
-            Option<crate::projection::SectionSchema>,
-            Option<crate::projection::SectionSchema>,
-        ) = conv
+        let layer_items: Vec<SystemPromptItem> = conv
             .projection
             .schema()
             .layers
             .iter()
             .find(|l| l.id == target.layer)
-            .map(|l| {
-                (
-                    l.system_prompt.items.clone(),
-                    l.system_start_section.clone(),
-                    l.system_end_section.clone(),
-                )
-            })
-            .unwrap_or_else(|| (Vec::new(), None, None));
+            .map(|l| l.system_prompt.items.clone())
+            .unwrap_or_default();
 
-        // The ChatML / dialect role wrappers around the system block
-        // (`<|im_start|>system\n` and `<|im_end|>\n` in Qwen3's dialect)
-        // live as two synthetic sections on the layer schema, installed
-        // by the dialect-aware caller via [`Builder::set_system_markers`].
-        // Their K/V is set up by the cumulative ingest below; emission
-        // is unconditional structural envelope (see
-        // `project::emit_system_prompt_items`).
-        //
-        // The end-marker is special: it's prefilled with a
-        // `linear_prefix` that excludes every Collection's members and
-        // every Section with `depends_on` set, so its K/V represents
-        // "the system block closes after the FIXED framing" and is
-        // coherent regardless of which collection members materialise
-        // at any given turn. The tools collection thereby becomes
-        // pure RAG — context that slides in between two structurally
-        // invariant anchors.
+        // Cumulative-prefix ingest builds each content section's K/V
+        // conditioned on the chain of previously-ingested content
+        // sections.  Templates do not appear in this chain — their K/V
+        // is live-prefilled at projection-apply time under the actual
+        // runtime context, so substrate carries no entries for them
+        // and they contribute nothing to the prefix here.
         let mut linear_prefix: Vec<SectionId> = Vec::new();
-        // The list mirroring `linear_prefix` but excluding Collection
-        // members and `depends_on`-gated sections — feeds into the
-        // end-marker's ingest below.
+        // Mirrors `linear_prefix` but excludes Collection members and
+        // `depends_on`-gated sections — feeds the priming projection
+        // so the first-turn slot mirrors the empty-collection layout.
         let mut fixed_prefix: Vec<SectionId> = Vec::new();
 
         // ── Progress accounting ────────────────────────────────────────
@@ -289,25 +269,27 @@ impl Sequence {
         // ingest loop below, so the load screen actually moves between
         // 0 % and 100 % instead of sitting at 0 % until the final
         // `set_step` transition.
-        let total_bytes: u64 = system_start
-            .as_ref()
-            .map(|s| s.content.len() as u64)
-            .unwrap_or(0)
-            + layer_items
-                .iter()
-                .map(|item| match item {
-                    SystemPromptItem::Section(s) => s.content.len() as u64,
-                    SystemPromptItem::Collection(c) => c
-                        .sections
-                        .iter()
-                        .map(|s| s.content.len() as u64)
-                        .sum::<u64>(),
-                })
-                .sum::<u64>()
-            + system_end
-                .as_ref()
-                .map(|s| s.content.len() as u64)
-                .unwrap_or(0);
+        // Templates are filtered from the ingest loop and contribute
+        // nothing to the byte-count progress — they don't enter the
+        // substrate, so there's no work to count for them.
+        let total_bytes: u64 = layer_items
+            .iter()
+            .map(|item| match item {
+                SystemPromptItem::Section(s) => {
+                    if s.is_template {
+                        0
+                    } else {
+                        s.content.len() as u64
+                    }
+                }
+                SystemPromptItem::Collection(c) => c
+                    .sections
+                    .iter()
+                    .filter(|s| !s.is_template)
+                    .map(|s| s.content.len() as u64)
+                    .sum::<u64>(),
+            })
+            .sum::<u64>();
         let mut done_bytes: u64 = 0;
         let report = |done: u64| {
             if let Some(cb) = section_progress {
@@ -319,23 +301,19 @@ impl Sequence {
         // finishes, which can be seconds for a heavy schema.
         report(0);
 
-        // Ingest the system-start marker first so every subsequent
-        // section attends to its bytes.
-        if let Some(start) = &system_start {
-            conv.insert_section_with_prefix(start.id, start.content.as_str(), &linear_prefix)?;
-            linear_prefix.push(start.id);
-            fixed_prefix.push(start.id);
-            done_bytes += start.content.len() as u64;
-            report(done_bytes);
-        }
-
         // Cumulative ingest: walk schema items in declaration order,
-        // ingesting each `Section`-kind item with all previously-
-        // ingested sections Arc-injected onto the scratch slot as
-        // its prefix.  The prefill forward pass for section N
-        // therefore attends to sections 0..N-1 just like it would
-        // at projection time, producing K_raw values conditioned
-        // on the real preceding context.
+        // ingesting each non-template `Section`-kind item with all
+        // previously-ingested content sections Arc-injected onto the
+        // scratch slot as its prefix.  The prefill forward pass for
+        // section N therefore attends to content sections 0..N-1 just
+        // like it would at projection time, producing K_raw values
+        // conditioned on the real preceding content context.
+        //
+        // Template-kind sections (`is_template = true`) are skipped:
+        // their K/V is live-prefilled at projection-apply time under
+        // the actual runtime left context, so the substrate never sees
+        // them and they contribute nothing to other sections' ingest
+        // prefix here.
         //
         // `Collection` items: every member ingests in parallel with
         // the *same* pre-collection prefix (members do not attend to
@@ -345,12 +323,15 @@ impl Sequence {
         for item in &layer_items {
             match item {
                 SystemPromptItem::Section(s) => {
+                    if s.is_template {
+                        continue;
+                    }
                     conv.insert_section_with_prefix(s.id, s.content.as_str(), &linear_prefix)?;
                     linear_prefix.push(s.id);
                     // Sections with `depends_on` are conditional — they
-                    // only emit when the named collection materialises
-                    // — so they must NOT contribute to the end-marker's
-                    // `fixed_prefix`.
+                    // only emit when the named collection materialises —
+                    // so they must NOT contribute to the priming
+                    // projection's `fixed_prefix`.
                     if s.depends_on.is_none() {
                         fixed_prefix.push(s.id);
                     }
@@ -361,14 +342,20 @@ impl Sequence {
                     let batch: Vec<(SectionId, &str)> = coll
                         .sections
                         .iter()
+                        .filter(|sec| !sec.is_template)
                         .map(|sec| (sec.id, sec.content.as_str()))
                         .collect();
-                    conv.insert_section_collection(&batch, &linear_prefix)?;
-                    // Extend the live linear_prefix with every member
-                    // so subsequent sections see them at ingest, but
-                    // do NOT add them to fixed_prefix — the end-marker
+                    if !batch.is_empty() {
+                        conv.insert_section_collection(&batch, &linear_prefix)?;
+                    }
+                    // Extend the live linear_prefix with every ingested
+                    // member so subsequent sections see them, but do NOT
+                    // add them to fixed_prefix — the priming projection
                     // must be coherent for the empty-collection case.
                     for sec in &coll.sections {
+                        if sec.is_template {
+                            continue;
+                        }
                         linear_prefix.push(sec.id);
                         done_bytes += sec.content.len() as u64;
                     }
@@ -378,16 +365,6 @@ impl Sequence {
                     report(done_bytes);
                 }
             }
-        }
-
-        // Ingest the system-end marker last with the curated
-        // `fixed_prefix` so its K/V is conditioned on framing only —
-        // collections-as-empty.
-        if let Some(end) = &system_end {
-            conv.insert_section_with_prefix(end.id, end.content.as_str(), &fixed_prefix)?;
-            fixed_prefix.push(end.id);
-            done_bytes += end.content.len() as u64;
-            report(done_bytes);
         }
 
         // Pre-warm the slot: inject all system-prompt sections now so the

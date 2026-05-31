@@ -1,22 +1,41 @@
-//! Per-slot projection assembler — full rebuild of the slot's sealed
-//! K/V prefix on every call.
+﻿//! Per-slot projection assembler — full rebuild of the slot's prefix
+//! K/V on every call, with a content-addressed cache for live-prefilled
+//! structural template runs.
 //!
-//! Snapshots the slot's writer tail, truncates the slot to zero,
-//! resolves each [`ProjectionSegment::Sealed`] from the substrate,
-//! concatenates the per-layer sealed sequences, injects them, patches
-//! substrate `block_range` entries, then re-attaches the writer tail.
+//! Snapshots the slot's writer tail, truncates to zero, then walks
+//! `Vec<ProjectionSegment>` in declaration order:
 //!
-//! [`SlotProjectionState`] records what landed on the slot so future
-//! work can build on it (cache keying for live-prefill runs, etc.); the
-//! current implementation never consults that record during apply —
-//! every call is an independent rebuild.
+//! - `Sealed(Section|Turn)` — resolve the substrate entry's per-layer
+//!   sealed K/V, Arc-clone it onto the slot.  Fold the segment's tokens
+//!   into the rolling hash.
+//! - `Generated { tokens, .. }` — accumulate into the current run; do
+//!   not advance the slot or the rolling hash yet.  Cache keying is by
+//!   the whole run (every adjacent Generated up to the next non-Generated
+//!   segment), so partial-prefix folding would produce keys that don't
+//!   match any captured K/V.
+//! - On a non-Generated segment (or end of list), flush the current
+//!   run: compute `key = fold(rolling_hash, run_tokens)`, look up in
+//!   the slot cache.  Hit → inject the cached `Vec<SealedSequence>`.
+//!   Miss → run a synchronous forward pass over `run_tokens`, capture
+//!   the per-layer K/V from the resulting slot range, insert into the
+//!   cache.  Either way, commit `rolling_hash = key`.
+//!
+//! Re-attach the writer tail at the end.
+//!
+//! The cache is content-addressed (key = hash of preceding tokens plus
+//! run tokens), so stale entries miss benignly — there is no way for a
+//! wrong cache value to leak onto the slot.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_nn::kv_cache::SealedSequence;
-use candle_transformers::models::batched_inference::BatchedInferenceSession;
+use candle::{Device, Tensor};
+use candle_nn::kv_cache::{SealedSequence, WriterTail};
+use candle_transformers::models::batched_inference::{
+    BatchedInferenceSession, ManagedBatchedModel,
+};
 
+use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
 use crate::projection::{
     Conversation, GroupId, ProjectionSegment, ProjectionTarget, SealedKind, SectionId, TimelineId,
@@ -24,23 +43,64 @@ use crate::projection::{
 };
 use crate::sequence_handle::SequenceId;
 
-/// Per-slot record of the projection that last landed on the slot.
-///
-/// Lives in [`super::Scheduler`] keyed by `SequenceId`; written by
-/// [`apply_segments`] at the end of every rebuild.  The three arrays
-/// are positionally aligned — `previous_segments[i]`,
-/// `previous_segment_block_counts[i]` and `previous_segment_hashes[i]`
-/// all describe the same injected unit.  Read-only at the moment; held
-/// for future work that diffs successive projections to skip
-/// re-injecting unchanged segments.
-#[derive(Debug, Default)]
-pub(super) struct SlotProjectionState {
-    pub(super) previous_segments: Vec<ProjectionSegment>,
-    pub(super) previous_segment_block_counts: Vec<u32>,
-    pub(super) previous_segment_hashes: Vec<u64>,
+// FNV-1a constants — deterministic, dependency-free, sufficient
+// collision resistance over u64 for per-slot caches.
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// Roll `tokens` into a 64-bit FNV-1a state.  Bytes are little-endian
+/// over each `u32` so the hash is platform-stable.
+fn fold_tokens(mut h: u64, tokens: &[u32]) -> u64 {
+    for &t in tokens {
+        for b in t.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
 }
 
-impl SlotProjectionState {
+/// Content-addressed cache of captured live-prefilled runs on a slot.
+///
+/// Keyed by `fold_tokens(preceding_slot_tokens ++ run_tokens)`.  Values
+/// are the per-layer `Vec<SealedSequence>` captured from the slot just
+/// after the prefill that produced them.  Lives as long as the slot;
+/// dropped wholesale when the slot is freed.
+#[derive(Debug, Default)]
+pub(super) struct SlotProjectionCache {
+    memo: HashMap<u64, Arc<Vec<SealedSequence>>>,
+}
+
+impl SlotProjectionCache {
+    fn get(&self, key: u64) -> Option<Arc<Vec<SealedSequence>>> {
+        self.memo.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: u64, value: Arc<Vec<SealedSequence>>) {
+        self.memo.insert(key, value);
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.memo.len()
+    }
+}
+
+/// Per-slot state owned by the projection assembler.
+///
+/// `cache` memoises captured live-prefill runs for cheap reuse across
+/// reprojections.  `pending_user_part` holds the captured K/V for the
+/// in-flight turn's user message — populated when a `NewUserMessage`
+/// segment is prefilled, cleared at seal time; survives mid-decode
+/// reprojection (which truncates the slot) because it lives here on
+/// `SlotState`, not on the slot.
+#[derive(Debug, Default)]
+pub(super) struct SlotState {
+    pub(super) cache: SlotProjectionCache,
+    pub(super) pending_user_part: Option<Arc<Vec<SealedSequence>>>,
+}
+
+impl SlotState {
     pub(super) fn new() -> Self {
         Self::default()
     }
@@ -48,352 +108,392 @@ impl SlotProjectionState {
 
 /// Borrowed scheduler state the assembler needs in order to run.
 ///
-/// Bundled into one struct so [`apply_segments`] keeps a tractable
-/// signature.  All references are `&mut` only where the assembler must
-/// mutate; substrate and target are immutable to the operation.
+/// `model` and `device` are required so cache-miss runs can drive a
+/// synchronous `forward_batched` to compute and capture the missing
+/// K/V; `max_prefill_chunk` caps the per-pass token count to keep
+/// activation buffers bounded.
 pub(super) struct ApplyContext<'a> {
     pub(super) session: &'a mut BatchedInferenceSession,
+    pub(super) model: &'a mut Box<dyn ManagedBatchedModel + Send>,
+    pub(super) device: &'a Device,
     pub(super) conversation: &'a Conversation,
     pub(super) slot_target: Option<ProjectionTarget>,
     pub(super) parent_id: SequenceId,
     pub(super) chunk_size: usize,
-    /// Used only under `feature = "context-dump"` to decode injected
-    /// tokens for the diagnostic projection-dump log.  Kept in the
-    /// context unconditionally so the public shape stays stable across
-    /// feature toggles.
+    pub(super) max_prefill_chunk: usize,
+    /// Used only under `feature = "context-dump"`; kept unconditionally
+    /// so the public shape stays stable across feature toggles.
     #[cfg_attr(not(feature = "context-dump"), allow(dead_code))]
     pub(super) tokenizer: &'a tokenizers::Tokenizer,
     pub(super) slot_tokens: &'a mut HashMap<SequenceId, Vec<u32>>,
 }
 
-/// Apply `new_segments` onto the slot.  Truncates the slot to zero,
-/// resolves each segment's sealed bytes from the substrate, and
-/// injects them in declaration order.
+/// Apply `new_segments` onto the slot.
 ///
 /// Post-condition: the slot's per-layer K/V is the concatenation of
-/// every `new_segments[i]`'s sealed bytes, in declaration order, plus
-/// the pre-existing writer tail (re-attached at the end).  Equivalent
-/// at LCP = 0 to a full truncate-to-zero + inject-everything rebuild.
+/// every `new_segments[i]`'s K/V (substrate-pinned for `Sealed`,
+/// live-prefilled or cache-loaded for `Generated`, captured to
+/// `pending_user_part` for `NewUserMessage`), in declaration order,
+/// plus the pre-existing writer tail re-attached at the end.
 pub(super) fn apply_segments(
-    state: &mut SlotProjectionState,
-    ctx: ApplyContext<'_>,
+    state: &mut SlotState,
+    mut ctx: ApplyContext<'_>,
     new_segments: &[ProjectionSegment],
 ) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
 
-    // Snapshot any writer-owned tail (in-flight decode chunks).
-    // At turn-submit boundaries this is empty; mid-decode
-    // reprojection has a non-empty tail that must survive the
-    // prefix rewrite.  The snapshot holds RAII refs that keep the
-    // underlying arena chunks alive across the truncate.
-    let tail_per_layer: Vec<candle_nn::kv_cache::WriterTail> = {
-        let mut out: Vec<candle_nn::kv_cache::WriterTail> =
-            Vec::with_capacity(ctx.session.backings().len());
-        for backing in ctx.session.backings() {
-            out.push(
-                backing
-                    .split_off_writer_tail(parent_id.0)
-                    .map_err(ConversationError::Model)?,
-            );
-        }
-        out
-    };
+    // 1. Snapshot the writer tail (in-flight decode chunks).  Empty at
+    //    turn-submit boundaries; non-empty during mid-decode reproject.
+    let tail_per_layer = snapshot_tail(ctx.session, parent_id)?;
 
-    // Full rebuild: truncate the slot to zero and re-inject every
-    // segment from substrate.  An earlier draft of this module diffed
-    // against `state.previous_segments` and truncated only to the
-    // longest-common-prefix boundary so reprojection could skip
-    // re-injecting unchanged sections.  That path is correct only when
-    // `state.previous_segments` describes EXACTLY what's on the slot in
-    // the same block layout; under the reproject control flow the slot
-    // can be partially drained (the caller snapshots the writer tail
-    // before calling), and any prior call that filtered out
-    // non-hot-resident sections leaves a state vs. slot mismatch that
-    // a later LCP truncate happily honours — wiping the prefix.  Until
-    // the state model tracks slot truth precisely, take the safe path
-    // every call: truncate, re-resolve, re-inject.
+    // 2. Truncate the slot.  Drops Arc refs to whatever it previously
+    //    held; arenas reclaim asynchronously.
     ctx.session
         .truncate_sequence_to_blocks(parent_id.0, 0)
         .map_err(ConversationError::Model)?;
 
-    let suffix = new_segments;
-    if suffix.is_empty() {
-        // Nothing to inject — restore the writer tail (no-op when it
-        // was already empty) and clear the per-slot segment record so
-        // the next call also rebuilds from scratch.
-        for (backing, tail) in ctx.session.backings().iter().zip(tail_per_layer) {
-            backing
-                .extend_writer_tail(parent_id.0, tail)
-                .map_err(ConversationError::Model)?;
-        }
-        state.previous_segments.clear();
-        state.previous_segment_block_counts.clear();
-        state.previous_segment_hashes.clear();
-        return Ok(());
-    }
-
-    // Gather per-unit per-layer sealed sequences in suffix order.
-    // Each `SealedSequence` is a vector of windowed `SealedChunk`s
-    // (any may be partial — sharing the underlying physical chunk
-    // with the writer is safe because windows assert only the bytes
-    // they cover).
-    //
-    // The working set has already been brought into VRAM by
-    // `elevate_to_hot` ahead of this call; these lookups just pull
-    // the residence's hot bytes out of the substrate.  Any item the
-    // elevator missed will surface as `None` here and gets skipped —
-    // the elevate report's `missing` / `failed` counters are where
-    // to look if turns silently drop.
-    enum InjectedUnit {
-        Section(SectionId),
-        Turn(GroupId, TurnIndex, TimelineId),
-    }
-
-    // `units`, `surviving_segments`, and (later) `suffix_block_counts`
-    // are positionally aligned — entry `i` in each array describes the
-    // same injected unit.  Segments whose substrate lookup misses are
-    // skipped from all three so the bookkeeping stays consistent with
-    // what actually lands on the slot.
-    let mut units: Vec<(InjectedUnit, Arc<Vec<SealedSequence>>)> = Vec::with_capacity(suffix.len());
-    let mut surviving_segments: Vec<ProjectionSegment> = Vec::with_capacity(suffix.len());
-    let mut suffix_block_counts: Vec<u32> = Vec::with_capacity(suffix.len());
-    {
-        let view = ctx.conversation.read();
-        for seg in suffix {
-            match seg {
-                ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                    let sid = rs.id;
-                    if let Some(s) = view.section_sealed_of(sid) {
-                        units.push((InjectedUnit::Section(sid), s));
-                        surviving_segments.push(seg.clone());
-                    } else {
-                        tracing::warn!(
-                            target: "candle_conversation::persistence::tier",
-                            section = sid.raw(),
-                            slot = parent_id.0,
-                            "apply_projection: section not hot — elevate missed it; skipping borrow"
-                        );
-                    }
-                }
-                ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
-                    let g = rt.group();
-                    let t = rt.index();
-                    let timeline = match ctx.slot_target {
-                        Some(tgt) if g == tgt.group => Some(tgt.timeline),
-                        _ => view.timelines_for_group(g).next(),
-                    };
-                    if let Some(timeline) = timeline {
-                        if let Some(s) = view.turn_sealed_of(timeline, t) {
-                            units.push((InjectedUnit::Turn(g, t, timeline), s));
-                            surviving_segments.push(seg.clone());
-                        } else {
-                            tracing::warn!(
-                                target: "candle_conversation::persistence::tier",
-                                timeline = timeline.raw(),
-                                turn = t.0,
-                                slot = parent_id.0,
-                                "apply_projection: turn not hot — elevate missed it; skipping borrow"
-                            );
-                        }
-                    }
-                }
-                ProjectionSegment::Generated { .. } | ProjectionSegment::NewUserMessage { .. } => {
-                    // Generated and NewUserMessage runs do not flow
-                    // through this code path — their K/V is captured
-                    // out-of-band by the live-prefill machinery.  If
-                    // one shows up here it's a routing bug upstream;
-                    // skip it rather than corrupt the slot layout.
-                    tracing::warn!(
-                        slot = parent_id.0,
-                        "apply_projection: unexpected non-Sealed segment — skipping"
-                    );
-                }
-            }
-        }
-    }
-
-    // No units survived (e.g. every segment was missing from hot).
-    // Restore the tail on an empty slot and clear the state record.
-    if units.is_empty() {
-        for (backing, tail) in ctx.session.backings().iter().zip(tail_per_layer) {
-            backing
-                .extend_writer_tail(parent_id.0, tail)
-                .map_err(ConversationError::Model)?;
-        }
-        state.previous_segments.clear();
-        state.previous_segment_block_counts.clear();
-        state.previous_segment_hashes.clear();
-        return Ok(());
-    }
-
-    // Concatenate per-layer + remember each unit's block extent so
-    // we can patch substrate `block_range` entries after inject.
-    // Layer-count mismatches drop the unit AND its `surviving_segments`
-    // entry so the parallel arrays stay aligned.
-    let n_layers = ctx.session.num_layers();
-    let chunk_size = ctx.chunk_size;
-    let mut per_layer_chunks: Vec<Vec<candle_nn::kv_cache::SealedChunk>> =
-        (0..n_layers).map(|_| Vec::new()).collect();
-    let mut per_layer_token_count: Vec<usize> = vec![0; n_layers];
-    let mut unit_extents: Vec<(InjectedUnit, usize)> = Vec::with_capacity(units.len());
-    let mut kept_segments: Vec<ProjectionSegment> = Vec::with_capacity(units.len());
-    let units_iter = units.into_iter().zip(surviving_segments.into_iter());
-    for ((unit, sealed), seg) in units_iter {
-        if sealed.len() != n_layers {
-            tracing::warn!(
-                "apply_projection: unit has {} layers, expected {}; skipping",
-                sealed.len(),
-                n_layers
-            );
-            continue;
-        }
-        // Layer 0's block count is the canonical extent (every
-        // layer's chunk count matches for a well-formed sealed
-        // entry).
-        let block_count = sealed[0].chunks.len();
-        for layer_idx in 0..n_layers {
-            let layer_seq = &sealed[layer_idx];
-            per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
-            per_layer_token_count[layer_idx] += layer_seq.token_count;
-        }
-        unit_extents.push((unit, block_count));
-        suffix_block_counts.push(block_count as u32);
-        kept_segments.push(seg);
-    }
-    let surviving_segments = kept_segments;
-    let gpu_per_layer: Vec<SealedSequence> = per_layer_chunks
-        .into_iter()
-        .zip(per_layer_token_count.into_iter())
-        .map(|(chunks, tokens)| SealedSequence {
-            chunks,
-            token_count: tokens,
-            chunk_size,
-            location: candle_nn::kv_cache::ArenaLocation::Gpu,
-        })
-        .collect();
-
-    let (start_block, _end_block) = ctx
-        .session
-        .inject_sealed_at_tail(parent_id.0, &gpu_per_layer)
-        .map_err(ConversationError::Model)?;
-
-    // Record each injected unit's `(start, end)` block range in the
-    // substrate so `reproject_view`'s `block_range_of` lookups
-    // resolve against the current parent layout.  Also mirror each
-    // unit's token IDs into the slot's diagnostic log so the turn-
-    // complete dump can reconstruct the exact context the kernel
-    // saw.
-    let mut injected_tokens: Vec<u32> = Vec::new();
-    {
-        let mut view = ctx.conversation.write();
-        let mut cursor = start_block;
-        for (unit, block_count) in unit_extents {
-            let next = cursor + block_count;
-            match unit {
-                InjectedUnit::Section(sid) => {
-                    view.set_section_block_range(sid, cursor as u64, next as u64);
-                    let toks = view.section_tokens_of(sid);
-                    #[cfg(feature = "context-dump")]
-                    if tracing::enabled!(
-                        target: "candle_conversation::scheduler::projection_dump",
-                        tracing::Level::INFO,
-                    ) {
-                        let decoded = ctx
-                            .tokenizer
-                            .decode(&toks, false)
-                            .unwrap_or_else(|e| format!("<decode error: {e}>"));
-                        tracing::info!(
-                            target: "candle_conversation::scheduler::projection_dump",
-                            slot = parent_id.0,
-                            label = %format!("Section({sid:?})"),
-                            token_count = toks.len(),
-                            "{decoded}\n---"
-                        );
-                    }
-                    injected_tokens.extend_from_slice(&toks);
-                }
-                InjectedUnit::Turn(_g, t, timeline) => {
-                    view.set_block_range(timeline, t, cursor as u64, next as u64);
-                    let toks = view.token_ids_of(timeline, t).to_vec();
-                    #[cfg(feature = "context-dump")]
-                    if tracing::enabled!(
-                        target: "candle_conversation::scheduler::projection_dump",
-                        tracing::Level::INFO,
-                    ) {
-                        let decoded = ctx
-                            .tokenizer
-                            .decode(&toks, false)
-                            .unwrap_or_else(|e| format!("<decode error: {e}>"));
-                        tracing::info!(
-                            target: "candle_conversation::scheduler::projection_dump",
-                            slot = parent_id.0,
-                            label = %format!("Turn(group={_g:?}, index={t:?})"),
-                            token_count = toks.len(),
-                            "{decoded}\n---"
-                        );
-                    }
-                    injected_tokens.extend_from_slice(&toks);
-                }
-            }
-            cursor = next;
-        }
-    }
-    #[cfg(feature = "context-dump")]
-    if tracing::enabled!(
-        target: "candle_conversation::scheduler::projection_dump",
-        tracing::Level::INFO,
-    ) {
-        tracing::info!(
-            target: "candle_conversation::scheduler::projection_dump",
-            slot = parent_id.0,
-            total_tokens = injected_tokens.len(),
-            "=== apply_projection injection order complete ==="
-        );
-    }
-    // Diagnostic log: every call truncates the slot to zero before
-    // re-injecting, so the slot's full token content is the run of
-    // tokens we just injected.  Clear the prior entry and write
-    // exactly what's on the slot.
+    // 3. Diagnostic log: full rebuild, so the slot_tokens record is
+    //    rewritten from scratch this call.
     if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
         entry.clear();
     }
-    super::Scheduler::record_slot_tokens(ctx.slot_tokens, parent_id, &injected_tokens);
 
-    // Restore the writer-owned tail snapshot taken at the top.
-    for (backing, tail) in ctx.session.backings().iter().zip(tail_per_layer) {
+    // 4. Walk segments in declaration order, batching adjacent
+    //    Generated entries into a single run.
+    let mut walker = SegmentWalker {
+        rolling_hash: FNV_OFFSET_BASIS,
+        run_tokens: Vec::new(),
+        last_was_sealed: false,
+    };
+
+    let mut i = 0;
+    while i < new_segments.len() {
+        if matches!(&new_segments[i], ProjectionSegment::Generated { .. }) {
+            // Collect every adjacent Generated into one run.  The
+            // batched forward pass amortises the per-call kernel
+            // launch overhead across all the structural tokens.
+            while i < new_segments.len() {
+                let ProjectionSegment::Generated { tokens, .. } = &new_segments[i] else {
+                    break;
+                };
+                walker.run_tokens.extend(tokens.iter().copied());
+                i += 1;
+            }
+            walker.flush_run(state, &mut ctx)?;
+            continue;
+        }
+
+        match &new_segments[i] {
+            ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                walker.flush_run(state, &mut ctx)?;
+                inject_sealed_section(state, &mut ctx, &mut walker, rs.id)?;
+            }
+            ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
+                walker.flush_run(state, &mut ctx)?;
+                inject_sealed_turn(state, &mut ctx, &mut walker, rt.group(), rt.index())?;
+            }
+            ProjectionSegment::NewUserMessage { tokens } => {
+                walker.flush_run(state, &mut ctx)?;
+                handle_new_user_message(state, &mut ctx, &mut walker, tokens)?;
+            }
+            ProjectionSegment::Generated { .. } => unreachable!("handled in run loop above"),
+        }
+        i += 1;
+    }
+    walker.flush_run(state, &mut ctx)?;
+
+    // 5. Re-attach the writer tail at the slot's current end.
+    restore_tail(ctx.session, parent_id, tail_per_layer)?;
+
+    Ok(())
+}
+
+/// State carried across a single `apply_segments` walk.
+struct SegmentWalker {
+    rolling_hash: u64,
+    run_tokens: Vec<u32>,
+    /// True if the most recent slot mutation was a Sealed inject (Arc-
+    /// shared, partial trailing chunk possible).  Set on Sealed inject,
+    /// cleared after we push a fresh writer chunk for a subsequent
+    /// prefill so the prefill doesn't write into the Arc-shared partial.
+    last_was_sealed: bool,
+}
+
+impl SegmentWalker {
+    fn flush_run(
+        &mut self,
+        state: &mut SlotState,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<(), ConversationError> {
+        if self.run_tokens.is_empty() {
+            return Ok(());
+        }
+        let key = fold_tokens(self.rolling_hash, &self.run_tokens);
+
+        if let Some(cached) = state.cache.get(key) {
+            inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached)?;
+            log_injected_tokens(ctx, &self.run_tokens);
+        } else {
+            let captured =
+                drive_prefill_and_capture(ctx, &self.run_tokens, self.last_was_sealed)?;
+            state.cache.insert(key, captured);
+        }
+
+        self.rolling_hash = key;
+        self.run_tokens.clear();
+        // The slot now ends in chunks the writer just wrote (cache
+        // miss) or just Arc-cloned (cache hit).  Either way the next
+        // Sealed inject will append cleanly; the next prefill, if
+        // any, will need a fresh writer chunk because the cached run
+        // also ends in a (possibly partial) Arc-shared chunk.
+        self.last_was_sealed = true;
+        Ok(())
+    }
+}
+
+// ── Sealed-segment injection ─────────────────────────────────────────────────
+
+fn inject_sealed_section(
+    _state: &mut SlotState,
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    sid: SectionId,
+) -> Result<(), ConversationError> {
+    let parent_id = ctx.parent_id;
+    let sealed = match ctx.conversation.read().section_sealed_of(sid) {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                target: "candle_conversation::persistence::tier",
+                section = sid.raw(),
+                slot = parent_id.0,
+                "apply_projection: section not hot — elevate missed it; skipping borrow"
+            );
+            return Ok(());
+        }
+    };
+    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+
+    let toks = ctx.conversation.read().section_tokens_of(sid);
+    let start_block = ctx
+        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?
+        .saturating_sub(sealed[0].chunks.len());
+    let end_block = start_block + sealed[0].chunks.len();
+    ctx.conversation
+        .write()
+        .set_section_block_range(sid, start_block as u64, end_block as u64);
+
+    walker.rolling_hash = fold_tokens(walker.rolling_hash, &toks);
+    log_injected_tokens(ctx, &toks);
+    walker.last_was_sealed = true;
+    Ok(())
+}
+
+fn inject_sealed_turn(
+    _state: &mut SlotState,
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    group: GroupId,
+    index: TurnIndex,
+) -> Result<(), ConversationError> {
+    let parent_id = ctx.parent_id;
+
+    let timeline: Option<TimelineId> = match ctx.slot_target {
+        Some(tgt) if group == tgt.group => Some(tgt.timeline),
+        _ => ctx.conversation.read().timelines_for_group(group).next(),
+    };
+    let Some(timeline) = timeline else {
+        return Ok(());
+    };
+
+    let sealed = match ctx.conversation.read().turn_sealed_of(timeline, index) {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                target: "candle_conversation::persistence::tier",
+                timeline = timeline.raw(),
+                turn = index.0,
+                slot = parent_id.0,
+                "apply_projection: turn not hot — elevate missed it; skipping borrow"
+            );
+            return Ok(());
+        }
+    };
+    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+
+    let toks = ctx.conversation.read().token_ids_of(timeline, index).to_vec();
+    let start_block = ctx
+        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?
+        .saturating_sub(sealed[0].chunks.len());
+    let end_block = start_block + sealed[0].chunks.len();
+    ctx.conversation
+        .write()
+        .set_block_range(timeline, index, start_block as u64, end_block as u64);
+
+    walker.rolling_hash = fold_tokens(walker.rolling_hash, &toks);
+    log_injected_tokens(ctx, &toks);
+    walker.last_was_sealed = true;
+    Ok(())
+}
+
+fn inject_arc_sealed(
+    session: &mut BatchedInferenceSession,
+    parent_id: SequenceId,
+    chunk_size: usize,
+    sealed: &Arc<Vec<SealedSequence>>,
+) -> Result<(), ConversationError> {
+    let n_layers = session.num_layers();
+    if sealed.len() != n_layers {
+        tracing::warn!(
+            "apply_projection: unit has {} layers, expected {}; skipping",
+            sealed.len(),
+            n_layers,
+        );
+        return Ok(());
+    }
+    let mut per_layer: Vec<SealedSequence> = Vec::with_capacity(n_layers);
+    for layer_seq in sealed.iter() {
+        per_layer.push(SealedSequence {
+            chunks: layer_seq.chunks.clone(),
+            token_count: layer_seq.token_count,
+            chunk_size,
+            location: candle_nn::kv_cache::ArenaLocation::Gpu,
+        });
+    }
+    session
+        .inject_sealed_at_tail(parent_id.0, &per_layer)
+        .map_err(ConversationError::Model)?;
+    Ok(())
+}
+
+// ── NewUserMessage handling (live-prefill into pending_user_part) ────────────
+
+fn handle_new_user_message(
+    state: &mut SlotState,
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    tokens: &Arc<Vec<u32>>,
+) -> Result<(), ConversationError> {
+    if let Some(cached) = state.pending_user_part.clone() {
+        // Mid-decode reproject path: the user's K/V was already
+        // captured on an earlier apply.  Re-inject the cached bytes;
+        // do not re-run the forward pass.
+        inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached)?;
+        log_injected_tokens(ctx, tokens);
+    } else {
+        let captured = drive_prefill_and_capture(ctx, tokens, walker.last_was_sealed)?;
+        state.pending_user_part = Some(captured);
+    }
+    walker.rolling_hash = fold_tokens(walker.rolling_hash, tokens);
+    walker.last_was_sealed = true;
+    Ok(())
+}
+
+// ── Live prefill drive (cache-miss path) ─────────────────────────────────────
+
+/// Run a synchronous forward pass over `tokens` on the slot, then
+/// extract the per-layer `SealedSequence` for the just-written block
+/// range.  Returns the captured K/V wrapped in an `Arc` so the cache
+/// (or `pending_user_part`) can store it without further copies.
+///
+/// `last_was_sealed` indicates whether the slot's current tail is
+/// Arc-shared with the substrate.  If so, we push a fresh writer
+/// chunk first so this prefill's writes don't alias the partial
+/// trailing chunk of the previous Sealed inject.
+fn drive_prefill_and_capture(
+    ctx: &mut ApplyContext<'_>,
+    tokens: &[u32],
+    last_was_sealed: bool,
+) -> Result<Arc<Vec<SealedSequence>>, ConversationError> {
+    let parent_id = ctx.parent_id;
+
+    if last_was_sealed {
+        ctx.session
+            .push_empty_writer_chunk(parent_id.0)
+            .map_err(ConversationError::Model)?;
+    }
+
+    let start_block = ctx
+        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?;
+
+    let mut offset = 0;
+    while offset < tokens.len() {
+        let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_chunk);
+        let slice = &tokens[offset..offset + chunk_len];
+        let input = Tensor::new(slice, ctx.device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(ConversationError::Model)?;
+        let _logits = ctx
+            .model
+            .forward_batched(ctx.session, &[parent_id.0], &[input])
+            .map_err(ConversationError::Model)?;
+        ctx.session
+            .advance_sequence(parent_id.0, chunk_len)
+            .map_err(ConversationError::Model)?;
+        offset += chunk_len;
+    }
+
+    let end_block = ctx
+        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?;
+
+    let full = ctx
+        .session
+        .snapshot_sequence_per_layer(parent_id.0)
+        .map_err(ConversationError::Model)?;
+    let captured = slice_per_layer_sealed(&full, start_block, end_block);
+    log_injected_tokens(ctx, tokens);
+
+    Ok(Arc::new(captured))
+}
+
+// ── Writer-tail snapshot / restore ───────────────────────────────────────────
+
+fn snapshot_tail(
+    session: &mut BatchedInferenceSession,
+    parent_id: SequenceId,
+) -> Result<Vec<WriterTail>, ConversationError> {
+    let mut out: Vec<WriterTail> = Vec::with_capacity(session.backings().len());
+    for backing in session.backings() {
+        out.push(
+            backing
+                .split_off_writer_tail(parent_id.0)
+                .map_err(ConversationError::Model)?,
+        );
+    }
+    Ok(out)
+}
+
+fn restore_tail(
+    session: &mut BatchedInferenceSession,
+    parent_id: SequenceId,
+    tail_per_layer: Vec<WriterTail>,
+) -> Result<(), ConversationError> {
+    for (backing, tail) in session.backings().iter().zip(tail_per_layer) {
         backing
             .extend_writer_tail(parent_id.0, tail)
             .map_err(ConversationError::Model)?;
     }
-
-    // Record what landed on the slot.  `surviving_segments` is built
-    // alongside `units` / `suffix_block_counts` so the three arrays
-    // are positionally aligned — `previous_segments[i]` corresponds
-    // to `previous_segment_block_counts[i]` for the unit that
-    // actually injected.  Segments whose substrate lookup returned
-    // None are dropped from the record entirely.
-    let n = suffix_block_counts.len();
-    debug_assert_eq!(surviving_segments.len(), n);
-    state.previous_segments = surviving_segments;
-    state.previous_segment_block_counts = suffix_block_counts;
-    state.previous_segment_hashes = vec![0u64; n];
-
     Ok(())
+}
+
+// ── Diagnostic logging ───────────────────────────────────────────────────────
+
+fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
+    super::Scheduler::record_slot_tokens(ctx.slot_tokens, ctx.parent_id, tokens);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{GroupId, LayerId, TimelineId};
-    use crate::projection::{ResolvedSection, ResolvedTurn, SectionId, TurnId, TurnIndex};
+    use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TurnId};
 
-    fn section(id: u32) -> ProjectionSegment {
+    fn section_seg(id: u32) -> ProjectionSegment {
         ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
             id: SectionId::new(id),
         }))
     }
 
-    fn turn(layer: u32, group: u32, index: u32) -> ProjectionSegment {
+    fn turn_seg(layer: u32, group: u32, index: u32) -> ProjectionSegment {
         ProjectionSegment::Sealed(SealedKind::Turn(ResolvedTurn {
             id: TurnId {
                 layer_id: LayerId::for_test(layer),
@@ -403,33 +503,89 @@ mod tests {
         }))
     }
 
-    #[test]
-    fn slot_state_default_is_empty() {
-        let s = SlotProjectionState::new();
-        assert!(s.previous_segments.is_empty());
-        assert!(s.previous_segment_block_counts.is_empty());
-        assert!(s.previous_segment_hashes.is_empty());
+    fn generated_seg(name: &str, position: usize, tokens: &[u32]) -> ProjectionSegment {
+        ProjectionSegment::Generated {
+            tokens: Arc::new(tokens.to_vec()),
+            identity: crate::projection::GeneratedIdentity {
+                name: name.to_string(),
+                position,
+            },
+        }
     }
 
     #[test]
-    fn segment_helpers_produce_expected_kinds() {
-        // Sanity check on the test fixtures used in this module —
-        // catches accidental drift in `ResolvedSection` / `ResolvedTurn`
-        // construction.
-        let s = section(7);
-        let t = turn(1, 2, 3);
-        match s {
+    fn fold_tokens_deterministic() {
+        let a = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
+        let b = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fold_tokens_order_sensitive() {
+        let a = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
+        let b = fold_tokens(FNV_OFFSET_BASIS, &[3, 2, 1]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fold_tokens_preceding_context_matters() {
+        // Same run, different preceding hash → different key.
+        let pre_a = fold_tokens(FNV_OFFSET_BASIS, &[100]);
+        let pre_b = fold_tokens(FNV_OFFSET_BASIS, &[101]);
+        let a = fold_tokens(pre_a, &[1, 2, 3]);
+        let b = fold_tokens(pre_b, &[1, 2, 3]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn fold_tokens_incremental_matches_one_shot() {
+        let one_shot = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3, 4, 5, 6]);
+        let h1 = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
+        let h2 = fold_tokens(h1, &[4, 5, 6]);
+        assert_eq!(one_shot, h2);
+    }
+
+    #[test]
+    fn cache_get_set_round_trip() {
+        let mut cache = SlotProjectionCache::default();
+        assert_eq!(cache.len(), 0);
+        let v: Arc<Vec<SealedSequence>> = Arc::new(Vec::new());
+        cache.insert(42, v.clone());
+        assert_eq!(cache.len(), 1);
+        let got = cache.get(42).unwrap();
+        assert!(Arc::ptr_eq(&got, &v));
+        assert!(cache.get(43).is_none());
+    }
+
+    #[test]
+    fn slot_state_default_is_empty() {
+        let s = SlotState::new();
+        assert_eq!(s.cache.len(), 0);
+        assert!(s.pending_user_part.is_none());
+    }
+
+    #[test]
+    fn fixture_helpers_produce_expected_kinds() {
+        match section_seg(7) {
             ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
                 assert_eq!(rs.id, SectionId::new(7));
             }
             _ => panic!("expected Sealed(Section)"),
         }
-        match t {
+        match turn_seg(1, 2, 3) {
             ProjectionSegment::Sealed(SealedKind::Turn(rt)) => {
                 assert_eq!(rt.group(), GroupId::for_test(2));
                 assert_eq!(rt.index(), TurnIndex(3));
             }
             _ => panic!("expected Sealed(Turn)"),
+        }
+        match generated_seg("x", 0, &[1, 2, 3]) {
+            ProjectionSegment::Generated { tokens, identity } => {
+                assert_eq!(*tokens, vec![1, 2, 3]);
+                assert_eq!(identity.name, "x");
+                assert_eq!(identity.position, 0);
+            }
+            _ => panic!("expected Generated"),
         }
     }
 }

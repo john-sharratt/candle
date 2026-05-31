@@ -1,4 +1,4 @@
-//! Public [`Builder`] type — the projection engine's user-facing API.
+﻿//! Public [`Builder`] type — the projection engine's user-facing API.
 //!
 //! # Lifecycle
 //!
@@ -316,6 +316,47 @@ impl Builder {
         })
     }
 
+    /// Pre-tokenise every `is_template` section's content with the
+    /// caller-supplied tokenizer.
+    ///
+    /// Walks the schema, finds every [`SectionSchema`] whose
+    /// `is_template` flag is set, calls the tokenize closure to convert
+    /// its content string to token IDs, and stores the result in
+    /// `template_tokens`.  Must be called once before the first
+    /// `project()` if the schema contains any template items —
+    /// otherwise the projection engine has no tokens to emit in the
+    /// `Generated` segments it would produce for those items.
+    ///
+    /// The closure form keeps this crate tokenizer-agnostic;
+    /// `candle-conversation` doesn't pull in a tokenizer dependency.
+    /// Callers typically pass a closure that wraps their
+    /// `tokenizers::Tokenizer::encode`.
+    pub fn tokenize_templates<E, F>(&mut self, mut tokenize: F) -> Result<(), E>
+    where
+        F: FnMut(&str) -> Result<Vec<u32>, E>,
+    {
+        for layer in self.schema.layers.iter_mut() {
+            for item in layer.system_prompt.items.iter_mut() {
+                match item {
+                    super::schema::SystemPromptItem::Section(s) => {
+                        if s.is_template && s.template_tokens.is_none() {
+                            s.template_tokens = Some(std::sync::Arc::new(tokenize(&s.content)?));
+                        }
+                    }
+                    super::schema::SystemPromptItem::Collection(c) => {
+                        for s in c.sections.iter_mut() {
+                            if s.is_template && s.template_tokens.is_none() {
+                                s.template_tokens =
+                                    Some(std::sync::Arc::new(tokenize(&s.content)?));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Use a pre-built [`Schema`] (e.g. constructed programmatically).
     ///
     /// Construction validation runs identically to [`Builder::from_yaml`].
@@ -409,7 +450,7 @@ impl Builder {
             .copied()
     }
 
-    /// The span α used by [`super::project::FIXED_FORMULA`].
+    /// The span Î± used by [`super::project::FIXED_FORMULA`].
     ///
     /// The BDP scanner in the reprojection path must use the same alpha so
     /// scores accumulated during live decode are consistent with the scores
@@ -471,6 +512,7 @@ impl Builder {
                 priority,
                 depends_on: None,
                 is_template: false,
+                        template_tokens: None,
             }),
         );
         self.name_maps.section_names.insert((layer, name), new_id);
@@ -584,65 +626,10 @@ impl Builder {
             priority,
             depends_on: None,
             is_template: false,
+                        template_tokens: None,
         });
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
-    }
-
-    /// Install the dialect-specific structural markers — the bytes that
-    /// open and close the system block — as two synthetic sections on
-    /// `layer`. They live outside `system_prompt.items` (so they are not
-    /// subject to selection rules), get fresh [`SectionId`]s, and register
-    /// in `name_maps` under reserved names (`__system_start`,
-    /// `__system_end`).
-    ///
-    /// Called by the dialect-aware caller (e.g. zend) after the schema
-    /// has been built from YAML but before the conversation is created.
-    /// Idempotent per layer — calling twice is an error.
-    pub fn set_system_markers(
-        &mut self,
-        layer: LayerId,
-        start_content: impl Into<String>,
-        end_content: impl Into<String>,
-    ) -> Result<(SectionId, SectionId), ConstructionError> {
-        let layer_idx = self.layer_idx(layer)?;
-        if self.schema.layers[layer_idx].system_start_section.is_some()
-            || self.schema.layers[layer_idx].system_end_section.is_some()
-        {
-            return Err(ConstructionError::DuplicateSectionName(
-                "__system_start/__system_end already set on this layer".to_string(),
-            ));
-        }
-        const START_NAME: &str = "__system_start";
-        const END_NAME: &str = "__system_end";
-        self.assert_section_name_free(layer_idx, START_NAME)?;
-        self.assert_section_name_free(layer_idx, END_NAME)?;
-
-        let start_id = SectionId::new(self.next_section_id_raw());
-        let end_id = SectionId::new(self.next_section_id_raw() + 1);
-        self.schema.layers[layer_idx].system_start_section = Some(SectionSchema {
-            id: start_id,
-            name: START_NAME.to_string(),
-            content: start_content.into(),
-            priority: 100.0,
-            depends_on: None,
-            is_template: false,
-        });
-        self.schema.layers[layer_idx].system_end_section = Some(SectionSchema {
-            id: end_id,
-            name: END_NAME.to_string(),
-            content: end_content.into(),
-            priority: 100.0,
-            depends_on: None,
-            is_template: false,
-        });
-        self.name_maps
-            .section_names
-            .insert((layer, START_NAME.to_string()), start_id);
-        self.name_maps
-            .section_names
-            .insert((layer, END_NAME.to_string()), end_id);
-        Ok((start_id, end_id))
     }
 
     /// Look up a layer's index in `self.schema.layers` by id, returning
@@ -686,12 +673,7 @@ impl Builder {
             .schema
             .layers
             .iter()
-            .flat_map(|l| {
-                l.system_prompt
-                    .all_sections()
-                    .chain(l.system_start_section.iter())
-                    .chain(l.system_end_section.iter())
-            })
+            .flat_map(|l| l.system_prompt.all_sections())
             .map(|s| s.id.raw())
             .max()
             .unwrap_or(0);
@@ -821,6 +803,7 @@ impl Builder {
                         priority: 50.0,
                         depends_on: None,
                         is_template: false,
+                        template_tokens: None,
                     })],
                 },
                 groups: vec![GroupSchema {
@@ -835,8 +818,6 @@ impl Builder {
                     },
                 }],
                 depth_weights: DepthWeights::default(),
-                system_start_section: None,
-                system_end_section: None,
             }],
         };
         validate(&schema).expect("synthetic schema must always be valid");
