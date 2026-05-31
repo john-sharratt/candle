@@ -1160,6 +1160,22 @@ impl ArenaStorage {
         self.write(|s| s.mark_chunk_allocated_at(arena_idx, chunk_idx))
     }
 
+    /// Bulk variant — mark every `(arena_idx, chunk_idx)` in `pairs`
+    /// under a single storage write lock acquisition. Used by the
+    /// cold-load bulk-alloc path to collapse the per-GID lock churn
+    /// that dominated `bulk_alloc_us` in the allocator breakdown.
+    pub(super) fn mark_chunks_allocated_at_bulk(&self, pairs: &[(usize, usize)]) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        self.write(|s| {
+            for &(arena_idx, chunk_idx) in pairs {
+                s.mark_chunk_allocated_at(arena_idx, chunk_idx);
+            }
+            Ok(())
+        })?
+    }
+
     /// Build per-arena diagnostic rows. The `active` and `free_list` fields
     /// are set to zero/storage-local values; backing.rs patches them from pool data.
     pub(super) fn arena_rows(&self) -> Result<Vec<ArenaRow>> {

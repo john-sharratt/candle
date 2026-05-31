@@ -654,18 +654,26 @@ impl SequenceState {
             ref mut gpu_chunks,
             ..
         } = *self;
+        // Prefix-sum cumulative usage once so each block's rope_base
+        // is an O(1) lookup. The previous `chunks[..blk].iter().sum()`
+        // was O(blk) per block — quadratic over a layer's blocks.
+        let mut rope_bases: Vec<u32> = Vec::with_capacity(chunks.len());
+        let mut acc: u32 = 0;
+        for c in chunks.iter() {
+            rope_bases.push(acc);
+            acc = acc.wrapping_add(c.usage);
+        }
         // One guard, scoped over the whole loop — its drop coalesces
         // every dirty chunk into the fewest contiguous memcpy_htod
         // runs the index set allows.
         let mut guard = gpu_chunks.as_mut();
         for &blk in block_indices {
-            let rope_base: u32 = chunks[..blk].iter().map(|c| c.usage).sum();
             guard.update_chunk(
                 blk,
                 &chunks[blk],
                 n_kv_head,
                 head_dim,
-                rope_base,
+                rope_bases[blk],
                 arena_info,
             )?;
         }

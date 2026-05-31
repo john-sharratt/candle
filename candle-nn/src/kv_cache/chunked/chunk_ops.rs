@@ -1273,13 +1273,45 @@ impl ChunkedKvBacking {
     /// On error, the lock guard drops and any partial allocations remain
     /// in place — the caller is expected to `free_sequence` the slot to
     /// recycle them.
+    /// Pre-allocate the slot's block table + sequence chunks for a
+    /// cold-load. Caller pairs this with [`Self::alloc_sealed_blocks_bulk`]:
+    /// invoke once per layer at the start of the cold-load (with the
+    /// turn's total `chunks_per_layer`), then the per-unit bulk allocs
+    /// inherit the capacity and skip their own `ensure_*` work
+    /// (saving 2 × `state.write()` acquires per bulk call).
+    pub fn ensure_capacity_for_blocks(
+        &self,
+        batch_idx: usize,
+        n_blocks: usize,
+    ) -> Result<()> {
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        self.ensure_max_blocks(n_blocks)?;
+        self.ensure_for_offset(batch_idx, 0, n_blocks * CHUNK_SIZE)?;
+        Ok(())
+    }
+
+    /// Returns the alloc'd `HeadGids` alongside the **freshly-resolved**
+    /// `arena_info` snapshot used for the GPU metadata push. The caller
+    /// can hand the same `arena_info` to a follow-up
+    /// [`Self::resolve_block_ptrs_in_slot`] call on the same backing
+    /// to skip a redundant `storage.read()` arena walk — the data is
+    /// valid as long as no arena-mutating call runs in between (true
+    /// for the cold-load pipeline's per-unit, per-layer pair).
     pub fn alloc_sealed_blocks_bulk(
         &self,
         batch_idx: usize,
         specs: &[BlockAllocSpec],
-    ) -> Result<Vec<HeadGids>> {
+        pool_us_out: &mut u64,
+        register_us_out: &mut u64,
+        gpu_push_us_out: &mut u64,
+    ) -> Result<(
+        Vec<HeadGids>,
+        Vec<crate::kv_cache::arena_table::ResolvedArenaInfo>,
+    )> {
         if specs.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let n_kv_head = self.inner.n_kv_head;
         let head_dim = self.inner.head_dim;
@@ -1297,20 +1329,23 @@ impl ChunkedKvBacking {
         }
         let location = self.inner.storage.default_location();
 
-        // Up-front grow: ensure the block table + sequence slot have
-        // room for every block_idx we'll touch. Done before the
-        // critical section so `ensure_max_blocks` / `ensure_for_offset`
-        // (which take their own locks internally) don't contend with us.
-        let max_block_idx = specs
-            .iter()
-            .map(|s| s.block_idx)
-            .max()
-            .expect("specs is non-empty");
-        self.ensure_max_blocks(max_block_idx + 1)?;
-        self.ensure_for_offset(batch_idx, 0, (max_block_idx + 1) * CHUNK_SIZE)?;
+        // **Caller contract**: the slot must already have at least
+        // `max(spec.block_idx) + 1` chunks allocated before entering
+        // this function. The cold-load pipeline ensures this once up
+        // front via [`Self::ensure_capacity_for_blocks`], which avoids
+        // the per-call `ensure_max_blocks` + `ensure_for_offset` lock
+        // churn (each acquires `state.write()` — 2 acquires/call ×
+        // 82 calls/turn = ~10 ms wall-clock on a 1824-chunk turn).
 
-        // Resolve arena_info once for all per-block GPU chunk updates.
-        let arena_info = self.resolve_arena_info()?;
+        // `resolve_arena_info` must be called **after** the per-spec
+        // gid allocs below (which can register fresh arena indices via
+        // `pool.register_arena` when a format's pool is exhausted). We
+        // hold off on resolving until just before the GPU metadata
+        // push so it reflects every arena that the alloc grew. Doing
+        // it earlier would leave the `update_gpu_chunks_bulk` call
+        // with stale `base_ptr` / `chunk_byte_stride` for the freshly-
+        // registered arenas — silent corruption with `R16`-formatted
+        // chunks, or "arena index N out of range" downstream.
 
         // Single critical section covering: pool allocs, block_gid
         // registration, window stamping, then a **single batched**
@@ -1318,31 +1353,73 @@ impl ChunkedKvBacking {
         // whole layer's blocks, so the drop coalesces adjacent
         // indices into a few `memcpy_htod` runs instead of one per
         // block).
+        // ── Phase 1: batched GID alloc, outside the state lock ───────
+        //
+        // Group every (sub-band, K|V) GID need across all specs by
+        // `ArenaKey`, then allocate per-key in **one** call. That
+        // pays the per-format pool mutex and storage write lock once
+        // per unique key instead of once per GID. For the cold-load
+        // shape (~600 GIDs/spec × ~22 specs/call, mostly the same
+        // few formats) this collapses ~10,000 pool/storage lock
+        // acquires into a few dozen.
+        let t_pool = std::time::Instant::now();
+        let gids_per_spec = GIDS_PER_HEAD * n_kv_head;
+        let mut needs_per_key: ahash::HashMap<ArenaKey, usize> =
+            ahash::HashMap::with_capacity_and_hasher(8, ahash::RandomState::new());
+        for spec in specs {
+            for h in 0..n_kv_head {
+                for p in 0..N_PALETTE {
+                    let sub = h * N_PALETTE + p;
+                    *needs_per_key
+                        .entry(ArenaKey::uniform(spec.k_formats[sub], location))
+                        .or_insert(0) += 1;
+                    *needs_per_key
+                        .entry(ArenaKey::uniform(spec.v_formats[sub], location))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        // Allocate each key's worth in one batched call, then drain
+        // back into per-spec GID layouts in the next pass.
+        let mut per_key_gids: ahash::HashMap<ArenaKey, std::vec::IntoIter<super::gid_pool::ChunkGid>> =
+            ahash::HashMap::with_capacity_and_hasher(needs_per_key.len(), ahash::RandomState::new());
+        for (key, count) in needs_per_key {
+            let gids = self.alloc_chunks_for_key_bulk(key.clone(), count)?;
+            per_key_gids.insert(key, gids.into_iter());
+        }
+        *pool_us_out += t_pool.elapsed().as_micros() as u64;
+
+        // ── Phase 2: register blocks under the state write lock ──────
         let mut hgids_per_block: Vec<HeadGids> = Vec::with_capacity(specs.len());
         let mut updated_blocks: Vec<usize> = Vec::with_capacity(specs.len());
+        // Declared outside the `state.write()` scope so we can return
+        // it to the caller (immediately reused by
+        // `resolve_block_ptrs_in_slot` to skip its own arena walk).
+        let arena_info: Vec<crate::kv_cache::arena_table::ResolvedArenaInfo>;
         {
             let mut state = self
                 .state
                 .write()
                 .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
 
+            let t_register = std::time::Instant::now();
             for spec in specs {
-                // Allocate this block's per-(head, palette, K|V) chunks.
-                let mut gid_vec: Vec<super::gid_pool::ChunkGid> =
-                    Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
+                // Pull this block's per-(head, palette, K|V) chunks
+                // from the pre-allocated per-key streams. Order
+                // matches the loop in Phase 1 exactly, so the GIDs
+                // line up with their sub-band slots.
+                let mut gid_vec: Vec<super::gid_pool::ChunkGid> = Vec::with_capacity(gids_per_spec);
                 for h in 0..n_kv_head {
                     for p in 0..N_PALETTE {
                         let sub = h * N_PALETTE + p;
-                        let k_gid = self.alloc_chunk_for_key(ArenaKey::uniform(
-                            spec.k_formats[sub],
-                            location,
-                        ))?;
-                        let v_gid = self.alloc_chunk_for_key(ArenaKey::uniform(
-                            spec.v_formats[sub],
-                            location,
-                        ))?;
-                        gid_vec.push(k_gid);
-                        gid_vec.push(v_gid);
+                        let k_iter = per_key_gids
+                            .get_mut(&ArenaKey::uniform(spec.k_formats[sub], location))
+                            .expect("phase 1 allocated this key");
+                        gid_vec.push(k_iter.next().expect("phase 1 allocated enough"));
+                        let v_iter = per_key_gids
+                            .get_mut(&ArenaKey::uniform(spec.v_formats[sub], location))
+                            .expect("phase 1 allocated this key");
+                        gid_vec.push(v_iter.next().expect("phase 1 allocated enough"));
                     }
                 }
                 let gids = HeadGids::from_vec(gid_vec);
@@ -1368,14 +1445,22 @@ impl ChunkedKvBacking {
                 }
                 hgids_per_block.push(gids);
             }
+            *register_us_out += t_register.elapsed().as_micros() as u64;
 
-            // One bulk push for the whole layer — see
-            // `SequenceState::update_gpu_chunks_bulk`.
+            // ── Phase 3: resolve arena_info + GPU metadata push ─────
+            //
+            // Resolve arena_info NOW — after every spec's allocs have
+            // potentially registered new arenas — so the GPU metadata
+            // push reflects every arena the chunks point into. (See
+            // the comment block before the critical section.)
+            let t_gpu_push = std::time::Instant::now();
+            arena_info = self.resolve_arena_info()?;
             if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
                 slot.update_gpu_chunks_bulk(&updated_blocks, n_kv_head, head_dim, &arena_info)?;
             }
+            *gpu_push_us_out += t_gpu_push.elapsed().as_micros() as u64;
         }
-        Ok(hgids_per_block)
+        Ok((hgids_per_block, arena_info))
     }
 
     /// Walk a [`HeadGids`] and produce the per-`(head, palette)` K/V

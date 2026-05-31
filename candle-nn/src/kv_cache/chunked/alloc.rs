@@ -420,6 +420,20 @@ impl ChunkedKvBacking {
         self.inner.alloc_chunk_for_key(key)
     }
 
+    /// Bulk variant of [`Self::alloc_chunk_for_key`] — allocates `n`
+    /// GIDs of the same `key` while paying the per-format pool mutex
+    /// and the per-arena storage write lock only **once each**
+    /// (instead of `n` times). Used by the cold-load
+    /// `alloc_sealed_blocks_bulk` path where a single layer can need
+    /// ~600 GIDs of the same format.
+    pub(super) fn alloc_chunks_for_key_bulk(
+        &self,
+        key: super::arena::ArenaKey,
+        n: usize,
+    ) -> Result<Vec<super::gid_pool::ChunkGid>> {
+        self.inner.alloc_chunks_for_key_bulk(key, n)
+    }
+
     pub(super) fn ensure_arena_exists(
         &self,
         arena_idx: usize,
@@ -462,6 +476,63 @@ impl BackingInner {
         self.storage
             .mark_chunk_allocated_at(gid.arena_idx(), gid.chunk_idx())?;
         Ok(gid)
+    }
+
+    /// Bulk allocator — mirrors [`Self::alloc_chunk_for_key`]'s
+    /// register-on-exhaustion loop but in batch.
+    ///
+    /// Per pass:
+    /// - **One** `pool.allocate_n_for(key, remaining)` returns up to
+    ///   `remaining` GIDs under a single per-format mutex.
+    /// - **One** `ensure_arena_exists` per unique arena index we
+    ///   touched (cheap — the inner check is a `storage.read`).
+    /// - **One** `storage.mark_chunks_allocated_at_bulk(pairs)` under
+    ///   a single storage write lock, for every GID we just took.
+    ///
+    /// If the pool returned fewer GIDs than requested, the format's
+    /// pool was exhausted — we register a fresh arena (one
+    /// `register_arena + ensure_arena_exists` round) and re-enter the
+    /// loop to fill the remainder. Same termination guarantee as the
+    /// singular path.
+    pub(super) fn alloc_chunks_for_key_bulk(
+        &self,
+        key: super::arena::ArenaKey,
+        n: usize,
+    ) -> Result<Vec<super::gid_pool::ChunkGid>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<super::gid_pool::ChunkGid> = Vec::with_capacity(n);
+        while out.len() < n {
+            let remaining = n - out.len();
+            let batch = self.pool.allocate_n_for(key.clone(), remaining);
+            if batch.is_empty() {
+                // Pool exhausted — register a fresh arena and retry.
+                let arena_idx = self.pool.register_arena(key.clone());
+                self.ensure_arena_exists(arena_idx, key.clone())?;
+                continue;
+            }
+            // Ensure every unique arena index we just got is materialised
+            // in storage. Most calls hit the cheap `storage.read`-only
+            // path because the arena already exists.
+            let mut seen: ahash::HashSet<usize> =
+                ahash::HashSet::with_capacity_and_hasher(4, ahash::RandomState::new());
+            for gid in &batch {
+                let ai = gid.arena_idx();
+                if seen.insert(ai) {
+                    self.ensure_arena_exists(ai, key.clone())?;
+                }
+            }
+            // Bulk-mark every (arena, chunk) slot active under one
+            // storage write lock acquire.
+            let pairs: Vec<(usize, usize)> = batch
+                .iter()
+                .map(|g| (g.arena_idx(), g.chunk_idx()))
+                .collect();
+            self.storage.mark_chunks_allocated_at_bulk(&pairs)?;
+            out.extend(batch);
+        }
+        Ok(out)
     }
 
     /// Ensure that an arena exists at the given index in storage.

@@ -244,6 +244,61 @@ impl ArenaPool {
         Some(gid)
     }
 
+    /// Allocate up to `n` GIDs in **one mutex acquisition**. Drains the
+    /// smallest-index non-empty arena first, spilling to the next one
+    /// only when the current arena's heap empties. Returns however many
+    /// GIDs the pool had available (caller registers a fresh arena and
+    /// retries to fill the remainder).
+    ///
+    /// Used by the cold-load bulk-alloc path to avoid paying N×
+    /// `data.lock()` for a single layer's ~600 GID requests — the lock
+    /// acquire alone showed up as the dominant cost in the allocator
+    /// breakdown (~16 µs × 16 GIDs × N specs).
+    fn allocate_any_n(&self, n: usize) -> Vec<i64> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut out: Vec<i64> = Vec::with_capacity(n);
+        let mut data = match self.data.lock() {
+            Ok(g) => g,
+            Err(_) => return out,
+        };
+        while out.len() < n {
+            let arena_idx = match data.non_empty_arenas.iter().next().copied() {
+                Some(a) => a,
+                None => break,
+            };
+            let want = n - out.len();
+            let mut took = 0usize;
+            if let Some(heap) = data.per_arena_free.get_mut(&arena_idx) {
+                while took < want {
+                    match heap.pop() {
+                        Some(Reverse(gid)) => {
+                            out.push(gid);
+                            took += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            // Maintain the invariants the singular path expects.
+            if data
+                .per_arena_free
+                .get(&arena_idx)
+                .map(|h| h.is_empty())
+                .unwrap_or(true)
+            {
+                data.non_empty_arenas.remove(&arena_idx);
+            }
+            if let Some(count) = data.free_counts.get_mut(&arena_idx) {
+                *count -= took as u32;
+            }
+            data.total_free = data.total_free.saturating_sub(took);
+        }
+        self.total_live.fetch_add(out.len(), Ordering::Relaxed);
+        out
+    }
+
     fn allocate_from_arena(&self, target_arena: usize) -> Option<i64> {
         let mut data = self.data.lock().ok()?;
         let gid = {
@@ -592,6 +647,28 @@ impl ChunkGidPool {
                 id: gid,
             }),
         })
+    }
+
+    /// Bulk variant of [`Self::allocate_for`] — returns up to `n` GIDs
+    /// under a single per-format mutex acquisition. The returned `Vec`
+    /// may be shorter than `n` if the pool ran out of capacity; the
+    /// caller registers a fresh arena and re-invokes to fill the
+    /// remainder, exactly mirroring the singular code path's
+    /// `register_arena + retry`.
+    pub fn allocate_n_for(&self, key: ArenaKey, n: usize) -> Vec<ChunkGid> {
+        let Some(pool) = self.inner.pools.get(&key) else {
+            return Vec::new();
+        };
+        let raw = pool.allocate_any_n(n);
+        raw.into_iter()
+            .map(|id| ChunkGid {
+                inner: Arc::new(GidInner {
+                    pool: Arc::clone(&self.inner),
+                    route_key: Some(key.clone()),
+                    id,
+                }),
+            })
+            .collect()
     }
 
     /// Allocate a GID from a specific arena (for consolidation that must target

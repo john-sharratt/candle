@@ -106,6 +106,32 @@ struct UnitWork {
     records: Vec<RecordMigrate>,
 }
 
+/// Sub-timer breakdown of the allocator thread's CPU time. Sum of
+/// `decode_us + bulk_alloc_us + resolve_ptrs_us` should approximate
+/// `alloc_ms * 1000`; the remainder is the per-unit accounting overhead
+/// (per-layer Vec/clone construction, channel sends, etc.).
+///
+/// `bulk_alloc_us` is further split into:
+///   - `pool_us`     – Phase 1: batched per-key gid alloc (no lock).
+///   - `register_us` – Phase 2: per-spec slot mutation (state.write held).
+///   - `gpu_push_us` – Phase 3: `resolve_arena_info` + per-layer
+///     `update_gpu_chunks_bulk` (still inside state.write; the bulk
+///     emits coalesced `memcpy_htod` runs onto the CUDA stream).
+/// Sum of the three sub-sub-timers ≤ `bulk_alloc_us` (channel/hash
+/// overhead in between accounts for the gap).
+#[derive(Clone, Copy, Debug, Default)]
+struct AllocBreakdown {
+    alloc_ms: u64,
+    decode_us: u64,
+    bulk_alloc_us: u64,
+    resolve_ptrs_us: u64,
+    n_bulk_calls: u32,
+    n_resolve_calls: u32,
+    pool_us: u64,
+    register_us: u64,
+    gpu_push_us: u64,
+}
+
 /// One alloc'd record ready for the migrate plan.
 struct RecordMigrate {
     /// Byte offset of the record's `kv_bytes` in the pinned scratch /
@@ -149,6 +175,31 @@ pub struct PipelineStats {
     pub total_ms: u64,
     /// Number of 1 MiB units in the chunk batch.
     pub n_units: u32,
+    /// Per-record decode time, accumulated over the per-unit phase.
+    /// Covers `decode_record` + `ChunkPayload::decode_with_kv_range`
+    /// + `BlockAllocSpec` construction (Arc-wrap of pal/scale,
+    /// Vec<KvFormat> build). Microseconds.
+    pub decode_us: u64,
+    /// Time inside `alloc_sealed_blocks_bulk` summed across every
+    /// per-unit, per-layer dispatch. Microseconds.
+    pub bulk_alloc_us: u64,
+    /// Time inside `resolve_block_ptrs_in_slot` summed similarly.
+    /// Microseconds.
+    pub resolve_ptrs_us: u64,
+    /// Number of `alloc_sealed_blocks_bulk` invocations.
+    pub n_bulk_calls: u32,
+    /// Number of `resolve_block_ptrs_in_slot` invocations.
+    pub n_resolve_calls: u32,
+    /// Sub-sub-timer of `bulk_alloc_us`: Phase 1, batched per-key gid
+    /// alloc outside the state lock.
+    pub pool_us: u64,
+    /// Sub-sub-timer of `bulk_alloc_us`: Phase 2, per-spec slot
+    /// mutation inside `state.write()`.
+    pub register_us: u64,
+    /// Sub-sub-timer of `bulk_alloc_us`: Phase 3, `resolve_arena_info`
+    /// + per-layer `update_gpu_chunks_bulk` (coalesced `memcpy_htod`
+    /// runs onto the CUDA stream).
+    pub gpu_push_us: u64,
 }
 
 /// Run the pipelined cold-load for one [`ChunkBatch`]. The pinned
@@ -234,7 +285,7 @@ pub fn run_pipeline(
     // from allocator/dispatcher latency.
     let reads_done_at_ms = Arc::new(AtomicU64::new(0));
 
-    let ((htod_ms, migrate_ms), alloc_ms): ((u64, u64), u64) = std::thread::scope(|s| {
+    let ((htod_ms, migrate_ms), alloc_brk): ((u64, u64), AllocBreakdown) = std::thread::scope(|s| {
         // ── Reader pool ────────────────────────────────────────────
         for handle_idx in 0..n_readers {
             let work_rx = work_rx.clone();
@@ -276,7 +327,7 @@ pub fn run_pipeline(
         let unit_plan_ref: &UnitPlan = &unit_plan;
 
         // ── Allocator ──────────────────────────────────────────────
-        let alloc_handle = s.spawn(move || -> candle::Result<u64> {
+        let alloc_handle = s.spawn(move || -> candle::Result<AllocBreakdown> {
             allocator_worker(
                 backings,
                 chunk_batch,
@@ -308,7 +359,7 @@ pub fn run_pipeline(
             .unwrap_or_else(|_| Err(candle::Error::Msg("pipeline allocator panicked".into())));
 
         match (dispatcher_result, alloc_result) {
-            (Ok(ms), Ok(alloc_ms)) => Ok((ms, alloc_ms)),
+            (Ok(ms), Ok(brk)) => Ok((ms, brk)),
             (Err(e), _) | (_, Err(e)) => Err(e),
         }
     })?;
@@ -322,11 +373,19 @@ pub fn run_pipeline(
     let reads_ms = reads_done_at_ms.load(Ordering::Relaxed);
     Ok(PipelineStats {
         reads_ms,
-        alloc_ms,
+        alloc_ms: alloc_brk.alloc_ms,
         htod_ms,
         migrate_ms,
         total_ms,
         n_units: n_units as u32,
+        decode_us: alloc_brk.decode_us,
+        bulk_alloc_us: alloc_brk.bulk_alloc_us,
+        resolve_ptrs_us: alloc_brk.resolve_ptrs_us,
+        n_bulk_calls: alloc_brk.n_bulk_calls,
+        n_resolve_calls: alloc_brk.n_resolve_calls,
+        pool_us: alloc_brk.pool_us,
+        register_us: alloc_brk.register_us,
+        gpu_push_us: alloc_brk.gpu_push_us,
     })
 }
 
@@ -343,14 +402,38 @@ fn allocator_worker(
     mut record_wait_count: Vec<u32>,
     done_rx: Receiver<UnitDone>,
     dispatch_tx: Sender<UnitWork>,
-) -> candle::Result<u64> {
+) -> candle::Result<AllocBreakdown> {
     let n_layers = backings.len();
     // SAFETY: pinned scratch is alive for the whole pipeline run.
     let buf: &[u8] = unsafe { pinned_ptr.slice(0, chunk_batch.total_bytes) };
 
+    // Pre-allocate each layer's slot block table + chunk vec **once**
+    // for the whole cold-load. Per-unit `alloc_sealed_blocks_bulk`
+    // calls then inherit this capacity and skip their own
+    // `ensure_max_blocks` + `ensure_for_offset` — both of which
+    // acquire `state.write()` and dominated the in-call gap (~10 ms
+    // wall-clock on the 1824-chunk turn).
+    for (li, backing) in backings.iter().enumerate() {
+        backing.ensure_capacity_for_blocks(slots[li], chunks_per_layer)?;
+    }
+
     let total_units = unit_plan.units.len() as u32;
     let mut units_received: u32 = 0;
-    let mut alloc_ms_accum: u64 = 0;
+
+    // Top-level allocator-thread CPU time and its sub-buckets.
+    // Everything is accumulated in MICROSECONDS — `.as_millis()` would
+    // truncate per-unit elapsed under 1 ms, losing up to `n_units` ms
+    // of accumulated signal. We convert to ms only at the output
+    // boundary.
+    let mut alloc_us_accum: u64 = 0;
+    let mut decode_us: u64 = 0;
+    let mut bulk_alloc_us: u64 = 0;
+    let mut resolve_ptrs_us: u64 = 0;
+    let mut n_bulk_calls: u32 = 0;
+    let mut n_resolve_calls: u32 = 0;
+    let mut pool_us: u64 = 0;
+    let mut register_us: u64 = 0;
+    let mut gpu_push_us: u64 = 0;
 
     while units_received < total_units {
         let done = done_rx
@@ -376,17 +459,23 @@ fn allocator_worker(
         let mut records_to_dispatch: Vec<RecordMigrate> = Vec::new();
 
         if !ready.is_empty() {
-            // Group ready records by layer for batched alloc.
+            // Group ready records by layer for batched alloc. Per-unit
+            // dispatch keeps the alloc work overlapped with subsequent
+            // reads on the allocator thread — measured empirically to
+            // beat end-of-batch deferral (lost pipelining + per-spec
+            // re-clones outweighed the per-call overhead saving).
             let mut per_layer: Vec<Vec<(usize, BlockAllocSpec, i64)>> =
                 (0..n_layers).map(|_| Vec::new()).collect();
 
+            // ── Sub-timer: decode + spec construction ────────────
+            let t_decode = Instant::now();
             for &r_idx in &ready {
                 let rec = &chunk_batch.records[r_idx];
                 let record_bytes = &buf[rec.buf_offset..rec.buf_offset + rec.record_size as usize];
-                // Single pass: one header parse + CRC walk + meta parse.
-                // `payload` is a borrowed view into `record_bytes`, so we
-                // recover the header byte count from the pointer offset
-                // instead of re-decoding the header.
+                // Single pass: one header parse + meta parse. `payload`
+                // is a borrowed view into `record_bytes`, so we recover
+                // the header byte count from the pointer offset instead
+                // of re-decoding the header.
                 let (_header, payload, _total) = decode_record(record_bytes)
                     .map_err(|e| candle::Error::Msg(format!("pipeline decode_record: {e}")))?;
                 let header_bytes = payload.as_ptr() as usize - record_bytes.as_ptr() as usize;
@@ -427,10 +516,10 @@ fn allocator_worker(
                     block_idx,
                     k_formats: k_formats?,
                     v_formats: v_formats?,
-                    k_pal: Arc::new(meta.k_pal.clone()),
-                    v_pal: Arc::new(meta.v_pal.clone()),
-                    k_scale: Arc::new(meta.k_scale.clone()),
-                    v_scale: Arc::new(meta.v_scale.clone()),
+                    k_pal: Arc::new(meta.k_pal),
+                    v_pal: Arc::new(meta.v_pal),
+                    k_scale: Arc::new(meta.k_scale),
+                    v_scale: Arc::new(meta.v_scale),
                     offset: meta.offset,
                     usage: rec.token_count as u32,
                 };
@@ -438,8 +527,9 @@ fn allocator_worker(
                 per_layer[layer].push((r_idx, spec, src_offset));
                 total_tokens_per_layer[layer] += rec.token_count as usize;
             }
+            decode_us += t_decode.elapsed().as_micros() as u64;
 
-            // Per-layer alloc + resolve dst ptrs.
+            // ── Per-layer alloc + resolve dst ptrs ───────────────
             for (li, layer_recs) in per_layer.iter().enumerate() {
                 if layer_recs.is_empty() {
                     continue;
@@ -448,20 +538,42 @@ fn allocator_worker(
                     layer_recs.iter().map(|(_, s, _)| s.clone()).collect();
                 let target_block_idxs: Vec<usize> =
                     layer_recs.iter().map(|(_, s, _)| s.block_idx).collect();
-                backings[li].alloc_sealed_blocks_bulk(slots[li], &specs)?;
-                let dst_ptrs_per_rec =
-                    backings[li].resolve_block_ptrs_in_slot(slots[li], &target_block_idxs)?;
 
-                for ((_, _, src_offset), dst_ptrs) in layer_recs.iter().zip(dst_ptrs_per_rec.iter())
+                let t_bulk = Instant::now();
+                let (_hgids, arena_info) = backings[li].alloc_sealed_blocks_bulk(
+                    slots[li],
+                    &specs,
+                    &mut pool_us,
+                    &mut register_us,
+                    &mut gpu_push_us,
+                )?;
+                bulk_alloc_us += t_bulk.elapsed().as_micros() as u64;
+                n_bulk_calls += 1;
+
+                // Reuse the arena_info that `alloc_sealed_blocks_bulk`
+                // just freshly resolved — no arena-mutating call runs
+                // between this and the resolve below on the same
+                // backing, so the data is still authoritative.
+                let t_resolve = Instant::now();
+                let dst_ptrs_per_rec = backings[li].resolve_block_ptrs_in_slot(
+                    slots[li],
+                    &target_block_idxs,
+                    &arena_info,
+                )?;
+                resolve_ptrs_us += t_resolve.elapsed().as_micros() as u64;
+                n_resolve_calls += 1;
+
+                for ((_, _, src_offset), dst_ptrs) in
+                    layer_recs.iter().zip(dst_ptrs_per_rec.into_iter())
                 {
                     records_to_dispatch.push(RecordMigrate {
                         src_offset: *src_offset,
-                        dst_ptrs: dst_ptrs.clone(),
+                        dst_ptrs,
                     });
                 }
             }
         }
-        alloc_ms_accum += t_alloc.elapsed().as_millis() as u64;
+        alloc_us_accum += t_alloc.elapsed().as_micros() as u64;
 
         // Even if no records anchored here, send UnitWork so the
         // dispatcher knows this unit's bytes are ready for HtoD —
@@ -475,7 +587,17 @@ fn allocator_worker(
 
     // Drop dispatch_tx (implicit at function return) signals the
     // dispatcher to exit its recv loop.
-    Ok(alloc_ms_accum)
+    Ok(AllocBreakdown {
+        alloc_ms: alloc_us_accum / 1000,
+        decode_us,
+        bulk_alloc_us,
+        resolve_ptrs_us,
+        n_bulk_calls,
+        n_resolve_calls,
+        pool_us,
+        register_us,
+        gpu_push_us,
+    })
 }
 
 /// Returns `(htod_ms, migrate_ms)` — the two stages this thread owns.

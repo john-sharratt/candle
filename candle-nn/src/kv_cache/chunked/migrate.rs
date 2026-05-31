@@ -194,12 +194,23 @@ impl super::ChunkedKvBacking {
     /// allocation and clone-per-chunk overhead of building a
     /// `SealedSequence` snapshot when the caller only needs the
     /// device pointers for a known subset of blocks.
+    /// Caller is responsible for providing a `arena_info` that covers
+    /// every arena_idx referenced by the requested blocks. The
+    /// canonical source is the value returned by
+    /// [`super::ChunkedKvBacking::alloc_sealed_blocks_bulk`] on the
+    /// same backing — captured **after** that call's allocs, so it
+    /// reflects every arena the freshly-allocated chunks point into.
+    /// Reusing it here avoids a redundant `storage.read()` walk per
+    /// call (~50 µs × 82 calls ≈ 4 ms on the 1824-chunk turn).
+    ///
+    /// If the caller doesn't have a fresh `arena_info` handy, pass
+    /// `&self.resolve_arena_info()?`.
     pub fn resolve_block_ptrs_in_slot(
         &self,
         slot: usize,
         block_indices: &[usize],
+        arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> candle::Result<Vec<Vec<(i64, i64)>>> {
-        let arena_info = self.resolve_arena_info()?;
         let state = self
             .state
             .read()

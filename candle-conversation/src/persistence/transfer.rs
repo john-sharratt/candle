@@ -329,6 +329,15 @@ mod cuda_impl {
         let mut htod_ms_total: u64 = 0;
         let mut migrate_ms_total: u64 = 0;
         let mut n_units_total: u32 = 0;
+        // Allocator sub-bucket breakdown (microseconds).
+        let mut decode_us_total: u64 = 0;
+        let mut bulk_alloc_us_total: u64 = 0;
+        let mut resolve_ptrs_us_total: u64 = 0;
+        let mut n_bulk_calls_total: u32 = 0;
+        let mut n_resolve_calls_total: u32 = 0;
+        let mut pool_us_total: u64 = 0;
+        let mut register_us_total: u64 = 0;
+        let mut gpu_push_us_total: u64 = 0;
 
         for batch in &plan.chunks {
             let stats = crate::persistence::pipeline::run_pipeline(
@@ -346,6 +355,14 @@ mod cuda_impl {
             htod_ms_total += stats.htod_ms;
             migrate_ms_total += stats.migrate_ms;
             n_units_total += stats.n_units;
+            decode_us_total += stats.decode_us;
+            bulk_alloc_us_total += stats.bulk_alloc_us;
+            resolve_ptrs_us_total += stats.resolve_ptrs_us;
+            n_bulk_calls_total += stats.n_bulk_calls;
+            n_resolve_calls_total += stats.n_resolve_calls;
+            pool_us_total += stats.pool_us;
+            register_us_total += stats.register_us;
+            gpu_push_us_total += stats.gpu_push_us;
         }
 
         // Final per-layer SealedSequence — the snapshot caller wanted.
@@ -370,6 +387,27 @@ mod cuda_impl {
             migrate_ms = migrate_ms_total,
             total_ms,
             "load_turn_into_hot timing (pipelined)"
+        );
+
+        // Separate breakdown line for the allocator stage so the
+        // top-line "load_turn_into_hot timing" stays compact. The
+        // three sub-timers add up to ~`alloc_ms` (in µs); the gap
+        // is per-unit bookkeeping (`per_layer` Vec construction,
+        // `records_to_dispatch` builds, channel sends).
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            timeline = decl.timeline_id,
+            turn = decl.turn_index,
+            alloc_ms = alloc_ms_total,
+            decode_us = decode_us_total,
+            bulk_alloc_us = bulk_alloc_us_total,
+            pool_us = pool_us_total,
+            register_us = register_us_total,
+            gpu_push_us = gpu_push_us_total,
+            resolve_ptrs_us = resolve_ptrs_us_total,
+            n_bulk_calls = n_bulk_calls_total,
+            n_resolve_calls = n_resolve_calls_total,
+            "load_turn_into_hot alloc breakdown"
         );
 
         Ok(sealed_per_layer)
