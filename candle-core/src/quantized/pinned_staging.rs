@@ -199,6 +199,31 @@ unsafe impl Sync for PinnedBuf {}
 impl PinnedBuf {
     /// Allocate `len` bytes of write-combined pinned host memory (owned mode).
     pub fn alloc_owned(len: usize) -> Result<Self> {
+        // CU_MEMHOSTALLOC_WRITECOMBINED = 0x04 — fast for CPU→GPU
+        // burst writes, **slow** for CPU reads (uncached) and slow as
+        // a destination of Windows kernel I/O (`ReadFile` and friends
+        // bounce through a degraded path when the destination is WC).
+        // The HtoD-only staging paths (bg-quantizer DtoH-then-HtoD,
+        // PinnedStager arenas) want WC; the cold-load read scratch
+        // does not — see [`Self::alloc_owned_default`].
+        Self::alloc_owned_with_flags(len, 0x04)
+    }
+
+    /// Allocate `len` bytes of pinned host memory with no write-combining
+    /// attribute (owned mode).
+    ///
+    /// Use this when the buffer is a **destination of kernel I/O** —
+    /// most notably the cold-load `NVMe → pinned` direct read on
+    /// Windows, where WC pages take a degraded `ReadFile` path that
+    /// caps at ~7 MB/s. Plain pinned (page-locked, write-back-cached)
+    /// memory accepts the NVMe DMA at full sequential bandwidth, and
+    /// the subsequent HtoD upload only loses the small WC bonus on
+    /// the GPU side (driver handles cache snooping).
+    pub fn alloc_owned_default(len: usize) -> Result<Self> {
+        Self::alloc_owned_with_flags(len, 0)
+    }
+
+    fn alloc_owned_with_flags(len: usize, flags: u32) -> Result<Self> {
         if len == 0 {
             return Ok(Self::Bump {
                 ptr: std::ptr::NonNull::dangling().as_ptr(),
@@ -207,8 +232,7 @@ impl PinnedBuf {
         }
         let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         unsafe {
-            // CU_MEMHOSTALLOC_WRITECOMBINED = 0x04
-            sys::cuMemHostAlloc(&mut host_ptr, len, 0x04)
+            sys::cuMemHostAlloc(&mut host_ptr, len, flags)
                 .result()
                 .map_err(|e| crate::Error::Msg(format!("cuMemHostAlloc failed: {:?}", e)))?;
         }
@@ -292,8 +316,8 @@ impl PinnedArena {
     fn new(capacity: usize) -> Result<Self> {
         let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         unsafe {
-            // 0x02 = CU_MEMHOSTALLOC_DEVICEMAP
-            // 0x04 = CU_MEMHOSTALLOC_WRITECOMBINED
+            // CU_MEMHOSTALLOC_DEVICEMAP = 0x02
+            // CU_MEMHOSTALLOC_WRITECOMBINED = 0x04
             sys::cuMemHostAlloc(&mut host_ptr, capacity, 0x02 | 0x04)
                 .result()
                 .map_err(|e| {

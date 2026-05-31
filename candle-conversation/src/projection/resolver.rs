@@ -433,6 +433,62 @@ impl Conversation {
         Ok(Some(recovered.layers))
     }
 
+    /// Cold-load fast path that fuses `recover_turn_chunks` + `load_to_hot`
+    /// into a single batched pipeline using pinned host scratch
+    /// throughout — see `transfer::load_turn_into_hot` for the pipeline.
+    ///
+    /// Returns:
+    ///  - `Ok(None)` if no `TurnDecl` matches `(timeline, index)`
+    ///    (chunks haven't landed; same semantics as `recover_turn_chunks`).
+    ///  - `Ok(Some((sealed_per_layer, kv_bytes_total)))` on success;
+    ///    `kv_bytes_total` is the sum of every chunk's `kv_bytes` length
+    ///    (the warm-LRU / cold-budget accounting unit).
+    pub fn cold_load_turn_into_hot(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+        backings: &[candle_nn::kv_cache::ChunkedKvBacking],
+        device: &candle::Device,
+        stager: &mut crate::persistence::cold_load::ColdLoadStager,
+    ) -> candle::Result<Option<(Vec<SealedSequence>, u64)>> {
+        use crate::persistence::resume::recovered_turn_decls;
+        use crate::persistence::transfer::load_turn_into_hot;
+        let mut p = self.persistence.lock().unwrap();
+        let decls = recovered_turn_decls(&p);
+        let decl = match decls
+            .into_iter()
+            .find(|d| d.timeline_id == timeline.raw() && d.turn_index == index.0)
+        {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let sealed = load_turn_into_hot(backings, device, &mut p, &decl, stager)?;
+        // Accounting bytes: sum of every chunk's `kv_bytes` size across
+        // every layer in the manifest snapshot — matches the previous
+        // `TurnChunkGrid::bytes()` semantics.
+        let stream_id =
+            crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
+        let kv_bytes_total: u64 = p
+            .manifest()
+            .streams
+            .get(&stream_id)
+            .map(|s| {
+                s.chunks
+                    .values()
+                    .map(|loc| loc.payload_len.saturating_sub(0))
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+        // `payload_len` is the whole ChunkPayload-encoded size (offset +
+        // formats + pal + scales + kv_bytes + length-prefix overhead), so
+        // it slightly over-counts vs. `kv_bytes` alone. For LRU/budget
+        // accounting that's the better signal anyway (it tracks the
+        // bytes the warm-tier writeback will produce on the next persist
+        // pass). Keep the simple total here; the old `grid.bytes()`
+        // delta is small.
+        Ok(Some((sealed, kv_bytes_total)))
+    }
+
     /// Clear a turn's hot sealed grid, releasing VRAM arena chunks via
     /// dropping its ChunkGid Arcs. Returns `true` if hot bytes were
     /// dropped (see [`Substrate::clear_turn_sealed`]).

@@ -20,13 +20,16 @@
 //! [`SubstratePersistence`] is the public API tying them together.
 
 pub mod checkpoint;
+pub mod chunk_plan;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
+pub mod direct_io;
 pub mod elevate;
 pub mod inherit;
 pub mod log_file;
 pub mod manifest;
+pub mod pipeline;
 pub mod record;
 pub mod resume;
 pub mod streams;
@@ -40,10 +43,11 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use checkpoint::recover;
+use chunk_plan::ChunkedReadPlan;
 use inherit::InheritedSubstrate;
-use log_file::{read_record_at, LogFile};
+use log_file::{read_record_at, LogFile, LogSource};
 use manifest::Manifest;
-use record::{encode_record, ChunkPayload, Record, RecordHeader, RecordType};
+use record::{decode_record, encode_record, ChunkPayload, Record, RecordHeader, RecordType};
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use walker::WalkEntry;
 
@@ -201,16 +205,16 @@ impl SubstratePersistence {
         let (mut log, manifest) = open_or_create_active(active)?;
         let model_spec = manifest
             .model_spec
-            .map(|loc| read_record_at(&mut log, loc.offset).map(|r| r.payload))
+            .map(|loc| read_record_at(&mut log, loc.offset, loc.record_size).map(|r| r.payload))
             .transpose()?;
         let template = manifest
             .template
-            .map(|loc| read_record_at(&mut log, loc.offset).map(|r| r.payload))
+            .map(|loc| read_record_at(&mut log, loc.offset, loc.record_size).map(|r| r.payload))
             .transpose()?;
         let tokenizer_sha256 = manifest
             .tokenizer
             .map(|loc| {
-                let r = read_record_at(&mut log, loc.offset)?;
+                let r = read_record_at(&mut log, loc.offset, loc.record_size)?;
                 hash_from_tokenizer_payload(&r.payload)
             })
             .transpose()?;
@@ -234,6 +238,17 @@ impl SubstratePersistence {
     /// The durable logical end of the active log.
     pub fn write_offset(&self) -> u64 {
         self.log.write_offset()
+    }
+
+    /// The cache-bypassing read handles for the active log — exposed
+    /// for the pipelined cold-load reader pool.
+    pub(super) fn active_direct_file(&self) -> &direct_io::DirectFile {
+        self.log.direct_file()
+    }
+
+    /// The cache-bypassing read handles for the `i`-th inherited log.
+    pub(super) fn inherited_direct_file(&self, i: usize) -> &direct_io::DirectFile {
+        self.inherited[i].direct_file()
     }
 
     /// Number of inherited logs.
@@ -314,12 +329,7 @@ impl SubstratePersistence {
     /// titler finishes. This call is a no-op when the manifest already
     /// holds the same `(conv_id, label)` tuple — cheap to invoke on
     /// every submit.
-    pub fn write_conv_meta(
-        &mut self,
-        timeline_id: u64,
-        conv_id: &str,
-        label: &str,
-    ) -> Result<()> {
+    pub fn write_conv_meta(&mut self, timeline_id: u64, conv_id: &str, label: &str) -> Result<()> {
         if let Some(existing) = self.manifest.labels.get(&timeline_id) {
             if existing.conv_id == conv_id && existing.label == label {
                 return Ok(());
@@ -336,11 +346,7 @@ impl SubstratePersistence {
     /// Caller invariant: `timeline_id` should refer to a registered
     /// timeline (otherwise the state is orphaned on disk and the
     /// reload path's `set_archived` no-op will drop it on the floor).
-    pub fn write_conv_state(
-        &mut self,
-        timeline_id: u64,
-        state: manifest::ConvState,
-    ) -> Result<()> {
+    pub fn write_conv_state(&mut self, timeline_id: u64, state: manifest::ConvState) -> Result<()> {
         if let Some(existing) = self.manifest.conv_states.get(&timeline_id) {
             if *existing == state {
                 return Ok(());
@@ -423,7 +429,7 @@ impl SubstratePersistence {
             .and_then(|s| s.chunks.get(&chunk_index))
             .copied()
         {
-            let record = read_record_at(&mut self.log, loc.offset)?;
+            let record = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
             return ChunkPayload::decode(&record.payload);
         }
         for inherited in &self.inherited {
@@ -434,7 +440,7 @@ impl SubstratePersistence {
                 .and_then(|s| s.chunks.get(&chunk_index))
                 .copied()
             {
-                let record = inherited.read_record(loc.offset)?;
+                let record = inherited.read_record(loc.offset, loc.record_size)?;
                 return ChunkPayload::decode(&record.payload);
             }
         }
@@ -446,30 +452,198 @@ impl SubstratePersistence {
 
     /// Read every chunk of a stream, in chunk-index order — the cold-load
     /// disk read. Resolves across the active and inherited logs.
+    ///
+    /// Allocates a scratch buffer internally; callers that load many turns
+    /// in sequence (e.g. `elevate_to_hot`) should call
+    /// [`Self::read_stream_chunks_batched`] directly with a reusable buffer.
     pub fn read_stream_chunks(&mut self, stream_id: StreamId) -> Result<Vec<(u64, ChunkPayload)>> {
-        let mut indices: Vec<u64> = Vec::new();
-        if let Some(s) = self.manifest.streams.get(&stream_id) {
-            indices.extend(s.chunks.keys().copied());
+        let mut buf: Vec<u8> = Vec::new();
+        self.read_stream_chunks_batched(stream_id, &mut buf)
+    }
+
+    /// Read every chunk of a stream in a small number of stripe-coalesced
+    /// I/Os — the cold-load hot path.
+    ///
+    /// For each chunk, the manifest already carries `offset` and the
+    /// exact padded `record_size`. We sort chunks by file offset per
+    /// source log (active + inherited), coalesce adjacent records into
+    /// stripes, and issue **one read per stripe** into the caller's
+    /// reusable scratch buffer. For a freshly-persisted turn the records
+    /// are contiguous on disk → ~1 syscall covers all of them.
+    ///
+    /// Decoding (CRC verify + payload parse) happens in memory against
+    /// slices of `buf`. The returned `ChunkPayload`s own their data;
+    /// `buf` can be reused for the next stream.
+    ///
+    /// `buf` is resized as needed (grows monotonically across calls).
+    pub fn read_stream_chunks_batched(
+        &mut self,
+        stream_id: StreamId,
+        buf: &mut Vec<u8>,
+    ) -> Result<Vec<(u64, ChunkPayload)>> {
+        use std::collections::HashSet;
+
+        #[derive(Copy, Clone)]
+        struct ChunkSource {
+            chunk_idx: u64,
+            file_offset: u64,
+            record_size: u64,
         }
-        for inherited in &self.inherited {
-            if let Some(s) = inherited.manifest().streams.get(&stream_id) {
-                indices.extend(s.chunks.keys().copied());
+        #[derive(Copy, Clone)]
+        struct Stripe {
+            file_offset: u64,
+            len: usize,
+        }
+
+        fn build_stripes(chunks: &[ChunkSource]) -> Vec<Stripe> {
+            let mut out: Vec<Stripe> = Vec::new();
+            let mut it = chunks.iter();
+            let Some(first) = it.next() else {
+                return out;
+            };
+            let mut start = first.file_offset;
+            let mut end = first.file_offset + first.record_size;
+            for c in it {
+                if c.file_offset == end {
+                    end = c.file_offset + c.record_size;
+                } else {
+                    out.push(Stripe {
+                        file_offset: start,
+                        len: (end - start) as usize,
+                    });
+                    start = c.file_offset;
+                    end = c.file_offset + c.record_size;
+                }
+            }
+            out.push(Stripe {
+                file_offset: start,
+                len: (end - start) as usize,
+            });
+            out
+        }
+
+        // Collect from active first; remember which indices we've seen so
+        // inherited logs don't shadow live entries.
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut active: Vec<ChunkSource> = Vec::new();
+        if let Some(s) = self.manifest.streams.get(&stream_id) {
+            for (&chunk_idx, loc) in &s.chunks {
+                seen.insert(chunk_idx);
+                active.push(ChunkSource {
+                    chunk_idx,
+                    file_offset: loc.offset,
+                    record_size: loc.record_size,
+                });
             }
         }
-        indices.sort_unstable();
-        indices.dedup();
-        let mut out = Vec::with_capacity(indices.len());
-        for idx in indices {
-            out.push((idx, self.read_chunk(stream_id, idx)?));
+        // Then each inherited log, filling in indices not present in active.
+        let mut per_inh: Vec<Vec<ChunkSource>> =
+            self.inherited.iter().map(|_| Vec::new()).collect();
+        for (i, inh) in self.inherited.iter().enumerate() {
+            if let Some(s) = inh.manifest().streams.get(&stream_id) {
+                for (&chunk_idx, loc) in &s.chunks {
+                    if seen.insert(chunk_idx) {
+                        per_inh[i].push(ChunkSource {
+                            chunk_idx,
+                            file_offset: loc.offset,
+                            record_size: loc.record_size,
+                        });
+                    }
+                }
+            }
         }
+
+        // Per-source: sort by file_offset, build stripes.
+        active.sort_unstable_by_key(|c| c.file_offset);
+        for v in &mut per_inh {
+            v.sort_unstable_by_key(|c| c.file_offset);
+        }
+        let active_stripes = build_stripes(&active);
+        let inh_stripes: Vec<Vec<Stripe>> = per_inh.iter().map(|v| build_stripes(v)).collect();
+
+        // Size the scratch buffer to the exact sum of stripe spans.
+        let total: usize = active_stripes.iter().map(|s| s.len).sum::<usize>()
+            + inh_stripes
+                .iter()
+                .flat_map(|v| v.iter())
+                .map(|s| s.len)
+                .sum::<usize>();
+        if buf.len() < total {
+            buf.resize(total, 0);
+        }
+
+        // Walk each source's stripes; read each stripe once, then decode
+        // every chunk that falls within it.
+        let mut out: Vec<(u64, ChunkPayload)> =
+            Vec::with_capacity(active.len() + per_inh.iter().map(|v| v.len()).sum::<usize>());
+        let mut buf_cur: usize = 0;
+
+        // Active source.
+        {
+            let mut chunk_iter = active.iter().peekable();
+            for stripe in &active_stripes {
+                let region = &mut buf[buf_cur..buf_cur + stripe.len];
+                self.log.read_into(stripe.file_offset, region)?;
+                let stripe_end = stripe.file_offset + stripe.len as u64;
+                while let Some(c) = chunk_iter.peek() {
+                    if c.file_offset >= stripe_end {
+                        break;
+                    }
+                    let within = (c.file_offset - stripe.file_offset) as usize;
+                    let start = buf_cur + within;
+                    let end = start + c.record_size as usize;
+                    let (record, _) = decode_record(&buf[start..end])?;
+                    let payload = ChunkPayload::decode(&record.payload)?;
+                    out.push((c.chunk_idx, payload));
+                    chunk_iter.next();
+                }
+                buf_cur += stripe.len;
+            }
+        }
+
+        // Each inherited source.
+        for (i, chunks) in per_inh.iter().enumerate() {
+            let stripes = &inh_stripes[i];
+            let mut chunk_iter = chunks.iter().peekable();
+            for stripe in stripes {
+                let region = &mut buf[buf_cur..buf_cur + stripe.len];
+                self.inherited[i].read_into(stripe.file_offset, region)?;
+                let stripe_end = stripe.file_offset + stripe.len as u64;
+                while let Some(c) = chunk_iter.peek() {
+                    if c.file_offset >= stripe_end {
+                        break;
+                    }
+                    let within = (c.file_offset - stripe.file_offset) as usize;
+                    let start = buf_cur + within;
+                    let end = start + c.record_size as usize;
+                    let (record, _) = decode_record(&buf[start..end])?;
+                    let payload = ChunkPayload::decode(&record.payload)?;
+                    out.push((c.chunk_idx, payload));
+                    chunk_iter.next();
+                }
+                buf_cur += stripe.len;
+            }
+        }
+
+        out.sort_unstable_by_key(|(idx, _)| *idx);
         Ok(out)
+    }
+
+    /// Build a chunked-read plan for `stream_id`, sized so each
+    /// chunk's bytes fit within `buffer_size`. Used by the cold-load
+    /// orchestrator to stream a turn through a fixed-size pinned
+    /// scratch — see [`chunk_plan`] for the partition semantics.
+    pub fn plan_chunked_read(&self, stream_id: StreamId, buffer_size: usize) -> ChunkedReadPlan {
+        let inherited_manifests: Vec<&Manifest> =
+            self.inherited.iter().map(|i| i.manifest()).collect();
+        chunk_plan::plan_chunked_read(&self.manifest, &inherited_manifests, stream_id, buffer_size)
     }
 
     /// Read a stream's latest `Tokens` record payload — from the active log,
     /// else any inherited log. `None` if the stream has no `Tokens` record.
     pub fn read_tokens(&mut self, stream_id: StreamId) -> Result<Option<Vec<u8>>> {
         if let Some(loc) = self.manifest.streams.get(&stream_id).and_then(|s| s.tokens) {
-            let record = read_record_at(&mut self.log, loc.offset)?;
+            let record = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
             return Ok(Some(record.payload));
         }
         for inherited in &self.inherited {
@@ -479,7 +653,7 @@ impl SubstratePersistence {
                 .get(&stream_id)
                 .and_then(|s| s.tokens)
             {
-                let record = inherited.read_record(loc.offset)?;
+                let record = inherited.read_record(loc.offset, loc.record_size)?;
                 return Ok(Some(record.payload));
             }
         }
@@ -495,7 +669,7 @@ impl SubstratePersistence {
             .get(&stream_id)
             .and_then(|s| s.signatures)
         {
-            let record = read_record_at(&mut self.log, loc.offset)?;
+            let record = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
             return Ok(Some(record.payload));
         }
         for inherited in &self.inherited {
@@ -505,7 +679,7 @@ impl SubstratePersistence {
                 .get(&stream_id)
                 .and_then(|s| s.signatures)
             {
-                let record = inherited.read_record(loc.offset)?;
+                let record = inherited.read_record(loc.offset, loc.record_size)?;
                 return Ok(Some(record.payload));
             }
         }
@@ -720,18 +894,22 @@ impl SubstratePersistence {
         self.model_spec = self
             .manifest
             .model_spec
-            .map(|loc| read_record_at(&mut self.log, loc.offset).map(|r| r.payload))
+            .map(|loc| {
+                read_record_at(&mut self.log, loc.offset, loc.record_size).map(|r| r.payload)
+            })
             .transpose()?;
         self.template = self
             .manifest
             .template
-            .map(|loc| read_record_at(&mut self.log, loc.offset).map(|r| r.payload))
+            .map(|loc| {
+                read_record_at(&mut self.log, loc.offset, loc.record_size).map(|r| r.payload)
+            })
             .transpose()?;
         self.tokenizer_sha256 = self
             .manifest
             .tokenizer
             .map(|loc| {
-                let r = read_record_at(&mut self.log, loc.offset)?;
+                let r = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
                 hash_from_tokenizer_payload(&r.payload)
             })
             .transpose()?;

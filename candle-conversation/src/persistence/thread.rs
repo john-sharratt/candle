@@ -40,6 +40,7 @@ use candle::Device;
 use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy, SealedSequence};
 use crossbeam::channel::{self, Receiver, Sender};
 
+use super::cold_load::{preallocate_pinned_scratch, PINNED_PREALLOC_BYTES};
 use super::resume::TurnChunkGrid;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
@@ -191,10 +192,23 @@ fn run_loop(
     trigger_rx: Receiver<()>,
     shutdown_rx: Receiver<()>,
 ) {
-    // Re-used pinned host scratch for the hot→warm DtoH. Grows on
-    // demand inside `migrate_sealed_to_cpu_batch_async`; stays
-    // allocated across passes.
-    let mut pinned_scratch: Option<PinnedBuf> = None;
+    // Bind this thread to the device's CUDA context BEFORE any pinned
+    // alloc — the CUDA context is per-thread on Windows and the
+    // persistence thread was spawned without an active binding.
+    // `cuMemHostAlloc` returns `CUDA_ERROR_NOT_INITIALIZED` otherwise,
+    // silently falling back to non-pinned heap memory and crippling
+    // the hot→warm DtoH leg.
+    if let candle::Device::Cuda(d) = &device {
+        let _ = d.cuda_context().bind_to_thread();
+    }
+
+    // Re-used pinned host scratch for the hot→warm DtoH. Eagerly
+    // allocated at thread start so the first migration doesn't pay
+    // the `cuMemHostAlloc` cost on the hot path; stays allocated
+    // across passes and grows in-place if a turn exceeds the
+    // preallocation size.
+    let mut pinned_scratch: Option<PinnedBuf> =
+        preallocate_pinned_scratch(PINNED_PREALLOC_BYTES, "persistence::pinned_scratch");
     loop {
         // Wait for trigger, shutdown, or the periodic tick — whichever
         // fires first. The `default` arm fires after `DEFAULT_TICK` if

@@ -30,7 +30,6 @@ use candle::{Device, Result};
 use candle_nn::kv_cache::ChunkedKvBacking;
 
 use super::cold_load::ColdLoadStager;
-use super::transfer::load_to_hot;
 use crate::projection::{Conversation, SectionId, TurnKey};
 use crate::substrate::{
     ColdRecall, EvictionReport, PromotionItemKind, PromotionPlan, PurgeReport, WarmLift,
@@ -115,7 +114,9 @@ pub fn elevate_to_hot(
     turns: &[TurnKey],
 ) -> Result<ElevationReport> {
     // ── Phase 1: classify ───────────────────────────────────────────────
-    let plan: PromotionPlan = conversation.read().snapshot_promotion_state(sections, turns);
+    let plan: PromotionPlan = conversation
+        .read()
+        .snapshot_promotion_state(sections, turns);
 
     let mut report = ElevationReport {
         already_hot: plan.already_hot.len(),
@@ -154,11 +155,10 @@ pub fn elevate_to_hot(
             sys.refresh_memory();
             let total_ram = sys.total_memory();
             let available_ram = sys.available_memory();
-            let purged: PurgeReport = conversation.write().purge_warm_to_target(
-                incoming_bytes,
-                available_ram,
-                total_ram,
-            );
+            let purged: PurgeReport =
+                conversation
+                    .write()
+                    .purge_warm_to_target(incoming_bytes, available_ram, total_ram);
             report.warm_purged = purged.count;
             report.bytes_warm_purged = purged.bytes;
         }
@@ -188,12 +188,22 @@ pub fn elevate_to_hot(
     for cold_entry in plan.cold_to_hot {
         match cold_entry.kind {
             PromotionItemKind::Turn(key) => {
-                let grid = match conversation.recover_turn_chunks(
+                // Fused cold-load fast path: one stripe-coalesced disk
+                // read straight into pinned host scratch, one HtoD, one
+                // batched `kv_migrate` covering every layer's
+                // destinations. Replaces the old
+                // `recover_turn_chunks` + `load_to_hot` pair which paid
+                // a per-chunk `Vec<u8>` allocation for `kv_bytes` and a
+                // host-to-host memcpy from heap into the pinned scratch
+                // before HtoD.
+                let (hot_sealed, bytes_for_item) = match conversation.cold_load_turn_into_hot(
                     key.timeline,
                     key.index,
-                    n_layers,
+                    backings,
+                    device,
+                    cold_stager,
                 ) {
-                    Ok(Some(g)) => g,
+                    Ok(Some(pair)) => pair,
                     Ok(None) => {
                         tracing::warn!(
                             "elevate_to_hot: cold-load found no chunks for turn {key:?}"
@@ -202,16 +212,7 @@ pub fn elevate_to_hot(
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!("elevate_to_hot: recover_turn_chunks {key:?}: {e}");
-                        report.failed += 1;
-                        continue;
-                    }
-                };
-                let bytes_for_item: u64 = grid.bytes() as u64;
-                let hot_sealed = match load_to_hot(backings, device, &grid, cold_stager) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("elevate_to_hot: load_to_hot {key:?}: {e}");
+                        tracing::warn!("elevate_to_hot: cold_load_turn_into_hot {key:?}: {e}");
                         report.failed += 1;
                         continue;
                     }
@@ -345,16 +346,13 @@ pub fn elevate_to_hot(
 
     if !warm_items.is_empty() {
         // Per-item collector of (layer-indexed) hot results.
-        let mut hot_per_item: Vec<Vec<candle_nn::kv_cache::SealedSequence>> =
-            (0..warm_items.len())
-                .map(|_| Vec::with_capacity(n_layers))
-                .collect();
+        let mut hot_per_item: Vec<Vec<candle_nn::kv_cache::SealedSequence>> = (0..warm_items.len())
+            .map(|_| Vec::with_capacity(n_layers))
+            .collect();
         let mut layer_ok = true;
         for layer in 0..n_layers {
-            let inputs: Vec<&candle_nn::kv_cache::SealedSequence> = warm_items
-                .iter()
-                .map(|w| &w.warm[layer])
-                .collect();
+            let inputs: Vec<&candle_nn::kv_cache::SealedSequence> =
+                warm_items.iter().map(|w| &w.warm[layer]).collect();
             match backings[layer].migrate_sealed_to_gpu_batch_async(
                 device,
                 copy_stream,
@@ -510,14 +508,10 @@ mod tests {
             let data: Vec<bf16> = (0..total)
                 .map(|i| bf16::from_f32(((pattern_base as usize + i) as f32) * 0.001))
                 .collect();
-            let k = Tensor::from_vec(
-                data,
-                (1, n_kv_head, n_tokens, head_dim),
-                &Device::Cpu,
-            )
-            .unwrap()
-            .to_device(device)
-            .unwrap();
+            let k = Tensor::from_vec(data, (1, n_kv_head, n_tokens, head_dim), &Device::Cpu)
+                .unwrap()
+                .to_device(device)
+                .unwrap();
             let v = k.clone();
             backing.write_contiguous(slot, 0, &k, &v).unwrap();
             backing.set_len(slot, n_tokens);
@@ -561,7 +555,10 @@ mod tests {
 
     /// Standard test setup: ephemeral conversation, N CUDA-backed
     /// `ChunkedKvBacking`s (one per layer), a registered timeline.
-    fn fresh_setup(device: &Device, n_layers: usize) -> (Conversation, Vec<ChunkedKvBacking>, TimelineId) {
+    fn fresh_setup(
+        device: &Device,
+        n_layers: usize,
+    ) -> (Conversation, Vec<ChunkedKvBacking>, TimelineId) {
         let conv = Conversation::ephemeral();
         let backings: Vec<ChunkedKvBacking> = (0..n_layers)
             .map(|_| ChunkedKvBacking::new(4, 2, 16, DType::BF16, device, 256).unwrap())
@@ -674,13 +671,8 @@ mod tests {
         // it as warm.
         let residence = conv.read().turn_residence(timeline, idx).unwrap();
         let hot_arc = conv.read().turn_sealed_of(timeline, idx).unwrap();
-        let warm = migrate_layers_to_cpu(
-            &backings,
-            &device,
-            &r.copy_stream,
-            &mut r.pinned,
-            &hot_arc,
-        );
+        let warm =
+            migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
         // `hot_arc` is the only outstanding Arc apart from the substrate's
         // — drop it so install_warm + eviction don't see a phantom
         // borrower.
@@ -740,13 +732,8 @@ mod tests {
         let warm_idx = seed_turn(&conv, &backings, &device, timeline, 2, 16, 32, 1000);
         let residence = conv.read().turn_residence(timeline, warm_idx).unwrap();
         let hot_arc = conv.read().turn_sealed_of(timeline, warm_idx).unwrap();
-        let warm = migrate_layers_to_cpu(
-            &backings,
-            &device,
-            &r.copy_stream,
-            &mut r.pinned,
-            &hot_arc,
-        );
+        let warm =
+            migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
         drop(hot_arc);
         conv.write().install_warm(residence, warm);
 
@@ -838,10 +825,24 @@ mod tests {
         let (conv, backings, timeline) = fresh_setup(&device, 2);
         let mut r = cuda_resources(&device);
 
-        let a = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 100);
-        let b = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 200);
+        let a = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            100,
+        );
+        let b = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            200,
+        );
 
         let keep_turns = vec![TurnKey::new(timeline, a), TurnKey::new(timeline, b)];
         let report = evict_from_hot(&conv, &[], &keep_turns);
@@ -863,10 +864,24 @@ mod tests {
         let (conv, backings, timeline) = fresh_setup(&device, 2);
         let mut r = cuda_resources(&device);
 
-        let a = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 100);
-        let b = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 200);
+        let a = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            100,
+        );
+        let b = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            200,
+        );
 
         let report = evict_from_hot(&conv, &[], &[]);
 
@@ -887,10 +902,24 @@ mod tests {
         let (conv, backings, timeline) = fresh_setup(&device, 2);
         let mut r = cuda_resources(&device);
 
-        let a = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 100);
-        let b = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 200);
+        let a = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            100,
+        );
+        let b = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            200,
+        );
 
         // Keep only A.
         let keep = vec![TurnKey::new(timeline, a)];
@@ -900,7 +929,10 @@ mod tests {
         assert!(report.bytes > 0);
         // A is still hot, B is cold-marker (warm-only).
         assert!(conv.read().turn_sealed_of(timeline, a).is_some(), "A kept");
-        assert!(conv.read().turn_sealed_of(timeline, b).is_none(), "B evicted");
+        assert!(
+            conv.read().turn_sealed_of(timeline, b).is_none(),
+            "B evicted"
+        );
     }
 
     /// A turn with no warm backup is skipped even when it's not in the
@@ -917,8 +949,15 @@ mod tests {
         // Hot-only turn (no warm copy installed).
         let no_warm = seed_turn(&conv, &backings, &device, timeline, 2, 16, 32, 0);
         // Warm-backed turn to give the report something to count.
-        let warm_backed = seed_warm_backed_turn(&conv, &backings, &device, timeline,
-            &r.copy_stream, &mut r.pinned, 200);
+        let warm_backed = seed_warm_backed_turn(
+            &conv,
+            &backings,
+            &device,
+            timeline,
+            &r.copy_stream,
+            &mut r.pinned,
+            200,
+        );
 
         // Empty keep set — would-evict-everything semantics, but the
         // hot-only turn must survive because its warm is None.
@@ -962,13 +1001,8 @@ mod tests {
         let residence = conv.read().turn_residence(timeline, idx).unwrap();
         let hot_arc = conv.read().turn_sealed_of(timeline, idx).unwrap();
         let hot_clone: Vec<SealedSequence> = hot_arc.iter().cloned().collect();
-        let warm_clone = migrate_layers_to_cpu(
-            &backings,
-            &device,
-            &r.copy_stream,
-            &mut r.pinned,
-            &hot_arc,
-        );
+        let warm_clone =
+            migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
         drop(hot_arc);
         conv.write().clear_turn_sealed(timeline, idx);
         assert!(conv.read().turn_sealed_of(timeline, idx).is_none());

@@ -35,15 +35,15 @@ pub fn collect_live_records(
     let mut out: Vec<(RecordHeader, Vec<u8>)> = Vec::new();
 
     if let Some(loc) = manifest.model_spec {
-        let r = read_record_at(log, loc.offset)?;
+        let r = read_record_at(log, loc.offset, loc.record_size)?;
         out.push((r.header, r.payload));
     }
     if let Some(loc) = manifest.template {
-        let r = read_record_at(log, loc.offset)?;
+        let r = read_record_at(log, loc.offset, loc.record_size)?;
         out.push((r.header, r.payload));
     }
     if let Some(loc) = manifest.tokenizer {
-        let r = read_record_at(log, loc.offset)?;
+        let r = read_record_at(log, loc.offset, loc.record_size)?;
         out.push((r.header, r.payload));
     }
 
@@ -64,15 +64,15 @@ pub fn collect_live_records(
             ));
         }
         for loc in entry.chunks.values() {
-            let r = read_record_at(log, loc.offset)?;
+            let r = read_record_at(log, loc.offset, loc.record_size)?;
             out.push((r.header, r.payload));
         }
         if let Some(loc) = entry.tokens {
-            let r = read_record_at(log, loc.offset)?;
+            let r = read_record_at(log, loc.offset, loc.record_size)?;
             out.push((r.header, r.payload));
         }
         if let Some(loc) = entry.signatures {
-            let r = read_record_at(log, loc.offset)?;
+            let r = read_record_at(log, loc.offset, loc.record_size)?;
             out.push((r.header, r.payload));
         }
         if let Some(through) = entry.committed_through {

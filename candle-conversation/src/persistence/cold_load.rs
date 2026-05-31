@@ -22,42 +22,24 @@
 //! implements the cold-load path as a **bridge**:
 //!
 //! ```text
-//!   chunk records  ─pread─▶  pinned host scratch  ─cuMemcpyHtoDAsync─▶  VRAM staging  ─kv_migrate─▶  arena chunks
-//!                            (cudaHostAlloc'd)         (copy stream)
+//!   chunk records  ─direct-pread─▶  pinned host scratch  ─cuMemcpyHtoDAsync─▶  VRAM staging  ─kv_migrate─▶  arena chunks
+//!                  (O_DIRECT /         (cuMemHostAlloc,         (copy stream)
+//!                  FILE_FLAG_           no WC)
+//!                  NO_BUFFERING)
 //! ```
 //!
-//! The host pinned scratch lets the HtoD leg run as a single DMA without
-//! the driver's internal pageable-bounce buffer; the VRAM staging
-//! scratch is the same one `scatter_chunks` already uses.
+//! The reader pool ([`super::pipeline`]) `pread`s directly into this
+//! pinned scratch — no `Vec<u8>` intermediate, no host-to-host copy.
+//! The pinned scratch is allocated once at startup (no growth on the
+//! hot path) without `CU_MEMHOSTALLOC_WRITECOMBINED` so the NVMe DMA
+//! and CPU-side metadata decode both run at full bandwidth.
+//!
+//! ## Interface
 //!
 //! The interface here ([`ColdLoadStager`]) is shaped so that the Linux
 //! GDS backend can be swapped in as a single `cuFileReadAsync` against a
 //! `cuFileBufRegister`'d VRAM scratch — replacing both the pinned-host
 //! step and the HtoD step — without changing the cold-load caller.
-//!
-//! ## What's optimized vs. what's deferred
-//!
-//! This bridge gives us:
-//! - **No pageable bounce.** The host source of the HtoD is real pinned
-//!   memory, so the driver does not need to synthesise a hidden
-//!   `cudaMallocHost` + memcpy step before the DMA.
-//! - **Reused scratch.** The pinned scratch is allocated once and grown
-//!   on demand, not allocated per cold load.
-//!
-//! Explicitly *not* in the bridge:
-//! - **`pread`-directly-into-pinned.** Today the chunk records are
-//!   decoded into a [`ChunkPayload`](super::record::ChunkPayload) (which
-//!   owns a pageable `Vec<u8>` for `kv_bytes`), and we then `memcpy` from
-//!   that `Vec` into the pinned scratch. The extra host memcpy is the
-//!   cost of not extending [`ChunkLoc`](super::manifest::ChunkLoc) with
-//!   the absolute file offset of `kv_bytes`. The GDS upgrade fixes both
-//!   in one step (GDS needs the offset and removes the host hop), so
-//!   plumbing the offset for the bridge alone would be throwaway work.
-//! - **Double-buffering + NVMe/PCIe overlap.** Single-buffer for now —
-//!   we issue one HtoD per cold load, not a ping-pong pipeline. For
-//!   typical 50–500 chunk loads this is invisible; at multi-GB loads
-//!   it leaves perf on the table. Double-buffering is straightforward
-//!   to add but is moot once we have GDS.
 
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::cuda_backend::WrapErr;
@@ -65,19 +47,96 @@ use candle::quantized::pinned_staging::PinnedBuf;
 use candle::CudaDevice;
 use candle::Result;
 
-/// A reusable host-side cold-load scratch: pinned-via-`cuMemHostAlloc`
-/// when a CUDA context is initialised, plain `Vec<u8>` otherwise (the
-/// fallback path is unit-test-only — `cuMemHostAlloc` fails with
-/// `CUDA_ERROR_NOT_INITIALIZED` when no GPU has been touched, and we
-/// transparently fall back so the pack/upload logic stays testable
-/// without spinning up a CUDA device). The scratch is grown on demand
-/// and persists across cold loads, so a steady-state daemon allocates at
-/// most a handful of times in its life.
+use super::direct_io::AlignedScratch;
+
+/// The cold-load scratch's backing storage — always 4 KiB-aligned so
+/// the chunked direct-I/O reads land safely. The `Pinned` arm is the
+/// production path (`cuMemHostAlloc`, no-WC pinned memory);
+/// `Aligned` is a no-CUDA test fallback that uses `alloc_zeroed` with
+/// a 4 KiB layout — still sector-aligned, just not CUDA-pinned, so
+/// HtoD goes through the slower pageable path. CPU-only unit tests
+/// take the `Aligned` arm; every other path takes `Pinned`.
+enum ColdLoadBuf {
+    Pinned(PinnedBuf),
+    Aligned(AlignedScratch),
+}
+
+impl ColdLoadBuf {
+    fn alloc(len: usize) -> Self {
+        match PinnedBuf::alloc_owned_default(len) {
+            Ok(b) => Self::Pinned(b),
+            Err(_) => {
+                let mut a = AlignedScratch::new();
+                a.ensure(len)
+                    .expect("ColdLoadBuf::alloc: AlignedScratch::ensure failed");
+                Self::Aligned(a)
+            }
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Pinned(b) => b.len(),
+            Self::Aligned(a) => a.capacity(),
+        }
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        match self {
+            Self::Pinned(b) => &mut b.as_mut_slice()[..len],
+            Self::Aligned(a) => a.as_mut_slice(len),
+        }
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        match self {
+            Self::Pinned(b) => &b.as_slice()[..len],
+            Self::Aligned(a) => a.as_slice(len),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            Self::Pinned(b) => b.as_mut_slice().as_mut_ptr(),
+            Self::Aligned(a) => a.as_mut_slice(a.capacity()).as_mut_ptr(),
+        }
+    }
+}
+
+/// Per-pinned-scratch initial allocation size, in bytes — used by every
+/// scheduler/persistence-thread pinned buffer that wants to skip the
+/// first-cold-load `cuMemHostAlloc` cost (~10–30 ms on Windows for
+/// 64 MiB).
+///
+/// 64 MiB is sized against the actual observed cold-load shape on
+/// Qwen3-30B-A3B: a typical turn is ~10–40 MiB of compressed KV (depends
+/// on compression policy and turn length); 64 MiB covers ~95% of turns
+/// without paying allocation cost on the hot path. Longer turns (16K+
+/// context, or C0 reference quality) trigger a single grow inside
+/// [`ColdLoadStager::ensure_capacity`] which thereafter holds at the
+/// new high-water size.
+///
+/// Total pinned host RAM at init across all three buffers (cold-load,
+/// elevate, persistence-thread): 192 MiB. A rounding error on any
+/// production-relevant system.
+pub const PINNED_PREALLOC_BYTES: usize = 64 * 1024 * 1024;
+
+/// A reusable host-side cold-load scratch: a single fixed-size pinned
+/// host buffer that the cold-load chunked read pipeline streams data
+/// through, and the HtoD upload sources from. **Never grows.**
+///
+/// Allocated once at substrate startup via [`Self::with_preallocation`]
+/// at [`PINNED_PREALLOC_BYTES`] bytes via `cuMemHostAlloc` **without**
+/// `CU_MEMHOSTALLOC_WRITECOMBINED` — the cold-load fast path needs
+/// NVMe DMA to write into the buffer at full bandwidth, and CPU reads
+/// the metadata bytes for decode; both regress on WC pages.
+///
+/// `Option<ColdLoadBuf>` is a tri-state:
+///  - `None`: stager has been constructed but never allocated (legacy
+///    `::new()` path, unit-test-only).
+///  - `Some(Pinned/Aligned)`: cuMemHostAlloc'd or aligned-heap fallback.
 pub struct ColdLoadStager {
-    buf: Option<PinnedBuf>,
-    /// High-water mark: the number of bytes we last *used* (not the buffer
-    /// capacity). Diagnostic only — useful for the inspector.
-    high_water_bytes: usize,
+    buf: Option<ColdLoadBuf>,
 }
 
 impl Default for ColdLoadStager {
@@ -87,104 +146,63 @@ impl Default for ColdLoadStager {
 }
 
 impl ColdLoadStager {
-    /// Build an empty stager. The first call to `pack` grows the scratch
-    /// to fit the request; subsequent calls re-use the allocation
-    /// (growing again only if the request is larger than the high-water
-    /// mark).
     pub fn new() -> Self {
+        Self { buf: None }
+    }
+
+    /// Construct a stager and immediately allocate a `bytes`-sized
+    /// pinned host buffer. The buffer never grows after this.
+    pub fn with_preallocation(bytes: usize) -> Self {
         Self {
-            buf: None,
-            high_water_bytes: 0,
+            buf: Some(ColdLoadBuf::alloc(bytes)),
         }
     }
 
-    /// Bytes the stager has reserved.
     pub fn capacity(&self) -> usize {
-        self.buf.as_ref().map(|b| b.len()).unwrap_or(0)
+        self.buf.as_ref().map(|b| b.capacity()).unwrap_or(0)
     }
 
-    /// Largest amount of data ever packed in a single call — a stable
-    /// proxy for the steady-state cold-load size.
-    pub fn high_water_bytes(&self) -> usize {
-        self.high_water_bytes
-    }
-
-    /// Copy each chunk's `kv_bytes` into the scratch in iteration order,
-    /// returning the slice the caller should upload to the device.
-    ///
-    /// Grows the scratch if needed. Returns `Ok(&[])` for an empty
-    /// iterator (no allocation performed).
-    pub fn pack<'a, I>(&mut self, chunks: I) -> Result<&[u8]>
-    where
-        I: IntoIterator<Item = &'a [u8]>,
-    {
-        // Collect into a small Vec first so we can size-the-buffer once.
-        // Iterator size_hint is unreliable for the manifest-driven
-        // chunk-record streaming path; a small Vec of `&[u8]` is cheap.
-        let chunks: Vec<&[u8]> = chunks.into_iter().collect();
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
-        if total == 0 {
-            return Ok(&[]);
+    /// Borrow the first `len` bytes of the pinned scratch as a mutable
+    /// slice — the direct-I/O landing pad for one chunked-read chunk.
+    /// Lazy-allocates on the `::new()` test path; thereafter fixed-size.
+    pub fn buffer_mut(&mut self, len: usize) -> &mut [u8] {
+        if self.buf.is_none() {
+            self.buf = Some(ColdLoadBuf::alloc(PINNED_PREALLOC_BYTES.max(len)));
         }
-        self.ensure_capacity(total)?;
-        self.high_water_bytes = self.high_water_bytes.max(total);
-
-        let dst = self
-            .buf
-            .as_mut()
-            .expect("ensure_capacity allocated before pack")
-            .as_mut_slice();
-        let mut off = 0usize;
-        for c in chunks {
-            let end = off + c.len();
-            dst[off..end].copy_from_slice(c);
-            off = end;
-        }
-        Ok(&self.as_slice()[..total])
+        assert!(
+            len <= self.capacity(),
+            "ColdLoadStager::buffer_mut: chunk request {len} > capacity {} \
+             (the chunk planner should have partitioned the turn to fit)",
+            self.capacity(),
+        );
+        let buf = self.buf.as_mut().unwrap();
+        buf.as_mut_slice(len)
     }
 
-    /// Borrow the packed bytes from the previous `pack` call. The slice
-    /// length is the most recent `high_water_bytes` value, which after
-    /// `pack` equals the packed length.
-    pub fn as_slice(&self) -> &[u8] {
+    /// Raw mutable pointer to the start of the pinned scratch — used
+    /// by the pipelined cold-load to hand a stable pointer to the
+    /// reader threads. Lazy-allocates if needed.
+    pub fn buffer_ptr_mut(&mut self) -> *mut u8 {
+        if self.buf.is_none() {
+            self.buf = Some(ColdLoadBuf::alloc(PINNED_PREALLOC_BYTES));
+        }
+        self.buf.as_mut().unwrap().as_mut_ptr()
+    }
+
+    /// Immutable view of the first `len` bytes of the pinned scratch.
+    pub fn buffer(&self, len: usize) -> &[u8] {
+        debug_assert!(len <= self.capacity());
         match &self.buf {
-            Some(b) => b.as_slice(),
-            None => &[],
+            Some(b) => b.as_slice(len),
+            None => {
+                debug_assert_eq!(len, 0);
+                &[]
+            }
         }
     }
 
-    fn ensure_capacity(&mut self, len: usize) -> Result<()> {
-        let need_grow = match &self.buf {
-            Some(b) => b.len() < len,
-            None => true,
-        };
-        if need_grow {
-            // `cuMemHostAlloc` needs an initialised CUDA context — in
-            // unit tests (no GPU touched) it returns
-            // `CUDA_ERROR_NOT_INITIALIZED`. Fall back to a plain
-            // `Vec<u8>`-backed `PinnedBuf::Host` in that case so the
-            // pack/upload logic is exercisable in unit tests; the real
-            // pinned path is exercised by the integration test that
-            // actually allocates a CUDA device first.
-            self.buf = Some(match PinnedBuf::alloc_owned(len) {
-                Ok(b) => b,
-                Err(_) => PinnedBuf::Host {
-                    data: vec![0u8; len],
-                },
-            });
-        }
-        Ok(())
-    }
-
-    /// Asynchronously upload the *first `len` bytes* of the scratch to a
-    /// freshly-allocated device buffer via `cuMemcpyHtoDAsync`. The
-    /// `len` is typically what the most recent [`Self::pack`] returned —
-    /// pass `self.high_water_bytes()` to upload everything the last call
-    /// packed.
-    ///
-    /// Returns a device slice and the `i64` device base pointer (the
-    /// shape `kv_migrate` expects). The returned device slice must
-    /// outlive the kernel that reads from it.
+    /// Asynchronously upload the first `len` bytes of the scratch to a
+    /// freshly-allocated device buffer via `cuMemcpyHtoDAsync`.
     pub fn upload_async(
         &self,
         dev: &CudaDevice,
@@ -199,7 +217,7 @@ impl ColdLoadStager {
                 base_ptr: 0,
             });
         }
-        let src = &self.as_slice()[..len];
+        let src = self.buffer(len);
         let mut gpu: CudaSlice<u8> = unsafe { stream.alloc::<u8>(len).w()? };
         stream.memcpy_htod(src, &mut gpu).w()?;
         let base = {
@@ -213,104 +231,58 @@ impl ColdLoadStager {
     }
 }
 
-/// Result of [`ColdLoadStager::upload_async`] — a freshly-allocated device
-/// slice plus its base pointer ready to feed to a scatter kernel.
+/// Result of [`ColdLoadStager::upload_async`] — a freshly-allocated
+/// device slice plus its base pointer ready to feed to a scatter
+/// kernel.
 pub struct UploadedScratch {
-    /// Owns the device allocation. Drop frees the device memory; keep
-    /// alive until the consuming kernel completes.
     pub slice: CudaSlice<u8>,
-    /// `i64`-typed base pointer (the shape `MigrationPlan` expects).
     pub base_ptr: i64,
+}
+
+/// Eagerly allocate a `bytes`-sized non-write-combined pinned host
+/// buffer for the elevate / persistence-thread DtoH staging paths.
+///
+/// Same best-effort semantics as
+/// [`ColdLoadStager::with_preallocation`]: returns `None` and logs a
+/// warning if `cuMemHostAlloc` fails, falling back to lazy allocation
+/// on first use. `tag` is included in the warning for diagnostics.
+///
+/// Use `alloc_owned_default` (no `CU_MEMHOSTALLOC_WRITECOMBINED`)
+/// because every consumer of these buffers is a destination of
+/// `memcpy_dtoh` followed by a CPU read of the bytes — WC would
+/// pessimise the CPU-read leg.
+pub fn preallocate_pinned_scratch(bytes: usize, tag: &'static str) -> Option<PinnedBuf> {
+    match PinnedBuf::alloc_owned_default(bytes) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(
+                target: "candle_conversation::persistence::cold_load",
+                bytes,
+                tag,
+                error = %e,
+                "pinned scratch preallocation failed — falling back to lazy alloc",
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A fresh stager allocates nothing until the first `pack`.
+    /// `::new()` allocates nothing.
     #[test]
-    fn stager_starts_empty_and_lazy() {
+    fn stager_new_starts_empty() {
         let s = ColdLoadStager::new();
         assert_eq!(s.capacity(), 0);
-        assert_eq!(s.high_water_bytes(), 0);
-        assert!(s.as_slice().is_empty());
+        assert!(s.buffer(0).is_empty());
     }
 
-    /// Packing concatenates inputs in iteration order, byte-for-byte —
-    /// the property the scatter kernel relies on.
+    /// `with_preallocation` sizes the buffer up front.
     #[test]
-    fn pack_concatenates_in_order() {
-        let mut s = ColdLoadStager::new();
-        let a = b"alpha".as_slice();
-        let b = b"beta".as_slice();
-        let c = b"gamma".as_slice();
-        let packed_len = {
-            let packed = s.pack([a, b, c]).expect("pack");
-            assert_eq!(packed, b"alphabetagamma");
-            packed.len()
-        };
-        assert_eq!(s.high_water_bytes(), packed_len);
-    }
-
-    /// An empty pack is a no-op: no allocation, no high-water bump.
-    #[test]
-    fn pack_empty_is_noop() {
-        let mut s = ColdLoadStager::new();
-        let packed = s.pack(std::iter::empty::<&[u8]>()).unwrap();
-        assert!(packed.is_empty());
-        assert_eq!(s.capacity(), 0);
-        assert_eq!(s.high_water_bytes(), 0);
-    }
-
-    /// A second `pack` smaller than the first reuses the buffer without
-    /// shrinking — the capacity stays at the high-water mark, but
-    /// `high_water_bytes` does not regress.
-    #[test]
-    fn pack_reuses_buffer_across_calls() {
-        let mut s = ColdLoadStager::new();
-        let big = vec![0xABu8; 4096];
-        s.pack([big.as_slice()]).unwrap();
-        let cap_after_big = s.capacity();
-        assert!(cap_after_big >= 4096);
-        assert_eq!(s.high_water_bytes(), 4096);
-
-        let small = vec![0xCDu8; 128];
-        let packed = s.pack([small.as_slice()]).unwrap();
-        assert_eq!(packed, &small[..]);
-        // Buffer not shrunk.
-        assert_eq!(s.capacity(), cap_after_big);
-        // High water reflects the largest pack, not the latest.
-        assert_eq!(s.high_water_bytes(), 4096);
-    }
-
-    /// Growing past the existing capacity reallocates and copies the
-    /// new payload correctly (round-trip byte equality).
-    #[test]
-    fn pack_grows_for_larger_payloads() {
-        let mut s = ColdLoadStager::new();
-        s.pack([&[0xAAu8; 256][..]]).unwrap();
-        let huge: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
-        let packed = s.pack([huge.as_slice()]).unwrap();
-        assert_eq!(packed, &huge[..]);
-        assert!(s.capacity() >= huge.len());
-        assert_eq!(s.high_water_bytes(), huge.len());
-    }
-
-    /// Packing many small chunks (the typical cold-load shape — one
-    /// `kv_bytes` blob per persisted chunk, many tens to hundreds of
-    /// them) preserves boundary positions exactly.
-    #[test]
-    fn pack_preserves_chunk_boundaries() {
-        let mut s = ColdLoadStager::new();
-        let chunks: Vec<Vec<u8>> = (0..50)
-            .map(|i| (0..128u32).map(|j| ((i * 31 + j) % 256) as u8).collect())
-            .collect();
-        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
-        let packed = s.pack(refs.iter().copied()).unwrap();
-        let mut expected = Vec::with_capacity(50 * 128);
-        for c in &chunks {
-            expected.extend_from_slice(c);
-        }
-        assert_eq!(packed, expected.as_slice());
+    fn with_preallocation_sizes_buffer_exactly() {
+        let s = ColdLoadStager::with_preallocation(4096);
+        assert_eq!(s.capacity(), 4096);
     }
 }

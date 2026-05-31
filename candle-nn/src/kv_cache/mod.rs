@@ -54,8 +54,8 @@ pub use chunked::{
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{
-    production_adaptive_candidates, ChunkGid, ChunkGidPool, ChunkMeta, ChunkedKvBacking,
-    CompressionPolicy, HeadGids, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
+    production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
+    ChunkedKvBacking, CompressionPolicy, HeadGids, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,

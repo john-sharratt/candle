@@ -19,11 +19,11 @@ mod cuda_impl {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::{Device, Result};
     use candle_nn::kv_cache::{
-        kv_migrate, ArenaLocation, ChunkedKvBacking, KvFormat, MigrationPlan, SealedSequence,
+        kv_migrate, ArenaLocation, ChunkedKvBacking, MigrationPlan, SealedSequence,
     };
 
     use crate::persistence::cold_load::ColdLoadStager;
-    use crate::persistence::resume::{ChunkImage, TurnChunkGrid};
+    use crate::persistence::resume::ChunkImage;
 
     fn cuda_device(device: &Device) -> Result<&candle::CudaDevice> {
         match device {
@@ -104,8 +104,8 @@ mod cuda_impl {
     /// paired with each chunk's offset, K/V formats, palettes and scales.
     ///
     /// This is the shared gather used by both warm eviction and the
-    /// seal-time redo-log write — the representation `load_stream` can
-    /// rebuild VRAM chunks from.
+    /// seal-time redo-log write — the representation the cold-load path
+    /// rebuilds VRAM chunks from.
     pub fn seal_to_chunk_images(
         backing: &ChunkedKvBacking,
         device: &Device,
@@ -196,7 +196,11 @@ mod cuda_impl {
                 let stride = info.chunk_byte_stride as usize;
                 let start = blob.len();
                 blob.resize(start + stride, 0);
-                backing.read_chunk_into_bytes(arena_idx, chunk_idx, &mut blob[start..start + stride])?;
+                backing.read_chunk_into_bytes(
+                    arena_idx,
+                    chunk_idx,
+                    &mut blob[start..start + stride],
+                )?;
             }
         }
         let mut cursor = 0usize;
@@ -229,157 +233,146 @@ mod cuda_impl {
         Ok(images)
     }
 
-    /// Materialize a recovered chunk grid into VRAM — the warm→hot
-    /// leg shared by every cold-load orchestrator.
+    /// Cold-load fast path — stream a turn's records through a
+    /// fixed-size pinned scratch and migrate them onto the GPU.
     ///
-    /// Per layer: allocates fresh sealed blocks in the policy-selected
-    /// per-(h,p) Q-format arenas, packs the `kv_bytes` into the pinned
-    /// host scratch, `cuMemcpyHtoDAsync`s into a fresh device staging
-    /// slice, and `kv_migrate`-scatters into the new arena chunks. The
-    /// returned `SealedSequence`s own the chunks via `Arc<ChunkGid>`,
-    /// so dropping them frees the chunks back to the pool.
-    pub fn load_to_hot(
+    /// The turn's records are partitioned by
+    /// [`crate::persistence::chunk_plan::plan_chunked_read`] into chunk
+    /// batches that each fit within the stager's pinned buffer. Each
+    /// batch then runs through [`crate::persistence::pipeline::run_pipeline`],
+    /// which fans the batch out into 1 MiB units processed concurrently
+    /// by a reader pool, a per-layer bulk allocator, and a GPU
+    /// dispatcher — reads, HtoDs, and the `kv_migrate` scatter all
+    /// overlap at sub-stripe granularity.
+    ///
+    /// After every batch has been processed, each layer's final
+    /// `record_turn` produces the `SealedSequence` returned to the
+    /// caller. Memory bound: one [`PINNED_PREALLOC_BYTES`]-sized
+    /// pinned buffer + one same-sized GPU staging slice per batch —
+    /// independent of turn size.
+    ///
+    /// Returns one `SealedSequence` per layer; the order matches `backings`.
+    pub fn load_turn_into_hot(
         backings: &[ChunkedKvBacking],
         device: &Device,
-        grid: &TurnChunkGrid,
+        persistence: &mut crate::persistence::SubstratePersistence,
+        decl: &crate::persistence::streams::TurnDecl,
         stager: &mut ColdLoadStager,
     ) -> Result<Vec<SealedSequence>> {
-        if backings.len() != grid.n_layers() {
-            return Err(candle::Error::Msg(format!(
-                "load_to_hot: {} backings vs {} layers in warm grid",
-                backings.len(),
-                grid.n_layers()
-            )));
+        use std::time::Instant;
+
+        let n_layers = backings.len();
+        let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
+        // Early CUDA-device validation; the pipeline itself re-derives
+        // the device for its own use.
+        let _dev = cuda_device(device)?;
+        let stream_id =
+            crate::persistence::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
+
+        let t_total = Instant::now();
+
+        // Build the chunk plan up front. The plan sizes each chunk to
+        // fit in the stager's buffer; if the buffer is unallocated
+        // (the unit-test `::new()` path) we fall back to processing
+        // the whole turn as one chunk by using a very large size —
+        // production always has `with_preallocation` capacity.
+        let buffer_size = stager.capacity().max(1 << 30);
+        let plan = persistence.plan_chunked_read(stream_id, buffer_size);
+
+        // Empty turn — no chunks. Build empty sealed sequences per
+        // layer (matches the legacy `recover_turn` + `load_to_hot`
+        // pair on an empty grid).
+        if plan.n_records == 0 {
+            let mut out = Vec::with_capacity(n_layers);
+            for backing in backings {
+                let slot = backing.alloc_sequence()?;
+                let seq = backing.record_turn(slot, 0)?;
+                backing.free_sequence(slot)?;
+                out.push(seq);
+            }
+            return Ok(out);
         }
-        let mut out = Vec::with_capacity(grid.n_layers());
-        for (backing, chunks) in backings.iter().zip(grid.iter_layers()) {
-            out.push(load_stream(backing, device, chunks, stager)?);
+
+        // RAII: free every scratch slot on drop, success or error.
+        struct SlotsGuard<'a> {
+            backings: &'a [ChunkedKvBacking],
+            items: Vec<(usize, usize)>,
         }
-        Ok(out)
-    }
-
-    /// Reconstruct one layer's [`SealedSequence`] from its recovered
-    /// [`ChunkImage`]s — the body of the design's `load_stream` (§16.12).
-    ///
-    /// Built entirely on the allocation keystone and the layout-agnostic
-    /// migration path: a scratch slot is allocated, `alloc_sealed_block`
-    /// materialises each chunk's GIDs in arenas of its persisted `KvFormat`,
-    /// `set_block_window` stamps the `offset` / `token_count`, `record_turn`
-    /// snapshots a `SealedSequence` with real GIDs, and `scatter_chunks`
-    /// fills the opaque `kv_bytes` through `resolve_sealed_chunk_ptrs`. The
-    /// scratch slot is then freed — the returned sequence keeps the chunks
-    /// alive via its `ChunkGid` `Arc`s.
-    ///
-    /// Gather and scatter route through the *same* `resolve_sealed_chunk_ptrs`
-    /// and the *same* `chunk_byte_stride`-from-`format`; there is no second
-    /// layout calculation, so the round trip is correct by construction.
-    pub fn load_stream(
-        backing: &ChunkedKvBacking,
-        device: &Device,
-        chunks: &[ChunkImage],
-        stager: &mut crate::persistence::cold_load::ColdLoadStager,
-    ) -> Result<SealedSequence> {
-        use std::sync::Arc;
-
-        let dev = cuda_device(device)?;
-        let slot = backing.alloc_sequence()?;
-        let decode_formats = |tags: &[u8], side: &str| -> Result<Vec<KvFormat>> {
-            tags.iter()
-                .map(|&t| {
-                    KvFormat::from_tag(t).ok_or_else(|| {
-                        candle::Error::Msg(format!("load_stream: unrecognised {side} format tag {t}"))
-                    })
-                })
-                .collect()
+        impl<'a> Drop for SlotsGuard<'a> {
+            fn drop(&mut self) {
+                for &(bi, slot) in &self.items {
+                    let _ = self.backings[bi].free_sequence(slot);
+                }
+            }
+        }
+        let mut slots_guard = SlotsGuard {
+            backings,
+            items: Vec::with_capacity(n_layers),
         };
-        let mut build = || -> Result<SealedSequence> {
-            let mut total_tokens = 0usize;
-            for (block_idx, image) in chunks.iter().enumerate() {
-                let k_formats = decode_formats(&image.payload.k_formats, "k")?;
-                let v_formats = decode_formats(&image.payload.v_formats, "v")?;
-                backing.alloc_sealed_block(
-                    slot,
-                    block_idx,
-                    &k_formats,
-                    &v_formats,
-                    Arc::new(image.payload.k_pal.clone()),
-                    Arc::new(image.payload.v_pal.clone()),
-                    Arc::new(image.payload.k_scale.clone()),
-                    Arc::new(image.payload.v_scale.clone()),
-                )?;
-                backing.set_block_window(
-                    slot,
-                    block_idx,
-                    image.payload.offset,
-                    image.token_count as u32,
-                )?;
-                total_tokens += image.token_count as usize;
-            }
-            let seq = backing.record_turn(slot, total_tokens)?;
-            let ptrs = backing.resolve_sealed_chunk_ptrs(&seq)?;
 
-            // Bridge path: pack the per-chunk kv_bytes into the
-            // reusable pinned host scratch and HtoD once into a fresh
-            // device staging slice; then `kv_migrate` scatters into the
-            // freshly-allocated VRAM chunks. The bytes source for the
-            // HtoD is real pinned memory, so the driver does not need
-            // to synthesise a pageable bounce buffer. See
-            // `crate::persistence::cold_load` for the bridge-vs-GDS
-            // rationale.
-            let total_bytes: usize = chunks.iter().map(|c| c.payload.kv_bytes.len()).sum();
-            let expected_bytes: i64 = ptrs.iter().map(|&(_, len)| len).sum();
-            if total_bytes == 0 {
-                return Ok(seq);
-            }
-            // Detect under-persisted data — kv_bytes was written with a
-            // smaller per-chunk size than the rebuilt arena slots
-            // expect. This happens for any turn that was persisted by
-            // a pre-fix daemon (the `arena_byte_size` dedup-by-arena
-            // -idx bug capped `SealedChunk.byte_size` at one stride).
-            // The scatter will run regardless, but the OOB-read sub-
-            // bands beyond the persisted slice will contain undefined
-            // memory and the model's attention against this turn will
-            // be broken. Log loudly so the operator can correlate
-            // sidebar entries against the "this turn won't have
-            // useful KV" outcome.
-            if (total_bytes as i64) < expected_bytes {
-                tracing::warn!(
-                    target: "candle_conversation::persistence::tier",
-                    persisted_bytes = total_bytes,
-                    expected_bytes,
-                    n_chunks = chunks.len(),
-                    n_ptrs = ptrs.len(),
-                    ratio = (total_bytes as f64) / (expected_bytes as f64),
-                    "cold-load: persisted kv_bytes shorter than fresh arena footprint — \
-                     turn was written by a pre-fix daemon and is permanently corrupt \
-                     (sub-bands beyond the first will contain undefined memory). \
-                     Start a fresh conversation to recover."
-                );
-            }
-            let _packed_len = {
-                let packed = stager.pack(chunks.iter().map(|c| c.payload.kv_bytes.as_slice()))?;
-                packed.len()
-            };
-            let stream = dev.cuda_stream();
-            let staging = stager.upload_async(dev, &stream, total_bytes)?;
+        // Pre-allocate one slot per layer. Holds the accumulated
+        // chunks across every chunk-batch's reads.
+        let mut slots: Vec<usize> = Vec::with_capacity(n_layers);
+        let mut total_tokens_per_layer: Vec<usize> = vec![0; n_layers];
+        for (li, backing) in backings.iter().enumerate() {
+            let slot = backing.alloc_sequence()?;
+            slots_guard.items.push((li, slot));
+            slots.push(slot);
+        }
 
-            let mut plan = MigrationPlan::new();
-            let mut offset = 0i64;
-            for &(ptr, len) in &ptrs {
-                plan.push(staging.base_ptr + offset, ptr, len);
-                offset += len;
-            }
-            kv_migrate(device, &plan)?;
-            // `staging.slice` drops here, freeing the device allocation
-            // after `kv_migrate` returns.
-            drop(staging);
-            Ok(seq)
-        };
-        let result = build();
-        // The scratch slot is no longer needed — the returned sequence owns
-        // the chunks through its `ChunkGid` Arcs. Free even on the error path.
-        backing.free_sequence(slot)?;
-        result
+        // Per-chunk-batch loop: each batch fans out into the 1 MiB-unit
+        // pipeline (reader pool, allocator thread, GPU dispatcher on
+        // main thread). Reads, HtoDs, and the migrate kernel all
+        // overlap at sub-stripe granularity.
+        let mut reads_ms_total: u64 = 0;
+        let mut alloc_ms_total: u64 = 0;
+        let mut htod_ms_total: u64 = 0;
+        let mut migrate_ms_total: u64 = 0;
+        let mut n_units_total: u32 = 0;
+
+        for batch in &plan.chunks {
+            let stats = crate::persistence::pipeline::run_pipeline(
+                persistence,
+                backings,
+                device,
+                batch,
+                stager,
+                &slots,
+                &mut total_tokens_per_layer,
+                chunks_per_layer,
+            )?;
+            reads_ms_total += stats.reads_ms;
+            alloc_ms_total += stats.alloc_ms;
+            htod_ms_total += stats.htod_ms;
+            migrate_ms_total += stats.migrate_ms;
+            n_units_total += stats.n_units;
+        }
+
+        // Final per-layer SealedSequence — the snapshot caller wanted.
+        let mut sealed_per_layer: Vec<SealedSequence> = Vec::with_capacity(n_layers);
+        for (li, backing) in backings.iter().enumerate() {
+            let seq = backing.record_turn(slots[li], total_tokens_per_layer[li])?;
+            sealed_per_layer.push(seq);
+        }
+
+        let total_ms = t_total.elapsed().as_millis();
+        tracing::debug!(
+            target: "candle_conversation::persistence::tier",
+            timeline = decl.timeline_id,
+            turn = decl.turn_index,
+            n_chunks_total = plan.n_records,
+            pinned_bytes = plan.total_bytes,
+            n_chunk_batches = plan.chunks.len(),
+            n_units = n_units_total,
+            reads_ms = reads_ms_total,
+            alloc_ms = alloc_ms_total,
+            htod_ms = htod_ms_total,
+            migrate_ms = migrate_ms_total,
+            total_ms,
+            "load_turn_into_hot timing (pipelined)"
+        );
+
+        Ok(sealed_per_layer)
     }
 
     #[cfg(test)]
@@ -490,13 +483,15 @@ mod cuda_impl {
                     .collect()
             };
 
-            // Pack → upload via the bridge primitive.
-            let mut stager = ColdLoadStager::new();
+            // Pack → upload via the chunked-cold-load primitives.
+            let mut stager = ColdLoadStager::with_preallocation(total);
             {
-                let packed = stager
-                    .pack(chunks.iter().map(|c| c.as_slice()))
-                    .expect("pack into pinned scratch");
-                assert_eq!(packed.len(), total);
+                let buf = stager.buffer_mut(total);
+                let mut off = 0;
+                for c in &chunks {
+                    buf[off..off + c.len()].copy_from_slice(c);
+                    off += c.len();
+                }
             }
             let stream = dev.cuda_stream();
             let staging = stager
@@ -524,6 +519,4 @@ mod cuda_impl {
     }
 }
 
-pub use cuda_impl::{
-    gather_chunks, load_stream, load_to_hot, scatter_chunks, seal_to_chunk_images,
-};
+pub use cuda_impl::{gather_chunks, load_turn_into_hot, scatter_chunks, seal_to_chunk_images};

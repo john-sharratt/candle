@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::checkpoint;
+use super::direct_io::DirectFile;
 use super::log_file::{read_record_at, LogFile};
 use super::manifest::Manifest;
 use super::record::Record;
@@ -27,6 +28,10 @@ pub struct InheritedSubstrate {
     /// The open file, for reading inherited records on demand. Behind a
     /// `Mutex` because reads seek and the substrate is shared.
     file: Mutex<LogFile>,
+    /// Cache-bypassing handle for the cold-load fast path. Independent
+    /// of `file` — positioned reads via `pread`/`ReadFile`+`OVERLAPPED`
+    /// are thread-safe so this is shared without a lock.
+    direct: DirectFile,
 }
 
 impl InheritedSubstrate {
@@ -45,10 +50,28 @@ impl InheritedSubstrate {
         self.manifest.streams.contains_key(&stream_id)
     }
 
-    /// Read a record at `offset` from the inherited log.
-    pub fn read_record(&self, offset: u64) -> Result<Record> {
+    /// Read a record at `offset` from the inherited log. `record_size`
+    /// is the padded on-disk size from the manifest entry — captured at
+    /// walk time, persisted through checkpoints. Single read.
+    pub fn read_record(&self, offset: u64, record_size: u64) -> Result<Record> {
         let mut file = self.file.lock().unwrap();
-        read_record_at(&mut *file, offset)
+        read_record_at(&mut *file, offset, record_size)
+    }
+
+    /// Read `dest.len()` bytes at `offset` from the inherited log
+    /// directly into `dest`. Used by the batched cold-read path so a
+    /// single caller-provided scratch absorbs a whole turn's records.
+    pub fn read_into(&self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        use super::log_file::LogSource;
+        let mut file = self.file.lock().unwrap();
+        LogSource::read_into(&mut *file, offset, dest)
+    }
+
+    /// The cache-bypassing read handle on this inherited log. Used by
+    /// the cold-load fast path to submit stripe reads in parallel via
+    /// [`DirectFile::read_stripes_concurrent`].
+    pub fn direct_file(&self) -> &DirectFile {
+        &self.direct
     }
 }
 
@@ -74,10 +97,12 @@ impl InheritedSubstrate {
         let mut file = LogFile::open(&canonical)?;
         let hint = file.superblock().latest_checkpoint_offset;
         let recovered = checkpoint::recover(&mut file, hint)?;
+        let direct = DirectFile::open(&canonical)?;
         let loaded = Arc::new(InheritedSubstrate {
             path: canonical.clone(),
             manifest: recovered.manifest,
             file: Mutex::new(file),
+            direct,
         });
 
         let mut cache = cache().lock().unwrap();

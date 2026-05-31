@@ -13,7 +13,9 @@ use crate::conversation::slice_per_layer_sealed;
 use crate::decode_health::DecodeHealthState;
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnEvent, TurnResponse};
-use crate::persistence::cold_load::ColdLoadStager;
+use crate::persistence::cold_load::{
+    preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
+};
 use crate::persistence::elevate::{elevate_to_hot, evict_from_hot};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
@@ -762,6 +764,20 @@ impl Scheduler {
         persist_trigger: PersistenceTrigger,
     ) -> Self {
         let device = model.device().clone();
+
+        // Force this thread to bind to the device's CUDA context
+        // BEFORE we allocate pinned host memory below. The model and
+        // session were created on another thread; the CUDA context is
+        // per-thread on Windows, and `cuMemHostAlloc` returns
+        // `CUDA_ERROR_NOT_INITIALIZED` if called from a thread that
+        // hasn't bound to a context yet. A failed alloc silently falls
+        // back to non-pinned heap memory, which turns every cold-load
+        // HtoD into a synchronous copy at ~1 GB/s instead of an
+        // async-pinned DMA at PCIe rate.
+        if let Device::Cuda(d) = &device {
+            let _ = d.cuda_context().bind_to_thread();
+        }
+
         let sampler = BatchedSampler::new(
             device.clone(),
             vocab_size,
@@ -796,9 +812,12 @@ impl Scheduler {
             turn_views: HashMap::new(),
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
-            cold_load_stager: ColdLoadStager::new(),
+            cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
             persist_trigger,
-            elevate_pinned_scratch: None,
+            elevate_pinned_scratch: preallocate_pinned_scratch(
+                PINNED_PREALLOC_BYTES,
+                "scheduler::elevate_pinned_scratch",
+            ),
         }
     }
 
@@ -1120,14 +1139,13 @@ impl Scheduler {
                 };
 
                 // Step 3: carve the view sequence.
-                let (view_id, borrowed) =
-                    match self.create_view(parent_id, &effective_ranges) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = event_tx.send(TurnEvent::Error(e));
-                            return true;
-                        }
-                    };
+                let (view_id, borrowed) = match self.create_view(parent_id, &effective_ranges) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = event_tx.send(TurnEvent::Error(e));
+                        return true;
+                    }
+                };
 
                 // Step 4: anchor the active turn's start index in the
                 // view's chunk list.
@@ -2385,8 +2403,7 @@ impl Scheduler {
                 {
                     use crate::persistence::content_hash::turn_stream_id;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    if let Err(e) =
-                        conversation.persist_tokens_only(stream_id, &persist_token_ids)
+                    if let Err(e) = conversation.persist_tokens_only(stream_id, &persist_token_ids)
                     {
                         tracing::warn!("persist tokens failed: {e}");
                     }
@@ -3133,7 +3150,9 @@ impl Scheduler {
         let parent_id = view_state.parent_id;
         let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
         let (projected_sections, projected_turns): (Vec<SectionId>, Vec<(GroupId, TurnIndex)>) = {
-            let view = policy.substrate.read_for_scored(policy.target, &projection_scores);
+            let view = policy
+                .substrate
+                .read_for_scored(policy.target, &projection_scores);
             // Prefill mode: the section corpus is prefill-Q of tool
             // descriptions, so reprojection scores it with the calibrated
             // prefill profile (Max / semantic, no threshold gate).
@@ -3382,8 +3401,7 @@ impl Scheduler {
             &projected_sections,
             &projected_turns,
         )?;
-        let new_prefix_block_count =
-            self.session.sequence_block_count(parent_id.0).unwrap_or(0);
+        let new_prefix_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
 
         // Under the read-only projection model there's no COW prefix
         // duplication to guard against: the view never copied bytes from
@@ -3423,8 +3441,7 @@ impl Scheduler {
         } else {
             vec![BlockRange::new(0, parent_block_count)]
         };
-        let (new_view_id, new_borrowed) =
-            self.create_view(parent_id, &effective_ranges)?;
+        let (new_view_id, new_borrowed) = self.create_view(parent_id, &effective_ranges)?;
         // Diagnostic log: the new view's slot index may have been
         // recycled from the freed old view's slot; drop any stale
         // entry under the new id before decode resumes.

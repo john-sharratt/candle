@@ -10,9 +10,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use super::record::{
-    crc32, decode_header, decode_record, padded_record_len, Record, RecordHeader, ALIGN,
-};
+use super::direct_io::DirectFile;
+use super::record::{crc32, decode_header, decode_record, Record, RecordHeader, ALIGN};
 use super::{PersistenceError, Result};
 
 /// Size of the file superblock — the first block, holding file identity
@@ -93,6 +92,14 @@ impl Superblock {
 /// An open append-only log file.
 pub struct LogFile {
     file: File,
+    /// A second open handle on the same file, opened with `O_DIRECT` /
+    /// `FILE_FLAG_NO_BUFFERING`. Used exclusively for the cold-load fast
+    /// path ([`LogFile::direct_file`]) so bulk reads bypass the OS page
+    /// cache and let the NVMe controller DMA straight into sector-aligned
+    /// host scratch. The buffered `file` handle still owns every write
+    /// and every non-aligned small read (superblock, single-record
+    /// lookups, etc.).
+    direct: DirectFile,
     superblock: Superblock,
     /// Durable logical end — offset where the next record will land.
     write_offset: u64,
@@ -115,8 +122,10 @@ impl LogFile {
             format_version: FILE_FORMAT_VERSION,
             latest_checkpoint_offset: 0,
         };
+        let direct = DirectFile::open(path)?;
         let mut log = LogFile {
             file,
+            direct,
             superblock,
             write_offset: SUPERBLOCK_SIZE,
             allocated: 0,
@@ -134,8 +143,10 @@ impl LogFile {
     pub fn open(path: &Path) -> Result<LogFile> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let allocated = file.metadata()?.len();
+        let direct = DirectFile::open(path)?;
         let mut log = LogFile {
             file,
+            direct,
             superblock: Superblock {
                 format_version: FILE_FORMAT_VERSION,
                 latest_checkpoint_offset: 0,
@@ -147,6 +158,13 @@ impl LogFile {
         let head = log.read_at(0, SUPERBLOCK_SIZE as usize)?;
         log.superblock = Superblock::decode(&head)?;
         Ok(log)
+    }
+
+    /// The cache-bypassing read handle on this log. Used by the
+    /// cold-load fast path to submit stripe reads in parallel via
+    /// [`DirectFile::read_stripes_concurrent`].
+    pub fn direct_file(&self) -> &DirectFile {
+        &self.direct
     }
 
     /// The decoded superblock.
@@ -277,6 +295,10 @@ impl LogFile {
 pub trait LogSource {
     /// Read `len` bytes at `offset`, or an error if unavailable.
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>>;
+    /// Read `dest.len()` bytes at `offset` directly into `dest` — the
+    /// batched cold-read path calls this once per stripe so a single
+    /// reusable scratch buffer absorbs the whole turn's records.
+    fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()>;
     /// Total readable length.
     fn size(&mut self) -> Result<u64>;
 }
@@ -284,6 +306,21 @@ pub trait LogSource {
 impl LogSource for LogFile {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         LogFile::read_at(self, offset, len)
+    }
+
+    fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(dest).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                PersistenceError::Truncated {
+                    need: dest.len(),
+                    have: 0,
+                }
+            } else {
+                PersistenceError::Io(e)
+            }
+        })?;
+        Ok(())
     }
 
     fn size(&mut self) -> Result<u64> {
@@ -322,6 +359,19 @@ impl LogSource for MemLog {
         Ok(self.bytes[start..end].to_vec())
     }
 
+    fn read_into(&mut self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        let start = offset as usize;
+        let end = start + dest.len();
+        if end > self.bytes.len() {
+            return Err(PersistenceError::Truncated {
+                need: dest.len(),
+                have: self.bytes.len().saturating_sub(start),
+            });
+        }
+        dest.copy_from_slice(&self.bytes[start..end]);
+        Ok(())
+    }
+
     fn size(&mut self) -> Result<u64> {
         Ok(self.bytes.len() as u64)
     }
@@ -340,23 +390,13 @@ pub fn read_header_at(src: &mut dyn LogSource, offset: u64) -> Result<RecordHead
     Ok(header)
 }
 
-/// Read and decode (checksum-verify) the whole record at `offset` from
-/// any [`LogSource`]. Reads the first sector to learn the record's
-/// padded size, then reads any additional sectors the payload requires.
-pub fn read_record_at(src: &mut dyn LogSource, offset: u64) -> Result<Record> {
-    let size = src.size()?;
-    let remaining = size.saturating_sub(offset);
-    let probe_len = remaining.min(ALIGN as u64) as usize;
-    let probe = src.read_at(offset, probe_len)?;
-    let (header, header_bytes) = decode_header(&probe)?;
-    let total = padded_record_len(header_bytes - 1, header.payload_len);
-    let record_bytes = if total <= probe.len() {
-        // The record fit entirely in the probe — reuse it.
-        probe[..total].to_vec()
-    } else {
-        src.read_at(offset, total)?
-    };
-    let (record, _) = decode_record(&record_bytes)?;
+/// Read and decode (checksum-verify) the whole record at `offset`.
+/// `record_size` is the exact padded on-disk size from the manifest's
+/// `RecordLoc` / `ChunkLoc` — captured at walk time, persisted through
+/// checkpoints. Single read, no probe.
+pub fn read_record_at(src: &mut dyn LogSource, offset: u64, record_size: u64) -> Result<Record> {
+    let bytes = src.read_at(offset, record_size as usize)?;
+    let (record, _) = decode_record(&bytes)?;
     Ok(record)
 }
 

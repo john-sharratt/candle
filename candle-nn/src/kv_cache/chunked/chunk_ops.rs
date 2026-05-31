@@ -158,6 +158,28 @@ fn read_chunk_into_pinned_bytes(
     }
 }
 
+/// Per-block parameter bundle for [`ChunkedKvBacking::alloc_sealed_blocks_bulk`].
+///
+/// One spec carries everything that one call to
+/// [`ChunkedKvBacking::alloc_sealed_block`] +
+/// [`ChunkedKvBacking::set_block_window`] would need. The cold-load
+/// path constructs a `Vec<BlockAllocSpec>` for an entire turn's worth
+/// of blocks (per layer) and submits them in one bulk call, collapsing
+/// the per-block `state.write()` lock churn (3 acquisitions/block ×
+/// thousands of blocks) into 1 acquisition/layer.
+#[derive(Clone)]
+pub struct BlockAllocSpec {
+    pub block_idx: usize,
+    pub k_formats: Vec<KvFormat>,
+    pub v_formats: Vec<KvFormat>,
+    pub k_pal: std::sync::Arc<Vec<u8>>,
+    pub v_pal: std::sync::Arc<Vec<u8>>,
+    pub k_scale: std::sync::Arc<Vec<f32>>,
+    pub v_scale: std::sync::Arc<Vec<f32>>,
+    pub offset: u16,
+    pub usage: u32,
+}
+
 impl ChunkedKvBacking {
     /// Read the raw bytes of one chunk slot into `dst`. Works for both
     /// `Arena::Float` (any supported dtype) and `Arena::Quantized`
@@ -1233,6 +1255,118 @@ impl ChunkedKvBacking {
         Ok(gids)
     }
 
+    /// Bulk variant of [`Self::alloc_sealed_block`] + [`Self::set_block_window`]
+    /// that does all the per-block work for one layer under a **single**
+    /// per-layer `state.write()` critical section.
+    ///
+    /// Per the legacy path, each block paid:
+    ///   - 1 `state.write()` for the `alloc_chunk_for_key` loop,
+    ///   - 1 `state.write()` for `set_block_gids_sharded_and_update_gpu`,
+    ///   - 1 `state.write()` for `set_block_window`,
+    ///   - 1 `resolve_arena_info` call (CPU walk over arenas).
+    ///
+    /// For a Qwen3-30B-A3B turn (~1500 blocks × 48 layers) that was
+    /// ~216 000 lock acquisitions and ~72 000 arena-info walks. The bulk
+    /// call collapses all of them to 1 acquisition + 1 arena-info walk
+    /// per layer (48 each per turn).
+    ///
+    /// All blocks must satisfy the same per-sub-band shape constraint as
+    /// `alloc_sealed_block` (`k_formats.len() == v_formats.len() ==
+    /// n_kv_head × N_PALETTE`). Block indices need not be contiguous
+    /// but must each be `< max_blocks` after the upfront grow.
+    ///
+    /// On error, the lock guard drops and any partial allocations remain
+    /// in place — the caller is expected to `free_sequence` the slot to
+    /// recycle them.
+    pub fn alloc_sealed_blocks_bulk(
+        &self,
+        batch_idx: usize,
+        specs: &[BlockAllocSpec],
+    ) -> Result<Vec<HeadGids>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        let want = n_kv_head * N_PALETTE;
+        for spec in specs {
+            if spec.k_formats.len() != want || spec.v_formats.len() != want {
+                candle::bail!(
+                    "alloc_sealed_blocks_bulk: expected {want} per-sub-band formats, \
+                     got k={} v={} (block {})",
+                    spec.k_formats.len(),
+                    spec.v_formats.len(),
+                    spec.block_idx
+                );
+            }
+        }
+        let location = self.inner.storage.default_location();
+
+        // Up-front grow: ensure the block table + sequence slot have
+        // room for every block_idx we'll touch. Done before the
+        // critical section so `ensure_max_blocks` / `ensure_for_offset`
+        // (which take their own locks internally) don't contend with us.
+        let max_block_idx = specs
+            .iter()
+            .map(|s| s.block_idx)
+            .max()
+            .expect("specs is non-empty");
+        self.ensure_max_blocks(max_block_idx + 1)?;
+        self.ensure_for_offset(batch_idx, 0, (max_block_idx + 1) * CHUNK_SIZE)?;
+
+        // Resolve arena_info once for all per-block GPU chunk updates.
+        let arena_info = self.resolve_arena_info()?;
+
+        // Single critical section covering: pool allocs, block_gid
+        // registration, GPU chunk metadata update, and window stamping.
+        let mut hgids_per_block: Vec<HeadGids> = Vec::with_capacity(specs.len());
+        {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+
+            for spec in specs {
+                // Allocate this block's per-(head, palette, K|V) chunks.
+                let mut gid_vec: Vec<super::gid_pool::ChunkGid> =
+                    Vec::with_capacity(GIDS_PER_HEAD * n_kv_head);
+                for h in 0..n_kv_head {
+                    for p in 0..N_PALETTE {
+                        let sub = h * N_PALETTE + p;
+                        let k_gid = self
+                            .alloc_chunk_for_key(ArenaKey::uniform(spec.k_formats[sub], location))?;
+                        let v_gid = self
+                            .alloc_chunk_for_key(ArenaKey::uniform(spec.v_formats[sub], location))?;
+                        gid_vec.push(k_gid);
+                        gid_vec.push(v_gid);
+                    }
+                }
+                let gids = HeadGids::from_vec(gid_vec);
+
+                // Register on the block table + refresh the GPU slot
+                // metadata + stamp the window — all under the same
+                // already-held write lock.
+                if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
+                    slot.set_block_gids(
+                        spec.block_idx,
+                        gids.clone(),
+                        std::sync::Arc::clone(&spec.k_pal),
+                        std::sync::Arc::clone(&spec.v_pal),
+                        std::sync::Arc::clone(&spec.k_scale),
+                        std::sync::Arc::clone(&spec.v_scale),
+                    );
+                    slot.update_gpu_chunk(spec.block_idx, n_kv_head, head_dim, &arena_info)?;
+                    if let Some(cw) = slot.chunk_at_mut(spec.block_idx) {
+                        cw.offset = spec.offset;
+                        cw.usage = spec.usage;
+                    }
+                }
+                hgids_per_block.push(gids);
+            }
+        }
+        Ok(hgids_per_block)
+    }
+
     /// Walk a [`HeadGids`] and produce the per-`(head, palette)` K/V
     /// format pair — `(k_formats, v_formats)`, each `n_kv_head × N_PALETTE`
     /// entries in `[h*N_PALETTE + p]` order.
@@ -1607,12 +1741,20 @@ impl ChunkedKvBacking {
         }
 
         // ── Ensure pinned scratch capacity ──────────────────────────────
+        // **No** `CU_MEMHOSTALLOC_WRITECOMBINED`: this buffer's access
+        // pattern is GPU-DtoH-write then **CPU-read** (Phase 4 copies
+        // bytes out into the CPU arenas). WC's coalescing helps CPU
+        // *writes*; CPU *reads* of WC pages are uncached and slow.
+        // The buffer also sees no kernel-I/O fast/slow path issue here,
+        // but the cold-load symmetric path uses the same `_default`
+        // variant for the same reason — keep the staging buffers'
+        // attributes matched to their access pattern.
         let need_grow = pinned_scratch
             .as_ref()
             .map(|b| b.len() < total_bytes)
             .unwrap_or(true);
         if need_grow {
-            *pinned_scratch = Some(match PinnedBuf::alloc_owned(total_bytes) {
+            *pinned_scratch = Some(match PinnedBuf::alloc_owned_default(total_bytes) {
                 Ok(b) => b,
                 Err(_) => PinnedBuf::Host {
                     data: vec![0u8; total_bytes],

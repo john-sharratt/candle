@@ -22,7 +22,6 @@
 //! in `transfer.rs` — `candle-conversation` is CUDA-only so there is no
 //! non-CUDA half.
 
-use super::manifest::ChunkLoc;
 use super::record::{ChunkPayload, RecordType};
 use super::streams::{StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
@@ -406,22 +405,31 @@ pub fn recover_turn(
     let stream_id = super::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
     let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
 
-    // Snapshot the chunk locations from the manifest (so the immutable
-    // borrow ends before the `&mut` reads below).
-    let locs: Vec<(u64, ChunkLoc)> = p
+    // Snapshot per-chunk token_count from the manifest before the &mut
+    // read below — we need it to assemble `ChunkImage`s once the
+    // batched read returns. The chunk index → token_count map is
+    // small (one u64 per chunk), so cloning is cheap.
+    use std::collections::HashMap;
+    let token_counts: HashMap<u64, u64> = p
         .manifest()
         .streams
         .get(&stream_id)
-        .map(|s| s.chunks.iter().map(|(&i, &l)| (i, l)).collect())
+        .map(|s| s.chunks.iter().map(|(&i, l)| (i, l.token_count)).collect())
         .unwrap_or_default();
 
-    let mut flat: Vec<(u64, ChunkImage)> = Vec::with_capacity(locs.len());
-    for (idx, loc) in locs {
-        let payload = p.read_chunk(stream_id, idx)?;
+    // Stripe-coalesced batched read — one syscall per stripe across
+    // active + inherited logs. For a freshly-persisted turn the
+    // records are contiguous on disk → ~1 syscall covers all of them.
+    let mut buf: Vec<u8> = Vec::new();
+    let chunks_with_payload = p.read_stream_chunks_batched(stream_id, &mut buf)?;
+
+    let mut flat: Vec<(u64, ChunkImage)> = Vec::with_capacity(chunks_with_payload.len());
+    for (idx, payload) in chunks_with_payload {
+        let token_count = token_counts.get(&idx).copied().unwrap_or(0) as u16;
         flat.push((
             idx,
             ChunkImage {
-                token_count: loc.token_count as u16,
+                token_count,
                 payload,
             },
         ));
@@ -530,7 +538,10 @@ pub fn recover_turn_cold_refs(
     let stored: Vec<StoredSequence> = per_layer
         .into_iter()
         .zip(tokens_per_layer)
-        .map(|(chunks, token_count)| StoredSequence { chunks, token_count })
+        .map(|(chunks, token_count)| StoredSequence {
+            chunks,
+            token_count,
+        })
         .collect();
     Ok(Some(stored))
 }

@@ -29,10 +29,11 @@ pub struct RecordLoc {
     pub offset: u64,
     pub payload_len: u64,
     /// Padded on-disk size of the record (header + payload + sector
-    /// padding). Captured at write time; with the NDJSON header
-    /// framing the padded size depends on the header's serialized
-    /// length and can't be recomputed from `payload_len` alone.
-    #[serde(default)]
+    /// padding). Captured at write time and at walk-time; with the
+    /// NDJSON header framing the padded size depends on the header's
+    /// serialized length and can't be recomputed from `payload_len`
+    /// alone. Always populated — load-bearing for the batched cold-read
+    /// path (one read per stripe, sized exactly from the manifest).
     pub record_size: u64,
 }
 
@@ -42,7 +43,6 @@ pub struct ChunkLoc {
     pub offset: u64,
     pub payload_len: u64,
     /// Padded on-disk size of the record — see [`RecordLoc::record_size`].
-    #[serde(default)]
     pub record_size: u64,
     pub token_count: u64,
     pub format: u8,

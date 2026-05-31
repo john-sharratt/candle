@@ -227,7 +227,8 @@ mod tests {
     #[test]
     fn stream_decl_ignores_unknown_field() {
         // A Turn with an extra `future_field`. serde drops unknown keys.
-        let payload = br#"{"kind":"turn","timeline_id":1,"turn_index":0,"role":1,"future_field":"opaque"}"#;
+        let payload =
+            br#"{"kind":"turn","timeline_id":1,"turn_index":0,"role":1,"future_field":"opaque"}"#;
         let decoded = StreamDecl::decode(payload).unwrap();
         match decoded {
             StreamDecl::Turn(t) => {
