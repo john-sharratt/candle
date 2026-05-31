@@ -247,7 +247,14 @@ fn empty_builder_projection_has_no_turns() {
     let conv = b.id_for_group("conversation").unwrap();
     let resolver = MockResolver::new();
 
-    let proj = b.project(ProjectionTarget { layer: dialogue, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert!(proj.turns.is_empty());
 }
 
@@ -258,7 +265,14 @@ fn system_prompt_sections_always_emitted() {
     let conv = b.id_for_group("conversation").unwrap();
     let resolver = MockResolver::new();
 
-    let proj = b.project(ProjectionTarget { layer: dialogue, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.system_prompt.len(), 2);
 }
 
@@ -273,7 +287,14 @@ fn turns_appear_after_append() {
     resolver.append(conv);
     resolver.append(conv);
 
-    let proj = b.project(ProjectionTarget { layer: dialogue, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.turns.len(), 3);
 }
 
@@ -292,7 +313,14 @@ fn lower_layers_visible_for_dialogue_target() {
     resolver.append(facts);
     resolver.append(conv);
 
-    let proj = b.project(ProjectionTarget { layer: dialogue, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let groups: Vec<GroupId> = groups_in_order(&proj.turns);
     assert!(groups.contains(&facts), "ground/facts should be visible");
@@ -311,10 +339,20 @@ fn higher_layer_not_visible_for_lower_target() {
     resolver.append(facts);
     resolver.append(conv); // conv is in dialogue (higher layer)
 
-    let proj = b.project(ProjectionTarget { layer: ground, group: facts, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: ground,
+            group: facts,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let groups: Vec<GroupId> = groups_in_order(&proj.turns);
-    assert!(!groups.contains(&conv), "dialogue group must NOT be visible from ground target");
+    assert!(
+        !groups.contains(&conv),
+        "dialogue group must NOT be visible from ground target"
+    );
 }
 
 #[test]
@@ -343,11 +381,21 @@ layers:
     resolver.append(g1);
     resolver.append(g2);
 
-    let proj = b.project(ProjectionTarget { layer: layer_a, group: g1, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: layer_a,
+            group: g1,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let groups = groups_in_order(&proj.turns);
     assert!(groups.contains(&g1));
-    assert!(!groups.contains(&g2), "sibling group_a2 must not be visible");
+    assert!(
+        !groups.contains(&g2),
+        "sibling group_a2 must not be visible"
+    );
 }
 
 // ── Score threshold ───────────────────────────────────────────────────────────
@@ -381,10 +429,20 @@ layers:
         .with_score(grp, i1, 0.3) // below threshold
         .with_score(grp, i2, 0.7);
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
     assert!(indices.contains(&0));
-    assert!(!indices.contains(&1), "turn with score 0.3 should be filtered");
+    assert!(
+        !indices.contains(&1),
+        "turn with score 0.3 should be filtered"
+    );
     assert!(indices.contains(&2));
 }
 
@@ -427,12 +485,21 @@ layers:
     let mut resolver = MockResolver::new();
     let i0 = resolver.append(low_grp); // low score → group score < 0.8
     resolver.append(high_grp);
-    let resolver = resolver
-        .with_score(low_grp, i0, 0.3); // group score = 0.3 < 0.8 threshold → entire group dropped
+    let resolver = resolver.with_score(low_grp, i0, 0.3); // group score = 0.3 < 0.8 threshold → entire group dropped
 
-    let proj = b.project(ProjectionTarget { layer: high_layer, group: high_grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: high_layer,
+            group: high_grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let groups = groups_in_order(&proj.turns);
-    assert!(!groups.contains(&low_grp), "low_grp should be dropped by layer threshold");
+    assert!(
+        !groups.contains(&low_grp),
+        "low_grp should be dropped by layer threshold"
+    );
     assert!(groups.contains(&high_grp));
     let _ = low_layer;
 }
@@ -469,7 +536,14 @@ layers:
         .with_score(grp, i2, 0.7)
         .with_score(grp, i3, 0.1);
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     // top-2: i0 (0.9) and i2 (0.7), emitted in insertion order
     assert_eq!(proj.turns.len(), 2);
     assert_eq!(proj.turns[0].index().0, 0);
@@ -504,7 +578,14 @@ layers:
         .with_score(grp, i1, 0.9) // winner
         .with_score(grp, i2, 0.6);
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.turns.len(), 1);
     assert_eq!(proj.turns[0].index().0, 1);
 }
@@ -538,7 +619,14 @@ layers:
         .with_score(grp, i1, 0.1) // below threshold
         .with_score(grp, i2, 0.5);
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.turns.len(), 2);
     let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
     assert_eq!(indices, vec![0, 2]);
@@ -581,7 +669,14 @@ layers:
         .with_score(conv, idxs[4], 0.0) // recent, inviolate
         .with_score(conv, idxs[5], 0.0); // recent, inviolate
 
-    let proj = b.project(ProjectionTarget { layer, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
 
     // Expected: i0 (historical top-1), i3, i4, i5 (inviolate), in insertion order.
@@ -630,7 +725,14 @@ layers:
         .with_score(grp, i1, 0.5)
         .with_score(grp, i2, 0.1); // lowest-scored gets dropped
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.turns.len(), 2);
     let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
     assert!(indices.contains(&0));
@@ -664,7 +766,14 @@ layers:
         .with_tokens(grp, i0, 5000)
         .with_score(grp, i0, 0.99);
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert!(
         proj.turns.is_empty(),
         "oversized single turn should be dropped"
@@ -697,7 +806,14 @@ layers:
         resolver.append(grp);
     }
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
     for w in indices.windows(2) {
         assert!(w[0] < w[1], "turns must be in insertion order");
@@ -748,10 +864,21 @@ layers:
         .with_score(high_grp, hi0, 0.9)
         .with_default_score(0.5);
 
-    let proj = b.project(ProjectionTarget { layer: target_layer, group: target_grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: target_layer,
+            group: target_grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let order = groups_in_order(&proj.turns);
     // data_layer groups should both appear. high_grp (score 0.9) must be last within data_layer.
-    let data_order: Vec<GroupId> = order.iter().copied().filter(|&g| g == low_grp || g == high_grp).collect();
+    let data_order: Vec<GroupId> = order
+        .iter()
+        .copied()
+        .filter(|&g| g == low_grp || g == high_grp)
+        .collect();
     assert_eq!(data_order.len(), 2);
     assert_eq!(data_order[1], high_grp, "higher-scored group must be last");
 }
@@ -844,7 +971,11 @@ fn multi_layer_full_masking() {
 
     // Target: dialogue/primary_conversation → all lower layers and target group visible.
     let proj = b.project(
-        ProjectionTarget { layer: dialogue, group: pc, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: pc,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
 
@@ -853,7 +984,10 @@ fn multi_layer_full_masking() {
     assert!(groups.contains(&ss), "structure_specialist must be visible");
     assert!(groups.contains(&am), "active_mission must be visible");
     assert!(groups.contains(&gp), "goal_pressure must be visible");
-    assert!(groups.contains(&pc), "primary_conversation (target) must be visible");
+    assert!(
+        groups.contains(&pc),
+        "primary_conversation (target) must be visible"
+    );
 }
 
 #[test]
@@ -879,15 +1013,25 @@ fn multi_layer_motivational_target_hides_dialogue() {
 
     // Target: motivational/active_mission
     let proj = b.project(
-        ProjectionTarget { layer: motivational, group: am, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: motivational,
+            group: am,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
 
     let groups = groups_in_order(&proj.turns);
     assert!(groups.contains(&ts));
     assert!(groups.contains(&am)); // target
-    assert!(!groups.contains(&gp), "sibling goal_pressure must NOT be visible");
-    assert!(!groups.contains(&pc), "dialogue must NOT be visible from motivational");
+    assert!(
+        !groups.contains(&gp),
+        "sibling goal_pressure must NOT be visible"
+    );
+    assert!(
+        !groups.contains(&pc),
+        "dialogue must NOT be visible from motivational"
+    );
 }
 
 #[test]
@@ -907,15 +1051,19 @@ fn multi_layer_ground_target_sees_only_ground() {
     let resolver = resolver.with_score(ts, ts_i, 0.9);
 
     let proj = b.project(
-        ProjectionTarget { layer: perceptual, group: ts, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: perceptual,
+            group: ts,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
 
     let groups = groups_in_order(&proj.turns);
     assert!(groups.contains(&ts));
-    assert!(!groups.contains(&ss));  // sibling, masked
-    assert!(!groups.contains(&am));  // higher layer
-    assert!(!groups.contains(&pc));  // higher layer
+    assert!(!groups.contains(&ss)); // sibling, masked
+    assert!(!groups.contains(&am)); // higher layer
+    assert!(!groups.contains(&pc)); // higher layer
 }
 
 // ── System prompt emission ────────────────────────────────────────────────────
@@ -944,7 +1092,14 @@ layers:
     let big = b.id_for_section_in(layer, "big").unwrap();
 
     let resolver = MockResolver::new();
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let section_ids: Vec<u32> = proj.system_prompt.iter().map(|s| s.id.raw()).collect();
     assert_eq!(section_ids, vec![small.raw(), big.raw()]);
 }
@@ -959,7 +1114,14 @@ fn system_prompt_sections_in_declaration_order() {
     let guidance = b.id_for_section_in(dialogue, "guidance").unwrap();
 
     let resolver = MockResolver::new();
-    let proj = b.project(ProjectionTarget { layer: dialogue, group: pc, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: pc,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.system_prompt.len(), 3);
     assert_eq!(proj.system_prompt[0].id, frame);
     assert_eq!(proj.system_prompt[1].id, values);
@@ -1262,9 +1424,20 @@ layers:
         .with_score(grp_high, hi1, 0.5)
         .with_default_score(0.5);
 
-    let proj = b.project(ProjectionTarget { layer: upper_layer, group: upper_grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: upper_layer,
+            group: upper_grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let order = groups_in_order(&proj.turns);
-    let data_order: Vec<GroupId> = order.iter().copied().filter(|&g| g == grp_low || g == grp_high).collect();
+    let data_order: Vec<GroupId> = order
+        .iter()
+        .copied()
+        .filter(|&g| g == grp_low || g == grp_high)
+        .collect();
     assert_eq!(data_order.last().copied(), Some(grp_high));
 }
 
@@ -1303,13 +1476,30 @@ layers:
 
     let mut resolver = MockResolver::new().with_default_score(0.9);
     resolver.append(small); // count = 1
-    for _ in 0..5 { resolver.append(large); } // count = 5
+    for _ in 0..5 {
+        resolver.append(large);
+    } // count = 5
     resolver.append(upper_grp);
 
-    let proj = b.project(ProjectionTarget { layer: upper_layer, group: upper_grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer: upper_layer,
+            group: upper_grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     let order = groups_in_order(&proj.turns);
-    let data_order: Vec<GroupId> = order.iter().copied().filter(|&g| g == small || g == large).collect();
-    assert_eq!(data_order.last().copied(), Some(large), "large group (count=5) should emit last");
+    let data_order: Vec<GroupId> = order
+        .iter()
+        .copied()
+        .filter(|&g| g == small || g == large)
+        .collect();
+    assert_eq!(
+        data_order.last().copied(),
+        Some(large),
+        "large group (count=5) should emit last"
+    );
 }
 
 // ── Budget redistribution ─────────────────────────────────────────────────────
@@ -1348,24 +1538,34 @@ layers:
     let sparse_grp = b.id_for_group("sparse_grp").unwrap();
     let dense_grp = b.id_for_group("dense_grp").unwrap();
 
-    let mut resolver = MockResolver::new()
-        .with_default_tokens(100)
-        .with_tokens(sparse_grp, TurnIndex(0), 10);
+    let mut resolver =
+        MockResolver::new()
+            .with_default_tokens(100)
+            .with_tokens(sparse_grp, TurnIndex(0), 10);
 
     // sparse: 1 turn × 10 tokens = 10 (far less than its ~4750 share).
     resolver.append(sparse_grp);
     // dense: 20 turns × 100 tokens = 2000.
-    for _ in 0..20 { resolver.append(dense_grp); }
+    for _ in 0..20 {
+        resolver.append(dense_grp);
+    }
 
     let proj = b.project(
-        ProjectionTarget { layer: dense_layer, group: dense_grp, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dense_layer,
+            group: dense_grp,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
 
     // With redistribution, dense should get more than half of 9500 tokens
     // and include all 20 turns (20 * 100 = 2000 ≤ 9500).
     let dense_count = group_turn_count(&proj.turns, dense_grp);
-    assert_eq!(dense_count, 20, "freed budget from sparse should let dense include all 20 turns");
+    assert_eq!(
+        dense_count, 20,
+        "freed budget from sparse should let dense include all 20 turns"
+    );
 }
 
 // ── Edge cases ────────────────────────────────────────────────────────────────
@@ -1404,9 +1604,18 @@ layers:
 
     // Only append to full_grp; empty_grp gets nothing.
     let mut resolver = MockResolver::new().with_default_tokens(100);
-    for _ in 0..5 { resolver.append(full_grp); }
+    for _ in 0..5 {
+        resolver.append(full_grp);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: full_grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: full_grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let full_count = group_turn_count(&proj.turns, full_grp);
     assert_eq!(full_count, 5, "full_grp should have all 5 turns");
@@ -1433,9 +1642,18 @@ layers:
     let grp = b.id_for_group("grp").unwrap();
 
     let mut resolver = MockResolver::new().with_default_score(0.1);
-    for _ in 0..5 { resolver.append(grp); }
+    for _ in 0..5 {
+        resolver.append(grp);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert!(proj.turns.is_empty());
 }
 
@@ -1460,9 +1678,18 @@ layers:
 
     // 100 turns × 100 tokens each = 10000, far exceeds 4500 budget.
     let mut resolver = MockResolver::new().with_default_tokens(100);
-    for _ in 0..100 { resolver.append(grp); }
+    for _ in 0..100 {
+        resolver.append(grp);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let total_tokens: usize = proj
         .turns
@@ -1501,10 +1728,21 @@ layers:
 
     // Seed both with enough turns to consume the budget.
     let mut resolver = MockResolver::new().with_default_tokens(100);
-    for _ in 0..50 { resolver.append(priority_grp); }
-    for _ in 0..50 { resolver.append(other_grp); }
+    for _ in 0..50 {
+        resolver.append(priority_grp);
+    }
+    for _ in 0..50 {
+        resolver.append(other_grp);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: priority_grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: priority_grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let priority_count = group_turn_count(&proj.turns, priority_grp);
     let other_count = group_turn_count(&proj.turns, other_grp);
@@ -1558,7 +1796,14 @@ layers:
         .with_score(grp2, g2i0, 0.8)
         .with_score(grp2, g2i1, 0.7);
 
-    let proj = b.project(ProjectionTarget { layer, group: grp1, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp1,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     // grp2 has higher top-2-mean → should be emitted last.
     let order = groups_in_order(&proj.turns);
     if order.len() == 2 {
@@ -1591,10 +1836,21 @@ layers:
     let other = b.id_for_group("other_grp").unwrap();
 
     let mut resolver = MockResolver::new().with_default_tokens(100);
-    for _ in 0..100 { resolver.append(capped); }
-    for _ in 0..100 { resolver.append(other); }
+    for _ in 0..100 {
+        resolver.append(capped);
+    }
+    for _ in 0..100 {
+        resolver.append(other);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: capped, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: capped,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     let capped_tokens: usize = proj
         .turns
@@ -1633,9 +1889,18 @@ layers:
     let conv = b.id_for_group("conv").unwrap();
 
     let mut resolver = MockResolver::new().with_default_score(0.9);
-    for _ in 0..6 { resolver.append(conv); }
+    for _ in 0..6 {
+        resolver.append(conv);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
 
     // Only last 3 should appear.
     assert_eq!(proj.turns.len(), 3);
@@ -1676,7 +1941,14 @@ layers:
         .with_score(conv, i2, 0.7)
         .with_score(conv, i3, 0.2);
 
-    let proj = b.project(ProjectionTarget { layer, group: conv, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: conv,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.turns.len(), 2);
     let indices: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
     // top-2 historical: i0 (0.9) and i2 (0.7), insertion order
@@ -1717,10 +1989,7 @@ layers:
         selection: { kind: always_visible }
 "#;
     let err = Builder::from_yaml(yaml).unwrap_err();
-    assert!(matches!(
-        err,
-        super::error::ConstructionError::YamlParse(_)
-    ));
+    assert!(matches!(err, super::error::ConstructionError::YamlParse(_)));
 }
 
 #[test]
@@ -1815,11 +2084,8 @@ layers:
 
 #[test]
 fn substitution_replaces_placeholders() {
-    let b = Builder::from_yaml_with_vars(
-        SUBST_YAML,
-        &[("name", "Alice"), ("project", "Candle")],
-    )
-    .unwrap();
+    let b = Builder::from_yaml_with_vars(SUBST_YAML, &[("name", "Alice"), ("project", "Candle")])
+        .unwrap();
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let frame = b.id_for_section_in(dialogue, "frame").unwrap();
     let section = b.section(frame).unwrap();
@@ -1882,7 +2148,10 @@ layers:
     let dialogue = b.id_for_layer("dialogue").unwrap();
     let frame = b.id_for_section_in(dialogue, "frame").unwrap();
     let section = b.section(frame).unwrap();
-    assert_eq!(section.content, r#"Example JSON: {"tool": "search", "args": {}}"#);
+    assert_eq!(
+        section.content,
+        r#"Example JSON: {"tool": "search", "args": {}}"#
+    );
 }
 
 #[test]
@@ -1970,9 +2239,18 @@ layers:
     let grp = b.id_for_group("grp").unwrap();
 
     let mut resolver = MockResolver::new();
-    for _ in 0..5 { resolver.append(grp); }
+    for _ in 0..5 {
+        resolver.append(grp);
+    }
 
-    let proj = b.project(ProjectionTarget { layer, group: grp, timeline: TimelineId::for_test(1) }, &resolver);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
     assert_eq!(proj.turns.len(), 5, "default selection includes all turns");
 }
 
@@ -2122,9 +2400,11 @@ layers:
 
 #[test]
 fn session_resolver_picks_correct_metric_per_score_formula() {
-    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
     use super::schema::{DepthWeights, ScoreFormula};
     use super::ContentResolver;
+    use crate::substrate::{
+        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
+    };
 
     let mut r = Substrate::new();
     let yaml = r#"
@@ -2149,9 +2429,33 @@ layers:
         g,
         idx,
         PerDepthScores {
-            syn: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
-            sem: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
-            prag: TurnScores { max: 1.0, sum: 2.0, mean: 3.0, top_k_mean: 4.0, count: 5.0, span: 0.0, pertok_excess: 0.0 },
+            syn: TurnScores {
+                max: 1.0,
+                sum: 2.0,
+                mean: 3.0,
+                top_k_mean: 4.0,
+                count: 5.0,
+                span: 0.0,
+                pertok_excess: 0.0,
+            },
+            sem: TurnScores {
+                max: 1.0,
+                sum: 2.0,
+                mean: 3.0,
+                top_k_mean: 4.0,
+                count: 5.0,
+                span: 0.0,
+                pertok_excess: 0.0,
+            },
+            prag: TurnScores {
+                max: 1.0,
+                sum: 2.0,
+                mean: 3.0,
+                top_k_mean: 4.0,
+                count: 5.0,
+                span: 0.0,
+                pertok_excess: 0.0,
+            },
         },
     );
     let r = ScoredSubstrate::new(&r, &scores);
@@ -2160,15 +2464,20 @@ layers:
     assert_eq!(r.turn_score(g, idx, ScoreFormula::Max, &w), 1.0);
     assert_eq!(r.turn_score(g, idx, ScoreFormula::Sum, &w), 2.0);
     assert_eq!(r.turn_score(g, idx, ScoreFormula::Mean, &w), 3.0);
-    assert_eq!(r.turn_score(g, idx, ScoreFormula::TopKMean { k: 8 }, &w), 4.0);
+    assert_eq!(
+        r.turn_score(g, idx, ScoreFormula::TopKMean { k: 8 }, &w),
+        4.0
+    );
     assert_eq!(r.turn_score(g, idx, ScoreFormula::Count, &w), 5.0);
 }
 
 #[test]
 fn session_resolver_combines_depths_with_weights() {
-    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
     use super::schema::{DepthWeights, ScoreFormula};
     use super::ContentResolver;
+    use crate::substrate::{
+        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
+    };
 
     let yaml = r#"
 layers:
@@ -2195,15 +2504,28 @@ layers:
         g,
         idx,
         PerDepthScores {
-            syn: TurnScores { max: 10.0, ..Default::default() },
-            sem: TurnScores { max: 50.0, ..Default::default() },
-            prag: TurnScores { max: 100.0, ..Default::default() },
+            syn: TurnScores {
+                max: 10.0,
+                ..Default::default()
+            },
+            sem: TurnScores {
+                max: 50.0,
+                ..Default::default()
+            },
+            prag: TurnScores {
+                max: 100.0,
+                ..Default::default()
+            },
         },
     );
     let r = ScoredSubstrate::new(&r, &scores);
 
     // Equal weights: (10 + 50 + 100) / 3 = 53.333...
-    let equal = DepthWeights { syntactic: 1.0, semantic: 1.0, pragmatic: 1.0 };
+    let equal = DepthWeights {
+        syntactic: 1.0,
+        semantic: 1.0,
+        pragmatic: 1.0,
+    };
     let s = r.turn_score(g, idx, ScoreFormula::Max, &equal);
     assert!((s - 53.333_33).abs() < 1e-3);
 
@@ -2226,7 +2548,9 @@ layers:
 
 #[test]
 fn projection_uses_bdp_scores_to_pick_top_k() {
-    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
+    use crate::substrate::{
+        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
+    };
 
     // Five turns, top_k=2 by score.  Without BDP scores all are tied; we
     // set distinct max values to force a stable ordering.
@@ -2258,15 +2582,31 @@ layers:
             g,
             idx,
             PerDepthScores {
-                syn: TurnScores { span: s, ..Default::default() },
-                sem: TurnScores { span: s, ..Default::default() },
-                prag: TurnScores { span: s, ..Default::default() },
+                syn: TurnScores {
+                    span: s,
+                    ..Default::default()
+                },
+                sem: TurnScores {
+                    span: s,
+                    ..Default::default()
+                },
+                prag: TurnScores {
+                    span: s,
+                    ..Default::default()
+                },
             },
         );
     }
     let r = ScoredSubstrate::new(&r, &bdp_scores);
 
-    let proj = b.project(ProjectionTarget { layer, group: g, timeline: TimelineId::for_test(1) }, &r);
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: g,
+            timeline: TimelineId::for_test(1),
+        },
+        &r,
+    );
     let picked: Vec<u32> = proj.turns.iter().map(|t| t.index().0).collect();
     // The top-2 by max score are idx 4 (100.0) and idx 2 (50.0); they emit
     // in insertion order regardless of selection order.
@@ -2275,7 +2615,9 @@ layers:
 
 #[test]
 fn projection_per_layer_depth_weights_alter_ranking() {
-    use crate::substrate::{PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores};
+    use crate::substrate::{
+        PerDepthScores, ProjectionScores, ScoredSubstrate, Substrate, TurnScores,
+    };
 
     // Two turns; turn A has high syn but low prag, turn B has low syn but
     // high prag.  By tilting depth_weights toward one or the other, we
@@ -2315,9 +2657,15 @@ layers:
         g,
         a,
         PerDepthScores {
-            syn: TurnScores { span: 100.0, ..Default::default() },
+            syn: TurnScores {
+                span: 100.0,
+                ..Default::default()
+            },
             sem: TurnScores::default(),
-            prag: TurnScores { span: 1.0, ..Default::default() },
+            prag: TurnScores {
+                span: 1.0,
+                ..Default::default()
+            },
         },
     );
     bdp.set_for_group_test(
@@ -2325,15 +2673,28 @@ layers:
         g,
         bturn,
         PerDepthScores {
-            syn: TurnScores { span: 1.0, ..Default::default() },
+            syn: TurnScores {
+                span: 1.0,
+                ..Default::default()
+            },
             sem: TurnScores::default(),
-            prag: TurnScores { span: 100.0, ..Default::default() },
+            prag: TurnScores {
+                span: 100.0,
+                ..Default::default()
+            },
         },
     );
     let r_view = ScoredSubstrate::new(&r, &bdp);
 
     // Syn-heavy weights: turn A wins.
-    let proj = b_syn.project(ProjectionTarget { layer, group: g, timeline: TimelineId::for_test(1) }, &r_view);
+    let proj = b_syn.project(
+        ProjectionTarget {
+            layer,
+            group: g,
+            timeline: TimelineId::for_test(1),
+        },
+        &r_view,
+    );
     assert_eq!(proj.turns.len(), 1);
     assert_eq!(proj.turns[0].index(), a);
 
@@ -2352,9 +2713,15 @@ layers:
         g2,
         a2,
         PerDepthScores {
-            syn: TurnScores { span: 100.0, ..Default::default() },
+            syn: TurnScores {
+                span: 100.0,
+                ..Default::default()
+            },
             sem: TurnScores::default(),
-            prag: TurnScores { span: 1.0, ..Default::default() },
+            prag: TurnScores {
+                span: 1.0,
+                ..Default::default()
+            },
         },
     );
     bdp2.set_for_group_test(
@@ -2362,13 +2729,26 @@ layers:
         g2,
         b2,
         PerDepthScores {
-            syn: TurnScores { span: 1.0, ..Default::default() },
+            syn: TurnScores {
+                span: 1.0,
+                ..Default::default()
+            },
             sem: TurnScores::default(),
-            prag: TurnScores { span: 100.0, ..Default::default() },
+            prag: TurnScores {
+                span: 100.0,
+                ..Default::default()
+            },
         },
     );
     let r2_view = ScoredSubstrate::new(&r2, &bdp2);
-    let proj = b_prag.project(ProjectionTarget { layer: layer2, group: g2, timeline: TimelineId::for_test(1) }, &r2_view);
+    let proj = b_prag.project(
+        ProjectionTarget {
+            layer: layer2,
+            group: g2,
+            timeline: TimelineId::for_test(1),
+        },
+        &r2_view,
+    );
     assert_eq!(proj.turns.len(), 1);
     assert_eq!(proj.turns[0].index(), b2);
 }
@@ -2442,7 +2822,11 @@ fn flat_sections_yaml_emits_all_in_declaration_order() {
 
     let resolver = MockResolver::new();
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
 
@@ -2509,7 +2893,11 @@ fn collection_top_k_keeps_highest_scored_in_declaration_order() {
         .with_section_score(tool_d, 0.8);
 
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
 
@@ -2540,7 +2928,11 @@ fn collection_top_k_with_priority_tiebreak() {
         .with_section_score(tool_d, 0.5);
 
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
     let tool_ids: Vec<SectionId> = p
@@ -2590,7 +2982,11 @@ fn collection_score_threshold_filters_below_floor() {
         .with_section_score(high, 0.9);
 
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
     let ids: Vec<SectionId> = p.system_prompt.iter().map(|s| s.id).collect();
@@ -2632,7 +3028,11 @@ layers:
         .with_section_score(b.id_for_section_in(dialogue, "c").unwrap(), 0.6);
 
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
     assert_eq!(p.system_prompt.len(), 1);
@@ -2666,10 +3066,18 @@ layers:
 
     let resolver = MockResolver::new();
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
-    assert_eq!(p.system_prompt.len(), 2, "AlwaysVisible collection emits all");
+    assert_eq!(
+        p.system_prompt.len(),
+        2,
+        "AlwaysVisible collection emits all"
+    );
 }
 
 #[test]
@@ -2703,7 +3111,11 @@ layers:
 
     let resolver = MockResolver::new(); // both score 0 by default → tie → priority wins
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
     assert_eq!(p.system_prompt.len(), 1);
@@ -2746,7 +3158,11 @@ layers:
         .with_section_score(b.id_for_section_in(dialogue, "b").unwrap(), 0.2);
 
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
     // Static framing still emits — only the collection drops everything.
@@ -2829,7 +3245,11 @@ fn add_section_to_collection_appends_in_collection() {
         .with_section_score(t3, 0.5);
 
     let p = b.project(
-        ProjectionTarget { layer: dialogue, group: convo, timeline: TimelineId::for_test(1) },
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
         &resolver,
     );
     // Static `alpha`/`beta`/`gamma` from SECTIONS_YAML_FLAT plus the
@@ -2885,4 +3305,245 @@ fn add_section_invalid_priority_fails() {
         result,
         Err(super::error::ConstructionError::InvalidPriority { .. })
     ));
+}
+
+// ── Dialect-template parsing (Phase 1) ────────────────────────────────────────
+//
+// These tests cover the new `kind: template` system-prompt item that
+// references a [`DialectTemplate`] catalog entry by snake-case name. The
+// resolved string lands in a `SectionSchema` with `is_template = true`;
+// downstream behaviour is identical to a `kind: section` item.
+
+mod dialect_templates {
+    use super::*;
+    use crate::projection::builder::Builder;
+    use crate::projection::error::ConstructionError;
+    use crate::projection::schema::SystemPromptItem;
+    use candle_transformers::models::dialect::Dialect;
+
+    const TEMPLATE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: template
+          id: system_open
+          dialect: system_start
+        - kind: section
+          id: frame
+          content: "You are a senior engineer."
+        - kind: template
+          id: system_close
+          dialect: system_end
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+    #[test]
+    fn template_item_resolves_to_dialect_content() {
+        let dlct = Dialect::chat_ml();
+        let b = Builder::from_yaml_with_vars_and_dialect(TEMPLATE_YAML, &[], Some(&dlct)).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let layer = b.layer(dialogue).unwrap();
+
+        let mut found: Vec<(&str, &str, bool)> = Vec::new();
+        for it in &layer.system_prompt.items {
+            if let SystemPromptItem::Section(s) = it {
+                found.push((s.name.as_str(), s.content.as_str(), s.is_template));
+            }
+        }
+        assert_eq!(
+            found,
+            vec![
+                ("system_open", "<|im_start|>system\n", true),
+                ("frame", "You are a senior engineer.", false),
+                ("system_close", "<|im_end|>\n", true),
+            ],
+        );
+    }
+
+    #[test]
+    fn template_without_dialect_errors() {
+        let err = Builder::from_yaml_with_vars_and_dialect(TEMPLATE_YAML, &[], None).unwrap_err();
+        assert!(
+            matches!(err, ConstructionError::DialectRequired { ref item } if item == "dialogue/system_open"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn template_unknown_dialect_name_errors() {
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: template
+          id: bogus
+          dialect: not_a_real_template
+        - kind: section
+          id: frame
+          content: "x"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let err = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConstructionError::UnknownDialectTemplate { ref item, ref name }
+                if item == "dialogue/bogus" && name == "not_a_real_template"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn empty_template_content_is_dropped() {
+        // Llama3 has no `no_think_prefix` (empty string), so a
+        // `kind: template` referencing it must be filtered at build time —
+        // projection never sees an empty section.
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: template
+          id: maybe_no_think
+          dialect: no_think_prefix
+        - kind: section
+          id: frame
+          content: "x"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::llama3();
+        let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let layer = b.layer(dialogue).unwrap();
+        let names: Vec<&str> = layer
+            .system_prompt
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SystemPromptItem::Section(s) => Some(s.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["frame"]);
+        // The dropped template item is also absent from the name map.
+        assert!(b.id_for_section_in(dialogue, "maybe_no_think").is_none());
+    }
+
+    #[test]
+    fn template_depends_on_resolves_to_collection_id() {
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: tools
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 1 }
+          sections:
+            - id: t1
+              content: "tool one"
+        - kind: template
+          id: tools_close
+          dialect: tool_block_close
+          depends_on: tools
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let tools_cid = b.id_for_collection_in(dialogue, "tools").unwrap();
+        let layer = b.layer(dialogue).unwrap();
+
+        let template_deps: Vec<Option<super::super::ids::CollectionId>> = layer
+            .system_prompt
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SystemPromptItem::Section(s) if s.is_template => Some(s.depends_on),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(template_deps, vec![Some(tools_cid), Some(tools_cid)]);
+    }
+
+    #[test]
+    fn template_depends_on_unknown_collection_errors() {
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: nonexistent
+        - kind: section
+          id: frame
+          content: "x"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let err = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap_err();
+        assert!(
+            matches!(err, ConstructionError::UnknownCollection(_)),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn template_id_collision_with_section_errors() {
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: section
+          id: dup
+          content: "x"
+        - kind: template
+          id: dup
+          dialect: system_start
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let err = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap_err();
+        assert!(
+            matches!(err, ConstructionError::DuplicateSectionName(ref n) if n == "dup"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn existing_from_yaml_still_works_without_dialect() {
+        // Schemas with no `kind: template` items must continue to parse via
+        // the dialect-less entry points.
+        let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+        assert!(b.id_for_layer("dialogue").is_some());
+    }
 }

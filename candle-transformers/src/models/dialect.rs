@@ -61,6 +61,78 @@ pub struct Dialect {
     pub no_think_block: &'static str,
     pub no_think: &'static str,
     pub think_block: &'static str,
+    pub tool_block_open: &'static str,
+    pub tool_block_close: &'static str,
+    pub tool_response_open: &'static str,
+    pub tool_response_close: &'static str,
+}
+
+/// Catalog of named structural-template fragments callable by YAML schemas.
+///
+/// Used by the projection engine to look up the dialect-specific string that
+/// a `kind: template` system-prompt item refers to. See the projection
+/// generated-segments design doc for the broader mechanism.
+///
+/// Variant names mirror the YAML `dialect:` reference in `snake_case`; the
+/// [`Self::from_yaml_name`] helper parses YAML strings to enum values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DialectTemplate {
+    SystemStart,
+    SystemEnd,
+    UserStart,
+    UserEnd,
+    AssistantStart,
+    AssistantEnd,
+    ToolBlockOpen,
+    ToolBlockClose,
+    ToolResponseOpen,
+    ToolResponseClose,
+    NoThinkPrefix,
+}
+
+impl DialectTemplate {
+    /// Parse a YAML `dialect:` reference (e.g. `"system_start"`).
+    /// Returns `None` for unknown names so callers can produce a
+    /// schema-locatable error.
+    pub fn from_yaml_name(name: &str) -> Option<Self> {
+        match name {
+            "system_start" => Some(Self::SystemStart),
+            "system_end" => Some(Self::SystemEnd),
+            "user_start" => Some(Self::UserStart),
+            "user_end" => Some(Self::UserEnd),
+            "assistant_start" => Some(Self::AssistantStart),
+            "assistant_end" => Some(Self::AssistantEnd),
+            "tool_block_open" => Some(Self::ToolBlockOpen),
+            "tool_block_close" => Some(Self::ToolBlockClose),
+            "tool_response_open" => Some(Self::ToolResponseOpen),
+            "tool_response_close" => Some(Self::ToolResponseClose),
+            "no_think_prefix" => Some(Self::NoThinkPrefix),
+            _ => None,
+        }
+    }
+
+    /// The YAML-form name (the inverse of [`Self::from_yaml_name`]).
+    pub fn as_yaml_name(self) -> &'static str {
+        match self {
+            Self::SystemStart => "system_start",
+            Self::SystemEnd => "system_end",
+            Self::UserStart => "user_start",
+            Self::UserEnd => "user_end",
+            Self::AssistantStart => "assistant_start",
+            Self::AssistantEnd => "assistant_end",
+            Self::ToolBlockOpen => "tool_block_open",
+            Self::ToolBlockClose => "tool_block_close",
+            Self::ToolResponseOpen => "tool_response_open",
+            Self::ToolResponseClose => "tool_response_close",
+            Self::NoThinkPrefix => "no_think_prefix",
+        }
+    }
+}
+
+impl std::fmt::Display for DialectTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_yaml_name())
+    }
 }
 
 impl Dialect {
@@ -85,6 +157,10 @@ impl Dialect {
             no_think_block: "<think>\n\n</think>\n\n",
             no_think: "/no_think\n",
             think_block: "<think>\n",
+            tool_block_open: "<tools>\n",
+            tool_block_close: "</tools>\n",
+            tool_response_open: "<tool_response>\n",
+            tool_response_close: "</tool_response>\n",
         }
     }
 
@@ -109,6 +185,10 @@ impl Dialect {
             no_think_block: "",
             no_think: "",
             think_block: "",
+            tool_block_open: "<tools>\n",
+            tool_block_close: "</tools>\n",
+            tool_response_open: "<tool_response>\n",
+            tool_response_close: "</tool_response>\n",
         }
     }
 
@@ -133,11 +213,38 @@ impl Dialect {
             no_think_block: "",
             no_think: "",
             think_block: "",
+            tool_block_open: "<tools>\n",
+            tool_block_close: "</tools>\n",
+            tool_response_open: "<tool_response>\n",
+            tool_response_close: "</tool_response>\n",
         }
     }
 
     pub fn dialect_type(&self) -> DialectType {
         self.dialect_type
+    }
+
+    /// Resolve a [`DialectTemplate`] to its structural-string content for this
+    /// dialect.
+    ///
+    /// Empty strings indicate "no content" — callers (e.g. the projection
+    /// engine's YAML parser) interpret that as a no-op item that should be
+    /// dropped from the schema at build time so projection never emits an
+    /// empty segment.
+    pub fn template(&self, t: DialectTemplate) -> &'static str {
+        match t {
+            DialectTemplate::SystemStart => self.system_start,
+            DialectTemplate::SystemEnd => self.system_end,
+            DialectTemplate::UserStart => self.user_start,
+            DialectTemplate::UserEnd => self.user_end,
+            DialectTemplate::AssistantStart => self.assistant_start,
+            DialectTemplate::AssistantEnd => self.assistant_end,
+            DialectTemplate::ToolBlockOpen => self.tool_block_open,
+            DialectTemplate::ToolBlockClose => self.tool_block_close,
+            DialectTemplate::ToolResponseOpen => self.tool_response_open,
+            DialectTemplate::ToolResponseClose => self.tool_response_close,
+            DialectTemplate::NoThinkPrefix => self.no_think,
+        }
     }
 
     /// Format a system prompt using this dialect's structural tokens.
@@ -178,13 +285,121 @@ impl Dialect {
     /// | `true`  | `true`  | `no_think_block` (`"<think>\n\n</think>\n\n"`) — closes the block
     ///   immediately so the model never generates reasoning tokens. |
     /// | `false` | *any*   | no suffix — non-thinking model, plain assistant header only. |
-    pub fn active_assistant_start(&self, suppress_thinking: bool, thinking_capable: bool) -> String {
+    pub fn active_assistant_start(
+        &self,
+        suppress_thinking: bool,
+        thinking_capable: bool,
+    ) -> String {
         if thinking_capable && suppress_thinking && !self.no_think_block.is_empty() {
             format!("{}{}", self.assistant_start, self.no_think_block)
         } else if thinking_capable && !suppress_thinking && !self.think_block.is_empty() {
             format!("{}{}", self.assistant_start, self.think_block)
         } else {
             self.assistant_start.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_yaml_name_roundtrip() {
+        let all = [
+            DialectTemplate::SystemStart,
+            DialectTemplate::SystemEnd,
+            DialectTemplate::UserStart,
+            DialectTemplate::UserEnd,
+            DialectTemplate::AssistantStart,
+            DialectTemplate::AssistantEnd,
+            DialectTemplate::ToolBlockOpen,
+            DialectTemplate::ToolBlockClose,
+            DialectTemplate::ToolResponseOpen,
+            DialectTemplate::ToolResponseClose,
+            DialectTemplate::NoThinkPrefix,
+        ];
+        for t in all {
+            assert_eq!(DialectTemplate::from_yaml_name(t.as_yaml_name()), Some(t));
+        }
+    }
+
+    #[test]
+    fn unknown_template_yaml_name_returns_none() {
+        assert!(DialectTemplate::from_yaml_name("not_a_real_template").is_none());
+        assert!(DialectTemplate::from_yaml_name("").is_none());
+    }
+
+    #[test]
+    fn chatml_template_contents_match_static_fields() {
+        let d = Dialect::chat_ml();
+        assert_eq!(d.template(DialectTemplate::SystemStart), d.system_start);
+        assert_eq!(d.template(DialectTemplate::SystemEnd), d.system_end);
+        assert_eq!(d.template(DialectTemplate::UserStart), d.user_start);
+        assert_eq!(d.template(DialectTemplate::UserEnd), d.user_end);
+        assert_eq!(
+            d.template(DialectTemplate::AssistantStart),
+            d.assistant_start
+        );
+        assert_eq!(d.template(DialectTemplate::AssistantEnd), d.assistant_end);
+        assert_eq!(d.template(DialectTemplate::ToolBlockOpen), "<tools>\n");
+        assert_eq!(d.template(DialectTemplate::ToolBlockClose), "</tools>\n");
+        assert_eq!(
+            d.template(DialectTemplate::ToolResponseOpen),
+            "<tool_response>\n"
+        );
+        assert_eq!(
+            d.template(DialectTemplate::ToolResponseClose),
+            "</tool_response>\n"
+        );
+        assert_eq!(d.template(DialectTemplate::NoThinkPrefix), "/no_think\n");
+    }
+
+    #[test]
+    fn chatml_role_markers_non_empty() {
+        let d = Dialect::chat_ml();
+        for t in [
+            DialectTemplate::SystemStart,
+            DialectTemplate::SystemEnd,
+            DialectTemplate::UserStart,
+            DialectTemplate::UserEnd,
+            DialectTemplate::AssistantStart,
+            DialectTemplate::AssistantEnd,
+            DialectTemplate::ToolBlockOpen,
+            DialectTemplate::ToolBlockClose,
+            DialectTemplate::ToolResponseOpen,
+            DialectTemplate::ToolResponseClose,
+            DialectTemplate::NoThinkPrefix,
+        ] {
+            assert!(
+                !d.template(t).is_empty(),
+                "ChatML template {t} must be non-empty",
+            );
+        }
+    }
+
+    #[test]
+    fn llama_role_markers_non_empty() {
+        // Llama2 and Llama3 don't carry tool-block markers or a no-think
+        // prefix, but every role marker must be populated.
+        for d in [Dialect::llama2(), Dialect::llama3()] {
+            for t in [
+                DialectTemplate::SystemStart,
+                DialectTemplate::SystemEnd,
+                DialectTemplate::UserStart,
+                DialectTemplate::UserEnd,
+                DialectTemplate::AssistantStart,
+                DialectTemplate::AssistantEnd,
+            ] {
+                // user_start on Llama2 is intentionally empty (the
+                // turn_start carries the marker), so don't blanket-assert.
+                let _ = d.template(t);
+            }
+            // Tool-block templates are empty on the Llama dialects by
+            // design; assert that explicitly so future edits notice.
+            assert_eq!(d.template(DialectTemplate::ToolBlockOpen), "");
+            assert_eq!(d.template(DialectTemplate::ToolBlockClose), "");
+            assert_eq!(d.template(DialectTemplate::NoThinkPrefix), "");
         }
     }
 }

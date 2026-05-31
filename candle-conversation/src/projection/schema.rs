@@ -193,6 +193,15 @@ pub struct SectionSchema {
     /// markers (e.g. `<tools>` / `</tools>`) that should only appear
     /// when the collection itself emits anything.
     pub depends_on: Option<CollectionId>,
+    /// Marks this section as resolved from a dialect template (a
+    /// `kind: template` YAML item that referenced a `DialectTemplate`
+    /// catalog entry, e.g. `system_start`).  At Phase 1 of the
+    /// generated-segments rollout this is purely an annotation —
+    /// downstream code ingests, pins and Arc-clones the section
+    /// identically to a `kind: section` item.  Later phases pivot on
+    /// this flag to route template-kind items through live prefill
+    /// rather than the substrate-backed sealed path.
+    pub is_template: bool,
 }
 
 /// Per-layer weighting for the three Binary Directional Provenance depths.
@@ -223,7 +232,7 @@ impl Default for DepthWeights {
         // MRR=0.854, Top-1=81.6% across 640 probes × 64 items (8 layers).
         Self {
             syntactic: 1.0,
-            semantic:  1.0,
+            semantic: 1.0,
             pragmatic: 4.0,
         }
     }
@@ -399,7 +408,10 @@ pub enum SelectionRule {
     ///                   historical          recent
     ///                  (top-K by score)   (inviolate, last `recent`)
     /// ```
-    Sequence { recent: usize, historical_top_k: usize },
+    Sequence {
+        recent: usize,
+        historical_top_k: usize,
+    },
 }
 
 /// How turn scores are aggregated into a single group score.
@@ -424,13 +436,17 @@ pub enum ScoreFormula {
     Max,
     Sum,
     Mean,
-    TopKMean { k: usize },
+    TopKMean {
+        k: usize,
+    },
     Count,
     /// Power-law span scoring: consecutive runs of probe tokens that each find
     /// an above-threshold corpus match score L^α (default α=2.0).  Isolated
     /// hits score 1.0; a run of 3 scores 9.0.  The group-level aggregate
     /// (turn scores → group score) uses Max of per-turn span scores.
-    Span { alpha: f32 },
+    Span {
+        alpha: f32,
+    },
     /// Per-token excess: Σ over probe tokens of `max(0, best_agreement − 64)`.
     /// Recentered on the random XOR-popcount baseline and reduced per probe
     /// token, with no hit threshold.  Calibrated as the strongest

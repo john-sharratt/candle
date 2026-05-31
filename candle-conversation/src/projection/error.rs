@@ -67,9 +67,7 @@ pub enum ConstructionError {
     // ── Construction-time ─────────────────────────────────────────────────────
     /// Sum of declared `min_percent` across siblings exceeds 100. Statically
     /// infeasible — the configured floors cannot all be honoured.
-    #[error(
-        "sum of min_percent for siblings of {parent:?} is {sum:.1}, exceeds 100"
-    )]
+    #[error("sum of min_percent for siblings of {parent:?} is {sum:.1}, exceeds 100")]
     MinPercentExceedsTotal { parent: String, sum: f32 },
 
     /// `max_percent < min_percent` for a single node.
@@ -95,8 +93,10 @@ pub enum ConstructionError {
     /// time. After that the schema is immutable, so a missed substitution
     /// here is the difference between the system-prompt KV cache being
     /// stable across invocations and being silently broken.
-    #[error("unresolved {{{name}}} placeholder in YAML template — \
-             pass it via Builder::from_yaml_with_vars or fix the template")]
+    #[error(
+        "unresolved {{{name}}} placeholder in YAML template — \
+             pass it via Builder::from_yaml_with_vars or fix the template"
+    )]
     UnresolvedVariable { name: String },
 
     /// `top_k` selection had a missing or zero `k`.
@@ -130,4 +130,21 @@ pub enum ConstructionError {
     /// was given a collection id that no layer in the schema owns.
     #[error("unknown collection {0:?}")]
     UnknownCollection(String),
+
+    /// A `kind: template` item referenced a `dialect:` name that
+    /// [`candle_transformers::models::dialect::DialectTemplate::from_yaml_name`]
+    /// could not resolve.
+    #[error("unknown dialect template {name:?} on item {item:?}")]
+    UnknownDialectTemplate { item: String, name: String },
+
+    /// A `kind: template` item appeared in the YAML but no
+    /// [`Dialect`](candle_transformers::models::dialect::Dialect) was
+    /// supplied to the parser. Use
+    /// [`super::Builder::from_yaml_with_vars_and_dialect`] when the
+    /// schema uses template items.
+    #[error(
+        "schema contains `kind: template` item {item:?} but no dialect was \
+         supplied to the parser — use Builder::from_yaml_with_vars_and_dialect"
+    )]
+    DialectRequired { item: String },
 }

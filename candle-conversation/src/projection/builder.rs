@@ -38,12 +38,14 @@
 //!
 //! Anything that survives this is guaranteed to project without errors.
 
+use candle_transformers::models::dialect::Dialect;
+
 use super::error::ConstructionError;
 use super::ids::{GroupId, LayerId, SectionId};
 use super::project::{run, Projection, ProjectionMode, ProjectionTarget};
-use crate::substrate::ContentResolver;
 use super::schema::{GroupSchema, LayerSchema, Schema, SectionSchema};
 use super::yaml::{from_yaml, NameMaps};
+use crate::substrate::ContentResolver;
 
 /// Run all construction-time validation checks against a parsed schema.
 ///
@@ -138,10 +140,7 @@ fn validate_budget_bounds(
 /// Returns `UnresolvedVariable` on the first `{ident}` that has no entry.
 /// Identifier syntax: `[A-Za-z_][A-Za-z0-9_]*`. Other `{...}` patterns
 /// (e.g. JSON-like fragments in content) are left untouched.
-fn substitute_template(
-    template: &str,
-    vars: &[(&str, &str)],
-) -> Result<String, ConstructionError> {
+fn substitute_template(template: &str, vars: &[(&str, &str)]) -> Result<String, ConstructionError> {
     let lookup: std::collections::HashMap<&str, &str> = vars.iter().copied().collect();
     let mut out = String::with_capacity(template.len());
     let bytes = template.as_bytes();
@@ -197,13 +196,16 @@ fn validate_selection(
 ) -> Result<(), ConstructionError> {
     use super::schema::SelectionRule;
     match rule {
-        SelectionRule::TopK { k } if *k == 0 => {
-            Err(ConstructionError::InvalidTopK { name: name.to_string() })
-        }
-        SelectionRule::Sequence { recent, historical_top_k }
-            if *recent == 0 && *historical_top_k == 0 =>
-        {
-            Err(ConstructionError::InvalidConversationK { name: name.to_string() })
+        SelectionRule::TopK { k } if *k == 0 => Err(ConstructionError::InvalidTopK {
+            name: name.to_string(),
+        }),
+        SelectionRule::Sequence {
+            recent,
+            historical_top_k,
+        } if *recent == 0 && *historical_top_k == 0 => {
+            Err(ConstructionError::InvalidConversationK {
+                name: name.to_string(),
+            })
         }
         _ => Ok(()),
     }
@@ -289,8 +291,23 @@ impl Builder {
         yaml_template: &str,
         vars: &[(&str, &str)],
     ) -> Result<Self, ConstructionError> {
+        Self::from_yaml_with_vars_and_dialect(yaml_template, vars, None)
+    }
+
+    /// Full-fat parser: substitutes `{name}` placeholders, parses YAML,
+    /// validates, and resolves any `kind: template` items against `dialect`.
+    ///
+    /// When `dialect` is `None`, any `kind: template` item in the YAML
+    /// produces [`ConstructionError::DialectRequired`]. Use this entry
+    /// point whenever the schema's `items:` list mixes content sections with
+    /// dialect-template references.
+    pub fn from_yaml_with_vars_and_dialect(
+        yaml_template: &str,
+        vars: &[(&str, &str)],
+        dialect: Option<&Dialect>,
+    ) -> Result<Self, ConstructionError> {
         let resolved = substitute_template(yaml_template, vars)?;
-        let (schema, maps) = from_yaml(&resolved)?;
+        let (schema, maps) = from_yaml(&resolved, dialect)?;
         validate(&schema)?;
         Ok(Self {
             schema,
@@ -446,16 +463,16 @@ impl Builder {
         let layer_idx = self.layer_idx(layer)?;
         self.assert_section_name_free(layer_idx, &name)?;
         let new_id = SectionId::new(self.next_section_id_raw());
-        self.schema.layers[layer_idx]
-            .system_prompt
-            .items
-            .push(super::schema::SystemPromptItem::Section(SectionSchema {
+        self.schema.layers[layer_idx].system_prompt.items.push(
+            super::schema::SystemPromptItem::Section(SectionSchema {
                 id: new_id,
                 name: name.clone(),
                 content,
                 priority,
                 depends_on: None,
-            }));
+                is_template: false,
+            }),
+        );
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
     }
@@ -477,7 +494,11 @@ impl Builder {
     ) -> Result<super::ids::CollectionId, ConstructionError> {
         let name: String = name.into();
         let layer_idx = self.layer_idx(layer)?;
-        if self.name_maps.collection_names.contains_key(&(layer, name.clone())) {
+        if self
+            .name_maps
+            .collection_names
+            .contains_key(&(layer, name.clone()))
+        {
             return Err(ConstructionError::DuplicateCollectionName(name));
         }
         if score_threshold < 0.0 {
@@ -534,8 +555,10 @@ impl Builder {
             .system_prompt
             .items
             .iter()
-            .any(|it| matches!(it,
-                super::schema::SystemPromptItem::Collection(c) if c.id == collection));
+            .any(|it| {
+                matches!(it,
+                super::schema::SystemPromptItem::Collection(c) if c.id == collection)
+            });
         if !coll_exists {
             return Err(ConstructionError::UnknownCollection(format!(
                 "CollectionId({:?})",
@@ -560,6 +583,7 @@ impl Builder {
             content,
             priority,
             depends_on: None,
+            is_template: false,
         });
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
@@ -602,6 +626,7 @@ impl Builder {
             content: start_content.into(),
             priority: 100.0,
             depends_on: None,
+            is_template: false,
         });
         self.schema.layers[layer_idx].system_end_section = Some(SectionSchema {
             id: end_id,
@@ -609,6 +634,7 @@ impl Builder {
             content: end_content.into(),
             priority: 100.0,
             depends_on: None,
+            is_template: false,
         });
         self.name_maps
             .section_names
@@ -751,10 +777,7 @@ impl Builder {
     /// YAML schema without colliding.
     ///
     /// [`Reserved`]: super::Reserved
-    pub fn for_plain_prompt_reserved(
-        system_prompt_text: &str,
-        kind: super::ids::Reserved,
-    ) -> Self {
+    pub fn for_plain_prompt_reserved(system_prompt_text: &str, kind: super::ids::Reserved) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
             super::ids::LayerId::reserved(kind),
@@ -774,8 +797,8 @@ impl Builder {
         section_id: super::ids::SectionId,
     ) -> Self {
         use super::schema::{
-            Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionSchema,
-            SelectionRule, SystemPromptSchema,
+            Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionSchema, SelectionRule,
+            SystemPromptSchema,
         };
 
         let schema = Schema {
@@ -785,7 +808,11 @@ impl Builder {
                 description: String::new(),
                 score_threshold: 0.0,
                 window: 32_768,
-                budget: Budget { priority: 100.0, min_percent: None, max_percent: None },
+                budget: Budget {
+                    priority: 100.0,
+                    min_percent: None,
+                    max_percent: None,
+                },
                 system_prompt: SystemPromptSchema {
                     items: vec![super::schema::SystemPromptItem::Section(SectionSchema {
                         id: section_id,
@@ -793,6 +820,7 @@ impl Builder {
                         content: system_prompt_text.to_string(),
                         priority: 50.0,
                         depends_on: None,
+                        is_template: false,
                     })],
                 },
                 groups: vec![GroupSchema {
@@ -800,7 +828,11 @@ impl Builder {
                     name: "primary_conversation".to_string(),
                     selection: SelectionRule::AlwaysVisible,
                     score_threshold: 0.0,
-                    budget: Budget { priority: 100.0, min_percent: None, max_percent: None },
+                    budget: Budget {
+                        priority: 100.0,
+                        min_percent: None,
+                        max_percent: None,
+                    },
                 }],
                 depth_weights: DepthWeights::default(),
                 system_start_section: None,
@@ -812,9 +844,15 @@ impl Builder {
         // Populate name maps so `id_for_layer` / `id_for_group` /
         // `id_for_section_in` work the same as for YAML-derived builders.
         let mut name_maps = super::yaml::NameMaps::default();
-        name_maps.layer_names.insert("dialogue".to_string(), layer_id);
-        name_maps.group_names.insert("primary_conversation".to_string(), group_id);
-        name_maps.section_names.insert((layer_id, "frame".to_string()), section_id);
+        name_maps
+            .layer_names
+            .insert("dialogue".to_string(), layer_id);
+        name_maps
+            .group_names
+            .insert("primary_conversation".to_string(), group_id);
+        name_maps
+            .section_names
+            .insert((layer_id, "frame".to_string()), section_id);
 
         // A synthetic single-section schema, not parsed from YAML.
         Self {
@@ -824,4 +862,3 @@ impl Builder {
         }
     }
 }
-

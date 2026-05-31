@@ -61,13 +61,14 @@
 
 use std::collections::HashMap;
 
+use candle_transformers::models::dialect::{Dialect, DialectTemplate};
 use serde::Deserialize;
 
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::schema::{
-    Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection,
-    SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema,
+    Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema,
+    SelectionRule, SystemPromptItem, SystemPromptSchema,
 };
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
@@ -115,10 +116,17 @@ pub struct NameMaps {
 
 /// Parse a YAML schema string. Runs parse-time validation; returns
 /// `(Schema, NameMaps)` on success.
-pub fn from_yaml(yaml: &str) -> Result<(Schema, NameMaps), ConstructionError> {
+///
+/// When `dialect` is `Some`, `kind: template` items resolve against it.  When
+/// `None`, any `kind: template` item in the YAML produces
+/// [`ConstructionError::DialectRequired`].
+pub fn from_yaml(
+    yaml: &str,
+    dialect: Option<&Dialect>,
+) -> Result<(Schema, NameMaps), ConstructionError> {
     let raw: YamlSchema =
         serde_yaml::from_str(yaml).map_err(|e| ConstructionError::YamlParse(e.to_string()))?;
-    build(raw)
+    build(raw, dialect)
 }
 
 // ── Shadow deserialization types ─────────────────────────────────────────────
@@ -162,6 +170,9 @@ struct YamlSection {
 ///   - kind: section
 ///     id: frame
 ///     content: "..."
+///   - kind: template
+///     id: system_open
+///     dialect: system_start
 ///   - kind: collection
 ///     name: tools
 ///     selection: { kind: top_k, k: 3 }
@@ -181,6 +192,21 @@ enum YamlSystemPromptItem {
         /// Conditional emission: this section only emits at projection
         /// time if the named sibling Collection materialised ≥ 1 of its
         /// members. Ingested unconditionally either way.
+        #[serde(default)]
+        depends_on: Option<String>,
+    },
+    /// References a [`DialectTemplate`] catalog entry by snake-case name.
+    /// Resolves to the dialect's string at build time. At Phase 1 of the
+    /// generated-segments rollout the resolved content lands in a
+    /// `SectionSchema` with `is_template = true`; downstream behaviour is
+    /// identical to a `kind: section` item.
+    Template {
+        id: String,
+        /// Catalog reference, e.g. `system_start`, `tool_block_open`,
+        /// `no_think_prefix`.
+        dialect: String,
+        /// Conditional emission gate — same semantics as
+        /// [`Self::Section::depends_on`].
         #[serde(default)]
         depends_on: Option<String>,
     },
@@ -263,7 +289,10 @@ struct YamlSelection {
 
 // ── Conversion ────────────────────────────────────────────────────────────────
 
-fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
+fn build(
+    raw: YamlSchema,
+    dialect: Option<&Dialect>,
+) -> Result<(Schema, NameMaps), ConstructionError> {
     let mut maps = NameMaps::default();
     let mut section_alloc = SectionIdAlloc(0);
     let mut collection_alloc = CollectionIdAlloc(0);
@@ -311,6 +340,7 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                 content: s.content.clone(),
                 priority,
                 depends_on: None,
+                is_template: false,
             }));
         }
 
@@ -366,6 +396,55 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                         content: content.clone(),
                         priority: pri,
                         depends_on: depends_on_cid,
+                        is_template: false,
+                    }));
+                }
+                YamlSystemPromptItem::Template {
+                    id,
+                    dialect: dialect_name,
+                    depends_on,
+                } => {
+                    // Dialect required; cannot resolve template content
+                    // without one. Surface a schema-locatable error.
+                    let dlct = dialect.ok_or_else(|| ConstructionError::DialectRequired {
+                        item: format!("{}/{}", yl.name, id),
+                    })?;
+                    let template =
+                        DialectTemplate::from_yaml_name(dialect_name).ok_or_else(|| {
+                            ConstructionError::UnknownDialectTemplate {
+                                item: format!("{}/{}", yl.name, id),
+                                name: dialect_name.clone(),
+                            }
+                        })?;
+                    let content = dlct.template(template);
+                    // Empty-string templates (e.g. NoThinkPrefix for a
+                    // dialect that doesn't suppress thinking) are dropped
+                    // at build time — projection never sees a no-op
+                    // segment.
+                    if content.is_empty() {
+                        continue;
+                    }
+                    if !layer_section_names.insert(id.clone()) {
+                        return Err(ConstructionError::DuplicateSectionName(id.clone()));
+                    }
+                    let sid = section_alloc.next();
+                    maps.section_names.insert((lid, id.clone()), sid);
+                    let depends_on_cid = match depends_on {
+                        Some(name) => Some(*layer_collections.get(name).ok_or_else(|| {
+                            ConstructionError::UnknownCollection(format!(
+                                "{}: template '{}' depends_on unknown collection '{}'",
+                                yl.name, id, name,
+                            ))
+                        })?),
+                        None => None,
+                    };
+                    items.push(SystemPromptItem::Section(SectionSchema {
+                        id: sid,
+                        name: id.clone(),
+                        content: content.to_string(),
+                        priority: 50.0,
+                        depends_on: depends_on_cid,
+                        is_template: true,
                     }));
                 }
                 YamlSystemPromptItem::Collection {
@@ -402,6 +481,7 @@ fn build(raw: YamlSchema) -> Result<(Schema, NameMaps), ConstructionError> {
                             content: s.content.clone(),
                             priority: pri,
                             depends_on: None,
+                            is_template: false,
                         });
                     }
 
