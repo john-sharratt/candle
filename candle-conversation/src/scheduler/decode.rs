@@ -136,7 +136,7 @@ impl Scheduler {
         let sample_ms = t_sample.elapsed().as_millis() as u64;
         super::record_phase(t_sample, "decode_sample");
 
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::scheduler::timing",
             batch = seq_ids.len(), fwd_ms, sample_ms,
             "decode_step",

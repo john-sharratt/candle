@@ -393,8 +393,11 @@ mod cuda_impl {
         // top-line "load_turn_into_hot timing" stays compact. The
         // three sub-timers add up to ~`alloc_ms` (in µs); the gap
         // is per-unit bookkeeping (`per_layer` Vec construction,
-        // `records_to_dispatch` builds, channel sends).
-        tracing::debug!(
+        // `records_to_dispatch` builds, channel sends). Emitted at
+        // trace level since it's only useful when actively profiling
+        // the alloc path — enable with
+        // `RUST_LOG=candle_conversation::persistence::tier=trace`.
+        tracing::trace!(
             target: "candle_conversation::persistence::tier",
             timeline = decl.timeline_id,
             turn = decl.turn_index,

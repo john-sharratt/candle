@@ -315,7 +315,7 @@ pub fn run<R: ContentResolver>(
                 })
                 .collect();
 
-            tracing::debug!(
+            tracing::trace!(
                 group = %group.name,
                 selected = format!("{}/{}", selected.len(), all_turns.len()),
                 "projection"
@@ -679,7 +679,7 @@ fn select_collection_sections<R: ContentResolver>(
                 .iter()
                 .map(|(_, s, _)| ResolvedSection { id: s.id })
                 .collect();
-            tracing::debug!(
+            tracing::trace!(
                 collection = %coll.name,
                 selected = format!("{}/{}", selected.len(), coll.sections.len()),
                 sections = ?scored.iter().map(|(_, s, _)| s.name.as_str()).collect::<Vec<_>>(),
