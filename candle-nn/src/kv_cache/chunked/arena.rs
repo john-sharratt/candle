@@ -5,7 +5,6 @@
 //! - `StoragePolicy` - How sealed chunks should be stored
 //! - `ChunkStatus` - Status of a chunk (Unallocated/Sealed/Active)
 //! - `Arena` - A single arena holding K and V cache tensors
-//! - `ArenaAllocState` - Per-arena allocation tracking
 //! - `ArenaStorage` - Collection of arenas with heterogeneous formats
 
 use crate::kv_cache::{
@@ -18,7 +17,7 @@ use candle::{DType, Result, Tensor};
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
-use crate::kv_cache::chunked::types::{arena_chunks_for_format, arena_gid_stride};
+use crate::kv_cache::chunked::types::arena_chunks_for_format;
 
 // ==================== Arena Key ====================
 
@@ -611,81 +610,31 @@ impl Arena {
     }
 }
 
-// ==================== Arena Allocation State ====================
-
-/// Per-arena allocation state.
-#[derive(Debug)]
-pub(crate) struct ArenaAllocState {
-    /// Free chunk indices within this arena
-    free_chunks: Vec<usize>,
-    /// Next chunk index to allocate if free list is empty
-    next_chunk: usize,
-    /// Maximum chunks this arena can hold (0 for released arenas)
-    pub(super) max_chunks: usize,
-}
-
-impl ArenaAllocState {
-    pub(super) fn new(max_chunks: usize) -> Self {
-        Self {
-            free_chunks: Vec::new(),
-            next_chunk: 0,
-            max_chunks,
-        }
-    }
-
-    /// Try to allocate a chunk from this arena.
-    /// Returns Some(chunk_idx) if successful, None if arena is full.
-    pub(super) fn alloc(&mut self) -> Option<usize> {
-        // Prefer reusing from free list (lower indices for locality)
-        if !self.free_chunks.is_empty() {
-            let min_idx = self
-                .free_chunks
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, &id)| id)
-                .map(|(idx, _)| idx)
-                .unwrap();
-            return Some(self.free_chunks.swap_remove(min_idx));
-        }
-
-        // Allocate new chunk if space available
-        if self.next_chunk < self.max_chunks {
-            let idx = self.next_chunk;
-            self.next_chunk += 1;
-            return Some(idx);
-        }
-
-        None // Arena is full
-    }
-}
-
 // ==================== Arena Storage State ====================
 
 /// The mutable state of arena storage - NO LOCKS HERE.
 /// All methods on this struct are lock-free and can safely call each other.
 /// This is the key to preventing deadlocks: the lock is held by ArenaStorage,
 /// and ArenaStorageState methods cannot acquire any locks.
+///
+/// Per-arena slot allocation state is NOT tracked here — the
+/// [`ChunkGidPool`]'s lock-free `ArenaRefcounts` table is the
+/// authoritative record of "which chunk slots are live". Storage only
+/// keeps the physical arena tensors.
 #[derive(Debug)]
 pub(crate) struct ArenaStorageState {
     /// The arenas themselves, keyed by arena index.
     pub(super) arenas: AHashMap<usize, Arena>,
-    /// Per-arena allocation state, keyed by arena index.
-    alloc_states: AHashMap<usize, ArenaAllocState>,
-    /// Map from (format, location) to arena indices for fast lookup.
-    arena_pools: AHashMap<ArenaKey, Vec<usize>>,
 }
 
 impl ArenaStorageState {
     /// Create new empty state.
     fn new() -> Self {
         // Sized to typical steady-state working set: ~30-60 live arenas across
-        // all formats (production runs peak around 28). Storing pre-sized
-        // avoids a chain of ~6 rehash/grow cycles during warmup.
+        // all formats (production runs peak around 28). Pre-sizing avoids a
+        // chain of ~6 rehash/grow cycles during warmup.
         Self {
             arenas: AHashMap::with_capacity(64),
-            alloc_states: AHashMap::with_capacity(64),
-            // arena_pools key count = formats * locations (~58 max).
-            arena_pools: AHashMap::with_capacity(64),
         }
     }
 
@@ -723,15 +672,7 @@ impl ArenaStorageState {
 
     /// Truncate arenas to the given count.
     pub(super) fn truncate(&mut self, count: usize) {
-        // Remove from pools any arena indices >= count
-        for indices in self.arena_pools.values_mut() {
-            indices.retain(|&idx| idx < count);
-        }
-        // Remove empty pools
-        self.arena_pools.retain(|_, v| !v.is_empty());
-
         self.arenas.retain(|&k, _| k < count);
-        self.alloc_states.retain(|&k, _| k < count);
     }
 
     /// Get the ArenaKey for a specific arena.
@@ -739,142 +680,17 @@ impl ArenaStorageState {
         self.arenas.get(&arena_idx).map(|a| a.arena_key())
     }
 
-    /// Find arenas matching the given key.
-    #[allow(dead_code)] // Used for format-specific arena queries during migration
-    pub(super) fn find_arenas_by_key(&self, key: ArenaKey) -> &[usize] {
-        self.arena_pools
-            .get(&key)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Register a newly created arena in the pools.
-    fn register_arena(&mut self, arena_idx: usize, key: ArenaKey) {
-        self.arena_pools.entry(key).or_default().push(arena_idx);
-    }
-
-    /// Try to allocate a chunk from existing arenas with the given key.
-    /// Returns Some((arena_idx, chunk_idx)) if successful.
-    /// Per-head arenas never pool — always returns None for per_head keys.
-    fn try_alloc_from_existing(&mut self, key: &ArenaKey) -> Option<(usize, usize)> {
-        let arena_indices = self.arena_pools.get(key)?;
-        for &arena_idx in arena_indices {
-            if let Some(state) = self.alloc_states.get_mut(&arena_idx) {
-                if let Some(chunk_idx) = state.alloc() {
-                    return Some((arena_idx, chunk_idx));
-                }
-            }
-        }
-        None
-    }
-
-    /// Add a new arena and allocate the first chunk from it.
-    /// Returns (arena_idx, chunk_idx).
-    pub(super) fn add_arena_and_alloc(
-        &mut self,
-        arena: Arena,
-        arena_idx: usize,
-        arena_chunks: usize,
-    ) -> (usize, usize) {
-        let key = arena.arena_key();
+    /// Insert a freshly created arena into storage. Slot-level allocation
+    /// state lives in the [`ChunkGidPool`]; storage only owns the tensor.
+    /// `_arena_chunks` is kept for call-site parity with the legacy
+    /// alloc-state path but is no longer consulted here.
+    pub(super) fn push_arena(&mut self, arena: Arena, arena_idx: usize, _arena_chunks: usize) {
         self.arenas.insert(arena_idx, arena);
-
-        let mut state = ArenaAllocState::new(arena_chunks);
-        let chunk_idx = state.alloc().expect("fresh arena should have space");
-        self.alloc_states.insert(arena_idx, state);
-
-        self.register_arena(arena_idx, key);
-
-        (arena_idx, chunk_idx)
-    }
-
-    /// Allocate a chunk in an arena with the specified key.
-    /// If no space in existing arenas, calls create_arena_fn to create a new one.
-    /// Returns (arena_idx, chunk_idx).
-    pub(super) fn alloc_chunk_in_key(
-        &mut self,
-        key: ArenaKey,
-        arena_chunks: usize,
-        create_arena_fn: impl FnOnce(ArenaKey, usize) -> Result<Arena>,
-    ) -> Result<(usize, usize)> {
-        // Try existing arenas first
-        if let Some(result) = self.try_alloc_from_existing(&key) {
-            return Ok(result);
-        }
-
-        // Create new arena
-        let arena_idx = self.arenas.keys().max().map(|&m| m + 1).unwrap_or(0);
-        let arena = create_arena_fn(key, arena_idx)?;
-        Ok(self.add_arena_and_alloc(arena, arena_idx, arena_chunks))
-    }
-
-    /// Allocate a chunk, returning global chunk ID.
-    /// Used during migration when we need to return i64 chunk ID.
-    #[allow(dead_code)] // Used during chunk migration when global IDs are needed
-    pub(super) fn alloc_chunk_in_key_global(
-        &mut self,
-        key: ArenaKey,
-        arena_chunks: usize,
-        create_arena_fn: impl FnOnce(ArenaKey, usize) -> Result<Arena>,
-    ) -> Result<i64> {
-        let (arena_idx, chunk_idx) = self.alloc_chunk_in_key(key, arena_chunks, create_arena_fn)?;
-        Ok((arena_idx * arena_gid_stride() + chunk_idx) as i64)
-    }
-
-    /// Mark a specific chunk as allocated, advancing the sequential allocator so that
-    /// `alloc_chunk_in_key` (used by migration) never re-issues the same GID.
-    ///
-    /// The `next_global` path in `alloc_chunk_internal` bypasses `ArenaAllocState`, so
-    /// without this call the per-arena `next_chunk` counter stays at 0 and
-    /// `try_alloc_from_existing` would hand out chunk 0 again on the next migration.
-    pub(super) fn mark_chunk_allocated_at(&mut self, arena_idx: usize, chunk_idx: usize) {
-        // Advance the sequential counter so alloc_chunk_in_key skips past this chunk.
-        if let Some(state) = self.alloc_states.get_mut(&arena_idx) {
-            if state.next_chunk <= chunk_idx {
-                state.next_chunk = chunk_idx + 1;
-            }
-            // Remove from free list if it ended up there (shouldn't normally happen).
-            state.free_chunks.retain(|&c| c != chunk_idx);
-        }
-    }
-
-    /// Push a new arena with full tracking (alloc_states + arena_pools).
-    pub(super) fn push_arena(&mut self, arena: Arena, arena_idx: usize, arena_chunks: usize) {
-        let key = arena.arena_key();
-        self.arenas.insert(arena_idx, arena);
-        self.alloc_states
-            .insert(arena_idx, ArenaAllocState::new(arena_chunks));
-        self.register_arena(arena_idx, key);
-    }
-
-    /// Ensure alloc_states and arena_pools are in sync with the arenas map.
-    /// Call after adding arenas through the raw arenas_mut() map.
-    #[allow(dead_code)]
-    pub(super) fn sync_alloc_states(&mut self, arena_chunks: usize) {
-        let keys: Vec<usize> = self.arenas.keys().copied().collect();
-        for idx in keys {
-            if !self.alloc_states.contains_key(&idx) {
-                let key = self.arenas[&idx].arena_key();
-                self.alloc_states
-                    .insert(idx, ArenaAllocState::new(arena_chunks));
-                self.register_arena(idx, key);
-            }
-        }
     }
 
     /// Release an empty arena, removing it from storage and freeing its GPU tensors.
     pub(super) fn release_arena(&mut self, arena_idx: usize) {
-        if let Some(arena) = self.arenas.get(&arena_idx) {
-            let old_key = arena.arena_key();
-            if let Some(indices) = self.arena_pools.get_mut(&old_key) {
-                indices.retain(|&idx| idx != arena_idx);
-                if indices.is_empty() {
-                    self.arena_pools.remove(&old_key);
-                }
-            }
-        }
         self.arenas.remove(&arena_idx);
-        self.alloc_states.remove(&arena_idx);
     }
 
     /// Check if an arena at the given index can have chunks allocated into it.
@@ -930,6 +746,11 @@ impl ArenaRow {
 
 impl ArenaStorageState {
     /// Build a per-arena diagnostic row for every slot, sorted by index.
+    ///
+    /// `capacity` is derived directly from the arena's format. `active`,
+    /// `free_list`, and `hwm` are placeholders here — `backing.rs`
+    /// patches them in from the [`ChunkGidPool`] (the authoritative
+    /// per-slot owner) before exposing rows to callers.
     pub(super) fn arena_rows(&self) -> Vec<ArenaRow> {
         let mut indices: Vec<usize> = self.arenas.keys().copied().collect();
         indices.sort_unstable();
@@ -937,12 +758,7 @@ impl ArenaStorageState {
             .iter()
             .map(|&idx| {
                 let arena = &self.arenas[&idx];
-                let (capacity, hwm, free_list) = self
-                    .alloc_states
-                    .get(&idx)
-                    .map(|s| (s.max_chunks, s.next_chunk, s.free_chunks.len()))
-                    .unwrap_or((0, 0, 0));
-                let active = 0;
+                let capacity = arena_chunks_for_format(arena.arena_key().format);
                 let gpu_bytes = arena.gpu_memory_bytes();
                 let type_label = match arena {
                     Arena::Float {
@@ -961,9 +777,9 @@ impl ArenaStorageState {
                     type_label,
                     is_tombstone: false,
                     capacity,
-                    hwm,
-                    active,
-                    free_list,
+                    hwm: 0,
+                    active: 0,
+                    free_list: 0,
                     gpu_bytes,
                 }
             })
@@ -1089,25 +905,6 @@ impl ArenaStorage {
         })?
     }
 
-    /// Find arenas matching the given key.
-    #[allow(dead_code)] // Used for format-specific arena queries
-    pub(super) fn find_arenas_by_key(&self, key: ArenaKey) -> Result<Vec<usize>> {
-        self.read(|s| s.find_arenas_by_key(key).to_vec())
-    }
-
-    /// Allocate a chunk in an arena with the specified key.
-    /// Creates a new arena if needed.
-    /// Returns (arena_idx, chunk_idx).
-    #[allow(dead_code)] // Used for format-specific chunk allocation
-    pub(super) fn alloc_chunk_in_key(
-        &self,
-        key: ArenaKey,
-        arena_chunks: usize,
-        create_arena_fn: impl FnOnce(ArenaKey, usize) -> Result<Arena>,
-    ) -> Result<(usize, usize)> {
-        self.try_write(|s| s.alloc_chunk_in_key(key, arena_chunks, create_arena_fn))
-    }
-
     /// Check if an arena at the given index can have chunks allocated into it.
     #[allow(dead_code)]
     pub(super) fn is_allocatable(&self, arena_idx: usize) -> Result<bool> {
@@ -1151,29 +948,6 @@ impl ArenaStorage {
     pub(super) fn release_arena(&self, arena_idx: usize) -> Result<()> {
         self.write(|s| s.release_arena(arena_idx))?;
         Ok(())
-    }
-
-    /// Mark a specific (arena_idx, chunk_idx) pair as allocated.
-    /// Advances the per-arena `next_chunk` counter so `alloc_chunk_in_key` never
-    /// re-issues a GID that was assigned by the `next_global` path.
-    pub(super) fn mark_chunk_allocated_at(&self, arena_idx: usize, chunk_idx: usize) -> Result<()> {
-        self.write(|s| s.mark_chunk_allocated_at(arena_idx, chunk_idx))
-    }
-
-    /// Bulk variant — mark every `(arena_idx, chunk_idx)` in `pairs`
-    /// under a single storage write lock acquisition. Used by the
-    /// cold-load bulk-alloc path to collapse the per-GID lock churn
-    /// that dominated `bulk_alloc_us` in the allocator breakdown.
-    pub(super) fn mark_chunks_allocated_at_bulk(&self, pairs: &[(usize, usize)]) -> Result<()> {
-        if pairs.is_empty() {
-            return Ok(());
-        }
-        self.write(|s| {
-            for &(arena_idx, chunk_idx) in pairs {
-                s.mark_chunk_allocated_at(arena_idx, chunk_idx);
-            }
-            Ok(())
-        })?
     }
 
     /// Build per-arena diagnostic rows. The `active` and `free_list` fields

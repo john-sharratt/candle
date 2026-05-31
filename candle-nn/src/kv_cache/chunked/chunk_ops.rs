@@ -52,6 +52,11 @@ pub(super) fn needs_reconcile_source_format(format: KvFormat) -> bool {
 /// inferred from the arena's total element count divided by its
 /// arena_chunks (so it handles any head_dim, not just the canonical
 /// 128).
+///
+/// Used by the cuda-gated `migrate_sealed_to_gpu_batch_async` path and
+/// its test fixtures; cfg'd to that feature so non-cuda builds don't
+/// see it as dead code.
+#[cfg(feature = "cuda")]
 fn chunk_byte_size_of(arena: &Arena) -> Result<usize> {
     match arena {
         Arena::Float { data, dtype, .. } => {
@@ -1955,6 +1960,10 @@ impl ChunkedKvBacking {
     ///
     /// `Arena::Quantized` is not supported here — see the module-level
     /// caveat on [`Self::migrate_sealed_to_cpu_batch_async`].
+    ///
+    /// Gated behind the cuda feature to match the only caller
+    /// (`migrate_sealed_to_cpu_batch_async`).
+    #[cfg(feature = "cuda")]
     fn write_chunk_from_pinned_bytes(
         arenas: &mut ahash::AHashMap<usize, Arena>,
         arena_idx: usize,

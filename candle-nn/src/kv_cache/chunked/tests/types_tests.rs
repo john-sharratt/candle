@@ -328,25 +328,42 @@ mod tests {
         }
 
         #[test]
-        fn test_chunked_state_global_free_list() {
+        fn test_chunked_state_free_lifecycle_across_arenas() {
             use crate::kv_cache::chunked::arena::ArenaKey;
 
+            // The new per-arena refcount-table design replaces the
+            // old global min-heap free list. Free counts are computed
+            // from `arena_chunks - live` per arena and summed across
+            // arenas. This test verifies the lifecycle: register two
+            // arenas, allocate from each, then drop and confirm the
+            // free count returns to the baseline.
             let _state = create_test_state(2, 4);
             let pool = ChunkGidPool::new();
             let key = ArenaKey::gpu_float(candle::DType::BF16);
 
-            // Register arena and inject a few extra raw IDs beyond the first arena.
             pool.register_arena(key.clone());
-            let base = crate::kv_cache::arena_gid_stride();
+            pool.register_arena(key.clone());
             let initial_free = pool.free_list_len_for(key.clone());
 
-            // Free 3 additional IDs beyond the arena range
-            pool.free(key.clone(), (base + 10) as i64);
-            pool.free(key.clone(), (base + 5) as i64);
-            pool.free(key.clone(), (base + 15) as i64);
+            let g_a = pool.allocate_from_arena(key.clone(), 1).unwrap();
+            let g_b = pool.allocate_from_arena(key.clone(), 1).unwrap();
+            let g_c = pool.allocate_from_arena(key.clone(), 1).unwrap();
+            assert_eq!(
+                pool.free_list_len_for(key.clone()),
+                initial_free - 3,
+                "3 allocs from arena 1 should reduce the free count by 3"
+            );
+            drop(g_a);
+            drop(g_b);
+            drop(g_c);
+            assert_eq!(
+                pool.free_list_len_for(key.clone()),
+                initial_free,
+                "after dropping all 3, the free count returns to baseline"
+            );
 
-            assert_eq!(pool.free_list_len_for(key.clone()), initial_free + 3);
-            // allocate_for should return lowest first (0 from registered arena)
+            // allocate_for picks the lowest available gid — arena 0 was
+            // untouched so gid 0 is first.
             let gid = pool.allocate_for(key.clone()).unwrap();
             assert_eq!(gid.raw(), 0);
         }

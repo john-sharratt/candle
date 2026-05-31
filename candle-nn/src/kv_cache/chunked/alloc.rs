@@ -446,36 +446,29 @@ impl ChunkedKvBacking {
 impl BackingInner {
     /// Allocate a chunk of any format through the pool exclusively.
     ///
-    /// This is the single canonical path for chunk allocation regardless of format.
-    /// The pool drives GID selection; storage just records the physical slot as active.
+    /// The pool's lock-free refcount table is the single source of truth
+    /// for "this slot is allocated" — `pool.allocate_for` performs the
+    /// CAS-claim that flips it. Storage only has to ensure the physical
+    /// arena tensor exists; no separate per-slot bookkeeping is needed.
     ///
     /// 1. Try `pool.allocate_for(key)` — reuses a freed slot from any arena of this format.
     /// 2. If no capacity: `pool.register_arena(key)` → create physical arena → retry.
-    ///
-    /// Returns the `ChunkGid`. The caller uses `gid.arena_idx()` and `gid.chunk_idx()`
-    /// to address the physical storage slot.
     pub(super) fn alloc_chunk_for_key(
         &self,
         key: super::arena::ArenaKey,
     ) -> Result<super::gid_pool::ChunkGid> {
         if let Some(gid) = self.pool.allocate_for(key.clone()) {
-            let arena_idx = gid.arena_idx();
-            self.ensure_arena_exists(arena_idx, key)?;
-            self.storage
-                .mark_chunk_allocated_at(arena_idx, gid.chunk_idx())?;
+            self.ensure_arena_exists(gid.arena_idx(), key)?;
             return Ok(gid);
         }
 
         let arena_idx = self.pool.register_arena(key.clone());
         self.ensure_arena_exists(arena_idx, key.clone())?;
 
-        let gid = self
+        Ok(self
             .pool
             .allocate_for(key)
-            .expect("just registered arena, must have capacity");
-        self.storage
-            .mark_chunk_allocated_at(gid.arena_idx(), gid.chunk_idx())?;
-        Ok(gid)
+            .expect("just registered arena, must have capacity"))
     }
 
     /// Bulk allocator — mirrors [`Self::alloc_chunk_for_key`]'s
@@ -483,11 +476,10 @@ impl BackingInner {
     ///
     /// Per pass:
     /// - **One** `pool.allocate_n_for(key, remaining)` returns up to
-    ///   `remaining` GIDs under a single per-format mutex.
+    ///   `remaining` GIDs; CAS-claim makes the refcount table
+    ///   immediately authoritative, no follow-up bookkeeping required.
     /// - **One** `ensure_arena_exists` per unique arena index we
     ///   touched (cheap — the inner check is a `storage.read`).
-    /// - **One** `storage.mark_chunks_allocated_at_bulk(pairs)` under
-    ///   a single storage write lock, for every GID we just took.
     ///
     /// If the pool returned fewer GIDs than requested, the format's
     /// pool was exhausted — we register a fresh arena (one
@@ -523,13 +515,6 @@ impl BackingInner {
                     self.ensure_arena_exists(ai, key.clone())?;
                 }
             }
-            // Bulk-mark every (arena, chunk) slot active under one
-            // storage write lock acquire.
-            let pairs: Vec<(usize, usize)> = batch
-                .iter()
-                .map(|g| (g.arena_idx(), g.chunk_idx()))
-                .collect();
-            self.storage.mark_chunks_allocated_at_bulk(&pairs)?;
             out.extend(batch);
         }
         Ok(out)
