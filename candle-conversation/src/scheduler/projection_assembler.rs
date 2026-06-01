@@ -302,7 +302,7 @@ fn inject_sealed_turn(
     walker: &mut SegmentWalker,
     group: GroupId,
     index: TurnIndex,
-    part: crate::Role,
+    _part: crate::Role,
 ) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
 
@@ -314,34 +314,20 @@ fn inject_sealed_turn(
         return Ok(());
     };
 
-    let sealed = match ctx
-        .conversation
-        .read()
-        .turn_sealed_of_part(timeline, index, part)
-    {
+    let sealed = match ctx.conversation.read().turn_sealed_of(timeline, index) {
         Some(s) => s,
-        None => {
-            // Empty half: the user half under today's seal path
-            // legitimately has no bytes.  Fold a zero-token
-            // contribution into the rolling hash and move on.
-            return Ok(());
-        }
+        None => return Ok(()),
     };
     if sealed.is_empty() {
         return Ok(());
     }
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
 
-    // Pull the per-half tokens; under today's seal path everything
-    // lives in the assistant half so the user half is empty.
-    let toks: Vec<u32> = match part {
-        crate::Role::User => Vec::new(),
-        _ => ctx
-            .conversation
-            .read()
-            .assistant_token_ids_of(timeline, index)
-            .to_vec(),
-    };
+    let toks: Vec<u32> = ctx
+        .conversation
+        .read()
+        .assistant_token_ids_of(timeline, index)
+        .to_vec();
     let start_block = ctx
         .session
         .sequence_block_count(parent_id.0)

@@ -2115,15 +2115,12 @@ impl Scheduler {
                 // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
 
-                // Phase 4 seal: the entire turn content lands in the
-                // assistant half.  Phase 5 will populate the user half
-                // from the slot's `pending_user_part`.
-                let user_part = crate::substrate::TurnPartWrite {
-                    block_start: block_from as u64,
-                    block_end: block_from as u64,
-                    ..Default::default()
-                };
-                let assistant_part = crate::substrate::TurnPartWrite {
+                // The turn is sealed as one indivisible content
+                // block — the full user_start ... user_msg ...
+                // user_end assistant_start ... decoded ... post_decode
+                // exchange — landing in a single `TurnPart` on the
+                // substrate side.
+                let write = crate::substrate::TurnPartWrite {
                     text,
                     token_ids,
                     token_count: turn_token_count,
@@ -2132,13 +2129,7 @@ impl Scheduler {
                     sealed_gpu: Some(Arc::new(delta_gpu)),
                 };
                 let idx = conversation
-                    .record_turn(
-                        target.timeline,
-                        role,
-                        user_part,
-                        assistant_part,
-                        |seqs| Ok(seqs.to_vec()),
-                    )
+                    .record_turn(target.timeline, role, write, |seqs| Ok(seqs.to_vec()))
                     .map_err(ConversationError::Model)?;
                 if !new_sig_entries.is_empty() {
                     {
