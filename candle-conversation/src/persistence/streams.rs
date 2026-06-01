@@ -114,21 +114,27 @@ pub struct TurnDecl {
     pub view: Vec<u32>,
     #[serde(default)]
     pub scores: PerDepthScores,
-    /// Per-half partition counts that disambiguate where the user
-    /// half ends and the assistant half begins inside the turn's
-    /// Chunks / Tokens / Signatures streams.  The user half occupies
-    /// `[0..user_chunk_count)` of the per-layer chunk grid, the first
-    /// `user_token_count` tokens of the Tokens record, and the first
-    /// `user_sig_count` sig entries of the Signatures record.  The
-    /// remainder belongs to the assistant half.  When the user half
-    /// is empty (today's seal path), all three are zero and the
-    /// entire payload reduces to the assistant half.
-    ///
-    /// Required for v2 logs (no `#[serde(default)]` here on purpose):
-    /// a record missing any of these is malformed and decode fails.
+    /// Per-half partition counts.  Reserved for a future per-half
+    /// K/V split; under the current seal path they're always zero.
+    /// Kept on the record so the on-disk shape doesn't shift again
+    /// when that work lands.
+    #[serde(default)]
     pub user_chunk_count: u32,
+    #[serde(default)]
     pub user_token_count: u32,
+    #[serde(default)]
     pub user_sig_count: u32,
+    /// The user message text for this turn — exactly what
+    /// `submit_turn` received, with no role-marker envelope and no
+    /// `/no_think` prefix.  Stored directly so reload re-populates
+    /// `TurnPart::user_text` without re-tokenising or scanning for
+    /// boundary markers.
+    #[serde(default)]
+    pub user_text: String,
+    /// The assistant's decoded reply text for this turn — same
+    /// "store what the caller already has" rule as `user_text`.
+    #[serde(default)]
+    pub assistant_text: String,
 }
 
 /// The payload of a `StreamDecl` record — declares a stream and
@@ -216,6 +222,8 @@ mod tests {
             user_chunk_count: 0,
             user_token_count: 0,
             user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
         });
         let bytes = decl.encode();
         let decoded = StreamDecl::decode(&bytes).unwrap();
@@ -241,6 +249,8 @@ mod tests {
             user_chunk_count: 0,
             user_token_count: 0,
             user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
         });
         assert_eq!(StreamDecl::decode(&decl.encode()).unwrap(), decl);
     }

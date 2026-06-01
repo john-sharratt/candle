@@ -557,6 +557,9 @@ impl ModelBuilder {
         ret.health = self.health_config.clone();
         ret.workspace_path = self.workspace_path.clone();
         ret.model_spec = Some(self.model_spec_blob());
+        // The engine uses the model's dialect to pre-tokenise the
+        // inter-turn boundary markers once at scheduler construction.
+        ret.dialect = self.spec.dialect.clone();
         ret
     }
 

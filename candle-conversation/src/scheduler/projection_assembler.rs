@@ -106,6 +106,47 @@ impl SlotState {
     }
 }
 
+/// Pre-tokenised dialect role markers the assembler wraps around
+/// every `Sealed::Turn` segment to produce attention-correct turn
+/// boundaries at projection time.
+///
+/// The two markers are the inter-turn ones — `user_start` opens a
+/// turn against whatever causal prefix actually precedes it on the
+/// slot, and `assistant_end` closes a turn before the next region
+/// begins.  The intra-turn `user_end` and `assistant_start` markers
+/// stay baked in the persisted turn bytes because their hidden
+/// state is dominated by the turn's own (invariant) content.
+///
+/// The scheduler owns a single instance, pre-tokenised by the
+/// engine from the active model's dialect at engine construction.
+/// Passed to the assembler as a borrow on `ApplyContext`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BoundaryMarkers {
+    pub(crate) user_start: Arc<Vec<u32>>,
+    pub(crate) assistant_end: Arc<Vec<u32>>,
+}
+
+impl BoundaryMarkers {
+    /// Pre-tokenise the dialect's `user_start` and `assistant_end`
+    /// strings via the caller-supplied closure.  The closure form
+    /// keeps this module tokenizer-agnostic — callers (the engine)
+    /// wrap their `tokenizers::Tokenizer::encode`.
+    pub(crate) fn from_dialect<E, F>(
+        dialect: &candle_transformers::models::dialect::Dialect,
+        mut tokenize: F,
+    ) -> Result<Self, E>
+    where
+        F: FnMut(&str) -> Result<Vec<u32>, E>,
+    {
+        let user_start = Arc::new(tokenize(dialect.user_start)?);
+        let assistant_end = Arc::new(tokenize(dialect.assistant_end)?);
+        Ok(Self {
+            user_start,
+            assistant_end,
+        })
+    }
+}
+
 /// Borrowed scheduler state the assembler needs in order to run.
 ///
 /// `model` and `device` are required so cache-miss runs can drive a
@@ -126,6 +167,10 @@ pub(super) struct ApplyContext<'a> {
     #[cfg_attr(not(feature = "context-dump"), allow(dead_code))]
     pub(super) tokenizer: &'a tokenizers::Tokenizer,
     pub(super) slot_tokens: &'a mut HashMap<SequenceId, Vec<u32>>,
+    /// Pre-tokenised inter-turn boundary markers — see [`BoundaryMarkers`].
+    /// The walker pre-pends `user_start` and trails `assistant_end`
+    /// around every `Sealed::Turn` segment.
+    pub(super) boundary_markers: &'a BoundaryMarkers,
 }
 
 /// Apply `new_segments` onto the slot.
@@ -189,6 +234,22 @@ pub(super) fn apply_segments(
                 inject_sealed_section(state, &mut ctx, &mut walker, rs.id)?;
             }
             ProjectionSegment::Sealed(SealedKind::Turn(rt, part)) => {
+                // Wrap the turn in live-prefilled boundary markers:
+                // `user_start` joins the run that flushes immediately
+                // before the turn injects (batching with whatever
+                // `Generated` segments — or with the previous turn's
+                // trailing `assistant_end` — preceded it), and
+                // `assistant_end` opens a fresh run that accumulates
+                // until the next non-Generated segment (the next
+                // turn's `user_start`, or the trailing
+                // `Generated(UserStart)` the scheduler appends for
+                // the current turn's prefill).  The result is one
+                // 5-token batched prefill run at every cross-turn
+                // boundary — and at every system→turn / last-turn→
+                // current-turn-prefill boundary.
+                walker
+                    .run_tokens
+                    .extend(ctx.boundary_markers.user_start.iter().copied());
                 walker.flush_run(state, &mut ctx)?;
                 inject_sealed_turn(
                     state,
@@ -198,6 +259,9 @@ pub(super) fn apply_segments(
                     rt.index(),
                     *part,
                 )?;
+                walker
+                    .run_tokens
+                    .extend(ctx.boundary_markers.assistant_end.iter().copied());
             }
             ProjectionSegment::NewUserMessage { tokens } => {
                 walker.flush_run(state, &mut ctx)?;

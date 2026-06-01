@@ -119,6 +119,21 @@ impl ConversationEngine {
         let show_special_tokens = config.show_special_tokens;
         let tokenizer_for_scheduler = tokenizer.clone();
 
+        // Pre-tokenise the dialect's `user_start` and `assistant_end`
+        // strings once at engine construction.  The scheduler hands a
+        // borrow of this to every `ApplyContext` so the assembler can
+        // wrap every `Sealed::Turn` in live-prefilled boundary
+        // markers without re-tokenising on each projection.
+        let boundary_markers = crate::scheduler::projection_assembler::BoundaryMarkers::from_dialect(
+            &config.dialect,
+            |s| {
+                let encoded = tokenizer.encode(s, false).map_err(|e| {
+                    ConversationError::Channel(format!("boundary marker tokenise: {e}"))
+                })?;
+                Ok::<_, ConversationError>(encoded.get_ids().to_vec())
+            },
+        )?;
+
         // Create the scheduler channel (unbounded — backpressure is per-conversation
         // via the turn_in_flight guard, not at the channel level).
         let (tx, rx) = channel::unbounded();
@@ -210,6 +225,7 @@ impl ConversationEngine {
                     scheduler_provenance,
                     model_core,
                     persist_trigger,
+                    boundary_markers,
                 );
                 // §16.12 — reload any persisted turns into the substrate
                 // before serving requests.
@@ -318,40 +334,10 @@ impl ConversationEngine {
         kind: crate::projection::Reserved,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
-        let mut builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
-        self.tokenize_boundary_markers_on(&mut builder, &config)?;
+        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
         let layer_id = crate::projection::LayerId::reserved(kind);
         let group_id = crate::projection::GroupId::reserved(kind);
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
-    }
-
-    /// Populate the projection schema's `boundary_markers` using the
-    /// engine's tokenizer and the supplied dialect.  Engine-internal
-    /// constructors (synthetic-prompt callers like the titler and the
-    /// plain-prompt path) need this so the projection's per-turn
-    /// expansion can emit `Generated(UserStart)` / `Generated(AssistantEnd)`
-    /// around each past turn.  External builders that own their own
-    /// tokenisation (zend's session.rs) call
-    /// [`crate::projection::Builder::tokenize_boundary_markers`]
-    /// directly.
-    fn tokenize_boundary_markers_on(
-        &self,
-        builder: &mut Builder,
-        config: &SequenceConfig,
-    ) -> crate::Result<()> {
-        let tokenizer = self.tokenizer().clone();
-        builder
-            .tokenize_boundary_markers::<crate::error::ConversationError, _>(
-                &config.dialect,
-                |s| {
-                    let encoded = tokenizer.encode(s, false).map_err(|e| {
-                        crate::error::ConversationError::Channel(format!(
-                            "boundary marker tokenise: {e}"
-                        ))
-                    })?;
-                    Ok(encoded.get_ids().to_vec())
-                },
-            )
     }
 
     pub fn new_conversation(
@@ -372,8 +358,7 @@ impl ConversationEngine {
                 .unwrap_or(system_prompt);
             s.strip_suffix(config.dialect.system_end).unwrap_or(s)
         };
-        let mut builder = Builder::for_plain_prompt(inner_prompt);
-        self.tokenize_boundary_markers_on(&mut builder, &config)?;
+        let builder = Builder::for_plain_prompt(inner_prompt);
         let (layer_id, group_id) = {
             let layer = &builder.schema().layers[0];
             (layer.id, layer.groups[0].id)
@@ -537,6 +522,7 @@ impl ConversationEngine {
                 projection_inputs: None,
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),
+                user_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens,
                 sampling: SamplingConfig::argmax(),

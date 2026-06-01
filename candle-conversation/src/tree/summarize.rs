@@ -251,6 +251,7 @@ impl SummarizationTask {
                 projection_inputs: None,
                 prefill_tokens,
                 prefill_text: window_text,
+                user_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens: config.summarization_max_tokens as usize,
                 sampling: summarization_sampling,

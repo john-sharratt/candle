@@ -60,7 +60,6 @@ use crate::projection::{
     GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
 use crate::token_buffer::TokenBuffer;
-use crate::turn::Role;
 use crate::SigEntry;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
@@ -510,21 +509,44 @@ pub struct SectionEntryData {
 
 // ── Per-turn record ───────────────────────────────────────────────────────────
 
-/// One turn's pinned content in the substrate.  Carries the turn's
-/// text, token IDs, BDP signatures, and KV residence as a single
-/// indivisible unit — `user_start ... user_msg ... user_end
-/// assistant_start ... decoded ... assistant_end` (today's seal).  A
-/// later iteration strips the inter-turn boundary tokens
-/// (`user_start` head, `assistant_end` tail) from the persisted
-/// shape and regenerates them as live `Generated` segments at
-/// projection time; the interior `user_end` / `assistant_start`
-/// pair stays baked because its semantic context (the turn's own
-/// user message and decoded response) is invariant across
-/// projections.
+/// One turn's pinned content in the substrate.  The turn's K/V
+/// chunks are a single contiguous block addressing the persisted
+/// token sequence
+/// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`
+/// — the inter-turn `user_start` head and `assistant_end` tail are
+/// **not** persisted: the projection assembler re-emits them as
+/// live `Generated` runs at every cross-turn boundary so their K
+/// vectors are computed under the actual runtime causal prefix.
+/// The interior `user_end` + `assistant_start` pair stays baked
+/// because its semantic context (the turn's own user message and
+/// decoded response) is invariant across projections.
+///
+/// The text fields (`user_text` / `assistant_text`) carry the
+/// human-readable strings exactly as the caller had them at
+/// submit time — no role markers, no `/no_think` prefix.  They're
+/// stored verbatim so the sidebar reload path renders without any
+/// re-tokenising or boundary scanning.
 #[derive(Debug, Clone)]
 pub struct TurnPart {
-    pub text: String,
+    /// The user's message text, exactly as `submit_turn` received it
+    /// — no role-marker envelope, no `/no_think` prefix, no
+    /// boundary tokens.  Stored verbatim so the sidebar can render
+    /// it without re-tokenising or pattern-matching at read time.
+    pub user_text: String,
+    /// The assistant's reply text — the decoded body of the model's
+    /// response with special tokens skipped.  Same "what the caller
+    /// already has" rule as `user_text`.
+    pub assistant_text: String,
+    /// Total token count this turn pins onto the slot — sum of the
+    /// K/V chunk's `token_count` fields.  Must match the combined
+    /// `token_ids.len()` (modulo the slot's chunk granularity).
     pub token_count: usize,
+    /// Combined turn token ids in slot order:
+    /// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`.
+    /// Stored as one buffer because the K/V chunk grid pins this
+    /// exact sequence; the persisted `Tokens` record carries the
+    /// same bytes so cross-process replay (`recover_turn`)
+    /// reconstructs the slot K/V exactly.
     pub token_ids: TokenBuffer,
     pub sig_entries: Vec<SigEntry>,
     /// Slot in [`Substrate::residence`] holding this turn's
@@ -543,7 +565,11 @@ pub struct TurnEntryData {
 /// Caller-supplied content for a turn at append / restore time.
 #[derive(Debug, Clone, Default)]
 pub struct TurnPartWrite {
-    pub text: String,
+    /// The user's message text, exactly as the caller had it before
+    /// concatenation with role markers — see [`TurnPart::user_text`].
+    pub user_text: String,
+    /// The decoded assistant body — see [`TurnPart::assistant_text`].
+    pub assistant_text: String,
     pub token_ids: TokenBuffer,
     pub token_count: usize,
     pub block_start: u64,
@@ -1385,7 +1411,8 @@ impl Substrate {
             TurnEntryData {
                 block_range: (block_start, block_end),
                 content: TurnPart {
-                    text: String::new(),
+                    user_text: String::new(),
+                    assistant_text: String::new(),
                     token_count,
                     token_ids: TokenBuffer::default(),
                     sig_entries: Vec::new(),
@@ -1436,7 +1463,8 @@ impl Substrate {
                 TurnEntryData {
                     block_range: (block_start, block_end),
                     content: TurnPart {
-                        text: write.text,
+                        user_text: write.user_text,
+                        assistant_text: write.assistant_text,
                         token_count: write.token_count,
                         token_ids: write.token_ids,
                         sig_entries: Vec::new(),
@@ -1468,7 +1496,8 @@ impl Substrate {
     pub fn restore_turn(
         &mut self,
         timeline: TimelineId,
-        text: String,
+        user_text: String,
+        assistant_text: String,
         token_ids: TokenBuffer,
         token_count: usize,
         cold: Option<Vec<StoredSequence>>,
@@ -1488,7 +1517,8 @@ impl Substrate {
                 TurnEntryData {
                     block_range: (block_start, block_end),
                     content: TurnPart {
-                        text,
+                        user_text,
+                        assistant_text,
                         token_count,
                         token_ids,
                         sig_entries: Vec::new(),
@@ -1512,21 +1542,6 @@ impl Substrate {
             }
         }
         idx
-    }
-
-    /// Set the turn's text + token IDs.
-    pub fn set_turn_content(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        _role: Role,
-        text: String,
-        token_ids: TokenBuffer,
-    ) {
-        if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.content.text = text;
-            entry.content.token_ids = token_ids;
-        }
     }
 
     /// Drop a turn's hot residence, freeing its VRAM arena chunks
@@ -1610,18 +1625,18 @@ impl Substrate {
         None
     }
 
-    /// Logical role of the turn — always `Role::Assistant` (a
-    /// combined-content turn always carries a finished
-    /// user+assistant exchange and `Role` survives only as a
-    /// diagnostic tag).
-    pub fn role_of(&self, _timeline: TimelineId, _index: TurnIndex) -> Role {
-        Role::Assistant
+    /// The user's message text for this turn — exactly as
+    /// `submit_turn` received it.
+    pub fn user_text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {
+        self.turn(timeline, index)
+            .map(|e| e.content.user_text.clone())
+            .unwrap_or_default()
     }
 
-    /// Turn text — the full ChatML-formatted content the seal pinned.
-    pub fn text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {
+    /// The assistant's decoded reply text for this turn.
+    pub fn assistant_text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {
         self.turn(timeline, index)
-            .map(|e| e.content.text.clone())
+            .map(|e| e.content.assistant_text.clone())
             .unwrap_or_default()
     }
 
@@ -2327,7 +2342,7 @@ mod tests {
             .append_complete(
                 timeline,
                 TurnPartWrite {
-                    text: "hello".to_string(),
+                    assistant_text: "hello".to_string(),
                     token_count: 3,
                     block_end: 1,
                     sealed_gpu: Some(Arc::new(vec![])),
@@ -2579,6 +2594,7 @@ mod tests {
         let idx = sub.restore_turn(
             timeline,
             String::new(),
+            String::new(),
             TokenBuffer::default(),
             32,
             Some(cold_payload),
@@ -2597,6 +2613,7 @@ mod tests {
         // None branch — no cold payload.
         let idx2 = sub.restore_turn(
             timeline,
+            String::new(),
             String::new(),
             TokenBuffer::default(),
             0,

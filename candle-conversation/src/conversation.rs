@@ -747,6 +747,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
+            user_message.to_string(),
             post_decode_tokens,
             max_tokens,
             sampling,
@@ -782,6 +783,7 @@ impl Sequence {
         projection_inputs: Option<ProjectionInputs>,
         prefill_text: String,
         prefill_tokens: TokenBuffer,
+        user_text: String,
         post_decode_tokens: TokenBuffer,
         max_decode_tokens: usize,
         sampling: SamplingConfig,
@@ -794,6 +796,7 @@ impl Sequence {
                 projection_inputs,
                 prefill_tokens,
                 prefill_text,
+                user_text,
                 post_decode_tokens,
                 max_decode_tokens,
                 sampling,
@@ -895,6 +898,7 @@ impl Sequence {
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
+            user_message.to_string(),
             post_decode_tokens,
             0,
             self.config.sampling.clone(),
@@ -1265,18 +1269,29 @@ impl Sequence {
         self.tree.system_prompt_text()
     }
 
-    /// Every recovered turn in the given timeline, paired with its role
-    /// and raw token ids — for re-populating a sidebar after restart.
-    pub fn recovered_history(&self, timeline: TimelineId) -> Vec<(Role, Vec<u32>)> {
+    /// Every recovered turn in the given timeline, split into a
+    /// `User` half and an `Assistant` half — for re-populating a
+    /// sidebar after restart.
+    ///
+    /// Each turn surfaces as two `(Role, String)` entries in order:
+    /// the user's message (exactly what `submit_turn` received) then
+    /// the assistant's reply (the decoded body).  Both strings come
+    /// straight off `TurnPart::user_text` and `assistant_text` — no
+    /// re-tokenising, no marker scanning, no decoding.
+    pub fn recovered_history(&self, timeline: TimelineId) -> Vec<(Role, String)> {
         let read = self.substrate.read();
-        read.turn_indices(timeline)
-            .map(|idx| {
-                (
-                    read.role_of(timeline, idx),
-                    read.token_ids_of(timeline, idx).to_vec(),
-                )
-            })
-            .collect()
+        let mut out: Vec<(Role, String)> = Vec::new();
+        for idx in read.turn_indices(timeline) {
+            let user_text = read.user_text_of(timeline, idx);
+            let assistant_text = read.assistant_text_of(timeline, idx);
+            if !user_text.is_empty() {
+                out.push((Role::User, user_text));
+            }
+            if !assistant_text.is_empty() {
+                out.push((Role::Assistant, assistant_text));
+            }
+        }
+        out
     }
 
     /// Every timeline with at least one recovered turn, paired with the

@@ -1209,6 +1209,8 @@ mod tests {
             user_chunk_count: 0,
             user_token_count: 0,
             user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
         });
         let turn_id;
         {
@@ -1272,6 +1274,8 @@ mod tests {
             user_chunk_count: 0,
             user_token_count: 0,
             user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
         });
         child.declare_stream(&child_turn).unwrap();
         child.commit().unwrap();

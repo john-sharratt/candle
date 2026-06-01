@@ -38,7 +38,6 @@
 //!
 //! Anything that survives this is guaranteed to project without errors.
 
-use candle_transformers::models::dialect::Dialect;
 
 use super::error::ConstructionError;
 use super::ids::{GroupId, LayerId, SectionId};
@@ -304,7 +303,7 @@ impl Builder {
     pub fn from_yaml_with_vars_and_dialect(
         yaml_template: &str,
         vars: &[(&str, &str)],
-        dialect: Option<&Dialect>,
+        dialect: Option<&candle_transformers::models::dialect::Dialect>,
     ) -> Result<Self, ConstructionError> {
         let resolved = substitute_template(yaml_template, vars)?;
         let (schema, maps) = from_yaml(&resolved, dialect)?;
@@ -354,36 +353,6 @@ impl Builder {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Pre-tokenise the dialect's turn-boundary markers — `user_start`
-    /// at the head of every projected turn and `assistant_end` at its
-    /// tail — and store them on [`super::schema::Schema::boundary_markers`].
-    /// The projection engine wraps each past turn in
-    /// `Generated(UserStart) .. Sealed(Turn) .. Generated(AssistantEnd)`;
-    /// the scheduler appends another `Generated(UserStart)` after the
-    /// past-turn run so the current turn's user-side content prefills
-    /// behind a fresh, live-prefilled role marker.  Adjacent
-    /// `Generated` segments at every cross-turn boundary batch into a
-    /// single prefill run via the assembler's run accumulator.
-    ///
-    /// The closure form mirrors [`Self::tokenize_templates`]; callers
-    /// typically pass a `tokenizers::Tokenizer::encode` wrapper.
-    pub fn tokenize_boundary_markers<E, F>(
-        &mut self,
-        dialect: &Dialect,
-        mut tokenize: F,
-    ) -> Result<(), E>
-    where
-        F: FnMut(&str) -> Result<Vec<u32>, E>,
-    {
-        let user_start = std::sync::Arc::new(tokenize(dialect.user_start)?);
-        let assistant_end = std::sync::Arc::new(tokenize(dialect.assistant_end)?);
-        self.schema.boundary_markers = Some(super::schema::BoundaryMarkers {
-            user_start,
-            assistant_end,
-        });
         Ok(())
     }
 
@@ -849,7 +818,6 @@ impl Builder {
                 }],
                 depth_weights: DepthWeights::default(),
             }],
-            boundary_markers: None,
         };
         validate(&schema).expect("synthetic schema must always be valid");
 

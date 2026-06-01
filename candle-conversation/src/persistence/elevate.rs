@@ -474,7 +474,6 @@ pub fn evict_from_hot(
 mod tests {
     use super::*;
     use crate::projection::{GroupId, LayerId, TimelineAllocator, TimelineId, TurnIndex};
-    use crate::token_buffer::TokenBuffer;
     use crate::turn::Role;
     use candle::{DType, Tensor};
     use candle_nn::kv_cache::{ChunkedKvBacking, SealedSequence};

@@ -172,6 +172,12 @@ impl Conversation {
     ) -> candle::Result<TurnIndex> {
         let block_start = write.block_start;
         let block_end = write.block_end;
+        // Capture the per-half text strings before the write moves
+        // into the substrate — the redo-log `TurnDecl` carries them
+        // verbatim so reload can re-populate `TurnPart::user_text` /
+        // `assistant_text` without re-tokenising or scanning.
+        let user_text = write.user_text.clone();
+        let assistant_text = write.assistant_text.clone();
         let idx = {
             let mut view = self.inner.write().unwrap();
             view.append_complete(timeline, write, migrate_to_cpu)?
@@ -201,6 +207,8 @@ impl Conversation {
             user_chunk_count: 0,
             user_token_count: 0,
             user_sig_count: 0,
+            user_text,
+            assistant_text,
         });
         self.persistence
             .lock()
@@ -242,7 +250,7 @@ impl Conversation {
             crate::persistence::resume::recovered_turn_decls(&p)
         };
         let mut restored = 0usize;
-        for decl in decls {
+        for mut decl in decls {
             let (recovered, cold_refs) = {
                 let mut p = self.persistence.lock().unwrap();
                 let recovered = crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
@@ -263,11 +271,6 @@ impl Conversation {
             let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
                 candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
             })?;
-            let role = match decl.role {
-                0 => Role::System,
-                1 => Role::User,
-                _ => Role::Assistant,
-            };
             let token_count: usize = if recovered.layers.n_layers() == 0 {
                 0
             } else {
@@ -300,10 +303,10 @@ impl Conversation {
             // a recoverable-token-only turn (no persisted chunks) —
             // the substrate keeps it discoverable but it stays unable
             // to materialise KV.
-            let _ = role;
             let idx = view.restore_turn(
                 timeline,
-                String::new(),
+                std::mem::take(&mut decl.user_text),
+                std::mem::take(&mut decl.assistant_text),
                 TokenBuffer::from(recovered.token_ids),
                 token_count,
                 cold_refs,

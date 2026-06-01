@@ -4,7 +4,7 @@
 //! Phase 1 uses single-mode prefill (no small/large split).
 mod decode;
 mod prefill;
-mod projection_assembler;
+pub(crate) mod projection_assembler;
 mod run;
 mod sample;
 
@@ -135,6 +135,12 @@ pub(crate) enum SchedulerRequest {
         prefill_tokens: TokenBuffer,
         /// The formatted text being prefilled (emitted as TurnEvent::Prefill).
         prefill_text: String,
+        /// Raw user message string — passed through verbatim to the
+        /// substrate's `TurnPart::user_text` at seal time so the
+        /// sidebar reload path renders it without re-tokenising.
+        /// Empty for non-turn paths (RULER, summarisation) that
+        /// have no user message.
+        user_text: String,
         /// Trailing structural tokens written into the slot **after**
         /// decode finishes, before the seal.  The model didn't emit
         /// these — the scheduler appends them as if they were part of
@@ -411,20 +417,26 @@ struct DecodeState {
     /// residual partial block (and any post-decode tail tokens), not the
     /// bulk that the bg_quantizer may have already compressed.
     prov_sig_entries: Vec<crate::provenance::SigEntry>,
-    /// Trailing structural tokens written into the slot after decode
-    /// finishes, before the seal.  Lifted to a forward pass in
-    /// `cleanup_finished` so the turn's pinned KV closes its own
-    /// brackets (e.g. ChatML's `\n` after `<|im_end|>`).
+    /// Trailing structural tokens forwarded into the slot after
+    /// decode finishes, before the seal.  Today's seal path leaves
+    /// this empty (the `assistant_end` boundary is a live
+    /// `Generated` segment at projection time, not part of the
+    /// persisted turn).  Kept on `DecodeState` for the no-decode
+    /// `insert_turn` path that still needs to close its own brackets.
     post_decode_tokens: TokenBuffer,
-    /// Full prefill token sequence (the user/system content the turn
-    /// opened with).  Carried verbatim into the substrate's
-    /// `TurnEntryData` at seal time so the on-disk record can be
-    /// reconstructed without re-tokenising.
+    /// Full prefill token sequence pinned into the slot at this
+    /// turn's submit:
+    /// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block]`.
+    /// Concatenated with `generated_tokens` and `post_decode_tokens`
+    /// at seal time to form `TurnContent::token_ids` — the
+    /// cross-process replay sequence persisted to the redo log.
     prefill_tokens: TokenBuffer,
-    /// Full prefill text in its ChatML-formatted form.  Combined with
-    /// the decoded generation and the post-decode tail to form the
-    /// substrate entry's `text` at seal time.
-    prefill_text: String,
+    /// The raw user message string — passed through from
+    /// `submit_turn` verbatim (no role-marker envelope, no
+    /// `/no_think` prefix).  Stored directly on the substrate at
+    /// seal time as `TurnPart::user_text` so the sidebar reload
+    /// path never has to re-tokenise or scan for boundary markers.
+    user_text: String,
 }
 
 /// Per-turn view bookkeeping carried in the scheduler's `turn_views` map.
@@ -476,16 +488,24 @@ pub(crate) enum SealAction {
 }
 
 /// Content the substrate pins on a `SealAction::Turn` write — the
-/// role, full ChatML text, and full token sequence assembled from
-/// the prefill + decoded generation + post-decode tail.
+/// user message, the assistant reply, and the full token sequence
+/// assembled from the prefill + decoded generation + post-decode tail.
 ///
-/// Defaulting (`Role::Assistant`, empty text, empty tokens) is fine
-/// for paths that lack a content trail (test fixtures, in-process
-/// seals where the caller doesn't care about cross-process restore).
+/// Defaulting (empty strings, empty tokens) is fine for paths that
+/// lack a content trail (test fixtures, in-process seals where the
+/// caller doesn't care about cross-process restore).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TurnContent {
     pub role: crate::turn::Role,
-    pub text: String,
+    /// The user's message text — exactly what `submit_turn`
+    /// received, no role-marker envelope, no `/no_think` prefix.
+    pub user_text: String,
+    /// The assistant's decoded reply text — the model's response
+    /// body with special tokens skipped.
+    pub assistant_text: String,
+    /// The combined token sequence pinned onto the slot, in slot
+    /// order.  Must match the K/V chunk grid 1-1; consumed by
+    /// `persist_tokens_only` for cross-process replay.
     pub token_ids: TokenBuffer,
 }
 
@@ -495,6 +515,8 @@ pub(super) struct PrefillWork {
     pub(super) tokens: TokenBuffer,
     /// Text to emit as TurnEvent::Prefill before starting decode.
     pub(super) prefill_text: String,
+    /// Raw user message string — see [`DecodeState::user_text`].
+    pub(super) user_text: String,
     pub(super) event_tx: Sender<TurnEvent>,
     pub(super) max_decode_tokens: usize,
     pub(super) sampling: SamplingConfig,
@@ -701,6 +723,16 @@ pub(crate) struct Scheduler {
     /// Scattering on the main stream lets the subsequent prefill
     /// kernels see the writes for free (same-stream serialisation).
     elevate_pinned_scratch: Option<PinnedBuf>,
+
+    /// Pre-tokenised inter-turn boundary markers (`user_start` /
+    /// `assistant_end`) for the engine's dialect.  Built once at
+    /// engine construction and passed into the scheduler; the
+    /// projection assembler reads them via `ApplyContext` to wrap
+    /// every `Sealed::Turn` segment in a live-prefilled boundary
+    /// run, and the `SubmitTurn` handler reads `user_start` to
+    /// append the trailing `Generated(UserStart)` ahead of the
+    /// current turn's prefill.
+    boundary_markers: projection_assembler::BoundaryMarkers,
 }
 
 /// Per-chunk debug trace of the BDP signatures emitted at seal time.
@@ -771,6 +803,7 @@ impl Scheduler {
         provenance: Arc<ProvenanceFile>,
         model_core: ModelCoreProperties,
         persist_trigger: PersistenceTrigger,
+        boundary_markers: projection_assembler::BoundaryMarkers,
     ) -> Self {
         let device = model.device().clone();
 
@@ -828,6 +861,7 @@ impl Scheduler {
                 PINNED_PREALLOC_BYTES,
                 "scheduler::elevate_pinned_scratch",
             ),
+            boundary_markers,
         }
     }
 
@@ -918,6 +952,7 @@ impl Scheduler {
                 projection_inputs,
                 prefill_tokens,
                 prefill_text,
+                user_text,
                 post_decode_tokens,
                 max_decode_tokens,
                 sampling,
@@ -1048,24 +1083,17 @@ impl Scheduler {
                     // live `<|im_start|>user\n` opener.  This is the
                     // boundary between the most recent past turn (or
                     // the system block) and the new turn — adjacent to
-                    // whatever `Generated` segment closed the past-turn
-                    // run, so the assembler batches them into a single
-                    // live-prefill run at the boundary.
-                    if let Some(markers) = inputs
-                        .projection
-                        .schema()
-                        .boundary_markers
-                        .as_ref()
-                    {
-                        let pos = segments.len();
-                        segments.push(crate::projection::ProjectionSegment::Generated {
-                            tokens: markers.user_start.clone(),
-                            identity: crate::projection::GeneratedIdentity {
-                                name: "user_start_current".into(),
-                                position: pos,
-                            },
-                        });
-                    }
+                    // the previous turn's assembler-emitted
+                    // `assistant_end` boundary, so the assembler
+                    // batches them into a single live-prefill run.
+                    let pos = segments.len();
+                    segments.push(crate::projection::ProjectionSegment::Generated {
+                        tokens: self.boundary_markers.user_start.clone(),
+                        identity: crate::projection::GeneratedIdentity {
+                            name: "user_start_current".into(),
+                            position: pos,
+                        },
+                    });
                     (sections, segments)
                 } else {
                     (Vec::new(), Vec::new())
@@ -1217,6 +1245,7 @@ impl Scheduler {
                     sequence_id: view_id,
                     tokens: prefill_tokens,
                     prefill_text,
+                    user_text,
                     event_tx,
                     max_decode_tokens,
                     sampling,
@@ -1505,6 +1534,7 @@ impl Scheduler {
                 max_prefill_chunk: self.max_prefill_chunk,
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
+                boundary_markers: &self.boundary_markers,
             },
             segments,
         )
@@ -1736,25 +1766,25 @@ impl Scheduler {
                 let seal_result = match &state.seal_action {
                     SealAction::None => None,
                     action => {
-                        // Assemble the full turn content (prefill + decoded
-                        // generation + post-decode tail) so the substrate
-                        // entry holds the verbatim ChatML text and token
-                        // sequence that the seal pinned into the slot.
+                        // Bundle the per-half display text and the
+                        // combined token sequence the seal pinned
+                        // into the slot.  Text and tokens carry
+                        // distinct shapes here: the substrate stores
+                        // `user_text` / `assistant_text` as the
+                        // human-readable strings the caller supplied,
+                        // while `token_ids` carries the full slot
+                        // token sequence (prefill + decoded body +
+                        // post-decode tail) so cross-process replay
+                        // reconstructs the exact K/V the kernel saw.
                         let turn_content = if matches!(action, SealAction::Turn) {
-                            let post_decode_text = if state.post_decode_tokens.is_empty() {
-                                String::new()
-                            } else {
-                                self.tokenizer
-                                    .decode(&state.post_decode_tokens, skip)
-                                    .unwrap_or_default()
-                            };
-                            let mut full_text = String::with_capacity(
-                                state.prefill_text.len() + text.len() + post_decode_text.len(),
-                            );
-                            full_text.push_str(&state.prefill_text);
-                            full_text.push_str(&text);
-                            full_text.push_str(&post_decode_text);
-
+                            // user_text comes through verbatim from
+                            // submit_turn (raw user message, no role
+                            // markers, no /no_think prefix).
+                            // assistant_text is the model's decoded
+                            // body — special tokens skipped, just the
+                            // reply the user sees streamed.  The
+                            // substrate stores both halves verbatim;
+                            // no caller assembles a combined string.
                             let mut full_tokens: Vec<u32> = Vec::with_capacity(
                                 state.prefill_tokens.len()
                                     + state.generated_tokens.len()
@@ -1766,7 +1796,8 @@ impl Scheduler {
 
                             Some(TurnContent {
                                 role: crate::turn::Role::Assistant,
-                                text: full_text,
+                                user_text: state.user_text.clone(),
+                                assistant_text: text.clone(),
                                 token_ids: TokenBuffer::from(full_tokens),
                             })
                         } else {
@@ -2131,7 +2162,8 @@ impl Scheduler {
                 })?;
                 let TurnContent {
                     role,
-                    text,
+                    user_text,
+                    assistant_text,
                     token_ids,
                 } = turn_content.unwrap_or_default();
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
@@ -2139,13 +2171,13 @@ impl Scheduler {
                 // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
 
-                // The turn is sealed as one indivisible content
-                // block — the full user_start ... user_msg ...
-                // user_end assistant_start ... decoded ... post_decode
-                // exchange — landing in a single `TurnPart` on the
-                // substrate side.
+                // The turn is sealed as one indivisible K/V block but
+                // the substrate stores the user and assistant text
+                // separately — clean strings the sidebar can render
+                // without re-tokenising at read time.
                 let write = crate::substrate::TurnPartWrite {
-                    text,
+                    user_text,
+                    assistant_text,
                     token_ids,
                     token_count: turn_token_count,
                     block_start: block_from as u64,
@@ -3460,6 +3492,7 @@ mod tests {
                 v_low_error_threshold_factor: 1.0,
             },
             PersistenceTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
         );
         (scheduler, tx)
     }
@@ -3579,6 +3612,7 @@ mod tests {
                 v_low_error_threshold_factor: 1.0,
             },
             PersistenceTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();
@@ -3646,6 +3680,7 @@ mod tests {
                 v_low_error_threshold_factor: 1.0,
             },
             PersistenceTrigger::noop(),
+            projection_assembler::BoundaryMarkers::default(),
         );
 
         let parent_raw = scheduler.session.create_sequence().unwrap();

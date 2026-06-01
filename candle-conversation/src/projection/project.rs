@@ -644,51 +644,19 @@ pub fn run<R: ContentResolver>(
     }
 
     let mut segments: Vec<ProjectionSegment> =
-        Vec::with_capacity(system_prompt_segments.len() + turns.len() * 3);
+        Vec::with_capacity(system_prompt_segments.len() + turns.len());
     segments.extend(system_prompt_segments);
-    // Each past turn projects as
-    // `Generated(UserStart) + Sealed(Turn) + Generated(AssistantEnd)`.
-    // The `user_start` markers at the head of each turn and the
-    // `assistant_end` markers at its tail were stripped from the
-    // sealed bytes at seal time; the projection re-emits them as
-    // live-prefilled `Generated` runs so their K vectors are
-    // computed under the actual runtime causal prefix on every
-    // projection.  Adjacent `Generated` segments at every
-    // boundary — the previous turn's `AssistantEnd` next to the
-    // following turn's `UserStart` — collapse into a single
-    // batched prefill run via the assembler's run accumulator, so
-    // the boundary K/V is one cache-keyed prefill per transition.
-    //
-    // When the schema's boundary markers aren't populated yet
-    // (synthetic-prompt schemas that didn't call
-    // `Builder::tokenize_boundary_markers`), the turn collapses to
-    // its single `Sealed` segment — same legacy behaviour as a
-    // pre-Phase-5 projection.
-    let markers = schema.boundary_markers.clone();
-    for t in turns {
-        if let Some(m) = markers.as_ref() {
-            segments.push(ProjectionSegment::Generated {
-                tokens: m.user_start.clone(),
-                identity: GeneratedIdentity {
-                    name: "user_start".into(),
-                    position: segments.len(),
-                },
-            });
-        }
-        segments.push(ProjectionSegment::Sealed(SealedKind::Turn(
-            t,
-            crate::Role::Assistant,
-        )));
-        if let Some(m) = markers.as_ref() {
-            segments.push(ProjectionSegment::Generated {
-                tokens: m.assistant_end.clone(),
-                identity: GeneratedIdentity {
-                    name: "assistant_end".into(),
-                    position: segments.len(),
-                },
-            });
-        }
-    }
+    // Past turns emit as a single `Sealed::Turn` segment each.  The
+    // projection engine doesn't know about dialect tokens or boundary
+    // wrapping — the projection assembler owns that concern and
+    // injects `user_start` before / `assistant_end` after every
+    // `Sealed::Turn` from its own pre-tokenised `BoundaryMarkers`
+    // (held on the scheduler, threaded through `ApplyContext`).
+    segments.extend(
+        turns
+            .into_iter()
+            .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant))),
+    );
     Projection { segments }
 }
 

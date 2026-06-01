@@ -558,10 +558,7 @@ fn build(
         });
     }
 
-    let schema = Schema {
-        layers,
-        boundary_markers: None,
-    };
+    let schema = Schema { layers };
     Ok((schema, maps))
 }
 

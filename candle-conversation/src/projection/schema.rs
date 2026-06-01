@@ -448,40 +448,19 @@ pub enum ScoreFormula {
     PerTokenExcess,
 }
 
-/// Pre-tokenised dialect markers the projection engine wraps around
-/// each past turn — and around the current turn at the head of every
-/// projection — as live `Generated` segments.
-///
-/// `user_start` (e.g. ChatML's `<|im_start|>user\n`) opens the run
-/// just before a turn's sealed content; `assistant_end` (e.g. ChatML's
-/// `<|im_end|>\n`) closes the run just after a turn's sealed content.
-/// At every cross-turn boundary the previous turn's `assistant_end`
-/// and the next turn's `user_start` sit adjacent in the segment
-/// list, so the assembler batches them into one combined prefill
-/// run — five tokens of fully live K/V on every boundary.
-///
-/// Populated by [`super::Builder::tokenize_boundary_markers`] after
-/// the engine's tokenizer is available; `None` when the schema is
-/// used in a context that never projects turns (pure-section
-/// schemas, unit-test fixtures).
-#[derive(Debug, Clone)]
-pub struct BoundaryMarkers {
-    pub user_start: std::sync::Arc<Vec<u32>>,
-    pub assistant_end: std::sync::Arc<Vec<u32>>,
-}
-
 /// The complete parsed, validated schema. Immutable after construction.
 ///
 /// All structural state lives on individual layers — there is no top-level
 /// system prompt and no top-level token budget. Each layer carries its own
 /// `window` (per-target turn budget) and `system_prompt` (framing for when
 /// it is the target).
+///
+/// The schema does **not** carry dialect-specific structural tokens
+/// (turn-boundary markers, role openers/closers).  Those are runtime
+/// concerns owned by the scheduler / projection assembler — see
+/// `crate::scheduler::projection_assembler::BoundaryMarkers`.
 #[derive(Debug, Clone)]
 pub struct Schema {
     /// Ordered: layer 0 first. Order is meaningful for masking and emission.
     pub layers: Vec<LayerSchema>,
-    /// Pre-tokenised dialect role markers wrapped as live `Generated`
-    /// segments around each turn at projection time.  `None` until
-    /// [`super::Builder::tokenize_boundary_markers`] is called.
-    pub boundary_markers: Option<BoundaryMarkers>,
 }

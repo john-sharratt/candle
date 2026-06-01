@@ -615,6 +615,8 @@ mod tests {
             user_chunk_count: 0,
             user_token_count: 0,
             user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
         }
     }
 

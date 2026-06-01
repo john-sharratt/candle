@@ -1136,6 +1136,16 @@ pub struct EngineConfig {
     /// can detokenize offline without a separate tokenizer file. `None` skips
     /// the write.
     pub tokenizer: Option<Vec<u8>>,
+
+    /// The model's chat dialect — the structural-token strings the
+    /// engine needs to know about for inter-turn boundary handling.
+    /// Pre-tokenised at engine construction into the assembler's
+    /// `BoundaryMarkers` so every projection can wrap each
+    /// `Sealed::Turn` in a live-prefilled boundary run without
+    /// re-tokenising.  Defaults to ChatML (the most common dialect
+    /// in the modern model lineup the engine supports); model
+    /// builders override via `ret.dialect = ...`.
+    pub dialect: Dialect,
 }
 
 impl EngineConfig {
@@ -1161,6 +1171,7 @@ impl EngineConfig {
             workspace_path: None,
             model_spec: None,
             tokenizer: None,
+            dialect: Dialect::chat_ml(),
         }
     }
 }
