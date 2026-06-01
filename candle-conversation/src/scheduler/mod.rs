@@ -1042,6 +1042,30 @@ impl Scheduler {
                             }
                         }
                     }
+
+                    // Append a trailing `Generated(UserStart)` so the
+                    // current turn's user-side prefill begins behind a
+                    // live `<|im_start|>user\n` opener.  This is the
+                    // boundary between the most recent past turn (or
+                    // the system block) and the new turn — adjacent to
+                    // whatever `Generated` segment closed the past-turn
+                    // run, so the assembler batches them into a single
+                    // live-prefill run at the boundary.
+                    if let Some(markers) = inputs
+                        .projection
+                        .schema()
+                        .boundary_markers
+                        .as_ref()
+                    {
+                        let pos = segments.len();
+                        segments.push(crate::projection::ProjectionSegment::Generated {
+                            tokens: markers.user_start.clone(),
+                            identity: crate::projection::GeneratedIdentity {
+                                name: "user_start_current".into(),
+                                position: pos,
+                            },
+                        });
+                    }
                     (sections, segments)
                 } else {
                     (Vec::new(), Vec::new())

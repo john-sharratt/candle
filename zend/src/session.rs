@@ -171,6 +171,21 @@ impl InferenceState {
                     .map_err(|e| anyhow::anyhow!("template tokenise: {e}"))?;
                 Ok(encoded.get_ids().to_vec())
             })?;
+        // Pre-tokenise the dialect's turn-boundary markers (`user_start`
+        // / `assistant_end`) so the projection engine can wrap every
+        // past turn in `Generated(UserStart) .. Sealed(Turn) ..
+        // Generated(AssistantEnd)` and append a trailing
+        // `Generated(UserStart)` ahead of the current turn's prefill.
+        // Adjacent `Generated` runs at each cross-turn boundary
+        // collapse into one batched prefill via the assembler's run
+        // accumulator.
+        proj_builder
+            .tokenize_boundary_markers::<anyhow::Error, _>(&conv_config.dialect, |s| {
+                let encoded = tokenizer
+                    .encode(s, false)
+                    .map_err(|e| anyhow::anyhow!("boundary marker tokenise: {e}"))?;
+                Ok(encoded.get_ids().to_vec())
+            })?;
 
         progress.set_step(LoadStep::Sections);
         // Per-section progress callback — bytes ingested out of total

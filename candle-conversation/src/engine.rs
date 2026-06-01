@@ -318,10 +318,40 @@ impl ConversationEngine {
         kind: crate::projection::Reserved,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
-        let builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
+        let mut builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
+        self.tokenize_boundary_markers_on(&mut builder, &config)?;
         let layer_id = crate::projection::LayerId::reserved(kind);
         let group_id = crate::projection::GroupId::reserved(kind);
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
+    }
+
+    /// Populate the projection schema's `boundary_markers` using the
+    /// engine's tokenizer and the supplied dialect.  Engine-internal
+    /// constructors (synthetic-prompt callers like the titler and the
+    /// plain-prompt path) need this so the projection's per-turn
+    /// expansion can emit `Generated(UserStart)` / `Generated(AssistantEnd)`
+    /// around each past turn.  External builders that own their own
+    /// tokenisation (zend's session.rs) call
+    /// [`crate::projection::Builder::tokenize_boundary_markers`]
+    /// directly.
+    fn tokenize_boundary_markers_on(
+        &self,
+        builder: &mut Builder,
+        config: &SequenceConfig,
+    ) -> crate::Result<()> {
+        let tokenizer = self.tokenizer().clone();
+        builder
+            .tokenize_boundary_markers::<crate::error::ConversationError, _>(
+                &config.dialect,
+                |s| {
+                    let encoded = tokenizer.encode(s, false).map_err(|e| {
+                        crate::error::ConversationError::Channel(format!(
+                            "boundary marker tokenise: {e}"
+                        ))
+                    })?;
+                    Ok(encoded.get_ids().to_vec())
+                },
+            )
     }
 
     pub fn new_conversation(
@@ -342,7 +372,8 @@ impl ConversationEngine {
                 .unwrap_or(system_prompt);
             s.strip_suffix(config.dialect.system_end).unwrap_or(s)
         };
-        let builder = Builder::for_plain_prompt(inner_prompt);
+        let mut builder = Builder::for_plain_prompt(inner_prompt);
+        self.tokenize_boundary_markers_on(&mut builder, &config)?;
         let (layer_id, group_id) = {
             let layer = &builder.schema().layers[0];
             (layer.id, layer.groups[0].id)

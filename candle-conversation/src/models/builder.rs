@@ -9,6 +9,7 @@ use crate::error::ConversationError;
 use crate::models::DialectType;
 use crate::tree::ConversationTreeConfig;
 use candle::Device;
+use candle_nn::kv_cache::QuantFormat;
 use candle_nn::{arena_chunks_for_format, CHUNK_SIZE};
 use candle_transformers::models::batched_model::BatchedInference;
 use std::path::{Path, PathBuf};
@@ -547,7 +548,8 @@ impl ModelBuilder {
         // pal_map and unit scales for every conversation consumer. V keeps
         // full selection adaptivity. Drop the override once the decode
         // kernel's K-path is fixed.
-        ret.batched_config.override_k_quant = Some(candle_nn::kv_cache::QuantFormat::Q4_KS);
+        ret.batched_config.override_k_quant = Some(QuantFormat::Q4_KS);
+        ret.batched_config.override_v_quant = None;
         ret.vocab_size = vocab_size;
         ret.max_concurrent_conversations = self.max_concurrent;
         ret.show_special_tokens = self.show_special_tokens;

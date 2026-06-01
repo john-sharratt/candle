@@ -686,15 +686,22 @@ impl Sequence {
         } else {
             ""
         };
-        // Format: {user_start}[/no_think]{user_message}{user_end}{assistant_start}.
-        // Each turn opens its own user role marker and closes the
-        // assistant tail via `post_decode_tokens` after the model
-        // emits EOS — see `cleanup_finished`.  System sections no
-        // longer bake the trailing `user_start` into their pinned
-        // bytes; turns are now self-contained ChatML units.
+        // The persisted turn shape is
+        //     [no_think_prefix] + user_message + user_end + assistant_start [+ think_block] + decoded_body
+        // — i.e. `user_start` is **not** in the prefill and `assistant_end`
+        // is **not** appended after decode.  Both boundary markers are
+        // emitted as live `Generated` segments by the projection engine
+        // (the trailing `Generated(UserStart)` the scheduler appends
+        // before this prefill, and the `Generated(AssistantEnd)` that
+        // closes every past-turn injection on the next projection that
+        // includes this turn).  Their K vectors are computed under the
+        // actual runtime causal prefix on every projection, so the
+        // attention-pivot K/V stays correct as projection-selected
+        // context changes.  The intra-turn `user_end` and
+        // `assistant_start` markers stay baked — their hidden state is
+        // dominated by the turn's own (invariant) content.
         let formatted = format!(
-            "{}{}{}{}{}",
-            self.config.dialect.user_start,
+            "{}{}{}{}",
             no_think_prefix,
             user_message,
             self.config.dialect.user_end,
@@ -707,22 +714,13 @@ impl Sequence {
         );
         let prefill_tokens = self.tokenize(&formatted)?;
 
-        // `post_decode_tokens` close the turn's structural tail in
-        // the slot — appended after the model's EOS so the seal
-        // captures `<eos><tail>` together.  Computed by stripping the
-        // dialect's role-end marker from `assistant_end`; the model
-        // already emitted that marker as EOS.
-        let post_decode_text = self
-            .config
-            .dialect
-            .assistant_end
-            .strip_prefix(self.config.dialect.marker_end)
-            .unwrap_or("");
-        let post_decode_tokens = if post_decode_text.is_empty() {
-            TokenBuffer::new()
-        } else {
-            self.tokenize(post_decode_text)?
-        };
+        // No post-decode tail in the Phase 5 layout.  The model's
+        // `<|im_end|>` EOS doesn't get forwarded (sampling stops on
+        // EOS without a follow-up forward pass), and the trailing
+        // `\n` that used to come from `assistant_end` is now the live
+        // `Generated(AssistantEnd)` segment the projection emits
+        // after the sealed turn on every future projection.
+        let post_decode_tokens = TokenBuffer::new();
 
         // Record the pending user turn (text + raw tokens for the tree).
         let user_tokens = self.tokenize(user_message)?;
@@ -857,9 +855,14 @@ impl Sequence {
         // by the model; we append the full `assistant_end` (EOS +
         // structural tail) ourselves so the seal captures a
         // structurally-complete turn.
+        // Same Phase 5 shape as `submit_turn`: `user_start` and
+        // `assistant_end` are stripped from the persisted bytes; the
+        // projection's live `Generated` segments re-emit them around
+        // the sealed turn on every future projection.  The trailing
+        // `Generated(UserStart)` the scheduler appends ahead of this
+        // prefill supplies the live `<|im_start|>user\n` opener.
         let formatted = format!(
-            "{}{}{}{}{}{}",
-            self.config.dialect.user_start,
+            "{}{}{}{}{}",
             no_think_prefix,
             user_message,
             self.config.dialect.user_end,
@@ -872,7 +875,7 @@ impl Sequence {
             assistant_text,
         );
         let prefill_tokens = self.tokenize(&formatted)?;
-        let post_decode_tokens = self.tokenize(self.config.dialect.assistant_end)?;
+        let post_decode_tokens = TokenBuffer::new();
 
         // Build the TokenizedText for both halves now — assistant
         // text is supplied directly, not decoded, so we can fill it
