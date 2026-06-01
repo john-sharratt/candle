@@ -1,7 +1,9 @@
 # Projection Generated Segments — attention-correct boundary K/V via live prefill
 
-> **Status — Phases 1–5 shipped (Phase 5 in a simplified shape), Phase 6
-> still pending.** Specifies a structural change to the projection engine,
+> **Status — Phases 1–6 shipped.** Phase 5 landed in a simplified shape
+> and Phase 6's deliverables were absorbed into the earlier phases as
+> they shipped — no separate Phase 6 commit was needed.  Specifies a
+> structural change to the projection engine,
 > scheduler, and substrate: pre-baked sealed K/V for *content* (sections,
 > turns), live-prefilled K/V for *structural template* tokens (system
 > framing, inter-turn role markers), with a per-slot cache so the common
@@ -804,8 +806,8 @@ Next `apply_segments` overwrites with a fresh set.
 - `Substrate::sections` shrinks: template-kind items no longer ingest as
   sections (Phase 3).  No `__system_start` / `__system_end` synthetic
   sections (Phase 3 retired the synthetic marker mechanism).  The
-  zend-side `tools_open` / `tools_close` migration to `kind: template`
-  remains pending Phase 6 work.
+  zend-side `tools_open` / `tools_close` / `mode` are already `kind:
+  template` (Phase 1 YAML migration).
 - `SectionEntryData` stores authored content sections only.
 - `TurnEntryData` holds one `TurnPart` carrying `user_text` +
   `assistant_text` strings and one indivisible K/V block (§3.4).  The
@@ -872,7 +874,12 @@ walks.
 
 ## 9. YAML migration (zend's `projection.yaml`)
 
-Before (current):
+This migration shipped alongside Phase 1's dialect catalog +
+`kind: template` parser; `zend/src/prompts/projection.yaml` is
+already in the **After** shape below.  Recorded here for the
+before/after diff history.
+
+Before (pre-Phase-1):
 
 ```yaml
 - name: dialogue
@@ -904,7 +911,7 @@ Before (current):
 (With `__system_start` / `__system_end` installed programmatically via
 `Builder::set_system_markers` outside the YAML.)
 
-After (Phase 6):
+After (as shipped):
 
 ```yaml
 - name: dialogue
@@ -989,7 +996,7 @@ Module-level diff summary (as shipped through Phase 5):
 | `candle-conversation/src/projection/yaml.rs` | Parse `kind: template`, resolve `dialect:` refs at build. |
 | `candle-conversation/src/projection/project.rs` | Emit `Vec<ProjectionSegment>`.  One `Sealed::Turn` per past turn (boundary wrapping is the assembler's job). |
 | `candle-conversation/src/projection/builder.rs` | `Builder::tokenize_boundary_markers` removed; markers built at engine construction instead. |
-| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` calls `ProjectionAssembler`.  `Scheduler` owns `BoundaryMarkers` + `SlotProjectionCache` per slot.  `perform_seal_and_write` trims trailing EOS, fires `clear_post_turn`, asserts `token_ids.len() == token_count`. |
+| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` calls `ProjectionAssembler`.  `Scheduler` owns `BoundaryMarkers` + `SlotProjectionCache` per slot.  `perform_seal_and_write` trims trailing EOS, fires `trim_post_turn`, asserts `token_ids.len() == token_count`. |
 | `candle-conversation/src/scheduler/projection_assembler.rs` | Walk logic, rolling-hash cache lookup, inline prefill+capture.  Wraps every `Sealed::Turn` with `user_start` / `assistant_end`. |
 | `candle-conversation/src/scheduler/prefill.rs` | Carries `user_text` through to `DecodeState` for verbatim seal storage. |
 | `candle-conversation/src/substrate.rs` | `TurnPart { user_text, assistant_text, token_count, token_ids, sig_entries, residence }` — single block, paired strings. |
@@ -997,7 +1004,7 @@ Module-level diff summary (as shipped through Phase 5):
 | `candle-conversation/src/conversation.rs` | `submit_turn` formats prefill without the inter-turn boundary tokens.  `recovered_history` returns `Vec<(Role, String)>` straight from substrate. |
 | `candle-conversation/src/engine.rs` | Pre-tokenises `BoundaryMarkers` once at engine construction and passes them to `Scheduler::new`. |
 | `zend/src/session.rs` | No longer tokenises boundary markers; no decode call on `recovered_history`. |
-| **Pending Phase 6:** `zend/src/prompts/projection.yaml` migration of `tools_*` to `kind: template`. |
+| `zend/src/prompts/projection.yaml` | `system_open`, `system_close`, `mode`, `tools_open`, `tools_close` migrated to `kind: template` (landed in Phase 1's YAML migration). |
 
 ---
 
@@ -1205,36 +1212,48 @@ Risk: **medium** as built.  Scheduler hot path touched, but the
 simplification removed the riskiest pieces (pending_user_part /
 reproject interaction, the two-range `TurnDecl`).  Redo log rebuilt.
 
-### Phase 6 — YAML migration + cleanup (pending)
+### Phase 6 — YAML migration + cleanup (absorbed into Phases 1–5)
 
-**Status: not yet shipped.**
+**Status: complete — every code deliverable landed during an earlier
+phase rather than as a separate Phase 6 commit.**  The original list
+anticipated cleanup work that would still be needed after Phase 5
+landed; in practice the relevant pieces were retired in-flight as
+each phase rewrote its surrounding code.  Recorded here per
+deliverable.
 
-**Consolidation. Code-debt removal.**
+Deliverables (as shipped):
+- ✅ **YAML migration.**  `zend/src/prompts/projection.yaml` already
+  uses `kind: template` with `dialect:` references for `system_open`,
+  `mode` (`no_think_prefix`), `tools_open`, `tools_close`,
+  `system_close`.  Landed alongside Phase 1's dialect catalog +
+  `kind: template` parser.
+- ✅ **Synthetic-marker cleanup.**  `LayerSchema::system_start_section`,
+  `system_end_section`, and `Builder::set_system_markers` no longer
+  exist (Phase 3 retired the synthetic marker mechanism when the
+  schema became self-describing via dialect templates).
+  `next_section_id_raw` survives but is **not** synthetic-marker
+  machinery — it's the section-ID allocator backing `add_section` /
+  `add_section_to_collection` builder methods, which remain
+  legitimate user-facing API.  Kept by design.
+- ✅ **Template ingest skip.**  `conversation.rs`'s cumulative-prefix
+  ingest loop filters out template-kind items via `is_template`
+  guards at every step (sec setup, byte accounting, batch ingest).
+  Templates contribute nothing to `linear_prefix` /
+  `fixed_prefix`; content sections still cumulative-ingest, as
+  intended.
+- ✅ **BDP sig extractor structural-block skip.**  Satisfied
+  structurally: the boundary-marker `Generated` runs live on the
+  slot cache, never enter the substrate, and the sig extractor
+  doesn't walk the cache region.  No explicit skip flag needed.
 
-Deliverables (still pending):
-- zend's `projection.yaml` migrated: `tools_open`, `tools_close`,
-  `mode` → `kind: template`.  (`__system_start` / `__system_end` were
-  already retired during Phase 3's synthetic-marker removal.)
-- Delete `LayerSchema::system_start_section`, `system_end_section`,
-  `Builder::set_system_markers`, `next_section_id_raw` synthetic-id
-  machinery if any residual remains.
-- Delete the `linear_prefix` / `fixed_prefix` cumulative ingest dance
-  in `conversation.rs` for template handling; content sections still
-  cumulative-ingest.
+Remaining (measurement, not code):
+- ⏳ **BDP retrieval MRR / Top-1 against canonical probe set: equal
+  or better than Phase 3 baseline.**  Part of the broader benchmark
+  backlog for the May 2026 arXiv submission — runs against the
+  current shipped state, no further code changes required to
+  measure.
 
-Already satisfied structurally (not via explicit deliverables):
-- "BDP sig extractor skips blocks captured to `SlotCache`."  The
-  boundary cache region doesn't intersect the sealed-turn region the
-  sig extractor walks, so this is true by construction in the shipped
-  Phase 5 shape — no explicit skip flag needed.  See §8.4.
-
-Tests (when Phase 6 lands):
-- BDP retrieval MRR / Top-1 against canonical probe set: equal or
-  better than Phase 3 baseline.
-- YAML migration: zend boots, ingest completes, conversation works.
-- Integration suite green.
-
-Risk: **low.** Mostly mechanical.
+Risk: closed.
 
 ---
 
