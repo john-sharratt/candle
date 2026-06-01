@@ -1785,13 +1785,25 @@ impl Scheduler {
                             // reply the user sees streamed.  The
                             // substrate stores both halves verbatim;
                             // no caller assembles a combined string.
+                            // The last entry in state.generated_tokens
+                            // was sampled from the most recent forward
+                            // pass but never forwarded itself — the
+                            // loop terminated (EOS or max_tokens) before
+                            // another forward could write its K/V into
+                            // the slot.  Drop it so token_ids aligns
+                            // 1:1 with the K/V chunk grid.
+                            let forwarded_generated: &[u32] = state
+                                .generated_tokens
+                                .split_last()
+                                .map(|(_, rest)| rest)
+                                .unwrap_or(&[]);
                             let mut full_tokens: Vec<u32> = Vec::with_capacity(
                                 state.prefill_tokens.len()
-                                    + state.generated_tokens.len()
+                                    + forwarded_generated.len()
                                     + state.post_decode_tokens.len(),
                             );
                             full_tokens.extend_from_slice(&state.prefill_tokens);
-                            full_tokens.extend_from_slice(&state.generated_tokens);
+                            full_tokens.extend_from_slice(forwarded_generated);
                             full_tokens.extend_from_slice(&state.post_decode_tokens);
 
                             Some(TurnContent {
@@ -2170,6 +2182,12 @@ impl Scheduler {
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
                 let persist_token_ids: Vec<u32> = token_ids[..].to_vec();
+                debug_assert_eq!(
+                    persist_token_ids.len(),
+                    turn_token_count,
+                    "persisted token_ids must align 1:1 with the K/V chunk grid \
+                     (off-by-one usually means an unforwarded token slipped through)"
+                );
 
                 // The turn is sealed as one indivisible K/V block but
                 // the substrate stores the user and assistant text
@@ -2238,6 +2256,19 @@ impl Scheduler {
                 // turn (hot→warm migrate, warm→cold redo-log write,
                 // group fsync) without waiting for its 5 s tick.
                 self.persist_trigger.fire();
+                // Trim the slot's live-prefill capture cache down to
+                // the working set this projection actually touched.
+                // Without trimming, each turn would append at least
+                // one new boundary-run entry (the trailing
+                // `user_start_current`) and pin GPU arenas via its
+                // `Arc<Vec<SealedSequence>>` values indefinitely.
+                // Retaining the active keys keeps the boundary K/V
+                // hot for next-turn reprojection while bounding the
+                // cache at ~one projection's worth of entries — see
+                // `SlotState::trim_post_turn`.
+                if let Some(state) = self.slot_projection_state.get_mut(&seal_slot) {
+                    state.trim_post_turn();
+                }
             }
             SealAction::Section { section_id, tokens } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);

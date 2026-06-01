@@ -538,8 +538,13 @@ pub struct TurnPart {
     /// already has" rule as `user_text`.
     pub assistant_text: String,
     /// Total token count this turn pins onto the slot — sum of the
-    /// K/V chunk's `token_count` fields.  Must match the combined
-    /// `token_ids.len()` (modulo the slot's chunk granularity).
+    /// K/V chunk's `token_count` fields.  Holds the invariant
+    /// `token_count == token_ids.len()` — every persisted token id
+    /// has a corresponding slot position in the K/V chunk grid.  The
+    /// decode-loop trailing-terminator (EOS or max-tokens edge token,
+    /// sampled but never forwarded) is trimmed at seal time to
+    /// preserve this; a `debug_assert_eq!` at the seal site guards
+    /// against any future regression.
     pub token_count: usize,
     /// Combined turn token ids in slot order:
     /// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`.

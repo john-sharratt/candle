@@ -1,16 +1,48 @@
 # Projection Generated Segments — attention-correct boundary K/V via live prefill
 
-> **Status — Design v1, ready to build.** Specifies a structural change to the
-> projection engine, scheduler, and substrate: pre-baked sealed K/V for
-> *content* (sections, turns), live-prefilled K/V for *structural template*
-> tokens (role markers, block envelopes), with a per-slot cache so the
-> common case stays free. The change makes attention-pivot K/V correct
-> against the actual runtime context instead of a frozen ingest-time
-> approximation, eliminates structural tokens from the persistent
-> substrate, and lets the schema declare conversation structure
-> declaratively against the dialect catalog. Implementation is phased
-> (§13); each phase compiles, tests pass, runs end-to-end, and is
-> standalone-mergeable.
+> **Status — Phases 1–5 shipped (Phase 5 in a simplified shape), Phase 6
+> still pending.** Specifies a structural change to the projection engine,
+> scheduler, and substrate: pre-baked sealed K/V for *content* (sections,
+> turns), live-prefilled K/V for *structural template* tokens (system
+> framing, inter-turn role markers), with a per-slot cache so the common
+> case stays free. The change makes attention-pivot K/V correct against
+> the actual runtime context instead of a frozen ingest-time approximation,
+> removes inter-turn role markers from the persistent substrate, and lets
+> the schema declare conversation structure declaratively against the
+> dialect catalog.
+>
+> **Implementation deviation from the original design (recorded here for
+> future readers).**  The shipped Phase 5 is leaner than this doc's
+> original spec.  Specifically:
+>
+> - Only the **inter-turn** boundary markers (`user_start` at a turn's head,
+>   `assistant_end` at its tail) regenerate as `Generated` segments at
+>   projection time.  The **intra-turn** pair (`user_end` +
+>   `assistant_start`, plus an optional `/think_block`) stays baked in the
+>   persisted prefill bytes — its K/V context is dominated by the turn's
+>   own invariant content on both sides, so re-prefilling on every
+>   projection would burn compute for no attention-correctness gain.
+> - `TurnEntryData` is a single `TurnPart` carrying both `user_text` and
+>   `assistant_text` as verbatim strings (not tokens, not K/V halves).
+>   The K/V is one indivisible sealed block per turn.
+> - `ProjectionSegment::NewUserMessage` and `SlotState::pending_user_part`
+>   are retained as forward-looking infrastructure but no current code
+>   path emits or populates them.  The current turn's user message
+>   prefills as ordinary `prefill_tokens` (the bytes the substrate seals
+>   anyway), not as a captured `NewUserMessage` run.
+> - `BoundaryMarkers` lives on the scheduler and is threaded through the
+>   assembler's `ApplyContext` — **not** on the `Schema`.  Dialect-specific
+>   tokens are a runtime concern, not a schema concern.
+> - `SlotProjectionCache::retain_keys()` fires at end-of-turn against
+>   the working-set of cache keys the most recent `apply_segments` walk
+>   actually touched.  Entries from prior projections that fell out of
+>   the current window (or that lived under a now-divergent prefix) are
+>   dropped; entries the new projection still depends on stay hot.
+>   Without this trim the cache grows monotonically per turn over a
+>   long conversation.
+>
+> Sections below describe the **as-built** shape; the original phased
+> deliverable list in §13 is kept with a status annotation per phase.
 
 ---
 
@@ -54,17 +86,23 @@ at projection time**, cached per-slot. Concretely:
    selected turn, sourced from the dialect catalog. The current
    role-marker baking in the user-prefill goes away.
 
-5. New user messages become `NewUserMessage` segments captured to a
-   slot-attached pending-user-part buffer at prefill time; committed to
-   the substrate as one half of a `TurnEntryData` at seal time alongside
-   the decoded assistant half.
+5. **(Not shipped — reserved infrastructure.)**  The `NewUserMessage`
+   segment variant exists in `ProjectionSegment` as a forward-looking
+   path for a future feature (mid-turn speculative capture, parallel
+   user-message ingestion).  In the current shipped path the user
+   message prefills as ordinary `prefill_tokens` and lands directly in
+   the slot's writable region ahead of decode.
 
-6. `TurnEntryData` keeps single-record identity (preserving BDP selection
-   surface) but splits internally into `user: TurnPart` and `assistant:
-   TurnPart`, each with its own residence, tokens, signatures.
+6. `TurnEntryData` holds a single `TurnPart` carrying `user_text` and
+   `assistant_text` as verbatim strings, plus a single combined K/V
+   block.  The doc's original per-role internal split was implemented in
+   Phase 4 and walked back during the Phase 5 simplification — see
+   commit `44f915c7`.
 
-7. BDP signatures cover only content — never structural template ranges,
-   which were polluting retrieval signal anyway.
+7. BDP signatures cover only content — never the boundary-marker ranges
+   that live as `Generated` segments (they're never persisted, so
+   they're never sig'd).  This is a structural property of the cutover,
+   not a separate filter.
 
 Net cost: tens of tokens prefilled per cache-miss projection, batched
 across all active slots in the standard prefill loop. Steady-state
@@ -177,19 +215,25 @@ pub enum ProjectionSegment {
         identity: GeneratedIdentity,    // diagnostic; not in cache key
     },
 
-    /// A new user message being submitted this turn. Prefilled onto the
-    /// slot and captured into the slot's `pending_user_part` buffer.
-    /// Committed to substrate at seal time as the `user` half of the
-    /// resulting `TurnEntryData`.
+    /// **Reserved infrastructure — not currently emitted.**  Originally
+    /// designed as the projection-side handle for a new user message
+    /// being captured for substrate commit at seal.  The shipped path
+    /// prefills the user message as ordinary `prefill_tokens` instead.
+    /// Retained for a future feature (mid-turn capture, speculative
+    /// decoding, parallel ingestion).
     NewUserMessage { tokens: Arc<Vec<u32>> },
 }
 
 pub enum SealedKind {
     Section(SectionId),
+    /// One sealed turn — single indivisible K/V block.  The `part`
+    /// field is retained for forward-compatibility with the doc's
+    /// original per-role split design but is always `Role::Assistant`
+    /// in the shipped path.
     Turn {
         timeline: TimelineId,
         index: TurnIndex,
-        part: Role,                     // User | Assistant
+        part: Role,
     },
 }
 
@@ -306,44 +350,54 @@ dialect-aware caller (zend) declares them as ordinary `kind: template`
 items at the head and tail of every layer's `system_prompt.items` via a
 builder helper. The schema becomes self-describing.
 
-### 3.4 `TurnEntryData` per-role split
+### 3.4 `TurnEntryData` shape
 
 ```rust
 pub struct TurnEntryData {
-    block_range: (u64, u64),    // overall slot extent across both parts
-    user: TurnPart,
-    assistant: TurnPart,
+    block_range: (u64, u64),    // slot extent of the indivisible K/V block
+    content: TurnPart,
 }
 
 pub struct TurnPart {
-    text: String,
-    token_count: usize,
-    token_ids: TokenBuffer,
-    sig_entries: Vec<SigEntry>,  // BDP sigs for this part's content tokens
-    residence: ResidenceIndex,
+    user_text: String,            // verbatim user message
+    assistant_text: String,       // verbatim decoded reply (special tokens skipped)
+    token_count: usize,           // K/V token count = token_ids.len() (invariant)
+    token_ids: TokenBuffer,       // [/no_think][user_msg][user_end][assistant_start]
+                                  //   [/think_block][response]
+    sig_entries: Vec<SigEntry>,   // BDP sigs over the turn's content tokens
+    residence: ResidenceIndex,    // hot/warm/cold residence for the K/V block
 }
 ```
 
-Required fields, both halves present. A `TurnEntryData` is never written
-to the substrate until both halves exist. There is no "half-turn" state
-the substrate has to know about — submit_turn captures the user half to a
-slot-local buffer; finish_turn assembles both halves and writes one atomic
-record.
+A turn is one indivisible K/V block at the substrate layer.  The text
+fields carry the human-readable strings exactly as the caller had them
+at submit time (no role-marker envelope, no `/no_think` prefix); they're
+stored verbatim so the sidebar reload path renders without any
+re-tokenising or boundary scanning.  The `token_ids` field is the
+slot's actual token sequence in slot order, used for cross-process
+replay (`recover_turn`).  The invariant `token_count == token_ids.len()`
+is enforced by a `debug_assert_eq!` at the seal site; see
+`scheduler/mod.rs` `perform_seal_and_write`.
 
-`Role` stays `User | Assistant | System` (System is currently unused for
-turn records but retained for the role-marker handling that already
-threads through).
+**Design evolution.**  An earlier iteration (commit `44b00b53`, Phase 4)
+implemented a per-role internal split with separate `user: TurnPart` +
+`assistant: TurnPart`, two residences, and a chunk-aligned boundary
+between them.  The split was walked back in commit `44f915c7` because
+(a) the K/V is one indivisible block anyway — the prefill writes the
+whole `[/no_think][user_msg][user_end][assistant_start][...]` sequence
+in one pass and seals it as one chunk grid; (b) splitting the residence
+created bookkeeping overhead for no operational benefit; (c) the
+sidebar reload path actually needs the strings, not the K/V halves.
+The single-block shape with paired text fields delivers the same UX
+without the split.
 
-BDP scoring is at turn granularity. `Substrate::turn_score(timeline,
-index, formula, weights)` aggregates the per-part sig material:
-concatenates `user.sig_entries` and `assistant.sig_entries`, scores once.
-Selection rules (`Sequence { recent, historical_top_k }`) operate on whole
-turns, unchanged.
+`Role` stays `User | Assistant | System` for the boundary-marker
+machinery in `Dialect`; it is **not** stored on `TurnPart` (every turn
+implicitly carries a user-then-assistant exchange).
 
-Two residence slots per turn — one for each part. Independent in
-principle, elevated/evicted together in practice (no use case for one
-without the other). The existing `Substrate::snapshot_promotion_state`
-classifier handles per-residence promotion plans without modification.
+BDP scoring is at turn granularity, against the single combined
+`content.sig_entries`.  Selection rules (`Sequence { recent,
+historical_top_k }`) operate on whole turns, unchanged.
 
 ### 3.5 Cache identity
 
@@ -380,10 +434,12 @@ vanishingly small. Treated as zero.
 
 `Builder::project` returns `Projection { segments: Vec<ProjectionSegment>
 }`. The 12-step pipeline in `project.rs` is unchanged through step 11
-(scoring, selection, reconcile, budgeting). Step 12 (emit) changes shape:
+(scoring, selection, reconcile, budgeting). Step 12 (emit) emits one
+`Sealed::Turn` segment per selected turn — the projection engine does
+not know about dialect tokens or boundary wrapping:
 
 ```text
-Step 12 (new):
+Step 12:
   out = Vec::new()
   for item in target_layer.system_prompt.items in declaration order:
       match item:
@@ -398,23 +454,28 @@ Step 12 (new):
                   out.push(Sealed(Section(member.id)))
   for layer in surviving_layers (by ascending group score):
       for turn in selected_turns_of_layer:
-          out.extend(expand_turn(turn))
+          out.push(Sealed(Turn { timeline, index, part: Assistant }))
   return Projection { segments: out }
-
-expand_turn(turn) -> Vec<ProjectionSegment>:
-    [
-        Generated(dialect.template(UserStart)),
-        Sealed(Turn { timeline, index, part: User }),
-        Generated(dialect.template(UserEnd)),
-        Generated(dialect.template(AssistantStart)),
-        Sealed(Turn { timeline, index, part: Assistant }),
-        Generated(dialect.template(AssistantEnd)),
-    ]
 ```
 
-`NewUserMessage` is **not** emitted by `Builder::project`. It is appended
-by the scheduler's submit-turn handler after the projection list is
-assembled, as part of the user-prefill staging step (§5).
+Inter-turn boundary wrapping happens in the **projection assembler**,
+not the projection engine.  When the assembler walks a `Sealed::Turn`
+segment it `extend`s the current `Generated` run with the dialect's
+`user_start` tokens, flushes the run (one batched prefill at the
+boundary), injects the sealed turn, then `extend`s the next run with
+the dialect's `assistant_end` tokens.  The next `Sealed::Turn` (or the
+trailing `Generated(UserStart)` the scheduler appends ahead of the
+current turn's prefill) collapses with that `assistant_end` into one
+5-token batched prefill at the cross-turn boundary.  See
+`projection_assembler.rs` `apply_segments`.
+
+The trailing `Generated(UserStart)` ahead of the current turn's prefill
+is appended **by the scheduler's `SubmitTurn` handler** (see
+`scheduler/mod.rs` around the comment `// Append a trailing
+Generated(UserStart) so the current turn's user-side prefill begins
+behind a live opener`), not by `Builder::project`.
+
+`NewUserMessage` is not emitted by anything in the shipped path.
 
 ### 4.2 `depends_on` semantics unchanged
 
@@ -553,37 +614,68 @@ and prefill fresh.
 
 ### 5.3 Prefill-run capture targets
 
-```rust
-pub enum RunCapture {
-    /// Generated template run — captured to slot.cache under `key`.
-    SlotCache { key: u64 },
+The shipped path has only one active capture target — generated template
+runs captured into the slot cache.  The `PendingUserPart` target
+described in the original design remains reserved infrastructure (no
+emitter, no consumer in the current code).
 
-    /// New user message run — captured to slot.pending_user_part. Not
-    /// cached. Committed to substrate as `TurnEntryData.user` at seal.
-    PendingUserPart,
+```rust
+/// Reserved for future use — defined inline at the capture site,
+/// not as a public enum in the shipped path.
+enum RunCapture {
+    SlotCache { key: u64 },     // shipped
+    PendingUserPart,             // reserved
 }
 ```
 
-Capture happens in the scheduler's prefill-completion hook (§6). The
-captured `Vec<SealedSequence>` is one entry per layer; the assembler
-treats it identically to a substrate-sourced sealed sequence for the
-purposes of Arc-cloning.
+Capture happens directly inside the assembler's `drive_prefill_and_capture`
+helper: after a successful `forward_batched` over a run's tokens, the
+per-layer `Vec<SealedSequence>` covering the just-written block range is
+sliced off the slot and inserted into `state.cache.memo` under the
+content-addressed key.  The assembler treats a captured run identically
+to a substrate-sourced sealed sequence on subsequent hits.
 
 ### 5.4 Cache lifetime and growth
 
-`SlotProjectionCache::memo` is `AHashMap<u64, Vec<SealedSequence>>`. It
-lives on the slot — populated as runs miss, queried as runs hit, dropped
-entirely when the slot is freed. No eviction policy. The Arc refs inside
-the cached `SealedSequence`s keep their arena chunks alive; dropping the
-cache releases them.
+`SlotProjectionCache::memo` is `HashMap<u64, Arc<Vec<SealedSequence>>>`. It
+lives on `SlotState`, populated as runs miss, queried as runs hit.
 
-In long-running slots the cache grows monotonically with the number of
-unique `(preceding_context, run_tokens)` combinations the conversation
-has produced. Typical bound: O(turns × structural-variations-per-turn).
-For zend's dialogue layer with 5 tools and ~10 templates per projection,
-this is a few hundred entries over a long conversation. Each entry holds
-a small number of layers × small SealedSequences = on the order of
-kilobytes per entry. Total: small megabytes. Acceptable.
+**Trim policy.**  Every `apply_segments` walk records each key it
+touches (hit or freshly captured) into `SlotState::last_apply_keys`.
+At seal time (`perform_seal_and_write` after `persist_trigger.fire()`),
+`SlotState::trim_post_turn` calls `SlotProjectionCache::retain_keys`
+against that set, dropping every cache entry whose key wasn't part of
+the most recent projection's working set.  The Arcs of the dropped
+entries release their refcount; GPU arenas reclaim asynchronously
+once no other reference holds the captured `SealedSequence`s.
+
+The kept set is exactly the boundary K/V the slot's current
+post-seal state depends on — every `user_start` and `assistant_end`
+between past turns within the projection's window, plus the trailing
+`user_start_current` (which becomes the inter-turn boundary opener
+for this turn in next-turn projections).  Next-turn reprojection
+with the same window shape hits every entry; cost is zero forward
+passes for boundaries.
+
+**What gets dropped:**
+- Boundary runs from turns that fell out of the projection's window
+  (the schema's per-target turn budget bounds the live working set).
+- Runs whose rolling-hash prefix diverged when an upstream segment
+  changed (e.g. a different system-prompt window selected, a section
+  collection materialised differently) — these entries were stranded
+  on a hash that no current segment list will ever reproduce.
+
+**Memory bound.**  The cache stabilises at ~one projection's worth of
+generated runs: window-bounded, not conversation-length-bounded.  For
+zend's dialogue layer (~16 past-turn window) the working set is ~17
+entries.  Each entry holds a per-layer `Vec<SealedSequence>` covering
+a few-token boundary run — kilobytes per layer × layer count ≈ a few
+hundred KB per entry on Qwen3-30B-A3B.  Total steady-state: low
+single-digit MB of GPU per slot.
+
+The mid-decode reprojection path also benefits: it happens within a
+single turn, before `trim_post_turn` fires, so reprojection sees the
+full cache.
 
 ---
 
@@ -624,24 +716,26 @@ arises in practice.)
 
 ### 6.3 Capture hook
 
-When a `PrefillRun` completes its forward pass:
+The shipped path performs capture inline inside the assembler's
+`drive_prefill_and_capture` (no separate hook stage):
 
 ```text
-let captured = extract_sealed_sequence_from_slot(
-    slot, write_offset, write_offset + ceil(len(tokens) / CHUNK_SIZE)
-);
-
-match run.capture:
-    SlotCache { key }:
-        slot_state.cache.insert(key, captured);
-    PendingUserPart:
-        slot_state.pending_user_part = Some(captured);
+forward_batched over run.tokens → writes K/V into slot at [start, end)
+captured = slice_per_layer_sealed(snapshot_sequence_per_layer(slot),
+                                  start_block, end_block)
+state.cache.insert(key, Arc::new(captured))
 ```
 
-The captured `Vec<SealedSequence>` is one per layer, sourced from the
-slot's existing per-layer state. The Arc refs in the SealedChunks keep
-the arena chunks alive even if the slot's prefix is later rebuilt past
-them.
+`PendingUserPart` has no live capture path today.  When (or if) a future
+feature wires up `NewUserMessage` emission, the same inline capture
+shape applies — write to `state.pending_user_part` instead of
+`state.cache`.
+
+The captured `Vec<SealedSequence>` is one per layer.  Wrapping in `Arc`
+lets the cache hand the same captured bytes back via Arc-clone on
+subsequent hits without further copies; the Arc refs inside the
+`SealedChunk`s keep the arena chunks alive even if the slot's prefix is
+later rebuilt past them.
 
 ### 6.4 Error propagation
 
@@ -656,39 +750,50 @@ state.
 
 ### 6.5 Decode integration
 
-Decode starts on the slot once all queued prefills (projection-prefills
-+ user-prefill) have completed. The slot's `ActiveDecode` is initialised
-with the writer tail attached at the position immediately after the last
-prefill range — i.e., after `Generated(AssistantStart)` in the submit-turn
-expansion.
+Decode starts on the slot once the projection apply has finished and
+the user-message prefill has landed.  In the shipped path the user
+message is part of `prefill_tokens` (which the `submit_turn` formatter
+concatenates as
+`[/no_think][user_msg][user_end][assistant_start][/think_block]`), so
+the writer tail naturally attaches at the position after the baked
+`assistant_start` (+ optional `/think_block`) — exactly where the
+model should start emitting its first response token.
 
 ---
 
 ## 7. Slot state
 
 ```rust
-pub struct SlotState {
-    pub cache: SlotProjectionCache,
-    pub pending_user_part: Option<Vec<SealedSequence>>,
+pub(super) struct SlotState {
+    pub(super) cache: SlotProjectionCache,
+    pub(super) pending_user_part: Option<Arc<Vec<SealedSequence>>>,
+    pub(super) last_apply_keys: HashSet<u64>,
 }
 ```
 
 `cache` is the content-addressed memo of captured live-prefill runs.
 Keyed by `hash(rolling_hash_at_run_start ++ concat(run_tokens))`, valued
-as the per-layer `Vec<SealedSequence>` captured from the slot after the
-prefill that produced it.  Populated on cache miss after the prefill
-completes; queried on every run-flush during the assembler walk.  No
-eviction policy; lives until the slot is freed.
+as the per-layer `Arc<Vec<SealedSequence>>` captured from the slot after
+the prefill that produced it.  Populated on cache miss after the prefill
+completes; queried on every run-flush during the assembler walk.
+**Trimmed at end-of-turn** to the most recent apply's working set
+(`SlotState::trim_post_turn`, fired from `perform_seal_and_write`
+after persistence has been triggered) so memory stays bounded while
+still-relevant boundary K/V stays hot — see §5.4.
 
-`pending_user_part` is populated by a `NewUserMessage` capture and
-cleared at seal time when the resulting bytes are written to the
-substrate.  If the turn is aborted (decode error, EOS forced before
-seal, slot freed mid-flight), the buffer drops without persistence.
-Mid-decode reprojection drops the prior slot contents along with
-everything else; the captured `Vec<SealedSequence>` survives the
-rebuild because it lives on `SlotState`, not on the slot, and the
-assembler re-injects it as the `NewUserMessage`'s K/V when it walks
-that segment.
+`pending_user_part` is reserved infrastructure (no current emitter or
+consumer).  `trim_post_turn` resets it to `None` alongside the cache
+trim, so when `NewUserMessage` emission is eventually wired up the
+field will already participate in the end-of-turn reset contract.  The
+original design's mid-decode-reproject survival contract still applies:
+the field lives on `SlotState`, not on the slot, so a truncate-to-zero
+rebuild during reprojection would preserve it.
+
+`last_apply_keys` is the working set the slot's current K/V residency
+reflects.  Reset to empty at the start of every `apply_segments`; each
+`flush_run` inserts its computed key into the set.  Outlives the apply
+that produced it because `trim_post_turn` consults it at seal time.
+Next `apply_segments` overwrites with a fresh set.
 
 ---
 
@@ -696,64 +801,72 @@ that segment.
 
 ### 8.1 Substrate
 
-- `Substrate::sections` shrinks: no more `__system_start`,
-  `__system_end`, `tools_open`, `tools_close`, or any other
-  template-kind item.
+- `Substrate::sections` shrinks: template-kind items no longer ingest as
+  sections (Phase 3).  No `__system_start` / `__system_end` synthetic
+  sections (Phase 3 retired the synthetic marker mechanism).  The
+  zend-side `tools_open` / `tools_close` migration to `kind: template`
+  remains pending Phase 6 work.
 - `SectionEntryData` stores authored content sections only.
-- `TurnEntryData` splits internals into `user: TurnPart` + `assistant:
-  TurnPart`, each with `residence: ResidenceIndex`.
-- `Substrate::append_full` becomes `Substrate::append_complete(timeline,
-  user_part, assistant_part)`. Both residences allocated; both filled
-  from the seal-time data.
-- `Substrate::turn_token_count(group, index)` sums
-  `user.token_count + assistant.token_count + (role-marker
-  tokens contributed by Generated boundaries in projection)`. The
-  role-marker contribution is computed from the dialect catalog — not
-  stored, derived.
-- BDP scoring (`turn_score`) concatenates `user.sig_entries` and
-  `assistant.sig_entries` before running the formula.
+- `TurnEntryData` holds one `TurnPart` carrying `user_text` +
+  `assistant_text` strings and one indivisible K/V block (§3.4).  The
+  doc's original per-role residence split shipped in Phase 4 and was
+  walked back in commit `44f915c7`.
+- `Substrate::append_complete(timeline, write)` appends one turn.  The
+  inter-turn role markers (`user_start` head, `assistant_end` tail) are
+  **not** stored — they're re-emitted as `Generated` segments at every
+  projection.
+- `Substrate::turn_token_count(group, index)` returns
+  `TurnPart::token_count`, which is the K/V block's exact token count.
+  The boundary markers' tokens are not counted (they're not pinned).
+- BDP scoring (`turn_score`) runs against the single combined
+  `content.sig_entries`.
 
 ### 8.2 Persistence (redo log)
 
-- `TurnDecl` carries two `(block_start, block_end)` ranges: one for the
-  user part, one for the assistant part. Both required.
-- Per-turn `Chunks` stream carries chunks for both parts. The simplest
-  layout: chunks ordered (user part first, then assistant part). A
-  `(user_chunk_count, assistant_chunk_count)` pair in TurnDecl
-  disambiguates the split. Reload walks both regions in order.
-- Per-turn `Tokens` record carries the concatenation of `user.token_ids
-  ++ assistant.token_ids` with the split point recorded in TurnDecl
-  (matching the chunk count partition).
-- Per-turn `Signatures` record similarly split with the partition
-  recorded.
-- No template-section records. The redo log shrinks for every session.
+- `TurnDecl` carries one `(block_start, block_end)` range covering the
+  turn's indivisible K/V block, plus verbatim `user_text` and
+  `assistant_text` strings (`#[serde(default)]` for forward
+  compatibility).
+- Per-turn `Chunks` stream carries the turn's K/V chunks in slot order.
+  The original `user_chunk_count` / `user_token_count` /
+  `user_sig_count` partition fields are persisted as zeros (kept for
+  forward compatibility with the per-role split design; no consumer
+  reads them in the shipped path).
+- Per-turn `Tokens` record carries the slot's full token sequence
+  `[/no_think][user_msg][user_end][assistant_start][/think_block][response]`
+  — without the inter-turn `user_start` head and `assistant_end` tail,
+  which are projection-time only.  The trailing EOS that decode samples
+  but never forwards is **trimmed at seal** so `token_ids.len() ==
+  token_count` (the K/V chunk grid token count).  See
+  `scheduler/mod.rs` `perform_seal_and_write` for the trim and the
+  `debug_assert_eq!` that guards the invariant.
+- Per-turn `Signatures` record is unsplit.
+- No template-section records.  Inter-turn boundary markers don't
+  persist.  Redo log shrinks accordingly.
 
 ### 8.3 Reload
 
-`SubstrateReload::recover_turn` reconstructs both halves of each
-`TurnEntryData` from the persisted records. Cold-marker turns (chunks
-not yet landed when the daemon shut down) materialise both `TurnPart`s
-with empty `Vec<SealedSequence>` cold residences until elevation
-recovers them.
+`SubstrateReload::recover_turn` reconstructs each `TurnEntryData`'s
+single `TurnPart` from the persisted records.  Cold-marker turns
+(chunks not yet landed when the daemon shut down) materialise with an
+empty `Vec<SealedSequence>` cold residence until elevation recovers
+them.  The `user_text` + `assistant_text` strings come straight off the
+`TurnDecl` — no re-tokenising, no boundary scanning.
 
 ### 8.4 BDP signature scope
 
-The sig extractor (`extract_prov_after_step` and the per-block prefill
-sig capture) gains a "this block is structural" flag. Sigs are skipped
-for any block range captured to `SlotCache`. Sigs are extracted for any
-block range captured to `PendingUserPart` (user content) or written by
-decode (assistant content) — i.e., everything destined for the substrate.
+Sigs are extracted from the decode path (assistant content) and the
+prefill path (user content + intra-turn role markers).  Inter-turn
+boundary markers (`user_start` head, `assistant_end` tail) are never
+sig'd because they're never persisted — they only exist as transient
+`Generated` segments at projection time, and the sig extractor doesn't
+look at the boundary-cache region.
 
-The persisted `Signatures` records carry only content sigs. The BDP
-scanner's per-turn corpus becomes:
-
-```text
-per-turn corpus = user content tokens ++ assistant content tokens
-```
-
-— no role markers, no structural framing. Retrieval ranking improves
-because the high-self-similarity noise from role-marker positions is
-gone.
+The Phase 6 "BDP sig extractor skips blocks captured to SlotCache"
+deliverable described in the original design is therefore satisfied
+**structurally** rather than via an explicit skip flag: the cache
+region doesn't intersect the sealed-turn region the sig extractor
+walks.
 
 ---
 
@@ -866,24 +979,25 @@ is wiped between major schema versions during this work.
 
 ## 12. What this DOES change
 
-Module-level diff summary:
+Module-level diff summary (as shipped through Phase 5):
 
 | Module | Change |
 |---|---|
 | `candle-conversation/src/models/dialect.rs` | `DialectTemplate` enum, new dialect fields. |
 | `candle-conversation/src/models/qwen3.rs`, etc. | Populate new dialect fields per model. |
-| `candle-conversation/src/projection/schema.rs` | `SystemPromptItem::Template` variant, no synthetic-marker fields on `LayerSchema`. |
+| `candle-conversation/src/projection/schema.rs` | `SystemPromptItem::Template` variant. **No `BoundaryMarkers` on `Schema`** — moved to scheduler. |
 | `candle-conversation/src/projection/yaml.rs` | Parse `kind: template`, resolve `dialect:` refs at build. |
-| `candle-conversation/src/projection/project.rs` | Emit `Vec<ProjectionSegment>`, turn expansion, depends_on unchanged. |
-| `candle-conversation/src/projection/builder.rs` | `Builder::set_system_markers` deleted; helper for dialect-aware caller to inject template items. |
-| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` becomes thin wrapper around `ProjectionAssembler`. `SlotState` gains `cache` and `pending_user_part`. |
-| `candle-conversation/src/scheduler/projection_assembler.rs` | **NEW.** Walk logic, rolling-hash cache lookup, prefill-run emission. |
-| `candle-conversation/src/scheduler/prefill.rs` | `PrefillRun` peer to `ActivePrefill`. Combined-run forward-pass logic. Capture hook. |
-| `candle-conversation/src/substrate.rs` | `TurnEntryData` split, `TurnPart`, `append_complete`. |
-| `candle-conversation/src/persistence/record.rs`, `streams.rs`, `resume.rs` | `TurnDecl` two-range layout, `Chunks`/`Tokens`/`Signatures` split. |
-| `candle-conversation/src/provenance/scan.rs` | Skip-structural-blocks flag for sig extraction. |
-| `candle-conversation/src/conversation.rs` | Drop role-marker formatting from `submit_turn`. Drop synthetic-section ingest dance from `new`. |
-| `zend/src/prompts/projection.yaml` | Migrate `__system_*`, `tools_*` to `kind: template`. |
+| `candle-conversation/src/projection/project.rs` | Emit `Vec<ProjectionSegment>`.  One `Sealed::Turn` per past turn (boundary wrapping is the assembler's job). |
+| `candle-conversation/src/projection/builder.rs` | `Builder::tokenize_boundary_markers` removed; markers built at engine construction instead. |
+| `candle-conversation/src/scheduler/mod.rs` | `apply_projection` calls `ProjectionAssembler`.  `Scheduler` owns `BoundaryMarkers` + `SlotProjectionCache` per slot.  `perform_seal_and_write` trims trailing EOS, fires `clear_post_turn`, asserts `token_ids.len() == token_count`. |
+| `candle-conversation/src/scheduler/projection_assembler.rs` | Walk logic, rolling-hash cache lookup, inline prefill+capture.  Wraps every `Sealed::Turn` with `user_start` / `assistant_end`. |
+| `candle-conversation/src/scheduler/prefill.rs` | Carries `user_text` through to `DecodeState` for verbatim seal storage. |
+| `candle-conversation/src/substrate.rs` | `TurnPart { user_text, assistant_text, token_count, token_ids, sig_entries, residence }` — single block, paired strings. |
+| `candle-conversation/src/persistence/streams.rs`, `resume.rs` | `TurnDecl` carries `user_text` + `assistant_text` strings (`#[serde(default)]`).  Partition fields persisted as zeros (forward-compat). |
+| `candle-conversation/src/conversation.rs` | `submit_turn` formats prefill without the inter-turn boundary tokens.  `recovered_history` returns `Vec<(Role, String)>` straight from substrate. |
+| `candle-conversation/src/engine.rs` | Pre-tokenises `BoundaryMarkers` once at engine construction and passes them to `Scheduler::new`. |
+| `zend/src/session.rs` | No longer tokenises boundary markers; no decode call on `recovered_history`. |
+| **Pending Phase 6:** `zend/src/prompts/projection.yaml` migration of `tools_*` to `kind: template`. |
 
 ---
 
@@ -1020,102 +1134,142 @@ Tests:
 Risk: **medium.** Substrate format change. Reload is the main gate.
 Redo log rebuilt on first boot.
 
-### Phase 5 — `NewUserMessage` + pending-user-part + turn-boundary `Generated`s
+### Phase 5 — inter-turn boundary `Generated`s (shipped, simplified)
 
-**Behaviour change. Turn-boundary attention pivots become correct.**
+**Status: shipped in commits `b16cc728` + `fdd058a4`.**
 
-Deliverables:
-- `ProjectionSegment::NewUserMessage { tokens }` actively emitted by the
-  scheduler's submit-turn handler at the projection-list tail.
-- `RunCapture::PendingUserPart` capture target.
-- `SlotState::pending_user_part: Option<Vec<SealedSequence>>` populated
-  by `NewUserMessage` capture, cleared at seal.
-- Turn expansion in `Builder::project`: each turn emits
-  `[Generated(UserStart), Sealed::Turn { part: User }, Generated(UserEnd),
-  Generated(AssistantStart), Sealed::Turn { part: Assistant },
-  Generated(AssistantEnd)]`.
-- Seal flow: `pending_user_part` + decoded slot range →
-  `Substrate::append_complete` with both `TurnPart`s populated.
-- Mid-decode reproject: `pending_user_part` lives on `SlotState`, not
-  on the slot, so the truncate-to-zero rebuild doesn't drop it; the
-  assembler re-injects it like a sealed segment when it walks the
-  `NewUserMessage` segment.
-- `conversation.rs` `submit_turn` formatting reduced to user-message
-  tokens only (role markers move to projection).
+**Behaviour change: inter-turn attention pivots become correct.**
 
-Tests:
-- End-to-end: submit_turn → decode → seal → reload → replay; output
-  text coherent.
-- Mid-decode reproject: trigger reproject during decode;
-  `pending_user_part` survives; turn completes.
-- Crash mid-decode: no substrate state for the in-flight turn; reload
-  sees no orphan.
-- Multi-turn: turn N attends correctly to turn N-1.
-- Persistence: `TurnDecl` + both `TurnPart`s written atomically at seal.
+The shipped Phase 5 is leaner than the original spec.  It delivers
+attention-correct inter-turn boundary K/V (the actual goal — see §2.1)
+without the per-role `TurnPart` split, the `NewUserMessage` capture
+path, or the four-marker turn expansion the original design called for.
+The trade-off is recorded in commit `44f915c7` (which walked back the
+Phase 4 per-role split) and reflected in §3.4 and §1 above.
 
-Risk: **high.** Scheduler hot path. Pending-user-part interacts with
-reproject and seal. Redo log rebuilt.
+Deliverables (as shipped):
+- The projection engine emits one `Sealed::Turn` segment per past turn.
+  Inter-turn boundary markers are **not** segments at this layer.
+- The projection assembler wraps each `Sealed::Turn` it walks with
+  `user_start` (joined into the run that flushes before the inject) and
+  `assistant_end` (opened on a fresh run after the inject).  Adjacent
+  runs at cross-turn boundaries collapse into a single 5-token batched
+  prefill via the assembler's run accumulator.  See
+  `projection_assembler.rs` `apply_segments`.
+- The scheduler's `SubmitTurn` handler appends a trailing
+  `Generated(UserStart)` after the projection's past-turn segments and
+  before the current turn's prefill.  See `scheduler/mod.rs`.
+- `BoundaryMarkers` (pre-tokenised `user_start` + `assistant_end`) is
+  built once at engine construction and lives on the scheduler.
+  Threaded into the assembler via `ApplyContext.boundary_markers`.
+  **Not on `Schema`** — the schema is dialect-agnostic.
+- `TurnPart` carries `user_text` + `assistant_text` as verbatim
+  strings.  Single indivisible K/V block (Phase 4's per-role split was
+  walked back).
+- `conversation.rs` `submit_turn` formats prefill as
+  `[/no_think][user_msg][user_end][assistant_start][/think_block]` —
+  the inter-turn `user_start` head and `assistant_end` tail are
+  stripped from the persisted prefill bytes.  The intra-turn pair
+  (`user_end` + `assistant_start`) stays baked because its hidden
+  state is dominated by the turn's own invariant content on both sides.
+- `recovered_history` returns `Vec<(Role, String)>` straight from the
+  substrate's text fields — no re-tokenising, no marker scanning.
+- Trailing-EOS trim at seal: `state.generated_tokens` always ends with
+  one unforwarded terminator (EOS or max-tokens edge); the seal-site
+  assembly drops it so `token_ids.len() == token_count`.  Guarded by
+  `debug_assert_eq!` (see `scheduler/mod.rs` `perform_seal_and_write`).
+- `SlotState::trim_post_turn` at end-of-turn: retains only the cache
+  entries whose keys were touched by the most recent `apply_segments`
+  walk, dropping stranded entries from prior projections.  Bounds GPU
+  arena memory at ~one projection's working set while keeping next-turn
+  reprojection cache-hot.  See §5.4.
 
-### Phase 6 — BDP scope + YAML migration + cleanup
+Deferred (originally Phase 5, intentionally left for later):
+- `ProjectionSegment::NewUserMessage` emission.  Variant exists in the
+  enum as forward-looking infrastructure; nothing currently emits it.
+- `SlotState::pending_user_part` population.  Field exists and
+  participates in `clear_post_turn`; nothing currently populates it.
+- Per-role `TurnPart` split with two residences.  Walked back; see
+  `44f915c7`.
 
-**Consolidation. Signal-quality improvement. Code-debt removal.**
+Tests (shipped):
+- End-to-end: submit_turn → decode → seal → reload → replay.  Output
+  text coherent; sidebar renders user + assistant turns in the right
+  roles after daemon resume.
+- Multi-turn: turn N attends correctly to turn N-1 (inter-turn boundary
+  K/V is computed under the actual runtime causal prefix at every
+  projection).
+- 360 `candle-conversation` lib tests pass on every commit.
 
-Deliverables:
-- BDP sig extractor skips blocks captured to `SlotCache`. Sigs only
-  cover `PendingUserPart` and decode-time content captures.
-- zend's `projection.yaml` migrated: `__system_start`, `__system_end`,
-  `tools_open`, `tools_close`, `mode` → `kind: template`.
+Risk: **medium** as built.  Scheduler hot path touched, but the
+simplification removed the riskiest pieces (pending_user_part /
+reproject interaction, the two-range `TurnDecl`).  Redo log rebuilt.
+
+### Phase 6 — YAML migration + cleanup (pending)
+
+**Status: not yet shipped.**
+
+**Consolidation. Code-debt removal.**
+
+Deliverables (still pending):
+- zend's `projection.yaml` migrated: `tools_open`, `tools_close`,
+  `mode` → `kind: template`.  (`__system_start` / `__system_end` were
+  already retired during Phase 3's synthetic-marker removal.)
 - Delete `LayerSchema::system_start_section`, `system_end_section`,
   `Builder::set_system_markers`, `next_section_id_raw` synthetic-id
-  machinery.
+  machinery if any residual remains.
 - Delete the `linear_prefix` / `fixed_prefix` cumulative ingest dance
   in `conversation.rs` for template handling; content sections still
   cumulative-ingest.
 
-Tests:
+Already satisfied structurally (not via explicit deliverables):
+- "BDP sig extractor skips blocks captured to `SlotCache`."  The
+  boundary cache region doesn't intersect the sealed-turn region the
+  sig extractor walks, so this is true by construction in the shipped
+  Phase 5 shape — no explicit skip flag needed.  See §8.4.
+
+Tests (when Phase 6 lands):
 - BDP retrieval MRR / Top-1 against canonical probe set: equal or
   better than Phase 3 baseline.
 - YAML migration: zend boots, ingest completes, conversation works.
 - Integration suite green.
 
-Risk: **low.** Mostly mechanical. BDP scope change has measurable
-signal-quality outcome.
+Risk: **low.** Mostly mechanical.
 
 ---
 
 ## 14. Open issues
 
-None blocking. Detail-level questions to settle during implementation:
+- ~~**Chunk-aligned user/assistant boundary.**~~  Moot — the per-role
+  `TurnPart` split was walked back in commit `44f915c7`.  Turns are
+  one indivisible K/V block at the substrate layer.
 
-- **Chunk-aligned user/assistant boundary.** The seal-time split between
-  user content and assistant content lands at whatever block the
-  prefill happened to finish on. Since user-message length is
-  arbitrary, the split is generally not chunk-aligned. The two
-  `TurnPart`s either pay padding bytes at the boundary or share a
-  partial chunk via Arc semantics. The existing chunked-cache supports
-  partial chunks; reuse that. Concrete mechanism worked out in Phase 4.
-
-- **Reproject and pending_user_part.** When reprojection mid-decode
-  truncates and rebuilds the slot, `pending_user_part` must land back at
-  the position the projection's `NewUserMessage` segment occupies.  It
-  sits on `SlotState`, not on the slot, so it survives the truncate;
-  the assembler treats the `NewUserMessage` segment as "inject from
-  `pending_user_part` rather than enqueue a fresh prefill" when the
-  buffer is populated.  Worked out in Phase 5.
+- ~~**Reproject and pending_user_part.**~~  Reserved infrastructure;
+  nothing currently emits `NewUserMessage` so the mid-decode survival
+  contract doesn't fire in the shipped path.  The contract is still
+  documented in §5.4 / §7 for the future feature that wires it up.
 
 - **PrefillRun granularity for batch-throughput.** The single-slot
   concatenation rule says "adjacent runs on the same slot combine into
   one forward pass." For very long generated runs the per-pass cap
   (`max_prefill_chunk`) still applies — the run executes as multiple
-  chunks through the same forward batcher. Capture hooks fire after the
-  **final** chunk of a run completes. Standard prefill-batcher
-  mechanics.
+  chunks through the same forward batcher.  In the shipped assembler
+  this is handled by the chunked-loop inside `drive_prefill_and_capture`.
 
 - **Cache key cross-conversation reuse.** Keys are deterministic across
   slots since they're hashes of token sequences. In principle a cache
   shared across slots in the same workspace could be useful. Out of
   scope for v1; revisit if profiling shows the per-slot cache misses
   are concentrated on common prefixes.
+
+- **Cache trim policy.**  The end-of-turn `trim_post_turn` retains
+  cache entries by the working set of the most recent apply.  This
+  keeps next-turn reprojection cache-hot (same window shape → all
+  kept entries hit) while bounding the cache at ~one projection's
+  worth of entries.  An alternative would be a hard `clear_post_turn`
+  that drops everything — simpler but pays `O(window × ~5)` tokens
+  of batched re-prefill on every next-turn projection.  Trim won
+  on cost/complexity grounds.  See §5.4.
 
 ---
 
