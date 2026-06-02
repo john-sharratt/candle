@@ -518,6 +518,94 @@ fn run_pass(
         }
     }
 
+    // ── Phase 2.5: section persist ─────────────────────────────────────
+    //
+    // Sections are pinned and never enter `hot_lru` / `warm_lru`, so
+    // the two-phase walk above misses them.  This sub-phase walks the
+    // substrate's section map directly, finds any section whose
+    // residence has hot bytes installed under a non-default stream id
+    // and no cold copy yet, and writes its chunks to the redo log.
+    //
+    // **Native format only** — no quantize, no `replace_section_hot`.
+    // The bytes on disk match exactly what the prefill produced so
+    // the cold-load reverse path reproduces the prefill output
+    // byte-identically (verified by the `section_no_compress_round_trip`
+    // integration test).  Adaptive C0+Q8_KS quantization for sections
+    // is plumbed (see `quantize_sealed_in_place` + the section policy
+    // shape preserved in git history) but disabled — it shrinks the
+    // disk footprint but interacts with a still-unresolved decode-side
+    // regression around the K-side post-quantize bytes.
+    let pending_section_cold = conversation.read().snapshot_pending_section_cold();
+    let mut section_to_cold_bytes: u64 = 0;
+    let mut section_to_cold_count: usize = 0;
+    if !pending_section_cold.is_empty() {
+        let mut section_cold_installs: Vec<(
+            crate::substrate::ResidenceIndex,
+            Vec<crate::substrate::StoredSequence>,
+            u64,
+        )> = Vec::with_capacity(pending_section_cold.len());
+        for (idx, stream_id, hot) in pending_section_cold {
+            if hot.len() != n_layers {
+                tracing::warn!(
+                    "persist: section {idx:?} hot has {} layers, expected {n_layers} — skipping",
+                    hot.len()
+                );
+                continue;
+            }
+            // Gather native hot bytes into a `TurnChunkGrid` — same
+            // path the turn warm→cold leg uses.
+            let grid = match build_grid(&hot, backings, device) {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!("persist: section gather failed for {idx:?}: {e}");
+                    continue;
+                }
+            };
+            // Append chunk records to the redo log, capture the
+            // per-layer `StoredSequence` for cold-tier install.
+            let stored = match conversation.persist_turn_chunks_capture(stream_id, &grid) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("persist: section write failed for {idx:?}: {e}");
+                    continue;
+                }
+            };
+            if stored.is_empty() {
+                continue;
+            }
+            // Stream-level commit so the manifest's
+            // `committed_through` covers every chunk we just wrote —
+            // the trigger for the next daemon start's "is this
+            // section persisted?" check.
+            let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
+            let through = (total_chunks.max(1) - 1) as u64;
+            if let Err(e) = conversation.commit_stream_through(stream_id, through) {
+                tracing::warn!("persist: section commit_stream for {idx:?} failed: {e}");
+            }
+            let bytes_for_item: u64 = stored
+                .iter()
+                .flat_map(|s| s.chunks.iter())
+                .map(|c| c.record_len)
+                .sum();
+            tracing::debug!(
+                target: "candle_conversation::persistence::tier",
+                residence = idx.0,
+                stream_id = stream_id.0,
+                bytes = bytes_for_item,
+                "persisted section (native, redo-log append)"
+            );
+            section_cold_installs.push((idx, stored, bytes_for_item));
+        }
+        if !section_cold_installs.is_empty() {
+            let mut view = conversation.write();
+            for (idx, stored, bytes) in section_cold_installs {
+                section_to_cold_bytes = section_to_cold_bytes.saturating_add(bytes);
+                section_to_cold_count += 1;
+                view.install_cold(idx, stored);
+            }
+        }
+    }
+
     // ── Phase 3: fsync ─────────────────────────────────────────────────
     //
     // Group-commit anything the previous phases staged. No-op when both
@@ -528,13 +616,15 @@ fn run_pass(
     }
 
     // Per-pass aggregate. Only logged when something actually moved.
-    if hot_to_warm_count > 0 || warm_to_cold_count > 0 {
+    if hot_to_warm_count > 0 || warm_to_cold_count > 0 || section_to_cold_count > 0 {
         tracing::info!(
             target: "candle_conversation::persistence::tier",
             hot_to_warm_count,
             hot_to_warm_bytes,
             warm_to_cold_count,
             warm_to_cold_bytes,
+            section_to_cold_count,
+            section_to_cold_bytes,
             "persistence pass complete"
         );
     }

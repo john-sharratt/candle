@@ -481,12 +481,17 @@ some text
 
     #[test]
     fn render_tool_json_line_is_valid_hermes_format() {
+        // The catalog deliberately emits a flat
+        // `{"name", "description", "parameters"}` shape — see
+        // `render_tool_json_line`'s doc comment for the rationale
+        // (Qwen3-A3B echoes the canonical wrapper's `"function"` key
+        // back into tool calls, and the flat shape saves ~10 tokens
+        // per tool across the 90+ tool catalog).
         let tool = registry::find("datetime").expect("datetime tool registered");
         let line = render_tool_json_line(tool);
         let parsed: Value = serde_json::from_str(line.trim_end()).expect("must parse");
-        assert_eq!(parsed["type"], "function");
-        assert_eq!(parsed["function"]["name"], "datetime");
-        assert!(parsed["function"]["description"].is_string());
-        assert!(parsed["function"]["parameters"].is_object());
+        assert_eq!(parsed["name"], "datetime");
+        assert!(parsed["description"].is_string());
+        assert!(parsed["parameters"].is_object());
     }
 }

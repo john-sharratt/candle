@@ -33,8 +33,17 @@ const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
 
 /// Parse the bundled projection.yaml the same way the daemon does.
 fn build_test_projection() -> projection::Builder {
-    projection::Builder::from_yaml_with_vars(PROJECTION_YAML, &[("workspace", "test")])
-        .expect("projection.yaml must parse")
+    // The bundled YAML uses `kind: template` items (system_open,
+    // tools_open, etc.) so the parser needs a `Dialect`; ChatML is
+    // the closest standard analogue to Qwen3's tokens for resolving
+    // the template strings.
+    let dialect = candle_conversation::models::Dialect::chat_ml();
+    projection::Builder::from_yaml_with_vars_and_dialect(
+        PROJECTION_YAML,
+        &[("workspace", "test")],
+        Some(&dialect),
+    )
+    .expect("projection.yaml must parse")
 }
 
 /// Helper: count tool sections currently in the dialogue layer's
@@ -123,20 +132,20 @@ fn install_tool_catalog_emits_valid_hermes_json_lines() {
     let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
     let installed = install_tool_catalog(&mut builder, dialogue).unwrap();
 
+    // The catalog deliberately emits a flat
+    // `{"name", "description", "parameters"}` shape — see the doc on
+    // `render_tool_json_line` in zend/src/tools.rs for the rationale
+    // (Qwen3-A3B's "function" key echo + token-count savings).
     for (name, _, json_line) in &installed {
         let parsed: Value = serde_json::from_str(json_line.trim_end())
             .unwrap_or_else(|e| panic!("tool {name:?} produced invalid JSON: {e}"));
-        assert_eq!(parsed["type"], "function", "tool {name:?} missing type");
-        assert_eq!(
-            parsed["function"]["name"], *name,
-            "tool {name:?} function.name mismatch",
-        );
+        assert_eq!(parsed["name"], *name, "tool {name:?} name mismatch");
         assert!(
-            parsed["function"]["description"].is_string(),
+            parsed["description"].is_string(),
             "tool {name:?} missing description",
         );
         assert!(
-            parsed["function"]["parameters"].is_object(),
+            parsed["parameters"].is_object(),
             "tool {name:?} parameters not an object",
         );
     }
@@ -170,15 +179,11 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
         n_top_before, n_top_after,
         "top-level static sections must not move when tools are installed",
     );
-    // And the static names are all still findable.
-    for name in [
-        "mode",
-        "frame",
-        "history_stance",
-        "grounding",
-        "tools_intro",
-        "tools_outro",
-    ] {
+    // And the static content-section names are all still findable.
+    // (`mode`, `system_open`/`system_close`, `tools_open`/`tools_close`
+    // are `kind: template` items now and don't appear in the section
+    // name map — see `projection.yaml`.)
+    for name in ["frame", "history_stance", "grounding", "tools_overview"] {
         assert!(
             builder.id_for_section_in(dialogue, name).is_some(),
             "static section {name:?} must still resolve",

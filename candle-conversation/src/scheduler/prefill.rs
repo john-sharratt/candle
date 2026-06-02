@@ -165,6 +165,8 @@ impl Scheduler {
                 s.section_id,
                 s.seal_block_from,
                 std::sync::Arc::new(s.tokens.to_vec()),
+                s.address,
+                s.debug_name,
             );
             let _ = s.response_tx.send(result);
             // swap_remove pulled the last element into i; don't increment.
@@ -478,6 +480,7 @@ impl Scheduler {
                     &work.event_tx,
                     prefill_ms,
                     turn_start,
+                    context_depth,
                 );
             }
             return;

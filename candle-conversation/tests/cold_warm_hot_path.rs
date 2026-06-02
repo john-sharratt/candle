@@ -178,6 +178,7 @@ fn seed_section(
     conv.write()
         .set_section_full(
             section,
+            candle_conversation::persistence::streams::StreamId::default(),
             N_TOKENS_PER_TURN,
             Vec::new(),
             Arc::new(sealed_per_layer),
@@ -2578,4 +2579,395 @@ fn no_policy_metadata_round_trip() {
         let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
         assert_chunk_images_eq(&reference, &snap, "no-policy second cold→hot");
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Section persist / cold-load round-trip
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Drives the same byte-level integrity check the turn tests run, but
+// through the section-specific pipeline: `set_section_full` →
+// (optional `quantize_sealed_in_place` + `replace_section_hot`) →
+// `build_grid` → `persist_turn_chunks_capture` → `install_cold` →
+// `cold_load_section_into_hot` → re-gather → assert bytes match what
+// went in.
+//
+// Two flavours:
+//   1. `section_no_compress_round_trip` — F16 native, no quantization.
+//      Isolates the raw persist + cold-load plumbing for sections.
+//   2. `section_c0_q8ks_round_trip` — the **exact** chain the disabled
+//      Phase 2.5 ran in production: F16 → C0+Q8_KS quantize → replace
+//      section hot with the quantized form → persist → cold-load.
+//      Asserts that the cold-loaded bytes are byte-identical to the
+//      post-quantize bytes (the lossy quantize ran *before* persist).
+//
+// If both pass, the persist/cold-load round-trip itself is correct
+// and any garbled-decode regression must be elsewhere (e.g. how the
+// scheduler installs the loaded bytes onto a live slot).  If either
+// fails, the failure message names the layer, the chunk index, and
+// the first diverging byte — exactly the diagnostic the prior
+// guess-and-check sessions never produced.
+
+use candle_conversation::persistence::content_hash::section_stream_id;
+use candle_conversation::persistence::resume::TurnChunkGrid;
+use candle_conversation::persistence::streams::ContentAddress;
+use candle_nn::kv_cache::quantize_sealed_in_place;
+
+/// Seed a section in `backings` at `head_dim` width and `n_tokens`
+/// length, optionally migrating every chunk to `target_format`.  Mirrors
+/// [`seed_turn_with_format`] but writes through
+/// [`set_section_full`] instead of `record_turn`.  Returns the
+/// [`ResidenceIndex`] of the newly-installed section so the test can
+/// later swap hot bytes (`replace_section_hot`) and install cold refs
+/// (`install_cold`) against the same slot.
+#[allow(clippy::too_many_arguments)]
+fn seed_section_with_format(
+    conv: &Conversation,
+    backings: &[ChunkedKvBacking],
+    device: &Device,
+    section: SectionId,
+    stream_id: candle_conversation::persistence::streams::StreamId,
+    head_dim: usize,
+    n_tokens: usize,
+    pattern_base: u32,
+    target_format: Option<KvFormat>,
+) -> candle_conversation::substrate::ResidenceIndex {
+    use half::f16;
+
+    let mut sealed_per_layer: Vec<SealedSequence> = Vec::with_capacity(backings.len());
+    for backing in backings {
+        let slot = backing.alloc_sequence().unwrap();
+        backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+        let total = N_KV_HEAD * n_tokens * head_dim;
+        // F16 (not BF16) so F16→R16 / F16→Q* migrations match source dtype.
+        let data: Vec<f16> = (0..total)
+            .map(|i| f16::from_f32(((pattern_base as usize + i) as f32) * 0.0001))
+            .collect();
+        let k = Tensor::from_vec(data, (1, N_KV_HEAD, n_tokens, head_dim), &Device::Cpu)
+            .unwrap()
+            .to_device(device)
+            .unwrap();
+        let v = k.clone();
+        backing.write_contiguous(slot, 0, &k, &v).unwrap();
+        backing.set_len(slot, n_tokens);
+        let mut sealed = backing.record_turn(slot, n_tokens).unwrap();
+        if let Some(target) = target_format {
+            sealed = migrate_sealed_to_format(backing, sealed, target, ArenaLocation::Gpu);
+        }
+        sealed_per_layer.push(sealed);
+    }
+    conv.write()
+        .set_section_full(
+            section,
+            stream_id,
+            n_tokens,
+            Vec::new(),
+            Arc::new(sealed_per_layer),
+            |seqs| Ok(seqs.to_vec()),
+            Arc::new(vec![0u32; n_tokens]),
+        )
+        .unwrap();
+    conv.read()
+        .section_residence(section)
+        .expect("section just installed must have a residence")
+}
+
+/// Re-gather a section's hot bytes per layer via `seal_to_chunk_images`
+/// — the same path `persist_turn_chunks_capture` uses internally.  The
+/// returned `Vec<Vec<u8>>` is one entry per layer, each entry being
+/// the concatenated per-chunk `kv_bytes`.  Byte-equal across
+/// transitions ↔ the section's K/V survived intact.
+fn snapshot_section_bytes_at(
+    conv: &Conversation,
+    backings: &[ChunkedKvBacking],
+    device: &Device,
+    section: SectionId,
+) -> Vec<Vec<u8>> {
+    let sealed = conv
+        .read()
+        .section_sealed_of(section)
+        .expect("section must be hot");
+    gather_sealed_bytes(&sealed, backings, device)
+}
+
+/// Same as `snapshot_section_bytes_at` but for an arbitrary
+/// `SealedSequence` per layer (e.g. the `Vec<SealedSequence>` returned
+/// by `cold_load_section_into_hot` before it gets installed).
+fn gather_sealed_bytes(
+    sealed: &[SealedSequence],
+    backings: &[ChunkedKvBacking],
+    device: &Device,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(sealed.len());
+    for (backing, seq) in backings.iter().zip(sealed.iter()) {
+        let images = seal_to_chunk_images(backing, device, seq).unwrap();
+        let mut bytes = Vec::new();
+        for img in &images {
+            bytes.extend_from_slice(&img.payload.kv_bytes);
+        }
+        out.push(bytes);
+    }
+    out
+}
+
+/// Diff helper — prints layer/byte index of the first divergence when
+/// two snapshots disagree.  Without this, `assert_eq!` on
+/// `Vec<Vec<u8>>` just dumps both blobs; the diagnostic value of the
+/// round-trip test is in knowing *where* the bytes drifted.
+fn assert_section_bytes_eq(
+    expected: &[Vec<u8>],
+    actual: &[Vec<u8>],
+    context: &str,
+) {
+    assert_eq!(
+        expected.len(),
+        actual.len(),
+        "{context}: layer count mismatch (expected {}, got {})",
+        expected.len(),
+        actual.len(),
+    );
+    for (layer, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
+        if e == a {
+            continue;
+        }
+        let len = e.len().min(a.len());
+        let first_diff = (0..len).find(|&i| e[i] != a[i]);
+        match first_diff {
+            Some(i) => {
+                let lo = i.saturating_sub(8);
+                let hi = (i + 8).min(len);
+                panic!(
+                    "{context}: layer {layer} bytes diverge.\n  \
+                     expected len={}, actual len={}, first diff at byte {i}\n  \
+                     expected[{lo}..{hi}] = {:02x?}\n  \
+                       actual[{lo}..{hi}] = {:02x?}",
+                    e.len(),
+                    a.len(),
+                    &e[lo..hi],
+                    &a[lo..hi],
+                );
+            }
+            None => panic!(
+                "{context}: layer {layer} lengths differ (expected {} bytes, got {})",
+                e.len(),
+                a.len(),
+            ),
+        }
+    }
+}
+
+/// Drive a section through the full persist + cold-load round-trip
+/// against the same backings, asserting that the post-cold-load bytes
+/// are byte-identical to whatever was in the section's hot tier at
+/// the moment of `build_grid`.  The `apply_quantize` callback runs
+/// after seed but before snapshot — pass `None` for the no-quantize
+/// flavour, or `Some(...)` to exercise the C0+Q8_KS path.
+fn drive_section_round_trip<F>(
+    label: &str,
+    head_dim: usize,
+    n_tokens: usize,
+    seed_format: Option<KvFormat>,
+    apply_quantize: Option<F>,
+) where
+    F: FnOnce(
+        &Conversation,
+        &[ChunkedKvBacking],
+        &Device,
+        &Arc<CudaStream>,
+        SectionId,
+    ) -> Vec<SealedSequence>,
+{
+    let Some(device) = cuda_device_or_skip() else {
+        return;
+    };
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dir = tmpdir.path().to_path_buf();
+    let persistence = SubstratePersistence::open_in(&dir).unwrap();
+    let conv = Conversation::with_persistence(persistence);
+    let backings = make_backings_f16(&device, head_dim);
+    let section = SectionId::new(7_777);
+
+    // Synthetic content address — for the test, all we need is a
+    // stable `(prefix_hash, section_hash)` distinct from the
+    // default-zero sentinel.  The hash values themselves don't have
+    // to mean anything semantically; `section_stream_id` derives a
+    // deterministic StreamId from them.
+    use candle_conversation::persistence::content_hash::ContentHash;
+    let address = ContentAddress {
+        prefix_hash: ContentHash { lo: 0xabcd_1234, hi: 0x5678_dead },
+        section_hash: ContentHash { lo: 0xfeed_face, hi: 0xcafe_babe },
+    };
+    let stream_id = conv
+        .declare_section_stream(address, "test-section")
+        .unwrap();
+    assert_eq!(
+        stream_id,
+        section_stream_id(address),
+        "declared stream id must match content-address derivation",
+    );
+
+    // Seed: section hot in `seed_format`, residence index captured.
+    let residence = seed_section_with_format(
+        &conv,
+        &backings,
+        &device,
+        section,
+        stream_id,
+        head_dim,
+        n_tokens,
+        424_242,
+        seed_format,
+    );
+
+    // Optionally quantize + replace hot.  After this point the
+    // section's hot tier holds the bytes that will go to disk.
+    let main_stream = cuda_stream(&device);
+    if let Some(quantize_fn) = apply_quantize {
+        let new_hot = quantize_fn(&conv, &backings, &device, &main_stream, section);
+        conv.write().replace_section_hot(residence, new_hot);
+    }
+
+    // Capture the canonical reference: what's in hot right now is
+    // what the cold round-trip must reproduce.
+    let reference = snapshot_section_bytes_at(&conv, &backings, &device, section);
+    assert!(
+        reference.iter().all(|l| !l.is_empty()),
+        "{label}: reference snapshot has empty layers",
+    );
+    let chunks_per_layer = conv
+        .read()
+        .section_sealed_of(section)
+        .unwrap()
+        .first()
+        .map(|s| s.chunks.len())
+        .unwrap_or(0);
+    assert!(
+        chunks_per_layer > 0,
+        "{label}: section must have at least one chunk",
+    );
+
+    // Persist: gather + write chunks to redo log + commit + install_cold.
+    let mut layers = Vec::with_capacity(backings.len());
+    let sealed = conv
+        .read()
+        .section_sealed_of(section)
+        .expect("hot must be present at persist time");
+    for (backing, seq) in backings.iter().zip(sealed.iter()) {
+        layers.push(seal_to_chunk_images(backing, &device, seq).unwrap());
+    }
+    let grid = TurnChunkGrid::new(layers);
+    let stored = conv
+        .persist_turn_chunks_capture(stream_id, &grid)
+        .unwrap();
+    assert!(!stored.is_empty(), "{label}: persist produced no chunks");
+    let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
+    let through = (total_chunks.max(1) - 1) as u64;
+    conv.commit_stream_through(stream_id, through).unwrap();
+    conv.write().install_cold(residence, stored);
+    conv.commit_persistence().unwrap();
+
+    // Verify the section is now hot+cold (warm is N/A for sections).
+    let tier = conv
+        .read()
+        .section_tier_state(section)
+        .expect("section tracked");
+    assert!(
+        tier.hot && tier.cold,
+        "{label}: post-persist state should be hot+cold, got {tier:?}",
+    );
+
+    // Cold-load: drop hot, re-load from disk, gather bytes from the
+    // freshly-loaded sealed sequence.  Allocating into the same
+    // backings is safe — fresh ChunkGids are minted, the old hot
+    // GIDs stay live until we explicitly drop them.
+    let mut stager = ColdLoadStager::new();
+    let restored = conv
+        .cold_load_section_into_hot(stream_id, chunks_per_layer, &backings, &device, &mut stager)
+        .unwrap();
+    assert_eq!(
+        restored.len(),
+        backings.len(),
+        "{label}: cold-load returned wrong layer count",
+    );
+    let restored_bytes = gather_sealed_bytes(&restored, &backings, &device);
+
+    // The assertion — drift here is the bug we've been hunting.
+    assert_section_bytes_eq(
+        &reference,
+        &restored_bytes,
+        &format!("{label}: cold-load round-trip"),
+    );
+}
+
+#[test]
+fn section_no_compress_round_trip() {
+    drive_section_round_trip::<fn(
+        &Conversation,
+        &[ChunkedKvBacking],
+        &Device,
+        &Arc<CudaStream>,
+        SectionId,
+    ) -> Vec<SealedSequence>>(
+        "F16 no-compress",
+        QUANT_HEAD_DIM,
+        N_TOKENS_PER_TURN,
+        None,
+        None,
+    );
+}
+
+/// The exact policy the disabled Phase 2.5 used: level 0 (C0), K
+/// override to Q8_KS, V left to selection (which at C0 picks the
+/// near-lossless candidate).  This is the only quantization path
+/// sections ever take on the persist side under the production
+/// configuration we'd want to re-enable.
+#[test]
+fn section_c0_q8ks_round_trip() {
+    let quantize_fn = |conv: &Conversation,
+                       backings: &[ChunkedKvBacking],
+                       device: &Device,
+                       copy_stream: &Arc<CudaStream>,
+                       section: SectionId|
+     -> Vec<SealedSequence> {
+        let policy = CompressionPolicy::default()
+            .with_override_k_quant(Some(QuantFormat::Q8_KS));
+        let policy = CompressionPolicy {
+            compression_level: 0,
+            ..policy
+        };
+        let hot = conv
+            .read()
+            .section_sealed_of(section)
+            .expect("section seeded hot");
+        let mut quantized_per_layer: Vec<SealedSequence> = Vec::with_capacity(backings.len());
+        let mut pinned: Option<PinnedBuf> = None;
+        for (backing, seq) in backings.iter().zip(hot.iter()) {
+            let mut out = quantize_sealed_in_place(
+                backing,
+                &[seq],
+                &policy,
+                device,
+                copy_stream,
+                &mut pinned,
+            )
+            .unwrap();
+            assert_eq!(
+                out.len(),
+                1,
+                "quantize_sealed_in_place: one input → one output sequence",
+            );
+            quantized_per_layer.push(out.remove(0));
+        }
+        if let Device::Cuda(d) = device {
+            d.cuda_stream().synchronize().unwrap();
+        }
+        quantized_per_layer
+    };
+    drive_section_round_trip(
+        "C0 + Q8_KS K override",
+        QUANT_HEAD_DIM,
+        N_TOKENS_PER_TURN,
+        None,
+        Some(quantize_fn),
+    );
 }

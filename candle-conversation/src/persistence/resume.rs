@@ -546,6 +546,72 @@ pub fn recover_turn_cold_refs(
     Ok(Some(stored))
 }
 
+/// Section variant of [`recover_turn_cold_refs`].  Resolves the
+/// per-chunk redo-log locations for a content-addressed section
+/// stream into per-layer [`StoredSequence`] refs — the cold-tier
+/// representation the substrate's residence slab needs.  Used by the
+/// scheduler's `RestoreSection` path to install `cold = Some(...)` on
+/// the freshly-restored section residence so the persistence thread
+/// recognises it as durable.
+pub fn recover_section_cold_refs(
+    p: &SubstratePersistence,
+    stream_id: StreamId,
+    n_layers: usize,
+) -> Result<Option<Vec<StoredSequence>>> {
+    let Some(stream) = p.manifest().streams.get(&stream_id) else {
+        return Ok(None);
+    };
+    if stream.chunks.is_empty() || n_layers == 0 {
+        return Ok(None);
+    }
+    if stream.chunks.len() % n_layers != 0 {
+        return Err(PersistenceError::Corrupt(format!(
+            "recover_section_cold_refs: stream {stream_id:?} has {} chunks not divisible by \
+             {n_layers} layers",
+            stream.chunks.len()
+        )));
+    }
+    let chunks_per_layer = stream.chunks.len() / n_layers;
+    let expected = n_layers * chunks_per_layer;
+    let mut per_layer: Vec<Vec<StoredChunk>> = (0..n_layers)
+        .map(|_| Vec::with_capacity(chunks_per_layer))
+        .collect();
+    let mut tokens_per_layer: Vec<usize> = vec![0; n_layers];
+    for (&flat_idx, loc) in &stream.chunks {
+        let layer = (flat_idx as usize) / chunks_per_layer;
+        let chunk = (flat_idx as usize) % chunks_per_layer;
+        if layer >= n_layers || chunk >= chunks_per_layer {
+            return Err(PersistenceError::Corrupt(format!(
+                "recover_section_cold_refs: chunk_index {flat_idx} out of range \
+                 ({n_layers}×{chunks_per_layer}; expected {expected})"
+            )));
+        }
+        let lane = &mut per_layer[layer];
+        while lane.len() <= chunk {
+            lane.push(StoredChunk {
+                log_offset: 0,
+                record_len: 0,
+                token_count: 0,
+            });
+        }
+        lane[chunk] = StoredChunk {
+            log_offset: loc.offset,
+            record_len: loc.record_size,
+            token_count: loc.token_count as u16,
+        };
+        tokens_per_layer[layer] += loc.token_count as usize;
+    }
+    let stored: Vec<StoredSequence> = per_layer
+        .into_iter()
+        .zip(tokens_per_layer)
+        .map(|(chunks, token_count)| StoredSequence {
+            chunks,
+            token_count,
+        })
+        .collect();
+    Ok(Some(stored))
+}
+
 /// Every turn stream in the recovered manifest, in `(timeline_id, turn_index)`
 /// order — the deterministic replay order a substrate reload walks.
 pub fn recovered_turn_decls(p: &SubstratePersistence) -> Vec<TurnDecl> {

@@ -259,15 +259,39 @@ mod cuda_impl {
         decl: &crate::persistence::streams::TurnDecl,
         stager: &mut ColdLoadStager,
     ) -> Result<Vec<SealedSequence>> {
+        let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
+        let stream_id =
+            crate::persistence::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
+        load_stream_into_hot(
+            backings,
+            device,
+            persistence,
+            stream_id,
+            chunks_per_layer,
+            stager,
+        )
+    }
+
+    /// Load any persisted stream (turn or section) from cold storage
+    /// into hot VRAM.  Generalised body of [`load_turn_into_hot`];
+    /// section paths call this directly with their content-addressed
+    /// stream id + `manifest.chunks.len() / n_layers` as
+    /// `chunks_per_layer`.  The behaviour and timing are identical —
+    /// the routing is just a parameterisation difference.
+    pub fn load_stream_into_hot(
+        backings: &[ChunkedKvBacking],
+        device: &Device,
+        persistence: &mut crate::persistence::SubstratePersistence,
+        stream_id: crate::persistence::streams::StreamId,
+        chunks_per_layer: usize,
+        stager: &mut ColdLoadStager,
+    ) -> Result<Vec<SealedSequence>> {
         use std::time::Instant;
 
         let n_layers = backings.len();
-        let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
         // Early CUDA-device validation; the pipeline itself re-derives
         // the device for its own use.
         let _dev = cuda_device(device)?;
-        let stream_id =
-            crate::persistence::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
 
         let t_total = Instant::now();
 
@@ -375,8 +399,7 @@ mod cuda_impl {
         let total_ms = t_total.elapsed().as_millis();
         tracing::debug!(
             target: "candle_conversation::persistence::tier",
-            timeline = decl.timeline_id,
-            turn = decl.turn_index,
+            stream_id = stream_id.0,
             n_chunks_total = plan.n_records,
             pinned_bytes = plan.total_bytes,
             n_chunk_batches = plan.chunks.len(),
@@ -386,11 +409,11 @@ mod cuda_impl {
             htod_ms = htod_ms_total,
             migrate_ms = migrate_ms_total,
             total_ms,
-            "load_turn_into_hot timing (pipelined)"
+            "load_stream_into_hot timing (pipelined)"
         );
 
         // Separate breakdown line for the allocator stage so the
-        // top-line "load_turn_into_hot timing" stays compact. The
+        // top-line "load_stream_into_hot timing" stays compact. The
         // three sub-timers add up to ~`alloc_ms` (in µs); the gap
         // is per-unit bookkeeping (`per_layer` Vec construction,
         // `records_to_dispatch` builds, channel sends). Emitted at
@@ -399,8 +422,7 @@ mod cuda_impl {
         // `RUST_LOG=candle_conversation::persistence::tier=trace`.
         tracing::trace!(
             target: "candle_conversation::persistence::tier",
-            timeline = decl.timeline_id,
-            turn = decl.turn_index,
+            stream_id = stream_id.0,
             alloc_ms = alloc_ms_total,
             decode_us = decode_us_total,
             bulk_alloc_us = bulk_alloc_us_total,
@@ -560,4 +582,6 @@ mod cuda_impl {
     }
 }
 
-pub use cuda_impl::{gather_chunks, load_turn_into_hot, scatter_chunks, seal_to_chunk_images};
+pub use cuda_impl::{
+    gather_chunks, load_stream_into_hot, load_turn_into_hot, scatter_chunks, seal_to_chunk_images,
+};

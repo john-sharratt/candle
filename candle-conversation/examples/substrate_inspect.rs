@@ -270,7 +270,11 @@ fn chunks(log: &mut LogFile, stream_id: StreamId, preview: usize) -> Result<()> 
         println!("stream {} has no chunk records", stream_hex(stream_id.0));
         return Ok(());
     }
-    let locs: Vec<u64> = entry.chunks.values().map(|l| l.offset).collect();
+    let locs: Vec<(u64, u64)> = entry
+        .chunks
+        .values()
+        .map(|l| (l.offset, l.record_size))
+        .collect();
     let n_chunks = locs.len();
 
     // Accumulate the per-sub-band format distribution across every chunk, plus
@@ -281,8 +285,8 @@ fn chunks(log: &mut LogFile, stream_id: StreamId, preview: usize) -> Result<()> 
     let mut sub_bands = 0usize;
     let (mut full, mut partial) = (0usize, 0usize);
     let mut first_kv: Option<Vec<u8>> = None;
-    for (i, &offset) in locs.iter().enumerate() {
-        let rec = read_record_at(log, offset)?;
+    for (i, &(offset, record_size)) in locs.iter().enumerate() {
+        let rec = read_record_at(log, offset, record_size)?;
         let p = ChunkPayload::decode(&rec.payload)?;
         if i == 0 {
             sub_bands = p.k_formats.len();
@@ -349,7 +353,7 @@ fn tokens(
         .get(&stream_id)
         .and_then(|s| s.tokens)
         .with_context(|| format!("stream {} has no Tokens record", stream_hex(stream_id.0)))?;
-    let rec = read_record_at(log, loc.offset)?;
+    let rec = read_record_at(log, loc.offset, loc.record_size)?;
     let ids = decode_token_ids(&rec.payload)?;
     println!("stream {}  ({} tokens)", stream_hex(stream_id.0), ids.len());
 
@@ -401,8 +405,16 @@ fn load_log_tokenizer(log_path: &std::path::Path) -> Result<Option<Tokenizer>> {
 
 fn meta(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
     let manifest = build_manifest(log)?;
-    print_singleton(log, "model spec", manifest.model_spec.map(|l| l.offset))?;
-    print_singleton(log, "template", manifest.template.map(|l| l.offset))?;
+    print_singleton(
+        log,
+        "model spec",
+        manifest.model_spec.map(|l| (l.offset, l.record_size)),
+    )?;
+    print_singleton(
+        log,
+        "template",
+        manifest.template.map(|l| (l.offset, l.record_size)),
+    )?;
     // Tokenizer bytes live in a sidecar; the record itself is just the
     // 32-byte SHA-256 digest.
     match manifest.tokenizer {
@@ -479,11 +491,15 @@ fn stream_kind_counts(manifest: &Manifest) -> (usize, usize) {
     (turns, sections)
 }
 
-fn print_singleton(log: &mut LogFile, label: &str, offset: Option<u64>) -> Result<()> {
-    match offset {
+fn print_singleton(
+    log: &mut LogFile,
+    label: &str,
+    loc: Option<(u64, u64)>,
+) -> Result<()> {
+    match loc {
         None => println!("{label:<11} (none)"),
-        Some(off) => {
-            let rec = read_record_at(log, off)?;
+        Some((off, size)) => {
+            let rec = read_record_at(log, off, size)?;
             println!("{label:<11} {} bytes", rec.payload.len());
             println!("            {}", payload_render(&rec));
         }

@@ -227,11 +227,58 @@ pub fn elevate_to_hot(
                 });
             }
             PromotionItemKind::Section(sid) => {
-                tracing::warn!(
-                    "elevate_to_hot: cold-load for section {sid:?} not supported; \
-                     sections are expected to be pinned at conversation setup"
-                );
-                report.failed += 1;
+                // Cold-load the section's chunks via the shared
+                // `load_stream_into_hot` pipeline (same machinery
+                // turns use).  Sections are read-mostly fixtures
+                // installed at conversation construction; once a
+                // reload installs cold-markers, the next projection
+                // that depends on this section triggers the cold→hot
+                // lift here.
+                let chunks_per_layer = cold_entry
+                    .cold
+                    .first()
+                    .map(|s| s.chunks.len())
+                    .unwrap_or(0);
+                if chunks_per_layer == 0 {
+                    tracing::warn!(
+                        "elevate_to_hot: section {sid:?} has empty cold refs — skipping"
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+                let backings_slice = backings;
+                let hot_sealed = match conversation.cold_load_section_into_hot(
+                    cold_entry.stream_id,
+                    chunks_per_layer,
+                    backings_slice,
+                    device,
+                    cold_stager,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            "elevate_to_hot: cold-load section {sid:?}: {e}"
+                        );
+                        report.failed += 1;
+                        continue;
+                    }
+                };
+                let bytes_for_item: u64 = cold_entry
+                    .cold
+                    .iter()
+                    .flat_map(|s| s.chunks.iter())
+                    .map(|c| c.record_len)
+                    .sum();
+                pending.push(PendingRecall {
+                    kind: cold_entry.kind,
+                    residence: cold_entry.residence,
+                    hot_sealed,
+                    bytes_for_item,
+                    // Sections don't have timeline/turn coordinates;
+                    // the trace just sees `0` and the section id.
+                    timeline_raw: 0,
+                    turn_index: sid.raw(),
+                });
             }
         }
     }

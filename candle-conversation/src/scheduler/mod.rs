@@ -201,7 +201,48 @@ pub(crate) enum SchedulerRequest {
         /// the original section-ingest flow.
         prefix_section_ids: Vec<SectionId>,
         tokens: TokenBuffer,
+        /// Content-addressed `(prefix_hash, section_hash)` for this
+        /// section, computed by the caller via a `ContentChain` walked
+        /// alongside the schema items.  The scheduler derives the
+        /// persistence stream id from this and uses it to declare the
+        /// SectionDecl + write Tokens/Signatures records at seal time
+        /// — see `SealAction::Section`.
+        address: crate::persistence::streams::ContentAddress,
+        /// Section's symbolic name (schema item id or tool name) used
+        /// purely as diagnostic metadata on the SectionDecl record.
+        debug_name: String,
         response_tx: Sender<Result<SealResult, ConversationError>>,
+    },
+
+    /// Recover a previously-persisted section directly from the redo
+    /// log instead of running a fresh prefill.  Used when an ingest
+    /// caller has computed a section's content-addressed stream id
+    /// and confirmed that the persistence manifest has durable chunks
+    /// for it.  The scheduler cold-loads the chunks into hot VRAM via
+    /// the same pipeline used for turn cold-loads, restores the
+    /// section into the substrate (`SectionEntryData` + residence
+    /// with both hot and cold installed), and replies with `Ok(())`.
+    ///
+    /// On any failure the scheduler falls back to a normal
+    /// `IngestSection` would be issued by the caller — this request
+    /// just reports `Err`.
+    RestoreSection {
+        /// Workspace conversation the section lands in.  Sections are
+        /// shared substrate state — every conversation in the
+        /// workspace sees the same map — but the handle is needed so
+        /// the scheduler can call `restore_section` + `recover_*` on
+        /// the right `Arc<RwLock<Substrate>>`.
+        conversation: Conversation,
+        section_id: SectionId,
+        stream_id: crate::persistence::streams::StreamId,
+        address: crate::persistence::streams::ContentAddress,
+        chunks_per_layer: usize,
+        /// Pre-tokenised section content — the same byte sequence
+        /// the original prefill used.  Reused verbatim so we don't
+        /// need to read the `Tokens` record back from disk just to
+        /// repopulate `SectionEntryData::tokens`.
+        tokens: TokenBuffer,
+        response_tx: Sender<Result<(), ConversationError>>,
     },
 
     /// Pre-warm a freshly-allocated slot by injecting the static system-prompt
@@ -478,9 +519,18 @@ pub(crate) enum SealAction {
     Turn,
     /// Seal the parent slot and pin the result on the workspace
     /// substrate under `section_id` via `set_section_full`.
+    ///
+    /// `address` is the content-addressed `(prefix_hash, section_hash)`
+    /// pair computed at IngestSection time — used to derive the
+    /// stream id under which the section's chunks persist.
+    /// `debug_name` is the section's symbolic name (e.g. tool name or
+    /// schema item id) carried into the SectionDecl record purely
+    /// for diagnostic surfacing in the manifest dump.
     Section {
         section_id: SectionId,
         tokens: Arc<Vec<u32>>,
+        address: crate::persistence::streams::ContentAddress,
+        debug_name: String,
     },
     /// Skip the seal entirely.  Used by raw RULER eval and
     /// summarisation paths that don't write to the substrate.
@@ -562,6 +612,13 @@ pub(super) struct ActiveSectionIngest {
     pub(super) tokens: TokenBuffer,
     pub(super) offset: usize,
     pub(super) seal_block_from: usize,
+    /// Content address derived from the section's tokens + cumulative
+    /// prefix at IngestSection time.  Used to derive the persistence
+    /// stream id at seal — see `SealAction::Section::address`.
+    pub(super) address: crate::persistence::streams::ContentAddress,
+    /// Section's symbolic name for the SectionDecl record — see
+    /// `SealAction::Section::debug_name`.
+    pub(super) debug_name: String,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
     pub(super) error: Option<ConversationError>,
 }
@@ -1046,6 +1103,12 @@ impl Scheduler {
                     for seg in &projection.segments {
                         match seg {
                             ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                                // Hot-only filter — sections live hot
+                                // for their lifetime in the current
+                                // configuration (the cold→hot section
+                                // pipeline is plumbed but disabled on
+                                // the runtime path while we debug a
+                                // regression).
                                 if view.section_sealed_of(rs.id).is_some() {
                                     sections.push(rs.id);
                                     segments.push(seg.clone());
@@ -1299,6 +1362,8 @@ impl Scheduler {
                 section_id,
                 prefix_section_ids,
                 tokens,
+                address,
+                debug_name,
                 response_tx,
             } => {
                 match self.prepare_section_ingest(
@@ -1317,6 +1382,8 @@ impl Scheduler {
                                     &SealAction::Section {
                                         section_id,
                                         tokens: Arc::new(tokens.to_vec()),
+                                        address,
+                                        debug_name: debug_name.clone(),
                                     },
                                     None,
                                     vec![],
@@ -1336,6 +1403,8 @@ impl Scheduler {
                                 tokens,
                                 offset: 0,
                                 seal_block_from,
+                                address,
+                                debug_name,
                                 response_tx,
                                 error: None,
                             });
@@ -1348,6 +1417,27 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::RestoreSection {
+                conversation,
+                section_id,
+                stream_id,
+                address,
+                chunks_per_layer,
+                tokens,
+                response_tx,
+            } => {
+                let result = self.restore_section_from_persistence(
+                    &conversation,
+                    section_id,
+                    stream_id,
+                    address,
+                    chunks_per_layer,
+                    tokens,
+                );
+                let _ = response_tx.send(result);
+                true
+            }
+
             SchedulerRequest::PrimingProjection {
                 sequence_id,
                 section_ids,
@@ -1357,6 +1447,13 @@ impl Scheduler {
                     Ok(())
                 } else {
                     use crate::projection::{ProjectionSegment, ResolvedSection, SealedKind};
+                    // Section cold→hot elevate at priming time is
+                    // plumbed (see git history for the `elevate_to_hot`
+                    // block over this same `section_ids`) but disabled
+                    // on the runtime path while we debug a regression.
+                    // Sections live hot for their lifetime in the
+                    // current configuration, so apply_projection finds
+                    // them via `section_sealed_of`.
                     let segments: Vec<ProjectionSegment> = section_ids
                         .iter()
                         .map(|&id| {
@@ -1442,6 +1539,7 @@ impl Scheduler {
         event_tx: &Sender<TurnEvent>,
         prefill_ms: f64,
         turn_start: Instant,
+        prefill_token_count: usize,
     ) {
         let skip = !self.show_special_tokens;
         let text = self.tokenizer.decode(&[token], skip).unwrap_or_default();
@@ -1456,6 +1554,7 @@ impl Scheduler {
                 total_ms,
                 tokens_generated: 1,
                 tokens_per_second: 0.0,
+                prefill_token_count,
                 sequence: self.session.get_sequence_stats(seq_id.0),
             },
             // `finish_immediately` fires before any decode starts and
@@ -1855,12 +1954,134 @@ impl Scheduler {
                         total_ms,
                         tokens_generated,
                         tokens_per_second,
+                        prefill_token_count: state.prefill_token_count,
                         sequence: sequence_stats,
                     },
                     seal: seal_result,
                 }));
             }
         }
+    }
+
+    /// Install a persisted section by cold-loading its chunks directly
+    /// into hot VRAM at restore time.  Skips the prefill cost that
+    /// `insert_section_collection` would otherwise pay — the section
+    /// is fully present and addressable through `section_sealed_of`
+    /// as soon as this returns.
+    ///
+    /// Eager (not lazy) install: the section's chunks read off disk
+    /// here, not on the next projection.  Trades a small per-restart
+    /// startup cost (~one cold-load per persisted section) for a
+    /// flat runtime cost surface — no surprise stalls during decode
+    /// when the first projection selects a never-elevated section.
+    /// Sections are read-mostly fixtures pinned for the daemon's
+    /// lifetime; paying their cold-load once at startup is the right
+    /// trade.  The elevate-cold-marker path for sections remains
+    /// plumbed (see `elevate_to_hot`'s `PromotionItemKind::Section`
+    /// branch) but unused in this configuration.
+    fn restore_section_from_persistence(
+        &mut self,
+        conversation: &Conversation,
+        section_id: SectionId,
+        stream_id: crate::persistence::streams::StreamId,
+        _address: crate::persistence::streams::ContentAddress,
+        chunks_per_layer: usize,
+        tokens: TokenBuffer,
+    ) -> Result<(), ConversationError> {
+        let n_layers = self.session.num_layers();
+
+        // 1. Resolve cold refs from the manifest — these point at
+        //    each chunk's `(log_offset, record_len, token_count)` in
+        //    the redo log.  Installed alongside the hot bytes below
+        //    so the persistence thread's section-persist pass
+        //    recognises this section as already durable and skips it.
+        let cold_refs = conversation
+            .recover_section_cold_refs(stream_id, n_layers)
+            .map_err(ConversationError::Model)?
+            .unwrap_or_default();
+
+        // 2. Cold-load the section's chunks into hot VRAM through the
+        //    shared pipeline turns use.  Allocates fresh ChunkGids in
+        //    the workspace backings; the returned per-layer
+        //    `SealedSequence` is what we install as the section's hot
+        //    tier.
+        let backings = self.session.backings().to_vec();
+        let device = self.session.device().clone();
+        let hot_sealed = conversation
+            .cold_load_section_into_hot(
+                stream_id,
+                chunks_per_layer,
+                &backings,
+                &device,
+                &mut self.cold_load_stager,
+            )
+            .map_err(ConversationError::Model)?;
+
+        // 3. Read persisted BDP signatures back into SigEntry values
+        //    by re-appending the raw bytes to the workspace provenance
+        //    file.  Same machinery the turn-reload path uses
+        //    (see `reconstruct_from_log_in_place` in this file).
+        let sig_bytes = conversation
+            .read_section_signatures(stream_id)
+            .map_err(ConversationError::Model)?;
+        let sig_entries: Vec<crate::provenance::SigEntry> = if sig_bytes.is_empty() {
+            Vec::new()
+        } else {
+            let n_bytes = crate::provenance::TokenSignature::BYTE_LEN;
+            let mut out = Vec::with_capacity(sig_bytes.len());
+            for (token_count, bytes) in &sig_bytes {
+                let tc = *token_count as usize;
+                let want = tc * n_bytes * 3;
+                if bytes.len() != want {
+                    tracing::warn!(
+                        "restore_section: stream {stream_id:?} sig record has {} bytes, expected {want} — skipping",
+                        bytes.len()
+                    );
+                    continue;
+                }
+                let depth = |d: usize| -> Vec<crate::provenance::TokenSignature> {
+                    bytes[d * tc * n_bytes..(d + 1) * tc * n_bytes]
+                        .chunks_exact(n_bytes)
+                        .map(|c| {
+                            let arr: [u8; crate::provenance::TokenSignature::BYTE_LEN] =
+                                c.try_into().unwrap();
+                            crate::provenance::TokenSignature::from_bytes(&arr)
+                        })
+                        .collect()
+                };
+                match self
+                    .provenance
+                    .append(&depth(0), &depth(1), &depth(2))
+                {
+                    Ok(entry) => out.push(entry),
+                    Err(e) => {
+                        tracing::warn!("restore_section sig append failed: {e}");
+                    }
+                }
+            }
+            out
+        };
+
+        // 3. Install hot + cold under one write lock.  `restore_section`
+        //    sets `residence.hot = Some(hot_sealed)` and
+        //    `residence.cold = Some(cold_refs)`; the persistence pass
+        //    sees the populated cold refs and skips the section on
+        //    its next walk.  `token_count` comes from the cold refs
+        //    (sum of per-chunk token counts across one layer) — same
+        //    value either tier reports.
+        let token_count = cold_refs.first().map(|s| s.token_count).unwrap_or(0);
+        let tokens_arc = Arc::new(tokens[..].to_vec());
+        let mut view = conversation.write();
+        view.restore_section(
+            section_id,
+            stream_id,
+            token_count,
+            sig_entries,
+            hot_sealed,
+            cold_refs,
+            tokens_arc,
+        );
+        Ok(())
     }
 
     /// CPU-only setup for a section ingest: truncate slot, inject prefix,
@@ -1980,6 +2201,8 @@ impl Scheduler {
         section_id: SectionId,
         seal_block_from: usize,
         tokens: Arc<Vec<u32>>,
+        address: crate::persistence::streams::ContentAddress,
+        debug_name: String,
     ) -> Result<SealResult, ConversationError> {
         #[cfg(feature = "context-dump")]
         if tracing::enabled!(
@@ -2003,7 +2226,12 @@ impl Scheduler {
         let seal = self.perform_seal_and_write(
             sequence_id,
             seal_block_from,
-            &SealAction::Section { section_id, tokens },
+            &SealAction::Section {
+                section_id,
+                tokens,
+                address,
+                debug_name,
+            },
             None,
             vec![],
         )?;
@@ -2270,18 +2498,70 @@ impl Scheduler {
                     state.trim_post_turn();
                 }
             }
-            SealAction::Section { section_id, tokens } => {
+            SealAction::Section {
+                section_id,
+                tokens,
+                address,
+                debug_name,
+            } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
-                let mut view = conversation.write();
-                view.set_section_full(
-                    *section_id,
-                    turn_token_count,
-                    new_sig_entries.clone(),
-                    Arc::new(delta_gpu),
-                    |seqs| Ok(seqs.to_vec()),
-                    Arc::clone(tokens),
-                )
-                .map_err(ConversationError::Model)?;
+                // Derive the section's content-addressed stream id from
+                // the (prefix_hash, section_hash) the conversation
+                // layer attached at IngestSection time.  The substrate
+                // installs the residence under this id so the
+                // persistence thread's section-persist pass picks it
+                // up for warm→cold migration.
+                let stream_id =
+                    crate::persistence::content_hash::section_stream_id(*address);
+                {
+                    let mut view = conversation.write();
+                    view.set_section_full(
+                        *section_id,
+                        stream_id,
+                        turn_token_count,
+                        new_sig_entries.clone(),
+                        Arc::new(delta_gpu),
+                        |seqs| Ok(seqs.to_vec()),
+                        Arc::clone(tokens),
+                    )
+                    .map_err(ConversationError::Model)?;
+                }
+                // Declare the section stream in the redo log so the
+                // manifest knows the (address, debug_name) before any
+                // chunks land.  Mirrors record_turn's StreamDecl write.
+                if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
+                    tracing::warn!("declare section stream failed: {e}");
+                }
+                // Persist BDP signatures (if any) and the section's
+                // token ids, then fire the persistence trigger so the
+                // chunks land on disk in the next pass.
+                if !new_sig_entries.is_empty() {
+                    let mut sig_bytes = Vec::with_capacity(new_sig_entries.len());
+                    for e in &new_sig_entries {
+                        match self.provenance.read_entry(*e) {
+                            Ok((syn, sem, prag)) => {
+                                let mut bytes = Vec::with_capacity(e.byte_len());
+                                for s in syn.iter().chain(sem.iter()).chain(prag.iter()) {
+                                    bytes.extend_from_slice(s.as_bytes());
+                                }
+                                sig_bytes.push((e.token_count, bytes));
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    "read provenance entry for section persistence: {err}"
+                                )
+                            }
+                        }
+                    }
+                    let payload = crate::persistence::resume::encode_signatures(&sig_bytes);
+                    if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
+                        tracing::warn!("persist section signatures failed: {e}");
+                    }
+                }
+                if let Err(e) = conversation.persist_tokens_only(stream_id, tokens) {
+                    tracing::warn!("persist section tokens failed: {e}");
+                }
+                self.persist_trigger.fire();
             }
             SealAction::None => unreachable!("filtered above"),
         }
@@ -3015,6 +3295,10 @@ impl Scheduler {
             for seg in &projection.segments {
                 match seg {
                     ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                        // Hot-only filter — matches the SubmitTurn
+                        // path.  Section cold→hot is plumbed but
+                        // disabled on the runtime path while we
+                        // debug the cold-loaded section regression.
                         if view.section_sealed_of(rs.id).is_some() {
                             sections.push(rs.id);
                             segments.push(seg.clone());

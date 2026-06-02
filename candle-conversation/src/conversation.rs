@@ -7,6 +7,8 @@
 use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use crate::handle::{SealResult, TurnHandle, TurnResponse};
+use crate::persistence::content_hash::{hash_tokens, ContentChain};
+use crate::persistence::streams::ContentAddress;
 use crate::projection::{
     Builder, Conversation, ProjectionTarget, SectionId, SystemPromptItem, TimelineId, TurnIndex,
 };
@@ -346,23 +348,37 @@ impl Sequence {
                         .map(|sec| (sec.id, sec.content.as_str()))
                         .collect();
                     if !batch.is_empty() {
-                        conv.insert_section_collection(&batch, &linear_prefix)?;
+                        // Per-section progress: tick `done_bytes`
+                        // and call the outer report() as each member
+                        // completes its ingest / restore / skip.
+                        // Collection members complete in submission
+                        // order at the wait-phase boundary inside
+                        // `insert_section_collection_with_progress`,
+                        // so the bar advances ~once per ~prefill of
+                        // a single tool description rather than
+                        // jumping at the end of the whole collection.
+                        let done_bytes_ref = &mut done_bytes;
+                        let report_ref = &report;
+                        conv.insert_section_collection_with_progress(
+                            &batch,
+                            &linear_prefix,
+                            |_sid, content_len| {
+                                *done_bytes_ref += content_len as u64;
+                                report_ref(*done_bytes_ref);
+                            },
+                        )?;
                     }
-                    // Extend the live linear_prefix with every ingested
-                    // member so subsequent sections see them, but do NOT
-                    // add them to fixed_prefix — the priming projection
-                    // must be coherent for the empty-collection case.
+                    // Extend the live linear_prefix with every
+                    // collection member so subsequent sections see
+                    // them at projection time, but do NOT add them
+                    // to fixed_prefix — the priming projection must
+                    // be coherent for the empty-collection case.
                     for sec in &coll.sections {
                         if sec.is_template {
                             continue;
                         }
                         linear_prefix.push(sec.id);
-                        done_bytes += sec.content.len() as u64;
                     }
-                    // Collection members ingest in parallel — emit one
-                    // tick after the whole batch lands rather than
-                    // per-member.
-                    report(done_bytes);
                 }
             }
         }
@@ -486,6 +502,28 @@ impl Sequence {
         sections: &[(SectionId, &str)],
         prefix_section_ids: &[SectionId],
     ) -> crate::Result<Vec<(SectionId, usize)>> {
+        self.insert_section_collection_with_progress(
+            sections,
+            prefix_section_ids,
+            |_, _| {},
+        )
+    }
+
+    /// Same as [`Self::insert_section_collection`] but fires
+    /// `on_section_done(section_id, content_len_bytes)` after every
+    /// single section completes — skipped, restored from disk, or
+    /// freshly ingested — so the surrounding ingest loop can update
+    /// its progress bar at section granularity instead of waiting for
+    /// the whole batch.
+    pub fn insert_section_collection_with_progress<F>(
+        &mut self,
+        sections: &[(SectionId, &str)],
+        prefix_section_ids: &[SectionId],
+        mut on_section_done: F,
+    ) -> crate::Result<Vec<(SectionId, usize)>>
+    where
+        F: FnMut(SectionId, usize),
+    {
         if sections.is_empty() {
             return Ok(Vec::new());
         }
@@ -498,8 +536,68 @@ impl Sequence {
             content: &'a str,
             tokens: TokenBuffer,
             token_count: usize,
+            address: ContentAddress,
+            debug_name: String,
         }
-        let mut work: Vec<Pending<'_>> = Vec::with_capacity(sections.len());
+        // Rebuild a `ContentChain` snapshot from the supplied prefix
+        // section ids.  Sections in this call all share the same
+        // prefix snapshot (collection-member semantics: members don't
+        // attend to each other, so each member's `prefix_hash` is the
+        // chain state *before* the collection).  The chain reads each
+        // prefix section's tokens from the substrate — they were
+        // tokenised and pinned on a previous `insert_section_*` call.
+        //
+        // **Collection members are excluded from the chain.**  Without
+        // this, every change to a collection member (installing a new
+        // tool, removing one, editing a tool's description) would
+        // produce a fresh `prefix_hash` for every section *after* the
+        // collection, cascading stream-id invalidation through the
+        // whole downstream tail and forcing a re-prefill of sections
+        // whose own content didn't change.  Collection members are
+        // already an approximation in the post-collection prefix
+        // (projection selects a subset at runtime, so the cached K/V
+        // is never a strict function of the specific members that
+        // ingested) — treating them as outside the content chain
+        // matches that approximation and keeps minor catalog changes
+        // local.
+        let prefix_hash = {
+            let mut chain = ContentChain::new();
+            let view = self.substrate.read();
+            let schema = self.projection.schema();
+            for &pid in prefix_section_ids {
+                // Skip collection members from any layer's prompt —
+                // they don't advance the content chain.
+                if schema
+                    .layers
+                    .iter()
+                    .any(|l| l.system_prompt.is_collection_member(pid))
+                {
+                    continue;
+                }
+                let pre_tokens = view.section_tokens_of(pid);
+                if pre_tokens.is_empty() {
+                    // A prefix section with no recorded tokens — this
+                    // happens for template-kind items that don't enter
+                    // the substrate.  Skip; they contribute nothing to
+                    // the cumulative content prefix anyway.
+                    continue;
+                }
+                chain.push_section(&pre_tokens);
+            }
+            chain.prefix()
+        };
+        // Walk every requested section and triage into three buckets:
+        //   - Already hot in the substrate → skip entirely (a prior
+        //     `insert_section_*` call in this same daemon run already
+        //     pinned it).  Block-count contribution is its
+        //     `section_sealed_of` chunk count.
+        //   - Persisted in the redo log under its content-addressed
+        //     stream id → restore from disk (`RestoreSection`).
+        //   - Otherwise → ingest with a fresh prefill (`IngestSection`).
+        let n_layers = self.model_core.num_layers;
+        let mut to_ingest: Vec<Pending<'_>> = Vec::with_capacity(sections.len());
+        let mut to_restore: Vec<Pending<'_>> = Vec::with_capacity(sections.len());
+        let mut out_skip: Vec<(SectionId, usize)> = Vec::new();
         for &(section_id, content) in sections {
             if content.is_empty() {
                 continue;
@@ -509,18 +607,115 @@ impl Sequence {
                 continue;
             }
             let token_count = tokens.len();
-            work.push(Pending {
+            let address = ContentAddress {
+                prefix_hash,
+                section_hash: hash_tokens(&tokens),
+            };
+            let debug_name = self.section_debug_name(section_id);
+            // Already-present check first — cheapest, no lock
+            // contention on the persistence mutex.  `section_exists`
+            // is broader than `section_is_hot`: it returns true for
+            // cold-marker sections that were restored on substrate
+            // reload but haven't been elevated yet.  Either way the
+            // substrate already knows about this section; the elevate
+            // path will lift it on the next projection that needs it.
+            if self.substrate.read().section_exists(section_id) {
+                let block_count = self
+                    .substrate
+                    .read()
+                    .section_block_count(section_id)
+                    .unwrap_or(0);
+                out_skip.push((section_id, block_count));
+                on_section_done(section_id, content.len());
+                continue;
+            }
+            // Manifest check.  Only meaningful when the model's
+            // layer count is known; without backings (test harnesses
+            // that don't register a session) we can't compute
+            // `chunks_per_layer`, so we fall through to ingest.
+            let stream_id = crate::persistence::content_hash::section_stream_id(address);
+            if n_layers > 0 && self.substrate.section_stream_is_persisted(stream_id) {
+                if let Some((_, _, _)) =
+                    self.substrate.section_stream_layout(stream_id, n_layers)
+                {
+                    to_restore.push(Pending {
+                        section_id,
+                        content,
+                        tokens,
+                        token_count,
+                        address,
+                        debug_name,
+                    });
+                    continue;
+                }
+            }
+            to_ingest.push(Pending {
                 section_id,
                 content,
                 tokens,
                 token_count,
+                address,
+                debug_name,
             });
         }
-        if work.is_empty() {
-            return Ok(Vec::new());
+        let total = to_ingest.len() + to_restore.len();
+        if total == 0 {
+            return Ok(out_skip);
         }
-        let n_sections = work.len();
+        let n_sections = total;
         let t0 = std::time::Instant::now();
+
+        // Dispatch restores first — they short-circuit the
+        // prefill batcher entirely and the scheduler handles them
+        // synchronously per request.  Wait for each to complete before
+        // moving to ingest so the restored sections are visible in the
+        // substrate if the upcoming ingest happens to need them in a
+        // prefix (it won't in the cumulative-ingest loop, but it's
+        // cheap insurance).
+        let mut restore_out: Vec<(SectionId, usize)> = Vec::with_capacity(to_restore.len());
+        for item in to_restore.into_iter() {
+            let stream_id = crate::persistence::content_hash::section_stream_id(item.address);
+            let chunks_per_layer = self
+                .substrate
+                .section_stream_layout(stream_id, n_layers)
+                .map(|(c, _, _)| c)
+                .unwrap_or(0);
+            // Capture the content length for the progress callback
+            // before `item.tokens` / `item.content` get consumed by
+            // the request payload below.
+            let item_section_id = item.section_id;
+            let item_content_len = item.content.len();
+            let (tx, rx) = crossbeam::channel::bounded(1);
+            self.scheduler_tx
+                .send(SchedulerRequest::RestoreSection {
+                    conversation: self.substrate.clone(),
+                    section_id: item.section_id,
+                    stream_id,
+                    address: item.address,
+                    chunks_per_layer,
+                    tokens: item.tokens.clone(),
+                    response_tx: tx,
+                })
+                .map_err(|_| ConversationError::SchedulerGone)?;
+            match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
+                Ok(()) => {
+                    // Block count for diagnostics — the section is
+                    // now a cold-marker; the actual hot grid lands
+                    // when the next projection elevates it.  Use the
+                    // manifest's chunks_per_layer as the count.
+                    restore_out.push((item.section_id, chunks_per_layer));
+                    on_section_done(item_section_id, item_content_len);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        section_id = ?item.section_id,
+                        "section restore failed ({e}) — falling back to ingest",
+                    );
+                    to_ingest.push(item);
+                }
+            }
+            let _ = item.token_count;
+        }
 
         // Bulk-allocate-then-fire: allocate one scratch slot per
         // section first (cheap, no timeline minting), then fire every
@@ -538,8 +733,8 @@ impl Sequence {
         // right shape.  `fork()` would also mint a timeline (and write
         // a manifest record per section under any future persistence
         // layer), which is wasted effort here.
-        let mut slot_ids: Vec<SequenceId> = Vec::with_capacity(work.len());
-        for _ in 0..work.len() {
+        let mut slot_ids: Vec<SequenceId> = Vec::with_capacity(to_ingest.len());
+        for _ in 0..to_ingest.len() {
             slot_ids.push(self.alloc_scratch_slot()?);
         }
         let t_alloc = std::time::Instant::now();
@@ -547,33 +742,68 @@ impl Sequence {
         let mut pending: Vec<(
             SequenceId,
             SectionId,
+            usize, // content_len for the progress callback
             crossbeam::channel::Receiver<crate::Result<SealResult>>,
-        )> = Vec::with_capacity(work.len());
-        for (slot_id, item) in slot_ids.into_iter().zip(work.into_iter()) {
+        )> = Vec::with_capacity(to_ingest.len());
+        for (slot_id, item) in slot_ids.into_iter().zip(to_ingest.into_iter()) {
             let (tx, rx) = crossbeam::channel::bounded(1);
+            let content_len = item.content.len();
             self.scheduler_tx
                 .send(SchedulerRequest::IngestSection {
                     sequence_id: slot_id,
                     section_id: item.section_id,
                     prefix_section_ids: prefix_section_ids.to_vec(),
                     tokens: item.tokens,
+                    address: item.address,
+                    debug_name: item.debug_name,
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;
             let _ = item.token_count;
-            let _ = item.content;
-            pending.push((slot_id, item.section_id, rx));
+            pending.push((slot_id, item.section_id, content_len, rx));
         }
         let t_fire = std::time::Instant::now();
 
-        let mut out: Vec<(SectionId, usize)> = Vec::with_capacity(pending.len());
-        for (slot_id, section_id, rx) in pending {
-            let seal = rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+        let mut out: Vec<(SectionId, usize)> =
+            Vec::with_capacity(pending.len() + out_skip.len() + restore_out.len());
+        out.extend(out_skip);
+        out.extend(restore_out);
+        // Drain pending in **completion order** rather than submission
+        // order.  Sections in a collection ingest in parallel under
+        // the same scheduler batch; shorter sections finish earlier
+        // than longer ones, but the scheduler doesn't reorder
+        // responses — each section's reply lands on its own bounded(1)
+        // channel as soon as its forward passes complete.  Iterating
+        // `pending` in order with blocking `rx.recv()` would stall on
+        // the longest section's channel, drain every shorter section's
+        // channel in microseconds afterwards, and produce one big
+        // GUI jump.  `crossbeam::channel::Select` lets us pick up the
+        // next ready receiver instead, firing `on_section_done`
+        // progressively as sections actually complete.
+        while !pending.is_empty() {
+            // Pick the next-ready receiver via `Select`, drop the
+            // `Select` borrow before mutating `pending`.
+            let (idx, recv_result) = {
+                let mut select = crossbeam::channel::Select::new();
+                for (_, _, _, rx) in &pending {
+                    select.recv(rx);
+                }
+                let op = select.select();
+                let idx = op.index();
+                let rx = &pending[idx].3;
+                let r = op
+                    .recv(rx)
+                    .map_err(|_| ConversationError::SchedulerGone)?;
+                (idx, r)
+            };
+            let (slot_id, section_id, content_len, _rx) = pending.swap_remove(idx);
+            let seal = recv_result?;
             let block_count = seal.block_to.saturating_sub(seal.block_from);
             let _ = self.scheduler_tx.send(SchedulerRequest::FreeSequence {
                 sequence_id: slot_id,
             });
             out.push((section_id, block_count));
+            on_section_done(section_id, content_len);
         }
         let t_done = std::time::Instant::now();
 
@@ -586,6 +816,23 @@ impl Sequence {
             "section_collection",
         );
         Ok(out)
+    }
+
+    /// Look up a section's symbolic name from the projection schema.
+    /// Used as the `debug_name` field on the persisted SectionDecl
+    /// record so manifest dumps surface human-readable section ids
+    /// rather than just `SectionId(u32)` raw values.  Falls back to a
+    /// formatted `section_<raw>` string when the section isn't found
+    /// in any layer (e.g. throwaway sigs-probe sections).
+    fn section_debug_name(&self, section_id: SectionId) -> String {
+        for layer in &self.projection.schema().layers {
+            for s in layer.system_prompt.all_sections() {
+                if s.id == section_id {
+                    return s.name.clone();
+                }
+            }
+        }
+        format!("section_{}", section_id.raw())
     }
 
     /// Allocate a fresh GPU slot bound to the workspace substrate
@@ -608,47 +855,6 @@ impl Sequence {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         rx.recv().map_err(|_| ConversationError::SchedulerGone)?
-    }
-
-    /// Prefill `text` through a throw-away scratch slot and return the
-    /// Q-sign-bit [`SigEntry`] values extracted from that prefill.
-    ///
-    /// No decode step is run; the slot is freed immediately after the seal.
-    /// The returned entries reference the same engine-level
-    /// [`ProvenanceFile`] that [`ConversationEngine::provenance_file`]
-    /// returns, so callers can read the raw bytes back with
-    /// `pf.read_entry(entry)`.
-    ///
-    /// Intended for the calibration harness: generates prefill-phase Q
-    /// vectors from representative user prompts so they can be compared
-    /// against decode-phase vectors to measure the information gain of
-    /// running a full decode probe.
-    pub fn prefill_sigs_for(&self, text: &str) -> crate::Result<Vec<crate::provenance::SigEntry>> {
-        let tokens = self.tokenize(text)?;
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Use a reserved throwaway section ID — the substrate entry for
-        // this ID is overwritten on each call, which is harmless since
-        // callers read from `seal.new_sig_entries` directly rather than
-        // from the substrate.
-        let dummy_id = SectionId::new(u32::MAX);
-        let slot_id = self.alloc_scratch_slot()?;
-        let (tx, rx) = crossbeam::channel::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::IngestSection {
-                sequence_id: slot_id,
-                section_id: dummy_id,
-                prefix_section_ids: vec![],
-                tokens,
-                response_tx: tx,
-            })
-            .map_err(|_| ConversationError::SchedulerGone)?;
-        let seal = rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
-        let _ = self.scheduler_tx.send(SchedulerRequest::FreeSequence {
-            sequence_id: slot_id,
-        });
-        Ok(seal.new_sig_entries)
     }
 
     /// Submit a user turn for processing.

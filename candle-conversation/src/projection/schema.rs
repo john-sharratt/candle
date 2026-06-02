@@ -99,6 +99,28 @@ impl SystemPromptSchema {
             _ => None,
         })
     }
+
+    /// True when `section_id` belongs to any `SectionCollection` in
+    /// this layer's prompt.  Used by the content-address chain in
+    /// `Sequence::insert_section_collection` to avoid hashing
+    /// collection-member tokens into the prefix — without this
+    /// filter, every change to a collection member (e.g. installing
+    /// or removing a single tool) would cascade into a new
+    /// `prefix_hash` for every downstream section, force-invalidating
+    /// the manifest entries that would otherwise have cold-loaded.
+    /// Collection members are an approximation-rich prefix anyway —
+    /// projection picks a subset at runtime, so the section's K/V
+    /// already isn't a strict function of which specific members
+    /// ingested.  Treating them as outside the content chain matches
+    /// that existing approximation.
+    pub fn is_collection_member(&self, section_id: super::ids::SectionId) -> bool {
+        self.items.iter().any(|it| match it {
+            SystemPromptItem::Collection(c) => {
+                c.sections.iter().any(|s| s.id == section_id)
+            }
+            _ => false,
+        })
+    }
 }
 
 /// One entry in a layer's system-prompt list.  Either a single

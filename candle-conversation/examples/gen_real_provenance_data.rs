@@ -499,49 +499,6 @@ fn main() -> anyhow::Result<()> {
                 None
             };
 
-            // ── Capture prefill Q from user prompt (scratch-slot, no decode) ──
-            let prefill_out_entry: Option<SigEntry> = match conv.prefill_sigs_for(&user_prompt) {
-                Ok(prefill_sigs) if !prefill_sigs.is_empty() => {
-                    let mut pre_syn = Vec::new();
-                    let mut pre_sem = Vec::new();
-                    let mut pre_prag = Vec::new();
-                    let mut ok = true;
-                    for entry in &prefill_sigs {
-                        match pf.read_entry(*entry) {
-                            Ok((s, se, p)) => {
-                                pre_syn.extend(s);
-                                pre_sem.extend(se);
-                                pre_prag.extend(p);
-                            }
-                            Err(e) => {
-                                eprintln!("  [{global_idx}] WARNING: prefill read_entry failed: {e}");
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if ok && !pre_syn.is_empty() {
-                        match out_prefill_pf.append(&pre_syn, &pre_sem, &pre_prag) {
-                            Ok(e) => Some(e),
-                            Err(e) => {
-                                eprintln!("  [{global_idx}] WARNING: prefill append failed: {e}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                }
-                Ok(_) => {
-                    eprintln!("  [{global_idx}] WARNING: prefill_sigs_for returned empty for {id}");
-                    None
-                }
-                Err(e) => {
-                    eprintln!("  [{global_idx}] WARNING: prefill_sigs_for failed: {e}");
-                    None
-                }
-            };
-
             drop(conv); // release KV slot for the next batch
 
             let seal = match &resp.seal {
@@ -552,12 +509,76 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
+            // Partition `seal.new_sig_entries` into prefill-phase and
+            // decode-phase chunks using `prefill_token_count` reported
+            // by the scheduler.  The two phases land in distinct sets
+            // of chunks (the scheduler push_empty_writer_chunk's after
+            // prefill ends), so accumulating `token_count` along the
+            // entries gives us the partition without a second
+            // forward pass — this replaces the old `prefill_sigs_for`
+            // call which ran a separate prefill of just `user_prompt`
+            // on a scratch slot (different prefix shape, separate
+            // provenance write).  The new path captures prefill sigs
+            // under the actual ChatML-formatted prefix the model
+            // sees at runtime — same code path, fewer artefacts.
+            let prefill_tokens_target = resp.stats.prefill_token_count;
+            let mut prefill_sig_entries: Vec<&SigEntry> = Vec::new();
+            let mut decode_sig_entries: Vec<&SigEntry> = Vec::new();
+            {
+                let mut tokens_so_far: usize = 0;
+                for entry in &seal.new_sig_entries {
+                    if tokens_so_far < prefill_tokens_target {
+                        prefill_sig_entries.push(entry);
+                        tokens_so_far += entry.token_count as usize;
+                    } else {
+                        decode_sig_entries.push(entry);
+                    }
+                }
+            }
+
+            // Write prefill sigs to their dedicated provenance file.
+            let prefill_out_entry: Option<SigEntry> = if !prefill_sig_entries.is_empty() {
+                let mut pre_syn = Vec::new();
+                let mut pre_sem = Vec::new();
+                let mut pre_prag = Vec::new();
+                let mut ok = true;
+                for entry in &prefill_sig_entries {
+                    match pf.read_entry(**entry) {
+                        Ok((s, se, p)) => {
+                            pre_syn.extend(s);
+                            pre_sem.extend(se);
+                            pre_prag.extend(p);
+                        }
+                        Err(e) => {
+                            eprintln!("  [{global_idx}] WARNING: prefill read_entry failed: {e}");
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && !pre_syn.is_empty() {
+                    match out_prefill_pf.append(&pre_syn, &pre_sem, &pre_prag) {
+                        Ok(e) => Some(e),
+                        Err(e) => {
+                            eprintln!("  [{global_idx}] WARNING: prefill append failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Read real Q sign-bits from engine's internal ProvenanceFile.
+            // Decode-only sigs go to signatures.prov (prefill chunks
+            // were already accounted for above).
             let mut all_syn = Vec::new();
             let mut all_sem = Vec::new();
             let mut all_prag = Vec::new();
-            for entry in &seal.new_sig_entries {
-                let (syn, sem, prag) = pf.read_entry(*entry)?;
+            for entry in &decode_sig_entries {
+                let (syn, sem, prag) = pf.read_entry(**entry)?;
                 all_syn.extend(syn);
                 all_sem.extend(sem);
                 all_prag.extend(prag);

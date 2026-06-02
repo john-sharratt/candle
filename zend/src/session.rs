@@ -106,21 +106,25 @@ impl InferenceState {
 
         // Install the tool catalog into the schema before building the
         // base conversation.  Each tool gets a section in dialogue's
-        // system_prompt; the layer's section selection switches to
-        // TopK so only the K most relevant survive into projection.
+        // system_prompt; the projection layer's `tools` collection
+        // governs `top_k` so only the K most relevant tools survive
+        // into any single projection.
         //
-        // Temporarily disabled while we debug the bg-quantizer / persist
-        // chain: the tool catalog adds ~90 sections of bulky JSON to the
-        // base conversation which crowds the persisted-chunk inspector
-        // output and slows down iteration. Re-enable when ready.
-        // let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
-        //     .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
-        // tracing::info!(
-        //     n_tools = tool_sections.len(),
-        //     "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
-        // );
-        let tool_sections: Vec<()> = Vec::new();
-        let _ = dialogue_layer;
+        // Sections re-prefill on every daemon start in the current
+        // configuration — section cold-load is plumbed end-to-end but
+        // disabled on the runtime path (see Phase 2.5 in
+        // `persistence/thread.rs` and the matching scheduler filter
+        // notes).  Tool sections live hot for the daemon's lifetime
+        // and the manifest never grows section chunk records.  Cost
+        // is one prefill pass over the catalog per daemon start
+        // (~90 tools × short JSON line); cheap on the 4090 mobile
+        // baseline and easy to re-flip once cold-load is back.
+        let tool_sections = install_tool_catalog(&mut proj_builder, dialogue_layer)
+            .map_err(|e| anyhow::anyhow!("tool catalog install: {e}"))?;
+        tracing::info!(
+            n_tools = tool_sections.len(),
+            "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
+        );
 
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/history_stance/grounding/tools_intro) →

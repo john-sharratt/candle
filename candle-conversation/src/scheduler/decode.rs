@@ -136,9 +136,35 @@ impl Scheduler {
         let sample_ms = t_sample.elapsed().as_millis() as u64;
         super::record_phase(t_sample, "decode_sample");
 
-        tracing::trace!(
+        // Pre-decode the sampled tokens into a readable string for the
+        // timing trace.  Only built when the debug level is actually
+        // active (gated by `tracing::enabled!`) so the tokenizer call
+        // doesn't fire on the hot path under default logging.  Multi-
+        // sequence batches join the per-sequence fragments with `|`.
+        let token_str: String = if tracing::enabled!(
             target: "candle_conversation::scheduler::timing",
-            batch = seq_ids.len(), fwd_ms, sample_ms,
+            tracing::Level::DEBUG,
+        ) {
+            let skip = !self.show_special_tokens;
+            next_tokens
+                .iter()
+                .map(|&t| {
+                    self.tokenizer
+                        .decode(&[t], skip)
+                        .unwrap_or_else(|_| "<?>".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        } else {
+            String::new()
+        };
+
+        tracing::debug!(
+            target: "candle_conversation::scheduler::timing",
+            batch = seq_ids.len(),
+            fwd_ms,
+            sample_ms,
+            token_str = %token_str,
             "decode_step",
         );
 

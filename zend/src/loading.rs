@@ -125,6 +125,11 @@ impl LoadProgress {
     }
 
     /// Whether the daemon has finished loading.
+    ///
+    /// Kept as a typed boolean API for callers that don't want to
+    /// parse `snapshot() -> Option<LoadingSnapshot>` themselves; only
+    /// the unit tests exercise it today, hence `#[allow(dead_code)]`.
+    #[allow(dead_code)]
     pub fn is_ready(&self) -> bool {
         matches!(*self.inner.lock().unwrap(), Inner::Ready)
     }

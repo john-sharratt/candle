@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::schema::{DepthWeights, ScoreFormula};
-use crate::persistence::streams::{PerDepthScores, StreamDecl, StreamId, TurnDecl};
+use crate::persistence::streams::{
+    ContentAddress, PerDepthScores, SectionDecl, StreamDecl, StreamId, TurnDecl,
+};
 use crate::persistence::SubstratePersistence;
 use crate::provenance::SigEntry;
 use crate::substrate::{
@@ -710,6 +712,123 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         p.append_signatures(stream_id, sigs)
             .map_err(|e| candle::Error::Msg(format!("persist signatures: {e}")))
+    }
+
+    /// Declare a section stream — appends a `StreamDecl::PromptSection`
+    /// record carrying the content address and debug name.  The
+    /// derived stream id matches `section_stream_id(address)`.  Called
+    /// by the scheduler at section seal time; pairs with later
+    /// `Tokens` / `Signatures` / `Chunks` records keyed by the same id.
+    pub fn declare_section_stream(
+        &self,
+        address: ContentAddress,
+        debug_name: &str,
+    ) -> candle::Result<StreamId> {
+        let decl = StreamDecl::PromptSection(SectionDecl {
+            address,
+            debug_name: debug_name.to_string(),
+        });
+        self.persistence
+            .lock()
+            .unwrap()
+            .declare_stream(&decl)
+            .map_err(|e| candle::Error::Msg(format!("declare section stream: {e}")))
+    }
+
+    /// True when the workspace's manifest already holds durable
+    /// chunks for `stream_id` — i.e. a section under this content
+    /// address has been persisted and can be cold-loaded back into
+    /// hot without re-prefilling.  The check matches the ingest
+    /// loop's skip-if-present gate.
+    pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
+        let p = self.persistence.lock().unwrap();
+        p.manifest()
+            .streams
+            .get(&stream_id)
+            .map(|s| s.committed_through.is_some() && !s.chunks.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Snapshot a persisted section stream's manifest metadata for the
+    /// cold-load path.  Returns `(chunks_per_layer, tokens_present,
+    /// signatures_present)` when the stream is known, otherwise `None`.
+    /// `chunks_per_layer = manifest.chunks.len() / n_layers`.
+    pub fn section_stream_layout(
+        &self,
+        stream_id: StreamId,
+        n_layers: usize,
+    ) -> Option<(usize, bool, bool)> {
+        let p = self.persistence.lock().unwrap();
+        let entry = p.manifest().streams.get(&stream_id)?;
+        if entry.chunks.is_empty() || n_layers == 0 {
+            return None;
+        }
+        let total = entry.chunks.len();
+        if total % n_layers != 0 {
+            return None;
+        }
+        let chunks_per_layer = total / n_layers;
+        Some((chunks_per_layer, entry.tokens.is_some(), entry.signatures.is_some()))
+    }
+
+    /// Cold-load a persisted section's chunks back into hot VRAM via
+    /// the shared `load_stream_into_hot` pipeline.  Returns the
+    /// per-layer `SealedSequence` the substrate's residence slab
+    /// installs as the section's hot tier.
+    pub fn cold_load_section_into_hot(
+        &self,
+        stream_id: StreamId,
+        chunks_per_layer: usize,
+        backings: &[candle_nn::kv_cache::ChunkedKvBacking],
+        device: &candle::Device,
+        stager: &mut crate::persistence::cold_load::ColdLoadStager,
+    ) -> candle::Result<Vec<SealedSequence>> {
+        use crate::persistence::transfer::load_stream_into_hot;
+        let mut p = self.persistence.lock().unwrap();
+        load_stream_into_hot(backings, device, &mut p, stream_id, chunks_per_layer, stager)
+            .map_err(|e| candle::Error::Msg(format!("cold_load_section_into_hot: {e}")))
+    }
+
+    /// Resolve a section stream's per-chunk redo-log locations into
+    /// per-layer cold references — what the substrate stores under
+    /// `residence.cold = Some(...)`.  Returns `None` when the stream
+    /// is unknown or has no chunks recorded.
+    pub fn recover_section_cold_refs(
+        &self,
+        stream_id: StreamId,
+        n_layers: usize,
+    ) -> candle::Result<Option<Vec<crate::substrate::StoredSequence>>> {
+        let p = self.persistence.lock().unwrap();
+        crate::persistence::resume::recover_section_cold_refs(&p, stream_id, n_layers)
+            .map_err(|e| candle::Error::Msg(format!("recover_section_cold_refs: {e}")))
+    }
+
+    /// Look up a section by the human-readable `debug_name` recorded
+    /// on its `SectionDecl`.  Wrapper around
+    /// [`Substrate::section_id_for_debug_name`] that bundles the
+    /// persistence lock.  Used by calibration consumers that pick
+    /// scenarios out of a loaded workspace by id.
+    pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<crate::projection::SectionId> {
+        let p = self.persistence.lock().unwrap();
+        self.read().section_id_for_debug_name(&p, debug_name)
+    }
+
+    /// Read a persisted section's `Signatures` record from disk and
+    /// decode it into the `(token_count, raw_bytes)` tuples the BDP
+    /// scanner re-ingests.  Returns an empty Vec if the section has
+    /// no signatures recorded.
+    pub fn read_section_signatures(
+        &self,
+        stream_id: StreamId,
+    ) -> candle::Result<Vec<(u16, Vec<u8>)>> {
+        let mut p = self.persistence.lock().unwrap();
+        let bytes = match p.read_signatures(stream_id) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Err(candle::Error::Msg(format!("read section sigs: {e}"))),
+        };
+        crate::persistence::resume::decode_signatures(&bytes)
+            .map_err(|e| candle::Error::Msg(format!("decode section sigs: {e}")))
     }
 
     /// Durably flush the persistence redo log — the group-commit point.

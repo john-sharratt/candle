@@ -1139,9 +1139,12 @@ impl Substrate {
         })
     }
 
-    /// Section counterpart of [`Self::turn_tier_state`]. Sections only
-    /// occupy hot today (no warm/cold equivalent), so `warm` and `cold`
-    /// will always be `false`.
+    /// Section counterpart of [`Self::turn_tier_state`].  Sections
+    /// can now occupy any of the three tiers: hot when prefilled
+    /// fresh or post-elevate, cold-marker when restored from the
+    /// redo log on daemon reload (lazy lift on next projection),
+    /// and warm transiently during a tier transition.  Returns
+    /// `None` for unknown section ids.
     pub fn section_tier_state(&self, section: SectionId) -> Option<TierState> {
         let residence = self.sections.get(&section).map(|e| e.residence)?;
         let slot = &self.residence[residence.0];
@@ -1885,10 +1888,17 @@ impl Substrate {
     ///
     /// `block_start`/`block_end` are omitted — written later by
     /// `set_section_block_range` when the section is injected.
+    ///
+    /// `stream_id` is the content-addressed stream id under which this
+    /// section's chunks land in the redo log.  The substrate uses it
+    /// for the residence so the persistence thread's section-persist
+    /// pass picks the section up by snapshotting hot bytes for any
+    /// section residence whose `stream_id != default && cold == None`.
     #[allow(clippy::too_many_arguments)]
     pub fn set_section_full(
         &mut self,
         section: SectionId,
+        stream_id: StreamId,
         token_count: usize,
         sig_entries: Vec<SigEntry>,
         sealed_gpu: Arc<Vec<SealedSequence>>,
@@ -1896,11 +1906,7 @@ impl Substrate {
         tokens: Arc<Vec<u32>>,
     ) -> candle::Result<()> {
         let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
-        // Sections don't go through the cold tier today (they're pinned
-        // at conversation setup), so `cold` simply stays `None` and the
-        // stream id is the reserved sentinel until sections gain a
-        // durable home.
-        let residence = self.alloc_residence(StreamId::default());
+        let residence = self.alloc_residence(stream_id);
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
@@ -1913,6 +1919,158 @@ impl Substrate {
             self.install_section_hot(residence, sealed_cpu);
         }
         Ok(())
+    }
+
+    /// Section variant of [`Self::restore_turn`] — install a section
+    /// recovered from the redo log directly into the hot tier without
+    /// going through a fresh forward pass.
+    ///
+    /// `sealed_hot` is the per-layer K/V already materialised in VRAM
+    /// (by the caller's `load_section_into_hot` cold-load).  `cold` is
+    /// the on-disk reference list returned by `recover_section_cold_refs`;
+    /// installing it pre-emptively marks the section as already
+    /// persisted so the persistence thread's section-persist pass
+    /// skips it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_section(
+        &mut self,
+        section: SectionId,
+        stream_id: StreamId,
+        token_count: usize,
+        sig_entries: Vec<SigEntry>,
+        sealed_hot: Vec<SealedSequence>,
+        cold: Vec<StoredSequence>,
+        tokens: Arc<Vec<u32>>,
+    ) {
+        let residence = self.alloc_residence(stream_id);
+        self.residence[residence.0].cold = Some(cold);
+        let entry = SectionEntryData {
+            token_count,
+            block_range: (0, 0),
+            sig_entries,
+            tokens,
+            residence,
+        };
+        self.sections.insert(section, entry);
+        if !sealed_hot.is_empty() {
+            self.install_section_hot(residence, sealed_hot);
+        }
+    }
+
+    /// True when `section` already has a hot-resident entry in the
+    /// substrate — used by the ingest loop's skip-if-present check to
+    /// avoid re-prefilling sections that recovered from the redo log.
+    pub fn section_is_hot(&self, section: SectionId) -> bool {
+        match self.sections.get(&section) {
+            Some(entry) => self.residence[entry.residence.0].hot.is_some(),
+            None => false,
+        }
+    }
+
+    /// True when `section` is recorded in the substrate's section map
+    /// at any tier (hot, warm, or cold-marker only).  Stricter than
+    /// `section_is_hot`: a cold-marker section restored from the redo
+    /// log returns true here even before any projection has elevated
+    /// it to hot.  Used by the ingest loop to skip re-issuing a
+    /// `RestoreSection` for a section the substrate already knows
+    /// about (preventing duplicate residence allocations).
+    pub fn section_exists(&self, section: SectionId) -> bool {
+        self.sections.contains_key(&section)
+    }
+
+    /// Per-layer chunk count for the section's hot residence, or
+    /// `None` if the section isn't hot.  Used by the ingest loop's
+    /// skip path for the per-section block-count diagnostic.
+    pub fn section_block_count(&self, section: SectionId) -> Option<usize> {
+        let entry = self.sections.get(&section)?;
+        let hot = self.residence[entry.residence.0].hot.as_ref()?;
+        hot.first().map(|s| s.chunks.len())
+    }
+
+    /// Look up a section by its persistence `debug_name` (the symbolic
+    /// id passed to `insert_section` at ingest time).  Walks the
+    /// persistence manifest's `SectionDecl` records to resolve the
+    /// content-addressed `StreamId`, then walks the in-RAM `sections`
+    /// map to find which `SectionId` got that stream installed.  Used
+    /// by calibration consumers that want to pick out individual
+    /// scenarios by their human-readable identifier after loading the
+    /// workspace's full substrate.
+    ///
+    /// Linear in section count; the calibration scenario list is
+    /// O(thousands) at most so this is fine.  Returns the first match
+    /// when duplicate `debug_name`s exist (callers should keep names
+    /// unique per workspace).
+    pub fn section_id_for_debug_name(
+        &self,
+        persistence: &crate::persistence::SubstratePersistence,
+        debug_name: &str,
+    ) -> Option<SectionId> {
+        // Find the stream id matching this debug_name in the manifest.
+        let stream_id = persistence
+            .manifest()
+            .streams
+            .iter()
+            .find_map(|(sid, entry)| match entry.decl.as_ref()? {
+                crate::persistence::streams::StreamDecl::PromptSection(s)
+                    if s.debug_name == debug_name =>
+                {
+                    Some(*sid)
+                }
+                _ => None,
+            })?;
+        // Map stream_id back to the in-RAM SectionId via the residence
+        // slab — the residence holds the stream id we installed at
+        // ingest time.
+        self.sections.iter().find_map(|(sid, entry)| {
+            if self.residence[entry.residence.0].stream_id == stream_id {
+                Some(*sid)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Replace a section residence's hot bytes with `new_hot`.  Used
+    /// by the persistence thread's section-persist pass after it
+    /// quantizes the section's K/V to the section-compression policy
+    /// (C0 by default) — the new Q-format sequences land here so
+    /// subsequent in-session reads see the same bytes the cold tier
+    /// will reproduce on the next reload.
+    pub fn replace_section_hot(
+        &mut self,
+        residence: ResidenceIndex,
+        new_hot: Vec<SealedSequence>,
+    ) {
+        debug_assert!(!new_hot.is_empty(), "replace_section_hot called with empty Vec");
+        let bytes = sealed_bytes(&new_hot) as u64;
+        let slot = &mut self.residence[residence.0];
+        slot.byte_size = bytes;
+        slot.hot = Some(new_hot);
+    }
+
+    /// Snapshot the section residences that have hot bytes installed
+    /// but haven't been written to the cold tier yet — the work list
+    /// for the persistence thread's section-persist pass.  Mirrors
+    /// [`Self::snapshot_pending_cold`] but walks the `sections` map
+    /// rather than `warm_lru` (sections are pinned and never appear on
+    /// the LRUs).  Skips sentinel-stream residences (sections still
+    /// using the legacy `StreamId::default()` path won't try to
+    /// persist).
+    pub fn snapshot_pending_section_cold(
+        &self,
+    ) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
+        self.sections
+            .values()
+            .filter_map(|entry| {
+                let slot = &self.residence[entry.residence.0];
+                if slot.cold.is_some() || slot.stream_id == StreamId::default() {
+                    return None;
+                }
+                slot.hot
+                    .as_ref()
+                    .map(|hot| (entry.residence, slot.stream_id, hot.clone()))
+            })
+            .collect()
     }
 
     pub fn set_section_block_range(
@@ -2371,6 +2529,7 @@ mod tests {
         let sealed_gpu = Arc::new(vec![minimal_sealed_layer(), minimal_sealed_layer()]);
         sub.set_section_full(
             section,
+            StreamId::default(),
             10,
             vec![],
             sealed_gpu,
