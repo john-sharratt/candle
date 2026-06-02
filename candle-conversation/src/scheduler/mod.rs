@@ -1103,13 +1103,16 @@ impl Scheduler {
                     for seg in &projection.segments {
                         match seg {
                             ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                                // Hot-only filter — sections live hot
-                                // for their lifetime in the current
-                                // configuration (the cold→hot section
-                                // pipeline is plumbed but disabled on
-                                // the runtime path while we debug a
-                                // regression).
-                                if view.section_sealed_of(rs.id).is_some() {
+                                // Any-tier filter — cold-marker
+                                // sections (post-reload, before
+                                // elevate) must survive this filter
+                                // so the `elevate_to_hot` call below
+                                // can lift them.  Filtering on
+                                // `section_sealed_of` (hot-only)
+                                // would silently drop every
+                                // not-yet-elevated section the
+                                // projection selected.
+                                if view.section_tier_state(rs.id).is_some() {
                                     sections.push(rs.id);
                                     segments.push(seg.clone());
                                 }
@@ -1447,13 +1450,39 @@ impl Scheduler {
                     Ok(())
                 } else {
                     use crate::projection::{ProjectionSegment, ResolvedSection, SealedKind};
-                    // Section cold→hot elevate at priming time is
-                    // plumbed (see git history for the `elevate_to_hot`
-                    // block over this same `section_ids`) but disabled
-                    // on the runtime path while we debug a regression.
-                    // Sections live hot for their lifetime in the
-                    // current configuration, so apply_projection finds
-                    // them via `section_sealed_of`.
+                    // Elevate priming sections cold→hot before
+                    // `apply_projection`.  Cold-marker sections
+                    // restored from the redo log have `hot = None`
+                    // until elevate lifts them; without this call
+                    // `inject_sealed_section` would warn-and-skip
+                    // and the primed slot would be missing every
+                    // persisted section from the schema's prelude.
+                    if let Some(conversation) =
+                        self.slot_conversations.get(&sequence_id).cloned()
+                    {
+                        let backings = self.session.backings().to_vec();
+                        let device = self.session.device().clone();
+                        let main_stream = match &device {
+                            Device::Cuda(d) => d.cuda_stream(),
+                            _ => panic!("scheduler: requires a CUDA device"),
+                        };
+                        let no_turns: Vec<TurnKey> = Vec::new();
+                        if let Err(e) = elevate_to_hot(
+                            &conversation,
+                            &backings,
+                            &device,
+                            &main_stream,
+                            &mut self.elevate_pinned_scratch,
+                            &mut self.cold_load_stager,
+                            &section_ids,
+                            &no_turns,
+                        ) {
+                            tracing::warn!(
+                                "priming elevate failed for slot {sequence_id}: {e} — \
+                                 apply_projection will warn-and-skip cold sections"
+                            );
+                        }
+                    }
                     let segments: Vec<ProjectionSegment> = section_ids
                         .iter()
                         .map(|&id| {
@@ -1963,61 +1992,38 @@ impl Scheduler {
         }
     }
 
-    /// Install a persisted section by cold-loading its chunks directly
-    /// into hot VRAM at restore time.  Skips the prefill cost that
-    /// `insert_section_collection` would otherwise pay — the section
-    /// is fully present and addressable through `section_sealed_of`
-    /// as soon as this returns.
+    /// Install a persisted section as a **cold-marker** — `cold = Some`,
+    /// `hot = None`.  No disk I/O for the chunks at restore time; the
+    /// K/V is materialised into VRAM on the first projection that
+    /// selects this section, via `elevate_to_hot`'s
+    /// `PromotionItemKind::Section` branch.
     ///
-    /// Eager (not lazy) install: the section's chunks read off disk
-    /// here, not on the next projection.  Trades a small per-restart
-    /// startup cost (~one cold-load per persisted section) for a
-    /// flat runtime cost surface — no surprise stalls during decode
-    /// when the first projection selects a never-elevated section.
-    /// Sections are read-mostly fixtures pinned for the daemon's
-    /// lifetime; paying their cold-load once at startup is the right
-    /// trade.  The elevate-cold-marker path for sections remains
-    /// plumbed (see `elevate_to_hot`'s `PromotionItemKind::Section`
-    /// branch) but unused in this configuration.
+    /// Lazy reload pays cold-load only for sections that actually get
+    /// projected.  For a `top_k=3` tools collection over 90 entries
+    /// that's 3 cold-loads at first projection vs. 90 at startup —
+    /// the trade we want once selection is honoured.
     fn restore_section_from_persistence(
         &mut self,
         conversation: &Conversation,
         section_id: SectionId,
         stream_id: crate::persistence::streams::StreamId,
         _address: crate::persistence::streams::ContentAddress,
-        chunks_per_layer: usize,
+        _chunks_per_layer: usize,
         tokens: TokenBuffer,
     ) -> Result<(), ConversationError> {
         let n_layers = self.session.num_layers();
 
         // 1. Resolve cold refs from the manifest — these point at
         //    each chunk's `(log_offset, record_len, token_count)` in
-        //    the redo log.  Installed alongside the hot bytes below
-        //    so the persistence thread's section-persist pass
-        //    recognises this section as already durable and skips it.
+        //    the redo log.  Installed alone (with hot = None) so the
+        //    elevate path can lift the section when a projection
+        //    needs it.
         let cold_refs = conversation
             .recover_section_cold_refs(stream_id, n_layers)
             .map_err(ConversationError::Model)?
             .unwrap_or_default();
 
-        // 2. Cold-load the section's chunks into hot VRAM through the
-        //    shared pipeline turns use.  Allocates fresh ChunkGids in
-        //    the workspace backings; the returned per-layer
-        //    `SealedSequence` is what we install as the section's hot
-        //    tier.
-        let backings = self.session.backings().to_vec();
-        let device = self.session.device().clone();
-        let hot_sealed = conversation
-            .cold_load_section_into_hot(
-                stream_id,
-                chunks_per_layer,
-                &backings,
-                &device,
-                &mut self.cold_load_stager,
-            )
-            .map_err(ConversationError::Model)?;
-
-        // 3. Read persisted BDP signatures back into SigEntry values
+        // 2. Read persisted BDP signatures back into SigEntry values
         //    by re-appending the raw bytes to the workspace provenance
         //    file.  Same machinery the turn-reload path uses
         //    (see `reconstruct_from_log_in_place` in this file).
@@ -2062,13 +2068,13 @@ impl Scheduler {
             out
         };
 
-        // 3. Install hot + cold under one write lock.  `restore_section`
-        //    sets `residence.hot = Some(hot_sealed)` and
-        //    `residence.cold = Some(cold_refs)`; the persistence pass
-        //    sees the populated cold refs and skips the section on
-        //    its next walk.  `token_count` comes from the cold refs
-        //    (sum of per-chunk token counts across one layer) — same
-        //    value either tier reports.
+        // 3. Install as a cold-marker.  `sealed_hot = Vec::new()`
+        //    leaves `residence.hot = None`; `cold_refs` lands in
+        //    `residence.cold` so `elevate_to_hot` can lift the
+        //    section on the first projection that selects it.
+        //    `token_count` comes from the cold refs (sum of
+        //    per-chunk token counts across one layer's
+        //    StoredSequence).
         let token_count = cold_refs.first().map(|s| s.token_count).unwrap_or(0);
         let tokens_arc = Arc::new(tokens[..].to_vec());
         let mut view = conversation.write();
@@ -2077,7 +2083,7 @@ impl Scheduler {
             stream_id,
             token_count,
             sig_entries,
-            hot_sealed,
+            Vec::new(),
             cold_refs,
             tokens_arc,
         );
@@ -3295,11 +3301,12 @@ impl Scheduler {
             for seg in &projection.segments {
                 match seg {
                     ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                        // Hot-only filter — matches the SubmitTurn
-                        // path.  Section cold→hot is plumbed but
-                        // disabled on the runtime path while we
-                        // debug the cold-loaded section regression.
-                        if view.section_sealed_of(rs.id).is_some() {
+                        // Any-tier filter — same logic as the
+                        // SubmitTurn path.  Cold-marker sections
+                        // survive the filter; `elevate_to_hot`
+                        // below lifts them before
+                        // `apply_projection` injects them.
+                        if view.section_tier_state(rs.id).is_some() {
                             sections.push(rs.id);
                             segments.push(seg.clone());
                         }
