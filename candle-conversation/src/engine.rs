@@ -248,6 +248,19 @@ impl ConversationEngine {
         })
     }
 
+    /// Clone the workspace `Conversation` handle.
+    ///
+    /// The handle wraps the substrate behind its `RwLock`, so callers
+    /// can take `.read()` / `.write()` views to inspect or mutate
+    /// section / turn / timeline state directly.  Most production
+    /// callers should instead go through `new_conversation` /
+    /// `new_conversation_with_projection` / `Sequence::submit_turn`
+    /// — this accessor is for tooling that needs the raw substrate
+    /// (integration tests, diagnostics, the workspace inspector).
+    pub fn conversation(&self) -> Conversation {
+        self.conversation.clone()
+    }
+
     /// Create a new conversation.
     ///
     /// Creates a sequence slot on the scheduler. The system prompt is NOT

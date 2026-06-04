@@ -526,15 +526,14 @@ fn run_pass(
     // residence has hot bytes installed under a non-default stream id
     // and no cold copy yet, and writes its chunks to the redo log.
     //
-    // **Native format only** — no quantize, no `replace_section_hot`.
-    // The bytes on disk match exactly what the prefill produced so
-    // the cold-load reverse path reproduces the prefill output
-    // byte-identically (verified by the `section_no_compress_round_trip`
-    // integration test).  Adaptive C0+Q8_KS quantization for sections
-    // is plumbed (see `quantize_sealed_in_place` + the section policy
-    // shape preserved in git history) but disabled — it shrinks the
-    // disk footprint but interacts with a still-unresolved decode-side
-    // regression around the K-side post-quantize bytes.
+    // **No quantize, no `replace_section_hot`.** Section bytes are
+    // immutable once committed by the scheduler's `SealAction::Section`
+    // handler: it applies the configured `compression_policy` inline
+    // (synchronous, on the main thread) before installing the residence,
+    // so `slot.hot` already holds the final (possibly quantized) form
+    // by the time we read it here.  The persistence thread's job is
+    // purely to gather those final bytes off GPU and append them to the
+    // redo log — no mutation of substrate state.
     let pending_section_cold = conversation.read().snapshot_pending_section_cold();
     let mut section_to_cold_bytes: u64 = 0;
     let mut section_to_cold_count: usize = 0;
@@ -552,8 +551,6 @@ fn run_pass(
                 );
                 continue;
             }
-            // Gather native hot bytes into a `TurnChunkGrid` — same
-            // path the turn warm→cold leg uses.
             let grid = match build_grid(&hot, backings, device) {
                 Ok(g) => g,
                 Err(e) => {
@@ -561,8 +558,6 @@ fn run_pass(
                     continue;
                 }
             };
-            // Append chunk records to the redo log, capture the
-            // per-layer `StoredSequence` for cold-tier install.
             let stored = match conversation.persist_turn_chunks_capture(stream_id, &grid) {
                 Ok(s) => s,
                 Err(e) => {
@@ -573,10 +568,6 @@ fn run_pass(
             if stored.is_empty() {
                 continue;
             }
-            // Stream-level commit so the manifest's
-            // `committed_through` covers every chunk we just wrote —
-            // the trigger for the next daemon start's "is this
-            // section persisted?" check.
             let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
             let through = (total_chunks.max(1) - 1) as u64;
             if let Err(e) = conversation.commit_stream_through(stream_id, through) {
@@ -592,7 +583,7 @@ fn run_pass(
                 residence = idx.0,
                 stream_id = stream_id.0,
                 bytes = bytes_for_item,
-                "persisted section (native, redo-log append)"
+                "persisted section (redo-log append)"
             );
             section_cold_installs.push((idx, stored, bytes_for_item));
         }

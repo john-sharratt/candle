@@ -170,6 +170,16 @@ pub struct SequenceResidence {
     pub stream_id: StreamId,
     /// VRAM-resident sealed chunks. `None` ⇒ not in VRAM.
     pub hot: Option<Vec<SealedSequence>>,
+    /// `true` while the scheduler still owes this section a quantize
+    /// pass.  Sections are ingested with their native (prefill-output)
+    /// K/V installed in `hot`; the scheduler later replaces `hot` with
+    /// the quantized form at the next turn-seal boundary.  Until that
+    /// drain runs, `hot` is the *interim* native form — disk
+    /// persistence must skip the residence (a cold copy of native
+    /// would diverge from the final in-memory Q form after the drain,
+    /// and the daemon would resume in an inconsistent state on
+    /// restart).  Cleared by the same drain that does the swap.
+    pub pending_quantize: bool,
     /// RAM-resident sealed chunks. `None` ⇒ not in RAM.
     pub warm: Option<Vec<SealedSequence>>,
     /// Cold-tier references — one [`StoredSequence`] per layer. `None`
@@ -762,6 +772,7 @@ impl Substrate {
         self.residence.push(SequenceResidence {
             stream_id,
             hot: None,
+            pending_quantize: false,
             warm: None,
             cold: None,
             byte_size: 0,
@@ -1114,11 +1125,21 @@ impl Substrate {
         self.turn(timeline, index).map(|e| e.content.residence)
     }
 
-    /// Test/integration counterpart of [`Self::turn_residence`] for
-    /// section entries.
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Resolve a section's residence index in the substrate.
+    ///
+    /// Used by the scheduler's section-quantize drain to look up the
+    /// hot slot it needs to swap, and by integration tests that walk
+    /// the section map directly.
     pub fn section_residence(&self, section: SectionId) -> Option<ResidenceIndex> {
         self.sections.get(&section).map(|e| e.residence)
+    }
+
+    /// Every section id currently registered in the substrate, in
+    /// unspecified order.  Used by tooling that needs to walk the
+    /// section map — integration tests, workspace diagnostics, the
+    /// section-quantize regression test in `zend/tests/`.
+    pub fn all_section_ids(&self) -> Vec<SectionId> {
+        self.sections.keys().copied().collect()
     }
 
     /// Which tiers a turn residence currently occupies. Returns `None`
@@ -2063,7 +2084,10 @@ impl Substrate {
             .values()
             .filter_map(|entry| {
                 let slot = &self.residence[entry.residence.0];
-                if slot.cold.is_some() || slot.stream_id == StreamId::default() {
+                if slot.cold.is_some()
+                    || slot.stream_id == StreamId::default()
+                    || slot.pending_quantize
+                {
                     return None;
                 }
                 slot.hot
@@ -2071,6 +2095,25 @@ impl Substrate {
                     .map(|hot| (entry.residence, slot.stream_id, hot.clone()))
             })
             .collect()
+    }
+
+    /// Mark a section residence as awaiting the scheduler's quantize
+    /// drain.  Called from `SealAction::Section` right after
+    /// `set_section_full` installs the native bytes, when a
+    /// `compression_policy` is configured.  While this flag is set,
+    /// `snapshot_pending_section_cold` ignores the residence — the
+    /// persistence thread holds off on writing native bytes that the
+    /// scheduler is about to replace with their quantized form.
+    pub fn mark_section_pending_quantize(&mut self, residence: ResidenceIndex) {
+        self.residence[residence.0].pending_quantize = true;
+    }
+
+    /// Clear the pending-quantize flag — called from the same drain
+    /// that calls `replace_section_hot`.  After this the persistence
+    /// thread is free to gather the residence's (now final) hot bytes
+    /// and persist them.
+    pub fn clear_section_pending_quantize(&mut self, residence: ResidenceIndex) {
+        self.residence[residence.0].pending_quantize = false;
     }
 
     pub fn set_section_block_range(

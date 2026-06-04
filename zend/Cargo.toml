@@ -36,6 +36,8 @@ regex               = "1"
 tokenizers          = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []

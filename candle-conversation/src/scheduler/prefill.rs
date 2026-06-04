@@ -167,6 +167,7 @@ impl Scheduler {
                 std::sync::Arc::new(s.tokens.to_vec()),
                 s.address,
                 s.debug_name,
+                s.in_collection,
             );
             let _ = s.response_tx.send(result);
             // swap_remove pulled the last element into i; don't increment.

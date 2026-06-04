@@ -124,7 +124,7 @@ impl ModelBuilder {
             model_path: None,
             tokenizer_path: None,
             thinking: None,
-            kv_compression_level: 5,
+            kv_compression_level: 4,
             show_special_tokens: false,
             penalty_log_path: None,
             health_config: DecodeHealthConfig::default(),

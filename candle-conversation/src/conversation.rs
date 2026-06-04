@@ -362,6 +362,8 @@ impl Sequence {
                         conv.insert_section_collection_with_progress(
                             &batch,
                             &linear_prefix,
+                            true, // schema Collection: members get the
+                                  // aggressive turn-level quantize policy
                             |_sid, content_len| {
                                 *done_bytes_ref += content_len as u64;
                                 report_ref(*done_bytes_ref);
@@ -456,7 +458,7 @@ impl Sequence {
         if content.is_empty() {
             return Ok(());
         }
-        let mut results = self.insert_section_collection(&[(section, content)], &[])?;
+        let mut results = self.insert_section_collection(&[(section, content)], &[], false)?;
         results.pop();
         Ok(())
     }
@@ -477,7 +479,7 @@ impl Sequence {
             return Ok(());
         }
         let mut results =
-            self.insert_section_collection(&[(section, content)], prefix_section_ids)?;
+            self.insert_section_collection(&[(section, content)], prefix_section_ids, false)?;
         results.pop();
         Ok(())
     }
@@ -501,10 +503,12 @@ impl Sequence {
         &mut self,
         sections: &[(SectionId, &str)],
         prefix_section_ids: &[SectionId],
+        in_collection: bool,
     ) -> crate::Result<Vec<(SectionId, usize)>> {
         self.insert_section_collection_with_progress(
             sections,
             prefix_section_ids,
+            in_collection,
             |_, _| {},
         )
     }
@@ -515,10 +519,21 @@ impl Sequence {
     /// freshly ingested — so the surrounding ingest loop can update
     /// its progress bar at section granularity instead of waiting for
     /// the whole batch.
+    ///
+    /// `in_collection = true` when the caller is materialising a
+    /// schema `Collection` (tools in a tool catalog, hits in a
+    /// retrieval list, …): every section in `sections` becomes a
+    /// collection member, and the scheduler picks the more
+    /// aggressive turn-level compression policy for them.  `false`
+    /// is for boundary sections — `insert_section` and
+    /// `insert_section_with_prefix` always pass `false` because the
+    /// model needs near-lossless K/V on the role markers / opening
+    /// and closing tags every later token attends back over.
     pub fn insert_section_collection_with_progress<F>(
         &mut self,
         sections: &[(SectionId, &str)],
         prefix_section_ids: &[SectionId],
+        in_collection: bool,
         mut on_section_done: F,
     ) -> crate::Result<Vec<(SectionId, usize)>>
     where
@@ -756,6 +771,7 @@ impl Sequence {
                     tokens: item.tokens,
                     address: item.address,
                     debug_name: item.debug_name,
+                    in_collection,
                     response_tx: tx,
                 })
                 .map_err(|_| ConversationError::SchedulerGone)?;

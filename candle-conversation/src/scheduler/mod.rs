@@ -33,7 +33,7 @@ use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, IndexOp, Tensor};
 #[cfg(feature = "sig-trace")]
 use candle_nn::kv_cache::SealedChunk;
-use candle_nn::kv_cache::SealedSequence;
+use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, ProvenanceLayerIndices,
@@ -211,6 +211,15 @@ pub(crate) enum SchedulerRequest {
         /// Section's symbolic name (schema item id or tool name) used
         /// purely as diagnostic metadata on the SectionDecl record.
         debug_name: String,
+        /// `true` when this section is a member of a schema
+        /// `Collection` (e.g. one tool inside a tool catalog) — its
+        /// K/V can absorb more aggressive quantization because the
+        /// projection's top-k selection downsamples collection
+        /// members at every turn, so per-member precision matters
+        /// less than for boundary sections (role markers, opening /
+        /// closing tags) which the slot always carries.  Drives
+        /// section-quantize policy selection at seal time.
+        in_collection: bool,
         response_tx: Sender<Result<SealResult, ConversationError>>,
     },
 
@@ -531,6 +540,17 @@ pub(crate) enum SealAction {
         tokens: Arc<Vec<u32>>,
         address: crate::persistence::streams::ContentAddress,
         debug_name: String,
+        /// Propagated from `SchedulerRequest::IngestSection` — `true`
+        /// when this section is a schema-Collection member (a tool in
+        /// the tool catalog, an entry in a hits list, etc.), `false`
+        /// for boundary sections (role markers, opening / closing
+        /// tags).  Drives section-quantize policy selection: members
+        /// use the turn-level adaptive policy (much smaller VRAM at a
+        /// small precision cost — top-k projection masks the
+        /// per-member noise anyway); boundary sections use the
+        /// near-lossless C0 / Q8_KS / Q8_0 policy because every
+        /// later token of every later turn attends back over them.
+        in_collection: bool,
     },
     /// Skip the seal entirely.  Used by raw RULER eval and
     /// summarisation paths that don't write to the substrate.
@@ -557,6 +577,24 @@ pub(crate) struct TurnContent {
     /// order.  Must match the K/V chunk grid 1-1; consumed by
     /// `persist_tokens_only` for cross-process replay.
     pub token_ids: TokenBuffer,
+}
+
+/// A section whose hot bytes are in their native (prefill-output) form
+/// and need to be quantized to the configured `compression_policy` at
+/// the next turn-seal boundary.  The conversation handle picks up the
+/// section's current hot residence via `section_residence(section_id)`
+/// when the drain runs.
+struct PendingSectionQuantize {
+    section_id: crate::projection::SectionId,
+    /// Propagated from `SealAction::Section::in_collection` — drives
+    /// the drain's choice of compression policy.  Collection members
+    /// (tools in a tool catalog, hits in a retrieval list, etc.) take
+    /// the turn-level adaptive policy because the projection's top-k
+    /// already masks their per-member K/V noise; boundary sections
+    /// (role markers, opening/closing tags) take the conservative
+    /// near-lossless policy because every later token attends back
+    /// over them.
+    in_collection: bool,
 }
 
 /// A unit of prefill work queued for processing.
@@ -619,6 +657,10 @@ pub(super) struct ActiveSectionIngest {
     /// Section's symbolic name for the SectionDecl record — see
     /// `SealAction::Section::debug_name`.
     pub(super) debug_name: String,
+    /// Carried from the `IngestSection` request through to
+    /// `SealAction::Section` — see that variant's docstring for the
+    /// quantize-policy implications.
+    pub(super) in_collection: bool,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
     pub(super) error: Option<ConversationError>,
 }
@@ -768,6 +810,17 @@ pub(crate) struct Scheduler {
     /// drain promptly instead of waiting up to 5 s on its tick.
     persist_trigger: PersistenceTrigger,
 
+    /// Sections that have been ingested (their native K/V is installed
+    /// in `substrate.section.hot`) but haven't been quantized to the
+    /// configured `compression_policy` yet.  Drained synchronously by
+    /// the next `SealAction::Turn` handler, *after* the turn record
+    /// completes — so the in-flight conversation build (priming +
+    /// sysprompt prefill) computes against the original native section
+    /// K/V, and only post-turn-boundary reads see the quantized form.
+    /// Empty when no `compression_policy` is configured (the queue is
+    /// effectively dead code on engines without quantize).
+    pending_section_quantize: Vec<PendingSectionQuantize>,
+
     /// Re-used pinned host scratch for the cold→hot leg inside
     /// `elevate_to_hot`. Grows on demand across submits; stays
     /// allocated for the scheduler's lifetime.
@@ -914,6 +967,7 @@ impl Scheduler {
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
             persist_trigger,
+            pending_section_quantize: Vec::new(),
             elevate_pinned_scratch: preallocate_pinned_scratch(
                 PINNED_PREALLOC_BYTES,
                 "scheduler::elevate_pinned_scratch",
@@ -1367,6 +1421,7 @@ impl Scheduler {
                 tokens,
                 address,
                 debug_name,
+                in_collection,
                 response_tx,
             } => {
                 match self.prepare_section_ingest(
@@ -1387,6 +1442,7 @@ impl Scheduler {
                                         tokens: Arc::new(tokens.to_vec()),
                                         address,
                                         debug_name: debug_name.clone(),
+                                        in_collection,
                                     },
                                     None,
                                     vec![],
@@ -1408,6 +1464,7 @@ impl Scheduler {
                                 seal_block_from,
                                 address,
                                 debug_name,
+                                in_collection,
                                 response_tx,
                                 error: None,
                             });
@@ -1489,7 +1546,46 @@ impl Scheduler {
                             ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }))
                         })
                         .collect();
-                    self.apply_projection(sequence_id, BlockCount(0), &segments)
+                    let r = self.apply_projection(sequence_id, BlockCount(0), &segments);
+                    // End-of-build boundary: every section the schema
+                    // ingested earlier in `new_with_projection` is now
+                    // installed in `substrate.section.hot` (native) and
+                    // has been injected into this slot's block table.
+                    // The slot's `Arc<ChunkGid>` refs keep the native
+                    // chunks alive even after we swap the residence's
+                    // hot to its quantized form, so swap is safe here.
+                    // Any conversation forked from this point on will
+                    // re-project sections fresh from `section.hot` and
+                    // see the quantized form.
+                    if r.is_ok() && !self.pending_section_quantize.is_empty() {
+                        if let Some(turn_policy) = self.session.compression_policy() {
+                            if let Some(conversation) =
+                                self.slot_conversations.get(&sequence_id).cloned()
+                            {
+                                let boundary_policy =
+                                    Self::section_compression_policy_boundary();
+                                let member_policy =
+                                    Self::section_compression_policy_member(&turn_policy);
+                                if let Err(e) = self.quantize_pending_sections(
+                                    &conversation,
+                                    &boundary_policy,
+                                    &member_policy,
+                                ) {
+                                    tracing::warn!(
+                                        "post-priming section quantize drain failed: {e:?}"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "post-priming drain: no conversation handle for slot {sequence_id}"
+                                );
+                                self.pending_section_quantize.clear();
+                            }
+                        } else {
+                            self.pending_section_quantize.clear();
+                        }
+                    }
+                    r
                 };
                 let _ = response_tx.send(result);
                 true
@@ -2209,6 +2305,7 @@ impl Scheduler {
         tokens: Arc<Vec<u32>>,
         address: crate::persistence::streams::ContentAddress,
         debug_name: String,
+        in_collection: bool,
     ) -> Result<SealResult, ConversationError> {
         #[cfg(feature = "context-dump")]
         if tracing::enabled!(
@@ -2237,6 +2334,7 @@ impl Scheduler {
                 tokens,
                 address,
                 debug_name,
+                in_collection,
             },
             None,
             vec![],
@@ -2254,6 +2352,211 @@ impl Scheduler {
     /// `seal_action`.  Returns the [`SealResult`] payload, or
     /// `Ok(None)` when there are no new blocks to seal.
     ///
+    /// Near-lossless compression policy for **boundary** sections —
+    /// role markers, opening/closing tags, anything outside a schema
+    /// `Collection`.
+    ///
+    /// Boundary sections sit at the head of every slot and every
+    /// later token of every later turn attends back over them, so any
+    /// K *or* V noise on them is amplified through 48 layers of
+    /// attention.  At Q4_KS K + level-5 V the model produced raw
+    /// gibberish; at Q8_KS K + level-5 V it stayed coherent but the
+    /// model's tool-detection heads dropped below their decision
+    /// threshold.  So we override both sides — K to Q8_KS, V to
+    /// Q8_0, `compression_level = 0` — every K and V block is 8-bit
+    /// with no adaptive Q2/Q4 selection.  ~2.5× smaller than native,
+    /// effectively lossless for downstream attention.
+    fn section_compression_policy_boundary() -> candle_nn::kv_cache::CompressionPolicy {
+        candle_nn::kv_cache::CompressionPolicy::new(0)
+            .with_override_k_quant(Some(QuantFormat::Q8_KS))
+            .with_override_v_quant(Some(QuantFormat::Q8_0))
+    }
+
+    /// Compression policy for **collection-member** sections —
+    /// individual tools in a tool catalog, hits in a retrieval list,
+    /// anything inside a schema `Collection`.
+    ///
+    /// The projection's per-turn top-k selection already masks
+    /// per-member precision: of N tools in the catalog only k make it
+    /// into the slot at any given turn, and the scorer picks them on
+    /// relevance, so per-member K/V noise gets averaged out by the
+    /// selection itself.  Members tolerate aggressive compression
+    /// better than boundary sections, but not *as* aggressive as
+    /// turns — a turn is read by a handful of decode steps right
+    /// after its seal, a collection member is read by every later
+    /// token of every later turn the projection re-selects it into.
+    ///
+    /// So members sit between the boundary near-lossless policy
+    /// (C0 / Q8 / Q8) and the turn policy (C4 / Q4_KS K / level-4
+    /// adaptive V): **C3 with K overridden to Q8_KS**, V uses
+    /// adaptive level-3 selection.  Roughly 4× smaller than native.
+    /// `_turn_policy` is taken to keep the call sites future-proof
+    /// for a per-engine override knob; today it's ignored.
+    fn section_compression_policy_member(
+        _turn_policy: &candle_nn::kv_cache::CompressionPolicy,
+    ) -> candle_nn::kv_cache::CompressionPolicy {
+        candle_nn::kv_cache::CompressionPolicy::new(3)
+            .with_override_k_quant(Some(QuantFormat::Q8_KS))
+    }
+
+    /// Drain [`Self::pending_section_quantize`]: re-read each section's
+    /// current native hot bytes from the substrate, quantize them
+    /// per-layer with the section policy, and atomically replace
+    /// the residence's hot with the quantized form.
+    ///
+    /// Called from the `SealAction::Turn` handler, on the main scheduler
+    /// thread, *after* the turn record has been committed.  At that
+    /// instant every in-flight reader of the native sections has
+    /// finished — no other thread (including the persistence thread)
+    /// holds a stale assumption about the section's contents — so the
+    /// hot-replace is safe.  See the call site for the full ordering
+    /// argument.
+    fn quantize_pending_sections(
+        &mut self,
+        conversation: &crate::projection::Conversation,
+        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
+        member_policy: &candle_nn::kv_cache::CompressionPolicy,
+    ) -> Result<(), ConversationError> {
+        // Snapshot per-section native hot + residence + which policy
+        // applies under a brief read lock; the heavy GPU work runs
+        // unlocked.  Pending list is partitioned into (residence,
+        // sealed, in_collection); the per-layer loop below groups by
+        // in_collection so each policy gets its own batched launch.
+        let pending: Vec<(
+            crate::projection::SectionId,
+            crate::substrate::ResidenceIndex,
+            Vec<SealedSequence>,
+            bool,
+        )> = {
+            let view = conversation.read();
+            self.pending_section_quantize
+                .drain(..)
+                .filter_map(|p| {
+                    let residence = view.section_residence(p.section_id)?;
+                    let sealed = view.section_sealed_of(p.section_id)?;
+                    Some((p.section_id, residence, (*sealed).clone(), p.in_collection))
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let n_layers = self.session.num_layers();
+        let backings = self.session.backings();
+        let device = self.session.device().clone();
+        let copy_stream = match &device {
+            Device::Cuda(d) => d.cuda_stream(),
+            _ => {
+                return Err(ConversationError::Channel(
+                    "section quantize requires a CUDA device".into(),
+                ))
+            }
+        };
+
+        // Split pending into two groups so each gets its own batched
+        // per-layer launch under its own policy.  `indices_*` records
+        // the position of each section in the original `pending` list
+        // so we can stitch the per-group results back together in the
+        // install loop without losing the original order.
+        let mut indices_boundary: Vec<usize> = Vec::new();
+        let mut indices_member: Vec<usize> = Vec::new();
+        for (i, (_, _, _, in_collection)) in pending.iter().enumerate() {
+            if *in_collection {
+                indices_member.push(i);
+            } else {
+                indices_boundary.push(i);
+            }
+        }
+        tracing::debug!(
+            target: "candle_conversation::scheduler::section_quantize",
+            boundary = indices_boundary.len(),
+            member = indices_member.len(),
+            "quantize drain: boundary vs collection-member split"
+        );
+
+        // Batch across sections per layer for each group.
+        // `quantize_sealed_in_place` returns one output SealedSequence
+        // per input SealedSequence in the same order, so the per-group
+        // result slot is filled positionally before being scattered
+        // back into the global `quantized_per_section` Vec.
+        let mut quantized_per_section: Vec<Vec<SealedSequence>> =
+            (0..pending.len()).map(|_| Vec::with_capacity(n_layers)).collect();
+        let groups: [(&[usize], &candle_nn::kv_cache::CompressionPolicy); 2] = [
+            (indices_boundary.as_slice(), boundary_policy),
+            (indices_member.as_slice(), member_policy),
+        ];
+        for (group_indices, group_policy) in groups {
+            if group_indices.is_empty() {
+                continue;
+            }
+            for layer in 0..n_layers {
+                let inputs: Vec<&SealedSequence> = group_indices
+                    .iter()
+                    .map(|&idx| {
+                        let hot = &pending[idx].2;
+                        debug_assert_eq!(
+                            hot.len(),
+                            n_layers,
+                            "pending section hot must have one SealedSequence per layer",
+                        );
+                        &hot[layer]
+                    })
+                    .collect();
+                let out = quantize_sealed_in_place(
+                    &backings[layer],
+                    &inputs,
+                    group_policy,
+                    &device,
+                    &copy_stream,
+                    &mut self.elevate_pinned_scratch,
+                )
+                .map_err(ConversationError::Model)?;
+                for (slot_idx, qi) in out.into_iter().enumerate() {
+                    let global_idx = group_indices[slot_idx];
+                    quantized_per_section[global_idx].push(qi);
+                }
+            }
+        }
+
+        copy_stream
+            .synchronize()
+            .map_err(|e| ConversationError::Channel(format!("section quantize sync: {e}")))?;
+
+        // Atomic swap: take the substrate write lock once, replace every
+        // pending residence's hot with its quantized form, clear the
+        // pending-quantize flag (so the persistence thread can now
+        // gather and write the final bytes), then release.  Dropping
+        // the (in-Vec) native SealedSequences after the lock is
+        // released decrements the source chunks' refcounts to zero;
+        // their arena slots return to the pool for reuse by the next
+        // prefill.
+        {
+            let mut view = conversation.write();
+            for ((_, residence, _native, _in_collection), q_per_layer) in
+                pending.into_iter().zip(quantized_per_section.into_iter())
+            {
+                if q_per_layer.len() != n_layers {
+                    tracing::warn!(
+                        "quantize_pending_sections: layer-count mismatch ({} vs {}), skipping section {:?}",
+                        q_per_layer.len(),
+                        n_layers,
+                        residence
+                    );
+                    continue;
+                }
+                view.replace_section_hot(residence, q_per_layer);
+                view.clear_section_pending_quantize(residence);
+            }
+        }
+        // Now that the substrate holds the final (quantized) form for
+        // every drained section, wake the persistence thread so it
+        // gathers them and appends to the redo log without waiting for
+        // its 5 s tick.
+        self.persist_trigger.fire();
+        Ok(())
+    }
+
     /// `turn_content`, when `seal_action == SealAction::Turn`, carries
     /// the role / text / token IDs the substrate pins on the new turn
     /// entry so the on-disk record can be reconstructed later without
@@ -2439,6 +2742,38 @@ impl Scheduler {
                 let idx = conversation
                     .record_turn(target.timeline, role, write, |seqs| Ok(seqs.to_vec()))
                     .map_err(ConversationError::Model)?;
+
+                // Drain pending section quantizations.  Every section in
+                // the queue was ingested earlier in this conversation
+                // build with its native (prefill-output) K/V installed in
+                // `substrate.section.hot`, and every reader up to this
+                // point — priming projection's top-k selection, this
+                // turn's prefill kernel attending back over the injected
+                // sections — has consumed that native form.  This
+                // turn-seal boundary is the first moment where no
+                // in-flight operation depends on those native bytes any
+                // more, which makes it the only safe place to swap the
+                // residence's hot to its quantized form.  Synchronous,
+                // on the main scheduler thread, batched across all
+                // pending sections so the per-launch kernel overhead
+                // amortises.  See the bisect history in
+                // `tests/section_quantize_real_model.rs` for why earlier
+                // / asynchronous attempts corrupt sysprompt K/V.
+                if !self.pending_section_quantize.is_empty() {
+                    if let Some(turn_policy) = self.session.compression_policy() {
+                        let boundary_policy =
+                            Self::section_compression_policy_boundary();
+                        let member_policy =
+                            Self::section_compression_policy_member(&turn_policy);
+                        self.quantize_pending_sections(
+                            &conversation,
+                            &boundary_policy,
+                            &member_policy,
+                        )?;
+                    } else {
+                        self.pending_section_quantize.clear();
+                    }
+                }
                 if !new_sig_entries.is_empty() {
                     {
                         let mut view = conversation.write();
@@ -2509,16 +2844,12 @@ impl Scheduler {
                 tokens,
                 address,
                 debug_name,
+                in_collection,
             } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
-                // Derive the section's content-addressed stream id from
-                // the (prefix_hash, section_hash) the conversation
-                // layer attached at IngestSection time.  The substrate
-                // installs the residence under this id so the
-                // persistence thread's section-persist pass picks it
-                // up for warm→cold migration.
                 let stream_id =
                     crate::persistence::content_hash::section_stream_id(*address);
+                let policy_active = self.session.compression_policy().is_some();
                 {
                     let mut view = conversation.write();
                     view.set_section_full(
@@ -2531,6 +2862,39 @@ impl Scheduler {
                         Arc::clone(tokens),
                     )
                     .map_err(ConversationError::Model)?;
+                    if policy_active {
+                        if let Some(residence) = view.section_residence(*section_id) {
+                            view.mark_section_pending_quantize(residence);
+                        }
+                    }
+                }
+                // Queue the section for quantization at the next safe
+                // boundary (end of `PrimingProjection` for sections
+                // ingested during a base-conv build, or `SealAction::
+                // Turn` for sections ingested mid-conversation).  Until
+                // the drain runs, `mark_section_pending_quantize` keeps
+                // the persistence thread from writing the interim
+                // native bytes to disk — otherwise the cold tier would
+                // hold a form that diverges from the post-drain hot
+                // tier, and a daemon restart would resume in an
+                // inconsistent state.
+                //
+                // Sections **must** be left in their native form for the
+                // in-flight build: priming projection reads
+                // `substrate.section.hot` to pick top-k tools, the user
+                // prefill kernel attends back over those injected K/V
+                // to compute the prompt's own hidden states.  If we
+                // quantize before that attention runs, the small Q4_KS
+                // K error compounds across 48 layers into corrupted
+                // prompt K/V — and everything downstream reads from a
+                // poisoned cache.  See the bisect history in
+                // `tests/section_quantize_real_model.rs`.
+                if policy_active {
+                    self.pending_section_quantize
+                        .push(PendingSectionQuantize {
+                            section_id: *section_id,
+                            in_collection: *in_collection,
+                        });
                 }
                 // Declare the section stream in the redo log so the
                 // manifest knows the (address, debug_name) before any
