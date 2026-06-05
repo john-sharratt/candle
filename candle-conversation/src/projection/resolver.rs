@@ -5,15 +5,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
+use super::project::ProjectionTarget;
 use super::schema::{DepthWeights, ScoreFormula};
+use crate::persistence::record::TreeMetadataPayload;
 use crate::persistence::streams::{
     ContentAddress, PerDepthScores, SectionDecl, StreamDecl, StreamId, TurnDecl,
 };
 use crate::persistence::SubstratePersistence;
 use crate::provenance::SigEntry;
 use crate::substrate::{
-    ContentResolver, ProjectionScores, Substrate, SubstrateRead, SubstrateWrite,
+    ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
+    TurnPartWrite,
 };
+use crate::summary_tree::SelectionDiagnostics;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use candle_nn::kv_cache::SealedSequence;
@@ -71,22 +75,35 @@ impl Conversation {
             .unwrap_or(0);
         let seq = EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("zend_ephemeral_{nanos}_{seq}"));
-        let persistence =
-            SubstratePersistence::open_in(&dir).expect("ephemeral SubstratePersistence");
+        let mut substrate = Substrate::new();
+        let persistence = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate)
+            .expect("ephemeral SubstratePersistence");
         Self {
-            inner: Arc::new(RwLock::new(Substrate::new())),
+            inner: Arc::new(RwLock::new(substrate)),
+            allocator: Arc::new(TimelineAllocator::new()),
+            persistence: Arc::new(Mutex::new(persistence)),
+        }
+    }
+
+    /// Create a conversation from a freshly-built `(Substrate,
+    /// SubstratePersistence)` pair.  Callers that want the walker to
+    /// dispatch into the substrate in one pass should use
+    /// [`SubstratePersistence::open_in_with_substrate`] and pass both
+    /// here.
+    pub fn from_parts(substrate: Substrate, persistence: SubstratePersistence) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(substrate)),
             allocator: Arc::new(TimelineAllocator::new()),
             persistence: Arc::new(Mutex::new(persistence)),
         }
     }
 
     /// Create a conversation backed by a real [`SubstratePersistence`].
+    /// Equivalent to `from_parts(Substrate::new(), persistence)` — for
+    /// callers that already have a populated persistence and want an
+    /// empty substrate.
     pub fn with_persistence(persistence: SubstratePersistence) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Substrate::new())),
-            allocator: Arc::new(TimelineAllocator::new()),
-            persistence: Arc::new(Mutex::new(persistence)),
-        }
+        Self::from_parts(Substrate::new(), persistence)
     }
 
     /// Allocate a fresh [`TimelineId`] and register it against
@@ -140,14 +157,14 @@ impl Conversation {
     /// Acquire a target-aware read guard.  The returned [`TargetedRead`]
     /// implements [`ContentResolver`] with proper sibling-timeline masking
     /// for `target.group`, with score lookups returning zero (unscored).
-    pub fn read_for(&self, target: super::project::ProjectionTarget) -> TargetedRead<'_> {
+    pub fn read_for(&self, target: ProjectionTarget) -> TargetedRead<'_> {
         TargetedRead::new(self.read(), target)
     }
 
     /// Target-aware variant of [`Self::read_scored`].
     pub fn read_for_scored<'a>(
         &'a self,
-        target: super::project::ProjectionTarget,
+        target: ProjectionTarget,
         scores: &'a ProjectionScores,
     ) -> TargetedRead<'a> {
         TargetedRead::new(self.read_scored(scores), target)
@@ -169,7 +186,7 @@ impl Conversation {
         &self,
         timeline: TimelineId,
         role: Role,
-        write: crate::substrate::TurnPartWrite,
+        write: TurnPartWrite,
         migrate_to_cpu: impl FnMut(&[SealedSequence]) -> candle::Result<Vec<SealedSequence>>,
     ) -> candle::Result<TurnIndex> {
         let block_start = write.block_start;
@@ -220,6 +237,62 @@ impl Conversation {
         Ok(idx)
     }
 
+    /// Append a summariser-allocated turn (SoT leaf or SoS internal)
+    /// and persist its declaration to the redo log.
+    ///
+    /// The summariser allocates these turns to back tree nodes; they
+    /// carry no KV chunks (`block_range = 0..0`) and `token_count` is
+    /// the placeholder for the summary text.  Without persistence, on
+    /// reopen the walker would replay [`TreeMetadata`] records for
+    /// these indices but find no matching [`TurnDecl`], leaving
+    /// orphan `tree_meta` entries that the score-density selector
+    /// would then pick and elevate would fail to lift.
+    ///
+    /// Drops the auto-pending entry that [`append_with_blocks`] pushed
+    /// — summary turns are not Normal and shouldn't loop back through
+    /// the pending queue.
+    pub fn record_summary_turn(
+        &self,
+        timeline: TimelineId,
+        token_count: usize,
+    ) -> candle::Result<TurnIndex> {
+        let idx = {
+            let mut view = self.inner.write().unwrap();
+            let idx = view.append_with_blocks(timeline, token_count, 0, 0);
+            view.pop_pending_summary(timeline);
+            idx
+        };
+        let (layer_id, group_id) = self
+            .timeline_target(timeline)
+            .map(|(l, g)| (l.raw(), g.raw()))
+            .unwrap_or((0, 0));
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: timeline.raw(),
+            turn_index: idx.0,
+            turn_id_day: 0,
+            turn_id_seq: idx.0 + 1,
+            role: 2,
+            block_start: 0,
+            block_end: 0,
+            layer_id,
+            group_id,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            scores: PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
+        });
+        self.persistence
+            .lock()
+            .unwrap()
+            .declare_stream(&decl)
+            .map_err(|e| candle::Error::Msg(format!("persist summary turn: {e}")))?;
+        Ok(idx)
+    }
+
     /// Rebuild the in-RAM [`Substrate`] from the persistence redo log — the
     /// §5.6 / §16.12 substrate-reload path run on daemon restart.
     ///
@@ -247,19 +320,34 @@ impl Conversation {
         n_layers: usize,
         restore_sigs: impl Fn(&[(u16, Vec<u8>)]) -> candle::Result<Vec<SigEntry>>,
     ) -> candle::Result<usize> {
+        // Substrate's per-stream / per-timeline state was populated
+        // in one walker pass during `SubstratePersistence::open_in_with_substrate`
+        // — no mirror step needed here.  This pass replays turn-decl
+        // records into the substrate's per-turn KV residence slots
+        // (the cold-load setup that demands knowing layer count) and
+        // then runs the post-reload sweeps for the summary tree.
         let decls = {
-            let p = self.persistence.lock().unwrap();
-            crate::persistence::resume::recovered_turn_decls(&p)
+            let substrate = self.read();
+            crate::persistence::resume::recovered_turn_decls(&substrate)
         };
         let mut restored = 0usize;
         for mut decl in decls {
             let (recovered, cold_refs) = {
                 let mut p = self.persistence.lock().unwrap();
-                let recovered = crate::persistence::resume::recover_turn(&mut p, &decl, n_layers)
-                    .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?;
-                let cold_refs =
-                    crate::persistence::resume::recover_turn_cold_refs(&p, &decl, n_layers)
-                        .map_err(|e| candle::Error::Msg(format!("recover cold refs: {e}")))?;
+                let substrate_read = self.read();
+                let recovered = crate::persistence::resume::recover_turn(
+                    &mut p,
+                    &substrate_read,
+                    &decl,
+                    n_layers,
+                )
+                .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?;
+                let cold_refs = crate::persistence::resume::recover_turn_cold_refs(
+                    &substrate_read,
+                    &decl,
+                    n_layers,
+                )
+                .map_err(|e| candle::Error::Msg(format!("recover cold refs: {e}")))?;
                 (recovered, cold_refs)
             };
             // Re-append the BDP signatures into the (fresh) provenance file,
@@ -320,51 +408,60 @@ impl Conversation {
             }
             restored += 1;
         }
-        // Conversation metadata lives in its own `RecordType::Label`
-        // records — `(timeline, conv_id, label)` triples, last-write-wins.
-        // Replay them after the TurnDecl pass so the in-RAM
-        // `substrate.labels` and `substrate.conv_ids` maps are populated
-        // for every recovered timeline.
-        let (metas, conv_states) = {
-            let p = self.persistence.lock().unwrap();
-            (p.collected_conv_metas(), p.collected_conv_states())
-        };
-        let n_meta_records = metas.len();
-        let n_state_records = conv_states.len();
-        let mut n_meta_applied = 0usize;
-        let mut n_meta_dropped_unregistered = 0usize;
-        let mut n_state_applied = 0usize;
+        // Post-walker sweeps on substrate state (no manifest reads —
+        // all per-entity state was written during the open-time
+        // walker pass into `substrate.apply_walker_entry`).
+        //
+        // 1. Re-enqueue orphan Normal turns onto the summariser's
+        //    pending queue.  An orphan is any Normal turn whose index
+        //    is NOT in any SummaryOfTurns leaf's children list — i.e.
+        //    a crash interrupted its absorption before a leaf was
+        //    sealed over it.  Compute the "covered" set by walking
+        //    summary nodes' children.
+        // 2. Re-seed the `dirty_summary_set` from `dirty: true`
+        //    `TreeNodeMeta` entries — the apply path writes the flag
+        //    but doesn't index into the dirty set; this sweep does.
+        let n_meta_records = 0usize;
+        let n_state_records = 0usize;
+        let n_meta_applied = 0usize;
+        let n_meta_dropped_unregistered = 0usize;
+        let n_state_applied = 0usize;
         {
             let mut view = self.write();
-            for (timeline_raw, meta) in metas {
-                let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
-                    continue;
-                };
-                // `set_conv_id` / `set_label` no-op when the timeline
-                // isn't registered. Count any drops here so the reload
-                // summary can flag "Label record without matching
-                // TurnDecl" — a state we expect to be rare.
-                if view.timeline_target(timeline).is_none() {
-                    n_meta_dropped_unregistered += 1;
-                    continue;
+            let timeline_ids: Vec<TimelineId> = view.all_timeline_ids().collect();
+            for timeline in timeline_ids {
+                // Build the "covered by a summary leaf" set from the
+                // substrate's tree_meta — every Normal turn that's a
+                // child of some SoT leaf is covered; every Normal
+                // outside that set is orphaned.
+                let mut covered: std::collections::BTreeSet<u32> =
+                    std::collections::BTreeSet::new();
+                for leaf_idx in view.summary_leaves_chrono(timeline) {
+                    if let Some(meta) = view.tree_meta_of(timeline, leaf_idx) {
+                        for c in &meta.children {
+                            covered.insert(c.0);
+                        }
+                    }
                 }
-                view.set_conv_id(timeline, &meta.conv_id);
-                view.set_label(timeline, &meta.label);
-                n_meta_applied += 1;
-            }
-            // ConvState records — last-write-wins archive flag. Same
-            // "registered-timeline-only" rule; the no-op `set_archived`
-            // returns false for unknown timelines and we just count
-            // those as applied=0.
-            for (timeline_raw, state) in conv_states {
-                let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
-                    continue;
-                };
-                if view.timeline_target(timeline).is_none() {
-                    continue;
+                for normal_idx in view.normal_turns_chrono(timeline) {
+                    if !covered.contains(&normal_idx.0) {
+                        view.push_pending_summary(timeline, normal_idx);
+                    }
                 }
-                view.set_archived(timeline, state.archived);
-                n_state_applied += 1;
+                // Re-seed the dirty set from `dirty: true` meta entries.
+                let dirty_ids: Vec<TurnIndex> = view
+                    .summary_leaves_chrono(timeline)
+                    .into_iter()
+                    .chain(view.summary_internals_chrono(timeline).into_iter())
+                    .filter(|idx| {
+                        view.tree_meta_of(timeline, *idx)
+                            .map(|m| m.dirty)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                for id in dirty_ids {
+                    view.mark_summary_dirty(timeline, id);
+                }
             }
         }
         let read = self.read();
@@ -406,10 +503,11 @@ impl Conversation {
         let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
         let mut p = self.persistence.lock().unwrap();
         // We need the turn's `StreamDecl` to drive `recover_turn`. Walk
-        // the manifest's persisted decls and pick the one matching this
+        // the substrate's persisted decls and pick the one matching this
         // (timeline, index). The decl set is small and rebuilt once at
         // restart, so a linear scan is fine.
-        let decls = recovered_turn_decls(&p);
+        let substrate_read = self.read();
+        let decls = recovered_turn_decls(&substrate_read);
         let decl = match decls
             .into_iter()
             .find(|d| d.timeline_id == timeline.raw() && d.turn_index == index.0)
@@ -417,7 +515,8 @@ impl Conversation {
             Some(d) => d,
             None => return Ok(None),
         };
-        let recovered = recover_turn(&mut p, &decl, n_layers)
+        let substrate = self.read();
+        let recovered = recover_turn(&mut p, &substrate, &decl, n_layers)
             .map_err(|e| candle::Error::Msg(format!("recover_turn_chunks: {e}")))?;
         if recovered.layers.is_empty() {
             return Ok(None);
@@ -447,7 +546,10 @@ impl Conversation {
         use crate::persistence::resume::recovered_turn_decls;
         use crate::persistence::transfer::load_turn_into_hot;
         let mut p = self.persistence.lock().unwrap();
-        let decls = recovered_turn_decls(&p);
+        let decls = {
+            let substrate = self.read();
+            recovered_turn_decls(&substrate)
+        };
         let decl = match decls
             .into_iter()
             .find(|d| d.timeline_id == timeline.raw() && d.turn_index == index.0)
@@ -455,15 +557,14 @@ impl Conversation {
             Some(d) => d,
             None => return Ok(None),
         };
-        let sealed = load_turn_into_hot(backings, device, &mut p, &decl, stager)?;
+        let substrate = self.read();
+        let sealed = load_turn_into_hot(backings, device, &mut p, &substrate, &decl, stager)?;
         // Accounting bytes: sum of every chunk's `kv_bytes` size across
-        // every layer in the manifest snapshot — matches the previous
-        // `TurnChunkGrid::bytes()` semantics.
+        // every layer in the substrate's stream snapshot — matches the
+        // previous `TurnChunkGrid::bytes()` semantics.
         let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
-        let kv_bytes_total: u64 = p
-            .manifest()
-            .streams
-            .get(&stream_id)
+        let kv_bytes_total: u64 = substrate
+            .stream_of(stream_id)
             .map(|s| {
                 s.chunks
                     .values()
@@ -606,6 +707,73 @@ impl Conversation {
         self.read().is_archived(timeline)
     }
 
+    /// Set the substrate-side resume key (`debug_id`) for `timeline`
+    /// and persist a `RecordType::DebugId` record to the redo log.
+    /// Last-write-wins on replay.  Idempotent: if the substrate
+    /// already holds the requested key, the record is not written and
+    /// the call returns `Ok(())` without touching the log.
+    pub fn set_conversation_debug_id(
+        &self,
+        timeline: TimelineId,
+        debug_id: &str,
+    ) -> candle::Result<()> {
+        if debug_id.is_empty() {
+            return Ok(());
+        }
+        self.write().set_debug_id(timeline, debug_id);
+        let mut p = self.persistence.lock().unwrap();
+        p.write_debug_id(timeline.raw(), debug_id)
+            .map_err(|e| candle::Error::Msg(format!("write_debug_id: {e}")))?;
+        Ok(())
+    }
+
+    /// Look up a timeline by `debug_id`.  O(1).
+    pub fn lookup_by_debug_id(&self, debug_id: &str) -> Option<TimelineId> {
+        self.read().lookup_by_debug_id(debug_id)
+    }
+
+    /// Number of turns currently waiting on the summariser thread to
+    /// absorb them into the summary tree (§9 backpressure metric).
+    /// `0` means steady state: the background tempo is keeping up
+    /// with the foreground turn rate.
+    pub fn pending_summary_len(&self, timeline: TimelineId) -> usize {
+        self.read().pending_summary_len(timeline)
+    }
+
+    /// Number of summary nodes currently marked dirty (children
+    /// changed since last regeneration).  `0` means the dirty sweep
+    /// has caught up.
+    pub fn dirty_summary_len(&self, timeline: TimelineId) -> usize {
+        self.read().dirty_summary_len(timeline)
+    }
+
+    /// Most recent score-density [`SelectionDiagnostics`] for
+    /// `timeline`, or `None` if no projection has run yet (or the
+    /// projection used the rule-based path).  Pure test-harness
+    /// instrumentation: the substrate retains only the latest
+    /// selection per timeline, written by the scheduler at projection
+    /// time.  Production daemons can ignore.
+    pub fn last_selection_diagnostics(
+        &self,
+        timeline: TimelineId,
+    ) -> Option<SelectionDiagnostics> {
+        self.read().last_selection_of(timeline).cloned()
+    }
+
+    /// Persist a per-`(timeline, turn_index)` summary-tree metadata
+    /// record to the redo log.  Idempotent: skips the append when the
+    /// in-memory manifest already records the same payload.  Called
+    /// by the summariser thread after every atomic tree mutation
+    /// (§7.2).
+    pub fn write_tree_metadata(
+        &self,
+        payload: TreeMetadataPayload,
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.write_tree_metadata(payload)
+            .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
+    }
+
     /// Persist a sealed turn's per-layer KV grid + token ids to the redo log
     /// — the seal-time half of the resume path (§16.12). All layers share
     /// one chunk count.
@@ -641,7 +809,7 @@ impl Conversation {
         &self,
         stream_id: StreamId,
         layers: &crate::persistence::resume::TurnChunkGrid,
-    ) -> candle::Result<Vec<crate::substrate::StoredSequence>> {
+    ) -> candle::Result<Vec<StoredSequence>> {
         let mut p = self.persistence.lock().unwrap();
         crate::persistence::resume::persist_turn_chunks_capture(&mut p, stream_id, layers)
             .map_err(|e| candle::Error::Msg(format!("persist turn chunks capture: {e}")))
@@ -741,10 +909,9 @@ impl Conversation {
     /// hot without re-prefilling.  The check matches the ingest
     /// loop's skip-if-present gate.
     pub fn section_stream_is_persisted(&self, stream_id: StreamId) -> bool {
-        let p = self.persistence.lock().unwrap();
-        p.manifest()
-            .streams
-            .get(&stream_id)
+        drop(self.persistence.lock().unwrap());
+        self.read()
+            .stream_of(stream_id)
             .map(|s| s.committed_through.is_some() && !s.chunks.is_empty())
             .unwrap_or(false)
     }
@@ -758,8 +925,9 @@ impl Conversation {
         stream_id: StreamId,
         n_layers: usize,
     ) -> Option<(usize, bool, bool)> {
-        let p = self.persistence.lock().unwrap();
-        let entry = p.manifest().streams.get(&stream_id)?;
+        drop(self.persistence.lock().unwrap());
+        let substrate = self.read();
+        let entry = substrate.stream_of(stream_id)?;
         if entry.chunks.is_empty() || n_layers == 0 {
             return None;
         }
@@ -785,8 +953,17 @@ impl Conversation {
     ) -> candle::Result<Vec<SealedSequence>> {
         use crate::persistence::transfer::load_stream_into_hot;
         let mut p = self.persistence.lock().unwrap();
-        load_stream_into_hot(backings, device, &mut p, stream_id, chunks_per_layer, stager)
-            .map_err(|e| candle::Error::Msg(format!("cold_load_section_into_hot: {e}")))
+        let substrate = self.read();
+        load_stream_into_hot(
+            backings,
+            device,
+            &mut p,
+            &substrate,
+            stream_id,
+            chunks_per_layer,
+            stager,
+        )
+        .map_err(|e| candle::Error::Msg(format!("cold_load_section_into_hot: {e}")))
     }
 
     /// Resolve a section stream's per-chunk redo-log locations into
@@ -797,20 +974,18 @@ impl Conversation {
         &self,
         stream_id: StreamId,
         n_layers: usize,
-    ) -> candle::Result<Option<Vec<crate::substrate::StoredSequence>>> {
-        let p = self.persistence.lock().unwrap();
-        crate::persistence::resume::recover_section_cold_refs(&p, stream_id, n_layers)
+    ) -> candle::Result<Option<Vec<StoredSequence>>> {
+        let substrate = self.read();
+        crate::persistence::resume::recover_section_cold_refs(&substrate, stream_id, n_layers)
             .map_err(|e| candle::Error::Msg(format!("recover_section_cold_refs: {e}")))
     }
 
     /// Look up a section by the human-readable `debug_name` recorded
     /// on its `SectionDecl`.  Wrapper around
-    /// [`Substrate::section_id_for_debug_name`] that bundles the
-    /// persistence lock.  Used by calibration consumers that pick
-    /// scenarios out of a loaded workspace by id.
-    pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<crate::projection::SectionId> {
-        let p = self.persistence.lock().unwrap();
-        self.read().section_id_for_debug_name(&p, debug_name)
+    /// [`Substrate::section_id_for_debug_name`].  Used by calibration
+    /// consumers that pick scenarios out of a loaded workspace by id.
+    pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<SectionId> {
+        self.read().section_id_for_debug_name(debug_name)
     }
 
     /// Read a persisted section's `Signatures` record from disk and
@@ -822,7 +997,8 @@ impl Conversation {
         stream_id: StreamId,
     ) -> candle::Result<Vec<(u16, Vec<u8>)>> {
         let mut p = self.persistence.lock().unwrap();
-        let bytes = match p.read_signatures(stream_id) {
+        let substrate = self.read();
+        let bytes = match p.read_signatures(&substrate, stream_id) {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(Vec::new()),
             Err(e) => return Err(candle::Error::Msg(format!("read section sigs: {e}"))),
@@ -860,10 +1036,14 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         p.commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
-        if p.should_compact()
-            .map_err(|e| candle::Error::Msg(format!("persist compaction check: {e}")))?
-        {
-            p.compact()
+        let should = {
+            let substrate = self.read();
+            p.should_compact(&substrate)
+                .map_err(|e| candle::Error::Msg(format!("persist compaction check: {e}")))?
+        };
+        if should {
+            let mut substrate = self.write();
+            p.compact(&mut substrate)
                 .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
         }
         p.checkpoint()
@@ -893,11 +1073,11 @@ impl Conversation {
 /// Sections are workspace singletons and pass straight through.
 pub struct TargetedRead<'a> {
     read: SubstrateRead<'a>,
-    target: super::project::ProjectionTarget,
+    target: ProjectionTarget,
 }
 
 impl<'a> TargetedRead<'a> {
-    pub fn new(read: SubstrateRead<'a>, target: super::project::ProjectionTarget) -> Self {
+    pub fn new(read: SubstrateRead<'a>, target: ProjectionTarget) -> Self {
         Self { read, target }
     }
 

@@ -10,6 +10,8 @@ use super::manifest::Manifest;
 use super::record::{decode_header, decode_record, padded_record_len, RecordType, ALIGN};
 use super::walker;
 use super::{PersistenceError, Result};
+#[cfg(test)]
+use crate::substrate::Substrate;
 
 /// The outcome of recovering a log.
 #[derive(Clone, Debug)]
@@ -60,26 +62,52 @@ fn load_checkpoint(src: &mut dyn LogSource, offset: u64) -> Result<(Manifest, u6
 /// from that snapshot and replays only the tail; otherwise it falls back to
 /// a full walk from the first record. Both paths produce the same manifest.
 pub fn recover(src: &mut dyn LogSource, checkpoint_hint: u64) -> Result<Recovered> {
-    let (mut manifest, replay_from) = if checkpoint_hint >= SUPERBLOCK_SIZE {
+    recover_with_sink(src, checkpoint_hint, |_| {})
+}
+
+/// Recovery + per-record sink.  Identical to [`recover`] except every
+/// walked record is also passed to `sink`.  Used by the production
+/// open paths to dispatch records straight into a [`Substrate`]
+/// (via [`Substrate::apply_walker_entry`]) during the same walker pass
+/// that builds the manifest's singleton offsets — so per-entity state
+/// never has to be mirrored from the manifest into the substrate
+/// afterwards.
+pub fn recover_with_sink<F>(
+    src: &mut dyn LogSource,
+    checkpoint_hint: u64,
+    mut sink: F,
+) -> Result<Recovered>
+where
+    F: FnMut(&walker::WalkEntry),
+{
+    // The checkpoint payload carries only singleton offsets (Phase 3):
+    // `streams`, `labels`, `conv_states`, `tree_metadata`, `debug_ids`
+    // are `#[serde(skip)]`.  Load the snapshot for its singletons, then
+    // ALWAYS walk from `SUPERBLOCK_SIZE` so the per-record sink (and
+    // the manifest's own per-record dispatch) rebuilds every
+    // per-entity collection from the records on disk.  Compaction
+    // bounds this walk's wall-clock by rewriting the log to contain
+    // only live records.
+    let mut manifest = if checkpoint_hint >= SUPERBLOCK_SIZE {
         match load_checkpoint(src, checkpoint_hint) {
-            Ok((mut snapshot, next)) => {
+            Ok((mut snapshot, _next)) => {
                 snapshot.last_checkpoint_offset = Some(checkpoint_hint);
-                (snapshot, next)
+                snapshot
             }
-            // A stale or corrupt hint — recover the safe way, from scratch.
-            Err(_) => (Manifest::new(), SUPERBLOCK_SIZE),
+            Err(_) => Manifest::new(),
         }
     } else {
-        (Manifest::new(), SUPERBLOCK_SIZE)
+        Manifest::new()
     };
 
     let mut ingest_err: Option<PersistenceError> = None;
-    let outcome = walker::walk(src, replay_from, |entry| {
+    let outcome = walker::walk(src, SUPERBLOCK_SIZE, |entry| {
         if ingest_err.is_none() {
             if let Err(e) = manifest.ingest(entry) {
                 ingest_err = Some(e);
             }
         }
+        sink(entry);
     })?;
     if let Some(e) = ingest_err {
         return Err(e);
@@ -130,9 +158,12 @@ mod tests {
         blob.extend_from_slice(&record(RecordType::Chunk, 1, 1, b"b"));
         let mut mem = MemLog::with_records(&blob);
 
-        let rec = recover(&mut mem, 0).unwrap();
+        let mut substrate = Substrate::new();
+        let rec =
+            recover_with_sink(&mut mem, 0, |e| substrate.apply_walker_entry(e)).unwrap();
         assert!(!rec.torn);
-        assert_eq!(rec.manifest.live_chunk_count(), 2);
+        // Chunk count is on the substrate now.
+        assert_eq!(substrate.live_chunk_count(), 2);
     }
 
     #[test]
@@ -154,17 +185,19 @@ mod tests {
         full.extend_from_slice(&record(RecordType::Chunk, 2, 0, b"d0"));
 
         let mut mem_a = MemLog::with_records(&full);
-        let from_scratch = recover(&mut mem_a, 0).unwrap();
+        let (_, sub_a, out_a) = Manifest::build_with_substrate(&mut mem_a, SUPERBLOCK_SIZE).unwrap();
 
         let mut mem_b = MemLog::with_records(&full);
         let from_checkpoint = recover(&mut mem_b, checkpoint_offset).unwrap();
+        let mut mem_c = MemLog::with_records(&full);
+        let (_, sub_b, _) = Manifest::build_with_substrate(&mut mem_c, SUPERBLOCK_SIZE).unwrap();
 
-        assert_eq!(
-            from_scratch.manifest.streams,
-            from_checkpoint.manifest.streams
-        );
-        assert_eq!(from_scratch.tail_offset, from_checkpoint.tail_offset);
-        assert_eq!(from_checkpoint.manifest.live_chunk_count(), 4);
+        // Per-stream state lives on the substrate; walking from
+        // checkpoint vs from scratch reproduces the same in-RAM
+        // chunk count.
+        assert_eq!(sub_a.live_chunk_count(), sub_b.live_chunk_count());
+        assert_eq!(out_a.tail_offset, from_checkpoint.tail_offset);
+        assert_eq!(sub_a.live_chunk_count(), 4);
     }
 
     #[test]
@@ -173,8 +206,12 @@ mod tests {
         blob.extend_from_slice(&record(RecordType::Chunk, 1, 0, b"x"));
         let mut mem = MemLog::with_records(&blob);
         // A hint pointing into the middle of nowhere — recovery must still work.
-        let rec = recover(&mut mem, SUPERBLOCK_SIZE + 999_999).unwrap();
-        assert_eq!(rec.manifest.live_chunk_count(), 1);
+        let _rec = recover(&mut mem, SUPERBLOCK_SIZE + 999_999).unwrap();
+        // Chunk count is on the substrate now.
+        let mut mem2 = MemLog::with_records(&blob);
+        let (_, substrate, _) =
+            Manifest::build_with_substrate(&mut mem2, SUPERBLOCK_SIZE).unwrap();
+        assert_eq!(substrate.live_chunk_count(), 1);
     }
 
     #[test]
@@ -206,10 +243,12 @@ mod tests {
         {
             let mut log = LogFile::open(&path).unwrap();
             let hint = log.superblock().latest_checkpoint_offset;
-            let rec = recover(&mut log, hint).unwrap();
+            let mut substrate = Substrate::new();
+            let rec = recover_with_sink(&mut log, hint, |e| substrate.apply_walker_entry(e))
+                .unwrap();
             assert!(rec.torn, "the truncated third record must be detected");
             assert_eq!(rec.tail_offset, good_records);
-            assert_eq!(rec.manifest.live_chunk_count(), 2);
+            assert_eq!(substrate.live_chunk_count(), 2);
             // Applying the recovery: truncate to the good tail.
             log.truncate_to(rec.tail_offset).unwrap();
             log.set_write_offset(rec.tail_offset);
@@ -218,13 +257,34 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Phase 3: the `Checkpoint` payload carries only singleton
+    /// offsets (`model_spec`, `template`, `tokenizer`,
+    /// `last_checkpoint_offset`).  Per-entity collections like
+    /// `streams`, `labels`, `tree_metadata` are marked
+    /// `#[serde(skip)]` — they get rebuilt by the walker on reload, so
+    /// the checkpoint payload stays bounded by singleton count.
+    ///
+    /// This test verifies the contract: encode/decode round-trips the
+    /// singletons but drops the per-entity collections.
     #[test]
-    fn checkpoint_payload_roundtrip() {
+    fn checkpoint_payload_carries_only_singletons() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&record(RecordType::Chunk, 9, 0, b"only"));
         let mut mem = MemLog::with_records(&blob);
-        let (manifest, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert!(
+            substrate.live_chunk_count() > 0,
+            "walker should have built a non-empty in-RAM streams index on the substrate"
+        );
         let payload = encode_checkpoint(&manifest);
-        assert_eq!(Manifest::decode(&payload).unwrap(), manifest);
+        let decoded = Manifest::decode(&payload).unwrap();
+        // The checkpoint payload no longer contains any per-entity
+        // state — that lives on the substrate; reload rebuilds it via
+        // the walker.  Only singletons round-trip.
+        assert_eq!(decoded.model_spec, manifest.model_spec);
+        assert_eq!(decoded.template, manifest.template);
+        assert_eq!(decoded.tokenizer, manifest.tokenizer);
+        assert_eq!(decoded.last_checkpoint_offset, manifest.last_checkpoint_offset);
     }
 }

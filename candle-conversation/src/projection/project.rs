@@ -95,7 +95,7 @@
 
 use std::collections::HashMap;
 
-use super::ids::{GroupId, LayerId, SectionId, TurnId, TurnIndex};
+use super::ids::{CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex};
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
@@ -103,6 +103,7 @@ use super::schema::{
 };
 use super::selection::apply_selection;
 use crate::substrate::ContentResolver;
+use crate::summary_tree::{NodeId, SelectionDiagnostics};
 
 /// Fixed scoring formula used for all turn scoring and section selection.
 /// Calibrated against real Qwen3-30B-A3B Q-vector data; span α=2.0 with
@@ -332,7 +333,7 @@ pub struct ProjectionTarget {
     /// across all timelines (Phase 3 of the substrate refactor enforces
     /// this masking; Phase 1 still aggregates the first-registered
     /// timeline per group).
-    pub timeline: super::ids::TimelineId,
+    pub timeline: TimelineId,
 }
 
 // ── Main entry-point ──────────────────────────────────────────────────────────
@@ -347,6 +348,28 @@ pub fn run<R: ContentResolver>(
     target: ProjectionTarget,
     resolver: &R,
     mode: ProjectionMode,
+) -> Projection {
+    run_with_sink(schema, target, resolver, mode, &mut |_| {})
+}
+
+/// Variant of [`run`] that delivers score-density [`SelectionDiagnostics`]
+/// to a sink the caller provides.  Used by the scheduler to ferry the
+/// diagnostic straight into the substrate's
+/// [`Substrate::set_last_selection`](crate::substrate::Substrate::set_last_selection)
+/// side-channel without polluting [`Projection`] with a test-only field.
+///
+/// When the projection used the rule-based path (no summary tree for
+/// the target timeline), the sink is never invoked.  When score-density
+/// did run, the sink is called exactly once with the fully-assembled
+/// diagnostic — token counts, origin tags, effective scores, pending
+/// backpressure metric — built from the resolver's existing
+/// `turn_token_count` + `pending_summary_len` methods.
+pub fn run_with_sink<R: ContentResolver>(
+    schema: &Schema,
+    target: ProjectionTarget,
+    resolver: &R,
+    mode: ProjectionMode,
+    sink: &mut dyn FnMut(SelectionDiagnostics),
 ) -> Projection {
     // ── Step 1: Mask ─────────────────────────────────────────────────────────
     let target_layer_idx = schema
@@ -400,30 +423,76 @@ pub fn run<R: ContentResolver>(
 
             let tc = |idx: TurnIndex| resolver.turn_token_count(group.id, idx);
 
-            // Unbounded selection (no budget constraint yet).
-            let selected_indices = apply_selection(
-                &group.selection,
-                group.score_threshold,
-                &all_turns,
-                None,
-                &tc,
-            );
-
-            let selected: Vec<(TurnIndex, f32)> = selected_indices
-                .iter()
-                .map(|&idx| {
-                    let score = all_turns
+            // Score-density override: when this is the *target* group
+            // and a summary tree exists for the target timeline, swap
+            // out the rule-based unbounded selection for the §8
+            // algorithm.  The result is already budget-fitted into
+            // `layer.window` so the flexbox step caps the group's
+            // natural consumption at the score-density total.
+            let mut score_density_used = false;
+            let selected: Vec<(TurnIndex, f32)> = if layer_is_target && group.id == target.group {
+                if let Some(picks) = resolver.summary_tree_select(
+                    target.timeline,
+                    layer.window as u32,
+                    FIXED_FORMULA,
+                    &weights,
+                ) {
+                    score_density_used = true;
+                    // Score-density diagnostics for the test harness
+                    // (§10.8.4): assemble per-node selection metadata
+                    // and hand it to the caller-supplied sink.  The
+                    // scheduler's sink writes this to the substrate's
+                    // last-selection side-channel; production callers
+                    // pass a no-op.  Skipped entirely when the
+                    // rule-based path runs (no tree → no `picks`).
+                    let mut diag = SelectionDiagnostics::new(layer.window as u32);
+                    for (turn_idx, origin, score) in &picks {
+                        let tokens = resolver.turn_token_count(group.id, *turn_idx) as u32;
+                        diag.push(NodeId(turn_idx.0), *origin, *score, tokens);
+                    }
+                    diag.pending_count = resolver.pending_summary_len(target.timeline);
+                    sink(diag);
+                    picks
                         .iter()
-                        .find(|(i, _)| *i == idx)
-                        .map(|(_, s)| *s)
-                        .unwrap_or(0.0);
-                    (idx, score)
-                })
-                .collect();
+                        .map(|(idx, _origin, score)| (*idx, *score))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Fall through to the rule-based unbounded selection path
+            // when score-density wasn't applicable.
+            let selected: Vec<(TurnIndex, f32)> = if score_density_used {
+                selected
+            } else {
+                let selected_indices = apply_selection(
+                    &group.selection,
+                    group.score_threshold,
+                    &all_turns,
+                    None,
+                    &tc,
+                );
+
+                selected_indices
+                    .iter()
+                    .map(|&idx| {
+                        let score = all_turns
+                            .iter()
+                            .find(|(i, _)| *i == idx)
+                            .map(|(_, s)| *s)
+                            .unwrap_or(0.0);
+                        (idx, score)
+                    })
+                    .collect()
+            };
 
             tracing::trace!(
                 group = %group.name,
                 selected = format!("{}/{}", selected.len(), all_turns.len()),
+                score_density = score_density_used,
                 "projection"
             );
 
@@ -677,7 +746,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
     // their materialised section sets are known when we walk the
     // items for emission. Cached by CollectionId.
     let mut collection_results: std::collections::HashMap<
-        super::ids::CollectionId,
+        CollectionId,
         Vec<ProjectionSegment>,
     > = std::collections::HashMap::new();
     for item in &layer.system_prompt.items {

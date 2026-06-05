@@ -1,12 +1,18 @@
 //! The conversation engine: entry point, spawns the scheduler thread.
 
-use crate::config::{EngineConfig, SequenceConfig};
+use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::Sequence;
 use crate::error::ConversationError;
+use crate::handle::{TokenDecoder, TurnEvent};
 use crate::persistence::thread::PersistenceThread;
-use crate::projection::{Builder, Conversation, ProjectionTarget};
+use crate::persistence::SubstratePersistence;
+use crate::projection::{
+    Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
+};
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
+use crate::substrate::Substrate;
+use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
 use candle_nn::CHUNK_SIZE;
@@ -58,6 +64,14 @@ pub struct ConversationEngine {
     /// drain pass. `PersistenceThread::shutdown` is `&self`-callable —
     /// no `Option`/`Mutex` shuffle at this layer.
     persist_thread: PersistenceThread,
+
+    /// Async summariser thread — drains the per-turn pending queue,
+    /// runs §6 probes, builds the per-timeline AVL summary tree.
+    /// Mirrors [`PersistenceThread`]'s lifecycle (trigger / tick /
+    /// shutdown).  Spawned alongside the scheduler at engine startup;
+    /// [`Self::shutdown`] joins it after the persistence thread has
+    /// drained, and `Drop` falls through to the same path.
+    summariser_thread: SummariserThread,
 
     /// Shared provenance signature file (anonymous temp, deleted on process exit).
     ///
@@ -145,10 +159,18 @@ impl ConversationEngine {
         //
         // Mandatory substrate persistence — the redo log under the
         // workspace's `.substrate/` directory (or the process CWD).
-        let mut persistence = match config.workspace_path.as_ref() {
-            Some(dir) => crate::persistence::SubstratePersistence::open_in(dir.as_ref()),
-            None => crate::persistence::SubstratePersistence::open(),
-        }
+        // Open persistence and drive every record straight into the
+        // substrate's in-RAM state in one walker pass — no manifest
+        // mirror, no `reconstruct → collected_*` second pass.
+        let mut substrate = Substrate::new();
+        let workspace_dir: std::path::PathBuf = match config.workspace_path.as_ref() {
+            Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
+            None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        };
+        let mut persistence = SubstratePersistence::open_in_with_substrate(
+            &workspace_dir,
+            &mut substrate,
+        )
         .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
         })?;
@@ -178,7 +200,7 @@ impl ConversationEngine {
                 })?;
             }
         }
-        let conversation = Conversation::with_persistence(persistence);
+        let conversation = Conversation::from_parts(substrate, persistence);
 
         // Workspace-shared `ProvenanceFile`: created up-front so the
         // scheduler can append to it inline during `cleanup_finished`'s
@@ -200,6 +222,21 @@ impl ConversationEngine {
             config.batched_config.compression_policy(),
         );
         let persist_trigger = persist_thread.trigger_handle();
+
+        // Spawn the async summariser thread (`docs/infinite_conversations.md`
+        // §3.3 / §7).  Drains the per-timeline pending queue every
+        // 250 ms (or on trigger), runs §6 probes via the
+        // scheduler-backed [`ChannelProbeRunner`], extends the
+        // per-timeline summary tree, and persists the resulting
+        // [`TreeMetadata`] records to the redo log.  Spawned after the
+        // persistence thread so its writes flow through the same
+        // workspace handle.
+        let summariser_runner = Arc::new(ChannelProbeRunner::new(tx.clone()));
+        let summariser_thread =
+            SummariserThread::spawn(conversation.clone(), summariser_runner);
+        // Hand the trigger to the scheduler so every assistant-turn
+        // seal wakes the summariser immediately — design §4 step ③.
+        let summariser_trigger = summariser_thread.trigger_handle();
 
         // Spawn the scheduler thread.
         let penalty_log = config.penalty_log_path.clone();
@@ -225,6 +262,7 @@ impl ConversationEngine {
                     scheduler_provenance,
                     model_core,
                     persist_trigger,
+                    summariser_trigger,
                     boundary_markers,
                 );
                 // §16.12 — reload any persisted turns into the substrate
@@ -245,6 +283,7 @@ impl ConversationEngine {
             model_core,
             conversation,
             persist_thread,
+            summariser_thread,
         })
     }
 
@@ -272,12 +311,60 @@ impl ConversationEngine {
     ///
     /// * `system_prompt` — The formatted system prompt text. Pass `""` for none.
     /// * `config` — Per-conversation configuration (role markers, sampling, etc.).
+    /// Persist a substrate-side resume key (`debug_id`) for
+    /// `timeline`.  Used by the debug-id-resumable grow-conversation
+    /// harness (`docs/infinite_conversations.md` §10.4): a test can
+    /// re-open the workspace, call [`Self::lookup_by_debug_id`] to
+    /// find a previously-built timeline, and continue growing.
+    ///
+    /// Last-write-wins on replay.  Idempotent: the redo-log writer
+    /// skips the append when the substrate already records the same
+    /// value.
+    pub fn set_conversation_debug_id(
+        &self,
+        timeline: TimelineId,
+        debug_id: &str,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_debug_id(timeline, debug_id)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Look up a timeline by its previously-set `debug_id`.  O(1).
+    /// Returns `None` when no timeline carries that key.
+    pub fn lookup_by_debug_id(&self, debug_id: &str) -> Option<TimelineId> {
+        self.conversation.lookup_by_debug_id(debug_id)
+    }
+
+    /// Backpressure metric — turns awaiting summariser absorption for
+    /// `timeline`.  Zero in steady state.
+    pub fn pending_summary_len(&self, timeline: TimelineId) -> usize {
+        self.conversation.pending_summary_len(timeline)
+    }
+
+    /// Backpressure metric — summary nodes currently dirty for
+    /// `timeline`.  Zero when the dirty sweep is caught up.
+    pub fn dirty_summary_len(&self, timeline: TimelineId) -> usize {
+        self.conversation.dirty_summary_len(timeline)
+    }
+
+    /// Test-harness diagnostic — the most recent score-density
+    /// [`SelectionDiagnostics`] for `timeline`, or `None` if no
+    /// projection has run yet (or projection used the rule-based
+    /// path).  Last-write-wins across reprojections within a turn.
+    pub fn last_selection_diagnostics(
+        &self,
+        timeline: TimelineId,
+    ) -> Option<SelectionDiagnostics> {
+        self.conversation.last_selection_diagnostics(timeline)
+    }
+
     /// Persist a sidebar label for `timeline` to the workspace substrate.
     /// Last-write-wins; preserves whatever `conv_id` is already known
     /// for this timeline. The daemon's titler is the typical caller.
     pub fn set_conversation_label(
         &self,
-        timeline: crate::projection::TimelineId,
+        timeline: TimelineId,
         label: &str,
     ) -> crate::Result<()> {
         self.conversation
@@ -292,7 +379,7 @@ impl ConversationEngine {
     /// timeline mapping now lives in the redo log.
     pub fn set_conversation_conv_id(
         &self,
-        timeline: crate::projection::TimelineId,
+        timeline: TimelineId,
         conv_id: &str,
     ) -> crate::Result<()> {
         self.conversation
@@ -303,7 +390,7 @@ impl ConversationEngine {
     /// Read the workspace substrate's sidebar label for `timeline`, or
     /// `None` if none has been recorded. Useful for "should we still run
     /// the titler?" checks at submit time.
-    pub fn conversation_label_of(&self, timeline: crate::projection::TimelineId) -> Option<String> {
+    pub fn conversation_label_of(&self, timeline: TimelineId) -> Option<String> {
         self.conversation.label_of(timeline)
     }
 
@@ -312,7 +399,7 @@ impl ConversationEngine {
     /// daemon's `GET /v1/conversations` sidebar listing directly.
     pub fn known_conversations(
         &self,
-    ) -> Vec<(crate::projection::TimelineId, String, String, bool)> {
+    ) -> Vec<(TimelineId, String, String, bool)> {
         self.conversation.known_conversations()
     }
 
@@ -322,12 +409,12 @@ impl ConversationEngine {
     /// `POST /v1/conversations/{id}/archive` and `/unarchive`.
     pub fn set_conversation_archived(
         &self,
-        timeline: crate::projection::TimelineId,
+        timeline: TimelineId,
         archived: bool,
     ) -> crate::Result<()> {
         self.conversation
             .set_conversation_archived(timeline, archived)
-            .map_err(crate::error::ConversationError::Model)
+            .map_err(ConversationError::Model)
     }
 
     /// Build an **engine-internal** conversation that lives on the reserved
@@ -344,12 +431,12 @@ impl ConversationEngine {
     pub fn new_reserved_conversation(
         &self,
         system_prompt: &str,
-        kind: crate::projection::Reserved,
+        kind: Reserved,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
         let builder = Builder::for_plain_prompt_reserved(system_prompt, kind);
-        let layer_id = crate::projection::LayerId::reserved(kind);
-        let group_id = crate::projection::GroupId::reserved(kind);
+        let layer_id = LayerId::reserved(kind);
+        let group_id = GroupId::reserved(kind);
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
     }
 
@@ -393,8 +480,8 @@ impl ConversationEngine {
         &self,
         system_prompt: &str,
         builder: Builder,
-        layer: crate::projection::LayerId,
-        group: crate::projection::GroupId,
+        layer: LayerId,
+        group: GroupId,
         config: SequenceConfig,
     ) -> crate::Result<Sequence> {
         self.new_conversation_with_projection_progress(
@@ -418,8 +505,8 @@ impl ConversationEngine {
         &self,
         system_prompt: &str,
         builder: Builder,
-        layer: crate::projection::LayerId,
-        group: crate::projection::GroupId,
+        layer: LayerId,
+        group: GroupId,
         config: SequenceConfig,
         section_progress: Option<&dyn Fn(u64, u64)>,
     ) -> crate::Result<Sequence> {
@@ -505,8 +592,6 @@ impl ConversationEngine {
         tokens: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<String> {
-        use crate::config::SamplingConfig;
-        use crate::handle::TurnEvent;
 
         // 1. Allocate a sequence.
         let (resp_tx, resp_rx) = channel::bounded(1);
@@ -586,8 +671,8 @@ impl ConversationEngine {
     /// Get a `TokenDecoder` for decoding token IDs into text.
     ///
     /// The decoder is cheap to clone and can be used across threads.
-    pub fn token_decoder(&self) -> crate::handle::TokenDecoder {
-        crate::handle::TokenDecoder::new(Arc::clone(&self.tokenizer))
+    pub fn token_decoder(&self) -> TokenDecoder {
+        TokenDecoder::new(Arc::clone(&self.tokenizer))
     }
 
     /// Durably flush the substrate redo log — the group-commit point.
@@ -636,6 +721,13 @@ impl ConversationEngine {
         // call is idempotent, so a redundant invocation from `Drop`
         // after this is a no-op.
         self.persist_thread.shutdown();
+        // Tear down the summariser thread last: it depends on the
+        // scheduler for §6 probes (via `ChannelProbeRunner` over the
+        // scheduler request channel).  Once the scheduler has joined,
+        // any in-flight probe request hangs forever — shutdown
+        // signals the loop to exit on its next select rather than
+        // wait for a probe response that will never arrive.
+        self.summariser_thread.shutdown();
         Ok(())
     }
 }

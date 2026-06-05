@@ -32,8 +32,8 @@ use candle_nn::kv_cache::ChunkedKvBacking;
 use super::cold_load::ColdLoadStager;
 use crate::projection::{Conversation, SectionId, TurnKey};
 use crate::substrate::{
-    ColdRecall, EvictionReport, PromotionItemKind, PromotionPlan, PurgeReport, WarmLift,
-    WarmToHotEntry,
+    ColdRecall, EvictionReport, PromotionItemKind, PromotionPlan, PurgeReport, ResidenceIndex,
+    WarmLift, WarmToHotEntry,
 };
 use candle_nn::kv_cache::SealedSequence;
 use sysinfo::System;
@@ -178,7 +178,7 @@ pub fn elevate_to_hot(
     // scheduler/mod.rs); cold sections are warned and dropped.
     struct PendingRecall {
         kind: PromotionItemKind,
-        residence: crate::substrate::ResidenceIndex,
+        residence: ResidenceIndex,
         hot_sealed: Vec<SealedSequence>,
         bytes_for_item: u64,
         timeline_raw: u64,
@@ -521,6 +521,7 @@ pub fn evict_from_hot(
 mod tests {
     use super::*;
     use crate::projection::{GroupId, LayerId, TimelineAllocator, TimelineId, TurnIndex};
+    use crate::substrate::TurnPartWrite;
     use crate::turn::Role;
     use candle::{DType, Tensor};
     use candle_nn::kv_cache::{ChunkedKvBacking, SealedSequence};
@@ -566,7 +567,7 @@ mod tests {
         conv.record_turn(
             timeline,
             Role::User,
-            crate::substrate::TurnPartWrite {
+            TurnPartWrite {
                 token_count: n_tokens,
                 sealed_gpu: Some(Arc::new(sealed_per_layer)),
                 ..Default::default()

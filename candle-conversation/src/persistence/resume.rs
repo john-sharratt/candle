@@ -23,9 +23,9 @@
 //! non-CUDA half.
 
 use super::record::{ChunkPayload, RecordType};
-use super::streams::{StreamId, TurnDecl};
+use super::streams::{StreamDecl, StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
-use crate::substrate::{StoredChunk, StoredSequence};
+use crate::substrate::{StoredChunk, StoredSequence, Substrate};
 
 /// One sealed chunk staged for the log: the `Chunk` record's `token_count`
 /// header field paired with its decoded [`ChunkPayload`] (which carries the
@@ -399,21 +399,21 @@ pub fn demux_layers(
 /// `n_layers` is the running model's layer count.
 pub fn recover_turn(
     p: &mut SubstratePersistence,
+    substrate: &Substrate,
     decl: &TurnDecl,
     n_layers: usize,
 ) -> Result<RecoveredTurn> {
     let stream_id = super::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
     let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
 
-    // Snapshot per-chunk token_count from the manifest before the &mut
-    // read below — we need it to assemble `ChunkImage`s once the
-    // batched read returns. The chunk index → token_count map is
-    // small (one u64 per chunk), so cloning is cheap.
+    // Snapshot per-chunk token_count from the substrate's stream
+    // index before the `&mut p` read below — we need it to assemble
+    // `ChunkImage`s once the batched read returns.  The chunk index →
+    // token_count map is small (one u64 per chunk), so cloning is
+    // cheap.
     use std::collections::HashMap;
-    let token_counts: HashMap<u64, u64> = p
-        .manifest()
-        .streams
-        .get(&stream_id)
+    let token_counts: HashMap<u64, u64> = substrate
+        .stream_of(stream_id)
         .map(|s| s.chunks.iter().map(|(&i, l)| (i, l.token_count)).collect())
         .unwrap_or_default();
 
@@ -421,7 +421,7 @@ pub fn recover_turn(
     // active + inherited logs. For a freshly-persisted turn the
     // records are contiguous on disk → ~1 syscall covers all of them.
     let mut buf: Vec<u8> = Vec::new();
-    let chunks_with_payload = p.read_stream_chunks_batched(stream_id, &mut buf)?;
+    let chunks_with_payload = p.read_stream_chunks_batched(substrate, stream_id, &mut buf)?;
 
     let mut flat: Vec<(u64, ChunkImage)> = Vec::with_capacity(chunks_with_payload.len());
     for (idx, payload) in chunks_with_payload {
@@ -445,12 +445,12 @@ pub fn recover_turn(
         demux_layers(flat, n_layers, chunks_per_layer)?
     };
 
-    let token_ids = match p.read_tokens(stream_id)? {
+    let token_ids = match p.read_tokens(substrate, stream_id)? {
         Some(bytes) => decode_token_ids(&bytes)?,
         None => Vec::new(),
     };
 
-    let signatures = match p.read_signatures(stream_id)? {
+    let signatures = match p.read_signatures(substrate, stream_id)? {
         Some(bytes) => decode_signatures(&bytes)?,
         None => Vec::new(),
     };
@@ -477,7 +477,7 @@ pub fn recover_turn(
 /// compression was disabled at run time). The reload path treats
 /// these as `cold = None` and the substrate leaves the turn empty.
 pub fn recover_turn_cold_refs(
-    p: &SubstratePersistence,
+    substrate: &Substrate,
     decl: &TurnDecl,
     n_layers: usize,
 ) -> Result<Option<Vec<StoredSequence>>> {
@@ -487,7 +487,7 @@ pub fn recover_turn_cold_refs(
         return Ok(None);
     }
 
-    let Some(stream) = p.manifest().streams.get(&stream_id) else {
+    let Some(stream) = substrate.stream_of(stream_id) else {
         return Ok(None);
     };
     if stream.chunks.is_empty() {
@@ -554,11 +554,11 @@ pub fn recover_turn_cold_refs(
 /// the freshly-restored section residence so the persistence thread
 /// recognises it as durable.
 pub fn recover_section_cold_refs(
-    p: &SubstratePersistence,
+    substrate: &Substrate,
     stream_id: StreamId,
     n_layers: usize,
 ) -> Result<Option<Vec<StoredSequence>>> {
-    let Some(stream) = p.manifest().streams.get(&stream_id) else {
+    let Some(stream) = substrate.stream_of(stream_id) else {
         return Ok(None);
     };
     if stream.chunks.is_empty() || n_layers == 0 {
@@ -614,13 +614,10 @@ pub fn recover_section_cold_refs(
 
 /// Every turn stream in the recovered manifest, in `(timeline_id, turn_index)`
 /// order — the deterministic replay order a substrate reload walks.
-pub fn recovered_turn_decls(p: &SubstratePersistence) -> Vec<TurnDecl> {
-    use super::streams::StreamDecl;
-    let mut turns: Vec<TurnDecl> = p
-        .manifest()
-        .streams
-        .values()
-        .filter_map(|s| match &s.decl {
+pub fn recovered_turn_decls(substrate: &Substrate) -> Vec<TurnDecl> {
+    let mut turns: Vec<TurnDecl> = substrate
+        .all_streams()
+        .filter_map(|(_, s)| match &s.decl {
             Some(StreamDecl::Turn(t)) => Some(t.clone()),
             _ => None,
         })
@@ -633,7 +630,7 @@ pub fn recovered_turn_decls(p: &SubstratePersistence) -> Vec<TurnDecl> {
 mod tests {
     use super::*;
     use crate::persistence::record::ChunkPayload;
-    use crate::persistence::streams::{PerDepthScores, StreamDecl, TurnDecl};
+    use crate::persistence::streams::PerDepthScores;
     use crate::persistence::SUBSTRATE_DIR;
     use std::path::PathBuf;
 
@@ -771,12 +768,13 @@ mod tests {
         }
         // Reopen — a simulated restart — and recover the turn from disk.
         {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            let decls = recovered_turn_decls(&sp);
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let decls = recovered_turn_decls(&substrate);
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0], decl);
-
-            let recovered = recover_turn(&mut sp, &decls[0], n_layers).unwrap();
+            let recovered = recover_turn(&mut sp, &substrate, &decls[0], n_layers).unwrap();
             assert_eq!(recovered.token_ids, token_ids);
             assert_eq!(recovered.layers, layers);
         }
@@ -800,9 +798,11 @@ mod tests {
             sp.commit().unwrap();
         }
         {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             // The turn was written with 3 layers; recovering as 4 must fail.
-            assert!(recover_turn(&mut sp, &decl, 4).is_err());
+            assert!(recover_turn(&mut sp, &substrate, &decl, 4).is_err());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -846,8 +846,9 @@ mod tests {
             sp.checkpoint().unwrap();
         }
         {
-            let sp = SubstratePersistence::open_in(&dir).unwrap();
-            let cold = recover_turn_cold_refs(&sp, &decl, n_layers)
+            let mut substrate = Substrate::new();
+            SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let cold = recover_turn_cold_refs(&substrate, &decl, n_layers)
                 .unwrap()
                 .expect("Some(...) when chunks exist");
             assert_eq!(cold.len(), n_layers, "one StoredSequence per layer");
@@ -886,8 +887,9 @@ mod tests {
             sp.commit().unwrap();
         }
         {
-            let sp = SubstratePersistence::open_in(&dir).unwrap();
-            let cold = recover_turn_cold_refs(&sp, &decl, 2).unwrap();
+            let mut substrate = Substrate::new();
+            SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let cold = recover_turn_cold_refs(&substrate, &decl, 2).unwrap();
             assert!(cold.is_none(), "no chunks → None");
         }
         std::fs::remove_dir_all(&dir).ok();

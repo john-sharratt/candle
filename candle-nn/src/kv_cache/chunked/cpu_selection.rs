@@ -326,7 +326,7 @@ pub fn q_relevance_quantiles(k_block: &[f32], q_block_f16: &[u16]) -> (f32, f32)
     let median_v = head_min + median_bin as f32 * scale;
     let q3_v = head_min + q3_bin as f32 * scale;
     let iqr = (q3_v - q1_v).max(1.0e-8);
-    let spread = iqr * 2.0 * 1.4426950408889634;
+    let spread = iqr * 2.0 * std::f32::consts::LOG2_E;
     (median_v, spread)
 }
 

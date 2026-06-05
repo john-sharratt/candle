@@ -13,18 +13,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::checkpoint;
 use super::direct_io::DirectFile;
+use super::log_file::LogSource;
 use super::log_file::{read_record_at, LogFile};
 use super::manifest::Manifest;
 use super::record::Record;
 use super::streams::StreamId;
 use super::Result;
+use crate::substrate::Substrate;
 
 /// A loaded, read-only inherited substrate log.
 pub struct InheritedSubstrate {
     /// Canonical path of the inherited log file.
     path: PathBuf,
-    /// The recovered manifest — the inherited log's stream index.
+    /// The recovered manifest — carries only the singleton offsets
+    /// (`ModelSpec`, `Template`, `Tokenizer`, `last_checkpoint_offset`).
     manifest: Manifest,
+    /// In-RAM substrate populated by walking the inherited log during
+    /// `load`.  Holds per-stream / per-timeline state (chunks, tokens,
+    /// signatures, decls, labels, tree metadata, etc.) — the same
+    /// state the active substrate gets from its log, just for the
+    /// inherited (read-only) ancestor.  Cold-load consumers query
+    /// `inherited.substrate()` instead of `inherited.manifest().streams`.
+    substrate: Substrate,
     /// The open file, for reading inherited records on demand. Behind a
     /// `Mutex` because reads seek and the substrate is shared.
     file: Mutex<LogFile>,
@@ -40,14 +50,21 @@ impl InheritedSubstrate {
         &self.path
     }
 
-    /// The inherited log's manifest.
+    /// The inherited log's manifest.  Carries only singleton offsets;
+    /// per-entity state lives on [`Self::substrate`].
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
+    /// In-RAM substrate populated by walking the inherited log.
+    /// Cold-load reads stream / timeline state from here.
+    pub fn substrate(&self) -> &Substrate {
+        &self.substrate
+    }
+
     /// Whether this inherited log declares `stream_id`.
     pub fn has_stream(&self, stream_id: StreamId) -> bool {
-        self.manifest.streams.contains_key(&stream_id)
+        self.substrate.has_stream(stream_id)
     }
 
     /// Read a record at `offset` from the inherited log. `record_size`
@@ -62,7 +79,6 @@ impl InheritedSubstrate {
     /// directly into `dest`. Used by the batched cold-read path so a
     /// single caller-provided scratch absorbs a whole turn's records.
     pub fn read_into(&self, offset: u64, dest: &mut [u8]) -> Result<()> {
-        use super::log_file::LogSource;
         let mut file = self.file.lock().unwrap();
         LogSource::read_into(&mut *file, offset, dest)
     }
@@ -93,14 +109,20 @@ impl InheritedSubstrate {
             }
         }
         // Recover outside the cache lock so a slow load does not block
-        // other paths.
+        // other paths.  The walker drives both the manifest's
+        // singleton offsets AND the substrate's per-entity state in a
+        // single pass — checkpoint::recover_with_sink dispatches each
+        // record through `substrate.apply_walker_entry`.
         let mut file = LogFile::open(&canonical)?;
         let hint = file.superblock().latest_checkpoint_offset;
-        let recovered = checkpoint::recover(&mut file, hint)?;
+        let mut substrate = Substrate::new();
+        let recovered =
+            checkpoint::recover_with_sink(&mut file, hint, |entry| substrate.apply_walker_entry(entry))?;
         let direct = DirectFile::open(&canonical)?;
         let loaded = Arc::new(InheritedSubstrate {
             path: canonical.clone(),
             manifest: recovered.manifest,
+            substrate,
             file: Mutex::new(file),
             direct,
         });
@@ -170,7 +192,7 @@ mod tests {
         InheritedSubstrate::forget(&path);
         let inherited = InheritedSubstrate::load(&path).unwrap();
         assert!(inherited.has_stream(sid));
-        assert_eq!(inherited.manifest().streams.len(), 1);
+        assert_eq!(inherited.substrate().all_stream_ids().count(), 1);
 
         InheritedSubstrate::forget(&path);
         std::fs::remove_file(&path).ok();

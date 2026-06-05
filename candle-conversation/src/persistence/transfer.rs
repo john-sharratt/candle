@@ -24,6 +24,9 @@ mod cuda_impl {
 
     use crate::persistence::cold_load::ColdLoadStager;
     use crate::persistence::resume::ChunkImage;
+    use crate::persistence::streams::{StreamId, TurnDecl};
+    use crate::persistence::SubstratePersistence;
+    use crate::substrate::Substrate;
 
     fn cuda_device(device: &Device) -> Result<&candle::CudaDevice> {
         match device {
@@ -255,8 +258,9 @@ mod cuda_impl {
     pub fn load_turn_into_hot(
         backings: &[ChunkedKvBacking],
         device: &Device,
-        persistence: &mut crate::persistence::SubstratePersistence,
-        decl: &crate::persistence::streams::TurnDecl,
+        persistence: &mut SubstratePersistence,
+        substrate: &Substrate,
+        decl: &TurnDecl,
         stager: &mut ColdLoadStager,
     ) -> Result<Vec<SealedSequence>> {
         let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
@@ -266,6 +270,7 @@ mod cuda_impl {
             backings,
             device,
             persistence,
+            substrate,
             stream_id,
             chunks_per_layer,
             stager,
@@ -281,8 +286,9 @@ mod cuda_impl {
     pub fn load_stream_into_hot(
         backings: &[ChunkedKvBacking],
         device: &Device,
-        persistence: &mut crate::persistence::SubstratePersistence,
-        stream_id: crate::persistence::streams::StreamId,
+        persistence: &mut SubstratePersistence,
+        substrate: &Substrate,
+        stream_id: StreamId,
         chunks_per_layer: usize,
         stager: &mut ColdLoadStager,
     ) -> Result<Vec<SealedSequence>> {
@@ -301,7 +307,7 @@ mod cuda_impl {
         // the whole turn as one chunk by using a very large size —
         // production always has `with_preallocation` capacity.
         let buffer_size = stager.capacity().max(1 << 30);
-        let plan = persistence.plan_chunked_read(stream_id, buffer_size);
+        let plan = persistence.plan_chunked_read(substrate, stream_id, buffer_size);
 
         // Empty turn — no chunks. Build empty sealed sequences per
         // layer (matches the legacy `recover_turn` + `load_to_hot`

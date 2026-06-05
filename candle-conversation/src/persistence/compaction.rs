@@ -16,10 +16,11 @@ use std::path::Path;
 
 use super::checkpoint;
 use super::log_file::{read_record_at, LogFile, LogSource, SUPERBLOCK_SIZE};
-use super::manifest::Manifest;
-use super::record::{encode_record, Record, RecordHeader, RecordType};
+use super::manifest::{encode_conv_state_payload, ConvState, Manifest};
+use super::record::{encode_record, DebugIdPayload, Record, RecordHeader, RecordType};
 use super::walker::{self, WalkEntry};
 use super::Result;
+use crate::substrate::Substrate;
 
 /// Collect every **live** record from `log`, in dependency order, as
 /// `(header, payload)` pairs ready to re-encode.
@@ -31,6 +32,7 @@ use super::Result;
 pub fn collect_live_records(
     log: &mut dyn LogSource,
     manifest: &Manifest,
+    substrate: &Substrate,
 ) -> Result<Vec<(RecordHeader, Vec<u8>)>> {
     let mut out: Vec<(RecordHeader, Vec<u8>)> = Vec::new();
 
@@ -47,7 +49,9 @@ pub fn collect_live_records(
         out.push((r.header, r.payload));
     }
 
-    for (stream_id, entry) in &manifest.streams {
+    // Per-stream live records — sourced from the substrate's in-RAM
+    // stream index (the authoritative state since Phase 3).
+    for (stream_id, entry) in substrate.all_streams() {
         if let Some(decl) = &entry.decl {
             let payload = decl.encode();
             out.push((
@@ -90,12 +94,10 @@ pub fn collect_live_records(
             ));
         }
     }
-    // Synthesised — per-timeline conv metadata the manifest holds decoded.
-    // One record per surviving entry; last-write-wins semantics mean the
-    // manifest already holds the canonical winner per timeline.
-    for (timeline_id, meta) in &manifest.labels {
-        let payload =
-            super::manifest::encode_label_payload(*timeline_id, &meta.conv_id, &meta.label);
+    // Per-timeline Label / ConvState records — synthesised from the
+    // substrate's live label + conv-state state.
+    for (timeline_id, conv_id, label, archived) in substrate.live_conv_meta() {
+        let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label);
         out.push((
             RecordHeader {
                 record_type: RecordType::Label,
@@ -108,25 +110,60 @@ pub fn collect_live_records(
             },
             payload,
         ));
+        if archived {
+            let cs_payload = encode_conv_state_payload(
+                timeline_id,
+                ConvState { archived: true },
+            );
+            out.push((
+                RecordHeader {
+                    record_type: RecordType::ConvState,
+                    format: 0,
+                    payload_len: cs_payload.len() as u64,
+                    crc: 0,
+                    stream_id: 0,
+                    chunk_index: 0,
+                    token_count: 0,
+                },
+                cs_payload,
+            ));
+        }
     }
-    // Per-timeline lifecycle state — same last-write-wins shape as
-    // Label. One record per timeline whose archive state has ever
-    // been touched; default-false states aren't written (the
-    // `write_conv_state` no-op gate plus the default `archived=false`
-    // mean an untouched timeline carries no ConvState record at all).
-    for (timeline_id, state) in &manifest.conv_states {
-        let payload = super::manifest::encode_conv_state_payload(*timeline_id, *state);
+    // Per-(timeline, turn) summary-tree metadata — emit one record
+    // per live tree node directly from substrate state.
+    for payload in substrate.live_tree_metadata_payloads() {
+        let bytes = payload.encode();
         out.push((
             RecordHeader {
-                record_type: RecordType::ConvState,
+                record_type: RecordType::TreeMetadata,
                 format: 0,
-                payload_len: payload.len() as u64,
+                payload_len: bytes.len() as u64,
                 crc: 0,
                 stream_id: 0,
                 chunk_index: 0,
                 token_count: 0,
             },
-            payload,
+            bytes,
+        ));
+    }
+    // Per-timeline debug_id.
+    for (timeline_id, id) in substrate.live_debug_ids() {
+        let payload = DebugIdPayload {
+            timeline_id,
+            debug_id: id,
+        };
+        let bytes = payload.encode();
+        out.push((
+            RecordHeader {
+                record_type: RecordType::DebugId,
+                format: 0,
+                payload_len: bytes.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            bytes,
         ));
     }
     Ok(out)
@@ -182,16 +219,22 @@ pub fn write_compacted_log(
 
 /// Fraction of the log's records that are dead weight — the heuristic that
 /// drives the automatic compaction trigger. `0.0` = nothing to reclaim.
-pub fn dead_record_ratio(log: &mut dyn LogSource, manifest: &Manifest) -> Result<f32> {
+pub fn dead_record_ratio(
+    log: &mut dyn LogSource,
+    manifest: &Manifest,
+    substrate: &Substrate,
+) -> Result<f32> {
     let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
     let total = entries.len();
     if total == 0 {
         return Ok(0.0);
     }
-    // Live on-disk records: read-back records (model/template/chunk/tokens/
-    // signatures) — the StreamDecl/Commit/Label entries collect_live_records
-    // synthesises are excluded from the "live on disk" count.
-    let live_on_disk = collect_live_records(log, manifest)?
+    // Live on-disk records: read-back records (model/template/chunk/
+    // tokens/signatures) — synthesised entries (StreamDecl, Commit,
+    // Label, ConvState, TreeMetadata, DebugId) are not on disk in the
+    // active log; they're re-emitted from substrate state during
+    // compaction.
+    let live_on_disk = collect_live_records(log, manifest, substrate)?
         .iter()
         .filter(|(h, _)| {
             !matches!(
@@ -200,21 +243,22 @@ pub fn dead_record_ratio(log: &mut dyn LogSource, manifest: &Manifest) -> Result
                     | RecordType::Commit
                     | RecordType::Label
                     | RecordType::ConvState
+                    | RecordType::TreeMetadata
+                    | RecordType::DebugId
             )
         })
         .count()
-        + manifest
-            .streams
-            .values()
-            .filter(|s| s.decl.is_some())
+        + substrate
+            .all_streams()
+            .filter(|(_, s)| s.decl.is_some())
             .count()
-        + manifest
-            .streams
-            .values()
-            .filter(|s| s.committed_through.is_some())
+        + substrate
+            .all_streams()
+            .filter(|(_, s)| s.committed_through.is_some())
             .count()
-        + manifest.labels.len()
-        + manifest.conv_states.len();
+        + substrate.live_conv_meta().len()
+        + substrate.live_tree_metadata_payloads().len()
+        + substrate.live_debug_ids().len();
     let dead = total.saturating_sub(live_on_disk.min(total));
     Ok(dead as f32 / total as f32)
 }
@@ -224,7 +268,6 @@ mod tests {
     use super::*;
     use crate::persistence::log_file::MemLog;
     use crate::persistence::record::encode_record;
-    use crate::persistence::streams::StreamId;
 
     fn record(rt: RecordType, stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
         encode_record(
@@ -251,9 +294,10 @@ mod tests {
         blob.extend_from_slice(&record(RecordType::Chunk, 5, 0, b"partial-20tok-dead"));
         blob.extend_from_slice(&record(RecordType::Chunk, 5, 0, b"sealed-final-live"));
         let mut mem = MemLog::with_records(&blob);
-        let (manifest, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&mut mem, &manifest).unwrap();
+        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
         // Exactly: 1 ModelSpec + 1 Chunk = 2 (no StreamDecl/Commit/Tokens here).
         assert_eq!(live.len(), 2);
         let model = live
@@ -281,9 +325,10 @@ mod tests {
         blob.extend_from_slice(&record(RecordType::Chunk, 7, 1, b"c1"));
         blob.extend_from_slice(&record(RecordType::Tokens, 7, 0, b"tokens"));
         let mut mem = MemLog::with_records(&blob);
-        let (before, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (before, before_sub, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
 
-        let live = collect_live_records(&mut mem, &before).unwrap();
+        let live = collect_live_records(&mut mem, &before, &before_sub).unwrap();
         let path = std::env::temp_dir().join(format!(
             "kvtier_compact_{}.log",
             std::time::SystemTime::now()
@@ -291,19 +336,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let (mut new_log, after) = write_compacted_log(&path, &live).unwrap();
+        let (mut new_log, _after_manifest) = write_compacted_log(&path, &live).unwrap();
 
-        // The compacted manifest has the same live streams + chunks.
-        assert_eq!(before.streams.len(), after.streams.len());
-        assert_eq!(
-            before.streams[&StreamId(7)].chunks.len(),
-            after.streams[&StreamId(7)].chunks.len(),
-        );
-        // And it recovers cleanly from disk.
+        // The compacted log re-walked into a substrate has the same
+        // live streams + chunks as the source.
         let hint = new_log.superblock().latest_checkpoint_offset;
-        let recovered = checkpoint::recover(&mut new_log, hint).unwrap();
-        assert_eq!(recovered.manifest.streams.len(), 1);
-        assert_eq!(recovered.manifest.live_chunk_count(), 2);
+        let mut after_sub = Substrate::new();
+        let _ = checkpoint::recover_with_sink(&mut new_log, hint, |e| {
+            after_sub.apply_walker_entry(e)
+        })
+        .unwrap();
+        assert_eq!(before_sub.live_chunk_count(), after_sub.live_chunk_count());
+        assert_eq!(after_sub.live_chunk_count(), 2);
         std::fs::remove_file(&path).ok();
     }
 
@@ -312,8 +356,12 @@ mod tests {
         let mut blob = Vec::new();
         blob.extend_from_slice(&record(RecordType::Chunk, 1, 0, b"only"));
         let mut mem = MemLog::with_records(&blob);
-        let (manifest, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        assert_eq!(dead_record_ratio(&mut mem, &manifest).unwrap(), 0.0);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert_eq!(
+            dead_record_ratio(&mut mem, &manifest, &substrate).unwrap(),
+            0.0
+        );
     }
 
     #[test]
@@ -324,8 +372,9 @@ mod tests {
             blob.extend_from_slice(&record(RecordType::Chunk, 1, 0, format!("v{i}").as_bytes()));
         }
         let mut mem = MemLog::with_records(&blob);
-        let (manifest, _) = Manifest::build_from_walk(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let ratio = dead_record_ratio(&mut mem, &manifest).unwrap();
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let ratio = dead_record_ratio(&mut mem, &manifest, &substrate).unwrap();
         assert!(ratio > 0.8, "7 of 8 records are dead, got ratio {ratio}");
     }
 }

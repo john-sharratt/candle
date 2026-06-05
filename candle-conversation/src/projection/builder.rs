@@ -40,11 +40,17 @@
 
 
 use super::error::ConstructionError;
-use super::ids::{GroupId, LayerId, SectionId};
-use super::project::{run, Projection, ProjectionMode, ProjectionTarget};
-use super::schema::{GroupSchema, LayerSchema, Schema, SectionSchema};
+use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
+use super::project::{run, run_with_sink, Projection, ProjectionMode, ProjectionTarget};
+use super::schema::{
+    Budget, DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection,
+    SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema,
+};
 use super::yaml::{from_yaml, NameMaps};
+use super::project::FIXED_FORMULA;
+use crate::provenance::DEFAULT_SPAN_ALPHA;
 use crate::substrate::ContentResolver;
+use crate::summary_tree::SelectionDiagnostics;
 
 /// Run all construction-time validation checks against a parsed schema.
 ///
@@ -122,7 +128,7 @@ fn validate(schema: &Schema) -> Result<(), ConstructionError> {
 
 fn validate_budget_bounds(
     name: &str,
-    budget: &super::schema::Budget,
+    budget: &Budget,
 ) -> Result<(), ConstructionError> {
     if let (Some(min), Some(max)) = (budget.min_percent, budget.max_percent) {
         if max < min {
@@ -191,9 +197,9 @@ fn substitute_template(template: &str, vars: &[(&str, &str)]) -> Result<String, 
 
 fn validate_selection(
     name: &str,
-    rule: &super::schema::SelectionRule,
+    rule: &SelectionRule,
 ) -> Result<(), ConstructionError> {
-    use super::schema::SelectionRule;
+    use SelectionRule;
     match rule {
         SelectionRule::TopK { k } if *k == 0 => Err(ConstructionError::InvalidTopK {
             name: name.to_string(),
@@ -337,12 +343,12 @@ impl Builder {
         for layer in self.schema.layers.iter_mut() {
             for item in layer.system_prompt.items.iter_mut() {
                 match item {
-                    super::schema::SystemPromptItem::Section(s) => {
+                    SystemPromptItem::Section(s) => {
                         if s.is_template && s.template_tokens.is_none() {
                             s.template_tokens = Some(std::sync::Arc::new(tokenize(&s.content)?));
                         }
                     }
-                    super::schema::SystemPromptItem::Collection(c) => {
+                    SystemPromptItem::Collection(c) => {
                         for s in c.sections.iter_mut() {
                             if s.is_template && s.template_tokens.is_none() {
                                 s.template_tokens =
@@ -442,14 +448,14 @@ impl Builder {
         &self,
         layer: LayerId,
         name: &str,
-    ) -> Option<super::ids::CollectionId> {
+    ) -> Option<CollectionId> {
         self.name_maps
             .collection_names
             .get(&(layer, name.to_string()))
             .copied()
     }
 
-    /// The span Î± used by [`super::project::FIXED_FORMULA`].
+    /// The span α used by [`super::project::FIXED_FORMULA`].
     ///
     /// The BDP scanner in the reprojection path must use the same alpha so
     /// scores accumulated during live decode are consistent with the scores
@@ -457,9 +463,9 @@ impl Builder {
     /// pipeline).  Returns `DEFAULT_SPAN_ALPHA` for non-Span formulas as a
     /// safe fallback.
     pub fn span_alpha(&self) -> f32 {
-        match super::project::FIXED_FORMULA {
-            super::schema::ScoreFormula::Span { alpha } => alpha,
-            _ => crate::provenance::DEFAULT_SPAN_ALPHA,
+        match FIXED_FORMULA {
+            ScoreFormula::Span { alpha } => alpha,
+            _ => DEFAULT_SPAN_ALPHA,
         }
     }
 
@@ -504,7 +510,7 @@ impl Builder {
         self.assert_section_name_free(layer_idx, &name)?;
         let new_id = SectionId::new(self.next_section_id_raw());
         self.schema.layers[layer_idx].system_prompt.items.push(
-            super::schema::SystemPromptItem::Section(SectionSchema {
+            SystemPromptItem::Section(SectionSchema {
                 id: new_id,
                 name: name.clone(),
                 content,
@@ -530,9 +536,9 @@ impl Builder {
         &mut self,
         layer: LayerId,
         name: impl Into<String>,
-        selection: super::schema::SelectionRule,
+        selection: SelectionRule,
         score_threshold: f32,
-    ) -> Result<super::ids::CollectionId, ConstructionError> {
+    ) -> Result<CollectionId, ConstructionError> {
         let name: String = name.into();
         let layer_idx = self.layer_idx(layer)?;
         if self
@@ -548,9 +554,9 @@ impl Builder {
                 value: score_threshold,
             });
         }
-        let new_id = super::ids::CollectionId::new(self.next_collection_id_raw());
+        let new_id = CollectionId::new(self.next_collection_id_raw());
         self.schema.layers[layer_idx].system_prompt.items.push(
-            super::schema::SystemPromptItem::Collection(super::schema::SectionCollection {
+            SystemPromptItem::Collection(SectionCollection {
                 id: new_id,
                 name: name.clone(),
                 sections: Vec::new(),
@@ -576,7 +582,7 @@ impl Builder {
     pub fn add_section_to_collection(
         &mut self,
         layer: LayerId,
-        collection: super::ids::CollectionId,
+        collection: CollectionId,
         name: impl Into<String>,
         content: impl Into<String>,
         priority: f32,
@@ -598,7 +604,7 @@ impl Builder {
             .iter()
             .any(|it| {
                 matches!(it,
-                super::schema::SystemPromptItem::Collection(c) if c.id == collection)
+                SystemPromptItem::Collection(c) if c.id == collection)
             });
         if !coll_exists {
             return Err(ConstructionError::UnknownCollection(format!(
@@ -614,7 +620,7 @@ impl Builder {
             .items
             .iter_mut()
             .find_map(|it| match it {
-                super::schema::SystemPromptItem::Collection(c) if c.id == collection => Some(c),
+                SystemPromptItem::Collection(c) if c.id == collection => Some(c),
                 _ => None,
             })
             .expect("existence checked above");
@@ -650,10 +656,10 @@ impl Builder {
         let layer = &self.schema.layers[layer_idx];
         for it in &layer.system_prompt.items {
             match it {
-                super::schema::SystemPromptItem::Section(s) if s.name == name => {
+                SystemPromptItem::Section(s) if s.name == name => {
                     return Err(ConstructionError::DuplicateSectionName(name.to_string()));
                 }
-                super::schema::SystemPromptItem::Collection(c) => {
+                SystemPromptItem::Collection(c) => {
                     if c.sections.iter().any(|s| s.name == name) {
                         return Err(ConstructionError::DuplicateSectionName(name.to_string()));
                     }
@@ -688,7 +694,7 @@ impl Builder {
             .iter()
             .flat_map(|l| l.system_prompt.items.iter())
             .filter_map(|it| match it {
-                super::schema::SystemPromptItem::Collection(c) => Some(c.id.raw()),
+                SystemPromptItem::Collection(c) => Some(c.id.raw()),
                 _ => None,
             })
             .max()
@@ -728,6 +734,34 @@ impl Builder {
         run(&self.schema, target, resolver, mode)
     }
 
+    /// Variant of [`Self::project_with_mode`] that delivers score-density
+    /// [`SelectionDiagnostics`] to a caller-supplied sink.  The scheduler
+    /// uses this to ferry the diagnostic into the substrate's
+    /// last-selection side-channel without polluting [`Projection`] with
+    /// a test-only field.  When the projection used the rule-based path
+    /// (no summary tree for the target timeline), the sink is never
+    /// invoked.
+    pub fn project_with_mode_and_sink<R: ContentResolver>(
+        &self,
+        target: ProjectionTarget,
+        resolver: &R,
+        mode: ProjectionMode,
+        sink: &mut dyn FnMut(SelectionDiagnostics),
+    ) -> Projection {
+        run_with_sink(&self.schema, target, resolver, mode, sink)
+    }
+
+    /// Token-window budget configured for `layer`.  Used by the
+    /// scheduler to populate `SelectionDiagnostics.budget`.  Returns
+    /// `None` when the layer id isn't in the schema.
+    pub fn schema_layer_window(&self, layer: LayerId) -> Option<usize> {
+        self.schema
+            .layers
+            .iter()
+            .find(|l| l.id == layer)
+            .map(|l| l.window)
+    }
+
     // ── Synthetic construction ────────────────────────────────────────────────
 
     /// Build a minimal single-layer schema around a pre-rendered system-prompt
@@ -745,9 +779,9 @@ impl Builder {
     pub fn for_plain_prompt(system_prompt_text: &str) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
-            super::ids::LayerId::new(1),
-            super::ids::GroupId::new(1),
-            super::ids::SectionId::new(1),
+            LayerId::new(1),
+            GroupId::new(1),
+            SectionId::new(1),
         )
     }
 
@@ -758,12 +792,12 @@ impl Builder {
     /// YAML schema without colliding.
     ///
     /// [`Reserved`]: super::Reserved
-    pub fn for_plain_prompt_reserved(system_prompt_text: &str, kind: super::ids::Reserved) -> Self {
+    pub fn for_plain_prompt_reserved(system_prompt_text: &str, kind: Reserved) -> Self {
         Self::synthetic_single_section(
             system_prompt_text,
-            super::ids::LayerId::reserved(kind),
-            super::ids::GroupId::reserved(kind),
-            super::ids::SectionId::reserved(kind),
+            LayerId::reserved(kind),
+            GroupId::reserved(kind),
+            SectionId::reserved(kind),
         )
     }
 
@@ -773,15 +807,10 @@ impl Builder {
     /// caller-supplied ids.
     fn synthetic_single_section(
         system_prompt_text: &str,
-        layer_id: super::ids::LayerId,
-        group_id: super::ids::GroupId,
-        section_id: super::ids::SectionId,
+        layer_id: LayerId,
+        group_id: GroupId,
+        section_id: SectionId,
     ) -> Self {
-        use super::schema::{
-            Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionSchema, SelectionRule,
-            SystemPromptSchema,
-        };
-
         let schema = Schema {
             layers: vec![LayerSchema {
                 id: layer_id,
@@ -795,7 +824,7 @@ impl Builder {
                     max_percent: None,
                 },
                 system_prompt: SystemPromptSchema {
-                    items: vec![super::schema::SystemPromptItem::Section(SectionSchema {
+                    items: vec![SystemPromptItem::Section(SectionSchema {
                         id: section_id,
                         name: "frame".to_string(),
                         content: system_prompt_text.to_string(),
@@ -823,7 +852,7 @@ impl Builder {
 
         // Populate name maps so `id_for_layer` / `id_for_group` /
         // `id_for_section_in` work the same as for YAML-derived builders.
-        let mut name_maps = super::yaml::NameMaps::default();
+        let mut name_maps = NameMaps::default();
         name_maps
             .layer_names
             .insert("dialogue".to_string(), layer_id);

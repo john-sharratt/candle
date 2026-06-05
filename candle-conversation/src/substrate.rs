@@ -54,10 +54,19 @@ use std::collections::{BTreeMap, HashMap, LinkedList};
 use std::sync::Arc;
 
 use crate::persistence::content_hash::turn_stream_id;
-use crate::persistence::streams::StreamId;
+use crate::persistence::manifest::{
+    decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
+};
+use crate::persistence::record::{DebugIdPayload, RecordType, TreeMetadataPayload};
+use crate::persistence::streams::{StreamDecl, StreamId};
+use crate::persistence::walker::WalkEntry;
 use crate::projection::{DepthWeights, ScoreFormula};
 use crate::projection::{
     GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
+};
+use crate::summary_tree::{
+    select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
+    TurnKind,
 };
 use crate::token_buffer::TokenBuffer;
 use crate::SigEntry;
@@ -120,6 +129,37 @@ pub struct Substrate {
     /// membership invariant as [`Self::hot_lru`] but tracking
     /// `residence[idx].warm`.
     warm_lru: LinkedList<ResidenceIndex>,
+
+    /// Per-stream in-RAM index of where each chunk / tokens record /
+    /// signatures record / committed-through watermark sits on disk.
+    /// Built by replaying the redo log on startup (and updated on
+    /// every fresh append).  Cold-load and seal-time persistence read
+    /// this directly — it used to live as `Manifest.streams`, but
+    /// since the manifest gets serialised into every `Checkpoint`
+    /// record, mirroring per-chunk pointers there forced the
+    /// checkpoint payload to scale with chunk count.  Holding the
+    /// index in the substrate's RAM instead bounds the checkpoint
+    /// payload to a few hundred bytes regardless of stream size; the
+    /// per-stream `BTreeMap` only ever sits in memory.
+    streams: HashMap<StreamId, StreamRuntime>,
+
+    /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
+    /// Populated by [`Self::set_debug_id`] and the cold-load reader.
+    /// Provides O(1) lookup for the test-harness `find_or_create`
+    /// pattern (§10.4 of `docs/infinite_conversations.md`).
+    timeline_by_debug_id: HashMap<String, TimelineId>,
+
+    /// Walker scratch: `Label` / `ConvState` payloads decoded for a
+    /// timeline that hasn't yet been registered.  Zend writes the
+    /// `Label` (carrying conv_id) immediately on conversation
+    /// creation, before any TurnDecl exists, so the walker hits the
+    /// Label record first and the TurnDecl second.  Stashing here
+    /// lets `register_timeline` drain and apply pending meta when
+    /// the timeline finally registers — otherwise restored
+    /// conversations would vanish from the sidebar listing because
+    /// their `conv_id` would never reach the TimelineEntry.
+    pending_conv_meta: HashMap<u64, ConvMeta>,
+    pending_conv_state: HashMap<u64, ConvState>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -658,6 +698,40 @@ pub trait ContentResolver {
         0
     }
 
+    /// Score-density selection over a timeline's summary tree
+    /// (`docs/infinite_conversations.md` §8).  Returns the chrono-
+    /// logically ordered `(turn_index, effective_score)` list for the
+    /// given timeline, fitted into `budget` tokens, or `None` when no
+    /// summary tree exists yet for that timeline.
+    ///
+    /// When `Some(_)`, the projection's step-9 reconciler skips the
+    /// flexbox / rule-based budget allocation for this timeline's
+    /// target group and emits the returned list verbatim — score-
+    /// density already picked turns inside `budget`.
+    ///
+    /// Default impl returns `None` so existing test resolvers and
+    /// non-summary-tree groups keep their current behaviour.
+    fn summary_tree_select(
+        &self,
+        _timeline: TimelineId,
+        _budget: u32,
+        _formula: ScoreFormula,
+        _weights: &DepthWeights,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        None
+    }
+
+    /// Number of turns currently awaiting the async summariser for
+    /// `timeline`.  Used by the projection to populate the
+    /// score-density backpressure metric inside its diagnostic sink
+    /// (§9 of `docs/infinite_conversations.md`).  Default returns 0.
+    fn pending_summary_len(
+        &self,
+        _timeline: TimelineId,
+    ) -> usize {
+        0
+    }
+
     /// Relevance score for a system-prompt section.  Default returns
     /// `0.0` — concrete resolvers (e.g. [`Substrate`]) override
     /// this with BDP-derived scores.
@@ -731,6 +805,109 @@ pub struct TimelineEntry {
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
     pub turns: BTreeMap<TurnIndex, TurnEntryData>,
+    /// Per-turn tree metadata for the infinite-conversation summary
+    /// tree (`docs/infinite_conversations.md` §5).  Parallel to
+    /// `turns`: every recorded turn carries exactly one
+    /// [`TreeNodeMeta`] entry (defaults to a `Normal` content
+    /// sub-leaf with no children).  Promoted to a
+    /// `SummaryOfTurns` / `SummaryOfSummaries` by the async
+    /// summariser thread after the §6 probe runs.
+    pub tree_meta: BTreeMap<TurnIndex, TreeNodeMeta>,
+    /// Root of the per-timeline summary tree.  `None` until the first
+    /// `SummaryOfTurns` leaf is sealed.  Persisted as part of the
+    /// timeline's `TreeMetadata` records on the redo log and
+    /// reconstructed on cold-load.
+    pub tree_root: Option<TurnIndex>,
+    /// Optional substrate-side resume key.  Set via
+    /// [`Substrate::set_debug_id`] and reverse-indexed by
+    /// [`Substrate::timeline_by_debug_id`].  Used by the
+    /// debug-id-resumable grow-conversation harness (§10.4).
+    pub debug_id: Option<String>,
+    /// Turns currently waiting on the async summariser to absorb them
+    /// into the tree (i.e. they have arrived in the substrate but the
+    /// summariser thread has not yet produced or extended a
+    /// `SummaryOfTurns` leaf covering them).  Drained in FIFO order by
+    /// the summariser's `pop_pending_turn` API.
+    pub pending_summary_queue: std::collections::VecDeque<TurnIndex>,
+    /// Summary nodes whose stored Q-fingerprint is stale because their
+    /// children changed (most commonly after an AVL rotation).  The
+    /// summariser sweep regenerates one per pass (§7.3).
+    pub dirty_summary_set: std::collections::BTreeSet<TurnIndex>,
+    /// Most recent score-density [`SelectionDiagnostics`] for this
+    /// timeline, written by the scheduler at projection time and read
+    /// by the test harness via
+    /// [`Substrate::last_selection_of`].  Last-write-wins across
+    /// re-projections within a single turn — by the time `send_turn`
+    /// returns, this holds the final selection that produced the
+    /// model's response.  Test-harness diagnostic only; production
+    /// daemons can ignore it.
+    pub last_selection: Option<SelectionDiagnostics>,
+}
+
+/// Tree-bookkeeping metadata stored alongside every substrate turn.
+///
+/// Every persisted turn carries one of these — defaults are a `Normal`
+/// content sub-leaf with no children and a clean dirty flag.  Summary
+/// nodes (produced by the §6 probe) overwrite the defaults with the
+/// real kind / children / height when the summariser thread seals
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNodeMeta {
+    /// Three-kind tag from `summary_tree::TurnKind`, mirrored here so
+    /// the substrate is the single source of truth and the redo-log
+    /// codec can round-trip without depending on the algorithm module.
+    pub kind: TurnKind,
+    /// For `SummaryOfTurns`: the Normal-turn children in
+    /// chronological order.  For `SummaryOfSummaries`: exactly the
+    /// `[left, right]` summary children.  For `Normal`: empty.
+    pub children: Vec<TurnIndex>,
+    /// AVL height for binary summary nodes.  Always `0` for `Normal`.
+    /// `SummaryOfTurns` defaults to `1`; `SummaryOfSummaries` carries
+    /// `max(child_height) + 1` per the standard AVL invariant.
+    pub tree_height: u8,
+    /// `true` when this summary's children have changed since the
+    /// stored content (and its Q-fingerprint) was generated.  The
+    /// summariser sweep clears this when it regenerates.
+    pub dirty: bool,
+}
+
+impl Default for TreeNodeMeta {
+    fn default() -> Self {
+        Self {
+            kind: TurnKind::Normal,
+            children: Vec::new(),
+            tree_height: 0,
+            dirty: false,
+        }
+    }
+}
+
+impl TreeNodeMeta {
+    /// Sensible default for a Normal content turn.
+    pub fn normal() -> Self {
+        Self::default()
+    }
+}
+
+/// Per-stream in-RAM runtime state — built by replaying the redo log
+/// on startup and updated on every fresh append.
+///
+/// Holds everything `Manifest.streams.<id>` used to hold; moving it
+/// here keeps the `Checkpoint` record payload bounded by singleton
+/// count instead of per-chunk count.  The chunk index supports O(1)
+/// `(stream_id, chunk_idx) → ChunkLoc` lookup for cold-load.
+#[derive(Debug, Clone, Default)]
+pub struct StreamRuntime {
+    /// The decoded stream declaration (`StreamDecl` record).
+    pub decl: Option<StreamDecl>,
+    /// Live chunk locations by chunk index — last-writer-wins.
+    pub chunks: BTreeMap<u64, ChunkLoc>,
+    /// Latest `Tokens` record for the stream.
+    pub tokens: Option<RecordLoc>,
+    /// Latest `Signatures` record for the stream.
+    pub signatures: Option<RecordLoc>,
+    /// Highest chunk index the stream is durably committed through.
+    pub committed_through: Option<u64>,
 }
 
 impl TimelineEntry {
@@ -742,6 +919,12 @@ impl TimelineEntry {
             conv_id: None,
             archived: false,
             turns: BTreeMap::new(),
+            tree_meta: BTreeMap::new(),
+            tree_root: None,
+            debug_id: None,
+            pending_summary_queue: std::collections::VecDeque::new(),
+            dirty_summary_set: std::collections::BTreeSet::new(),
+            last_selection: None,
         }
     }
 
@@ -1344,6 +1527,20 @@ impl Substrate {
             .entry(group)
             .or_default()
             .push(timeline);
+        // Drain any walker-stashed conv meta / state that arrived
+        // before this timeline registered.  Sidebar listing depends
+        // on the conv_id landing on the TimelineEntry.
+        if let Some(meta) = self.pending_conv_meta.remove(&timeline.raw()) {
+            if !meta.conv_id.is_empty() {
+                self.set_conv_id(timeline, &meta.conv_id);
+            }
+            if !meta.label.is_empty() {
+                self.set_label(timeline, &meta.label);
+            }
+        }
+        if let Some(state) = self.pending_conv_state.remove(&timeline.raw()) {
+            let _ = self.set_archived(timeline, state.archived);
+        }
     }
 
     pub fn mint_timeline(
@@ -1392,6 +1589,576 @@ impl Substrate {
             .get(&group)
             .into_iter()
             .flat_map(|v| v.iter().copied())
+    }
+
+    // ── debug_id resume keys ────────────────────────────────────────────────
+
+    /// Set the substrate-side resume key for a timeline.  Replaces any
+    /// previous mapping for the same `id`; clears the old mapping if
+    /// the timeline already had a different debug_id.  Used by the
+    /// test harness's `find_or_create(debug_id)` path (§10.4) and
+    /// reconstructed on cold-load from the timeline's record stream.
+    pub fn set_debug_id(&mut self, timeline: TimelineId, id: impl Into<String>) {
+        let id = id.into();
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            if let Some(old) = tl.debug_id.take() {
+                if old != id {
+                    self.timeline_by_debug_id.remove(&old);
+                }
+            }
+            tl.debug_id = Some(id.clone());
+            self.timeline_by_debug_id.insert(id, timeline);
+        }
+    }
+
+    /// Look up a timeline by its `debug_id`.  O(1).
+    pub fn lookup_by_debug_id(&self, id: &str) -> Option<TimelineId> {
+        self.timeline_by_debug_id.get(id).copied()
+    }
+
+    /// Current `debug_id` for a timeline, if one has been set.
+    pub fn debug_id_of(&self, timeline: TimelineId) -> Option<&str> {
+        self.timelines
+            .get(&timeline)
+            .and_then(|tl| tl.debug_id.as_deref())
+    }
+
+    // ── Tree metadata read / write ───────────────────────────────────────────
+
+    /// Read the parallel [`TreeNodeMeta`] for a turn.  Returns `None`
+    /// when the timeline or the turn index is unknown.
+    pub fn tree_meta_of(&self, timeline: TimelineId, idx: TurnIndex) -> Option<&TreeNodeMeta> {
+        self.timelines
+            .get(&timeline)
+            .and_then(|tl| tl.tree_meta.get(&idx))
+    }
+
+    /// Overwrite a turn's [`TreeNodeMeta`].  The summariser thread
+    /// calls this once it has decided how a turn slots into the
+    /// summary tree (Normal sub-leaf vs SummaryOfTurns leaf vs
+    /// SummaryOfSummaries internal).  Clearing `dirty` is the caller's
+    /// responsibility; this method writes the value verbatim.
+    pub fn set_tree_meta(&mut self, timeline: TimelineId, idx: TurnIndex, meta: TreeNodeMeta) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            tl.tree_meta.insert(idx, meta);
+        }
+    }
+
+    /// Mark a summary node dirty (children changed; stored Q-fingerprint
+    /// no longer reflects the subtree).  Adds the node to the dirty set
+    /// so the summariser sweep picks it up.  No-op for Normal turns.
+    pub fn mark_summary_dirty(&mut self, timeline: TimelineId, idx: TurnIndex) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            if let Some(meta) = tl.tree_meta.get_mut(&idx) {
+                if meta.kind.is_summary() {
+                    meta.dirty = true;
+                    tl.dirty_summary_set.insert(idx);
+                }
+            }
+        }
+    }
+
+    /// Clear the dirty bit + remove from the dirty set.  Called by the
+    /// summariser after a regeneration probe completes successfully.
+    pub fn clear_summary_dirty(&mut self, timeline: TimelineId, idx: TurnIndex) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            if let Some(meta) = tl.tree_meta.get_mut(&idx) {
+                meta.dirty = false;
+            }
+            tl.dirty_summary_set.remove(&idx);
+        }
+    }
+
+    /// Current tree root of a timeline.
+    pub fn tree_root_of(&self, timeline: TimelineId) -> Option<TurnIndex> {
+        self.timelines.get(&timeline).and_then(|tl| tl.tree_root)
+    }
+
+    /// Set the tree root for a timeline.  Used by the summariser
+    /// thread after every insertion that surfaces a new root.
+    pub fn set_tree_root(&mut self, timeline: TimelineId, root: Option<TurnIndex>) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            tl.tree_root = root;
+        }
+    }
+
+    // ── Pending + dirty queue accessors (§6 backpressure metrics) ──────────
+
+    /// FIFO pop: next pending turn for the summariser to absorb, or
+    /// `None` if the queue is empty.
+    pub fn pop_pending_summary(&mut self, timeline: TimelineId) -> Option<TurnIndex> {
+        self.timelines
+            .get_mut(&timeline)
+            .and_then(|tl| tl.pending_summary_queue.pop_front())
+    }
+
+    /// Push a turn onto the pending-summary queue.  Used during
+    /// cold-load reconstruction (§4) to re-enqueue orphan turns whose
+    /// summary parent didn't survive a crash.
+    pub fn push_pending_summary(&mut self, timeline: TimelineId, idx: TurnIndex) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            tl.pending_summary_queue.push_back(idx);
+        }
+    }
+
+    /// Pop the oldest dirty summary node.  Returns `None` when no
+    /// summary is currently dirty.  The summariser sweep regenerates
+    /// at most one node per pass (§7.3).
+    pub fn pop_oldest_dirty(&mut self, timeline: TimelineId) -> Option<TurnIndex> {
+        let tl = self.timelines.get_mut(&timeline)?;
+        let id = *tl.dirty_summary_set.iter().next()?;
+        tl.dirty_summary_set.remove(&id);
+        Some(id)
+    }
+
+    /// `pending_summary_queue.len()` — backpressure metric (§9).
+    pub fn pending_summary_len(&self, timeline: TimelineId) -> usize {
+        self.timelines
+            .get(&timeline)
+            .map(|tl| tl.pending_summary_queue.len())
+            .unwrap_or(0)
+    }
+
+    /// `dirty_summary_set.len()` — backpressure metric (§9).
+    pub fn dirty_summary_len(&self, timeline: TimelineId) -> usize {
+        self.timelines
+            .get(&timeline)
+            .map(|tl| tl.dirty_summary_set.len())
+            .unwrap_or(0)
+    }
+
+    /// Store the latest score-density [`SelectionDiagnostics`] for a
+    /// timeline.  Called by the scheduler at projection time;
+    /// last-write-wins across re-projections within a turn.  Pure
+    /// test-harness instrumentation — production daemons can ignore.
+    pub fn set_last_selection(&mut self, timeline: TimelineId, diag: SelectionDiagnostics) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            tl.last_selection = Some(diag);
+        }
+    }
+
+    /// Most recent [`SelectionDiagnostics`] for a timeline, or `None`
+    /// if no projection has run yet (or the projection used the
+    /// rule-based path).
+    pub fn last_selection_of(&self, timeline: TimelineId) -> Option<&SelectionDiagnostics> {
+        self.timelines
+            .get(&timeline)
+            .and_then(|tl| tl.last_selection.as_ref())
+    }
+
+    /// Chronologically-ordered `SummaryOfTurns` leaf turn indices for
+    /// a timeline.  Walked by the projection's score-density selector
+    /// (§8) to evaluate the right-edge recency anchor.  Empty when no
+    /// summary tree exists yet.
+    pub fn summary_leaves_chrono(&self, timeline: TimelineId) -> Vec<TurnIndex> {
+        let tl = match self.timelines.get(&timeline) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        tl.tree_meta
+            .iter()
+            .filter(|(_, m)| m.kind == TurnKind::SummaryOfTurns)
+            .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// Chronologically-ordered `Normal` turn indices for a timeline.
+    pub fn normal_turns_chrono(&self, timeline: TimelineId) -> Vec<TurnIndex> {
+        let tl = match self.timelines.get(&timeline) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        tl.tree_meta
+            .iter()
+            .filter(|(_, m)| m.kind == TurnKind::Normal)
+            .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// Chronologically-ordered `SummaryOfSummaries` internal-node turn
+    /// indices for a timeline.
+    pub fn summary_internals_chrono(&self, timeline: TimelineId) -> Vec<TurnIndex> {
+        let tl = match self.timelines.get(&timeline) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        tl.tree_meta
+            .iter()
+            .filter(|(_, m)| m.kind == TurnKind::SummaryOfSummaries)
+            .map(|(idx, _)| *idx)
+            .collect()
+    }
+
+    /// All registered timelines.
+    pub fn all_timeline_ids(&self) -> impl Iterator<Item = TimelineId> + '_ {
+        self.timelines.keys().copied()
+    }
+
+    // ── Per-stream runtime state (was Manifest.streams) ─────────────────
+
+    /// Read the in-RAM runtime state for `stream_id` — chunk index +
+    /// latest tokens/signatures locations + committed-through
+    /// watermark + decl.
+    pub fn stream_of(&self, stream_id: StreamId) -> Option<&StreamRuntime> {
+        self.streams.get(&stream_id)
+    }
+
+    /// True iff the substrate has any record of `stream_id`.
+    pub fn has_stream(&self, stream_id: StreamId) -> bool {
+        self.streams.contains_key(&stream_id)
+    }
+
+    /// All stream ids known to the substrate.
+    pub fn all_stream_ids(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.streams.keys().copied()
+    }
+
+    /// Iterate `(stream_id, &StreamRuntime)` pairs.
+    pub fn all_streams(&self) -> impl Iterator<Item = (StreamId, &StreamRuntime)> + '_ {
+        self.streams.iter().map(|(k, v)| (*k, v))
+    }
+
+    /// Total live chunk count across all streams.  Used by the
+    /// compaction dead-ratio calculation.
+    pub fn live_chunk_count(&self) -> usize {
+        self.streams.values().map(|s| s.chunks.len()).sum()
+    }
+
+    /// Clear every per-entity collection populated from redo-log
+    /// records — used by `compact()` after the active log swap to
+    /// re-walk the freshly-compacted log into substrate state with
+    /// updated offsets.  Singleton-style state (timeline registrations,
+    /// per-turn KV residence slots) is preserved.
+    pub fn clear_walker_state(&mut self) {
+        self.streams.clear();
+        self.timeline_by_debug_id.clear();
+        for tl in self.timelines.values_mut() {
+            tl.label = None;
+            tl.conv_id = None;
+            tl.archived = false;
+            tl.debug_id = None;
+            tl.tree_meta.clear();
+            tl.tree_root = None;
+            tl.pending_summary_queue.clear();
+            tl.dirty_summary_set.clear();
+        }
+    }
+
+    /// Emit `(timeline_id, conv_id, label, archived)` quads for every
+    /// timeline that holds non-default values.  Used by compaction to
+    /// re-emit live `Label` / `ConvState` records.
+    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool)> {
+        self.timelines
+            .iter()
+            .filter_map(|(tid, tl)| {
+                let conv_id = tl.conv_id.clone().unwrap_or_default();
+                let label = tl.label.clone().unwrap_or_default();
+                if conv_id.is_empty() && label.is_empty() && !tl.archived {
+                    None
+                } else {
+                    Some((tid.raw(), conv_id, label, tl.archived))
+                }
+            })
+            .collect()
+    }
+
+    /// Emit one `TreeMetadataPayload` per live tree node across every
+    /// timeline.  Used by compaction to re-emit live `TreeMetadata`
+    /// records.
+    pub fn live_tree_metadata_payloads(&self) -> Vec<TreeMetadataPayload> {
+        let mut out = Vec::new();
+        for (tid, tl) in &self.timelines {
+            for (idx, meta) in &tl.tree_meta {
+                let kind = match meta.kind {
+                    TurnKind::Normal => 0,
+                    TurnKind::SummaryOfTurns => 1,
+                    TurnKind::SummaryOfSummaries => 2,
+                };
+                let root_now = if tl.tree_root == Some(*idx) {
+                    Some(idx.0)
+                } else {
+                    None
+                };
+                out.push(TreeMetadataPayload {
+                    timeline_id: tid.raw(),
+                    turn_index: idx.0,
+                    kind,
+                    tree_height: meta.tree_height,
+                    dirty: meta.dirty,
+                    children: meta.children.iter().map(|c| c.0).collect(),
+                    root_now,
+                });
+            }
+        }
+        out
+    }
+
+    /// Emit `(timeline_id, debug_id)` for every timeline that has one
+    /// set.  Used by compaction to re-emit live `DebugId` records.
+    pub fn live_debug_ids(&self) -> Vec<(u64, String)> {
+        self.timelines
+            .iter()
+            .filter_map(|(tid, tl)| tl.debug_id.as_ref().map(|id| (tid.raw(), id.clone())))
+            .collect()
+    }
+
+    /// Install a stream declaration.  Idempotent: subsequent decls for
+    /// the same stream overwrite (last-writer-wins).
+    pub fn apply_stream_decl(&mut self, stream_id: StreamId, decl: StreamDecl) {
+        // Turn decls implicitly register their timeline.  The walker
+        // pass applies records in log order; without this, a `Label`
+        // record carrying the conv_id (written after `NewConversation`
+        // but typically before any TurnDecl) would land before the
+        // timeline exists in `self.timelines` and `set_conv_id`
+        // would silently no-op.  Net effect was that restored
+        // conversations vanished from the sidebar listing.
+        if let StreamDecl::Turn(t) = &decl {
+            if let (Some(timeline), Some(layer), Some(group)) = (
+                TimelineId::from_raw(t.timeline_id),
+                LayerId::from_raw(t.layer_id),
+                GroupId::from_raw(t.group_id),
+            ) {
+                self.register_timeline(timeline, layer, group);
+            }
+        }
+        self.streams.entry(stream_id).or_default().decl = Some(decl);
+    }
+
+    /// Record a chunk location for `stream_id` at chunk index `idx`.
+    /// Last-writer-wins on `idx`.
+    pub fn apply_chunk_loc(&mut self, stream_id: StreamId, idx: u64, loc: ChunkLoc) {
+        self.streams
+            .entry(stream_id)
+            .or_default()
+            .chunks
+            .insert(idx, loc);
+    }
+
+    /// Record the latest `Tokens` record location for `stream_id`.
+    pub fn apply_tokens_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
+        self.streams.entry(stream_id).or_default().tokens = Some(loc);
+    }
+
+    /// Record the latest `Signatures` record location for `stream_id`.
+    pub fn apply_signatures_loc(&mut self, stream_id: StreamId, loc: RecordLoc) {
+        self.streams.entry(stream_id).or_default().signatures = Some(loc);
+    }
+
+    /// Record the highest chunk index the stream is durably committed
+    /// through.  Last-writer-wins.
+    pub fn apply_commit_through(&mut self, stream_id: StreamId, through_index: u64) {
+        self.streams.entry(stream_id).or_default().committed_through = Some(through_index);
+    }
+
+    // ── Per-timeline LWW payload applicators (decode + dispatch) ────────
+
+    /// Apply a decoded `ConvMeta` (Label payload).  When the
+    /// timeline isn't registered yet (Label record written before
+    /// the first TurnDecl — the common zend pattern), the meta is
+    /// stashed in `pending_conv_meta` and drained by
+    /// `register_timeline` once the matching TurnDecl arrives.
+    pub fn apply_conv_meta(&mut self, timeline_raw: u64, meta: &ConvMeta) {
+        let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
+            return;
+        };
+        if self.timelines.contains_key(&timeline) {
+            if !meta.conv_id.is_empty() {
+                self.set_conv_id(timeline, &meta.conv_id);
+            }
+            if !meta.label.is_empty() {
+                self.set_label(timeline, &meta.label);
+            }
+        } else {
+            // Merge into any prior pending entry so an earlier
+            // partial Label (conv_id only) plus a later partial
+            // (label only) both survive registration.
+            let slot = self.pending_conv_meta.entry(timeline_raw).or_default();
+            if !meta.conv_id.is_empty() {
+                slot.conv_id = meta.conv_id.clone();
+            }
+            if !meta.label.is_empty() {
+                slot.label = meta.label.clone();
+            }
+        }
+    }
+
+    /// Apply a decoded `ConvState` payload.  Same stash-and-drain
+    /// pattern as [`Self::apply_conv_meta`] for unregistered
+    /// timelines.
+    pub fn apply_conv_state(&mut self, timeline_raw: u64, state: ConvState) {
+        let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
+            return;
+        };
+        if self.timelines.contains_key(&timeline) {
+            let _ = self.set_archived(timeline, state.archived);
+        } else {
+            self.pending_conv_state.insert(timeline_raw, state);
+        }
+    }
+
+    /// Apply a decoded `TreeMetadataPayload`.  Sets per-turn tree
+    /// meta + (if `root_now` is set) the timeline's tree root.
+    pub fn apply_tree_metadata_payload(&mut self, payload: &TreeMetadataPayload) {
+        let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
+            return;
+        };
+        let kind = match payload.kind {
+            0 => TurnKind::Normal,
+            1 => TurnKind::SummaryOfTurns,
+            2 => TurnKind::SummaryOfSummaries,
+            _ => return,
+        };
+        let meta = TreeNodeMeta {
+            kind,
+            children: payload
+                .children
+                .iter()
+                .map(|c| TurnIndex(*c))
+                .collect(),
+            tree_height: payload.tree_height,
+            dirty: payload.dirty,
+        };
+        self.set_tree_meta(timeline, TurnIndex(payload.turn_index), meta);
+        if let Some(root) = payload.root_now {
+            self.set_tree_root(timeline, Some(TurnIndex(root)));
+        }
+    }
+
+    /// Apply a decoded `DebugIdPayload`.
+    pub fn apply_debug_id_payload(&mut self, payload: &DebugIdPayload) {
+        let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
+            return;
+        };
+        self.set_debug_id(timeline, payload.debug_id.clone());
+    }
+
+    /// Apply one walked redo-log record directly into the substrate's
+    /// in-RAM state.  The dispatch lives here (not on `Manifest`)
+    /// because per-entity records — chunks, stream decls, labels,
+    /// tree metadata, debug ids — are substrate state, not manifest
+    /// state.  The manifest only sees singletons (`ModelSpec`,
+    /// `Template`, `Tokenizer`, `Checkpoint`).
+    ///
+    /// Called from `SubstratePersistence::recover_with_substrate_sink`
+    /// during startup so the walker pass populates both the manifest's
+    /// singleton hints and the substrate's per-entity state in one
+    /// sweep over the log.
+    pub fn apply_walker_entry(&mut self, entry: &WalkEntry) {
+        let h = &entry.record.header;
+        let stream_id = StreamId(h.stream_id);
+        match h.record_type {
+            RecordType::StreamDecl => {
+                if let Ok(decl) = StreamDecl::decode(&entry.record.payload) {
+                    self.apply_stream_decl(stream_id, decl);
+                }
+            }
+            RecordType::Chunk => {
+                self.apply_chunk_loc(
+                    stream_id,
+                    h.chunk_index,
+                    ChunkLoc {
+                        offset: entry.offset,
+                        payload_len: h.payload_len,
+                        record_size: entry.size,
+                        token_count: h.token_count,
+                        format: h.format,
+                    },
+                );
+            }
+            RecordType::Tokens => {
+                self.apply_tokens_loc(
+                    stream_id,
+                    RecordLoc {
+                        offset: entry.offset,
+                        payload_len: h.payload_len,
+                        record_size: entry.size,
+                    },
+                );
+            }
+            RecordType::Signatures => {
+                self.apply_signatures_loc(
+                    stream_id,
+                    RecordLoc {
+                        offset: entry.offset,
+                        payload_len: h.payload_len,
+                        record_size: entry.size,
+                    },
+                );
+            }
+            RecordType::Commit => {
+                self.apply_commit_through(stream_id, h.chunk_index);
+            }
+            RecordType::Label => {
+                if let Ok((tl, meta)) = decode_label_payload(&entry.record.payload) {
+                    self.apply_conv_meta(tl, &meta);
+                }
+            }
+            RecordType::ConvState => {
+                if let Ok((tl, state)) = decode_conv_state_payload(&entry.record.payload) {
+                    self.apply_conv_state(tl, state);
+                }
+            }
+            RecordType::TreeMetadata => {
+                if let Ok(payload) = TreeMetadataPayload::decode(&entry.record.payload) {
+                    self.apply_tree_metadata_payload(&payload);
+                }
+            }
+            RecordType::DebugId => {
+                if let Ok(payload) = DebugIdPayload::decode(&entry.record.payload) {
+                    self.apply_debug_id_payload(&payload);
+                }
+            }
+            // Singletons go to the manifest, not the substrate.
+            RecordType::ModelSpec
+            | RecordType::Template
+            | RecordType::Tokenizer
+            | RecordType::Checkpoint
+            | RecordType::Unknown => {}
+        }
+    }
+
+    /// Build an in-memory [`summary_tree::SummaryTree`] from the
+    /// timeline's persisted `tree_meta`.  Used by the projection's
+    /// score-density selector (§8) and the cold-load missing-child
+    /// regeneration sweep.
+    ///
+    /// The returned tree's [`NodeId`](NodeId)
+    /// values are `TurnIndex.0` directly — there's a 1-to-1 mapping
+    /// between substrate turns and tree nodes.
+    pub fn build_summary_tree_in_memory(
+        &self,
+        timeline: TimelineId,
+    ) -> SummaryTree {
+        let mut tree = SummaryTree::new();
+        let tl = match self.timelines.get(&timeline) {
+            Some(t) => t,
+            None => return tree,
+        };
+        for (idx, meta) in &tl.tree_meta {
+            let token_count = tl
+                .turns
+                .get(idx)
+                .map(|e| e.content.token_count as u32)
+                .unwrap_or(0);
+            let node_children: Vec<NodeId> =
+                meta.children.iter().map(|c| NodeId(c.0)).collect();
+            let node = Node {
+                id: NodeId(idx.0),
+                kind: meta.kind,
+                children: node_children,
+                tree_height: meta.tree_height,
+                dirty: meta.dirty,
+                tokens: token_count,
+            };
+            tree.insert_node(node);
+            match meta.kind {
+                TurnKind::Normal => tree.push_chrono_normal(NodeId(idx.0)),
+                TurnKind::SummaryOfTurns => tree.push_chrono_leaf(NodeId(idx.0)),
+                TurnKind::SummaryOfSummaries => {}
+            }
+        }
+        tree.set_root(tl.tree_root.map(|r| NodeId(r.0)));
+        tree
     }
 
     // ── Append paths ─────────────────────────────────────────────────────────
@@ -1449,6 +2216,12 @@ impl Substrate {
                 },
             },
         );
+        // Every persisted turn carries a parallel `TreeNodeMeta`.  New
+        // turns default to a `Normal` content sub-leaf and are pushed
+        // onto the summariser's pending queue so the async thread can
+        // absorb them into a `SummaryOfTurns` leaf.
+        tl.tree_meta.insert(idx, TreeNodeMeta::default());
+        tl.pending_summary_queue.push_back(idx);
         idx
     }
 
@@ -1501,6 +2274,8 @@ impl Substrate {
                     },
                 },
             );
+            tl.tree_meta.insert(idx, TreeNodeMeta::default());
+            tl.pending_summary_queue.push_back(idx);
         }
         if !sealed_cpu.is_empty() {
             self.install_hot(residence, sealed_cpu);
@@ -1555,6 +2330,15 @@ impl Substrate {
                     },
                 },
             );
+            // Tree metadata defaults to a Normal sub-leaf — a
+            // subsequent `TreeMetadata` redo-log record (if present)
+            // overwrites this with the persisted kind / children /
+            // height during cold-load.  Restored turns are NOT pushed
+            // onto the pending queue: that queue captures only fresh
+            // turns the live summariser hasn't seen yet.  The
+            // missing-child reload sweep in §10.6 re-enqueues anything
+            // the persisted tree records as still-orphan.
+            tl.tree_meta.insert(idx, TreeNodeMeta::default());
         }
         if let Some(cold_seqs) = cold {
             if !cold_seqs.is_empty() {
@@ -1719,7 +2503,7 @@ impl Substrate {
         &mut self,
         timeline: TimelineId,
         index: TurnIndex,
-        entries: Vec<crate::provenance::SigEntry>,
+        entries: Vec<SigEntry>,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
             entry.content.sig_entries = entries;
@@ -1730,7 +2514,7 @@ impl Substrate {
         &mut self,
         timeline: TimelineId,
         index: TurnIndex,
-        entries: impl IntoIterator<Item = crate::provenance::SigEntry>,
+        entries: impl IntoIterator<Item = SigEntry>,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
             entry.content.sig_entries.extend(entries);
@@ -1743,7 +2527,7 @@ impl Substrate {
         &self,
         timeline: TimelineId,
         index: TurnIndex,
-    ) -> Vec<crate::provenance::SigEntry> {
+    ) -> Vec<SigEntry> {
         self.turn(timeline, index)
             .map(|e| e.content.sig_entries.clone())
             .unwrap_or_default()
@@ -2021,22 +2805,15 @@ impl Substrate {
     /// O(thousands) at most so this is fine.  Returns the first match
     /// when duplicate `debug_name`s exist (callers should keep names
     /// unique per workspace).
-    pub fn section_id_for_debug_name(
-        &self,
-        persistence: &crate::persistence::SubstratePersistence,
-        debug_name: &str,
-    ) -> Option<SectionId> {
-        // Find the stream id matching this debug_name in the manifest.
-        let stream_id = persistence
-            .manifest()
-            .streams
-            .iter()
+    pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<SectionId> {
+        // Find the stream id matching this debug_name from the
+        // substrate's in-RAM stream index (the authoritative source
+        // since Phase 3 — the manifest no longer holds per-entity
+        // state).
+        let stream_id = self
+            .all_streams()
             .find_map(|(sid, entry)| match entry.decl.as_ref()? {
-                crate::persistence::streams::StreamDecl::PromptSection(s)
-                    if s.debug_name == debug_name =>
-                {
-                    Some(*sid)
-                }
+                StreamDecl::PromptSection(s) if s.debug_name == debug_name => Some(sid),
                 _ => None,
             })?;
         // Map stream_id back to the in-RAM SectionId via the residence
@@ -2146,7 +2923,7 @@ impl Substrate {
             .map_or((0, 0), |e| e.block_range)
     }
 
-    pub fn section_sig_entries(&self, section: SectionId) -> &[crate::provenance::SigEntry] {
+    pub fn section_sig_entries(&self, section: SectionId) -> &[SigEntry] {
         self.sections
             .get(&section)
             .map_or(&[][..], |e| &e.sig_entries)
@@ -2322,6 +3099,83 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         }
         combine_per_depth(self.scores.section(section), formula, weights)
     }
+
+    fn summary_tree_select(
+        &self,
+        timeline: TimelineId,
+        budget: u32,
+        formula: ScoreFormula,
+        weights: &DepthWeights,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        // No tree yet → fall through to the rule-based path.
+        let root = self.substrate.tree_root_of(timeline)?;
+        // Reachability guard: if the recorded root isn't actually
+        // present, treat as "no tree" rather than crash.
+        if self.substrate.tree_meta_of(timeline, root).is_none() {
+            return None;
+        }
+        let tree = self.substrate.build_summary_tree_in_memory(timeline);
+        if tree.is_empty() {
+            return None;
+        }
+        let mut scores: ahash::AHashMap<NodeId, f32> =
+            ahash::AHashMap::default();
+        for id in tree.all_ids() {
+            let idx = TurnIndex(id.0);
+            // A tree node without a backing substrate turn is an
+            // orphan — possible if the redo log holds TreeMetadata
+            // records whose matching TurnDecl never landed (e.g. an
+            // older session ran before summariser persistence was
+            // wired up).  These can't be elevated, so they must be
+            // excluded from the selection that flows into the
+            // projection / elevate path.  Leaving them in `scores`
+            // with a default 0.0 wouldn't help — `select_dense`
+            // walks the tree shape and would still return them.
+            if self.substrate.turn(timeline, idx).is_none() {
+                continue;
+            }
+            let s = combine_per_depth(
+                self.scores.turn(timeline, idx),
+                formula,
+                weights,
+            );
+            scores.insert(id, s);
+        }
+        let cfg = RecencyConfig::default();
+        let sel = select_dense(&tree, &scores, cfg, budget);
+        // Convert (NodeId, SelectionOrigin) pairs back to TurnIndex,
+        // dropping any picks whose tree node has no backing
+        // substrate turn.  The substrate-turn check at scoring time
+        // (above) only guards scoring — `select_dense` walks the
+        // tree shape and can still return orphan NodeIds; this
+        // post-filter is what actually keeps them out of the
+        // elevate plan.
+        let out: Vec<_> = sel
+            .selected
+            .iter()
+            .zip(sel.origins.iter())
+            .filter_map(|(id, origin)| {
+                let idx = TurnIndex(id.0);
+                if self.substrate.turn(timeline, idx).is_none() {
+                    return None;
+                }
+                let eff = sel
+                    .effective_scores
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0.0);
+                Some((idx, *origin, eff))
+            })
+            .collect();
+        Some(out)
+    }
+
+    fn pending_summary_len(
+        &self,
+        timeline: TimelineId,
+    ) -> usize {
+        self.substrate.pending_summary_len(timeline)
+    }
 }
 
 // ── Guards ────────────────────────────────────────────────────────────────────
@@ -2440,6 +3294,13 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         }
         combine_per_depth(self.scores_or_empty().section(section), formula, weights)
     }
+
+    fn pending_summary_len(
+        &self,
+        timeline: TimelineId,
+    ) -> usize {
+        self.guard.pending_summary_len(timeline)
+    }
 }
 
 /// Write guard over a [`Substrate`] inside a [`super::resolver::Conversation`].
@@ -2466,10 +3327,10 @@ impl<'a> std::ops::DerefMut for SubstrateWrite<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{GroupId, LayerId, SectionId, TimelineAllocator};
+    use crate::projection::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId};
     use crate::token_buffer::TokenBuffer;
 
-    fn make_timeline() -> (LayerId, GroupId, crate::projection::TimelineId, Substrate) {
+    fn make_timeline() -> (LayerId, GroupId, TimelineId, Substrate) {
         let layer = LayerId::for_test(1);
         let group = GroupId::for_test(1);
         let alloc = TimelineAllocator::new();
@@ -2477,6 +3338,100 @@ mod tests {
         let mut sub = Substrate::new();
         sub.register_timeline(timeline, layer, group);
         (layer, group, timeline, sub)
+    }
+
+    // ── Phase 1: TreeNodeMeta + debug_id substrate APIs ──────────────────
+
+    #[test]
+    fn appended_turn_gets_default_tree_meta_as_normal() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let idx = sub.append_with_blocks(timeline, 10, 0, 1);
+        let meta = sub.tree_meta_of(timeline, idx).expect("meta present");
+        assert_eq!(meta.kind, TurnKind::Normal);
+        assert!(meta.children.is_empty());
+        assert_eq!(meta.tree_height, 0);
+        assert!(!meta.dirty);
+    }
+
+    #[test]
+    fn appended_turn_pushed_onto_pending_summary_queue() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let idx_a = sub.append_with_blocks(timeline, 10, 0, 1);
+        let idx_b = sub.append_with_blocks(timeline, 10, 1, 2);
+        assert_eq!(sub.pending_summary_len(timeline), 2);
+        assert_eq!(sub.pop_pending_summary(timeline), Some(idx_a));
+        assert_eq!(sub.pop_pending_summary(timeline), Some(idx_b));
+        assert_eq!(sub.pop_pending_summary(timeline), None);
+    }
+
+    #[test]
+    fn set_tree_meta_overwrites_in_place() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let idx = sub.append_with_blocks(timeline, 10, 0, 1);
+        let meta = TreeNodeMeta {
+            kind: TurnKind::SummaryOfTurns,
+            children: vec![TurnIndex(99)],
+            tree_height: 1,
+            dirty: false,
+        };
+        sub.set_tree_meta(timeline, idx, meta.clone());
+        assert_eq!(sub.tree_meta_of(timeline, idx), Some(&meta));
+        let leaves = sub.summary_leaves_chrono(timeline);
+        assert_eq!(leaves, vec![idx]);
+    }
+
+    #[test]
+    fn mark_summary_dirty_indexes_into_dirty_set() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let idx = sub.append_with_blocks(timeline, 10, 0, 1);
+        // Marking a Normal turn is a no-op.
+        sub.mark_summary_dirty(timeline, idx);
+        assert_eq!(sub.dirty_summary_len(timeline), 0);
+        // Convert to summary then mark dirty.
+        sub.set_tree_meta(
+            timeline,
+            idx,
+            TreeNodeMeta {
+                kind: TurnKind::SummaryOfTurns,
+                ..Default::default()
+            },
+        );
+        sub.mark_summary_dirty(timeline, idx);
+        assert_eq!(sub.dirty_summary_len(timeline), 1);
+        assert_eq!(sub.pop_oldest_dirty(timeline), Some(idx));
+        assert_eq!(sub.dirty_summary_len(timeline), 0);
+        // After pop the meta's `dirty` flag is still true — the caller
+        // (the summariser) clears it explicitly via `clear_summary_dirty`
+        // once the regeneration probe lands.  This decoupling lets the
+        // sweep batch the regeneration without losing the dirty bit on
+        // a crash mid-sweep.
+        assert!(sub.tree_meta_of(timeline, idx).unwrap().dirty);
+        sub.clear_summary_dirty(timeline, idx);
+        assert!(!sub.tree_meta_of(timeline, idx).unwrap().dirty);
+    }
+
+    #[test]
+    fn debug_id_round_trip_and_lookup() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        assert_eq!(sub.lookup_by_debug_id("foo"), None);
+        sub.set_debug_id(timeline, "coherent-50");
+        assert_eq!(sub.lookup_by_debug_id("coherent-50"), Some(timeline));
+        assert_eq!(sub.debug_id_of(timeline), Some("coherent-50"));
+        // Replacing supersedes — old key disappears.
+        sub.set_debug_id(timeline, "two-topics-100");
+        assert_eq!(sub.lookup_by_debug_id("coherent-50"), None);
+        assert_eq!(sub.lookup_by_debug_id("two-topics-100"), Some(timeline));
+    }
+
+    #[test]
+    fn tree_root_set_and_get() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        assert_eq!(sub.tree_root_of(timeline), None);
+        let idx = sub.append_with_blocks(timeline, 10, 0, 1);
+        sub.set_tree_root(timeline, Some(idx));
+        assert_eq!(sub.tree_root_of(timeline), Some(idx));
+        sub.set_tree_root(timeline, None);
+        assert_eq!(sub.tree_root_of(timeline), None);
     }
 
     /// Identity migration: returns the input unchanged (simulates CPU == GPU in tests).
@@ -2879,5 +3834,72 @@ mod tests {
         assert_eq!(conv_id, "abc");
         assert_eq!(label, "tour");
         assert!(*archived);
+    }
+
+    /// Regression: zend's redo log writes the `Label` record carrying
+    /// `conv_id` immediately on conversation creation, before any
+    /// TurnDecl exists.  On reopen, the walker would replay the
+    /// Label first and the TurnDecl second.  If `apply_conv_meta`
+    /// dropped the meta when the timeline wasn't registered yet,
+    /// every restored conversation would vanish from the sidebar
+    /// because `conv_id` never reached the TimelineEntry.
+    #[test]
+    fn conv_meta_before_timeline_registration_survives() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let timeline = alloc.next();
+        let mut sub = Substrate::new();
+
+        let meta = super::ConvMeta {
+            conv_id: "1780659918260".to_string(),
+            label: String::new(),
+        };
+        sub.apply_conv_meta(timeline.raw(), &meta);
+        sub.apply_conv_state(timeline.raw(), super::ConvState { archived: false });
+        assert!(
+            sub.known_conversations().is_empty(),
+            "pre-registration: meta stashed, not visible yet"
+        );
+
+        sub.register_timeline(timeline, layer, group);
+
+        let convs = sub.known_conversations();
+        assert_eq!(convs.len(), 1, "post-registration: drained meta visible");
+        assert_eq!(convs[0].1, "1780659918260");
+    }
+
+    /// Partial Label payloads merge in the stash — an earlier
+    /// conv_id-only Label and a later label-only Label must both
+    /// land on the TimelineEntry when registration finally drains
+    /// the pending state.
+    #[test]
+    fn pending_conv_meta_merges_partial_updates() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let timeline = alloc.next();
+        let mut sub = Substrate::new();
+
+        sub.apply_conv_meta(
+            timeline.raw(),
+            &super::ConvMeta {
+                conv_id: "abc".into(),
+                label: String::new(),
+            },
+        );
+        sub.apply_conv_meta(
+            timeline.raw(),
+            &super::ConvMeta {
+                conv_id: String::new(),
+                label: "tour".into(),
+            },
+        );
+        sub.register_timeline(timeline, layer, group);
+
+        let convs = sub.known_conversations();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].1, "abc");
+        assert_eq!(convs[0].2, "tour");
     }
 }

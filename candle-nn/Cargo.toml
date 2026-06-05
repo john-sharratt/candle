@@ -36,6 +36,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 rand_distr = { workspace = true }
 criterion = { workspace = true }
+# Required by the `candle::test_device!` macro (re-exported from
+# candle-core) which annotates GPU test variants with
+# `#[serial_test::serial]` to serialise per-device test execution.
+serial_test = "3.0"
 
 [features]
 default = []

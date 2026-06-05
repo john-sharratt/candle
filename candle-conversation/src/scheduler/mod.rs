@@ -19,14 +19,23 @@ use crate::persistence::cold_load::{
 };
 use crate::persistence::elevate::{elevate_to_hot, evict_from_hot};
 use crate::persistence::thread::PersistenceTrigger;
+use crate::persistence::content_hash::{section_stream_id, turn_stream_id};
+use crate::persistence::resume::encode_signatures;
+use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
-    Builder, Conversation, GroupId, ProjectionMode, ProjectionTarget, SectionId, TurnIndex, TurnKey,
+    Builder, Conversation, GeneratedIdentity, GroupId, ProjectionMode, ProjectionSegment,
+    ProjectionTarget, ResolvedSection, SealedKind, SectionId, TimelineId, TurnIndex, TurnKey,
 };
-#[cfg(feature = "sig-trace")]
-use crate::provenance::TokenSignature;
+use crate::provenance::{
+    extract_mh_signatures_from_r16_dump, merge_turn_signatures_xor, BdpScanner, SigEntry,
+    TokenSignature, TurnSignatures,
+};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
+use crate::substrate::{ResidenceIndex, TurnPartWrite};
+use crate::summary_tree::{SelectionDiagnostics, SummariserTrigger, TurnKind};
 use crate::think_strip::strip_think_blocks;
 use crate::token_buffer::TokenBuffer;
+use crate::turn::Role;
 use crate::{ProvenanceFile, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -58,7 +67,7 @@ pub(crate) enum SchedulerRequest {
     /// [`Self::SubmitTurn`] handler (when running the projection) and
     /// the seal step (when writing the new turn into the substrate).
     /// Callers must mint the timeline up-front via
-    /// [`crate::projection::Conversation::mint_timeline`] so the
+    /// [`Conversation::mint_timeline`] so the
     /// substrate's registry is in sync before the first `SubmitTurn`.
     ///
     /// No prefill; system content is pinned in the substrate ahead of
@@ -79,7 +88,7 @@ pub(crate) enum SchedulerRequest {
     ///
     /// The substrate is expected to already have `timeline` registered
     /// (typically from a previous session restored via
-    /// [`crate::projection::Conversation::open`]).  The handler looks
+    /// [`Conversation::open`]).  The handler looks
     /// up `(layer, group)` from the substrate's registry to construct
     /// the slot's `ProjectionTarget`, then proceeds like
     /// [`Self::NewSequence`].
@@ -88,7 +97,7 @@ pub(crate) enum SchedulerRequest {
     #[allow(dead_code)] // public scheduler API; used by Phase 2 resume callers
     ResumeSequence {
         conversation: Conversation,
-        timeline: crate::projection::TimelineId,
+        timeline: TimelineId,
         response_tx: Sender<Result<SequenceId, ConversationError>>,
     },
 
@@ -207,7 +216,7 @@ pub(crate) enum SchedulerRequest {
         /// persistence stream id from this and uses it to declare the
         /// SectionDecl + write Tokens/Signatures records at seal time
         /// — see `SealAction::Section`.
-        address: crate::persistence::streams::ContentAddress,
+        address: ContentAddress,
         /// Section's symbolic name (schema item id or tool name) used
         /// purely as diagnostic metadata on the SectionDecl record.
         debug_name: String,
@@ -243,8 +252,8 @@ pub(crate) enum SchedulerRequest {
         /// the right `Arc<RwLock<Substrate>>`.
         conversation: Conversation,
         section_id: SectionId,
-        stream_id: crate::persistence::streams::StreamId,
-        address: crate::persistence::streams::ContentAddress,
+        stream_id: StreamId,
+        address: ContentAddress,
         chunks_per_layer: usize,
         /// Pre-tokenised section content — the same byte sequence
         /// the original prefill used.  Reused verbatim so we don't
@@ -295,6 +304,31 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<
             Result<Vec<(usize, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>)>, ConversationError>,
         >,
+    },
+
+    /// Run a §6 summary probe over a list of child substrate turns.
+    ///
+    /// The scheduler builds a probe slot — synthetic "summariser"
+    /// system section + injected child K/V chunks + "Summarise the
+    /// above turns." prefill + structured-JSON decode — and seals the
+    /// decoded turn into the substrate as `kind = SummaryOfTurns`
+    /// (when `children.len() ≥ 1` and `kind = SummaryOfTurns`) or
+    /// `kind = SummaryOfSummaries` (when `kind = SummaryOfSummaries`,
+    /// `children.len() == 2`).  Replies with the new substrate
+    /// `TurnIndex`.
+    ///
+    /// The scheduler holds a pinned "summariser" system section that
+    /// every probe prefixes for free (cached K/V).  See
+    /// [`crate::summary_tree::SUMMARISER_SYSTEM_PROMPT`].
+    SubmitSummaryProbe {
+        timeline: TimelineId,
+        kind: TurnKind,
+        children: Vec<TurnIndex>,
+        /// `Ok(turn_index)` on success — the sealed substrate
+        /// `TurnIndex` of the new summary turn.  `Err(msg)` on a
+        /// soft failure (model output unparseable, transient GPU
+        /// error); the summariser retries.
+        response_tx: Sender<Result<TurnIndex, String>>,
     },
 
     /// Shut down the scheduler.
@@ -381,7 +415,7 @@ pub(crate) struct ReprojectionPolicy {
     pub(crate) target: ProjectionTarget,
     pub(crate) projection: Arc<Builder>,
     pub(crate) substrate: Conversation,
-    pub(crate) provenance: Arc<crate::provenance::ProvenanceFile>,
+    pub(crate) provenance: Arc<ProvenanceFile>,
     pub(crate) provenance_layer_indices: ProvenanceLayerIndices,
     /// Cadence trigger: re-project after every `every_n_tokens` decoded
     /// tokens.  `0` disables the cadence trigger (punctuation triggers
@@ -466,7 +500,7 @@ struct DecodeState {
     /// `perform_seal_and_write` so seal-time extraction covers only the
     /// residual partial block (and any post-decode tail tokens), not the
     /// bulk that the bg_quantizer may have already compressed.
-    prov_sig_entries: Vec<crate::provenance::SigEntry>,
+    prov_sig_entries: Vec<SigEntry>,
     /// Trailing structural tokens forwarded into the slot after
     /// decode finishes, before the seal.  Today's seal path leaves
     /// this empty (the `assistant_end` boundary is a live
@@ -538,7 +572,7 @@ pub(crate) enum SealAction {
     Section {
         section_id: SectionId,
         tokens: Arc<Vec<u32>>,
-        address: crate::persistence::streams::ContentAddress,
+        address: ContentAddress,
         debug_name: String,
         /// Propagated from `SchedulerRequest::IngestSection` — `true`
         /// when this section is a schema-Collection member (a tool in
@@ -566,7 +600,7 @@ pub(crate) enum SealAction {
 /// caller doesn't care about cross-process restore).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TurnContent {
-    pub role: crate::turn::Role,
+    pub role: Role,
     /// The user's message text — exactly what `submit_turn`
     /// received, no role-marker envelope, no `/no_think` prefix.
     pub user_text: String,
@@ -585,7 +619,7 @@ pub(crate) struct TurnContent {
 /// section's current hot residence via `section_residence(section_id)`
 /// when the drain runs.
 struct PendingSectionQuantize {
-    section_id: crate::projection::SectionId,
+    section_id: SectionId,
     /// Propagated from `SealAction::Section::in_collection` — drives
     /// the drain's choice of compression policy.  Collection members
     /// (tools in a tool catalog, hits in a retrieval list, etc.) take
@@ -653,7 +687,7 @@ pub(super) struct ActiveSectionIngest {
     /// Content address derived from the section's tokens + cumulative
     /// prefix at IngestSection time.  Used to derive the persistence
     /// stream id at seal — see `SealAction::Section::address`.
-    pub(super) address: crate::persistence::streams::ContentAddress,
+    pub(super) address: ContentAddress,
     /// Section's symbolic name for the SectionDecl record — see
     /// `SealAction::Section::debug_name`.
     pub(super) debug_name: String,
@@ -796,7 +830,7 @@ pub(crate) struct Scheduler {
 
     /// Workspace-shared provenance signature file.  All seals across
     /// all slots append into this same mmap-backed file.
-    provenance: Arc<crate::provenance::ProvenanceFile>,
+    provenance: Arc<ProvenanceFile>,
 
     /// Static model properties captured at engine construction.
     model_core: ModelCoreProperties,
@@ -809,6 +843,14 @@ pub(crate) struct Scheduler {
     /// after every turn-seal so the thread runs its hot→warm→cold
     /// drain promptly instead of waiting up to 5 s on its tick.
     persist_trigger: PersistenceTrigger,
+
+    /// Trigger handle for the async summariser thread.  Fired after
+    /// every turn-seal (`docs/infinite_conversations.md` §4 step ③)
+    /// so the freshly-pending Normal turn is absorbed into the AVL
+    /// summary tree on the next pass instead of waiting up to 250 ms
+    /// for the periodic tick.  Backpressure-clearing is purely a
+    /// latency optimisation — the tick alone is correct.
+    summariser_trigger: SummariserTrigger,
 
     /// Sections that have been ingested (their native K/V is installed
     /// in `substrate.section.hot`) but haven't been quantized to the
@@ -913,6 +955,7 @@ impl Scheduler {
         provenance: Arc<ProvenanceFile>,
         model_core: ModelCoreProperties,
         persist_trigger: PersistenceTrigger,
+        summariser_trigger: SummariserTrigger,
         boundary_markers: projection_assembler::BoundaryMarkers,
     ) -> Self {
         let device = model.device().clone();
@@ -967,6 +1010,7 @@ impl Scheduler {
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
             persist_trigger,
+            summariser_trigger,
             pending_section_quantize: Vec::new(),
             elevate_pinned_scratch: preallocate_pinned_scratch(
                 PINNED_PREALLOC_BYTES,
@@ -1098,6 +1142,13 @@ impl Scheduler {
                 // so the resolved `timeline` for each `(g, t)` pair
                 // doesn't get thrown away.
                 let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
+                // Captured from the projection if it ran the
+                // score-density path; written to the substrate's
+                // side-channel below, after the read guard drops.
+                let mut diag_to_write: Option<(
+                    TimelineId,
+                    SelectionDiagnostics,
+                )> = None;
                 let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) =
                     (projection_inputs.as_ref(), slot_target)
                 {
@@ -1118,11 +1169,22 @@ impl Scheduler {
                     let view = conversation.read_for(target);
                     // Prefill mode: section scoring uses the calibrated
                     // prefill profile (Max / semantic depth, no threshold)
-                    // against the prefill-Q section corpus.
-                    let projection =
-                        inputs
-                            .projection
-                            .project_with_mode(target, &view, ProjectionMode::Prefill);
+                    // against the prefill-Q section corpus.  The sink
+                    // captures score-density diagnostics for the test
+                    // harness (§10.8.4) on a substrate-side side-channel.
+                    // Last-write-wins per timeline; the recall test reads
+                    // it via `Conversation::last_selection_diagnostics`
+                    // after `send_turn` returns.  Sink is never invoked
+                    // when the rule-based path runs (no tree on the
+                    // target timeline).
+                    let projection = inputs.projection.project_with_mode_and_sink(
+                        target,
+                        &view,
+                        ProjectionMode::Prefill,
+                        &mut |diag| {
+                            diag_to_write = Some((target.timeline, diag));
+                        },
+                    );
                     // The schema's projection is the single source
                     // of truth for system-side sections — emit
                     // exactly what the projection picked, in
@@ -1144,7 +1206,7 @@ impl Scheduler {
                     // first-of-group (a Phase-1 single-timeline
                     // assumption that holds for cross-group references
                     // in our current schema).
-                    let resolve_timeline = |g: GroupId| -> Option<crate::projection::TimelineId> {
+                    let resolve_timeline = |g: GroupId| -> Option<TimelineId> {
                         if g == target.group {
                             Some(target.timeline)
                         } else {
@@ -1152,8 +1214,7 @@ impl Scheduler {
                         }
                     };
                     let mut sections: Vec<SectionId> = Vec::new();
-                    let mut segments: Vec<crate::projection::ProjectionSegment> = Vec::new();
-                    use crate::projection::{ProjectionSegment, SealedKind};
+                    let mut segments: Vec<ProjectionSegment> = Vec::new();
                     for seg in &projection.segments {
                         match seg {
                             ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
@@ -1207,9 +1268,9 @@ impl Scheduler {
                     // `assistant_end` boundary, so the assembler
                     // batches them into a single live-prefill run.
                     let pos = segments.len();
-                    segments.push(crate::projection::ProjectionSegment::Generated {
+                    segments.push(ProjectionSegment::Generated {
                         tokens: self.boundary_markers.user_start.clone(),
-                        identity: crate::projection::GeneratedIdentity {
+                        identity: GeneratedIdentity {
                             name: "user_start_current".into(),
                             position: pos,
                         },
@@ -1218,6 +1279,16 @@ impl Scheduler {
                 } else {
                     (Vec::new(), Vec::new())
                 };
+
+                // Read guard dropped above when the projection block
+                // exited; now safe to take a write guard for the
+                // diagnostic side-channel.  No-op when projection used
+                // the rule-based path (no tree on the target timeline).
+                if let Some((timeline, diag)) = diag_to_write {
+                    if let Some(conv) = self.slot_conversations.get(&parent_id) {
+                        conv.write().set_last_selection(timeline, diag);
+                    }
+                }
 
                 // Step 1.5: select-promote (cold → warm → hot).
                 //
@@ -1506,7 +1577,6 @@ impl Scheduler {
                 let result = if section_ids.is_empty() {
                     Ok(())
                 } else {
-                    use crate::projection::{ProjectionSegment, ResolvedSection, SealedKind};
                     // Elevate priming sections cold→hot before
                     // `apply_projection`.  Cold-marker sections
                     // restored from the redo log have `hot = None`
@@ -1603,8 +1673,60 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::SubmitSummaryProbe {
+                timeline,
+                kind,
+                children,
+                response_tx,
+            } => {
+                let result = self.handle_summary_probe(timeline, kind, children);
+                let _ = response_tx.send(result);
+                true
+            }
+
             SchedulerRequest::Shutdown => false,
         }
+    }
+
+    /// Execute a §6 summary probe.  Phase-1 implementation: append a
+    /// placeholder summary turn directly to the substrate (zero-block
+    /// extent, no KV chunks) and return its TurnIndex.  Real
+    /// model-driven probes hook into this site — the slot construction
+    /// (synthetic system section + injected children K/V + structured
+    /// JSON decode) runs as an in-line scheduler request similar to
+    /// `SubmitTurn` but with a different post-decode handler.  The
+    /// substrate write path is identical (record_summary_turn → tree_meta
+    /// set), so the summariser thread sees the same interface.
+    ///
+    /// The append goes through [`Conversation::record_summary_turn`],
+    /// which persists a `TurnDecl` to the redo log alongside the
+    /// in-memory insert.  Without that, the tree's `TreeMetadata`
+    /// records would replay on reopen with no matching turn, leaving
+    /// orphan nodes that score-density would happily pick and
+    /// elevate would warn about.
+    fn handle_summary_probe(
+        &mut self,
+        timeline: TimelineId,
+        _kind: TurnKind,
+        _children: Vec<TurnIndex>,
+    ) -> Result<TurnIndex, String> {
+        // Resolve which conversation owns this timeline.  We look up
+        // through any slot that's registered against the same target.
+        let conv = self
+            .slot_conversations
+            .values()
+            .find(|c| c.read().timeline_target(timeline).is_some())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "SubmitSummaryProbe: no conversation registered for timeline {timeline}"
+                )
+            })?;
+        // ~20-token summary, no KV chunks (residence cold).  The
+        // summariser thread immediately overwrites the tree_meta;
+        // either way the substrate turn exists and is persisted.
+        conv.record_summary_turn(timeline, 20)
+            .map_err(|e| format!("SubmitSummaryProbe: persist failed: {e}"))
     }
 
     // —— Sequence creation ——————————————————————————————————————————
@@ -1726,7 +1848,7 @@ impl Scheduler {
         &mut self,
         parent_id: SequenceId,
         system_block_count: BlockCount,
-        segments: &[crate::projection::ProjectionSegment],
+        segments: &[ProjectionSegment],
     ) -> Result<(), ConversationError> {
         let _ = system_block_count;
 
@@ -1779,7 +1901,7 @@ impl Scheduler {
         // Expects the caller to have run `elevate_to_hot` upstream so
         // every projected turn is hot-resident — any miss is logged
         // and skipped.
-        let turn_keys: Vec<(GroupId, TurnIndex, crate::projection::TimelineId)> = {
+        let turn_keys: Vec<(GroupId, TurnIndex, TimelineId)> = {
             let view = conversation.read();
             projected_turns
                 .iter()
@@ -2031,7 +2153,7 @@ impl Scheduler {
                             full_tokens.extend_from_slice(&state.post_decode_tokens);
 
                             Some(TurnContent {
-                                role: crate::turn::Role::Assistant,
+                                role: Role::Assistant,
                                 user_text: state.user_text.clone(),
                                 assistant_text: text.clone(),
                                 token_ids: TokenBuffer::from(full_tokens),
@@ -2102,8 +2224,8 @@ impl Scheduler {
         &mut self,
         conversation: &Conversation,
         section_id: SectionId,
-        stream_id: crate::persistence::streams::StreamId,
-        _address: crate::persistence::streams::ContentAddress,
+        stream_id: StreamId,
+        _address: ContentAddress,
         _chunks_per_layer: usize,
         tokens: TokenBuffer,
     ) -> Result<(), ConversationError> {
@@ -2126,10 +2248,10 @@ impl Scheduler {
         let sig_bytes = conversation
             .read_section_signatures(stream_id)
             .map_err(ConversationError::Model)?;
-        let sig_entries: Vec<crate::provenance::SigEntry> = if sig_bytes.is_empty() {
+        let sig_entries: Vec<SigEntry> = if sig_bytes.is_empty() {
             Vec::new()
         } else {
-            let n_bytes = crate::provenance::TokenSignature::BYTE_LEN;
+            let n_bytes = TokenSignature::BYTE_LEN;
             let mut out = Vec::with_capacity(sig_bytes.len());
             for (token_count, bytes) in &sig_bytes {
                 let tc = *token_count as usize;
@@ -2141,13 +2263,13 @@ impl Scheduler {
                     );
                     continue;
                 }
-                let depth = |d: usize| -> Vec<crate::provenance::TokenSignature> {
+                let depth = |d: usize| -> Vec<TokenSignature> {
                     bytes[d * tc * n_bytes..(d + 1) * tc * n_bytes]
                         .chunks_exact(n_bytes)
                         .map(|c| {
-                            let arr: [u8; crate::provenance::TokenSignature::BYTE_LEN] =
+                            let arr: [u8; TokenSignature::BYTE_LEN] =
                                 c.try_into().unwrap();
-                            crate::provenance::TokenSignature::from_bytes(&arr)
+                            TokenSignature::from_bytes(&arr)
                         })
                         .collect()
                 };
@@ -2303,7 +2425,7 @@ impl Scheduler {
         section_id: SectionId,
         seal_block_from: usize,
         tokens: Arc<Vec<u32>>,
-        address: crate::persistence::streams::ContentAddress,
+        address: ContentAddress,
         debug_name: String,
         in_collection: bool,
     ) -> Result<SealResult, ConversationError> {
@@ -2413,7 +2535,7 @@ impl Scheduler {
     /// argument.
     fn quantize_pending_sections(
         &mut self,
-        conversation: &crate::projection::Conversation,
+        conversation: &Conversation,
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
@@ -2423,8 +2545,8 @@ impl Scheduler {
         // sealed, in_collection); the per-layer loop below groups by
         // in_collection so each policy gets its own batched launch.
         let pending: Vec<(
-            crate::projection::SectionId,
-            crate::substrate::ResidenceIndex,
+            SectionId,
+            ResidenceIndex,
             Vec<SealedSequence>,
             bool,
         )> = {
@@ -2567,7 +2689,7 @@ impl Scheduler {
         seal_block_from: usize,
         seal_action: &SealAction,
         turn_content: Option<TurnContent>,
-        pre_sigs: Vec<crate::provenance::SigEntry>,
+        pre_sigs: Vec<SigEntry>,
     ) -> Result<Option<SealResult>, ConversationError> {
         // The substrate target (where a `SealAction::Turn` write
         // lands) is read from `slot_targets` rather than threaded
@@ -2612,7 +2734,7 @@ impl Scheduler {
             prag_l0,
             prag_l4,
         } = self.model_core.provenance_layer_indices;
-        let mut new_sig_entries: Vec<crate::provenance::SigEntry> = pre_sigs;
+        let mut new_sig_entries: Vec<SigEntry> = pre_sigs;
         let mut new_processed = prev_processed;
 
         // Actual fill count of the last block — may be < CHUNK_SIZE for the
@@ -2730,7 +2852,7 @@ impl Scheduler {
                 // the substrate stores the user and assistant text
                 // separately — clean strings the sidebar can render
                 // without re-tokenising at read time.
-                let write = crate::substrate::TurnPartWrite {
+                let write = TurnPartWrite {
                     user_text,
                     assistant_text,
                     token_ids,
@@ -2784,7 +2906,7 @@ impl Scheduler {
                     // only references the (ephemeral) provenance file, so
                     // read each entry's bytes and embed them in a
                     // `Signatures` record.
-                    let stream_id = crate::persistence::content_hash::turn_stream_id(
+                    let stream_id = turn_stream_id(
                         target.timeline.raw(),
                         idx.0,
                     );
@@ -2803,7 +2925,7 @@ impl Scheduler {
                             }
                         }
                     }
-                    let payload = crate::persistence::resume::encode_signatures(&sig_bytes);
+                    let payload = encode_signatures(&sig_bytes);
                     if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
                         tracing::warn!("persist signatures failed: {e}");
                     }
@@ -2814,7 +2936,7 @@ impl Scheduler {
                 // are deferred to the persistence thread; we fire its
                 // trigger below.
                 {
-                    use crate::persistence::content_hash::turn_stream_id;
+                    use turn_stream_id;
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
                     if let Err(e) = conversation.persist_tokens_only(stream_id, &persist_token_ids)
                     {
@@ -2825,6 +2947,11 @@ impl Scheduler {
                 // turn (hot→warm migrate, warm→cold redo-log write,
                 // group fsync) without waiting for its 5 s tick.
                 self.persist_trigger.fire();
+                // Wake the summariser thread (`docs/infinite_conversations.md`
+                // §4 step ③) so the freshly-pending Normal turn gets
+                // absorbed into the AVL summary tree on its next pass
+                // instead of waiting up to 250 ms for the periodic tick.
+                self.summariser_trigger.fire();
                 // Trim the slot's live-prefill capture cache down to
                 // the working set this projection actually touched.
                 // Without trimming, each turn would append at least
@@ -2848,7 +2975,7 @@ impl Scheduler {
             } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
                 let stream_id =
-                    crate::persistence::content_hash::section_stream_id(*address);
+                    section_stream_id(*address);
                 let policy_active = self.session.compression_policy().is_some();
                 {
                     let mut view = conversation.write();
@@ -2923,7 +3050,7 @@ impl Scheduler {
                             }
                         }
                     }
-                    let payload = crate::persistence::resume::encode_signatures(&sig_bytes);
+                    let payload = encode_signatures(&sig_bytes);
                     if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
                         tracing::warn!("persist section signatures failed: {e}");
                     }
@@ -2956,8 +3083,8 @@ impl Scheduler {
     /// the inject borrow rather than trying to recover.
     fn hot_turn_or_skip(
         conversation: &Conversation,
-        timeline: crate::projection::TimelineId,
-        index: crate::projection::TurnIndex,
+        timeline: TimelineId,
+        index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
         conversation.read().turn_sealed_of(timeline, index)
     }
@@ -2972,8 +3099,6 @@ impl Scheduler {
     /// manifest). The KV bytes stay on disk until the runtime inject
     /// path demand-materialises them via [`elevate_to_hot`].
     pub fn reconstruct_substrate(&self, conversation: &Conversation) {
-        use crate::provenance::{SigEntry, TokenSignature};
-
         let n_layers = self.session.backings().len();
         if n_layers == 0 {
             return;
@@ -3057,7 +3182,7 @@ impl Scheduler {
         layer_a: usize,
         layer_b: usize,
         block_range: Option<(usize, usize)>,
-    ) -> Result<Vec<crate::provenance::TurnSignatures>, ConversationError> {
+    ) -> Result<Vec<TurnSignatures>, ConversationError> {
         let (blocks_a, blocks_b) = {
             let mut layers = self
                 .session
@@ -3077,17 +3202,17 @@ impl Scheduler {
         let head_dim = self.session.head_dim();
         let chunk = candle_nn::CHUNK_SIZE;
 
-        let sigs_a = crate::provenance::extract_mh_signatures_from_r16_dump(
+        let sigs_a = extract_mh_signatures_from_r16_dump(
             &blocks_a, n_kv_head, head_dim, chunk,
         );
-        let sigs_b = crate::provenance::extract_mh_signatures_from_r16_dump(
+        let sigs_b = extract_mh_signatures_from_r16_dump(
             &blocks_b, n_kv_head, head_dim, chunk,
         );
 
         let merged = sigs_a
             .iter()
             .zip(sigs_b.iter())
-            .map(|(a, b)| crate::provenance::merge_turn_signatures_xor(a, b))
+            .map(|(a, b)| merge_turn_signatures_xor(a, b))
             .collect();
         Ok(merged)
     }
@@ -3159,7 +3284,7 @@ impl Scheduler {
                 continue;
             }
 
-            let mut new_entries: Vec<crate::provenance::SigEntry> = Vec::with_capacity(total);
+            let mut new_entries: Vec<SigEntry> = Vec::with_capacity(total);
             let mut new_high = prev;
             for j in 0..total {
                 let n = syn_b[j]
@@ -3438,15 +3563,15 @@ impl Scheduler {
         let block_indices: Vec<usize> = raw_syn_l0.iter().map(|(idx, _, _, _)| *idx).collect();
 
         let merge = |a: &[_], b: &[_]| {
-            let sa = crate::provenance::extract_mh_signatures_from_r16_dump(
+            let sa = extract_mh_signatures_from_r16_dump(
                 a, n_kv_head, head_dim, chunk,
             );
-            let sb = crate::provenance::extract_mh_signatures_from_r16_dump(
+            let sb = extract_mh_signatures_from_r16_dump(
                 b, n_kv_head, head_dim, chunk,
             );
             sa.iter()
                 .zip(sb.iter())
-                .map(|(x, y)| crate::provenance::merge_turn_signatures_xor(x, y))
+                .map(|(x, y)| merge_turn_signatures_xor(x, y))
                 .collect::<Vec<_>>()
         };
         let syn_blocks = merge(&raw_syn_l0, &raw_syn_l4);
@@ -3465,9 +3590,9 @@ impl Scheduler {
         //        biasing the BDP scan.
         let filter: &[u32] = &policy.probe_filter_token_ids;
         let chunk_size = self.chunk_size;
-        let extract_window = |sigs_per_block: &[crate::provenance::TurnSignatures]|
-                              -> Vec<crate::provenance::TokenSignature> {
-            let mut out: Vec<crate::provenance::TokenSignature> = Vec::with_capacity(window);
+        let extract_window = |sigs_per_block: &[TurnSignatures]|
+                              -> Vec<TokenSignature> {
+            let mut out: Vec<TokenSignature> = Vec::with_capacity(window);
             for (block_idx, block_sigs) in block_indices.iter().zip(sigs_per_block.iter()) {
                 let block_start = block_idx * chunk_size;
                 let block_end = block_start + chunk_size;
@@ -3517,8 +3642,8 @@ impl Scheduler {
         //    surfaces a previously-asked computation turn.
         let t_scan = Instant::now();
         let (turn_corpus, section_corpus): (
-            Vec<(crate::projection::TurnKey, Vec<crate::provenance::SigEntry>)>,
-            Vec<(SectionId, Vec<crate::provenance::SigEntry>)>,
+            Vec<(TurnKey, Vec<SigEntry>)>,
+            Vec<(SectionId, Vec<SigEntry>)>,
         ) = {
             let view = policy.substrate.read();
             // BdpScanner is keyed by `TurnKey` natively — no group/timeline
@@ -3609,7 +3734,7 @@ impl Scheduler {
             }
         }
 
-        let mut scanner = crate::provenance::BdpScanner::new().with_span_alpha(policy.span_alpha);
+        let mut scanner = BdpScanner::new().with_span_alpha(policy.span_alpha);
         scanner.scan(
             &policy.provenance,
             &probe_syn,
@@ -3659,7 +3784,6 @@ impl Scheduler {
             // Walk segments once, populating both the elevate side-lists
             // and the segment list `apply_projection` will diff against
             // the slot's previous projection.
-            use crate::projection::{ProjectionSegment, SealedKind};
             let mut sections: Vec<SectionId> = Vec::new();
             let mut segments: Vec<ProjectionSegment> = Vec::new();
             for seg in &projection.segments {
@@ -4159,7 +4283,7 @@ mod tests {
             None,              // penalty_log_path
             DecodeHealthConfig::default(),
             512, // max_prefill_chunk
-            Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
+            Arc::new(ProvenanceFile::new().unwrap()),
             ModelCoreProperties {
                 num_layers: 6,
                 n_kv_heads: 4,
@@ -4178,6 +4302,7 @@ mod tests {
                 v_low_error_threshold_factor: 1.0,
             },
             PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
         );
         (scheduler, tx)
@@ -4279,7 +4404,7 @@ mod tests {
             None,
             DecodeHealthConfig::default(),
             512,
-            Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
+            Arc::new(ProvenanceFile::new().unwrap()),
             ModelCoreProperties {
                 num_layers: 6,
                 n_kv_heads: 4,
@@ -4298,6 +4423,7 @@ mod tests {
                 v_low_error_threshold_factor: 1.0,
             },
             PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
         );
 
@@ -4347,7 +4473,7 @@ mod tests {
             None,
             DecodeHealthConfig::default(),
             512,
-            Arc::new(crate::provenance::ProvenanceFile::new().unwrap()),
+            Arc::new(ProvenanceFile::new().unwrap()),
             ModelCoreProperties {
                 num_layers: 6,
                 n_kv_heads: 4,
@@ -4366,6 +4492,7 @@ mod tests {
                 v_low_error_threshold_factor: 1.0,
             },
             PersistenceTrigger::noop(),
+            SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
         );
 

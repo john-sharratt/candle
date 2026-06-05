@@ -28,10 +28,10 @@
 //! - Empty turns yield a plan with `chunks.len() == 0` and
 //!   `total_bytes == 0`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::crc_validator::BadChunkRegistry;
-use super::manifest::{ChunkLoc, Manifest};
+use super::manifest::ChunkLoc;
 use super::streams::StreamId;
 
 /// Identifies which log a record's bytes live in. The orchestrator
@@ -104,13 +104,13 @@ pub struct ChunkedReadPlan {
     pub n_records: usize,
 }
 
-/// Build a [`ChunkedReadPlan`] from an active manifest and an
-/// ordered list of inherited manifests.
+/// Build a [`ChunkedReadPlan`] from an active stream's chunk index
+/// and an ordered list of inherited chunk indices.
 ///
-/// Walks the active manifest first — its records win on `chunk_idx`
+/// Walks the active source first — its records win on `chunk_idx`
 /// collision via the `seen` set, matching the existing
-/// `read_stream_chunks_batched` semantics. Each inherited manifest
-/// then fills indices not present in active or in earlier-inherited
+/// `read_stream_chunks_batched` semantics. Each inherited source then
+/// fills indices not present in active or in earlier-inherited
 /// sources. Within each source the records are sorted by
 /// `file_offset` and partitioned greedily into chunks of
 /// `<= buffer_size` bytes. Empty sources contribute no chunks; an
@@ -120,8 +120,8 @@ pub struct ChunkedReadPlan {
 /// validator has marked them as bit-rot, and the cold-load would
 /// fail downstream anyway.
 pub fn plan_chunked_read(
-    active: &Manifest,
-    inherited: &[&Manifest],
+    active_chunks: Option<&BTreeMap<u64, ChunkLoc>>,
+    inherited_chunks: &[Option<&BTreeMap<u64, ChunkLoc>>],
     stream_id: StreamId,
     buffer_size: usize,
     bad_chunks: &BadChunkRegistry,
@@ -131,7 +131,7 @@ pub fn plan_chunked_read(
 
     {
         let active_recs = collect_records(
-            active.streams.get(&stream_id).map(|s| &s.chunks),
+            active_chunks,
             SourceLog::Active,
             stream_id,
             &mut seen,
@@ -140,9 +140,9 @@ pub fn plan_chunked_read(
         partition_and_append(active_recs, buffer_size, &mut plan);
     }
 
-    for (i, inh) in inherited.iter().enumerate() {
+    for (i, chunks) in inherited_chunks.iter().enumerate() {
         let inh_recs = collect_records(
-            inh.streams.get(&stream_id).map(|s| &s.chunks),
+            *chunks,
             SourceLog::Inherited(i),
             stream_id,
             &mut seen,

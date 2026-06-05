@@ -44,7 +44,7 @@ use super::cold_load::{preallocate_pinned_scratch, PINNED_PREALLOC_BYTES};
 use super::resume::TurnChunkGrid;
 use super::transfer::seal_to_chunk_images;
 use crate::projection::Conversation;
-use crate::substrate::ResidenceIndex;
+use crate::substrate::{ResidenceIndex, StoredSequence};
 
 /// How often the loop wakes up on its own when no triggers arrive.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
@@ -458,7 +458,7 @@ fn run_pass(
     // GPU sealed); the same payload as warm, only its device backing
     // differs.
     let pending_cold = conversation.read().snapshot_pending_cold();
-    let mut cold_installs: Vec<(ResidenceIndex, Vec<crate::substrate::StoredSequence>, u64)> =
+    let mut cold_installs: Vec<(ResidenceIndex, Vec<StoredSequence>, u64)> =
         Vec::with_capacity(pending_cold.len());
     for (idx, stream_id, hot) in pending_cold {
         if backings.len() != hot.len() {
@@ -539,8 +539,8 @@ fn run_pass(
     let mut section_to_cold_count: usize = 0;
     if !pending_section_cold.is_empty() {
         let mut section_cold_installs: Vec<(
-            crate::substrate::ResidenceIndex,
-            Vec<crate::substrate::StoredSequence>,
+            ResidenceIndex,
+            Vec<StoredSequence>,
             u64,
         )> = Vec::with_capacity(pending_section_cold.len());
         for (idx, stream_id, hot) in pending_section_cold {

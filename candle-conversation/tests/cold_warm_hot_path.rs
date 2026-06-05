@@ -1701,13 +1701,11 @@ fn quantize_on_evict_actually_compresses() {
             policy_opt,
         );
         persist.shutdown();
-        conv.with_persistence_manifest(|m| {
-            m.streams
-                .values()
-                .flat_map(|s| s.chunks.values())
-                .map(|loc| loc.record_size)
-                .sum::<u64>()
-        })
+        let view = conv.read();
+        view.all_streams()
+            .flat_map(|(_, s)| s.chunks.values())
+            .map(|loc| loc.record_size)
+            .sum::<u64>()
     };
 
     let f16_bytes = run_cycle(None);

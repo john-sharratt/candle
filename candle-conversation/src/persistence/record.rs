@@ -97,6 +97,17 @@ pub enum RecordType {
     /// Per-timeline lifecycle state (archived flag, future flags…).
     /// Last-writer-wins on replay.
     ConvState = 11,
+    /// Summary-tree node metadata for one turn — kind / children /
+    /// height / dirty.  JSON payload — see
+    /// [`TreeMetadataPayload`].  Reload constructs the per-timeline
+    /// summary tree by replaying these records in order (the latest
+    /// record per `(timeline, turn_index)` wins).  Last-writer-wins.
+    TreeMetadata = 12,
+    /// Per-timeline substrate-side resume key (`debug_id`).  JSON
+    /// payload `{ debug_id: String }`.  Last-writer-wins.  Allows
+    /// `find_or_create(debug_id)` to recover a workspace timeline
+    /// after restart.
+    DebugId = 13,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -634,6 +645,72 @@ impl<'a> ByteReader<'a> {
     }
 }
 
+// ── TreeMetadata + DebugId structured payloads ──────────────────────────────
+
+/// JSON payload for a [`RecordType::TreeMetadata`] record — one entry
+/// per `(timeline, turn_index)`.  Last-writer-wins on reload: a later
+/// record for the same key supersedes the earlier one.
+///
+/// Stored as JSON because it's small (a handful of integer fields plus
+/// a children list whose length is bounded by the AVL invariants) and
+/// because the redo-log already has a JSON-header culture; binary
+/// would buy nothing here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeMetadataPayload {
+    /// `TimelineId.raw()` — opaque u64 key.
+    pub timeline_id: u64,
+    /// `TurnIndex.0` — the turn this metadata belongs to.
+    pub turn_index: u32,
+    /// Discriminant matching `summary_tree::TurnKind`:
+    ///   0 = Normal, 1 = SummaryOfTurns, 2 = SummaryOfSummaries.
+    pub kind: u8,
+    /// AVL height for binary summary nodes; 0 for Normal sub-leaves.
+    pub tree_height: u8,
+    /// `true` iff the summary's stored Q-fingerprint is stale (a
+    /// rotation moved children around since the last regeneration).
+    pub dirty: bool,
+    /// For `SummaryOfTurns`: Normal-child indices in chronological
+    /// order.  For `SummaryOfSummaries`: exactly `[left, right]`.  For
+    /// `Normal`: empty.
+    pub children: Vec<u32>,
+    /// Optional tree-root marker — when `Some`, the writer is also
+    /// declaring that the timeline's tree root is now this turn
+    /// (i.e. the rotation surfaced a new root).  Reload tracks the
+    /// most-recently-written `Some(_)` per timeline as the final root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_now: Option<u32>,
+}
+
+impl TreeMetadataPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("TreeMetadataPayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("TreeMetadata JSON parse: {e}")))
+    }
+}
+
+/// JSON payload for a [`RecordType::DebugId`] record.  One entry per
+/// `(timeline)`, last-writer-wins on replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugIdPayload {
+    pub timeline_id: u64,
+    pub debug_id: String,
+}
+
+impl DebugIdPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("DebugIdPayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("DebugId JSON parse: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +719,91 @@ mod tests {
     fn crc32_known_vector() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0x0000_0000);
+    }
+
+    #[test]
+    fn tree_metadata_payload_round_trips() {
+        let p = TreeMetadataPayload {
+            timeline_id: 42,
+            turn_index: 17,
+            kind: 1, // SummaryOfTurns
+            tree_height: 1,
+            dirty: false,
+            children: vec![10, 11, 12, 13, 14],
+            root_now: None,
+        };
+        let bytes = p.encode();
+        let back = TreeMetadataPayload::decode(&bytes).unwrap();
+        assert_eq!(p, back);
+
+        // Through a real record frame.
+        let header = RecordHeader {
+            record_type: RecordType::TreeMetadata,
+            format: 0,
+            payload_len: bytes.len() as u64,
+            crc: crc32(&bytes),
+            stream_id: 0,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let frame = encode_record(&header, &bytes);
+        let (hdr2, payload2, _total) = decode_record(&frame).unwrap();
+        assert_eq!(hdr2.record_type, RecordType::TreeMetadata);
+        let back2 = TreeMetadataPayload::decode(payload2).unwrap();
+        assert_eq!(back2, p);
+    }
+
+    #[test]
+    fn tree_metadata_root_now_round_trips() {
+        let p = TreeMetadataPayload {
+            timeline_id: 7,
+            turn_index: 99,
+            kind: 2, // SummaryOfSummaries
+            tree_height: 4,
+            dirty: true,
+            children: vec![50, 75],
+            root_now: Some(99),
+        };
+        let bytes = p.encode();
+        let back = TreeMetadataPayload::decode(&bytes).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn debug_id_payload_round_trips() {
+        let p = DebugIdPayload {
+            timeline_id: 123,
+            debug_id: "coherent-50".to_string(),
+        };
+        let bytes = p.encode();
+        let back = DebugIdPayload::decode(&bytes).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn record_header_serialises_tree_metadata_variant() {
+        // The new variants must serialise as JSON strings the decoder
+        // can round-trip — protects against typo'd `rename_all` collisions.
+        let h = RecordHeader {
+            record_type: RecordType::TreeMetadata,
+            format: 0,
+            payload_len: 0,
+            crc: 0,
+            stream_id: 0,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let line = serde_json::to_string(&h).unwrap();
+        let back: RecordHeader = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.record_type, RecordType::TreeMetadata);
+
+        let h2 = RecordHeader {
+            record_type: RecordType::DebugId,
+            ..h
+        };
+        let line2 = serde_json::to_string(&h2).unwrap();
+        let back2: RecordHeader = serde_json::from_str(&line2).unwrap();
+        assert_eq!(back2.record_type, RecordType::DebugId);
     }
 
     #[test]

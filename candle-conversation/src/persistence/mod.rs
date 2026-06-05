@@ -43,12 +43,16 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use checkpoint::recover;
+use crate::substrate::Substrate;
+
 use chunk_plan::ChunkedReadPlan;
 use inherit::InheritedSubstrate;
 use log_file::{read_record_at, LogFile, LogSource};
-use manifest::Manifest;
-use record::{decode_record, encode_record, ChunkPayload, Record, RecordHeader, RecordType};
+use manifest::{ChunkLoc, Manifest};
+use record::{
+    decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
+    TreeMetadataPayload,
+};
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use walker::WalkEntry;
 
@@ -191,6 +195,28 @@ impl SubstratePersistence {
         SubstratePersistence::from_paths(&active, &[])
     }
 
+    /// Open the persistence layer and drive every record through
+    /// [`Substrate::apply_walker_entry`] in the same pass that builds
+    /// the manifest's singleton offsets.  The substrate ends up fully
+    /// populated (streams, labels, conv_states, tree metadata, debug
+    /// ids) by the time this returns.
+    ///
+    /// Replaces the legacy two-phase `open_in` + `reconstruct →
+    /// mirror_from_manifest` pattern with a single walker pass.  No
+    /// per-entity state is mirrored from manifest to substrate
+    /// afterwards because the manifest's per-entity fields are
+    /// `#[serde(skip)]` and the substrate is the authoritative
+    /// in-RAM index.
+    pub fn open_in_with_substrate(
+        dir: &Path,
+        substrate: &mut Substrate,
+    ) -> Result<SubstratePersistence> {
+        let active = ensure_active_path(dir)?;
+        SubstratePersistence::from_paths_with_sink(&active, &[], |entry| {
+            substrate.apply_walker_entry(entry)
+        })
+    }
+
     /// Open over an ordered list of logs. The last entry is the active,
     /// writable log; every earlier entry is inherited and read-only,
     /// loaded through the shared cache (§13.5).
@@ -205,12 +231,23 @@ impl SubstratePersistence {
     }
 
     fn from_paths(active: &Path, inherited: &[PathBuf]) -> Result<SubstratePersistence> {
+        Self::from_paths_with_sink(active, inherited, |_| {})
+    }
+
+    fn from_paths_with_sink<F>(
+        active: &Path,
+        inherited: &[PathBuf],
+        sink: F,
+    ) -> Result<SubstratePersistence>
+    where
+        F: FnMut(&walker::WalkEntry),
+    {
         let mut inherited_subs = Vec::with_capacity(inherited.len());
         for path in inherited {
             inherited_subs.push(InheritedSubstrate::load(path)?);
         }
 
-        let (mut log, manifest) = open_or_create_active(active)?;
+        let (mut log, manifest) = open_or_create_active_with_sink(active, sink)?;
         let model_spec = manifest
             .model_spec
             .map(|loc| read_record_at(&mut log, loc.offset, loc.record_size).map(|r| r.payload))
@@ -266,6 +303,14 @@ impl SubstratePersistence {
     /// The active log's manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// All inherited (read-only) substrates, in registration order.
+    /// Each carries its own manifest.  Exposed so the substrate-side
+    /// reload can mirror per-stream state across all inherited logs
+    /// without each call site re-deriving the list.
+    pub fn inherited_substrates(&self) -> &[Arc<InheritedSubstrate>] {
+        &self.inherited
     }
 
     /// The durable logical end of the active log.
@@ -363,69 +408,46 @@ impl SubstratePersistence {
     /// holds the same `(conv_id, label)` tuple — cheap to invoke on
     /// every submit.
     pub fn write_conv_meta(&mut self, timeline_id: u64, conv_id: &str, label: &str) -> Result<()> {
-        if let Some(existing) = self.manifest.labels.get(&timeline_id) {
-            if existing.conv_id == conv_id && existing.label == label {
-                return Ok(());
-            }
-        }
+        // Idempotency was previously checked against `manifest.labels`;
+        // after Phase 3 the substrate is the authority for live label
+        // state.  Callers are expected to check against substrate
+        // state before invoking this method (the Conversation-level
+        // setters already do; daemon writes are infrequent enough
+        // that an occasional duplicate log entry is negligible —
+        // compaction collapses them).
         let payload = manifest::encode_label_payload(timeline_id, conv_id, label);
         self.append_record(RecordType::Label, 0, 0, 0, 0, &payload)?;
         Ok(())
     }
 
-    /// Append a `ConvState` record for `timeline_id`, idempotent on
-    /// the manifest's current value. Last-write-wins on replay.
-    ///
-    /// Caller invariant: `timeline_id` should refer to a registered
-    /// timeline (otherwise the state is orphaned on disk and the
-    /// reload path's `set_archived` no-op will drop it on the floor).
+    /// Append a `ConvState` record for `timeline_id`.  Idempotency on
+    /// the current value is now the caller's responsibility (see
+    /// `write_conv_meta`).
     pub fn write_conv_state(&mut self, timeline_id: u64, state: manifest::ConvState) -> Result<()> {
-        if let Some(existing) = self.manifest.conv_states.get(&timeline_id) {
-            if *existing == state {
-                return Ok(());
-            }
-        }
         let payload = manifest::encode_conv_state_payload(timeline_id, state);
         self.append_record(RecordType::ConvState, 0, 0, 0, 0, &payload)?;
         Ok(())
     }
 
-    /// Every recovered `(timeline_id, ConvState)` pair from the active
-    /// manifest and any inherited substrates. Mirrors
-    /// [`Self::collected_conv_metas`]; the reload path applies these
-    /// alongside the labels.
-    pub fn collected_conv_states(&self) -> Vec<(u64, manifest::ConvState)> {
-        let mut out: std::collections::BTreeMap<u64, manifest::ConvState> = self
-            .manifest
-            .conv_states
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        for inherited in &self.inherited {
-            for (k, v) in &inherited.manifest().conv_states {
-                out.entry(*k).or_insert(*v);
-            }
-        }
-        out.into_iter().collect()
+    /// Append a `TreeMetadata` record for one `(timeline_id,
+    /// turn_index)` summary-tree node.  Last-writer-wins on replay.
+    /// Callers check idempotency against substrate state.
+    pub fn write_tree_metadata(&mut self, payload: TreeMetadataPayload) -> Result<()> {
+        let bytes = payload.encode();
+        self.append_record(RecordType::TreeMetadata, 0, 0, 0, 0, &bytes)?;
+        Ok(())
     }
 
-    /// Every recovered `(timeline_id, ConvMeta)` pair from the active
-    /// manifest and any inherited substrates. The substrate-reload path
-    /// uses this to repopulate the in-RAM `Substrate::labels` /
-    /// `Substrate::conv_ids` maps after the TurnDecl walk.
-    pub fn collected_conv_metas(&self) -> Vec<(u64, manifest::ConvMeta)> {
-        let mut out: std::collections::BTreeMap<u64, manifest::ConvMeta> = self
-            .manifest
-            .labels
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-        for inherited in &self.inherited {
-            for (k, v) in &inherited.manifest().labels {
-                out.entry(*k).or_insert_with(|| v.clone());
-            }
-        }
-        out.into_iter().collect()
+    /// Append a `DebugId` record for `timeline_id`.  Last-writer-wins
+    /// on replay.  Callers check idempotency against substrate state.
+    pub fn write_debug_id(&mut self, timeline_id: u64, debug_id: &str) -> Result<()> {
+        let payload = DebugIdPayload {
+            timeline_id,
+            debug_id: debug_id.to_string(),
+        };
+        let bytes = payload.encode();
+        self.append_record(RecordType::DebugId, 0, 0, 0, 0, &bytes)?;
+        Ok(())
     }
 
     /// Append a `Chunk` record — one sealed or partial KV chunk's bytes and
@@ -454,11 +476,14 @@ impl SubstratePersistence {
     /// Read one chunk's payload — from the active log, else any inherited
     /// log (§13.5). The chunk must be durable (committed); it is read from
     /// the file, not the un-flushed staging buffer.
-    pub fn read_chunk(&mut self, stream_id: StreamId, chunk_index: u64) -> Result<ChunkPayload> {
-        if let Some(loc) = self
-            .manifest
-            .streams
-            .get(&stream_id)
+    pub fn read_chunk(
+        &mut self,
+        substrate: &Substrate,
+        stream_id: StreamId,
+        chunk_index: u64,
+    ) -> Result<ChunkPayload> {
+        if let Some(loc) = substrate
+            .stream_of(stream_id)
             .and_then(|s| s.chunks.get(&chunk_index))
             .copied()
         {
@@ -467,9 +492,8 @@ impl SubstratePersistence {
         }
         for inherited in &self.inherited {
             if let Some(loc) = inherited
-                .manifest()
-                .streams
-                .get(&stream_id)
+                .substrate()
+                .stream_of(stream_id)
                 .and_then(|s| s.chunks.get(&chunk_index))
                 .copied()
             {
@@ -489,9 +513,13 @@ impl SubstratePersistence {
     /// Allocates a scratch buffer internally; callers that load many turns
     /// in sequence (e.g. `elevate_to_hot`) should call
     /// [`Self::read_stream_chunks_batched`] directly with a reusable buffer.
-    pub fn read_stream_chunks(&mut self, stream_id: StreamId) -> Result<Vec<(u64, ChunkPayload)>> {
+    pub fn read_stream_chunks(
+        &mut self,
+        substrate: &Substrate,
+        stream_id: StreamId,
+    ) -> Result<Vec<(u64, ChunkPayload)>> {
         let mut buf: Vec<u8> = Vec::new();
-        self.read_stream_chunks_batched(stream_id, &mut buf)
+        self.read_stream_chunks_batched(substrate, stream_id, &mut buf)
     }
 
     /// Read every chunk of a stream in a small number of stripe-coalesced
@@ -511,6 +539,7 @@ impl SubstratePersistence {
     /// `buf` is resized as needed (grows monotonically across calls).
     pub fn read_stream_chunks_batched(
         &mut self,
+        substrate: &Substrate,
         stream_id: StreamId,
         buf: &mut Vec<u8>,
     ) -> Result<Vec<(u64, ChunkPayload)>> {
@@ -559,7 +588,7 @@ impl SubstratePersistence {
         // inherited logs don't shadow live entries.
         let mut seen: HashSet<u64> = HashSet::new();
         let mut active: Vec<ChunkSource> = Vec::new();
-        if let Some(s) = self.manifest.streams.get(&stream_id) {
+        if let Some(s) = substrate.stream_of(stream_id) {
             for (&chunk_idx, loc) in &s.chunks {
                 seen.insert(chunk_idx);
                 active.push(ChunkSource {
@@ -573,7 +602,7 @@ impl SubstratePersistence {
         let mut per_inh: Vec<Vec<ChunkSource>> =
             self.inherited.iter().map(|_| Vec::new()).collect();
         for (i, inh) in self.inherited.iter().enumerate() {
-            if let Some(s) = inh.manifest().streams.get(&stream_id) {
+            if let Some(s) = inh.substrate().stream_of(stream_id) {
                 for (&chunk_idx, loc) in &s.chunks {
                     if seen.insert(chunk_idx) {
                         per_inh[i].push(ChunkSource {
@@ -670,12 +699,21 @@ impl SubstratePersistence {
     /// Chunks flagged by the background CRC validator are filtered
     /// out of the plan — they would fail to load anyway and the
     /// validator has already warned about them via `tracing`.
-    pub fn plan_chunked_read(&self, stream_id: StreamId, buffer_size: usize) -> ChunkedReadPlan {
-        let inherited_manifests: Vec<&Manifest> =
-            self.inherited.iter().map(|i| i.manifest()).collect();
+    pub fn plan_chunked_read(
+        &self,
+        substrate: &Substrate,
+        stream_id: StreamId,
+        buffer_size: usize,
+    ) -> ChunkedReadPlan {
+        let active_chunks = substrate.stream_of(stream_id).map(|s| &s.chunks);
+        let inherited_chunks: Vec<Option<&std::collections::BTreeMap<u64, ChunkLoc>>> =
+            self.inherited
+                .iter()
+                .map(|i| i.substrate().stream_of(stream_id).map(|s| &s.chunks))
+                .collect();
         chunk_plan::plan_chunked_read(
-            &self.manifest,
-            &inherited_manifests,
+            active_chunks,
+            &inherited_chunks,
             stream_id,
             buffer_size,
             &self.bad_chunks,
@@ -684,16 +722,19 @@ impl SubstratePersistence {
 
     /// Read a stream's latest `Tokens` record payload — from the active log,
     /// else any inherited log. `None` if the stream has no `Tokens` record.
-    pub fn read_tokens(&mut self, stream_id: StreamId) -> Result<Option<Vec<u8>>> {
-        if let Some(loc) = self.manifest.streams.get(&stream_id).and_then(|s| s.tokens) {
+    pub fn read_tokens(
+        &mut self,
+        substrate: &Substrate,
+        stream_id: StreamId,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(loc) = substrate.stream_of(stream_id).and_then(|s| s.tokens) {
             let record = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
             return Ok(Some(record.payload));
         }
         for inherited in &self.inherited {
             if let Some(loc) = inherited
-                .manifest()
-                .streams
-                .get(&stream_id)
+                .substrate()
+                .stream_of(stream_id)
                 .and_then(|s| s.tokens)
             {
                 let record = inherited.read_record(loc.offset, loc.record_size)?;
@@ -705,21 +746,19 @@ impl SubstratePersistence {
 
     /// Read a stream's latest `Signatures` record payload — from the active
     /// log, else any inherited log. `None` if the stream has no `Signatures`.
-    pub fn read_signatures(&mut self, stream_id: StreamId) -> Result<Option<Vec<u8>>> {
-        if let Some(loc) = self
-            .manifest
-            .streams
-            .get(&stream_id)
-            .and_then(|s| s.signatures)
-        {
+    pub fn read_signatures(
+        &mut self,
+        substrate: &Substrate,
+        stream_id: StreamId,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(loc) = substrate.stream_of(stream_id).and_then(|s| s.signatures) {
             let record = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
             return Ok(Some(record.payload));
         }
         for inherited in &self.inherited {
             if let Some(loc) = inherited
-                .manifest()
-                .streams
-                .get(&stream_id)
+                .substrate()
+                .stream_of(stream_id)
                 .and_then(|s| s.signatures)
             {
                 let record = inherited.read_record(loc.offset, loc.record_size)?;
@@ -879,9 +918,13 @@ impl SubstratePersistence {
 
     /// Resolve a content-addressed prompt section across the active log and
     /// every inherited log (§13.5). `Some` is a prefix-cache hit.
-    pub fn lookup_section(&self, addr: ContentAddress) -> Option<StreamRef> {
+    pub fn lookup_section(
+        &self,
+        substrate: &Substrate,
+        addr: ContentAddress,
+    ) -> Option<StreamRef> {
         let id = content_hash::section_stream_id(addr);
-        if self.has_stream(id) {
+        if self.has_stream(substrate, id) {
             Some(StreamRef {
                 stream_id: id,
                 kind: StreamKind::PromptSection,
@@ -891,9 +934,16 @@ impl SubstratePersistence {
         }
     }
 
-    /// Whether `stream_id` is present in the active log or any inherited log.
-    pub fn has_stream(&self, stream_id: StreamId) -> bool {
-        self.manifest.streams.contains_key(&stream_id)
+    /// Whether `stream_id` is present in the active substrate or any
+    /// inherited log.  The active source is read from `substrate.streams`
+    /// (the in-RAM index built by the reload walk); inherited logs still
+    /// carry their own manifest.
+    pub fn has_stream(
+        &self,
+        substrate: &Substrate,
+        stream_id: StreamId,
+    ) -> bool {
+        substrate.has_stream(stream_id)
             || self.inherited.iter().any(|i| i.has_stream(stream_id))
     }
 
@@ -901,9 +951,12 @@ impl SubstratePersistence {
     /// a compaction pass — the dead-record ratio (§5.8) crossing
     /// [`COMPACTION_DEAD_RATIO_THRESHOLD`]. Flushes pending writes first so
     /// the measurement reflects the durable log.
-    pub fn should_compact(&mut self) -> Result<bool> {
+    pub fn should_compact(
+        &mut self,
+        substrate: &Substrate,
+    ) -> Result<bool> {
         self.log.commit()?;
-        let ratio = compaction::dead_record_ratio(&mut self.log, &self.manifest)?;
+        let ratio = compaction::dead_record_ratio(&mut self.log, &self.manifest, substrate)?;
         Ok(ratio >= COMPACTION_DEAD_RATIO_THRESHOLD)
     }
 
@@ -914,12 +967,16 @@ impl SubstratePersistence {
     /// active log. The in-RAM manifest and the `ModelSpec`/`Template` caches
     /// are rebuilt from the compacted file. Inherited logs are untouched —
     /// a child never compacts a base it only reads (§13.5).
-    pub fn compact(&mut self) -> Result<()> {
+    pub fn compact(
+        &mut self,
+        substrate: &mut Substrate,
+    ) -> Result<()> {
         // 1. Quiesce — every staged write is now durable on disk.
         self.log.commit()?;
 
-        // 2. Collect the live winners, in dependency order.
-        let live = compaction::collect_live_records(&mut self.log, &self.manifest)?;
+        // 2. Collect the live winners, in dependency order — sourced
+        //    from substrate state (per-entity) + manifest singletons.
+        let live = compaction::collect_live_records(&mut self.log, &self.manifest, substrate)?;
 
         // 3. Rewrite into a sibling file.
         let compact_path = compaction_path(&self.active_path);
@@ -956,6 +1013,23 @@ impl SubstratePersistence {
                 hash_from_tokenizer_payload(&r.payload)
             })
             .transpose()?;
+        // 6. The substrate's stream / timeline state still holds
+        //    offsets into the OLD active log.  Reset the walker-built
+        //    collections and replay the new compacted log to rebuild
+        //    them with the new offsets.  Per-turn KV residence and
+        //    timeline registrations survive (they're not walker-built).
+        substrate.clear_walker_state();
+        let hint = self.log.superblock().latest_checkpoint_offset;
+        // Build a fresh manifest snapshot from the new log + dispatch
+        // every record back into substrate.
+        let recovered = checkpoint::recover_with_sink(&mut self.log, hint, |entry| {
+            substrate.apply_walker_entry(entry);
+        })?;
+        if recovered.torn {
+            self.log.truncate_to(recovered.tail_offset)?;
+        }
+        self.log.set_write_offset(recovered.tail_offset);
+        self.manifest = recovered.manifest;
         Ok(())
     }
 }
@@ -979,11 +1053,16 @@ fn ensure_active_path(dir: &Path) -> Result<PathBuf> {
 }
 
 /// Open the active log, recovering and truncating a torn tail; or create it.
-fn open_or_create_active(path: &Path) -> Result<(LogFile, Manifest)> {
+/// Each [`walker::WalkEntry`] surfaced during recovery is handed to the sink
+/// so the caller can populate substrate state in the same pass.
+fn open_or_create_active_with_sink<F>(path: &Path, sink: F) -> Result<(LogFile, Manifest)>
+where
+    F: FnMut(&walker::WalkEntry),
+{
     if path.exists() {
         let mut log = LogFile::open(path)?;
         let hint = log.superblock().latest_checkpoint_offset;
-        let recovered = recover(&mut log, hint)?;
+        let recovered = checkpoint::recover_with_sink(&mut log, hint, sink)?;
         if recovered.torn {
             log.truncate_to(recovered.tail_offset)?;
         }
@@ -998,6 +1077,7 @@ fn open_or_create_active(path: &Path) -> Result<(LogFile, Manifest)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log_file::LogFile;
     use streams::{SectionDecl, TurnDecl};
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -1221,9 +1301,11 @@ mod tests {
             sp.commit().unwrap();
         }
         {
-            let sp = SubstratePersistence::open_in(&dir).unwrap();
-            assert!(sp.has_stream(turn_id));
-            let entry = &sp.manifest().streams[&turn_id];
+            let mut substrate = Substrate::new();
+            let sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert!(sp.has_stream(&substrate, turn_id));
+            let entry = substrate.stream_of(turn_id).unwrap();
             assert_eq!(entry.committed_through, Some(0));
             assert!(entry.tokens.is_some());
         }
@@ -1251,10 +1333,16 @@ mod tests {
         assert_eq!(child.inherited_count(), 1);
 
         // The section stream resolves through inheritance — a prefix-cache hit.
-        let hit = child.lookup_section(match &sec {
-            StreamDecl::PromptSection(s) => s.address,
-            _ => unreachable!(),
-        });
+        // The active substrate has no streams; the resolve falls through to
+        // the inherited substrate's stream index.
+        let substrate = Substrate::new();
+        let hit = child.lookup_section(
+            &substrate,
+            match &sec {
+                StreamDecl::PromptSection(s) => s.address,
+                _ => unreachable!(),
+            },
+        );
         assert!(hit.is_some(), "inherited section must resolve");
 
         // The child writes only to its own active log.
@@ -1279,12 +1367,30 @@ mod tests {
         });
         child.declare_stream(&child_turn).unwrap();
         child.commit().unwrap();
-        // The child's turn is in the child; the base is untouched.
-        assert!(child
-            .manifest()
-            .streams
-            .contains_key(&child_turn.stream_id()));
-        assert!(!child.manifest().streams.contains_key(&sec.stream_id()));
+        // Drop child + re-open via the substrate-aware path so the
+        // walker rebuilds substrate.streams; then assert that the
+        // child has its own turn and the inherited base section.
+        drop(child);
+        let mut child_substrate = Substrate::new();
+        let child = SubstratePersistence::open_concat(&[base_log.clone(), child_log.clone()])
+            .unwrap();
+        // open_concat populates the active substrate via the same
+        // walker pass that builds the manifest.  We approximate it
+        // here by walking the active log explicitly into substrate.
+        // (open_concat doesn't have a *_with_substrate variant; the
+        // production path uses open_in_with_substrate.)
+        {
+            let mut log = LogFile::open(&child_log).unwrap();
+            let hint = log.superblock().latest_checkpoint_offset;
+            checkpoint::recover_with_sink(&mut log, hint, |e| {
+                child_substrate.apply_walker_entry(e)
+            })
+            .unwrap();
+        }
+        assert!(child_substrate.has_stream(child_turn.stream_id()));
+        assert!(child.inherited_substrates()[0]
+            .substrate()
+            .has_stream(sec.stream_id()));
 
         InheritedSubstrate::forget(&base_log);
         std::fs::remove_dir_all(&base_dir).ok();
@@ -1295,11 +1401,12 @@ mod tests {
     fn unknown_section_is_a_cache_miss() {
         let dir = tmp_dir("miss");
         let sp = SubstratePersistence::open_in(&dir).unwrap();
+        let substrate = Substrate::new();
         let absent = ContentAddress {
             prefix_hash: content_hash::ContentHash { lo: 12345, hi: 678 },
             section_hash: content_hash::ContentHash { lo: 9, hi: 9 },
         };
-        assert!(sp.lookup_section(absent).is_none());
+        assert!(sp.lookup_section(&substrate, absent).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1322,10 +1429,17 @@ mod tests {
         let sid = StreamId(777);
         let payload = chunk_payload(3);
         {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             sp.write_chunk(sid, 0, 32, 4, &payload).unwrap();
             sp.commit().unwrap();
-            assert_eq!(sp.read_chunk(sid, 0).unwrap(), payload);
+            // After write, repoen so the walker rebuilds substrate.streams.
+            drop(sp);
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), payload);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1344,8 +1458,10 @@ mod tests {
             sp.commit().unwrap();
         }
         {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            let read = sp.read_stream_chunks(sid).unwrap();
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let read = sp.read_stream_chunks(&substrate, sid).unwrap();
             assert_eq!(read.len(), 3);
             for (i, (idx, c)) in read.iter().enumerate() {
                 assert_eq!(*idx, i as u64);
@@ -1361,7 +1477,9 @@ mod tests {
         let sid = StreamId(55);
         let live_chunk = chunk_payload(7);
         {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             // Dead weight: superseded ModelSpecs and stale chunk-0 bodies.
             for s in ["qwen3-8b", "qwen3-14b", "qwen3-30b"] {
                 sp.set_model_spec(s.as_bytes()).unwrap();
@@ -1374,28 +1492,36 @@ mod tests {
             sp.write_chunk(sid, 0, 32, 4, &live_chunk).unwrap();
             sp.commit_stream(sid, 0).unwrap();
             sp.commit().unwrap();
+            // Re-walk so substrate.streams sees the freshly-written
+            // chunks (writes don't auto-apply to substrate).
+            drop(sp);
+            substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
 
             assert!(
-                sp.should_compact().unwrap(),
+                sp.should_compact(&substrate).unwrap(),
                 "a log half dead weight wants compaction"
             );
-            sp.compact().unwrap();
+            sp.compact(&mut substrate).unwrap();
 
             // Caches and the manifest survive the swap.
             assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
-            assert_eq!(sp.read_chunk(sid, 0).unwrap(), live_chunk);
+            assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
             assert!(
-                !sp.should_compact().unwrap(),
+                !sp.should_compact(&substrate).unwrap(),
                 "a freshly compacted log has no dead weight"
             );
         }
         // The compacted file recovers to the same live substrate on reopen.
         {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
-            assert_eq!(sp.read_chunk(sid, 0).unwrap(), live_chunk);
+            assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
         }
         assert!(
             !dir.join(SUBSTRATE_DIR)
@@ -1420,8 +1546,10 @@ mod tests {
         }
         let child_log = child_dir.join(SUBSTRATE_DIR).join(ACTIVE_LOG_NAME);
         let mut child = SubstratePersistence::open_concat(&[base_log.clone(), child_log]).unwrap();
-        // The chunk lives only in the inherited base — read_chunk resolves it.
-        assert_eq!(child.read_chunk(sid, 0).unwrap(), payload);
+        // The chunk lives only in the inherited base — read_chunk
+        // resolves it via the inherited substrate's stream index.
+        let substrate = Substrate::new();
+        assert_eq!(child.read_chunk(&substrate, sid, 0).unwrap(), payload);
 
         InheritedSubstrate::forget(&base_log);
         std::fs::remove_dir_all(&base_dir).ok();

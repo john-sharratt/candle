@@ -478,7 +478,7 @@ fn palette4_convert_r16_identity_copy_check() -> Result<()> {
             1,
             num_chunks,
             &PinnedStager::new(cuda_dev).begin_generation(),
-            cuda_dev,
+            &stream,
         )?;
     }
 
@@ -753,7 +753,7 @@ fn read_f32_channel_arena(data: &[u8], num_dims: usize, num_chunks: usize) -> Ve
 /// Both K and V channels use the same arenas so both execute; callers only verify K output.
 /// The `_is_k` parameter is retained for call-site compatibility but is otherwise unused.
 fn run_kernel_pass(
-    cuda_dev: &candle_core::CudaDevice,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     dev: &Device,
     src_arenas: &[cudarc::driver::CudaSlice<u8>],
     dst_arenas: &[cudarc::driver::CudaSlice<u8>],
@@ -765,11 +765,16 @@ fn run_kernel_pass(
     _is_k: bool,
 ) -> Result<()> {
     use candle_core::quantized::cuda::{quantize_palette4_convert_buffered, PalHeadDesc};
-    let stream = cuda_dev.cuda_stream();
+    // `cuda_dev` derived from the live `Device` so the `PinnedStager`
+    // construction below still has its CudaDevice handle.
+    let cuda_dev = match dev {
+        Device::Cuda(d) => d,
+        _ => unreachable!("run_kernel_pass requires a CUDA device"),
+    };
     let src_ptrs: [u64; N_PAL] =
-        std::array::from_fn(|p| src_arenas[p].device_ptr(&stream).0 as u64);
+        std::array::from_fn(|p| src_arenas[p].device_ptr(stream).0 as u64);
     let dst_ptrs: [u64; N_PAL] =
-        std::array::from_fn(|p| dst_arenas[p].device_ptr(&stream).0 as u64);
+        std::array::from_fn(|p| dst_arenas[p].device_ptr(stream).0 as u64);
     let sg: [GgmlDType; N_PAL] = std::array::from_fn(|i| fmt_code_to_ggml_dtype(src_fmts[i]));
     let dg: [GgmlDType; N_PAL] = std::array::from_fn(|i| fmt_code_to_ggml_dtype(dst_fmts[i]));
     let desc = PalHeadDesc {
@@ -796,7 +801,7 @@ fn run_kernel_pass(
         1,
         num_chunks,
         &PinnedStager::new(cuda_dev).begin_generation(),
-        &stream,
+        stream,
     )?;
     dev.synchronize()
 }
@@ -2930,7 +2935,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
             num_layers,
             num_chunks,
             &generation,
-            cuda_dev,
+            &stream,
         )?;
         candle_core::quantized::cuda::quantize_palette4_convert_buffered(
             &descs_bwd,
@@ -2938,7 +2943,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
             num_layers,
             num_chunks,
             &generation,
-            cuda_dev,
+            &stream,
         )?;
         dev.synchronize()?;
 
@@ -2951,7 +2956,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
                 num_layers,
                 num_chunks,
                 &generation,
-                cuda_dev,
+                &stream,
             )?;
             candle_core::quantized::cuda::quantize_palette4_convert_buffered(
                 &descs_bwd,
@@ -2959,7 +2964,7 @@ fn palette4_convert_throughput_bench() -> Result<()> {
                 num_layers,
                 num_chunks,
                 &generation,
-                cuda_dev,
+                &stream,
             )?;
             call_pairs += 1;
         }

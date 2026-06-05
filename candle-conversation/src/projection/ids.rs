@@ -201,6 +201,12 @@ impl TurnIndex {
     }
 }
 
+impl std::fmt::Display for TurnIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "t{}", self.0)
+    }
+}
+
 /// Fully-qualified address of one turn in the workspace — the `(timeline,
 /// index)` pair as a strongly-typed key.
 ///
