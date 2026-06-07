@@ -156,7 +156,7 @@ impl Clone for ConversationTree {
             plan: self.plan.clone(),
             pending_tasks: Vec::new(),
             task_event_observer: self.task_event_observer.clone(),
-            max_turns: self.max_turns.clone(),
+            max_turns: self.max_turns,
         }
     }
 }
@@ -184,7 +184,7 @@ impl ConversationTree {
                 content: TokenizedText::plaintext(text),
             },
             nodes: LinkedList::new(),
-            max_turns: config.max_turns.clone(),
+            max_turns: config.max_turns,
             config,
             time_source: Arc::new(WallClockTimeSource::new()),
             next_seq: 1,
@@ -429,7 +429,7 @@ impl ConversationTree {
             let last_seg_seq = self.last_summarize_seq().unwrap_or(0);
             let already_pending = self.pending_tasks.iter().any(|t| {
                 t.relevant_turns()
-                    .map_or(false, |r| r.end().seq > last_seg_seq)
+                    .is_some_and(|r| r.end().seq > last_seg_seq)
             });
             if already_pending {
                 tracing::debug!("summarization task already pending for this window — skipping");
@@ -457,7 +457,7 @@ impl ConversationTree {
 
         let end_turn_id = window()
             .filter_map(|n| n.as_turn())
-            .last()
+            .next_back()
             .map(|t| t.0.turn_id)
             .unwrap_or(start_turn_id);
 
@@ -616,7 +616,7 @@ impl ConversationTree {
             .unwrap_or(0);
         let already_pending = self.pending_tasks.iter().any(|t| {
             t.relevant_turns()
-                .map_or(false, |r| r.end().seq >= max_end_seq)
+                .is_some_and(|r| r.end().seq >= max_end_seq)
         });
         if already_pending {
             tracing::debug!("segment-level summarization task already pending — skipping");

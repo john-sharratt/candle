@@ -253,7 +253,7 @@ pub fn run_pipeline(
     let mut unit_to_records: Vec<Vec<usize>> = vec![Vec::new(); n_units];
     let mut record_wait_count: Vec<u32> = vec![0; chunk_batch.records.len()];
     for (r_idx, ru) in unit_plan.record_units.iter().enumerate() {
-        record_wait_count[r_idx] = (ru.last_unit - ru.first_unit + 1) as u32;
+        record_wait_count[r_idx] = ru.last_unit - ru.first_unit + 1;
         for u in ru.first_unit..=ru.last_unit {
             unit_to_records[u as usize].push(r_idx);
         }
@@ -290,7 +290,6 @@ pub fn run_pipeline(
         for handle_idx in 0..n_readers {
             let work_rx = work_rx.clone();
             let done_tx = done_tx.clone();
-            let pinned_ptr = pinned_ptr;
             let reads_done_at_ms = Arc::clone(&reads_done_at_ms);
             s.spawn(move || {
                 while let Ok(work) = work_rx.recv() {

@@ -285,10 +285,8 @@ impl DirectFile {
                     }
                     Err(_) => {
                         if first_err.is_none() {
-                            first_err = Some(io::Error::new(
-                                io::ErrorKind::Other,
-                                "DirectFile worker thread panicked",
-                            ));
+                            first_err =
+                                Some(io::Error::other("DirectFile worker thread panicked"));
                         }
                     }
                 }

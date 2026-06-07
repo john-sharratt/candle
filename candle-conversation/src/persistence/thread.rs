@@ -327,9 +327,7 @@ fn run_pass(
                     "cache: hot→warm layer {layer} quantize failed: {e} (last CUDA kernel on this thread: {})",
                     candle::last_cuda_kernel_launch()
                 );
-                for ok in &mut batch_ok {
-                    *ok = false;
-                }
+                batch_ok.fill(false);
                 break;
             }
         };
@@ -350,9 +348,7 @@ fn run_pass(
                     "cache: hot→warm layer {layer} DtoH failed: {e} (last CUDA kernel on this thread: {})",
                     candle::last_cuda_kernel_launch()
                 );
-                for ok in &mut batch_ok {
-                    *ok = false;
-                }
+                batch_ok.fill(false);
                 break;
             }
         };
@@ -363,9 +359,7 @@ fn run_pass(
                 gpu_hot.len(),
                 cpu_warm.len()
             );
-            for ok in &mut batch_ok {
-                *ok = false;
-            }
+            batch_ok.fill(false);
             break;
         }
 
@@ -398,9 +392,7 @@ fn run_pass(
                 "cache: primary-stream sync after hot→warm batch failed: {e:?} (last CUDA kernel on this thread: {})",
                 candle::last_cuda_kernel_launch()
             );
-            for ok in &mut batch_ok {
-                *ok = false;
-            }
+            batch_ok.fill(false);
         }
     }
 
@@ -417,7 +409,7 @@ fn run_pass(
             let bytes: u64 = warm
                 .iter()
                 .flat_map(|s| s.chunks.iter())
-                .map(|c| c.byte_size as u64)
+                .map(|c| c.byte_size)
                 .sum();
             tracing::debug!(
                 target: "candle_conversation::persistence::tier",

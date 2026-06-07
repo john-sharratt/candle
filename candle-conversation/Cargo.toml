@@ -60,6 +60,19 @@ clap.workspace = true
 clap-verbosity-flag.workspace = true
 term_size = { workspace = true }
 
+# Crate-wide clippy lint policy.  These four lints are deliberately
+# silenced because the patterns they flag are systemic to the design
+# (deeply nested projection / scheduler types, wide function
+# signatures on engine + scheduler entry points, etc.) — see the
+# rationale comment in `src/lib.rs`.  Setting it here rather than
+# per-file means the integration test crates under `tests/` inherit
+# the same policy.
+[lints.clippy]
+doc_lazy_continuation = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+
 [features]
 default = []
 sig-trace = []   # enables per-chunk BDP signature tracing (TRACE level, high volume)

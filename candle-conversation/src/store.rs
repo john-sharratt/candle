@@ -512,8 +512,7 @@ impl SubstrateStore {
         let file = File::options()
             .write(true)
             .create_new(true)
-            .open(&path)
-            .map_err(io::Error::from)?;
+            .open(&path)?;
         let mut store = Self {
             writer: BufWriter::new(file),
             path,

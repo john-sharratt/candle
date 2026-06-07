@@ -331,24 +331,58 @@ impl Conversation {
             crate::persistence::resume::recovered_turn_decls(&substrate)
         };
         let mut restored = 0usize;
+        let mut skipped_corrupt = 0usize;
         for mut decl in decls {
-            let (recovered, cold_refs) = {
+            // Per-turn fault isolation.  A single turn whose
+            // persisted state is inconsistent (e.g. a daemon was
+            // killed between chunk writes and the final TurnDecl
+            // seal update, leaving a TurnDecl with
+            // `block_end == block_start` but real chunks on disk)
+            // should not poison the entire reload — every other turn
+            // is independent.  Log the failure and tombstone the
+            // corrupt turn's timeline so the next reload doesn't
+            // re-encounter it.
+            let recover_result = {
                 let mut p = self.persistence.lock().unwrap();
                 let substrate_read = self.read();
-                let recovered = crate::persistence::resume::recover_turn(
+                let r = crate::persistence::resume::recover_turn(
                     &mut p,
                     &substrate_read,
                     &decl,
                     n_layers,
-                )
-                .map_err(|e| candle::Error::Msg(format!("recover turn: {e}")))?;
-                let cold_refs = crate::persistence::resume::recover_turn_cold_refs(
-                    &substrate_read,
-                    &decl,
-                    n_layers,
-                )
-                .map_err(|e| candle::Error::Msg(format!("recover cold refs: {e}")))?;
-                (recovered, cold_refs)
+                );
+                let cr = if r.is_ok() {
+                    crate::persistence::resume::recover_turn_cold_refs(
+                        &substrate_read,
+                        &decl,
+                        n_layers,
+                    )
+                } else {
+                    Ok(Default::default())
+                };
+                r.and_then(|recovered| cr.map(|cold_refs| (recovered, cold_refs)))
+            };
+            let (recovered, cold_refs) = match recover_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        timeline_id = decl.timeline_id,
+                        turn_index = decl.turn_index,
+                        "skipping corrupt turn during substrate reload: {e}",
+                    );
+                    skipped_corrupt += 1;
+                    if let Some(timeline) = TimelineId::from_raw(decl.timeline_id) {
+                        self.write().tombstone_timeline(timeline);
+                        // Best-effort durable mark — failures here
+                        // just mean the next reload will encounter
+                        // the same turn and skip it again, which is
+                        // still correct, so we don't propagate.
+                        if let Ok(mut p) = self.persistence.lock() {
+                            let _ = p.write_tombstone(timeline.raw());
+                        }
+                    }
+                    continue;
+                }
             };
             // Re-append the BDP signatures into the (fresh) provenance file,
             // yielding entries that point at the rebuilt offsets. Sigs are
@@ -474,6 +508,7 @@ impl Conversation {
             timelines = n_timelines,
             conversations = n_conversations,
             turns = restored,
+            skipped_corrupt = skipped_corrupt,
             label_records = n_meta_records,
             label_records_applied = n_meta_applied,
             label_records_dropped = n_meta_dropped_unregistered,
@@ -705,6 +740,25 @@ impl Conversation {
     /// timelines return `false`.
     pub fn is_conversation_archived(&self, timeline: TimelineId) -> bool {
         self.read().is_archived(timeline)
+    }
+
+    /// Tombstone `timeline` — marks it logically deleted both
+    /// in-RAM (so projection retrieval stops surfacing its turns on
+    /// the next query) and on disk (via a
+    /// [`crate::persistence::record::RecordType::Tombstone`]
+    /// record).  The compactor drops the underlying records on the
+    /// next compaction pass; ordinary reads never see them.
+    pub fn tombstone_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
+        self.write().tombstone_timeline(timeline);
+        let mut p = self.persistence.lock().unwrap();
+        p.write_tombstone(timeline.raw())
+            .map_err(|e| candle::Error::Msg(format!("write_tombstone: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether `timeline` has been tombstoned.
+    pub fn is_timeline_tombstoned(&self, timeline: TimelineId) -> bool {
+        self.read().is_tombstoned(timeline)
     }
 
     /// Set the substrate-side resume key (`debug_id`) for `timeline`

@@ -192,7 +192,7 @@ fn depth_weight_grid_sweep() {
     let metrics: &[(&str, Metric)] = &[
         ("max",          Box::new(|h, r, t, w| r.section_score(h.tool_section_ids[t], ScoreFormula::Max,          w))),
         ("top_k_mean_8", Box::new(|h, r, t, w| r.section_score(h.tool_section_ids[t], ScoreFormula::TopKMean{k:8}, w))),
-        ("hit_rate",     Box::new(|h, r, t, w| section_hit_rate(h, r, t, w))),
+        ("hit_rate",     Box::new(section_hit_rate)),
     ];
 
     for (mname, score_fn) in metrics {
@@ -272,7 +272,7 @@ fn content_type_calibration_sweep() {
         ("max",           Box::new(|h, r, t, w| r.section_score(h.tool_section_ids[t], ScoreFormula::Max, w))),
         ("top_k_mean_8",  Box::new(|h, r, t, w| r.section_score(h.tool_section_ids[t], ScoreFormula::TopKMean { k: 8 }, w))),
         ("span_a2",       Box::new(|h, r, t, w| r.section_score(h.tool_section_ids[t], ScoreFormula::Span { alpha: 2.0 }, w))),
-        ("hit_rate",      Box::new(|h, r, t, w| section_hit_rate(h, r, t, w))),
+        ("hit_rate",      Box::new(section_hit_rate)),
     ];
 
     // (metric_name, best_min_ratio, best_mean_ratio, best_syn, best_sem, best_prag)
@@ -829,8 +829,8 @@ fn multi_layer_calibration_sweep() {
     // Summary table.
     println!("\n{}", "=".repeat(110));
     println!("Calibration summary  (chosen config per layer)");
-    println!("{:<28} {:<12} {:>7} {:>10} {:>5} {:>5}  {}",
-        "layer", "weights", "ratio", "threshold", "TP%", "FP%", "depth_weights (syn/sem/prag)");
+    println!("{:<28} {:<12} {:>7} {:>10} {:>5} {:>5}  depth_weights (syn/sem/prag)",
+        "layer", "weights", "ratio", "threshold", "TP%", "FP%");
     println!("{}", "-".repeat(110));
     for r in &layer_results {
         let c = &r.configs[r.chosen];
@@ -1372,13 +1372,13 @@ fn cross_corpus_provenance_sweep() {
     println!("\n  Best config per content type (by MRR across {n_configs} weight combos):");
     println!("{:<28}  {:<16}  {:>8}  {:>8}", "layer", "syn/sem/prag", "MRR", "Top-1%");
     println!("{}", "-".repeat(68));
-    for li in 0..n_layers {
+    for (li, layer) in LAYERS.iter().enumerate().take(n_layers) {
         let best = results.iter()
             .max_by(|a, b| a.per_layer_mrr[li].partial_cmp(&b.per_layer_mrr[li])
                 .unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
         println!("  {:<26}  {:<16}  {:>8.4}  {:>7.1}%",
-            LAYERS[li].2,
+            layer.2,
             w_label(&best.weights),
             best.per_layer_mrr[li],
             best.per_layer_top1[li] * 100.0);
@@ -1425,13 +1425,9 @@ fn tool_score_dump() {
 
     for &probe_id in probe_ids {
         // Look up the probe to display its user prompt.
-        let probe_text = manifest.scenarios.iter()
+        let _probe_text = manifest.scenarios.iter()
             .find(|s| s.id == probe_id)
-            .and_then(|s| {
-                // The real manifest (OutScenario) has user_prompt; try to deserialize it.
-                // Fallback to just the id.
-                Some(s.id.as_str())
-            })
+            .map(|s| s.id.as_str())
             .unwrap_or(probe_id);
 
         // Skip probes not in the real manifest (might not exist yet).
@@ -1456,7 +1452,7 @@ fn tool_score_dump() {
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         println!("\n  probe: {}", probe_id);
-        println!("  {:<14} {:>10}  {}", "tool", "score", "selected?");
+        println!("  {:<14} {:>10}  selected?", "tool", "score");
         println!("  {}", "-".repeat(45));
         let mut selected = 0;
         for (i, (tool, score)) in scores.iter().enumerate() {

@@ -124,7 +124,7 @@ pub struct TurnSignatures {
 }
 
 impl TurnSignatures {
-    pub fn from_iter(it: impl IntoIterator<Item = TokenSignature>) -> Self {
+    pub fn from_sigs(it: impl IntoIterator<Item = TokenSignature>) -> Self {
         Self { sigs: it.into_iter().collect() }
     }
 

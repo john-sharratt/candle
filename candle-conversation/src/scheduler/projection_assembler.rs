@@ -116,10 +116,6 @@ pub(super) struct SlotState {
 }
 
 impl SlotState {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-
     /// Trim the slot's per-turn cache state after a successful seal —
     /// retain only the entries whose keys were touched by the most
     /// recent `apply_segments` (i.e. the entries that back the slot's
@@ -686,7 +682,7 @@ mod tests {
 
     #[test]
     fn slot_state_default_is_empty() {
-        let s = SlotState::new();
+        let s = SlotState::default();
         assert_eq!(s.cache.len(), 0);
         assert!(s.pending_user_part.is_none());
     }

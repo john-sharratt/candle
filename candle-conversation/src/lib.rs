@@ -1,3 +1,26 @@
+// Several clippy lints are systemic in this crate by deliberate
+// design and silenced here at the crate root with rationale:
+//
+// * `doc_lazy_continuation` — Markdown list continuations are
+//   formatted to read well at the source level; the rendered
+//   docs.rs output is fine either way.
+// * `too_many_arguments` — scheduler / model / engine entry points
+//   carry many distinct concerns by necessity (model weights,
+//   tokenizer, projection schema, persistence config, progress
+//   sinks, etc.); bundling them into context structs at the API
+//   boundary would hide intent without saving complexity.
+// * `type_complexity` — projection / scheduler types form nested
+//   tuples by design (turns × layers × tiers).  Aliases would just
+//   rename them, not simplify.
+// * `large_enum_variant` — `SchedulerRequest` and `RefreshOutcome`
+//   carry one heavy variant alongside lightweight ones; the
+//   payloads are consumed at the receiving end and never queued,
+//   so the size disparity is academic.
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::large_enum_variant)]
+
 //! Turn-based conversation engine for the candle inference stack.
 //!
 //! Provides a high-level conversation API that manages multi-turn dialogue

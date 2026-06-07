@@ -553,7 +553,7 @@ mod tests {
         let sel = select_dense(&tree, &scores, RecencyConfig::default(), 50);
         // Hard anchor includes the rightmost (only) leaf.
         assert!(sel.contains(NodeId(1)));
-        assert!(sel.origins.iter().any(|o| *o == SelectionOrigin::HardAnchor));
+        assert!(sel.origins.contains(&SelectionOrigin::HardAnchor));
     }
 
     #[test]

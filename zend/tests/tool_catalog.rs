@@ -391,7 +391,6 @@ fn format_tool_responses_escapes_nested_json_correctly() {
 
 #[test]
 fn max_tool_iterations_is_reasonable() {
-    // Sanity: the constant is publicly exposed and within a sensible range.
-    assert!(MAX_TOOL_ITERATIONS >= 2);
-    assert!(MAX_TOOL_ITERATIONS <= 32);
+    const _: () = assert!(MAX_TOOL_ITERATIONS >= 2);
+    const _: () = assert!(MAX_TOOL_ITERATIONS <= 32);
 }

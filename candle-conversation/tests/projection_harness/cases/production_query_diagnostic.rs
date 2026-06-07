@@ -119,9 +119,9 @@ fn sweep_phase(
     }
     println!("\n  ── hit-log promiscuity (semantic depth) ──");
     println!("    probe tokens hitting N tools:");
-    for n in 1..=8 {
-        if spread[n] > 0 {
-            println!("      {n} tool(s): {} probe token(s)", spread[n]);
+    for (n, &count) in spread.iter().enumerate().take(9).skip(1) {
+        if count > 0 {
+            println!("      {n} tool(s): {count} probe token(s)");
         }
     }
     let discriminative: Vec<u16> = tok_tools

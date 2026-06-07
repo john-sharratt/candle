@@ -108,6 +108,13 @@ pub enum RecordType {
     /// `find_or_create(debug_id)` to recover a workspace timeline
     /// after restart.
     DebugId = 13,
+    /// Per-timeline tombstone — marks every turn, section, and
+    /// stream record bound to the named timeline as logically
+    /// deleted.  JSON payload [`TombstonePayload`].  Replay applies
+    /// the tombstone so the old turns vanish from the substrate's
+    /// view; the compactor physically drops the matching records
+    /// on the next compaction pass.
+    Tombstone = 14,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -175,7 +182,7 @@ pub fn encode_record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
          that variant is the reader's catch-all for tags it does \
          not recognise, not a writable type"
     );
-    let mut effective = header.clone();
+    let mut effective = *header;
     effective.crc = crc32(payload);
 
     let header_line = serde_json::to_string(&effective)
@@ -711,6 +718,29 @@ impl DebugIdPayload {
     }
 }
 
+/// JSON payload for a [`RecordType::Tombstone`] record.  Naming
+/// `timeline_id` marks it as logically deleted: every
+/// `StreamDecl::Turn`, `Chunk`, `Tokens`, `Signatures`, `Commit`,
+/// `TreeMetadata`, `Label`, `ConvState`, and `DebugId` record bound
+/// to that timeline becomes inert on replay, and the compactor
+/// drops them from disk on the next compaction pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstonePayload {
+    pub timeline_id: u64,
+}
+
+impl TombstonePayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("TombstonePayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf).map_err(|e| {
+            PersistenceError::Corrupt(format!("Tombstone JSON parse: {e}"))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,6 +1164,6 @@ mod tests {
         // bound exists: pin MAX_HEADER_LINE against ALIGN so a
         // future tweak doesn't accidentally allow multi-sector
         // headers.
-        assert!(MAX_HEADER_LINE < ALIGN);
+        const _: () = assert!(MAX_HEADER_LINE < ALIGN);
     }
 }

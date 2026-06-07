@@ -1,18 +1,25 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
 
 use futures::{Stream, StreamExt};
+use notify::RecommendedWatcher;
 
-use candle_conversation::models::Model;
-use candle_conversation::persistence::content_hash;
-use candle_conversation::projection;
-use candle_conversation::{ConversationEngine, TokenDecoder, TurnEvent};
+use candle_conversation::models::{Dialect, Model};
+use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
+use candle_conversation::projection::{
+    self, Builder, Reserved, SystemPromptItem, TimelineId,
+};
+use candle_conversation::{ConversationEngine, Sequence, TokenDecoder, TurnEvent};
 
+use crate::code_read::CodeReadState;
 use crate::config::DaemonConfig;
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
+use crate::refresh_ctx::RefreshContext;
+use crate::repo_scan::{ClusterState, RepoMap};
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
     MAX_TOOL_ITERATIONS,
@@ -20,6 +27,35 @@ use crate::tools::{
 use crate::types::{ChatMessage, Role};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
+
+// ── Repo-map handle ──────────────────────────────────────────────────────────
+
+/// The `repo_map` layer's owning conversation paired with the
+/// per-cluster hash record.  Refresh is at this granularity — the
+/// whole conversation resets and re-inserts when any cluster's
+/// file-name hash changes, so the [`Sequence`] and the [`ClusterState`]
+/// must stay in lock-step.  Wrapping them in one struct keeps that
+/// invariant under one mutex.
+pub(crate) struct RepoMapConv {
+    pub(crate) sequence: Sequence,
+    pub(crate) state: ClusterState,
+}
+
+/// The `code_reading` layer's owning conversation paired with the
+/// per-file content-hash record.  Same lock-step contract as
+/// [`RepoMapConv`].
+pub(crate) struct CodeReadConv {
+    /// Parallel timelines for the `code_reading` layer.  Each holds
+    /// the scopes of an interleaved subset of workspace files (file
+    /// indices distributed round-robin across the workers).
+    /// Dialogue retrieval queries across all of them via the
+    /// substrate's `active_timelines_for_group` iterator, so the
+    /// projection is opaque to the parallelism.  The refresh path
+    /// tombstones every entry here in one engine call when the
+    /// fresh generation is ready to swap in.
+    pub(crate) sequences: Vec<Sequence>,
+    pub(crate) state: CodeReadState,
+}
 
 // The number of tools surfaced into the system prompt is governed by
 // the `selection: { kind: top_k, k: N }` rule on the `tools` collection
@@ -36,7 +72,7 @@ pub enum StreamItem {
 // ── Inference state ───────────────────────────────────────────────────────────
 
 struct ConvState {
-    conv: candle_conversation::Sequence,
+    conv: Sequence,
 }
 
 struct InferenceState {
@@ -44,19 +80,38 @@ struct InferenceState {
     /// Owns the scheduler `JoinHandle` (conversations hold cloned
     /// `scheduler_tx` senders) and the substrate persistence handle —
     /// locked for the per-turn group-commit and for shutdown checkpointing.
-    engine: std::sync::Mutex<ConversationEngine>,
+    engine: Mutex<ConversationEngine>,
     /// Per-conversation state, keyed by the client-supplied conv_id string.
-    conversations: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConvState>>>>,
+    conversations: Mutex<HashMap<String, Arc<Mutex<ConvState>>>>,
     /// System-prompt already prefilled; all new conversations fork from this.
-    base_conv: std::sync::Mutex<candle_conversation::Sequence>,
+    base_conv: Mutex<Sequence>,
     /// Dedicated tiny-system-prompt conversation that turns the user's
     /// first message into a short sidebar title. Shared across all main
     /// conversations; serialised by the mutex but each call is fast
     /// (~30 ms — prefill is bounded by `head_tail_truncate`).
-    titler: std::sync::Mutex<candle_conversation::Sequence>,
+    titler: Mutex<Sequence>,
     /// The titler's timeline id — excluded from `list_conversations` so
     /// it doesn't show up in the user-facing sidebar.
-    titler_timeline: candle_conversation::projection::TimelineId,
+    titler_timeline: TimelineId,
+    /// `repo_map` layer's owning conversation.  Holds one
+    /// prefilled turn pair per directory cluster; [`ClusterState`]
+    /// is the per-cluster file-name hash record the refresh path
+    /// consults to decide whether to rebuild atomically.
+    repo_map_conv: Mutex<RepoMapConv>,
+    /// Workspace root captured at startup — the refresh path
+    /// re-walks from here on every filesystem event.
+    workspace: PathBuf,
+    /// `code_reading` layer's owning conversation.  Holds the
+    /// tool-call exchange per scope; [`CodeReadState`] is the
+    /// per-file content hash record the refresh path consults.
+    code_read_conv: Mutex<CodeReadConv>,
+    /// Projection builder + sequence config kept alive for the
+    /// atomic refresh paths.  Minting a fresh repo_map or
+    /// code_reading timeline after a file change reuses the same
+    /// schema clone and the same dialect config the initial
+    /// ingestion ran under.
+    refresh_builder: Builder,
+    refresh_config: candle_conversation::SequenceConfig,
     /// Tokenizer shared with the engine — used by `head_tail_truncate`
     /// to bound the titler's prefill at first 50 + last 50 tokens.
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -76,7 +131,7 @@ const TITLER_MAX_TOKENS: usize = 16;
 
 impl InferenceState {
     fn load(
-        mut proj_builder: projection::Builder,
+        mut proj_builder: Builder,
         model_path: PathBuf,
         tokenizer_path: PathBuf,
         workspace: PathBuf,
@@ -89,6 +144,34 @@ impl InferenceState {
         progress.set_step(LoadStep::Model);
         let device = candle::Device::cuda_if_available(0)
             .map_err(|e| anyhow::anyhow!("device init: {e}"))?;
+
+        // VRAM advisory at startup.  The 4090 mobile baseline is
+        // 16 GB; the daemon's model + expert cache + scheduler
+        // buffers leave roughly 3-5 GB for parallel-ingest peak
+        // working set.  When VRAM is constrained we shout a clear
+        // recommendation in the log so a CUDA OOM during code-read
+        // is traceable rather than an opaque exit-1.
+        if let Ok((free, total)) = device.mem_get_info() {
+            let free_gib = (free as f64) / (1024.0 * 1024.0 * 1024.0);
+            let total_gib = (total as f64) / (1024.0 * 1024.0 * 1024.0);
+            let n_workers = crate::code_read::CODE_READ_PARALLELISM;
+            let recommended = if total_gib < 24.0 {
+                "<= 8 workers recommended for 16 GB"
+            } else if total_gib < 40.0 {
+                "<= 16 workers recommended for 24-32 GB"
+            } else {
+                "32-64 workers usable on this VRAM budget"
+            };
+            tracing::info!(
+                free_vram_gib = free_gib,
+                total_vram_gib = total_gib,
+                default_workers = n_workers,
+                "VRAM advisory: {recommended}; \
+                 override code_read parallelism with ZEND_CODE_READ_PARALLELISM=N. \
+                 A hard process exit during code-read decode is almost always GPU OOM \
+                 — lower the worker count and retry.",
+            );
+        }
 
         // Resolve the dialogue layer / primary group up front.  The
         // tool-catalog injection adds sections to that layer.
@@ -140,7 +223,7 @@ impl InferenceState {
             .system_prompt(&before_text)
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
-            .workspace_path(workspace)
+            .workspace_path(workspace.clone())
             .thinking(false);
         let conv_config = builder.conversation_config();
 
@@ -184,6 +267,17 @@ impl InferenceState {
         let section_hook = move |done: u64, total: u64| {
             section_progress.set_step_progress(done, total);
         };
+        // Two clones of the (tools-installed + templates-tokenised)
+        // projection builder go to the repo_map and code_reading
+        // conversations below.  Cloning is cheap (schemas are
+        // `Arc`-backed) and avoids re-running the install +
+        // tokenise passes.
+        let proj_builder_repo_map = proj_builder.clone();
+        let proj_builder_code_read = proj_builder.clone();
+        // Third clone stays on `InferenceState` for the atomic
+        // refresh paths to mint fresh repo_map / code_reading
+        // timelines when the watcher fires.
+        let proj_builder_refresh = proj_builder.clone();
         let base_conv = engine
             .new_conversation_with_projection_progress(
                 &formatted_prompt,
@@ -224,7 +318,7 @@ impl InferenceState {
         let titler = engine
             .new_reserved_conversation(
                 &titler_formatted,
-                projection::Reserved::Titler,
+                Reserved::Titler,
                 conv_config.clone(),
             )
             .map_err(|e| anyhow::anyhow!("titler create: {e}"))?;
@@ -235,16 +329,161 @@ impl InferenceState {
             "titler conversation ready",
         );
 
+        // Walk the workspace, cluster the directory tree under a
+        // token budget, and prefill one (user, assistant) turn pair
+        // per cluster into the `repo_map` layer.  `ClusterState`
+        // is the per-cluster file-name hash record `refresh_repo_map`
+        // consults so a filesystem event triggers a rebuild only
+        // when something actually changed.
+        progress.set_step(LoadStep::RepoScan);
+        let (repo_map_sequence, repo_map, repo_map_state) = crate::repo_scan::ingest_repo_map(
+            &engine,
+            proj_builder_repo_map,
+            &workspace,
+            conv_config.clone(),
+            &progress,
+        )?;
+
+        // For every file the walker surfaced, carve into
+        // scope-aware chunks and prefill the four-turn tool-call
+        // exchange per scope into the `code_reading` layer.
+        progress.set_step(LoadStep::CodeRead);
+        let (code_read_sequences, code_read_state) = crate::code_read::ingest_code_reading(
+            &engine,
+            proj_builder_code_read,
+            &workspace,
+            &repo_map,
+            conv_config.clone(),
+            &progress,
+        )?;
+
         Ok(Arc::new(Self {
             decoder,
-            engine: std::sync::Mutex::new(engine),
-            conversations: std::sync::Mutex::new(HashMap::new()),
-            base_conv: std::sync::Mutex::new(base_conv),
-            titler: std::sync::Mutex::new(titler),
+            engine: Mutex::new(engine),
+            conversations: Mutex::new(HashMap::new()),
+            base_conv: Mutex::new(base_conv),
+            titler: Mutex::new(titler),
             titler_timeline,
+            repo_map_conv: Mutex::new(RepoMapConv {
+                sequence: repo_map_sequence,
+                state: repo_map_state,
+            }),
+            code_read_conv: Mutex::new(CodeReadConv {
+                sequences: code_read_sequences,
+                state: code_read_state,
+            }),
+            refresh_builder: proj_builder_refresh,
+            refresh_config: conv_config.clone(),
+            workspace,
             tokenizer,
             tool_host: ToolHost::new(),
         }))
+    }
+
+    /// Build a [`RefreshContext`] bound to this state's engine,
+    /// projection schema, and dialect config.  Cheap (the schema is
+    /// `Arc`-backed) and avoids duplicating the construction in
+    /// both refresh paths.
+    fn refresh_ctx(&self) -> RefreshContext<'_> {
+        RefreshContext {
+            engine: &self.engine,
+            proj_builder: self.refresh_builder.clone(),
+            config: self.refresh_config.clone(),
+        }
+    }
+
+    /// Atomic refresh of the `repo_map` conversation when any
+    /// directory cluster's file-name hash changed.  Mints a fresh
+    /// timeline, prefills the new clusters, tombstones the old
+    /// timeline (so projection / compaction physically drop it),
+    /// then swaps the new `Sequence` into `repo_map_conv`.  Returns
+    /// `Ok(true)` when the conversation was replaced, `Ok(false)`
+    /// when the hash check found nothing to do.
+    ///
+    /// Stale-better-than-missing: between the new timeline being
+    /// registered (start of prefill) and the tombstone being
+    /// written, both timelines are alive in the substrate.  The
+    /// resolver's `active_timelines_for_group` iterator picks the
+    /// older one (registered first), so dialogue retrieval against
+    /// this layer keeps seeing the prior content the whole way
+    /// through the refresh.  The swap-in is observed by the next
+    /// query as a single atomic transition from old to new.
+    ///
+    /// When `map` is `Some`, the refresh reuses that workspace walk
+    /// instead of doing its own — the watcher callback walks once
+    /// per filesystem-event burst and shares the result with both
+    /// refresh paths.
+    pub(crate) fn refresh_repo_map(
+        &self,
+        map: Option<RepoMap>,
+    ) -> anyhow::Result<bool> {
+        let progress = LoadProgress::new();
+        let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
+        let (old_timeline, prior_state) = {
+            let guard = self.repo_map_conv.lock().unwrap();
+            (guard.sequence.timeline_id(), guard.state.clone())
+        };
+        let ctx = self.refresh_ctx();
+        let outcome =
+            crate::repo_scan::refresh_repo_map(&ctx, &map, &prior_state, old_timeline, &progress)?;
+        match outcome {
+            crate::repo_scan::RefreshOutcome::NoOp => Ok(false),
+            crate::repo_scan::RefreshOutcome::Replaced { sequence, state } => {
+                let mut guard = self.repo_map_conv.lock().unwrap();
+                *guard = RepoMapConv { sequence, state };
+                Ok(true)
+            }
+        }
+    }
+
+    /// Atomic refresh of the `code_reading` conversation when any
+    /// file's content hash changed.  Same shape as
+    /// [`Self::refresh_repo_map`]: mints a fresh generation of
+    /// parallel timelines (one per `code_read::parallelism()` worker),
+    /// runs the 4-turn-per-scope tool-call ingestion (including the
+    /// model-decoded summaries) across them, tombstones the entire
+    /// prior generation, then swaps the new `Vec<Sequence>` in.
+    /// Stale-better-than-missing invariant holds throughout —
+    /// dialogue retrieval against this layer sees the old content
+    /// the whole way through prefill and summary decode, then flips
+    /// to the new content at the tombstone instant.
+    ///
+    /// When `map` is `Some`, the refresh reuses that workspace walk
+    /// instead of doing its own.
+    pub(crate) fn refresh_code_reading(
+        &self,
+        map: Option<RepoMap>,
+    ) -> anyhow::Result<bool> {
+        let progress = LoadProgress::new();
+        let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
+        let (old_timelines, prior_state) = {
+            let guard = self.code_read_conv.lock().unwrap();
+            (
+                guard
+                    .sequences
+                    .iter()
+                    .map(|s| s.timeline_id())
+                    .collect::<Vec<_>>(),
+                guard.state.clone(),
+            )
+        };
+        let ctx = self.refresh_ctx();
+        let outcome = crate::code_read::refresh_code_reading(
+            &ctx,
+            &self.workspace,
+            &map,
+            &prior_state,
+            &old_timelines,
+            &progress,
+        )?;
+        match outcome {
+            crate::code_read::RefreshOutcome::NoOp => Ok(false),
+            crate::code_read::RefreshOutcome::Replaced { sequences, state } => {
+                let mut guard = self.code_read_conv.lock().unwrap();
+                *guard = CodeReadConv { sequences, state };
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -277,7 +516,7 @@ fn run_inference_stream(
         );
 
         let timeline = timeline_for(&conv_id);
-        let conv_arc: Arc<std::sync::Mutex<ConvState>> = {
+        let conv_arc: Arc<Mutex<ConvState>> = {
             let mut map = state.conversations.lock().unwrap();
             if let Some(existing) = map.get(&conv_id) {
                 tracing::debug!(conv_id = %conv_id, "reusing existing conv");
@@ -296,7 +535,7 @@ fn run_inference_stream(
                         return;
                     }
                 };
-                let arc = Arc::new(std::sync::Mutex::new(ConvState { conv }));
+                let arc = Arc::new(Mutex::new(ConvState { conv }));
                 map.insert(conv_id.clone(), Arc::clone(&arc));
                 arc
             }
@@ -504,7 +743,7 @@ fn run_inference_stream(
 /// — the worst case is a missing sidebar label, never a failed response.
 fn generate_and_set_title(
     state: Arc<InferenceState>,
-    timeline: candle_conversation::projection::TimelineId,
+    timeline: TimelineId,
     user_message: String,
 ) {
     use candle_conversation::{TurnEvent, TurnOptions};
@@ -582,7 +821,7 @@ fn generate_and_set_title(
 
 pub struct ZendSession {
     config: DaemonConfig,
-    projection_builder: projection::Builder,
+    projection_builder: Builder,
     #[allow(dead_code)] // read by api/ws_logs.rs in the bin target
     pub(crate) log: Arc<LogBus>,
     /// Fires `true` once the daemon transitions to fully-ready (every
@@ -602,7 +841,11 @@ pub struct ZendSession {
     /// re-fetch the conversations list.
     started_at_ms: u64,
     /// Populated in the background after construction; None until model loads.
-    inference: Arc<std::sync::RwLock<Option<Arc<InferenceState>>>>,
+    inference: Arc<RwLock<Option<Arc<InferenceState>>>>,
+    /// Workspace file-watcher.  Started after the model loads; held
+    /// here so dropping the session also drops the watch.  None until
+    /// the inference state is ready.
+    watcher: Mutex<Option<RecommendedWatcher>>,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -643,12 +886,13 @@ impl ZendSession {
         tracing::info!(workspace = %config.workspace.display(), "session initialised");
         let (ready_tx, _) = tokio::sync::watch::channel(false);
         let (status_tx, _) = tokio::sync::watch::channel(String::new());
-        let started_at_ms = std::time::SystemTime::now()
+        let started_at_ms = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         Self {
-            inference: Arc::new(std::sync::RwLock::new(None)),
+            inference: Arc::new(RwLock::new(None)),
+            watcher: Mutex::new(None),
             config,
             projection_builder,
             log,
@@ -699,8 +943,8 @@ impl ZendSession {
         let log_path = self
             .config
             .workspace
-            .join(candle_conversation::persistence::SUBSTRATE_DIR)
-            .join(candle_conversation::persistence::ACTIVE_LOG_NAME);
+            .join(SUBSTRATE_DIR)
+            .join(ACTIVE_LOG_NAME);
         if !log_path.exists() {
             return Vec::new();
         }
@@ -777,39 +1021,69 @@ impl ZendSession {
         let status_tx = self.status_tx.clone();
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
-        tokio::spawn(async move {
+        // Held by the spawned thread so the workspace watcher's
+        // lifetime ends when the session is dropped — the watcher
+        // is stored under `Arc<ZendSession>::watcher`.
+        let session_for_watcher: Arc<Self> = Arc::clone(self);
+        // OS thread, not `tokio::spawn` — `start_loading` may be
+        // called from contexts without an ambient Tokio runtime
+        // (integration tests, alternative binaries).  The bits that
+        // need an async runtime (HF download) drive a local
+        // current-thread runtime built inside this thread.
+        std::thread::Builder::new()
+            .name("zend-loader".into())
+            .spawn(move || {
             load_progress.set_step(LoadStep::Model);
             status_tx.send("Checking for model…".into()).ok();
-            let (model_path, tok_path) = match crate::download::ensure_model(&status_tx).await {
-                Ok(p) => p,
+
+            // The download path is async (hf-hub, tokio::fs, reqwest);
+            // build a tiny current-thread runtime so we can `block_on`
+            // it without requiring the caller to be on Tokio.
+            let download_runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
                 Err(e) => {
-                    tracing::warn!("model download failed: {e:#}");
-                    status_tx.send(format!("Download failed: {e}")).ok();
-                    // Surface the error to anyone waiting on ready by
-                    // flipping into the ready state with the error
-                    // detail still visible — the chat will fail loudly
-                    // when the user actually submits.
+                    tracing::warn!("local tokio runtime for download failed: {e:#}");
+                    status_tx.send(format!("Runtime build failed: {e}")).ok();
                     load_progress.mark_ready();
                     ready_tx.send(true).ok();
                     return;
                 }
             };
+            let (model_path, tok_path) =
+                match download_runtime.block_on(crate::download::ensure_model(&status_tx)) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("model download failed: {e:#}");
+                        status_tx.send(format!("Download failed: {e}")).ok();
+                        // Surface the error to anyone waiting on ready
+                        // by flipping into the ready state with the
+                        // error detail still visible — the chat will
+                        // fail loudly when the user actually submits.
+                        load_progress.mark_ready();
+                        ready_tx.send(true).ok();
+                        return;
+                    }
+                };
+            // Drop the runtime; the model load below is sync.
+            drop(download_runtime);
 
             status_tx.send("Loading model…".into()).ok();
             tracing::info!("loading inference engine (Qwen3-30B-A3B) …");
             let load_progress_for_blocking = Arc::clone(&load_progress);
-            match tokio::task::spawn_blocking(move || {
-                InferenceState::load(
-                    proj_builder,
-                    model_path,
-                    tok_path,
-                    workspace,
-                    load_progress_for_blocking,
-                )
-            })
-            .await
-            {
-                Ok(Ok(state)) => {
+            // `InferenceState::load` is fully synchronous (CUDA model
+            // load + substrate recovery + ingestion).  Call directly
+            // on this thread — no `spawn_blocking` needed.
+            match InferenceState::load(
+                proj_builder,
+                model_path,
+                tok_path,
+                workspace,
+                load_progress_for_blocking,
+            ) {
+                Ok(state) => {
                     *slot.write().unwrap() = Some(Arc::clone(&state));
                     tracing::info!("inference engine ready");
                     status_tx.send(String::new()).ok();
@@ -817,28 +1091,71 @@ impl ZendSession {
                     // thread (`PersistenceThread`) — 5 s tick + per-turn
                     // trigger from the scheduler — so no periodic-flush
                     // task is needed at the daemon level here.
+                    //
+                    // `LoadStep::RepoScan` and `LoadStep::CodeRead`
+                    // are advanced inside `InferenceState::load`
+                    // itself — the ingestion passes own those steps
+                    // and report sub-step progress through the same
+                    // `LoadProgress` handle.
 
-                    // Steps 4 + 5 are stubbed for now — we walk through
-                    // them so the frontend sees the full state-machine
-                    // progression. When the workspace scan / per-file
-                    // prefill paths land, the real work goes here.
-                    load_progress.set_step(LoadStep::RepoScan);
-                    // (no work yet)
-                    load_progress.set_step(LoadStep::CodeRead);
-                    // (no work yet)
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("inference engine failed to load: {e:#}");
-                    status_tx.send(format!("Load failed: {e}")).ok();
+                    // Arm the workspace watcher.  Filesystem events
+                    // debounce into a single refresh call covering
+                    // BOTH layers — name-relevant events (create /
+                    // remove / rename) can move the repo-map
+                    // cluster hashes, and content edits can move
+                    // the code-reading file-content hashes.  Each
+                    // refresh path short-circuits internally when
+                    // its hash record is unchanged, so the work is
+                    // bounded.
+                    let inference_for_watcher = Arc::clone(&slot);
+                    let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        let Some(state) = inference_for_watcher
+                            .read()
+                            .unwrap()
+                            .as_ref()
+                            .map(Arc::clone)
+                        else {
+                            return;
+                        };
+                        // Walk the workspace once per event burst and
+                        // share the result between both refresh paths.
+                        // Walks are the dominant cost on workspaces
+                        // with tens of thousands of files; doing it
+                        // twice per burst is wasted work.
+                        let map = crate::repo_scan::walk_workspace(&state.workspace);
+                        match state.refresh_repo_map(Some(map.clone())) {
+                            Ok(true) => {
+                                tracing::info!("repo map refreshed after fs event burst")
+                            }
+                            Ok(false) => tracing::debug!(
+                                "fs event burst saw no cluster hash change — repo map skipped"
+                            ),
+                            Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
+                        }
+                        match state.refresh_code_reading(Some(map)) {
+                            Ok(true) => tracing::info!(
+                                "code reading refreshed after fs event burst"
+                            ),
+                            Ok(false) => tracing::debug!(
+                                "fs event burst saw no file content change — code read skipped"
+                            ),
+                            Err(e) => tracing::warn!("code read refresh failed: {e:#}"),
+                        }
+                    });
+                    match crate::watcher::spawn(&state.workspace, on_refresh) {
+                        Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
+                        Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
+                    }
                 }
                 Err(e) => {
-                    tracing::warn!("inference engine panicked: {e}");
-                    status_tx.send("Model load panicked.".into()).ok();
+                    tracing::warn!("inference engine failed to load: {e:#}");
+                    status_tx.send(format!("Load failed: {e}")).ok();
                 }
             }
             load_progress.mark_ready();
             ready_tx.send(true).ok();
-        });
+        })
+        .expect("spawn zend-loader thread");
     }
 
     /// Graceful shutdown: durably checkpoint the substrate redo log, then
@@ -1012,11 +1329,11 @@ fn clean_title(raw: &str) -> String {
     let s = s.strip_prefix("Title:").unwrap_or(s).trim();
     let s = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(s);
     let s = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')).unwrap_or(s);
-    let s = s.trim_end_matches(|c: char| c == '.' || c == '!' || c == '?');
+    let s = s.trim_end_matches(['.', '!', '?']);
     s.trim().to_string()
 }
 
-fn build_projection_builder(workspace: &Path) -> projection::Builder {
+fn build_projection_builder(workspace: &Path) -> Builder {
     let name = workspace
         .file_name()
         .and_then(|n| n.to_str())
@@ -1025,8 +1342,8 @@ fn build_projection_builder(workspace: &Path) -> projection::Builder {
     // so the schema's `kind: template` items (system_open / system_close,
     // tool_block_open/close, no_think_prefix) resolve to the right
     // structural-token strings at parse time.
-    let dialect = candle_conversation::models::Dialect::chat_ml();
-    projection::Builder::from_yaml_with_vars_and_dialect(
+    let dialect = Dialect::chat_ml();
+    Builder::from_yaml_with_vars_and_dialect(
         PROJECTION_SCHEMA_TEMPLATE,
         &[("workspace", name)],
         Some(&dialect),
@@ -1042,8 +1359,7 @@ fn build_projection_builder(workspace: &Path) -> projection::Builder {
 /// first Collection onward is expanded inside
 /// [`Sequence::preemptive_prefill`] (collection sections via
 /// fork-and-merge, post-collection sections via per-section prefill).
-fn pre_collection_prelude(builder: &projection::Builder) -> String {
-    use projection::SystemPromptItem;
+fn pre_collection_prelude(builder: &Builder) -> String {
     let layer = builder
         .schema()
         .layers

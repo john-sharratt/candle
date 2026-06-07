@@ -551,7 +551,7 @@ layers:
     );
     // top-2: i0 (0.9) and i2 (0.7), emitted in insertion order
     assert_eq!(proj.sealed_turns().count(), 2);
-    assert_eq!(proj.sealed_turns().nth(0).unwrap().index().0, 0);
+    assert_eq!(proj.sealed_turns().next().unwrap().index().0, 0);
     assert_eq!(proj.sealed_turns().nth(1).unwrap().index().0, 2);
 }
 
@@ -592,7 +592,7 @@ layers:
         &resolver,
     );
     assert_eq!(proj.sealed_turns().count(), 1);
-    assert_eq!(proj.sealed_turns().nth(0).unwrap().index().0, 1);
+    assert_eq!(proj.sealed_turns().next().unwrap().index().0, 1);
 }
 
 #[test]
@@ -1128,7 +1128,7 @@ fn system_prompt_sections_in_declaration_order() {
         &resolver,
     );
     assert_eq!(proj.sealed_sections().count(), 3);
-    assert_eq!(proj.sealed_sections().nth(0).unwrap().id, frame);
+    assert_eq!(proj.sealed_sections().next().unwrap().id, frame);
     assert_eq!(proj.sealed_sections().nth(1).unwrap().id, values);
     assert_eq!(proj.sealed_sections().nth(2).unwrap().id, guidance);
 }
@@ -2709,7 +2709,7 @@ layers:
         &r_view,
     );
     assert_eq!(proj.sealed_turns().count(), 1);
-    assert_eq!(proj.sealed_turns().nth(0).unwrap().index(), a);
+    assert_eq!(proj.sealed_turns().next().unwrap().index(), a);
 
     // Prag-heavy weights: turn B wins.
     let b_prag = Builder::from_yaml(&yaml_prag_heavy).unwrap();
@@ -2763,7 +2763,7 @@ layers:
         &r2_view,
     );
     assert_eq!(proj.sealed_turns().count(), 1);
-    assert_eq!(proj.sealed_turns().nth(0).unwrap().index(), b2);
+    assert_eq!(proj.sealed_turns().next().unwrap().index(), b2);
 }
 
 #[test]
@@ -2844,7 +2844,7 @@ fn flat_sections_yaml_emits_all_in_declaration_order() {
     );
 
     assert_eq!(p.sealed_sections().count(), 3);
-    assert_eq!(p.sealed_sections().nth(0).unwrap().id, alpha);
+    assert_eq!(p.sealed_sections().next().unwrap().id, alpha);
     assert_eq!(p.sealed_sections().nth(1).unwrap().id, beta);
     assert_eq!(p.sealed_sections().nth(2).unwrap().id, gamma);
 }
@@ -3048,7 +3048,7 @@ layers:
         &resolver,
     );
     assert_eq!(p.sealed_sections().count(), 1);
-    assert_eq!(p.sealed_sections().nth(0).unwrap().id, b_id);
+    assert_eq!(p.sealed_sections().next().unwrap().id, b_id);
 }
 
 #[test]
@@ -3131,7 +3131,7 @@ layers:
         &resolver,
     );
     assert_eq!(p.sealed_sections().count(), 1);
-    assert_eq!(p.sealed_sections().nth(0).unwrap().id, high);
+    assert_eq!(p.sealed_sections().next().unwrap().id, high);
 }
 
 #[test]

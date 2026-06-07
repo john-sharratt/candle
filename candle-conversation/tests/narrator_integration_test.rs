@@ -577,7 +577,7 @@ fn test_narrator_prose_comprehensive() {
         .filter(|s| s.chars().any(|c| c.is_alphabetic()))
         .count();
     assert!(
-        sentence_count >= 1 && sentence_count <= 3,
+        (1..=3).contains(&sentence_count),
         "D: prose must be 1–3 sentences, got {sentence_count}: {prose1}"
     );
 
@@ -657,7 +657,7 @@ fn test_narrator_prose_comprehensive() {
         .filter(|s| s.chars().any(|c| c.is_alphabetic()))
         .count();
     assert!(
-        sentence_count2 >= 1 && sentence_count2 <= 3,
+        (1..=3).contains(&sentence_count2),
         "G/D: turn 2 must be 1–3 sentences, got {sentence_count2}: {prose2}"
     );
 

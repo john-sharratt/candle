@@ -539,7 +539,7 @@ impl BatchedSampler {
             // EOS failsafe overrides (post-sampler)
             if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
                 // Hard stop: unconditionally force EOS regardless of sentence position.
-                token = eos_token_id as u32;
+                token = eos_token_id;
             } else if config.graceful_eos_after > 0
                 && state.current_len >= config.graceful_eos_after
                 && !config.sentence_end_token_ids.is_empty()
@@ -554,14 +554,14 @@ impl BatchedSampler {
                     .map(|&t| config.sentence_end_token_ids.contains(&t))
                     .unwrap_or(false)
                 {
-                    token = eos_token_id as u32;
+                    token = eos_token_id;
                 }
             } else if config.graceful_eos_after > 0
                 && state.current_len >= config.graceful_eos_after
                 && config.sentence_end_token_ids.is_empty()
             {
                 // No sentence-end tokens resolved: fall back to hard stop.
-                token = eos_token_id as u32;
+                token = eos_token_id;
             }
             output_tokens[i] = token;
 
@@ -634,7 +634,7 @@ impl BatchedSampler {
             let start = total - window;
             recent_lens.push(window as i32);
             recent_tokens.extend_from_slice(&state.recent_tokens[start..]);
-            recent_tokens.extend(std::iter::repeat(0).take(self.max_recent_len - window));
+            recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
         }
 
         // Current generated lengths (for dynamic EOS ramp)
@@ -899,19 +899,19 @@ impl BatchedSampler {
                 CudaStorageSlice::F32(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
                     let logits_ptr =
-                        (ptr as u64 + (start_offset as u64 * 4)) as *const std::ffi::c_void;
+                        (ptr + (start_offset as u64 * 4)) as *const std::ffi::c_void;
                     call_kernel(logits_ptr);
                 }
                 CudaStorageSlice::F16(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
                     let logits_ptr =
-                        (ptr as u64 + (start_offset as u64 * 2)) as *const std::ffi::c_void;
+                        (ptr + (start_offset as u64 * 2)) as *const std::ffi::c_void;
                     call_kernel(logits_ptr);
                 }
                 CudaStorageSlice::BF16(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
                     let logits_ptr =
-                        (ptr as u64 + (start_offset as u64 * 2)) as *const std::ffi::c_void;
+                        (ptr + (start_offset as u64 * 2)) as *const std::ffi::c_void;
                     call_kernel(logits_ptr);
                 }
                 _ => {

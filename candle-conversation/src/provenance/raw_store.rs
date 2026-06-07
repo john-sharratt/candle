@@ -441,10 +441,10 @@ pub fn extract_q_vector_r16(
             q_vec.extend_from_slice(&q_flat[tok_base..end]);
             // zero-fill if sub_dim was clipped
             if end - tok_base < sub_dim {
-                q_vec.extend(std::iter::repeat(0.0f32).take(sub_dim - (end - tok_base)));
+                q_vec.extend(std::iter::repeat_n(0.0f32, sub_dim - (end - tok_base)));
             }
         } else {
-            q_vec.extend(std::iter::repeat(0.0f32).take(sub_dim));
+            q_vec.extend(std::iter::repeat_n(0.0f32, sub_dim));
         }
     }
     // ensure length
@@ -501,12 +501,9 @@ pub fn build_token_blob(
 
     for t in 0..actual_tokens {
         let t_base = t * bpt;
-        for band in 0..3usize {
+        for (band, layer_data) in band_layer_data.iter().enumerate().take(3) {
             for layer in 0..nl {
-                let (k_flat, q_flat) = band_layer_data[band]
-                    .get(layer)
-                    .copied()
-                    .unwrap_or((&[], &[]));
+                let (k_flat, q_flat) = layer_data.get(layer).copied().unwrap_or((&[], &[]));
                 for head in 0..nh {
                     // K
                     let k_off = t_base + header.slot_offset(band, layer, head, false);
@@ -554,7 +551,7 @@ pub fn band_layer_indices(
     // If end was clamped, shift start back
     let start = end.saturating_sub(n_layers_per_band);
     (start..end)
-        .chain(std::iter::repeat(end.saturating_sub(1)).take(n_layers_per_band.saturating_sub(end - start)))
+        .chain(std::iter::repeat_n(end.saturating_sub(1), n_layers_per_band.saturating_sub(end - start)))
         .take(n_layers_per_band)
         .collect()
 }
@@ -659,7 +656,8 @@ mod tests {
         // set a unique value per (palette, sub_dim)
         for p in 0..4usize {
             for d in 0..sub_dim {
-                let idx = p * chunk_size * sub_dim + 0 * sub_dim + d;
+                // Token 0 — token offset is 0 * sub_dim, elided.
+                let idx = p * chunk_size * sub_dim + d;
                 q_flat[idx] = (p * sub_dim + d + 1) as f32;
             }
         }

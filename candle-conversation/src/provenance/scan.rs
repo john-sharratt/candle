@@ -945,8 +945,8 @@ mod tests {
         let s_match = sig_with_first_byte(0x55);
         let s_mismatch = {
             let mut b = [0u8; 16];
-            for i in 0..16 {
-                b[i] = !s_match.as_bytes()[i];
+            for (i, slot) in b.iter_mut().enumerate() {
+                *slot = !s_match.as_bytes()[i];
             }
             TokenSignature::from_bytes(&b)
         };

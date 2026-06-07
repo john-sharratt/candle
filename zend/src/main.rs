@@ -14,13 +14,18 @@
 //! ```
 
 mod api;
+mod code_read;
 mod config;
 mod download;
 mod loading;
 mod log_broadcast;
+mod refresh_ctx;
+mod repo_scan;
 mod session;
 mod tools;
+mod turn_sink;
 mod types;
+mod watcher;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

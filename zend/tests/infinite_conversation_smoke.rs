@@ -27,7 +27,7 @@
 //!   live in the deeper-scale harness because they need a meaningful
 //!   filler distribution.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use candle::Device;
 use candle_conversation::models::Model;
@@ -150,7 +150,7 @@ fn init_tracing() {
     });
 }
 
-fn load_engine_and_base(workspace: &PathBuf) -> (ConversationEngine, Sequence) {
+fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     init_tracing();
     let device = cuda_device().expect("CUDA required for Tier-3 recall harness");
     eprintln!(
@@ -180,7 +180,7 @@ fn load_engine_and_base(workspace: &PathBuf) -> (ConversationEngine, Sequence) {
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
-        .workspace_path(workspace.as_path())
+        .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())
         .seed(0)
         .max_response_tokens(40)

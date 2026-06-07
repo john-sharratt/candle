@@ -146,6 +146,7 @@ impl ProvenanceFile {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
         let write_pos = file.metadata()?.len();
         Ok(Self {

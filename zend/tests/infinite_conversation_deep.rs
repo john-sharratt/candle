@@ -21,7 +21,7 @@
 //!     infinite_conversation_cruise --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use candle::Device;
 use candle_conversation::models::Model;
@@ -54,7 +54,7 @@ fn workspace_dir(default: &str) -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join(default))
 }
 
-fn load_engine_and_base(workspace: &PathBuf) -> (ConversationEngine, Sequence) {
+fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     let device = cuda_device().expect("CUDA required for Tier-3 cruise");
     let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
     let workspace_str = workspace.display().to_string();
@@ -74,7 +74,7 @@ fn load_engine_and_base(workspace: &PathBuf) -> (ConversationEngine, Sequence) {
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
-        .workspace_path(workspace.as_path())
+        .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())
         .seed(0)
         .max_response_tokens(40)

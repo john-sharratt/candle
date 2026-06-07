@@ -565,10 +565,10 @@ impl Scheduler {
             // The view may have finished (EOS/health) between trigger
             // and drain — in that case the cleanup path handles finalize
             // and we have nothing to do.
-            if !self
+            if self
                 .active_decodes
                 .get(&view_id)
-                .map_or(false, |s| !s.finished)
+                .is_none_or(|s| s.finished)
             {
                 continue;
             }

@@ -1087,7 +1087,7 @@ pub fn check_phrase_loop(
 /// - `interval`             — steps between each check (for context)
 /// - `prefill_token_count`  — prompt length in tokens (context depth at decode start)
 /// - `temperature` / `top_k` / `top_p` / `rep_penalty` — sampling config snapshot
-
+//
 /// Build a filtered view of the health log for chart and table rendering.
 ///
 /// Keeps only:
@@ -1097,7 +1097,7 @@ pub fn check_phrase_loop(
 /// - The abort sample (always the last entry)
 ///
 /// Stats (min/max/mean/slope) are still computed from the full log.
-fn filter_log_for_display<'a>(log: &'a [HealthSample], interval: usize) -> Vec<&'a HealthSample> {
+fn filter_log_for_display(log: &[HealthSample], interval: usize) -> Vec<&HealthSample> {
     let n = log.len();
     if n == 0 {
         return vec![];
@@ -1308,8 +1308,7 @@ pub fn render_health_dump(
     );
     let _ = writeln!(
         out,
-        "   {}  {}  {}  {}  {}  {}  {}",
-        "---", "------", "--------", "-------", "-------", "----------", "----------"
+        "   ---  ------  --------  -------  -------  ----------  ----------"
     );
     for (i, s) in display_log.iter().enumerate() {
         let is_abort = i + 1 == dn;
@@ -1346,9 +1345,9 @@ pub fn render_health_dump(
     if !tok_tail.is_empty() {
         let tail_len = tok_tail.len();
         let first_step = abort_step.saturating_sub(tail_len);
-        let _ = writeln!(out, "\n final {} token steps before abort:", tail_len);
+        let _ = writeln!(out, "\n final {tail_len} token steps before abort:");
         let _ = writeln!(out, "   {:>6}  {:>8}", "step", "token-id");
-        let _ = writeln!(out, "   {}  {}", "------", "--------");
+        let _ = writeln!(out, "   ------  --------");
         for (j, &tok) in tok_tail.iter().enumerate() {
             let _ = writeln!(out, "   {:>6}  {:>8}", first_step + j, tok);
         }
@@ -1374,13 +1373,7 @@ pub fn render_health_dump(
         );
         let _ = writeln!(
             out,
-            "   {}  {}  {}  {}  {}  {}",
-            "----",
-            "--------",
-            "----------",
-            "----------",
-            "--------",
-            "------------------------------"
+            "   ----  --------  ----------  ----------  --------  ------------------------------"
         );
         let max_p = abort_top_tokens.first().map(|(_, p, _)| *p).unwrap_or(1.0);
         let mut cum = 0.0f32;

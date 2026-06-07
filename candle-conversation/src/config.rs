@@ -672,7 +672,7 @@ impl SamplingConfig {
 
     /// Returns `true` if DRY penalty is enabled.
     pub fn has_dry(&self) -> bool {
-        self.dry.as_ref().map_or(false, |d| d.multiplier != 0.0)
+        self.dry.as_ref().is_some_and(|d| d.multiplier != 0.0)
     }
 
     /// Returns `true` if stencil constraint is active.

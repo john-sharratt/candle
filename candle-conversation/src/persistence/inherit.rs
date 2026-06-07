@@ -208,7 +208,7 @@ mod tests {
         let b = InheritedSubstrate::load(&path).unwrap();
         // The common base is loaded once and shared — not duplicated.
         assert!(Arc::ptr_eq(&a, &b));
-        assert_eq!(Arc::strong_count(&a) >= 2, true);
+        assert!(Arc::strong_count(&a) >= 2);
 
         InheritedSubstrate::forget(&path);
         std::fs::remove_file(&path).ok();

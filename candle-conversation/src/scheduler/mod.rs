@@ -1865,7 +1865,7 @@ impl Scheduler {
         let state = self
             .slot_projection_state
             .entry(parent_id)
-            .or_insert_with(projection_assembler::SlotState::new);
+            .or_default();
 
         projection_assembler::apply_segments(
             state,
@@ -1941,7 +1941,7 @@ impl Scheduler {
         }
         let gpu_per_layer: Vec<SealedSequence> = per_layer_chunks
             .into_iter()
-            .zip(per_layer_token_count.into_iter())
+            .zip(per_layer_token_count)
             .map(|(chunks, tokens)| SealedSequence {
                 chunks,
                 token_count: tokens,
@@ -2365,7 +2365,7 @@ impl Scheduler {
                     let per_layer_sealed: Vec<candle_nn::kv_cache::SealedSequence> =
                         per_layer_chunks
                             .into_iter()
-                            .zip(per_layer_token_count.into_iter())
+                            .zip(per_layer_token_count)
                             .map(|(chunks, toks)| candle_nn::kv_cache::SealedSequence {
                                 chunks,
                                 token_count: toks,
@@ -3409,10 +3409,10 @@ impl Scheduler {
     /// 2. **Capture the active turn's tail**: snapshot the view per
     ///    layer as `SealedSequence`s and slice off
     ///    `chunks[original_borrowed..]`.  Those chunks hold every
-    ///    K/V byte computed since the view was carved (user prefill
-    ///    + decoded-so-far).  The Q vectors and BDP signatures for
-    ///    the decoded tokens are already captured by provenance —
-    ///    nothing in the tail needs regenerating.
+    ///    K/V byte computed since the view was carved (user prefill +
+    ///    decoded-so-far).  The Q vectors and BDP signatures for the
+    ///    decoded tokens are already captured by provenance — nothing
+    ///    in the tail needs regenerating.
     /// 3. **Free the old view**: drops its `ChunkGid` refs.  The
     ///    captured tail Arc-refs keep the underlying chunks alive
     ///    across the free, so the GPU bytes survive untouched.
@@ -4430,7 +4430,7 @@ mod tests {
         let parent_raw = scheduler.session.create_sequence().unwrap();
         let parent_id = SequenceId(parent_raw);
         // Populate one full chunk on the parent so the view has a block to borrow.
-        let tokens = vec![1u32, 2, 3, 4, 5, 6, 7, 8];
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8];
         let input = candle::Tensor::new(&tokens[..], &scheduler.device)
             .unwrap()
             .unsqueeze(0)

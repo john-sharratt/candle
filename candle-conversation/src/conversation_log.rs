@@ -83,17 +83,17 @@ impl LogWriter {
     /// Multi-line string fields are written with YAML literal block style (`|`)
     /// so the log file is human-readable.
     pub fn append(&mut self, record: &LogRecord) -> Result<()> {
-        write!(self.file, "---\n")?;
+        writeln!(self.file, "---")?;
         match record {
             LogRecord::Header {
                 character_system_prompt,
                 guide_system_prompt,
                 started_at,
             } => {
-                write!(self.file, "kind: header\n")?;
+                writeln!(self.file, "kind: header")?;
                 write_block_scalar(&mut self.file, "character_system_prompt", character_system_prompt)?;
                 write_block_scalar(&mut self.file, "guide_system_prompt", guide_system_prompt)?;
-                write!(self.file, "started_at: {}\n", started_at)?;
+                writeln!(self.file, "started_at: {started_at}")?;
             }
             LogRecord::Turn {
                 seq,
@@ -101,19 +101,19 @@ impl LogWriter {
                 character_response,
                 character_token_count,
             } => {
-                write!(self.file, "kind: turn\n")?;
-                write!(self.file, "seq: {}\n", seq)?;
+                writeln!(self.file, "kind: turn")?;
+                writeln!(self.file, "seq: {seq}")?;
                 write_block_scalar(&mut self.file, "guide_message", guide_message)?;
                 write_block_scalar(&mut self.file, "character_response", character_response)?;
-                write!(self.file, "character_token_count: {}\n", character_token_count)?;
+                writeln!(self.file, "character_token_count: {character_token_count}")?;
             }
             LogRecord::Done {
                 total_turns,
                 elapsed_secs,
             } => {
-                write!(self.file, "kind: done\n")?;
-                write!(self.file, "total_turns: {}\n", total_turns)?;
-                write!(self.file, "elapsed_secs: {:.1}\n", elapsed_secs)?;
+                writeln!(self.file, "kind: done")?;
+                writeln!(self.file, "total_turns: {total_turns}")?;
+                writeln!(self.file, "elapsed_secs: {elapsed_secs:.1}")?;
             }
         }
         self.file.flush()?;
@@ -129,21 +129,19 @@ fn write_block_scalar(w: &mut impl Write, key: &str, value: &str) -> std::io::Re
     let value = value.replace("\r\n", "\n");
     let value = value.trim_end_matches('\n');
     if value.contains('\n') {
-        write!(w, "{}: |\n", key)?;
+        writeln!(w, "{key}: |")?;
         for line in value.split('\n') {
             if line.is_empty() {
-                write!(w, "\n")?;
+                writeln!(w)?;
             } else {
-                write!(w, "  {}\n", line)?;
+                writeln!(w, "  {line}")?;
             }
         }
-    } else {
+    } else if value.contains(':') || value.contains('#') || value.contains('\'') || value.contains('"') {
         // Single-line: inline, but quote if it contains special YAML characters.
-        if value.contains(':') || value.contains('#') || value.contains('\'') || value.contains('"') {
-            write!(w, "{}: {:?}\n", key, value)?;
-        } else {
-            write!(w, "{}: {}\n", key, value)?;
-        }
+        writeln!(w, "{key}: {value:?}")?;
+    } else {
+        writeln!(w, "{key}: {value}")?;
     }
     Ok(())
 }

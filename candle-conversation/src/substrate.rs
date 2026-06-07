@@ -50,14 +50,16 @@ use std::sync::{OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
 use candle_nn::kv_cache::SealedSequence;
-use std::collections::{BTreeMap, HashMap, LinkedList};
+use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
-use crate::persistence::record::{DebugIdPayload, RecordType, TreeMetadataPayload};
+use crate::persistence::record::{
+    DebugIdPayload, RecordType, TombstonePayload, TreeMetadataPayload,
+};
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{DepthWeights, ScoreFormula};
@@ -160,6 +162,16 @@ pub struct Substrate {
     /// their `conv_id` would never reach the TimelineEntry.
     pending_conv_meta: HashMap<u64, ConvMeta>,
     pending_conv_state: HashMap<u64, ConvState>,
+
+    /// Timelines flagged by [`RecordType::Tombstone`] as logically
+    /// deleted.  [`Self::active_timelines_for_group`] filters them
+    /// out so projection never surfaces their turns; the compactor
+    /// drops the on-disk records during the next compaction pass.
+    /// Entries may name timelines that are not yet registered
+    /// (walker can apply a tombstone before its target
+    /// `StreamDecl::Turn`) — registration just observes them as
+    /// already tombstoned, which is the correct behaviour.
+    tombstoned_timelines: HashSet<TimelineId>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -323,7 +335,30 @@ pub struct PromotionPlan {
     pub already_hot: Vec<AlreadyHotEntry>,
     pub warm_to_hot: Vec<WarmToHotEntry>,
     pub cold_to_hot: Vec<ColdToHotEntry>,
+    /// Items the substrate has no record of at all — neither a turn
+    /// entry in `timelines.<tl>.turns` nor a section entry in
+    /// `sections`.  This is the genuinely-problematic bucket: the
+    /// projection plan referenced an id that the substrate cannot
+    /// resolve, which is either a stale projection or a substrate
+    /// invariant violation.  `elevate_to_hot` logs a `WARN` per
+    /// item in this bucket.
     pub missing: Vec<PromotionItemKind>,
+    /// Items the substrate DOES have a record of, but whose
+    /// residence has no hot/warm/cold tier installed — so there's
+    /// nothing to elevate.  The two cases that produce this:
+    ///
+    ///  1. Ghost summary turns appended by the
+    ///     `substrate-summariser` thread via
+    ///     `record_summary_turn` → `append_with_blocks(0..0)`.
+    ///     These declare a node in the per-timeline summary tree
+    ///     and carry no K/V, by design.
+    ///  2. A turn whose tier state was rolled back (a
+    ///     `clear_turn_sealed` call between projection and elevate).
+    ///
+    /// `elevate_to_hot` silently skips these items.  Distinct from
+    /// `missing` so the WARN doesn't fire for legitimately-tier-less
+    /// turns.
+    pub tier_less: Vec<PromotionItemKind>,
 }
 
 /// A full rehydration from cold (disk-only) state.
@@ -1237,7 +1272,13 @@ impl Substrate {
             });
             return;
         }
-        plan.missing.push(kind);
+        // The item is tracked in the substrate but its residence has
+        // no tier installed.  This is the expected state for ghost
+        // summary turns appended via `append_with_blocks(0..0)` —
+        // they exist as tree-meta anchors without any K/V to load.
+        // Route to `tier_less`, not `missing`, so `elevate_to_hot`'s
+        // WARN doesn't fire for the design-intended case.
+        plan.tier_less.push(kind);
     }
 
     /// Bulk install of freshly-promoted bytes — both elevation legs
@@ -1483,7 +1524,7 @@ impl Substrate {
                     return None;
                 }
                 let slot = &self.residence[idx.0];
-                (slot.hot.is_some() && slot.warm.is_some()).then(|| (idx, slot.byte_size))
+                (slot.hot.is_some() && slot.warm.is_some()).then_some((idx, slot.byte_size))
             })
             .collect();
 
@@ -1589,6 +1630,30 @@ impl Substrate {
             .get(&group)
             .into_iter()
             .flat_map(|v| v.iter().copied())
+    }
+
+    /// Like [`Self::timelines_for_group`] but excludes timelines
+    /// flagged `archived` or tombstoned.  Projection retrieval
+    /// ([`ContentResolver`]) uses this so retired and user-archived
+    /// conversations drop out of selection without their turns
+    /// being physically deleted from the substrate.
+    pub fn active_timelines_for_group(
+        &self,
+        group: GroupId,
+    ) -> impl Iterator<Item = TimelineId> + '_ {
+        self.timelines_by_group
+            .get(&group)
+            .into_iter()
+            .flat_map(|v| v.iter().copied())
+            .filter(move |tl| {
+                if self.tombstoned_timelines.contains(tl) {
+                    return false;
+                }
+                self.timelines
+                    .get(tl)
+                    .map(|e| !e.archived)
+                    .unwrap_or(true)
+            })
     }
 
     // ── debug_id resume keys ────────────────────────────────────────────────
@@ -2032,6 +2097,36 @@ impl Substrate {
         self.set_debug_id(timeline, payload.debug_id.clone());
     }
 
+    /// Apply a decoded [`TombstonePayload`].  Works whether or not
+    /// the timeline is currently registered — registration just
+    /// observes the tombstone bit when it later drains the same set.
+    pub fn apply_tombstone(&mut self, payload: &TombstonePayload) {
+        let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
+            return;
+        };
+        self.tombstoned_timelines.insert(timeline);
+    }
+
+    /// Mark `timeline` as tombstoned in-RAM.  Callers writing the
+    /// matching `Tombstone` record to the redo log invoke this to
+    /// keep the live projection / resolver in sync — without it the
+    /// deletion would only take effect on the next reload.
+    pub fn tombstone_timeline(&mut self, timeline: TimelineId) {
+        self.tombstoned_timelines.insert(timeline);
+    }
+
+    /// Whether `timeline` has been tombstoned.
+    pub fn is_tombstoned(&self, timeline: TimelineId) -> bool {
+        self.tombstoned_timelines.contains(&timeline)
+    }
+
+    /// Direct read of the tombstoned-timeline set.  Used by the
+    /// compactor to filter dead records out of the next compacted
+    /// log.
+    pub fn tombstoned_timelines(&self) -> &HashSet<TimelineId> {
+        &self.tombstoned_timelines
+    }
+
     /// Apply one walked redo-log record directly into the substrate's
     /// in-RAM state.  The dispatch lives here (not on `Manifest`)
     /// because per-entity records — chunks, stream decls, labels,
@@ -2108,6 +2203,11 @@ impl Substrate {
                     self.apply_debug_id_payload(&payload);
                 }
             }
+            RecordType::Tombstone => {
+                if let Ok(payload) = TombstonePayload::decode(&entry.record.payload) {
+                    self.apply_tombstone(&payload);
+                }
+            }
             // Singletons go to the manifest, not the substrate.
             RecordType::ModelSpec
             | RecordType::Template
@@ -2172,7 +2272,7 @@ impl Substrate {
         block_start: u64,
         block_end: u64,
     ) -> TurnIndex {
-        let existing = self.timelines_for_group(group).next();
+        let existing = self.active_timelines_for_group(group).next();
         let timeline = if let Some(t) = existing {
             t
         } else {
@@ -2950,14 +3050,14 @@ impl Substrate {
 /// the target group.
 impl ContentResolver for Substrate {
     fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.timelines_for_group(group).next() else {
+        let Some(timeline) = self.active_timelines_for_group(group).next() else {
             return 0;
         };
         Substrate::turn_count(self, timeline)
     }
 
     fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.timelines_for_group(group).next() else {
+        let Some(timeline) = self.active_timelines_for_group(group).next() else {
             return 0;
         };
         self.turn(timeline, index)
@@ -2977,7 +3077,7 @@ impl ContentResolver for Substrate {
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.timelines_for_group(group).next()?;
+        let timeline = self.active_timelines_for_group(group).next()?;
         let (layer, _) = self.timeline_target(timeline)?;
         Some(layer)
     }
@@ -3044,14 +3144,14 @@ fn combine_per_depth(
 /// `TargetedRead` which filters by `target.timeline` within the target group.
 impl<'a> ContentResolver for ScoredSubstrate<'a> {
     fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
+        let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
             return 0;
         };
         Substrate::turn_count(self.substrate, timeline)
     }
 
     fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
+        let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
             return 0;
         };
         self.substrate
@@ -3066,7 +3166,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        let Some(timeline) = self.substrate.timelines_for_group(group).next() else {
+        let Some(timeline) = self.substrate.active_timelines_for_group(group).next() else {
             return 0.0;
         };
         if self.substrate.turn(timeline, index).is_none() {
@@ -3076,7 +3176,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.substrate.timelines_for_group(group).next()?;
+        let timeline = self.substrate.active_timelines_for_group(group).next()?;
         let (layer, _) = self.substrate.timeline_target(timeline)?;
         Some(layer)
     }
@@ -3111,9 +3211,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         let root = self.substrate.tree_root_of(timeline)?;
         // Reachability guard: if the recorded root isn't actually
         // present, treat as "no tree" rather than crash.
-        if self.substrate.tree_meta_of(timeline, root).is_none() {
-            return None;
-        }
+        self.substrate.tree_meta_of(timeline, root)?;
         let tree = self.substrate.build_summary_tree_in_memory(timeline);
         if tree.is_empty() {
             return None;
@@ -3156,14 +3254,8 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
             .zip(sel.origins.iter())
             .filter_map(|(id, origin)| {
                 let idx = TurnIndex(id.0);
-                if self.substrate.turn(timeline, idx).is_none() {
-                    return None;
-                }
-                let eff = sel
-                    .effective_scores
-                    .get(id)
-                    .copied()
-                    .unwrap_or(0.0);
+                self.substrate.turn(timeline, idx)?;
+                let eff = sel.effective_scores.get(id).copied().unwrap_or(0.0);
                 Some((idx, *origin, eff))
             })
             .collect();
@@ -3235,14 +3327,14 @@ impl<'a> std::ops::Deref for SubstrateRead<'a> {
 
 impl<'a> ContentResolver for SubstrateRead<'a> {
     fn turn_count(&self, group: GroupId) -> u32 {
-        let Some(timeline) = self.guard.timelines_for_group(group).next() else {
+        let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
             return 0;
         };
         Substrate::turn_count(&self.guard, timeline)
     }
 
     fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-        let Some(timeline) = self.guard.timelines_for_group(group).next() else {
+        let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
             return 0;
         };
         self.guard
@@ -3257,7 +3349,7 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> f32 {
-        let Some(timeline) = self.guard.timelines_for_group(group).next() else {
+        let Some(timeline) = self.guard.active_timelines_for_group(group).next() else {
             return 0.0;
         };
         if self.guard.turn(timeline, index).is_none() {
@@ -3271,7 +3363,7 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
-        let timeline = self.guard.timelines_for_group(group).next()?;
+        let timeline = self.guard.active_timelines_for_group(group).next()?;
         let (layer, _) = self.guard.timeline_target(timeline)?;
         Some(layer)
     }
@@ -3693,7 +3785,7 @@ mod tests {
         // `pop_back` returning None.
         let r = sub.purge_warm_to_target(
             10 * 1024 * 1024 * 1024,
-            1 * 1024 * 1024 * 1024, // 1 GiB available
+            1024 * 1024 * 1024, // 1 GiB available
             64 * 1024 * 1024 * 1024, // 64 GiB total
         );
         assert_eq!(r.count, 0);
@@ -3901,5 +3993,163 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].1, "abc");
         assert_eq!(convs[0].2, "tour");
+    }
+
+    // ── Tombstone ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tombstone_hides_timeline_from_active_iterator() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let alive = alloc.next();
+        let dead = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(alive, layer, group);
+        sub.register_timeline(dead, layer, group);
+
+        // Before tombstone: both surface.
+        let pre: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
+        assert!(pre.contains(&alive));
+        assert!(pre.contains(&dead));
+
+        sub.tombstone_timeline(dead);
+        assert!(sub.is_tombstoned(dead));
+        assert!(!sub.is_tombstoned(alive));
+
+        // After tombstone: only the alive one.
+        let post: Vec<TimelineId> = sub.active_timelines_for_group(group).collect();
+        assert_eq!(post, vec![alive]);
+    }
+
+    #[test]
+    fn tombstone_for_unregistered_timeline_survives_registration() {
+        // Walker replay order: a `Tombstone` record can precede the
+        // matching `StreamDecl::Turn` (the redo log is append-only
+        // and a refresh may write the tombstone before the new
+        // generation's turn decls).  The tombstone bit must persist
+        // through the eventual registration so the just-registered
+        // timeline is observably dead from the start.
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let timeline = alloc.next();
+        let mut sub = Substrate::new();
+
+        sub.apply_tombstone(&super::TombstonePayload {
+            timeline_id: timeline.raw(),
+        });
+        assert!(sub.is_tombstoned(timeline));
+
+        sub.register_timeline(timeline, layer, group);
+        assert!(sub.is_tombstoned(timeline));
+        assert!(sub
+            .active_timelines_for_group(group)
+            .all(|t| t != timeline));
+    }
+
+    #[test]
+    fn tombstoned_timelines_set_includes_unregistered_entries() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let registered = alloc.next();
+        let unregistered = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(registered, layer, group);
+        sub.tombstone_timeline(registered);
+        sub.apply_tombstone(&super::TombstonePayload {
+            timeline_id: unregistered.raw(),
+        });
+
+        let set = sub.tombstoned_timelines();
+        assert!(set.contains(&registered));
+        assert!(set.contains(&unregistered));
+        assert_eq!(set.len(), 2);
+    }
+
+    /// Regression: `snapshot_promotion_state` used to misclassify
+    /// every tier-less turn (a turn whose residence has no
+    /// hot/warm/cold installed — the design-intended state for
+    /// ghost summary turns the substrate-summariser appends via
+    /// `append_with_blocks(0..0)`) as `missing`, which used the
+    /// same bucket as "substrate has no record of this turn at all."
+    /// `elevate_to_hot` then logged a WARN per item, flooding the
+    /// production daemon's trace with apparent corruption warnings
+    /// every time a parallel-ingest worker submitted a turn whose
+    /// projection plan included any of those tree-meta-only nodes.
+    ///
+    /// The fix splits the two cases — `missing` keeps the "not in
+    /// substrate" semantic; `tier_less` is the new bucket for
+    /// "in substrate but nothing to elevate."  Both get skipped by
+    /// the elevation orchestrator, but only `missing` triggers the
+    /// WARN.
+    #[test]
+    fn snapshot_promotion_state_classifies_tier_less_turns_separately_from_missing() {
+        let (_layer, _group, timeline, mut sub) = make_timeline();
+        // 4 turns with `block_range = 0..*` but no sealed K/V.
+        // `append_with_blocks` allocates a residence slot with
+        // hot/warm/cold all None — exactly what the summariser does
+        // for ghost summary turns.
+        for i in 0..4 {
+            sub.append_with_blocks(timeline, 10, i, i + 1);
+        }
+
+        let stored_indices: Vec<TurnIndex> = sub.turn_indices(timeline).collect();
+        assert_eq!(
+            stored_indices,
+            vec![TurnIndex(0), TurnIndex(1), TurnIndex(2), TurnIndex(3)],
+        );
+
+        let turn_keys: Vec<TurnKey> = stored_indices
+            .iter()
+            .map(|idx| TurnKey::new(timeline, *idx))
+            .collect();
+        let plan = sub.snapshot_promotion_state(&[], &turn_keys);
+
+        // Every appended turn is tracked but tier-less — they
+        // belong in `tier_less`, NOT `missing`.
+        assert!(
+            plan.missing.is_empty(),
+            "no turn should be reported missing — they're all in the substrate; \
+             missing={:?}",
+            plan.missing,
+        );
+        assert_eq!(
+            plan.tier_less.len(),
+            4,
+            "every tier-less ghost turn lands in `tier_less`; tier_less={:?}",
+            plan.tier_less,
+        );
+        assert_eq!(plan.already_hot.len(), 0);
+        assert_eq!(plan.warm_to_hot.len(), 0);
+        assert_eq!(plan.cold_to_hot.len(), 0);
+    }
+
+    /// Counterpart to the regression test: a TurnKey naming an
+    /// index the substrate genuinely has no record of must still
+    /// land in `missing` (not `tier_less`), so the WARN in
+    /// `elevate_to_hot` still fires for true corruption / stale
+    /// projection plans.
+    #[test]
+    fn snapshot_promotion_state_marks_truly_unknown_turns_as_missing() {
+        let (_layer, _group, timeline, mut sub) = make_timeline();
+        sub.append_with_blocks(timeline, 10, 0, 1);
+
+        let turn_keys = vec![
+            TurnKey::new(timeline, TurnIndex(0)), // exists, tier-less
+            TurnKey::new(timeline, TurnIndex(99)), // does not exist
+        ];
+        let plan = sub.snapshot_promotion_state(&[], &turn_keys);
+
+        assert_eq!(plan.tier_less.len(), 1);
+        assert_eq!(plan.missing.len(), 1);
+        match &plan.missing[0] {
+            PromotionItemKind::Turn(k) => {
+                assert_eq!(k.index, TurnIndex(99));
+                assert_eq!(k.timeline, timeline);
+            }
+            other => panic!("expected Turn variant, got {other:?}"),
+        }
     }
 }

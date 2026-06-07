@@ -44,7 +44,7 @@ use sysinfo::System;
 fn sealed_total_bytes(seqs: &[SealedSequence]) -> u64 {
     seqs.iter()
         .flat_map(|s| s.chunks.iter())
-        .map(|c| c.byte_size as u64)
+        .map(|c| c.byte_size)
         .sum()
 }
 
@@ -123,6 +123,10 @@ pub fn elevate_to_hot(
         missing: plan.missing.len(),
         ..Default::default()
     };
+    // `missing` is "substrate has no record of this id" — the
+    // genuine error case.  `tier_less` (tracked in substrate but no
+    // K/V to elevate, the design-intended state for ghost summary
+    // turns) is silently skipped without alarming logs.
     for kind in &plan.missing {
         tracing::warn!("elevate_to_hot: item not found in substrate: {kind:?}");
     }
@@ -304,10 +308,10 @@ pub fn elevate_to_hot(
         .collect();
     let mut batch_ok = !pending.is_empty();
     if batch_ok {
-        for layer in 0..n_layers {
+        for (layer, backing) in backings.iter().enumerate().take(n_layers) {
             let inputs: Vec<&SealedSequence> =
                 pending.iter().map(|p| &p.hot_sealed[layer]).collect();
-            match backings[layer].migrate_sealed_to_cpu_batch_async(
+            match backing.migrate_sealed_to_cpu_batch_async(
                 device,
                 copy_stream,
                 pinned_scratch,
@@ -397,10 +401,10 @@ pub fn elevate_to_hot(
             .map(|_| Vec::with_capacity(n_layers))
             .collect();
         let mut layer_ok = true;
-        for layer in 0..n_layers {
+        for (layer, backing) in backings.iter().enumerate().take(n_layers) {
             let inputs: Vec<&candle_nn::kv_cache::SealedSequence> =
                 warm_items.iter().map(|w| &w.warm[layer]).collect();
-            match backings[layer].migrate_sealed_to_gpu_batch_async(
+            match backing.migrate_sealed_to_gpu_batch_async(
                 device,
                 copy_stream,
                 pinned_scratch,

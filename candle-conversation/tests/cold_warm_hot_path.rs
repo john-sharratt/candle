@@ -39,7 +39,6 @@ use candle_conversation::projection::{
     Conversation, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
 use candle_conversation::substrate::TierState;
-use candle_conversation::token_buffer::TokenBuffer;
 use candle_conversation::turn::Role;
 use candle_nn::kv_cache::{
     ArenaKey, ArenaLocation, ChunkedKvBacking, KvFormat, QuantFormat, SealedChunk, SealedSequence,
@@ -1593,7 +1592,7 @@ fn make_backings_adaptive(
                 KvFormat::Float(DType::F16),
                 device,
                 ARENA_CAPACITY,
-                Some(policy.clone()),
+                Some(*policy),
             )
             .unwrap()
         })
@@ -1640,7 +1639,7 @@ fn quantize_on_evict_full_round_trip() {
         conv.clone(),
         Arc::new(backings.clone()),
         device.clone(),
-        Some(policy.clone()),
+        Some(policy),
     );
     persist.shutdown();
 
@@ -1770,7 +1769,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
             conv.clone(),
             Arc::new(backings.clone()),
             device.clone(),
-            Some(policy.clone()),
+            Some(policy),
         );
         persist.shutdown();
     }
@@ -1912,7 +1911,7 @@ fn make_backings_metadata(
                 KvFormat::Float(DType::F16),
                 device,
                 ARENA_CAPACITY,
-                Some(policy.clone()),
+                Some(*policy),
             )
             .unwrap()
         })
@@ -2303,7 +2302,7 @@ fn quantize_on_evict_metadata_round_trip() {
             conv.clone(),
             Arc::new(backings.clone()),
             device.clone(),
-            Some(policy.clone()),
+            Some(policy),
         );
         persist.shutdown();
 

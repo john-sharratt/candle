@@ -49,9 +49,24 @@ pub fn collect_live_records(
         out.push((r.header, r.payload));
     }
 
+    // Tombstoned timelines drop out of the compacted log entirely
+    // — their records are physically gone, not merely hidden.  This
+    // is what reclaims disk after a refresh cycle replaces a
+    // timeline.
+    let tombstoned: std::collections::HashSet<u64> = substrate
+        .tombstoned_timelines()
+        .iter()
+        .map(|t| t.raw())
+        .collect();
+
     // Per-stream live records — sourced from the substrate's in-RAM
-    // stream index (the authoritative state since Phase 3).
+    // stream index, the authoritative source.
     for (stream_id, entry) in substrate.all_streams() {
+        if let Some(crate::persistence::streams::StreamDecl::Turn(t)) = &entry.decl {
+            if tombstoned.contains(&t.timeline_id) {
+                continue;
+            }
+        }
         if let Some(decl) = &entry.decl {
             let payload = decl.encode();
             out.push((
@@ -94,9 +109,14 @@ pub fn collect_live_records(
             ));
         }
     }
-    // Per-timeline Label / ConvState records — synthesised from the
-    // substrate's live label + conv-state state.
+    // Per-timeline Label / ConvState records — synthesised from
+    // the substrate's live state.  Tombstoned timelines are
+    // skipped so retired conversations don't leave dangling
+    // sidebar entries on disk.
     for (timeline_id, conv_id, label, archived) in substrate.live_conv_meta() {
+        if tombstoned.contains(&timeline_id) {
+            continue;
+        }
         let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label);
         out.push((
             RecordHeader {
@@ -132,6 +152,9 @@ pub fn collect_live_records(
     // Per-(timeline, turn) summary-tree metadata — emit one record
     // per live tree node directly from substrate state.
     for payload in substrate.live_tree_metadata_payloads() {
+        if tombstoned.contains(&payload.timeline_id) {
+            continue;
+        }
         let bytes = payload.encode();
         out.push((
             RecordHeader {
@@ -148,6 +171,9 @@ pub fn collect_live_records(
     }
     // Per-timeline debug_id.
     for (timeline_id, id) in substrate.live_debug_ids() {
+        if tombstoned.contains(&timeline_id) {
+            continue;
+        }
         let payload = DebugIdPayload {
             timeline_id,
             debug_id: id,
@@ -376,5 +402,106 @@ mod tests {
             Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         let ratio = dead_record_ratio(&mut mem, &manifest, &substrate).unwrap();
         assert!(ratio > 0.8, "7 of 8 records are dead, got ratio {ratio}");
+    }
+
+    /// Compactor drops every record bound to a tombstoned timeline.
+    /// The simulation: write a `Label` for timeline X plus a stream
+    /// decl/chunk for X, then a `Tombstone` for X.  The
+    /// compactor's `collect_live_records` output must contain
+    /// neither the Label nor the chunk.
+    #[test]
+    fn tombstoned_timeline_records_drop_during_compaction() {
+        use crate::persistence::record::TombstonePayload;
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let dead_tl: u64 = 12345;
+        let alive_tl: u64 = 67890;
+
+        // Build a redo log that contains:
+        //   - a Label record for the dead timeline
+        //   - a Label record for the alive timeline
+        //   - a TurnDecl stream for the dead timeline + one Chunk
+        //   - a TurnDecl stream for the alive timeline + one Chunk
+        //   - the Tombstone naming the dead timeline
+        let turn_decl = |tl: u64| TurnDecl {
+            timeline_id: tl,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 1,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            scores: super::super::streams::PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
+        };
+        let dead_decl = StreamDecl::Turn(turn_decl(dead_tl));
+        let alive_decl = StreamDecl::Turn(turn_decl(alive_tl));
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::Label,
+            0,
+            0,
+            &super::super::manifest::encode_label_payload(dead_tl, "dead-conv", "Dead"),
+        ));
+        blob.extend_from_slice(&record(
+            RecordType::Label,
+            0,
+            0,
+            &super::super::manifest::encode_label_payload(alive_tl, "alive-conv", "Alive"),
+        ));
+        blob.extend_from_slice(&record(RecordType::StreamDecl, 100, 0, &dead_decl.encode()));
+        blob.extend_from_slice(&record(RecordType::Chunk, 100, 0, b"dead-chunk-payload"));
+        blob.extend_from_slice(&record(RecordType::StreamDecl, 200, 0, &alive_decl.encode()));
+        blob.extend_from_slice(&record(RecordType::Chunk, 200, 0, b"alive-chunk-payload"));
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload {
+                timeline_id: dead_tl,
+            }
+            .encode(),
+        ));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+
+        // The dead timeline's records are physically gone from the
+        // live set.
+        assert!(
+            !live.iter().any(|(_, p)| p == b"dead-chunk-payload"),
+            "tombstoned timeline's chunk must be dropped during compaction",
+        );
+        assert!(
+            !live.iter().any(|(_, p)| {
+                std::str::from_utf8(p)
+                    .map(|s| s.contains("dead-conv"))
+                    .unwrap_or(false)
+            }),
+            "tombstoned timeline's Label must be dropped during compaction",
+        );
+        // The alive timeline's records survive intact.
+        assert!(
+            live.iter().any(|(_, p)| p == b"alive-chunk-payload"),
+            "alive timeline's chunk must survive compaction",
+        );
+        assert!(
+            live.iter().any(|(_, p)| {
+                std::str::from_utf8(p)
+                    .map(|s| s.contains("alive-conv"))
+                    .unwrap_or(false)
+            }),
+            "alive timeline's Label must survive compaction",
+        );
     }
 }

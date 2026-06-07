@@ -26,7 +26,7 @@
 //! See `candle-conversation/src/scheduler/mod.rs::quantize_pending_sections`
 //! for the production code path this test guards.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use candle::Device;
 use candle_conversation::models::Model;
@@ -56,7 +56,7 @@ fn init_tracing() {
 /// Load the engine + base conversation exactly the way the daemon does:
 /// production projection.yaml, full tool catalog from `zend::tools`,
 /// argmax sampling, no thinking blocks, capped at 40 response tokens.
-fn load_engine_and_base(workspace: &PathBuf) -> (ConversationEngine, Sequence) {
+fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     init_tracing();
     let device = cuda_device().expect("CUDA required");
     eprintln!("=== Loading Qwen3-30B-A3B against {} ===", workspace.display());
@@ -86,7 +86,7 @@ fn load_engine_and_base(workspace: &PathBuf) -> (ConversationEngine, Sequence) {
 
     let mut builder = Model::Qwen3_30B_A3B_Q4
         .builder()
-        .workspace_path(workspace.as_path())
+        .workspace_path(workspace)
         .sampling(SamplingConfig::argmax())
         .seed(0)
         .max_response_tokens(40)

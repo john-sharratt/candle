@@ -193,6 +193,7 @@ impl Manifest {
             | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
+            | RecordType::Tombstone
             | RecordType::Unknown => {}
         }
         Ok(())
@@ -503,9 +504,32 @@ mod tests {
         );
     }
 
-    /// Phase 3: `conv_states` is `#[serde(skip)]` — it does NOT
-    /// survive a checkpoint encode/decode cycle.  ConvState records
-    /// are recovered by walking the log on reload (the
+    /// A `Tombstone` record in the redo log must propagate
+    /// to the substrate via the walker, regardless of whether it
+    /// arrives before or after the matching TurnDecls.
+    #[test]
+    fn timeline_tombstone_walker_replay_applies_to_substrate() {
+        use crate::persistence::record::TombstonePayload;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(
+            RecordType::Tombstone,
+            0,
+            0,
+            &TombstonePayload { timeline_id: 77 }.encode(),
+        ));
+        let mut mem = MemLog::with_records(&blob);
+        let (_, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let tl = TimelineId::from_raw(77).unwrap();
+        // Pending until register_timeline drains, but `is_tombstoned`
+        // sees the pending entry immediately.
+        assert!(substrate.is_tombstoned(tl));
+    }
+
+    /// `conv_states` is `#[serde(skip)]` — it does NOT survive a
+    /// checkpoint encode/decode cycle.  ConvState records are
+    /// recovered by walking the log on reload (the
     /// `conv_state_last_writer_wins_in_manifest` test covers that).
     #[test]
     fn conv_state_dropped_from_checkpoint_payload() {

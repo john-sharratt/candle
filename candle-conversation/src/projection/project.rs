@@ -383,10 +383,10 @@ pub fn run_with_sink<R: ContentResolver>(
         .iter()
         .enumerate()
         .filter_map(|(li, layer)| {
-            if li < target_layer_idx {
-                Some(layer) // all groups in lower layers are visible
-            } else if li == target_layer_idx {
-                Some(layer) // groups filtered per-group below
+            // All groups in lower layers are visible; on the target
+            // layer, groups are filtered individually further below.
+            if li <= target_layer_idx {
+                Some(layer)
             } else {
                 None
             }

@@ -438,6 +438,18 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Append a [`RecordType::Tombstone`] record marking
+    /// `timeline_id` as logically deleted.  Walker replay applies it
+    /// to the substrate; the compactor drops every record bound to
+    /// the timeline on the next compaction pass.  Idempotent —
+    /// duplicate tombstones replay identically.
+    pub fn write_tombstone(&mut self, timeline_id: u64) -> Result<()> {
+        let payload = record::TombstonePayload { timeline_id };
+        let bytes = payload.encode();
+        self.append_record(RecordType::Tombstone, 0, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
     /// Append a `DebugId` record for `timeline_id`.  Last-writer-wins
     /// on replay.  Callers check idempotency against substrate state.
     pub fn write_debug_id(&mut self, timeline_id: u64, debug_id: &str) -> Result<()> {
@@ -1321,7 +1333,7 @@ mod tests {
         let sec = section("shared_section", 0);
         let base_log = base_dir.join("base.log");
         {
-            let mut base = SubstratePersistence::open_concat(&[base_log.clone()]).unwrap();
+            let mut base = SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
             base.declare_stream(&sec).unwrap();
             base.commit().unwrap();
         }
@@ -1540,7 +1552,7 @@ mod tests {
         let sid = StreamId(9000);
         let payload = chunk_payload(11);
         {
-            let mut base = SubstratePersistence::open_concat(&[base_log.clone()]).unwrap();
+            let mut base = SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
             base.write_chunk(sid, 0, 32, 4, &payload).unwrap();
             base.commit().unwrap();
         }

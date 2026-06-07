@@ -205,7 +205,7 @@ impl ConversationEngine {
         // Workspace-shared `ProvenanceFile`: created up-front so the
         // scheduler can append to it inline during `cleanup_finished`'s
         // post-Done seal step.
-        let provenance = Arc::new(ProvenanceFile::new().map_err(ConversationError::from)?);
+        let provenance = Arc::new(ProvenanceFile::new()?);
         let scheduler_provenance = Arc::clone(&provenance);
 
         // Spawn the substrate persistence thread (§5s heartbeat + per-
@@ -417,6 +417,14 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Tombstone `timeline` — see
+    /// [`crate::projection::Conversation::tombstone_timeline`].
+    pub fn tombstone_timeline(&self, timeline: TimelineId) -> crate::Result<()> {
+        self.conversation
+            .tombstone_timeline(timeline)
+            .map_err(ConversationError::Model)
+    }
+
     /// Build an **engine-internal** conversation that lives on the reserved
     /// id range for `kind` — disjoint from any YAML-allocated user schema.
     ///
@@ -616,7 +624,7 @@ impl ConversationEngine {
         let (event_tx, event_rx) = channel::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
-                sequence_id: sequence_id,
+                sequence_id,
                 projection_inputs: None,
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),

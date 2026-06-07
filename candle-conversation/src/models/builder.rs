@@ -852,7 +852,7 @@ impl ModelBuilder {
         use candle::quantized::gguf_file;
         let mut file = std::fs::File::open(model_path)
             .map_err(|e| ConversationError::Model(candle::Error::Msg(format!("open GGUF: {e}"))))?;
-        let ct = gguf_file::Content::read(&mut file).map_err(|e| ConversationError::Model(e))?;
+        let ct = gguf_file::Content::read(&mut file).map_err(ConversationError::Model)?;
         let arch_str = ct
             .metadata
             .get("general.architecture")

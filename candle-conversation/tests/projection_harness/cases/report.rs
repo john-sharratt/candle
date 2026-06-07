@@ -62,7 +62,7 @@ fn score_matrix_and_ratio_report() {
     print_matrix(false);
 
     println!("\n── Projection top-3 selections ────────────────────────────────────────");
-    println!("{:<14} {:>6}  {}", "probe", "ok?", "emitted tools");
+    println!("{:<14} {:>6}  emitted tools", "probe", "ok?");
     for (probe_tool, resolver) in &resolvers {
         let projection = h.builder.project(target, resolver);
         let emitted = h.emitted_tools(&projection);

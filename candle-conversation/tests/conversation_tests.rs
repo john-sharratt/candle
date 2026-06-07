@@ -154,7 +154,6 @@ fn test_streaming_events() {
     let mut got_token = false;
     let mut got_done = false;
     let mut collected_tokens: Vec<u32> = Vec::new();
-    let response;
     let mut response_opt = None;
 
     for event in handle.stream() {
@@ -178,8 +177,7 @@ fn test_streaming_events() {
     assert!(got_token, "should have received Token events");
     assert!(got_done, "should have received Done event");
 
-    response = response_opt;
-    let resp = response.unwrap();
+    let resp = response_opt.unwrap();
     eprintln!(
         "Streaming result: '{}' ({} collected tokens)",
         resp.text,
@@ -600,7 +598,7 @@ fn test_rapid_turn_cycle() {
     for i in 0..5 {
         let resp = conv
             .send_turn(&format!("Turn number {i}."))
-            .expect(&format!("turn {i} failed"));
+            .unwrap_or_else(|_| panic!("turn {i} failed"));
         eprintln!(
             "Turn {i}: {} ({} tokens)",
             resp.text, resp.stats.tokens_generated
