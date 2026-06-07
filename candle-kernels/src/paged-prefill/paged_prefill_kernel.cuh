@@ -2557,11 +2557,23 @@ paged_prefill_attn_fwd_chunks_kernel(
 
     // K/V tile buffers
     constexpr bool USE_FP8 = std::is_same_v<T, __nv_fp8_e4m3>;
-    __shared__ alignas(128) T smem_k[NUM_STAGES][TILE_K * HEAD_DIM];
-    __shared__ alignas(128) T smem_v[NUM_STAGES][TILE_K * HEAD_DIM];
-
+    // K/V/Q rings live in dynamic shared memory so triple-buffering can opt into
+    // the >48 KB budget on SM80+ (size + cudaFuncSetAttribute handled by
+    // launch_paged_prefill_chunks). Contiguous layout, each region 128-B aligned
+    // (per-stage TILE_K·HEAD_DIM·sizeof(T) is a multiple of 128 for every
+    // supported HEAD_DIM/TILE_K, so the offsets below stay aligned):
+    //   [ smem_k : NUM_STAGES × TILE_K·HEAD_DIM × T   ]
+    //   [ smem_v : NUM_STAGES × TILE_K·HEAD_DIM × T   ]
+    //   [ smem_q : WARPS_TC   × BLOCK_M·HEAD_DIM × Q_T ]
+    extern __shared__ __align__(128) unsigned char prefill_smem[];
+    T (*smem_k)[TILE_K * HEAD_DIM] =
+        reinterpret_cast<T (*)[TILE_K * HEAD_DIM]>(prefill_smem);
+    T (*smem_v)[TILE_K * HEAD_DIM] =
+        reinterpret_cast<T (*)[TILE_K * HEAD_DIM]>(
+            prefill_smem + sizeof(T) * NUM_STAGES * TILE_K * HEAD_DIM);
     // Q tile (loaded once per block)
-    __shared__ alignas(128) Q_T smem_q[WARPS_TC * BLOCK_M * HEAD_DIM];
+    Q_T* smem_q = reinterpret_cast<Q_T*>(
+        prefill_smem + sizeof(T) * 2 * NUM_STAGES * TILE_K * HEAD_DIM);
 
     // Packed per-row metadata
     __shared__ uint32_t s_row_active_mask;        // bit r set iff row r is active
@@ -4181,11 +4193,21 @@ inline void launch_paged_prefill_chunks(
     // One-time per-instantiation: query smem requirements and configure extended smem.
     // Although prefill is not called every decode step, caching avoids redundancy on
     // multi-prompt batches and keeps the pattern consistent with the decode launcher.
+    // Dynamic-smem byte counts for the K/V/Q rings (declared extern in the
+    // kernel). Depends only on the stage count — not on HAS_PREFIX / USE_TC.
+#define PREFILL_DYN_BYTES(NSV) \
+    ( (size_t)sizeof(T)   * 2 * (NSV) * TILE_K * HEAD_DIM \
+    + (size_t)sizeof(Q_T) * WARPS_TC_COMPUTED * BLOCK_M * HEAD_DIM )
+    constexpr size_t DYN_TRIPLE = PREFILL_DYN_BYTES(3);
+    constexpr size_t DYN_DOUBLE = PREFILL_DYN_BYTES(2);
+
     static size_t s_smem_triple_actual = 0;
     static size_t s_smem_double_actual = 0;
     static bool   s_use_triple_buffer = true;
     static bool   s_configured = false;
     if (!s_configured) {
+        // sharedSizeBytes is now just the small static bookkeeping; total smem a
+        // launch needs is that plus the dynamic ring.
         cudaFuncAttributes attrs;
         cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
             TILE_K, BLOCK_M, true, WARPS_TC_COMPUTED, true, 3>);
@@ -4193,6 +4215,7 @@ inline void launch_paged_prefill_chunks(
         cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
             TILE_K, BLOCK_M, false, WARPS_TC_COMPUTED, true, 3>);
         if (attrs.sharedSizeBytes > s_smem_triple_actual) s_smem_triple_actual = attrs.sharedSizeBytes;
+        s_smem_triple_actual += DYN_TRIPLE;
 
         cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
             TILE_K, BLOCK_M, true, WARPS_TC_COMPUTED, true, 2>);
@@ -4200,28 +4223,30 @@ inline void launch_paged_prefill_chunks(
         cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
             TILE_K, BLOCK_M, false, WARPS_TC_COMPUTED, true, 2>);
         if (attrs.sharedSizeBytes > s_smem_double_actual) s_smem_double_actual = attrs.sharedSizeBytes;
+        s_smem_double_actual += DYN_DOUBLE;
 
         constexpr size_t SMEM_RESERVE = 2048;
         s_use_triple_buffer = true;
+        // cudaFuncSetAttribute takes the *dynamic* cap (DYN_*), not the total.
         if (s_smem_triple_actual + SMEM_RESERVE > caps.smem_optin) {
             s_use_triple_buffer = false;
         } else if (s_smem_triple_actual > caps.smem_default) {
             cudaError_t err1 = cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     true, WARPS_TC_COMPUTED, true, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_triple_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
             cudaError_t err2 = cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     true, WARPS_TC_COMPUTED, false, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_triple_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
             cudaError_t err3 = cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     false, WARPS_TC_COMPUTED, true, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_triple_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
             cudaError_t err4 = cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     false, WARPS_TC_COMPUTED, false, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_triple_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
             if (!(err1 == cudaSuccess && err2 == cudaSuccess &&
                   err3 == cudaSuccess && err4 == cudaSuccess)) {
                 cudaGetLastError();
@@ -4232,31 +4257,30 @@ inline void launch_paged_prefill_chunks(
             cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     true, WARPS_TC_COMPUTED, true, 2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_double_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_DOUBLE);
             cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     true, WARPS_TC_COMPUTED, false, 2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_double_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_DOUBLE);
             cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     false, WARPS_TC_COMPUTED, true, 2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_double_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_DOUBLE);
             cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     false, WARPS_TC_COMPUTED, false, 2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s_smem_double_actual);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_DOUBLE);
             cudaGetLastError();
         }
         s_configured = true;
     }
     bool use_triple_buffer = s_use_triple_buffer;
-    size_t smem_triple_actual = s_smem_triple_actual;
-    size_t smem_double_actual = s_smem_double_actual;
 
     // Launch kernel with appropriate configuration
     #define LAUNCH_KERNEL(HAS_PREFIX, USE_TC_VAL, NUM_STAGES_VAL) \
         paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M, \
-            HAS_PREFIX, WARPS_TC_COMPUTED, USE_TC_VAL, NUM_STAGES_VAL><<<grid, block_tc, 0, stream>>>( \
+            HAS_PREFIX, WARPS_TC_COMPUTED, USE_TC_VAL, NUM_STAGES_VAL>\
+            <<<grid, block_tc, PREFILL_DYN_BYTES(NUM_STAGES_VAL), stream>>>( \
             (const Q_T*)q_ptr, (const T*)k_ptr, (const T*)v_ptr, \
             headers_ptr, cu_seqlens_q, q_lens, kv_lens, \
             (O*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head, \
@@ -4281,6 +4305,7 @@ inline void launch_paged_prefill_chunks(
     }
 
     #undef LAUNCH_KERNEL
+    #undef PREFILL_DYN_BYTES
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

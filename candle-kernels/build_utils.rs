@@ -163,6 +163,13 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         // Enables compute-sanitizer and cuda-gdb to report the exact kernel
         // source file + line number on illegal-address and other faults.
         "--generate-line-info".to_string(),
+        // Target archs: native SASS for Ada (sm_89) and Blackwell (sm_120),
+        // plus compute_120 PTX as a forward-compat fallback. These live in the
+        // shared compile args (rather than hardcoded at the nvcc call) so that
+        // changing the target arch invalidates the per-kernel and archive
+        // caches — otherwise stale cubins of the wrong arch get reused.
+        "-gencode=arch=compute_89,code=sm_89".to_string(),
+        "-gencode=arch=compute_120,code=[sm_120,compute_120]".to_string(),
     ];
 
     if is_msvc {
@@ -569,7 +576,7 @@ fn detect_cuda_compute_cap() -> Result<u32> {
 // Compilation
 // ============================================================================
 
-/// Compile a single kernel with nvcc (SM89 only)
+/// Compile a single kernel with nvcc. Target archs come from `build_args`.
 fn compile_kernel_nvcc(
     kernel_path: &str,
     build_dir: &Path,
@@ -587,7 +594,10 @@ fn compile_kernel_nvcc(
         .arg(kernel_path)
         .arg("-o")
         .arg(&out_obj)
-        .arg("-gencode=arch=compute_89,code=[sm_89,compute_89]");
+        // Compile the gencode arches (sm_89 + sm_120) in parallel within this
+        // nvcc invocation — halves the per-kernel tail now that we emit two.
+        .arg("--threads")
+        .arg("2");
 
     for arg in build_args {
         cmd.arg(arg);

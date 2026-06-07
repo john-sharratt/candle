@@ -408,7 +408,13 @@ __device__ __forceinline__ void paged_decode_attn_v2_impl(
     PalIter<VEC, HEAD_DIM> ki, vi;
     int kv_pal_slice_idx = -1;
 
-    constexpr int SMEM_PAD = 8;
+    // Bank-conflict padding for the K/V staging rings. HD=256 with 16 warps and
+    // a 3-stage half ring is 50688 B with pad=8 — 1536 B (exactly the padding)
+    // over the 48 KB static-smem ceiling. Drop the pad for HD=256 only: it lands
+    // at exactly 49152 B, and that head_dim isn't used by our models (Qwen3 /
+    // Llama are 128), so its bank-conflict avoidance costs us nothing. The
+    // smaller, actually-used head dims keep their padding.
+    constexpr int SMEM_PAD = (HEAD_DIM >= 256) ? 0 : 8;
     static_assert((HEAD_DIM + SMEM_PAD) * sizeof(T) % 16 == 0,
                   "SMEM_PAD breaks 16-byte alignment required by cp.async.cg");
     __shared__ alignas(128) T shared_k[NUM_STAGES][WARPS_PER_BLOCK][HEAD_DIM + SMEM_PAD];

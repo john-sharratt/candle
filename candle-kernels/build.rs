@@ -76,7 +76,12 @@ fn main() -> Result<()> {
 
     let is_target_msvc = detect_is_msvc();
     let archive_groups = build_archive_groups(is_target_msvc);
-    let max_threads = 8;
+    // One nvcc job per kernel; bounded to keep peak RAM sane (ptxas ~1 GB each,
+    // and each job also runs --threads for its gencode arches). Scales with the
+    // box but caps at 16 so a 32-core machine doesn't oversubscribe memory.
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(8);
 
     // ================================================================
     // Phase 1: Hash all groups, partition into cached vs dirty
