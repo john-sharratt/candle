@@ -179,3 +179,7 @@ name = "ruler-eval"
 
 [[example]]
 name = "perplexity-eval"
+
+[[example]]
+name = "decode_ab"
+required-features = ["cuda"]
