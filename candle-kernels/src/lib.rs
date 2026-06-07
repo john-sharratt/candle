@@ -20,3 +20,6 @@ pub mod paged_decode;
 
 #[path = "paged-prefill/api.rs"]
 pub mod paged_prefill;
+
+#[path = "fused-attn-v1/api.rs"]
+pub mod fused_attn_v1;

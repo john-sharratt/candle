@@ -92,6 +92,8 @@ pub mod phi;
 pub mod phi3;
 pub mod pixtral;
 pub mod prefill_utils;
+#[cfg(feature = "cuda")]
+pub mod fused_qkv_attn;
 pub mod profile;
 pub mod quantized_blip;
 pub mod quantized_blip_text;

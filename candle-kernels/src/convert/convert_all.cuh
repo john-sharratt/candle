@@ -703,6 +703,142 @@ private:
             dst[dim] = dequant_element_inline<T>(block_ptr, elem_in_block, format, scale);
         }
     }
+
+    // =========================================================================
+    // LOAD HEAD INT8 UNSCALED (for deferred-scaling fused INT8 attention)
+    // =========================================================================
+    // Loads a head's elements into INT8 shared memory WITHOUT applying the
+    // per-block scale. The scale is exposed separately via *out_scale so the
+    // consumer can fold it into a parallel FP32 scale-product track at MMA
+    // output time.
+    //
+    // RESERVED — not yet called by any kernel. This is the read-through
+    // abstraction intended for the decode skip-dequant (Track A §1A in
+    // docs/decode_kernel_work_plan.md) and Track B's dequant path. NOTE: it
+    // currently returns a *single* block scale via *out_scale (see the Q8_0/
+    // Q4_0 bodies below), which collapses the per-(dim,block) scales — the
+    // skip-dequant work must extend it to emit per-dim scales before use.
+    //
+    // For Q4_0 / Q8_0 / R16 sources: the centered integer is already in INT8
+    // range, so we copy through directly and return the block scale.
+    //
+    // For F16 / BF16 / FP8 / F32 sources: we max-abs scan to derive a fresh
+    // INT8 scale per warp, then re-quantize. This is the lossy step for FP
+    // sources but keeps the INT8 MMA path uniform.
+    //
+    // Caller layout:
+    //   - dst        : int8 buffer, sub_head_dim bytes long (or HEAD_DIM if loading whole head)
+    //   - out_scale  : single FP32 slot (one per call); lane 0 writes
+    //   - within     : token index within the chunk
+    //   - lane       : warp lane id
+    //
+    // The function uses HEAD_DIM (the size of the destination, may be the
+    // sub-head for palette-routed loads). It does NOT yet implement the
+    // FP-source max-abs reduction in this initial revision because all
+    // current hot-path arenas use Q4_0/Q8_0/R16.
+    template <int HEAD_DIM, bool USE_TC>
+    __device__ __forceinline__ void load_head_int8_unscaled(
+        int8_t* dst,
+        float* out_scale,
+        int chunk_idx,
+        int head_idx,
+        int within_chunk,
+        int lane,
+        float in_scale_hint
+    ) const {
+        constexpr int DIMS_PER_LANE = HEAD_DIM / 32;
+        const int elem_in_block = within_chunk & 31;
+        const int block_within_dim = within_chunk >> 5;
+        const int64_t block_head_stride = (int64_t)HEAD_DIM * blocks_per_dim;
+        const int block_bytes = get_quant_block_bytes(format);
+
+        const char* head_base = (chunk_byte_stride > 0)
+            ? (base + (int64_t)chunk_idx * chunk_byte_stride
+                    + (int64_t)head_idx * block_head_stride * block_bytes)
+            : (base + ((int64_t)chunk_idx * ((chunk_stride / (head_stride > 0 ? head_stride : 1)) * block_head_stride)
+                      + (int64_t)head_idx * block_head_stride) * block_bytes);
+
+        if (format == ArenaFormat::Q4_0) {
+            // Q4_0 block: 16 packed bytes + FP16 scale. Centered nibble in [-8,7].
+            // Block layout (struct block_q4_0): { __half d; uint8_t qs[16]; } -> 18 bytes
+            float blk_scale = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DIMS_PER_LANE; ++i) {
+                const int dim = lane + i * 32;
+                const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
+                const uint8_t* blk = reinterpret_cast<const uint8_t*>(head_base + block_idx * 18);
+                __half d_h;
+                memcpy(&d_h, blk, sizeof(__half));
+                if (lane == 0 && i == 0) blk_scale = __half2float(d_h);
+                int byte_idx = elem_in_block >> 1;
+                int hi = elem_in_block & 1;
+                uint8_t b = blk[2 + byte_idx];
+                int n = hi ? (int)(b >> 4) : (int)(b & 0xF);
+                dst[dim] = (int8_t)(n - 8);
+            }
+            // Take a representative scale from lane 0's first dim. Since all blocks
+            // in a single 32-token group share the same nominal Q4_0 scale only when
+            // the policy flattens scales; for general use we treat this as a coarse
+            // fallback. The proper per-palette scale comes from the head metadata.
+            if (lane == 0 && out_scale) *out_scale = blk_scale;
+            return;
+        }
+
+        if (format == ArenaFormat::Q8_0) {
+            // Q8_0 block: { __half d; int8_t qs[32]; } -> 34 bytes. Already INT8.
+            float blk_scale = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DIMS_PER_LANE; ++i) {
+                const int dim = lane + i * 32;
+                const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
+                const uint8_t* blk = reinterpret_cast<const uint8_t*>(head_base + block_idx * 34);
+                __half d_h;
+                memcpy(&d_h, blk, sizeof(__half));
+                if (lane == 0 && i == 0) blk_scale = __half2float(d_h);
+                const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2);
+                dst[dim] = qs[elem_in_block];
+            }
+            if (lane == 0 && out_scale) *out_scale = blk_scale;
+            return;
+        }
+
+        if (format == ArenaFormat::R16) {
+            // R16: 64 FP16 K + 64 FP16 Q-capture per dim block. Re-quant to INT8.
+            // Use the scale hint or 1.0 as default and clamp.
+            float scale_used = (in_scale_hint > 0.f) ? in_scale_hint : 1.f;
+            float inv = 1.f / scale_used;
+            #pragma unroll
+            for (int i = 0; i < DIMS_PER_LANE; ++i) {
+                const int dim = lane + i * 32;
+                const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
+                const uint8_t* blk = reinterpret_cast<const uint8_t*>(head_base + block_idx * 128);
+                __half k_h;
+                memcpy(&k_h, blk + elem_in_block * 2, sizeof(__half));
+                float v = __half2float(k_h) * inv;
+                v = fminf(fmaxf(v, -127.f), 127.f);
+                dst[dim] = (int8_t)__float2int_rn(v);
+            }
+            if (lane == 0 && out_scale) *out_scale = scale_used;
+            return;
+        }
+
+        // Fallback: dequant via existing path to FP32, re-quant to INT8 with
+        // a passed scale hint. This handles F16/BF16/F8E4M3/Q8_KS/Q4_KS/etc.
+        float scale_used = (in_scale_hint > 0.f) ? in_scale_hint : 1.f;
+        float inv = 1.f / scale_used;
+        float fp_buf[HEAD_DIM];
+        // Reuse the quant token-oriented path via temporary FP32 buffer.
+        load_head_quant_token_oriented<float, HEAD_DIM>(
+            fp_buf, chunk_idx, head_idx, within_chunk, lane, 1.f);
+        #pragma unroll
+        for (int i = 0; i < DIMS_PER_LANE; ++i) {
+            const int dim = lane + i * 32;
+            float v = fp_buf[dim] * inv;
+            v = fminf(fmaxf(v, -127.f), 127.f);
+            dst[dim] = (int8_t)__float2int_rn(v);
+        }
+        if (lane == 0 && out_scale) *out_scale = scale_used;
+    }
 };
 
 // =============================================================================
