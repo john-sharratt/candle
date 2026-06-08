@@ -1,15 +1,11 @@
 #pragma once
 // =============================================================================
-// int8_decode_kernel.cuh — v2-API-compatible decode-attention kernel that we
-// own and evolve incrementally toward the design's INT8 MMA path.
+// int8_decode_kernel.cuh — v2-API-compatible decode-attention kernel (Track A).
 //
-// ITERATION LADDER:
-//   I0  Clone of v2's `paged_decode_attn_v2_impl` body verbatim.   <-- NOW
-//   I1  Replace QK^T fmaf with INT8 MMA per palette.
-//   I2  Replace PV fmaf with INT8 MMA per output tile.
-//   I3  Add per-block activation INT8 quant for fused QKV (later phase).
-//
-// The body is structurally a copy of v2 so we can diff and modify it in place.
+// Drop-in for v2's paged_decode_attn, computing the QK^T as an INT8 m16n8k32 MMA
+// per palette (lane-collective INT8 dot fallback for head dims whose palette
+// isn't 32-wide) and the PV in INT8, with a per-32-token tile-batched softmax
+// and the §1A V read-through. Same slot-header / paged-arena interface as v2.
 // =============================================================================
 
 #include <assert.h>
@@ -36,23 +32,16 @@
 
 namespace fused_attn {
 
-// INT8_QK / INT8_PV flags isolate the INT8 conversions:
-//   INT8_QK=false, INT8_PV=false → pure FP fmaf (iter-1 baseline; matches v2)
-//   INT8_QK=true,  INT8_PV=false → INT8 QK^T + FP PV
-//   INT8_QK=false, INT8_PV=true  → FP QK^T + INT8 manual PV
-//   INT8_QK=true,  INT8_PV=true  → fully INT8 (iter-2b/3 target)
-//
-// INT8_QK_USE_MMA selects MMA (true, default) vs naive lane-collective dot
-// product (false) for the INT8 QK^T computation. The manual dot uses the
-// SAME q_int8 / k_int8 / scale_Q / shared_k_scale data as the MMA, so any
-// agreement between FP and manual-dot paths but disagreement with MMA
-// localises the bug to the MMA fragment assembly or scale composition.
+// QK^T is computed with the m16n8k32 INT8 MMA when a palette spans exactly 32
+// dims (HEAD_DIM==128 → SUB_HEAD_DIM==32); for other head dims (e.g. hd64) it
+// falls back to the lane-collective INT8 dot — see USE_MMA_QK below. The PV is
+// INT8 throughout. V is read straight through from native-int8 arenas where the
+// format allows (§1A); otherwise it is dequantized to FP and re-quantized to
+// int8 for the PV.
 template <typename Q_T, typename T, typename O,
           int HEAD_DIM, int WARPS_PER_BLOCK,
           int TILE_K = 32, int NUM_STAGES = 2,
-          bool USE_TC = false, bool ROPE_INTERLEAVED = false,
-          bool INT8_QK = true, bool INT8_PV = true,
-          bool INT8_QK_USE_MMA = true>
+          bool USE_TC = false, bool ROPE_INTERLEAVED = false>
 __device__ __forceinline__ void int8_decode_attn_impl(
     const Q_T* __restrict__ q,
     const uint8_t* __restrict__ headers_ptr,
@@ -222,9 +211,18 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     __shared__ alignas(16)  float  shared_k_scale[NUM_STAGES][WARPS_PER_BLOCK][N_PALETTE];
 
     // INT8 V + per-token scale (single scale per V token; V is "value tokens"
-    // contributing equally across head_dim).
+    // contributing equally across head_dim). Used by the FP→INT8 V path.
     __shared__ alignas(128) int8_t shared_v_int8[NUM_STAGES][WARPS_PER_BLOCK][HEAD_DIM];
     __shared__ alignas(16)  float  shared_v_scale[NUM_STAGES][WARPS_PER_BLOCK];
+
+    // V skip-dequant (Track A §1A): when the V arena is natively INT8
+    // (Q8_0/Q4_0) for all palettes, V int8 is read straight through with no FP
+    // round-trip into shared_v_int8 in PALETTE order, and the per-(dim,block)
+    // scale lands here (one per dim — all 32 tokens of a chunk share it). The
+    // PV gathers V via the `vi` palette iterator and applies the per-dim scale.
+    // shared_v_readthrough[stage] flags the mode chosen for that tile's slice.
+    __shared__ alignas(16) float shared_v_dim_scale[NUM_STAGES][HEAD_DIM];
+    __shared__ int shared_v_readthrough[NUM_STAGES];
 
     // Tile-batched logits buffer for INT8 MMA / manual-dot paths. Each warp
     // owns one Q head, so the buffer must be PER-WARP — otherwise the 3+
@@ -241,7 +239,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     // m16n8k32 fragment straddles two palettes and reads past q_int8[VEC], which
     // structurally corrupts the logits. Fall back to the manual per-lane INT8
     // dot (correct for any VEC) whenever the palette isn't exactly 32 dims.
-    constexpr bool USE_MMA_QK = INT8_QK_USE_MMA && (SUB_HEAD_DIM == 32);
+    constexpr bool USE_MMA_QK = (SUB_HEAD_DIM == 32);
 
     // ─── Per-palette Q quantization (warp-collective) ──────────────────
     // q_reg holds VEC=HEAD_DIM/32 dims per lane; lane t covers dims [t*VEC..t*VEC+VEC).
@@ -251,7 +249,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     int8_t q_int8[VEC];
     uint32_t q_packed = 0;  // packed VEC=4 INT8 of this lane's Q dims (for MMA shuffles)
     float scale_Q[N_PALETTE];
-    if constexpr (INT8_QK) {
+    {  // Per-palette Q INT8 quantization.
         float my_max = 0.f;
         #pragma unroll
         for (int j = 0; j < VEC; ++j) {
@@ -290,11 +288,6 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                      | ((uint32_t)(uint8_t)q_int8[2] << 16)
                      | ((uint32_t)(uint8_t)q_int8[3] << 24);
         }
-    } else {
-        #pragma unroll
-        for (int p = 0; p < N_PALETTE; ++p) scale_Q[p] = 1.f;
-        #pragma unroll
-        for (int j = 0; j < VEC; ++j) q_int8[j] = 0;
     }
 
     float m_i = -1e38f;
@@ -332,7 +325,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                 k_dst[lane * VEC + j] = from_f32<T>(0.f);
                 v_dst[lane * VEC + j] = from_f32<T>(0.f);
             }
-            if constexpr (INT8_QK) {
+            {
                 int8_t* k_int8_dst = shared_k_int8[stage][warp];
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) {
@@ -342,7 +335,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                     shared_k_scale[stage][warp][lane] = 1.f;
                 }
             }
-            if constexpr (INT8_PV) {
+            {
                 int8_t* v_int8_dst = shared_v_int8[stage][warp];
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) v_int8_dst[lane * VEC + j] = 0;
@@ -353,6 +346,20 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
         const uint8_t* sl_ptr = get_slice<HEAD_DIM>(slices_ptr, my_slice_idx, n_kv_head);
         const uint8_t* head_ptr = get_head<HEAD_DIM>(sl_ptr, kv_head_idx);
+
+        // V skip-dequant eligibility (Track A §1A): read V straight from the
+        // arena (no FP round-trip) only when EVERY palette's V format is a
+        // passthrough int8 family (Q8_0/Q4_0/Q5_0/Q2_0/Q3_0/Q4_KS/Q8_KS).
+        // Mixed/asymmetric/FP formats keep the dequant→requant path. K never
+        // skips — RoPE needs FP.
+        bool v_readthrough = true;
+        #pragma unroll
+        for (int p = 0; p < N_PALETTE; ++p) {
+            int vf = kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+            if (!ArenaAccessor::is_int8_readthrough_format(vf)) v_readthrough = false;
+        }
+        if (lane == 0) shared_v_readthrough[stage] = v_readthrough ? 1 : 0;
+
         for (int p = 0; p < N_PALETTE; ++p) {
             uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
             uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
@@ -363,7 +370,21 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             ArenaAccessor k_acc((const char*)(uintptr_t)k_ptr_p, k_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
             k_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC>(k_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, k_scale_p);
             ArenaAccessor v_acc((const char*)(uintptr_t)v_ptr_p, v_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-            v_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC>(v_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+            // V load. The per-tile gate `v_readthrough` (= is_int8_readthrough_format
+            // over ALL palettes) selects the layout — read straight through (the
+            // dispatcher hides the format switch, like load_head_scaled does) into
+            // PALETTE-order int8 + per-dim block scale, or FP dequant for a
+            // non-passthrough tile. Tile-uniform because the PV needs one layout per
+            // tile. apply_rope_to_tile skips V quant on the read-through path; the PV
+            // gathers via vi. K never skips (RoPE needs FP).
+            if (v_readthrough) {
+                v_acc.template load_head_int8_readthrough<SUB_HEAD_DIM>(
+                    shared_v_int8[stage][warp] + p * SUB_HEAD_DIM,
+                    shared_v_dim_scale[stage] + p * SUB_HEAD_DIM,
+                    0, 0, within, lane, v_scale_p);
+            } else {
+                v_acc.template load_head_scaled<T, SUB_HEAD_DIM, USE_TC>(v_dst + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+            }
         }
     };
 
@@ -401,7 +422,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                 // ─── INT8 K quantization (per-palette scale per token) ─
                 // After RoPE: lane t holds K dims [t*VEC..t*VEC+VEC). Same
                 // palette geometry as Q: lanes [p*8..p*8+7] cover palette p.
-                if constexpr (INT8_QK) {
+                {
                     float my_max = 0.f;
                     #pragma unroll
                     for (int j = 0; j < VEC; ++j) {
@@ -428,42 +449,48 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                     }
                 }
 
-                T* v_dst = shared_v[stage][warp];
-                #pragma unroll
-                for (int j = 0; j < VEC; ++j)
-                    k_regs[j] = to_f32<T>(v_dst[vi[j]]);
-                __syncwarp();
-                #pragma unroll
-                for (int j = 0; j < VEC; ++j)
-                    v_dst[lane * VEC + j] = from_f32<T>(k_regs[j]);
+                // V FP→INT8 path. SKIPPED entirely when the V arena was read
+                // straight through as int8 in load_tile (§1A): shared_v_int8 is
+                // already populated (palette order) with per-dim scales. The
+                // branch is warp-uniform (flag set per tile/slice in load_tile).
+                if (!shared_v_readthrough[stage]) {
+                    T* v_dst = shared_v[stage][warp];
+                    #pragma unroll
+                    for (int j = 0; j < VEC; ++j)
+                        k_regs[j] = to_f32<T>(v_dst[vi[j]]);
+                    __syncwarp();
+                    #pragma unroll
+                    for (int j = 0; j < VEC; ++j)
+                        v_dst[lane * VEC + j] = from_f32<T>(k_regs[j]);
 
-                // ─── INT8 V quantization (single per-token scale) ────────
-                // V is consumed in PV as B[token=K][dim=N]. We use one scale
-                // per token (max-abs across the 128 dims) — coarser than K's
-                // per-palette but PV is less sensitive than QK^T per design §3.3.
-                if constexpr (INT8_PV) {
-                    float my_max = 0.f;
-                    #pragma unroll
-                    for (int j = 0; j < VEC; ++j) {
-                        float a = fabsf(k_regs[j]);
-                        if (a > my_max) my_max = a;
-                    }
-                    float tok_max = my_max;
-                    tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 1));
-                    tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 2));
-                    tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 4));
-                    tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 8));
-                    tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 16));
-                    float v_scale = tok_max / 127.f;
-                    if (v_scale == 0.f) v_scale = 1.f;
-                    if (lane == 0) shared_v_scale[stage][warp] = v_scale;
-                    float inv = 1.f / v_scale;
-                    int8_t* v_int8_dst = shared_v_int8[stage][warp];
-                    #pragma unroll
-                    for (int j = 0; j < VEC; ++j) {
-                        float vf = k_regs[j] * inv;
-                        vf = fminf(fmaxf(vf, -127.f), 127.f);
-                        v_int8_dst[lane * VEC + j] = (int8_t)__float2int_rn(vf);
+                    // ─── INT8 V quantization (single per-token scale) ────────
+                    // V is consumed in PV as B[token=K][dim=N]. We use one scale
+                    // per token (max-abs across the 128 dims) — coarser than K's
+                    // per-palette but PV is less sensitive than QK^T per design §3.3.
+                    {
+                        float my_max = 0.f;
+                        #pragma unroll
+                        for (int j = 0; j < VEC; ++j) {
+                            float a = fabsf(k_regs[j]);
+                            if (a > my_max) my_max = a;
+                        }
+                        float tok_max = my_max;
+                        tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 1));
+                        tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 2));
+                        tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 4));
+                        tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 8));
+                        tok_max = fmaxf(tok_max, __shfl_xor_sync(0xffffffff, tok_max, 16));
+                        float v_scale = tok_max / 127.f;
+                        if (v_scale == 0.f) v_scale = 1.f;
+                        if (lane == 0) shared_v_scale[stage][warp] = v_scale;
+                        float inv = 1.f / v_scale;
+                        int8_t* v_int8_dst = shared_v_int8[stage][warp];
+                        #pragma unroll
+                        for (int j = 0; j < VEC; ++j) {
+                            float vf = k_regs[j] * inv;
+                            vf = fminf(fmaxf(vf, -127.f), 127.f);
+                            v_int8_dst[lane * VEC + j] = (int8_t)__float2int_rn(vf);
+                        }
                     }
                 }
             }
@@ -488,8 +515,8 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             tile_bv = (uint32_t)CHUNK_SIZE;
             tile_off = 0u;
         }
-        // ── QK^T: precompute INT8 logits if INT8_QK=true, broadcast via tile_logits[].
-        if constexpr (INT8_QK && USE_MMA_QK) {
+        // ── QK^T: precompute the INT8 logits, broadcast via tile_logits[].
+        if constexpr (USE_MMA_QK) {
             if (warp_active) {
                 float acc_lo = 0.f;
                 float acc_hi = 0.f;
@@ -537,10 +564,10 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                 __syncwarp();
 
             }
-        } else if constexpr (INT8_QK && !USE_MMA_QK) {
-            // ── Manual per-lane INT8 dot — correct for any VEC / SUB_HEAD_DIM.
-            // Used for the MMA bug-bisect harness AND as the production path for
-            // head dims whose palette isn't 32 dims (e.g. HEAD_DIM=64).
+        } else {
+            // ── Manual per-lane INT8 dot — the production path for head dims
+            // whose palette isn't 32 dims (e.g. HEAD_DIM=64), where the
+            // m16n8k32 fragment layout doesn't apply.
             if (warp_active) {
                 for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
                     int my_pal = lane / 8;
@@ -562,66 +589,79 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         }
 
         if (warp_active) {
-            constexpr int TILE_UNROLL = (WARPS_PER_BLOCK <= 8) ? 4 : 2;
-            #pragma unroll TILE_UNROLL
+            // ── Tile-batched (FlashAttention-style) softmax ────────────────
+            // One running-max update per TILE, not per token. Phase 1 computes
+            // the tile's per-token scores and the tile max; phase 2 rescales the
+            // accumulator (carried from previous tiles) ONCE by alpha; phase 3
+            // adds beta·V for every token relative to the tile max with no
+            // per-token rescale. Mathematically identical to the per-token
+            // online softmax (softmax is associative), but the rescale-free
+            // accumulation is what lets the PV become a batched MMA (1C).
+            float scores[WARPS_PER_BLOCK];
+            float tile_max = -1e38f;
+            #pragma unroll
             for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
                 int actual_k = k_base + t;
                 int actual_within = tile_within_base + t;
-                float valid_mask = (actual_k < kv_len &&
-                                    actual_within >= (int)tile_off &&
-                                    actual_within < (int)(tile_off + tile_bv)) ? 1.f : 0.f;
+                bool valid = (actual_k < kv_len &&
+                              actual_within >= (int)tile_off &&
+                              actual_within < (int)(tile_off + tile_bv));
+                float dot = tile_logits[stage][warp][t];
+                scores[t] = valid ? dot * softmax_scale : -1e38f;
+                tile_max = fmaxf(tile_max, scores[t]);
+            }
 
-                float dot;
-                if constexpr (INT8_QK) {
-                    dot = tile_logits[stage][warp][t];
-                } else {
-                    float d = 0.f;
-                    #pragma unroll
-                    for (int j = 0; j < VEC; ++j)
-                        d = __fmaf_rn(q_reg[j], to_f32<T>(shared_k[stage][t][lane * VEC + j]), d);
-                    dot = warp_reduce_sum(d);
-                }
+            // Phase 2: single accumulator rescale for the whole tile.
+            float new_m = fmaxf(m_i, tile_max);
+            float alpha = fast_exp::exp2<float, fast_exp::Softmax>(
+                              make_float2(m_i - new_m, 0.f)).x;
+            l_i *= alpha;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) out_reg[j] *= alpha;
 
-                float score = dot * softmax_scale;
-                float masked_score = (valid_mask > 0.f) ? score : -1e38f;
-                float new_m = fmaxf(m_i, masked_score);
-                float2 exp_ab = fast_exp::exp2<float, fast_exp::Softmax>(
-                    make_float2(m_i - new_m, masked_score - new_m));
-                float alpha = exp_ab.x;
-                float beta = valid_mask * exp_ab.y;
-                l_i = __fmaf_rn(l_i, alpha, beta);
+            // Phase 3: accumulate beta·V per token (no per-token rescale).
+            // v_rt: V came straight from an int8 arena (palette order + per-dim
+            // block scales, §1A) — gather via the vi palette iterator and scale
+            // per dim. Otherwise V is in the FP→int8 path's logical layout with
+            // one per-token scale.
+            const bool v_rt = (shared_v_readthrough[stage] != 0);
+            #pragma unroll
+            for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
+                // scores[t] == -1e38 marks an invalid token; guard so an
+                // all-invalid tile (new_m == -1e38) can't yield exp2(0)=1.
+                float beta = (scores[t] > -1e37f)
+                    ? fast_exp::exp2<float, fast_exp::Softmax>(
+                          make_float2(scores[t] - new_m, 0.f)).x
+                    : 0.f;
+                l_i += beta;
 
-                if constexpr (INT8_PV) {
+                {
                     float beta_abs = fabsf(beta);
                     float beta_scale = beta_abs / 127.f;
                     if (beta_scale == 0.f) beta_scale = 1.f;
                     int beta_q = (int)__float2int_rn(fminf(fmaxf(beta / beta_scale, -127.f), 127.f));
-                    float v_scale_t = shared_v_scale[stage][t];
-                    float combined_scale = beta_scale * v_scale_t;
-
                     int8_t* v_int8_t = shared_v_int8[stage][t];
-                    #pragma unroll
-                    for (int j = 0; j < VEC; ++j) {
-                        int32_t prod = (int32_t)beta_q * (int32_t)v_int8_t[lane * VEC + j];
-                        out_reg[j] = __fmaf_rn(out_reg[j], alpha, (float)prod * combined_scale);
-                    }
-                } else if constexpr ((std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>) && VEC >= 2) {
-                    constexpr int VEC2 = VEC / 2;
-                    #pragma unroll
-                    for (int j = 0; j < VEC2; ++j) {
-                        float2 vf = load_vec2<T>(&shared_v[stage][t][lane * VEC + j * 2]);
-                        out_reg[j * 2]     = __fmaf_rn(out_reg[j * 2], alpha, beta * vf.x);
-                        out_reg[j * 2 + 1] = __fmaf_rn(out_reg[j * 2 + 1], alpha, beta * vf.y);
-                    }
-                } else {
-                    #pragma unroll
-                    for (int j = 0; j < VEC; ++j) {
-                        float v_val = to_f32<T>(shared_v[stage][t][lane * VEC + j]);
-                        out_reg[j] = __fmaf_rn(out_reg[j], alpha, beta * v_val);
+                    if (v_rt) {
+                        // Read-through: gather palette-order V via vi, per-dim scale.
+                        #pragma unroll
+                        for (int j = 0; j < VEC; ++j) {
+                            int src = vi[j];
+                            int32_t prod = (int32_t)beta_q * (int32_t)v_int8_t[src];
+                            float sc = beta_scale * shared_v_dim_scale[stage][src];
+                            out_reg[j] = __fmaf_rn((float)prod, sc, out_reg[j]);
+                        }
+                    } else {
+                        // FP→int8 path: logical layout, single per-token scale.
+                        float combined_scale = beta_scale * shared_v_scale[stage][t];
+                        #pragma unroll
+                        for (int j = 0; j < VEC; ++j) {
+                            int32_t prod = (int32_t)beta_q * (int32_t)v_int8_t[lane * VEC + j];
+                            out_reg[j] = __fmaf_rn((float)prod, combined_scale, out_reg[j]);
+                        }
                     }
                 }
-                m_i = new_m;
             }
+            m_i = new_m;
         }
     };
 
@@ -686,8 +726,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
 }
 
 template <typename Q_T, typename T, typename O,
-          int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED,
-          bool INT8_QK, bool INT8_PV, bool INT8_QK_USE_MMA>
+          int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE,
                                    v2_min_blocks_per_sm<WARPS_PER_BLOCK>())
 int8_decode_kernel(
@@ -704,7 +743,7 @@ int8_decode_kernel(
 ) {
     constexpr bool IS_HALF_TYPE = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
     constexpr int STAGES = IS_HALF_TYPE ? 3 : 2;
-    int8_decode_attn_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, 32, STAGES, true, ROPE_INTERLEAVED, INT8_QK, INT8_PV, INT8_QK_USE_MMA>(
+    int8_decode_attn_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, 32, STAGES, true, ROPE_INTERLEAVED>(
         q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head, softmax_scale,
         k_new, v_new, rope_cs);
 }
@@ -728,15 +767,12 @@ void launch_int8_decode_attn(
     if (heads_per_group < 1) heads_per_group = 1;
     const bool use_wide = (HEAD_DIM >= 128) && (heads_per_group > 8);
 
-    auto launch = [&](auto warps_const, auto rope_const, auto qk_const, auto pv_const, auto mma_const) {
+    auto launch = [&](auto warps_const, auto rope_const) {
         constexpr int WARPS_PER_BLOCK = decltype(warps_const)::value;
         constexpr bool ROPE_INTERLEAVED = decltype(rope_const)::value;
-        constexpr bool INT8_QK = decltype(qk_const)::value;
-        constexpr bool INT8_PV = decltype(pv_const)::value;
-        constexpr bool INT8_QK_USE_MMA = decltype(mma_const)::value;
         dim3 grid(num_active_slots, n_kv_head);
         dim3 block(WARP_SIZE * WARPS_PER_BLOCK);
-        int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED, INT8_QK, INT8_PV, INT8_QK_USE_MMA>
+        int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
             <<<grid, block, 0, stream>>>(
                 q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
                 softmax_scale, k_new, v_new, rope_cs);
@@ -747,59 +783,19 @@ void launch_int8_decode_attn(
             headers_ptr, num_active_slots, n_kv_head);
     };
 
-    // CANDLE_FUSED_ATTN_INT8 (bitmask, default 3 = full INT8 since the
-    // gated test passes in that mode):
-    //   bit 0 (1) = INT8 QK^T (else FP)
-    //   bit 1 (2) = INT8 PV   (else FP)
-    //   bit 2 (4) = use manual lane-collective dot for INT8 QK^T (else MMA)
-    // Common values:
-    //   0 → FP/FP                   (iter-1 baseline / fallback)
-    //   1 → MMA QK + FP PV          (isolate INT8 QK^T)
-    //   2 → FP QK + INT8 PV         (isolate INT8 PV)
-    //   3 → MMA QK + INT8 PV        (default — full INT8)
-    //   5 → manual QK + FP PV       (DEBUG)
-    //   7 → manual QK + INT8 PV     (DEBUG)
-    static int int8_mode = -1;
-    if (int8_mode < 0) {
-        const char* env = std::getenv("CANDLE_FUSED_ATTN_INT8");
-        int8_mode = env ? std::atoi(env) : 3;
-        if (int8_mode < 0 || int8_mode > 7) int8_mode = 3;
-    }
-
-    auto dispatch = [&](auto warps_c, auto rope_c) {
-        const bool qk = (int8_mode & 1) != 0;
-        const bool pv = (int8_mode & 2) != 0;
-        const bool use_mma = (int8_mode & 4) == 0;
-        if (!qk && !pv) {
-            launch(warps_c, rope_c, std::false_type{}, std::false_type{}, std::true_type{});
-        } else if (qk && !pv && use_mma) {
-            launch(warps_c, rope_c, std::true_type{}, std::false_type{}, std::true_type{});
-        } else if (!qk && pv) {
-            launch(warps_c, rope_c, std::false_type{}, std::true_type{}, std::true_type{});
-        } else if (qk && pv && use_mma) {
-            launch(warps_c, rope_c, std::true_type{}, std::true_type{}, std::true_type{});
-        } else if (qk && !pv && !use_mma) {
-            launch(warps_c, rope_c, std::true_type{}, std::false_type{}, std::false_type{});
-        } else if (qk && pv && !use_mma) {
-            launch(warps_c, rope_c, std::true_type{}, std::true_type{}, std::false_type{});
-        } else {
-            launch(warps_c, rope_c, std::false_type{}, std::false_type{}, std::true_type{});
-        }
-    };
-
     // 4-way dispatch over (use_wide, rope_interleaved). use_wide selects
-    // WARPS_PER_BLOCK=16 for heads_per_group > 8 (e.g. Llama-3 70B class).
+    // WARPS_PER_BLOCK=16 for heads_per_group > 8 (e.g. Llama-3 70B class), else 8.
     if (use_wide) {
         if (rope_interleaved) {
-            dispatch(std::integral_constant<int, 16>{}, std::true_type{});
+            launch(std::integral_constant<int, 16>{}, std::true_type{});
         } else {
-            dispatch(std::integral_constant<int, 16>{}, std::false_type{});
+            launch(std::integral_constant<int, 16>{}, std::false_type{});
         }
     } else {
         if (rope_interleaved) {
-            dispatch(std::integral_constant<int, 8>{}, std::true_type{});
+            launch(std::integral_constant<int, 8>{}, std::true_type{});
         } else {
-            dispatch(std::integral_constant<int, 8>{}, std::false_type{});
+            launch(std::integral_constant<int, 8>{}, std::false_type{});
         }
     }
 }
