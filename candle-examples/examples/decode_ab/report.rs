@@ -36,7 +36,9 @@ pub fn render_golden(rows: &[GoldenRow], cosine_tol: f32) -> String {
     s.push_str(&format!(
         "# decode golden check — both kernels vs FP32 ground truth (identity RoPE)\n\n\
          Pass gate: V2 **and** fused cosine-vs-golden ≥ {cosine_tol:.4} (structural \
-         correctness; quant precision shows up as MAE, not cosine).\n\n",
+         correctness; quant precision shows up as MAE, not cosine). The 1-bit Q1_S \
+         format uses a relaxed floor (0.80) — its sign-only V legitimately tops out \
+         near 0.87, where a structural bug would still crater below ~0.6.\n\n",
     ));
     s.push_str(
         "| scenario | format | status | v2 cos | v2 MAE | fused cos | fused MAE | A/B MAE |\n",

@@ -21,7 +21,6 @@ mod metrics;
 mod report;
 mod scenarios;
 
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use candle::Device;
@@ -207,7 +206,10 @@ fn run_golden(
             eprint!("golden  {:<24} {:<14} ... ", sc.name, fmt.label());
             let outcome = match golden_cell(sc, fmt, device, stager) {
                 Ok((v2, fused, ab_mae)) => {
-                    let passed = v2.cosine >= cosine_tol && fused.cosine >= cosine_tol;
+                    // Per-format floor: the most aggressive formats (1-bit Q1_S)
+                    // have a legitimately lower structural-correctness ceiling.
+                    let floor = fmt.golden_cosine_floor(cosine_tol);
+                    let passed = v2.cosine >= floor && fused.cosine >= floor;
                     any_fail |= !passed;
                     eprintln!(
                         "{} v2cos={:.5} fusedcos={:.5} (v2mae={:.2e} fusedmae={:.2e})",
@@ -353,14 +355,29 @@ fn run_bench(
             }
             eprint!("bench   {:<24} {:<8} ... ", sc.name, fmt.label());
             let run = || -> candle::Result<(std::time::Duration, std::time::Duration)> {
-                // One fresh fixture per backend (both start at the same ctx_len),
-                // reused across all iters for speed.
+                // Twin fixtures (identical seed), built once. We INTERLEAVE the
+                // V2 and fused timed decodes per iteration so both see the same
+                // GPU clock/thermal state back-to-back. Timing V2 fully then
+                // fused fully would let a clock shift between the two phases bias
+                // the ratio (the dominant noise source). The commit-drift from
+                // the decode write token then affects both equally per iter.
                 let fix_v2 = Fixture::build(sc, fmt, device, stager)?;
-                let v2 = bench_backend(&fix_v2, DecodeBackend::V2, iters, warmup, device, stager)?;
                 let fix_fused = Fixture::build(sc, fmt, device, stager)?;
-                let fused =
-                    bench_backend(&fix_fused, DecodeBackend::FusedV1, iters, warmup, device, stager)?;
-                Ok((v2, fused))
+                for _ in 0..warmup {
+                    let _ = fix_v2.decode(DecodeBackend::V2, device, stager)?;
+                    let _ = fix_fused.decode(DecodeBackend::FusedV1, device, stager)?;
+                }
+                let mut v2s: Vec<std::time::Duration> = Vec::with_capacity(iters.max(1));
+                let mut fs: Vec<std::time::Duration> = Vec::with_capacity(iters.max(1));
+                for _ in 0..iters.max(1) {
+                    let (_, dt_v2) = fix_v2.decode(DecodeBackend::V2, device, stager)?;
+                    let (_, dt_f) = fix_fused.decode(DecodeBackend::FusedV1, device, stager)?;
+                    v2s.push(dt_v2);
+                    fs.push(dt_f);
+                }
+                v2s.sort();
+                fs.sort();
+                Ok((v2s[v2s.len() / 2], fs[fs.len() / 2]))
             };
             let (v2, fused) = match run() {
                 Ok(d) => d,
@@ -397,32 +414,6 @@ fn run_bench(
         }
     }
     Ok(render_bench(&rows))
-}
-
-/// Median per-call **GPU kernel** time over `iters` measured decodes (CUDA-event
-/// timed inside `decode`). The fixture is built **once** and reused: each decode
-/// commits its write token so the context drifts slowly, but that drift is tiny
-/// relative to ctx_len and affects V2 and fused identically, so the speedup
-/// ratio (the quantity that matters here) is preserved — and building once
-/// keeps the bench fast enough to iterate on kernel changes.
-fn bench_backend(
-    fixture: &Fixture,
-    backend: DecodeBackend,
-    iters: usize,
-    warmup: usize,
-    device: &Device,
-    stager: &PinnedStager,
-) -> candle::Result<Duration> {
-    for _ in 0..warmup {
-        let _ = fixture.decode(backend, device, stager)?;
-    }
-    let mut samples: Vec<Duration> = Vec::with_capacity(iters.max(1));
-    for _ in 0..iters.max(1) {
-        let (_, dt) = fixture.decode(backend, device, stager)?;
-        samples.push(dt);
-    }
-    samples.sort();
-    Ok(samples[samples.len() / 2])
 }
 
 /// Build a fresh fixture and run a single decode on `backend`. The fresh build
