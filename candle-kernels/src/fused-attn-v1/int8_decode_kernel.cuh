@@ -790,6 +790,264 @@ int8_decode_kernel(
         k_new, v_new, rope_cs, partial_acc, partial_ml);
 }
 
+// =============================================================================
+// WARP-STRIPE decode (1C) — every warp computes. Each warp walks its own KV
+// token stripe for ALL heads in the group, one token at a time, accumulating
+// per-head flash-state, then emits one partial per head. The combine folds the
+// warp axis in for free: the partial index is (split * WARPS_PER_BLOCK + warp),
+// so it reduces over num_splits*WARPS partials per (slot, head). Used when
+// heads_per_group < WARPS_PER_BLOCK (the GQA case that idles 5/8 warps).
+// FP path (v1); manual-INT8 dot + V read-through to follow (M3).
+// =============================================================================
+template <typename Q_T, typename T, typename O,
+          int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED, int HPG>
+__device__ __forceinline__ void int8_decode_stripe_impl(
+    const Q_T* __restrict__ q,
+    const uint8_t* __restrict__ headers_ptr,
+    int num_active_slots,
+    int n_q_head,
+    int n_kv_head,
+    float softmax_scale,
+    const T* __restrict__ k_new,
+    const T* __restrict__ v_new,
+    const float* __restrict__ rope_cs,
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_ml
+) {
+    constexpr int VEC = HEAD_DIM / WARP_SIZE;
+    constexpr int N_PALETTE = 4;
+    constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;
+    constexpr int MAXH = HPG;  // heads-per-group is compile-time → arrays in registers
+
+    int slot_idx = (int)blockIdx.x;
+    int kv_head_idx = (int)blockIdx.y;
+    int split_idx = (int)blockIdx.z;
+    int num_splits = (int)gridDim.z;
+    int tid = (int)threadIdx.x;
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (slot_idx >= num_active_slots || kv_head_idx >= n_kv_head) return;
+
+    constexpr int hpg = HPG;
+    int num_partials = num_splits * WARPS_PER_BLOCK;
+
+    // Per-head flash-state for this warp's stripe (un-normalized ΣwV, m, l).
+    float out_reg[MAXH][VEC];
+    float m_i[MAXH], l_i[MAXH];
+    #pragma unroll
+    for (int h = 0; h < MAXH; ++h) {
+        m_i[h] = -1e38f; l_i[h] = 0.f;
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) out_reg[h][j] = 0.f;
+    }
+
+    auto emit_partial = [&](int qh_local) {
+        int qh = kv_head_idx * hpg + qh_local;
+        if (qh >= n_q_head) return;
+        int64_t base = ((int64_t)slot_idx * n_q_head + qh) * num_partials
+                     + (int64_t)split_idx * WARPS_PER_BLOCK + warp;
+        float* acc = partial_acc + base * HEAD_DIM;
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) acc[lane * VEC + j] = out_reg[qh_local][j];
+        if (lane == 0) { partial_ml[base * 2] = m_i[qh_local]; partial_ml[base * 2 + 1] = l_i[qh_local]; }
+    };
+
+    const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
+    const uint32_t n_slices = slot.n_slices;
+    const uint32_t write_slice_idx = slot.write_slice;
+    const uint64_t slices_ptr = slot.slices_ptr;
+
+    if (n_slices == 0) {
+        for (int h = 0; h < hpg; ++h) emit_partial(h);  // null partials
+        return;
+    }
+
+    uint8_t* write_slice_ptr = get_slice_mut<HEAD_DIM>(slices_ptr, (int)write_slice_idx, n_kv_head);
+    const uint16_t ws_offset = slice_offset(write_slice_ptr);
+    const uint16_t ws_len = slice_len(write_slice_ptr);
+    const uint32_t ws_rope = slice_rope(write_slice_ptr);
+
+    // ─── Fused KV scatter (warp 0; idempotent across split/warp blocks) ──
+    {
+        const int within = (int)ws_offset + (int)ws_len;
+        constexpr int LANES_PER_PAL = WARP_SIZE / N_PALETTE;
+        if (warp == 0 && within < CHUNK_SIZE) {
+            const uint8_t* head_ptr = get_head<HEAD_DIM>(write_slice_ptr, kv_head_idx);
+            int pal = lane / LANES_PER_PAL;
+            int local_lane = lane % LANES_PER_PAL;
+            uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, pal);
+            uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, pal);
+            int k_fmt = kvhead_k_fmt<HEAD_DIM>(head_ptr, pal);
+            int v_fmt = kvhead_v_fmt<HEAD_DIM>(head_ptr, pal);
+            if (k_ptr_p != 0) {
+                char* k_arena = (char*)(uintptr_t)k_ptr_p;
+                char* v_arena = (char*)(uintptr_t)v_ptr_p;
+                int k_esz = ArenaFormat::float_elem_size(k_fmt);
+                int v_esz = ArenaFormat::float_elem_size(v_fmt);
+                int64_t src_base = ((int64_t)slot_idx * (int64_t)n_kv_head + (int64_t)kv_head_idx) * (int64_t)HEAD_DIM;
+                const T* k_src = k_new + src_base;
+                const T* v_src = v_new + src_base;
+                float k_regs[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(k_src[lane * VEC + j]);
+                if (k_fmt == ArenaFormat::R16) {
+                    int hpg_w = n_q_head / n_kv_head; if (hpg_w < 1) hpg_w = 1;
+                    int q_head = kv_head_idx * hpg_w;
+                    int64_t q_base = ((int64_t)slot_idx * (int64_t)n_q_head + (int64_t)q_head) * (int64_t)HEAD_DIM;
+                    float q_regs[VEC];
+                    #pragma unroll
+                    for (int j = 0; j < VEC; ++j) q_regs[j] = to_f32<Q_T>(q[q_base + lane * VEC + j]);
+                    write_regs_to_r16<VEC>(k_arena, 0, within, local_lane, k_regs, q_regs);
+                } else if (k_esz > 0) {
+                    int64_t eo = (int64_t)within * SUB_HEAD_DIM;
+                    write_regs_to_arena<VEC>(k_arena, eo, local_lane, k_esz, k_fmt, k_regs);
+                }
+                float v_regs[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(v_src[lane * VEC + j]);
+                if (v_esz > 0) {
+                    int64_t eo_v = (int64_t)within * SUB_HEAD_DIM;
+                    write_regs_to_arena<VEC>(v_arena, eo_v, local_lane, v_esz, v_fmt, v_regs);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    int kv_len = (int)ws_rope + (int)ws_len + 1;
+    if (kv_len <= 0) { for (int h = 0; h < hpg; ++h) emit_partial(h); return; }
+    int max_len = (int)n_slices * CHUNK_SIZE;
+    if (kv_len > max_len) kv_len = max_len;
+
+    // Q for all heads (logical, RoPE'd) in SHARED smem — the query is
+    // warp-independent, so one copy serves every warp and it stays out of
+    // per-thread registers/stack. Loaded once by warp 0.
+    __shared__ float shared_q[HPG][HEAD_DIM];
+    if (warp == 0) {
+        uint32_t q_rope_pos = (uint32_t)ws_rope + (uint32_t)ws_len;
+        #pragma unroll
+        for (int h = 0; h < HPG; ++h) {
+            int qh = kv_head_idx * HPG + h;
+            const Q_T* q_ptr = q + ((int64_t)slot_idx * n_q_head + qh) * (int64_t)HEAD_DIM;
+            float qr[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) qr[j] = to_f32<Q_T>(q_ptr[lane * VEC + j]);
+            if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
+                apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+            else
+                apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) shared_q[h][lane * VEC + j] = qr[j];
+        }
+    }
+    __syncthreads();
+
+    // Per-warp token K/V scratch (FP, palette order before the ki/vi gather).
+    __shared__ alignas(128) T sk[WARPS_PER_BLOCK][HEAD_DIM];
+    __shared__ alignas(128) T sv[WARPS_PER_BLOCK][HEAD_DIM];
+
+    constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
+    constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
+
+    int n_tiles = (kv_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
+    int tok_lo = (split_idx * tiles_per_split) * WARPS_PER_BLOCK;
+    int tok_hi = (split_idx * tiles_per_split + tiles_per_split) * WARPS_PER_BLOCK;
+    if (tok_hi > kv_len) tok_hi = kv_len;
+
+    PalIter<VEC, HEAD_DIM> ki, vi;
+    int cur_slice = -1;
+
+    for (int k = tok_lo + warp; k < tok_hi; k += WARPS_PER_BLOCK) {
+        int slice_idx = chunk_div(k);
+        int within = chunk_mod(k);
+        if (slice_idx >= (int)n_slices) continue;
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
+        uint32_t bv = (uint32_t)slice_len(sl);
+        uint32_t off = (uint32_t)slice_offset(sl);
+        if (slice_idx == (int)write_slice_idx && bv < CHUNK_SIZE && off + bv < CHUNK_SIZE) bv += 1;
+        if (!(within >= (int)off && within < (int)(off + bv))) continue;
+        const uint8_t* head_ptr = get_head<HEAD_DIM>(sl, kv_head_idx);
+
+        if (slice_idx != cur_slice) {
+            ki.init(kvhead_k_pal_map<HEAD_DIM>(head_ptr), lane);
+            vi.init(kvhead_v_pal_map<HEAD_DIM>(head_ptr), lane);
+            cur_slice = slice_idx;
+        }
+
+        #pragma unroll
+        for (int p = 0; p < N_PALETTE; ++p) {
+            uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
+            float k_scale_p = kvhead_k_scale<HEAD_DIM>(head_ptr, p);
+            int k_fmt = kvhead_k_fmt<HEAD_DIM>(head_ptr, p);
+            if (k_ptr_p) {
+                ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, k_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                ka.template load_head_scaled<T, SUB_HEAD_DIM, false>(sk[warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, k_scale_p);
+            }
+            uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+            float v_scale_p = kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+            int v_fmt = kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+            if (v_ptr_p) {
+                ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, v_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                va.template load_head_scaled<T, SUB_HEAD_DIM, false>(sv[warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+            }
+        }
+        __syncwarp();
+
+        float k_regs[VEC], v_regs[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            k_regs[j] = to_f32<T>(sk[warp][ki[j]]);
+            v_regs[j] = to_f32<T>(sv[warp][vi[j]]);
+        }
+        const int32_t rope_pos = (int32_t)slice_rope(sl) + (within - (int)off);
+        if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
+            apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+        else
+            apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+
+        #pragma unroll 1
+        for (int h = 0; h < hpg; ++h) {
+            float dr = 0.f;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) dr = __fmaf_rn(shared_q[h][lane * VEC + j], k_regs[j], dr);
+            dr = warp_reduce_sum(dr);
+            float logit = dr * softmax_scale;
+            float new_m = fmaxf(m_i[h], logit);
+            float alpha = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(m_i[h] - new_m, 0.f)).x;
+            float beta = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(logit - new_m, 0.f)).x;
+            l_i[h] = l_i[h] * alpha + beta;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) out_reg[h][j] = out_reg[h][j] * alpha + beta * v_regs[j];
+            m_i[h] = new_m;
+        }
+    }
+
+    for (int h = 0; h < hpg; ++h) emit_partial(h);
+}
+
+template <typename Q_T, typename T, typename O,
+          int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED, int HPG>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE,
+                                   int8_decode_min_blocks<WARPS_PER_BLOCK>())
+int8_decode_stripe_kernel(
+    const Q_T* q,
+    const uint8_t* headers_ptr,
+    int num_active_slots,
+    int n_q_head,
+    int n_kv_head,
+    float softmax_scale,
+    const T* k_new,
+    const T* v_new,
+    const float* rope_cs,
+    float* partial_acc,
+    float* partial_ml
+) {
+    int8_decode_stripe_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED, HPG>(
+        q, headers_ptr, num_active_slots, n_q_head, n_kv_head, softmax_scale,
+        k_new, v_new, rope_cs, partial_acc, partial_ml);
+}
+
 // -----------------------------------------------------------------------------
 // Split-KV combine: merge the num_splits per-split partial flash-states for each
 // (slot, query-head) into the final normalized output. One block per output row
@@ -903,28 +1161,63 @@ void launch_int8_decode_attn(
     if (num_splits < 1) num_splits = 1;
     if (num_splits > MAX_SPLITS) num_splits = MAX_SPLITS;
 
-    float* partial_acc = nullptr;
-    float* partial_ml  = nullptr;
-    if (num_splits > 1) {
-        fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, num_splits,
-                                HEAD_DIM, &partial_acc, &partial_ml);
-        if (partial_acc == nullptr) num_splits = 1;  // alloc failed → single-block fallback
-    }
-
     auto launch = [&](auto warps_const, auto rope_const) {
         constexpr int WARPS_PER_BLOCK = decltype(warps_const)::value;
         constexpr bool ROPE_INTERLEAVED = decltype(rope_const)::value;
+
+        // Warp-stripe (1C) when heads_per_group < WARPS: every warp computes,
+        // each over its own KV stripe for all heads, and the partial index folds
+        // in the warp axis (split*WARPS + warp) — so it always writes partials +
+        // combines. partials_per_row = num_splits*WARPS for stripe, else num_splits.
+        const bool use_stripe = (heads_per_group >= 1 && heads_per_group <= 8
+                                 && heads_per_group < WARPS_PER_BLOCK);
+        const int partials_per_row = use_stripe ? (num_splits * WARPS_PER_BLOCK) : num_splits;
+        const bool need_pool = use_stripe || (num_splits > 1);
+        float* pa = nullptr;
+        float* pm = nullptr;
+        if (need_pool) {
+            fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, partials_per_row,
+                                    HEAD_DIM, &pa, &pm);
+        }
+
         dim3 grid(num_active_slots, n_kv_head, num_splits);
         dim3 block(WARP_SIZE * WARPS_PER_BLOCK);
-        int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
-            <<<grid, block, 0, stream>>>(
-                q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
-                softmax_scale, k_new, v_new, rope_cs, partial_acc, partial_ml);
+        if (use_stripe && pa != nullptr) {
+            // HPG is compile-time so the per-head flash-state arrays size exactly
+            // and stay in registers (no STACK local memory).
+            #define STRIPE_LAUNCH(H)                                                       \
+                int8_decode_stripe_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,            \
+                                          ROPE_INTERLEAVED, H>                             \
+                    <<<grid, block, 0, stream>>>(                                          \
+                        q, headers_ptr, num_active_slots, n_q_head, n_kv_head,             \
+                        softmax_scale, k_new, v_new, rope_cs, pa, pm)
+            switch (heads_per_group) {
+                case 1: STRIPE_LAUNCH(1); break;
+                case 2: STRIPE_LAUNCH(2); break;
+                case 3: STRIPE_LAUNCH(3); break;
+                case 4: STRIPE_LAUNCH(4); break;
+                case 5: STRIPE_LAUNCH(5); break;
+                case 6: STRIPE_LAUNCH(6); break;
+                case 7: STRIPE_LAUNCH(7); break;
+                case 8: STRIPE_LAUNCH(8); break;
+                default: break;
+            }
+            #undef STRIPE_LAUNCH
+        } else {
+            // Existing INT8-MMA kernel (warp=head). Direct write if no pool
+            // (single block) — also the fallback if the stripe pool alloc failed.
+            float* kpa = (pa != nullptr && num_splits > 1) ? pa : nullptr;
+            float* kpm = (pm != nullptr && num_splits > 1) ? pm : nullptr;
+            int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
+                <<<grid, block, 0, stream>>>(
+                    q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
+                    softmax_scale, k_new, v_new, rope_cs, kpa, kpm);
+        }
 
-        if (num_splits > 1) {
+        if (pa != nullptr && (use_stripe || num_splits > 1)) {
             int num_rows = num_active_slots * n_q_head;
             int8_decode_combine_kernel<O, HEAD_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
-                out, partial_acc, partial_ml, num_rows, num_splits);
+                out, pa, pm, num_rows, partials_per_row);
         }
 
         constexpr int COMMIT_THREADS = 128;
