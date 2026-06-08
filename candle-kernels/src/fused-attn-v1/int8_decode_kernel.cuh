@@ -52,7 +52,9 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     float softmax_scale,
     const T* __restrict__ k_new,
     const T* __restrict__ v_new,
-    const float* __restrict__ rope_cs
+    const float* __restrict__ rope_cs,
+    float* __restrict__ partial_acc,   // split-KV: [slot*n_q_head+qh][split][HEAD_DIM] un-normalized ΣwV; nullptr → write final
+    float* __restrict__ partial_ml     // split-KV: [slot*n_q_head+qh][split][2] = (m, l)
 ) {
     constexpr int VEC = HEAD_DIM / WARP_SIZE;
     static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be multiple of 32");
@@ -63,11 +65,32 @@ __device__ __forceinline__ void int8_decode_attn_impl(
 
     int slot_idx = (int)blockIdx.x;
     int kv_head_idx = (int)blockIdx.y;
+    int split_idx = (int)blockIdx.z;
+    int num_splits = (int)gridDim.z;
     int tid = (int)threadIdx.x;
     int warp = tid / WARP_SIZE;
     int lane = tid % WARP_SIZE;
 
     if (slot_idx >= num_active_slots || kv_head_idx >= n_kv_head) return;
+
+    // Emit a warp's result: in split-KV mode (partial_acc != nullptr) write the
+    // un-normalized partial (ΣwV, m, l) for this split; otherwise normalize and
+    // write the final output. The combine kernel merges the per-split partials.
+    auto emit_result = [&](int qh, const float* oreg, float mval, float lval, bool active) {
+        if (!active) return;
+        if (partial_acc != nullptr) {
+            int64_t base = ((int64_t)slot_idx * n_q_head + qh) * num_splits + split_idx;
+            float* acc = partial_acc + base * HEAD_DIM;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) acc[lane * VEC + j] = oreg[j];
+            if (lane == 0) { partial_ml[base * 2] = mval; partial_ml[base * 2 + 1] = lval; }
+        } else {
+            float inv_l = __fdividef(1.f, fmaxf(lval, 1e-10f));
+            O* out_ptr = out + ((int64_t)slot_idx * (int64_t)n_q_head + (int64_t)qh) * (int64_t)HEAD_DIM;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) out_ptr[lane * VEC + j] = from_f32<O>(oreg[j] * inv_l);
+        }
+    };
 
     const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
     const uint32_t n_slices  = slot.n_slices;
@@ -79,12 +102,10 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         if (heads_per_group <= 0) heads_per_group = 1;
         int head_idx = kv_head_idx * heads_per_group + warp;
         bool warp_active = (warp < heads_per_group) && (head_idx < n_q_head);
-        if (warp_active) {
-            int64_t out_base = ((int64_t)slot_idx * (int64_t)n_q_head + (int64_t)head_idx) * (int64_t)HEAD_DIM;
-            #pragma unroll
-            for (int j = 0; j < VEC; ++j)
-                out[out_base + lane * VEC + j] = from_f32<O>(0.f);
-        }
+        float zero_reg[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) zero_reg[j] = 0.f;
+        emit_result(head_idx, zero_reg, -1e38f, 0.f, warp_active);
         return;
     }
 
@@ -153,12 +174,10 @@ __device__ __forceinline__ void int8_decode_attn_impl(
 
     int kv_len = (int)ws_rope + (int)ws_len + 1;
     if (kv_len <= 0) {
-        if (warp_active) {
-            int64_t out_base = ((int64_t)slot_idx * (int64_t)n_q_head + (int64_t)head_idx) * (int64_t)HEAD_DIM;
-            #pragma unroll
-            for (int j = 0; j < VEC; ++j)
-                out[out_base + lane * VEC + j] = from_f32<O>(0.f);
-        }
+        float zero_reg[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) zero_reg[j] = 0.f;
+        emit_result(head_idx, zero_reg, -1e38f, 0.f, warp_active);
         return;
     }
     int max_len = (int)n_slices * CHUNK_SIZE;
@@ -297,6 +316,15 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     for (int j = 0; j < VEC; ++j) out_reg[j] = 0.f;
 
     const int n_tiles = (kv_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    // Split-KV: this block processes the contiguous tile sub-range [tile_lo,
+    // tile_hi). num_splits==1 → the whole [0, n_tiles). An empty range
+    // (tile_lo >= n_tiles) runs no tiles and emits a null partial (m=-inf, l=0)
+    // from the initial m_i/l_i/out_reg, which the combine ignores.
+    const int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
+    int tile_lo = split_idx * tiles_per_split;
+    int tile_hi = tile_lo + tiles_per_split;
+    if (tile_lo > n_tiles) tile_lo = n_tiles;
+    if (tile_hi > n_tiles) tile_hi = n_tiles;
     constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
 
     auto load_tile = [&](int tile_idx, int stage) {
@@ -665,13 +693,14 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         }
     };
 
-    // Pipelined main loop (mirrors v2's structure).
+    // Pipelined main loop (mirrors v2's structure), over this split's tile range.
+    const int range = tile_hi - tile_lo;
     if constexpr (NUM_STAGES >= 2 && USE_TC) {
         int tiles_loaded = 0;
-        if (n_tiles > 0) { load_tile(0, 0); cp_async_commit<USE_TC>(); tiles_loaded = 1; }
-        if (n_tiles > 1 && NUM_STAGES >= 2) { load_tile(1, 1); cp_async_commit<USE_TC>(); tiles_loaded = 2; }
+        if (range > 0) { load_tile(tile_lo + 0, 0); cp_async_commit<USE_TC>(); tiles_loaded = 1; }
+        if (range > 1 && NUM_STAGES >= 2) { load_tile(tile_lo + 1, 1); cp_async_commit<USE_TC>(); tiles_loaded = 2; }
         if constexpr (NUM_STAGES >= 3) {
-            if (n_tiles > 2) { load_tile(2, 2); cp_async_commit<USE_TC>(); tiles_loaded = 3; }
+            if (range > 2) { load_tile(tile_lo + 2, 2); cp_async_commit<USE_TC>(); tiles_loaded = 3; }
         }
         if (tiles_loaded >= NUM_STAGES) {
             cp_async_wait<NUM_STAGES - 1, USE_TC>();
@@ -681,22 +710,22 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             cp_async_wait<0, USE_TC>();
         }
         __syncthreads();
-        if (n_tiles > 0) {
-            maybe_init_kv_iters_for_tile(0);
-            apply_rope_to_tile(0, 0);
+        if (range > 0) {
+            maybe_init_kv_iters_for_tile(tile_lo + 0);
+            apply_rope_to_tile(tile_lo + 0, 0);
         }
         int cur_stage = 0;
-        for (int tile = 0; tile < n_tiles; ++tile) {
+        for (int tile = tile_lo; tile < tile_hi; ++tile) {
             __syncthreads();
             process_tile(tile, cur_stage);
             __syncthreads();
             int prefetch_tile = tile + NUM_STAGES;
-            if (prefetch_tile < n_tiles) {
+            if (prefetch_tile < tile_hi) {
                 load_tile(prefetch_tile, cur_stage);
                 cp_async_commit<USE_TC>();
             }
             int next_tile = tile + 1;
-            if (next_tile < n_tiles) {
+            if (next_tile < tile_hi) {
                 cp_async_wait<NUM_STAGES - 1, USE_TC>();
                 __syncthreads();
                 maybe_init_kv_iters_for_tile(next_tile);
@@ -705,7 +734,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             cur_stage = (cur_stage + 1) % NUM_STAGES;
         }
     } else {
-        for (int tile = 0; tile < n_tiles; ++tile) {
+        for (int tile = tile_lo; tile < tile_hi; ++tile) {
             load_tile(tile, 0);
             __syncthreads();
             maybe_init_kv_iters_for_tile(tile);
@@ -716,13 +745,7 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         }
     }
 
-    if (warp_active) {
-        float inv_l = __fdividef(1.f, fmaxf(l_i, 1e-10f));
-        O* out_ptr = out + ((int64_t)slot_idx * (int64_t)n_q_head + (int64_t)head_idx) * (int64_t)HEAD_DIM;
-        #pragma unroll
-        for (int j = 0; j < VEC; ++j)
-            out_ptr[lane * VEC + j] = from_f32<O>(out_reg[j] * inv_l);
-    }
+    emit_result(head_idx, out_reg, m_i, l_i, warp_active);
 }
 
 template <typename Q_T, typename T, typename O,
@@ -739,13 +762,95 @@ int8_decode_kernel(
     float softmax_scale,
     const T* k_new,
     const T* v_new,
-    const float* rope_cs
+    const float* rope_cs,
+    float* partial_acc,
+    float* partial_ml
 ) {
     constexpr bool IS_HALF_TYPE = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
     constexpr int STAGES = IS_HALF_TYPE ? 3 : 2;
     int8_decode_attn_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, 32, STAGES, true, ROPE_INTERLEAVED>(
         q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head, softmax_scale,
-        k_new, v_new, rope_cs);
+        k_new, v_new, rope_cs, partial_acc, partial_ml);
+}
+
+// -----------------------------------------------------------------------------
+// Split-KV combine: merge the num_splits per-split partial flash-states for each
+// (slot, query-head) into the final normalized output. One block per output row
+// (slot*n_q_head + qh); HEAD_DIM threads, each owning one output dim. The merge
+// is the standard log-sum-exp (base-2, matching the decode kernel's exp2):
+//   gm = max_s m_s;  out = (Σ_s ΣwV_s · 2^(m_s-gm)) / (Σ_s l_s · 2^(m_s-gm)).
+// Null partials (m=-inf, l=0) contribute zero.
+// -----------------------------------------------------------------------------
+template <typename O, int HEAD_DIM>
+__global__ void int8_decode_combine_kernel(
+    O* __restrict__ out,
+    const float* __restrict__ partial_acc,   // [row][split][HEAD_DIM]
+    const float* __restrict__ partial_ml,    // [row][split][2]
+    int num_rows,
+    int num_splits
+) {
+    int row = (int)blockIdx.x;
+    if (row >= num_rows) return;
+    int d = (int)threadIdx.x;
+    if (d >= HEAD_DIM) return;
+
+    const float* ml = partial_ml + (int64_t)row * num_splits * 2;
+    const float* pa = partial_acc + (int64_t)row * num_splits * HEAD_DIM;
+
+    float gm = -1e38f;
+    for (int s = 0; s < num_splits; ++s) gm = fmaxf(gm, ml[s * 2]);
+
+    float acc = 0.f, L = 0.f;
+    for (int s = 0; s < num_splits; ++s) {
+        float w = exp2f(ml[s * 2] - gm);
+        acc += pa[(int64_t)s * HEAD_DIM + d] * w;
+        L   += ml[s * 2 + 1] * w;
+    }
+    float inv = __fdividef(1.f, fmaxf(L, 1e-10f));
+    out[(int64_t)row * HEAD_DIM + d] = from_f32<O>(acc * inv);
+}
+
+// SM count (cached) — used to size the split-KV factor to fill the device.
+inline int fused_attn_sm_count() {
+    static int sm = 0;
+    if (sm == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
+        if (sm <= 0) sm = 1;
+    }
+    return sm;
+}
+
+// Grow-on-demand device scratch for split-KV partials. Persistent (never freed),
+// reused across launches; allocation happens on the first split launch / on a
+// grow, never in the steady-state timed path. Single-stream decode only (the
+// pool is process-global, not per-stream).
+inline void fused_attn_partial_pool(
+    int64_t rows, int splits, int head_dim, float** acc_out, float** ml_out
+) {
+    static float* g_acc = nullptr;
+    static float* g_ml  = nullptr;
+    static int64_t g_cap_acc = 0;  // capacity in floats
+    static int64_t g_cap_ml  = 0;
+    int64_t need_acc = rows * splits * head_dim;
+    int64_t need_ml  = rows * splits * 2;
+    if (need_acc > g_cap_acc) {
+        if (g_acc) cudaFree(g_acc);
+        if (cudaMalloc(&g_acc, (size_t)need_acc * sizeof(float)) != cudaSuccess) {
+            g_acc = nullptr; g_cap_acc = 0; *acc_out = nullptr; *ml_out = nullptr; return;
+        }
+        g_cap_acc = need_acc;
+    }
+    if (need_ml > g_cap_ml) {
+        if (g_ml) cudaFree(g_ml);
+        if (cudaMalloc(&g_ml, (size_t)need_ml * sizeof(float)) != cudaSuccess) {
+            g_ml = nullptr; g_cap_ml = 0; *acc_out = nullptr; *ml_out = nullptr; return;
+        }
+        g_cap_ml = need_ml;
+    }
+    *acc_out = g_acc;
+    *ml_out  = g_ml;
 }
 
 template <typename Q_T, typename T, typename O, int HEAD_DIM>
@@ -767,15 +872,43 @@ void launch_int8_decode_attn(
     if (heads_per_group < 1) heads_per_group = 1;
     const bool use_wide = (HEAD_DIM >= 128) && (heads_per_group > 8);
 
+    // ── Split-KV factor: fan each (slot, kv_head)'s KV-tile loop across multiple
+    // blocks so the grid fills the SMs when batch*heads is a small grid. Target
+    // ~2 waves at the register-bound ~3 blocks/SM; clamp to MAX_SPLITS. Empty
+    // splits (short context) early-out cheaply; S=1 keeps the direct-write path.
+    int base_blocks = num_active_slots * n_kv_head;
+    int num_splits = 1;
+    if (base_blocks > 0) {
+        int target_blocks = fused_attn_sm_count() * 3 * 2;
+        num_splits = (target_blocks + base_blocks - 1) / base_blocks;
+    }
+    constexpr int MAX_SPLITS = 32;
+    if (num_splits < 1) num_splits = 1;
+    if (num_splits > MAX_SPLITS) num_splits = MAX_SPLITS;
+
+    float* partial_acc = nullptr;
+    float* partial_ml  = nullptr;
+    if (num_splits > 1) {
+        fused_attn_partial_pool((int64_t)num_active_slots * n_q_head, num_splits,
+                                HEAD_DIM, &partial_acc, &partial_ml);
+        if (partial_acc == nullptr) num_splits = 1;  // alloc failed → single-block fallback
+    }
+
     auto launch = [&](auto warps_const, auto rope_const) {
         constexpr int WARPS_PER_BLOCK = decltype(warps_const)::value;
         constexpr bool ROPE_INTERLEAVED = decltype(rope_const)::value;
-        dim3 grid(num_active_slots, n_kv_head);
+        dim3 grid(num_active_slots, n_kv_head, num_splits);
         dim3 block(WARP_SIZE * WARPS_PER_BLOCK);
         int8_decode_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED>
             <<<grid, block, 0, stream>>>(
                 q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head,
-                softmax_scale, k_new, v_new, rope_cs);
+                softmax_scale, k_new, v_new, rope_cs, partial_acc, partial_ml);
+
+        if (num_splits > 1) {
+            int num_rows = num_active_slots * n_q_head;
+            int8_decode_combine_kernel<O, HEAD_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
+                out, partial_acc, partial_ml, num_rows, num_splits);
+        }
 
         constexpr int COMMIT_THREADS = 128;
         dim3 commit_grid((num_active_slots + COMMIT_THREADS - 1) / COMMIT_THREADS);
