@@ -625,7 +625,10 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             // per-token rescale. Mathematically identical to the per-token
             // online softmax (softmax is associative), but the rescale-free
             // accumulation is what lets the PV become a batched MMA (1C).
-            float scores[WARPS_PER_BLOCK];
+            // Scores stay in tile_logits[] (smem); each phase recomputes the
+            // scaled score from there rather than holding an 8-wide per-lane
+            // register array — frees ~8 registers/thread for occupancy. The
+            // smem reads are warp-uniform broadcasts.
             float tile_max = -1e38f;
             #pragma unroll
             for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
@@ -634,9 +637,8 @@ __device__ __forceinline__ void int8_decode_attn_impl(
                 bool valid = (actual_k < kv_len &&
                               actual_within >= (int)tile_off &&
                               actual_within < (int)(tile_off + tile_bv));
-                float dot = tile_logits[stage][warp][t];
-                scores[t] = valid ? dot * softmax_scale : -1e38f;
-                tile_max = fmaxf(tile_max, scores[t]);
+                float s = valid ? tile_logits[stage][warp][t] * softmax_scale : -1e38f;
+                tile_max = fmaxf(tile_max, s);
             }
 
             // Phase 2: single accumulator rescale for the whole tile.
@@ -655,11 +657,18 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             const bool v_rt = (shared_v_readthrough[stage] != 0);
             #pragma unroll
             for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
-                // scores[t] == -1e38 marks an invalid token; guard so an
-                // all-invalid tile (new_m == -1e38) can't yield exp2(0)=1.
-                float beta = (scores[t] > -1e37f)
+                int actual_k = k_base + t;
+                int actual_within = tile_within_base + t;
+                bool valid = (actual_k < kv_len &&
+                              actual_within >= (int)tile_off &&
+                              actual_within < (int)(tile_off + tile_bv));
+                // Recompute the score from tile_logits[] (smem). s <= -1e37 marks
+                // an invalid token; guard so an all-invalid tile (new_m==-1e38)
+                // can't yield exp2(0)=1.
+                float s = valid ? tile_logits[stage][warp][t] * softmax_scale : -1e38f;
+                float beta = (s > -1e37f)
                     ? fast_exp::exp2<float, fast_exp::Softmax>(
-                          make_float2(scores[t] - new_m, 0.f)).x
+                          make_float2(s - new_m, 0.f)).x
                     : 0.f;
                 l_i += beta;
 
@@ -748,10 +757,18 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     emit_result(head_idx, out_reg, m_i, l_i, warp_active);
 }
 
+// Register target for the INT8 decode kernel. WARPS=8 (256 thr): 4 blocks/SM,
+// which caps ptxas at 65536/(4*256)=64 registers → 67% theoretical occupancy
+// (vs 50% at the v2 target of 3). WARPS=16 (512 thr) keeps 2.
+template <int WARPS_PER_BLOCK>
+constexpr int int8_decode_min_blocks() {
+    return (WARPS_PER_BLOCK <= 8) ? 4 : 2;
+}
+
 template <typename Q_T, typename T, typename O,
           int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED>
 __global__ void __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE,
-                                   v2_min_blocks_per_sm<WARPS_PER_BLOCK>())
+                                   int8_decode_min_blocks<WARPS_PER_BLOCK>())
 int8_decode_kernel(
     const Q_T* q,
     const uint8_t* headers_ptr,
