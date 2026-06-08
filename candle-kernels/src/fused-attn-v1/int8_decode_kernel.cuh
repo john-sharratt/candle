@@ -1218,7 +1218,7 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     __syncthreads();
 
     // ── Per-warp tile scratch ────────────────────────────────────────────
-    __shared__ alignas(128) T      skt[WARPS_PER_BLOCK][HEAD_DIM];           // K load (palette order)
+    __shared__ alignas(128) T      skt[2][WARPS_PER_BLOCK][HEAD_DIM];        // K load (palette order), cp.async double-buffered
     __shared__ alignas(128) int8_t shared_kb[WARPS_PER_BLOCK][8][HEAD_DIM];  // K int8 (logical = B-frag src)
     __shared__ alignas(16)  float  scaleK[WARPS_PER_BLOCK][8][N_PALETTE];
     __shared__ alignas(16)  float  scores_smem[WARPS_PER_BLOCK][HPG][8];
@@ -1255,36 +1255,58 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
 
         int tok_within[8];
         bool tok_valid[8];
-        // ── stage the 8 tokens' K (int8 logical → the MMA B-operand) ──
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
             int kidx = k_base + t;
             int within = chunk_mod(kidx);
-            bool valid = slice_ok && (kidx < kv_len)
-                       && (within >= (int)off && within < (int)(off + bv));
             tok_within[t] = within;
-            tok_valid[t] = valid;
-            if (!valid) {
+            tok_valid[t] = slice_ok && (kidx < kv_len)
+                         && (within >= (int)off && within < (int)(off + bv));
+        }
+        // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
+        // token's load overlaps the previous token's gather/RoPE/quant. The
+        // prefetch is unconditional when slice_ok (all 8 tokens share the chunk,
+        // so every `within` is in-bounds); invalid tokens just zero shared_kb.
+        if (slice_ok) {
+            #pragma unroll
+            for (int p = 0; p < N_PALETTE; ++p) {
+                uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
+                if (k_ptr_p) {
+                    ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                    ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[0], lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
+                }
+            }
+            cp_async_commit<true>();
+        }
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (slice_ok) {
+                if (t + 1 < 8) {
+                    #pragma unroll
+                    for (int p = 0; p < N_PALETTE; ++p) {
+                        uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
+                        if (k_ptr_p) {
+                            ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, kvhead_k_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                            ka.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[t + 1], lane, kvhead_k_scale<HEAD_DIM>(head_ptr, p));
+                        }
+                    }
+                    cp_async_commit<true>();
+                    cp_async_wait<1, true>();
+                } else {
+                    cp_async_wait<0, true>();
+                }
+            }
+            __syncwarp();
+            if (!tok_valid[t]) {
                 #pragma unroll
                 for (int j = 0; j < VEC; ++j) shared_kb[warp][t][lane * VEC + j] = 0;
                 if (lane < N_PALETTE) scaleK[warp][t][lane] = 1.f;
                 continue;
             }
-            #pragma unroll
-            for (int p = 0; p < N_PALETTE; ++p) {
-                uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
-                float k_scale_p = kvhead_k_scale<HEAD_DIM>(head_ptr, p);
-                int k_fmt = kvhead_k_fmt<HEAD_DIM>(head_ptr, p);
-                if (k_ptr_p) {
-                    ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, k_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    ka.template load_head_scaled<T, SUB_HEAD_DIM, false>(skt[warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, k_scale_p);
-                }
-            }
-            __syncwarp();
             float k_regs[VEC];
             #pragma unroll
-            for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(skt[warp][ki[j]]);
-            int32_t rope_pos = rope_base + (within - (int)off);
+            for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(skt[t & 1][warp][ki[j]]);
+            int32_t rope_pos = rope_base + (tok_within[t] - (int)off);
             if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
                 apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
             else
@@ -1305,7 +1327,6 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 float v = fminf(fmaxf(k_regs[j] * inv, -127.f), 127.f);
                 shared_kb[warp][t][lane * VEC + j] = (int8_t)__float2int_rn(v);
             }
-            __syncwarp();
         }
 
         // ── QK^T: M=HPG x N=8 INT8 MMA per palette, scaled-accumulate ──
@@ -1364,13 +1385,13 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
                 int v_fmt = kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
                 if (v_ptr_p) {
                     ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, v_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    va.template load_head_scaled<T, SUB_HEAD_DIM, false>(skt[warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+                    va.template load_head_scaled<T, SUB_HEAD_DIM, false>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
                 }
             }
             __syncwarp();
             float v_regs[VEC];
             #pragma unroll
-            for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(skt[warp][vi[j]]);
+            for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(skt[0][warp][vi[j]]);
             #pragma unroll
             for (int h = 0; h < HPG; ++h) {
                 float s = scores_smem[warp][h][t];
