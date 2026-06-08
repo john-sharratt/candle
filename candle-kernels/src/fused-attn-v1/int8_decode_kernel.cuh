@@ -1372,26 +1372,45 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
             new_m[h] = nm;
         }
 
-        // ── PV pass 2: load each token's V once (FP, into the reused skt) and
-        // accumulate it across all heads — no per-tile V smem staging. ──
-        #pragma unroll
-        for (int t = 0; t < 8; ++t) {
-            if (!tok_valid[t]) continue;
-            int within = tok_within[t];
+        // ── PV pass 2: load each token's V once (cp.async double-buffered into
+        // the reused skt ring) so its load overlaps the previous token's
+        // accumulate, and add it across all heads — no per-tile V smem staging.
+        // Prefetch is unconditional when slice_ok (in-bounds); invalid tokens are
+        // skipped in the accumulate. ──
+        if (slice_ok) {
             #pragma unroll
             for (int p = 0; p < N_PALETTE; ++p) {
                 uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
-                float v_scale_p = kvhead_v_scale<HEAD_DIM>(head_ptr, p);
-                int v_fmt = kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
                 if (v_ptr_p) {
-                    ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, v_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
-                    va.template load_head_scaled<T, SUB_HEAD_DIM, false>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+                    ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                    va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[0][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[0], lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
+                }
+            }
+            cp_async_commit<true>();
+        }
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (slice_ok) {
+                if (t + 1 < 8) {
+                    #pragma unroll
+                    for (int p = 0; p < N_PALETTE; ++p) {
+                        uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+                        if (v_ptr_p) {
+                            ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, kvhead_v_fmt<HEAD_DIM>(head_ptr, p), sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                            va.template load_head_scaled<T, SUB_HEAD_DIM, true>(skt[(t + 1) & 1][warp] + p * SUB_HEAD_DIM, 0, 0, tok_within[t + 1], lane, kvhead_v_scale<HEAD_DIM>(head_ptr, p));
+                        }
+                    }
+                    cp_async_commit<true>();
+                    cp_async_wait<1, true>();
+                } else {
+                    cp_async_wait<0, true>();
                 }
             }
             __syncwarp();
+            if (!tok_valid[t]) continue;
             float v_regs[VEC];
             #pragma unroll
-            for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(skt[0][warp][vi[j]]);
+            for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(skt[t & 1][warp][vi[j]]);
             #pragma unroll
             for (int h = 0; h < HPG; ++h) {
                 float s = scores_smem[warp][h][t];

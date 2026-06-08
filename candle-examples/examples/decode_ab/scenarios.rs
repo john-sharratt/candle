@@ -216,11 +216,73 @@ pub fn single_decode_scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// Codec-coverage grid for the `suite` command: hd128 GQA 3:1 (Llama-3.2-3B-ish,
+/// the production shape), single (b1) and multi (b8) batch at shallow → mid
+/// context (128 → 2048). Paired with [`quant_formats`](crate::formats::quant_formats)
+/// this validates **every** compression codec at representative single- and
+/// multi-batch shapes. Codec correctness is depth-independent (a quant/read bug
+/// surfaces at ctx512 as readily as at 32K), so the aggressive formats only need
+/// these cheap fixtures; the expensive deep regime is covered separately by
+/// [`suite_deep_scenarios`] on the production INT8 formats alone.
+pub fn suite_scenarios() -> Vec<Scenario> {
+    let mk = |name: &'static str, ctx: usize, slots: usize| Scenario {
+        name,
+        n_q_head: 24,
+        n_kv_head: 8,
+        head_dim: 128,
+        ctx_len: ctx,
+        num_slots: slots,
+        rope_interleaved: true,
+        compute: DType::F16,
+    };
+    vec![
+        // single batch (most grid-starved)
+        mk("suite_b1_ctx128", 128, 1),
+        mk("suite_b1_ctx512", 512, 1),
+        mk("suite_b1_ctx2048", 2048, 1),
+        // multi batch (fills the decode grid)
+        mk("suite_b8_ctx128", 128, 8),
+        mk("suite_b8_ctx512", 512, 8),
+        mk("suite_b8_ctx2048", 2048, 8),
+    ]
+}
+
+/// Depth / scale grid for the `suite` command: the *expensive* fixtures — deep
+/// single-session context (8K → 32K) and large-batch scale (b16) — paired with
+/// [`deep_formats`](crate::formats::deep_formats) (the production native-INT8
+/// formats only). These exercise the deep-scan / split-KV path and the multi-slot
+/// grid fill, which are codec-agnostic, so running the full quant set here is
+/// overkill — and the deep fixtures are the slow ones to build. Batch-1 keeps even
+/// 32K KV within VRAM (≈134 MB f16); the b16 row stresses the multi-slot grid at
+/// the largest total-KV footprint the suite builds.
+pub fn suite_deep_scenarios() -> Vec<Scenario> {
+    let mk = |name: &'static str, ctx: usize, slots: usize| Scenario {
+        name,
+        n_q_head: 24,
+        n_kv_head: 8,
+        head_dim: 128,
+        ctx_len: ctx,
+        num_slots: slots,
+        rope_interleaved: true,
+        compute: DType::F16,
+    };
+    vec![
+        // deep single-session
+        mk("suite_b1_ctx8192", 8192, 1),
+        mk("suite_b1_ctx16384", 16384, 1),
+        mk("suite_b1_ctx32768", 32768, 1),
+        // large-batch scale
+        mk("suite_b16_ctx2048", 2048, 16),
+    ]
+}
+
 /// Filter scenarios by a comma-separated list of names (`--scenarios a,b`).
 pub fn select_scenarios(filter: &str) -> Result<Vec<Scenario>, String> {
     let mut universe = all_scenarios();
     universe.extend(perf_scenarios());
     universe.extend(single_decode_scenarios());
+    universe.extend(suite_scenarios());
+    universe.extend(suite_deep_scenarios());
     let mut out = Vec::new();
     let mut unknown = Vec::new();
     for want in filter.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {

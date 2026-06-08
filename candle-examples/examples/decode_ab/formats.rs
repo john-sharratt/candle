@@ -120,6 +120,47 @@ pub fn default_formats() -> Vec<ArenaFmt> {
     ]
 }
 
+/// The quant-coverage format axis for the `suite` command's **codec sweep** (run
+/// against the cheap shallow/mid [`suite_scenarios`](crate::scenarios::suite_scenarios)):
+/// the F16 baseline plus every compression codec the decode kernel reads through
+/// its real palette quantization. The native-INT8 arenas (Q8_0/Q4_0/Q2_0 +
+/// adaptive) run at both ends of the compression ladder — L0 (near-lossless
+/// reference) and L7 (aggressive) — to bracket the quant-error range; the
+/// remaining read-through families run at L0. A subset of [`all_formats`], so
+/// every label here resolves via `select_formats`.
+pub fn quant_formats() -> Vec<ArenaFmt> {
+    use QuantFormat::*;
+    let mut v = vec![ArenaFmt::Float(DType::F16)];
+    for level in [0u8, 7] {
+        for of in [Q8_0, Q4_0, Q2_0] {
+            v.push(ArenaFmt::RealQuant { level, override_fmt: Some(of) });
+        }
+        v.push(ArenaFmt::RealQuant { level, override_fmt: None });
+    }
+    for qf in [Q5_0, Q3_0, Q4_KS, Q8_KS, Q2_S, Q1_S, Q1_A, Q0, Q0_M2, Q0_M4, Q0_X] {
+        v.push(ArenaFmt::RealQuant { level: 0, override_fmt: Some(qf) });
+    }
+    v
+}
+
+/// Production-format axis for the `suite` command's **depth/scale sweep** (run
+/// against the expensive deep [`suite_deep_scenarios`](crate::scenarios::suite_deep_scenarios)):
+/// the F16 correctness baseline plus the native-INT8 arenas Q8_0 and Q4_0 at both
+/// ends of the compression ladder (L0 reference, L7 aggressive). The deep/large
+/// fixtures are slow to build and the codec under read doesn't change the
+/// deep-scan or split-KV path, so the aggressive codecs stay out of the deep
+/// sweep — they're already covered by [`quant_formats`] at the cheap shapes.
+pub fn deep_formats() -> Vec<ArenaFmt> {
+    use QuantFormat::*;
+    vec![
+        ArenaFmt::Float(DType::F16),
+        ArenaFmt::RealQuant { level: 0, override_fmt: Some(Q8_0) },
+        ArenaFmt::RealQuant { level: 7, override_fmt: Some(Q8_0) },
+        ArenaFmt::RealQuant { level: 0, override_fmt: Some(Q4_0) },
+        ArenaFmt::RealQuant { level: 7, override_fmt: Some(Q4_0) },
+    ]
+}
+
 /// Every arena format the kernels claim to support — the exhaustive sweep used
 /// under `--all-formats`. The exotic capture/experimental formats are included;
 /// any that cannot be used as a uniform sealing format are reported as skipped

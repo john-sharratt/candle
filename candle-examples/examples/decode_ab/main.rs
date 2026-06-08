@@ -29,14 +29,17 @@ use candle_transformers::models::prefill_utils::DecodeBackend;
 use clap::{Parser, Subcommand};
 
 use fixture::Fixture;
-use formats::{all_formats, default_formats, select_formats, ArenaFmt};
+use formats::{
+    all_formats, default_formats, deep_formats, quant_formats, select_formats, ArenaFmt,
+};
 use metrics::Metrics;
 use report::{
     render_bench, render_compare, render_golden, BenchRow, CompareOutcome, CompareRow,
     GoldenOutcome, GoldenRow,
 };
 use scenarios::{
-    default_scenarios, perf_scenarios, select_scenarios, single_decode_scenarios, Scenario,
+    default_scenarios, perf_scenarios, select_scenarios, single_decode_scenarios,
+    suite_deep_scenarios, suite_scenarios, Scenario,
 };
 
 #[derive(Parser)]
@@ -117,16 +120,37 @@ enum Cmd {
         #[arg(long, default_value = "q4_0")]
         quant: String,
     },
+    /// Comprehensive regression suite: run BOTH gates — A/B parity (fused vs V2)
+    /// and ground truth (vs FP32) — across the full quant × shape matrix in one
+    /// pass. Defaults to `suite_scenarios` × `quant_formats` (every codec at
+    /// every context depth, single and multi batch); `--scenarios` / `--formats`
+    /// / `--all-formats` override either axis.
+    Suite {
+        /// Max mean-abs error allowed for an A/B pass.
+        #[arg(long, default_value_t = 1.0e-2)]
+        mae_tol: f32,
+        /// Max absolute error allowed for an A/B pass.
+        #[arg(long, default_value_t = 1.0e-1)]
+        max_abs_tol: f32,
+        /// Min cosine similarity required for an A/B pass.
+        #[arg(long, default_value_t = 0.99)]
+        cosine_tol: f32,
+        /// Golden pass gate: min cosine of each kernel vs FP32 truth.
+        #[arg(long, default_value_t = 0.93)]
+        golden_cosine_tol: f32,
+    },
 }
 
-fn resolve_matrix(cli: &Cli) -> Result<(Vec<Scenario>, Vec<ArenaFmt>)> {
+fn resolve_matrix(cli: &Cli, is_suite: bool) -> Result<(Vec<Scenario>, Vec<ArenaFmt>)> {
     let scenarios = match &cli.scenarios {
         Some(f) => select_scenarios(f).map_err(|e| anyhow::anyhow!(e))?,
+        None if is_suite => suite_scenarios(),
         None => default_scenarios(),
     };
     let formats = match (&cli.formats, cli.all_formats) {
         (Some(f), _) => select_formats(f).map_err(|e| anyhow::anyhow!(e))?,
         (None, true) => all_formats(),
+        (None, false) if is_suite => quant_formats(),
         (None, false) => default_formats(),
     };
     if scenarios.is_empty() {
@@ -147,7 +171,8 @@ fn main() -> Result<()> {
     }
     let stager = PinnedStager::new_from_device(&device);
 
-    let (scenarios, fmts) = resolve_matrix(&cli)?;
+    let is_suite = matches!(cli.cmd, Cmd::Suite { .. });
+    let (scenarios, fmts) = resolve_matrix(&cli, is_suite)?;
 
     let markdown = match &cli.cmd {
         Cmd::Compare {
@@ -184,6 +209,56 @@ fn main() -> Result<()> {
             run_bench(&bench_scen, &fmts, *iters, *warmup, &device, &stager)?
         }
         Cmd::Xcheck { quant } => run_xcheck(&scenarios, quant, &device, &stager)?,
+        Cmd::Suite {
+            mae_tol,
+            max_abs_tol,
+            cosine_tol,
+            golden_cosine_tol,
+        } => {
+            let tol = (*mae_tol, *max_abs_tol, *cosine_tol);
+            // Default suite = two sweeps:
+            //   • CODEC: every quant format at the cheap shallow/mid shapes
+            //     (resolve_matrix already set scenarios/fmts to
+            //     suite_scenarios × quant_formats) — validates each codec.
+            //   • DEPTH/SCALE: only the production native-INT8 formats at the
+            //     expensive deep / large-batch shapes — exercises the deep-scan /
+            //     split-KV path (codec-agnostic), without rebuilding every
+            //     aggressive codec at depth.
+            // An explicit --scenarios/--formats/--all-formats collapses to one
+            // flat group for ad-hoc runs.
+            let overridden = cli.scenarios.is_some() || cli.formats.is_some() || cli.all_formats;
+            let groups: Vec<(Vec<Scenario>, Vec<ArenaFmt>, &str)> = if overridden {
+                vec![(scenarios.clone(), fmts.clone(), "override")]
+            } else {
+                vec![
+                    (
+                        scenarios.clone(),
+                        fmts.clone(),
+                        "codec sweep — all quants × shallow/mid shapes",
+                    ),
+                    (
+                        suite_deep_scenarios(),
+                        deep_formats(),
+                        "depth/scale — Q8_0/Q4_0/f16 × deep & large-batch shapes",
+                    ),
+                ]
+            };
+            // A/B parity first (real RoPE); DECODE_AB_IDENTITY_ROPE must be set
+            // only AFTER the parity fixtures are built, since it forces identity
+            // RoPE for the FP32 truth.
+            let mut ab = String::from("# Decode suite — A/B parity (fused vs V2)\n");
+            for (scn, fmt, label) in &groups {
+                ab.push_str(&format!("\n## {label}\n\n"));
+                ab.push_str(&run_compare(scn, fmt, tol, &device, &stager)?);
+            }
+            std::env::set_var("DECODE_AB_IDENTITY_ROPE", "1");
+            let mut golden = String::from("# Decode suite — ground truth (vs FP32)\n");
+            for (scn, fmt, label) in &groups {
+                golden.push_str(&format!("\n## {label}\n\n"));
+                golden.push_str(&run_golden(scn, fmt, *golden_cosine_tol, &device, &stager)?);
+            }
+            format!("{ab}\n{golden}")
+        }
     };
 
     println!("{markdown}");
