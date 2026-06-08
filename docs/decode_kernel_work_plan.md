@@ -7,6 +7,38 @@ This is the authoritative TODO for finishing the fused-attn-v1 kernel. It covers
 mostly scaffolding). Read alongside `docs/fused_attn_v1_status.md` (the original
 design/status) and `docs/new_decode_kernel.md` (the design).
 
+> ## Progress
+> - ✅ **1B — tile-batched softmax** — DONE, golden-identical. Per-token online
+>   rescale → one `alpha` per tile; the PV is now rescale-free (the prerequisite
+>   for any batched PV).
+> - ✅ **1A — V skip-dequant read-through** — DONE, golden-green. V is read
+>   straight from native-int8 arenas in palette order (no FP round-trip), PV
+>   gathers via `vi` with a per-(dim,block) scale; the FP path is untouched behind
+>   a per-tile runtime flag. Net effect is **int8 V arenas run at ~f16 speed** —
+>   the dequant→requant penalty is gone, so you get the KV compression for free.
+>   (Earlier "int8 beats f16 by 1.2×" numbers were bench noise; see below.)
+> - ✅ **Typed read-through + 15 formats** — `BlockInt8<BlockT>` extractors live
+>   per-format in `block_*.cuh` (next to `BlockConverter`); a void
+>   `ArenaAccessor::load_head_int8_readthrough` dispatcher mirrors
+>   `load_head_quant_token_oriented`. Covers all 15 int8-representable families
+>   (symmetric `_0`, KS, sign `Q1_*`, centroid `Q0*`); the offset `_1` family and
+>   `Q0_V` correctly fall to the FP path. All golden-validated against real arenas.
+> - ✅ **Cleanup** — removed the `CANDLE_FUSED_ATTN_INT8` debug mode-flag and its
+>   5 non-production instantiations + FP/debug branches (~6× fewer kernel
+>   instantiations, ~3 min off a full build); production is always full-INT8 with
+>   `USE_MMA_QK = (SUB_HEAD_DIM==32)` gating hd64→manual-dot.
+> - ⏳ **1C — batched-M MMA** — NOT done. The `warp=head` → batched-M restructure
+>   (§1C): `out_reg` becomes per-group, output writeback + load/compute warp
+>   mapping change. **This is the lever to ≥2×** and needs a focused session.
+> - ⏳ **Track B** — NOT started (the §2 fused QKV kernel + 6 Phase-B TODOs +
+>   model integration + a new harness mode). The end goal; large.
+>
+> **Honest perf (de-noised, interleaved bench, RTX 4090 Mobile, batch-8):**
+> fused-attn-v1 is a consistent **~1.12× over V2** across context depths and
+> formats — a real, shippable attention-kernel win, *plus* free int8 V. The
+> headline 2× is still entirely in **1C**. Validate any further change with
+> `compare --golden` then `bench` before keeping it.
+
 ---
 
 ## 0. Current state (what is true right now)
@@ -46,9 +78,13 @@ Fused vs V2, **geomean ≈ 1.22–1.25×**, eroding to ~1.0× at deep context:
 
 ¹ Q4_0 ctx2048 "1.45×" is V2 getting *slower* reading Q4, not fused getting faster.
 
-**The smoking gun:** the fused kernel **dequant→requants every arena to FP then back to
-INT8**, so an int8 arena (Q8_0/Q4_0) buys it nothing today (306 µs at ctx512 for f16 ==
-Q8_0 == Q4_0). Target is **≥ 2×**.
+**The smoking gun:** the int8 arena read is *already* cheaper in global bytes (`load_head_scaled`
+reads the int8 bytes), but the kernel then does a full FP **dequant→requant round-trip** per
+tile (load to FP, RoPE/scatter, re-quant to int8), and that overhead cancels the benefit — so
+an int8 arena buys nothing today (306 µs at ctx512 for f16 == Q8_0 == Q4_0; Q8_0 is even
+*slower* at ctx2048). Removing that round-trip is §1A, but **only V can skip it** — K needs FP
+for RoPE (see §1A). Target is **≥ 2×**, and the main lever for it is the batched-M MMA (§1C),
+not the skip-dequant.
 
 ### Tooling built this session — `candle-examples/examples/decode_ab/`
 A standalone A/B + correctness + perf harness for V2 vs fused. **Use it to validate every
@@ -81,44 +117,57 @@ cargo build --release --features cuda --example decode_ab
 
 ## 1. Track A — make the INT8 decode kernel fast (to ≥ 2×)
 
-These three are **one coupled rework** of `int8_decode_kernel.cuh` (+ the shared convert
-header), not three independent edits. The per-dim scale plumbing, the tile-batched
-softmax, and the batched-M MMA all interlock through how the per-(dim,block) int8 scale is
-applied to the contraction output.
+**1B (tile-batched softmax) and 1C (batched-M MMA) are the throughput path to ≥2×; 1A
+(V-only skip-dequant) is a smaller follow-on, not the main lever.** They share machinery in
+`int8_decode_kernel.cuh` (+ the shared convert header) — the tile-batched softmax and the
+per-(dim,block) V scale both land in the same loop — so do them in the order in §5 rather than
+independently. (1A is V-only because K must stay FP for RoPE; see 1A.)
 
-### 1A. Per-dim-scale skip-dequant (zero-cost int8 read-through)
-**Goal:** stop dequant→requanting. When the arena is native int8 (Q8_0/Q4_0/Q2_0), read
-the int8 straight into the MMA operand and carry the scale, instead of
-`load_head_scaled` (→FP) followed by re-quantization in `apply_rope_to_tile`.
+### 1A. V-only skip-dequant — remove the FP round-trip (NOT a global-bandwidth win)
 
-**The blocker (precise):** the existing `ArenaAccessor::load_head_int8_unscaled`
-(`candle-kernels/src/convert/convert_all.cuh`) **collapses the per-dim block scales to a
-single `out_scale`** (it only writes `out_scale` from `lane==0 && i==0`). But Q8_0/Q4_0
-store a scale **per (dim, 32-token block)**; the int8 values are meaningless without their
-per-dim scale. That single-scale return is the "coarse fallback" the comment warns about —
-it is **not** correct for non-uniform dims and must not be used as-is.
+**Scope (verified in code): this applies to V only. K cannot skip the FP round-trip.**
+RoPE is applied to K *on read, in FP* — `apply_rope_to_tile`
+([int8_decode_kernel.cuh:386-395](../candle-kernels/src/fused-attn-v1/int8_decode_kernel.cuh#L386-L395))
+does `k_regs = to_f32(arena); apply_rope_*(k_regs, rope_pos, rope_cs)` **before** the INT8
+quant at :422-428. RoPE is a rotary rotation of dim pairs (FP cos/sin multiply-adds); it
+can't be applied to raw int8. And the arena stores **un-rotated** K (`rope_pos =
+slice_rope(sl) + (within-off)`, :384-385) — rotate-on-read, for position remapping. So K
+stays `arena → FP → RoPE → int8` unless the cache is changed to store *pre-rotated* K, which
+breaks position remapping. Llama/Qwen3 use *full* head-dim RoPE, so there's no non-RoPE part
+of K to exploit either. V gets **no RoPE** (:431-467 is scatter + quantize only) — V is the
+only skip target.
 
-**Tasks:**
-- [ ] Extend `load_head_int8_unscaled` to emit a **per-dim scale vector** (one scale per
-      `dim` this lane owns, into a register array / smem), not one scalar. Keep the
-      existing single-scalar overload only if something else relies on it (check call sites).
-- [ ] Apply the int8 scale **on the contraction output**, per output dim: for V,
-      `out[dim] = scale[dim][chunk] · Σ_token (beta_q[token] · v_int8[token][dim])`. The
-      per-dim scale factors out of the int8 contraction cleanly — this is why it aligns
-      with the tile-batched structure (1B): one Q8_0 token-oriented block == one 32-token
-      chunk == one tile, so `scale[dim]` is constant within a tile.
-- [ ] **K caveat:** K still needs RoPE in FP, so K **cannot** fully skip the FP round-trip.
-      Skip-dequant primarily benefits **V** (no RoPE) and any K path that doesn't RoPE.
-      Decide whether K reads int8 for the *non-RoPE* component only, or stays FP→int8.
-- [ ] Add per-format paths in `load_tile` so int8-native formats take the direct route and
-      FP formats (f16/bf16/R16) keep the dequant path. Make it a **compile-time** dispatch
-      on the format tag where possible (zero runtime branch in the hot loop) — this is the
-      "zero-cost abstraction" requirement.
-- [ ] Validate: `compare --golden` must stay green on `rq-uni-q8_0/q4_0/q2_0` **and**
+**What it actually saves (corrected):** the arena is *already* int8 in global memory and
+`load_head_scaled` already reads those int8 bytes (4× fewer than f16) before dequanting — so
+this is **not** a global-bandwidth win; that saving is already realized. What §1A removes is
+the per-tile **smem FP round-trip + dequant/requant compute** for V:
+`global int8 → smem FP (shared_v) → re-read → smem int8 (shared_v_int8) → PV` collapses to
+`global int8 → smem int8 → PV`. The bench shows the current round-trip makes Q8_0 ≈ f16 (and
+*slower* at ctx2048) — the dequant overhead cancels the int8 read benefit — so this is about
+**erasing that overhead**, a modest smem/compute win, not a 4× anything.
+
+**The scale blocker (precise):** to read V int8 straight through you must consume the arena's
+**per-(dim, 32-token-block)** scale, but today V uses a single **per-token** scale (max-abs
+across 128 dims, computed *after* dequant — :440-467). And
+`ArenaAccessor::load_head_int8_unscaled` (`candle-kernels/src/convert/convert_all.cuh`)
+currently **collapses the per-dim block scales to one `out_scale`** (written only from
+`lane==0 && i==0`) — its "coarse fallback," not usable as-is.
+
+**Tasks (V only):**
+- [ ] Extend `load_head_int8_unscaled` to emit a **per-dim scale vector** for V (one scale per
+      dim the lane owns, into a register array / smem), not a single scalar.
+- [ ] Restructure the V/PV path to apply the per-(dim,block) scale **on the PV output**:
+      `out[dim] = scale[dim][chunk] · Σ_token (beta_q[token] · v_int8[token][dim])`. This
+      aligns with the tile-batched structure (1B): one Q8_0 token-oriented block == one
+      32-token chunk == one tile, so `scale[dim]` is constant within a tile.
+- [ ] Compile-time format dispatch in `load_tile`: int8-native V (Q8_0/Q4_0/Q2_0) → read
+      straight to `shared_v_int8`; FP V (f16/bf16/R16) keeps the dequant path. **K is
+      untouched** (always FP→RoPE→int8).
+- [ ] Validate: `compare --golden` stays green on `rq-uni-q8_0/q4_0/q2_0` **and**
       `rq-adaptive-L{0,5,7}` (non-unity palette, per-dim scales actually vary).
 
-**Expected win:** memory-bound deep-context cases (ctx ≥ 1024) — Q4_0 reads 4× less KV
-traffic; the round-trip elimination is what converts that into real speedup.
+**Expected win:** modest — erases the V dequant/requant overhead that currently makes int8
+arenas no faster than f16. **Do it after 1C**, once the batched-M PV structure is settled.
 
 ### 1B. Tile-batched (FlashAttention-style) softmax
 **Goal:** enable a token-batched PV. Today `process_tile` does a **per-token** online
@@ -271,9 +320,10 @@ After (1)–(6), `fused_attn_v1_dispatch` should return success for at least the
 
 ## 5. Suggested sequencing
 
-1. **Commit the current branch** (hd64 fix, harness+golden+bench, INSTALL.md, fused graft).
+1. **Commit the current branch** — ✅ done (hd64 fix, harness+golden+bench, INSTALL.md, fused graft).
 2. **Track A 1B** (tile-batched softmax) — numerically identical, low risk, unblocks PV MMA.
-3. **Track A 1A** (per-dim-scale skip-dequant) — memory-bound win, validate on `rq-*`.
-4. **Track A 1C** (batched-M MMA QK+PV) — the throughput win; drive with `bench` to ≥ 2×.
+3. **Track A 1C** (batched-M MMA QK+PV) — the throughput win; drive with `bench` to ≥ 2×.
+4. **Track A 1A** (V-only skip-dequant) — modest smem/compute win; **after 1C** so the PV
+   structure is settled. Validate on `rq-*`.
 5. **Track B 1** (lift the now-fast attention helper into `consumer_role`) + 2–6.
 6. **Track B iter 4b** (model integration) + extend the harness to validate fused QKV+attn.
