@@ -27,7 +27,7 @@ mod turn_sink;
 mod types;
 mod watcher;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,6 +58,25 @@ struct Cli {
     /// Increase log verbosity.  -v = DEBUG, -vv = TRACE.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Skip the startup code-reading ingest pass. Brings the daemon up fast
+    /// (model + substrate + sections only) so you can test conversations
+    /// without the per-file prefill sweep.
+    #[arg(long)]
+    skip_code_read: bool,
+
+    /// Compact the substrate redo log once at startup (reclaims dead records
+    /// from superseded turns / tombstoned timelines). Off by default;
+    /// compaction only ever runs when this flag is passed.
+    #[arg(long)]
+    compact_substrate: bool,
+
+    /// Address to bind the HTTP server to. Defaults to loopback only
+    /// (`127.0.0.1`) — reachable from this machine alone. Pass `0.0.0.0` to
+    /// listen on all IPv4 interfaces (LAN / VPN reachable). WARNING: the daemon
+    /// is UNAUTHENTICATED, so only expose it on a trusted network.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -119,7 +138,16 @@ async fn main() -> anyhow::Result<()> {
     let config = DaemonConfig {
         workspace: workspace.clone(),
         port: cli.port,
+        skip_code_read: cli.skip_code_read,
+        compact_substrate: cli.compact_substrate,
     };
+
+    if cli.skip_code_read {
+        tracing::info!("--skip-code-read: startup code-reading ingest is disabled");
+    }
+    if cli.compact_substrate {
+        tracing::info!("--compact-substrate: will compact the redo log once at startup");
+    }
 
     tracing::info!(workspace = %workspace.display(), port = cli.port, "starting zend");
 
@@ -131,7 +159,20 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Bind ──────────────────────────────────────────────────────────────────
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let bind_ip: IpAddr = match cli.host.as_str() {
+        "localhost" => IpAddr::from([127, 0, 0, 1]),
+        h => h.parse().map_err(|_| {
+            anyhow::anyhow!("invalid --host {h:?}: expected an IP address, e.g. 127.0.0.1 or 0.0.0.0")
+        })?,
+    };
+    let addr = SocketAddr::new(bind_ip, config.port);
+    if !bind_ip.is_loopback() {
+        tracing::warn!(
+            %addr,
+            "binding to a non-loopback address — the UNAUTHENTICATED inference daemon \
+             is now reachable from the network; only do this on a trusted network",
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!(

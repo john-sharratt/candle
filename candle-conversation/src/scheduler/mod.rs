@@ -3919,14 +3919,67 @@ impl Scheduler {
                             segments.push(seg.clone());
                         }
                     }
-                    ProjectionSegment::Generated { .. }
-                    | ProjectionSegment::NewUserMessage { .. } => {}
+                    ProjectionSegment::Generated { .. } => {
+                        // Keep prefix structural / live-prefill runs in the
+                        // segment chain, exactly as the SubmitTurn path does
+                        // (see the matching arm where submit builds its
+                        // `segments`). The live-prefill cache is keyed by a
+                        // rolling hash over the *segment sequence*; dropping
+                        // these here makes the reproject's chain diverge from
+                        // submit's, so every downstream boundary run misses the
+                        // cache and gets needlessly re-prefilled. Keeping them
+                        // aligns the keys so the reproject reuses the cached K/V.
+                        segments.push(seg.clone());
+                    }
+                    ProjectionSegment::NewUserMessage { .. } => {
+                        // The active turn's user message is captured as the
+                        // writer tail (snapshot/restore in the swap), so it must
+                        // NOT be re-injected into the rebuilt prefix here.
+                    }
                 }
             }
             (sections, segments)
         };
         let project_ms = t_project.elapsed().as_millis() as u64;
         record_phase(t_project, "reproject_project");
+
+        // Diagnostic: is the score-sort RE-ORDERING the same turns each
+        // reproject? `order_sig` hashes the sealed-turn sequence in emit order;
+        // `set_sig` hashes the SORTED set. If `set_sig` stays constant across
+        // reprojects while `order_sig` changes, identical membership is being
+        // reshuffled by the volatile `group_score` sort — exactly what stops the
+        // rolling-hash glue cache from ever hitting on the turn region.
+        {
+            let fnv = |seq: &[(u32, u32)]| -> u64 {
+                let mut h = 0xcbf2_9ce4_8422_2325u64;
+                for &(g, t) in seq {
+                    for b in g.to_le_bytes().iter().chain(t.to_le_bytes().iter()) {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+                h
+            };
+            let mut turns: Vec<(u32, u32)> = projected_segments
+                .iter()
+                .filter_map(|seg| match seg {
+                    ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
+                        Some((rt.group().raw(), rt.index().0))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let order_sig = fnv(&turns);
+            turns.sort_unstable();
+            let set_sig = fnv(&turns);
+            tracing::info!(
+                target: "candle_conversation::scheduler::reproject",
+                n_turns = turns.len(),
+                order_sig = format!("{order_sig:016x}"),
+                set_sig = format!("{set_sig:016x}"),
+                "reproject turn-order signature (set stable + order changing = score-sort churn)",
+            );
+        }
 
         // 6. Zero-copy rebuild.
         //
@@ -4078,6 +4131,7 @@ impl Scheduler {
         // single batched scatter per layer + per-item cold-recover
         // turns the per-unit `ensure_*_hot` calls inside
         // `apply_projection` into hot-hit no-ops.
+        let t_elevate = Instant::now();
         if !projected_sections.is_empty() || !turn_keys_for_elevate.is_empty() {
             let backings = self.session.backings().to_vec();
             let device = self.session.device().clone();
@@ -4137,8 +4191,12 @@ impl Scheduler {
             }
         }
 
+        let elevate_ms = t_elevate.elapsed().as_millis() as u64;
+
+        let t_apply = Instant::now();
         self.apply_projection(parent_id, BlockCount(0), &projected_segments)?;
         let new_prefix_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
+        let apply_ms = t_apply.elapsed().as_millis() as u64;
 
         // Under the read-only projection model there's no COW prefix
         // duplication to guard against: the view never copied bytes from
@@ -4149,6 +4207,7 @@ impl Scheduler {
 
         // Append the captured tail to parent (metadata-only Arc clone).
         let tail_token_count: usize = tail_per_layer.first().map(|s| s.token_count).unwrap_or(0);
+        let t_inject = Instant::now();
         if tail_token_count > 0 {
             self.session
                 .inject_sealed_at_tail(parent_id.0, &tail_per_layer)
@@ -4170,6 +4229,8 @@ impl Scheduler {
             );
         }
 
+        let inject_ms = t_inject.elapsed().as_millis() as u64;
+
         // Carve a fresh view from the rebuilt parent.  Empty
         // `effective_ranges` means "borrow every chunk".
         let parent_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
@@ -4178,7 +4239,9 @@ impl Scheduler {
         } else {
             vec![BlockRange::new(0, parent_block_count)]
         };
+        let t_view = Instant::now();
         let (new_view_id, new_borrowed) = self.create_view(parent_id, &effective_ranges)?;
+        let view_ms = t_view.elapsed().as_millis() as u64;
         // Diagnostic log: the new view's slot index may have been
         // recycled from the freed old view's slot; drop any stale
         // entry under the new id before decode resumes.
@@ -4222,6 +4285,10 @@ impl Scheduler {
             scan_ms,
             project_ms,
             swap_ms,
+            elevate_ms,
+            apply_ms,
+            inject_ms,
+            view_ms,
             sections = projected_sections.len(),
             segments = projected_segments.len(),
             "reproject (zero-copy rebuild)",

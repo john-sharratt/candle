@@ -336,7 +336,7 @@ mod tests {
 
             // Providing wrong number of offsets should fail
             let offsets = vec![0, 0]; // Only 2, but batch=4
-            let result = backing.ensure_for_offsets(&offsets, 8);
+            let result = backing.ensure_for_offsets(&offsets, &[8, 8]);
             assert!(result.is_err());
         }
 
@@ -345,7 +345,7 @@ mod tests {
             let backing = create_test_backing();
 
             let offsets = vec![0, 0, 0, 0]; // Correct: 4 offsets for batch=4
-            backing.ensure_for_offsets(&offsets, 0).unwrap();
+            backing.ensure_for_offsets(&offsets, &[0, 0, 0, 0]).unwrap();
         }
     }
 }

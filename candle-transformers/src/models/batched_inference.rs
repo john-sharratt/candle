@@ -2473,13 +2473,18 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             .iter()
             .map(|&i| session.sequence_offset(i).unwrap_or(0))
             .collect();
+        // Per-sequence new-token (query) lengths — ragged across the prefill batch.
+        let input_lens: Vec<usize> = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(1))
+            .collect();
         #[cfg(feature = "cuda")]
         let (_pm_guard, decode_headers) = if max_input_len == 1 {
             let (pm_guard, buf, stride) =
                 session.build_decode_metadata(seq_indices, &stager_generation)?;
             (pm_guard, DecodeHeaders::Decode { buf, stride })
         } else {
-            let meta = BatchedPrefillMeta::new(&seq_offsets, max_input_len, self.device())?;
+            let meta = BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
             (None, DecodeHeaders::Prefill(meta))
         };
         #[cfg(not(feature = "cuda"))]
@@ -2489,18 +2494,12 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 stride: 0,
             }
         } else {
-            let meta = BatchedPrefillMeta::new(&seq_offsets, max_input_len, self.device())?;
+            let meta = BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
             DecodeHeaders::Prefill(meta)
         };
 
         // Get caches for the requested sequences
         let mut caches_data = session.caches_for_sequences_mut(seq_indices);
-
-        // Calculate input lengths
-        let input_lens: Vec<usize> = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .collect();
 
         // Build contexts from the collected data
         let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(inputs.len());
@@ -2514,29 +2513,35 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             });
         }
 
-        // Slice large prefills into smaller batches to avoid OOM.
-        // GPU compute saturates around MAX_PREFILL_TOKENS, so slicing is free perf-wise.
-        // Decode (seq_len=1) is always cheap and never needs slicing.
-        let total_tokens = contexts.len() * max_input_len;
+        // Slice large prefills to bound a single forward's token count. Ragged:
+        // group sequences so each slice's TOTAL tokens (Σ input_lens) stays within
+        // MAX_PREFILL_TOKENS, rather than count × max_len. Decode (1 token/seq) is
+        // cheap and never sliced.
+        let total_tokens: usize = input_lens.iter().sum();
         let outputs = if total_tokens > MAX_PREFILL_TOKENS && max_input_len > 1 {
-            // Compute sequences per slice, rounded down to multiple of 32 when >= 32
-            // for optimal CUDA kernel utilization.
-            let raw_seqs = MAX_PREFILL_TOKENS / max_input_len;
-            let seqs_per_slice = if raw_seqs >= 32 {
-                (raw_seqs / 32) * 32
-            } else {
-                raw_seqs.max(1)
-            };
-
             let mut all_logits = Vec::with_capacity(contexts.len());
-            for slice_start in (0..contexts.len()).step_by(seqs_per_slice) {
-                let slice_end = (slice_start + seqs_per_slice).min(contexts.len());
+            let mut slice_start = 0usize;
+            while slice_start < contexts.len() {
+                // Grow the slice until the next sequence would exceed the token
+                // budget; always take at least one sequence.
+                let mut slice_tokens = 0usize;
+                let mut slice_end = slice_start;
+                while slice_end < contexts.len() {
+                    let l = contexts[slice_end].input_len;
+                    if slice_end > slice_start && slice_tokens + l > MAX_PREFILL_TOKENS {
+                        break;
+                    }
+                    slice_tokens += l;
+                    slice_end += 1;
+                }
                 let slice = &mut contexts[slice_start..slice_end];
                 let offsets: Vec<usize> = slice.iter().map(|c| c.offset).collect();
-                let meta = BatchedPrefillMeta::new(&offsets, max_input_len, self.device())?;
+                let lens: Vec<usize> = slice.iter().map(|c| c.input_len).collect();
+                let meta = BatchedPrefillMeta::new_ragged(&offsets, &lens, self.device())?;
                 let slice_logits =
                     self.forward_batch(slice, &stager_generation, DecodeHeaders::Prefill(meta))?;
                 all_logits.extend(slice_logits.into_vec()?);
+                slice_start = slice_end;
             }
             all_logits
         } else {

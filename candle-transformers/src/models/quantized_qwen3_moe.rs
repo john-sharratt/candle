@@ -1946,7 +1946,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -1957,7 +1957,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -1968,7 +1968,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -1979,7 +1979,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -1990,7 +1990,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -2001,7 +2001,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -2012,7 +2012,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -2023,7 +2023,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 64,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -2034,7 +2034,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 120,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
@@ -2045,7 +2045,7 @@ mod tests {
                 #[cfg(feature = "huge-context")]
                 num_contexts: 10,
                 #[cfg(not(feature = "huge-context"))]
-                num_contexts: 1,
+                num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),

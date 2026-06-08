@@ -249,6 +249,11 @@ pub(super) fn apply_segments(
         rolling_hash: FNV_OFFSET_BASIS,
         run_tokens: Vec::new(),
         last_was_sealed: false,
+        n_prefill: 0,
+        prefill_ms: 0,
+        prefill_tokens: 0,
+        n_hit: 0,
+        hit_ms: 0,
     };
 
     let mut i = 0;
@@ -316,6 +321,16 @@ pub(super) fn apply_segments(
     // 5. Re-attach the writer tail at the slot's current end.
     restore_tail(ctx.session, parent_id, tail_per_layer)?;
 
+    tracing::info!(
+        target: "candle_conversation::scheduler::reproject",
+        n_prefill = walker.n_prefill,
+        prefill_ms = walker.prefill_ms as u64,
+        prefill_tokens = walker.prefill_tokens,
+        n_hit = walker.n_hit,
+        hit_ms = walker.hit_ms as u64,
+        "apply_segments breakdown (cache miss=prefill, hit=arc-clone)",
+    );
+
     Ok(())
 }
 
@@ -328,6 +343,12 @@ struct SegmentWalker {
     /// cleared after we push a fresh writer chunk for a subsequent
     /// prefill so the prefill doesn't write into the Arc-shared partial.
     last_was_sealed: bool,
+    // Instrumentation: cache miss (re-prefill) vs hit (Arc-clone) accounting.
+    n_prefill: usize,
+    prefill_ms: u128,
+    prefill_tokens: usize,
+    n_hit: usize,
+    hit_ms: u128,
 }
 
 impl SegmentWalker {
@@ -345,11 +366,18 @@ impl SegmentWalker {
         state.last_apply_keys.insert(key);
 
         if let Some(cached) = state.cache.get(key) {
+            let t = std::time::Instant::now();
             inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached)?;
+            self.hit_ms += t.elapsed().as_millis();
+            self.n_hit += 1;
             log_injected_tokens(ctx, &self.run_tokens);
         } else {
+            let t = std::time::Instant::now();
             let captured =
                 drive_prefill_and_capture(ctx, &self.run_tokens, self.last_was_sealed)?;
+            self.prefill_ms += t.elapsed().as_millis();
+            self.n_prefill += 1;
+            self.prefill_tokens += self.run_tokens.len();
             state.cache.insert(key, captured);
         }
 
@@ -666,6 +694,53 @@ mod tests {
         let h1 = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
         let h2 = fold_tokens(h1, &[4, 5, 6]);
         assert_eq!(one_shot, h2);
+    }
+
+    #[test]
+    fn reproject_chain_must_match_submit_for_cache_reuse() {
+        // The live-prefill cache key is a rolling hash over the *segment
+        // sequence*: `inject_sealed_*` folds each sealed unit's tokens into
+        // the chain, and `flush_run` keys each Generated/boundary run off the
+        // chain-so-far. So a boundary run's key depends on EVERY preceding
+        // segment — including the `Generated` (template) runs.
+        //
+        // This reproduces, at the key level, the bug the daemon showed as
+        // `n_hit=0`: the SubmitTurn path keeps `Generated` runs in the chain,
+        // but the reproject path used to drop them. We model the chain
+        // BASIS -> [Generated] -> [Sealed section] -> key(boundary run).
+        let generated_run: &[u32] = &[1, 2, 3]; // a template section's Generated tokens
+        let sealed_section: &[u32] = &[10, 11]; // a sealed section's folded tokens
+        let boundary_run: &[u32] = &[100]; // a user_start boundary the walker re-prefills
+
+        // Submit: Generated IS in the chain.
+        let submit_key = {
+            let h = fold_tokens(FNV_OFFSET_BASIS, generated_run); // flush_run(Generated)
+            let h = fold_tokens(h, sealed_section); // inject_sealed_section
+            fold_tokens(h, boundary_run) // flush_run(boundary)
+        };
+
+        // Reproject BEFORE the fix: Generated dropped from the chain.
+        let reproject_key_buggy = {
+            let h = fold_tokens(FNV_OFFSET_BASIS, sealed_section);
+            fold_tokens(h, boundary_run)
+        };
+        // Dropping the Generated run shifts every downstream key → cache MISS.
+        assert_ne!(
+            submit_key, reproject_key_buggy,
+            "dropping the Generated run changes the boundary key — this is the n_hit=0 bug"
+        );
+
+        // Reproject AFTER the fix: Generated kept, chain identical to submit.
+        let reproject_key_fixed = {
+            let h = fold_tokens(FNV_OFFSET_BASIS, generated_run);
+            let h = fold_tokens(h, sealed_section);
+            fold_tokens(h, boundary_run)
+        };
+        // Keys match → the reproject reuses submit's cached K/V → cache HIT.
+        assert_eq!(
+            submit_key, reproject_key_fixed,
+            "keeping the Generated run aligns the reproject key with submit — cache hit"
+        );
     }
 
     #[test]

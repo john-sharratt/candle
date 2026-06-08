@@ -829,6 +829,17 @@ impl ConversationEngine {
         Ok(self.conversation.checkpoint_persistence()?)
     }
 
+    /// Force a full redo-log compaction (startup-only, operator opt-in).
+    /// Rewrites the log to just the live record set, reclaiming the dead
+    /// weight that accrues from superseded turns and tombstoned timelines.
+    /// `progress` reports coarse phase progress (0..=5) for the loading screen.
+    pub fn compact_substrate(
+        &self,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<()> {
+        Ok(self.conversation.compact_substrate(progress)?)
+    }
+
     /// Shut down the scheduler, releasing all GPU resources.
     ///
     /// Safe to call multiple times (idempotent). Takes `&self` so it can be

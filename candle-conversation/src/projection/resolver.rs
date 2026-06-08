@@ -1185,20 +1185,32 @@ impl Conversation {
     }
 
     /// Flush and write a `Checkpoint` over the substrate manifest — the
-    /// fast-recovery snapshot. Compacts the log first when it has accrued
-    /// enough dead weight (§5.8).
+    /// fast-recovery snapshot. Does NOT compact: compaction is an explicit,
+    /// startup-only operation (see [`Self::compact_substrate`]) so it never
+    /// blocks the checkpoint cadence or a graceful shutdown.
     pub fn checkpoint_persistence(&self) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         p.commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
-        let should = {
-            let substrate = self.read();
-            p.should_compact(&substrate)
-                .map_err(|e| candle::Error::Msg(format!("persist compaction check: {e}")))?
-        };
-        if should {
+        p.checkpoint()
+            .map_err(|e| candle::Error::Msg(format!("persist checkpoint: {e}")))
+    }
+
+    /// Force a full redo-log compaction — the whole-file dead-record rewrite
+    /// (§5.8). Unlike the (now removed) checkpoint path this ignores the
+    /// dead-ratio threshold: the operator opted in explicitly via the daemon's
+    /// startup flag. `progress` reports coarse phase progress (0..=5) for the
+    /// loading screen.
+    pub fn compact_substrate(
+        &self,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.commit()
+            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
+        {
             let mut substrate = self.write();
-            p.compact(&mut substrate)
+            p.compact(&mut substrate, progress)
                 .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
         }
         p.checkpoint()

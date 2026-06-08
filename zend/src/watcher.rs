@@ -53,6 +53,13 @@ pub fn spawn(
         if !is_refresh_relevant(&event.kind) {
             return;
         }
+        // Drop events confined to ignored directories. Critically this includes
+        // the daemon's OWN `.substrate/` redo-log writes — without this filter,
+        // persistence I/O continuously self-triggers a workspace refresh (a
+        // feedback loop) — plus build/VCS churn that never affects source.
+        if !event.paths.is_empty() && event.paths.iter().all(|p| is_ignored_path(p)) {
+            return;
+        }
         let _ = tx.send(());
     })?;
     watcher.watch(workspace, RecursiveMode::Recursive)?;
@@ -84,6 +91,19 @@ pub fn spawn(
         }
     });
     Ok(watcher)
+}
+
+/// Whether a path lives under a directory the watcher must ignore: the
+/// daemon's own substrate store (self-trigger feedback), the build output, or
+/// the VCS / dependency dirs. Matched on any path component so it catches the
+/// dir itself and everything beneath it.
+fn is_ignored_path(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some(".substrate") | Some(".git") | Some("target") | Some("node_modules")
+        )
+    })
 }
 
 fn is_refresh_relevant(kind: &EventKind) -> bool {

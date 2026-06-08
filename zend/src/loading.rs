@@ -24,6 +24,7 @@ use std::time::Instant;
 pub enum LoadStep {
     Model,
     Substrate,
+    Compacting,
     Sections,
     RepoScan,
     CodeRead,
@@ -35,6 +36,7 @@ impl LoadStep {
     pub const ALL: &'static [LoadStep] = &[
         LoadStep::Model,
         LoadStep::Substrate,
+        LoadStep::Compacting,
         LoadStep::Sections,
         LoadStep::RepoScan,
         LoadStep::CodeRead,
@@ -45,6 +47,7 @@ impl LoadStep {
         match self {
             LoadStep::Model => "Loading model",
             LoadStep::Substrate => "Loading substrate",
+            LoadStep::Compacting => "Compacting substrate",
             LoadStep::Sections => "Prefilling sections",
             LoadStep::RepoScan => "Scanning repository",
             LoadStep::CodeRead => "Reading code",

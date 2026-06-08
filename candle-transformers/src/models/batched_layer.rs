@@ -69,6 +69,10 @@ pub struct BatchedAttentionParams<'a> {
     /// Whether this is a prefill or decode pass, and — for decode — the GPU buffer
     /// of per-layer slot headers packed contiguously with constant byte stride.
     pub decode_headers: DecodeHeaders,
+    /// Per-sequence new-token (query) lengths for the batch. For prefill these are
+    /// the ragged per-sequence chunk lengths (Σ = the flat-packed token count);
+    /// for decode they are all 1. Host-side; drives the varlen prefill plumbing.
+    pub q_lens: &'a [usize],
     /// Pinned-stager generation guard for quantization kernel metadata allocations.
     /// Threaded from forward_batched through to reconcile → quantize_palette4_convert_buffered.
     pub generation: &'a Generation,
@@ -78,6 +82,7 @@ impl<'a> BatchedAttentionParams<'a> {
     /// Create params with all fields populated.
     ///
     /// RoPE (cos, sin) must always be provided - they are computed once at the model level.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cos: &'a Tensor,
         sin: &'a Tensor,
@@ -85,6 +90,7 @@ impl<'a> BatchedAttentionParams<'a> {
         inv_freq_device: &'a Tensor,
         rope_cs: &'a Tensor,
         decode_headers: DecodeHeaders,
+        q_lens: &'a [usize],
         generation: &'a Generation,
     ) -> Self {
         Self {
@@ -94,6 +100,7 @@ impl<'a> BatchedAttentionParams<'a> {
             inv_freq_device,
             rope_cs,
             decode_headers,
+            q_lens,
             generation,
         }
     }
@@ -112,30 +119,56 @@ pub struct BatchedPrefillMeta {
 }
 
 impl BatchedPrefillMeta {
-    /// Build paged-prefill metadata from per-sequence KV offsets.
-    ///
-    /// All sequences in the batch must have the same `seq_len` (uniform prefill).
+    /// Build paged-prefill metadata for a uniform batch — every sequence
+    /// prefills the same `seq_len` new tokens. Thin wrapper over
+    /// [`Self::new_ragged`] (uniform is the special case where all query
+    /// lengths are equal), kept for the decode/uniform-prefill call sites.
     pub fn new(offsets: &[usize], seq_len: usize, device: &Device) -> Result<Self> {
+        let q_lens = vec![seq_len; offsets.len()];
+        Self::new_ragged(offsets, &q_lens, device)
+    }
+
+    /// Build paged-prefill metadata for a **ragged** batch — each sequence has
+    /// its own query length `q_lens[i]`. This is the flash-attention varlen
+    /// format: `cu_seqlens_q` is the exclusive prefix sum of `q_lens` (so the
+    /// packed Q layout is `[Σ q_lens, n_head, head_dim]`), `q_lens` are the
+    /// per-sequence new-token counts, and `kv_lens[i] = offsets[i] + q_lens[i]`
+    /// is each sequence's total context length after this prefill.
+    pub fn new_ragged(offsets: &[usize], q_lens: &[usize], device: &Device) -> Result<Self> {
+        if offsets.len() != q_lens.len() {
+            candle::bail!(
+                "BatchedPrefillMeta::new_ragged: {} offsets vs {} q_lens",
+                offsets.len(),
+                q_lens.len()
+            );
+        }
         let batch_size = offsets.len();
         let mut cu = Vec::with_capacity(batch_size + 1);
         cu.push(0u32);
-        for i in 1..=batch_size {
-            cu.push((i * seq_len) as u32);
+        let mut acc = 0u32;
+        for &ql in q_lens {
+            acc += ql as u32;
+            cu.push(acc);
         }
         let cu_seqlens_q = Tensor::from_vec(cu, batch_size + 1, device)?;
-        let q_lens = Tensor::from_vec(vec![seq_len as u32; batch_size], batch_size, device)?;
+        let q_lens_t = Tensor::from_vec(
+            q_lens.iter().map(|&l| l as u32).collect::<Vec<_>>(),
+            batch_size,
+            device,
+        )?;
         let has_prefix = offsets.iter().any(|&o| o > 0);
         let kv_lens = Tensor::from_vec(
             offsets
                 .iter()
-                .map(|&o| (o + seq_len) as u32)
+                .zip(q_lens.iter())
+                .map(|(&o, &l)| (o + l) as u32)
                 .collect::<Vec<_>>(),
             batch_size,
             device,
         )?;
         Ok(Self {
             cu_seqlens_q,
-            q_lens,
+            q_lens: q_lens_t,
             kv_lens,
             has_prefix,
         })
@@ -407,6 +440,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
             caches,
             x,
             offsets,
+            params.q_lens,
             params.rope_cos,
             params.rope_sin,
             params.rope_interleaved,
@@ -556,6 +590,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     caches: &mut [&mut KvCache],
     x: TensorCat,
     offsets: &[usize],
+    q_lens: &[usize],
     cos: &Tensor,
     sin: &Tensor,
     rope_interleaved: bool,
@@ -564,10 +599,17 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     write_offset_shifts_ptr: u64,
     generation: &Generation,
 ) -> Result<TensorCat> {
-    validate_batch_sizes(caches.len(), offsets.len(), x.len())?;
+    // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
+    // against the sequence count carried by q_lens instead.
+    validate_batch_sizes(caches.len(), offsets.len(), q_lens.len())?;
 
+    // FLAT-packed activation: x_tensor is [1, total_q, hidden] where
+    // total_q = Σ q_lens and per-sequence token ranges live in cu_seqlens
+    // (prefill_meta). `n_seqs` is the sequence count (= caches.len()), NOT the
+    // leading tensor dim (which is 1 for the flat batch-of-one layout).
+    let n_seqs = caches.len();
     let x_tensor = x.as_cat_tensor();
-    let (b_sz, seq_len, _n_embd) = x_tensor.dims3()?;
+    let (_one, total_q, _n_embd) = x_tensor.dims3()?;
 
     // Project Q/K/V
     let t_qkv = profile_now();
@@ -577,27 +619,18 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     let n_kv_head = layer.n_kv_head();
     let head_dim = layer.head_dim();
 
-    // Reshape and transpose: (B, L, H*D) -> (B, H, L, D)
-    let q = q
-        .reshape((b_sz, seq_len, n_head, head_dim))?
-        .transpose(1, 2)?;
-    let k = k
-        .reshape((b_sz, seq_len, n_kv_head, head_dim))?
-        .transpose(1, 2)?;
-    let v = v
-        .reshape((b_sz, seq_len, n_kv_head, head_dim))?
-        .transpose(1, 2)?
-        .contiguous()?;
-
-    // Ensure Q/K are contiguous
+    // Varlen packed layout: (1, total_q, H*D) -> (total_q, H, D).
+    let q = q.reshape((total_q, n_head, head_dim))?;
+    let k = k.reshape((total_q, n_kv_head, head_dim))?;
+    let v = v.reshape((total_q, n_kv_head, head_dim))?.contiguous()?;
     let q = ensure_contiguous(&q)?;
     let k = ensure_contiguous(&k)?;
     profile_sync(q.device());
     pipeline_record("prefill:qkv_proj", t_qkv);
 
     // Check for paged (chunked) CUDA path BEFORE applying model-side RoPE.
-    // The paged prefill kernel always applies RoPE internally via zeros rope_offsets;
-    // applying RoPE here first would double-rotate Q/K.
+    // The paged prefill kernel applies RoPE internally; applying it here first
+    // would double-rotate Q/K.
     #[cfg(feature = "cuda")]
     let is_cuda_paged = caches
         .first()
@@ -606,33 +639,52 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     #[cfg(not(feature = "cuda"))]
     let is_cuda_paged = false;
 
-    // Apply model-side RoPE only when NOT using the paged kernel.
+    // Model-side RoPE only on the non-paged (CPU) path. rope() wants [B, H, L, D];
+    // for the flat layout that's [1, n_head, total_q, head_dim], with cos/sin
+    // carrying the ragged per-token positions ([1, total_q, rotary]).
     let (q, k) = if is_cuda_paged {
-        // Paged kernel rotates internally â€” do NOT pre-rotate.
         (q, k)
-    } else if rope_interleaved {
-        (
-            candle_nn::rotary_emb::rope_i(&q, cos, sin)?,
-            candle_nn::rotary_emb::rope_i(&k, cos, sin)?,
-        )
     } else {
-        (
-            candle_nn::rotary_emb::rope(&q, cos, sin)?,
-            candle_nn::rotary_emb::rope(&k, cos, sin)?,
-        )
+        let q4 = q
+            .reshape((1, total_q, n_head, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k4 = k
+            .reshape((1, total_q, n_kv_head, head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let (q4, k4) = if rope_interleaved {
+            (
+                candle_nn::rotary_emb::rope_i(&q4, cos, sin)?,
+                candle_nn::rotary_emb::rope_i(&k4, cos, sin)?,
+            )
+        } else {
+            (
+                candle_nn::rotary_emb::rope(&q4, cos, sin)?,
+                candle_nn::rotary_emb::rope(&k4, cos, sin)?,
+            )
+        };
+        let q = q4
+            .transpose(1, 2)?
+            .reshape((total_q, n_head, head_dim))?;
+        let k = k4
+            .transpose(1, 2)?
+            .reshape((total_q, n_kv_head, head_dim))?;
+        (ensure_contiguous(&q)?, ensure_contiguous(&k)?)
     };
 
     reset_caches_at_zero(caches, offsets);
 
-    let rope_zeros = Tensor::zeros(b_sz, DType::U32, q.device())?;
-    let output_vec: Vec<Tensor> = paged_prefill_batched(
+    let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
+    // Flat attention output: [total_q, n_head, head_dim].
+    let out_packed = paged_prefill_batched(
         caches,
         offsets,
         &q,
         &k,
         &v,
-        b_sz,
-        seq_len,
+        n_seqs,
+        q_lens,
         n_head,
         n_kv_head,
         head_dim,
@@ -643,19 +695,20 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         write_offset_shifts_ptr,
         generation,
     )?;
-    let outputs = TensorCat::from_tensors(0, output_vec)?.to_tensor();
 
-    // Note: n_head*head_dim may differ from n_embd (e.g. Qwen3-MoE)
-    let reshaped_ctx =
-        outputs
-            .contiguous()?
-            .transpose(1, 2)?
-            .reshape((b_sz, seq_len, n_head * head_dim))?;
+    // Project per-token: [total_q, n_head*head_dim] -> [total_q, hidden_out].
+    // (n_head*head_dim may differ from n_embd, e.g. Qwen3-MoE.)
+    let reshaped_ctx = out_packed
+        .contiguous()?
+        .reshape((total_q, n_head * head_dim))?;
     let t_out_proj = profile_now();
     let output = layer.output_projection(&reshaped_ctx)?;
     profile_sync(output.device());
     pipeline_record("prefill:out_proj", t_out_proj);
-    TensorCat::from_cat_tensor(output, 0)
+    // Restore the flat-packed [1, total_q, hidden_out] activation.
+    let hidden_out = output.dim(1)?;
+    let output = output.reshape((1, total_q, hidden_out))?;
+    TensorCat::from_cat_tensor(output, 1)
 }
 
 /// Simple per-sequence prefill attention fallback.
@@ -1004,5 +1057,44 @@ fn ensure_contiguous(t: &Tensor) -> Result<Tensor> {
         Ok(t.clone())
     } else {
         t.contiguous()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefill_meta_ragged_builds_varlen_layout() {
+        let dev = Device::Cpu;
+        // Three sequences with different prefix offsets and different new-token
+        // (query) lengths — the ragged case.
+        let offsets = [0usize, 5, 100];
+        let q_lens = [3usize, 7, 2];
+        let m = BatchedPrefillMeta::new_ragged(&offsets, &q_lens, &dev).unwrap();
+
+        // cu_seqlens_q is the exclusive prefix sum of q_lens → packed Q has
+        // 3+7+2 = 12 rows.
+        assert_eq!(m.cu_seqlens_q.to_vec1::<u32>().unwrap(), vec![0, 3, 10, 12]);
+        // q_lens passthrough.
+        assert_eq!(m.q_lens.to_vec1::<u32>().unwrap(), vec![3, 7, 2]);
+        // kv_lens[i] = offset[i] + q_len[i].
+        assert_eq!(m.kv_lens.to_vec1::<u32>().unwrap(), vec![3, 12, 102]);
+        // A non-zero offset is present.
+        assert!(m.has_prefix);
+    }
+
+    #[test]
+    fn prefill_meta_uniform_matches_ragged_special_case() {
+        let dev = Device::Cpu;
+        let offsets = [0usize, 0, 0];
+        let seq_len = 4usize;
+        let u = BatchedPrefillMeta::new(&offsets, seq_len, &dev).unwrap();
+
+        // Uniform is exactly the ragged case with equal q_lens.
+        assert_eq!(u.cu_seqlens_q.to_vec1::<u32>().unwrap(), vec![0, 4, 8, 12]);
+        assert_eq!(u.q_lens.to_vec1::<u32>().unwrap(), vec![4, 4, 4]);
+        assert_eq!(u.kv_lens.to_vec1::<u32>().unwrap(), vec![4, 4, 4]);
+        assert!(!u.has_prefix);
     }
 }

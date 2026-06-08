@@ -653,7 +653,7 @@ impl ChunkedKvBacking {
     /// Ensure that chunks needed to write `add` tokens at `offsets` are allocated.
     ///
     /// `offsets` must have exactly `batch_capacity()` elements, one per sequence slot.
-    pub fn ensure_for_offsets(&self, offsets: &[usize], add: usize) -> Result<()> {
+    pub fn ensure_for_offsets(&self, offsets: &[usize], adds: &[usize]) -> Result<()> {
         let batch = self.batch_capacity();
         if offsets.len() != batch {
             candle::bail!(
@@ -662,13 +662,20 @@ impl ChunkedKvBacking {
                 batch
             )
         }
-        if add == 0 {
+        if adds.len() != offsets.len() {
+            candle::bail!(
+                "ensure_for_offsets: {} adds for {} offsets",
+                adds.len(),
+                offsets.len()
+            )
+        }
+        if adds.iter().all(|&a| a == 0) {
             return Ok(());
         }
 
         let mut required_max_blocks = 1usize;
-        for &off in offsets.iter() {
-            let end_pos = off.saturating_add(add).saturating_sub(1);
+        for (i, &off) in offsets.iter().enumerate() {
+            let end_pos = off.saturating_add(adds[i]).saturating_sub(1);
             let need_blocks = (end_pos / CHUNK_SIZE) + 1;
             required_max_blocks = cmp::max(required_max_blocks, need_blocks);
         }
@@ -681,12 +688,12 @@ impl ChunkedKvBacking {
 
         let chunk_size = CHUNK_SIZE;
         for (b, &off) in offsets.iter().enumerate() {
-            // Skip unallocated slots
-            if state.sequences[b].is_none() {
+            // Skip unallocated slots and slots with nothing to add.
+            if state.sequences[b].is_none() || adds[b] == 0 {
                 continue;
             }
 
-            let end_pos = off.saturating_add(add).saturating_sub(1);
+            let end_pos = off.saturating_add(adds[b]).saturating_sub(1);
             let need_blocks = (end_pos / chunk_size) + 1;
             for blk in 0..need_blocks {
                 if state.sequences[b].as_ref().unwrap().chunk_at(blk).is_none() {
