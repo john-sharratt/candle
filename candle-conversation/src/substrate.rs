@@ -115,6 +115,12 @@ pub struct Substrate {
     /// Maintained in lockstep with [`Self::timelines`].
     timelines_by_group: HashMap<GroupId, Vec<TimelineId>>,
 
+    /// Per-timeline KV-compression override (set from the conversation's
+    /// `SequenceConfig` at creation). Copied onto each turn residence at
+    /// alloc time so the persistence thread can quantize different
+    /// conversations at different levels. Absent ⇒ engine-wide turn policy.
+    timeline_compression: HashMap<TimelineId, ConvCompression>,
+
     /// Pinned section entries (system prompts, tool catalogs). Sections
     /// do not pass through LRU eviction — once ingested they stay hot
     /// for the session.
@@ -213,6 +219,19 @@ pub struct ResidenceIndex(pub usize);
 /// residence appears in the hot list iff `hot.is_some()`, and in the
 /// warm list iff `warm.is_some()`. Tier transition methods on
 /// `Substrate` enforce that invariant.
+/// Per-conversation KV-compression override, resolved from the owning
+/// timeline's [`SequenceConfig`] at residence-allocation time and read by
+/// the persistence thread's hot→warm quantize pass. `None` on a residence
+/// means "use the engine-wide turn policy"; `Some` replaces the level and,
+/// when `disable_k_override` is set, drops the global K-format override so
+/// K is adaptively quantized like V. Used to compress utility layers
+/// (e.g. `code_reading`) harder than live dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConvCompression {
+    pub level: u8,
+    pub disable_k_override: bool,
+}
+
 #[derive(Debug)]
 pub struct SequenceResidence {
     /// Persistence-layer stream identity for this residence. Set at
@@ -220,6 +239,11 @@ pub struct SequenceResidence {
     /// `turn_stream_id(timeline, index)`; sections that don't persist
     /// to disk use [`StreamId::default()`] (the reserved sentinel).
     pub stream_id: StreamId,
+    /// Per-conversation compression override inherited from the owning
+    /// timeline at alloc time (turns only; sections are `None`). The
+    /// persistence thread groups residences by this when quantizing
+    /// hot→warm so different conversations can target different levels.
+    pub compression: Option<ConvCompression>,
     /// VRAM-resident sealed chunks. `None` ⇒ not in VRAM.
     pub hot: Option<Vec<SealedSequence>>,
     /// `true` while the scheduler still owes this section a quantize
@@ -830,6 +854,12 @@ pub struct TimelineEntry {
     /// this conversation, persisted at first-submit time alongside any
     /// label as a `RecordType::Label` record.
     pub conv_id: Option<String>,
+    /// Free-form key/value metadata, persisted in the same
+    /// `RecordType::Label` record as `label`/`conv_id` and merged
+    /// (last-write-wins per key) on update. Used as a content-addressed
+    /// cache index by utility ingests; searchable via
+    /// [`Substrate::timelines_with_metadata`].
+    pub custom: BTreeMap<String, String>,
     /// Conversation lifecycle: `true` once the user has closed
     /// (archived) the conversation. The sidebar filters archived
     /// entries out by default; the "show archived" checkbox toggles
@@ -952,6 +982,7 @@ impl TimelineEntry {
             group,
             label: None,
             conv_id: None,
+            custom: BTreeMap::new(),
             archived: false,
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
@@ -985,10 +1016,15 @@ impl Substrate {
     /// disk; until then any cold-load attempt errors out. The LRU
     /// lists ignore the slot until the tier-transition methods put
     /// bytes into hot or warm.
-    fn alloc_residence(&mut self, stream_id: StreamId) -> ResidenceIndex {
+    fn alloc_residence(
+        &mut self,
+        stream_id: StreamId,
+        compression: Option<ConvCompression>,
+    ) -> ResidenceIndex {
         let idx = ResidenceIndex(self.residence.len());
         self.residence.push(SequenceResidence {
             stream_id,
+            compression,
             hot: None,
             pending_quantize: false,
             warm: None,
@@ -996,6 +1032,25 @@ impl Substrate {
             byte_size: 0,
         });
         idx
+    }
+
+    /// Set (or clear) the per-conversation compression override for
+    /// `timeline`. Called at conversation creation from the
+    /// `SequenceConfig`. Must run before the timeline's first turn seals
+    /// so each turn residence picks it up at alloc time.
+    pub fn set_timeline_compression(
+        &mut self,
+        timeline: TimelineId,
+        compression: Option<ConvCompression>,
+    ) {
+        match compression {
+            Some(cc) => {
+                self.timeline_compression.insert(timeline, cc);
+            }
+            None => {
+                self.timeline_compression.remove(&timeline);
+            }
+        }
     }
 
     /// Place `sealed` into the residence slot's hot tier and push the
@@ -1153,7 +1208,9 @@ impl Substrate {
     /// The clone of `Vec<SealedSequence>` is cheap — the inner
     /// `SealedChunk`s hold `Arc<ChunkGid>` references; clone bumps the
     /// arena refcount but doesn't copy KV bytes.
-    pub fn snapshot_pending_warm(&self) -> Vec<(ResidenceIndex, Vec<SealedSequence>)> {
+    pub fn snapshot_pending_warm(
+        &self,
+    ) -> Vec<(ResidenceIndex, Vec<SealedSequence>, Option<ConvCompression>)> {
         self.hot_lru
             .iter()
             .filter_map(|&idx| {
@@ -1161,7 +1218,9 @@ impl Substrate {
                 if slot.warm.is_some() {
                     return None;
                 }
-                slot.hot.as_ref().map(|hot| (idx, hot.clone()))
+                slot.hot
+                    .as_ref()
+                    .map(|hot| (idx, hot.clone(), slot.compression))
             })
             .collect()
     }
@@ -1578,6 +1637,9 @@ impl Substrate {
             if !meta.label.is_empty() {
                 self.set_label(timeline, &meta.label);
             }
+            if !meta.custom.is_empty() {
+                self.merge_custom(timeline, &meta.custom);
+            }
         }
         if let Some(state) = self.pending_conv_state.remove(&timeline.raw()) {
             let _ = self.set_archived(timeline, state.archived);
@@ -1909,19 +1971,19 @@ impl Substrate {
         }
     }
 
-    /// Emit `(timeline_id, conv_id, label, archived)` quads for every
-    /// timeline that holds non-default values.  Used by compaction to
-    /// re-emit live `Label` / `ConvState` records.
-    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool)> {
+    /// Emit `(timeline_id, conv_id, label, archived, custom)` tuples for
+    /// every timeline that holds non-default values.  Used by compaction
+    /// to re-emit live `Label` / `ConvState` records.
+    pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool, BTreeMap<String, String>)> {
         self.timelines
             .iter()
             .filter_map(|(tid, tl)| {
                 let conv_id = tl.conv_id.clone().unwrap_or_default();
                 let label = tl.label.clone().unwrap_or_default();
-                if conv_id.is_empty() && label.is_empty() && !tl.archived {
+                if conv_id.is_empty() && label.is_empty() && !tl.archived && tl.custom.is_empty() {
                     None
                 } else {
-                    Some((tid.raw(), conv_id, label, tl.archived))
+                    Some((tid.raw(), conv_id, label, tl.archived, tl.custom.clone()))
                 }
             })
             .collect()
@@ -2033,6 +2095,9 @@ impl Substrate {
             if !meta.label.is_empty() {
                 self.set_label(timeline, &meta.label);
             }
+            if !meta.custom.is_empty() {
+                self.merge_custom(timeline, &meta.custom);
+            }
         } else {
             // Merge into any prior pending entry so an earlier
             // partial Label (conv_id only) plus a later partial
@@ -2043,6 +2108,9 @@ impl Substrate {
             }
             if !meta.label.is_empty() {
                 slot.label = meta.label.clone();
+            }
+            for (k, v) in &meta.custom {
+                slot.custom.insert(k.clone(), v.clone());
             }
         }
     }
@@ -2296,7 +2364,9 @@ impl Substrate {
             .get(&timeline)
             .expect("append_with_blocks: timeline not registered")
             .next_turn_index();
-        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let compression = self.timeline_compression.get(&timeline).copied();
+        let residence =
+            self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         // `append_with_blocks` declares a turn's existence and block
         // range, but holds no sealed KV — the residence stays cold
         // (`hot = None`) until an elevate / restore_turn install
@@ -2355,7 +2425,9 @@ impl Substrate {
             .get(&timeline)
             .expect("append_complete: timeline not registered")
             .next_turn_index();
-        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let compression = self.timeline_compression.get(&timeline).copied();
+        let residence =
+            self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         let block_start = write.block_start;
         let block_end = write.block_end;
         {
@@ -2413,7 +2485,9 @@ impl Substrate {
             .get(&timeline)
             .expect("restore_turn: timeline must be registered first")
             .next_turn_index();
-        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0));
+        let compression = self.timeline_compression.get(&timeline).copied();
+        let residence =
+            self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         {
             let tl = self.timelines.get_mut(&timeline).unwrap();
             tl.turns.insert(
@@ -2713,6 +2787,67 @@ impl Substrate {
         }
     }
 
+    /// Merge key/value pairs into a timeline's `custom` metadata bag
+    /// (last-write-wins per key). No-op if the timeline isn't registered;
+    /// the caller (handle setter) stages it in `pending_conv_meta` first
+    /// so pre-registration writes survive, mirroring label/conv_id.
+    pub fn merge_custom(&mut self, timeline: TimelineId, kv: &BTreeMap<String, String>) {
+        if kv.is_empty() {
+            return;
+        }
+        if let Some(entry) = self.timelines.get_mut(&timeline) {
+            for (k, v) in kv {
+                entry.custom.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    /// The `custom` metadata bag for `timeline`, or `None` if unregistered.
+    pub fn custom_of(&self, timeline: TimelineId) -> Option<&BTreeMap<String, String>> {
+        self.timelines.get(&timeline).map(|e| &e.custom)
+    }
+
+    /// All **live** (non-tombstoned) timelines whose `custom` metadata
+    /// contains `key == value` (exact match). The content-addressed cache
+    /// lookup used by utility ingests to skip re-building units already
+    /// present after load. Tombstoned timelines are excluded — a dead
+    /// conversation must never count as a cache hit (it no longer serves
+    /// retrieval), or its file would silently vanish from the layer.
+    pub fn timelines_with_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
+        self.timelines
+            .iter()
+            .filter(|(tid, tl)| {
+                !self.tombstoned_timelines.contains(tid)
+                    && tl.custom.get(key).map(|v| v.as_str()) == Some(value)
+            })
+            .map(|(tid, _)| *tid)
+            .collect()
+    }
+
+    /// The set of distinct `custom[key]` values across all **live**
+    /// (non-tombstoned) timelines. A one-pass snapshot so callers can
+    /// probe membership in O(1) instead of an O(timelines) scan per probe
+    /// (e.g. the code_read resume cache over thousands of files).
+    pub fn metadata_values_for_key(&self, key: &str) -> std::collections::HashSet<String> {
+        self.timelines
+            .iter()
+            .filter(|(tid, _)| !self.tombstoned_timelines.contains(tid))
+            .filter_map(|(_, tl)| tl.custom.get(key).cloned())
+            .collect()
+    }
+
+    /// All **live** (non-tombstoned) timelines that carry `key` in their
+    /// `custom` metadata, paired with that key's value. Drives utility
+    /// ingest reconciliation (e.g. tombstone every `code_read`
+    /// conversation whose `path` is no longer on disk).
+    pub fn timelines_with_metadata_key(&self, key: &str) -> Vec<(TimelineId, String)> {
+        self.timelines
+            .iter()
+            .filter(|(tid, _)| !self.tombstoned_timelines.contains(tid))
+            .filter_map(|(tid, tl)| tl.custom.get(key).map(|v| (*tid, v.clone())))
+            .collect()
+    }
+
     /// Whether `timeline` has been archived by the user. Untouched
     /// timelines default to `false`. Returns `false` for unknown
     /// timelines (matches "not archived" since the conversation
@@ -2811,7 +2946,7 @@ impl Substrate {
         tokens: Arc<Vec<u32>>,
     ) -> candle::Result<()> {
         let sealed_cpu = migrate_to_cpu(&sealed_gpu)?;
-        let residence = self.alloc_residence(stream_id);
+        let residence = self.alloc_residence(stream_id, None);
         let entry = SectionEntryData {
             token_count,
             block_range: (0, 0),
@@ -2847,7 +2982,7 @@ impl Substrate {
         cold: Vec<StoredSequence>,
         tokens: Arc<Vec<u32>>,
     ) {
-        let residence = self.alloc_residence(stream_id);
+        let residence = self.alloc_residence(stream_id, None);
         self.residence[residence.0].cold = Some(cold);
         let entry = SectionEntryData {
             token_count,
@@ -3946,6 +4081,7 @@ mod tests {
         let meta = super::ConvMeta {
             conv_id: "1780659918260".to_string(),
             label: String::new(),
+            custom: Default::default(),
         };
         sub.apply_conv_meta(timeline.raw(), &meta);
         sub.apply_conv_state(timeline.raw(), super::ConvState { archived: false });
@@ -3978,6 +4114,7 @@ mod tests {
             &super::ConvMeta {
                 conv_id: "abc".into(),
                 label: String::new(),
+                custom: Default::default(),
             },
         );
         sub.apply_conv_meta(
@@ -3985,6 +4122,7 @@ mod tests {
             &super::ConvMeta {
                 conv_id: String::new(),
                 label: "tour".into(),
+                custom: Default::default(),
             },
         );
         sub.register_timeline(timeline, layer, group);
@@ -3993,6 +4131,93 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].1, "abc");
         assert_eq!(convs[0].2, "tour");
+    }
+
+    // ── Custom metadata (content-addressed cache) ──────────────────────
+
+    #[test]
+    fn custom_metadata_merges_and_is_searchable() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let tl = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(tl, layer, group);
+
+        let mut kv = std::collections::BTreeMap::new();
+        kv.insert("kind".to_string(), "code_read".to_string());
+        kv.insert("path".to_string(), "src/lib.rs".to_string());
+        kv.insert("content_sha256".to_string(), "abc123".to_string());
+        sub.merge_custom(tl, &kv);
+
+        let got = sub.custom_of(tl).expect("registered timeline has custom map");
+        assert_eq!(got.get("kind").map(String::as_str), Some("code_read"));
+        assert_eq!(got.get("content_sha256").map(String::as_str), Some("abc123"));
+
+        // Exact (key, value) search — the resume-cache + invalidation lookup.
+        assert_eq!(sub.timelines_with_metadata("content_sha256", "abc123"), vec![tl]);
+        assert_eq!(sub.timelines_with_metadata("path", "src/lib.rs"), vec![tl]);
+        assert!(sub.timelines_with_metadata("content_sha256", "nope").is_empty());
+        assert!(sub.timelines_with_metadata("absent_key", "x").is_empty());
+
+        // live_conv_meta carries custom so compaction can re-emit it.
+        let live = sub.live_conv_meta();
+        let entry = live.iter().find(|e| e.0 == tl.raw()).expect("timeline in live meta");
+        assert_eq!(entry.4.get("path").map(String::as_str), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn custom_metadata_survives_pre_registration_and_merges() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let tl = alloc.next();
+        let mut sub = Substrate::new();
+
+        // Two partial Label payloads (different custom keys) arrive before
+        // the timeline registers — both must survive and merge on drain.
+        let mut m1 = std::collections::BTreeMap::new();
+        m1.insert("path".to_string(), "src/a.rs".to_string());
+        sub.apply_conv_meta(
+            tl.raw(),
+            &super::ConvMeta { conv_id: String::new(), label: String::new(), custom: m1 },
+        );
+        let mut m2 = std::collections::BTreeMap::new();
+        m2.insert("content_sha256".to_string(), "h1".to_string());
+        sub.apply_conv_meta(
+            tl.raw(),
+            &super::ConvMeta { conv_id: String::new(), label: String::new(), custom: m2 },
+        );
+
+        assert!(sub.custom_of(tl).is_none(), "pre-registration: not visible yet");
+        sub.register_timeline(tl, layer, group);
+
+        let got = sub.custom_of(tl).expect("custom drained on registration");
+        assert_eq!(got.get("path").map(String::as_str), Some("src/a.rs"));
+        assert_eq!(got.get("content_sha256").map(String::as_str), Some("h1"));
+        assert_eq!(sub.timelines_with_metadata("content_sha256", "h1"), vec![tl]);
+    }
+
+    #[test]
+    fn timelines_with_metadata_matches_only_exact_pairs() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let a = alloc.next();
+        let b = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(a, layer, group);
+        sub.register_timeline(b, layer, group);
+        let mut ma = std::collections::BTreeMap::new();
+        ma.insert("path".to_string(), "x.rs".to_string());
+        let mut mb = std::collections::BTreeMap::new();
+        mb.insert("path".to_string(), "y.rs".to_string());
+        sub.merge_custom(a, &ma);
+        sub.merge_custom(b, &mb);
+
+        assert_eq!(sub.timelines_with_metadata("path", "x.rs"), vec![a]);
+        assert_eq!(sub.timelines_with_metadata("path", "y.rs"), vec![b]);
+        assert!(sub.timelines_with_metadata("path", "z.rs").is_empty());
     }
 
     // ── Tombstone ─────────────────────────────────────────────────────

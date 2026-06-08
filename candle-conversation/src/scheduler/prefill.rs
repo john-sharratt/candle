@@ -10,6 +10,19 @@ impl Scheduler {
     pub(super) fn promote_new_prefills(&mut self) {
         const MAX_ACTIVE_PREFILLS: usize = 16;
         while self.active_prefills.len() < MAX_ACTIVE_PREFILLS {
+            // VRAM-pressure backpressure (wave budgeting). Each admitted prefill
+            // pins its conversation's KV in VRAM, so under pressure we stop
+            // piling on more concurrent prefills: first force a compaction to
+            // reclaim arenas, and if VRAM is still tight, leave the rest queued
+            // this pass. We always keep ≥1 prefill in flight so the engine makes
+            // progress — a single oversized turn is then bounded by the per-arena
+            // VRAM budget gate (which compacts/fails fast rather than spilling).
+            if !self.active_prefills.is_empty() && self.vram_under_pressure() {
+                let _ = self.session.compact_forced();
+                if self.vram_under_pressure() {
+                    break;
+                }
+            }
             let work = match self.prefill_queue.pop_front() {
                 Some(w) => w,
                 None => break,
@@ -36,6 +49,21 @@ impl Scheduler {
                 error,
                 prefill_start: None,
             });
+        }
+    }
+
+    /// True when device VRAM free space has dropped below the admission
+    /// reserve (10% of total, floor 1 GiB) — the signal to stop admitting
+    /// additional concurrent prefills. Sits just above the per-arena VRAM
+    /// budget gate's reserve so admission throttles slightly before a hard
+    /// arena OOM. `false` on non-CUDA devices / when the query is unavailable.
+    pub(super) fn vram_under_pressure(&self) -> bool {
+        match self.session.vram_free_total() {
+            Some((free, total)) => {
+                let reserve = (total / 10).max(1usize << 30);
+                free < reserve
+            }
+            None => false,
         }
     }
 
@@ -240,6 +268,8 @@ impl Scheduler {
             seq_ids
         );
 
+        let n_seqs = seq_ids.len();
+        let t_fwd = Instant::now();
         let logits_vec = match self
             .model
             .forward_batched(&mut self.session, &seq_ids, &inputs)
@@ -253,6 +283,13 @@ impl Scheduler {
                 return;
             }
         };
+        // Prefill batch = n_seqs sequences × chunk_len tokens each.
+        self.wave_stats.record(
+            true,
+            n_seqs,
+            n_seqs * chunk_len,
+            t_fwd.elapsed().as_millis() as u64,
+        );
 
         for (logits, &i) in logits_vec.into_iter().zip(group_idxs.iter()) {
             let p = &mut self.active_prefills[i];

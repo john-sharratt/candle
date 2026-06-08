@@ -257,6 +257,7 @@ impl SummarizationTask {
                 sampling: summarization_sampling,
                 event_tx,
                 reprojection: None,
+                disable_reprojection: false,
             })
             .is_err()
         {

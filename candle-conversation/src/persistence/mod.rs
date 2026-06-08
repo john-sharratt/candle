@@ -407,7 +407,13 @@ impl SubstratePersistence {
     /// titler finishes. This call is a no-op when the manifest already
     /// holds the same `(conv_id, label)` tuple — cheap to invoke on
     /// every submit.
-    pub fn write_conv_meta(&mut self, timeline_id: u64, conv_id: &str, label: &str) -> Result<()> {
+    pub fn write_conv_meta(
+        &mut self,
+        timeline_id: u64,
+        conv_id: &str,
+        label: &str,
+        custom: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
         // Idempotency was previously checked against `manifest.labels`;
         // after Phase 3 the substrate is the authority for live label
         // state.  Callers are expected to check against substrate
@@ -415,7 +421,12 @@ impl SubstratePersistence {
         // setters already do; daemon writes are infrequent enough
         // that an occasional duplicate log entry is negligible —
         // compaction collapses them).
-        let payload = manifest::encode_label_payload(timeline_id, conv_id, label);
+        //
+        // The Label record carries the *full* ConvMeta (conv_id + label +
+        // custom), so each setter reads the sibling fields from the
+        // substrate and passes them through — a partial write would drop
+        // the others on reload/compaction.
+        let payload = manifest::encode_label_payload(timeline_id, conv_id, label, custom);
         self.append_record(RecordType::Label, 0, 0, 0, 0, &payload)?;
         Ok(())
     }

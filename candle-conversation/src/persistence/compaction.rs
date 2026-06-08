@@ -113,11 +113,11 @@ pub fn collect_live_records(
     // the substrate's live state.  Tombstoned timelines are
     // skipped so retired conversations don't leave dangling
     // sidebar entries on disk.
-    for (timeline_id, conv_id, label, archived) in substrate.live_conv_meta() {
+    for (timeline_id, conv_id, label, archived, custom) in substrate.live_conv_meta() {
         if tombstoned.contains(&timeline_id) {
             continue;
         }
-        let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label);
+        let payload = super::manifest::encode_label_payload(timeline_id, &conv_id, &label, &custom);
         out.push((
             RecordHeader {
                 record_type: RecordType::Label,
@@ -449,13 +449,23 @@ mod tests {
             RecordType::Label,
             0,
             0,
-            &super::super::manifest::encode_label_payload(dead_tl, "dead-conv", "Dead"),
+            &super::super::manifest::encode_label_payload(
+                dead_tl,
+                "dead-conv",
+                "Dead",
+                &std::collections::BTreeMap::new(),
+            ),
         ));
         blob.extend_from_slice(&record(
             RecordType::Label,
             0,
             0,
-            &super::super::manifest::encode_label_payload(alive_tl, "alive-conv", "Alive"),
+            &super::super::manifest::encode_label_payload(
+                alive_tl,
+                "alive-conv",
+                "Alive",
+                &std::collections::BTreeMap::new(),
+            ),
         ));
         blob.extend_from_slice(&record(RecordType::StreamDecl, 100, 0, &dead_decl.encode()));
         blob.extend_from_slice(&record(RecordType::Chunk, 100, 0, b"dead-chunk-payload"));

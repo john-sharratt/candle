@@ -20,6 +20,7 @@ mod persistence {
     use candle_conversation::persistence::{
         SubstratePersistence, ACTIVE_LOG_NAME, SUBSTRATE_DIR,
     };
+    use candle_conversation::substrate::Substrate;
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
     use zend::session::{StreamItem, ZendSession};
@@ -89,13 +90,21 @@ mod persistence {
             "the daemon must leave a substrate log at {}",
             log_path.display(),
         );
-        let recovered =
-            SubstratePersistence::open_in(&workspace).expect("substrate must reopen cleanly");
-        let turn_streams = recovered
-            .manifest()
-            .streams
-            .values()
-            .filter(|s| s.decl.is_some())
+        // Per-stream runtime state moved from the manifest into the
+        // walker-populated `Substrate` (see `open_in_with_substrate`),
+        // so reopen through that path and count the streams that came
+        // back with a declaration — one per recorded turn.
+        let mut substrate = Substrate::new();
+        let _recovered = SubstratePersistence::open_in_with_substrate(&workspace, &mut substrate)
+            .expect("substrate must reopen cleanly");
+        let turn_streams = substrate
+            .all_stream_ids()
+            .filter(|id| {
+                substrate
+                    .stream_of(*id)
+                    .map(|s| s.decl.is_some())
+                    .unwrap_or(false)
+            })
             .count();
         assert!(
             turn_streams >= 2,

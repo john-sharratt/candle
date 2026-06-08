@@ -217,7 +217,6 @@ pub fn run_pipeline(
     chunk_batch: &ChunkBatch,
     stager: &mut ColdLoadStager,
     slots: &[usize],
-    total_tokens_per_layer: &mut [usize],
     chunks_per_layer: usize,
 ) -> candle::Result<PipelineStats> {
     if chunk_batch.total_bytes == 0 {
@@ -333,7 +332,6 @@ pub fn run_pipeline(
                 unit_plan_ref,
                 pinned_ptr,
                 slots,
-                total_tokens_per_layer,
                 chunks_per_layer,
                 unit_to_records,
                 record_wait_count,
@@ -395,7 +393,6 @@ fn allocator_worker(
     unit_plan: &UnitPlan,
     pinned_ptr: PinnedPtr,
     slots: &[usize],
-    total_tokens_per_layer: &mut [usize],
     chunks_per_layer: usize,
     unit_to_records: Vec<Vec<usize>>,
     mut record_wait_count: Vec<u32>,
@@ -524,7 +521,6 @@ fn allocator_worker(
                 };
 
                 per_layer[layer].push((r_idx, spec, src_offset));
-                total_tokens_per_layer[layer] += rec.token_count as usize;
             }
             decode_us += t_decode.elapsed().as_micros() as u64;
 

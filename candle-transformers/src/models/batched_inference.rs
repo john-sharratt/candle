@@ -912,6 +912,105 @@ impl BatchedInferenceSession {
         Ok(())
     }
 
+    /// Quantize the live K/V chunks of each sequence in `seq_indices` in place
+    /// using the session's compression policy, then re-seal.
+    ///
+    /// Mirrors the substrate scheduler's boundary quantize (`SealAction::Turn` /
+    /// `PrimingProjection`): for every layer the live float chunks are
+    /// snapshotted with [`ChunkedKvBacking::record_turn`], run through
+    /// [`quantize_sealed_in_place`], and swapped back in via
+    /// `truncate_sequence_to_blocks(0)` + [`Self::inject_sealed_at_tail`]. The
+    /// quantized `SealedSequence`s are held across the truncate, so their
+    /// refcounted arena slots stay alive through the swap while the source float
+    /// arenas return to the pool.
+    ///
+    /// With `start_new_chunk`, a fresh writer chunk is pushed so the next writes
+    /// (decode) land in a new chunk instead of appending to the now-immutable
+    /// quantized tail. Already-quantized chunks pass through the quantizer's
+    /// preserve bucket unchanged, so this is safe to call after both prefill and
+    /// decode. No-op when the mode is uncompressed, the device is not CUDA, or
+    /// `head_dim != 128` (the palette4 quantizer requires 128).
+    #[cfg(feature = "cuda")]
+    pub fn quantize_and_seal_sequences(
+        &mut self,
+        seq_indices: &[usize],
+        start_new_chunk: bool,
+    ) -> Result<()> {
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use candle_nn::kv_cache::{quantize_sealed_in_place, SealedSequence};
+
+        let policy = match self.compression_policy() {
+            Some(p) => p,
+            None => {
+                // Legacy uniform-quant modes (Q8_0, Q4_0, …) carry no
+                // compression_level but a fixed Quantized K/V format. Drive the
+                // quantizer with a forced uniform override so they still
+                // compress to that format. The level (5) only feeds the
+                // discarded candidate scaffolding — both overrides bypass
+                // per-block selection entirely.
+                match self.config.k_format.as_quant() {
+                    Some(k_fmt) => {
+                        let v_fmt = self.config.v_format.as_quant().unwrap_or(k_fmt);
+                        CompressionPolicy::new_with_error_threshold_factors(5, 1.0, 1.0, 1.0, 1.0)
+                            .with_override_k_quant(Some(k_fmt))
+                            .with_override_v_quant(Some(v_fmt))
+                    }
+                    // Uncompressed (F16/BF16) — nothing to quantize.
+                    None => return Ok(()),
+                }
+            }
+        };
+        let copy_stream = match &self.device {
+            Device::Cuda(d) => d.cuda_stream(),
+            _ => return Ok(()),
+        };
+        // The fused palette4 quantizer requires head_dim == 128.
+        if self.backings.first().map(|b| b.head_dim()) != Some(128) {
+            return Ok(());
+        }
+
+        let mut scratch: Option<PinnedBuf> = None;
+        for &seq_idx in seq_indices {
+            // Snapshot + quantize each layer. Holding the outputs across the
+            // truncate below keeps their (refcounted) arena slots alive.
+            let mut quantized_per_layer: Vec<SealedSequence> =
+                Vec::with_capacity(self.backings.len());
+            for backing in &self.backings {
+                let live = backing.record_turn(seq_idx)?;
+                if live.chunks.is_empty() {
+                    quantized_per_layer.push(live);
+                    continue;
+                }
+                let out = quantize_sealed_in_place(
+                    backing,
+                    &[&live],
+                    &policy,
+                    &self.device,
+                    &copy_stream,
+                    &mut scratch,
+                )?;
+                let q = out.into_iter().next().ok_or_else(|| {
+                    candle::Error::Msg(
+                        "quantize_and_seal_sequences: quantizer returned no sequence".into(),
+                    )
+                })?;
+                quantized_per_layer.push(q);
+            }
+            // Convert kernels must finish before we drop the source float chunks
+            // (truncate) and before decode reads the quantized bytes.
+            copy_stream
+                .synchronize()
+                .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+
+            self.truncate_sequence_to_blocks(seq_idx, 0)?;
+            self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
+            if start_new_chunk {
+                self.push_empty_writer_chunk(seq_idx)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Cheap session-level compaction check.
     ///
     /// This only inspects backing state and does not move or free anything.
@@ -940,6 +1039,29 @@ impl BatchedInferenceSession {
         }
         pipeline_record("session:kv_compact_run", t_compact);
         Ok(total_freed)
+    }
+
+    /// Force compaction across all backings (defrag threshold 0) and release
+    /// reclaimed arenas. Used by the scheduler's VRAM-pressure backpressure
+    /// path, where reclaiming any arena is worth it. Returns arenas freed.
+    pub fn compact_forced(&self) -> Result<usize> {
+        let mut total_freed = 0;
+        for backing in &self.backings {
+            total_freed += backing.compact_forced()?;
+        }
+        Ok(total_freed)
+    }
+
+    /// Device VRAM `(free, total)` in bytes, or `None` on non-CUDA devices /
+    /// query failure. Drives the scheduler's VRAM-pressure admission gate.
+    pub fn vram_free_total(&self) -> Option<(usize, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(d) = &self.device {
+                return d.mem_get_info().ok();
+            }
+        }
+        None
     }
 
     /// Create a view sequence that borrows KV blocks from a parent.
@@ -1631,29 +1753,17 @@ impl BatchedInferenceSession {
     /// Record a turn boundary for a sequence, capturing the current KV state.
     ///
     /// Commits the active window to `recorded_metas` and returns a `SealedSequence`
-    /// snapshot of the just-committed turn.  Replaces the old `seal_sequence` +
-    /// `snapshot_sequence` pair.
+    /// snapshot of the just-committed turn.
     ///
     /// No-op when the sequence has zero tokens.
     pub fn record_turn(&mut self, idx: usize) -> Result<candle_nn::kv_cache::SealedSequence> {
-        let seq_len = self
-            .sequence_offset(idx)
-            .ok_or_else(|| candle::Error::Msg(format!("record_turn: sequence {idx} not found")))?;
         let backing = self
             .backings
             .first()
             .ok_or_else(|| candle::Error::Msg("record_turn: no backings".into()))?;
         backing
-            .record_turn(idx, seq_len)
+            .record_turn(idx)
             .map_err(|e| candle::Error::Msg(format!("record_turn: {e}")))
-    }
-
-    /// Seal the current active chunk for a sequence.
-    ///
-    /// **Deprecated**: turn boundaries are now recorded by [`record_turn`].
-    /// This method is a no-op kept for API compatibility.
-    pub fn seal_sequence(&mut self, _idx: usize) -> Result<()> {
-        Ok(())
     }
 
     /// Validate that no two sessions share a raw GID across all layers.
@@ -1756,29 +1866,20 @@ impl BatchedInferenceSession {
 
     /// Snapshot the current KV state of a sequence as a [`SealedSequence`].
     ///
-    /// Captures the sequence's current chunk IDs and token counts **before**
-    /// any `seal_sequence` call.  The last chunk may be partial (fewer than
-    /// `chunk_size` tokens); its token count is computed from the current
-    /// sequence offset.
-    ///
-    /// Snapshot the current KV state of a sequence as a [`SealedSequence`].
-    ///
-    /// In the new turn-recording design, this also **commits** the turn boundary
-    /// (moves the active window to `recorded_metas`).  Callers that previously
-    /// used `snapshot_sequence` followed by `seal_sequence` should now call
-    /// `record_turn` directly; `seal_sequence` is a no-op.
+    /// Captures the sequence's current chunk IDs and token counts.  The last
+    /// chunk may be partial (fewer than `chunk_size` tokens); its token count
+    /// is computed from the current sequence offset.  In the turn-recording
+    /// design this also **commits** the turn boundary (moves the active window
+    /// to `recorded_metas`).
     ///
     /// Returns an error if the sequence is not allocated.
     pub fn snapshot_sequence(&self, idx: usize) -> Result<candle_nn::kv_cache::SealedSequence> {
-        let seq_len = self.sequence_offset(idx).ok_or_else(|| {
-            candle::Error::Msg(format!("snapshot_sequence: sequence {idx} not found"))
-        })?;
         let backing = self
             .backings
             .first()
             .ok_or_else(|| candle::Error::Msg("snapshot_sequence: no backings".into()))?;
         backing
-            .record_turn(idx, seq_len)
+            .record_turn(idx)
             .map_err(|e| candle::Error::Msg(format!("snapshot_sequence: {e}")))
     }
 
@@ -1789,16 +1890,11 @@ impl BatchedInferenceSession {
         &self,
         idx: usize,
     ) -> Result<Vec<candle_nn::kv_cache::SealedSequence>> {
-        let seq_len = self.sequence_offset(idx).ok_or_else(|| {
-            candle::Error::Msg(format!(
-                "snapshot_sequence_per_layer: sequence {idx} not found"
-            ))
-        })?;
         let mut out = Vec::with_capacity(self.backings.len());
         for backing in &self.backings {
             out.push(
                 backing
-                    .record_turn(idx, seq_len)
+                    .record_turn(idx)
                     .map_err(|e| candle::Error::Msg(format!("snapshot_sequence_per_layer: {e}")))?,
             );
         }

@@ -85,7 +85,7 @@ fn seed_f16_sealed(
     let v = k.clone();
     backing.write_contiguous(slot, 0, &k, &v).unwrap();
     backing.set_len(slot, n_tokens);
-    backing.record_turn(slot, n_tokens).unwrap()
+    backing.record_turn(slot).unwrap()
 }
 
 /// After quantize-on-evict the returned sequence:
@@ -400,27 +400,28 @@ fn quantize_to_cpu_requantizes_filled_partials() {
 /// without needing the substrate scheduler:
 ///
 /// 1. **Turn 1** seals at 50 tokens (1 full chunk + 1 partial of 18).
-/// 2. **Persist**: `quantize_sealed_in_place` runs. Full chunk lands
-///    in CPU Quantized; partial stays format-preserved (F16 here,
-///    R16 in production).
-/// 3. **Cold-elevate**: `migrate_sealed_to_gpu_batch_async` brings
-///    the warm SealedSequence back to GPU with the same per-chunk
-///    formats (Q* full + F16 partial).
-/// 4. **Inject + view**: `inject_sealed_at_tail` puts the elevated
-///    turn into a parent slot; `create_view_sequence` borrows all
-///    blocks (this is exactly the scheduler's projection path).
-///    The COW partial-tail step would fail with `quant dtype
-///    mismatch` if the partial weren't in the active K format.
-/// 5. **Decoder extends**: 30 more tokens go past the 50-token
-///    boundary. First 14 fill the COW'd partial (18 → 32), then
-///    16 land in a fresh new partial.
-/// 6. **Turn 2 sealed**: `record_turn(view, 80)` snapshots a
-///    3-chunk sequence: borrowed turn-1 full (Q*), formerly-partial
-///    now-full (F16), new partial (F16).
+/// 2. **Persist**: `quantize_sealed_in_place` quantizes the full chunk
+///    to Q* and leaves the partial in float — both still on GPU. A
+///    separate `migrate_sealed_to_cpu` evicts the sealed turn to the
+///    warm (CPU) tier, formats preserved.
+/// 3. **Cold-elevate**: `migrate_sealed_to_gpu_batch_async` brings the
+///    warm SealedSequence back to GPU with the same per-chunk formats
+///    (Q* full + F16 partial).
+/// 4. **Inject + view**: `inject_sealed_at_tail` puts the elevated turn
+///    into a parent slot; `create_view_sequence` borrows all blocks —
+///    including the partial tail — read-only via Arc (this is the
+///    scheduler's projection path). A borrowed partial can be any
+///    format because nothing ever appends to it.
+/// 5. **Decoder extends**: 32 more tokens past the 50-token boundary.
+///    The borrowed partial stays read-only at 18 tokens; the new tokens
+///    fill one fresh full 32-token chunk.
+/// 6. **Turn 2 sealed**: `record_turn(view)` snapshots a 3-chunk
+///    sequence: borrowed turn-1 full (Q*), borrowed turn-1 partial
+///    (F16, unchanged), new full chunk (F16).
 /// 7. **Re-persist**: `quantize_sealed_in_place` runs again. The
-///    borrowed Q* chunk must pass through to warm format-preserving
-///    (already compressed). The COW'd-and-filled chunk must be
-///    freshly quantized. The new partial must stay format-preserved.
+///    borrowed Q* chunk passes through unchanged (already compressed),
+///    the borrowed partial passes through unchanged (still float), and
+///    the new full chunk is freshly quantized.
 ///
 /// This pins the entire "resume → continue → re-quantize" contract
 /// in one self-contained test.
@@ -440,8 +441,11 @@ fn cold_load_partial_extend_then_requantize() {
     assert_eq!(sealed_t1.chunks[0].token_count, 32);
     assert_eq!(sealed_t1.chunks[1].token_count, 18);
 
-    // ── Phase 2: simulate persistence Phase 1 (quantize on evict) ──
-    let warm_cpu = quantize_sealed_in_place(
+    // ── Phase 2: persist = quantize-in-place (GPU) then evict (DtoH) ──
+    // `quantize_sealed_in_place` compresses the full chunk to Q* and leaves
+    // the partial tail in float — both still GPU-resident. Eviction to the
+    // warm tier is the separate `migrate_sealed_to_cpu` step.
+    let quantized_gpu = quantize_sealed_in_place(
         &backing,
         &[&sealed_t1],
         &policy,
@@ -450,7 +454,12 @@ fn cold_load_partial_extend_then_requantize() {
         &mut pinned,
     )
     .expect("turn 1 quantize");
+    assert_eq!(quantized_gpu.len(), 1);
+    let warm_cpu = backing
+        .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[&quantized_gpu[0]])
+        .expect("turn 1 evict to warm (CPU)");
     assert_eq!(warm_cpu.len(), 1);
+    assert_eq!(warm_cpu[0].location, ArenaLocation::Cpu);
 
     // ── Phase 3: simulate cold-elevate back to GPU ─────────────────
     let elevated = backing
@@ -459,9 +468,9 @@ fn cold_load_partial_extend_then_requantize() {
     let elevated_seq = &elevated[0];
     assert_eq!(elevated_seq.chunks.len(), 2);
 
-    // Sanity: the elevated partial is back on GPU in F16 Float, so
-    // the COW partial-tail byte copy in `create_view_sequence` will
-    // succeed (same-format source ↔ destination).
+    // Sanity: the elevated partial is back on GPU in F16 Float — the
+    // format-preserving migrate round-trip (Q* full, float partial)
+    // must not have quantized it on the way out or back.
     backing
         .inner
         .storage
@@ -504,26 +513,27 @@ fn cold_load_partial_extend_then_requantize() {
     assert_eq!(end, 2, "parent slot now has 2 chunks (1 full + 1 partial)");
 
     // ── Phase 5: view borrows all parent blocks ────────────────────
-    // The COW partial-tail path inside create_view_sequence is the
-    // exact line that hit `quant dtype mismatch (Q3_0 vs R16)` in
-    // production before the partial-skip fix.
+    // `create_view_sequence` borrows every parent block — including the
+    // cold-loaded partial tail — read-only via Arc clone, then pushes one
+    // fresh active chunk for new writes. No COW, no format coupling: a
+    // borrowed partial can be in any format because nothing ever appends
+    // to it (new tokens always land in the fresh active chunk).
     let view = backing.alloc_sequence().unwrap();
     let (_borrowed_blocks, borrowed_tokens) = backing
         .create_view_sequence(view, parent, &[(0, 2)])
-        .expect(
-            "create_view_sequence over a cold-loaded turn with a partial tail \
-             must succeed — the COW byte copy needs same-format arenas",
-        );
+        .expect("create_view_sequence over a cold-loaded turn with a partial tail");
     assert_eq!(
         borrowed_tokens, 50,
         "view inherits both turn 1 blocks (50 tokens)"
     );
 
     // ── Phase 6: decoder extends past the partial boundary ─────────
-    // 30 more tokens at offset 50:
-    //   - 50..64 fills the view's COW'd-from-partial block (18 → 32).
-    //   - 64..80 lands in a fresh block (16 tokens — new partial).
-    let extra_tokens = 30;
+    // 32 more tokens at cumulative offset 50. The borrowed partial (18) is
+    // read-only, so the writes land in a fresh chunk past it rather than
+    // filling the partial: cumulative offsets 50..82 become one full new
+    // 32-token chunk. The borrowed partial stays 18 tokens; it is never
+    // extended in place.
+    let extra_tokens = 32;
     let total_after = 50 + extra_tokens;
     backing.ensure_for_offset(view, 50, extra_tokens).unwrap();
     let n_elems = N_KV_HEAD * extra_tokens * HEAD_DIM;
@@ -543,31 +553,29 @@ fn cold_load_partial_extend_then_requantize() {
     backing.set_len(view, total_after);
 
     // ── Phase 7: seal turn 2 ───────────────────────────────────────
-    let sealed_t2 = backing.record_turn(view, total_after).unwrap();
+    let sealed_t2 = backing.record_turn(view).unwrap();
     assert_eq!(
         sealed_t2.chunks.len(),
         3,
-        "turn 2 = 1 borrowed full + 1 COW'd-filled + 1 new partial"
+        "turn 2 = borrowed full + borrowed partial (read-only) + new full"
     );
     assert_eq!(sealed_t2.chunks[0].token_count, 32, "borrowed turn-1 full");
     assert_eq!(
-        sealed_t2.chunks[1].token_count, 32,
-        "COW'd-and-filled block (was the cold-loaded partial)"
+        sealed_t2.chunks[1].token_count, 18,
+        "borrowed turn-1 partial — unchanged, never extended in place"
     );
     assert_eq!(
-        sealed_t2.chunks[2].token_count, 16,
-        "new partial appended by the extension"
+        sealed_t2.chunks[2].token_count, 32,
+        "new full chunk written by the extension"
     );
 
     // ── Phase 8: re-quantize turn 2 ────────────────────────────────
     // The bucketing must handle three distinct cases in one call:
     //   chunks[0]: borrowed cold-loaded full → already Quantized →
-    //              passes through to warm format-preserving (the
-    //              eligibility check skips it, the preserve bucket
-    //              picks it up).
-    //   chunks[1]: COW'd-and-filled → was F16 (the COW dst format),
-    //              now full → eligible for the kernel → re-quantized.
-    //   chunks[2]: new partial → token_count < CHUNK_SIZE → preserve.
+    //              eligibility check skips it, preserve bucket keeps it.
+    //   chunks[1]: borrowed partial → token_count < CHUNK_SIZE → preserve
+    //              (stays F16, never quantized).
+    //   chunks[2]: new full F16 chunk → eligible for the kernel → quantized.
     let warm_t2 = quantize_sealed_in_place(
         &backing,
         &[&sealed_t2],
@@ -578,13 +586,13 @@ fn cold_load_partial_extend_then_requantize() {
     )
     .expect(
         "re-quantize after partial extend must succeed — the bucketing has to \
-         pass borrowed already-quantized chunks through to warm format-preserving",
+         pass borrowed already-quantized and partial chunks through unchanged",
     );
     let warm_t2_seq = &warm_t2[0];
     assert_eq!(warm_t2_seq.chunks.len(), 3);
     assert_eq!(warm_t2_seq.chunks[0].token_count, 32);
-    assert_eq!(warm_t2_seq.chunks[1].token_count, 32);
-    assert_eq!(warm_t2_seq.chunks[2].token_count, 16);
+    assert_eq!(warm_t2_seq.chunks[1].token_count, 18);
+    assert_eq!(warm_t2_seq.chunks[2].token_count, 32);
 
     backing
         .inner
@@ -619,14 +627,12 @@ fn cold_load_partial_extend_then_requantize() {
                     }
                 }
             };
-            // chunks[0]: borrowed cold-loaded full → format-preserved
-            //            from GPU Q* to CPU Q* (still Quantized, just
-            //            different location).
+            // chunks[0]: borrowed cold-loaded full → already Q*, preserved.
             check(0, true, "borrowed cold-loaded full (Q* preserved)");
-            // chunks[1]: COW'd-and-filled → freshly quantized.
-            check(1, true, "COW'd-and-filled (freshly re-quantized)");
-            // chunks[2]: new partial → format-preserved F16.
-            check(2, false, "new partial (F16 preserved)");
+            // chunks[1]: borrowed partial → F16 preserved (never quantized).
+            check(1, false, "borrowed partial (F16 preserved)");
+            // chunks[2]: new full F16 chunk → freshly quantized.
+            check(2, true, "new full chunk (freshly quantized)");
             Ok::<(), candle::Error>(())
         })
         .unwrap()

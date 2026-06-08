@@ -36,7 +36,7 @@ use crate::summary_tree::{SelectionDiagnostics, SummariserTrigger, TurnKind};
 use crate::think_strip::strip_think_blocks;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
-use crate::{ProvenanceFile, TurnStats};
+use crate::{ProvenanceFile, SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, IndexOp, Tensor};
@@ -167,6 +167,18 @@ pub(crate) enum SchedulerRequest {
         /// for the full contract.  `None` skips re-projection entirely
         /// (used by single-shot paths like RULER eval and summarisation).
         reprojection: Option<ReprojectionPolicy>,
+        /// When `true`, skip the per-turn projection rebuild
+        /// (`apply_projection` reset + re-project) as long as the slot
+        /// already holds content, and append the prefill onto the
+        /// cumulative slot instead.  The `seal_action` is unaffected, so
+        /// the turn still seals into the substrate.  The system prompt is
+        /// seeded by PrimingProjection at conversation creation (so the
+        /// slot is already non-empty and this stays true from turn 1);
+        /// see the handler for the gated-section trade-off.  Used by
+        /// append-only utility ingests (e.g. `code_reading`) where
+        /// re-projecting the whole trunk every turn is both unnecessary
+        /// and O(n²) — see `zend::code_read`.
+        disable_reprojection: bool,
     },
 
     /// Free a sequence slot.
@@ -705,6 +717,63 @@ pub(super) struct ActiveSectionIngest {
 
 /// The scheduler: single thread that owns all GPU resources.
 ///
+/// One forward-pass "channel" (prefill or decode) accumulator for [`WaveStats`].
+#[derive(Default)]
+struct WaveChannel {
+    fwds: u64,
+    seq_sum: u64,
+    seq_max: usize,
+    tok_sum: u64,
+    ms_sum: u64,
+}
+
+/// Periodic aggregator for forward-pass batch ("wave") sizes. Lets us see
+/// whether the scheduler is actually batching wide under load without
+/// per-forward log spam — it emits a single INFO line at most every 2 s and
+/// resets. Single-threaded (scheduler thread only), so no synchronization.
+struct WaveStats {
+    window_start: std::time::Instant,
+    prefill: WaveChannel,
+    decode: WaveChannel,
+}
+
+impl WaveStats {
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            prefill: WaveChannel::default(),
+            decode: WaveChannel::default(),
+        }
+    }
+
+    /// Record one forward. `n_tokens` is the total tokens in the batch
+    /// (seqs × per-seq chunk for prefill, seqs × 1 for decode).
+    fn record(&mut self, prefill: bool, n_seqs: usize, n_tokens: usize, fwd_ms: u64) {
+        let ch = if prefill { &mut self.prefill } else { &mut self.decode };
+        ch.fwds += 1;
+        ch.seq_sum += n_seqs as u64;
+        ch.seq_max = ch.seq_max.max(n_seqs);
+        ch.tok_sum += n_tokens as u64;
+        ch.ms_sum += fwd_ms;
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= std::time::Duration::from_secs(2) {
+            let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
+            let p = &self.prefill;
+            let d = &self.decode;
+            tracing::info!(
+                "wave {:.1}s: prefill fwds={} seqs avg={:.1} max={} tok/fwd avg={:.0} fwd avg={:.0}ms \
+                 | decode fwds={} seqs avg={:.1} max={} fwd avg={:.0}ms",
+                elapsed.as_secs_f64(),
+                p.fwds, avg(p.seq_sum, p.fwds), p.seq_max, avg(p.tok_sum, p.fwds), avg(p.ms_sum, p.fwds),
+                d.fwds, avg(d.seq_sum, d.fwds), d.seq_max, avg(d.ms_sum, d.fwds),
+            );
+            self.window_start = std::time::Instant::now();
+            self.prefill = WaveChannel::default();
+            self.decode = WaveChannel::default();
+        }
+    }
+}
+
 /// Runs a continuous loop:
 /// 1. Drain pending submissions (non-blocking)
 /// 2. If idle, block waiting for work
@@ -885,6 +954,9 @@ pub(crate) struct Scheduler {
     /// append the trailing `Generated(UserStart)` ahead of the
     /// current turn's prefill.
     boundary_markers: projection_assembler::BoundaryMarkers,
+
+    /// Periodic forward-pass batch-size telemetry (diagnostic; one line / 2 s).
+    wave_stats: WaveStats,
 }
 
 /// Per-chunk debug trace of the BDP signatures emitted at seal time.
@@ -1017,6 +1089,7 @@ impl Scheduler {
                 "scheduler::elevate_pinned_scratch",
             ),
             boundary_markers,
+            wave_stats: WaveStats::new(),
         }
     }
 
@@ -1113,6 +1186,7 @@ impl Scheduler {
                 sampling,
                 event_tx,
                 reprojection,
+                disable_reprojection,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -1131,6 +1205,24 @@ impl Scheduler {
                     (Some(_), Some(_)) => SealAction::Turn,
                     _ => SealAction::None,
                 };
+                // Append-only ingests (e.g. code_reading) opt out of the
+                // per-turn projection rebuild once their slot is seeded:
+                // skip the reset + re-project and prefill straight onto the
+                // cumulative slot. The seal is unaffected — turns still land
+                // in the substrate.
+                //
+                // The system prompt is laid down at conversation creation by
+                // PrimingProjection (see `Conversation::new_*`), so the slot
+                // already has blocks before turn 1 and `skip_projection` is
+                // true from the first turn — `apply_projection` never runs for
+                // these ingests. That's intentional: priming injects the
+                // `fixed_prefix` (system) sections. The trade-off is that
+                // collection-member / `depends_on`-gated sections (which only
+                // materialize via per-turn `apply_projection`) are NOT added;
+                // utility-layer system prompts (code_reading, repo_map) use
+                // only fixed sections, so this is exact for them.
+                let skip_projection = disable_reprojection
+                    && self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
                 // Step 1: run projection (if requested) and apply it
                 // — reset `parent_id` to empty and write the
                 // projected sections + projected turns from the
@@ -1150,7 +1242,7 @@ impl Scheduler {
                     SelectionDiagnostics,
                 )> = None;
                 let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) =
-                    (projection_inputs.as_ref(), slot_target)
+                    (projection_inputs.as_ref().filter(|_| !skip_projection), slot_target)
                 {
                     let conversation = match self.slot_conversations.get(&parent_id) {
                         Some(c) => c.clone(),
@@ -1368,10 +1460,18 @@ impl Scheduler {
                     }
                 }
 
-                if let Err(e) = self.apply_projection(parent_id, BlockCount(0), &projected_segments)
-                {
-                    let _ = event_tx.send(TurnEvent::Error(e));
-                    return true;
+                // When reprojection is disabled and the slot is already
+                // seeded, leave the cumulative slot intact — prefill appends
+                // onto it below. `apply_projection(_, BlockCount(0), _)` would
+                // reset it to empty, so it must be skipped here (not just fed
+                // empty segments, which is the RULER/summarisation reset path).
+                if !skip_projection {
+                    if let Err(e) =
+                        self.apply_projection(parent_id, BlockCount(0), &projected_segments)
+                    {
+                        let _ = event_tx.send(TurnEvent::Error(e));
+                        return true;
+                    }
                 }
 
                 // Step 2: borrowed ranges cover the whole
@@ -2509,9 +2609,8 @@ impl Scheduler {
     /// token of every later turn the projection re-selects it into.
     ///
     /// So members sit between the boundary near-lossless policy
-    /// (C0 / Q8 / Q8) and the turn policy (C4 / Q4_KS K / level-4
-    /// adaptive V): **C3 with K overridden to Q8_KS**, V uses
-    /// adaptive level-3 selection.  Roughly 4× smaller than native.
+    /// (C0 / Q8 / Q8) and the dialogue turn policy: **C3 with K
+    /// overridden to Q8_KS**, V uses adaptive level-3 selection.
     /// `_turn_policy` is taken to keep the call sites future-proof
     /// for a per-engine override knob; today it's ignored.
     fn section_compression_policy_member(
@@ -3098,9 +3197,15 @@ impl Scheduler {
     /// cold-marker (`hot/warm = None`, `cold = Some(...)` from the
     /// manifest). The KV bytes stay on disk until the runtime inject
     /// path demand-materialises them via [`elevate_to_hot`].
-    pub fn reconstruct_substrate(&self, conversation: &Conversation) {
+    pub fn reconstruct_substrate(
+        &self,
+        conversation: &Conversation,
+        status: &SubstrateReloadStatus,
+    ) {
         let n_layers = self.session.backings().len();
         if n_layers == 0 {
+            // Nothing to replay (CPU/test backings) — unblock the waiter.
+            status.finish();
             return;
         }
         // Re-append each persisted chunk's signatures into the fresh
@@ -3136,7 +3241,11 @@ impl Scheduler {
             }
             Ok(out)
         };
-        match conversation.reconstruct_from_log(n_layers, restore_sigs) {
+        let progress = |done: usize, total: usize| status.record(done, total);
+        let result = conversation.reconstruct_from_log(n_layers, restore_sigs, Some(&progress));
+        // Always unblock the daemon's loading-screen waiter, success or not.
+        status.finish();
+        match result {
             Ok(0) => {}
             Ok(n) => tracing::info!("substrate reload: {n} turns restored from redo log"),
             Err(e) => tracing::error!("substrate reload failed: {e}"),

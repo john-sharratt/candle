@@ -212,26 +212,43 @@ pub fn quantize_sealed_in_place(
     backing.inner.storage.read(|storage| {
         for (seq_idx, seq) in sequences.iter().enumerate() {
             for (chunk_idx, chunk) in seq.chunks.iter().enumerate() {
-                // Full and partial chunks both go through the kernel when
-                // their source GIDs qualify. The recycle hook on `ChunkGid`
-                // Drop guarantees each chunk slot's bytes are zero past
-                // whatever its prior tenant wrote, and decode/prefill only
-                // writes slots [0..token_count). So positions
-                // [token_count..32] read as zero, quantize cleanly (no
-                // random noise → no compression ratio penalty). A
-                // closed-off partial never gets appended to — new tokens
-                // always land in a fresh active chunk pushed by the next
-                // writer.
-                let mut all_gids_kernel_eligible = true;
-                for gid in chunk.gids.as_slice() {
-                    let ok = matches!(
-                        storage.arena_key(gid.arena_idx()),
-                        Some(k) if k.location == ArenaLocation::Gpu
-                            && super::chunk_ops::needs_reconcile_source_format(k.format)
-                    );
-                    if !ok {
-                        all_gids_kernel_eligible = false;
-                        break;
+                // Partial trailing chunks (token_count < CHUNK_SIZE) are
+                // never quantized. They stay in their source float format and
+                // pass through the preserve bucket unchanged: the active
+                // writer chunk is GPU-float while it fills, and the persist
+                // path writes the partial tail as a plain float `Chunk`
+                // record (see docs/kv_tier_migration.md §3 / §5.5).
+                //
+                // Quantizing a partial is unsafe: the palette4 selection
+                // (`select_palette4_formats_fused`) is token_count-blind — it
+                // computes per-(h, p) amax over the full 32-token block. The
+                // active writer chunk is allocated via `alloc_block_chunks`,
+                // whose pool path does NOT zero recycled slots, so positions
+                // [token_count..32] hold stale bytes from the prior tenant.
+                // Feeding that garbage into amax inflates the outer scale and
+                // corrupts the precision of the real tokens [0..token_count].
+                //
+                // A full chunk goes through the fused palette4 kernel when
+                // every (h, p) source GID lives in a GPU `Float` or
+                // `Quantized(R16)` arena — the formats the selection + convert
+                // kernels read directly. Otherwise (e.g. a view borrowing
+                // older chunks that came back from cold storage in mixed
+                // Q-formats) it goes to the preserve bucket: those GIDs
+                // already carry the format/pal_map/scale an earlier persist
+                // pass selected, and re-quantizing would be redundant.
+                let is_full = usize::from(chunk.token_count) >= CHUNK_SIZE;
+                let mut all_gids_kernel_eligible = is_full;
+                if all_gids_kernel_eligible {
+                    for gid in chunk.gids.as_slice() {
+                        let ok = matches!(
+                            storage.arena_key(gid.arena_idx()),
+                            Some(k) if k.location == ArenaLocation::Gpu
+                                && super::chunk_ops::needs_reconcile_source_format(k.format)
+                        );
+                        if !ok {
+                            all_gids_kernel_eligible = false;
+                            break;
+                        }
                     }
                 }
                 if all_gids_kernel_eligible {

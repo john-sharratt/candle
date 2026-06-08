@@ -860,6 +860,16 @@ impl TestParams {
         // Snapshot bulk profile at prompt→generate boundary
         let bulk_profile = model.snapshot_profiles();
 
+        // Quantize + seal the prefilled history, mirroring the substrate
+        // scheduler's priming-projection boundary. `start_new_chunk = true` so
+        // decode writes land in a fresh chunk rather than appending to the now
+        // immutable quantized tail. Deliberately outside the timing windows.
+        #[cfg(feature = "cuda")]
+        {
+            session.quantize_and_seal_sequences(&sequence_indices, true)?;
+            self.device.synchronize()?;
+        }
+
         // Generate phase
         let mut remaining_steps = self.generate_token_count;
 
@@ -888,8 +898,18 @@ impl TestParams {
             (generate_tokens as f64) / generate_duration.as_secs_f64()
         };
 
-        // Calculate quantized token percentage for quantized modes
-        // Chunks are quantized during generation (after each prefill/decode), so stats are already up to date.
+        // Quantize + seal the decode tail before measuring so %Quantized and the
+        // compression ratio reflect the full sequence (the substrate quantizes
+        // at every turn boundary). Already-quantized prefill chunks pass through
+        // the quantizer's preserve bucket unchanged.
+        #[cfg(feature = "cuda")]
+        {
+            session.quantize_and_seal_sequences(&sequence_indices, false)?;
+            self.device.synchronize()?;
+        }
+
+        // Calculate quantized token percentage for quantized modes (reads the
+        // post-quantize arena formats set above).
         let quantized_token_percent = if config.mode.is_quantized() {
             session.estimate_quantized_percentage_by_sequences(&sequence_indices)
         } else {
@@ -902,6 +922,7 @@ impl TestParams {
             None
         };
 
+        #[cfg(feature = "verbose")]
         let compression_distribution = if config.mode.is_quantized() {
             Some(session.compression_dist_by_sequences(&sequence_indices))
         } else {

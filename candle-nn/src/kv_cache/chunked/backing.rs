@@ -26,6 +26,24 @@ use crate::{arena_gid_stride, CHUNK_SIZE};
 /// Default fraction of reclaimable arenas that triggers pack-down.
 const DEFAULT_DEFRAG_THRESHOLD: f32 = 0.20;
 
+/// Substring embedded in the error returned when a GPU KV arena cannot be
+/// allocated within the VRAM budget (even after a forced compaction). The
+/// scheduler matches on this via [`is_device_oom`] to drive eviction / batch
+/// clipping instead of letting the driver spill KV to host memory (which on
+/// WDDM silently collapses throughput rather than failing).
+pub const KV_DEVICE_OOM_MARKER: &str = "kv-cache GPU VRAM budget exceeded";
+
+/// Recognize a device-out-of-memory error — either our own budget rejection
+/// ([`KV_DEVICE_OOM_MARKER`]) or a driver-reported CUDA OOM (when sysmem
+/// fallback is disabled, `cuMemAlloc` returns `CUDA_ERROR_OUT_OF_MEMORY`).
+pub fn is_device_oom(err: &candle::Error) -> bool {
+    let s = err.to_string();
+    s.contains(KV_DEVICE_OOM_MARKER)
+        || s.contains("out of memory")
+        || s.contains("OUT_OF_MEMORY")
+        || s.contains("CUDA_ERROR_OUT_OF_MEMORY")
+}
+
 /// Global registry of all ChunkedKvBacking instances for cooperative compaction.
 /// When one backing needs to grow arenas but fails (OOM), it can ask others to compact.
 static BACKING_REGISTRY: Mutex<Vec<Weak<BackingInner>>> = Mutex::new(Vec::new());
@@ -46,13 +64,17 @@ fn register_state(inner: &Arc<BackingInner>, state: &Arc<RwLock<BlockTableState>
     }
 }
 
-/// Ask all other backings to compact, returns total chunks freed.
+/// Ask all registered backings to compact and return total arenas freed.
+///
+/// Called from the arena-alloc OOM/budget path, so it compacts **forced**
+/// (defrag threshold 0): under VRAM pressure we want to reclaim every
+/// arena we can, not wait for the steady-state fragmentation threshold.
 pub(super) fn request_global_compact() -> usize {
     let mut freed = 0;
     if let Ok(registry) = BACKING_REGISTRY.lock() {
         for weak in registry.iter() {
             if let Some(backing) = weak.upgrade() {
-                if let Ok(n) = backing.compact_arenas() {
+                if let Ok(n) = backing.compact_arenas_forced() {
                     freed += n;
                 }
             }
@@ -446,6 +468,15 @@ impl BackingInner {
         let _ = self.defragment_arenas(DEFAULT_DEFRAG_THRESHOLD)?;
         self.release_empty_arenas()
     }
+
+    /// Like [`Self::compact_arenas`] but forces defragmentation regardless of
+    /// the steady-state fragmentation threshold. Used by the VRAM-pressure /
+    /// OOM path ([`request_global_compact`]) where reclaiming any arena beats
+    /// leaving it resident.
+    pub(crate) fn compact_arenas_forced(&self) -> Result<usize> {
+        let _ = self.defragment_arenas(0.0)?;
+        self.release_empty_arenas()
+    }
 }
 
 /// Shared backing storage for a chunked (paged) KV cache.
@@ -736,6 +767,13 @@ impl ChunkedKvBacking {
     /// Returns the number of arenas freed.
     pub fn compact(&self) -> Result<usize> {
         self.inner.compact_arenas()
+    }
+
+    /// Force compaction (defrag threshold 0) then release — for the
+    /// VRAM-pressure / backpressure path where reclaiming any arena beats
+    /// waiting for the steady-state fragmentation threshold.
+    pub fn compact_forced(&self) -> Result<usize> {
+        self.inner.compact_arenas_forced()
     }
 
     /// Get the current batch capacity (number of sequence slots).

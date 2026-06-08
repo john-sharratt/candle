@@ -1572,9 +1572,7 @@ impl ChunkedKvBacking {
     ///
     /// # Parameters
     /// * `batch_idx` — slot index of the sequence
-    /// * `seq_len`   — current total token count (informational; used only as
-    ///                 a cross-check against the stored usages)
-    pub fn record_turn(&self, batch_idx: usize, _seq_len: usize) -> Result<SealedSequence> {
+    pub fn record_turn(&self, batch_idx: usize) -> Result<SealedSequence> {
         let chunk_size = CHUNK_SIZE;
 
         let state = self

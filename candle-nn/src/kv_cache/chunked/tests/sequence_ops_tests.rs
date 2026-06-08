@@ -1619,7 +1619,7 @@ mod tests {
             backing.write_contiguous(parent, 0, &k1, &v1).unwrap();
             backing.set_len(parent, turn1_tokens);
 
-            let sealed = backing.record_turn(parent, turn1_tokens).unwrap();
+            let sealed = backing.record_turn(parent).unwrap();
             assert_eq!(
                 sealed.chunks.len(),
                 2,
@@ -1810,7 +1810,7 @@ mod tests {
                 let seq = state.sequences[0].as_mut().expect("seq");
                 seq.chunks_slice_mut()[0].usage = CHUNK_SIZE as u32;
             }
-            let sealed = backing.record_turn(0, CHUNK_SIZE).expect("record_turn");
+            let sealed = backing.record_turn(0).expect("record_turn");
 
             // Inject into a fresh sequence and verify chunk count.
             let dst = backing.alloc_sequence().expect("alloc dst");
@@ -1865,7 +1865,7 @@ mod tests {
                 cs[2].usage = 7;
             }
 
-            let sealed = backing.record_turn(0, n_tokens).expect("record_turn");
+            let sealed = backing.record_turn(0).expect("record_turn");
             let dst = backing.alloc_sequence().expect("alloc dst");
             let (_, end) = backing.inject_sealed_at_tail(dst, &sealed).expect("inject");
             assert_eq!(end, sealed.chunks.len());
@@ -1875,7 +1875,7 @@ mod tests {
             // late in the kernel against the destination slot's
             // layout — so we only assert on the position-independent
             // window fields.
-            let resealed = backing.record_turn(dst, n_tokens).expect("record_turn dst");
+            let resealed = backing.record_turn(dst).expect("record_turn dst");
             assert_eq!(resealed.chunks.len(), sealed.chunks.len());
             for (i, (a, b)) in sealed.chunks.iter().zip(resealed.chunks.iter()).enumerate() {
                 assert_eq!(a.token_count, b.token_count, "chunk {i} usage");

@@ -45,15 +45,12 @@ pub(crate) struct RepoMapConv {
 /// per-file content-hash record.  Same lock-step contract as
 /// [`RepoMapConv`].
 pub(crate) struct CodeReadConv {
-    /// Parallel timelines for the `code_reading` layer.  Each holds
-    /// the scopes of an interleaved subset of workspace files (file
-    /// indices distributed round-robin across the workers).
-    /// Dialogue retrieval queries across all of them via the
-    /// substrate's `active_timelines_for_group` iterator, so the
-    /// projection is opaque to the parallelism.  The refresh path
-    /// tombstones every entry here in one engine call when the
-    /// fresh generation is ready to swap in.
-    pub(crate) sequences: Vec<Sequence>,
+    /// Merged per-file content-hash record. There are no live sequences:
+    /// `code_reading` is now **one conversation per file**, each freed
+    /// after its turns seal into the substrate. Retrieval queries the
+    /// substrate's `active_timelines_for_group`; refresh finds and
+    /// tombstones a changed file's conversation(s) by a `path` metadata
+    /// scan rather than from a held sequence list.
     pub(crate) state: CodeReadState,
 }
 
@@ -101,9 +98,10 @@ struct InferenceState {
     /// Workspace root captured at startup — the refresh path
     /// re-walks from here on every filesystem event.
     workspace: PathBuf,
-    /// `code_reading` layer's owning conversation.  Holds the
-    /// tool-call exchange per scope; [`CodeReadState`] is the
-    /// per-file content hash record the refresh path consults.
+    /// `code_reading` layer's owning conversations — one per file,
+    /// each a per-part tool-call exchange closed by a whole-file
+    /// summary; [`CodeReadState`] is the per-file content hash record
+    /// the refresh path consults.
     code_read_conv: Mutex<CodeReadConv>,
     /// Projection builder + sequence config kept alive for the
     /// atomic refresh paths.  Minting a fresh repo_map or
@@ -163,13 +161,8 @@ impl InferenceState {
                 "32-64 workers usable on this VRAM budget"
             };
             tracing::info!(
-                free_vram_gib = free_gib,
-                total_vram_gib = total_gib,
-                default_workers = n_workers,
-                "VRAM advisory: {recommended}; \
-                 override code_read parallelism with ZEND_CODE_READ_PARALLELISM=N. \
-                 A hard process exit during code-read decode is almost always GPU OOM \
-                 — lower the worker count and retry.",
+                "VRAM {free_gib:.1}/{total_gib:.1} GiB free · code_read workers={n_workers} \
+                 ({recommended}; override ZEND_CODE_READ_PARALLELISM=N)"
             );
         }
 
@@ -224,6 +217,11 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
+            // Normal (dialogue) conversation turns compress at C4. The library
+            // default is C5, tuned for non-zend model consumers; zend sets its
+            // own dialogue level explicitly and overrides code_reading to C8
+            // per-conversation (see `code_read`'s sequence config).
+            .compression_level(4)
             .thinking(false);
         let conv_config = builder.conversation_config();
 
@@ -238,10 +236,25 @@ impl InferenceState {
         let engine = builder
             .engine_with_progress(&device, Some(&model_hook))
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
-        // Substrate reload happened inside the engine ctor. Announce it
-        // as the active step briefly so the frontend can render the
-        // checkmark transition, then move on to sections.
+        // The substrate reload (redo-log replay) runs on the scheduler thread
+        // spawned by the engine ctor. As the substrate grows this is no longer
+        // instantaneous, so surface real progress and block here until it
+        // finishes before advancing to section prefill (which would otherwise
+        // stall against the busy scheduler under a misleading step label).
         progress.set_step(LoadStep::Substrate);
+        {
+            let reload = engine.substrate_reload_status();
+            loop {
+                let (done, total, finished) = reload.snapshot();
+                if total > 0 {
+                    progress.set_step_progress(done as u64, total as u64);
+                }
+                if finished {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();
 
@@ -344,11 +357,17 @@ impl InferenceState {
             &progress,
         )?;
 
-        // For every file the walker surfaced, carve into
-        // scope-aware chunks and prefill the four-turn tool-call
-        // exchange per scope into the `code_reading` layer.
+        // Wrap the engine in its session Mutex now: code_read's per-file
+        // pool takes `&Mutex<ConversationEngine>` so it can hold the lock
+        // only for the quick create/tombstone ops and release it across the
+        // decode-heavy summary generation (keeping refresh non-blocking).
+        let engine = Mutex::new(engine);
+
+        // For every file the walker surfaced, carve into scope-aware parts
+        // and build a one-conversation-per-file `code_reading` ingest (one
+        // prefill turn per part + a final whole-file summary).
         progress.set_step(LoadStep::CodeRead);
-        let (code_read_sequences, code_read_state) = crate::code_read::ingest_code_reading(
+        let code_read_state = crate::code_read::ingest_code_reading(
             &engine,
             proj_builder_code_read,
             &workspace,
@@ -359,7 +378,7 @@ impl InferenceState {
 
         Ok(Arc::new(Self {
             decoder,
-            engine: Mutex::new(engine),
+            engine,
             conversations: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
             titler: Mutex::new(titler),
@@ -369,7 +388,6 @@ impl InferenceState {
                 state: repo_map_state,
             }),
             code_read_conv: Mutex::new(CodeReadConv {
-                sequences: code_read_sequences,
                 state: code_read_state,
             }),
             refresh_builder: proj_builder_refresh,
@@ -436,17 +454,15 @@ impl InferenceState {
         }
     }
 
-    /// Atomic refresh of the `code_reading` conversation when any
-    /// file's content hash changed.  Same shape as
-    /// [`Self::refresh_repo_map`]: mints a fresh generation of
-    /// parallel timelines (one per `code_read::parallelism()` worker),
-    /// runs the 4-turn-per-scope tool-call ingestion (including the
-    /// model-decoded summaries) across them, tombstones the entire
-    /// prior generation, then swaps the new `Vec<Sequence>` in.
-    /// Stale-better-than-missing invariant holds throughout —
-    /// dialogue retrieval against this layer sees the old content
-    /// the whole way through prefill and summary decode, then flips
-    /// to the new content at the tombstone instant.
+    /// Atomic refresh of the `code_reading` layer when any file's
+    /// content hash changed.  Reconciles deleted files (tombstones
+    /// their per-file conversations), then re-runs the parallel
+    /// per-file ingestion — each changed file gets a fresh per-file
+    /// conversation (per-part tool-call prefills closed by a decoded
+    /// whole-file summary) while files whose hash is unchanged are
+    /// skipped via the resume cache.  Stale-better-than-missing holds
+    /// throughout: dialogue retrieval sees a file's old content until
+    /// that file's new conversation tombstones the old one.
     ///
     /// When `map` is `Some`, the refresh reuses that workspace walk
     /// instead of doing its own.
@@ -456,31 +472,20 @@ impl InferenceState {
     ) -> anyhow::Result<bool> {
         let progress = LoadProgress::new();
         let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
-        let (old_timelines, prior_state) = {
-            let guard = self.code_read_conv.lock().unwrap();
-            (
-                guard
-                    .sequences
-                    .iter()
-                    .map(|s| s.timeline_id())
-                    .collect::<Vec<_>>(),
-                guard.state.clone(),
-            )
-        };
+        let prior_state = self.code_read_conv.lock().unwrap().state.clone();
         let ctx = self.refresh_ctx();
         let outcome = crate::code_read::refresh_code_reading(
             &ctx,
             &self.workspace,
             &map,
             &prior_state,
-            &old_timelines,
             &progress,
         )?;
         match outcome {
             crate::code_read::RefreshOutcome::NoOp => Ok(false),
-            crate::code_read::RefreshOutcome::Replaced { sequences, state } => {
+            crate::code_read::RefreshOutcome::Replaced { state } => {
                 let mut guard = self.code_read_conv.lock().unwrap();
-                *guard = CodeReadConv { sequences, state };
+                *guard = CodeReadConv { state };
                 Ok(true)
             }
         }

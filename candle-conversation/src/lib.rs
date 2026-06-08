@@ -71,7 +71,7 @@ pub use config::{
     EngineConfig, SamplingConfig, SchedulerConfig,
 };
 pub use conversation::Sequence;
-pub use engine::ConversationEngine;
+pub use engine::{ConversationEngine, SubstrateReloadStatus};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use sequence_handle::SequenceId;

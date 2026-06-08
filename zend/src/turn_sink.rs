@@ -5,18 +5,18 @@
 //!
 //! 1. **`insert_prefill_turn(user, assistant)`** — prefill a complete
 //!    user/assistant exchange with no decode.  The repo_map layer's
-//!    cluster listings and the two prefilled halves of the
-//!    code_reading layer's tool-call conversation (the user-side
-//!    "read X and summarise" prompt + the assistant-side
+//!    cluster listings and the per-part prefilled halves of the
+//!    code_reading layer's per-file tool-call conversation (the
+//!    user-side "Read X lines A-B." prompt + the assistant-side
 //!    `<tool_call>` echo, and the user-side `<tool_response>`
 //!    carrying the file content) all flow through this method.
 //!
 //! 2. **`decode_summary_turn(user)`** — submit a user turn and run
 //!    the model to decode the assistant response.  The code_reading
-//!    layer uses this for the per-scope one-sentence summary so the
-//!    resulting K/V — and the summary text itself — lands in the
-//!    trunk under genuine model reasoning, not a prefilled
-//!    placeholder.
+//!    layer uses this for the final whole-file summary (≤200 words)
+//!    that closes each per-file conversation, so the resulting K/V —
+//!    and the summary text itself — lands in the trunk under genuine
+//!    model reasoning, not a prefilled placeholder.
 //!
 //! Integration tests wire a [`RecordingTurnSink`] that captures
 //! every call into memory and returns a deterministic placeholder
@@ -41,6 +41,19 @@ pub trait InsertTurnSink {
         user: &str,
         max_tokens: usize,
     ) -> anyhow::Result<String>;
+
+    /// Restart-resume cache probe: whether some conversation in the
+    /// substrate already carries `key == value` in its `custom` metadata
+    /// (i.e. this unit was ingested in a prior run and reloaded from the
+    /// redo log). Default `false` — non-substrate sinks never cache-hit.
+    fn unit_cached(&self, _key: &str, _value: &str) -> bool {
+        false
+    }
+
+    /// Tag the underlying conversation with `tags` (content hash + rich
+    /// descriptive fields) so a later run's [`Self::unit_cached`] finds it.
+    /// Default no-op for sinks without a backing conversation.
+    fn tag_unit(&self, _tags: &std::collections::BTreeMap<String, String>) {}
 }
 
 /// Sink that drives a live [`Sequence`] — the daemon's production
@@ -185,6 +198,22 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             "decode_summary_turn: finish_turn returned",
         );
         Ok(text)
+    }
+
+    fn unit_cached(&self, key: &str, value: &str) -> bool {
+        !self
+            .inner
+            .find_conversations_by_metadata(key, value)
+            .is_empty()
+    }
+
+    fn tag_unit(&self, tags: &std::collections::BTreeMap<String, String>) {
+        if let Err(e) = self.inner.set_metadata_many(tags) {
+            tracing::warn!(
+                target: "zend::turn_sink",
+                "failed to tag conversation metadata (resume cache): {e:#}",
+            );
+        }
     }
 }
 
