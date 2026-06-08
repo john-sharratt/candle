@@ -59,3 +59,13 @@ template <> struct BlockConverter<block_q3_0, __nv_fp8_e4m3> {
         return from_f32<__nv_fp8_e4m3>(__half2float(src->d) * ((float)q3_0_get_q(src, idx) - 3.5f) / scale);
     }
 };
+
+template <> struct BlockInt8<block_q3_0> {
+    static __device__ __forceinline__ Int8Sample load(const block_q3_0* b, int e) {
+        const int lo = (b->qs[e >> 2] >> ((e & 3) << 1)) & 3;
+        const int hi = (b->qh[e >> 3] >> (e & 7)) & 1;
+        const int q = (hi << 2) | lo;                            // [0,7]
+        // x = d*(q-3.5) == (2q-7)*(d/2); 2q-7 odd in [-7,7].
+        return Int8Sample{ (int8_t)(2 * q - 7), __half2float(b->d) * 0.5f };
+    }
+};

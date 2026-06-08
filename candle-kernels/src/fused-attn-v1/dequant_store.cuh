@@ -8,8 +8,8 @@
 // dequant_kv_tile_V: load V from arena into mn-major INT8, scales come from
 //   the per-token V scale tensor (loaded via cp.async by the loader pool).
 //
-// Reuses ArenaAccessor::load_head_int8_unscaled (added to convert_all.cuh)
-// and v2's apply_rope_*_f32 helpers.
+// Reuses ArenaAccessor::load_head_int8_readthrough (per-dim block scales) from
+// convert_all.cuh and v2's apply_rope_*_f32 helpers.
 // =============================================================================
 
 #include "../convert/convert_all.cuh"

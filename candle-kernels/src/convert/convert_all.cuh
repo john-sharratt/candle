@@ -297,8 +297,7 @@ __device__ __noinline__ T dequant_element_slow(const void* block_ptr, int idx, i
             return BlockConverter<block_q0_m4, T>::load_element(
                 reinterpret_cast<const block_q0_m4*>(block_ptr), idx, scale);
         default:
-            printf("dequant_element_slow: unhandled format %d\n", format);
-            __trap();
+            __trap();  // unhandled format — a programming error (no valid arena hits this)
             return T(0);
     }
 }
@@ -405,8 +404,7 @@ __device__ __forceinline__ T dequant_element_inline(const void* block_ptr, int i
             return BlockConverter<block_q0_m4, T>::load_element(
                 reinterpret_cast<const block_q0_m4*>(block_ptr), idx, scale);
         default:
-            printf("dequant_element_inline: unhandled format %d\n", format);
-            __trap();
+            __trap();  // unhandled format — a programming error (no valid arena hits this)
             return T(0);
     }
 }
@@ -430,7 +428,7 @@ __device__ __forceinline__ void cp_async_cg_16(void* dst, const void* src) {
 // ARENA ACCESSOR - CLEAN INDEX-BASED ACCESS ABSTRACTION
 // =============================================================================
 // Handles both dtype (channel-oriented) and quant (token-oriented) formats.
-// 
+//
 // For dtype formats: contiguous head vectors, traditional linear access
 // For quant formats: token-oriented blocking where each block has 32 tokens × 1 dim
 
@@ -704,140 +702,114 @@ private:
         }
     }
 
+public:
     // =========================================================================
-    // LOAD HEAD INT8 UNSCALED (for deferred-scaling fused INT8 attention)
+    // LOAD HEAD INT8 READ-THROUGH (per-dim block scales) — for V skip-dequant
     // =========================================================================
-    // Loads a head's elements into INT8 shared memory WITHOUT applying the
-    // per-block scale. The scale is exposed separately via *out_scale so the
-    // consumer can fold it into a parallel FP32 scale-product track at MMA
-    // output time.
+    // Reads a head's int8 values straight from a native-INT8 arena with NO FP
+    // round-trip, writing each dim's per-(dim,block) scale into out_dim_scale[]
+    // so the consumer (the INT8 PV, §1A) applies one scale per output dim.
+    // Three pieces, same shape as load_head_scaled's quant path:
+    //   - is_int8_readthrough_format(fmt) — the eligibility predicate;
+    //   - load_head_int8_readthrough_typed<BlockT> — the TYPED worker, keyed on
+    //     the block struct so BLOCK_BYTES = sizeof(BlockT) and the element
+    //     extraction (BlockInt8<BlockT>) compile away (no magic sizes, no
+    //     duplicated unpack);
+    //   - load_head_int8_readthrough<HEAD_DIM> — the void format DISPATCHER that
+    //     switch()es the runtime format to the worker (the generic home for the
+    //     switch, mirroring load_head_quant_token_oriented). No bool to drop:
+    //     the caller gates with is_int8_readthrough_format and supplies the FP
+    //     path (load_head_scaled) for non-passthrough formats.
     //
-    // RESERVED — not yet called by any kernel. This is the read-through
-    // abstraction intended for the decode skip-dequant (Track A §1A in
-    // docs/decode_kernel_work_plan.md) and Track B's dequant path. NOTE: it
-    // currently returns a *single* block scale via *out_scale (see the Q8_0/
-    // Q4_0 bodies below), which collapses the per-(dim,block) scales — the
-    // skip-dequant work must extend it to emit per-dim scales before use.
+    //   dst[dim]          : centered int8 for this token (palette-local order)
+    //   out_dim_scale[dim]: FP32 scale s with dequant == dst[dim] * s, already
+    //                       divided by in_scale (matching load_head_scaled's
+    //                       `/ scale`)
+    //   in_scale          : per-palette scale from the head metadata (v_scale_p)
     //
-    // For Q4_0 / Q8_0 / R16 sources: the centered integer is already in INT8
-    // range, so we copy through directly and return the block scale.
-    //
-    // For F16 / BF16 / FP8 / F32 sources: we max-abs scan to derive a fresh
-    // INT8 scale per warp, then re-quantize. This is the lossy step for FP
-    // sources but keeps the INT8 MMA path uniform.
-    //
-    // Caller layout:
-    //   - dst        : int8 buffer, sub_head_dim bytes long (or HEAD_DIM if loading whole head)
-    //   - out_scale  : single FP32 slot (one per call); lane 0 writes
-    //   - within     : token index within the chunk
-    //   - lane       : warp lane id
-    //
-    // The function uses HEAD_DIM (the size of the destination, may be the
-    // sub-head for palette-routed loads). It does NOT yet implement the
-    // FP-source max-abs reduction in this initial revision because all
-    // current hot-path arenas use Q4_0/Q8_0/R16.
-    template <int HEAD_DIM, bool USE_TC>
-    __device__ __forceinline__ void load_head_int8_unscaled(
+    // K never uses this (RoPE needs FP).
+
+    // True for the formats the dispatcher/worker handle. The caller gates the
+    // read-through on this; keep in sync with the switch in the dispatcher below.
+    static __device__ __forceinline__ bool is_int8_readthrough_format(int fmt) {
+        return fmt == ArenaFormat::Q8_0  || fmt == ArenaFormat::Q4_0
+            || fmt == ArenaFormat::Q5_0  || fmt == ArenaFormat::Q2_0
+            || fmt == ArenaFormat::Q3_0  || fmt == ArenaFormat::Q4_KS
+            || fmt == ArenaFormat::Q8_KS || fmt == ArenaFormat::Q8_1
+            || fmt == ArenaFormat::Q2_S  || fmt == ArenaFormat::Q1_S
+            || fmt == ArenaFormat::Q1_A  || fmt == ArenaFormat::Q0
+            || fmt == ArenaFormat::Q0_M2 || fmt == ArenaFormat::Q0_M4
+            || fmt == ArenaFormat::Q0_X;
+    }
+
+    template <typename BlockT, int HEAD_DIM>
+    __device__ __forceinline__ void load_head_int8_readthrough_typed(
         int8_t* dst,
-        float* out_scale,
+        float* out_dim_scale,
         int chunk_idx,
         int head_idx,
         int within_chunk,
         int lane,
-        float in_scale_hint
+        float in_scale
     ) const {
         constexpr int DIMS_PER_LANE = HEAD_DIM / 32;
+        constexpr int BLOCK_BYTES = sizeof(BlockT);
         const int elem_in_block = within_chunk & 31;
         const int block_within_dim = within_chunk >> 5;
         const int64_t block_head_stride = (int64_t)HEAD_DIM * blocks_per_dim;
-        const int block_bytes = get_quant_block_bytes(format);
+        const float inv = 1.0f / in_scale;
 
         const char* head_base = (chunk_byte_stride > 0)
             ? (base + (int64_t)chunk_idx * chunk_byte_stride
-                    + (int64_t)head_idx * block_head_stride * block_bytes)
+                    + (int64_t)head_idx * block_head_stride * BLOCK_BYTES)
             : (base + ((int64_t)chunk_idx * ((chunk_stride / (head_stride > 0 ? head_stride : 1)) * block_head_stride)
-                      + (int64_t)head_idx * block_head_stride) * block_bytes);
+                      + (int64_t)head_idx * block_head_stride) * BLOCK_BYTES);
 
-        if (format == ArenaFormat::Q4_0) {
-            // Q4_0 block: 16 packed bytes + FP16 scale. Centered nibble in [-8,7].
-            // Block layout (struct block_q4_0): { __half d; uint8_t qs[16]; } -> 18 bytes
-            float blk_scale = 0.f;
-            #pragma unroll
-            for (int i = 0; i < DIMS_PER_LANE; ++i) {
-                const int dim = lane + i * 32;
-                const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
-                const uint8_t* blk = reinterpret_cast<const uint8_t*>(head_base + block_idx * 18);
-                __half d_h;
-                memcpy(&d_h, blk, sizeof(__half));
-                if (lane == 0 && i == 0) blk_scale = __half2float(d_h);
-                int byte_idx = elem_in_block >> 1;
-                int hi = elem_in_block & 1;
-                uint8_t b = blk[2 + byte_idx];
-                int n = hi ? (int)(b >> 4) : (int)(b & 0xF);
-                dst[dim] = (int8_t)(n - 8);
-            }
-            // Take a representative scale from lane 0's first dim. Since all blocks
-            // in a single 32-token group share the same nominal Q4_0 scale only when
-            // the policy flattens scales; for general use we treat this as a coarse
-            // fallback. The proper per-palette scale comes from the head metadata.
-            if (lane == 0 && out_scale) *out_scale = blk_scale;
-            return;
-        }
-
-        if (format == ArenaFormat::Q8_0) {
-            // Q8_0 block: { __half d; int8_t qs[32]; } -> 34 bytes. Already INT8.
-            float blk_scale = 0.f;
-            #pragma unroll
-            for (int i = 0; i < DIMS_PER_LANE; ++i) {
-                const int dim = lane + i * 32;
-                const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
-                const uint8_t* blk = reinterpret_cast<const uint8_t*>(head_base + block_idx * 34);
-                __half d_h;
-                memcpy(&d_h, blk, sizeof(__half));
-                if (lane == 0 && i == 0) blk_scale = __half2float(d_h);
-                const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2);
-                dst[dim] = qs[elem_in_block];
-            }
-            if (lane == 0 && out_scale) *out_scale = blk_scale;
-            return;
-        }
-
-        if (format == ArenaFormat::R16) {
-            // R16: 64 FP16 K + 64 FP16 Q-capture per dim block. Re-quant to INT8.
-            // Use the scale hint or 1.0 as default and clamp.
-            float scale_used = (in_scale_hint > 0.f) ? in_scale_hint : 1.f;
-            float inv = 1.f / scale_used;
-            #pragma unroll
-            for (int i = 0; i < DIMS_PER_LANE; ++i) {
-                const int dim = lane + i * 32;
-                const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
-                const uint8_t* blk = reinterpret_cast<const uint8_t*>(head_base + block_idx * 128);
-                __half k_h;
-                memcpy(&k_h, blk + elem_in_block * 2, sizeof(__half));
-                float v = __half2float(k_h) * inv;
-                v = fminf(fmaxf(v, -127.f), 127.f);
-                dst[dim] = (int8_t)__float2int_rn(v);
-            }
-            if (lane == 0 && out_scale) *out_scale = scale_used;
-            return;
-        }
-
-        // Fallback: dequant via existing path to FP32, re-quant to INT8 with
-        // a passed scale hint. This handles F16/BF16/F8E4M3/Q8_KS/Q4_KS/etc.
-        float scale_used = (in_scale_hint > 0.f) ? in_scale_hint : 1.f;
-        float inv = 1.f / scale_used;
-        float fp_buf[HEAD_DIM];
-        // Reuse the quant token-oriented path via temporary FP32 buffer.
-        load_head_quant_token_oriented<float, HEAD_DIM>(
-            fp_buf, chunk_idx, head_idx, within_chunk, lane, 1.f);
         #pragma unroll
         for (int i = 0; i < DIMS_PER_LANE; ++i) {
             const int dim = lane + i * 32;
-            float v = fp_buf[dim] * inv;
-            v = fminf(fmaxf(v, -127.f), 127.f);
-            dst[dim] = (int8_t)__float2int_rn(v);
+            const int64_t block_idx = (int64_t)dim * blocks_per_dim + block_within_dim;
+            const BlockT* blk = reinterpret_cast<const BlockT*>(head_base + block_idx * BLOCK_BYTES);
+            const Int8Sample smp = BlockInt8<BlockT>::load(blk, elem_in_block);
+            dst[dim] = smp.v;
+            out_dim_scale[dim] = smp.s * inv;
         }
-        if (lane == 0 && out_scale) *out_scale = scale_used;
+    }
+
+    // Format dispatcher — the generic home for the read-through switch, mirroring
+    // how load_head_scaled routes through load_head_quant_token_oriented's
+    // switch(format). Switches the RUNTIME format ONCE to the typed worker.
+    // Returns void (no dropped bool): the caller gates on
+    // is_int8_readthrough_format and supplies the FP path for non-passthrough
+    // formats, so the default below is unreachable.
+    template <int HEAD_DIM>
+    __device__ __forceinline__ void load_head_int8_readthrough(
+        int8_t* dst,
+        float* out_dim_scale,
+        int chunk_idx,
+        int head_idx,
+        int within_chunk,
+        int lane,
+        float in_scale
+    ) const {
+        switch (format) {
+            case ArenaFormat::Q8_0:  load_head_int8_readthrough_typed<block_q8_0,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q4_0:  load_head_int8_readthrough_typed<block_q4_0,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q5_0:  load_head_int8_readthrough_typed<block_q5_0,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q2_0:  load_head_int8_readthrough_typed<block_q2_0,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q3_0:  load_head_int8_readthrough_typed<block_q3_0,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q4_KS: load_head_int8_readthrough_typed<block_q4_ks, HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q8_KS: load_head_int8_readthrough_typed<block_q8_ks, HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q8_1:  load_head_int8_readthrough_typed<block_q8_1,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q2_S:  load_head_int8_readthrough_typed<block_q2_s,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q1_S:  load_head_int8_readthrough_typed<block_q1_s,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q1_A:  load_head_int8_readthrough_typed<block_q1_a,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q0:    load_head_int8_readthrough_typed<block_q0,    HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q0_M2: load_head_int8_readthrough_typed<block_q0_m2, HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q0_M4: load_head_int8_readthrough_typed<block_q0_m4, HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            case ArenaFormat::Q0_X:  load_head_int8_readthrough_typed<block_q0_x,  HEAD_DIM>(dst, out_dim_scale, chunk_idx, head_idx, within_chunk, lane, in_scale); return;
+            default: return;  // unreachable: caller gates on is_int8_readthrough_format
+        }
     }
 };
 

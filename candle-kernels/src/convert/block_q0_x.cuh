@@ -48,3 +48,15 @@ template <> struct BlockConverter<block_q0_x, __nv_fp8_e4m3> {
     static __device__ __forceinline__ __nv_fp8_e4m3 load_element(const block_q0_x* src, int e, float scale)
     { return from_f32<__nv_fp8_e4m3>(q0_x_elem(src, e) / scale); }
 };
+
+template <> struct BlockInt8<block_q0_x> {
+    static __device__ __forceinline__ Int8Sample load(const block_q0_x* b, int e) {
+        const uint8_t packed = b->outlier_packed;
+        const int outlier_idx = (int)(packed & 0x1F);
+        const int delta_u = (int)((packed >> 5) & 0x07);
+        const int outlier_delta = delta_u < 4 ? delta_u : delta_u - 8;  // sign-extend 3 bits
+        int v_i8 = (int)b->bulk_anchor + ((e == outlier_idx) ? outlier_delta * Q0_X_S_OUTLIER : 0);
+        v_i8 = max(-127, min(127, v_i8));
+        return Int8Sample{ (int8_t)v_i8, (1.0f / 127.0f) };
+    }
+};

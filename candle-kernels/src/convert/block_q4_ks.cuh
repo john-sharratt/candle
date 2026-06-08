@@ -62,3 +62,12 @@ template <> struct BlockConverter<block_q4_ks, __nv_fp8_e4m3> {
         return from_f32<__nv_fp8_e4m3>(q4_ks_decode(src, idx) / scale);
     }
 };
+
+template <> struct BlockInt8<block_q4_ks> {
+    static __device__ __forceinline__ Int8Sample load(const block_q4_ks* b, int e) {
+        const uint8_t byte = b->qs[e & 15];
+        const int nib = (e >= 16) ? (byte >> 4) : (byte & 0xF);
+        const float fine = (e < 4) ? (float)b->sa : (float)b->sb;
+        return Int8Sample{ (int8_t)(nib - 8), __half2float(b->d) * fine * (1.0f / 255.0f) };
+    }
+};

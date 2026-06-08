@@ -73,3 +73,11 @@ template <> struct BlockConverter<block_q4_0, __nv_fp8_e4m3> {
         return from_f32<__nv_fp8_e4m3>(d * ((float)nibble - 8.f));
     }
 };
+
+template <> struct BlockInt8<block_q4_0> {
+    static __device__ __forceinline__ Int8Sample load(const block_q4_0* b, int e) {
+        const uint8_t byte = b->qs[e & 15];
+        const int nib = (e >= 16) ? (byte >> 4) : (byte & 0xF);   // [0,15]
+        return Int8Sample{ (int8_t)(nib - 8), __half2float(b->d) }; // [-8,7]
+    }
+};

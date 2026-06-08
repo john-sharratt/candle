@@ -38,3 +38,9 @@ template <> struct BlockConverter<block_q0, __nv_fp8_e4m3> {
         return from_f32<__nv_fp8_e4m3>((float)src->centroid * (1.0f / 127.0f) / scale);
     }
 };
+
+template <> struct BlockInt8<block_q0> {
+    static __device__ __forceinline__ Int8Sample load(const block_q0* b, int) {
+        return Int8Sample{ b->centroid, (1.0f / 127.0f) };       // whole block = one centroid
+    }
+};

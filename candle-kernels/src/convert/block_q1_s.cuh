@@ -55,3 +55,10 @@ template <> struct BlockConverter<block_q1_s, __nv_fp8_e4m3> {
         return from_f32<__nv_fp8_e4m3>(bit ? blk_scale : -blk_scale);
     }
 };
+
+template <> struct BlockInt8<block_q1_s> {
+    static __device__ __forceinline__ Int8Sample load(const block_q1_s* b, int e) {
+        const int bit = (b->qs[e >> 3] >> (e & 7)) & 1;          // 1-bit sign
+        return Int8Sample{ (int8_t)(bit ? (int)b->scale : -(int)b->scale), (1.0f / 127.0f) };
+    }
+};

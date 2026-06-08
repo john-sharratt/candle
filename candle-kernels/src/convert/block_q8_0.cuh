@@ -49,3 +49,9 @@ template <> struct BlockConverter<block_q8_0, __nv_fp8_e4m3> {
         return from_f32<__nv_fp8_e4m3>(__half2float(src->d) * (float)src->qs[idx] / scale);
     }
 };
+
+template <> struct BlockInt8<block_q8_0> {
+    static __device__ __forceinline__ Int8Sample load(const block_q8_0* b, int e) {
+        return Int8Sample{ b->qs[e], __half2float(b->d) };
+    }
+};

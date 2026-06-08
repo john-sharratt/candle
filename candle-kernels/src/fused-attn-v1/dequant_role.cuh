@@ -51,8 +51,8 @@ __device__ void dequant_role(
     // PHASE 2: dequant W_qkv -> INT8 staging
     //
     // For v1 we keep the W_qkv staging body as a placeholder loop. The actual
-    // Q4_0 -> INT8 conversion mirrors load_head_int8_unscaled but with the
-    // weight tile shape (32 K-elems x W_QKV_TILE_N output dims).
+    // Q4_0 -> INT8 conversion mirrors ArenaAccessor::load_head_int8_readthrough
+    // but with the weight tile shape (32 K-elems x W_QKV_TILE_N output dims).
     // ───────────────────────────────────────────────────────────────────
     for (int k_chunk = 0; k_chunk < N_K_CHUNKS; ++k_chunk) {
         bar_sync(bar_id::W_OR_KV_LOADED, /*participants=*/2 * 32 + 2 * 32);

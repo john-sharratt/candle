@@ -170,6 +170,37 @@ struct BlockConverter {
 };
 
 // =============================================================================
+// INT8 READ-THROUGH EXTRACTOR (per-format raw int8 + per-block scale)
+// =============================================================================
+// Typed counterpart to BlockConverter for the V skip-dequant read-through
+// (ArenaAccessor::load_head_int8_readthrough_typed, §1A): return a block element
+// as a centered int8 plus the FP32 per-(dim,block) scale, with dequant == v*s.
+// Specialized (in each block_*.cuh, next to BlockConverter) for every family
+// whose dequant is expressible as int8 × one scale:
+//   symmetric      Q8_0/Q4_0/Q5_0/Q2_0/Q3_0  + Q8_1 (sum unused) + Q2_S
+//   sub-block      Q4_KS/Q8_KS                (scale = d·(sa|sb)/255)
+//   sign           Q1_S (±scale) / Q1_A       (sign → ±scale_pos|neg)
+//   centroid/anchor Q0 / Q0_M2 / Q0_M4 / Q0_X (v = the int8 codebook value)
+// Deliberately NOT specialized — no single int×scale form, so a read-through on
+// them is a compile error and the caller (gated by is_int8_readthrough_format)
+// keeps them on the FP path:
+//   asymmetric "+m" Q4_1/Q5_1/Q2_1/Q3_1/Q2_A  (need an offset term)
+//   curve codebook  Q0_V                       (128-entry parametric lookup)
+//   floating point  F16/BF16/F32/FP8/R16       (not a block integer)
+struct Int8Sample {
+    int8_t v;   // centered integer, guaranteed to fit int8
+    float  s;   // per-(dim,block) scale; dequant == v * s
+};
+
+template <typename SrcBlock> struct BlockInt8 {
+    static __device__ __forceinline__ Int8Sample load(const SrcBlock*, int) {
+        static_assert(sizeof(SrcBlock) == 0,
+                      "BlockInt8 not specialized: format is not an int8 passthrough family");
+        return Int8Sample{0, 0.f};
+    }
+};
+
+// =============================================================================
 // TYPE TRAITS
 // =============================================================================
 

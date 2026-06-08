@@ -40,3 +40,10 @@ template <> struct BlockConverter<block_q1_a, __nv_fp8_e4m3> {
     static __device__ __forceinline__ __nv_fp8_e4m3 load_element(const block_q1_a* src, int e, float scale)
     { return from_f32<__nv_fp8_e4m3>(q1_a_elem(src, e) / scale); }
 };
+
+template <> struct BlockInt8<block_q1_a> {
+    static __device__ __forceinline__ Int8Sample load(const block_q1_a* b, int e) {
+        const int sign = (b->qs[e >> 3] >> (e & 7)) & 1;
+        return Int8Sample{ (int8_t)(sign ? (int)b->scale_pos : -(int)b->scale_neg), (1.0f / 127.0f) };
+    }
+};

@@ -34,3 +34,9 @@ template <> struct BlockConverter<block_q0_m4, __nv_fp8_e4m3> {
     static __device__ __forceinline__ __nv_fp8_e4m3 load_element(const block_q0_m4* src, int e, float scale)
     { return from_f32<__nv_fp8_e4m3>(q0_m4_elem(src, e) / scale); }
 };
+
+template <> struct BlockInt8<block_q0_m4> {
+    static __device__ __forceinline__ Int8Sample load(const block_q0_m4* b, int e) {
+        return Int8Sample{ b->centroid[(b->qmask >> (2 * (e / 2))) & 3], (1.0f / 127.0f) };
+    }
+};
