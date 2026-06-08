@@ -1048,6 +1048,362 @@ int8_decode_stripe_kernel(
         k_new, v_new, rope_cs, partial_acc, partial_ml);
 }
 
+// =============================================================================
+// BATCHED-M decode (1C final) — INT8 tensor-core MMA + read-through V.
+// warp = tile-stripe (all warps compute). Per tile the warp runs an m16n8k32
+// INT8 MMA over its 8 tokens (N=8) for all HPG query heads at once (M=HPG),
+// 4 MMAs (one per 32-wide palette). C is extracted to scores_smem, then a
+// per-head flash softmax + read-through INT8 V PV. Partials fold split*warp
+// into the combine, as the stripe does. See docs/decode_kernel_batched_m.md.
+// =============================================================================
+template <typename Q_T, typename T, typename O,
+          int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED, int HPG>
+__device__ __forceinline__ void int8_decode_bmma_impl(
+    const Q_T* __restrict__ q,
+    const uint8_t* __restrict__ headers_ptr,
+    int num_active_slots,
+    int n_q_head,
+    int n_kv_head,
+    float softmax_scale,
+    const T* __restrict__ k_new,
+    const T* __restrict__ v_new,
+    const float* __restrict__ rope_cs,
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_ml
+) {
+    constexpr int VEC = HEAD_DIM / WARP_SIZE;
+    constexpr int N_PALETTE = 4;
+    constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;  // 32 for hd128
+    static_assert(SUB_HEAD_DIM == 32, "batched-M MMA requires SUB_HEAD_DIM==32 (HEAD_DIM==128)");
+
+    int slot_idx = (int)blockIdx.x;
+    int kv_head_idx = (int)blockIdx.y;
+    int split_idx = (int)blockIdx.z;
+    int num_splits = (int)gridDim.z;
+    int tid = (int)threadIdx.x;
+    int warp = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+    if (slot_idx >= num_active_slots || kv_head_idx >= n_kv_head) return;
+
+    constexpr int hpg = HPG;
+    int num_partials = num_splits * WARPS_PER_BLOCK;
+
+    float out_reg[HPG][VEC];
+    float m_i[HPG], l_i[HPG];
+    #pragma unroll
+    for (int h = 0; h < HPG; ++h) {
+        m_i[h] = -1e38f; l_i[h] = 0.f;
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) out_reg[h][j] = 0.f;
+    }
+
+    auto emit_partial = [&](int qh_local) {
+        int qh = kv_head_idx * hpg + qh_local;
+        if (qh >= n_q_head) return;
+        int64_t base = ((int64_t)slot_idx * n_q_head + qh) * num_partials
+                     + (int64_t)split_idx * WARPS_PER_BLOCK + warp;
+        float* acc = partial_acc + base * HEAD_DIM;
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) acc[lane * VEC + j] = out_reg[qh_local][j];
+        if (lane == 0) { partial_ml[base * 2] = m_i[qh_local]; partial_ml[base * 2 + 1] = l_i[qh_local]; }
+    };
+
+    const SlotHeader& slot = get_slot_header(headers_ptr, slot_idx);
+    const uint32_t n_slices = slot.n_slices;
+    const uint32_t write_slice_idx = slot.write_slice;
+    const uint64_t slices_ptr = slot.slices_ptr;
+    if (n_slices == 0) { for (int h = 0; h < hpg; ++h) emit_partial(h); return; }
+
+    uint8_t* write_slice_ptr = get_slice_mut<HEAD_DIM>(slices_ptr, (int)write_slice_idx, n_kv_head);
+    const uint16_t ws_offset = slice_offset(write_slice_ptr);
+    const uint16_t ws_len = slice_len(write_slice_ptr);
+    const uint32_t ws_rope = slice_rope(write_slice_ptr);
+
+    // ─── New-token scatter (warp 0; idempotent) ──────────────────────────
+    {
+        const int within = (int)ws_offset + (int)ws_len;
+        constexpr int LANES_PER_PAL = WARP_SIZE / N_PALETTE;
+        if (warp == 0 && within < CHUNK_SIZE) {
+            const uint8_t* head_ptr = get_head<HEAD_DIM>(write_slice_ptr, kv_head_idx);
+            int pal = lane / LANES_PER_PAL;
+            int local_lane = lane % LANES_PER_PAL;
+            uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, pal);
+            uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, pal);
+            int k_fmt = kvhead_k_fmt<HEAD_DIM>(head_ptr, pal);
+            int v_fmt = kvhead_v_fmt<HEAD_DIM>(head_ptr, pal);
+            if (k_ptr_p != 0) {
+                char* k_arena = (char*)(uintptr_t)k_ptr_p;
+                char* v_arena = (char*)(uintptr_t)v_ptr_p;
+                int k_esz = ArenaFormat::float_elem_size(k_fmt);
+                int v_esz = ArenaFormat::float_elem_size(v_fmt);
+                int64_t src_base = ((int64_t)slot_idx * (int64_t)n_kv_head + (int64_t)kv_head_idx) * (int64_t)HEAD_DIM;
+                const T* k_src = k_new + src_base;
+                const T* v_src = v_new + src_base;
+                float k_regs[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(k_src[lane * VEC + j]);
+                if (k_fmt == ArenaFormat::R16) {
+                    int q_head = kv_head_idx * hpg;
+                    int64_t q_base = ((int64_t)slot_idx * (int64_t)n_q_head + (int64_t)q_head) * (int64_t)HEAD_DIM;
+                    float q_regs[VEC];
+                    #pragma unroll
+                    for (int j = 0; j < VEC; ++j) q_regs[j] = to_f32<Q_T>(q[q_base + lane * VEC + j]);
+                    write_regs_to_r16<VEC>(k_arena, 0, within, local_lane, k_regs, q_regs);
+                } else if (k_esz > 0) {
+                    write_regs_to_arena<VEC>(k_arena, (int64_t)within * SUB_HEAD_DIM, local_lane, k_esz, k_fmt, k_regs);
+                }
+                float v_regs[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(v_src[lane * VEC + j]);
+                if (v_esz > 0) write_regs_to_arena<VEC>(v_arena, (int64_t)within * SUB_HEAD_DIM, local_lane, v_esz, v_fmt, v_regs);
+            }
+        }
+        __syncthreads();
+    }
+
+    int kv_len = (int)ws_rope + (int)ws_len + 1;
+    if (kv_len <= 0) { for (int h = 0; h < hpg; ++h) emit_partial(h); return; }
+    int max_len = (int)n_slices * CHUNK_SIZE;
+    if (kv_len > max_len) kv_len = max_len;
+
+    constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
+    constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
+
+    // ── Q staged as INT8 16x32 k-major per palette (rows 0..hpg-1 = heads). ──
+    __shared__ alignas(128) int8_t shared_qa[N_PALETTE][16][SUB_HEAD_DIM];
+    __shared__ float scaleQ[HPG][N_PALETTE];
+    {
+        // zero the pad rows (hpg..15) once
+        for (int idx = tid; idx < N_PALETTE * 16 * SUB_HEAD_DIM; idx += WARPS_PER_BLOCK * WARP_SIZE) {
+            int p = idx / (16 * SUB_HEAD_DIM);
+            int rem = idx % (16 * SUB_HEAD_DIM);
+            int r = rem / SUB_HEAD_DIM;
+            int k = rem % SUB_HEAD_DIM;
+            if (r >= hpg) shared_qa[p][r][k] = 0;
+        }
+        uint32_t q_rope_pos = (uint32_t)ws_rope + (uint32_t)ws_len;
+        if (warp == 0) {
+            #pragma unroll
+            for (int h = 0; h < HPG; ++h) {
+                int qh = kv_head_idx * hpg + h;
+                const Q_T* q_ptr = q + ((int64_t)slot_idx * n_q_head + qh) * (int64_t)HEAD_DIM;
+                float qr[VEC];
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) qr[j] = to_f32<Q_T>(q_ptr[lane * VEC + j]);
+                if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
+                    apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+                else
+                    apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, (int)q_rope_pos, rope_cs);
+                // per-palette quant (palette = lane/8, within-palette pos = (lane%8)*4+j)
+                float my_max = 0.f;
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) my_max = fmaxf(my_max, fabsf(qr[j]));
+                float pal_max = my_max;
+                pal_max = fmaxf(pal_max, __shfl_xor_sync(0xffffffff, pal_max, 1));
+                pal_max = fmaxf(pal_max, __shfl_xor_sync(0xffffffff, pal_max, 2));
+                pal_max = fmaxf(pal_max, __shfl_xor_sync(0xffffffff, pal_max, 4));
+                int my_pal = lane / 8;
+                float sc = pal_max / 127.f;
+                if (sc == 0.f) sc = 1.f;
+                if ((lane & 7) == 0) scaleQ[h][my_pal] = sc;
+                float inv = 1.f / sc;
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) {
+                    float v = fminf(fmaxf(qr[j] * inv, -127.f), 127.f);
+                    shared_qa[my_pal][h][(lane % 8) * 4 + j] = (int8_t)__float2int_rn(v);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // ── Per-warp tile scratch ────────────────────────────────────────────
+    __shared__ alignas(128) T      skt[WARPS_PER_BLOCK][HEAD_DIM];           // K load (palette order)
+    __shared__ alignas(128) int8_t shared_kb[WARPS_PER_BLOCK][8][HEAD_DIM];  // K int8 (logical = B-frag src)
+    __shared__ alignas(16)  float  scaleK[WARPS_PER_BLOCK][8][N_PALETTE];
+    __shared__ alignas(16)  float  scores_smem[WARPS_PER_BLOCK][HPG][8];
+
+    int n_tiles = (kv_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
+    int tile_lo = split_idx * tiles_per_split;
+    int tile_hi = tile_lo + tiles_per_split;
+    if (tile_hi > n_tiles) tile_hi = n_tiles;
+
+    PalIter<VEC, HEAD_DIM> ki, vi;
+    int cur_slice = -1;
+
+    // warp-stripe: each warp takes every WARPS_PER_BLOCK-th tile of the split's
+    // range (its own tile + smem buffers), so the 8 warps share the work rather
+    // than redundantly recomputing the whole range.
+    for (int tile = tile_lo + warp; tile < tile_hi; tile += WARPS_PER_BLOCK) {
+        int k_base = tile * WARPS_PER_BLOCK;
+        // A tile's 8 tokens (k_base..k_base+7) all live in one 32-token chunk, so
+        // the slice / head_ptr / off / bv / ki / vi are shared — hoist them.
+        int slice_idx = chunk_div(k_base);
+        bool slice_ok = (slice_idx < (int)n_slices);
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_ok ? slice_idx : 0, n_kv_head);
+        const uint8_t* head_ptr = get_head<HEAD_DIM>(sl, kv_head_idx);
+        uint32_t bv = (uint32_t)slice_len(sl);
+        uint32_t off = (uint32_t)slice_offset(sl);
+        if (slice_idx == (int)write_slice_idx && bv < CHUNK_SIZE && off + bv < CHUNK_SIZE) bv += 1;
+        if (slice_ok && slice_idx != cur_slice) {
+            ki.init(kvhead_k_pal_map<HEAD_DIM>(head_ptr), lane);
+            vi.init(kvhead_v_pal_map<HEAD_DIM>(head_ptr), lane);
+            cur_slice = slice_idx;
+        }
+        int32_t rope_base = (int32_t)slice_rope(sl);
+
+        int tok_within[8];
+        bool tok_valid[8];
+        // ── stage the 8 tokens' K (int8 logical → the MMA B-operand) ──
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            int kidx = k_base + t;
+            int within = chunk_mod(kidx);
+            bool valid = slice_ok && (kidx < kv_len)
+                       && (within >= (int)off && within < (int)(off + bv));
+            tok_within[t] = within;
+            tok_valid[t] = valid;
+            if (!valid) {
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) shared_kb[warp][t][lane * VEC + j] = 0;
+                if (lane < N_PALETTE) scaleK[warp][t][lane] = 1.f;
+                continue;
+            }
+            #pragma unroll
+            for (int p = 0; p < N_PALETTE; ++p) {
+                uint64_t k_ptr_p = kvhead_k_ptr<HEAD_DIM>(head_ptr, p);
+                float k_scale_p = kvhead_k_scale<HEAD_DIM>(head_ptr, p);
+                int k_fmt = kvhead_k_fmt<HEAD_DIM>(head_ptr, p);
+                if (k_ptr_p) {
+                    ArenaAccessor ka((const char*)(uintptr_t)k_ptr_p, k_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                    ka.template load_head_scaled<T, SUB_HEAD_DIM, false>(skt[warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, k_scale_p);
+                }
+            }
+            __syncwarp();
+            float k_regs[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) k_regs[j] = to_f32<T>(skt[warp][ki[j]]);
+            int32_t rope_pos = rope_base + (within - (int)off);
+            if constexpr (ROPE_INTERLEAVED && (VEC == 1 || VEC % 2 == 0))
+                apply_rope_interleaved_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+            else
+                apply_rope_rotary_f32<VEC, HEAD_DIM>(k_regs, lane, rope_pos, rope_cs);
+            float my_max = 0.f;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) my_max = fmaxf(my_max, fabsf(k_regs[j]));
+            float pal_max = my_max;
+            pal_max = fmaxf(pal_max, __shfl_xor_sync(0xffffffff, pal_max, 1));
+            pal_max = fmaxf(pal_max, __shfl_xor_sync(0xffffffff, pal_max, 2));
+            pal_max = fmaxf(pal_max, __shfl_xor_sync(0xffffffff, pal_max, 4));
+            int my_pal = lane / 8;
+            float sc = pal_max / 127.f; if (sc == 0.f) sc = 1.f;
+            if ((lane & 7) == 0) scaleK[warp][t][my_pal] = sc;
+            float inv = 1.f / sc;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                float v = fminf(fmaxf(k_regs[j] * inv, -127.f), 127.f);
+                shared_kb[warp][t][lane * VEC + j] = (int8_t)__float2int_rn(v);
+            }
+            __syncwarp();
+        }
+
+        // ── QK^T: M=HPG x N=8 INT8 MMA per palette, scaled-accumulate ──
+        int my_m = lane >> 2;            // head this lane's C holds
+        int tok0 = (lane & 3) * 2;
+        int tok1 = tok0 + 1;
+        float acc_lo = 0.f, acc_hi = 0.f;
+        #pragma unroll
+        for (int p = 0; p < N_PALETTE; ++p) {
+            uint32_t a_frag[4];
+            load_a_frag_m16k32(a_frag, &shared_qa[p][0][0], SUB_HEAD_DIM, lane);
+            uint32_t b_frag[2];
+            load_b_frag_n8k32(b_frag, &shared_kb[warp][0][p * SUB_HEAD_DIM], HEAD_DIM, lane);
+            int32_t c[4] = {0, 0, 0, 0};
+            mma_int8_m16n8k32(c, a_frag, b_frag, c);
+            if (my_m < hpg) {
+                float sq = scaleQ[my_m][p];
+                acc_lo += (float)c[0] * sq * scaleK[warp][tok0][p];
+                acc_hi += (float)c[1] * sq * scaleK[warp][tok1][p];
+            }
+        }
+        if (my_m < hpg) {
+            scores_smem[warp][my_m][tok0] = tok_valid[tok0] ? acc_lo : -1e38f;
+            scores_smem[warp][my_m][tok1] = tok_valid[tok1] ? acc_hi : -1e38f;
+        }
+        __syncwarp();
+
+        // ── softmax pass 1: per head, running-max + accumulator rescale ──
+        float new_m[HPG];
+        #pragma unroll
+        for (int h = 0; h < HPG; ++h) {
+            float tile_max = -1e38f;
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                float s = scores_smem[warp][h][t];
+                tile_max = fmaxf(tile_max, (s > -1e37f) ? s * softmax_scale : -1e38f);
+            }
+            float nm = fmaxf(m_i[h], tile_max);
+            float alpha = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(m_i[h] - nm, 0.f)).x;
+            l_i[h] *= alpha;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) out_reg[h][j] *= alpha;
+            new_m[h] = nm;
+        }
+
+        // ── PV pass 2: load each token's V once (FP, into the reused skt) and
+        // accumulate it across all heads — no per-tile V smem staging. ──
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (!tok_valid[t]) continue;
+            int within = tok_within[t];
+            #pragma unroll
+            for (int p = 0; p < N_PALETTE; ++p) {
+                uint64_t v_ptr_p = kvhead_v_ptr<HEAD_DIM>(head_ptr, p);
+                float v_scale_p = kvhead_v_scale<HEAD_DIM>(head_ptr, p);
+                int v_fmt = kvhead_v_fmt<HEAD_DIM>(head_ptr, p);
+                if (v_ptr_p) {
+                    ArenaAccessor va((const char*)(uintptr_t)v_ptr_p, v_fmt, sub_head_stride, sub_head_stride, BLOCKS_PER_DIM, 0);
+                    va.template load_head_scaled<T, SUB_HEAD_DIM, false>(skt[warp] + p * SUB_HEAD_DIM, 0, 0, within, lane, v_scale_p);
+                }
+            }
+            __syncwarp();
+            float v_regs[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) v_regs[j] = to_f32<T>(skt[warp][vi[j]]);
+            #pragma unroll
+            for (int h = 0; h < HPG; ++h) {
+                float s = scores_smem[warp][h][t];
+                if (!(s > -1e37f)) continue;
+                float beta = fast_exp::exp2<float, fast_exp::Softmax>(make_float2(s * softmax_scale - new_m[h], 0.f)).x;
+                l_i[h] += beta;
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) out_reg[h][j] = __fmaf_rn(beta, v_regs[j], out_reg[h][j]);
+            }
+            __syncwarp();
+        }
+        #pragma unroll
+        for (int h = 0; h < HPG; ++h) m_i[h] = new_m[h];
+    }
+
+    for (int h = 0; h < hpg; ++h) emit_partial(h);
+}
+
+template <typename Q_T, typename T, typename O,
+          int HEAD_DIM, int WARPS_PER_BLOCK, bool ROPE_INTERLEAVED, int HPG>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * WARP_SIZE,
+                                   int8_decode_min_blocks<WARPS_PER_BLOCK>())
+int8_decode_bmma_kernel(
+    const Q_T* q, const uint8_t* headers_ptr, int num_active_slots,
+    int n_q_head, int n_kv_head, float softmax_scale,
+    const T* k_new, const T* v_new, const float* rope_cs,
+    float* partial_acc, float* partial_ml
+) {
+    int8_decode_bmma_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, ROPE_INTERLEAVED, HPG>(
+        q, headers_ptr, num_active_slots, n_q_head, n_kv_head, softmax_scale,
+        k_new, v_new, rope_cs, partial_acc, partial_ml);
+}
+
 // -----------------------------------------------------------------------------
 // Split-KV combine: merge the num_splits per-split partial flash-states for each
 // (slot, query-head) into the final normalized output. One block per output row
@@ -1183,25 +1539,51 @@ void launch_int8_decode_attn(
         dim3 grid(num_active_slots, n_kv_head, num_splits);
         dim3 block(WARP_SIZE * WARPS_PER_BLOCK);
         if (use_stripe && pa != nullptr) {
-            // HPG is compile-time so the per-head flash-state arrays size exactly
-            // and stay in registers (no STACK local memory).
+            // HPG compile-time so the per-head flash-state arrays stay in registers.
+            // hd128 uses the batched-M INT8 tensor-core MMA; other head dims (no
+            // 32-wide palette) use the CUDA-core warp-stripe.
+            #define BMMA_LAUNCH(H)                                                         \
+                int8_decode_bmma_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,              \
+                                        ROPE_INTERLEAVED, H>                               \
+                    <<<grid, block, 0, stream>>>(                                          \
+                        q, headers_ptr, num_active_slots, n_q_head, n_kv_head,             \
+                        softmax_scale, k_new, v_new, rope_cs, pa, pm)
             #define STRIPE_LAUNCH(H)                                                       \
                 int8_decode_stripe_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,            \
                                           ROPE_INTERLEAVED, H>                             \
                     <<<grid, block, 0, stream>>>(                                          \
                         q, headers_ptr, num_active_slots, n_q_head, n_kv_head,             \
                         softmax_scale, k_new, v_new, rope_cs, pa, pm)
-            switch (heads_per_group) {
-                case 1: STRIPE_LAUNCH(1); break;
-                case 2: STRIPE_LAUNCH(2); break;
-                case 3: STRIPE_LAUNCH(3); break;
-                case 4: STRIPE_LAUNCH(4); break;
-                case 5: STRIPE_LAUNCH(5); break;
-                case 6: STRIPE_LAUNCH(6); break;
-                case 7: STRIPE_LAUNCH(7); break;
-                case 8: STRIPE_LAUNCH(8); break;
-                default: break;
+            if constexpr (HEAD_DIM == 128 && WARPS_PER_BLOCK <= 8) {
+                // batched-M's per-warp tile smem fits at WARPS<=8 (~29 KB);
+                // WARPS=16 (the hpg>8 wide path) never reaches use_stripe, so it
+                // would only be a compiled-never-run instantiation that blows the
+                // 48 KB cap — route it to the stripe instead.
+                switch (heads_per_group) {
+                    case 1: BMMA_LAUNCH(1); break;
+                    case 2: BMMA_LAUNCH(2); break;
+                    case 3: BMMA_LAUNCH(3); break;
+                    case 4: BMMA_LAUNCH(4); break;
+                    case 5: BMMA_LAUNCH(5); break;
+                    case 6: BMMA_LAUNCH(6); break;
+                    case 7: BMMA_LAUNCH(7); break;
+                    case 8: BMMA_LAUNCH(8); break;
+                    default: break;
+                }
+            } else {
+                switch (heads_per_group) {
+                    case 1: STRIPE_LAUNCH(1); break;
+                    case 2: STRIPE_LAUNCH(2); break;
+                    case 3: STRIPE_LAUNCH(3); break;
+                    case 4: STRIPE_LAUNCH(4); break;
+                    case 5: STRIPE_LAUNCH(5); break;
+                    case 6: STRIPE_LAUNCH(6); break;
+                    case 7: STRIPE_LAUNCH(7); break;
+                    case 8: STRIPE_LAUNCH(8); break;
+                    default: break;
+                }
             }
+            #undef BMMA_LAUNCH
             #undef STRIPE_LAUNCH
         } else {
             // Existing INT8-MMA kernel (warp=head). Direct write if no pool
