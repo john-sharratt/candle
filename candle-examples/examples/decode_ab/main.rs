@@ -35,7 +35,9 @@ use report::{
     render_bench, render_compare, render_golden, BenchRow, CompareOutcome, CompareRow,
     GoldenOutcome, GoldenRow,
 };
-use scenarios::{default_scenarios, perf_scenarios, select_scenarios, Scenario};
+use scenarios::{
+    default_scenarios, perf_scenarios, select_scenarios, single_decode_scenarios, Scenario,
+};
 
 #[derive(Parser)]
 #[command(
@@ -169,10 +171,13 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Bench { iters, warmup } => {
-            // Default the bench to the batch-8 perf set (fills the MMA M dim);
-            // an explicit --scenarios still overrides.
+            // Default the bench to the batch-8 perf set (fills the MMA M dim)
+            // plus the batch-1 deep-context single-decode set (the grid-starved
+            // regime split-KV targets); an explicit --scenarios still overrides.
             let bench_scen = if cli.scenarios.is_none() {
-                perf_scenarios()
+                let mut s = perf_scenarios();
+                s.extend(single_decode_scenarios());
+                s
             } else {
                 scenarios.clone()
             };

@@ -188,10 +188,39 @@ pub fn perf_scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// Single-decode (batch = 1) deep-context scenarios — 4K / 8K / 16K / 32K. This
+/// is the **most grid-starved** regime: without split-KV the grid is just
+/// `1 * n_kv_head` blocks (≈0.04 waves on this GPU), so it's where flash-decoding
+/// matters most and where the unbounded-context single-session latency lives.
+/// Kept as its own group, separate from the batched [`perf_scenarios`], so the
+/// future M-batch (batched-M / 1C) test can exclude these — a single decode row
+/// has no batch dimension to fill the MMA's M axis. GQA 3:1, hd128 (matches the
+/// `perf_scenarios` shape at batch 1). Batch-1 keeps even 32K KV well within
+/// VRAM (≈134 MB for an f16 arena), where batch-8 at 32K would not fit.
+pub fn single_decode_scenarios() -> Vec<Scenario> {
+    let mk = |name: &'static str, ctx: usize| Scenario {
+        name,
+        n_q_head: 24,
+        n_kv_head: 8,
+        head_dim: 128,
+        ctx_len: ctx,
+        num_slots: 1,
+        rope_interleaved: true,
+        compute: DType::F16,
+    };
+    vec![
+        mk("single_ctx4k", 4096),
+        mk("single_ctx8k", 8192),
+        mk("single_ctx16k", 16384),
+        mk("single_ctx32k", 32768),
+    ]
+}
+
 /// Filter scenarios by a comma-separated list of names (`--scenarios a,b`).
 pub fn select_scenarios(filter: &str) -> Result<Vec<Scenario>, String> {
     let mut universe = all_scenarios();
     universe.extend(perf_scenarios());
+    universe.extend(single_decode_scenarios());
     let mut out = Vec::new();
     let mut unknown = Vec::new();
     for want in filter.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
