@@ -439,7 +439,7 @@ fn build_segmented_slot(
         // before sealing so it doesn't bleed into slot B's layout.
         let real_chunks = seg_len.div_ceil(CHUNK_SIZE);
         backing.truncate_sequence_to_blocks(1, real_chunks)?;
-        let sealed = backing.record_turn(1, seg_len)?;
+        let sealed = backing.record_turn(1)?;
         backing.inject_sealed_at_tail(0, &sealed)?;
         cache.set_current_seq_len(end)?;
         start = end;

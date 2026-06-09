@@ -10,6 +10,19 @@ impl Scheduler {
     pub(super) fn promote_new_prefills(&mut self) {
         const MAX_ACTIVE_PREFILLS: usize = 16;
         while self.active_prefills.len() < MAX_ACTIVE_PREFILLS {
+            // VRAM-pressure backpressure (wave budgeting). Each admitted prefill
+            // pins its conversation's KV in VRAM, so under pressure we stop
+            // piling on more concurrent prefills: first force a compaction to
+            // reclaim arenas, and if VRAM is still tight, leave the rest queued
+            // this pass. We always keep ≥1 prefill in flight so the engine makes
+            // progress — a single oversized turn is then bounded by the per-arena
+            // VRAM budget gate (which compacts/fails fast rather than spilling).
+            if !self.active_prefills.is_empty() && self.vram_under_pressure() {
+                let _ = self.session.compact_forced();
+                if self.vram_under_pressure() {
+                    break;
+                }
+            }
             let work = match self.prefill_queue.pop_front() {
                 Some(w) => w,
                 None => break,
@@ -36,6 +49,21 @@ impl Scheduler {
                 error,
                 prefill_start: None,
             });
+        }
+    }
+
+    /// True when device VRAM free space has dropped below the admission
+    /// reserve (10% of total, floor 1 GiB) — the signal to stop admitting
+    /// additional concurrent prefills. Sits just above the per-arena VRAM
+    /// budget gate's reserve so admission throttles slightly before a hard
+    /// arena OOM. `false` on non-CUDA devices / when the query is unavailable.
+    pub(super) fn vram_under_pressure(&self) -> bool {
+        match self.session.vram_free_total() {
+            Some((free, total)) => {
+                let reserve = (total / 10).max(1usize << 30);
+                free < reserve
+            }
+            None => false,
         }
     }
 
@@ -194,33 +222,28 @@ impl Scheduler {
             return;
         }
 
-        // chunk_len = min remaining across active, capped by max_prefill_chunk.
-        let chunk_len = active
-            .iter()
-            .map(|&i| {
-                let p = &self.active_prefills[i];
-                p.work.tokens.len() - p.offset
-            })
-            .min()
-            .unwrap()
-            .min(self.max_prefill_chunk);
-
-        // Build uniform inputs.
+        // Ragged batch: each prefill advances by its OWN min(remaining, cap).
+        // The varlen forward packs the heterogeneous lengths flat, so a short
+        // scope no longer collapses the whole wave to the batch minimum.
+        let cap = self.max_prefill_chunk;
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
         let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
+        let mut chunks: Vec<usize> = Vec::with_capacity(active.len());
         for &i in &active {
             let p = &mut self.active_prefills[i];
             if p.prefill_start.is_none() {
                 p.prefill_start = Some(Instant::now());
             }
             let off = p.offset;
-            let tokens = &p.work.tokens[off..off + chunk_len];
+            let chunk = (p.work.tokens.len() - off).min(cap);
+            let tokens = &p.work.tokens[off..off + chunk];
             match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
                     seq_ids.push(p.work.sequence_id.0);
                     inputs.push(t);
                     group_idxs.push(i);
+                    chunks.push(chunk);
                 }
                 Err(e) => {
                     p.error = Some(ConversationError::Model(e));
@@ -231,15 +254,18 @@ impl Scheduler {
             return;
         }
 
+        let total_tokens: usize = chunks.iter().sum();
         tracing::debug!(
             target: "sched",
-            "prefill batch={} chunk_len={} decode_active={} seq_ids={:?}",
+            "prefill batch={} tokens={} decode_active={} seq_ids={:?}",
             seq_ids.len(),
-            chunk_len,
+            total_tokens,
             self.active_decodes.len(),
             seq_ids
         );
 
+        let n_seqs = seq_ids.len();
+        let t_fwd = Instant::now();
         let logits_vec = match self
             .model
             .forward_batched(&mut self.session, &seq_ids, &inputs)
@@ -253,13 +279,17 @@ impl Scheduler {
                 return;
             }
         };
+        // Prefill batch = n_seqs sequences, Σ chunks tokens (ragged).
+        self.wave_stats
+            .record(true, n_seqs, total_tokens, t_fwd.elapsed().as_millis() as u64);
 
-        for (logits, &i) in logits_vec.into_iter().zip(group_idxs.iter()) {
+        for ((logits, &i), &chunk) in logits_vec
+            .into_iter()
+            .zip(group_idxs.iter())
+            .zip(chunks.iter())
+        {
             let p = &mut self.active_prefills[i];
-            if let Err(e) = self
-                .session
-                .advance_sequence(p.work.sequence_id.0, chunk_len)
-            {
+            if let Err(e) = self.session.advance_sequence(p.work.sequence_id.0, chunk) {
                 p.error = Some(ConversationError::Model(e));
                 continue;
             }
@@ -270,9 +300,9 @@ impl Scheduler {
             // `run_prefill_with_shift`'s synchronous path.
             let seq_id = p.work.sequence_id;
             let off = p.offset;
-            let chunk_tokens = p.work.tokens[off..off + chunk_len].to_vec();
+            let chunk_tokens = p.work.tokens[off..off + chunk].to_vec();
             super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
-            p.offset += chunk_len;
+            p.offset += chunk;
             let total = p.work.tokens.len();
             let _ = p.work.event_tx.send(TurnEvent::PrefillProgress {
                 tokens_done: p.offset,

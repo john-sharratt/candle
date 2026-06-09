@@ -1329,4 +1329,27 @@ pub struct SequenceConfig {
     /// model's intent shifts.  Set to `vec![]` to disable
     /// punctuation-driven reprojection (cadence-only).
     pub reproject_trigger_texts: Vec<String>,
+
+    /// When `true`, turns on this conversation skip the per-turn
+    /// projection rebuild once the slot is seeded: the prefill appends
+    /// onto the cumulative slot instead of resetting + re-projecting, and
+    /// continuous mid-decode reprojection is forced off. The turn still
+    /// seals into the substrate. Used by append-only utility ingests
+    /// (`code_reading`, `repo_map`) where re-projecting the whole trunk
+    /// every turn is unnecessary and O(n²). **Default: `false`.**
+    pub disable_reprojection: bool,
+
+    /// Per-conversation KV-compression level override for this
+    /// conversation's *turns*. `None` ⇒ use the engine-wide turn policy
+    /// (the level set on the model builder). `Some(level)` quantizes this
+    /// conversation's sealed turns at `level` instead — used to compress
+    /// cold reference layers (e.g. `code_reading` at C8) harder than live
+    /// dialogue (C4). Section policies are unaffected. **Default: `None`.**
+    pub kv_compression_level: Option<u8>,
+
+    /// When `true`, this conversation's turns drop the engine-wide K-format
+    /// override (Q4_KS) so K is adaptively quantized per-block like V. Only
+    /// meaningful alongside `kv_compression_level`. Set for `code_reading`
+    /// so its K and V are both fully quantized. **Default: `false`.**
+    pub kv_disable_k_override: bool,
 }

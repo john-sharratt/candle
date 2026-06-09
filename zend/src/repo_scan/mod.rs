@@ -40,6 +40,13 @@ pub use walk::walk_workspace;
 pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     config.tree.summarize_every = 0;
     config.tree.segment_summarize_every = 0;
+    // Utility ingests (repo_map, code_reading) are append-only cumulative
+    // trunks — each turn just extends the layer. Skip the per-turn projection
+    // rebuild (reset + re-project the whole trunk, which is O(n²) and serial on
+    // the scheduler thread); turns still seal into the substrate. This lets the
+    // parallel workers' prefills/decodes actually batch instead of serialising
+    // behind reprojection.
+    config.disable_reprojection = true;
     config
 }
 
@@ -139,9 +146,43 @@ pub fn ingest_repo_map_into_sink<S: InsertTurnSink>(
         "repo map walk + cluster complete",
     );
 
+    // All clusters share one repo_map conversation, so their resume-cache
+    // tags accumulate into a single metadata bag written ONCE after the loop.
+    // Tagging per-cluster would re-persist the whole growing bag N times
+    // (O(n²) write volume) on the same conversation.
+    let mut tags = std::collections::BTreeMap::new();
+    tags.insert("kind".to_string(), "repo_map".to_string());
     for (i, cluster) in clusters.iter().enumerate() {
+        // Restart-resume cache: skip clusters already in the substrate
+        // (reloaded from the redo log with their content-hash tags).
+        let rm_key = format!("rm:{}", cluster.root_dir);
+        if sink.unit_cached(&rm_key, &cluster.content_hash) {
+            progress.set_step_progress((i + 1) as u64, clusters.len() as u64);
+            tracing::debug!(
+                target: "zend::repo_scan",
+                root = %cluster.root_dir,
+                "skip: cluster already in substrate (resume cache hit)",
+            );
+            continue;
+        }
         sink.insert_prefill_turn(&cluster.user_prompt, &cluster.listing)?;
+        // Discrete, escaping-safe descriptive fields keyed by cluster root —
+        // each value is stored verbatim by the substrate, so no JSON quoting
+        // is involved. `rm:<root>` is the cache key the next run probes.
+        tags.insert(rm_key, cluster.content_hash.clone());
+        tags.insert(
+            format!("rmdirs:{}", cluster.root_dir),
+            cluster.covered_dirs.len().to_string(),
+        );
+        tags.insert(
+            format!("rmbytes:{}", cluster.root_dir),
+            cluster.listing.len().to_string(),
+        );
         progress.set_step_progress((i + 1) as u64, clusters.len() as u64);
+    }
+    // Only the global `kind` tag means nothing changed; skip the write then.
+    if tags.len() > 1 {
+        sink.tag_unit(&tags);
     }
 
     let state = ClusterState::from_clusters(&clusters);

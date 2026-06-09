@@ -122,6 +122,15 @@ pub struct ConvMeta {
     pub conv_id: String,
     #[serde(default)]
     pub label: String,
+    /// Free-form per-conversation key/value metadata. Persisted in the
+    /// Label record (forward-compatible: old logs decode to an empty map).
+    /// Used as a content-addressed cache index — e.g. zend's `code_read`
+    /// and `repo_map` ingests tag each conversation with `kind`, `path`,
+    /// `content_sha256`, etc., then skip rebuilding any unit whose hash is
+    /// already present after substrate load. Searchable by (key, value)
+    /// via `Substrate::timelines_with_metadata`.
+    #[serde(default)]
+    pub custom: BTreeMap<String, String>,
 }
 
 /// Per-timeline lifecycle flags persisted in `RecordType::ConvState`.
@@ -143,6 +152,8 @@ struct LabelPayload {
     conv_id: String,
     #[serde(default)]
     label: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    custom: BTreeMap<String, String>,
 }
 
 /// Wire-format `ConvState` payload: `{timeline_id, archived}`.
@@ -266,11 +277,17 @@ impl Manifest {
 }
 
 /// Encode a `Label` record's payload — JSON.
-pub fn encode_label_payload(timeline_id: u64, conv_id: &str, label: &str) -> Vec<u8> {
+pub fn encode_label_payload(
+    timeline_id: u64,
+    conv_id: &str,
+    label: &str,
+    custom: &BTreeMap<String, String>,
+) -> Vec<u8> {
     let p = LabelPayload {
         timeline_id,
         conv_id: conv_id.to_string(),
         label: label.to_string(),
+        custom: custom.clone(),
     };
     serde_json::to_vec(&p).expect("Label payload JSON encoding is infallible")
 }
@@ -285,6 +302,7 @@ pub fn decode_label_payload(payload: &[u8]) -> Result<(u64, ConvMeta)> {
         ConvMeta {
             conv_id: p.conv_id,
             label: p.label,
+            custom: p.custom,
         },
     ))
 }
@@ -584,6 +602,40 @@ mod tests {
         assert_eq!(tl, 9);
         assert!(meta.conv_id.is_empty());
         assert!(meta.label.is_empty());
+        assert!(meta.custom.is_empty(), "missing custom must default to empty");
+    }
+
+    /// The `custom` key/value bag round-trips through encode → decode.
+    #[test]
+    fn label_payload_round_trips_custom_metadata() {
+        let mut custom = BTreeMap::new();
+        custom.insert("kind".to_string(), "code_read".to_string());
+        custom.insert("path".to_string(), "src/auth/handler.rs".to_string());
+        custom.insert("content_sha256".to_string(), "deadbeef".to_string());
+        let bytes = encode_label_payload(7, "cid", "Label", &custom);
+        let (tl, meta) = decode_label_payload(&bytes).unwrap();
+        assert_eq!(tl, 7);
+        assert_eq!(meta.conv_id, "cid");
+        assert_eq!(meta.label, "Label");
+        assert_eq!(meta.custom, custom);
+    }
+
+    /// A Label written by an older binary (no `custom` field at all)
+    /// decodes to an empty bag rather than failing — forward compat.
+    #[test]
+    fn label_payload_without_custom_decodes_empty() {
+        let payload = br#"{"timeline_id":4,"conv_id":"c","label":"L"}"#.to_vec();
+        let (_, meta) = decode_label_payload(&payload).unwrap();
+        assert!(meta.custom.is_empty());
+    }
+
+    /// An empty `custom` is omitted from the wire form (skip_serializing_if)
+    /// so existing logs/readers are byte-compatible when no metadata is set.
+    #[test]
+    fn label_payload_omits_empty_custom() {
+        let bytes = encode_label_payload(1, "c", "L", &BTreeMap::new());
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(!s.contains("custom"), "empty custom must not be serialized: {s}");
     }
 
     /// The Manifest itself must tolerate added/removed top-level

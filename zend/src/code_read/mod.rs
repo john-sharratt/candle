@@ -1,26 +1,27 @@
 //! `code_reading` layer ingestion.
 //!
-//! For every file in the [`crate::repo_scan::RepoMap`], parses into
-//! scope-aware chunks and emits a tool-call conversation onto the
-//! `code_reading` layer — for each scope, a prefilled
-//! `read_file` request, a prefilled `<tool_call>` echo, a prefilled
-//! `<tool_response>` carrying the source with line numbers, and a
-//! decoded one-sentence summary the model produces live.
+//! Each file in the [`crate::repo_scan::RepoMap`] becomes ONE
+//! conversation on the `code_reading` layer.  The file is parsed into
+//! scope-aware parts; each part contributes a prefilled `read_file`
+//! request, a prefilled `<tool_call>` echo, and a prefilled
+//! `<tool_response>` carrying the source with line numbers.  The
+//! conversation closes with a single decoded whole-file summary
+//! (≤200 words) the model produces live.
 //!
-//! Refresh is atomic: per-file content hashes ([`CodeReadState`])
-//! decide whether anything changed; if so, a fresh set of timelines
-//! is prefilled and the old set is tombstoned in a single swap.
+//! Refresh is per-file: content hashes ([`CodeReadState`]) decide
+//! which files changed; deleted files' conversations are tombstoned,
+//! changed files are re-ingested, and unchanged files are skipped via
+//! the substrate resume cache (the per-file `content_sha256` tag).
 //!
-//! **Parallel ingest.**  At the candle workspace's ~80k scopes and
-//! ~2-3s per scope decode, a single-session ingest would run for
-//! tens of hours.  Instead we mint [`CODE_READ_PARALLELISM`]
-//! Sequences on the same `(code_reading, scopes)` projection target
-//! — each a distinct timeline — and distribute files round-robin
-//! across them.  The scheduler's wave-batched grouped GEMM coalesces
-//! work across the concurrent sessions, and the resolver's
-//! `active_timelines_for_group` iterator surfaces all of them to
-//! dialogue retrieval without code changes.  Override the worker
-//! count with `ZEND_CODE_READ_PARALLELISM`.
+//! **Parallel ingest.**  At the candle workspace's tens of thousands
+//! of files, a single-session ingest would run for tens of hours.
+//! Instead [`CODE_READ_PARALLELISM`] workers each process whole files
+//! concurrently (prefill + summary decode as one unit), minting a
+//! distinct per-file conversation per file.  The scheduler's
+//! wave-batched grouped GEMM coalesces work across the concurrent
+//! sessions, and the resolver's `active_timelines_for_group` iterator
+//! surfaces all of them to dialogue retrieval without code changes.
+//! Override the worker count with `ZEND_CODE_READ_PARALLELISM`.
 
 pub mod carve;
 pub mod header;
@@ -33,15 +34,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
-use candle_conversation::projection::{Builder, SystemPromptItem, TimelineId};
-use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
+use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem};
+use candle_conversation::{ConversationEngine, SequenceConfig};
 use sha2::{Digest, Sha256};
 
 use crate::loading::LoadProgress;
 use crate::refresh_ctx::RefreshContext;
-use crate::repo_scan::{utility_config, FileEntry, RepoMap};
+use crate::repo_scan::{utility_config, FileEntry, Language, RepoMap};
 use crate::turn_sink::{InsertTurnSink, SequenceTurnSink};
 
 pub use types::Scope;
@@ -82,22 +84,47 @@ impl CodeReadState {
     }
 }
 
-/// Sink-driven core of the `code_reading` ingestion — walks every
-/// file in `map`, carves it into scopes, and emits the four-turn
-/// tool-call conversation per scope into `sink`.  Returns the
-/// per-file content hashes for the refresh path and reports progress
-/// as `(scopes_done, scopes_total)`.
+/// Emit one file's turns into `sink` — the one-conversation-per-file
+/// shape: a prefill turn per carved part (read_file tool-call + response)
+/// so the model reads the whole file across the conversation, then a final
+/// decoded turn summarising the entire file in ≤200 words. Shared by the
+/// production per-file ingest ([`process_one_file`]) and the sink-driven
+/// reference/test path ([`ingest_code_reading_into_sink`]).
+fn emit_file_turns<S: InsertTurnSink>(
+    sink: &mut S,
+    path: &str,
+    language: Language,
+    scopes: &[Scope],
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let line_offsets = compute_line_offsets(bytes);
+    for scope in scopes {
+        let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
+        let user = header::render_part_user_prompt(path, scope);
+        let assistant = format!(
+            "{}\n{}",
+            header::render_tool_call(path, scope),
+            header::render_tool_response(path, scope, language, &body),
+        );
+        sink.insert_prefill_turn(&user, &assistant)?;
+    }
+    let summary_prompt = header::render_file_summary_prompt(path);
+    sink.decode_summary_turn(&summary_prompt, header::FILE_SUMMARY_MAX_TOKENS)?;
+    Ok(())
+}
+
+/// Sink-driven reference for the per-file `code_reading` ingest — carves
+/// every file in `map` and drives [`emit_file_turns`] into `sink`. Returns
+/// the per-file content-hash record and the number of parts emitted.
 ///
 /// Kept for the integration test harness in
-/// `tests/code_read_integration.rs`, which exercises the carve +
-/// per-scope emission against the [`RecordingTurnSink`] without
-/// needing a live engine.  The production ingest paths use the
-/// parallel multi-Sequence wrapper [`ingest_code_reading`] instead;
-/// this is the single-sink reference implementation.
+/// `tests/code_read_integration.rs`, which exercises the carve + per-file
+/// emission against the [`RecordingTurnSink`] without a live engine. The
+/// production ingest is [`ingest_code_reading`] (parallel per-file pool);
+/// both shape turns through the shared [`emit_file_turns`].
 ///
-/// `dead_code`: the lint fires for the `bin` target because nothing
-/// inside the crate calls it (integration tests link as a separate
-/// crate and aren't visible to the lint).
+/// `dead_code`: the lint fires for the `bin` target because nothing inside
+/// the crate calls it (integration tests link as a separate crate).
 #[allow(dead_code)]
 pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
     sink: &mut S,
@@ -105,166 +132,28 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
     map: &RepoMap,
     progress: &LoadProgress,
 ) -> anyhow::Result<(usize, CodeReadState)> {
-    // First pass: carve everything so we know the scope total before
-    // we report any progress.  This is bounded by MAX_FILE_BYTES per
-    // file so the carve pass fits in memory.
-    let mut per_file: Vec<(FileEntry, Vec<Scope>, Vec<u8>)> = Vec::with_capacity(map.files.len());
-    let mut state = CodeReadState::default();
-    for file in &map.files {
-        let path = workspace.join(&file.path);
-        let bytes = match fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(file = %file.path, "code_read: skip unreadable file: {e}");
-                continue;
-            }
-        };
-        let is_tsx = file.path.ends_with(".tsx");
-        let scopes = carve::carve(&bytes, file.language, is_tsx);
-        if !scopes.is_empty() {
-            state.file_hashes.insert(file.path.clone(), sha256_hex(&bytes));
-            per_file.push((file.clone(), scopes, bytes));
-        }
-    }
-
-    let total: usize = per_file.iter().map(|(_, s, _)| s.len()).sum();
-    tracing::info!(
-        n_files = per_file.len(),
-        n_scopes = total,
-        "code_read carve complete",
-    );
+    let (per_file, state) = carve_workspace(workspace, map);
+    let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
+    tracing::info!(n_files = per_file.len(), n_scopes = total, "code_read carve complete");
     progress.set_step_progress(0, total as u64);
 
-    // Per-scope decode failures don't abort the whole ingest — a
-    // single bad scope shouldn't waste minutes of work.  We log
-    // each failure and keep walking; only when the failure count
-    // exceeds `MAX_DECODE_FAILURES` do we give up and propagate.
-    // Note: a failed scope leaves a half-emitted exchange — turn
-    // pair 1+2 (the prefilled tool_call) is on the trunk; turn
-    // pair 3+4 (the tool_response + decoded summary) is not.
-    // Retrieval still works because the layer's projection scores
-    // each turn pair independently.
     let mut done = 0usize;
-    let mut decode_failures = 0usize;
-    for (file, scopes, bytes) in &per_file {
-        tracing::debug!(
-            target: "zend::code_read::ingest",
-            file = %file.path,
-            file_bytes = bytes.len(),
-            n_scopes = scopes.len(),
-            "entering file",
-        );
-        let line_offsets = compute_line_offsets(bytes);
-        for scope in scopes {
-            let scope_label = format!("{}:{}-{}", file.path, scope.start_line, scope.end_line);
-            let user_q = header::render_user_prompt(&file.path, scope);
-            let tool_call = header::render_tool_call(&file.path, scope);
-            let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
-            let tool_response =
-                header::render_tool_response(&file.path, scope, file.language, &body);
-
-            tracing::debug!(
-                target: "zend::code_read::ingest",
-                scope = %scope_label,
-                kind = ?scope.kind,
-                body_bytes = body.len(),
-                tool_response_bytes = tool_response.len(),
-                progress = format!("{}/{}", done + 1, total),
-                "scope start",
-            );
-
-            // Turn 1 (user) + Turn 2 (assistant tool_call), both prefilled.
-            let prefill_start = std::time::Instant::now();
-            sink.insert_prefill_turn(&user_q, &tool_call)?;
-            tracing::debug!(
-                target: "zend::code_read::ingest",
-                scope = %scope_label,
-                ms = prefill_start.elapsed().as_millis() as u64,
-                "tool_call prefill done",
-            );
-
-            // Turn 3 (user tool_response) + Turn 4 (assistant summary,
-            // decoded live).
-            let decode_start = std::time::Instant::now();
-            tracing::debug!(
-                target: "zend::code_read::ingest",
-                scope = %scope_label,
-                tool_response_bytes = tool_response.len(),
-                "submitting summary decode",
-            );
-            match sink.decode_summary_turn(&tool_response, header::SUMMARY_MAX_TOKENS) {
-                Ok(summary) => {
-                    tracing::debug!(
-                        target: "zend::code_read::ingest",
-                        scope = %scope_label,
-                        ms = decode_start.elapsed().as_millis() as u64,
-                        summary_chars = summary.chars().count(),
-                        summary_head = %summary
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(80)
-                            .collect::<String>(),
-                        "summary decode done",
-                    );
-                }
-                Err(e) => {
-                    decode_failures += 1;
-                    tracing::warn!(
-                        target: "zend::code_read::ingest",
-                        scope = %scope_label,
-                        ms = decode_start.elapsed().as_millis() as u64,
-                        "scope summary decode failed: {e:#}",
-                    );
-                    if decode_failures > MAX_DECODE_FAILURES {
-                        return Err(anyhow::anyhow!(
-                            "code_read ingest: {decode_failures} scope summary decodes failed \
-                             (cap = {MAX_DECODE_FAILURES}); aborting refresh",
-                        ));
-                    }
-                }
-            }
-            done += 1;
-            progress.set_step_progress(done as u64, total as u64);
-            if done % 50 == 0 {
-                tracing::info!(
-                    target: "zend::code_read::ingest",
-                    done = done,
-                    total = total,
-                    decode_failures = decode_failures,
-                    "code_read progress",
-                );
-            }
-        }
+    for (file, scopes, bytes, _fhash) in &per_file {
+        emit_file_turns(sink, &file.path, file.language, scopes, bytes)?;
+        done += scopes.len();
+        progress.set_step_progress(done as u64, total as u64);
     }
 
-    tracing::info!(
-        n_scopes_emitted = done,
-        n_decode_failures = decode_failures,
-        "code_read prefill complete",
-    );
+    tracing::info!(n_scopes_emitted = done, "code_read prefill complete");
     Ok((done, state))
 }
 
-/// Maximum tolerated per-scope summary decode failures in a single
+/// Maximum tolerated per-file summary decode failures in a single
 /// ingestion pass before the whole refresh aborts.  A single
 /// failure can happen for legitimate reasons (scheduler hiccup,
 /// transient resource pressure); a cascade signals something
 /// systemic.
 pub const MAX_DECODE_FAILURES: usize = 16;
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let digest = h.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
-}
 
 /// Default number of concurrent worker timelines used by the
 /// parallel ingest path.  Override with `ZEND_CODE_READ_PARALLELISM`.
@@ -272,99 +161,73 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// these concurrent sessions, so the effective decode rate scales
 /// near-linearly until the model's expert-cache hot set saturates.
 ///
-/// Default is 8 — empirically OK on the 16 GB 4090 mobile.  16+
-/// workers reliably trips CUDA OOM during the larger tool_response
-/// prefills (the in-flight K/V across 16 concurrent prefills can
-/// peak at 8+ GB even with chunk-sealed quantisation, on top of the
-/// ~12 GB the model itself occupies).
-pub const CODE_READ_PARALLELISM: usize = 8;
+/// Default is 128 — intentionally high to exercise the VRAM-pressure path.
+/// Each concurrent worker pins a whole per-file conversation's KV in VRAM, so
+/// at 128 a large repo's combined working set will push device VRAM toward the
+/// budget. That now triggers backpressure rather than a spill: the scheduler's
+/// admission gate stops promoting new prefills + force-compacts under pressure,
+/// and the per-arena VRAM budget (`CANDLE_KV_VRAM_RESERVE_MB`) fails fast +
+/// compacts instead of letting the driver page KV to host memory. Lower it via
+/// `ZEND_CODE_READ_PARALLELISM` if you'd rather keep the live set well clear of
+/// the budget instead of relying on backpressure.
+pub const CODE_READ_PARALLELISM: usize = 128;
+
+/// KV compression level for `code_reading` turns. Dialogue runs at C4;
+/// code_reading is cold reference context the dialogue layer retrieves
+/// rarely, so it compresses its V harder (C8 adaptive selection).
+pub const CODE_READ_COMPRESSION_LEVEL: u8 = 8;
+
+/// [`utility_config`] specialised for the `code_reading` layer: append-only
+/// (no reprojection) plus the per-conversation C8 compression override.
+///
+/// **K override stays on.** Ideally code_reading would also drop the
+/// engine-wide K→Q4_KS override so K is fully adaptively quantized, but the
+/// decode kernel's K-side still fails recall on non-identity pal_map +
+/// non-unit outer scales (see `CompressionPolicy::override_k_quant` /
+/// `ModelBuilder::engine`). Dropping it would corrupt code_reading recall
+/// the moment dialogue attends back over it. So K stays Q4_KS (identity)
+/// and only V gets the harder C8 selection. Flip `kv_disable_k_override` to
+/// `true` once the decode K-path is fixed.
+fn code_read_config(config: SequenceConfig) -> SequenceConfig {
+    let mut cfg = utility_config(config);
+    cfg.kv_compression_level = Some(CODE_READ_COMPRESSION_LEVEL);
+    cfg.kv_disable_k_override = false;
+    cfg
+}
 
 /// Resolve the worker count for the parallel ingest.  Reads
 /// `ZEND_CODE_READ_PARALLELISM` if set and parseable, otherwise
-/// returns [`CODE_READ_PARALLELISM`].  Clamped to `[1, 64]` because
-/// the scheduler tops out around 64 concurrent sessions on the
-/// 4090 mobile baseline.
+/// returns [`CODE_READ_PARALLELISM`].  Clamped to `[1, 256]`.
 fn parallelism() -> usize {
     std::env::var("ZEND_CODE_READ_PARALLELISM")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, 64))
+        .map(|n| n.clamp(1, 256))
         .unwrap_or(CODE_READ_PARALLELISM)
 }
 
-/// Top-level `code_reading` ingestion — mints
-/// [`CODE_READ_PARALLELISM`] Sequences on the `(code_reading,
-/// scopes)` projection target and processes the workspace's files
-/// across them in parallel.  Files are distributed round-robin by
-/// index; each worker processes all scopes within each of its files
-/// serially before moving to the next file (reading the file's bytes
-/// once and keeping line-offset state local).
-///
-/// Returns the constructed Sequences (caller stores them under
-/// `CodeReadConv.sequences`) and the merged per-file content-hash
-/// record used by [`refresh_code_reading`].
-pub fn ingest_code_reading(
-    engine: &ConversationEngine,
-    proj_builder: Builder,
-    workspace: &Path,
-    map: &RepoMap,
-    config: SequenceConfig,
-    progress: &LoadProgress,
-) -> anyhow::Result<(Vec<Sequence>, CodeReadState)> {
-    let layer = proj_builder
-        .id_for_layer("code_reading")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'code_reading' layer"))?;
-    let group = proj_builder
-        .id_for_group("scopes")
-        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
-
-    let system_prompt = layer_system_prompt(&proj_builder, "code_reading", &config);
-    let utility_cfg = utility_config(config);
-    let n_workers = parallelism();
-    let user_override = std::env::var("ZEND_CODE_READ_PARALLELISM").is_ok();
-    tracing::info!(
-        n_workers = n_workers,
-        n_files = map.files.len(),
-        env_override = user_override,
-        "code_read: minting {n_workers} concurrent timelines \
-         (set ZEND_CODE_READ_PARALLELISM=N to override; lower it if you hit CUDA OOM)",
-    );
-
-    let mut sequences: Vec<Sequence> = Vec::with_capacity(n_workers);
-    for _ in 0..n_workers {
-        let seq = engine
-            .new_conversation_with_projection(
-                &system_prompt,
-                proj_builder.clone(),
-                layer,
-                group,
-                utility_cfg.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("code_reading conv create: {e}"))?;
-        sequences.push(seq);
-    }
-
-    let state = run_parallel_ingest(&mut sequences, workspace, map, progress, n_workers)?;
-    Ok((sequences, state))
+/// Per-file content hash (path-qualified) — the conversation's
+/// content-addressed cache key. A file move/rename or any content edit
+/// changes it, so the resume cache and the change-detection both key on
+/// it. Doubles as the [`CodeReadState`] change-detection digest (keyed by
+/// path), so a single hash per file serves both the resume cache and
+/// refresh. Path-qualified, so a move/rename re-ingests and the per-path
+/// invalidation scan is exact.
+fn file_content_hash(path: &str, bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(path.as_bytes());
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }
 
-/// Carve every file in `map`, distribute across `sequences`
-/// round-robin by file index, then drive the per-scope tool-call
-/// ingest in parallel using `std::thread::scope`.  Workers share
-/// atomic counters for progress + decode-failure accounting and an
-/// abort flag so the first worker error stops the rest.
-fn run_parallel_ingest(
-    sequences: &mut [Sequence],
+/// Carve `map`'s files into `(file, scopes, bytes, content_hash)` tuples,
+/// recording each file's hash into a fresh [`CodeReadState`]. Each file is
+/// hashed exactly once. Files that carve to no scopes are skipped.
+fn carve_workspace(
     workspace: &Path,
     map: &RepoMap,
-    progress: &LoadProgress,
-    n_workers: usize,
-) -> anyhow::Result<CodeReadState> {
-    // Carve every file sequentially up-front so we have an accurate
-    // `total` for the progress bar and a single source of truth for
-    // the per-file content hashes.  Carving is CPU-bound and small
-    // relative to ingest, so we don't bother parallelising it.
-    let mut per_file: Vec<(FileEntry, Vec<Scope>, Vec<u8>)> = Vec::with_capacity(map.files.len());
+) -> (Vec<(FileEntry, Vec<Scope>, Vec<u8>, String)>, CodeReadState) {
+    let mut per_file = Vec::with_capacity(map.files.len());
     let mut state = CodeReadState::default();
     for file in &map.files {
         let path = workspace.join(&file.path);
@@ -378,75 +241,170 @@ fn run_parallel_ingest(
         let is_tsx = file.path.ends_with(".tsx");
         let scopes = carve::carve(&bytes, file.language, is_tsx);
         if !scopes.is_empty() {
-            state
-                .file_hashes
-                .insert(file.path.clone(), sha256_hex(&bytes));
-            per_file.push((file.clone(), scopes, bytes));
+            let fhash = file_content_hash(&file.path, &bytes);
+            state.file_hashes.insert(file.path.clone(), fhash.clone());
+            per_file.push((file.clone(), scopes, bytes, fhash));
         }
     }
-    let total: usize = per_file.iter().map(|(_, s, _)| s.len()).sum();
+    (per_file, state)
+}
+
+/// Tombstone every live `code_read` conversation whose `path` is no longer
+/// present in `present_paths`. Covers files deleted while the daemon was
+/// down (the startup ingest only visits files that still exist) and files
+/// removed between fs-watcher refreshes. Still-present *changed* files are
+/// handled by [`process_one_file`], which tombstones a path's stale
+/// conversation before re-ingesting it.
+fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present_paths: &HashSet<&str>) {
+    let e = engine.lock().unwrap();
+    for (tl, path) in e.conversations_with_metadata_key("path") {
+        if !present_paths.contains(path.as_str()) {
+            if let Err(err) = e.tombstone_timeline(tl) {
+                tracing::warn!(
+                    target: "zend::code_read::ingest",
+                    path = %path,
+                    "tombstone of deleted file's conversation failed: {err:#}",
+                );
+            }
+        }
+    }
+}
+
+/// Top-level `code_reading` ingestion — **one conversation per file**.
+///
+/// Each file becomes its own `(code_reading, scopes)` conversation: one
+/// prefill turn per carved part (read_file tool-call + response) so the
+/// model reads the whole file, then a final decoded turn that summarises
+/// the entire file in ≤200 words. The conversation is tagged with a
+/// content hash + descriptive metadata, then freed — its sealed turns and
+/// metadata persist in the substrate, so retrieval and the restart-resume
+/// cache work off the substrate, not a live sequence.
+///
+/// Reconciliation runs first: conversations for files no longer on disk
+/// are tombstoned, then a one-pass snapshot of present content hashes lets
+/// each worker skip already-ingested files in O(1). A bounded pool of
+/// [`parallelism`] workers pulls files from a shared cursor, so at most
+/// that many conversations are live at once (VRAM bound) while the
+/// scheduler wave-batches their prefills/decodes. The engine mutex is
+/// taken only for the quick create/tombstone ops, never across a decode.
+pub fn ingest_code_reading(
+    engine: &Mutex<ConversationEngine>,
+    proj_builder: Builder,
+    workspace: &Path,
+    map: &RepoMap,
+    config: SequenceConfig,
+    progress: &LoadProgress,
+) -> anyhow::Result<CodeReadState> {
+    let layer = proj_builder
+        .id_for_layer("code_reading")
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'code_reading' layer"))?;
+    let group = proj_builder
+        .id_for_group("scopes")
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
+    let system_prompt = layer_system_prompt(&proj_builder, "code_reading", &config);
+    let utility_cfg = code_read_config(config);
+    let n_workers = parallelism();
+
+    let (per_file, state) = carve_workspace(workspace, map);
+    let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
+
+    // Retire conversations whose source file is gone, then snapshot the
+    // surviving content hashes once for O(1) per-file resume-cache probes.
+    let present_paths: HashSet<&str> = per_file.iter().map(|(f, _, _, _)| f.path.as_str()).collect();
+    reconcile_deleted(engine, &present_paths);
+    let present_hashes = engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values("content_sha256");
+
+    let user_override = std::env::var("ZEND_CODE_READ_PARALLELISM").is_ok();
     tracing::info!(
+        n_workers = n_workers,
         n_files = per_file.len(),
         n_scopes = total,
-        n_workers = n_workers,
-        "code_read carve complete; dispatching to workers",
+        n_cached = present_hashes.len(),
+        env_override = user_override,
+        "code_read: per-file ingest across {n_workers} workers \
+         (set ZEND_CODE_READ_PARALLELISM=N to override; lower it if you hit CUDA OOM)",
     );
     progress.set_step_progress(0, total as u64);
 
-    // Round-robin: worker `i` gets files at indices `i, i+N, i+2N, …`.
-    // Each chunk is a slice of file references — bytes/scopes stay
-    // owned by `per_file` (read-only borrow shared across threads).
-    let mut chunks: Vec<Vec<usize>> = (0..n_workers).map(|_| Vec::new()).collect();
-    for (idx, _) in per_file.iter().enumerate() {
-        chunks[idx % n_workers].push(idx);
-    }
+    run_file_pool(
+        engine,
+        &proj_builder,
+        &system_prompt,
+        &utility_cfg,
+        layer,
+        group,
+        &per_file,
+        &present_hashes,
+        total,
+        progress,
+        n_workers,
+    )?;
 
+    Ok(state)
+}
+
+/// Drive a bounded worker pool over `per_file`: each worker pulls the
+/// next file from a shared cursor and runs [`process_one_file`]. Workers
+/// share progress / decode-failure counters and an abort flag (first
+/// error stops the rest). Returns once every file is processed.
+#[allow(clippy::too_many_arguments)]
+fn run_file_pool(
+    engine: &Mutex<ConversationEngine>,
+    proj_builder: &Builder,
+    system_prompt: &str,
+    utility_cfg: &SequenceConfig,
+    layer: LayerId,
+    group: GroupId,
+    per_file: &[(FileEntry, Vec<Scope>, Vec<u8>, String)],
+    present_hashes: &HashSet<String>,
+    total: usize,
+    progress: &LoadProgress,
+    n_workers: usize,
+) -> anyhow::Result<()> {
+    let cursor = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let decode_failures = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
     let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let per_file_ref = &per_file;
-    let done_ref = &done;
-    let failures_ref = &decode_failures;
-    let abort_ref = &abort;
-    let first_error_ref = &first_error;
-    let progress_ref = progress;
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(n_workers);
-        for (worker_idx, (sequence, chunk)) in
-            sequences.iter_mut().zip(chunks.into_iter()).enumerate()
-        {
-            let chunk = chunk;
-            handles.push(s.spawn(move || {
-                let mut sink = SequenceTurnSink::new(sequence);
-                for file_idx in chunk {
-                    if abort_ref.load(Ordering::Relaxed) {
-                        return;
+        for _ in 0..n_workers.max(1) {
+            handles.push(s.spawn(|| loop {
+                if abort.load(Ordering::Relaxed) {
+                    return;
+                }
+                let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                if idx >= per_file.len() {
+                    return;
+                }
+                let (file, scopes, bytes, fhash) = &per_file[idx];
+                if let Err(e) = process_one_file(
+                    engine,
+                    proj_builder,
+                    system_prompt,
+                    utility_cfg,
+                    layer,
+                    group,
+                    file,
+                    scopes,
+                    bytes,
+                    fhash,
+                    present_hashes,
+                    total,
+                    &done,
+                    &decode_failures,
+                    progress,
+                ) {
+                    let mut slot = first_error.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(e);
                     }
-                    let (file, scopes, bytes) = &per_file_ref[file_idx];
-                    if let Err(e) = process_file(
-                        &mut sink,
-                        worker_idx,
-                        file,
-                        scopes,
-                        bytes,
-                        total,
-                        done_ref,
-                        failures_ref,
-                        progress_ref,
-                    ) {
-                        // Park the first error and signal the rest
-                        // of the scope to wind down.  Subsequent
-                        // errors from other workers are dropped —
-                        // the first cause is what matters.
-                        let mut slot = first_error_ref.lock().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
-                        abort_ref.store(true, Ordering::Relaxed);
-                        return;
-                    }
+                    abort.store(true, Ordering::Relaxed);
+                    return;
                 }
             }));
         }
@@ -458,163 +416,163 @@ fn run_parallel_ingest(
     if let Some(e) = first_error.into_inner().unwrap() {
         return Err(e);
     }
-
     tracing::info!(
-        n_scopes_emitted = done.load(Ordering::Relaxed),
+        n_files = per_file.len(),
         n_decode_failures = decode_failures.load(Ordering::Relaxed),
-        "code_read parallel ingest complete",
+        "code_read per-file ingest complete",
     );
-
-    Ok(state)
+    Ok(())
 }
 
-/// Process every scope of one file on the calling worker's sink.
-/// Mirrors the inner loop of [`ingest_code_reading_into_sink`] but
-/// reports progress / decode-failure accounting through atomic
-/// counters so multiple workers can share them safely.
+/// Ingest one file into a fresh per-file conversation: skip via the
+/// resume-cache snapshot if its content hash is already present;
+/// otherwise prefill each carved part (read_file tool-call + response),
+/// decode a final ≤200-word whole-file summary, tag the conversation
+/// with its content hash + metadata, then drop it (freeing the GPU slot;
+/// the sealed turns + tags persist in the substrate).
 #[allow(clippy::too_many_arguments)]
-fn process_file(
-    sink: &mut SequenceTurnSink<'_>,
-    worker_idx: usize,
+fn process_one_file(
+    engine: &Mutex<ConversationEngine>,
+    proj_builder: &Builder,
+    system_prompt: &str,
+    utility_cfg: &SequenceConfig,
+    layer: LayerId,
+    group: GroupId,
     file: &FileEntry,
     scopes: &[Scope],
     bytes: &[u8],
+    file_hash: &str,
+    present_hashes: &HashSet<String>,
     total: usize,
     done: &AtomicUsize,
     decode_failures: &AtomicUsize,
     progress: &LoadProgress,
 ) -> anyhow::Result<()> {
-    tracing::debug!(
-        target: "zend::code_read::ingest",
-        worker = worker_idx,
-        file = %file.path,
-        file_bytes = bytes.len(),
-        n_scopes = scopes.len(),
-        "entering file",
-    );
-    let line_offsets = compute_line_offsets(bytes);
-    for scope in scopes {
-        let scope_label = format!(
-            "[w{worker_idx}] {}:{}-{}",
-            file.path, scope.start_line, scope.end_line
-        );
-        let user_q = header::render_user_prompt(&file.path, scope);
-        let tool_call = header::render_tool_call(&file.path, scope);
-        let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
-        let tool_response = header::render_tool_response(&file.path, scope, file.language, &body);
-
-        // Turn 1 (user) + Turn 2 (assistant tool_call) — both prefilled.
-        let prefill_start = std::time::Instant::now();
-        sink.insert_prefill_turn(&user_q, &tool_call)?;
+    // Resume cache: this content hash was already in the (live, non-
+    // tombstoned) substrate at ingest start — skip the prefill+decode.
+    if present_hashes.contains(file_hash) {
+        let done_now = done.fetch_add(scopes.len(), Ordering::Relaxed) + scopes.len();
+        progress.set_step_progress(done_now as u64, total as u64);
         tracing::debug!(
             target: "zend::code_read::ingest",
-            scope = %scope_label,
-            ms = prefill_start.elapsed().as_millis() as u64,
-            "tool_call prefill done",
+            file = %file.path,
+            n_scopes = scopes.len(),
+            "skip: file already in substrate (resume cache hit)",
         );
+        return Ok(());
+    }
 
-        // Turn 3 (user tool_response) + Turn 4 (assistant summary, decoded live).
-        let decode_start = std::time::Instant::now();
-        match sink.decode_summary_turn(&tool_response, header::SUMMARY_MAX_TOKENS) {
-            Ok(summary) => {
-                tracing::debug!(
-                    target: "zend::code_read::ingest",
-                    scope = %scope_label,
-                    ms = decode_start.elapsed().as_millis() as u64,
-                    summary_chars = summary.chars().count(),
-                    summary_head = %summary
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(80)
-                        .collect::<String>(),
-                    "summary decode done",
-                );
-            }
-            Err(e) => {
-                let n = decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
+    // Cache miss → new / changed / crashed-partial file. Tombstone any
+    // stale conversation for this path (a prior generation, or a partial
+    // left by a crash before its tag was written), then mint the fresh
+    // conversation. The engine lock covers only these quick ops and is
+    // released before the decode-heavy body below.
+    let mut conv = {
+        let e = engine.lock().unwrap();
+        for tl in e.find_conversations_by_metadata("path", &file.path) {
+            if let Err(err) = e.tombstone_timeline(tl) {
                 tracing::warn!(
                     target: "zend::code_read::ingest",
-                    scope = %scope_label,
-                    ms = decode_start.elapsed().as_millis() as u64,
-                    "scope summary decode failed: {e:#}",
+                    file = %file.path,
+                    "tombstone of stale conversation failed: {err:#}",
                 );
-                if n > MAX_DECODE_FAILURES {
-                    return Err(anyhow::anyhow!(
-                        "code_read ingest: {n} scope summary decodes failed \
-                         (cap = {MAX_DECODE_FAILURES}); aborting refresh",
-                    ));
-                }
             }
         }
+        e.new_conversation_with_projection(
+            system_prompt,
+            proj_builder.clone(),
+            layer,
+            group,
+            utility_cfg.clone(),
+        )
+        .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?
+    };
 
-        let done_now = done.fetch_add(1, Ordering::Relaxed) + 1;
-        progress.set_step_progress(done_now as u64, total as u64);
-        if done_now.is_multiple_of(50) {
-            tracing::info!(
-                target: "zend::code_read::ingest",
-                done = done_now,
-                total = total,
-                decode_failures = decode_failures.load(Ordering::Relaxed),
-                "code_read progress",
-            );
+    // Shape the file's turns (per-part prefills + final summary decode).
+    let emit_result = {
+        let mut sink = SequenceTurnSink::new(&mut conv);
+        emit_file_turns(&mut sink, &file.path, file.language, scopes, bytes)
+    };
+    // Progress is per-file (the unit is now the file, not the scope).
+    let done_now = done.fetch_add(scopes.len(), Ordering::Relaxed) + scopes.len();
+    progress.set_step_progress(done_now as u64, total as u64);
+
+    if let Err(e) = emit_result {
+        // Prefill/decode failed. Do NOT tag the conversation: leaving it
+        // untagged means the next run misses the resume cache and retries
+        // this file (the stale partial is tombstoned by the path scan
+        // above), rather than caching it as permanently summary-less.
+        let n = decode_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            target: "zend::code_read::ingest",
+            file = %file.path,
+            "file ingest failed (will retry next run): {e:#}",
+        );
+        if n > MAX_DECODE_FAILURES {
+            return Err(anyhow::anyhow!(
+                "code_read ingest: {n} file ingests failed \
+                 (cap = {MAX_DECODE_FAILURES}); aborting",
+            ));
         }
+        return Ok(()); // conv drops → slot freed; no tag written.
     }
+
+    // Tag the conversation: `content_sha256` is the resume-cache key,
+    // `path` is the invalidation-scan key, the rest is diagnostic.
+    let mut tags = std::collections::BTreeMap::new();
+    tags.insert("kind".to_string(), "code_read".to_string());
+    tags.insert("path".to_string(), file.path.clone());
+    tags.insert("content_sha256".to_string(), file_hash.to_string());
+    tags.insert("lang".to_string(), format!("{:?}", file.language));
+    tags.insert("scopes".to_string(), scopes.len().to_string());
+    tags.insert("size".to_string(), bytes.len().to_string());
+    if let Err(e) = conv.set_metadata_many(&tags) {
+        tracing::warn!(
+            target: "zend::code_read::ingest",
+            file = %file.path,
+            "failed to tag conversation metadata (resume cache): {e:#}",
+        );
+    }
+    // `conv` drops here → FreeSequence releases the GPU slot; the sealed
+    // turns and metadata remain in the substrate.
     Ok(())
 }
 
-/// Outcome of an atomic [`refresh_code_reading`] call.  Same shape
-/// as [`crate::repo_scan::RefreshOutcome`].  `Replaced.sequences`
-/// carries the freshly-minted set of parallel timelines; the caller
-/// is expected to swap them in atomically and tombstone all of the
-/// previous-generation timelines in one go.
+
+/// Outcome of a [`refresh_code_reading`] call. `Replaced` carries only
+/// the new content-hash `state` — per-file conversations are freed after
+/// seal and persist in the substrate, so there's no sequence list to swap.
 pub enum RefreshOutcome {
     NoOp,
     Replaced {
-        sequences: Vec<Sequence>,
+        /// The merged per-file content-hash record after the refresh.
+        /// No live sequences: per-file conversations are freed after seal
+        /// and live in the substrate, so the caller just swaps in `state`.
         state: CodeReadState,
     },
 }
 
-/// Atomic refresh of the `code_reading` conversation.
+/// Selective refresh of the `code_reading` layer.
 ///
-/// Re-hashes the files in `map`.  Returns `NoOp` when nothing
-/// changed.  Otherwise mints a fresh set of parallel timelines (one
-/// per worker, see [`parallelism`]), runs the full parallel
-/// tool-call ingestion (including per-scope summary decodes) across
-/// them, then tombstones every prior-generation timeline.  The
-/// active resolver continues to serve the prior timelines through
-/// the entire prefill + decode window — stale better than missing.
-/// At the tombstone instant retrieval flips atomically to the new
-/// content.
+/// Re-carves `map`. Returns `NoOp` when no file hash changed. Otherwise it
+/// runs the same reconcile + per-file pool as [`ingest_code_reading`]:
+/// `reconcile_deleted` tombstones conversations for files now gone, and the
+/// pool re-ingests over all files — unchanged files hit the resume-cache
+/// snapshot and are skipped, while a changed file misses the snapshot,
+/// tombstones its stale conversation, and re-ingests. So only changed/added
+/// files actually re-prefill + re-decode.
 ///
-/// Like [`crate::repo_scan::refresh_repo_map`], the engine mutex on
-/// `ctx` is acquired only at the boundary points (mint, then
-/// tombstone) so concurrent chat consumers aren't blocked for the
-/// duration of the decode-heavy middle.
+/// The engine mutex is taken only for the quick create/tombstone ops inside
+/// the pool (released across each decode), so chat consumers keep running.
 pub fn refresh_code_reading(
     ctx: &RefreshContext<'_>,
     workspace: &Path,
     map: &RepoMap,
     prior: &CodeReadState,
-    old_timelines: &[TimelineId],
     progress: &LoadProgress,
 ) -> anyhow::Result<RefreshOutcome> {
-    // Cheap dry-run hash pass — compute the would-be next state and
-    // compare against `prior` before any model work.
-    let mut next = CodeReadState::default();
-    for file in &map.files {
-        let path = workspace.join(&file.path);
-        if let Ok(bytes) = fs::read(&path) {
-            let is_tsx = file.path.ends_with(".tsx");
-            let scopes = carve::carve(&bytes, file.language, is_tsx);
-            if !scopes.is_empty() {
-                next.file_hashes
-                    .insert(file.path.clone(), sha256_hex(&bytes));
-            }
-        }
-    }
+    // Carve once — drives both the change comparison and the re-ingest.
+    let (per_file, next) = carve_workspace(workspace, map);
     if prior.equivalent_to(&next) {
         tracing::debug!("code_read refresh: no file hash changed, skipping refresh");
         return Ok(RefreshOutcome::NoOp);
@@ -624,8 +582,7 @@ pub fn refresh_code_reading(
     tracing::info!(
         n_changed = changed.len(),
         sample_changed = ?changed.iter().take(5).collect::<Vec<_>>(),
-        n_old_timelines = old_timelines.len(),
-        "code_read refresh: minting new generation and re-ingesting all scopes",
+        "code_read refresh: reconciling + re-ingesting changed files",
     );
 
     let layer = ctx
@@ -637,49 +594,37 @@ pub fn refresh_code_reading(
         .id_for_group("scopes")
         .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
     let system_prompt = layer_system_prompt(&ctx.proj_builder, "code_reading", &ctx.config);
-    let utility_cfg = utility_config(ctx.config.clone());
+    let utility_cfg = code_read_config(ctx.config.clone());
     let n_workers = parallelism();
+    let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
+    progress.set_step_progress(0, total as u64);
 
-    let mut new_sequences: Vec<Sequence> = {
-        let engine = ctx.engine.lock().unwrap();
-        let mut v = Vec::with_capacity(n_workers);
-        for _ in 0..n_workers {
-            v.push(
-                engine
-                    .new_conversation_with_projection(
-                        &system_prompt,
-                        ctx.proj_builder.clone(),
-                        layer,
-                        group,
-                        utility_cfg.clone(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("code_reading refresh: new conv create: {e}")
-                    })?,
-            );
-        }
-        v
-    };
+    // Tombstone conversations for deleted files, then snapshot surviving
+    // hashes; changed files miss the snapshot and are re-ingested (their
+    // stale conversation is tombstoned in process_one_file).
+    let present_paths: HashSet<&str> = per_file.iter().map(|(f, _, _, _)| f.path.as_str()).collect();
+    reconcile_deleted(ctx.engine, &present_paths);
+    let present_hashes = ctx
+        .engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values("content_sha256");
 
-    // Lock-free prefill + decode window — concurrent engine
-    // consumers (chat commits, sidebar reads) keep running while we
-    // prefill the tool-call exchange and decode the per-scope
-    // summaries across all parallel timelines.
-    let fresh_state = run_parallel_ingest(&mut new_sequences, workspace, map, progress, n_workers)?;
+    run_file_pool(
+        ctx.engine,
+        &ctx.proj_builder,
+        &system_prompt,
+        &utility_cfg,
+        layer,
+        group,
+        &per_file,
+        &present_hashes,
+        total,
+        progress,
+        n_workers,
+    )?;
 
-    {
-        let engine = ctx.engine.lock().unwrap();
-        for &tl in old_timelines {
-            engine
-                .tombstone_timeline(tl)
-                .map_err(|e| anyhow::anyhow!("code_read refresh: tombstone old timeline: {e}"))?;
-        }
-    }
-
-    Ok(RefreshOutcome::Replaced {
-        sequences: new_sequences,
-        state: fresh_state,
-    })
+    Ok(RefreshOutcome::Replaced { state: next })
 }
 
 fn layer_system_prompt(
@@ -735,6 +680,20 @@ fn slice_lines(bytes: &[u8], offsets: &[usize], start_line: u32, end_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_content_hash_deterministic_path_and_content_sensitive() {
+        let h = file_content_hash("src/a.rs", b"fn x() {}");
+        // Deterministic.
+        assert_eq!(h, file_content_hash("src/a.rs", b"fn x() {}"));
+        // SHA-256 hex.
+        assert_eq!(h.len(), 64);
+        // Content edit → different hash.
+        assert_ne!(h, file_content_hash("src/a.rs", b"fn y() {}"));
+        // Path-qualified: same content at a different path → different hash
+        // (so a move/rename re-ingests, and per-path invalidation is exact).
+        assert_ne!(h, file_content_hash("src/b.rs", b"fn x() {}"));
+    }
 
     #[test]
     fn slice_lines_returns_exact_line_range() {

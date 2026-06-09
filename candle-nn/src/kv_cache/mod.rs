@@ -47,6 +47,7 @@ pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
 pub use chunked::quantize_sealed_in_place;
 pub(crate) use chunked::Arena; // Internal use only
+pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{
     arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, WriterTail,

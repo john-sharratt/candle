@@ -23,12 +23,14 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::{ConversationEngine, SamplingConfig, Sequence, TurnEvent};
 
+use zend::code_read::CodeReadState;
 use zend::loading::LoadProgress;
 
 const PROJECTION_YAML: &str = include_str!("../src/prompts/projection.yaml");
@@ -100,12 +102,16 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 struct LoadedDaemon {
     engine: ConversationEngine,
     dialogue: Sequence,
-    /// Held alive — dropping these tears down the prefilled K/V on
-    /// the foundational layers, which is what we're testing.
+    /// Held alive — dropping this tears down the prefilled K/V on the
+    /// repo_map layer, which is what we're testing.
     #[allow(dead_code)]
     repo_map: Sequence,
+    /// The code_reading pass holds no live Sequences: each per-file
+    /// conversation's slot is freed after ingest while the substrate
+    /// retains its sealed K/V, so retrieval reads it back from there.
+    /// We keep the hash record purely so the field documents the pass.
     #[allow(dead_code)]
-    code_read: Vec<Sequence>,
+    code_read_state: CodeReadState,
 }
 
 fn load_daemon(workspace: &Path) -> LoadedDaemon {
@@ -177,7 +183,11 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         start.elapsed().as_secs_f64(),
         walked.files.len()
     );
-    let (code_read, _code_read_state) = zend::code_read::ingest_code_reading(
+    // The per-file code_reading pool locks the engine for its brief
+    // create/tombstone ops, so it takes a `&Mutex<ConversationEngine>`.
+    // Mirror the daemon: wrap for the pass, then unwrap to hold on.
+    let engine = Mutex::new(engine);
+    let code_read_state = zend::code_read::ingest_code_reading(
         &engine,
         proj_builder_code_read,
         workspace,
@@ -186,6 +196,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         &progress,
     )
     .expect("code reading ingest");
+    let engine = engine.into_inner().expect("engine mutex not poisoned");
     eprintln!(
         "code_reading ingestion done ({:.1}s)",
         start.elapsed().as_secs_f64()
@@ -195,7 +206,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         engine,
         dialogue,
         repo_map,
-        code_read,
+        code_read_state,
     }
 }
 

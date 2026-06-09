@@ -296,18 +296,24 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let _ = &generation;
         let batch_size = contexts.len();
 
-        // Collect offsets and input tensors
+        // Collect offsets, input tensors, and per-sequence new-token lengths.
         let mut offsets = Vec::with_capacity(batch_size);
         let mut input_tensors = Vec::with_capacity(batch_size);
         let mut write_shifts_raw = Vec::with_capacity(batch_size);
+        let mut q_lens = Vec::with_capacity(batch_size);
         for ctx in contexts.iter() {
             offsets.push(ctx.offset);
             input_tensors.push(ctx.input_ids.clone());
             write_shifts_raw.push(ctx.write_offset_shift as u32);
+            q_lens.push(ctx.input_len);
         }
 
-        // Convert to TensorCat with cat_dim=0 (batch dimension)
-        let x = TensorCat::from_tensors(0, input_tensors.into_iter())?;
+        // Prefill packs the batch FLAT along the token dimension ([1, Σlen, …])
+        // so heterogeneous per-sequence lengths share one varlen forward; decode
+        // (1 token/seq) stacks along the batch dimension ([b_sz, 1, …]).
+        let is_prefill = matches!(decode_headers, DecodeHeaders::Prefill(_));
+        let cat_dim = if is_prefill { 1 } else { 0 };
+        let x = TensorCat::from_tensors(cat_dim, input_tensors.into_iter())?;
 
         // Derive dtype from KV cache to ensure consistency throughout forward pass
         let cache_dtype = contexts
@@ -331,10 +337,12 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             .forward_as_dtype(&x_tensor, embed_dtype)?
             .contiguous()?;
 
+        // For prefill (flat) `seq_len` is the total packed token count; for decode
+        // it is 1. Per-sequence lengths are carried in `q_lens`.
         let (_, seq_len, _) = embedded.dims3()?;
 
-        // Pre-compute RoPE (cos, sin) for the batch
-        let rope_cos_sin = self.compute_rope_for_batch(&offsets, seq_len, embed_dtype)?;
+        // Pre-compute RoPE (cos, sin) for the batch (ragged per-token positions).
+        let rope_cos_sin = self.compute_rope_for_batch(&offsets, &q_lens, embed_dtype)?;
 
         // Get-or-compute the precomputed RoPE cos/sin table for decode.
         // Lazily initialized on first decode call, then cached for subsequent calls.
@@ -385,6 +393,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             &self.inv_freq_device,
             &rope_cs,
             decode_headers,
+            &q_lens,
             generation,
         );
 
@@ -448,8 +457,23 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let logits = if self.all_logits {
             // All positions (perplexity evaluation mode)
             self.model.output_proj().forward(&x)?
+        } else if is_prefill {
+            // Flat-packed prefill: x is [1, total, hidden]; the last token of
+            // sequence i sits at the flat index (Σ_{j<=i} q_lens[j]) - 1. Gather
+            // those rows → [n_seqs, hidden] before the vocab projection.
+            let hidden = x.dim(2)?;
+            let x_flat = x.reshape((seq_len, hidden))?;
+            let mut last_idx = Vec::with_capacity(q_lens.len());
+            let mut acc = 0u32;
+            for &l in &q_lens {
+                acc += l as u32;
+                last_idx.push(acc - 1);
+            }
+            let idx = Tensor::from_vec(last_idx, q_lens.len(), x_flat.device())?;
+            let last_hidden = x_flat.index_select(&idx, 0)?.contiguous()?;
+            self.model.output_proj().forward(&last_hidden)?
         } else {
-            // Last token only (normal inference)
+            // Decode: [b_sz, 1, hidden] → the single (last) token per sequence.
             let last_hidden = x.i((.., seq_len - 1, ..))?.contiguous()?;
             self.model.output_proj().forward(&last_hidden)?
         };
@@ -473,16 +497,18 @@ impl<M: BatchedModelCore> BatchedInference<M> {
     fn compute_rope_for_batch(
         &self,
         offsets: &[usize],
-        seq_len: usize,
+        q_lens: &[usize],
         dtype: DType,
     ) -> Result<(Tensor, Tensor)> {
         use super::decode_utils;
 
-        let batch_size = offsets.len();
-
-        // Calculate required RoPE table length
-        let max_offset = offsets.iter().copied().max().unwrap_or(0);
-        let required_len = max_offset + seq_len;
+        // Required RoPE table length = max over sequences of (offset + q_len).
+        let required_len = offsets
+            .iter()
+            .zip(q_lens.iter())
+            .map(|(&o, &l)| o + l)
+            .max()
+            .unwrap_or(1);
 
         // RoPE doesn't support F8E4M3, use BF16 instead
         let rope_dtype = if dtype == DType::F8E4M3 {
@@ -494,38 +520,39 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // Get RoPE tables (may extend if needed)
         let (cos_all, sin_all) = self.get_rope_tables(rope_dtype, required_len)?;
 
-        if seq_len == 1 {
-            // Decode path: gather (cos, sin) at offset positions
+        // Decode is the uniform single-token case (every q_len == 1): gather the
+        // (cos, sin) at the per-sequence offsets → [b_sz, rotary].
+        if q_lens.iter().all(|&l| l == 1) {
             let offsets_t = decode_utils::offsets_to_u32_tensor(offsets, self.model.device())?;
-            decode_utils::gather_rope_cos_sin(&cos_all, &sin_all, &offsets_t)
-        } else {
-            // Prefill path: build flattened position indices and gather
-            let mut pos = Vec::with_capacity(batch_size * seq_len);
-            for &off in offsets.iter() {
-                let base = off as u32;
-                for i in 0..seq_len {
-                    pos.push(base + i as u32);
-                }
-            }
-            let pos_flat = Tensor::from_vec(pos, (batch_size * seq_len,), self.model.device())?;
-
-            let mut cos = cos_all.index_select(&pos_flat, 0)?;
-            let mut sin = sin_all.index_select(&pos_flat, 0)?;
-
-            // Ensure contiguity
-            if !cos.is_contiguous() {
-                cos = cos.contiguous()?;
-            }
-            if !sin.is_contiguous() {
-                sin = sin.contiguous()?;
-            }
-
-            // Reshape for batch processing: (B*L, D/2) -> (B, L, D/2)
-            let rotary_dim = cos.dim(1)?;
-            let cos = cos.reshape((batch_size, seq_len, rotary_dim))?;
-            let sin = sin.reshape((batch_size, seq_len, rotary_dim))?;
-
-            Ok((cos, sin))
+            return decode_utils::gather_rope_cos_sin(&cos_all, &sin_all, &offsets_t);
         }
+
+        // Prefill: ragged per-token positions flat-packed in cu_seqlens order.
+        // Sequence i's new tokens occupy absolute positions [off_i, off_i+q_len_i).
+        let total: usize = q_lens.iter().sum();
+        let mut pos = Vec::with_capacity(total);
+        for (&off, &l) in offsets.iter().zip(q_lens.iter()) {
+            for i in 0..l {
+                pos.push((off + i) as u32);
+            }
+        }
+        let pos_flat = Tensor::from_vec(pos, (total,), self.model.device())?;
+
+        let mut cos = cos_all.index_select(&pos_flat, 0)?;
+        let mut sin = sin_all.index_select(&pos_flat, 0)?;
+        if !cos.is_contiguous() {
+            cos = cos.contiguous()?;
+        }
+        if !sin.is_contiguous() {
+            sin = sin.contiguous()?;
+        }
+
+        // [total, rotary] -> [1, total, rotary] to match the flat [1, total, …]
+        // activation (batch-of-one); the non-paged rope() consumes it directly.
+        let rotary_dim = cos.dim(1)?;
+        let cos = cos.reshape((1, total, rotary_dim))?;
+        let sin = sin.reshape((1, total, rotary_dim))?;
+
+        Ok((cos, sin))
     }
 }

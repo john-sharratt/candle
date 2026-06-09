@@ -38,7 +38,7 @@ fn paged_prefill_batched_impl(
     k: &Tensor,
     v: &Tensor,
     b_sz: usize,
-    seq_len: usize,
+    q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -48,16 +48,24 @@ fn paged_prefill_batched_impl(
     rope_interleaved: bool,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
-) -> Result<Vec<Tensor>> {
-    if !(seq_len > 1
+) -> Result<Tensor> {
+    // Ragged/varlen prefill. q/k/v arrive FLAT-packed:
+    //   q: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
+    // where total_q = Σ q_lens and the per-sequence token ranges are described
+    // by `prefill_meta` (cu_seqlens_q / q_lens / kv_lens). `b_sz` is the number
+    // of sequences (= caches.len() = q_lens.len()). Uniform prefill is the
+    // special case where all q_lens are equal.
+    let total_q: usize = q_lens.iter().sum();
+    let max_add = q_lens.iter().copied().max().unwrap_or(0);
+    if !(max_add >= 1
         && matches!(q.device(), Device::Cuda(_))
         && head_dim % 32 == 0
         && head_dim <= 256)
     {
         candle::bail!(
             "paged prefill batched attention not applicable: \
-             seq_len={}, device={:?}, head_dim={}",
-            seq_len,
+             total_q={}, device={:?}, head_dim={}",
+            total_q,
             q.device(),
             head_dim
         );
@@ -80,10 +88,10 @@ fn paged_prefill_batched_impl(
         let max_len = offsets.iter().copied().max().unwrap_or(0);
         let max_after = offsets
             .iter()
-            .copied()
-            .map(|o| o.saturating_add(seq_len))
+            .zip(q_lens.iter())
+            .map(|(&o, &l)| o.saturating_add(l))
             .max()
-            .unwrap_or(seq_len);
+            .unwrap_or(max_add);
 
         // If we're creating chunked backing from scratch (no prefix to migrate), use the
         // incoming K/V dtype. Empty caches may otherwise report a default dtype (often F32)
@@ -117,8 +125,10 @@ fn paged_prefill_batched_impl(
         let backing =
             ChunkedKvBacking::new(b_sz, n_kv_head, head_dim, dtype, q.device(), max_after)?;
 
-        // Allocate chunks covering the range we will write.
-        backing.ensure_for_offsets(offsets, seq_len)?;
+        // Allocate chunks for exactly each sequence's own new-token count — never
+        // over-allocate to max(q_lens), which would leave extra tail chunks that
+        // desync the decode writer slice.
+        backing.ensure_for_offsets(offsets, q_lens)?;
 
         // Switch caches to shared chunked backing.
         for (i, cache) in caches.iter_mut().enumerate() {
@@ -132,9 +142,16 @@ fn paged_prefill_batched_impl(
         candle::bail!("chunked backing unavailable");
     }
 
-    // Ensure chunks are allocated for writing this segment.
+    // Ensure chunks for EXACTLY each sequence's own q_len — never over-allocate
+    // to max(q_lens). Extra trailing chunks on a shorter sequence desync the
+    // decode writer slice (the kernel's "one free slot per chunk" contract),
+    // tripping the `ws_offset + ws_len < CHUNK_SIZE` assert on its next decode.
+    // Per-cache calls use each cache's real batch_idx, so a single-element slice
+    // targets the correct slot.
     let t_alloc = profile_now();
-    KvCache::ensure_chunked_capacity_batch(caches, offsets, seq_len)?;
+    for (i, &add) in q_lens.iter().enumerate() {
+        KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
+    }
     profile_sync(q.device());
     pipeline_record("prefill:alloc", t_alloc);
 
@@ -183,49 +200,49 @@ fn paged_prefill_batched_impl(
         v.contiguous()?
     };
 
-    // Build packed Q and metadata.
-    let total_q = b_sz * seq_len;
-    let mut q_packed = q.transpose(1, 2)?;
-    if !q_packed.is_contiguous() {
-        q_packed = q_packed.contiguous()?;
-    }
-    let q_packed = q_packed.reshape((total_q, n_head, head_dim))?;
+    // Q/K/V already arrive FLAT-packed in cu_seqlens_q token order:
+    //   q_packed: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
+    // (k/v were made contiguous just above). No transpose/reshape needed.
+    let q_packed = if q.is_contiguous() {
+        q.clone()
+    } else {
+        q.contiguous()?
+    };
+    let k_packed = k;
+    let v_packed = v;
+    debug_assert_eq!(q_packed.dim(0)?, total_q);
 
-    // Build packed K/V for this segment. Packed layout: (total_q, n_kv_head, head_dim)
-    // with the same token order as q_packed (cu_seqlens_q).
-    let mut k_packed = k.transpose(1, 2)?;
-    if !k_packed.is_contiguous() {
-        k_packed = k_packed.contiguous()?;
-    }
-    let k_packed = k_packed.reshape((total_q, n_kv_head, head_dim))?;
-
-    let mut v_packed = v.transpose(1, 2)?;
-    if !v_packed.is_contiguous() {
-        v_packed = v_packed.contiguous()?;
-    }
-    let v_packed = v_packed.reshape((total_q, n_kv_head, head_dim))?;
-
-    let (cu_seqlens_q, q_lens, kv_lens, has_prefix) =
+    // Varlen metadata (device tensors). Renamed to `*_dev` so the host
+    // `q_lens: &[usize]` param stays in scope for the per-seq seqlen update.
+    let (cu_seqlens_q, q_lens_dev, kv_lens, has_prefix) =
         if let Some((cu, ql, kv, has_prefix)) = prefill_meta {
             (cu.clone(), ql.clone(), kv.clone(), has_prefix)
         } else {
+            // Fallback: rebuild the ragged metadata from the host q_lens.
             let mut cu = Vec::with_capacity(b_sz + 1);
             cu.push(0u32);
-            for i in 1..=b_sz {
-                cu.push((i * seq_len) as u32);
+            let mut acc = 0u32;
+            for &l in q_lens {
+                acc += l as u32;
+                cu.push(acc);
             }
             let cu_seqlens_q = Tensor::from_vec(cu, b_sz + 1, q.device())?;
-            let q_lens = Tensor::from_vec(vec![seq_len as u32; b_sz], b_sz, q.device())?;
+            let q_lens_dev = Tensor::from_vec(
+                q_lens.iter().map(|&l| l as u32).collect::<Vec<_>>(),
+                b_sz,
+                q.device(),
+            )?;
             let kv_lens = Tensor::from_vec(
                 offsets
                     .iter()
-                    .map(|&o| (o + seq_len) as u32)
+                    .zip(q_lens.iter())
+                    .map(|(&o, &l)| (o + l) as u32)
                     .collect::<Vec<_>>(),
                 b_sz,
                 q.device(),
             )?;
             let has_prefix = offsets.iter().any(|&o| o > 0);
-            (cu_seqlens_q, q_lens, kv_lens, has_prefix)
+            (cu_seqlens_q, q_lens_dev, kv_lens, has_prefix)
         };
 
     let softmax_scale = 1f32 / (head_dim as f32).sqrt();
@@ -285,13 +302,13 @@ fn paged_prefill_batched_impl(
             })
             .collect();
 
-        // Extend each slot's position_map to cover the prefill's write
-        // region.  After this, `position_map.len() == offsets[i] + seq_len`
-        // for every slot, so the kernel can resolve any k_pos in
-        // `[0, kv_lens[i])` via a single lookup.
+        // Extend each slot's position_map to cover the prefill's write region.
+        // Ragged: slot i writes q_lens[i] new tokens, so after this
+        // `position_map.len() == offsets[i] + q_lens[i] == kv_lens[i]`, letting
+        // the kernel resolve any k_pos in `[0, kv_lens[i])` via a single lookup.
         let chunk_size = CHUNK_SIZE;
-        for slot in slots.iter_mut() {
-            slot.extend_for_write_region(seq_len, chunk_size);
+        for (slot, &add) in slots.iter_mut().zip(q_lens.iter()) {
+            slot.extend_for_write_region(add, chunk_size);
         }
 
         // Pack slices — upload via stager for zero-copy PCIe read.
@@ -360,7 +377,7 @@ fn paged_prefill_batched_impl(
     let out_packed = paged_prefill_attn_varlen_chunks(
         &q_packed,
         &cu_seqlens_q,
-        &q_lens,
+        &q_lens_dev,
         &kv_lens,
         &k_packed,
         &v_packed,
@@ -379,8 +396,10 @@ fn paged_prefill_batched_impl(
     )?;
     profile_sync(q.device());
     pipeline_record("prefill:kernel", t_kernel);
-    for (cache, &off) in caches.iter_mut().zip(offsets.iter()) {
-        cache.set_current_seq_len(off + seq_len)?;
+    // Per-sequence written length (each sequence advanced by its own q_lens[i],
+    // not the over-allocated max_add).
+    for ((cache, &off), &add) in caches.iter_mut().zip(offsets.iter()).zip(q_lens.iter()) {
+        cache.set_current_seq_len(off + add)?;
     }
 
     // After each prefill layer, eagerly quantize all fully-sealed chunks so that
@@ -404,19 +423,15 @@ fn paged_prefill_batched_impl(
         KvCache::prime_chunked_decode_slots_batch(caches)?;
     }
 
-    let out = out_packed
-        .reshape((b_sz, seq_len, n_head, head_dim))?
-        .transpose(1, 2)?;
-
-    let mut outputs = Vec::with_capacity(b_sz);
-    for i in 0..b_sz {
-        outputs.push(out.narrow(0, i, 1)?);
-    }
-    Ok(outputs)
+    // Return the attention output FLAT-packed in cu_seqlens_q token order:
+    // [total_q, n_head, head_dim]. The caller reshapes to [total_q, n_head*head_dim]
+    // and runs the output projection per-token (no per-sequence split needed).
+    Ok(out_packed)
 }
 
 /// Public wrapper: full-context prefill (no windowing).
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn paged_prefill_batched(
     caches: &mut [&mut KvCache],
     offsets: &[usize],
@@ -424,7 +439,7 @@ pub fn paged_prefill_batched(
     k: &Tensor,
     v: &Tensor,
     b_sz: usize,
-    seq_len: usize,
+    q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -434,7 +449,7 @@ pub fn paged_prefill_batched(
     rope_interleaved: bool,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
-) -> Result<Vec<Tensor>> {
+) -> Result<Tensor> {
     paged_prefill_batched_impl(
         caches,
         offsets,
@@ -442,7 +457,7 @@ pub fn paged_prefill_batched(
         k,
         v,
         b_sz,
-        seq_len,
+        q_lens,
         n_head,
         n_kv_head,
         head_dim,
@@ -456,6 +471,7 @@ pub fn paged_prefill_batched(
 }
 
 #[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
 pub fn paged_prefill_batched(
     caches: &mut [&mut KvCache],
     offsets: &[usize],
@@ -463,7 +479,7 @@ pub fn paged_prefill_batched(
     k: &Tensor,
     v: &Tensor,
     b_sz: usize,
-    seq_len: usize,
+    q_lens: &[usize],
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -473,10 +489,11 @@ pub fn paged_prefill_batched(
     _rope_interleaved: bool,
     _write_offset_shifts_ptr: u64,
     _generation: &Generation,
-) -> Result<Vec<Tensor>> {
-    // Fallback: per-sequence standard attention when paged prefill isn't available
-    // This happens when head_dim is not a multiple of 32, or device isn't CUDA
-    // NOTE: This fallback requires non-chunked caches since it uses cache.append()
+) -> Result<Tensor> {
+    // CPU fallback: per-sequence standard attention. The paged CUDA kernel is
+    // the production path; this exists only for non-chunked CPU caches.
+    // Q/K/V arrive FLAT-packed [total_q, n_*head, head_dim] in cu_seqlens order;
+    // we slice each sequence's rows via the running prefix sum of q_lens.
     let first_cache = caches
         .first()
         .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
@@ -490,15 +507,26 @@ pub fn paged_prefill_batched(
     }
 
     let mut all_outputs = Vec::with_capacity(b_sz);
+    let mut cu = 0usize;
     for (batch_idx, cache) in caches.iter_mut().enumerate() {
-        let q_seq = q.narrow(0, batch_idx, 1)?;
-        let k_seq = k.narrow(0, batch_idx, 1)?;
-        let v_seq = v.narrow(0, batch_idx, 1)?;
+        let seq_len = q_lens[batch_idx];
+        // Slice this sequence's flat rows and restore [1, n_*head, seq_len, head_dim].
+        let q_seq = q
+            .narrow(0, cu, seq_len)?
+            .reshape((1, seq_len, n_head, head_dim))?
+            .transpose(1, 2)?;
+        let k_seq = k
+            .narrow(0, cu, seq_len)?
+            .reshape((1, seq_len, n_kv_head, head_dim))?
+            .transpose(1, 2)?;
+        let v_seq = v
+            .narrow(0, cu, seq_len)?
+            .reshape((1, seq_len, n_kv_head, head_dim))?
+            .transpose(1, 2)?;
+        cu += seq_len;
 
         // Append new K/V to cache
         let (k_cached, v_cached) = cache.append(&k_seq, &v_seq)?;
-
-        // Get cache length before moving k_cached
         let cache_len = k_cached.dim(2)?;
 
         // Repeat K/V heads for MQA/GQA
@@ -509,7 +537,6 @@ pub fn paged_prefill_batched(
         let scale = 1.0 / (head_dim as f64).sqrt();
         let att = (q_seq.matmul(&k_rep.t()?)? * scale)?;
 
-        // Apply causal mask for multi-token sequences
         let offset = offsets[batch_idx];
         let mask: Vec<f32> = (0..seq_len)
             .flat_map(|i| {
@@ -526,11 +553,16 @@ pub fn paged_prefill_batched(
         let mask = mask.to_dtype(att.dtype())?;
         let att = att.broadcast_add(&mask)?;
         let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let attn_out = att.matmul(&v_rep.contiguous()?)?.transpose(1, 2)?;
+        // [1, n_head, seq_len, head_dim] -> [seq_len, n_head, head_dim] (flat row block)
+        let attn_out = att
+            .matmul(&v_rep.contiguous()?)?
+            .transpose(1, 2)?
+            .reshape((seq_len, n_head, head_dim))?;
         all_outputs.push(attn_out);
     }
 
-    Ok(all_outputs)
+    // Concatenate per-sequence outputs back into the flat [total_q, n_head, head_dim].
+    Tensor::cat(&all_outputs, 0)
 }
 
 #[cfg(feature = "cuda")]
@@ -1259,10 +1291,79 @@ unsafe extern "C" fn fused_v1_bf16_shim(
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
-    use super::paged_prefill_batched;
-    use candle::quantized::pinned_staging::PinnedStager;
+    use super::paged_prefill_batched as paged_prefill_flat;
+    use candle::quantized::pinned_staging::{Generation, PinnedStager};
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::KvCache;
+
+    /// Test shim mapping the legacy uniform calling convention (q/k/v as
+    /// `[b_sz, n_head, seq_len, head_dim]`, returning per-sequence
+    /// `[1, n_head, seq_len, head_dim]`) onto the production flat/ragged
+    /// [`paged_prefill_flat`]. Lets the kernel-correctness tests keep their
+    /// original shapes/assertions while the production API is flat-packed.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_prefill_uniform(
+        caches: &mut [&mut KvCache],
+        offsets: &[usize],
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        b_sz: usize,
+        seq_len: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        _prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+        rope_offsets: &Tensor,
+        rope_cs: &Tensor,
+        rope_interleaved: bool,
+        write_offset_shifts_ptr: u64,
+        generation: &Generation,
+    ) -> Result<Vec<Tensor>> {
+        let total_q = b_sz * seq_len;
+        let q_flat = q
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total_q, n_head, head_dim))?;
+        let k_flat = k
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total_q, n_kv_head, head_dim))?;
+        let v_flat = v
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((total_q, n_kv_head, head_dim))?;
+        let q_lens = vec![seq_len; b_sz];
+        let out = paged_prefill_flat(
+            caches,
+            offsets,
+            &q_flat,
+            &k_flat,
+            &v_flat,
+            b_sz,
+            &q_lens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            None,
+            rope_offsets,
+            rope_cs,
+            rope_interleaved,
+            write_offset_shifts_ptr,
+            generation,
+        )?;
+        // Flat [total_q, n_head, head_dim] -> per-seq [1, n_head, seq_len, head_dim].
+        let mut per_seq = Vec::with_capacity(b_sz);
+        for i in 0..b_sz {
+            per_seq.push(
+                out.narrow(0, i * seq_len, seq_len)?
+                    .reshape((1, seq_len, n_head, head_dim))?
+                    .transpose(1, 2)?
+                    .contiguous()?,
+            );
+        }
+        Ok(per_seq)
+    }
 
     /// Helper: create a standard inv_freq tensor for tests (theta = 10000.0).
     /// Shape: (head_dim / 2,), dtype F32, on the given device.
@@ -1326,7 +1427,7 @@ mod tests {
         let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
         let generation = PinnedStager::new(device.as_cuda_device()?).begin_generation();
 
-        let out = paged_prefill_batched(
+        let out = paged_prefill_uniform(
             &mut caches,
             &offsets,
             &q,
@@ -1414,7 +1515,7 @@ mod tests {
         let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
         let generation = PinnedStager::new(device.as_cuda_device()?).begin_generation();
 
-        let out = paged_prefill_batched(
+        let out = paged_prefill_uniform(
             &mut caches,
             &offsets,
             &q,
@@ -1495,7 +1596,7 @@ mod tests {
         let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
         let generation = PinnedStager::new(device.as_cuda_device()?).begin_generation();
 
-        let out = paged_prefill_batched(
+        let out = paged_prefill_uniform(
             &mut caches,
             &offsets,
             &q,
@@ -1668,7 +1769,7 @@ mod tests {
         let rope_zeros = Tensor::zeros(b_sz, DType::U32, q.device())?;
         let generation = PinnedStager::new(q.device().as_cuda_device()?).begin_generation();
 
-        let out = paged_prefill_batched(
+        let out = paged_prefill_uniform(
             &mut caches,
             &offsets,
             q,
@@ -1866,7 +1967,7 @@ mod tests {
             let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
             let generation = backing.begin_stager_generation_required();
 
-            let out = paged_prefill_batched(
+            let out = paged_prefill_uniform(
                 &mut caches,
                 &offsets,
                 &new_q,
@@ -1962,7 +2063,7 @@ mod tests {
             let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
             let generation = backing.begin_stager_generation_required();
 
-            let out = paged_prefill_batched(
+            let out = paged_prefill_uniform(
                 &mut caches,
                 &offsets,
                 &new_q,
@@ -2166,7 +2267,7 @@ mod tests {
         let mut caches: [&mut KvCache; 1] = [&mut cache0];
         let generation = backing.begin_stager_generation_required();
 
-        let out = paged_prefill_batched(
+        let out = paged_prefill_uniform(
             &mut caches,
             &offsets,
             q,

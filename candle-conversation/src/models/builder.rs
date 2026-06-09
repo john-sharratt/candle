@@ -124,7 +124,7 @@ impl ModelBuilder {
             model_path: None,
             tokenizer_path: None,
             thinking: None,
-            kv_compression_level: 4,
+            kv_compression_level: 5,
             show_special_tokens: false,
             penalty_log_path: None,
             health_config: DecodeHealthConfig::default(),
@@ -468,6 +468,12 @@ impl ModelBuilder {
             // Linefeed is the most reliable paragraph/section break
             // signal across chat templates and content styles.
             reproject_trigger_texts: vec!["\n".to_string()],
+            disable_reprojection: false,
+            // Default: turns use the engine-wide compression level. Utility
+            // layers override these per-conversation (e.g. code_reading → C8,
+            // K override dropped) via `repo_scan::utility_config` callers.
+            kv_compression_level: None,
+            kv_disable_k_override: false,
         }
     }
 

@@ -1,19 +1,20 @@
-//! Per-scope prefill rendering for the `code_reading` layer's
+//! Prefill rendering for the `code_reading` layer's per-file
 //! tool-call conversation.
 //!
-//! Each carved scope produces a four-turn exchange that teaches the
-//! model the canonical "use a tool, parse the response, summarise"
-//! pattern:
+//! Each file becomes ONE conversation. Every carved part of the file
+//! contributes a prefilled tool-call exchange that teaches the model
+//! the canonical "use a tool, read the response" pattern, and the
+//! conversation ends with a single DECODED whole-file summary:
 //!
 //! ```text
-//! Turn 1 (user, prefilled):
-//!   Read src/auth/handler.rs lines 47-93 and summarize it in a single sentence.
+//! Part turn (user, prefilled):
+//!   Read `src/auth/handler.rs` lines 47-93.
 //!
-//! Turn 2 (assistant, prefilled — tool call):
+//! Part turn (assistant, prefilled — tool call):
 //!   <tool_call>{"name":"read_file","arguments":{"path":"src/auth/handler.rs",
 //!               "start_line":47,"end_line":93}}</tool_call>
 //!
-//! Turn 3 (user, prefilled — tool response):
+//! Part turn (user, prefilled — tool response):
 //!   <tool_response>
 //!   src/auth/handler.rs (lines 47-93):
 //!
@@ -25,16 +26,21 @@
 //!   ```
 //!   </tool_response>
 //!
-//! Turn 4 (assistant, DECODED):
-//!   <one-sentence summary of the scope, generated live by the model>
+//! ... (one such exchange per part, in file order) ...
+//!
+//! Final turn (assistant, DECODED):
+//!   Summarize the entire file `src/auth/handler.rs` in no more than
+//!   200 words. → <whole-file summary, generated live by the model>
 //! ```
 //!
-//! Turns 1–3 are inserted via [`crate::turn_sink::InsertTurnSink::
-//! insert_prefill_turn`].  Turn 4 is submitted via
+//! The per-part prompt is rendered by [`render_part_user_prompt`] and
+//! the parts are inserted via [`crate::turn_sink::InsertTurnSink::
+//! insert_prefill_turn`].  The final summary prompt comes from
+//! [`render_file_summary_prompt`]; the turn is submitted via
 //! [`crate::turn_sink::InsertTurnSink::decode_summary_turn`] and the
 //! model's output becomes part of the code_reading trunk.
 //!
-//! The `<tool_call>` / `</tool_call>` tags in turn 2 mirror the
+//! The `<tool_call>` / `</tool_call>` tags in the part turns mirror the
 //! Hermes format the dialogue layer's tool-call extractor scans for
 //! at decode time — they're fine in prefilled context because the
 //! extractor only runs on the dialogue model's OWN decode output,
@@ -43,25 +49,36 @@
 use super::types::Scope;
 use crate::repo_scan::Language;
 
-/// Maximum decoded tokens for the per-scope summary.  Roughly
-/// one short paragraph; the prompt explicitly asks for one
-/// sentence so the model tends to stop well before this cap.
-pub const SUMMARY_MAX_TOKENS: usize = 80;
+/// Maximum decoded tokens for the final whole-file summary. The prompt
+/// caps the model at 200 words; ~1.4 tokens/word leaves headroom.
+pub const FILE_SUMMARY_MAX_TOKENS: usize = 300;
 
-/// Turn 1 — user-side prompt asking the model to read a scope and
-/// summarise it.
-pub fn render_user_prompt(path: &str, scope: &Scope) -> String {
+/// Per-part user prompt for the one-conversation-per-file layout: just
+/// asks the model to read the part (no per-part summary — the whole file
+/// is summarised in the final turn instead).
+pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
     format!(
-        "Read `{path}` lines {start}-{end} and summarize it in a single sentence.",
+        "Read `{path}` lines {start}-{end}.",
         path = path,
         start = scope.start_line,
         end = scope.end_line,
     )
 }
 
-/// Turn 2 — assistant-side `<tool_call>` echo.  Prefilled, so the
-/// model doesn't decode this; it learns the pattern by seeing it in
-/// context.
+/// Final-turn user prompt: summarise the whole file (which the model has
+/// now read part-by-part across the prior prefilled turns) in ≤200 words.
+pub fn render_file_summary_prompt(path: &str) -> String {
+    format!(
+        "Summarize the entire file `{path}` in no more than 200 words, \
+         covering its purpose, key types/functions, and how they fit together.",
+        path = path,
+    )
+}
+
+/// Assistant-side `<tool_call>` echo — the first half of a part
+/// turn's assistant message (the `<tool_response>` is appended after
+/// it).  Prefilled, so the model doesn't decode this; it learns the
+/// pattern by seeing it in context.
 pub fn render_tool_call(path: &str, scope: &Scope) -> String {
     format!(
         "<tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"{path}\",\
@@ -72,9 +89,10 @@ pub fn render_tool_call(path: &str, scope: &Scope) -> String {
     )
 }
 
-/// Turn 3 — user-side `<tool_response>` carrying the actual file
-/// content in a language-tagged markdown fence with `cat -n` style
-/// line numbers.  `body` is the verbatim source slice for
+/// Assistant-side `<tool_response>` carrying the actual file content
+/// in a language-tagged markdown fence with `cat -n` style line
+/// numbers — appended after [`render_tool_call`] to form the part
+/// turn's assistant message.  `body` is the verbatim source slice for
 /// `scope.start_line..=scope.end_line`.
 pub fn render_tool_response(
     path: &str,
@@ -143,30 +161,37 @@ mod tests {
         }
     }
 
-    // ── render_user_prompt ───────────────────────────────────────────────────
+    // ── per-file layout: render_part_user_prompt / render_file_summary_prompt ──
 
     #[test]
-    fn user_prompt_asks_for_one_sentence_summary() {
-        let prompt = render_user_prompt("src/lib.rs", &scope(142, 187));
-        assert_eq!(
-            prompt,
-            "Read `src/lib.rs` lines 142-187 and summarize it in a single sentence."
-        );
+    fn part_user_prompt_reads_range_without_summary_instruction() {
+        let p = render_part_user_prompt("src/lib.rs", &scope(10, 20));
+        assert_eq!(p, "Read `src/lib.rs` lines 10-20.");
+        // The per-part turn is prefill-only; the summary happens once at
+        // the end of the file conversation, not per part.
+        assert!(!p.to_lowercase().contains("summarize"));
     }
 
     #[test]
-    fn user_prompt_quotes_path_with_backticks() {
-        let prompt = render_user_prompt("packages/my-pkg/src/lib.rs", &scope(1, 5));
-        assert!(prompt.contains("`packages/my-pkg/src/lib.rs`"));
+    fn part_user_prompt_quotes_path_with_backticks() {
+        let p = render_part_user_prompt("packages/my-pkg/src/lib.rs", &scope(1, 5));
+        assert!(p.contains("`packages/my-pkg/src/lib.rs`"));
     }
 
     #[test]
-    fn user_prompt_is_byte_identical_on_repeat() {
+    fn part_user_prompt_is_byte_identical_on_repeat() {
         let s = scope(1, 10);
         assert_eq!(
-            render_user_prompt("src/x.rs", &s),
-            render_user_prompt("src/x.rs", &s)
+            render_part_user_prompt("src/x.rs", &s),
+            render_part_user_prompt("src/x.rs", &s)
         );
+    }
+
+    #[test]
+    fn file_summary_prompt_names_file_and_caps_at_200_words() {
+        let p = render_file_summary_prompt("src/auth/handler.rs");
+        assert!(p.contains("`src/auth/handler.rs`"));
+        assert!(p.contains("200 words"));
     }
 
     // ── render_tool_call ─────────────────────────────────────────────────────

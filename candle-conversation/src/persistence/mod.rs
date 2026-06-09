@@ -407,7 +407,13 @@ impl SubstratePersistence {
     /// titler finishes. This call is a no-op when the manifest already
     /// holds the same `(conv_id, label)` tuple — cheap to invoke on
     /// every submit.
-    pub fn write_conv_meta(&mut self, timeline_id: u64, conv_id: &str, label: &str) -> Result<()> {
+    pub fn write_conv_meta(
+        &mut self,
+        timeline_id: u64,
+        conv_id: &str,
+        label: &str,
+        custom: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
         // Idempotency was previously checked against `manifest.labels`;
         // after Phase 3 the substrate is the authority for live label
         // state.  Callers are expected to check against substrate
@@ -415,7 +421,12 @@ impl SubstratePersistence {
         // setters already do; daemon writes are infrequent enough
         // that an occasional duplicate log entry is negligible —
         // compaction collapses them).
-        let payload = manifest::encode_label_payload(timeline_id, conv_id, label);
+        //
+        // The Label record carries the *full* ConvMeta (conv_id + label +
+        // custom), so each setter reads the sibling fields from the
+        // substrate and passes them through — a partial write would drop
+        // the others on reload/compaction.
+        let payload = manifest::encode_label_payload(timeline_id, conv_id, label, custom);
         self.append_record(RecordType::Label, 0, 0, 0, 0, &payload)?;
         Ok(())
     }
@@ -982,17 +993,29 @@ impl SubstratePersistence {
     pub fn compact(
         &mut self,
         substrate: &mut Substrate,
+        progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<()> {
+        // Coarse phase progress (5 phases) for the loading screen.
+        let report = |phase: usize| {
+            if let Some(p) = progress {
+                p(phase, 5);
+            }
+        };
+        report(0);
+
         // 1. Quiesce — every staged write is now durable on disk.
         self.log.commit()?;
+        report(1);
 
         // 2. Collect the live winners, in dependency order — sourced
         //    from substrate state (per-entity) + manifest singletons.
         let live = compaction::collect_live_records(&mut self.log, &self.manifest, substrate)?;
+        report(2);
 
         // 3. Rewrite into a sibling file.
         let compact_path = compaction_path(&self.active_path);
         let (new_log, new_manifest) = compaction::write_compacted_log(&compact_path, &live)?;
+        report(3);
 
         // 4. Swap: drop the old active handle, then rename the compacted
         //    file over it. Renaming an open file is sound — Rust opens with
@@ -1000,6 +1023,7 @@ impl SubstratePersistence {
         let old = std::mem::replace(&mut self.log, new_log);
         drop(old);
         std::fs::rename(&compact_path, &self.active_path)?;
+        report(4);
 
         // 5. Adopt the compacted manifest and refresh the metadata caches.
         self.manifest = new_manifest;
@@ -1042,6 +1066,7 @@ impl SubstratePersistence {
         }
         self.log.set_write_offset(recovered.tail_offset);
         self.manifest = recovered.manifest;
+        report(5);
         Ok(())
     }
 }
@@ -1515,7 +1540,7 @@ mod tests {
                 sp.should_compact(&substrate).unwrap(),
                 "a log half dead weight wants compaction"
             );
-            sp.compact(&mut substrate).unwrap();
+            sp.compact(&mut substrate, None).unwrap();
 
             // Caches and the manifest survive the swap.
             assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));

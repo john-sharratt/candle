@@ -2362,7 +2362,7 @@ mod tests {
         let v = k.clone();
         backing.write_contiguous(slot, 0, &k, &v).unwrap();
         backing.set_len(slot, n_tokens);
-        backing.record_turn(slot, n_tokens).unwrap()
+        backing.record_turn(slot).unwrap()
     }
 
     /// `migrate_sealed_to_cpu` on a CPU-backed sequence copies chunks into new
@@ -2640,7 +2640,7 @@ mod tests {
         let v = k.clone();
         backing.write_contiguous(slot, 0, &k, &v).unwrap();
         backing.set_len(slot, n_tokens);
-        backing.record_turn(slot, n_tokens).unwrap()
+        backing.record_turn(slot).unwrap()
     }
 
     /// Walk every unique GID in `sealed` (which must be CPU-resident),
@@ -2921,7 +2921,7 @@ mod tests {
         let v = k.clone();
         backing.write_contiguous(slot, 0, &k, &v).unwrap();
         backing.set_len(slot, n_tokens);
-        let gpu_orig = backing.record_turn(slot, n_tokens).unwrap();
+        let gpu_orig = backing.record_turn(slot).unwrap();
 
         let cuda_dev = match &device {
             Device::Cuda(d) => d,
@@ -2997,7 +2997,7 @@ mod tests {
         let v = k.clone();
         backing.write_contiguous(slot, 0, &k, &v).unwrap();
         backing.set_len(slot, n_tokens);
-        let float_sealed = backing.record_turn(slot, n_tokens).unwrap();
+        let float_sealed = backing.record_turn(slot).unwrap();
 
         // Re-route every chunk's GIDs into a GPU R16 arena. R16 isn't
         // in the fused `can_fuse` set in `convert_chunk_data_static`,

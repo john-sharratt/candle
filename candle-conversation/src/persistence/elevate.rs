@@ -566,7 +566,7 @@ mod tests {
             let v = k.clone();
             backing.write_contiguous(slot, 0, &k, &v).unwrap();
             backing.set_len(slot, n_tokens);
-            sealed_per_layer.push(backing.record_turn(slot, n_tokens).unwrap());
+            sealed_per_layer.push(backing.record_turn(slot).unwrap());
         }
         conv.record_turn(
             timeline,

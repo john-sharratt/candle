@@ -1011,6 +1011,10 @@ impl Sequence {
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
     ) -> crate::Result<TurnHandle> {
+        let disable_reprojection = self.config.disable_reprojection;
+        // Append-only ingests skip the per-turn projection rebuild and also
+        // suppress continuous mid-decode reprojection.
+        let reprojection = if disable_reprojection { None } else { reprojection };
         let (event_tx, event_rx) = crossbeam::channel::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {
@@ -1024,6 +1028,7 @@ impl Sequence {
                 sampling,
                 event_tx,
                 reprojection,
+                disable_reprojection,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -1544,6 +1549,40 @@ impl Sequence {
         self.substrate
             .set_conversation_label(self.target.timeline, label)
             .map_err(ConversationError::Model)
+    }
+
+    /// Merge a `(key, value)` into this conversation's free-form `custom`
+    /// metadata bag and persist it (see [`ConvMeta::custom`]). Utility
+    /// ingests tag conversations with a content hash + descriptive fields
+    /// for the restart-resume cache.
+    pub fn set_metadata(&self, key: &str, value: &str) -> crate::Result<()> {
+        self.substrate
+            .set_conversation_metadata(self.target.timeline, key, value)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Merge several `(key, value)` pairs into this conversation's
+    /// `custom` metadata in one persisted record.
+    pub fn set_metadata_many(
+        &self,
+        kv: &std::collections::BTreeMap<String, String>,
+    ) -> crate::Result<()> {
+        self.substrate
+            .set_conversation_metadata_many(self.target.timeline, kv)
+            .map_err(ConversationError::Model)
+    }
+
+    /// This conversation's `custom` metadata bag, or `None` if the
+    /// timeline isn't registered yet.
+    pub fn metadata(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        self.substrate.conversation_metadata(self.target.timeline)
+    }
+
+    /// Every timeline (across the whole substrate) whose `custom`
+    /// metadata contains `key == value`. Used by utility ingests to skip
+    /// re-building units already present after substrate load.
+    pub fn find_conversations_by_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
+        self.substrate.find_timelines_by_metadata(key, value)
     }
 
     /// Whether a turn is currently in flight.

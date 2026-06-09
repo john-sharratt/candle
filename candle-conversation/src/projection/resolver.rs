@@ -128,6 +128,21 @@ impl Conversation {
             .register_timeline(timeline, layer, group);
     }
 
+    /// Set (or clear) the per-conversation KV-compression override for
+    /// `timeline`. Called at conversation creation from the
+    /// [`SequenceConfig`]; must run before the first turn seals so each
+    /// turn residence inherits it. See [`crate::substrate::ConvCompression`].
+    pub fn set_timeline_compression(
+        &self,
+        timeline: TimelineId,
+        compression: Option<crate::substrate::ConvCompression>,
+    ) {
+        self.inner
+            .write()
+            .unwrap()
+            .set_timeline_compression(timeline, compression);
+    }
+
     /// Acquire an unscored read guard.  The returned guard implements
     /// [`ContentResolver`] but every score lookup returns zero —
     /// appropriate for callers reading structural fields (turn counts,
@@ -319,6 +334,7 @@ impl Conversation {
         &self,
         n_layers: usize,
         restore_sigs: impl Fn(&[(u16, Vec<u8>)]) -> candle::Result<Vec<SigEntry>>,
+        progress: Option<&dyn Fn(usize, usize)>,
     ) -> candle::Result<usize> {
         // Substrate's per-stream / per-timeline state was populated
         // in one walker pass during `SubstratePersistence::open_in_with_substrate`
@@ -330,9 +346,16 @@ impl Conversation {
             let substrate = self.read();
             crate::persistence::resume::recovered_turn_decls(&substrate)
         };
+        let total = decls.len();
+        tracing::info!(turns = total, "substrate reconstruct: begin replay loop");
         let mut restored = 0usize;
         let mut skipped_corrupt = 0usize;
-        for mut decl in decls {
+        for (i, mut decl) in decls.into_iter().enumerate() {
+            // Report turns processed so far (restored + skipped) so the daemon's
+            // loading bar advances steadily even across corrupt-turn skips.
+            if let Some(p) = progress {
+                p(i, total);
+            }
             // Per-turn fault isolation.  A single turn whose
             // persisted state is inconsistent (e.g. a daemon was
             // killed between chunk writes and the final TurnDecl
@@ -497,6 +520,9 @@ impl Conversation {
                     view.mark_summary_dirty(timeline, id);
                 }
             }
+        }
+        if let Some(p) = progress {
+            p(total, total);
         }
         let read = self.read();
         let n_sections = read.section_count();
@@ -669,13 +695,87 @@ impl Conversation {
             return Ok(());
         }
         let conv_id = self.conv_id_of(timeline).unwrap_or_default();
+        let custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
         {
             let mut p = self.persistence.lock().unwrap();
-            p.write_conv_meta(timeline.raw(), &conv_id, label)
+            p.write_conv_meta(timeline.raw(), &conv_id, label, &custom)
                 .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
         }
         self.write().set_label(timeline, label);
         Ok(())
+    }
+
+    /// Merge a single `(key, value)` into `timeline`'s `custom` metadata
+    /// bag and persist the full ConvMeta. Used as a content-addressed
+    /// cache tag by utility ingests (code_read / repo_map). Reads the
+    /// sibling fields (conv_id, label, existing custom) so the Label
+    /// record stays complete.
+    pub fn set_conversation_metadata(
+        &self,
+        timeline: TimelineId,
+        key: &str,
+        value: &str,
+    ) -> candle::Result<()> {
+        if key.is_empty() {
+            return Ok(());
+        }
+        let mut one = std::collections::BTreeMap::new();
+        one.insert(key.to_string(), value.to_string());
+        self.set_conversation_metadata_many(timeline, &one)
+    }
+
+    /// Merge several `(key, value)` pairs into `timeline`'s `custom`
+    /// metadata in a single persisted Label record (cheaper than one
+    /// `set_conversation_metadata` per key when tagging a conversation
+    /// with several fields at once).
+    pub fn set_conversation_metadata_many(
+        &self,
+        timeline: TimelineId,
+        kv: &std::collections::BTreeMap<String, String>,
+    ) -> candle::Result<()> {
+        if kv.is_empty() {
+            return Ok(());
+        }
+        let conv_id = self.conv_id_of(timeline).unwrap_or_default();
+        let label = self.read().label_of(timeline).unwrap_or("").to_string();
+        let mut custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
+        for (k, v) in kv {
+            custom.insert(k.clone(), v.clone());
+        }
+        {
+            let mut p = self.persistence.lock().unwrap();
+            p.write_conv_meta(timeline.raw(), &conv_id, &label, &custom)
+                .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
+        }
+        self.write().merge_custom(timeline, kv);
+        Ok(())
+    }
+
+    /// `timeline`'s `custom` metadata bag, or `None` if unregistered.
+    pub fn conversation_metadata(
+        &self,
+        timeline: TimelineId,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        self.read().custom_of(timeline).cloned()
+    }
+
+    /// Every live timeline whose `custom` metadata contains `key == value`.
+    /// The reload-time cache lookup utility ingests use to skip units
+    /// already present in the substrate. Tombstoned timelines are excluded.
+    pub fn find_timelines_by_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
+        self.read().timelines_with_metadata(key, value)
+    }
+
+    /// Distinct `custom[key]` values across live timelines — a one-pass
+    /// snapshot for O(1) membership probing (e.g. the resume cache).
+    pub fn metadata_values_for_key(&self, key: &str) -> std::collections::HashSet<String> {
+        self.read().metadata_values_for_key(key)
+    }
+
+    /// Live timelines carrying `key`, paired with that key's value.
+    /// Drives ingest reconciliation (tombstone units whose source is gone).
+    pub fn timelines_with_metadata_key(&self, key: &str) -> Vec<(TimelineId, String)> {
+        self.read().timelines_with_metadata_key(key)
     }
 
     /// Persist the client-supplied `conv_id` for `timeline`. Idempotent;
@@ -693,9 +793,10 @@ impl Conversation {
             return Ok(());
         }
         let label = self.read().label_of(timeline).unwrap_or("").to_string();
+        let custom = self.read().custom_of(timeline).cloned().unwrap_or_default();
         {
             let mut p = self.persistence.lock().unwrap();
-            p.write_conv_meta(timeline.raw(), conv_id, &label)
+            p.write_conv_meta(timeline.raw(), conv_id, &label, &custom)
                 .map_err(|e| candle::Error::Msg(format!("write_conv_meta: {e}")))?;
         }
         self.write().set_conv_id(timeline, conv_id);
@@ -1084,20 +1185,32 @@ impl Conversation {
     }
 
     /// Flush and write a `Checkpoint` over the substrate manifest — the
-    /// fast-recovery snapshot. Compacts the log first when it has accrued
-    /// enough dead weight (§5.8).
+    /// fast-recovery snapshot. Does NOT compact: compaction is an explicit,
+    /// startup-only operation (see [`Self::compact_substrate`]) so it never
+    /// blocks the checkpoint cadence or a graceful shutdown.
     pub fn checkpoint_persistence(&self) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         p.commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
-        let should = {
-            let substrate = self.read();
-            p.should_compact(&substrate)
-                .map_err(|e| candle::Error::Msg(format!("persist compaction check: {e}")))?
-        };
-        if should {
+        p.checkpoint()
+            .map_err(|e| candle::Error::Msg(format!("persist checkpoint: {e}")))
+    }
+
+    /// Force a full redo-log compaction — the whole-file dead-record rewrite
+    /// (§5.8). Unlike the (now removed) checkpoint path this ignores the
+    /// dead-ratio threshold: the operator opted in explicitly via the daemon's
+    /// startup flag. `progress` reports coarse phase progress (0..=5) for the
+    /// loading screen.
+    pub fn compact_substrate(
+        &self,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> candle::Result<()> {
+        let mut p = self.persistence.lock().unwrap();
+        p.commit()
+            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
+        {
             let mut substrate = self.write();
-            p.compact(&mut substrate)
+            p.compact(&mut substrate, progress)
                 .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
         }
         p.checkpoint()

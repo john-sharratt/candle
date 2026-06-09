@@ -11,15 +11,56 @@ use crate::projection::{
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
-use crate::substrate::Substrate;
+use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use crossbeam::channel;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// Live progress of the startup substrate reload (redo-log replay), shared
+/// between the scheduler thread (writer) and the daemon's load-state machine
+/// (reader). As the substrate grows this replay stops being instantaneous, so
+/// the GUI needs a real progress signal instead of a stalled loading bar.
+#[derive(Debug, Default)]
+pub struct SubstrateReloadStatus {
+    /// Turns restored so far.
+    done: AtomicUsize,
+    /// Total turns to restore — `0` until the redo-log decl list is known.
+    total: AtomicUsize,
+    /// Set once the reload pass has finished (success *or* error). Readers must
+    /// key completion off this, not `done == total` — corrupt turns are skipped
+    /// so `done` may never reach `total`.
+    finished: AtomicBool,
+}
+
+impl SubstrateReloadStatus {
+    /// Writer (scheduler thread): record turns-restored / total-to-restore.
+    pub fn record(&self, done: usize, total: usize) {
+        self.total.store(total, Ordering::Relaxed);
+        self.done.store(done, Ordering::Relaxed);
+    }
+
+    /// Writer (scheduler thread): mark the reload pass complete. Always called,
+    /// even on the no-op / error paths, so a reader never waits forever.
+    pub fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+
+    /// Reader (load-state machine): `(done, total, finished)` snapshot.
+    pub fn snapshot(&self) -> (usize, usize, bool) {
+        let finished = self.finished.load(Ordering::Acquire);
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+            finished,
+        )
+    }
+}
 
 /// The entry point for the conversation engine.
 ///
@@ -81,6 +122,10 @@ pub struct ConversationEngine {
 
     /// Static model properties captured before the model moves to the scheduler thread.
     model_core: ModelCoreProperties,
+
+    /// Progress of the startup substrate reload, written by the scheduler
+    /// thread and polled by the daemon's load-state machine for the GUI.
+    substrate_reload_status: Arc<SubstrateReloadStatus>,
 }
 
 impl ConversationEngine {
@@ -244,9 +289,14 @@ impl ConversationEngine {
         // A clone of the workspace conversation for the scheduler thread —
         // used on startup to rebuild the substrate from the redo log.
         let scheduler_conversation = conversation.clone();
+        // Shared reload-progress handle: the scheduler thread updates it during
+        // the redo-log replay; the daemon polls it for the loading screen.
+        let substrate_reload_status = Arc::new(SubstrateReloadStatus::default());
+        let reload_status_for_thread = Arc::clone(&substrate_reload_status);
         let handle = std::thread::Builder::new()
             .name("conversation-scheduler".into())
             .spawn(move || {
+                let t_init = std::time::Instant::now();
                 let mut scheduler = Scheduler::new(
                     rx,
                     model,
@@ -265,9 +315,22 @@ impl ConversationEngine {
                     summariser_trigger,
                     boundary_markers,
                 );
+                // Localizes the startup gap between "model loaded" and the
+                // substrate progress bar moving: this is the scheduler thread
+                // binding its CUDA context + allocating its buffers, before the
+                // redo-log replay (which reports its own progress) begins.
+                tracing::info!(
+                    init_ms = t_init.elapsed().as_millis() as u64,
+                    "scheduler thread: init complete, starting substrate reconstruct"
+                );
                 // §16.12 — reload any persisted turns into the substrate
-                // before serving requests.
-                scheduler.reconstruct_substrate(&scheduler_conversation);
+                // before serving requests, reporting progress to the daemon.
+                let t_recon = std::time::Instant::now();
+                scheduler.reconstruct_substrate(&scheduler_conversation, &reload_status_for_thread);
+                tracing::info!(
+                    reconstruct_ms = t_recon.elapsed().as_millis() as u64,
+                    "scheduler thread: substrate reconstruct complete"
+                );
                 scheduler.run();
             })
             .map_err(|e| {
@@ -284,7 +347,15 @@ impl ConversationEngine {
             conversation,
             persist_thread,
             summariser_thread,
+            substrate_reload_status,
         })
+    }
+
+    /// Shared handle to the startup substrate-reload progress. The daemon's
+    /// load-state machine polls [`SubstrateReloadStatus::snapshot`] to drive
+    /// the GUI's "Loading substrate" step while the redo log replays.
+    pub fn substrate_reload_status(&self) -> Arc<SubstrateReloadStatus> {
+        Arc::clone(&self.substrate_reload_status)
     }
 
     /// Clone the workspace `Conversation` handle.
@@ -392,6 +463,48 @@ impl ConversationEngine {
     /// the titler?" checks at submit time.
     pub fn conversation_label_of(&self, timeline: TimelineId) -> Option<String> {
         self.conversation.label_of(timeline)
+    }
+
+    /// Merge a `(key, value)` into `timeline`'s free-form `custom`
+    /// metadata bag and persist it. Used by utility ingests to tag each
+    /// conversation with a content hash + descriptive fields for the
+    /// restart-resume cache.
+    pub fn set_conversation_metadata(
+        &self,
+        timeline: TimelineId,
+        key: &str,
+        value: &str,
+    ) -> crate::Result<()> {
+        self.conversation
+            .set_conversation_metadata(timeline, key, value)
+            .map_err(ConversationError::Model)
+    }
+
+    /// `timeline`'s `custom` metadata bag, or `None` if unregistered.
+    pub fn conversation_metadata(
+        &self,
+        timeline: TimelineId,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        self.conversation.conversation_metadata(timeline)
+    }
+
+    /// Every live conversation whose `custom` metadata contains `key == value`.
+    /// The content-addressed lookup utility ingests use after substrate
+    /// load to skip rebuilding units already present (tombstoned excluded).
+    pub fn find_conversations_by_metadata(&self, key: &str, value: &str) -> Vec<TimelineId> {
+        self.conversation.find_timelines_by_metadata(key, value)
+    }
+
+    /// One-pass snapshot of the distinct `custom[key]` values across live
+    /// conversations — for O(1) resume-cache membership probing.
+    pub fn conversation_metadata_values(&self, key: &str) -> std::collections::HashSet<String> {
+        self.conversation.metadata_values_for_key(key)
+    }
+
+    /// Live conversations carrying `key`, paired with its value. Drives
+    /// ingest reconciliation (tombstone units whose source file is gone).
+    pub fn conversations_with_metadata_key(&self, key: &str) -> Vec<(TimelineId, String)> {
+        self.conversation.timelines_with_metadata_key(key)
     }
 
     /// Every conversation the workspace substrate knows about —
@@ -532,6 +645,16 @@ impl ConversationEngine {
         // `(layer, group)` so the seal path can write turns into the
         // right timeline without consulting the schema.
         let timeline = self.conversation.mint_timeline(layer, group);
+        // Register this conversation's per-conversation KV-compression
+        // override (if any) before the first turn seals, so each turn
+        // residence inherits it at alloc time. Utility layers (code_reading)
+        // set a level + drop the K override via their SequenceConfig.
+        let compression = config.kv_compression_level.map(|level| ConvCompression {
+            level,
+            disable_k_override: config.kv_disable_k_override,
+        });
+        self.conversation
+            .set_timeline_compression(timeline, compression);
         let target = ProjectionTarget {
             layer,
             group,
@@ -634,6 +757,7 @@ impl ConversationEngine {
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
+                disable_reprojection: false,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 
@@ -703,6 +827,17 @@ impl ConversationEngine {
     /// and as part of graceful shutdown.
     pub fn checkpoint_persistence(&self) -> crate::Result<()> {
         Ok(self.conversation.checkpoint_persistence()?)
+    }
+
+    /// Force a full redo-log compaction (startup-only, operator opt-in).
+    /// Rewrites the log to just the live record set, reclaiming the dead
+    /// weight that accrues from superseded turns and tombstoned timelines.
+    /// `progress` reports coarse phase progress (0..=5) for the loading screen.
+    pub fn compact_substrate(
+        &self,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> crate::Result<()> {
+        Ok(self.conversation.compact_substrate(progress)?)
     }
 
     /// Shut down the scheduler, releasing all GPU resources.

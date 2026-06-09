@@ -44,6 +44,7 @@ mod tests;
 
 // Re-export public types
 pub use backing::ChunkedKvBacking;
+pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 #[cfg(feature = "cuda")]
 pub use compress::quantize_sealed_in_place;

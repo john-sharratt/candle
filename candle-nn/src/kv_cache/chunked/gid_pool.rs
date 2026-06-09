@@ -51,6 +51,7 @@
 //! arena and lets drops touch a single cache line.
 
 use ahash::{AHashMap, AHashSet};
+use std::collections::BTreeMap;
 use candle::DType;
 use std::{
     collections::VecDeque,
@@ -71,8 +72,23 @@ use crate::kv_cache::{ArenaLocation, KvFormat, QuantFormat};
 /// atomics on `counts[chunk_idx]` and `first_free`.
 #[derive(Debug)]
 pub struct ArenaRefcounts {
-    /// Refcount per chunk slot. `0` = free, `≥ 1` = allocated.
+    /// Refcount per chunk slot. `0` = free, `≥ 1` = allocated. This is the
+    /// **authority**; the `compare_exchange(0→1)` against it is the real
+    /// claim.
     counts: Vec<AtomicU16>,
+    /// Occupancy summary: one BIT per slot (set ⟺ `counts[i] > 0`), packed
+    /// 64 slots per `u64` word, so the scan skips 64 occupied slots in one
+    /// relaxed load instead of probing each `counts` entry.
+    ///
+    /// This is a **scan hint only** — never consulted for correctness. It is
+    /// maintained on exactly the same `0↔1` transitions as `live`: the bit is
+    /// set right after a successful claim in `try_claim_one`, and cleared on
+    /// the `1→0` last drop in `dec`. `inc`/non-last `dec` (clone / shared
+    /// drop) never cross `0↔1` and never touch it. Updates use atomic
+    /// `fetch_or` / `fetch_and` so concurrent set/clear of *different* bits in
+    /// the same word compose without lost updates. See the race analysis
+    /// above `try_claim_one`.
+    occupancy: Vec<AtomicU64>,
     /// Best-effort hint for the lowest known free slot. Allocators read
     /// it as a scan starting point; drops lower it via CAS when they
     /// free a slot below it.
@@ -109,8 +125,16 @@ impl ArenaRefcounts {
         for _ in 0..arena_chunks {
             counts.push(AtomicU16::new(0));
         }
+        // One bit per slot, 64 per word, rounded up. All zero ⇒ all free,
+        // matching the all-zero `counts` initial state.
+        let n_words = arena_chunks.div_ceil(64);
+        let mut occupancy = Vec::with_capacity(n_words);
+        for _ in 0..n_words {
+            occupancy.push(AtomicU64::new(0));
+        }
         Self {
             counts,
+            occupancy,
             first_free: AtomicU64::new(0),
             live: AtomicUsize::new(0),
             pool_total_live,
@@ -120,31 +144,118 @@ impl ArenaRefcounts {
         }
     }
 
-    /// Try to claim a single free slot starting from the `first_free`
-    /// hint. Returns the chunk_idx claimed, or `None` if the arena is
-    /// fully allocated.
+    /// Mark slot `i` occupied in the scan bitmap (set its bit).
+    ///
+    /// Atomic `fetch_or` so it composes with a concurrent `set_free` on a
+    /// *different* bit of the same word without a lost update. Relaxed is
+    /// sufficient: this is only read by the (gated) scan, and cross-claimer
+    /// visibility is carried by `ArenaPool::alloc_gate`'s lock release/acquire;
+    /// same-thread reuse is sequenced.
+    #[inline]
+    fn set_occupied(&self, i: usize) {
+        self.occupancy[i / 64].fetch_or(1u64 << (i % 64), Ordering::Relaxed);
+    }
+
+    /// Mark slot `i` free in the scan bitmap (clear its bit).
+    ///
+    /// Atomic `fetch_and` so it composes with a concurrent `set_occupied`.
+    /// **Release**: `dec` calls this and then lowers `first_free` with a
+    /// Release CAS, and the scan reads bitmap words with Acquire — so a
+    /// claimer that observes either the cleared bit or the lowered hint is
+    /// guaranteed to see this clear (drops are not gated, so this is the
+    /// synchronization that publishes a free slot to the scanner).
+    #[inline]
+    fn set_free(&self, i: usize) {
+        self.occupancy[i / 64].fetch_and(!(1u64 << (i % 64)), Ordering::Release);
+    }
+
+    // ── Occupancy-bitmap race analysis ───────────────────────────────────────
+    //
+    // `counts[i]` is the truth; the bitmap is a hint and the `compare_exchange`
+    // below is the authoritative claim. Two skews are possible; neither is a
+    // correctness bug:
+    //
+    //  * **bit set while slot free (would leak the slot): IMPOSSIBLE as a
+    //    persistent state.** A bit is only set by `set_occupied`, always right
+    //    after a successful `cmpxchg(0→1)` (i.e. with `count == 1`). For a
+    //    slot to reach `count == 0` a last-drop ran, and that `dec` always
+    //    calls `set_free` (an atomic `fetch_and`, never lost). Any `set_occupied`
+    //    after that implies another `cmpxchg(0→1)` → `count == 1` again. So
+    //    whenever `count` is stably 0 the bit is 0. The only `bit=1, count=0`
+    //    instant is the window *inside* a single `dec` between its `fetch_sub`
+    //    and its `set_free`, which the same thread closes immediately.
+    //
+    //  * **bit clear while slot occupied (a wasted probe): possible, transient,
+    //    self-healing.** If a `dec` frees a slot (`fetch_sub`→0) and a claimer
+    //    re-takes it (`cmpxchg 0→1`, `set_occupied`) before the `dec`'s trailing
+    //    `set_free` lands, the late `set_free` can clear a bit that now belongs
+    //    to the new owner → `bit=0, count>0`. The scan then probes that slot and
+    //    the `cmpxchg` cleanly fails (count≠0) — one wasted relaxed read+cmpxchg.
+    //    It heals on that owner's next drop (`count→0` with the bit already 0 =
+    //    consistent free). We deliberately do NOT re-set the bit on a failed
+    //    claim: a concurrent `dec` could be freeing the slot, and setting it
+    //    then would manufacture the leak skew above.
+    //
+    // Same-word concurrency is safe because `set_occupied`/`set_free` are atomic
+    // RMWs (OR / AND), so two threads flipping different bits of one word both
+    // take effect.
+
+    /// Try to claim a single free slot at or after the `first_free` hint.
+    /// Returns the chunk_idx claimed, or `None` if no free slot is observable.
+    ///
+    /// Callers serialize this via `ArenaPool::alloc_gate`, so at most one
+    /// claimer scans at a time; concurrent `dec` drops (ungated) only ever
+    /// *free* slots and clear bits.
     fn try_claim_one(&self) -> Option<usize> {
+        let n_words = self.occupancy.len();
         let mut start = self.first_free.load(Ordering::Acquire) as usize;
         loop {
-            for i in start..self.arena_chunks {
-                if self.counts[i]
-                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    let _ = self.first_free.compare_exchange(
-                        start as u64,
-                        (i + 1) as u64,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-                    self.live.fetch_add(1, Ordering::Relaxed);
-                    self.pool_total_live.fetch_add(1, Ordering::Relaxed);
-                    return Some(i);
+            let mut w = start / 64;
+            // In the first scanned word, ignore bits below `start`.
+            let mut first_word_skip = (start % 64) as u32;
+            while w < n_words {
+                // Free bits = zero bits of the occupancy word. Acquire pairs
+                // with the Release `set_free` in `dec` so a freed slot is
+                // visible here.
+                let occ = self.occupancy[w].load(Ordering::Acquire);
+                let mut free = !occ;
+                if first_word_skip != 0 {
+                    free &= u64::MAX << first_word_skip;
+                    first_word_skip = 0;
                 }
+                while free != 0 {
+                    let b = free.trailing_zeros() as usize;
+                    let i = w * 64 + b;
+                    if i >= self.arena_chunks {
+                        // Phantom high bits past capacity in the final word —
+                        // always zero in `occupancy`, never real free slots.
+                        break;
+                    }
+                    // Authoritative claim — the bitmap is only a hint.
+                    if self.counts[i]
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        self.set_occupied(i);
+                        let _ = self.first_free.compare_exchange(
+                            start as u64,
+                            (i + 1) as u64,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                        self.live.fetch_add(1, Ordering::Relaxed);
+                        self.pool_total_live.fetch_add(1, Ordering::Relaxed);
+                        return Some(i);
+                    }
+                    // Stale-free bit (occupied despite the 0): skip it. Do not
+                    // set it — see the race analysis above.
+                    free &= free - 1;
+                }
+                w += 1;
             }
-            // Reached the end. A concurrent drop may have lowered
-            // `first_free` below `start` — re-check and rescan that
-            // window before giving up.
+            // Scanned [start, arena_chunks) with nothing claimable. If a
+            // concurrent drop lowered `first_free` below `start`, rescan that
+            // lower window; otherwise the arena is (observably) full.
             let new_start = self.first_free.load(Ordering::Acquire) as usize;
             if new_start >= start {
                 return None;
@@ -171,6 +282,10 @@ impl ArenaRefcounts {
         if prev == 1 {
             self.live.fetch_sub(1, Ordering::Relaxed);
             self.pool_total_live.fetch_sub(1, Ordering::Relaxed);
+            // Clear the scan bitmap bit (Release) BEFORE lowering `first_free`
+            // below, so a claimer that Acquire-observes the lowered hint also
+            // sees this freed slot's bit. Sequenced before the first_free CAS.
+            self.set_free(chunk_idx);
             let mut cur = self.first_free.load(Ordering::Acquire);
             while (chunk_idx as u64) < cur {
                 match self.first_free.compare_exchange_weak(
@@ -393,7 +508,11 @@ impl Eq for ChunkGid {}
 struct ArenaPool {
     /// `arena_idx → refcount table`. `RwLock`'d for register/release;
     /// reads are uncontended in steady state.
-    tables: RwLock<AHashMap<usize, Arc<ArenaRefcounts>>>,
+    /// Keyed by `arena_idx`. A `BTreeMap` (not a hash map) so iteration is
+    /// already in ascending `arena_idx` order: the allocators walk it
+    /// lowest-first for compaction-friendly packing without rebuilding and
+    /// sorting an index `Vec` on every allocation.
+    tables: RwLock<BTreeMap<usize, Arc<ArenaRefcounts>>>,
     /// Number of currently-registered arenas for this key. Lock-free
     /// counter for fast diagnostics.
     total_arenas: AtomicUsize,
@@ -404,15 +523,25 @@ struct ArenaPool {
     total_live: Arc<AtomicUsize>,
     /// Physical chunk capacity for one arena of this specific format.
     arena_chunks: usize,
+    /// Serializes the *claiming* walk (`allocate_any` / `allocate_n` /
+    /// `allocate_excluding`). Only one thread scans this pool's `counts`
+    /// arrays for a free slot at a time, so the scan reads a slot's
+    /// occupancy with a plain relaxed load (no per-slot locked RMW) and the
+    /// 128 worker/persist threads stop ping-ponging the same cache lines.
+    /// Drops (`ArenaRefcounts::dec`) are deliberately NOT gated — they run
+    /// lock-free on arbitrary threads; the gate only removes claimer↔claimer
+    /// contention. Held for bookkeeping only, never across GPU work.
+    alloc_gate: Mutex<()>,
 }
 
 impl ArenaPool {
     fn new(format: KvFormat) -> Self {
         Self {
-            tables: RwLock::new(AHashMap::with_capacity(8)),
+            tables: RwLock::new(BTreeMap::new()),
             total_arenas: AtomicUsize::new(0),
             total_live: Arc::new(AtomicUsize::new(0)),
             arena_chunks: arena_chunks_for_format(format),
+            alloc_gate: Mutex::new(()),
         }
     }
 
@@ -436,23 +565,20 @@ impl ArenaPool {
     /// `arena_idx` order (lowest first) so live data clusters in low
     /// indices, keeping compaction effective.
     fn allocate_any(&self) -> Option<(i64, Arc<ArenaRefcounts>)> {
-        let mut arena_idxs: Vec<usize> = {
-            let tables = self.tables.read().unwrap();
-            tables.keys().copied().collect()
-        };
-        arena_idxs.sort_unstable();
-        for arena_idx in arena_idxs {
-            let table = {
-                let tables = self.tables.read().unwrap();
-                match tables.get(&arena_idx) {
-                    Some(t) => Arc::clone(t),
-                    None => continue,
-                }
-            };
+        // Serialize the claiming walk: only one thread scans this pool's
+        // `counts` arrays at a time, so `try_claim_one` can probe occupancy
+        // with a relaxed load (no per-slot locked RMW) without 128 threads
+        // ping-ponging the same cache lines. Drops stay lock-free.
+        let _gate = self.alloc_gate.lock().unwrap();
+        // `tables` is a BTreeMap, so `iter()` yields arenas in ascending
+        // arena_idx order — the lowest-first packing that keeps live data
+        // clustered for compaction — with no per-call index collect + sort.
+        let stride = arena_gid_stride();
+        let tables = self.tables.read().unwrap();
+        for (&arena_idx, table) in tables.iter() {
             if let Some(chunk_idx) = table.try_claim_one() {
-                let stride = arena_gid_stride();
                 let gid = (arena_idx * stride + chunk_idx) as i64;
-                return Some((gid, table));
+                return Some((gid, Arc::clone(table)));
             }
         }
         None
@@ -468,30 +594,22 @@ impl ArenaPool {
         }
         let mut out: Vec<(i64, Arc<ArenaRefcounts>)> = Vec::with_capacity(n);
 
-        let mut arena_idxs: Vec<usize> = {
-            let tables = self.tables.read().unwrap();
-            tables.keys().copied().collect()
-        };
-        arena_idxs.sort_unstable();
-
-        for arena_idx in arena_idxs {
+        // One gate acquisition for the whole bulk claim (see `allocate_any`).
+        let _gate = self.alloc_gate.lock().unwrap();
+        // Same lowest-first BTreeMap walk as `allocate_any`, draining each
+        // arena before moving up — one read lock, no index collect + sort.
+        let stride = arena_gid_stride();
+        let tables = self.tables.read().unwrap();
+        for (&arena_idx, table) in tables.iter() {
             if out.len() == n {
                 break;
             }
-            let table = {
-                let tables = self.tables.read().unwrap();
-                match tables.get(&arena_idx) {
-                    Some(t) => Arc::clone(t),
-                    None => continue,
-                }
-            };
-            let stride = arena_gid_stride();
             let base = (arena_idx * stride) as i64;
             // Drain as many as we can from this arena.
             while out.len() < n {
                 match table.try_claim_one() {
                     Some(chunk_idx) => {
-                        out.push((base + chunk_idx as i64, Arc::clone(&table)));
+                        out.push((base + chunk_idx as i64, Arc::clone(table)));
                     }
                     None => break,
                 }
@@ -503,6 +621,9 @@ impl ArenaPool {
     /// Allocate a gid from a specific arena. Returns `None` if the
     /// arena isn't registered with this pool, or has no free slots.
     fn allocate_from_arena(&self, arena_idx: usize) -> Option<(i64, Arc<ArenaRefcounts>)> {
+        // Gate with the other claim walks so `try_claim_one`'s relaxed probe
+        // only ever races drops, never another claimer (see `allocate_any`).
+        let _gate = self.alloc_gate.lock().unwrap();
         let table = {
             let tables = self.tables.read().unwrap();
             Arc::clone(tables.get(&arena_idx)?)
@@ -518,22 +639,16 @@ impl ArenaPool {
     /// uses it is gated behind the cuda feature.
     #[cfg(feature = "cuda")]
     fn allocate_excluding(&self, exclude_arena: usize) -> Option<(i64, Arc<ArenaRefcounts>)> {
-        let mut arena_idxs: Vec<usize> = {
-            let tables = self.tables.read().unwrap();
-            tables.keys().copied().filter(|&i| i != exclude_arena).collect()
-        };
-        arena_idxs.sort_unstable();
-        for arena_idx in arena_idxs {
-            let table = {
-                let tables = self.tables.read().unwrap();
-                match tables.get(&arena_idx) {
-                    Some(t) => Arc::clone(t),
-                    None => continue,
-                }
-            };
+        // Serialize with the other claim walks (see `allocate_any`).
+        let _gate = self.alloc_gate.lock().unwrap();
+        let stride = arena_gid_stride();
+        let tables = self.tables.read().unwrap();
+        for (&arena_idx, table) in tables.iter() {
+            if arena_idx == exclude_arena {
+                continue;
+            }
             if let Some(chunk_idx) = table.try_claim_one() {
-                let stride = arena_gid_stride();
-                return Some(((arena_idx * stride + chunk_idx) as i64, table));
+                return Some(((arena_idx * stride + chunk_idx) as i64, Arc::clone(table)));
             }
         }
         None

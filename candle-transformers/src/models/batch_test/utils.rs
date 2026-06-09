@@ -807,29 +807,38 @@ impl TestParams {
             })
             .collect();
 
-        let max_content_len = content_tokens_per_session
-            .iter()
-            .map(|t| t.len())
-            .max()
-            .unwrap_or(0);
-
+        // Ragged-batch validation: feed `forward_batched` genuinely UNEVEN
+        // prefill lengths (no padding to a common length). For StoryRewrite the
+        // user prompt is identical across sessions, so when the batch has >1
+        // sequence we make the LAST context LONGER by more than one 32-token
+        // CHUNK_SIZE of trailing whitespace — harmless padding inside the user
+        // turn that the model ignores, so NO session's output changes (every
+        // session still validates), yet the per-sequence chunk COUNT now differs
+        // across the batch. That difference is what exercises per-seq KV
+        // capacity + the decode writer slice: the bug (over-allocating every
+        // slot to max(q_lens)) would leave extra tail chunks on the *shorter*
+        // full-story sessions and desync their decode — so a regression shows up
+        // as those validated sessions diverging/asserting. A 1-token diff stays
+        // within one chunk and misses the class entirely.
         let pad_token = self
             .tokenizer
             .encode(" ", false)
             .ok()
             .and_then(|enc| enc.get_ids().first().copied())
             .unwrap_or(0);
-
-        // Pad content tokens to uniform length, then append the fixed suffix.
         let user_tokens_per_session: Vec<Vec<u32>> = content_tokens_per_session
             .into_iter()
-            .map(|mut tokens| {
-                tokens.resize(max_content_len, pad_token);
+            .enumerate()
+            .map(|(n, mut tokens)| {
+                if config.num_contexts > 1 && n + 1 == config.num_contexts {
+                    // > CHUNK_SIZE (32) so the chunk count actually differs.
+                    tokens.extend(std::iter::repeat(pad_token).take(40));
+                }
                 tokens.extend_from_slice(&suffix_tokens);
                 tokens
             })
             .collect();
-        let max_user_len = max_content_len + suffix_tokens.len();
+        let user_lens: Vec<usize> = user_tokens_per_session.iter().map(|t| t.len()).collect();
 
         let user_tensors: Vec<Tensor> = user_tokens_per_session
             .iter()
@@ -846,19 +855,30 @@ impl TestParams {
                 run.logits = logits;
             }
         }
-        // Advance all sequences by the (padded) prompt length
-        for &seq_idx in &sequence_indices {
-            session.advance_sequence(seq_idx, max_user_len)?;
+        // Advance each sequence by its own (ragged) prompt length.
+        for (&seq_idx, &ulen) in sequence_indices.iter().zip(user_lens.iter()) {
+            session.advance_sequence(seq_idx, ulen)?;
         }
         self.device.synchronize()?;
         pipeline_record("bench:bulk_total", t_prompt_total);
         let _ = session.compact_check()?;
         let prompt_duration = prompt_start.elapsed();
-        let prompt_tokens = max_user_len * config.num_contexts * config.num_repeats.max(1);
+        let prompt_tokens =
+            user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
 
         // Snapshot bulk profile at prompt→generate boundary
         let bulk_profile = model.snapshot_profiles();
+
+        // Quantize + seal the prefilled history, mirroring the substrate
+        // scheduler's priming-projection boundary. `start_new_chunk = true` so
+        // decode writes land in a fresh chunk rather than appending to the now
+        // immutable quantized tail. Deliberately outside the timing windows.
+        #[cfg(feature = "cuda")]
+        {
+            session.quantize_and_seal_sequences(&sequence_indices, true)?;
+            self.device.synchronize()?;
+        }
 
         // Generate phase
         let mut remaining_steps = self.generate_token_count;
@@ -888,8 +908,18 @@ impl TestParams {
             (generate_tokens as f64) / generate_duration.as_secs_f64()
         };
 
-        // Calculate quantized token percentage for quantized modes
-        // Chunks are quantized during generation (after each prefill/decode), so stats are already up to date.
+        // Quantize + seal the decode tail before measuring so %Quantized and the
+        // compression ratio reflect the full sequence (the substrate quantizes
+        // at every turn boundary). Already-quantized prefill chunks pass through
+        // the quantizer's preserve bucket unchanged.
+        #[cfg(feature = "cuda")]
+        {
+            session.quantize_and_seal_sequences(&sequence_indices, false)?;
+            self.device.synchronize()?;
+        }
+
+        // Calculate quantized token percentage for quantized modes (reads the
+        // post-quantize arena formats set above).
         let quantized_token_percent = if config.mode.is_quantized() {
             session.estimate_quantized_percentage_by_sequences(&sequence_indices)
         } else {
@@ -902,6 +932,7 @@ impl TestParams {
             None
         };
 
+        #[cfg(feature = "verbose")]
         let compression_distribution = if config.mode.is_quantized() {
             Some(session.compression_dist_by_sequences(&sequence_indices))
         } else {
@@ -910,7 +941,7 @@ impl TestParams {
 
         // Calculate peak tokens: sum of all tokens across all sessions
         let peak_tokens: usize = (0..config.num_contexts)
-            .map(|n| self.system_prompt_tokens(n).len() + max_user_len + self.generate_token_count)
+            .map(|n| self.system_prompt_tokens(n).len() + user_lens[n] + self.generate_token_count)
             .sum();
 
         // Verbose palette4 diagnostic: print per-chunk arena format distribution for the
@@ -966,6 +997,35 @@ impl TestParams {
 
         // Snapshot single (generate) profile
         let single_profile = model.snapshot_profiles();
+        #[cfg(feature = "profile")]
+        {
+            println!(
+                "── Decode speed — {:?} ctx×{} rep×{}: {:.1} gen tok/s  ({:.1} ms/token) ──",
+                config.mode,
+                config.num_contexts,
+                config.num_repeats,
+                generate_tokens_per_sec,
+                if generate_tokens_per_sec > 0.0 {
+                    1000.0 * config.num_contexts.max(1) as f64 / generate_tokens_per_sec
+                } else {
+                    0.0
+                },
+            );
+        }
+        #[cfg(feature = "profile")]
+        if !single_profile.entries.is_empty() {
+            println!("── Decode profile — {:?} ──", config.mode);
+            for (name, total_ms, count) in &single_profile.entries {
+                let avg = if *count > 0 {
+                    total_ms / *count as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "  {name:<26} total={total_ms:>9.2}ms count={count:>6} avg={avg:>7.3}ms"
+                );
+            }
+        }
 
         // Success path: disarm the error guard so it doesn't fire on normal drop.
         arena_guard.fire = false;

@@ -66,6 +66,9 @@ impl Scheduler {
         };
         let fwd_ms = t_fwd.elapsed().as_millis() as u64;
         super::record_phase(t_fwd, "decode_forward");
+        // Decode batch = N sequences × 1 token each.
+        self.wave_stats
+            .record(false, seq_ids.len(), seq_ids.len(), fwd_ms);
 
         // Advance offsets (1 token per sequence) and mirror the
         // input token into the slot's diagnostic log — this is the

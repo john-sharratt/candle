@@ -16,6 +16,8 @@ use candle::quantized::QTensor;
 use candle::{DType, Device, Result, Tensor};
 
 use super::backing::{request_global_compact, ChunkedKvBacking};
+#[cfg(feature = "cuda")]
+use super::backing::KV_DEVICE_OOM_MARKER;
 use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
 use super::types::{arena_chunks_for_format, ChunkWindow, CHUNK_SIZE};
@@ -24,6 +26,70 @@ use crate::kv_cache::arena_table::N_PALETTE;
 use crate::kv_cache::chunked::backing::BackingInner;
 use crate::kv_cache::chunked::ArenaStorageState;
 use crate::kv_cache::{KvFormat, QuantFormat};
+
+/// Bytes of device VRAM kept free so allocating a new KV arena never eats the
+/// headroom the in-flight forward pass needs for activations. On WDDM the
+/// driver would otherwise silently spill the over-budget allocation to host
+/// memory and collapse GPU throughput; reserving headroom (and failing fast
+/// when it can't be met) keeps everything resident. Default `max(8% of total,
+/// 1 GiB)`, overridable with `CANDLE_KV_VRAM_RESERVE_MB`.
+#[cfg(feature = "cuda")]
+fn vram_reserve_bytes(total: usize) -> usize {
+    if let Ok(v) = std::env::var("CANDLE_KV_VRAM_RESERVE_MB") {
+        if let Ok(mb) = v.trim().parse::<usize>() {
+            return mb.saturating_mul(1024 * 1024);
+        }
+    }
+    const FRACTION_NUM: usize = 8;
+    const FRACTION_DEN: usize = 100;
+    const FLOOR: usize = 1usize << 30; // 1 GiB
+    (total / FRACTION_DEN * FRACTION_NUM).max(FLOOR)
+}
+
+/// Whether `want` bytes can be allocated in device VRAM while keeping the
+/// reserve free. Returns `true` (permit) on non-CUDA devices or when the
+/// driver memory query fails — the gate only blocks when we can prove there
+/// isn't room.
+#[cfg(feature = "cuda")]
+fn vram_has_room(device: &Device, want: usize) -> bool {
+    match device {
+        Device::Cuda(d) => match d.mem_get_info() {
+            Ok((free, total)) => free >= want.saturating_add(vram_reserve_bytes(total)),
+            Err(_) => true,
+        },
+        _ => true,
+    }
+}
+
+/// Gate a GPU arena allocation of `arena_bytes` on the VRAM budget. When the
+/// budget is exceeded: if `retry_after_compact`, force a global compaction and
+/// re-check; if there's still no room, return a typed
+/// [`KV_DEVICE_OOM_MARKER`] error (instead of letting `cuMemAlloc` spill).
+/// `Ok(())` means it's safe to allocate. No-op on non-CUDA / CPU arenas.
+#[allow(unused_variables)]
+fn ensure_vram_budget(
+    device: &Device,
+    location: ArenaLocation,
+    arena_bytes: usize,
+    retry_after_compact: bool,
+    what: &str,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if matches!(location, ArenaLocation::Gpu) && !vram_has_room(device, arena_bytes) {
+            if retry_after_compact {
+                let _ = request_global_compact();
+            }
+            if !vram_has_room(device, arena_bytes) {
+                return Err(candle::Error::Msg(format!(
+                    "{KV_DEVICE_OOM_MARKER}: {what} arena needs {arena_bytes} B but free VRAM \
+                     (minus reserve) is insufficient after compaction"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 static ARENA_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
 static ARENA_CREATE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +260,19 @@ impl BackingInner {
     ) -> Result<Arena> {
         let t0 = Instant::now();
         let data_shape = shape;
+        // Budget gate: refuse (and compact-then-fail) rather than let the
+        // driver spill this arena to host memory. See `ensure_vram_budget`.
+        let arena_bytes = data_shape
+            .0
+            .saturating_mul(data_shape.1)
+            .saturating_mul(data_shape.2)
+            .saturating_mul(dtype.size_in_bytes());
+        if let Err(e) =
+            ensure_vram_budget(device, location, arena_bytes, retry_after_compact, "float")
+        {
+            record_arena_create("float", location, index, t0.elapsed().as_nanos() as u64);
+            return Err(e);
+        }
         let out = match Tensor::zeros(data_shape, dtype, device) {
             Ok(data) => Ok(Arena::Float {
                 data,
@@ -235,6 +314,17 @@ impl BackingInner {
         let t0 = Instant::now();
         let k_ggml = qformat.to_ggml_dtype();
         let total_elems = shape.0 * shape.1 * shape.2; // arena_chunks * chunk_size * head_dim
+
+        // Budget gate (see `create_float_arena`). Quantized byte size derives
+        // from the ggml block layout, not a plain dtype width.
+        let block_size = k_ggml.block_size().max(1);
+        let arena_bytes = (total_elems / block_size).saturating_mul(k_ggml.type_size());
+        if let Err(e) =
+            ensure_vram_budget(device, location, arena_bytes, retry_after_compact, "quantized")
+        {
+            record_arena_create("quantized", location, index, t0.elapsed().as_nanos() as u64);
+            return Err(e);
+        }
 
         let make_data = || QTensor::zeros(total_elems, k_ggml, device);
 
@@ -563,7 +653,7 @@ impl ChunkedKvBacking {
     /// Ensure that chunks needed to write `add` tokens at `offsets` are allocated.
     ///
     /// `offsets` must have exactly `batch_capacity()` elements, one per sequence slot.
-    pub fn ensure_for_offsets(&self, offsets: &[usize], add: usize) -> Result<()> {
+    pub fn ensure_for_offsets(&self, offsets: &[usize], adds: &[usize]) -> Result<()> {
         let batch = self.batch_capacity();
         if offsets.len() != batch {
             candle::bail!(
@@ -572,13 +662,20 @@ impl ChunkedKvBacking {
                 batch
             )
         }
-        if add == 0 {
+        if adds.len() != offsets.len() {
+            candle::bail!(
+                "ensure_for_offsets: {} adds for {} offsets",
+                adds.len(),
+                offsets.len()
+            )
+        }
+        if adds.iter().all(|&a| a == 0) {
             return Ok(());
         }
 
         let mut required_max_blocks = 1usize;
-        for &off in offsets.iter() {
-            let end_pos = off.saturating_add(add).saturating_sub(1);
+        for (i, &off) in offsets.iter().enumerate() {
+            let end_pos = off.saturating_add(adds[i]).saturating_sub(1);
             let need_blocks = (end_pos / CHUNK_SIZE) + 1;
             required_max_blocks = cmp::max(required_max_blocks, need_blocks);
         }
@@ -591,12 +688,12 @@ impl ChunkedKvBacking {
 
         let chunk_size = CHUNK_SIZE;
         for (b, &off) in offsets.iter().enumerate() {
-            // Skip unallocated slots
-            if state.sequences[b].is_none() {
+            // Skip unallocated slots and slots with nothing to add.
+            if state.sequences[b].is_none() || adds[b] == 0 {
                 continue;
             }
 
-            let end_pos = off.saturating_add(add).saturating_sub(1);
+            let end_pos = off.saturating_add(adds[b]).saturating_sub(1);
             let need_blocks = (end_pos / chunk_size) + 1;
             for blk in 0..need_blocks {
                 if state.sequences[b].as_ref().unwrap().chunk_at(blk).is_none() {

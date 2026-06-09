@@ -316,7 +316,7 @@ mod cuda_impl {
             let mut out = Vec::with_capacity(n_layers);
             for backing in backings {
                 let slot = backing.alloc_sequence()?;
-                let seq = backing.record_turn(slot, 0)?;
+                let seq = backing.record_turn(slot)?;
                 backing.free_sequence(slot)?;
                 out.push(seq);
             }
@@ -343,7 +343,6 @@ mod cuda_impl {
         // Pre-allocate one slot per layer. Holds the accumulated
         // chunks across every chunk-batch's reads.
         let mut slots: Vec<usize> = Vec::with_capacity(n_layers);
-        let mut total_tokens_per_layer: Vec<usize> = vec![0; n_layers];
         for (li, backing) in backings.iter().enumerate() {
             let slot = backing.alloc_sequence()?;
             slots_guard.items.push((li, slot));
@@ -377,7 +376,6 @@ mod cuda_impl {
                 batch,
                 stager,
                 &slots,
-                &mut total_tokens_per_layer,
                 chunks_per_layer,
             )?;
             reads_ms_total += stats.reads_ms;
@@ -398,7 +396,7 @@ mod cuda_impl {
         // Final per-layer SealedSequence — the snapshot caller wanted.
         let mut sealed_per_layer: Vec<SealedSequence> = Vec::with_capacity(n_layers);
         for (li, backing) in backings.iter().enumerate() {
-            let seq = backing.record_turn(slots[li], total_tokens_per_layer[li])?;
+            let seq = backing.record_turn(slots[li])?;
             sealed_per_layer.push(seq);
         }
 
