@@ -923,33 +923,18 @@ pub fn compute_rope_cs(
 
 /// Which decode-attention kernel backend to run.
 ///
-/// `V2` is the persistent-slot-buffer paged-decode kernel. `FusedV1` routes
-/// through fused-attn-v1's v2-API-compatible INT8 dispatch, falling back to
-/// `V2` for shapes the fused kernel doesn't instantiate (head_dim ∉
-/// {64,96,128}, or a non-F16/BF16 dtype) — detected before launch, since the
-/// shim can't propagate the dispatch's `cudaErrorNotSupported`. Selecting the
-/// backend explicitly (via [`paged_decode_attn_with_backend`]) is how the A/B
-/// harness drives both kernels over identical inputs; the env-var form
-/// ([`paged_decode_attn`]) is the user-facing toggle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Int8` is the production decode kernel (the INT8 split-KV / warp-stripe /
+/// batched-M kernel; `run_paged_decode_*`, with head_dim=256 falling back to the
+/// legacy kernel internally). `Legacy` is the original persistent-slot-buffer FP
+/// kernel (`run_paged_decode_legacy_*`), retained as the A/B regression
+/// reference. Selecting the backend explicitly (via
+/// [`paged_decode_attn_with_backend`]) is how the A/B harness drives both kernels
+/// over identical inputs; [`paged_decode_attn`] uses the `Int8` default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DecodeBackend {
-    V2,
-    FusedV1,
-}
-
-impl DecodeBackend {
-    /// Resolve the backend from the `CANDLE_FUSED_ATTN_V1` environment variable
-    /// (`1`/`true` selects `FusedV1`, anything else `V2`).
-    pub fn from_env() -> Self {
-        let fused = std::env::var("CANDLE_FUSED_ATTN_V1")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if fused {
-            DecodeBackend::FusedV1
-        } else {
-            DecodeBackend::V2
-        }
-    }
+    Int8,
+    #[default]
+    Legacy,
 }
 
 /// Paged decode attention using persistent slot buffers.
@@ -958,8 +943,8 @@ impl DecodeBackend {
 /// of the old per-step chunk_meta / head_gids / kv_lens / per_head_table.
 /// The kernel self-increments ws.len after scatter, so no write_offsets needed.
 ///
-/// The backend is resolved from the `CANDLE_FUSED_ATTN_V1` env var. For
-/// deterministic A/B selection, call [`paged_decode_attn_with_backend`].
+/// Uses the production `Int8` decode kernel. For deterministic A/B selection
+/// against the legacy reference, call [`paged_decode_attn_with_backend`].
 #[cfg(feature = "cuda")]
 pub fn paged_decode_attn(
     q: &Tensor,
@@ -986,7 +971,7 @@ pub fn paged_decode_attn(
         v_new,
         rope_cs,
         rope_interleaved,
-        DecodeBackend::from_env(),
+        DecodeBackend::default(),
     )
 }
 
@@ -1157,6 +1142,9 @@ impl candle::CustomOp1 for PagedDecode {
         q_l: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle_kernels::paged_decode::{run_paged_decode_bf16, run_paged_decode_fp16};
+        use candle_kernels::paged_decode_legacy::{
+            run_paged_decode_legacy_bf16, run_paged_decode_legacy_fp16,
+        };
 
         match self.head_dim {
             64 | 96 | 128 | 256 => {}
@@ -1165,128 +1153,25 @@ impl candle::CustomOp1 for PagedDecode {
             ),
         }
 
-        // Route through fused-attn-v1's v2-API-compatible dispatch when the
-        // FusedV1 backend is selected. `cuda_fwd_via_fused_v1` returns `Err` for
-        // shapes the fused kernel doesn't instantiate (head_dim ∉ {64,96,128} or
-        // a non-F16/BF16 dtype), in which case we fall through to v2.
-        if self.backend == DecodeBackend::FusedV1 {
-            if let Ok(out) = self.cuda_fwd_via_fused_v1(q, q_l) {
-                return Ok(out);
+        match (self.backend, self.arena_dtype) {
+            (DecodeBackend::Int8, DType::F16) => {
+                self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16)
             }
-            // fall through to v2
-        }
-
-        match self.arena_dtype {
-            DType::F16 => self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16),
-            DType::BF16 | DType::F8E4M3 => {
+            (DecodeBackend::Int8, DType::BF16 | DType::F8E4M3) => {
                 self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, run_paged_decode_bf16)
             }
-            dt => candle::bail!(
+            (DecodeBackend::Legacy, DType::F16) => {
+                self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_legacy_fp16)
+            }
+            (DecodeBackend::Legacy, DType::BF16 | DType::F8E4M3) => {
+                self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, run_paged_decode_legacy_bf16)
+            }
+            (_, dt) => candle::bail!(
                 "paged-decode: unsupported arena dtype {:?} (only F16/BF16 supported)",
                 dt
             ),
         }
     }
-}
-
-#[cfg(feature = "cuda")]
-impl PagedDecode {
-    fn cuda_fwd_via_fused_v1(
-        &self,
-        q: &candle::CudaStorage,
-        q_l: &Layout,
-    ) -> Result<(candle::CudaStorage, Shape)> {
-        // The fused v2-compat dispatch only instantiates the INT8 decode kernel
-        // for head_dim 64/96/128 (256 exceeds its 48 KB static-smem budget and
-        // is not compiled). The void-returning shims below cannot propagate the
-        // dispatch's `cudaErrorNotSupported` back through `cuda_fwd_typed`, so we
-        // reject unsupported shapes here and return `Err` — the caller in
-        // `cuda_fwd` then falls back to the v2 kernel.
-        if !matches!(self.head_dim, 64 | 96 | 128) {
-            candle::bail!(
-                "fused-attn-v1: unsupported head_dim {} (only 64/96/128)",
-                self.head_dim
-            );
-        }
-        match self.arena_dtype {
-            DType::F16 => self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, fused_v1_fp16_shim),
-            DType::BF16 | DType::F8E4M3 => {
-                self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, fused_v1_bf16_shim)
-            }
-            _ => candle::bail!("fused-attn-v1: unsupported dtype"),
-        }
-    }
-}
-
-// Shim wrappers that match the unsafe extern "C" fn signature expected by
-// `cuda_fwd_typed`. Internally they call `fused_attn_v1_v2_compat_dispatch`
-// with the appropriate dtype tag.
-#[cfg(feature = "cuda")]
-unsafe extern "C" fn fused_v1_fp16_shim(
-    q_ptr: *const core::ffi::c_void,
-    headers_ptr: *const u8,
-    o_ptr: *mut core::ffi::c_void,
-    num_active_slots: i32,
-    n_q_head: i32,
-    n_kv_head: i32,
-    head_dim: i32,
-    softmax_scale: f32,
-    k_new: *const core::ffi::c_void,
-    v_new: *const core::ffi::c_void,
-    rope_cs: *const f32,
-    rope_interleaved: i32,
-    stream: *mut core::ffi::c_void,
-) {
-    let _ = candle_kernels::fused_attn_v1::fused_attn_v1_v2_compat_dispatch(
-        /*q_dtype_tag=*/ 0,
-        head_dim,
-        q_ptr,
-        headers_ptr,
-        o_ptr,
-        num_active_slots,
-        n_q_head,
-        n_kv_head,
-        softmax_scale,
-        k_new,
-        v_new,
-        rope_cs,
-        rope_interleaved,
-        stream,
-    );
-}
-
-#[cfg(feature = "cuda")]
-unsafe extern "C" fn fused_v1_bf16_shim(
-    q_ptr: *const core::ffi::c_void,
-    headers_ptr: *const u8,
-    o_ptr: *mut core::ffi::c_void,
-    num_active_slots: i32,
-    n_q_head: i32,
-    n_kv_head: i32,
-    head_dim: i32,
-    softmax_scale: f32,
-    k_new: *const core::ffi::c_void,
-    v_new: *const core::ffi::c_void,
-    rope_cs: *const f32,
-    rope_interleaved: i32,
-    stream: *mut core::ffi::c_void,
-) {
-    let _ = candle_kernels::fused_attn_v1::fused_attn_v1_v2_compat_dispatch(
-        /*q_dtype_tag=*/ 1,
-        head_dim,
-        q_ptr,
-        headers_ptr,
-        o_ptr,
-        num_active_slots,
-        n_q_head,
-        n_kv_head,
-        softmax_scale,
-        k_new,
-        v_new,
-        rope_cs,
-        rope_interleaved,
-        stream,
-    );
 }
 
 #[cfg(all(test, feature = "cuda"))]

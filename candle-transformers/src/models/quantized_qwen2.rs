@@ -1112,7 +1112,7 @@ mod tests {
     fn test_clone_with_independent_kv_cache() -> Result<()> {
         // Download a small Qwen2 model from HuggingFace
         // Using Qwen2-0.5B-Instruct-GGUF (smallest available for fast testing)
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         let repo = api.model("Qwen/Qwen2-0.5B-Instruct-GGUF".to_string());
@@ -1247,7 +1247,7 @@ mod tests {
     fn test_flash_attention_prompt() -> Result<()> {
         println!("\n=== Testing Flash Attention for Prompt Processing ===\n");
 
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         let repo = api.model("Qwen/Qwen2-0.5B-Instruct-GGUF".to_string());
@@ -1361,7 +1361,7 @@ mod tests {
         let dialect = Dialect::chat_ml();
 
         // Download tokenizer.json (Qwen2) from HuggingFace.
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
         let tok_repo = api.model("Qwen/Qwen2-0.5B-Instruct".to_string());
         let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {

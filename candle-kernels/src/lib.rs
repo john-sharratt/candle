@@ -18,8 +18,8 @@ pub mod sampling;
 #[path = "paged-decode/api.rs"]
 pub mod paged_decode;
 
+#[path = "legacy/api.rs"]
+pub mod paged_decode_legacy;
+
 #[path = "paged-prefill/api.rs"]
 pub mod paged_prefill;
-
-#[path = "fused-attn-v1/api.rs"]
-pub mod fused_attn_v1;

@@ -699,6 +699,16 @@ impl BatchedInferenceSession {
                 ((chunks.len() - 1) as u32) << 16
                     | (last.offset as u32 + last.token_count as u32)
             }));
+            if std::env::var("KV_DEBUG_ROTATE").is_ok() {
+                if let Some(last) = chunks.last() {
+                    let within = last.offset as u32 + last.token_count as u32;
+                    eprintln!(
+                        "[rotate] seq={seq_idx} off={seq_offset} n_chunks={} last(off={},tok={}) within={within}{}",
+                        chunks.len(), last.offset, last.token_count,
+                        if within >= 32 { "  <<< WRITE SLICE FULL" } else { "" },
+                    );
+                }
+            }
         }
 
         // Upload position_map via the pinned stager — zero-copy PCIe read,

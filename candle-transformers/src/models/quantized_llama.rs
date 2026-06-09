@@ -1463,7 +1463,7 @@ mod tests {
     fn test_clone_with_independent_kv_cache() -> Result<()> {
         // Download a small Llama model from HuggingFace
         // Using Llama-3.2-1B-Instruct (smallest available for fast testing)
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         let repo = api.model("bartowski/Llama-3.2-1B-Instruct-GGUF".to_string());
@@ -1597,7 +1597,7 @@ mod tests {
     fn test_flash_attention_prompt() -> Result<()> {
         println!("\n=== Testing Flash Attention for Prompt Processing ===\n");
 
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         let repo = api.model("bartowski/Llama-3.2-1B-Instruct-GGUF".to_string());
@@ -1731,7 +1731,7 @@ mod tests {
         println!("\n=== Loading Model ===\n");
 
         // Download model from HuggingFace
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
@@ -2138,7 +2138,7 @@ mod tests {
         let dialect = Dialect::llama2();
 
         // Download tokenizer.json (Llama 2) from HuggingFace
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
         let tok_repo = api.model("NousResearch/Llama-2-7b-hf".to_string());
         let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
@@ -2386,7 +2386,7 @@ mod tests {
             );
 
             // Download model (same as the gated test — should already be cached).
-            let api = hf_hub::api::sync::Api::new()
+            let api = crate::models::batch_test::test_helpers::api()
                 .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
             let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
             let model_path = repo.get("model-Q4_K_M.gguf").map_err(|e| {
@@ -2551,7 +2551,7 @@ mod tests {
             Device::new_cuda(0).map_err(|e| candle::Error::Msg(format!("CUDA required: {}", e)))?;
 
         // Download model
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("HF API: {}", e)))?;
         let repo = api.model("VibeStudio/Nidum-Llama-3.2-3B-Uncensored-GGUF".to_string());
         let model_path = repo

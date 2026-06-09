@@ -292,7 +292,7 @@ fn run_golden(
                     let passed = v2.cosine >= floor && fused.cosine >= floor;
                     any_fail |= !passed;
                     eprintln!(
-                        "{} v2cos={:.5} fusedcos={:.5} (v2mae={:.2e} fusedmae={:.2e})",
+                        "{} legacy_cos={:.5} int8_cos={:.5} (legacy_mae={:.2e} int8_mae={:.2e})",
                         if passed { "pass" } else { "FAIL" },
                         v2.cosine,
                         fused.cosine,
@@ -402,11 +402,11 @@ fn compare_cell(
     // layout the second kernel sees — spuriously inflating the divergence,
     // most visibly at a chunk boundary (e.g. ctx=31 → 32). Fresh, deterministic
     // fixtures give both kernels bit-identical pristine input.
-    let out_v2 = match build_and_decode(sc, fmt, DecodeBackend::V2, device, stager) {
+    let out_v2 = match build_and_decode(sc, fmt, DecodeBackend::Legacy, device, stager) {
         Ok(o) => o,
         Err(e) => return CompareOutcome::Skipped(format!("v2: {}", short_err(&e))),
     };
-    let out_fused = match build_and_decode(sc, fmt, DecodeBackend::FusedV1, device, stager) {
+    let out_fused = match build_and_decode(sc, fmt, DecodeBackend::Int8, device, stager) {
         Ok(o) => o,
         Err(e) => return CompareOutcome::Skipped(format!("fused: {}", short_err(&e))),
     };
@@ -444,14 +444,14 @@ fn run_bench(
                 let fix_v2 = Fixture::build(sc, fmt, device, stager)?;
                 let fix_fused = Fixture::build(sc, fmt, device, stager)?;
                 for _ in 0..warmup {
-                    let _ = fix_v2.decode(DecodeBackend::V2, device, stager)?;
-                    let _ = fix_fused.decode(DecodeBackend::FusedV1, device, stager)?;
+                    let _ = fix_v2.decode(DecodeBackend::Legacy, device, stager)?;
+                    let _ = fix_fused.decode(DecodeBackend::Int8, device, stager)?;
                 }
                 let mut v2s: Vec<std::time::Duration> = Vec::with_capacity(iters.max(1));
                 let mut fs: Vec<std::time::Duration> = Vec::with_capacity(iters.max(1));
                 for _ in 0..iters.max(1) {
-                    let (_, dt_v2) = fix_v2.decode(DecodeBackend::V2, device, stager)?;
-                    let (_, dt_f) = fix_fused.decode(DecodeBackend::FusedV1, device, stager)?;
+                    let (_, dt_v2) = fix_v2.decode(DecodeBackend::Legacy, device, stager)?;
+                    let (_, dt_f) = fix_fused.decode(DecodeBackend::Int8, device, stager)?;
                     v2s.push(dt_v2);
                     fs.push(dt_f);
                 }
@@ -479,7 +479,7 @@ fn run_bench(
             let fused_us = fused.as_secs_f64() * 1e6;
             let tps = |us: f64| sc.num_slots as f64 * 1e6 / us;
             eprintln!(
-                "v2={v2_us:.1}µs ({:.0} tok/s)  fused={fused_us:.1}µs ({:.0} tok/s)  {:.2}×",
+                "legacy={v2_us:.1}µs ({:.0} tok/s)  int8={fused_us:.1}µs ({:.0} tok/s)  {:.2}×",
                 tps(v2_us),
                 tps(fused_us),
                 v2_us / fused_us
@@ -520,8 +520,8 @@ fn golden_cell(
     device: &Device,
     stager: &PinnedStager,
 ) -> candle::Result<(Metrics, Metrics, f32)> {
-    let out_v2 = build_and_decode(sc, fmt, DecodeBackend::V2, device, stager)?;
-    let out_fused = build_and_decode(sc, fmt, DecodeBackend::FusedV1, device, stager)?;
+    let out_v2 = build_and_decode(sc, fmt, DecodeBackend::Legacy, device, stager)?;
+    let out_fused = build_and_decode(sc, fmt, DecodeBackend::Int8, device, stager)?;
     let gold = fixture::golden_decode(sc, device)?;
     let v2 = Metrics::compute(&gold, &out_v2, sc.n_q_head, sc.head_dim)?;
     let fused = Metrics::compute(&gold, &out_fused, sc.n_q_head, sc.head_dim)?;
@@ -566,10 +566,10 @@ fn run_xcheck(
         let row = (|| -> candle::Result<(f32, f32, f32, f32)> {
             // Fresh fixture per decode — a decode commits the write token, so
             // reuse would cross-contaminate (see `compare_cell`).
-            let v2_f = build_and_decode(sc, ffmt, DecodeBackend::V2, device, stager)?;
-            let fu_f = build_and_decode(sc, ffmt, DecodeBackend::FusedV1, device, stager)?;
-            let v2_q = build_and_decode(sc, qfmt, DecodeBackend::V2, device, stager)?;
-            let fu_q = build_and_decode(sc, qfmt, DecodeBackend::FusedV1, device, stager)?;
+            let v2_f = build_and_decode(sc, ffmt, DecodeBackend::Legacy, device, stager)?;
+            let fu_f = build_and_decode(sc, ffmt, DecodeBackend::Int8, device, stager)?;
+            let v2_q = build_and_decode(sc, qfmt, DecodeBackend::Legacy, device, stager)?;
+            let fu_q = build_and_decode(sc, qfmt, DecodeBackend::Int8, device, stager)?;
             let m = |a, b| -> candle::Result<f32> {
                 Ok(Metrics::compute(a, b, sc.n_q_head, sc.head_dim)?.mae)
             };

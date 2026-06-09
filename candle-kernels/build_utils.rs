@@ -116,7 +116,7 @@ const QUANTIZED_KERNELS: [&str; 42] = [
 ];
 
 // Flash-attention kernels: 10 total
-const FLASH_KERNELS: [&str; 11] = [
+const FLASH_KERNELS: [&str; 12] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -126,12 +126,13 @@ const FLASH_KERNELS: [&str; 11] = [
     // Paged decode: per-dtype dispatchers (hdim 64/96/128/256)
     "src/paged-decode/paged_decode_api_fp16.cu",
     "src/paged-decode/paged_decode_api_bf16.cu",
+    // Legacy V2 paged-decode (A/B reference + head_dim=256 fallback)
+    "src/legacy/paged_decode_legacy_api_fp16.cu",
+    "src/legacy/paged_decode_legacy_api_bf16.cu",
     // Paged prefill (1 api dispatcher + 2 per-dtype variants: fp16, bf16)
     "src/paged-prefill/paged_prefill_api.cu",
     "src/paged-prefill/paged_prefill_api_fp16.cu",
     "src/paged-prefill/paged_prefill_api_bf16.cu",
-    // Fused QKV + attention v1 (single dispatch CU)
-    "src/fused-attn-v1/launch.cu",
 ];
 
 // ============================================================================
@@ -317,25 +318,6 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
             compile_args: decode_args.clone(),
             include_dirs: flash_includes.clone(),
         });
-    }
-
-    // 6. Fused QKV+attention v1 kernels.
-    // Compiled with the same flags as paged_decode (it shares headers from the
-    // paged-decode/ directory and the convert/ directory).
-    {
-        let fused_kernels: Vec<String> = FLASH_KERNELS
-            .iter()
-            .filter(|k| k.contains("fused-attn-v1") || k.contains("fused_attn_v1"))
-            .map(|s| s.to_string())
-            .collect();
-        if !fused_kernels.is_empty() {
-            groups.push(ArchiveGroup {
-                name: "fused_attn_v1".to_string(),
-                kernels: fused_kernels,
-                compile_args: decode_args,
-                include_dirs: flash_includes,
-            });
-        }
     }
 
     groups

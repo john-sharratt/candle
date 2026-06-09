@@ -1827,11 +1827,15 @@ mod tests {
         let num_generate_tokens = 10;
         let dialect = Dialect::chat_ml();
 
-        // Download tokenizer
-        let api = hf_hub::api::sync::Api::new()
-            .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
-        let tok_repo = api.model("Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
-        let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
+        // Download tokenizer (hf_get falls back from IPv6 to IPv4 if needed).
+        use crate::models::batch_test::test_helpers::hf_get;
+        let tokenizer_path = hf_get(
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            hf_hub::RepoType::Model,
+            "main",
+            "tokenizer.json",
+        )
+        .map_err(|e| {
             candle::Error::Msg(format!(
                 "Failed to download tokenizer.json: {}. This test requires internet access.",
                 e
@@ -1852,19 +1856,18 @@ mod tests {
 
         println!("\n=== Loading Model ===\n");
 
-        let repo = api.repo(hf_hub::Repo::with_revision(
-            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF".to_string(),
+        let model_path = hf_get(
+            "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
             hf_hub::RepoType::Model,
-            "main".to_string(),
-        ));
-        let model_path = repo
-            .get("Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf")
-            .map_err(|e| {
-                candle::Error::Msg(format!(
-                    "Failed to download model: {}. This test requires internet access.",
-                    e
-                ))
-            })?;
+            "main",
+            "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+        )
+        .map_err(|e| {
+            candle::Error::Msg(format!(
+                "Failed to download model: {}. This test requires internet access.",
+                e
+            ))
+        })?;
 
         println!("Model downloaded to: {:?}", model_path);
 
@@ -2130,7 +2133,7 @@ mod tests {
             println!("Using device: {:?}", device);
 
             // Download tokenizer
-            let api = hf_hub::api::sync::Api::new()
+            let api = crate::models::batch_test::test_helpers::api()
                 .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
             let tok_repo = api.model("Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
             let tokenizer_path = tok_repo

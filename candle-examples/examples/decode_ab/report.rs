@@ -35,13 +35,13 @@ pub fn render_golden(rows: &[GoldenRow], cosine_tol: f32) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "# decode golden check — both kernels vs FP32 ground truth (identity RoPE)\n\n\
-         Pass gate: V2 **and** fused cosine-vs-golden ≥ {cosine_tol:.4} (structural \
+         Pass gate: legacy **and** int8 cosine-vs-golden ≥ {cosine_tol:.4} (structural \
          correctness; quant precision shows up as MAE, not cosine). The 1-bit Q1_S \
          format uses a relaxed floor (0.80) — its sign-only V legitimately tops out \
          near 0.87, where a structural bug would still crater below ~0.6.\n\n",
     ));
     s.push_str(
-        "| scenario | format | status | v2 cos | v2 MAE | fused cos | fused MAE | A/B MAE |\n",
+        "| scenario | format | status | legacy cos | legacy MAE | int8 cos | int8 MAE | A/B MAE |\n",
     );
     s.push_str("|---|---|---|---|---|---|---|---|\n");
     let (mut np, mut nf, mut ns) = (0usize, 0usize, 0usize);
@@ -103,7 +103,7 @@ pub struct BenchRow {
 }
 
 impl BenchRow {
-    /// Speedup of fused over v2 (>1 = fused faster).
+    /// Speedup of int8 over legacy V2 (>1 = int8 faster).
     pub fn speedup(&self) -> f64 {
         if self.fused_us > 0.0 {
             self.v2_us / self.fused_us
@@ -126,7 +126,7 @@ pub fn render_compare(rows: &[CompareRow], tol: (f32, f32, f32)) -> String {
     let (mae_tol, max_tol, cos_tol) = tol;
     let mut s = String::new();
     s.push_str(&format!(
-        "# decode A/B — parity (V2 reference vs fused-attn-v1)\n\n\
+        "# decode A/B — parity (int8 vs legacy V2 reference)\n\n\
          Pass criterion: MAE ≤ {mae_tol:.1e}, max-abs ≤ {max_tol:.1e}, cosine ≥ {cos_tol:.5}\n\n",
     ));
     s.push_str("| scenario | format | status | MAE | max-abs | cosine | worst head |\n");
@@ -175,8 +175,8 @@ pub fn render_compare(rows: &[CompareRow], tol: (f32, f32, f32)) -> String {
 /// events); tokens/s = num_slots / per-call-time. Target for Track A: ≥ 2×.
 pub fn render_bench(rows: &[BenchRow]) -> String {
     let mut s = String::new();
-    s.push_str("# decode bench — V2 vs fused-attn-v1 (CUDA-event GPU kernel time)\n\n");
-    s.push_str("| scenario | format | slots | V2 µs | fused µs | V2 tok/s | fused tok/s | speedup |\n");
+    s.push_str("# decode bench — int8 vs legacy V2 (CUDA-event GPU kernel time)\n\n");
+    s.push_str("| scenario | format | slots | legacy µs | int8 µs | legacy tok/s | int8 tok/s | speedup |\n");
     s.push_str("|---|---|---|---|---|---|---|---|\n");
     for r in rows {
         let sp = r.speedup();

@@ -36,6 +36,9 @@ tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Direct HTTP client for the IPv6->IPv4 download fallback (test_helpers::hf_get).
+# native-tls matches hf-hub's backend (uses the system cert store).
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
 
 [features]
 default = []

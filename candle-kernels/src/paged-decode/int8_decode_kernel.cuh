@@ -23,11 +23,11 @@
 #include "../arena_table.cuh"
 #include "../simple/warp_reduce.cuh"
 #include "../convert/convert_all.cuh"
-#include "../paged-decode/slot_types.cuh"
-#include "../paged-decode/pal_iter.cuh"
-// Pull in v2's local helpers (vec2_traits, load_vec2, cp_async_*, RoPE, scatter
-// helpers). They're inline templates living in paged_decode_kernel.cuh.
-#include "../paged-decode/paged_decode_kernel.cuh"
+#include "slot_types.cuh"
+#include "pal_iter.cuh"
+// Shared decode helpers (vec2_traits, load_vec2, cp_async_*, RoPE, scatter,
+// write-len commit) — formerly inline in the V2 paged_decode_kernel.cuh.
+#include "decode_helpers.cuh"
 #include "mma_wrappers.cuh"
 
 namespace fused_attn {

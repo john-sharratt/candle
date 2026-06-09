@@ -1212,7 +1212,7 @@ mod tests {
     #[ignore] // Run manually with: cargo test benchmark_large_model_sequential --release --features cuda -- --ignored --nocapture
     fn benchmark_large_model_sequential() -> Result<()> {
         // Benchmark large 7B-8B model with sequential loading
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         // Using Llama-3.2-3B (larger than 0.6B but not too huge for testing)
@@ -1284,7 +1284,7 @@ mod tests {
     #[ignore] // Run manually with: cargo test benchmark_large_model_mmap --release --features cuda -- --ignored --nocapture
     fn benchmark_large_model_mmap() -> Result<()> {
         // Benchmark large 7B-8B model with mmap loading
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
 
         // Using Llama-3.2-3B (larger than 0.6B but not too huge for testing)
@@ -1363,7 +1363,7 @@ mod tests {
 
         // Download tokenizer.json (Qwen3) from HuggingFace.
         // We keep this runtime-loaded so the test can validate real token ranges.
-        let api = hf_hub::api::sync::Api::new()
+        let api = crate::models::batch_test::test_helpers::api()
             .map_err(|e| candle::Error::Msg(format!("Failed to initialize HF API: {}", e)))?;
         let tok_repo = api.model("Qwen/Qwen3-8B".to_string());
         let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
