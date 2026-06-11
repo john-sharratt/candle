@@ -932,8 +932,8 @@ pub fn compute_rope_cs(
 /// over identical inputs; [`paged_decode_attn`] uses the `Int8` default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DecodeBackend {
-    Int8,
     #[default]
+    Int8,
     Legacy,
 }
 
@@ -1680,8 +1680,65 @@ mod tests {
         Ok(out[0].clone())
     }
 
-    /// Helper: prefill KV cache, then run paged decode for one token.
-    /// Returns the decode output and the reference decode output.
+    /// Regression test for the int8 m16n8k32 MMA fragment loaders.
+    ///
+    /// Feeds known int8 `A` (16×32) and `B` (8×32) through the exact loaders the
+    /// decode QK dot uses (`load_a_frag_m16k32` / `load_b_frag_n8k32` /
+    /// `mma_int8_m16n8k32`) and asserts the int32 `C = A·Bᵀ` matches a trivial
+    /// CPU reference — exactly, no tolerance. Guards against the
+    /// `load_b_frag_n8k32` lane-decomposition bug that silently corrupted every
+    /// int8 QK dot, and any future MMA-fragment regression. Fast (one warp, no
+    /// model), so it runs on every `cargo test`.
+    #[test]
+    fn int8_mma_m16n8k32_fragment_layout() -> Result<()> {
+        use candle::cuda_backend::cudarc::driver::DevicePtr;
+        let device = Device::new_cuda(0)?;
+        let cuda = device.as_cuda_device()?;
+        let stream = cuda.cuda_stream();
+
+        // Deterministic int8 inputs spanning a range of magnitudes and signs.
+        let mut a = vec![0i8; 16 * 32];
+        let mut b = vec![0i8; 8 * 32];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = ((i * 31 + 7) % 17) as i8 - 8;
+        }
+        for (i, x) in b.iter_mut().enumerate() {
+            *x = ((i * 13 + 5) % 19) as i8 - 9;
+        }
+        // Reference: C[m][n] = Σ_k A[m][k]·B[n][k] (int32, exact).
+        let mut c_ref = vec![0i32; 16 * 8];
+        for m in 0..16 {
+            for n in 0..8 {
+                let mut s = 0i32;
+                for k in 0..32 {
+                    s += a[m * 32 + k] as i32 * b[n * 32 + k] as i32;
+                }
+                c_ref[m * 8 + n] = s;
+            }
+        }
+
+        let a_slice = cuda.memcpy_stod(&a)?;
+        let b_slice = cuda.memcpy_stod(&b)?;
+        let c_slice = cuda.alloc_zeros::<i32>(16 * 8)?;
+        unsafe {
+            let (a_ptr, _ga) = a_slice.device_ptr(&stream);
+            let (b_ptr, _gb) = b_slice.device_ptr(&stream);
+            let (c_ptr, _gc) = c_slice.device_ptr(&stream);
+            candle_kernels::paged_decode::mma_int8_m16n8k32_test(
+                a_ptr as *const i8,
+                b_ptr as *const i8,
+                c_ptr as *mut i32,
+                stream.cu_stream() as *mut core::ffi::c_void,
+            );
+        }
+        device.synchronize()?;
+        let c_gpu = cuda.memcpy_dtov(&c_slice)?;
+        assert_eq!(
+            c_gpu, c_ref,
+            "int8 m16n8k32 MMA fragment layout regressed (load_a/load_b/mma)"
+        );
+        Ok(())
+    }
 
     // ------------------------------------------------------------------
     // Prefill correctness: no prefix (offset=0)

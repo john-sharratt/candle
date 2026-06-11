@@ -1161,11 +1161,6 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
         __syncthreads();
     }
 
-    int kv_len = (int)ws_rope + (int)ws_len + 1;
-    if (kv_len <= 0) { for (int h = 0; h < hpg; ++h) emit_partial(h); return; }
-    int max_len = (int)n_slices * CHUNK_SIZE;
-    if (kv_len > max_len) kv_len = max_len;
-
     constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
     constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
 
@@ -1223,45 +1218,75 @@ __device__ __forceinline__ void int8_decode_bmma_impl(
     __shared__ alignas(16)  float  scaleK[WARPS_PER_BLOCK][8][N_PALETTE];
     __shared__ alignas(16)  float  scores_smem[WARPS_PER_BLOCK][HPG][8];
 
-    int n_tiles = (kv_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
+    // ── Per-slice tiling (gap-aware). Each slice contributes ceil(eff_len/8)
+    // 8-token MMA tiles, eff_len being its filled count (+1 for the write
+    // slice's freshly-scattered token). Iterating per slice — rather than by a
+    // flat chunk_div(logical) that assumes 32 logical tokens per slice — is what
+    // lets a sealed partial chunk's empty tail (the substrate-seal gap) be
+    // skipped: its unfilled positions are never addressed, and the writer slice
+    // that follows is reached at its true physical position rather than being
+    // aliased into the gap. ──
+    auto slice_eff_len = [&](int s) -> int {
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+        int len = (int)slice_len(sl);
+        int off = (int)slice_offset(sl);
+        if (s == (int)write_slice_idx && len < CHUNK_SIZE && off + len < CHUNK_SIZE) len += 1;
+        return len;
+    };
+    auto slice_tile_count = [&](int s) -> int { return (slice_eff_len(s) + 7) / 8; };
+
+    int total_tiles = 0;
+    for (int s = 0; s < (int)n_slices; ++s) total_tiles += slice_tile_count(s);
+
+
+    int tiles_per_split = (total_tiles + num_splits - 1) / num_splits;
     int tile_lo = split_idx * tiles_per_split;
     int tile_hi = tile_lo + tiles_per_split;
-    if (tile_hi > n_tiles) tile_hi = n_tiles;
+    if (tile_hi > total_tiles) tile_hi = total_tiles;
 
     PalIter<VEC, HEAD_DIM> ki, vi;
     int cur_slice = -1;
+    // Map a global tile g -> (slice, tile-in-slice) with a forward scan. g is
+    // monotonic within a warp's strided iteration, so the cursor only advances.
+    int scan_s = 0, scan_base = 0;
 
     // warp-stripe: each warp takes every WARPS_PER_BLOCK-th tile of the split's
     // range (its own tile + smem buffers), so the 8 warps share the work rather
     // than redundantly recomputing the whole range.
     for (int tile = tile_lo + warp; tile < tile_hi; tile += WARPS_PER_BLOCK) {
-        int k_base = tile * WARPS_PER_BLOCK;
-        // A tile's 8 tokens (k_base..k_base+7) all live in one 32-token chunk, so
+        while (scan_s + 1 < (int)n_slices) {
+            int t_here = slice_tile_count(scan_s);
+            if (scan_base + t_here <= tile) { scan_base += t_here; ++scan_s; }
+            else break;
+        }
+        int slice_idx = scan_s;
+        int tile_in_slice = tile - scan_base;
+        const bool slice_ok = true;  // we only iterate real slices now
+        // All 8 tokens of a per-slice tile live in this one 32-token chunk, so
         // the slice / head_ptr / off / bv / ki / vi are shared — hoist them.
-        int slice_idx = chunk_div(k_base);
-        bool slice_ok = (slice_idx < (int)n_slices);
-        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_ok ? slice_idx : 0, n_kv_head);
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
         const uint8_t* head_ptr = get_head<HEAD_DIM>(sl, kv_head_idx);
-        uint32_t bv = (uint32_t)slice_len(sl);
         uint32_t off = (uint32_t)slice_offset(sl);
+        uint32_t bv = (uint32_t)slice_len(sl);
         if (slice_idx == (int)write_slice_idx && bv < CHUNK_SIZE && off + bv < CHUNK_SIZE) bv += 1;
-        if (slice_ok && slice_idx != cur_slice) {
+        if (slice_idx != cur_slice) {
             ki.init(kvhead_k_pal_map<HEAD_DIM>(head_ptr), lane);
             vi.init(kvhead_v_pal_map<HEAD_DIM>(head_ptr), lane);
             cur_slice = slice_idx;
         }
         int32_t rope_base = (int32_t)slice_rope(sl);
+        int within_base = (int)off + tile_in_slice * 8;
 
         int tok_within[8];
         bool tok_valid[8];
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
-            int kidx = k_base + t;
-            int within = chunk_mod(kidx);
-            tok_within[t] = within;
-            tok_valid[t] = slice_ok && (kidx < kv_len)
-                         && (within >= (int)off && within < (int)(off + bv));
+            int within = within_base + t;
+            bool valid = (within < (int)(off + bv));
+            // Pad lanes of the slice's last tile read a safe in-bounds slot and
+            // are discarded (tok_valid=false) below.
+            tok_within[t] = valid ? within : (int)off;
+            tok_valid[t] = valid;
         }
         // ── stage the 8 tokens' K → shared_kb, cp.async double-buffered so each
         // token's load overlaps the previous token's gather/RoPE/quant. The
@@ -1561,12 +1586,14 @@ void launch_int8_decode_attn(
         constexpr int WARPS_PER_BLOCK = decltype(warps_const)::value;
         constexpr bool ROPE_INTERLEAVED = decltype(rope_const)::value;
 
-        // Warp-stripe (1C) when heads_per_group < WARPS: every warp computes,
+        // Warp-stripe (1C) when heads_per_group <= WARPS: every warp computes,
         // each over its own KV stripe for all heads, and the partial index folds
         // in the warp axis (split*WARPS + warp) — so it always writes partials +
         // combines. partials_per_row = num_splits*WARPS for stripe, else num_splits.
+        // hpg==8 (e.g. Qwen3-MoE, n_q/n_kv=32/4) is included: the batched-M MMA
+        // path is gap-aware and the warp=head path is not, so route it here.
         const bool use_stripe = (heads_per_group >= 1 && heads_per_group <= 8
-                                 && heads_per_group < WARPS_PER_BLOCK);
+                                 && heads_per_group <= WARPS_PER_BLOCK);
         const int partials_per_row = use_stripe ? (num_splits * WARPS_PER_BLOCK) : num_splits;
         const bool need_pool = use_stripe || (num_splits > 1);
         float* pa = nullptr;

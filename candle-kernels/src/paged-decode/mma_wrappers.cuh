@@ -111,17 +111,21 @@ __device__ __forceinline__ void load_a_frag_m16k32(
     a[3] = *reinterpret_cast<const uint32_t*>(smem_a + (int64_t)(row_base + 8) * lda_bytes + col_base + 16);
 }
 
-// Load an 8x32 INT8 B fragment (k-major). Per PTX ISA m16n8k32:
-//   b[0] = bytes at row(lane%8), cols (lane/8)*4 .. (lane/8)*4+3
-//   b[1] = bytes at row(lane%8), cols (lane/8)*4+16 .. +19
+// Load an 8x32 INT8 B fragment. Per PTX ISA m16n8k32 the B operand uses the
+// SAME (groupID, threadID) lane decomposition as A — groupID = laneid>>2 selects
+// the column n (0..7), threadID = laneid&3 selects the k-quad — NOT (lane%8,
+// lane/8). Getting this wrong makes the tensor core contract mismatched
+// elements, silently corrupting every QK dot.
+//   b[0] = bytes at row(n = lane>>2), cols (lane&3)*4 .. +3
+//   b[1] = bytes at row(n = lane>>2), cols (lane&3)*4 + 16 .. +19
 __device__ __forceinline__ void load_b_frag_n8k32(
     uint32_t      (&b)[2],
     const int8_t* smem_b,
     int           ldb_bytes,
     int           lane
 ) {
-    int row = lane & 7;
-    int col_base = (lane >> 3) * 4;
+    int row = lane >> 2;
+    int col_base = (lane & 3) * 4;
     b[0] = *reinterpret_cast<const uint32_t*>(smem_b + (int64_t)row * ldb_bytes + col_base);
     b[1] = *reinterpret_cast<const uint32_t*>(smem_b + (int64_t)row * ldb_bytes + col_base + 16);
 }
@@ -145,8 +149,10 @@ __device__ __forceinline__ void load_b_frag_n8k16(
     int           ldb_bytes,
     int           lane
 ) {
-    int row = lane & 7;
-    int col_base = (lane >> 3) * 4;
+    // Same B-operand decomposition as m16n8k32 (see load_b_frag_n8k32):
+    // n = lane>>2, k = (lane&3)*4.
+    int row = lane >> 2;
+    int col_base = (lane & 3) * 4;
     b[0] = *reinterpret_cast<const uint32_t*>(smem_b + (int64_t)row * ldb_bytes + col_base);
 }
 
