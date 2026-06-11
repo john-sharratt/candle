@@ -31,34 +31,103 @@ use crate::kv_cache::{KvFormat, QuantFormat};
 /// headroom the in-flight forward pass needs for activations. On WDDM the
 /// driver would otherwise silently spill the over-budget allocation to host
 /// memory and collapse GPU throughput; reserving headroom (and failing fast
-/// when it can't be met) keeps everything resident. Default `max(8% of total,
-/// 1 GiB)`, overridable with `CANDLE_KV_VRAM_RESERVE_MB`.
+/// when it can't be met) keeps everything resident.
+///
+/// The forward-pass activation working set is *transient* and *chunked*: ragged
+/// prefill processes one `CHUNK_SIZE`-bounded slice at a time and decode is a
+/// single token, so the peak scales with `batch × chunk × model_width` — a few
+/// hundred MiB for the models we run — and is *independent of total VRAM*. The
+/// previous `max(8% of total, 1 GiB)` heuristic instead scaled with card size,
+/// so on a memory-tight card (16 GB mostly filled by an 11.7 GB model) it
+/// reserved ~1.3 GiB — a third of the KV budget — and rejected KV allocations
+/// that fit fine in VRAM with no spill. A fixed headroom matches what the
+/// forward pass actually needs.
+///
+/// Default 256 MiB; override with `CANDLE_KV_VRAM_RESERVE_MB` (raise it for very
+/// wide models such as 235B, where the per-chunk activation is larger).
 #[cfg(feature = "cuda")]
-fn vram_reserve_bytes(total: usize) -> usize {
+fn vram_reserve_bytes(_total: usize) -> usize {
     if let Ok(v) = std::env::var("CANDLE_KV_VRAM_RESERVE_MB") {
         if let Ok(mb) = v.trim().parse::<usize>() {
             return mb.saturating_mul(1024 * 1024);
         }
     }
-    const FRACTION_NUM: usize = 8;
-    const FRACTION_DEN: usize = 100;
-    const FLOOR: usize = 1usize << 30; // 1 GiB
-    (total / FRACTION_DEN * FRACTION_NUM).max(FLOOR)
+    // 384 MiB. Serves two roles: headroom for forward-pass activations in our
+    // own accounting, AND the hard floor of *current* driver-free VRAM we refuse
+    // to dip below (see `vram_has_room`). The floor is what keeps the machine
+    // off the cliff — it guarantees we never drive free toward zero and push the
+    // OS into a paging death-spiral, regardless of what our pool accounting
+    // estimates. Sized to clear a 30B-A3B forward pass while still letting the
+    // 16 GB dev card hold large session batches; override with
+    // `CANDLE_KV_VRAM_RESERVE_MB` (e.g. raise it on a busy shared desktop).
+    384 * 1024 * 1024
 }
 
-/// Whether `want` bytes can be allocated in device VRAM while keeping the
-/// reserve free. Returns `true` (permit) on non-CUDA devices or when the
-/// driver memory query fails — the gate only blocks when we can prove there
-/// isn't room.
+/// Whether `want` bytes can be allocated on `device` without pushing *our own*
+/// live GPU footprint past the memory actually available to us. Returns `true`
+/// (permit) on non-CUDA devices, or when the pool/total queries are unavailable
+/// — the gate only blocks when we can prove our footprint wouldn't fit.
+///
+/// We gate on CUDA's own accounting of our stream-ordered memory pool
+/// (`pool_used_bytes` = model weights + KV + activations) against `init_free` —
+/// the VRAM free at device creation, i.e. `total` minus our CUDA context,
+/// before the model loaded. We deliberately do NOT gate on the driver's current
+/// `free`: on WDDM that is polluted by pageable memory from other processes
+/// (desktop / IDE / browser) which the OS evicts the instant our resident set
+/// needs the room, so gating on it false-OOMs and swings run-to-run. Our pool
+/// usage counts only us; `init_free` is the budget that's ours to spend.
 #[cfg(feature = "cuda")]
 fn vram_has_room(device: &Device, want: usize) -> bool {
-    match device {
-        Device::Cuda(d) => match d.mem_get_info() {
-            Ok((free, total)) => free >= want.saturating_add(vram_reserve_bytes(total)),
-            Err(_) => true,
-        },
-        _ => true,
+    let Device::Cuda(d) = device else {
+        return true;
+    };
+    let gpu_id = match device.location() {
+        candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
+        _ => return true,
+    };
+    let used = match d.pool_used_bytes() {
+        Ok(u) => u,
+        Err(_) => return true,
+    };
+    let (free, total) = match d.mem_get_info() {
+        Ok(ft) => ft,
+        Err(_) => return true,
+    };
+    let reserve = vram_reserve_bytes(total);
+    // Stable budget: our own pool usage (model + KV + activations), against the
+    // VRAM that was ours to spend — `init_free` = total minus the CUDA context,
+    // captured at device creation with the pageable desktop excluded. This is
+    // the primary gate and does NOT read the volatile driver free, so it never
+    // false-OOMs or swings run-to-run. Falls back to total if unrecorded.
+    let ceiling = candle::gpu_memory::device_init_free(gpu_id).unwrap_or(total);
+    let budget_ok = used.saturating_add(want).saturating_add(reserve) <= ceiling;
+    // Bytes this allocation must take *from the OS*, beyond what the pool already
+    // holds reserved-but-free (`reserved - used`). cudarc's stream-ordered pool
+    // retains freed blocks, so reusing them (e.g. the quant arenas a KV seal
+    // frees, immediately re-allocated) costs zero new OS memory — the driver's
+    // `free` doesn't move. Without this, the floor below would blindly reject
+    // pure pool reuse whenever `free` was already low.
+    let reserved = match d.pool_reserved_bytes() {
+        Ok(r) => r,
+        Err(_) => used,
+    };
+    let os_needed = want.saturating_sub(reserved.saturating_sub(used));
+    // Hard safety floor: only allocations that GROW our OS footprint are gated
+    // against the driver's *current* free — those are what could drive free
+    // toward zero and push the OS into a paging death-spiral (on WDDM, evicting
+    // an active desktop over PCIe locks the system). Pure pool reuse can't, so
+    // it's always permitted.
+    let free_ok = os_needed == 0 || free.saturating_sub(os_needed) >= reserve;
+    let ok = budget_ok && free_ok;
+    if std::env::var("KV_BUDGET_DEBUG").is_ok() {
+        let mb = |b: usize| b / (1024 * 1024);
+        eprintln!(
+            "[kv-budget] gpu{gpu_id} pool_used={} pool_reserved={} free={} want={} os_needed={} reserve={} ceiling={} budget_ok={budget_ok} free_ok={free_ok} -> {}",
+            mb(used), mb(reserved), mb(free), mb(want), mb(os_needed), mb(reserve), mb(ceiling),
+            if ok { "ALLOW" } else { "REJECT" }
+        );
     }
+    ok
 }
 
 /// Gate a GPU arena allocation of `arena_bytes` on the VRAM budget. When the
@@ -813,6 +882,12 @@ impl ChunkedKvBacking {
             .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
         if let Some(Some(slot)) = state.sequences.get_mut(batch_idx) {
             slot.push_chunk(cw);
+            // The freshly-appended empty chunk is now the writer. Advance the
+            // writer boundary to it so any partial sealed chunk before it sits
+            // below the boundary — its empty tail (gap) is then excluded from
+            // the writer region and never written to or attended.
+            let new_idx = slot.block_count().saturating_sub(1);
+            slot.set_writer_start_idx(new_idx);
             slot.invalidate_gpu_chunks();
         } else {
             candle::bail!("push_empty_writer_chunk: slot {} not allocated", batch_idx)

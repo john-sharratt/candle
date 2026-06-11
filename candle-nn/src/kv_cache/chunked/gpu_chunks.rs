@@ -179,6 +179,7 @@ impl GpuChunksGuard<'_> {
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
         write_len: u16,
+        write_idx: usize,
     ) -> candle::Result<()> {
         if chunks.is_empty() {
             self.clear();
@@ -192,7 +193,10 @@ impl GpuChunksGuard<'_> {
         for (i, chunk) in chunks.iter().enumerate() {
             let bs = i * chunk_byte_size;
             let slot = &mut self.inner.buf.as_mut_slice()[bs..bs + chunk_byte_size];
-            let len = if i + 1 == chunks.len() {
+            // The writer chunk gets the seq_offset-derived `write_len`; every
+            // other chunk (including trailing empties past the writer) keeps its
+            // own stored usage.
+            let len = if i == write_idx {
                 write_len
             } else {
                 chunk.usage as u16

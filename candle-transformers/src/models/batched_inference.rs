@@ -693,22 +693,28 @@ impl BatchedInferenceSession {
                 "decode position_map: cum_tokens {} != state.offset {seq_offset} for seq {seq_idx}",
                 pm_flat.len() - entry_start,
             );
-            // Write-slot entry: new token lands at next free position in the
-            // last chunk.  ensure_for_batch_entries above guarantees it exists.
-            pm_flat.push(chunks.last().map_or(0, |last| {
-                ((chunks.len() - 1) as u32) << 16
-                    | (last.offset as u32 + last.token_count as u32)
-            }));
-            if std::env::var("KV_DEBUG_ROTATE").is_ok() {
-                if let Some(last) = chunks.last() {
-                    let within = last.offset as u32 + last.token_count as u32;
-                    eprintln!(
-                        "[rotate] seq={seq_idx} off={seq_offset} n_chunks={} last(off={},tok={}) within={within}{}",
-                        chunks.len(), last.offset, last.token_count,
-                        if within >= 32 { "  <<< WRITE SLICE FULL" } else { "" },
-                    );
-                }
-            }
+            // Write-slot entry: the new token lands in the WRITE chunk — the
+            // first non-full chunk from `writer_start_idx`, NOT `chunks.last()`
+            // (which may be a trailing empty sitting past the writer). This MUST
+            // match the `write_slice` rule in `sync_decode_gpu_chunks`, or the
+            // kernel scatters the token into one chunk while attention is told
+            // (via the position_map) to read it from another.
+            let wstart = self.backings[0]
+                .writer_start_idx_for_seq(seq_idx)
+                .unwrap_or(0);
+            let n_ch = chunks.len();
+            let wi = if n_ch == 0 {
+                0
+            } else {
+                let start = wstart.min(n_ch - 1);
+                (start..n_ch)
+                    .find(|&i| (chunks[i].offset as usize + chunks[i].token_count as usize) < 32)
+                    .unwrap_or(n_ch - 1)
+            };
+            let wi_within = chunks
+                .get(wi)
+                .map_or(0, |c| c.offset as u32 + c.token_count as u32);
+            pm_flat.push(((wi as u32) << 16) | wi_within);
         }
 
         // Upload position_map via the pinned stager — zero-copy PCIe read,
@@ -949,8 +955,13 @@ impl BatchedInferenceSession {
         use candle::quantized::pinned_staging::PinnedBuf;
         use candle_nn::kv_cache::{quantize_sealed_in_place, SealedSequence};
 
-        let policy = match self.compression_policy() {
-            Some(p) => p,
+        // Quantization policy, or `None` for uncompressed (F16/BF16). When it's
+        // `None` we still SEAL + collapse the layout below (record_turn +
+        // re-inject + fresh writer) — only the quantize step is skipped. This is
+        // what keeps repeated prefills from leaving phantom empty chunks behind
+        // for float modes (which the quantized path already collapses).
+        let policy: Option<CompressionPolicy> = match self.compression_policy() {
+            Some(p) => Some(p),
             None => {
                 // Legacy uniform-quant modes (Q8_0, Q4_0, …) carry no
                 // compression_level but a fixed Quantized K/V format. Drive the
@@ -961,12 +972,16 @@ impl BatchedInferenceSession {
                 match self.config.k_format.as_quant() {
                     Some(k_fmt) => {
                         let v_fmt = self.config.v_format.as_quant().unwrap_or(k_fmt);
-                        CompressionPolicy::new_with_error_threshold_factors(5, 1.0, 1.0, 1.0, 1.0)
+                        Some(
+                            CompressionPolicy::new_with_error_threshold_factors(
+                                5, 1.0, 1.0, 1.0, 1.0,
+                            )
                             .with_override_k_quant(Some(k_fmt))
-                            .with_override_v_quant(Some(v_fmt))
+                            .with_override_v_quant(Some(v_fmt)),
+                        )
                     }
-                    // Uncompressed (F16/BF16) — nothing to quantize.
-                    None => return Ok(()),
+                    // Uncompressed (F16/BF16): no quantization, but still seal.
+                    None => None,
                 }
             }
         };
@@ -974,10 +989,13 @@ impl BatchedInferenceSession {
             Device::Cuda(d) => d.cuda_stream(),
             _ => return Ok(()),
         };
-        // The fused palette4 quantizer requires head_dim == 128.
-        if self.backings.first().map(|b| b.head_dim()) != Some(128) {
-            return Ok(());
-        }
+        // The fused palette4 quantizer requires head_dim == 128. If it isn't, we
+        // still collapse the layout below — just without quantizing.
+        let policy = if self.backings.first().map(|b| b.head_dim()) == Some(128) {
+            policy
+        } else {
+            None
+        };
 
         let mut scratch: Option<PinnedBuf> = None;
         for &seq_idx in seq_indices {
@@ -987,14 +1005,14 @@ impl BatchedInferenceSession {
                 Vec::with_capacity(self.backings.len());
             for backing in &self.backings {
                 let live = backing.record_turn(seq_idx)?;
-                if live.chunks.is_empty() {
+                if live.chunks.is_empty() || policy.is_none() {
                     quantized_per_layer.push(live);
                     continue;
                 }
                 let out = quantize_sealed_in_place(
                     backing,
                     &[&live],
-                    &policy,
+                    policy.as_ref().unwrap(),
                     &self.device,
                     &copy_stream,
                     &mut scratch,
@@ -1007,10 +1025,13 @@ impl BatchedInferenceSession {
                 quantized_per_layer.push(q);
             }
             // Convert kernels must finish before we drop the source float chunks
-            // (truncate) and before decode reads the quantized bytes.
-            copy_stream
-                .synchronize()
-                .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+            // (truncate) and before decode reads the quantized bytes. No convert
+            // kernel runs when quantization was skipped, so only sync then.
+            if policy.is_some() {
+                copy_stream
+                    .synchronize()
+                    .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+            }
 
             self.truncate_sequence_to_blocks(seq_idx, 0)?;
             self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;

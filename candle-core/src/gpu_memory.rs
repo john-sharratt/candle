@@ -21,7 +21,37 @@
 
 use crate::{Device, Result};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+/// Largest CUDA ordinal we track init-free for (mirrors the KV budget gate).
+const MAX_TRACKED_GPUS: usize = 16;
+
+/// Per-GPU free VRAM observed at device creation, indexed by physical ordinal
+/// (`0` = unset). Captured *before* model weights are loaded, so it reflects
+/// `total − cuda_context − whatever_else_was_resident` at process start. The KV
+/// VRAM budget gate uses it to estimate our model footprint (`init_free −
+/// free_after_load`) and to gate allocations against *total* VRAM rather than
+/// the driver's reported free — which on WDDM is polluted by pageable memory
+/// from other processes the OS will evict for us. We keep the *largest* (least-
+/// loaded) observation, which is closest to `total − context`.
+static DEVICE_INIT_FREE: [AtomicUsize; MAX_TRACKED_GPUS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_GPUS];
+
+/// Record the free VRAM seen at device creation for `gpu_id` (keeps the max).
+pub fn note_device_init_free(gpu_id: usize, free: usize) {
+    if let Some(cell) = DEVICE_INIT_FREE.get(gpu_id) {
+        cell.fetch_max(free, Ordering::Relaxed);
+    }
+}
+
+/// Free VRAM seen at device creation for `gpu_id`, or `None` if never recorded.
+pub fn device_init_free(gpu_id: usize) -> Option<usize> {
+    DEVICE_INIT_FREE.get(gpu_id).and_then(|c| match c.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v),
+    })
+}
 
 /// A single memory snapshot capturing free/total GPU memory at a labeled point.
 #[derive(Debug, Clone)]

@@ -244,14 +244,21 @@ impl CudaDevice {
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
-        Ok(Self {
+        let dev = Self {
             id: DeviceId::new(),
             context,
             stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        })
+        };
+        // Record free VRAM now, before any model weights load, so the KV budget
+        // gate can estimate our resident footprint and credit pageable memory
+        // the OS evicts for us (see `gpu_memory::device_init_free`).
+        if let Ok((free, _total)) = dev.mem_get_info() {
+            crate::gpu_memory::note_device_init_free(ordinal, free);
+        }
+        Ok(dev)
     }
 
     /// Returns the compute capability of this device as a (major, minor) tuple.
@@ -293,6 +300,49 @@ impl CudaDevice {
         self.context.bind_to_thread().w()?;
         cudarc::driver::result::mem_get_info().w()
     }
+
+    /// Bytes currently allocated by *our* CUDA stream-ordered memory pool on
+    /// this device — our live GPU footprint (model weights + KV cache +
+    /// activations), as tracked by CUDA itself via `cuMemAllocAsync`. Unlike
+    /// `mem_get_info().free`, this counts only *our* allocations and excludes
+    /// other processes' pageable memory entirely, so `total - pool_used` is the
+    /// correct budget denominator on WDDM (where `free` is polluted by whatever
+    /// desktop/IDE memory happens to be resident and the OS evicts on demand).
+    ///
+    /// Errors if the device doesn't use the async pool allocator (pre-Pascal /
+    /// pools unsupported); callers treat that as "unknown" and fall back.
+    pub fn pool_used_bytes(&self) -> Result<usize> {
+        self.pool_attr(
+            cudarc::driver::sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+        )
+    }
+
+    /// Bytes currently *reserved from the OS* by our CUDA memory pool — the
+    /// pool's high-water footprint. `reserved - used` is memory the pool holds
+    /// but isn't using, available to satisfy new allocations *without* touching
+    /// the driver's free VRAM. The budget gate uses this so that reusing pooled
+    /// memory (e.g. after a KV seal frees float arenas) isn't mistaken for new
+    /// OS pressure. See [`pool_used_bytes`].
+    pub fn pool_reserved_bytes(&self) -> Result<usize> {
+        self.pool_attr(
+            cudarc::driver::sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+        )
+    }
+
+    fn pool_attr(&self, attr: cudarc::driver::sys::CUmemPool_attribute_enum) -> Result<usize> {
+        use cudarc::driver::sys;
+        self.context.bind_to_thread().w()?;
+        let dev = self.context.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        let mut value: u64 = 0;
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, dev).result().w()?;
+            sys::cuMemPoolGetAttribute(pool, attr, &mut value as *mut u64 as *mut std::ffi::c_void)
+                .result()
+                .w()?;
+        }
+        Ok(value as usize)
+    }
 }
 
 impl BackendDevice for CudaDevice {
@@ -304,14 +354,21 @@ impl BackendDevice for CudaDevice {
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
-        Ok(Self {
+        let dev = Self {
             id: DeviceId::new(),
             context,
             stream,
             blas: Arc::new(blas),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        })
+        };
+        // Record free VRAM now, before any model weights load, so the KV budget
+        // gate can estimate our resident footprint and credit pageable memory
+        // the OS evicts for us (see `gpu_memory::device_init_free`).
+        if let Ok((free, _total)) = dev.mem_get_info() {
+            crate::gpu_memory::note_device_init_free(ordinal, free);
+        }
+        Ok(dev)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {

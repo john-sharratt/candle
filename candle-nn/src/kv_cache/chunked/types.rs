@@ -763,6 +763,27 @@ impl SequenceState {
     /// `seq_offset` is the current sequence length used to derive the true
     /// token count for the write chunk (overrides the potentially-stale
     /// `chunk.usage` field).
+    /// Index of the chunk the decode kernel writes into: the first non-full
+    /// chunk at or after `writer_start_idx`. Chunks after it are trailing
+    /// empties — e.g. a freshly-appended empty writer sitting past a partial
+    /// sealed chunk — and must be skipped. This is the same selection rule
+    /// `set_len` and the position_map use, so the K/V write, the rope base,
+    /// and attention all agree on which chunk is the writer.
+    fn decode_write_chunk_idx(&self) -> usize {
+        let n = self.chunks.len();
+        if n == 0 {
+            return 0;
+        }
+        let start = self.writer_start_idx().min(n - 1);
+        for i in start..n {
+            let c = &self.chunks[i];
+            if (c.offset as usize + c.usage as usize) < CHUNK_SIZE {
+                return i;
+            }
+        }
+        n - 1
+    }
+
     pub(crate) fn rebuild_decode_gpu_chunks(
         &mut self,
         n_kv_head: usize,
@@ -774,8 +795,14 @@ impl SequenceState {
         if n == 0 {
             return Ok((0, 0, 0));
         }
-        let last_rope_base: usize = self.chunks[..n - 1].iter().map(|c| c.usage as usize).sum();
-        let write_len = seq_offset.saturating_sub(last_rope_base) as u16;
+        // The writer is the first non-full chunk from `writer_start_idx`, NOT
+        // `host_n - 1`: trailing empty chunks (a fresh writer past a sealed
+        // partial chunk) must be skipped. Its rope base is the cum-token sum of
+        // the chunks before it, and its GPU length is the seq_offset-derived
+        // fill (overriding the possibly-stale stored usage).
+        let wi = self.decode_write_chunk_idx();
+        let before_wi: usize = self.chunks[..wi].iter().map(|c| c.usage as usize).sum();
+        let write_len = seq_offset.saturating_sub(before_wi) as u16;
 
         // Borrow chunks and gpu_chunks as disjoint fields simultaneously.
         let SequenceState {
@@ -785,10 +812,10 @@ impl SequenceState {
         } = *self;
         gpu_chunks
             .as_mut()
-            .rebuild_decode(chunks, n_kv_head, head_dim, arena_info, write_len)?;
+            .rebuild_decode(chunks, n_kv_head, head_dim, arena_info, write_len, wi)?;
 
         let ptr = self.gpu_chunks.raw_device_ptr();
-        Ok((ptr, n as u32, (n as u32).saturating_sub(1)))
+        Ok((ptr, n as u32, wi as u32))
     }
 
     /// Synchronise the GPU slot-state buffer for decode.
@@ -814,9 +841,10 @@ impl SequenceState {
             return Ok((rebuilt, DecodeGpuChunksSyncKind::Rebuild));
         }
 
+        let wi = self.decode_write_chunk_idx();
         let ptr = self.gpu_chunks.raw_device_ptr();
         Ok((
-            (ptr, host_n as u32, (host_n as u32).saturating_sub(1)),
+            (ptr, host_n as u32, wi as u32),
             DecodeGpuChunksSyncKind::Reuse,
         ))
     }
