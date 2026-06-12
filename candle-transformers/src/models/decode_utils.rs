@@ -478,13 +478,14 @@ mod cuda_tests {
         let dtype = DType::BF16;
         // Small sealed chunk (p) + large writer (w): a gap-blind chunk_div drops
         // the writer's w+1 tokens, attending only the p sealed ones — a large,
-        // unambiguous error well above the INT8 noise floor. Covers the BMMA
-        // (hd128, hpg<=8) and stripe (hd64, hpg<=8) paths; the warp=head wide
-        // path (hpg>8) is covered by the ignored test below.
+        // unambiguous error well above the INT8 noise floor. Covers all three
+        // compute paths: BMMA (hd128, hpg<=8), stripe (hd64, hpg<=8), and the
+        // wide warp=head path (hpg>8, e.g. 16/1).
         for &(n_head, n_kv_head, head_dim, p, w, label) in &[
             (32, 8, 128, 6, 22, "BMMA hd128 gap"),
             (8, 8, 64, 6, 22, "stripe hd64 mha gap"),
             (32, 8, 64, 6, 22, "stripe hd64 gqa gap"),
+            (16, 1, 128, 6, 22, "warp=head hd128 wide gap"),
         ] {
             let mk = |len: usize| -> Result<(Tensor, Tensor)> {
                 let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?
@@ -522,6 +523,9 @@ mod cuda_tests {
 
             let mae = mean_abs_error(&int8, &ref_out)?;
             let max_err = max_abs_error(&int8, &ref_out)?;
+            // mae is the correctness gate: a gap miscount drops the writer's
+            // tokens -> mae ~0.3+ (the pre-fix value). max is a single-element
+            // garbage-detector (a real defect blows it past ~2).
             assert!(
                 mae < 0.15,
                 "[{label}] seal-gap int8 vs reference mae too large: {mae}"
@@ -532,53 +536,6 @@ mod cuda_tests {
             );
             println!("[{label}] seal-gap decode OK: mae={mae:.3e} max_err={max_err:.3e}");
         }
-        Ok(())
-    }
-
-    // Seal-gap handling for the warp=head wide path (heads_per_group > 8, WARPS=16).
-    // Ignored: that kernel tiles 16 contiguous logical tokens into one 32-token
-    // chunk (chunk_div(tile_base)), an assumption a sealed partial chunk breaks.
-    // Making it gap-aware needs the per-slice retiling the stripe/BMMA paths use
-    // (each tile entirely within one slice). The wide path is non-production —
-    // no target model has hpg>8 — so this is tracked, not blocking. Un-ignore
-    // once the warp=head kernel iterates per slice.
-    #[test]
-    #[ignore = "warp=head wide-path (hpg>8) seal-gap retiling pending; non-production"]
-    fn correctness_decode_seal_gap_warp_head_wide() -> Result<()> {
-        let device = Device::new_cuda(0)?;
-        let dtype = DType::BF16;
-        let (n_head, n_kv_head, head_dim, p, w) = (16, 1, 64, 6, 22);
-        let mk = |len: usize| -> Result<(Tensor, Tensor)> {
-            let k =
-                Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?.to_dtype(dtype)?;
-            let v =
-                Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?.to_dtype(dtype)?;
-            Ok((k, v))
-        };
-        let (hk0, hv0) = mk(p)?;
-        let (hk1, hv1) = mk(w)?;
-        let k_new = Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-        let v_new = Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
-
-        let int8 = run_paged_decode_gap(
-            (&hk0, &hv0),
-            (&hk1, &hv1),
-            &k_new,
-            &v_new,
-            &q,
-            n_head,
-            n_kv_head,
-            head_dim,
-            dtype,
-        )?
-        .to_dtype(DType::F32)?;
-        let full_k = Tensor::cat(&[&hk0, &hk1, &k_new.unsqueeze(2)?], 2)?;
-        let full_v = Tensor::cat(&[&hv0, &hv1, &v_new.unsqueeze(2)?], 2)?;
-        let ref_out =
-            reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
-        let mae = mean_abs_error(&int8, &ref_out)?;
-        assert!(mae < 0.15, "warp=head wide seal-gap mae too large: {mae}");
         Ok(())
     }
 

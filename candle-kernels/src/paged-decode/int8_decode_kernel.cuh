@@ -203,12 +203,47 @@ __device__ __forceinline__ void int8_decode_attn_impl(
         }
     }
 
+    // Per-slice tiling (gap-aware). Each slice contributes ceil(eff_len/WARPS)
+    // tiles, every tile entirely within one 32-token chunk; a global tile maps to
+    // (slice, within_base = off + tile_in_slice*WARPS) by a forward scan. This is
+    // what lets a sealed partial chunk's empty tail (the substrate-seal gap) be
+    // skipped and the writer slice be reached at its true physical position
+    // rather than aliased into the gap by a flat chunk_div(logical). Gapless
+    // sequences (every slice full) tile identically to the old flat walk.
+    auto slice_eff_len = [&](int s) -> int {
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+        int len = (int)slice_len(sl);
+        int off = (int)slice_offset(sl);
+        if (s == (int)write_slice_idx && len < CHUNK_SIZE && off + len < CHUNK_SIZE) len += 1;
+        return len;
+    };
+    auto slice_tiles = [&](int s) -> int {
+        return (slice_eff_len(s) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    };
+    // tile_idx -> (slice, within_base). The warp's token sits at within_base + warp.
+    auto tile_to_slice = [&](int tile_idx, int& slice_out, int& within_base_out) {
+        int base = 0, s = 0;
+        while (s + 1 < (int)n_slices) {
+            int st = slice_tiles(s);
+            if (base + st <= tile_idx) {
+                base += st;
+                ++s;
+            } else {
+                break;
+            }
+        }
+        slice_out = s;
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+        within_base_out = (int)slice_offset(sl) + (tile_idx - base) * WARPS_PER_BLOCK;
+    };
+
     // Per-tile palette iterators (refresh on slice boundary).
     PalIter<VEC, HEAD_DIM> ki, vi;
     int kv_pal_slice_idx = -1;
     auto maybe_init_kv_iters_for_tile = [&](int tile_idx) {
-        int tile_k_base = tile_idx * WARPS_PER_BLOCK;
-        int tile_slice_idx = chunk_div(tile_k_base);
+        int tile_slice_idx, tile_within_base;
+        tile_to_slice(tile_idx, tile_slice_idx, tile_within_base);
+        (void)tile_within_base;
         if (tile_slice_idx != kv_pal_slice_idx && tile_slice_idx < (int)n_slices) {
             const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, tile_slice_idx, n_kv_head);
             const uint8_t* head_ptr = get_head<HEAD_DIM>(sl, kv_head_idx);
@@ -315,7 +350,8 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     #pragma unroll
     for (int j = 0; j < VEC; ++j) out_reg[j] = 0.f;
 
-    const int n_tiles = (kv_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    int n_tiles = 0;
+    for (int s = 0; s < (int)n_slices; ++s) n_tiles += slice_tiles(s);
     // Split-KV: this block processes the contiguous tile sub-range [tile_lo,
     // tile_hi). num_splits==1 → the whole [0, n_tiles). An empty range
     // (tile_lo >= n_tiles) runs no tiles and emits a null partial (m=-inf, l=0)
@@ -328,24 +364,19 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
 
     auto load_tile = [&](int tile_idx, int stage) {
-        int k_base = tile_idx * WARPS_PER_BLOCK;
-        int k_idx = k_base + warp;
-        bool valid_k = (k_idx < kv_len);
         T* k_dst = shared_k[stage][warp];
         T* v_dst = shared_v[stage][warp];
-        int my_slice_idx = chunk_div(k_idx);
-        int within = chunk_mod(k_idx);
-        if (valid_k && my_slice_idx < (int)n_slices) {
+        // All WARPS tokens of a tile live in one slice; the warp's token is at
+        // within = within_base + warp, valid while it is below the slice's filled
+        // count (slice_eff_len already folds in the writer's +1).
+        int my_slice_idx, within_base;
+        tile_to_slice(tile_idx, my_slice_idx, within_base);
+        int within = within_base + warp;
+        bool valid_k = my_slice_idx < (int)n_slices;
+        if (valid_k) {
             const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, my_slice_idx, n_kv_head);
-            uint32_t bv  = (uint32_t)slice_len(sl);
-            uint32_t off = (uint32_t)slice_offset(sl);
-            if (my_slice_idx == (int)write_slice_idx &&
-                bv < CHUNK_SIZE && off + bv < CHUNK_SIZE) {
-                bv += 1;
-            }
-            valid_k = (within >= (int)off && within < (int)(off + bv));
-        } else {
-            valid_k = false;
+            int off = (int)slice_offset(sl);
+            valid_k = within < off + slice_eff_len(my_slice_idx);
         }
         if (!valid_k) {
             #pragma unroll
@@ -417,21 +448,15 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     };
 
     auto apply_rope_to_tile = [&](int tile_idx, int stage) {
-        int k_base = tile_idx * WARPS_PER_BLOCK;
-        int k_idx = k_base + warp;
-        if (k_idx < kv_len) {
-            int my_slice_idx = chunk_div(k_idx);
-            int within = chunk_mod(k_idx);
-            const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, my_slice_idx, n_kv_head);
-            uint32_t bv  = (uint32_t)slice_len(sl);
-            uint32_t off = (uint32_t)slice_offset(sl);
-            if (my_slice_idx == (int)write_slice_idx &&
-                bv < CHUNK_SIZE && off + bv < CHUNK_SIZE) {
-                bv += 1;
-            }
-            if (within >= (int)off && within < (int)(off + bv)) {
+        int my_slice_idx, within_base;
+        tile_to_slice(tile_idx, my_slice_idx, within_base);
+        int within = within_base + warp;
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, my_slice_idx, n_kv_head);
+        int off = (int)slice_offset(sl);
+        if (my_slice_idx < (int)n_slices && within < off + slice_eff_len(my_slice_idx)) {
+            {
                 const int32_t rope_base = (int32_t)slice_rope(sl);
-                const int32_t rope_pos  = rope_base + (within - (int)off);
+                const int32_t rope_pos  = rope_base + (within - off);
                 T* k_dst = shared_k[stage][warp];
                 float k_regs[VEC];
                 #pragma unroll
@@ -526,22 +551,17 @@ __device__ __forceinline__ void int8_decode_attn_impl(
     };
 
     auto process_tile = [&](int tile_idx, int stage) {
-        int k_base = tile_idx * WARPS_PER_BLOCK;
-        int tile_slice = chunk_div(k_base);
-        int tile_within_base = chunk_mod(k_base);
-        uint32_t tile_bv  = 0;
+        int tile_slice, tile_within_base;
+        tile_to_slice(tile_idx, tile_slice, tile_within_base);
+        // tile_off/tile_bv frame the in-chunk validity window for the WARPS
+        // tokens of this tile; slice_eff_len already folds in the writer's +1, so
+        // a token is valid while within_base + t < tile_off + tile_bv.
         uint32_t tile_off = 0;
+        uint32_t tile_bv = (uint32_t)CHUNK_SIZE;
         if (tile_slice < (int)n_slices) {
             const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, tile_slice, n_kv_head);
-            tile_bv  = (uint32_t)slice_len(sl);
             tile_off = (uint32_t)slice_offset(sl);
-            if (tile_slice == (int)write_slice_idx &&
-                tile_bv < CHUNK_SIZE && tile_off + tile_bv < CHUNK_SIZE) {
-                tile_bv += 1;
-            }
-        } else {
-            tile_bv = (uint32_t)CHUNK_SIZE;
-            tile_off = 0u;
+            tile_bv = (uint32_t)slice_eff_len(tile_slice);
         }
         // ── QK^T: precompute the INT8 logits, broadcast via tile_logits[].
         if constexpr (USE_MMA_QK) {
@@ -632,10 +652,8 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             float tile_max = -1e38f;
             #pragma unroll
             for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
-                int actual_k = k_base + t;
                 int actual_within = tile_within_base + t;
-                bool valid = (actual_k < kv_len &&
-                              actual_within >= (int)tile_off &&
+                bool valid = (tile_slice < (int)n_slices &&
                               actual_within < (int)(tile_off + tile_bv));
                 float s = valid ? tile_logits[stage][warp][t] * softmax_scale : -1e38f;
                 tile_max = fmaxf(tile_max, s);
@@ -657,10 +675,8 @@ __device__ __forceinline__ void int8_decode_attn_impl(
             const bool v_rt = (shared_v_readthrough[stage] != 0);
             #pragma unroll
             for (int t = 0; t < WARPS_PER_BLOCK; ++t) {
-                int actual_k = k_base + t;
                 int actual_within = tile_within_base + t;
-                bool valid = (actual_k < kv_len &&
-                              actual_within >= (int)tile_off &&
+                bool valid = (tile_slice < (int)n_slices &&
                               actual_within < (int)(tile_off + tile_bv));
                 // Recompute the score from tile_logits[] (smem). s <= -1e37 marks
                 // an invalid token; guard so an all-invalid tile (new_m==-1e38)
