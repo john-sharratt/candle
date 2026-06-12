@@ -42,20 +42,20 @@
 //!
 //! `tcp_session_send` confirms every call.  Open, recv, list, and close do not.
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
-pub mod open;
-pub mod send;
-pub mod recv;
-pub mod list;
 pub mod close;
+pub mod list;
+pub mod open;
+pub mod recv;
+pub mod send;
 
-pub use open::TCP_SESSION_OPEN;
-pub use send::TCP_SESSION_SEND;
-pub use recv::TCP_SESSION_RECV;
-pub use list::TCP_SESSION_LIST;
 pub use close::TCP_SESSION_CLOSE;
+pub use list::TCP_SESSION_LIST;
+pub use open::TCP_SESSION_OPEN;
+pub use recv::TCP_SESSION_RECV;
+pub use send::TCP_SESSION_SEND;
 
 #[derive(Debug, Error)]
 pub enum TcpError {

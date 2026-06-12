@@ -53,19 +53,19 @@ use thiserror::Error;
 
 use crate::ToolError;
 
-pub mod open;
+pub mod close;
 pub mod exec;
 pub mod exec_async;
-pub mod poll;
 pub mod list;
-pub mod close;
+pub mod open;
+pub mod poll;
 
-pub use open::SSH_SESSION_OPEN;
+pub use close::SSH_SESSION_CLOSE;
 pub use exec::SSH_SESSION_EXEC;
 pub use exec_async::SSH_SESSION_EXEC_ASYNC;
-pub use poll::SSH_SESSION_POLL;
 pub use list::SSH_SESSION_LIST;
-pub use close::SSH_SESSION_CLOSE;
+pub use open::SSH_SESSION_OPEN;
+pub use poll::SSH_SESSION_POLL;
 
 pub const MAX_OUTPUT: usize = 32 * 1024; // 32 KiB
 

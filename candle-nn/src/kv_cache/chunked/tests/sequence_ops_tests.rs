@@ -1747,7 +1747,8 @@ mod tests {
                     "parent chunks[1] (Arc-shared partial — preserved) must have usage = partial_tokens"
                 );
                 assert_eq!(
-                    ps.chunks_slice()[2].usage as usize, turn2_tokens,
+                    ps.chunks_slice()[2].usage as usize,
+                    turn2_tokens,
                     "parent chunks[2] (view's new block) must have usage = turn2_tokens"
                 );
             }

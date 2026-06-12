@@ -898,20 +898,17 @@ impl BatchedSampler {
             match &cuda_storage.slice {
                 CudaStorageSlice::F32(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
-                    let logits_ptr =
-                        (ptr + (start_offset as u64 * 4)) as *const std::ffi::c_void;
+                    let logits_ptr = (ptr + (start_offset as u64 * 4)) as *const std::ffi::c_void;
                     call_kernel(logits_ptr);
                 }
                 CudaStorageSlice::F16(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
-                    let logits_ptr =
-                        (ptr + (start_offset as u64 * 2)) as *const std::ffi::c_void;
+                    let logits_ptr = (ptr + (start_offset as u64 * 2)) as *const std::ffi::c_void;
                     call_kernel(logits_ptr);
                 }
                 CudaStorageSlice::BF16(s) => {
                     let (ptr, _guard) = s.device_ptr(&stream);
-                    let logits_ptr =
-                        (ptr + (start_offset as u64 * 2)) as *const std::ffi::c_void;
+                    let logits_ptr = (ptr + (start_offset as u64 * 2)) as *const std::ffi::c_void;
                     call_kernel(logits_ptr);
                 }
                 _ => {

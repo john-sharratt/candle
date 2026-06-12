@@ -96,36 +96,84 @@ impl ContentType {
     fn items(self) -> &'static [&'static str] {
         match self {
             Self::CodeReading => &[
-                "decode_step", "kv_arena", "attention_fwd", "quant_block",
-                "bdp_scan", "moe_route", "prefill_run", "rope_enc",
+                "decode_step",
+                "kv_arena",
+                "attention_fwd",
+                "quant_block",
+                "bdp_scan",
+                "moe_route",
+                "prefill_run",
+                "rope_enc",
             ],
             Self::StaticAnalysis => &[
-                "cache_rs", "arena_rs", "compress_rs", "scan_rs",
-                "scheduler_rs", "projection_rs", "engine_rs", "config_rs",
+                "cache_rs",
+                "arena_rs",
+                "compress_rs",
+                "scan_rs",
+                "scheduler_rs",
+                "projection_rs",
+                "engine_rs",
+                "config_rs",
             ],
             Self::DependencyAnalysis => &[
-                "cache_deps", "arena_deps", "compress_deps", "scan_deps",
-                "scheduler_deps", "projection_deps", "engine_deps", "config_deps",
+                "cache_deps",
+                "arena_deps",
+                "compress_deps",
+                "scan_deps",
+                "scheduler_deps",
+                "projection_deps",
+                "engine_deps",
+                "config_deps",
             ],
             Self::ArchitecturalAnalysis => &[
-                "paged_kv", "quant_policy", "bdp_retrieval", "moe_predict",
-                "wave_batch", "three_tier", "o1_theorem", "proj_schema",
+                "paged_kv",
+                "quant_policy",
+                "bdp_retrieval",
+                "moe_predict",
+                "wave_batch",
+                "three_tier",
+                "o1_theorem",
+                "proj_schema",
             ],
             Self::CriticalAnalysis => &[
-                "kv_frag", "quant_drift", "bdp_collision", "sched_block",
-                "mem_pressure", "dtype_mismatch", "attn_overflow", "moe_imbalance",
+                "kv_frag",
+                "quant_drift",
+                "bdp_collision",
+                "sched_block",
+                "mem_pressure",
+                "dtype_mismatch",
+                "attn_overflow",
+                "moe_imbalance",
             ],
             Self::BugAnalysis => &[
-                "chunk_oob", "q4_sign", "kv_misalign", "sink_scale",
-                "mask_skip", "arena_leak", "dtype_cast", "flash_oob",
+                "chunk_oob",
+                "q4_sign",
+                "kv_misalign",
+                "sink_scale",
+                "mask_skip",
+                "arena_leak",
+                "dtype_cast",
+                "flash_oob",
             ],
             Self::DailyHistory => &[
-                "day_kv", "day_quant", "day_bdp", "day_moe",
-                "day_proj", "day_calib", "day_bugfix", "day_batch",
+                "day_kv",
+                "day_quant",
+                "day_bdp",
+                "day_moe",
+                "day_proj",
+                "day_calib",
+                "day_bugfix",
+                "day_batch",
             ],
             Self::DreamLog => &[
-                "dream_distrib", "dream_neural", "dream_stream", "dream_sinks",
-                "dream_prefetch", "dream_cluster", "dream_dynwin", "dream_fedkv",
+                "dream_distrib",
+                "dream_neural",
+                "dream_stream",
+                "dream_sinks",
+                "dream_prefetch",
+                "dream_cluster",
+                "dream_dynwin",
+                "dream_fedkv",
             ],
         }
     }
@@ -221,17 +269,30 @@ fn prompts(
 ) -> (String, String) {
     match ct {
         ContentType::CodeReading => code_reading_prompts(item, case_type, variant, wrong_item),
-        ContentType::StaticAnalysis => static_analysis_prompts(item, case_type, variant, wrong_item),
-        ContentType::DependencyAnalysis => dependency_analysis_prompts(item, case_type, variant, wrong_item),
-        ContentType::ArchitecturalAnalysis => architectural_analysis_prompts(item, case_type, variant, wrong_item),
-        ContentType::CriticalAnalysis => critical_analysis_prompts(item, case_type, variant, wrong_item),
+        ContentType::StaticAnalysis => {
+            static_analysis_prompts(item, case_type, variant, wrong_item)
+        }
+        ContentType::DependencyAnalysis => {
+            dependency_analysis_prompts(item, case_type, variant, wrong_item)
+        }
+        ContentType::ArchitecturalAnalysis => {
+            architectural_analysis_prompts(item, case_type, variant, wrong_item)
+        }
+        ContentType::CriticalAnalysis => {
+            critical_analysis_prompts(item, case_type, variant, wrong_item)
+        }
         ContentType::BugAnalysis => bug_analysis_prompts(item, case_type, variant, wrong_item),
         ContentType::DailyHistory => daily_history_prompts(item, case_type, variant, wrong_item),
         ContentType::DreamLog => dream_log_prompts(item, case_type, variant, wrong_item),
     }
 }
 
-fn code_reading_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn code_reading_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("Read the `{}` function and walk me through what it does.", item),
@@ -301,7 +362,12 @@ fn code_reading_prompts(item: &str, case_type: CaseType, variant: usize, wrong_i
     }
 }
 
-fn static_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn static_analysis_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("Run a static analysis pass on `{}` — what stands out?", item),
@@ -371,7 +437,12 @@ fn static_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wron
     }
 }
 
-fn dependency_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn dependency_analysis_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("What does `{}` depend on, and what depends on it?", item),
@@ -441,7 +512,12 @@ fn dependency_analysis_prompts(item: &str, case_type: CaseType, variant: usize, 
     }
 }
 
-fn architectural_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn architectural_analysis_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("Analyse the architecture of `{}` — what are the key design decisions?", item),
@@ -511,7 +587,12 @@ fn architectural_analysis_prompts(item: &str, case_type: CaseType, variant: usiz
     }
 }
 
-fn critical_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn critical_analysis_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("What's the most serious risk posed by `{}`?", item),
@@ -581,7 +662,12 @@ fn critical_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wr
     }
 }
 
-fn bug_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn bug_analysis_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("Analyse the `{}` bug — what's the root cause?", item),
@@ -651,7 +737,12 @@ fn bug_analysis_prompts(item: &str, case_type: CaseType, variant: usize, wrong_i
     }
 }
 
-fn daily_history_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn daily_history_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("Summarise today's work on `{}`.", item),
@@ -721,7 +812,12 @@ fn daily_history_prompts(item: &str, case_type: CaseType, variant: usize, wrong_
     }
 }
 
-fn dream_log_prompts(item: &str, case_type: CaseType, variant: usize, wrong_item: &str) -> (String, String) {
+fn dream_log_prompts(
+    item: &str,
+    case_type: CaseType,
+    variant: usize,
+    wrong_item: &str,
+) -> (String, String) {
     match (case_type, variant) {
         (CaseType::Positive, 0) => (
             format!("Describe the dream vision for `{}`.", item),
@@ -817,7 +913,9 @@ fn flip_mask(seed: u64, n_flips: u32) -> u128 {
     let mut s = seed;
     let mut count = 0u32;
     while count < n_flips {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bit = (s >> 57) as u32 & 0x7F;
         let bit_mask = 1u128 << bit;
         if mask & bit_mask == 0 {
@@ -855,10 +953,12 @@ fn generate(dir: &Path, ct: ContentType) -> anyhow::Result<Manifest> {
         // 6 positive cases
         for n in 0..6usize {
             let extra = fnv64(format!("{}+pos+{}", item, n).as_bytes());
-            let sigs: Vec<TokenSignature> =
-                (0..TOKENS_PER_CHUNK).map(|i| make_sig(concept, 12, i, extra)).collect();
+            let sigs: Vec<TokenSignature> = (0..TOKENS_PER_CHUNK)
+                .map(|i| make_sig(concept, 12, i, extra))
+                .collect();
             let entry = pf.append(&sigs, &sigs, &sigs)?;
-            let (user_prompt, assistant_prompt) = prompts(ct, item, CaseType::Positive, n, wrong_item);
+            let (user_prompt, assistant_prompt) =
+                prompts(ct, item, CaseType::Positive, n, wrong_item);
             scenarios.push(Scenario {
                 id: format!("{}_pos_{}", item, n),
                 item: Some(item.to_string()),
@@ -879,10 +979,15 @@ fn generate(dir: &Path, ct: ContentType) -> anyhow::Result<Manifest> {
             let extra_miss = fnv64(format!("{}+bnd_miss+{}", item, n).as_bytes());
             let half = TOKENS_PER_CHUNK / 2;
             let mut sigs: Vec<TokenSignature> = Vec::with_capacity(TOKENS_PER_CHUNK);
-            for i in 0..half { sigs.push(make_sig(concept, 12, i, extra_hit)); }
-            for i in 0..half { sigs.push(make_sig(concept, 90, i + half, extra_miss)); }
+            for i in 0..half {
+                sigs.push(make_sig(concept, 12, i, extra_hit));
+            }
+            for i in 0..half {
+                sigs.push(make_sig(concept, 90, i + half, extra_miss));
+            }
             let entry = pf.append(&sigs, &sigs, &sigs)?;
-            let (user_prompt, assistant_prompt) = prompts(ct, item, CaseType::Boundary, n, wrong_item);
+            let (user_prompt, assistant_prompt) =
+                prompts(ct, item, CaseType::Boundary, n, wrong_item);
             scenarios.push(Scenario {
                 id: format!("{}_bnd_{}", item, n),
                 item: Some(item.to_string()),
@@ -904,7 +1009,8 @@ fn generate(dir: &Path, ct: ContentType) -> anyhow::Result<Manifest> {
                 .map(|i| make_sig(wrong_concept, 12, i, extra))
                 .collect();
             let entry = pf.append(&sigs, &sigs, &sigs)?;
-            let (user_prompt, assistant_prompt) = prompts(ct, item, CaseType::Negative, n, wrong_item);
+            let (user_prompt, assistant_prompt) =
+                prompts(ct, item, CaseType::Negative, n, wrong_item);
             scenarios.push(Scenario {
                 id: format!("{}_neg_{}", item, n),
                 item: Some(item.to_string()),
@@ -928,7 +1034,8 @@ fn generate(dir: &Path, ct: ContentType) -> anyhow::Result<Manifest> {
                 .map(|i| make_sig(no_match_concept, 12, i, extra))
                 .collect();
             let entry = pf.append(&sigs, &sigs, &sigs)?;
-            let (user_prompt, assistant_prompt) = prompts(ct, item, CaseType::NoMatch, n, wrong_item);
+            let (user_prompt, assistant_prompt) =
+                prompts(ct, item, CaseType::NoMatch, n, wrong_item);
             scenarios.push(Scenario {
                 id: format!("{}_no_match_{}", item, n),
                 item: None,
@@ -949,11 +1056,18 @@ fn generate(dir: &Path, ct: ContentType) -> anyhow::Result<Manifest> {
         content_type: ct.dir_name().to_string(),
         scenarios,
     };
-    std::fs::write(dir.join("MANIFEST.json"), serde_json::to_string_pretty(&manifest)?)?;
+    std::fs::write(
+        dir.join("MANIFEST.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
     Ok(manifest)
 }
 
-fn generate_one(ct: ContentType, output_override: Option<&PathBuf>, force: bool) -> anyhow::Result<()> {
+fn generate_one(
+    ct: ContentType,
+    output_override: Option<&PathBuf>,
+    force: bool,
+) -> anyhow::Result<()> {
     let default_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/"))
         .join(format!("{}_provenance_data", ct.dir_name()));
     let dir = output_override.unwrap_or(&default_dir);
@@ -975,20 +1089,41 @@ fn generate_one(ct: ContentType, output_override: Option<&PathBuf>, force: bool)
     println!("Generating {} fixtures → {}", ct.dir_name(), dir.display());
     let manifest = generate(dir, ct)?;
 
-    let total_bytes: u64 = manifest.scenarios.iter()
+    let total_bytes: u64 = manifest
+        .scenarios
+        .iter()
         .map(|s| s.token_count as u64 * 48)
         .sum();
 
     println!(
         "  {} scenarios ({} positive, {} boundary, {} negative, {} no-match)",
         manifest.scenarios.len(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Positive).count(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Boundary).count(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Negative).count(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::NoMatch).count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::Positive)
+            .count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::Boundary)
+            .count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::Negative)
+            .count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::NoMatch)
+            .count(),
     );
     println!("  signatures.prov: {} bytes", total_bytes);
-    println!("  MANIFEST.json:   {} bytes", std::fs::metadata(dir.join("MANIFEST.json"))?.len());
+    println!(
+        "  MANIFEST.json:   {} bytes",
+        std::fs::metadata(dir.join("MANIFEST.json"))?.len()
+    );
     Ok(())
 }
 

@@ -735,9 +735,8 @@ impl TombstonePayload {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
-        serde_json::from_slice(buf).map_err(|e| {
-            PersistenceError::Corrupt(format!("Tombstone JSON parse: {e}"))
-        })
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("Tombstone JSON parse: {e}")))
     }
 }
 

@@ -534,12 +534,7 @@ impl ProjectionScores {
     }
 
     /// Record the BDP scores for one turn.
-    pub fn set_turn(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-        scores: PerDepthScores,
-    ) {
+    pub fn set_turn(&mut self, timeline: TimelineId, index: TurnIndex, scores: PerDepthScores) {
         self.turns.insert(TurnKey::new(timeline, index), scores);
     }
 
@@ -784,10 +779,7 @@ pub trait ContentResolver {
     /// `timeline`.  Used by the projection to populate the
     /// score-density backpressure metric inside its diagnostic sink
     /// (§9 of `docs/infinite_conversations.md`).  Default returns 0.
-    fn pending_summary_len(
-        &self,
-        _timeline: TimelineId,
-    ) -> usize {
+    fn pending_summary_len(&self, _timeline: TimelineId) -> usize {
         0
     }
 
@@ -1074,12 +1066,11 @@ impl Substrate {
     /// Section variant of [`Self::install_hot`]. Sections are pinned —
     /// once installed they stay hot and do **not** appear in
     /// [`Self::hot_lru`], so eviction never touches them.
-    fn install_section_hot(
-        &mut self,
-        residence: ResidenceIndex,
-        sealed: Vec<SealedSequence>,
-    ) {
-        debug_assert!(!sealed.is_empty(), "install_section_hot called with empty Vec");
+    fn install_section_hot(&mut self, residence: ResidenceIndex, sealed: Vec<SealedSequence>) {
+        debug_assert!(
+            !sealed.is_empty(),
+            "install_section_hot called with empty Vec"
+        );
         let bytes = sealed_bytes(&sealed) as u64;
         let slot = &mut self.residence[residence.0];
         slot.byte_size = bytes;
@@ -1171,8 +1162,14 @@ impl Substrate {
         hot: Vec<SealedSequence>,
         warm: Vec<SealedSequence>,
     ) {
-        debug_assert!(!hot.is_empty(), "install_warm_and_hot called with empty hot");
-        debug_assert!(!warm.is_empty(), "install_warm_and_hot called with empty warm");
+        debug_assert!(
+            !hot.is_empty(),
+            "install_warm_and_hot called with empty hot"
+        );
+        debug_assert!(
+            !warm.is_empty(),
+            "install_warm_and_hot called with empty warm"
+        );
         // Replace hot. The LRU entry stays (residence is still hot).
         self.residence[residence.0].hot = Some(hot);
         if !self.hot_lru.contains(&residence) {
@@ -1233,9 +1230,7 @@ impl Substrate {
     /// can read). Skips slots where hot has been evicted; future
     /// revisions can gather from warm directly once a CPU gather
     /// exists.
-    pub fn snapshot_pending_cold(
-        &self,
-    ) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
+    pub fn snapshot_pending_cold(&self) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
         // We persist the **warm** tier, not hot. In the legacy
         // format-preserving migration path warm and hot carry the
         // same bytes, so this doesn't change behavior. In the
@@ -1277,11 +1272,7 @@ impl Substrate {
                 plan.missing.push(PromotionItemKind::Section(sid));
                 continue;
             };
-            self.classify_one(
-                PromotionItemKind::Section(sid),
-                entry.residence,
-                &mut plan,
-            );
+            self.classify_one(PromotionItemKind::Section(sid), entry.residence, &mut plan);
         }
         for &key in turns {
             let Some(entry) = self.turn(key.timeline, key.index) else {
@@ -1363,9 +1354,7 @@ impl Substrate {
             // is guaranteed `warm = None` pre-recall (otherwise it'd
             // have classified as a WarmLift). install_hot then
             // transitions hot+warm dual-residency.
-            if !recall.warm.is_empty()
-                && self.residence[recall.residence.0].warm.is_none()
-            {
+            if !recall.warm.is_empty() && self.residence[recall.residence.0].warm.is_none() {
                 self.install_warm(recall.residence, recall.warm);
             }
             match recall.kind {
@@ -1400,11 +1389,7 @@ impl Substrate {
     /// outside the substrate's own write methods. Returns `None`
     /// when the turn isn't tracked.
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn turn_residence(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<ResidenceIndex> {
+    pub fn turn_residence(&self, timeline: TimelineId, index: TurnIndex) -> Option<ResidenceIndex> {
         self.turn(timeline, index).map(|e| e.content.residence)
     }
 
@@ -1432,9 +1417,7 @@ impl Substrate {
     /// so cold-marker turns (post-restart, before any elevation has
     /// fired) still survive the filter and reach `elevate_to_hot`.
     pub fn turn_tier_state(&self, timeline: TimelineId, index: TurnIndex) -> Option<TierState> {
-        let residence = self
-            .turn(timeline, index)
-            .map(|e| e.content.residence)?;
+        let residence = self.turn(timeline, index).map(|e| e.content.residence)?;
         let slot = &self.residence[residence.0];
         Some(TierState {
             hot: slot.hot.is_some(),
@@ -1611,6 +1594,80 @@ impl Substrate {
         EvictionReport { count, bytes }
     }
 
+    /// Budget-aware hot eviction: evict the **least-recently-promoted** hot
+    /// turns (oldest at the back of `hot_lru`) to warm, stopping as soon as
+    /// `target_bytes` of VRAM has been freed. Unlike [`Self::evict_hot_except`]
+    /// (which drops the entire non-selected working set every reproject), this
+    /// keeps the recent working set resident and only frees what the incoming
+    /// cold-load actually needs.
+    ///
+    /// Scoped to **this** conversation's residence (`self.hot_lru`) — it can
+    /// never touch another conversation's hot KV. The selection
+    /// (`keep_sections` / `keep_turns`) and sections (never on `hot_lru`) are
+    /// always protected. Only items with both a hot and a warm copy are evicted,
+    /// so eviction is hot→warm (the warm copy survives for a fast reload).
+    pub fn evict_hot_to_free(
+        &mut self,
+        keep_sections: &[SectionId],
+        keep_turns: &[TurnKey],
+        target_bytes: u64,
+    ) -> EvictionReport {
+        if target_bytes == 0 {
+            return EvictionReport { count: 0, bytes: 0 };
+        }
+        let mut keep: std::collections::HashSet<ResidenceIndex> =
+            std::collections::HashSet::with_capacity(keep_sections.len() + keep_turns.len());
+        for &sid in keep_sections {
+            if let Some(e) = self.sections.get(&sid) {
+                keep.insert(e.residence);
+            }
+        }
+        for &key in keep_turns {
+            if let Some(e) = self.turn(key.timeline, key.index) {
+                keep.insert(e.content.residence);
+            }
+        }
+
+        // Walk oldest→newest (back of the install/promote-ordered LRU first),
+        // collecting victims until we've freed enough. `byte_size` is the VRAM
+        // the hot copy holds, which `hot = None` releases.
+        let mut freed: u64 = 0;
+        let mut victims: Vec<ResidenceIndex> = Vec::new();
+        for idx in self.hot_lru.iter().rev().copied() {
+            if freed >= target_bytes {
+                break;
+            }
+            if keep.contains(&idx) {
+                continue;
+            }
+            let slot = &self.residence[idx.0];
+            if slot.hot.is_some() && slot.warm.is_some() {
+                freed += slot.byte_size;
+                victims.push(idx);
+            }
+        }
+
+        let count = victims.len();
+        for idx in &victims {
+            self.residence[idx.0].hot = None;
+            Self::remove_from_lru(&mut self.hot_lru, *idx);
+        }
+        if count > 0 {
+            tracing::info!(
+                target: "candle_conversation::persistence::tier",
+                count,
+                bytes = freed,
+                target_bytes,
+                keep_size = keep.len(),
+                "evict_hot_to_free (budget-aware) complete"
+            );
+        }
+        EvictionReport {
+            count,
+            bytes: freed,
+        }
+    }
+
     // ── Timeline registry ────────────────────────────────────────────────────
 
     pub fn register_timeline(&mut self, timeline: TimelineId, layer: LayerId, group: GroupId) {
@@ -1673,15 +1730,13 @@ impl Substrate {
     /// in the timeline), so the hot path is not measurably slower than
     /// the old flat AHashMap keyed by `(TimelineId, TurnIndex)`.
     fn turn(&self, timeline: TimelineId, index: TurnIndex) -> Option<&TurnEntryData> {
-        self.timelines.get(&timeline).and_then(|t| t.turns.get(&index))
+        self.timelines
+            .get(&timeline)
+            .and_then(|t| t.turns.get(&index))
     }
 
     /// Mutable variant of [`Self::turn`].
-    fn turn_mut(
-        &mut self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<&mut TurnEntryData> {
+    fn turn_mut(&mut self, timeline: TimelineId, index: TurnIndex) -> Option<&mut TurnEntryData> {
         self.timelines
             .get_mut(&timeline)
             .and_then(|t| t.turns.get_mut(&index))
@@ -1711,10 +1766,7 @@ impl Substrate {
                 if self.tombstoned_timelines.contains(tl) {
                     return false;
                 }
-                self.timelines
-                    .get(tl)
-                    .map(|e| !e.archived)
-                    .unwrap_or(true)
+                self.timelines.get(tl).map(|e| !e.archived).unwrap_or(true)
             })
     }
 
@@ -2143,11 +2195,7 @@ impl Substrate {
         };
         let meta = TreeNodeMeta {
             kind,
-            children: payload
-                .children
-                .iter()
-                .map(|c| TurnIndex(*c))
-                .collect(),
+            children: payload.children.iter().map(|c| TurnIndex(*c)).collect(),
             tree_height: payload.tree_height,
             dirty: payload.dirty,
         };
@@ -2293,10 +2341,7 @@ impl Substrate {
     /// The returned tree's [`NodeId`](NodeId)
     /// values are `TurnIndex.0` directly — there's a 1-to-1 mapping
     /// between substrate turns and tree nodes.
-    pub fn build_summary_tree_in_memory(
-        &self,
-        timeline: TimelineId,
-    ) -> SummaryTree {
+    pub fn build_summary_tree_in_memory(&self, timeline: TimelineId) -> SummaryTree {
         let mut tree = SummaryTree::new();
         let tl = match self.timelines.get(&timeline) {
             Some(t) => t,
@@ -2308,8 +2353,7 @@ impl Substrate {
                 .get(idx)
                 .map(|e| e.content.token_count as u32)
                 .unwrap_or(0);
-            let node_children: Vec<NodeId> =
-                meta.children.iter().map(|c| NodeId(c.0)).collect();
+            let node_children: Vec<NodeId> = meta.children.iter().map(|c| NodeId(c.0)).collect();
             let node = Node {
                 id: NodeId(idx.0),
                 kind: meta.kind,
@@ -2365,8 +2409,7 @@ impl Substrate {
             .expect("append_with_blocks: timeline not registered")
             .next_turn_index();
         let compression = self.timeline_compression.get(&timeline).copied();
-        let residence =
-            self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
+        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         // `append_with_blocks` declares a turn's existence and block
         // range, but holds no sealed KV — the residence stays cold
         // (`hot = None`) until an elevate / restore_turn install
@@ -2426,8 +2469,7 @@ impl Substrate {
             .expect("append_complete: timeline not registered")
             .next_turn_index();
         let compression = self.timeline_compression.get(&timeline).copied();
-        let residence =
-            self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
+        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         let block_start = write.block_start;
         let block_end = write.block_end;
         {
@@ -2486,8 +2528,7 @@ impl Substrate {
             .expect("restore_turn: timeline must be registered first")
             .next_turn_index();
         let compression = self.timeline_compression.get(&timeline).copied();
-        let residence =
-            self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
+        let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         {
             let tl = self.timelines.get_mut(&timeline).unwrap();
             tl.turns.insert(
@@ -2544,10 +2585,7 @@ impl Substrate {
     /// Drop the hot residences of both halves of the turn.  Returns
     /// `true` if either half had hot bytes to drop.
     pub fn clear_turn_sealed(&mut self, timeline: TimelineId, index: TurnIndex) -> bool {
-        let Some(residence) = self
-            .turn(timeline, index)
-            .map(|e| e.content.residence)
-        else {
+        let Some(residence) = self.turn(timeline, index).map(|e| e.content.residence) else {
             return false;
         };
         if self.residence[residence.0].hot.take().is_some() {
@@ -2585,10 +2623,7 @@ impl Substrate {
     pub fn turn_hot_bytes(&self, timeline: TimelineId, index: TurnIndex) -> Option<usize> {
         let entry = self.turn(timeline, index)?;
         let residence = &self.residence[entry.content.residence.0];
-        residence
-            .hot
-            .as_ref()
-            .map(|_| residence.byte_size as usize)
+        residence.hot.as_ref().map(|_| residence.byte_size as usize)
     }
 
     /// FIFO-oldest hot-resident turn, skipping `except`. "FIFO" =
@@ -2660,15 +2695,13 @@ impl Substrate {
         new_block_end: u64,
     ) {
         if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.content.token_count =
-                entry.content.token_count.saturating_add(additional_tokens);
+            entry.content.token_count = entry.content.token_count.saturating_add(additional_tokens);
             entry.block_range.1 = new_block_end;
         }
     }
 
     pub fn block_range_of(&self, timeline: TimelineId, index: TurnIndex) -> (u64, u64) {
-        self.turn(timeline, index)
-            .map_or((0, 0), |e| e.block_range)
+        self.turn(timeline, index).map_or((0, 0), |e| e.block_range)
     }
 
     /// Set the turn's BDP sig entries — one per chunk in the
@@ -2697,11 +2730,7 @@ impl Substrate {
 
     /// Turn's BDP sig entries — one per chunk in the content's
     /// residence, slot-block ordered.
-    pub fn sig_entries_of(
-        &self,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Vec<SigEntry> {
+    pub fn sig_entries_of(&self, timeline: TimelineId, index: TurnIndex) -> Vec<SigEntry> {
         self.turn(timeline, index)
             .map(|e| e.content.sig_entries.clone())
             .unwrap_or_default()
@@ -2853,9 +2882,7 @@ impl Substrate {
     /// timelines (matches "not archived" since the conversation
     /// doesn't exist as far as the sidebar is concerned).
     pub fn is_archived(&self, timeline: TimelineId) -> bool {
-        self.timelines
-            .get(&timeline)
-            .is_some_and(|e| e.archived)
+        self.timelines.get(&timeline).is_some_and(|e| e.archived)
     }
 
     /// Set a timeline's archived flag. No-op when the timeline isn't
@@ -3045,12 +3072,12 @@ impl Substrate {
         // substrate's in-RAM stream index (the authoritative source
         // since Phase 3 — the manifest no longer holds per-entity
         // state).
-        let stream_id = self
-            .all_streams()
-            .find_map(|(sid, entry)| match entry.decl.as_ref()? {
-                StreamDecl::PromptSection(s) if s.debug_name == debug_name => Some(sid),
-                _ => None,
-            })?;
+        let stream_id =
+            self.all_streams()
+                .find_map(|(sid, entry)| match entry.decl.as_ref()? {
+                    StreamDecl::PromptSection(s) if s.debug_name == debug_name => Some(sid),
+                    _ => None,
+                })?;
         // Map stream_id back to the in-RAM SectionId via the residence
         // slab — the residence holds the stream id we installed at
         // ingest time.
@@ -3069,12 +3096,11 @@ impl Substrate {
     /// (C0 by default) — the new Q-format sequences land here so
     /// subsequent in-session reads see the same bytes the cold tier
     /// will reproduce on the next reload.
-    pub fn replace_section_hot(
-        &mut self,
-        residence: ResidenceIndex,
-        new_hot: Vec<SealedSequence>,
-    ) {
-        debug_assert!(!new_hot.is_empty(), "replace_section_hot called with empty Vec");
+    pub fn replace_section_hot(&mut self, residence: ResidenceIndex, new_hot: Vec<SealedSequence>) {
+        debug_assert!(
+            !new_hot.is_empty(),
+            "replace_section_hot called with empty Vec"
+        );
         let bytes = sealed_bytes(&new_hot) as u64;
         let slot = &mut self.residence[residence.0];
         slot.byte_size = bytes;
@@ -3167,7 +3193,6 @@ impl Substrate {
     pub fn all_sections(&self) -> impl Iterator<Item = SectionId> + '_ {
         self.sections.keys().copied()
     }
-
 }
 
 /// Group-keyed [`ContentResolver`] over a bare [`Substrate`].
@@ -3259,11 +3284,7 @@ impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
 /// Shared between every scored ContentResolver impl so a substrate-side
 /// shape change can't drift the formula across them.
 #[inline]
-fn combine_per_depth(
-    s: PerDepthScores,
-    formula: ScoreFormula,
-    weights: &DepthWeights,
-) -> f32 {
+fn combine_per_depth(s: PerDepthScores, formula: ScoreFormula, weights: &DepthWeights) -> f32 {
     weights.combine(
         s.syn.pick(formula),
         s.sem.pick(formula),
@@ -3351,8 +3372,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         if tree.is_empty() {
             return None;
         }
-        let mut scores: ahash::AHashMap<NodeId, f32> =
-            ahash::AHashMap::default();
+        let mut scores: ahash::AHashMap<NodeId, f32> = ahash::AHashMap::default();
         for id in tree.all_ids() {
             let idx = TurnIndex(id.0);
             // A tree node without a backing substrate turn is an
@@ -3367,11 +3387,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
             if self.substrate.turn(timeline, idx).is_none() {
                 continue;
             }
-            let s = combine_per_depth(
-                self.scores.turn(timeline, idx),
-                formula,
-                weights,
-            );
+            let s = combine_per_depth(self.scores.turn(timeline, idx), formula, weights);
             scores.insert(id, s);
         }
         let cfg = RecencyConfig::default();
@@ -3397,10 +3413,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         Some(out)
     }
 
-    fn pending_summary_len(
-        &self,
-        timeline: TimelineId,
-    ) -> usize {
+    fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.substrate.pending_summary_len(timeline)
     }
 }
@@ -3522,10 +3535,7 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         combine_per_depth(self.scores_or_empty().section(section), formula, weights)
     }
 
-    fn pending_summary_len(
-        &self,
-        timeline: TimelineId,
-    ) -> usize {
+    fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.guard.pending_summary_len(timeline)
     }
 }
@@ -3830,11 +3840,7 @@ mod tests {
     /// Returns the residence index. Used by the purge tests below to
     /// drive the warm LRU without going through the (CUDA-only)
     /// migrate path.
-    fn install_warm_only(
-        sub: &mut Substrate,
-        timeline: TimelineId,
-        bytes: u64,
-    ) -> ResidenceIndex {
+    fn install_warm_only(sub: &mut Substrate, timeline: TimelineId, bytes: u64) -> ResidenceIndex {
         let idx = sub
             .append_complete(
                 timeline,
@@ -3872,11 +3878,8 @@ mod tests {
 
         // 64 GB total, 32 GB available, incoming 1 MB. Threshold is
         // max(2 GiB, 5% * 64 GB) = 3.2 GB. 32 GB - 1 MB >> 3.2 GB.
-        let r = sub.purge_warm_to_target(
-            1_000_000,
-            32 * 1024 * 1024 * 1024,
-            64 * 1024 * 1024 * 1024,
-        );
+        let r =
+            sub.purge_warm_to_target(1_000_000, 32 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024);
         assert_eq!(r.count, 0);
         assert_eq!(r.bytes, 0);
     }
@@ -3920,7 +3923,7 @@ mod tests {
         // `pop_back` returning None.
         let r = sub.purge_warm_to_target(
             10 * 1024 * 1024 * 1024,
-            1024 * 1024 * 1024, // 1 GiB available
+            1024 * 1024 * 1024,      // 1 GiB available
             64 * 1024 * 1024 * 1024, // 64 GiB total
         );
         assert_eq!(r.count, 0);
@@ -3938,30 +3941,106 @@ mod tests {
         // 256 GB total, 14 GB available, incoming 0. Threshold =
         // max(2 GiB, 256 GB * 0.05 = 12.8 GB) = 12.8 GB.
         // projected = 14 GB > 12.8 GB → no purge.
-        let r = sub.purge_warm_to_target(
-            0,
-            14 * 1000 * 1000 * 1000,
-            256 * 1000 * 1000 * 1000,
-        );
+        let r = sub.purge_warm_to_target(0, 14 * 1000 * 1000 * 1000, 256 * 1000 * 1000 * 1000);
         assert_eq!(r.count, 0, "14 GB available > 5% × 256 GB threshold");
 
         // Now 13 GB available, threshold still 12.8 GB. projected =
         // 13 GB > 12.8 GB → still no purge.
-        let r = sub.purge_warm_to_target(
-            0,
-            13 * 1000 * 1000 * 1000,
-            256 * 1000 * 1000 * 1000,
-        );
+        let r = sub.purge_warm_to_target(0, 13 * 1000 * 1000 * 1000, 256 * 1000 * 1000 * 1000);
         assert_eq!(r.count, 0);
 
         // 12 GB available → projected < threshold → purge fires.
-        let r = sub.purge_warm_to_target(
-            0,
-            12 * 1000 * 1000 * 1000,
-            256 * 1000 * 1000 * 1000,
-        );
+        let r = sub.purge_warm_to_target(0, 12 * 1000 * 1000 * 1000, 256 * 1000 * 1000 * 1000);
         assert_eq!(r.count, 1);
         assert_eq!(r.bytes, 2_000_000_000);
+    }
+
+    /// Helper: install a turn that is **both** hot (on `hot_lru`) and warm,
+    /// with a known `byte_size`. A non-empty sealed payload is required so
+    /// `append_complete` crosses `install_hot`'s `!is_empty()` gate (an empty
+    /// vec is treated as a cold-marker → `hot = None`). Returns
+    /// `(turn_index, residence)`.
+    fn install_hot_and_warm(
+        sub: &mut Substrate,
+        timeline: TimelineId,
+        bytes: u64,
+    ) -> (TurnIndex, ResidenceIndex) {
+        let idx = sub
+            .append_complete(
+                timeline,
+                TurnPartWrite {
+                    sealed_gpu: Some(Arc::new(vec![minimal_sealed_layer()])),
+                    ..Default::default()
+                },
+                identity_migrate,
+            )
+            .unwrap();
+        let residence = sub.turn_residence(timeline, idx).unwrap();
+        sub.residence[residence.0].byte_size = bytes;
+        sub.install_warm(residence, vec![minimal_sealed_layer()]);
+        (idx, residence)
+    }
+
+    /// Budget-aware eviction frees the **least-recently-promoted** turns
+    /// first (back of `hot_lru`) and stops as soon as the target is covered,
+    /// leaving the newest turn hot and every evicted turn's **warm copy
+    /// intact** (eviction is hot→warm, never hot→cold).
+    #[test]
+    fn evict_hot_to_free_oldest_first_keeps_warm() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        // install_hot pushes to the FRONT, so install order a,b,c leaves
+        // hot_lru = [c, b, a] (front newest). Eviction walks from the back:
+        // a first, then b.
+        let (_, a) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, b) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, c) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+
+        // Target 150 MB → evict a (100 MB) then b (200 MB ≥ 150 MB) and stop.
+        let report = sub.evict_hot_to_free(&[], &[], 150_000_000);
+        assert_eq!(report.count, 2, "a + b cover the 150 MB target");
+        assert_eq!(report.bytes, 200_000_000);
+        // Evicted turns: hot dropped, warm KEPT (the fast-reload backup).
+        assert!(sub.residence[a.0].hot.is_none(), "a hot evicted");
+        assert!(
+            sub.residence[a.0].warm.is_some(),
+            "a warm KEPT (→warm not →cold)"
+        );
+        assert!(sub.residence[b.0].hot.is_none(), "b hot evicted");
+        assert!(sub.residence[b.0].warm.is_some(), "b warm KEPT");
+        // Newest turn untouched — the working set stays resident.
+        assert!(sub.residence[c.0].hot.is_some(), "c (newest) still hot");
+    }
+
+    /// The selection (keep set) is never evicted, even when it's the oldest
+    /// turn — eviction skips it and frees a younger one instead.
+    #[test]
+    fn evict_hot_to_free_protects_keep_set() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (a_idx, a) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (_, b) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+
+        // a is oldest (would be evicted first) but it's in the keep set, so
+        // eviction must skip it and take b instead.
+        let keep = [TurnKey {
+            timeline,
+            index: a_idx,
+        }];
+        let report = sub.evict_hot_to_free(&[], &keep, 100_000_000);
+        assert_eq!(report.count, 1);
+        assert!(sub.residence[a.0].hot.is_some(), "a protected by keep set");
+        assert!(sub.residence[b.0].hot.is_none(), "b evicted instead");
+    }
+
+    /// A zero target evicts nothing — there's no incoming load to make room
+    /// for, so the working set is left fully hot.
+    #[test]
+    fn evict_hot_to_free_zero_target_is_noop() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (_, a) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let report = sub.evict_hot_to_free(&[], &[], 0);
+        assert_eq!(report.count, 0);
+        assert_eq!(report.bytes, 0);
+        assert!(sub.residence[a.0].hot.is_some());
     }
 
     /// `restore_turn` with `cold = Some(...)` lands the residence as
@@ -3992,7 +4071,10 @@ mod tests {
         );
         let residence = sub.turn_residence(timeline, idx).unwrap();
         assert!(sub.residence[residence.0].cold.is_some(), "cold installed");
-        assert!(sub.residence[residence.0].hot.is_none(), "hot empty (cold-marker)");
+        assert!(
+            sub.residence[residence.0].hot.is_none(),
+            "hot empty (cold-marker)"
+        );
         assert!(sub.residence[residence.0].warm.is_none(), "warm empty");
         assert_eq!(
             sub.residence[residence.0].byte_size, 1024,
@@ -4150,19 +4232,32 @@ mod tests {
         kv.insert("content_sha256".to_string(), "abc123".to_string());
         sub.merge_custom(tl, &kv);
 
-        let got = sub.custom_of(tl).expect("registered timeline has custom map");
+        let got = sub
+            .custom_of(tl)
+            .expect("registered timeline has custom map");
         assert_eq!(got.get("kind").map(String::as_str), Some("code_read"));
-        assert_eq!(got.get("content_sha256").map(String::as_str), Some("abc123"));
+        assert_eq!(
+            got.get("content_sha256").map(String::as_str),
+            Some("abc123")
+        );
 
         // Exact (key, value) search — the resume-cache + invalidation lookup.
-        assert_eq!(sub.timelines_with_metadata("content_sha256", "abc123"), vec![tl]);
+        assert_eq!(
+            sub.timelines_with_metadata("content_sha256", "abc123"),
+            vec![tl]
+        );
         assert_eq!(sub.timelines_with_metadata("path", "src/lib.rs"), vec![tl]);
-        assert!(sub.timelines_with_metadata("content_sha256", "nope").is_empty());
+        assert!(sub
+            .timelines_with_metadata("content_sha256", "nope")
+            .is_empty());
         assert!(sub.timelines_with_metadata("absent_key", "x").is_empty());
 
         // live_conv_meta carries custom so compaction can re-emit it.
         let live = sub.live_conv_meta();
-        let entry = live.iter().find(|e| e.0 == tl.raw()).expect("timeline in live meta");
+        let entry = live
+            .iter()
+            .find(|e| e.0 == tl.raw())
+            .expect("timeline in live meta");
         assert_eq!(entry.4.get("path").map(String::as_str), Some("src/lib.rs"));
     }
 
@@ -4180,22 +4275,36 @@ mod tests {
         m1.insert("path".to_string(), "src/a.rs".to_string());
         sub.apply_conv_meta(
             tl.raw(),
-            &super::ConvMeta { conv_id: String::new(), label: String::new(), custom: m1 },
+            &super::ConvMeta {
+                conv_id: String::new(),
+                label: String::new(),
+                custom: m1,
+            },
         );
         let mut m2 = std::collections::BTreeMap::new();
         m2.insert("content_sha256".to_string(), "h1".to_string());
         sub.apply_conv_meta(
             tl.raw(),
-            &super::ConvMeta { conv_id: String::new(), label: String::new(), custom: m2 },
+            &super::ConvMeta {
+                conv_id: String::new(),
+                label: String::new(),
+                custom: m2,
+            },
         );
 
-        assert!(sub.custom_of(tl).is_none(), "pre-registration: not visible yet");
+        assert!(
+            sub.custom_of(tl).is_none(),
+            "pre-registration: not visible yet"
+        );
         sub.register_timeline(tl, layer, group);
 
         let got = sub.custom_of(tl).expect("custom drained on registration");
         assert_eq!(got.get("path").map(String::as_str), Some("src/a.rs"));
         assert_eq!(got.get("content_sha256").map(String::as_str), Some("h1"));
-        assert_eq!(sub.timelines_with_metadata("content_sha256", "h1"), vec![tl]);
+        assert_eq!(
+            sub.timelines_with_metadata("content_sha256", "h1"),
+            vec![tl]
+        );
     }
 
     #[test]
@@ -4268,9 +4377,7 @@ mod tests {
 
         sub.register_timeline(timeline, layer, group);
         assert!(sub.is_tombstoned(timeline));
-        assert!(sub
-            .active_timelines_for_group(group)
-            .all(|t| t != timeline));
+        assert!(sub.active_timelines_for_group(group).all(|t| t != timeline));
     }
 
     #[test]
@@ -4362,7 +4469,7 @@ mod tests {
         sub.append_with_blocks(timeline, 10, 0, 1);
 
         let turn_keys = vec![
-            TurnKey::new(timeline, TurnIndex(0)), // exists, tier-less
+            TurnKey::new(timeline, TurnIndex(0)),  // exists, tier-less
             TurnKey::new(timeline, TurnIndex(99)), // does not exist
         ];
         let plan = sub.snapshot_promotion_state(&[], &turn_keys);

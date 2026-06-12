@@ -55,10 +55,12 @@ fn discrimination(
     weights: &DepthWeights,
 ) -> (f32, f32) {
     let intra = resolver.section_score(h.tool_section_ids[probe_tool], formula, weights);
-    let inter_mean = TOOLS.iter()
+    let inter_mean = TOOLS
+        .iter()
         .filter(|&&t| t != probe_tool)
         .map(|&t| resolver.section_score(h.tool_section_ids[t], formula, weights))
-        .sum::<f32>() / (TOOLS.len() - 1) as f32;
+        .sum::<f32>()
+        / (TOOLS.len() - 1) as f32;
     (intra, inter_mean)
 }
 
@@ -76,7 +78,16 @@ fn sweep_ratios(
     weights: &DepthWeights,
 ) -> (f32, f32, f32) {
     let cache = h.build_raw_corpus_cache(raw_pf, raw_manifest, strategy);
-    sweep_ratios_with_cache(h, raw_pf, raw_manifest, probe_ids, strategy, formula, weights, &cache)
+    sweep_ratios_with_cache(
+        h,
+        raw_pf,
+        raw_manifest,
+        probe_ids,
+        strategy,
+        formula,
+        weights,
+        &cache,
+    )
 }
 
 /// Inner sweep that reuses a precomputed `RawCorpusCache`.
@@ -90,11 +101,14 @@ fn sweep_ratios_with_cache(
     weights: &DepthWeights,
     cache: &RawCorpusCache,
 ) -> (f32, f32, f32) {
-    let ratios: Vec<f32> = probe_ids.iter().map(|(tool, id)| {
-        let resolver = h.scan_raw_cached(raw_pf, raw_manifest, id, strategy, cache);
-        let (intra, inter) = discrimination(h, &resolver, tool, formula, weights);
-        ratio(intra, inter)
-    }).collect();
+    let ratios: Vec<f32> = probe_ids
+        .iter()
+        .map(|(tool, id)| {
+            let resolver = h.scan_raw_cached(raw_pf, raw_manifest, id, strategy, cache);
+            let (intra, inter) = discrimination(h, &resolver, tool, formula, weights);
+            ratio(intra, inter)
+        })
+        .collect();
     let min_r = ratios.iter().cloned().fold(f32::INFINITY, f32::min);
     let mean_r = ratios.iter().sum::<f32>() / ratios.len() as f32;
     let max_r = ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -108,15 +122,21 @@ fn span_discrimination(
     probe_tool: &str,
     alpha: f32,
 ) -> (f32, f32) {
-    let intra = hit_log.get(&h.tool_section_ids[probe_tool])
+    let intra = hit_log
+        .get(&h.tool_section_ids[probe_tool])
         .map(|hits| span_score_mean(hits, alpha))
         .unwrap_or(0.0);
-    let inter_mean = TOOLS.iter()
+    let inter_mean = TOOLS
+        .iter()
         .filter(|&&t| t != probe_tool)
-        .map(|&t| hit_log.get(&h.tool_section_ids[t])
-            .map(|hits| span_score_mean(hits, alpha))
-            .unwrap_or(0.0))
-        .sum::<f32>() / (TOOLS.len() - 1) as f32;
+        .map(|&t| {
+            hit_log
+                .get(&h.tool_section_ids[t])
+                .map(|hits| span_score_mean(hits, alpha))
+                .unwrap_or(0.0)
+        })
+        .sum::<f32>()
+        / (TOOLS.len() - 1) as f32;
     (intra, inter_mean)
 }
 
@@ -160,46 +180,76 @@ fn sweep_ratios_additive_b(
     strat_count: &SignatureStrategy,
     alpha: f32,
 ) -> (f32, f32, f32) {
-    let eq = DepthWeights { syntactic: 1.0, semantic: 1.0, pragmatic: 1.0 };
+    let eq = DepthWeights {
+        syntactic: 1.0,
+        semantic: 1.0,
+        pragmatic: 1.0,
+    };
     let count_formula = ScoreFormula::Count;
 
-    let cache_span  = h.build_raw_corpus_cache(raw_pf, raw_manifest, strat_span);
+    let cache_span = h.build_raw_corpus_cache(raw_pf, raw_manifest, strat_span);
     let cache_count = h.build_raw_corpus_cache(raw_pf, raw_manifest, strat_count);
 
-    let ratios: Vec<f32> = probe_ids.iter().map(|(probe_tool, probe_id)| {
-        let (_, hit_log) = h.scan_raw_with_hits_cached(raw_pf, raw_manifest, probe_id, strat_span,  &cache_span);
-        let resolver     = h.scan_raw_cached(          raw_pf, raw_manifest, probe_id, strat_count, &cache_count);
+    let ratios: Vec<f32> = probe_ids
+        .iter()
+        .map(|(probe_tool, probe_id)| {
+            let (_, hit_log) = h.scan_raw_with_hits_cached(
+                raw_pf,
+                raw_manifest,
+                probe_id,
+                strat_span,
+                &cache_span,
+            );
+            let resolver =
+                h.scan_raw_cached(raw_pf, raw_manifest, probe_id, strat_count, &cache_count);
 
-        let span_scores: Vec<f32> = TOOLS.iter().map(|&t| {
-            hit_log.get(&h.tool_section_ids[t])
-                .map(|hits| span_score_mean(hits, alpha))
-                .unwrap_or(0.0)
-        }).collect();
-        let count_scores: Vec<f32> = TOOLS.iter().map(|&t|
-            resolver.section_score(h.tool_section_ids[t], count_formula, &eq)
-        ).collect();
+            let span_scores: Vec<f32> = TOOLS
+                .iter()
+                .map(|&t| {
+                    hit_log
+                        .get(&h.tool_section_ids[t])
+                        .map(|hits| span_score_mean(hits, alpha))
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            let count_scores: Vec<f32> = TOOLS
+                .iter()
+                .map(|&t| resolver.section_score(h.tool_section_ids[t], count_formula, &eq))
+                .collect();
 
-        let span_mean  = span_scores.iter().sum::<f32>()  / TOOLS.len() as f32;
-        let count_mean = count_scores.iter().sum::<f32>() / TOOLS.len() as f32;
+            let span_mean = span_scores.iter().sum::<f32>() / TOOLS.len() as f32;
+            let count_mean = count_scores.iter().sum::<f32>() / TOOLS.len() as f32;
 
-        let combined: Vec<f32> = span_scores.iter().zip(count_scores.iter()).map(|(&s, &c)| {
-            let ns = if span_mean  > 0.0 { s / span_mean  } else { 1.0 };
-            let nc = if count_mean > 0.0 { c / count_mean } else { 1.0 };
-            ns + nc
-        }).collect();
+            let combined: Vec<f32> = span_scores
+                .iter()
+                .zip(count_scores.iter())
+                .map(|(&s, &c)| {
+                    let ns = if span_mean > 0.0 { s / span_mean } else { 1.0 };
+                    let nc = if count_mean > 0.0 {
+                        c / count_mean
+                    } else {
+                        1.0
+                    };
+                    ns + nc
+                })
+                .collect();
 
-        let intra_idx = TOOLS.iter().position(|&t| t == *probe_tool).unwrap();
-        let intra = combined[intra_idx];
-        let inter_mean = combined.iter().enumerate()
-            .filter(|&(i, _)| i != intra_idx)
-            .map(|(_, &v)| v)
-            .sum::<f32>() / (TOOLS.len() - 1) as f32;
-        ratio(intra, inter_mean)
-    }).collect();
+            let intra_idx = TOOLS.iter().position(|&t| t == *probe_tool).unwrap();
+            let intra = combined[intra_idx];
+            let inter_mean = combined
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != intra_idx)
+                .map(|(_, &v)| v)
+                .sum::<f32>()
+                / (TOOLS.len() - 1) as f32;
+            ratio(intra, inter_mean)
+        })
+        .collect();
 
-    let min_r  = ratios.iter().cloned().fold(f32::INFINITY,     f32::min);
+    let min_r = ratios.iter().cloned().fold(f32::INFINITY, f32::min);
     let mean_r = ratios.iter().sum::<f32>() / ratios.len() as f32;
-    let max_r  = ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_r = ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     (min_r, mean_r, max_r)
 }
 
@@ -213,11 +263,23 @@ fn gated_span_score_section(
 ) -> f32 {
     let mut total = 0.0f32;
     for depth in 0u8..3 {
-        let span_toks: HashSet<u16> = hit_log_span.get(&section)
-            .map(|hits| hits.iter().filter(|h| h.depth == depth).map(|h| h.probe_tok).collect())
+        let span_toks: HashSet<u16> = hit_log_span
+            .get(&section)
+            .map(|hits| {
+                hits.iter()
+                    .filter(|h| h.depth == depth)
+                    .map(|h| h.probe_tok)
+                    .collect()
+            })
             .unwrap_or_default();
-        let gate_toks: HashSet<u16> = hit_log_gate.get(&section)
-            .map(|hits| hits.iter().filter(|h| h.depth == depth).map(|h| h.probe_tok).collect())
+        let gate_toks: HashSet<u16> = hit_log_gate
+            .get(&section)
+            .map(|hits| {
+                hits.iter()
+                    .filter(|h| h.depth == depth)
+                    .map(|h| h.probe_tok)
+                    .collect()
+            })
             .unwrap_or_default();
         let gated: Vec<u16> = span_toks.intersection(&gate_toks).cloned().collect();
         total += span_score_from_toks(gated, alpha);
@@ -240,22 +302,46 @@ fn sweep_ratios_gated_c(
     let cache_span = h.build_raw_corpus_cache(raw_pf, raw_manifest, strat_span);
     let cache_gate = h.build_raw_corpus_cache(raw_pf, raw_manifest, strat_gate);
 
-    let ratios: Vec<f32> = probe_ids.iter().map(|(probe_tool, probe_id)| {
-        let (_, hit_log_span) = h.scan_raw_with_hits_cached(raw_pf, raw_manifest, probe_id, strat_span, &cache_span);
-        let (_, hit_log_gate) = h.scan_raw_with_hits_cached(raw_pf, raw_manifest, probe_id, strat_gate, &cache_gate);
+    let ratios: Vec<f32> = probe_ids
+        .iter()
+        .map(|(probe_tool, probe_id)| {
+            let (_, hit_log_span) = h.scan_raw_with_hits_cached(
+                raw_pf,
+                raw_manifest,
+                probe_id,
+                strat_span,
+                &cache_span,
+            );
+            let (_, hit_log_gate) = h.scan_raw_with_hits_cached(
+                raw_pf,
+                raw_manifest,
+                probe_id,
+                strat_gate,
+                &cache_gate,
+            );
 
-        let intra_sid = h.tool_section_ids[*probe_tool];
-        let intra = gated_span_score_section(&hit_log_span, &hit_log_gate, intra_sid, alpha);
-        let inter_mean = TOOLS.iter()
-            .filter(|&&t| t != *probe_tool)
-            .map(|&t| gated_span_score_section(&hit_log_span, &hit_log_gate, h.tool_section_ids[t], alpha))
-            .sum::<f32>() / (TOOLS.len() - 1) as f32;
-        ratio(intra, inter_mean)
-    }).collect();
+            let intra_sid = h.tool_section_ids[*probe_tool];
+            let intra = gated_span_score_section(&hit_log_span, &hit_log_gate, intra_sid, alpha);
+            let inter_mean = TOOLS
+                .iter()
+                .filter(|&&t| t != *probe_tool)
+                .map(|&t| {
+                    gated_span_score_section(
+                        &hit_log_span,
+                        &hit_log_gate,
+                        h.tool_section_ids[t],
+                        alpha,
+                    )
+                })
+                .sum::<f32>()
+                / (TOOLS.len() - 1) as f32;
+            ratio(intra, inter_mean)
+        })
+        .collect();
 
-    let min_r  = ratios.iter().cloned().fold(f32::INFINITY,     f32::min);
+    let min_r = ratios.iter().cloned().fold(f32::INFINITY, f32::min);
     let mean_r = ratios.iter().sum::<f32>() / ratios.len() as f32;
-    let max_r  = ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_r = ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     (min_r, mean_r, max_r)
 }
 
@@ -270,8 +356,12 @@ fn raw_signature_strategy_comparison() {
     let h = Harness::build();
 
     let n_layers = raw_manifest.n_layers_per_band as usize;
-    let n_heads  = raw_manifest.n_kv_heads as usize;
-    let eq = DepthWeights { syntactic: 1.0, semantic: 1.0, pragmatic: 1.0 };
+    let n_heads = raw_manifest.n_kv_heads as usize;
+    let eq = DepthWeights {
+        syntactic: 1.0,
+        semantic: 1.0,
+        pragmatic: 1.0,
+    };
     let count = ScoreFormula::Count;
 
     // Sample layers and heads; keep it dense enough to see trends.
@@ -279,15 +369,25 @@ fn raw_signature_strategy_comparison() {
         0 => vec![],
         1 => vec![0],
         2 => vec![0, 1],
-        _ => (0..n_layers).step_by((n_layers - 1).max(1)).chain(std::iter::once(n_layers - 1)).collect::<std::collections::BTreeSet<_>>().into_iter()
-               .chain(std::iter::once(n_layers / 2)).collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
+        _ => (0..n_layers)
+            .step_by((n_layers - 1).max(1))
+            .chain(std::iter::once(n_layers - 1))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .chain(std::iter::once(n_layers / 2))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
     };
     let test_heads: Vec<usize> = (0..n_heads).collect(); // all heads (only 4 for Qwen3-30B-A3B)
 
     // All positive probe scenarios (6 per tool = 48 total).
-    let probe_ids: Vec<(&'static str, String)> = TOOLS.iter()
+    let probe_ids: Vec<(&'static str, String)> = TOOLS
+        .iter()
         .flat_map(|&tool| {
-            raw_manifest.scenarios.iter()
+            raw_manifest
+                .scenarios
+                .iter()
                 .filter(|s| s.tool.as_deref() == Some(tool) && s.case_type == CaseType::Positive)
                 .map(|s| (tool, s.id.clone()))
                 .collect::<Vec<_>>()
@@ -321,20 +421,35 @@ fn raw_signature_strategy_comparison() {
     fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     fprintln!("║  § 1  Strategy sweep (Count formula, equal depth weights)               ║");
     fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-    fprintln!("{:<28} {:>10} {:>12} {:>9}", "strategy", "min_ratio", "mean_ratio", "max_ratio");
+    fprintln!(
+        "{:<28} {:>10} {:>12} {:>9}",
+        "strategy",
+        "min_ratio",
+        "mean_ratio",
+        "max_ratio"
+    );
     fprintln!("{}", "─".repeat(62));
 
     let mut scored: Vec<(String, f32, f32, f32)> = Vec::new();
     for strat in &all_strategies {
-        let (min_r, mean_r, max_r) = sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, strat, count, &eq);
-        fprintln!("{:<28} {:>10.4} {:>12.4} {:>9.4}", strat.name(), min_r, mean_r, max_r);
+        let (min_r, mean_r, max_r) =
+            sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, strat, count, &eq);
+        fprintln!(
+            "{:<28} {:>10.4} {:>12.4} {:>9.4}",
+            strat.name(),
+            min_r,
+            mean_r,
+            max_r
+        );
         scored.push((strat.name(), min_r, mean_r, max_r));
     }
 
     // Sort by (min_ratio DESC, mean_ratio DESC): reliability first, then average signal.
     // min_ratio > 1.0 means the strategy discriminates correctly on every probe.
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap().then(b.2.partial_cmp(&a.2).unwrap())
+        b.1.partial_cmp(&a.1)
+            .unwrap()
+            .then(b.2.partial_cmp(&a.2).unwrap())
     });
     let top5: Vec<String> = scored.iter().take(5).map(|(n, ..)| n.clone()).collect();
     fprintln!("\nTop-5 by (min_ratio, mean_ratio): {}", top5.join("  |  "));
@@ -343,32 +458,58 @@ fn raw_signature_strategy_comparison() {
     fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     fprintln!("║  § 2  WindowMeanQ sweep (windows 1/2/4, all heads, sampled layers)      ║");
     fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-    fprintln!("{:<32} {:>10} {:>12} {:>9}", "strategy", "min_ratio", "mean_ratio", "max_ratio");
+    fprintln!(
+        "{:<32} {:>10} {:>12} {:>9}",
+        "strategy",
+        "min_ratio",
+        "mean_ratio",
+        "max_ratio"
+    );
     fprintln!("{}", "─".repeat(66));
 
-    let win_layers: Vec<usize> = if test_layers.is_empty() { vec![] }
-        else { vec![test_layers[test_layers.len() / 2]] }; // mid band layer
+    let win_layers: Vec<usize> = if test_layers.is_empty() {
+        vec![]
+    } else {
+        vec![test_layers[test_layers.len() / 2]]
+    }; // mid band layer
     for &l in &win_layers {
         for &head in &test_heads {
             for &w in &[1usize, 2, 4] {
-                let strat = SignatureStrategy::WindowMeanQ { window: w, layer: l, head };
-                let (min_r, mean_r, max_r) = sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &strat, count, &eq);
-                fprintln!("{:<32} {:>10.4} {:>12.4} {:>9.4}", strat.name(), min_r, mean_r, max_r);
+                let strat = SignatureStrategy::WindowMeanQ {
+                    window: w,
+                    layer: l,
+                    head,
+                };
+                let (min_r, mean_r, max_r) =
+                    sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &strat, count, &eq);
+                fprintln!(
+                    "{:<32} {:>10.4} {:>12.4} {:>9.4}",
+                    strat.name(),
+                    min_r,
+                    mean_r,
+                    max_r
+                );
                 scored.push((strat.name(), min_r, mean_r, max_r));
             }
         }
     }
     // Re-rank top-5 including window variants (same reliability-first sort).
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap().then(b.2.partial_cmp(&a.2).unwrap())
+        b.1.partial_cmp(&a.1)
+            .unwrap()
+            .then(b.2.partial_cmp(&a.2).unwrap())
     });
     let top5_all: Vec<String> = scored.iter().take(5).map(|(n, ..)| n.clone()).collect();
-    fprintln!("\nTop-5 (including window variants): {}", top5_all.join("  |  "));
+    fprintln!(
+        "\nTop-5 (including window variants): {}",
+        top5_all.join("  |  ")
+    );
 
     // ── § 3: Span scoring comparison ──────────────────────────────────────────
     // Re-run the top-5 strategies (from § 1+2) with record_hits=true and
     // compare Count vs Span(α=1.5) vs Span(α=2.0) discrimination.
-    let top_strats_for_span: Vec<&SignatureStrategy> = all_strategies.iter()
+    let top_strats_for_span: Vec<&SignatureStrategy> = all_strategies
+        .iter()
         .filter(|s| top5_all.contains(&s.name()))
         .take(5)
         .collect();
@@ -376,7 +517,13 @@ fn raw_signature_strategy_comparison() {
     fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     fprintln!("║  § 3  Span scoring — Count vs Span(α=1.5) vs Span(α=2.0)               ║");
     fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-    fprintln!("{:<28} {:>10} {:>12} {:>12}", "strategy", "count_mean", "span1.5_mean", "span2.0_mean");
+    fprintln!(
+        "{:<28} {:>10} {:>12} {:>12}",
+        "strategy",
+        "count_mean",
+        "span1.5_mean",
+        "span2.0_mean"
+    );
     fprintln!("{}", "─".repeat(65));
 
     let mut best_span_strategy_name = String::new();
@@ -403,10 +550,16 @@ fn raw_signature_strategy_comparison() {
         }
 
         let mean_count = count_ratios.iter().sum::<f32>() / count_ratios.len() as f32;
-        let mean_s15   = span15_ratios.iter().sum::<f32>() / span15_ratios.len() as f32;
-        let mean_s20   = span20_ratios.iter().sum::<f32>() / span20_ratios.len() as f32;
+        let mean_s15 = span15_ratios.iter().sum::<f32>() / span15_ratios.len() as f32;
+        let mean_s20 = span20_ratios.iter().sum::<f32>() / span20_ratios.len() as f32;
 
-        fprintln!("{:<28} {:>10.4} {:>12.4} {:>12.4}", strat.name(), mean_count, mean_s15, mean_s20);
+        fprintln!(
+            "{:<28} {:>10.4} {:>12.4} {:>12.4}",
+            strat.name(),
+            mean_count,
+            mean_s15,
+            mean_s20
+        );
 
         let best_span = mean_s15.max(mean_s20);
         if best_span > best_span_mean {
@@ -417,22 +570,37 @@ fn raw_signature_strategy_comparison() {
 
     // ── § 4: Per-tool breakdown for best § 1 strategy ────────────────────────
     let best_s1_name = &scored[0].0;
-    let best_s1_strat = all_strategies.iter().find(|s| &s.name() == best_s1_name).unwrap();
+    let best_s1_strat = all_strategies
+        .iter()
+        .find(|s| &s.name() == best_s1_name)
+        .unwrap();
 
     fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
-    fprintln!("║  § 4  Per-tool breakdown: {:<48}║", format!("{best_s1_name} (best § 1)"));
+    fprintln!(
+        "║  § 4  Per-tool breakdown: {:<48}║",
+        format!("{best_s1_name} (best § 1)")
+    );
     fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-    fprintln!("{:<14} {:>12} {:>14} {:>9} {:>9}", "tool", "mean_intra", "mean_inter", "mean_r", "min_r");
+    fprintln!(
+        "{:<14} {:>12} {:>14} {:>9} {:>9}",
+        "tool",
+        "mean_intra",
+        "mean_inter",
+        "mean_r",
+        "min_r"
+    );
     fprintln!("{}", "─".repeat(61));
 
     let s4_cache = h.build_raw_corpus_cache(&raw_pf, &raw_manifest, best_s1_strat);
     // Aggregate per tool: collect (intra, best_inter) across all positive probes.
-    let mut s4_intras:  HashMap<&str, Vec<f32>> = TOOLS.iter().map(|&t| (t, vec![])).collect();
-    let mut s4_inters:  HashMap<&str, Vec<f32>> = TOOLS.iter().map(|&t| (t, vec![])).collect();
+    let mut s4_intras: HashMap<&str, Vec<f32>> = TOOLS.iter().map(|&t| (t, vec![])).collect();
+    let mut s4_inters: HashMap<&str, Vec<f32>> = TOOLS.iter().map(|&t| (t, vec![])).collect();
     for (probe_tool, probe_id) in &probe_ids {
-        let resolver = h.scan_raw_cached(&raw_pf, &raw_manifest, probe_id, best_s1_strat, &s4_cache);
+        let resolver =
+            h.scan_raw_cached(&raw_pf, &raw_manifest, probe_id, best_s1_strat, &s4_cache);
         let intra = resolver.section_score(h.tool_section_ids[*probe_tool], count, &eq);
-        let best_inter = TOOLS.iter()
+        let best_inter = TOOLS
+            .iter()
             .filter(|&&t| t != *probe_tool)
             .map(|&t| resolver.section_score(h.tool_section_ids[t], count, &eq))
             .fold(f32::NEG_INFINITY, f32::max);
@@ -444,22 +612,40 @@ fn raw_signature_strategy_comparison() {
         let inters = &s4_inters[tool];
         let mean_intra = intras.iter().sum::<f32>() / intras.len() as f32;
         let mean_inter = inters.iter().sum::<f32>() / inters.len() as f32;
-        let min_r = intras.iter().zip(inters.iter()).map(|(&i, &e)| ratio(i, e)).fold(f32::INFINITY, f32::min);
-        fprintln!("{:<14} {:>12.1} {:>14.1} {:>9.4} {:>9.4}",
-            tool, mean_intra, mean_inter, ratio(mean_intra, mean_inter), min_r);
+        let min_r = intras
+            .iter()
+            .zip(inters.iter())
+            .map(|(&i, &e)| ratio(i, e))
+            .fold(f32::INFINITY, f32::min);
+        fprintln!(
+            "{:<14} {:>12.1} {:>14.1} {:>9.4} {:>9.4}",
+            tool,
+            mean_intra,
+            mean_inter,
+            ratio(mean_intra, mean_inter),
+            min_r
+        );
     }
 
     // ── § 5: QK and FloatSimHash layer × head sensitivity ────────────────────
     let sensitivity_pairs: &[(&str, Box<dyn Fn(usize, usize) -> SignatureStrategy>)] = &[
-        ("QK",           Box::new(|l, hd| SignatureStrategy::QK { layer: l, head: hd })),
-        ("FloatSimHash", Box::new(|l, hd| SignatureStrategy::FloatSimHash { layer: l, head: hd })),
+        (
+            "QK",
+            Box::new(|l, hd| SignatureStrategy::QK { layer: l, head: hd }),
+        ),
+        (
+            "FloatSimHash",
+            Box::new(|l, hd| SignatureStrategy::FloatSimHash { layer: l, head: hd }),
+        ),
     ];
     for (label, make) in sensitivity_pairs {
         fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
         fprintln!("║  § 5  {label} layer × head sensitivity (mean_ratio)                     ║");
         fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
         print!("{:<6}", "layer");
-        for &head in &test_heads { print!("  h{head:<9}"); }
+        for &head in &test_heads {
+            print!("  h{head:<9}");
+        }
         // flush after the header row
         fprintln!();
         fprintln!("{}", "─".repeat(6 + test_heads.len() * 12));
@@ -468,7 +654,8 @@ fn raw_signature_strategy_comparison() {
             print!("{:<6}", l);
             for &head in &test_heads {
                 let strat = make(l, head);
-                let (_, mean_r, _) = sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &strat, count, &eq);
+                let (_, mean_r, _) =
+                    sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &strat, count, &eq);
                 print!("  {:<10.4}", mean_r);
             }
             // flush after each data row
@@ -480,32 +667,61 @@ fn raw_signature_strategy_comparison() {
     fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     fprintln!("║  § 6  BandMean head sensitivity                                         ║");
     fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-    fprintln!("{:<28} {:>10} {:>12}", "strategy", "min_ratio", "mean_ratio");
+    fprintln!(
+        "{:<28} {:>10} {:>12}",
+        "strategy",
+        "min_ratio",
+        "mean_ratio"
+    );
     fprintln!("{}", "─".repeat(52));
 
     for &head in &test_heads {
-        for strat in [SignatureStrategy::BandMeanQQ { head }, SignatureStrategy::BandMeanQK { head }] {
-            let (min_r, mean_r, _) = sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &strat, count, &eq);
+        for strat in [
+            SignatureStrategy::BandMeanQQ { head },
+            SignatureStrategy::BandMeanQK { head },
+        ] {
+            let (min_r, mean_r, _) =
+                sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &strat, count, &eq);
             fprintln!("{:<28} {:>10.4} {:>12.4}", strat.name(), min_r, mean_r);
         }
     }
 
     // ── § 7: Span per-tool breakdown for best span strategy ──────────────────
-    if let Some(span_strat) = all_strategies.iter().find(|s| s.name() == best_span_strategy_name) {
+    if let Some(span_strat) = all_strategies
+        .iter()
+        .find(|s| s.name() == best_span_strategy_name)
+    {
         fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
-        fprintln!("║  § 7  Span per-tool breakdown: {:<43}║", format!("{best_span_strategy_name} (best § 3)"));
+        fprintln!(
+            "║  § 7  Span per-tool breakdown: {:<43}║",
+            format!("{best_span_strategy_name} (best § 3)")
+        );
         fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-        fprintln!("{:<14} {:>10} {:>12} {:>12} {:>9} {:>9}",
-            "tool", "cnt_mean", "sp1.5_mean", "sp2.0_mean", "cnt_min", "sp2_min");
+        fprintln!(
+            "{:<14} {:>10} {:>12} {:>12} {:>9} {:>9}",
+            "tool",
+            "cnt_mean",
+            "sp1.5_mean",
+            "sp2.0_mean",
+            "cnt_min",
+            "sp2_min"
+        );
         fprintln!("{}", "─".repeat(68));
 
         let s7_cache = h.build_raw_corpus_cache(&raw_pf, &raw_manifest, span_strat);
-        let mut s7: HashMap<&str, (Vec<f32>, Vec<f32>, Vec<f32>)> =
-            TOOLS.iter().map(|&t| (t, (vec![], vec![], vec![]))).collect();
+        let mut s7: HashMap<&str, (Vec<f32>, Vec<f32>, Vec<f32>)> = TOOLS
+            .iter()
+            .map(|&t| (t, (vec![], vec![], vec![])))
+            .collect();
         for (probe_tool, probe_id) in &probe_ids {
-            let (resolver, hit_log) =
-                h.scan_raw_with_hits_cached(&raw_pf, &raw_manifest, probe_id, span_strat, &s7_cache);
-            let (ic, ec)     = discrimination(&h, &resolver, probe_tool, count, &eq);
+            let (resolver, hit_log) = h.scan_raw_with_hits_cached(
+                &raw_pf,
+                &raw_manifest,
+                probe_id,
+                span_strat,
+                &s7_cache,
+            );
+            let (ic, ec) = discrimination(&h, &resolver, probe_tool, count, &eq);
             let (is15, es15) = span_discrimination(&h, &hit_log, probe_tool, 1.5);
             let (is20, es20) = span_discrimination(&h, &hit_log, probe_tool, 2.0);
             let e = s7.get_mut(probe_tool).unwrap();
@@ -516,132 +732,280 @@ fn raw_signature_strategy_comparison() {
         for &tool in TOOLS {
             let (cnt, sp15, sp20) = &s7[tool];
             let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
-            let min  = |v: &[f32]| v.iter().cloned().fold(f32::INFINITY, f32::min);
-            fprintln!("{:<14} {:>10.4} {:>12.4} {:>12.4} {:>9.4} {:>9.4}",
-                tool, mean(cnt), mean(sp15), mean(sp20), min(cnt), min(sp20));
+            let min = |v: &[f32]| v.iter().cloned().fold(f32::INFINITY, f32::min);
+            fprintln!(
+                "{:<14} {:>10.4} {:>12.4} {:>12.4} {:>9.4} {:>9.4}",
+                tool,
+                mean(cnt),
+                mean(sp15),
+                mean(sp20),
+                min(cnt),
+                min(sp20)
+            );
         }
     }
 
     // ── § 8: Dual-layer combinations ─────────────────────────────────────────
     // Test three ways of combining MH_XOR_QQ_l0 and MH_XOR_QQ_l4, comparing
     // each against the single-layer baselines.
-    let l0_strat   = SignatureStrategy::MultiHeadXorQQ { layer: 0 };
-    let l4_strat   = SignatureStrategy::MultiHeadXorQQ { layer: 4 };
-    let dual_strat = SignatureStrategy::MultiHeadXorQQDual { layer_a: 0, layer_b: 4 };
+    let l0_strat = SignatureStrategy::MultiHeadXorQQ { layer: 0 };
+    let l4_strat = SignatureStrategy::MultiHeadXorQQ { layer: 4 };
+    let dual_strat = SignatureStrategy::MultiHeadXorQQDual {
+        layer_a: 0,
+        layer_b: 4,
+    };
 
     fprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
     fprintln!("║  § 8  Dual-layer combinations: l0 × l4 (48 probes)                     ║");
     fprintln!("╚══════════════════════════════════════════════════════════════════════════╝");
-    fprintln!("{:<40} {:>10} {:>12} {:>9}", "strategy", "min_ratio", "mean_ratio", "max_ratio");
+    fprintln!(
+        "{:<40} {:>10} {:>12} {:>9}",
+        "strategy",
+        "min_ratio",
+        "mean_ratio",
+        "max_ratio"
+    );
     fprintln!("{}", "─".repeat(74));
 
     // Baselines (count)
-    let (l0_cnt_min, l0_cnt_mean, l0_cnt_max) =
-        sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &l0_strat, count, &eq);
-    fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-        "MH_XOR_QQ_l0 count (baseline)", l0_cnt_min, l0_cnt_mean, l0_cnt_max);
+    let (l0_cnt_min, l0_cnt_mean, l0_cnt_max) = sweep_ratios(
+        &h,
+        &raw_pf,
+        &raw_manifest,
+        &probe_ids,
+        &l0_strat,
+        count,
+        &eq,
+    );
+    fprintln!(
+        "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+        "MH_XOR_QQ_l0 count (baseline)",
+        l0_cnt_min,
+        l0_cnt_mean,
+        l0_cnt_max
+    );
 
-    let (l4_cnt_min, l4_cnt_mean, l4_cnt_max) =
-        sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &l4_strat, count, &eq);
-    fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-        "MH_XOR_QQ_l4 count (baseline)", l4_cnt_min, l4_cnt_mean, l4_cnt_max);
+    let (l4_cnt_min, l4_cnt_mean, l4_cnt_max) = sweep_ratios(
+        &h,
+        &raw_pf,
+        &raw_manifest,
+        &probe_ids,
+        &l4_strat,
+        count,
+        &eq,
+    );
+    fprintln!(
+        "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+        "MH_XOR_QQ_l4 count (baseline)",
+        l4_cnt_min,
+        l4_cnt_mean,
+        l4_cnt_max
+    );
 
     // Baseline span2.0 for l0 (the champion from § 7)
     {
         let s8_l0_cache = h.build_raw_corpus_cache(&raw_pf, &raw_manifest, &l0_strat);
-        let s8_sp20_ratios: Vec<f32> = probe_ids.iter().map(|(probe_tool, probe_id)| {
-            let (_, hit_log) = h.scan_raw_with_hits_cached(&raw_pf, &raw_manifest, probe_id, &l0_strat, &s8_l0_cache);
-            let (is20, es20) = span_discrimination(&h, &hit_log, probe_tool, 2.0);
-            ratio(is20, es20)
-        }).collect();
-        let sp_min  = s8_sp20_ratios.iter().cloned().fold(f32::INFINITY,     f32::min);
+        let s8_sp20_ratios: Vec<f32> = probe_ids
+            .iter()
+            .map(|(probe_tool, probe_id)| {
+                let (_, hit_log) = h.scan_raw_with_hits_cached(
+                    &raw_pf,
+                    &raw_manifest,
+                    probe_id,
+                    &l0_strat,
+                    &s8_l0_cache,
+                );
+                let (is20, es20) = span_discrimination(&h, &hit_log, probe_tool, 2.0);
+                ratio(is20, es20)
+            })
+            .collect();
+        let sp_min = s8_sp20_ratios.iter().cloned().fold(f32::INFINITY, f32::min);
         let sp_mean = s8_sp20_ratios.iter().sum::<f32>() / s8_sp20_ratios.len() as f32;
-        let sp_max  = s8_sp20_ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-            "MH_XOR_QQ_l0 span2.0 (baseline)", sp_min, sp_mean, sp_max);
+        let sp_max = s8_sp20_ratios
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        fprintln!(
+            "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+            "MH_XOR_QQ_l0 span2.0 (baseline)",
+            sp_min,
+            sp_mean,
+            sp_max
+        );
     }
 
     fprintln!("{}", "─".repeat(74));
 
     // Option A — 8-head XOR, count
-    let (a_cnt_min, a_cnt_mean, a_cnt_max) =
-        sweep_ratios(&h, &raw_pf, &raw_manifest, &probe_ids, &dual_strat, count, &eq);
-    fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-        "A: MH_XOR_QQ_l0xl4 count", a_cnt_min, a_cnt_mean, a_cnt_max);
+    let (a_cnt_min, a_cnt_mean, a_cnt_max) = sweep_ratios(
+        &h,
+        &raw_pf,
+        &raw_manifest,
+        &probe_ids,
+        &dual_strat,
+        count,
+        &eq,
+    );
+    fprintln!(
+        "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+        "A: MH_XOR_QQ_l0xl4 count",
+        a_cnt_min,
+        a_cnt_mean,
+        a_cnt_max
+    );
 
     // Option A — 8-head XOR, span α=2.0
     let (a_sp_min, a_sp_mean, a_sp_max) = {
         let s8_a_cache = h.build_raw_corpus_cache(&raw_pf, &raw_manifest, &dual_strat);
-        let sp_ratios: Vec<f32> = probe_ids.iter().map(|(probe_tool, probe_id)| {
-            let (_, hit_log) = h.scan_raw_with_hits_cached(&raw_pf, &raw_manifest, probe_id, &dual_strat, &s8_a_cache);
-            let (is20, es20) = span_discrimination(&h, &hit_log, probe_tool, 2.0);
-            ratio(is20, es20)
-        }).collect();
-        let sp_min  = sp_ratios.iter().cloned().fold(f32::INFINITY,     f32::min);
+        let sp_ratios: Vec<f32> = probe_ids
+            .iter()
+            .map(|(probe_tool, probe_id)| {
+                let (_, hit_log) = h.scan_raw_with_hits_cached(
+                    &raw_pf,
+                    &raw_manifest,
+                    probe_id,
+                    &dual_strat,
+                    &s8_a_cache,
+                );
+                let (is20, es20) = span_discrimination(&h, &hit_log, probe_tool, 2.0);
+                ratio(is20, es20)
+            })
+            .collect();
+        let sp_min = sp_ratios.iter().cloned().fold(f32::INFINITY, f32::min);
         let sp_mean = sp_ratios.iter().sum::<f32>() / sp_ratios.len() as f32;
-        let sp_max  = sp_ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sp_max = sp_ratios.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         (sp_min, sp_mean, sp_max)
     };
-    fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-        "A: MH_XOR_QQ_l0xl4 span2.0", a_sp_min, a_sp_mean, a_sp_max);
+    fprintln!(
+        "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+        "A: MH_XOR_QQ_l0xl4 span2.0",
+        a_sp_min,
+        a_sp_mean,
+        a_sp_max
+    );
 
     // Option B — additive: norm_span2.0(l0) + norm_count(l4)
-    let (b_min, b_mean, b_max) =
-        sweep_ratios_additive_b(&h, &raw_pf, &raw_manifest, &probe_ids, &l0_strat, &l4_strat, 2.0);
-    fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-        "B: norm span2.0(l0) + count(l4)", b_min, b_mean, b_max);
+    let (b_min, b_mean, b_max) = sweep_ratios_additive_b(
+        &h,
+        &raw_pf,
+        &raw_manifest,
+        &probe_ids,
+        &l0_strat,
+        &l4_strat,
+        2.0,
+    );
+    fprintln!(
+        "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+        "B: norm span2.0(l0) + count(l4)",
+        b_min,
+        b_mean,
+        b_max
+    );
 
     // Option C — gated span: l0 span filtered by l4 gate, α=2.0
-    let (c_min, c_mean, c_max) =
-        sweep_ratios_gated_c(&h, &raw_pf, &raw_manifest, &probe_ids, &l0_strat, &l4_strat, 2.0);
-    fprintln!("{:<40} {:>10.4} {:>12.4} {:>9.4}",
-        "C: gated span2.0(l0, gate=l4)", c_min, c_mean, c_max);
+    let (c_min, c_mean, c_max) = sweep_ratios_gated_c(
+        &h,
+        &raw_pf,
+        &raw_manifest,
+        &probe_ids,
+        &l0_strat,
+        &l4_strat,
+        2.0,
+    );
+    fprintln!(
+        "{:<40} {:>10.4} {:>12.4} {:>9.4}",
+        "C: gated span2.0(l0, gate=l4)",
+        c_min,
+        c_mean,
+        c_max
+    );
 
     fprintln!("{}", "─".repeat(74));
 
     // Identify winner among A-count, A-span, B, C by (min_ratio DESC, mean_ratio DESC)
     let s8_candidates = [
-        ("A-count",  a_cnt_min, a_cnt_mean),
+        ("A-count", a_cnt_min, a_cnt_mean),
         ("A-span2.0", a_sp_min, a_sp_mean),
-        ("B",        b_min,     b_mean),
-        ("C",        c_min,     c_mean),
+        ("B", b_min, b_mean),
+        ("C", c_min, c_mean),
     ];
-    let s8_winner = s8_candidates.iter()
-        .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then(x.2.partial_cmp(&y.2).unwrap()))
+    let s8_winner = s8_candidates
+        .iter()
+        .max_by(|x, y| {
+            x.1.partial_cmp(&y.1)
+                .unwrap()
+                .then(x.2.partial_cmp(&y.2).unwrap())
+        })
         .unwrap();
-    fprintln!("§ 8 winner: {}  (min={:.4}  mean={:.4})", s8_winner.0, s8_winner.1, s8_winner.2);
+    fprintln!(
+        "§ 8 winner: {}  (min={:.4}  mean={:.4})",
+        s8_winner.0,
+        s8_winner.1,
+        s8_winner.2
+    );
 
     // Per-tool breakdown for Option A span2.0 (most structurally interesting)
     fprintln!("\n  Per-tool breakdown — A: MH_XOR_QQ_l0xl4 span2.0");
-    fprintln!("  {:<14} {:>10} {:>12} {:>9} {:>9}",
-        "tool", "cnt_mean", "sp2.0_mean", "cnt_min", "sp2_min");
+    fprintln!(
+        "  {:<14} {:>10} {:>12} {:>9} {:>9}",
+        "tool",
+        "cnt_mean",
+        "sp2.0_mean",
+        "cnt_min",
+        "sp2_min"
+    );
     fprintln!("  {}", "─".repeat(57));
     {
         let s8_a_cache = h.build_raw_corpus_cache(&raw_pf, &raw_manifest, &dual_strat);
-        let mut a_cnt_by_tool:  HashMap<&str, Vec<f32>> = TOOLS.iter().map(|&t| (t, vec![])).collect();
-        let mut a_sp20_by_tool: HashMap<&str, Vec<f32>> = TOOLS.iter().map(|&t| (t, vec![])).collect();
+        let mut a_cnt_by_tool: HashMap<&str, Vec<f32>> =
+            TOOLS.iter().map(|&t| (t, vec![])).collect();
+        let mut a_sp20_by_tool: HashMap<&str, Vec<f32>> =
+            TOOLS.iter().map(|&t| (t, vec![])).collect();
         for (probe_tool, probe_id) in &probe_ids {
-            let (resolver, hit_log) =
-                h.scan_raw_with_hits_cached(&raw_pf, &raw_manifest, probe_id, &dual_strat, &s8_a_cache);
-            let (ic, ec)     = discrimination(&h, &resolver, probe_tool, count, &eq);
+            let (resolver, hit_log) = h.scan_raw_with_hits_cached(
+                &raw_pf,
+                &raw_manifest,
+                probe_id,
+                &dual_strat,
+                &s8_a_cache,
+            );
+            let (ic, ec) = discrimination(&h, &resolver, probe_tool, count, &eq);
             let (is20, es20) = span_discrimination(&h, &hit_log, probe_tool, 2.0);
-            a_cnt_by_tool.get_mut(probe_tool).unwrap().push(ratio(ic, ec));
-            a_sp20_by_tool.get_mut(probe_tool).unwrap().push(ratio(is20, es20));
+            a_cnt_by_tool
+                .get_mut(probe_tool)
+                .unwrap()
+                .push(ratio(ic, ec));
+            a_sp20_by_tool
+                .get_mut(probe_tool)
+                .unwrap()
+                .push(ratio(is20, es20));
         }
         for &tool in TOOLS {
-            let cnt  = &a_cnt_by_tool[tool];
+            let cnt = &a_cnt_by_tool[tool];
             let sp20 = &a_sp20_by_tool[tool];
             let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
-            let min  = |v: &[f32]| v.iter().cloned().fold(f32::INFINITY, f32::min);
-            fprintln!("  {:<14} {:>10.4} {:>12.4} {:>9.4} {:>9.4}",
-                tool, mean(cnt), mean(sp20), min(cnt), min(sp20));
+            let min = |v: &[f32]| v.iter().cloned().fold(f32::INFINITY, f32::min);
+            fprintln!(
+                "  {:<14} {:>10.4} {:>12.4} {:>9.4} {:>9.4}",
+                tool,
+                mean(cnt),
+                mean(sp20),
+                min(cnt),
+                min(sp20)
+            );
         }
     }
 
     fprintln!("\n── Run complete ────────────────────────────────────────────────────────────");
     fprintln!("Best strategy (§ 1, Count):  {best_s1_name}");
-    fprintln!("Best strategy (§ 3, Span):   {best_span_strategy_name}  (mean_ratio={best_span_mean:.4})");
-    fprintln!("Best dual-layer (§ 8):       {}  (min={:.4}  mean={:.4})",
-        s8_winner.0, s8_winner.1, s8_winner.2);
+    fprintln!(
+        "Best strategy (§ 3, Span):   {best_span_strategy_name}  (mean_ratio={best_span_mean:.4})"
+    );
+    fprintln!(
+        "Best dual-layer (§ 8):       {}  (min={:.4}  mean={:.4})",
+        s8_winner.0,
+        s8_winner.1,
+        s8_winner.2
+    );
     fprintln!();
 }

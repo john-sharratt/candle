@@ -124,7 +124,8 @@ impl ProfileAccumulator {
         _name: &'static str,
         _elapsed: std::time::Duration,
         _count: u64,
-    ) {}
+    ) {
+    }
 
     /// Merge another accumulator's data into this one.
     #[cfg(feature = "profile")]
@@ -255,13 +256,7 @@ impl ProfileAccumulator {
             entries: self
                 .entries
                 .iter()
-                .map(|e| {
-                    (
-                        e.name.to_string(),
-                        e.total.as_secs_f64() * 1000.0,
-                        e.count,
-                    )
-                })
+                .map(|e| (e.name.to_string(), e.total.as_secs_f64() * 1000.0, e.count))
                 .collect(),
         }
     }
@@ -308,11 +303,7 @@ pub fn pipeline_record(name: &'static str, start: ProfileMark) {
 /// Record an already measured duration for a pipeline span.
 #[cfg(feature = "profile")]
 #[inline(always)]
-pub fn pipeline_record_duration(
-    name: &'static str,
-    elapsed: std::time::Duration,
-    count: u64,
-) {
+pub fn pipeline_record_duration(name: &'static str, elapsed: std::time::Duration, count: u64) {
     PIPELINE_PROF.with(|prof| prof.borrow_mut().record_duration(name, elapsed, count));
 }
 
@@ -324,11 +315,7 @@ pub fn pipeline_record(_name: &'static str, _start: ProfileMark) {}
 /// No-op when profiling is disabled.
 #[cfg(not(feature = "profile"))]
 #[inline(always)]
-pub fn pipeline_record_duration(
-    _name: &'static str,
-    _elapsed: std::time::Duration,
-    _count: u64,
-) {}
+pub fn pipeline_record_duration(_name: &'static str, _elapsed: std::time::Duration, _count: u64) {}
 
 /// Snapshot and reset the pipeline profiler, returning a report string.
 #[cfg(feature = "profile")]

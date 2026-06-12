@@ -14,7 +14,12 @@ fn hash_compute_sha512() {
         json!({"algorithm": "sha512", "data": "hello", "data_encoding": "text"}),
     ));
     let digest = resp["digest"].as_str().unwrap();
-    assert_eq!(digest.len(), 128, "sha512 should be 128 hex chars, got {}", digest.len());
+    assert_eq!(
+        digest.len(),
+        128,
+        "sha512 should be 128 hex chars, got {}",
+        digest.len()
+    );
 }
 
 #[test]
@@ -34,7 +39,11 @@ fn hash_compute_blake3() {
         json!({"algorithm": "blake3", "data": "hello", "data_encoding": "text"}),
     ));
     let digest = resp["digest"].as_str().unwrap();
-    assert_eq!(digest.len(), 64, "blake3 default output should be 64 hex chars");
+    assert_eq!(
+        digest.len(),
+        64,
+        "blake3 default output should be 64 hex chars"
+    );
 }
 
 #[test]
@@ -106,11 +115,14 @@ fn hash_state_keep_true() {
 
 #[test]
 fn hash_compute_sha256() {
-    let resp = harness::expect_success(harness::invoke("hash_compute", json!({
-        "algorithm": "sha256",
-        "data": "hello",
-        "data_encoding": "text"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "hash_compute",
+        json!({
+            "algorithm": "sha256",
+            "data": "hello",
+            "data_encoding": "text"
+        }),
+    ));
     // SHA256 of "hello"
     assert_eq!(
         resp["digest"].as_str().unwrap(),
@@ -120,22 +132,31 @@ fn hash_compute_sha256() {
 
 #[test]
 fn hash_compute_md5() {
-    let resp = harness::expect_success(harness::invoke("hash_compute", json!({
-        "algorithm": "md5",
-        "data": "hello",
-        "data_encoding": "text"
-    })));
-    assert_eq!(resp["digest"].as_str().unwrap(), "5d41402abc4b2a76b9719d911017c592");
+    let resp = harness::expect_success(harness::invoke(
+        "hash_compute",
+        json!({
+            "algorithm": "md5",
+            "data": "hello",
+            "data_encoding": "text"
+        }),
+    ));
+    assert_eq!(
+        resp["digest"].as_str().unwrap(),
+        "5d41402abc4b2a76b9719d911017c592"
+    );
 }
 
 #[test]
 fn hash_compute_base64_output() {
-    let resp = harness::expect_success(harness::invoke("hash_compute", json!({
-        "algorithm": "sha256",
-        "data": "hello",
-        "data_encoding": "text",
-        "output_encoding": "base64"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "hash_compute",
+        json!({
+            "algorithm": "sha256",
+            "data": "hello",
+            "data_encoding": "text",
+            "output_encoding": "base64"
+        }),
+    ));
     assert_eq!(resp["output_encoding"], "base64");
     // Should be valid base64
     assert!(resp["digest"].as_str().unwrap().len() > 0);
@@ -143,34 +164,43 @@ fn hash_compute_base64_output() {
 
 #[test]
 fn hash_compute_unknown_algorithm() {
-    let resp = harness::invoke("hash_compute", json!({
-        "algorithm": "md2",
-        "data": "hello",
-        "data_encoding": "text"
-    }));
+    let resp = harness::invoke(
+        "hash_compute",
+        json!({
+            "algorithm": "md2",
+            "data": "hello",
+            "data_encoding": "text"
+        }),
+    );
     harness::expect_error(&resp, "unknown_algorithm");
 }
 
 #[test]
 fn hash_scan_finds_sha256() {
     // SHA256("hello") = 2cf24dba...
-    let resp = harness::expect_success(harness::invoke("hash_scan", json!({
-        "data": "hello",
-        "data_encoding": "text",
-        "known_hash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
-        "hash_encoding": "hex"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "hash_scan",
+        json!({
+            "data": "hello",
+            "data_encoding": "text",
+            "known_hash": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "hash_encoding": "hex"
+        }),
+    ));
     assert_eq!(resp["matches"], true);
     assert_eq!(resp["algorithm"], "sha256");
 }
 
 #[test]
 fn hash_scan_no_match() {
-    let resp = harness::invoke("hash_scan", json!({
-        "data": "hello",
-        "data_encoding": "text",
-        "known_hash": "deadbeefdeadbeefdeadbeefdeadbeef",
-        "hash_encoding": "hex"
-    }));
+    let resp = harness::invoke(
+        "hash_scan",
+        json!({
+            "data": "hello",
+            "data_encoding": "text",
+            "known_hash": "deadbeefdeadbeefdeadbeefdeadbeef",
+            "hash_encoding": "hex"
+        }),
+    );
     harness::expect_error(&resp, "no_match");
 }

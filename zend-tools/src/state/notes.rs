@@ -50,14 +50,17 @@ impl NotesStore {
         } else {
             guard[key].created_at.clone()
         };
-        guard.insert(key.to_string(), Note {
-            key: key.to_string(),
-            content,
-            tags,
-            created_at,
-            updated_at: now,
-            bytes,
-        });
+        guard.insert(
+            key.to_string(),
+            Note {
+                key: key.to_string(),
+                content,
+                tags,
+                created_at,
+                updated_at: now,
+                bytes,
+            },
+        );
         (created, bytes)
     }
 

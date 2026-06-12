@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::CredError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
@@ -49,15 +49,18 @@ impl Tool for CredentialList {
 
     fn run(ctx: &ToolContext, req: ListRequest) -> Result<ListResponse, CredError> {
         let creds = ctx.credentials.list(req.cred_type.as_deref());
-        let credentials = creds.into_iter().map(|c| CredEntry {
-            id: c.id,
-            name: c.name,
-            cred_type: c.cred_type,
-            username: c.username,
-            default_host: c.default_host,
-            default_port: c.default_port,
-            created_at: c.created_at,
-        }).collect();
+        let credentials = creds
+            .into_iter()
+            .map(|c| CredEntry {
+                id: c.id,
+                name: c.name,
+                cred_type: c.cred_type,
+                username: c.username,
+                default_host: c.default_host,
+                default_port: c.default_port,
+                created_at: c.created_at,
+            })
+            .collect();
         Ok(ListResponse { credentials })
     }
 }

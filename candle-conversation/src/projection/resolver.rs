@@ -586,61 +586,50 @@ impl Conversation {
         Ok(Some(recovered.layers))
     }
 
-    /// Cold-load fast path that fuses `recover_turn_chunks` + `load_to_hot`
-    /// into a single batched pipeline using pinned host scratch
-    /// throughout — see `transfer::load_turn_into_hot` for the pipeline.
-    ///
-    /// Returns:
-    ///  - `Ok(None)` if no `TurnDecl` matches `(timeline, index)`
-    ///    (chunks haven't landed; same semantics as `recover_turn_chunks`).
-    ///  - `Ok(Some((sealed_per_layer, kv_bytes_total)))` on success;
-    ///    `kv_bytes_total` is the sum of every chunk's `kv_bytes` length
-    ///    (the warm-LRU / cold-budget accounting unit).
-    pub fn cold_load_turn_into_hot(
+    /// Batched cold→hot load. Loads every key in `keys`, taking the
+    /// persistence + substrate locks **once** and scanning the recovered
+    /// turn-decl table **once** for the whole batch. `recovered_turn_decls`
+    /// walks every stream (O(total streams)); doing that per cold turn would
+    /// make the elevate cold-load loop O(cold_turns × total_streams), quadratic
+    /// in a deep conversation. Returns one `(key, result)` per input key, in
+    /// the same order, so the caller can pair each result with its plan entry.
+    pub fn cold_load_turns_into_hot(
         &self,
-        timeline: TimelineId,
-        index: TurnIndex,
+        keys: &[TurnKey],
         backings: &[candle_nn::kv_cache::ChunkedKvBacking],
         device: &candle::Device,
         stager: &mut crate::persistence::cold_load::ColdLoadStager,
-    ) -> candle::Result<Option<(Vec<SealedSequence>, u64)>> {
+    ) -> Vec<(TurnKey, candle::Result<Option<(Vec<SealedSequence>, u64)>>)> {
+        use std::collections::HashMap;
+
+        use crate::persistence::content_hash::turn_stream_id;
         use crate::persistence::resume::recovered_turn_decls;
         use crate::persistence::transfer::load_turn_into_hot;
+
         let mut p = self.persistence.lock().unwrap();
-        let decls = {
-            let substrate = self.read();
-            recovered_turn_decls(&substrate)
-        };
-        let decl = match decls
-            .into_iter()
-            .find(|d| d.timeline_id == timeline.raw() && d.turn_index == index.0)
-        {
-            Some(d) => d,
-            None => return Ok(None),
-        };
         let substrate = self.read();
-        let sealed = load_turn_into_hot(backings, device, &mut p, &substrate, &decl, stager)?;
-        // Accounting bytes: sum of every chunk's `kv_bytes` size across
-        // every layer in the substrate's stream snapshot — matches the
-        // previous `TurnChunkGrid::bytes()` semantics.
-        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
-        let kv_bytes_total: u64 = substrate
-            .stream_of(stream_id)
-            .map(|s| {
-                s.chunks
-                    .values()
-                    .map(|loc| loc.payload_len.saturating_sub(0))
-                    .sum::<u64>()
+        // One scan + sort of the recovered decls for the whole batch.
+        let decls: HashMap<(u64, u32), TurnDecl> = recovered_turn_decls(&substrate)
+            .into_iter()
+            .map(|d| ((d.timeline_id, d.turn_index), d))
+            .collect();
+        keys.iter()
+            .map(|&key| {
+                let Some(decl) = decls.get(&(key.timeline.raw(), key.index.0)) else {
+                    return (key, Ok(None));
+                };
+                let result = load_turn_into_hot(backings, device, &mut p, &substrate, decl, stager)
+                    .map(|sealed| {
+                        let stream_id = turn_stream_id(key.timeline.raw(), key.index.0);
+                        let kv_bytes_total: u64 = substrate
+                            .stream_of(stream_id)
+                            .map(|s| s.chunks.values().map(|loc| loc.payload_len).sum::<u64>())
+                            .unwrap_or(0);
+                        Some((sealed, kv_bytes_total))
+                    });
+                (key, result)
             })
-            .unwrap_or(0);
-        // `payload_len` is the whole ChunkPayload-encoded size (offset +
-        // formats + pal + scales + kv_bytes + length-prefix overhead), so
-        // it slightly over-counts vs. `kv_bytes` alone. For LRU/budget
-        // accounting that's the better signal anyway (it tracks the
-        // bytes the warm-tier writeback will produce on the next persist
-        // pass). Keep the simple total here; the old `grid.bytes()`
-        // delta is small.
-        Ok(Some((sealed, kv_bytes_total)))
+            .collect()
     }
 
     /// Clear a turn's hot sealed grid, releasing VRAM arena chunks via
@@ -908,10 +897,7 @@ impl Conversation {
     /// instrumentation: the substrate retains only the latest
     /// selection per timeline, written by the scheduler at projection
     /// time.  Production daemons can ignore.
-    pub fn last_selection_diagnostics(
-        &self,
-        timeline: TimelineId,
-    ) -> Option<SelectionDiagnostics> {
+    pub fn last_selection_diagnostics(&self, timeline: TimelineId) -> Option<SelectionDiagnostics> {
         self.read().last_selection_of(timeline).cloned()
     }
 
@@ -920,10 +906,7 @@ impl Conversation {
     /// in-memory manifest already records the same payload.  Called
     /// by the summariser thread after every atomic tree mutation
     /// (§7.2).
-    pub fn write_tree_metadata(
-        &self,
-        payload: TreeMetadataPayload,
-    ) -> candle::Result<()> {
+    pub fn write_tree_metadata(&self, payload: TreeMetadataPayload) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         p.write_tree_metadata(payload)
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
@@ -1107,7 +1090,11 @@ impl Conversation {
             return None;
         }
         let chunks_per_layer = total / n_layers;
-        Some((chunks_per_layer, entry.tokens.is_some(), entry.signatures.is_some()))
+        Some((
+            chunks_per_layer,
+            entry.tokens.is_some(),
+            entry.signatures.is_some(),
+        ))
     }
 
     /// Cold-load a persisted section's chunks back into hot VRAM via
@@ -1217,10 +1204,7 @@ impl Conversation {
     /// dead-ratio threshold: the operator opted in explicitly via the daemon's
     /// startup flag. `progress` reports coarse phase progress (0..=5) for the
     /// loading screen.
-    pub fn compact_substrate(
-        &self,
-        progress: Option<&dyn Fn(usize, usize)>,
-    ) -> candle::Result<()> {
+    pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         p.commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;

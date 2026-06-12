@@ -6,23 +6,29 @@
 //!   synthetic Q data → TokenSignature → ProvenanceFile::append
 //!                      scan_entries   → TurnChunkRank (correct turn at index 0)
 
-use candle_conversation::provenance::{
-    ProbeSignatures, ProvenanceFile, SigEntry, TokenSignature, TurnSignatures,
-};
 use candle_conversation::provenance::signature::{
     extract_signatures_from_r16_dump, r16_block_to_turn_signatures,
+};
+use candle_conversation::provenance::{
+    ProbeSignatures, ProvenanceFile, SigEntry, TokenSignature, TurnSignatures,
 };
 use candle_nn::kv_cache::CHUNK_SIZE;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn q_hot_n(n_hot: usize) -> Vec<f32> {
-    (0..128).map(|i| if i < n_hot { 1.0_f32 } else { -1.0_f32 }).collect()
+    (0..128)
+        .map(|i| if i < n_hot { 1.0_f32 } else { -1.0_f32 })
+        .collect()
 }
 
 /// Build a `ProbeSignatures` with the same signature at all three depths.
 fn uniform_probe(sig: TokenSignature) -> ProbeSignatures {
-    ProbeSignatures { syntactic: sig, semantic: sig, pragmatic: sig }
+    ProbeSignatures {
+        syntactic: sig,
+        semantic: sig,
+        pragmatic: sig,
+    }
 }
 
 /// Append one chunk group (same sig repeated `n_tokens` times at all three depths)
@@ -42,7 +48,9 @@ fn make_r16_q_flat(n_kv_head: usize, head_dim: usize, value: f32) -> Vec<f32> {
 
 #[test]
 fn agreement_of_identical_signatures_is_128() {
-    let q: Vec<f32> = (0..128).map(|i| if i % 3 == 0 { 1.0 } else { -1.0 }).collect();
+    let q: Vec<f32> = (0..128)
+        .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+        .collect();
     let s = TokenSignature::from_q_flat(&q);
     assert_eq!(s.agreement(&s), 128);
 }
@@ -59,7 +67,11 @@ fn agreement_plus_hamming_distance_is_always_128() {
     for n_hot in [0, 32, 64, 96, 128] {
         let s1 = TokenSignature::from_q_flat(&q_hot_n(n_hot));
         let s2 = TokenSignature::from_q_flat(&q_hot_n(128 - n_hot));
-        assert_eq!(s1.agreement(&s2) + s1.hamming_distance(&s2), 128, "n_hot={n_hot}");
+        assert_eq!(
+            s1.agreement(&s2) + s1.hamming_distance(&s2),
+            128,
+            "n_hot={n_hot}"
+        );
     }
 }
 
@@ -81,7 +93,11 @@ fn density_score_formula_is_hits_squared_over_length() {
     assert_eq!(ranks.len(), 1);
     let per_depth = 36.0_f64 / 10.0;
     let expected = per_depth * 3.0; // three depths, all identical
-    assert!((ranks[0].score - expected).abs() < 1e-9, "score={}", ranks[0].score);
+    assert!(
+        (ranks[0].score - expected).abs() < 1e-9,
+        "score={}",
+        ranks[0].score
+    );
 }
 
 // ── Single-probe retrieval accuracy ──────────────────────────────────────────
@@ -118,7 +134,9 @@ fn scan_entries_topic_b_probe_selects_topic_b_turn() {
     let e1 = append_uniform(&pf, TokenSignature::from_q_flat(&q_b), 10);
 
     let probe = uniform_probe(TokenSignature::from_q_flat(&q_b));
-    let ranks = pf.scan_entries(&[(0u64, e0), (1u64, e1)], &probe, 80, 10).unwrap();
+    let ranks = pf
+        .scan_entries(&[(0u64, e0), (1u64, e1)], &probe, 80, 10)
+        .unwrap();
 
     assert_eq!(ranks.len(), 1);
     assert_eq!(ranks[0].turn_id, 1);
@@ -138,7 +156,9 @@ fn scan_entries_density_favours_dense_turn_over_longer_sparse_turn() {
     let e1 = pf.append(&sigs1, &sigs1, &sigs1).unwrap();
 
     let probe = uniform_probe(hit);
-    let ranks = pf.scan_entries(&[(0u64, e0), (1u64, e1)], &probe, 80, 10).unwrap();
+    let ranks = pf
+        .scan_entries(&[(0u64, e0), (1u64, e1)], &probe, 80, 10)
+        .unwrap();
 
     assert_eq!(ranks.len(), 2);
     assert_eq!(ranks[0].turn_id, 0, "dense short turn should rank first");
@@ -183,7 +203,9 @@ fn scan_entries_zero_token_entry_is_skipped() {
     let real_entry = append_uniform(&pf, hit, 4);
 
     let probe = uniform_probe(hit);
-    let ranks = pf.scan_entries(&[(0u64, zero_entry), (1u64, real_entry)], &probe, 80, 10).unwrap();
+    let ranks = pf
+        .scan_entries(&[(0u64, zero_entry), (1u64, real_entry)], &probe, 80, 10)
+        .unwrap();
     assert_eq!(ranks.len(), 1);
     assert_eq!(ranks[0].turn_id, 1);
 }
@@ -235,24 +257,33 @@ fn r16_extract_dump_produces_one_turn_signatures_per_block() {
 
 #[test]
 fn end_to_end_r16_to_ranked_retrieval() {
-    let q_a = make_r16_q_flat(4, 128,  1.0); // topic A — positive
+    let q_a = make_r16_q_flat(4, 128, 1.0); // topic A — positive
     let q_b = make_r16_q_flat(4, 128, -1.0); // topic B — negative
 
     let sigs_a = extract_signatures_from_r16_dump(&[(0, vec![], vec![], q_a)], 4, 128, CHUNK_SIZE);
     let sigs_b = extract_signatures_from_r16_dump(&[(1, vec![], vec![], q_b)], 4, 128, CHUNK_SIZE);
 
     let pf = ProvenanceFile::new().unwrap();
-    let e0 = pf.append(&sigs_a[0].sigs, &sigs_a[0].sigs, &sigs_a[0].sigs).unwrap();
-    let e1 = pf.append(&sigs_b[0].sigs, &sigs_b[0].sigs, &sigs_b[0].sigs).unwrap();
+    let e0 = pf
+        .append(&sigs_a[0].sigs, &sigs_a[0].sigs, &sigs_a[0].sigs)
+        .unwrap();
+    let e1 = pf
+        .append(&sigs_b[0].sigs, &sigs_b[0].sigs, &sigs_b[0].sigs)
+        .unwrap();
 
     // Probe: positive Q → should retrieve turn 0 (topic A).
     let probe_sig = TokenSignature::from_q_flat(&[1.0_f32; 128]);
     let probe = uniform_probe(probe_sig);
 
-    let ranks = pf.scan_entries(&[(0u64, e0), (1u64, e1)], &probe, 80, 10).unwrap();
+    let ranks = pf
+        .scan_entries(&[(0u64, e0), (1u64, e1)], &probe, 80, 10)
+        .unwrap();
 
     assert!(!ranks.is_empty());
-    assert_eq!(ranks[0].turn_id, 0, "turn 0 (positive/topic A) must rank first");
+    assert_eq!(
+        ranks[0].turn_id, 0,
+        "turn 0 (positive/topic A) must rank first"
+    );
     assert_eq!(ranks.len(), 1, "topic B (agreement=0) should not appear");
 }
 

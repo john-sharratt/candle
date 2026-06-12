@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::TelnetError;
 use crate::state::sessions::{SessionMeta, TelnetEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::TelnetError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
@@ -36,8 +36,7 @@ pub struct TelnetSessionOpen;
 
 impl Tool for TelnetSessionOpen {
     const NAME: &'static str = "telnet_session_open";
-    const DESCRIPTION: &'static str =
-        "Open a Telnet session to a network device or host. \
+    const DESCRIPTION: &'static str = "Open a Telnet session to a network device or host. \
          Use for legacy network equipment, serial consoles, or any TCP text protocol. \
          Returns session_id for subsequent sends.";
 
@@ -46,8 +45,14 @@ impl Tool for TelnetSessionOpen {
     type Error = TelnetError;
 
     fn confirmation(req: &OpenRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Open Telnet to {}:{}", req.host, req.port.unwrap_or(23)))
-            .with_field("host", req.host.clone()))
+        Some(
+            ConfirmationDetails::new(format!(
+                "Open Telnet to {}:{}",
+                req.host,
+                req.port.unwrap_or(23)
+            ))
+            .with_field("host", req.host.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, TelnetError> {
@@ -55,12 +60,18 @@ impl Tool for TelnetSessionOpen {
         let addr = format!("{}:{}", req.host, port);
         let timeout = Duration::from_secs(req.timeout_sec.unwrap_or(10) as u64);
         let stream = TcpStream::connect_timeout(
-            &addr.parse().map_err(|e: std::net::AddrParseError| TelnetError::ConnectionFailed(e.to_string()))?,
+            &addr.parse().map_err(|e: std::net::AddrParseError| {
+                TelnetError::ConnectionFailed(e.to_string())
+            })?,
             timeout,
-        ).map_err(|e| TelnetError::ConnectionFailed(e.to_string()))?;
+        )
+        .map_err(|e| TelnetError::ConnectionFailed(e.to_string()))?;
         stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
 
-        let prompt_pattern = req.prompt_pattern.clone().unwrap_or_else(|| "[$#>] *$".to_string());
+        let prompt_pattern = req
+            .prompt_pattern
+            .clone()
+            .unwrap_or_else(|| "[$#>] *$".to_string());
 
         let mut banner_bytes = vec![0u8; 4096];
         let mut banner = String::new();

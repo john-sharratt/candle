@@ -219,81 +219,102 @@ fn signature_sign_verify_ed25519() {
 
 #[test]
 fn aead_encrypt_decrypt_aes256gcm() {
-    let enc = harness::expect_success(harness::invoke("aead_encrypt", json!({
-        "data": "secret message",
-        "data_encoding": "text",
-        "key_hex": KEY_HEX,
-        "algorithm": "aes256gcm",
-        "nonce_hex": NONCE_HEX
-    })));
+    let enc = harness::expect_success(harness::invoke(
+        "aead_encrypt",
+        json!({
+            "data": "secret message",
+            "data_encoding": "text",
+            "key_hex": KEY_HEX,
+            "algorithm": "aes256gcm",
+            "nonce_hex": NONCE_HEX
+        }),
+    ));
     assert_eq!(enc["algorithm"], "aes256gcm");
     let ct = enc["ciphertext_hex"].as_str().unwrap().to_string();
     let nonce = enc["nonce_hex"].as_str().unwrap().to_string();
 
-    let dec = harness::expect_success(harness::invoke("aead_decrypt", json!({
-        "ciphertext_hex": ct,
-        "key_hex": KEY_HEX,
-        "nonce_hex": nonce,
-        "algorithm": "aes256gcm"
-    })));
+    let dec = harness::expect_success(harness::invoke(
+        "aead_decrypt",
+        json!({
+            "ciphertext_hex": ct,
+            "key_hex": KEY_HEX,
+            "nonce_hex": nonce,
+            "algorithm": "aes256gcm"
+        }),
+    ));
     assert_eq!(dec["plaintext"], "secret message");
 }
 
 #[test]
 fn aead_encrypt_decrypt_chacha() {
-    let enc = harness::expect_success(harness::invoke("aead_encrypt", json!({
-        "data": "hello chacha",
-        "data_encoding": "text",
-        "key_hex": KEY_HEX,
-        "algorithm": "chacha20poly1305",
-        "nonce_hex": NONCE_HEX
-    })));
+    let enc = harness::expect_success(harness::invoke(
+        "aead_encrypt",
+        json!({
+            "data": "hello chacha",
+            "data_encoding": "text",
+            "key_hex": KEY_HEX,
+            "algorithm": "chacha20poly1305",
+            "nonce_hex": NONCE_HEX
+        }),
+    ));
     let ct = enc["ciphertext_hex"].as_str().unwrap();
     let nonce = enc["nonce_hex"].as_str().unwrap();
-    let dec = harness::expect_success(harness::invoke("aead_decrypt", json!({
-        "ciphertext_hex": ct,
-        "key_hex": KEY_HEX,
-        "nonce_hex": nonce,
-        "algorithm": "chacha20poly1305"
-    })));
+    let dec = harness::expect_success(harness::invoke(
+        "aead_decrypt",
+        json!({
+            "ciphertext_hex": ct,
+            "key_hex": KEY_HEX,
+            "nonce_hex": nonce,
+            "algorithm": "chacha20poly1305"
+        }),
+    ));
     assert_eq!(dec["plaintext"], "hello chacha");
 }
 
 #[test]
 fn hmac_sha256() {
     // HMAC-SHA256("", "") should be deterministic
-    let resp = harness::expect_success(harness::invoke("hmac_compute", json!({
-        "data": "hello",
-        "data_encoding": "text",
-        "key": "secret",
-        "key_encoding": "text",
-        "algorithm": "sha256"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "hmac_compute",
+        json!({
+            "data": "hello",
+            "data_encoding": "text",
+            "key": "secret",
+            "key_encoding": "text",
+            "algorithm": "sha256"
+        }),
+    ));
     assert_eq!(resp["algorithm"], "sha256");
     assert!(resp["mac"].as_str().unwrap().len() == 64); // 32 bytes hex
 }
 
 #[test]
 fn hmac_unknown_algorithm() {
-    let resp = harness::invoke("hmac_compute", json!({
-        "data": "d",
-        "key": "k",
-        "algorithm": "md4"
-    }));
+    let resp = harness::invoke(
+        "hmac_compute",
+        json!({
+            "data": "d",
+            "key": "k",
+            "algorithm": "md4"
+        }),
+    );
     harness::expect_error(&resp, "unknown_algorithm");
 }
 
 #[test]
 fn kdf_argon2id() {
-    let resp = harness::expect_success(harness::invoke("kdf_derive", json!({
-        "password": "mypassword",
-        "salt": "saltsalt",
-        "salt_encoding": "text",
-        "algorithm": "argon2id",
-        "length": 32,
-        "memory_kib": 1024,
-        "iterations": 1
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "kdf_derive",
+        json!({
+            "password": "mypassword",
+            "salt": "saltsalt",
+            "salt_encoding": "text",
+            "algorithm": "argon2id",
+            "length": 32,
+            "memory_kib": 1024,
+            "iterations": 1
+        }),
+    ));
     assert_eq!(resp["algorithm"], "argon2id");
     assert_eq!(resp["length"], 32);
     let key = resp["derived_key"].as_str().unwrap();
@@ -302,24 +323,30 @@ fn kdf_argon2id() {
 
 #[test]
 fn kdf_pbkdf2() {
-    let resp = harness::expect_success(harness::invoke("kdf_derive", json!({
-        "password": "pass",
-        "salt": "salt",
-        "salt_encoding": "text",
-        "algorithm": "pbkdf2_sha256",
-        "length": 16,
-        "iterations": 1000
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "kdf_derive",
+        json!({
+            "password": "pass",
+            "salt": "salt",
+            "salt_encoding": "text",
+            "algorithm": "pbkdf2_sha256",
+            "length": 16,
+            "iterations": 1000
+        }),
+    ));
     assert_eq!(resp["algorithm"], "pbkdf2_sha256");
 }
 
 #[test]
 fn hkdf_extract_sha256() {
-    let resp = harness::expect_success(harness::invoke("hkdf_extract", json!({
-        "ikm": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-        "ikm_encoding": "hex",
-        "algorithm": "sha256"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "hkdf_extract",
+        json!({
+            "ikm": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            "ikm_encoding": "hex",
+            "algorithm": "sha256"
+        }),
+    ));
     assert_eq!(resp["algorithm"], "sha256");
     assert!(resp["prk_hex"].as_str().unwrap().len() == 64);
 }
@@ -327,35 +354,44 @@ fn hkdf_extract_sha256() {
 #[test]
 fn hkdf_expand_label() {
     // Use known PRK
-    let resp = harness::expect_success(harness::invoke("hkdf_expand_label", json!({
-        "prk_hex": "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
-        "label": "test label",
-        "length": 32,
-        "algorithm": "sha256"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "hkdf_expand_label",
+        json!({
+            "prk_hex": "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+            "label": "test label",
+            "length": 32,
+            "algorithm": "sha256"
+        }),
+    ));
     assert_eq!(resp["length"], 32);
     assert_eq!(resp["okm_hex"].as_str().unwrap().len(), 64);
 }
 
 #[test]
 fn bytes_transcode_hex_to_base64() {
-    let resp = harness::expect_success(harness::invoke("bytes_transcode", json!({
-        "data": "48656c6c6f",
-        "from": "hex",
-        "to": "utf8"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "bytes_transcode",
+        json!({
+            "data": "48656c6c6f",
+            "from": "hex",
+            "to": "utf8"
+        }),
+    ));
     assert_eq!(resp["data"], "Hello");
 }
 
 #[test]
 fn bytes_xor_simple() {
-    let resp = harness::expect_success(harness::invoke("bytes_xor", json!({
-        "a": "ff",
-        "b": "0f",
-        "a_encoding": "hex",
-        "b_encoding": "hex",
-        "output_encoding": "hex"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "bytes_xor",
+        json!({
+            "a": "ff",
+            "b": "0f",
+            "a_encoding": "hex",
+            "b_encoding": "hex",
+            "output_encoding": "hex"
+        }),
+    ));
     assert_eq!(resp["result"], "f0");
     assert_eq!(resp["bytes"], 1);
 }

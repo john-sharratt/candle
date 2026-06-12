@@ -114,11 +114,9 @@ fn install_tool_catalog_returns_section_ids_in_registry_order() {
     let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
 
     let installed = install_tool_catalog(&mut builder, dialogue).unwrap();
-    let registry_names: Vec<&str> =
-        registry::all_tools().iter().map(|t| t.name).collect();
+    let registry_names: Vec<&str> = registry::all_tools().iter().map(|t| t.name).collect();
 
-    let installed_names: Vec<String> =
-        installed.iter().map(|(n, _, _)| n.clone()).collect();
+    let installed_names: Vec<String> = installed.iter().map(|(n, _, _)| n.clone()).collect();
 
     assert_eq!(
         installed_names, registry_names,
@@ -282,10 +280,7 @@ fn run_tool_calculator_succeeds_on_simple_expression() {
         arguments: json!({"expression": "2 + 2"}),
     };
     let resp = run_tool(&ctx, &call);
-    assert!(
-        resp.get("error").is_none(),
-        "calculator errored: {resp:?}",
-    );
+    assert!(resp.get("error").is_none(), "calculator errored: {resp:?}",);
 }
 
 #[test]

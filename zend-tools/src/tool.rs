@@ -57,7 +57,10 @@ pub struct ConfirmationDetails {
 
 impl ConfirmationDetails {
     pub fn new(summary: impl Into<String>) -> Self {
-        Self { summary: summary.into(), fields: Vec::new() }
+        Self {
+            summary: summary.into(),
+            fields: Vec::new(),
+        }
     }
 
     pub fn with_field(mut self, name: &'static str, value: impl Into<String>) -> Self {

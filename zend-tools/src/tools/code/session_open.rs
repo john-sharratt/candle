@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::{now, CodeError, NODE_REPL, PYTHON_REPL};
 use crate::state::sessions::{CodeEntry, SessionMeta};
 use crate::{RegisteredTool, Tool, ToolContext};
-use super::{now, CodeError, PYTHON_REPL, NODE_REPL};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SessionOpenReq {
@@ -40,7 +40,11 @@ impl Tool for CodeSessionOpen {
         let (interpreter, args, repl_source, ext): (&str, Vec<&str>, Option<&str>, &str) =
             match lang {
                 "python" | "python3" => {
-                    let py = if cfg!(windows) { "python.exe" } else { "python3" };
+                    let py = if cfg!(windows) {
+                        "python.exe"
+                    } else {
+                        "python3"
+                    };
                     (py, vec![], Some(PYTHON_REPL), "py")
                 }
                 "javascript" | "js" | "node" => {
@@ -53,10 +57,9 @@ impl Tool for CodeSessionOpen {
             };
 
         let temp_path = if let Some(src) = repl_source {
-            let p = std::env::temp_dir()
-                .join(format!("zend_repl_{}.{}", Uuid::new_v4().simple(), ext));
-            std::fs::write(&p, src)
-                .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
+            let p =
+                std::env::temp_dir().join(format!("zend_repl_{}.{}", Uuid::new_v4().simple(), ext));
+            std::fs::write(&p, src).map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
             Some(p)
         } else {
             None

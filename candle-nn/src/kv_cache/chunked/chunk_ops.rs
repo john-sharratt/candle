@@ -1284,11 +1284,7 @@ impl ChunkedKvBacking {
     /// turn's total `chunks_per_layer`), then the per-unit bulk allocs
     /// inherit the capacity and skip their own `ensure_*` work
     /// (saving 2 × `state.write()` acquires per bulk call).
-    pub fn ensure_capacity_for_blocks(
-        &self,
-        batch_idx: usize,
-        n_blocks: usize,
-    ) -> Result<()> {
+    pub fn ensure_capacity_for_blocks(&self, batch_idx: usize, n_blocks: usize) -> Result<()> {
         if n_blocks == 0 {
             return Ok(());
         }
@@ -1397,8 +1393,7 @@ impl ChunkedKvBacking {
         // Per-spec uninitialised buffers — `set_len` is free (no
         // per-element init), and every slot is written by the
         // scatter below.
-        let mut spec_buffers: Vec<Vec<MaybeUninit<super::gid_pool::ChunkGid>>> = (0..specs
-            .len())
+        let mut spec_buffers: Vec<Vec<MaybeUninit<super::gid_pool::ChunkGid>>> = (0..specs.len())
             .map(|_| {
                 let mut v: Vec<MaybeUninit<super::gid_pool::ChunkGid>> =
                     Vec::with_capacity(gids_per_spec);

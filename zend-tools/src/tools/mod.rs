@@ -63,6 +63,6 @@ pub mod tls_session;
 pub mod totp;
 pub mod udp_session;
 pub mod unit_convert;
+pub mod weather;
 pub mod web_fetch;
 pub mod web_search;
-pub mod weather;

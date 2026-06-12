@@ -561,33 +561,83 @@ impl Scheduler {
             return;
         }
         let _t_drain = super::PhaseTimer::new("drain_reprojections");
-        // Take the queue out so `reproject_view` can mutate `self.active_decodes`
-        // without aliasing.
         let pending = std::mem::take(&mut self.pending_reprojections);
+
+        // Phase 1 — prepare each view: BDP scan + projection + tier elevate +
+        // inject the sealed prefix + build the gap-fill descriptor. Removes the
+        // view's `DecodeState` into the in-flight; does NOT fire the forward.
+        let mut inflights: Vec<super::ReprojectInFlight> = Vec::new();
         for view_id in pending {
-            // The view may have finished (EOS/health) between trigger
-            // and drain — in that case the cleanup path handles finalize
-            // and we have nothing to do.
-            if self
-                .active_decodes
-                .get(&view_id)
-                .is_none_or(|s| s.finished)
-            {
+            // The view may have finished (EOS/health) between trigger and drain.
+            if self.active_decodes.get(&view_id).is_none_or(|s| s.finished) {
                 continue;
             }
-            match self.reproject_view(view_id) {
-                Ok(_new_id) => {} // re-key already done internally
+            match self.reproject_view_prepare(view_id) {
+                Ok(Some(inflight)) => inflights.push(inflight),
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
                         target: "candle_conversation::scheduler::reproject",
                         view_id = view_id.0, err = %e,
-                        "reprojection failed; aborting decode for this view"
+                        "reprojection prepare failed; aborting decode for this view"
                     );
                     if let Some(state) = self.active_decodes.get_mut(&view_id) {
                         let _ = state.event_tx.send(TurnEvent::Error(e));
                         state.finished = true;
                     }
                 }
+            }
+        }
+        if inflights.is_empty() {
+            return;
+        }
+
+        // Phase 2 — the cross-conversation wave: ONE batched multi-slot gap-fill
+        // forward computes every prepared conversation's boundary glue at once,
+        // amortising the per-forward fixed cost (MoE expert loads, layer loop,
+        // launch) across all of them.
+        let plan_refs: Vec<&super::projection_assembler::GapFillPlan> =
+            inflights.iter().map(|i| &i.plan).collect();
+        let glue_total: usize = inflights.iter().map(|i| i.plan.n_glue_tokens).sum();
+        tracing::debug!(
+            target: "candle_conversation::scheduler::reproject",
+            n_slots = inflights.len(),
+            glue_total,
+            "gap-fill wave: batched multi-slot forward",
+        );
+        let t_fire = std::time::Instant::now();
+        if let Err(e) = super::projection_assembler::fire_gap_fill_batch(
+            &mut self.session,
+            &*self.model,
+            &self.device,
+            &plan_refs,
+        ) {
+            tracing::warn!(
+                target: "candle_conversation::scheduler::reproject",
+                err = %e, n = inflights.len(),
+                "batched gap-fill forward failed; aborting decode for all prepared views"
+            );
+            for inflight in inflights {
+                let _ = inflight.decode_state.event_tx.send(TurnEvent::Error(
+                    ConversationError::Channel(format!("gap-fill wave forward failed: {e}")),
+                ));
+            }
+            return;
+        }
+        // The batched gap-fill forward time — for the wave it's shared across all
+        // slots, so each view's reproject log reports the same `glue_ms`.
+        let glue_ms = t_fire.elapsed().as_millis() as u64;
+
+        // Phase 3 — complete each view: finish (deferred user + restore tail) +
+        // carve the new view + re-key. Independent per view.
+        for inflight in inflights {
+            let view_id = inflight.view_id;
+            if let Err(e) = self.reproject_view_complete(inflight, glue_ms) {
+                tracing::warn!(
+                    target: "candle_conversation::scheduler::reproject",
+                    view_id = view_id.0, err = %e,
+                    "reprojection complete failed; decode for this view ends"
+                );
             }
         }
     }

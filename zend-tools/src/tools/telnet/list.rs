@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::TelnetError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {}
@@ -35,16 +35,21 @@ impl Tool for TelnetSessionList {
     type Error = TelnetError;
 
     fn run(ctx: &ToolContext, _req: ListRequest) -> Result<ListResponse, TelnetError> {
-        let sessions = ctx.sessions.list_telnet().into_iter().map(|arc| {
-            let e = arc.lock().unwrap();
-            SessionInfo {
-                session_id: e.meta.session_id.clone(),
-                host: e.host.clone(),
-                port: e.port,
-                opened_at: e.meta.opened_at.clone(),
-                alive: e.meta.alive,
-            }
-        }).collect();
+        let sessions = ctx
+            .sessions
+            .list_telnet()
+            .into_iter()
+            .map(|arc| {
+                let e = arc.lock().unwrap();
+                SessionInfo {
+                    session_id: e.meta.session_id.clone(),
+                    host: e.host.clone(),
+                    port: e.port,
+                    opened_at: e.meta.opened_at.clone(),
+                    alive: e.meta.alive,
+                }
+            })
+            .collect();
         Ok(ListResponse { sessions })
     }
 }

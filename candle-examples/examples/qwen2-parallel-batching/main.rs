@@ -125,7 +125,8 @@ fn main() -> Result<()> {
         let offsets: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
         let meta = BatchedPrefillMeta::new(&offsets, max_prompt_len, &device)?;
         let generation = stager.begin_generation();
-        let outputs = model.forward_batch(&mut contexts, &generation, DecodeHeaders::Prefill(meta))?;
+        let outputs =
+            model.forward_batch(&mut contexts, &generation, DecodeHeaders::Prefill(meta))?;
         // Sample from prefill output (last position gives next token prediction)
         let token1 = sample_token(&outputs.get(0)?)?;
         let token2 = sample_token(&outputs.get(1)?)?;
@@ -177,7 +178,14 @@ fn main() -> Result<()> {
             },
         ];
         let generation = stager.begin_generation();
-        let outputs = model.forward_batch(&mut contexts, &generation, DecodeHeaders::Decode { buf: None, stride: 0 })?;
+        let outputs = model.forward_batch(
+            &mut contexts,
+            &generation,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )?;
 
         let next_token1 = sample_token(&outputs.get(0)?)?;
         let next_token2 = sample_token(&outputs.get(1)?)?;
@@ -284,7 +292,14 @@ fn main() -> Result<()> {
             },
         ];
         let generation = stager.begin_generation();
-        let _ = model.forward_batch(&mut contexts, &generation, DecodeHeaders::Decode { buf: None, stride: 0 })?;
+        let _ = model.forward_batch(
+            &mut contexts,
+            &generation,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )?;
     }
     let parallel_time = start.elapsed();
 

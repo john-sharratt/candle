@@ -1,4 +1,4 @@
-﻿//! Sequence tree generator — life-timeline pipeline.
+//! Sequence tree generator — life-timeline pipeline.
 //!
 //! Reads a Markdown life-timeline (T-N format), drives three stages to plan
 //! and narrate each day, then feeds the narrated events to a character LLM
@@ -61,8 +61,7 @@ use candle_conversation::{
     models::{Model, ModelBuilder},
     prompts::{DIRECTOR_PROMPT, GUIDE_SUMMARIZE_PERIOD_PROMPT, GUIDE_TODAY_PROMPT},
     think_strip::strip_think_blocks,
-    DecodeHealthConfig, SamplingConfig, TokenDecoder, TurnEvent, TurnHandle,
-    TurnResponse,
+    DecodeHealthConfig, SamplingConfig, TokenDecoder, TurnEvent, TurnHandle, TurnResponse,
 };
 use clap::Parser;
 use clap_verbosity_flag::*;

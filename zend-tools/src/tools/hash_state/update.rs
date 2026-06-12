@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, HashStateError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct UpdateRequest {
@@ -38,9 +38,14 @@ impl Tool for HashStateUpdate {
     fn run(ctx: &ToolContext, req: UpdateRequest) -> Result<UpdateResponse, HashStateError> {
         let enc = req.data_encoding.as_deref().unwrap_or("text");
         let data = decode_data(&req.data, enc)?;
-        let total_bytes = ctx.hash_states.update(&req.id, &data)
+        let total_bytes = ctx
+            .hash_states
+            .update(&req.id, &data)
             .ok_or_else(|| HashStateError::NotFound(req.id.clone()))?;
-        Ok(UpdateResponse { id: req.id, total_bytes })
+        Ok(UpdateResponse {
+            id: req.id,
+            total_bytes,
+        })
     }
 }
 

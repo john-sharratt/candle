@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::UdpError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RecvRequest {
@@ -29,18 +29,23 @@ pub struct UdpSessionRecv;
 
 impl Tool for UdpSessionRecv {
     const NAME: &'static str = "udp_session_recv";
-    const DESCRIPTION: &'static str = "Read one incoming UDP datagram, returning its packet payload and the sender's address.";
+    const DESCRIPTION: &'static str =
+        "Read one incoming UDP datagram, returning its packet payload and the sender's address.";
 
     type Request = RecvRequest;
     type Response = RecvResponse;
     type Error = UdpError;
 
     fn run(ctx: &ToolContext, req: RecvRequest) -> Result<RecvResponse, UdpError> {
-        let entry_arc = ctx.sessions.get_udp(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_udp(&req.session_id)
             .ok_or_else(|| UdpError::SessionNotFound(req.session_id.clone()))?;
         let entry = entry_arc.lock().unwrap();
 
-        let timeout = req.timeout_sec.map(|s| Duration::from_millis((s * 1000.0) as u64))
+        let timeout = req
+            .timeout_sec
+            .map(|s| Duration::from_millis((s * 1000.0) as u64))
             .unwrap_or(Duration::from_secs(5));
         entry.socket.set_read_timeout(Some(timeout)).ok();
 
@@ -56,11 +61,23 @@ impl Tool for UdpSessionRecv {
                         Err(_) => hex::encode(&buf[..n]),
                     }
                 };
-                Ok(RecvResponse { data, bytes_received: n, from: from.to_string(), timed_out: false })
+                Ok(RecvResponse {
+                    data,
+                    bytes_received: n,
+                    from: from.to_string(),
+                    timed_out: false,
+                })
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                   || e.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(RecvResponse { data: String::new(), bytes_received: 0, from: String::new(), timed_out: true })
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                Ok(RecvResponse {
+                    data: String::new(),
+                    bytes_received: 0,
+                    from: String::new(),
+                    timed_out: true,
+                })
             }
             Err(e) => Err(UdpError::RecvFailed(e.to_string())),
         }

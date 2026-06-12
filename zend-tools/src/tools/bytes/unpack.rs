@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_bytes, parse_format, unpack_field, BytesError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct UnpackRequest {
@@ -44,13 +44,16 @@ impl Tool for BytesUnpack {
         let mut values = Vec::new();
 
         for field in &fields {
-            let v = unpack_field(&mut cursor, field, big_endian)
-                .map_err(BytesError::UnpackFailed)?;
+            let v =
+                unpack_field(&mut cursor, field, big_endian).map_err(BytesError::UnpackFailed)?;
             values.push(v);
         }
 
         let bytes_consumed = cursor.position() as usize;
-        Ok(UnpackResponse { values, bytes_consumed })
+        Ok(UnpackResponse {
+            values,
+            bytes_consumed,
+        })
     }
 }
 

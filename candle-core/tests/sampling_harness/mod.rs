@@ -707,7 +707,11 @@ pub fn run_cpu(p: &SamplingParams) -> Vec<u32> {
                 p.eot_ramp_start,
                 p.eot_ramp_len,
                 p.eot_boost_max_multiplier,
-                if batch_idx < p.thinking_lens.len() { p.thinking_lens[batch_idx] } else { 0 },
+                if batch_idx < p.thinking_lens.len() {
+                    p.thinking_lens[batch_idx]
+                } else {
+                    0
+                },
                 p.cross_turn_penalty,
                 &p.cross_turn_counts,
                 &p.token_counts,

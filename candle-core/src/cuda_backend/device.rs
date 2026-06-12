@@ -336,7 +336,9 @@ impl CudaDevice {
         let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
         let mut value: u64 = 0;
         unsafe {
-            sys::cuDeviceGetDefaultMemPool(&mut pool, dev).result().w()?;
+            sys::cuDeviceGetDefaultMemPool(&mut pool, dev)
+                .result()
+                .w()?;
             sys::cuMemPoolGetAttribute(pool, attr, &mut value as *mut u64 as *mut std::ffi::c_void)
                 .result()
                 .w()?;

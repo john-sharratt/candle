@@ -25,18 +25,18 @@
 //!
 //! `telnet_session_send` confirms every call.  Open, list, and close do not.
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
+pub mod close;
+pub mod list;
 pub mod open;
 pub mod send;
-pub mod list;
-pub mod close;
 
+pub use close::TELNET_SESSION_CLOSE;
+pub use list::TELNET_SESSION_LIST;
 pub use open::TELNET_SESSION_OPEN;
 pub use send::TELNET_SESSION_SEND;
-pub use list::TELNET_SESSION_LIST;
-pub use close::TELNET_SESSION_CLOSE;
 
 #[derive(Debug, Error)]
 pub enum TelnetError {

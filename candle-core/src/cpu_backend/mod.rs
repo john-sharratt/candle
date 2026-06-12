@@ -2595,7 +2595,8 @@ impl BackendStorage for CpuStorage {
                 if $rhs_l.is_contiguous() {
                     // Fast path: both contiguous
                     for i in 0..elem_count {
-                        $lhs[lhs_start + i] = $op_fn($lhs[lhs_start + i], $rhs_slice[rhs_start + i]);
+                        $lhs[lhs_start + i] =
+                            $op_fn($lhs[lhs_start + i], $rhs_slice[rhs_start + i]);
                     }
                 } else {
                     // Slow path: rhs is strided

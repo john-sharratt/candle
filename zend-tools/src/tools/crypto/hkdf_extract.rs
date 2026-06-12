@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, CryptoError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HkdfExtractRequest {
@@ -37,10 +37,12 @@ impl Tool for HkdfExtract {
     type Response = HkdfExtractResponse;
     type Error = CryptoError;
 
-    fn run(_ctx: &ToolContext, req: HkdfExtractRequest) -> Result<HkdfExtractResponse, CryptoError> {
+    fn run(
+        _ctx: &ToolContext,
+        req: HkdfExtractRequest,
+    ) -> Result<HkdfExtractResponse, CryptoError> {
         let ikm_enc = req.ikm_encoding.as_deref().unwrap_or("hex");
-        let ikm = decode_data(&req.ikm, ikm_enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
+        let ikm = decode_data(&req.ikm, ikm_enc).map_err(CryptoError::InvalidDataEncoding)?;
 
         let salt_opt: Option<Vec<u8>> = if let Some(s) = &req.salt {
             let salt_enc = req.salt_encoding.as_deref().unwrap_or("hex");
@@ -51,23 +53,20 @@ impl Tool for HkdfExtract {
 
         let prk_hex = match req.algorithm.as_str() {
             "sha256" => {
-                let (prk, _) = hkdf::Hkdf::<sha2::Sha256>::extract(
-                    salt_opt.as_deref(),
-                    &ikm,
-                );
+                let (prk, _) = hkdf::Hkdf::<sha2::Sha256>::extract(salt_opt.as_deref(), &ikm);
                 hex::encode(prk)
             }
             "sha512" => {
-                let (prk, _) = hkdf::Hkdf::<sha2::Sha512>::extract(
-                    salt_opt.as_deref(),
-                    &ikm,
-                );
+                let (prk, _) = hkdf::Hkdf::<sha2::Sha512>::extract(salt_opt.as_deref(), &ikm);
                 hex::encode(prk)
             }
             other => return Err(CryptoError::UnknownAlgorithm(other.to_string())),
         };
 
-        Ok(HkdfExtractResponse { prk_hex, algorithm: req.algorithm })
+        Ok(HkdfExtractResponse {
+            prk_hex,
+            algorithm: req.algorithm,
+        })
     }
 }
 

@@ -111,8 +111,8 @@ mod node;
 mod patch;
 mod summarize;
 mod task;
-mod types;
 pub mod token_text;
+mod types;
 
 #[cfg(test)]
 mod tests;
@@ -121,8 +121,8 @@ mod tests;
 
 pub use config::ConversationTreeConfig;
 
-pub use conversation_tree::{ConversationTree, ConversationTreeFork};
 pub use crate::prompts::TEMPORAL_MARKER_POSTFIX;
+pub use conversation_tree::{ConversationTree, ConversationTreeFork};
 
 pub use node::{
     ConversationNode, ConversationSegment, ConversationSegmentInner, ConversationSystemPrompt,

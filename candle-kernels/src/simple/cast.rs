@@ -137,12 +137,7 @@ extern "C" {
     ///
     /// # Safety
     /// The buffer must be large enough to hold `numel * max(src_size, dst_size)` bytes.
-    pub fn run_cast_mut(
-        src_dtype: i32,
-        dst_dtype: i32,
-        numel: usize,
-        buf: *mut c_void,
-    );
+    pub fn run_cast_mut(src_dtype: i32, dst_dtype: i32, numel: usize, buf: *mut c_void);
 
     /// Dispatches to the appropriate in-place cast kernel with explicit mode selection.
     ///
@@ -229,13 +224,7 @@ pub unsafe fn dispatch_cast_mut_with_mode(
     buf: *mut c_void,
     mode: CastMutMode,
 ) {
-    run_cast_mut_with_mode(
-        src_dtype as i32,
-        dst_dtype as i32,
-        numel,
-        buf,
-        mode as i32,
-    );
+    run_cast_mut_with_mode(src_dtype as i32, dst_dtype as i32, numel, buf, mode as i32);
 }
 
 // =============================================================================

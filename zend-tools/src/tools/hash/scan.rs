@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{compute_hash, decode_data, HashError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ScanRequest {
@@ -42,7 +42,9 @@ impl Tool for HashScan {
         let data = decode_data(&req.data, data_enc)?;
         let known = decode_data(&req.known_hash, hash_enc)?;
 
-        let algos = ["sha256", "sha512", "sha1", "md5", "sha3_256", "sha3_512", "blake3"];
+        let algos = [
+            "sha256", "sha512", "sha1", "md5", "sha3_256", "sha3_512", "blake3",
+        ];
         for algo in algos {
             if let Ok(digest) = compute_hash(&data, algo) {
                 if digest == known {

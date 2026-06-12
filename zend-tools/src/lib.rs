@@ -76,4 +76,6 @@ pub mod tools;
 pub use context::ToolContext;
 pub use registry::RegisteredTool;
 pub use runner::{confirmation, run};
-pub use tool::{ConfirmationDetails, SubagentRequest, SubagentResponse, SubagentRunner, Tool, ToolError};
+pub use tool::{
+    ConfirmationDetails, SubagentRequest, SubagentResponse, SubagentRunner, Tool, ToolError,
+};

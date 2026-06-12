@@ -169,10 +169,21 @@ impl ProvenanceFile {
         semantic: &[TokenSignature],
         pragmatic: &[TokenSignature],
     ) -> crate::Result<SigEntry> {
-        assert_eq!(syntactic.len(), semantic.len(), "depth slice length mismatch");
-        assert_eq!(syntactic.len(), pragmatic.len(), "depth slice length mismatch");
+        assert_eq!(
+            syntactic.len(),
+            semantic.len(),
+            "depth slice length mismatch"
+        );
+        assert_eq!(
+            syntactic.len(),
+            pragmatic.len(),
+            "depth slice length mismatch"
+        );
         let token_count = syntactic.len();
-        assert!(token_count <= u16::MAX as usize, "token_count exceeds u16::MAX");
+        assert!(
+            token_count <= u16::MAX as usize,
+            "token_count exceeds u16::MAX"
+        );
 
         if token_count == 0 {
             let state = self.state.lock().unwrap();
@@ -187,7 +198,11 @@ impl ProvenanceFile {
 
         use std::io::Seek;
         state.file.seek(std::io::SeekFrom::Start(byte_offset))?;
-        for sig in syntactic.iter().chain(semantic.iter()).chain(pragmatic.iter()) {
+        for sig in syntactic
+            .iter()
+            .chain(semantic.iter())
+            .chain(pragmatic.iter())
+        {
             state.file.write_all(sig.as_bytes())?;
         }
         state.file.flush()?;
@@ -206,7 +221,11 @@ impl ProvenanceFile {
     pub fn read_entry(
         &self,
         entry: SigEntry,
-    ) -> crate::Result<(Vec<TokenSignature>, Vec<TokenSignature>, Vec<TokenSignature>)> {
+    ) -> crate::Result<(
+        Vec<TokenSignature>,
+        Vec<TokenSignature>,
+        Vec<TokenSignature>,
+    )> {
         if entry.token_count == 0 {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
@@ -300,9 +319,15 @@ impl ProvenanceFile {
 
             let chunk = &mmap[offset..offset + total];
             let depth_slices: [(&[u8], &TokenSignature); NUM_DEPTHS] = [
-                (&chunk[depth_byte_range(DEPTH_SYNTACTIC, n)], &probe.syntactic),
-                (&chunk[depth_byte_range(DEPTH_SEMANTIC, n)],  &probe.semantic),
-                (&chunk[depth_byte_range(DEPTH_PRAGMATIC, n)], &probe.pragmatic),
+                (
+                    &chunk[depth_byte_range(DEPTH_SYNTACTIC, n)],
+                    &probe.syntactic,
+                ),
+                (&chunk[depth_byte_range(DEPTH_SEMANTIC, n)], &probe.semantic),
+                (
+                    &chunk[depth_byte_range(DEPTH_PRAGMATIC, n)],
+                    &probe.pragmatic,
+                ),
             ];
 
             let mut hit_counts = [0usize; 3];
@@ -314,12 +339,18 @@ impl ProvenanceFile {
             }
 
             if score > 0.0 {
-                ranks.push(TurnChunkRank { turn_id, score, hit_counts });
+                ranks.push(TurnChunkRank {
+                    turn_id,
+                    score,
+                    hit_counts,
+                });
             }
         }
 
         ranks.sort_unstable_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         ranks.truncate(top_k);
         Ok(ranks)

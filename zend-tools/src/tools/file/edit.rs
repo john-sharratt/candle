@@ -4,9 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::FileError;
 use crate::state::vfs::VfsError;
 use crate::{RegisteredTool, Tool, ToolContext};
-use super::FileError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct EditRequest {
@@ -40,12 +40,17 @@ impl Tool for FileEdit {
     type Error = FileError;
 
     fn run(ctx: &ToolContext, req: EditRequest) -> Result<EditResponse, FileError> {
-        let content = ctx.vfs.read(&req.path)
+        let content = ctx
+            .vfs
+            .read(&req.path)
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
 
         let count = content.matches(&req.old_str).count();
         if count == 0 {
-            return Err(FileError::NotFound(format!("old_str not found in {}", req.path)));
+            return Err(FileError::NotFound(format!(
+                "old_str not found in {}",
+                req.path
+            )));
         }
         if count > 1 {
             return Err(FileError::Ambiguous);
@@ -53,9 +58,13 @@ impl Tool for FileEdit {
 
         let new_content = content.replacen(&req.old_str, &req.new_str, 1);
         let bytes = new_content.len();
-        ctx.vfs.write(&req.path, new_content)
-            .map_err(|e| match e { VfsError::Full => FileError::VfsFull })?;
-        Ok(EditResponse { path: req.path, bytes })
+        ctx.vfs.write(&req.path, new_content).map_err(|e| match e {
+            VfsError::Full => FileError::VfsFull,
+        })?;
+        Ok(EditResponse {
+            path: req.path,
+            bytes,
+        })
     }
 }
 

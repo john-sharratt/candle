@@ -8,8 +8,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::CodeError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RunRequest {
@@ -49,24 +49,25 @@ impl Tool for CodeRun {
 
         let (mut cmd, temp_file) = match req.language.as_str() {
             "python" | "python3" => {
-                let tmp = std::env::temp_dir()
-                    .join(format!("zend_code_{}.py", uuid::Uuid::new_v4()));
+                let tmp =
+                    std::env::temp_dir().join(format!("zend_code_{}.py", uuid::Uuid::new_v4()));
                 std::fs::write(&tmp, &req.code)
                     .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-                let mut c = std::process::Command::new(
-                    if cfg!(windows) { "python.exe" } else { "python3" },
-                );
+                let mut c = std::process::Command::new(if cfg!(windows) {
+                    "python.exe"
+                } else {
+                    "python3"
+                });
                 c.arg(&tmp);
                 (c, Some(tmp))
             }
             "javascript" | "js" | "node" => {
-                let tmp = std::env::temp_dir()
-                    .join(format!("zend_code_{}.js", uuid::Uuid::new_v4()));
+                let tmp =
+                    std::env::temp_dir().join(format!("zend_code_{}.js", uuid::Uuid::new_v4()));
                 std::fs::write(&tmp, &req.code)
                     .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
-                let mut c = std::process::Command::new(
-                    if cfg!(windows) { "node.exe" } else { "node" },
-                );
+                let mut c =
+                    std::process::Command::new(if cfg!(windows) { "node.exe" } else { "node" });
                 c.arg(&tmp);
                 (c, Some(tmp))
             }

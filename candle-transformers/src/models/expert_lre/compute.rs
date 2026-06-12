@@ -284,10 +284,7 @@ pub fn compute_experts_grouped(
     let token_starts_dev = cuda_dev.memcpy_stod(&token_starts)?;
 
     // Reorder weight_ids to token-major using the same permutation.
-    let reordered_weight_ids: Vec<u32> = perm
-        .iter()
-        .map(|&i| all_weight_ids[i as usize])
-        .collect();
+    let reordered_weight_ids: Vec<u32> = perm.iter().map(|&i| all_weight_ids[i as usize]).collect();
     let reordered_wt_ids_dev = cuda_dev.memcpy_stod(&reordered_weight_ids)?;
 
     // Upload perm so the kernel can gather from down_out directly — no index_select needed.

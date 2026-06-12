@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::{exec_simple, SshError, MAX_OUTPUT};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::{SshError, MAX_OUTPUT, exec_simple};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ExecRequest {
@@ -44,13 +44,17 @@ impl Tool for SshSessionExec {
     type Error = SshError;
 
     fn confirmation(req: &ExecRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Execute: {}", req.command))
-            .with_field("session_id", req.session_id.clone())
-            .with_field("command", req.command.clone()))
+        Some(
+            ConfirmationDetails::new(format!("Execute: {}", req.command))
+                .with_field("session_id", req.session_id.clone())
+                .with_field("command", req.command.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: ExecRequest) -> Result<ExecResponse, SshError> {
-        let entry_arc = ctx.sessions.get_ssh(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_ssh(&req.session_id)
             .ok_or_else(|| SshError::SessionNotFound(req.session_id.clone()))?;
         let entry = entry_arc.lock().unwrap();
 
@@ -61,9 +65,11 @@ impl Tool for SshSessionExec {
         let start = Instant::now();
         let session = &entry.conn.session;
 
-        let mut channel = session.channel_session()
+        let mut channel = session
+            .channel_session()
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
-        channel.exec(&req.command)
+        channel
+            .exec(&req.command)
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
 
         let mut stdout_bytes = Vec::new();

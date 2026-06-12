@@ -124,6 +124,9 @@ mod tests {
             ]
         );
         assert_eq!(d.selected_tokens, 70);
-        assert_eq!(d.origin_of(NodeId(2)), Some(SelectionOrigin::ProvenanceScore));
+        assert_eq!(
+            d.origin_of(NodeId(2)),
+            Some(SelectionOrigin::ProvenanceScore)
+        );
     }
 }

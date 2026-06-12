@@ -729,11 +729,11 @@ impl SubstratePersistence {
         buffer_size: usize,
     ) -> ChunkedReadPlan {
         let active_chunks = substrate.stream_of(stream_id).map(|s| &s.chunks);
-        let inherited_chunks: Vec<Option<&std::collections::BTreeMap<u64, ChunkLoc>>> =
-            self.inherited
-                .iter()
-                .map(|i| i.substrate().stream_of(stream_id).map(|s| &s.chunks))
-                .collect();
+        let inherited_chunks: Vec<Option<&std::collections::BTreeMap<u64, ChunkLoc>>> = self
+            .inherited
+            .iter()
+            .map(|i| i.substrate().stream_of(stream_id).map(|s| &s.chunks))
+            .collect();
         chunk_plan::plan_chunked_read(
             active_chunks,
             &inherited_chunks,
@@ -941,11 +941,7 @@ impl SubstratePersistence {
 
     /// Resolve a content-addressed prompt section across the active log and
     /// every inherited log (§13.5). `Some` is a prefix-cache hit.
-    pub fn lookup_section(
-        &self,
-        substrate: &Substrate,
-        addr: ContentAddress,
-    ) -> Option<StreamRef> {
+    pub fn lookup_section(&self, substrate: &Substrate, addr: ContentAddress) -> Option<StreamRef> {
         let id = content_hash::section_stream_id(addr);
         if self.has_stream(substrate, id) {
             Some(StreamRef {
@@ -961,23 +957,15 @@ impl SubstratePersistence {
     /// inherited log.  The active source is read from `substrate.streams`
     /// (the in-RAM index built by the reload walk); inherited logs still
     /// carry their own manifest.
-    pub fn has_stream(
-        &self,
-        substrate: &Substrate,
-        stream_id: StreamId,
-    ) -> bool {
-        substrate.has_stream(stream_id)
-            || self.inherited.iter().any(|i| i.has_stream(stream_id))
+    pub fn has_stream(&self, substrate: &Substrate, stream_id: StreamId) -> bool {
+        substrate.has_stream(stream_id) || self.inherited.iter().any(|i| i.has_stream(stream_id))
     }
 
     /// Whether the active log has accumulated enough dead weight to justify
     /// a compaction pass — the dead-record ratio (§5.8) crossing
     /// [`COMPACTION_DEAD_RATIO_THRESHOLD`]. Flushes pending writes first so
     /// the measurement reflects the durable log.
-    pub fn should_compact(
-        &mut self,
-        substrate: &Substrate,
-    ) -> Result<bool> {
+    pub fn should_compact(&mut self, substrate: &Substrate) -> Result<bool> {
         self.log.commit()?;
         let ratio = compaction::dead_record_ratio(&mut self.log, &self.manifest, substrate)?;
         Ok(ratio >= COMPACTION_DEAD_RATIO_THRESHOLD)
@@ -1339,8 +1327,7 @@ mod tests {
         }
         {
             let mut substrate = Substrate::new();
-            let sp =
-                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             assert!(sp.has_stream(&substrate, turn_id));
             let entry = substrate.stream_of(turn_id).unwrap();
             assert_eq!(entry.committed_through, Some(0));
@@ -1358,7 +1345,8 @@ mod tests {
         let sec = section("shared_section", 0);
         let base_log = base_dir.join("base.log");
         {
-            let mut base = SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
+            let mut base =
+                SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
             base.declare_stream(&sec).unwrap();
             base.commit().unwrap();
         }
@@ -1409,8 +1397,8 @@ mod tests {
         // child has its own turn and the inherited base section.
         drop(child);
         let mut child_substrate = Substrate::new();
-        let child = SubstratePersistence::open_concat(&[base_log.clone(), child_log.clone()])
-            .unwrap();
+        let child =
+            SubstratePersistence::open_concat(&[base_log.clone(), child_log.clone()]).unwrap();
         // open_concat populates the active substrate via the same
         // walker pass that builds the manifest.  We approximate it
         // here by walking the active log explicitly into substrate.
@@ -1577,7 +1565,8 @@ mod tests {
         let sid = StreamId(9000);
         let payload = chunk_payload(11);
         {
-            let mut base = SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
+            let mut base =
+                SubstratePersistence::open_concat(std::slice::from_ref(&base_log)).unwrap();
             base.write_chunk(sid, 0, 32, 4, &payload).unwrap();
             base.commit().unwrap();
         }

@@ -161,12 +161,12 @@ unsafe impl Sync for RemoteFsConn {}
 pub struct RemoteFsEntry {
     pub meta: SessionMeta,
     pub uri: String,
-    pub protocol: String,       // "sftp"
+    pub protocol: String, // "sftp"
     pub host: String,
     pub port: u16,
     pub credential_id: String,
     pub credential_name: String,
-    pub remote_prefix: String,  // leading path from URI (e.g. "/home/user")
+    pub remote_prefix: String, // leading path from URI (e.g. "/home/user")
     pub conn: RemoteFsConn,
 }
 
@@ -206,7 +206,10 @@ impl SessionRegistry {
     // SSH
     pub fn insert_ssh(&self, entry: SshEntry) {
         let id = entry.meta.session_id.clone();
-        self.ssh.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.ssh
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_ssh(&self, id: &str) -> Option<Arc<Mutex<SshEntry>>> {
         self.ssh.read().unwrap().get(id).cloned()
@@ -221,7 +224,10 @@ impl SessionRegistry {
     // SSH processes
     pub fn insert_ssh_process(&self, proc: SshProcess) {
         let id = proc.process_id.clone();
-        self.ssh_processes.write().unwrap().insert(id, Arc::new(Mutex::new(proc)));
+        self.ssh_processes
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(proc)));
     }
     pub fn get_ssh_process(&self, id: &str) -> Option<Arc<Mutex<SshProcess>>> {
         self.ssh_processes.read().unwrap().get(id).cloned()
@@ -233,7 +239,10 @@ impl SessionRegistry {
     // Telnet
     pub fn insert_telnet(&self, entry: TelnetEntry) {
         let id = entry.meta.session_id.clone();
-        self.telnet.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.telnet
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_telnet(&self, id: &str) -> Option<Arc<Mutex<TelnetEntry>>> {
         self.telnet.read().unwrap().get(id).cloned()
@@ -248,7 +257,10 @@ impl SessionRegistry {
     // HTTP
     pub fn insert_http(&self, entry: HttpEntry) {
         let id = entry.meta.session_id.clone();
-        self.http.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.http
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_http(&self, id: &str) -> Option<Arc<Mutex<HttpEntry>>> {
         self.http.read().unwrap().get(id).cloned()
@@ -263,7 +275,10 @@ impl SessionRegistry {
     // TCP
     pub fn insert_tcp(&self, entry: TcpEntry) {
         let id = entry.meta.session_id.clone();
-        self.tcp.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.tcp
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_tcp(&self, id: &str) -> Option<Arc<Mutex<TcpEntry>>> {
         self.tcp.read().unwrap().get(id).cloned()
@@ -278,7 +293,10 @@ impl SessionRegistry {
     // UDP
     pub fn insert_udp(&self, entry: UdpEntry) {
         let id = entry.meta.session_id.clone();
-        self.udp.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.udp
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_udp(&self, id: &str) -> Option<Arc<Mutex<UdpEntry>>> {
         self.udp.read().unwrap().get(id).cloned()
@@ -293,7 +311,10 @@ impl SessionRegistry {
     // TLS
     pub fn insert_tls(&self, entry: TlsEntry) {
         let id = entry.meta.session_id.clone();
-        self.tls.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.tls
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_tls(&self, id: &str) -> Option<Arc<Mutex<TlsEntry>>> {
         self.tls.read().unwrap().get(id).cloned()
@@ -308,7 +329,10 @@ impl SessionRegistry {
     // SQL
     pub fn insert_sql(&self, entry: SqlEntry) {
         let id = entry.meta.session_id.clone();
-        self.sql.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.sql
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_sql(&self, id: &str) -> Option<Arc<Mutex<SqlEntry>>> {
         self.sql.read().unwrap().get(id).cloned()
@@ -323,7 +347,10 @@ impl SessionRegistry {
     // Remote FS
     pub fn insert_remote_fs(&self, entry: RemoteFsEntry) {
         let id = entry.meta.session_id.clone();
-        self.remote_fs.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.remote_fs
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_remote_fs(&self, id: &str) -> Option<Arc<Mutex<RemoteFsEntry>>> {
         self.remote_fs.read().unwrap().get(id).cloned()
@@ -338,7 +365,10 @@ impl SessionRegistry {
     // Code
     pub fn insert_code(&self, entry: CodeEntry) {
         let id = entry.meta.session_id.clone();
-        self.code.write().unwrap().insert(id, Arc::new(Mutex::new(entry)));
+        self.code
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_code(&self, id: &str) -> Option<Arc<Mutex<CodeEntry>>> {
         self.code.read().unwrap().get(id).cloned()

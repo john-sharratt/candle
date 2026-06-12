@@ -33,9 +33,7 @@ use candle::{Device, Result, Tensor};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
-use crate::models::batched_inference::{
-    BatchedConfig, InferenceMode, ManagedBatchedModel,
-};
+use crate::models::batched_inference::{BatchedConfig, InferenceMode, ManagedBatchedModel};
 
 /// Where to load samples from for [`run_ruler_benchmark`].
 pub enum RulerDataSource<'a> {
@@ -65,10 +63,36 @@ const ASST_PREFIX: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 /// Pool of unusual color/dye names used as "common words" in CWE tasks.
 /// These are chosen to be absent from the filler corpus.
 const CWE_WORD_POOL: &[&str] = &[
-    "crimson", "azure", "violet", "amber", "scarlet", "cobalt", "magenta", "tawny", "ochre",
-    "sienna", "umber", "taupe", "mauve", "cerise", "fuchsia", "vermillion", "periwinkle",
-    "chartreuse", "gamboge", "cinnabar", "carmine", "saffron", "turquoise", "verdigris", "puce",
-    "russet", "bisque", "ecru", "alabaster", "celadon",
+    "crimson",
+    "azure",
+    "violet",
+    "amber",
+    "scarlet",
+    "cobalt",
+    "magenta",
+    "tawny",
+    "ochre",
+    "sienna",
+    "umber",
+    "taupe",
+    "mauve",
+    "cerise",
+    "fuchsia",
+    "vermillion",
+    "periwinkle",
+    "chartreuse",
+    "gamboge",
+    "cinnabar",
+    "carmine",
+    "saffron",
+    "turquoise",
+    "verdigris",
+    "puce",
+    "russet",
+    "bisque",
+    "ecru",
+    "alabaster",
+    "celadon",
 ];
 
 /// Varied public-domain-style prose (~750 words, ~1050 Qwen3 tokens).
@@ -199,10 +223,7 @@ fn make_filler(tokenizer: &Tokenizer, target_len: usize) -> String {
 
 /// Count tokens for a string using the given tokenizer.
 fn token_count(tokenizer: &Tokenizer, text: &str) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|e| e.len())
-        .unwrap_or(0)
+    tokenizer.encode(text, false).map(|e| e.len()).unwrap_or(0)
 }
 
 // ── Prompt assembly ───────────────────────────────────────────────────────────
@@ -248,7 +269,8 @@ fn generate_niah_single(
             let depth = rng.random_range(10usize..90);
             let raw_split = filler.len() * depth / 100;
             let split = next_char_boundary(&filler, raw_split);
-            let needle = format!("\n\nRemember: The special magic number for {city} is: {number}.\n\n");
+            let needle =
+                format!("\n\nRemember: The special magic number for {city} is: {number}.\n\n");
             let body = format!("{}{}{}", &filler[..split], needle, &filler[split..]);
             let question = format!("What is the special magic number for {city}?");
             RulerSample {
@@ -286,11 +308,17 @@ fn generate_niah_multikey2(
             // Needle 1 at ~33%, needle 2 at ~67%.
             let split1 = next_char_boundary(&filler, len / 3);
             let split2 = next_char_boundary(&filler, 2 * len / 3);
-            let needle1 = format!("\n\nRemember: The special magic number for {city1} is: {num1}.\n\n");
-            let needle2 = format!("\n\nRemember: The special magic number for {city2} is: {num2}.\n\n");
+            let needle1 =
+                format!("\n\nRemember: The special magic number for {city1} is: {num1}.\n\n");
+            let needle2 =
+                format!("\n\nRemember: The special magic number for {city2} is: {num2}.\n\n");
             let body = format!(
                 "{}{}{}{}{}",
-                &filler[..split1], needle1, &filler[split1..split2], needle2, &filler[split2..]
+                &filler[..split1],
+                needle1,
+                &filler[split1..split2],
+                needle2,
+                &filler[split2..]
             );
             let question = format!(
                 "What are the special magic numbers for {city1} and {city2}? \
@@ -689,12 +717,36 @@ fn fisher_yates_shuffle<T>(slice: &mut Vec<T>, rng: &mut StdRng) {
 
 /// City names used as needle identifiers in NIAH tasks.
 const CITY_NAMES: &[&str] = &[
-    "Amsterdam", "Barcelona", "Cairo", "Dubai", "Edinburgh",
-    "Frankfurt", "Geneva", "Helsinki", "Istanbul", "Jakarta",
-    "Kyoto", "Lisbon", "Montreal", "Nairobi", "Oslo",
-    "Prague", "Quebec", "Reykjavik", "Seoul", "Tokyo",
-    "Utrecht", "Vienna", "Warsaw", "Xiamen", "Yokohama",
-    "Zagreb", "Bogota", "Colombo", "Dhaka", "Erevan",
+    "Amsterdam",
+    "Barcelona",
+    "Cairo",
+    "Dubai",
+    "Edinburgh",
+    "Frankfurt",
+    "Geneva",
+    "Helsinki",
+    "Istanbul",
+    "Jakarta",
+    "Kyoto",
+    "Lisbon",
+    "Montreal",
+    "Nairobi",
+    "Oslo",
+    "Prague",
+    "Quebec",
+    "Reykjavik",
+    "Seoul",
+    "Tokyo",
+    "Utrecht",
+    "Vienna",
+    "Warsaw",
+    "Xiamen",
+    "Yokohama",
+    "Zagreb",
+    "Bogota",
+    "Colombo",
+    "Dhaka",
+    "Erevan",
 ];
 
 // ── Benchmark orchestrator ────────────────────────────────────────────────────
@@ -739,11 +791,7 @@ impl Default for RulerBenchConfig<'static> {
                 (Some(InferenceMode::Q3_0), "Q3_0 (3.5 BPE)"),
                 (Some(InferenceMode::C8), "C8  (PalQuant ~3.3 BPE)"),
             ],
-            lengths_samples: &[
-                (4_096, 20),
-                (8_192, 10),
-                (16_384, 5),
-            ],
+            lengths_samples: &[(4_096, 20), (8_192, 10), (16_384, 5)],
             tasks: &[
                 RulerTask::NiahSingle1,
                 RulerTask::NiahMultiKey2,
@@ -779,13 +827,15 @@ pub fn load_ruler_samples_jsonl(path: &std::path::Path) -> Result<Vec<RulerSampl
         let input = extract_json_str(line, "input").ok_or_else(|| {
             candle::Error::Msg(format!(
                 "JSONL {:?} line {}: missing \"input\" field",
-                path, lineno + 1
+                path,
+                lineno + 1
             ))
         })?;
         let outputs = extract_json_str_array(line, "outputs").ok_or_else(|| {
             candle::Error::Msg(format!(
                 "JSONL {:?} line {}: missing \"outputs\" field",
-                path, lineno + 1
+                path,
+                lineno + 1
             ))
         })?;
         samples.push(RulerSample { input, outputs });
@@ -914,7 +964,10 @@ pub fn sweep_parallelism<M: ManagedBatchedModel>(
     cfg: &RulerBenchConfig<'_>,
 ) -> Result<Vec<(usize, Vec<usize>)>> {
     println!("\n=== Phase 1: Parallelism sweep (NIAH-S1, F16 KV) ===");
-    println!("{:<10} {:>8} {:>14} {:>14} {:>10}", "Ctx", "Batch", "Prefill t/s", "Decode t/s", "Selected");
+    println!(
+        "{:<10} {:>8} {:>14} {:>14} {:>10}",
+        "Ctx", "Batch", "Prefill t/s", "Decode t/s", "Selected"
+    );
 
     // Safety factor applied when scaling the F16 batch ceiling by compression ratio.
     // Accounts for imprecision in ratio estimates and activation memory overhead.
@@ -928,7 +981,8 @@ pub fn sweep_parallelism<M: ManagedBatchedModel>(
         // We need enough samples to fill the largest batch we'll try.
         let max_batch = cfg.token_budget / ctx_len;
         let n_sweep = max_batch.max(1);
-        let samples = generate_ruler_samples(tokenizer, RulerTask::NiahSingle1, ctx_len, n_sweep, 0);
+        let samples =
+            generate_ruler_samples(tokenizer, RulerTask::NiahSingle1, ctx_len, n_sweep, 0);
 
         let mut best_batch = 1usize;
         let mut best_decode_tps = 0.0f64;
@@ -942,8 +996,13 @@ pub fn sweep_parallelism<M: ManagedBatchedModel>(
 
             let mut timings = (0.0f64, 0.0f64);
             let preds = run_ruler_eval(
-                model, tokenizer, batch_samples,
-                None, cfg.max_gen_tokens, cfg.eos_ids, model.device(),
+                model,
+                tokenizer,
+                batch_samples,
+                None,
+                cfg.max_gen_tokens,
+                cfg.eos_ids,
+                model.device(),
                 Some(&mut timings),
             )?;
             let _ = preds; // discard predictions for sweep
@@ -953,13 +1012,25 @@ pub fn sweep_parallelism<M: ManagedBatchedModel>(
             // Prompt tokens for this batch.
             let prompt_toks: usize = batch_samples
                 .iter()
-                .map(|s| tokenizer.encode(s.input.as_str(), false)
-                    .map(|e| e.len()).unwrap_or(0))
+                .map(|s| {
+                    tokenizer
+                        .encode(s.input.as_str(), false)
+                        .map(|e| e.len())
+                        .unwrap_or(0)
+                })
                 .sum();
             let decode_toks = batch * cfg.max_gen_tokens;
 
-            let prefill_tps = if prefill_secs > 0.0 { prompt_toks as f64 / prefill_secs } else { 0.0 };
-            let decode_tps = if decode_secs > 0.0 { decode_toks as f64 / decode_secs } else { 0.0 };
+            let prefill_tps = if prefill_secs > 0.0 {
+                prompt_toks as f64 / prefill_secs
+            } else {
+                0.0
+            };
+            let decode_tps = if decode_secs > 0.0 {
+                decode_toks as f64 / decode_secs
+            } else {
+                0.0
+            };
 
             let selected = if decode_tps >= best_decode_tps * 0.97 {
                 // Still improving (or within 3% noise) — record as best.
@@ -992,8 +1063,13 @@ pub fn sweep_parallelism<M: ManagedBatchedModel>(
         // Scale to per-mode batch using compression ratio × safety factor.
         // token_budget / ctx_len is the F16 hard ceiling; best_batch may be lower.
         let f16_ceiling = cfg.token_budget / ctx_len;
-        println!("  → Projected batches for {}K (safety={:.0}%):", ctx_len / 1024, SAFETY * 100.0);
-        let mode_batches: Vec<usize> = cfg.modes
+        println!(
+            "  → Projected batches for {}K (safety={:.0}%):",
+            ctx_len / 1024,
+            SAFETY * 100.0
+        );
+        let mode_batches: Vec<usize> = cfg
+            .modes
             .iter()
             .map(|&(mode, label)| {
                 let ratio = kv_compression_ratio(mode);
@@ -1029,7 +1105,10 @@ pub fn run_ruler_benchmark<M: ManagedBatchedModel>(
     // scores[mode][length][task]
     let mut scores = vec![vec![vec![f64::NAN; n_tasks]; n_lengths]; n_modes];
 
-    println!("\n=== Phase 2: Full RULER benchmark — {} ===", cfg.model_name);
+    println!(
+        "\n=== Phase 2: Full RULER benchmark — {} ===",
+        cfg.model_name
+    );
 
     for (li, &(ctx_len, n_samples)) in cfg.lengths_samples.iter().enumerate() {
         let mode_batches: &[usize] = best_batches
@@ -1038,7 +1117,11 @@ pub fn run_ruler_benchmark<M: ManagedBatchedModel>(
             .map(|(_, mb)| mb.as_slice())
             .unwrap_or(&[]);
 
-        println!("\n─── Context {}K  ({} samples/task) ───", ctx_len / 1024, n_samples);
+        println!(
+            "\n─── Context {}K  ({} samples/task) ───",
+            ctx_len / 1024,
+            n_samples
+        );
 
         for (ti, &task) in cfg.tasks.iter().enumerate() {
             // Load or generate data once; reuse across compression modes.
@@ -1059,10 +1142,18 @@ pub fn run_ruler_benchmark<M: ManagedBatchedModel>(
             };
             let prompt_tok_count = all_samples
                 .first()
-                .map(|s| tokenizer.encode(s.input.as_str(), false)
-                    .map(|e| e.len()).unwrap_or(0))
+                .map(|s| {
+                    tokenizer
+                        .encode(s.input.as_str(), false)
+                        .map(|e| e.len())
+                        .unwrap_or(0)
+                })
                 .unwrap_or(0);
-            println!("{} samples, prompt ≈ {} tok", all_samples.len(), prompt_tok_count);
+            println!(
+                "{} samples, prompt ≈ {} tok",
+                all_samples.len(),
+                prompt_tok_count
+            );
 
             for (mi, &(mode, mode_label)) in cfg.modes.iter().enumerate() {
                 let mode_batch = mode_batches.get(mi).copied().unwrap_or(1).max(1);
@@ -1079,8 +1170,13 @@ pub fn run_ruler_benchmark<M: ManagedBatchedModel>(
                     let end = (i + mode_batch).min(all_samples.len());
                     let batch = &all_samples[i..end];
                     let preds = run_ruler_eval(
-                        model, tokenizer, batch, mode,
-                        cfg.max_gen_tokens, cfg.eos_ids, model.device(),
+                        model,
+                        tokenizer,
+                        batch,
+                        mode,
+                        cfg.max_gen_tokens,
+                        cfg.eos_ids,
+                        model.device(),
                         None,
                     )?;
                     for (pred, sample) in preds.iter().zip(batch.iter()) {
@@ -1093,7 +1189,10 @@ pub fn run_ruler_benchmark<M: ManagedBatchedModel>(
                 let elapsed = t0.elapsed().as_secs_f64();
                 let acc = 100.0 * correct as f64 / all_samples.len() as f64;
                 scores[mi][li][ti] = acc;
-                println!("{correct}/{} = {acc:.1}%  ({elapsed:.1}s)", all_samples.len());
+                println!(
+                    "{correct}/{} = {acc:.1}%  ({elapsed:.1}s)",
+                    all_samples.len()
+                );
             }
         }
     }
@@ -1103,12 +1202,13 @@ pub fn run_ruler_benchmark<M: ManagedBatchedModel>(
     let col_w = 14usize;
     let lbl_w = 26usize;
 
-    let header_cells: Vec<String> = cfg.lengths_samples
+    let header_cells: Vec<String> = cfg
+        .lengths_samples
         .iter()
         .flat_map(|&(ctx_len, n)| {
-            cfg.tasks.iter().map(move |&t| {
-                format!("{}@{}K(n={})", &t.name()[..4], ctx_len / 1024, n)
-            })
+            cfg.tasks
+                .iter()
+                .map(move |&t| format!("{}@{}K(n={})", &t.name()[..4], ctx_len / 1024, n))
         })
         .collect();
 
@@ -1177,14 +1277,14 @@ pub fn parse_ruler_mode(s: &str) -> Result<(Option<InferenceMode>, String)> {
     let upper = s.to_uppercase();
     let mode = match upper.as_str() {
         "F16" | "NONE" => None,
-        "Q8_0"         => Some(InferenceMode::Q8_0),
+        "Q8_0" => Some(InferenceMode::Q8_0),
         "Q8_Q4" | "Q8/Q4" => Some(InferenceMode::Q8_Q4),
-        "Q4_0"         => Some(InferenceMode::Q4_0),
-        "Q3_0"         => Some(InferenceMode::Q3_0),
-        "C5"           => Some(InferenceMode::C5),
-        "C8"           => Some(InferenceMode::C8),
-        "C9"           => Some(InferenceMode::C9),
-        "C10"          => Some(InferenceMode::C10),
+        "Q4_0" => Some(InferenceMode::Q4_0),
+        "Q3_0" => Some(InferenceMode::Q3_0),
+        "C5" => Some(InferenceMode::C5),
+        "C8" => Some(InferenceMode::C8),
+        "C9" => Some(InferenceMode::C9),
+        "C10" => Some(InferenceMode::C10),
         _ => return Err(candle::Error::Msg(format!("Unknown RULER mode: '{s}'"))),
     };
     Ok((mode, upper))
@@ -1224,7 +1324,10 @@ pub fn run_ruler_continuous<M: ManagedBatchedModel>(
         .map_err(|e| candle::Error::Msg(format!("open {:?}: {e}", log_path)))?;
     let mut writer = std::io::BufWriter::new(file);
 
-    println!("\n=== RULER stream: mode={mode_label}  log={} ===", log_path.display());
+    println!(
+        "\n=== RULER stream: mode={mode_label}  log={} ===",
+        log_path.display()
+    );
     println!(
         "Ctx batches: {}",
         ctx_config
@@ -1248,7 +1351,7 @@ pub fn run_ruler_continuous<M: ManagedBatchedModel>(
         task: RulerTask,
         ctx_len: usize,
         n_concurrent: usize,
-        batch_idx: u64,   // monotonic; used as seed and for sample numbering
+        batch_idx: u64, // monotonic; used as seed and for sample numbering
         backoff_secs: f64,
         next_run_at: std::time::Instant, // schedule: run the most-overdue slot first
     }
@@ -1302,74 +1405,83 @@ pub fn run_ruler_continuous<M: ManagedBatchedModel>(
             std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
 
-            let seed = slot.batch_idx;
-            let sample_base = slot.batch_idx * slot.n_concurrent as u64;
-            let samples = generate_ruler_samples(
-                tokenizer, slot.task, slot.ctx_len, slot.n_concurrent, seed,
-            );
+        let seed = slot.batch_idx;
+        let sample_base = slot.batch_idx * slot.n_concurrent as u64;
+        let samples =
+            generate_ruler_samples(tokenizer, slot.task, slot.ctx_len, slot.n_concurrent, seed);
 
-            let t0 = std::time::Instant::now();
-            let preds = match run_ruler_eval(
-                model, tokenizer, &samples, mode,
-                max_gen_tokens, eos_ids, device, None,
-            ) {
-                Ok(p) => {
-                    // Reset backoff on success.
-                    slot.backoff_secs = 0.0;
-                    p
-                }
-                Err(e) => {
-                    // Exponential backoff: 1 → 2 → 4 → … capped at 30 s.
-                    slot.backoff_secs = if slot.backoff_secs < 1.0 {
-                        1.0
-                    } else {
-                        (slot.backoff_secs * 2.0).min(30.0)
-                    };
-                    eprintln!(
-                        "[WARN] batch failed ({mode_label} {}K {}) — backoff {:.0}s: {e}",
-                        slot.ctx_len / 1024,
-                        slot.task.name(),
-                        slot.backoff_secs,
-                    );
-                    // On error: push next_run_at forward by backoff so we don't spin.
-                    slot.next_run_at = std::time::Instant::now()
-                        + std::time::Duration::from_secs_f64(slot.backoff_secs);
-                    continue;
-                }
-            };
-            let elapsed = t0.elapsed().as_secs_f64();
-            let per_sample = elapsed / slot.n_concurrent.max(1) as f64;
+        let t0 = std::time::Instant::now();
+        let preds = match run_ruler_eval(
+            model,
+            tokenizer,
+            &samples,
+            mode,
+            max_gen_tokens,
+            eos_ids,
+            device,
+            None,
+        ) {
+            Ok(p) => {
+                // Reset backoff on success.
+                slot.backoff_secs = 0.0;
+                p
+            }
+            Err(e) => {
+                // Exponential backoff: 1 → 2 → 4 → … capped at 30 s.
+                slot.backoff_secs = if slot.backoff_secs < 1.0 {
+                    1.0
+                } else {
+                    (slot.backoff_secs * 2.0).min(30.0)
+                };
+                eprintln!(
+                    "[WARN] batch failed ({mode_label} {}K {}) — backoff {:.0}s: {e}",
+                    slot.ctx_len / 1024,
+                    slot.task.name(),
+                    slot.backoff_secs,
+                );
+                // On error: push next_run_at forward by backoff so we don't spin.
+                slot.next_run_at = std::time::Instant::now()
+                    + std::time::Duration::from_secs_f64(slot.backoff_secs);
+                continue;
+            }
+        };
+        let elapsed = t0.elapsed().as_secs_f64();
+        let per_sample = elapsed / slot.n_concurrent.max(1) as f64;
 
-            // Schedule next run for this slot at "now" so it is eligible
-            // immediately. Slower slots will accumulate larger next_run_at
-            // values naturally, letting faster slots run more often.
-            slot.next_run_at = std::time::Instant::now();
+        // Schedule next run for this slot at "now" so it is eligible
+        // immediately. Slower slots will accumulate larger next_run_at
+        // values naturally, letting faster slots run more often.
+        slot.next_run_at = std::time::Instant::now();
 
-            let mut batch_correct = 0usize;
-            for (i, (pred, sample)) in preds.iter().zip(samples.iter()).enumerate() {
-                let correct = score_ruler_sample(slot.task, pred, &sample.outputs);
-                if correct { batch_correct += 1; }
-                let line = format!(
+        let mut batch_correct = 0usize;
+        for (i, (pred, sample)) in preds.iter().zip(samples.iter()).enumerate() {
+            let correct = score_ruler_sample(slot.task, pred, &sample.outputs);
+            if correct {
+                batch_correct += 1;
+            }
+            let line = format!(
                     "{{\"quant\":\"{mode_label}\",\"ctx\":{},\"task\":\"{}\",\"sample\":{},\"correct\":{correct},\"elapsed\":{per_sample:.3}}}\n",
                     slot.ctx_len,
                     slot.task.name(),
                     sample_base + i as u64,
                 );
-                writer
-                    .write_all(line.as_bytes())
-                    .map_err(|e| candle::Error::Msg(e.to_string()))?;
-            }
-            writer.flush().map_err(|e| candle::Error::Msg(e.to_string()))?;
+            writer
+                .write_all(line.as_bytes())
+                .map_err(|e| candle::Error::Msg(e.to_string()))?;
+        }
+        writer
+            .flush()
+            .map_err(|e| candle::Error::Msg(e.to_string()))?;
 
-            println!(
-                "[{mode_label} {}K {}  batch={}]  {batch_correct}/{} correct  {elapsed:.1}s",
-                slot.ctx_len / 1024,
-                slot.task.name(),
-                slot.batch_idx,
-                slot.n_concurrent,
-            );
+        println!(
+            "[{mode_label} {}K {}  batch={}]  {batch_correct}/{} correct  {elapsed:.1}s",
+            slot.ctx_len / 1024,
+            slot.task.name(),
+            slot.batch_idx,
+            slot.n_concurrent,
+        );
 
-            slot.batch_idx += 1;
+        slot.batch_idx += 1;
     }
 }
 
@@ -1527,7 +1639,9 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\":");
     let start = json.find(&needle)? + needle.len();
     let rest = json[start..].trim_start();
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }

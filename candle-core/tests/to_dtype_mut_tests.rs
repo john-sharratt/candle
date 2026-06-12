@@ -126,23 +126,23 @@ fn to_dtype_mut_3d(dev: &Device) -> Result<()> {
 
 fn to_dtype_mut_chain(dev: &Device) -> Result<()> {
     let mut t = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], dev)?;
-    
+
     // f32 -> f64
     t.to_dtype_mut(DType::F64)?;
     assert_eq!(t.dtype(), DType::F64);
-    
+
     // f64 -> f16
     t.to_dtype_mut(DType::F16)?;
     assert_eq!(t.dtype(), DType::F16);
-    
+
     // f16 -> bf16
     t.to_dtype_mut(DType::BF16)?;
     assert_eq!(t.dtype(), DType::BF16);
-    
+
     // bf16 -> f32
     t.to_dtype_mut(DType::F32)?;
     assert_eq!(t.dtype(), DType::F32);
-    
+
     let result: Vec<f32> = t.to_vec1()?;
     assert_eq!(result, vec![1.0f32, 2.0, 3.0, 4.0]);
     Ok(())
@@ -156,10 +156,10 @@ fn to_dtype_mut_large(dev: &Device) -> Result<()> {
     let size = 100_000;
     let data: Vec<f32> = (0..size).map(|x| x as f32).collect();
     let mut t = Tensor::from_vec(data.clone(), size, dev)?;
-    
+
     t.to_dtype_mut(DType::F64)?;
     assert_eq!(t.dtype(), DType::F64);
-    
+
     // Verify first and last few values
     let result: Vec<f64> = t.to_vec1()?;
     assert_eq!(result[0], 0.0f64);
@@ -179,12 +179,12 @@ fn to_dtype_mut_non_contiguous_transpose(dev: &Device) -> Result<()> {
     // Transpose makes it non-contiguous
     let mut t = t.t()?;
     assert!(!t.is_contiguous());
-    
+
     // to_dtype_mut should make it contiguous first, then convert
     t.to_dtype_mut(DType::F64)?;
     assert_eq!(t.dtype(), DType::F64);
     assert!(t.is_contiguous());
-    
+
     // Verify the transposed values are correct
     // Original: [[1, 2, 3], [4, 5, 6]]
     // Transposed: [[1, 4], [2, 5], [3, 6]]
@@ -200,11 +200,11 @@ fn to_dtype_mut_non_contiguous_narrow(dev: &Device) -> Result<()> {
     // Narrow the middle column
     let mut t = t.narrow(1, 1, 1)?;
     assert!(!t.is_contiguous());
-    
+
     t.to_dtype_mut(DType::F64)?;
     assert_eq!(t.dtype(), DType::F64);
     assert!(t.is_contiguous());
-    
+
     // Middle column: [2, 5, 8]
     let result: Vec<Vec<f64>> = t.to_vec2()?;
     assert_eq!(result, vec![vec![2.0], vec![5.0], vec![8.0]]);
@@ -238,18 +238,93 @@ macro_rules! test_device {
     };
 }
 
-test_device!(to_dtype_mut_same_type, to_dtype_mut_same_type_cpu, to_dtype_mut_same_type_cuda, to_dtype_mut_same_type_metal);
-test_device!(to_dtype_mut_f32_to_f64, to_dtype_mut_f32_to_f64_cpu, to_dtype_mut_f32_to_f64_cuda, to_dtype_mut_f32_to_f64_metal);
-test_device!(to_dtype_mut_f64_to_f32, to_dtype_mut_f64_to_f32_cpu, to_dtype_mut_f64_to_f32_cuda, to_dtype_mut_f64_to_f32_metal);
-test_device!(to_dtype_mut_f32_to_f16, to_dtype_mut_f32_to_f16_cpu, to_dtype_mut_f32_to_f16_cuda, to_dtype_mut_f32_to_f16_metal);
-test_device!(to_dtype_mut_f32_to_bf16, to_dtype_mut_f32_to_bf16_cpu, to_dtype_mut_f32_to_bf16_cuda, to_dtype_mut_f32_to_bf16_metal);
-test_device!(to_dtype_mut_u8_to_f32, to_dtype_mut_u8_to_f32_cpu, to_dtype_mut_u8_to_f32_cuda, to_dtype_mut_u8_to_f32_metal);
-test_device!(to_dtype_mut_f32_to_u8, to_dtype_mut_f32_to_u8_cpu, to_dtype_mut_f32_to_u8_cuda, to_dtype_mut_f32_to_u8_metal);
-test_device!(to_dtype_mut_u32_to_i64, to_dtype_mut_u32_to_i64_cpu, to_dtype_mut_u32_to_i64_cuda, to_dtype_mut_u32_to_i64_metal);
-test_device!(to_dtype_mut_i64_to_f32, to_dtype_mut_i64_to_f32_cpu, to_dtype_mut_i64_to_f32_cuda, to_dtype_mut_i64_to_f32_metal);
-test_device!(to_dtype_mut_2d, to_dtype_mut_2d_cpu, to_dtype_mut_2d_cuda, to_dtype_mut_2d_metal);
-test_device!(to_dtype_mut_3d, to_dtype_mut_3d_cpu, to_dtype_mut_3d_cuda, to_dtype_mut_3d_metal);
-test_device!(to_dtype_mut_chain, to_dtype_mut_chain_cpu, to_dtype_mut_chain_cuda, to_dtype_mut_chain_metal);
-test_device!(to_dtype_mut_large, to_dtype_mut_large_cpu, to_dtype_mut_large_cuda, to_dtype_mut_large_metal);
-test_device!(to_dtype_mut_non_contiguous_transpose, to_dtype_mut_non_contiguous_transpose_cpu, to_dtype_mut_non_contiguous_transpose_cuda, to_dtype_mut_non_contiguous_transpose_metal);
-test_device!(to_dtype_mut_non_contiguous_narrow, to_dtype_mut_non_contiguous_narrow_cpu, to_dtype_mut_non_contiguous_narrow_cuda, to_dtype_mut_non_contiguous_narrow_metal);
+test_device!(
+    to_dtype_mut_same_type,
+    to_dtype_mut_same_type_cpu,
+    to_dtype_mut_same_type_cuda,
+    to_dtype_mut_same_type_metal
+);
+test_device!(
+    to_dtype_mut_f32_to_f64,
+    to_dtype_mut_f32_to_f64_cpu,
+    to_dtype_mut_f32_to_f64_cuda,
+    to_dtype_mut_f32_to_f64_metal
+);
+test_device!(
+    to_dtype_mut_f64_to_f32,
+    to_dtype_mut_f64_to_f32_cpu,
+    to_dtype_mut_f64_to_f32_cuda,
+    to_dtype_mut_f64_to_f32_metal
+);
+test_device!(
+    to_dtype_mut_f32_to_f16,
+    to_dtype_mut_f32_to_f16_cpu,
+    to_dtype_mut_f32_to_f16_cuda,
+    to_dtype_mut_f32_to_f16_metal
+);
+test_device!(
+    to_dtype_mut_f32_to_bf16,
+    to_dtype_mut_f32_to_bf16_cpu,
+    to_dtype_mut_f32_to_bf16_cuda,
+    to_dtype_mut_f32_to_bf16_metal
+);
+test_device!(
+    to_dtype_mut_u8_to_f32,
+    to_dtype_mut_u8_to_f32_cpu,
+    to_dtype_mut_u8_to_f32_cuda,
+    to_dtype_mut_u8_to_f32_metal
+);
+test_device!(
+    to_dtype_mut_f32_to_u8,
+    to_dtype_mut_f32_to_u8_cpu,
+    to_dtype_mut_f32_to_u8_cuda,
+    to_dtype_mut_f32_to_u8_metal
+);
+test_device!(
+    to_dtype_mut_u32_to_i64,
+    to_dtype_mut_u32_to_i64_cpu,
+    to_dtype_mut_u32_to_i64_cuda,
+    to_dtype_mut_u32_to_i64_metal
+);
+test_device!(
+    to_dtype_mut_i64_to_f32,
+    to_dtype_mut_i64_to_f32_cpu,
+    to_dtype_mut_i64_to_f32_cuda,
+    to_dtype_mut_i64_to_f32_metal
+);
+test_device!(
+    to_dtype_mut_2d,
+    to_dtype_mut_2d_cpu,
+    to_dtype_mut_2d_cuda,
+    to_dtype_mut_2d_metal
+);
+test_device!(
+    to_dtype_mut_3d,
+    to_dtype_mut_3d_cpu,
+    to_dtype_mut_3d_cuda,
+    to_dtype_mut_3d_metal
+);
+test_device!(
+    to_dtype_mut_chain,
+    to_dtype_mut_chain_cpu,
+    to_dtype_mut_chain_cuda,
+    to_dtype_mut_chain_metal
+);
+test_device!(
+    to_dtype_mut_large,
+    to_dtype_mut_large_cpu,
+    to_dtype_mut_large_cuda,
+    to_dtype_mut_large_metal
+);
+test_device!(
+    to_dtype_mut_non_contiguous_transpose,
+    to_dtype_mut_non_contiguous_transpose_cpu,
+    to_dtype_mut_non_contiguous_transpose_cuda,
+    to_dtype_mut_non_contiguous_transpose_metal
+);
+test_device!(
+    to_dtype_mut_non_contiguous_narrow,
+    to_dtype_mut_non_contiguous_narrow_cpu,
+    to_dtype_mut_non_contiguous_narrow_cuda,
+    to_dtype_mut_non_contiguous_narrow_metal
+);

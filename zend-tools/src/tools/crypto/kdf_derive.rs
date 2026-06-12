@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, encode_output, CryptoError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct KdfRequest {
@@ -46,8 +46,7 @@ impl Tool for KdfDerive {
 
     fn run(_ctx: &ToolContext, req: KdfRequest) -> Result<KdfResponse, CryptoError> {
         let salt_enc = req.salt_encoding.as_deref().unwrap_or("text");
-        let salt = decode_data(&req.salt, salt_enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
+        let salt = decode_data(&req.salt, salt_enc).map_err(CryptoError::InvalidDataEncoding)?;
         let length = req.length.unwrap_or(32) as usize;
         let out_enc = req.output_encoding.as_deref().unwrap_or("hex");
         let mut output = vec![0u8; length];
@@ -58,13 +57,23 @@ impl Tool for KdfDerive {
                 let memory = req.memory_kib.unwrap_or(65536);
                 let params = argon2::Params::new(memory, iterations, 1, Some(length))
                     .map_err(|e| CryptoError::DerivationFailed(e.to_string()))?;
-                let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-                argon.hash_password_into(req.password.as_bytes(), &salt, &mut output)
+                let argon = argon2::Argon2::new(
+                    argon2::Algorithm::Argon2id,
+                    argon2::Version::V0x13,
+                    params,
+                );
+                argon
+                    .hash_password_into(req.password.as_bytes(), &salt, &mut output)
                     .map_err(|e| CryptoError::DerivationFailed(e.to_string()))?;
             }
             "pbkdf2_sha256" => {
                 let iters = req.iterations.unwrap_or(100000);
-                pbkdf2::pbkdf2_hmac::<sha2::Sha256>(req.password.as_bytes(), &salt, iters, &mut output);
+                pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+                    req.password.as_bytes(),
+                    &salt,
+                    iters,
+                    &mut output,
+                );
             }
             "scrypt" => {
                 let log_n = 15u8;

@@ -183,11 +183,7 @@ impl BackingInner {
                         // first and only allocate a remapped copy when
                         // a change is actually needed. The unchanged
                         // path is the common case and is now zero-cost.
-                        if !cw
-                            .gids
-                            .iter()
-                            .any(|gid| remap.contains_key(&gid.raw()))
-                        {
+                        if !cw.gids.iter().any(|gid| remap.contains_key(&gid.raw())) {
                             return None;
                         }
                         let new_inner: Vec<super::gid_pool::ChunkGid> = cw

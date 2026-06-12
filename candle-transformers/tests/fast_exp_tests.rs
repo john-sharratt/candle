@@ -5,8 +5,8 @@
 
 #[cfg(feature = "cuda")]
 mod fast_exp_cuda {
-    use candle::{DType, Device, Result, Tensor};
     use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle::{DType, Device, Result, Tensor};
     use candle_kernels::simple::fast_exp::{
         FastActivation, FastExpDType, FastExpMode, FastExpPrecision,
     };
@@ -56,13 +56,21 @@ mod fast_exp_cuda {
         // 1. Edge cases (if enabled)
         if config.include_edge_cases {
             // Exact boundaries
-            values.extend_from_slice(&[0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, -f32::MIN_POSITIVE]);
+            values.extend_from_slice(&[
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                f32::MIN_POSITIVE,
+                -f32::MIN_POSITIVE,
+            ]);
 
             // Near clamp boundaries
             values.extend_from_slice(&[-88.0, -87.99, -87.5, 88.0, 87.99, 87.5]);
 
             // Extreme values (should be clamped)
-            values.extend_from_slice(&[-100.0, -200.0, -500.0, -1000.0, 100.0, 200.0, 500.0, 1000.0]);
+            values
+                .extend_from_slice(&[-100.0, -200.0, -500.0, -1000.0, 100.0, 200.0, 500.0, 1000.0]);
         }
 
         // 2. Linear sweep across the valid range
@@ -121,7 +129,7 @@ mod fast_exp_cuda {
     }
 
     /// Compare results with tolerance
-    /// 
+    ///
     /// For clamped exp functions:
     /// - When ref is +inf and output > 1e30, that's correct (clamped to avoid overflow)
     /// - When ref is 0 and output is very small (< 1e-30), that's correct (clamped underflow)
@@ -152,7 +160,10 @@ mod fast_exp_cuda {
                 if out.is_nan() || (!out.is_finite() && *out < 0.0) {
                     error_count += 1;
                     if error_count <= 10 {
-                        println!("[{}] Input={}, Output={}, Expected=NaN or clamped", i, inp, out);
+                        println!(
+                            "[{}] Input={}, Output={}, Expected=NaN or clamped",
+                            i, inp, out
+                        );
                     }
                 }
                 nan_count += 1;
@@ -168,7 +179,10 @@ mod fast_exp_cuda {
                 } else {
                     error_count += 1;
                     if error_count <= 10 {
-                        println!("[{}] Input={}, Output={}, Expected=inf or >1e30", i, inp, out);
+                        println!(
+                            "[{}] Input={}, Output={}, Expected=inf or >1e30",
+                            i, inp, out
+                        );
                     }
                 }
                 inf_count += 1;
@@ -316,7 +330,13 @@ mod fast_exp_cuda {
 
         // Compare
         let name = format!("{:?}/{:?}", mode, precision);
-        compare_results(&input_values, &output_vec, &reference, &name, config.tolerance)?;
+        compare_results(
+            &input_values,
+            &output_vec,
+            &reference,
+            &name,
+            config.tolerance,
+        )?;
 
         Ok(())
     }
@@ -392,7 +412,13 @@ mod fast_exp_cuda {
 
         // Compare
         let name = format!("{:?}", activation);
-        compare_results(&input_values, &output_vec, &reference, &name, config.tolerance)?;
+        compare_results(
+            &input_values,
+            &output_vec,
+            &reference,
+            &name,
+            config.tolerance,
+        )?;
 
         Ok(())
     }
@@ -408,7 +434,12 @@ mod fast_exp_cuda {
             tolerance: 0.001, // 0.1% for high precision
             ..Default::default()
         };
-        run_exp_test(&device, FastExpMode::Generic, FastExpPrecision::High, &config)
+        run_exp_test(
+            &device,
+            FastExpMode::Generic,
+            FastExpPrecision::High,
+            &config,
+        )
     }
 
     #[test]
@@ -418,7 +449,12 @@ mod fast_exp_cuda {
             tolerance: 0.01, // 1% for medium precision (documented as ~0.08%)
             ..Default::default()
         };
-        run_exp_test(&device, FastExpMode::Generic, FastExpPrecision::Medium, &config)
+        run_exp_test(
+            &device,
+            FastExpMode::Generic,
+            FastExpPrecision::Medium,
+            &config,
+        )
     }
 
     #[test]
@@ -428,7 +464,12 @@ mod fast_exp_cuda {
             tolerance: 0.035, // 3.5% for low precision (documented as ~1.5%)
             ..Default::default()
         };
-        run_exp_test(&device, FastExpMode::Generic, FastExpPrecision::Low, &config)
+        run_exp_test(
+            &device,
+            FastExpMode::Generic,
+            FastExpPrecision::Low,
+            &config,
+        )
     }
 
     #[test]
@@ -438,7 +479,12 @@ mod fast_exp_cuda {
             tolerance: 0.001,
             ..Default::default()
         };
-        run_exp_test(&device, FastExpMode::Softmax, FastExpPrecision::High, &config)
+        run_exp_test(
+            &device,
+            FastExpMode::Softmax,
+            FastExpPrecision::High,
+            &config,
+        )
     }
 
     #[test]
@@ -448,7 +494,12 @@ mod fast_exp_cuda {
             tolerance: 0.01, // 1% for medium precision
             ..Default::default()
         };
-        run_exp_test(&device, FastExpMode::Softmax, FastExpPrecision::Medium, &config)
+        run_exp_test(
+            &device,
+            FastExpMode::Softmax,
+            FastExpPrecision::Medium,
+            &config,
+        )
     }
 
     #[test]
@@ -458,7 +509,12 @@ mod fast_exp_cuda {
             tolerance: 0.035, // 3.5% for low precision
             ..Default::default()
         };
-        run_exp_test(&device, FastExpMode::Softmax, FastExpPrecision::Low, &config)
+        run_exp_test(
+            &device,
+            FastExpMode::Softmax,
+            FastExpPrecision::Low,
+            &config,
+        )
     }
 
     #[test]
@@ -549,18 +605,29 @@ mod fast_exp_cuda {
         // Check monotonicity
         let mut violations = 0;
         for i in 1..output_vec.len() {
-            if output_vec[i] < output_vec[i - 1] && !output_vec[i].is_nan() && !output_vec[i - 1].is_nan() {
+            if output_vec[i] < output_vec[i - 1]
+                && !output_vec[i].is_nan()
+                && !output_vec[i - 1].is_nan()
+            {
                 violations += 1;
                 if violations <= 5 {
                     println!(
                         "Monotonicity violation at {}: f({})={} < f({})={}",
-                        i, input_values[i], output_vec[i], input_values[i - 1], output_vec[i - 1]
+                        i,
+                        input_values[i],
+                        output_vec[i],
+                        input_values[i - 1],
+                        output_vec[i - 1]
                     );
                 }
             }
         }
 
-        println!("Monotonicity test: {} violations out of {} pairs", violations, numel - 1);
+        println!(
+            "Monotonicity test: {} violations out of {} pairs",
+            violations,
+            numel - 1
+        );
 
         if violations > 0 {
             candle::bail!("Monotonicity violated {} times", violations);

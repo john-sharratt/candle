@@ -27,8 +27,8 @@
 //! | `invalid_data_encoding` | Bad hex or base64 input |
 //! | `no_match` | No algorithm produced the given digest (`hash_scan`) |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
 pub mod compute;
 pub mod scan;
@@ -66,7 +66,9 @@ pub fn decode_data(data: &str, encoding: &str) -> Result<Vec<u8>, HashError> {
                 .decode(data)
                 .map_err(|e| HashError::InvalidDataEncoding(e.to_string()))
         }
-        other => Err(HashError::InvalidDataEncoding(format!("unknown encoding: {other}"))),
+        other => Err(HashError::InvalidDataEncoding(format!(
+            "unknown encoding: {other}"
+        ))),
     }
 }
 

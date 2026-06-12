@@ -19,9 +19,9 @@ fn positive_probe_scores_above_boundary() {
     let h = Harness::build();
 
     let cases = [
-        ("weather",    "weather_pos_2",    "weather_bnd_0"),
+        ("weather", "weather_pos_2", "weather_bnd_0"),
         ("calculator", "calculator_pos_2", "calculator_bnd_0"),
-        ("code_run",   "code_run_pos_2",   "code_run_bnd_0"),
+        ("code_run", "code_run_pos_2", "code_run_bnd_0"),
     ];
 
     let mut failures: Vec<String> = Vec::new();
@@ -55,9 +55,9 @@ fn positive_probe_scores_above_negative() {
     let h = Harness::build();
 
     let cases = [
-        ("weather",    "weather_pos_2",    "weather_neg_0"),
+        ("weather", "weather_pos_2", "weather_neg_0"),
         ("calculator", "calculator_pos_2", "calculator_neg_0"),
-        ("code_run",   "code_run_pos_2",   "code_run_neg_0"),
+        ("code_run", "code_run_pos_2", "code_run_neg_0"),
     ];
 
     let mut failures: Vec<String> = Vec::new();

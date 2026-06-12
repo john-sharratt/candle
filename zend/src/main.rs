@@ -162,7 +162,9 @@ async fn main() -> anyhow::Result<()> {
     let bind_ip: IpAddr = match cli.host.as_str() {
         "localhost" => IpAddr::from([127, 0, 0, 1]),
         h => h.parse().map_err(|_| {
-            anyhow::anyhow!("invalid --host {h:?}: expected an IP address, e.g. 127.0.0.1 or 0.0.0.0")
+            anyhow::anyhow!(
+                "invalid --host {h:?}: expected an IP address, e.g. 127.0.0.1 or 0.0.0.0"
+            )
         })?,
     };
     let addr = SocketAddr::new(bind_ip, config.port);

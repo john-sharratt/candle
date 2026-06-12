@@ -91,7 +91,11 @@ impl LogWriter {
                 started_at,
             } => {
                 writeln!(self.file, "kind: header")?;
-                write_block_scalar(&mut self.file, "character_system_prompt", character_system_prompt)?;
+                write_block_scalar(
+                    &mut self.file,
+                    "character_system_prompt",
+                    character_system_prompt,
+                )?;
                 write_block_scalar(&mut self.file, "guide_system_prompt", guide_system_prompt)?;
                 writeln!(self.file, "started_at: {started_at}")?;
             }
@@ -137,7 +141,11 @@ fn write_block_scalar(w: &mut impl Write, key: &str, value: &str) -> std::io::Re
                 writeln!(w, "  {line}")?;
             }
         }
-    } else if value.contains(':') || value.contains('#') || value.contains('\'') || value.contains('"') {
+    } else if value.contains(':')
+        || value.contains('#')
+        || value.contains('\'')
+        || value.contains('"')
+    {
         // Single-line: inline, but quote if it contains special YAML characters.
         writeln!(w, "{key}: {value:?}")?;
     } else {
@@ -179,10 +187,17 @@ pub fn load_resume_log(path: impl AsRef<Path>) -> Result<ResumeLog> {
 
     for document in serde_yaml::Deserializer::from_str(&text) {
         match LogRecord::deserialize(document)? {
-            LogRecord::Header { character_system_prompt, .. } => {
+            LogRecord::Header {
+                character_system_prompt,
+                ..
+            } => {
                 system_prompt = character_system_prompt;
             }
-            LogRecord::Turn { guide_message, character_response, .. } => {
+            LogRecord::Turn {
+                guide_message,
+                character_response,
+                ..
+            } => {
                 turns.push(ResumeTurn {
                     user_message: guide_message,
                     character_response,
@@ -192,7 +207,10 @@ pub fn load_resume_log(path: impl AsRef<Path>) -> Result<ResumeLog> {
         }
     }
 
-    Ok(ResumeLog { character_system_prompt: system_prompt, turns })
+    Ok(ResumeLog {
+        character_system_prompt: system_prompt,
+        turns,
+    })
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

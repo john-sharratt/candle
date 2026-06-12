@@ -164,7 +164,8 @@ impl Aggregator {
         let top_k_mean = top_k_sum as f32 / k;
 
         // Span: Σ L^α over consecutive runs of hit probe positions.
-        let span: f32 = self.probe_hits
+        let span: f32 = self
+            .probe_hits
             .split(|&h| !h)
             .filter(|run| !run.is_empty())
             .map(|run| (run.len() as f32).powf(self.span_alpha))
@@ -333,8 +334,7 @@ impl BdpScanner {
             return Ok(());
         }
 
-        let entries_per_item: Vec<&[SigEntry]> =
-            corpus.iter().map(|(_, e)| e.as_slice()).collect();
+        let entries_per_item: Vec<&[SigEntry]> = corpus.iter().map(|(_, e)| e.as_slice()).collect();
         let (aggs, _) = scan_core(
             provenance,
             &entries_per_item,
@@ -387,8 +387,7 @@ impl BdpScanner {
             return Ok(());
         }
 
-        let entries_per_item: Vec<&[SigEntry]> =
-            corpus.iter().map(|(_, e)| e.as_slice()).collect();
+        let entries_per_item: Vec<&[SigEntry]> = corpus.iter().map(|(_, e)| e.as_slice()).collect();
         let (aggs, raw_hits) = scan_core(
             provenance,
             &entries_per_item,
@@ -456,11 +455,13 @@ fn scan_core(
     order.sort_unstable_by_key(|&(off, _, _)| off);
 
     let mut aggs: Vec<[Aggregator; 3]> = (0..n_items)
-        .map(|_| [
-            Aggregator::new(top_k, span_alpha),
-            Aggregator::new(top_k, span_alpha),
-            Aggregator::new(top_k, span_alpha),
-        ])
+        .map(|_| {
+            [
+                Aggregator::new(top_k, span_alpha),
+                Aggregator::new(top_k, span_alpha),
+                Aggregator::new(top_k, span_alpha),
+            ]
+        })
         .collect();
 
     let mut raw_hits: Option<Vec<Vec<TokenHit>>> = if record_hits {
@@ -585,8 +586,8 @@ unsafe fn accumulate_depth_avx2(
 
     // Nibble → popcount lookup, duplicated for both 128-bit halves of a YMM.
     let lut = _mm256_setr_epi8(
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
     );
     let lo_mask = _mm256_set1_epi8(0x0F_u8 as i8);
     let zero = _mm256_setzero_si256();
@@ -602,17 +603,13 @@ unsafe fn accumulate_depth_avx2(
         let mut best_pi = 0u32;
         // Two corpus tokens (32 bytes) per AVX2 iteration.
         while ci + 2 <= n {
-            let corpus256 =
-                _mm256_loadu_si256(data.as_ptr().add(ci * B) as *const __m256i);
+            let corpus256 = _mm256_loadu_si256(data.as_ptr().add(ci * B) as *const __m256i);
 
             // Per-byte Hamming bits via nibble popcount of XOR.
             let xor_v = _mm256_xor_si256(corpus256, probe256);
             let lo = _mm256_and_si256(xor_v, lo_mask);
             let hi = _mm256_and_si256(_mm256_srli_epi16(xor_v, 4), lo_mask);
-            let pc = _mm256_add_epi8(
-                _mm256_shuffle_epi8(lut, lo),
-                _mm256_shuffle_epi8(lut, hi),
-            );
+            let pc = _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo), _mm256_shuffle_epi8(lut, hi));
 
             // vpsadbw sums bytes in 64-bit blocks → 4 × u64 partial sums.
             let sad = _mm256_sad_epu8(pc, zero);
@@ -620,11 +617,11 @@ unsafe fn accumulate_depth_avx2(
             let hi128 = _mm256_extracti128_si256(sad, 1);
 
             // Token ci+0: Hamming = bytes 0..15 = sad lane0 + lane1.
-            let hdist0 = (_mm_extract_epi64(lo128, 0) as u64
-                + _mm_extract_epi64(lo128, 1) as u64) as u32;
+            let hdist0 =
+                (_mm_extract_epi64(lo128, 0) as u64 + _mm_extract_epi64(lo128, 1) as u64) as u32;
             // Token ci+1: Hamming = bytes 16..31 = sad lane2 + lane3.
-            let hdist1 = (_mm_extract_epi64(hi128, 0) as u64
-                + _mm_extract_epi64(hi128, 1) as u64) as u32;
+            let hdist1 =
+                (_mm_extract_epi64(hi128, 0) as u64 + _mm_extract_epi64(hi128, 1) as u64) as u32;
 
             let ag0 = 128 - hdist0;
             let ag1 = 128 - hdist1;
@@ -778,7 +775,9 @@ mod tests {
         assert_eq!(scanner.scores().len(), 1);
 
         // Empty corpus on the next scan should clear the map.
-        scanner.scan(&provenance, &[probe], &[probe], &[probe], &[]).unwrap();
+        scanner
+            .scan(&provenance, &[probe], &[probe], &[probe], &[])
+            .unwrap();
         assert!(scanner.scores().is_empty());
     }
 
@@ -786,20 +785,16 @@ mod tests {
     fn scanner_identical_probe_and_corpus_yields_max_128() {
         let provenance = ProvenanceFile::new().unwrap();
         let s = sig_with_first_byte(0x33);
-        let entry = provenance.append(&[s, s, s], &[s, s, s], &[s, s, s]).unwrap();
+        let entry = provenance
+            .append(&[s, s, s], &[s, s, s], &[s, s, s])
+            .unwrap();
         let t = timeline_id();
         let i = TurnIndex(0);
         let key = TurnKey::new(t, i);
 
         let mut scanner = BdpScanner::new().with_hit_threshold(120);
         scanner
-            .scan(
-                &provenance,
-                &[s],
-                &[s],
-                &[s],
-                &[(key, vec![entry])],
-            )
+            .scan(&provenance, &[s], &[s], &[s], &[(key, vec![entry])])
             .unwrap();
 
         let scores = scanner.scores().get(&key).unwrap();
@@ -816,7 +811,9 @@ mod tests {
     // ── AVX2 fast-path tests ──────────────────────────────────────────────────
 
     fn sigs_to_bytes(sigs: &[TokenSignature]) -> Vec<u8> {
-        sigs.iter().flat_map(|s| s.as_bytes().iter().copied()).collect()
+        sigs.iter()
+            .flat_map(|s| s.as_bytes().iter().copied())
+            .collect()
     }
 
     fn run_scalar_agg(data: &[u8], n: usize, probe: &[TokenSignature], thr: u32) -> TurnScores {
@@ -826,12 +823,19 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn run_avx2_agg(data: &[u8], n: usize, probe: &[TokenSignature], thr: u32) -> Option<TurnScores> {
+    fn run_avx2_agg(
+        data: &[u8],
+        n: usize,
+        probe: &[TokenSignature],
+        thr: u32,
+    ) -> Option<TurnScores> {
         if !is_x86_feature_detected!("avx2") {
             return None;
         }
         let mut agg = Aggregator::new(8, 2.0);
-        unsafe { accumulate_depth_avx2(data, n, probe, &mut agg, thr); }
+        unsafe {
+            accumulate_depth_avx2(data, n, probe, &mut agg, thr);
+        }
         Some(agg.finish())
     }
 

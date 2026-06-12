@@ -60,7 +60,10 @@ impl CredentialStore {
         let mut guard = self.inner.write().unwrap();
         // Check for duplicate name (exclude self-update by same name key)
         if guard.contains_key(&cred.name) && guard[&cred.name].id != cred.id {
-            return Err(format!("credential with name {:?} already exists", cred.name));
+            return Err(format!(
+                "credential with name {:?} already exists",
+                cred.name
+            ));
         }
         if cred.id.is_empty() {
             cred.id = format!("cred_{}", Uuid::new_v4());
@@ -96,6 +99,11 @@ impl CredentialStore {
 
     /// Linear scan by id — kept for backward-compat within this crate.
     pub fn get_by_id(&self, id: &str) -> Option<Credential> {
-        self.inner.read().unwrap().values().find(|c| c.id == id).cloned()
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .find(|c| c.id == id)
+            .cloned()
     }
 }

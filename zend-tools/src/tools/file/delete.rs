@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::FileError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
@@ -41,7 +41,10 @@ impl Tool for FileDelete {
         if !deleted {
             return Err(FileError::NotFound(req.path));
         }
-        Ok(DeleteResponse { path: req.path, deleted: true })
+        Ok(DeleteResponse {
+            path: req.path,
+            deleted: true,
+        })
     }
 }
 

@@ -16,10 +16,9 @@ async fn watcher_fires_callback_on_file_create() {
 
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = Arc::clone(&counter);
-    let cb: Arc<dyn Fn() + Send + Sync> =
-        Arc::new(move || {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
-        });
+    let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        counter_clone.fetch_add(1, Ordering::SeqCst);
+    });
 
     let _watcher = zend::watcher::spawn(&workspace, cb).expect("watcher started");
     // Allow the watcher's background task a moment to arm before we
@@ -31,8 +30,7 @@ async fn watcher_fires_callback_on_file_create() {
     std::fs::write(workspace.join("bravo.rs"), b"// new\n").unwrap();
 
     // Wait past the debounce window for the callback to fire.
-    tokio::time::sleep(zend::watcher::DEBOUNCE_WINDOW + Duration::from_millis(500))
-        .await;
+    tokio::time::sleep(zend::watcher::DEBOUNCE_WINDOW + Duration::from_millis(500)).await;
 
     assert!(
         counter.load(Ordering::SeqCst) >= 1,
@@ -60,8 +58,7 @@ async fn watcher_debounces_event_bursts_into_one_call() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     // Wait for the debounce to time out.
-    tokio::time::sleep(zend::watcher::DEBOUNCE_WINDOW + Duration::from_millis(500))
-        .await;
+    tokio::time::sleep(zend::watcher::DEBOUNCE_WINDOW + Duration::from_millis(500)).await;
 
     let n = counter.load(Ordering::SeqCst);
     assert!(

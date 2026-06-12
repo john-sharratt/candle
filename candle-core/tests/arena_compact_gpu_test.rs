@@ -444,7 +444,10 @@ fn perf_arena_compact_copy() -> Result<()> {
     let iters = 500;
 
     println!("\n=== arena_compact_copy_async perf (stride={stride}, blockDim=128) ===");
-    println!("{:>8} {:>12} {:>12} {:>10}", "moves", "calls/sec", "moves/sec", "GB/s");
+    println!(
+        "{:>8} {:>12} {:>12} {:>10}",
+        "moves", "calls/sec", "moves/sec", "GB/s"
+    );
 
     for &n_moves in &batch_sizes {
         let moves: Vec<CompactMove> = (0..n_moves)

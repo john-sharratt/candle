@@ -17,13 +17,19 @@ pub struct HarnessResolver {
 
 impl HarnessResolver {
     pub fn new() -> Self {
-        Self { section_scores: HashMap::new() }
+        Self {
+            section_scores: HashMap::new(),
+        }
     }
 }
 
 impl ContentResolver for HarnessResolver {
-    fn turn_count(&self, _group: GroupId) -> u32 { 0 }
-    fn turn_token_count(&self, _group: GroupId, _index: TurnIndex) -> usize { 0 }
+    fn turn_count(&self, _group: GroupId) -> u32 {
+        0
+    }
+    fn turn_token_count(&self, _group: GroupId, _index: TurnIndex) -> usize {
+        0
+    }
     fn turn_score(
         &self,
         _group: GroupId,
@@ -47,11 +53,13 @@ impl ContentResolver for HarnessResolver {
     ) -> f32 {
         self.section_scores
             .get(&section)
-            .map(|s| weights.combine(
-                s.syn.pick(formula),
-                s.sem.pick(formula),
-                s.prag.pick(formula),
-            ))
+            .map(|s| {
+                weights.combine(
+                    s.syn.pick(formula),
+                    s.sem.pick(formula),
+                    s.prag.pick(formula),
+                )
+            })
             .unwrap_or(0.0)
     }
 }

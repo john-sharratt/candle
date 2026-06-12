@@ -103,7 +103,10 @@ mod tests {
     fn extracts_function_and_class_method() {
         verify(
             "function alpha() {}\nclass Foo {\n  bar() {}\n}\n",
-            &[("function alpha", "function alpha"), ("class Foo > bar", "bar")],
+            &[
+                ("function alpha", "function alpha"),
+                ("class Foo > bar", "bar"),
+            ],
         );
     }
 
@@ -247,7 +250,10 @@ mod tests {
     fn preserves_crlf_endings() {
         verify(
             "function alpha() {}\r\nfunction beta() {}\r\n",
-            &[("function alpha", "function alpha"), ("function beta", "function beta")],
+            &[
+                ("function alpha", "function alpha"),
+                ("function beta", "function beta"),
+            ],
         );
     }
 
@@ -270,7 +276,9 @@ mod tests {
     fn preserves_object_method_shorthand_export() {
         // Method-shorthand inside an object literal isn't a
         // first-class scope; the binding still gets prefilled.
-        verify_cov("export const api = {\n    fetch(id) { return id; },\n    save(x) { return x; },\n};\n");
+        verify_cov(
+            "export const api = {\n    fetch(id) { return id; },\n    save(x) { return x; },\n};\n",
+        );
     }
 
     #[test]

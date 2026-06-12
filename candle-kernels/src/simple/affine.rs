@@ -38,16 +38,96 @@ impl AffineDType {
 
 extern "C" {
     // Individual typed kernel bindings
-    pub fn affine_f32(numel: usize, num_dims: usize, info: *const usize, inp: *const f32, out: *mut f32, mul: f32, add: f32);
-    pub fn affine_f64(numel: usize, num_dims: usize, info: *const usize, inp: *const f64, out: *mut f64, mul: f64, add: f64);
-    pub fn affine_u8(numel: usize, num_dims: usize, info: *const usize, inp: *const u8, out: *mut u8, mul: u8, add: u8);
-    pub fn affine_u32(numel: usize, num_dims: usize, info: *const usize, inp: *const u32, out: *mut u32, mul: u32, add: u32);
-    pub fn affine_i16(numel: usize, num_dims: usize, info: *const usize, inp: *const i16, out: *mut i16, mul: i16, add: i16);
-    pub fn affine_i32(numel: usize, num_dims: usize, info: *const usize, inp: *const i32, out: *mut i32, mul: i32, add: i32);
-    pub fn affine_i64(numel: usize, num_dims: usize, info: *const usize, inp: *const i64, out: *mut i64, mul: i64, add: i64);
-    pub fn affine_f16(numel: usize, num_dims: usize, info: *const usize, inp: *const c_void, out: *mut c_void, mul: u16, add: u16);
-    pub fn affine_bf16(numel: usize, num_dims: usize, info: *const usize, inp: *const c_void, out: *mut c_void, mul: u16, add: u16);
-    pub fn affine_f8_e4m3(numel: usize, num_dims: usize, info: *const usize, inp: *const c_void, out: *mut c_void, mul: u8, add: u8);
+    pub fn affine_f32(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const f32,
+        out: *mut f32,
+        mul: f32,
+        add: f32,
+    );
+    pub fn affine_f64(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const f64,
+        out: *mut f64,
+        mul: f64,
+        add: f64,
+    );
+    pub fn affine_u8(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const u8,
+        out: *mut u8,
+        mul: u8,
+        add: u8,
+    );
+    pub fn affine_u32(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const u32,
+        out: *mut u32,
+        mul: u32,
+        add: u32,
+    );
+    pub fn affine_i16(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const i16,
+        out: *mut i16,
+        mul: i16,
+        add: i16,
+    );
+    pub fn affine_i32(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const i32,
+        out: *mut i32,
+        mul: i32,
+        add: i32,
+    );
+    pub fn affine_i64(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const i64,
+        out: *mut i64,
+        mul: i64,
+        add: i64,
+    );
+    pub fn affine_f16(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const c_void,
+        out: *mut c_void,
+        mul: u16,
+        add: u16,
+    );
+    pub fn affine_bf16(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const c_void,
+        out: *mut c_void,
+        mul: u16,
+        add: u16,
+    );
+    pub fn affine_f8_e4m3(
+        numel: usize,
+        num_dims: usize,
+        info: *const usize,
+        inp: *const c_void,
+        out: *mut c_void,
+        mul: u8,
+        add: u8,
+    );
 
     /// Dispatches to the appropriate affine kernel based on dtype.
     ///

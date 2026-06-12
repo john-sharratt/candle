@@ -289,14 +289,15 @@ fn migrate_group_hot_to_warm(
         return;
     }
     // Per-residence (new_hot, new_warm) accumulators, one slot per layer.
-    let mut hot_per: Vec<Vec<SealedSequence>> =
-        (0..group.len()).map(|_| Vec::with_capacity(n_layers)).collect();
-    let mut warm_per: Vec<Vec<SealedSequence>> =
-        (0..group.len()).map(|_| Vec::with_capacity(n_layers)).collect();
+    let mut hot_per: Vec<Vec<SealedSequence>> = (0..group.len())
+        .map(|_| Vec::with_capacity(n_layers))
+        .collect();
+    let mut warm_per: Vec<Vec<SealedSequence>> = (0..group.len())
+        .map(|_| Vec::with_capacity(n_layers))
+        .collect();
     let mut ok = vec![true; group.len()];
     for layer in 0..n_layers {
-        let layer_inputs: Vec<&SealedSequence> =
-            group.iter().map(|(_, hot)| &hot[layer]).collect();
+        let layer_inputs: Vec<&SealedSequence> = group.iter().map(|(_, hot)| &hot[layer]).collect();
 
         // Step 1: when a policy is configured, run the GPU-only
         // quantize-in-place pass — a fresh `Vec<SealedSequence>` whose full
@@ -592,11 +593,8 @@ fn run_pass(
     let mut section_to_cold_bytes: u64 = 0;
     let mut section_to_cold_count: usize = 0;
     if !pending_section_cold.is_empty() {
-        let mut section_cold_installs: Vec<(
-            ResidenceIndex,
-            Vec<StoredSequence>,
-            u64,
-        )> = Vec::with_capacity(pending_section_cold.len());
+        let mut section_cold_installs: Vec<(ResidenceIndex, Vec<StoredSequence>, u64)> =
+            Vec::with_capacity(pending_section_cold.len());
         for (idx, stream_id, hot) in pending_section_cold {
             if hot.len() != n_layers {
                 tracing::warn!(

@@ -65,3 +65,7 @@ tracing-subscriber = { workspace = true }
 default = []
 # Enable to run GPU-backed integration tests (needs CUDA + GGUF model on disk).
 cuda = []
+# Zero-cost scoped timing of the projection / reproject hot path. Forwards to
+# candle-conversation; emits an aggregated breakdown under
+# `candle_conversation::scheduler::profile`.
+profile = ["candle-conversation/profile"]

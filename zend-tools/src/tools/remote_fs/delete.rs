@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::RemoteFsError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
@@ -53,5 +53,4 @@ impl Tool for RemoteFsSessionDelete {
     }
 }
 
-pub const REMOTE_FS_SESSION_DELETE: RegisteredTool =
-    RegisteredTool::new::<RemoteFsSessionDelete>();
+pub const REMOTE_FS_SESSION_DELETE: RegisteredTool = RegisteredTool::new::<RemoteFsSessionDelete>();

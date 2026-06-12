@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 use super::TlsError;
+use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SendRequest {
@@ -33,8 +33,10 @@ impl Tool for TlsSessionSend {
     type Error = TlsError;
 
     fn confirmation(req: &SendRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new("Send over TLS")
-            .with_field("session_id", req.session_id.clone()))
+        Some(
+            ConfirmationDetails::new("Send over TLS")
+                .with_field("session_id", req.session_id.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: SendRequest) -> Result<SendResponse, TlsError> {
@@ -43,16 +45,24 @@ impl Tool for TlsSessionSend {
         } else if let Some(text) = &req.data {
             text.as_bytes().to_vec()
         } else {
-            return Err(TlsError::InvalidParams("data or data_hex required".to_string()));
+            return Err(TlsError::InvalidParams(
+                "data or data_hex required".to_string(),
+            ));
         };
 
-        let entry_arc = ctx.sessions.get_tls(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_tls(&req.session_id)
             .ok_or_else(|| TlsError::SessionNotFound(req.session_id.clone()))?;
         let mut entry = entry_arc.lock().unwrap();
-        entry.stream.write_all(&bytes)
+        entry
+            .stream
+            .write_all(&bytes)
             .map_err(|e| TlsError::SendFailed(e.to_string()))?;
 
-        Ok(SendResponse { bytes_written: bytes.len() })
+        Ok(SendResponse {
+            bytes_written: bytes.len(),
+        })
     }
 }
 

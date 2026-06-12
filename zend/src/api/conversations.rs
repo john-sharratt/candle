@@ -53,11 +53,7 @@ pub async fn unarchive(
     set_archived(&session, &id, false)
 }
 
-fn set_archived(
-    session: &ZendSession,
-    id: &str,
-    archived: bool,
-) -> Result<StatusCode, StatusCode> {
+fn set_archived(session: &ZendSession, id: &str, archived: bool) -> Result<StatusCode, StatusCode> {
     match session.set_conversation_archived(id, archived) {
         Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
         Some(Err(e)) => {

@@ -286,7 +286,13 @@ fn binary_f8e4m3_large_aligned(dev: &Device) -> Result<()> {
     // Check first few values
     for i in 0..10 {
         let expected = ((i % 10) as f32) * 0.5 + ((i % 10) as f32) * 0.25;
-        assert!((result[i] - expected).abs() < 1.0, "index {}: expected {}, got {}", i, expected, result[i]);
+        assert!(
+            (result[i] - expected).abs() < 1.0,
+            "index {}: expected {}, got {}",
+            i,
+            expected,
+            result[i]
+        );
     }
     Ok(())
 }
@@ -300,7 +306,13 @@ fn binary_f8e4m3_odd_size(dev: &Device) -> Result<()> {
     let result = c.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     for i in 0..7 {
         let expected = (i + 2) as f32;
-        assert!((result[i] - expected).abs() < 0.5, "index {}: expected {}, got {}", i, expected, result[i]);
+        assert!(
+            (result[i] - expected).abs() < 0.5,
+            "index {}: expected {}, got {}",
+            i,
+            expected,
+            result[i]
+        );
     }
     Ok(())
 }
@@ -310,23 +322,88 @@ fn binary_f8e4m3_odd_size(dev: &Device) -> Result<()> {
 // =============================================================================
 
 // F32 tests
-test_device!(binary_add_f32, binary_add_f32_cpu, binary_add_f32_cuda, binary_add_f32_metal);
-test_device!(binary_sub_f32, binary_sub_f32_cpu, binary_sub_f32_cuda, binary_sub_f32_metal);
-test_device!(binary_mul_f32, binary_mul_f32_cpu, binary_mul_f32_cuda, binary_mul_f32_metal);
-test_device!(binary_div_f32, binary_div_f32_cpu, binary_div_f32_cuda, binary_div_f32_metal);
-test_device!(binary_min_max_f32, binary_min_max_f32_cpu, binary_min_max_f32_cuda, binary_min_max_f32_metal);
-test_device!(binary_f32_large_aligned, binary_f32_large_aligned_cpu, binary_f32_large_aligned_cuda, binary_f32_large_aligned_metal);
-test_device!(binary_f32_odd_size, binary_f32_odd_size_cpu, binary_f32_odd_size_cuda, binary_f32_odd_size_metal);
+test_device!(
+    binary_add_f32,
+    binary_add_f32_cpu,
+    binary_add_f32_cuda,
+    binary_add_f32_metal
+);
+test_device!(
+    binary_sub_f32,
+    binary_sub_f32_cpu,
+    binary_sub_f32_cuda,
+    binary_sub_f32_metal
+);
+test_device!(
+    binary_mul_f32,
+    binary_mul_f32_cpu,
+    binary_mul_f32_cuda,
+    binary_mul_f32_metal
+);
+test_device!(
+    binary_div_f32,
+    binary_div_f32_cpu,
+    binary_div_f32_cuda,
+    binary_div_f32_metal
+);
+test_device!(
+    binary_min_max_f32,
+    binary_min_max_f32_cpu,
+    binary_min_max_f32_cuda,
+    binary_min_max_f32_metal
+);
+test_device!(
+    binary_f32_large_aligned,
+    binary_f32_large_aligned_cpu,
+    binary_f32_large_aligned_cuda,
+    binary_f32_large_aligned_metal
+);
+test_device!(
+    binary_f32_odd_size,
+    binary_f32_odd_size_cpu,
+    binary_f32_odd_size_cuda,
+    binary_f32_odd_size_metal
+);
 
 // F16 tests
-test_device!(binary_add_f16, binary_add_f16_cpu, binary_add_f16_cuda, binary_add_f16_metal);
-test_device!(binary_f16_large_aligned, binary_f16_large_aligned_cpu, binary_f16_large_aligned_cuda, binary_f16_large_aligned_metal);
-test_device!(binary_f16_odd_size, binary_f16_odd_size_cpu, binary_f16_odd_size_cuda, binary_f16_odd_size_metal);
+test_device!(
+    binary_add_f16,
+    binary_add_f16_cpu,
+    binary_add_f16_cuda,
+    binary_add_f16_metal
+);
+test_device!(
+    binary_f16_large_aligned,
+    binary_f16_large_aligned_cpu,
+    binary_f16_large_aligned_cuda,
+    binary_f16_large_aligned_metal
+);
+test_device!(
+    binary_f16_odd_size,
+    binary_f16_odd_size_cpu,
+    binary_f16_odd_size_cuda,
+    binary_f16_odd_size_metal
+);
 
 // BF16 tests
-test_device!(binary_add_bf16, binary_add_bf16_cpu, binary_add_bf16_cuda, binary_add_bf16_metal);
-test_device!(binary_bf16_large_aligned, binary_bf16_large_aligned_cpu, binary_bf16_large_aligned_cuda, binary_bf16_large_aligned_metal);
-test_device!(binary_bf16_odd_size, binary_bf16_odd_size_cpu, binary_bf16_odd_size_cuda, binary_bf16_odd_size_metal);
+test_device!(
+    binary_add_bf16,
+    binary_add_bf16_cpu,
+    binary_add_bf16_cuda,
+    binary_add_bf16_metal
+);
+test_device!(
+    binary_bf16_large_aligned,
+    binary_bf16_large_aligned_cpu,
+    binary_bf16_large_aligned_cuda,
+    binary_bf16_large_aligned_metal
+);
+test_device!(
+    binary_bf16_odd_size,
+    binary_bf16_odd_size_cpu,
+    binary_bf16_odd_size_cuda,
+    binary_bf16_odd_size_metal
+);
 
 // F8E4M3 tests (CUDA only, requires SM89+)
 #[cfg(feature = "cuda")]
@@ -458,14 +535,54 @@ fn inplace_add_bf16(dev: &Device) -> Result<()> {
     Ok(())
 }
 
-test_device!(inplace_add_f32, inplace_add_f32_cpu, inplace_add_f32_cuda, inplace_add_f32_metal);
-test_device!(inplace_sub_f32, inplace_sub_f32_cpu, inplace_sub_f32_cuda, inplace_sub_f32_metal);
-test_device!(inplace_mul_f32, inplace_mul_f32_cpu, inplace_mul_f32_cuda, inplace_mul_f32_metal);
-test_device!(inplace_div_f32, inplace_div_f32_cpu, inplace_div_f32_cuda, inplace_div_f32_metal);
-test_device!(inplace_min_max_f32, inplace_min_max_f32_cpu, inplace_min_max_f32_cuda, inplace_min_max_f32_metal);
-test_device!(inplace_large_f32, inplace_large_f32_cpu, inplace_large_f32_cuda, inplace_large_f32_metal);
-test_device!(inplace_add_f16, inplace_add_f16_cpu, inplace_add_f16_cuda, inplace_add_f16_metal);
-test_device!(inplace_add_bf16, inplace_add_bf16_cpu, inplace_add_bf16_cuda, inplace_add_bf16_metal);
+test_device!(
+    inplace_add_f32,
+    inplace_add_f32_cpu,
+    inplace_add_f32_cuda,
+    inplace_add_f32_metal
+);
+test_device!(
+    inplace_sub_f32,
+    inplace_sub_f32_cpu,
+    inplace_sub_f32_cuda,
+    inplace_sub_f32_metal
+);
+test_device!(
+    inplace_mul_f32,
+    inplace_mul_f32_cpu,
+    inplace_mul_f32_cuda,
+    inplace_mul_f32_metal
+);
+test_device!(
+    inplace_div_f32,
+    inplace_div_f32_cpu,
+    inplace_div_f32_cuda,
+    inplace_div_f32_metal
+);
+test_device!(
+    inplace_min_max_f32,
+    inplace_min_max_f32_cpu,
+    inplace_min_max_f32_cuda,
+    inplace_min_max_f32_metal
+);
+test_device!(
+    inplace_large_f32,
+    inplace_large_f32_cpu,
+    inplace_large_f32_cuda,
+    inplace_large_f32_metal
+);
+test_device!(
+    inplace_add_f16,
+    inplace_add_f16_cpu,
+    inplace_add_f16_cuda,
+    inplace_add_f16_metal
+);
+test_device!(
+    inplace_add_bf16,
+    inplace_add_bf16_cpu,
+    inplace_add_bf16_cuda,
+    inplace_add_bf16_metal
+);
 
 #[cfg(feature = "cuda")]
 fn inplace_add_f8e4m3(dev: &Device) -> Result<()> {

@@ -4,9 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::FileError;
 use crate::state::vfs::VfsError;
 use crate::{RegisteredTool, Tool, ToolContext};
-use super::FileError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
@@ -42,9 +42,14 @@ impl Tool for FileWrite {
 
     fn run(ctx: &ToolContext, req: WriteRequest) -> Result<WriteResponse, FileError> {
         let bytes = req.content.len();
-        let created = ctx.vfs.write(&req.path, req.content)
-            .map_err(|e| match e { VfsError::Full => FileError::VfsFull })?;
-        Ok(WriteResponse { path: req.path, bytes, created })
+        let created = ctx.vfs.write(&req.path, req.content).map_err(|e| match e {
+            VfsError::Full => FileError::VfsFull,
+        })?;
+        Ok(WriteResponse {
+            path: req.path,
+            bytes,
+            created,
+        })
     }
 }
 

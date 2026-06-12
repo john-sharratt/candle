@@ -391,7 +391,6 @@ pub fn quantize_sealed_in_place(
     let k_palette_maps = pack_head_palette_maps(&k_assignments, n_chunks, n_kv_head, head_dim)?;
     let v_palette_maps = pack_head_palette_maps(&v_assignments, n_chunks, n_kv_head, head_dim)?;
 
-
     // ── Allocate GPU-quant destination GIDs ───────────────────────────
     // One destination GID per (chunk, head, palette, K/V). The
     // candidate arenas are warm-protected at backing creation when
@@ -427,187 +426,185 @@ pub fn quantize_sealed_in_place(
     let mut descs: Vec<PalHeadDesc> = Vec::with_capacity(n_chunks * n_kv_head);
 
     backing.inner.storage.try_write(|storage| {
-            for (chunk_i, src_gids) in chunk_jobs.iter().enumerate() {
-                let ident = identity_pal_map_128();
-                for h in 0..n_kv_head {
-                    let mut k_src_ptrs = [0u64; N_PALETTE];
-                    let mut k_dst_ptrs = [0u64; N_PALETTE];
-                    let mut k_src_fmts = [GgmlDType::F16; N_PALETTE];
-                    let mut k_dst_fmts = [GgmlDType::F16; N_PALETTE];
-                    let mut v_src_ptrs = [0u64; N_PALETTE];
-                    let mut v_dst_ptrs = [0u64; N_PALETTE];
-                    let mut v_src_fmts = [GgmlDType::F16; N_PALETTE];
-                    let mut v_dst_fmts = [GgmlDType::F16; N_PALETTE];
+        for (chunk_i, src_gids) in chunk_jobs.iter().enumerate() {
+            let ident = identity_pal_map_128();
+            for h in 0..n_kv_head {
+                let mut k_src_ptrs = [0u64; N_PALETTE];
+                let mut k_dst_ptrs = [0u64; N_PALETTE];
+                let mut k_src_fmts = [GgmlDType::F16; N_PALETTE];
+                let mut k_dst_fmts = [GgmlDType::F16; N_PALETTE];
+                let mut v_src_ptrs = [0u64; N_PALETTE];
+                let mut v_dst_ptrs = [0u64; N_PALETTE];
+                let mut v_src_fmts = [GgmlDType::F16; N_PALETTE];
+                let mut v_dst_fmts = [GgmlDType::F16; N_PALETTE];
 
-                    for p in 0..N_PALETTE {
-                        let gid_slot = h * GIDS_PER_HEAD + p * 2;
+                for p in 0..N_PALETTE {
+                    let gid_slot = h * GIDS_PER_HEAD + p * 2;
 
-                        // K source.
-                        let k_src = src_gids.k_gid_pal(h, p);
-                        let k_src_ai = k_src.arena_idx();
-                        let k_src_arena = storage.arenas().get(&k_src_ai).ok_or_else(|| {
-                            candle::Error::Msg(format!("k src arena {k_src_ai} not found"))
+                    // K source.
+                    let k_src = src_gids.k_gid_pal(h, p);
+                    let k_src_ai = k_src.arena_idx();
+                    let k_src_arena = storage.arenas().get(&k_src_ai).ok_or_else(|| {
+                        candle::Error::Msg(format!("k src arena {k_src_ai} not found"))
+                    })?;
+                    let k_is_r16 =
+                        matches!(k_src_arena.format(), KvFormat::Quantized(QuantFormat::R16));
+                    k_src_fmts[p] = if k_is_r16 {
+                        GgmlDType::R16
+                    } else {
+                        dtype_to_ggml_float(k_src_arena.float_data()?.dtype())?
+                    };
+                    k_src_ptrs[p] = if k_is_r16 {
+                        let qt = k_src_arena.quantized_data()?;
+                        ChunkedKvBacking::qtensor_ptr_at_byte_offset(
+                            qt,
+                            k_src.chunk_idx() * r16_bytes_per_head,
+                        )?
+                    } else {
+                        ChunkedKvBacking::tensor_ptr_at_offset(
+                            k_src_arena.float_data()?,
+                            k_src.chunk_idx() * elems_per_head,
+                        )?
+                    };
+
+                    // K destination — `policy.override_k_quant` decides
+                    // between uniform override format and selection's
+                    // per-(chunk, head, palette) pick. Must match the K
+                    // arena alloc above.
+                    let k_dst = &new_gids_per_chunk[chunk_i][gid_slot];
+                    let k_qfmt = policy
+                        .override_k_quant
+                        .unwrap_or(k_palette_formats[chunk_i][h * N_PALETTE + p]);
+                    let k_qdtype = k_qfmt.to_ggml_dtype();
+                    let k_dst_bpc = (elems_per_head / k_qdtype.block_size()) * k_qdtype.type_size();
+                    let k_dst_arena =
+                        storage.arenas().get(&k_dst.arena_idx()).ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "k dst arena {} not found",
+                                k_dst.arena_idx()
+                            ))
                         })?;
-                        let k_is_r16 =
-                            matches!(k_src_arena.format(), KvFormat::Quantized(QuantFormat::R16));
-                        k_src_fmts[p] = if k_is_r16 {
-                            GgmlDType::R16
-                        } else {
-                            dtype_to_ggml_float(k_src_arena.float_data()?.dtype())?
-                        };
-                        k_src_ptrs[p] = if k_is_r16 {
-                            let qt = k_src_arena.quantized_data()?;
-                            ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                                qt,
-                                k_src.chunk_idx() * r16_bytes_per_head,
-                            )?
-                        } else {
-                            ChunkedKvBacking::tensor_ptr_at_offset(
-                                k_src_arena.float_data()?,
-                                k_src.chunk_idx() * elems_per_head,
-                            )?
-                        };
+                    let k_dst_qt = k_dst_arena.quantized_data()?;
+                    k_dst_fmts[p] = k_qdtype;
+                    k_dst_ptrs[p] = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
+                        k_dst_qt,
+                        k_dst.chunk_idx() * k_dst_bpc,
+                    )?;
 
-                        // K destination — `policy.override_k_quant` decides
-                        // between uniform override format and selection's
-                        // per-(chunk, head, palette) pick. Must match the K
-                        // arena alloc above.
-                        let k_dst = &new_gids_per_chunk[chunk_i][gid_slot];
-                        let k_qfmt = policy
-                            .override_k_quant
-                            .unwrap_or(k_palette_formats[chunk_i][h * N_PALETTE + p]);
-                        let k_qdtype = k_qfmt.to_ggml_dtype();
-                        let k_dst_bpc =
-                            (elems_per_head / k_qdtype.block_size()) * k_qdtype.type_size();
-                        let k_dst_arena =
-                            storage.arenas().get(&k_dst.arena_idx()).ok_or_else(|| {
-                                candle::Error::Msg(format!(
-                                    "k dst arena {} not found",
-                                    k_dst.arena_idx()
-                                ))
-                            })?;
-                        let k_dst_qt = k_dst_arena.quantized_data()?;
-                        k_dst_fmts[p] = k_qdtype;
-                        k_dst_ptrs[p] = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                            k_dst_qt,
-                            k_dst.chunk_idx() * k_dst_bpc,
-                        )?;
+                    // V source.
+                    let v_src = src_gids.v_gid_pal(h, p);
+                    let v_src_ai = v_src.arena_idx();
+                    let v_src_arena = storage.arenas().get(&v_src_ai).ok_or_else(|| {
+                        candle::Error::Msg(format!("v src arena {v_src_ai} not found"))
+                    })?;
+                    let v_is_r16 =
+                        matches!(v_src_arena.format(), KvFormat::Quantized(QuantFormat::R16));
+                    v_src_fmts[p] = if v_is_r16 {
+                        GgmlDType::R16
+                    } else {
+                        dtype_to_ggml_float(v_src_arena.float_data()?.dtype())?
+                    };
+                    v_src_ptrs[p] = if v_is_r16 {
+                        let qt = v_src_arena.quantized_data()?;
+                        ChunkedKvBacking::qtensor_ptr_at_byte_offset(
+                            qt,
+                            v_src.chunk_idx() * r16_bytes_per_head,
+                        )?
+                    } else {
+                        ChunkedKvBacking::tensor_ptr_at_offset(
+                            v_src_arena.float_data()?,
+                            v_src.chunk_idx() * elems_per_head,
+                        )?
+                    };
 
-                        // V source.
-                        let v_src = src_gids.v_gid_pal(h, p);
-                        let v_src_ai = v_src.arena_idx();
-                        let v_src_arena = storage.arenas().get(&v_src_ai).ok_or_else(|| {
-                            candle::Error::Msg(format!("v src arena {v_src_ai} not found"))
+                    // V destination — `policy.override_v_quant` decides
+                    // between uniform override format and selection's
+                    // per-(chunk, head, palette) pick. Must match the V
+                    // arena alloc above.
+                    let v_dst = &new_gids_per_chunk[chunk_i][gid_slot + 1];
+                    let v_qfmt = policy
+                        .override_v_quant
+                        .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p]);
+                    let v_qdtype = v_qfmt.to_ggml_dtype();
+                    let v_dst_bpc = (elems_per_head / v_qdtype.block_size()) * v_qdtype.type_size();
+                    let v_dst_arena =
+                        storage.arenas().get(&v_dst.arena_idx()).ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "v dst arena {} not found",
+                                v_dst.arena_idx()
+                            ))
                         })?;
-                        let v_is_r16 =
-                            matches!(v_src_arena.format(), KvFormat::Quantized(QuantFormat::R16));
-                        v_src_fmts[p] = if v_is_r16 {
-                            GgmlDType::R16
-                        } else {
-                            dtype_to_ggml_float(v_src_arena.float_data()?.dtype())?
-                        };
-                        v_src_ptrs[p] = if v_is_r16 {
-                            let qt = v_src_arena.quantized_data()?;
-                            ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                                qt,
-                                v_src.chunk_idx() * r16_bytes_per_head,
-                            )?
-                        } else {
-                            ChunkedKvBacking::tensor_ptr_at_offset(
-                                v_src_arena.float_data()?,
-                                v_src.chunk_idx() * elems_per_head,
-                            )?
-                        };
-
-                        // V destination — `policy.override_v_quant` decides
-                        // between uniform override format and selection's
-                        // per-(chunk, head, palette) pick. Must match the V
-                        // arena alloc above.
-                        let v_dst = &new_gids_per_chunk[chunk_i][gid_slot + 1];
-                        let v_qfmt = policy
-                            .override_v_quant
-                            .unwrap_or(v_palette_formats[chunk_i][h * N_PALETTE + p]);
-                        let v_qdtype = v_qfmt.to_ggml_dtype();
-                        let v_dst_bpc =
-                            (elems_per_head / v_qdtype.block_size()) * v_qdtype.type_size();
-                        let v_dst_arena =
-                            storage.arenas().get(&v_dst.arena_idx()).ok_or_else(|| {
-                                candle::Error::Msg(format!(
-                                    "v dst arena {} not found",
-                                    v_dst.arena_idx()
-                                ))
-                            })?;
-                        let v_dst_qt = v_dst_arena.quantized_data()?;
-                        v_dst_fmts[p] = v_qdtype;
-                        v_dst_ptrs[p] = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
-                            v_dst_qt,
-                            v_dst.chunk_idx() * v_dst_bpc,
-                        )?;
-                    }
-
-                    let pal_bytes = ident.len();
-                    let pal_start = h * pal_bytes;
-                    let pal_end = pal_start + pal_bytes;
-                    // K and V dst pal_maps: identity when the corresponding
-                    // override is active, else selection's per-(chunk, head).
-                    let k_dst_pal_map = if policy.override_k_quant.is_some() {
-                        ident
-                    } else {
-                        let mut m = ident;
-                        m.copy_from_slice(&k_palette_maps[chunk_i][pal_start..pal_end]);
-                        m
-                    };
-                    let v_dst_pal_map = if policy.override_v_quant.is_some() {
-                        ident
-                    } else {
-                        let mut m = ident;
-                        m.copy_from_slice(&v_palette_maps[chunk_i][pal_start..pal_end]);
-                        m
-                    };
-
-                    let scale_start = h * N_PALETTE;
-                    let scale_end = scale_start + N_PALETTE;
-                    // K and V dst scales: unit (1.0) when the corresponding
-                    // override is active, else selection's per-palette.
-                    let k_dst_scales = if policy.override_k_quant.is_some() {
-                        [1.0f32; N_PALETTE]
-                    } else {
-                        let mut s = [1.0f32; N_PALETTE];
-                        s.copy_from_slice(&k_palette_scales[chunk_i][scale_start..scale_end]);
-                        s
-                    };
-                    let v_dst_scales = if policy.override_v_quant.is_some() {
-                        [1.0f32; N_PALETTE]
-                    } else {
-                        let mut s = [1.0f32; N_PALETTE];
-                        s.copy_from_slice(&v_palette_scales[chunk_i][scale_start..scale_end]);
-                        s
-                    };
-
-                    descs.push(PalHeadDesc {
-                        k_src_arena_ptrs: k_src_ptrs,
-                        v_src_arena_ptrs: v_src_ptrs,
-                        k_src_fmts,
-                        v_src_fmts,
-                        k_src_pal_map: ident,
-                        v_src_pal_map: ident,
-                        // Source is restricted to GPU Float (F16/F32/BF16) or
-                        // Quantized(R16) by the eligibility check upstream; the
-                        // palette-4 kernel API takes 1.0 for any float source
-                        // because those formats have no outer-scale concept.
-                        k_src_scales: [1.0f32; N_PALETTE],
-                        v_src_scales: [1.0f32; N_PALETTE],
-                        k_dst_arena_ptrs: k_dst_ptrs,
-                        v_dst_arena_ptrs: v_dst_ptrs,
-                        k_dst_fmts,
-                        v_dst_fmts,
-                        k_dst_pal_map,
-                        v_dst_pal_map,
-                        k_dst_scales,
-                        v_dst_scales,
-                    });
+                    let v_dst_qt = v_dst_arena.quantized_data()?;
+                    v_dst_fmts[p] = v_qdtype;
+                    v_dst_ptrs[p] = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
+                        v_dst_qt,
+                        v_dst.chunk_idx() * v_dst_bpc,
+                    )?;
                 }
+
+                let pal_bytes = ident.len();
+                let pal_start = h * pal_bytes;
+                let pal_end = pal_start + pal_bytes;
+                // K and V dst pal_maps: identity when the corresponding
+                // override is active, else selection's per-(chunk, head).
+                let k_dst_pal_map = if policy.override_k_quant.is_some() {
+                    ident
+                } else {
+                    let mut m = ident;
+                    m.copy_from_slice(&k_palette_maps[chunk_i][pal_start..pal_end]);
+                    m
+                };
+                let v_dst_pal_map = if policy.override_v_quant.is_some() {
+                    ident
+                } else {
+                    let mut m = ident;
+                    m.copy_from_slice(&v_palette_maps[chunk_i][pal_start..pal_end]);
+                    m
+                };
+
+                let scale_start = h * N_PALETTE;
+                let scale_end = scale_start + N_PALETTE;
+                // K and V dst scales: unit (1.0) when the corresponding
+                // override is active, else selection's per-palette.
+                let k_dst_scales = if policy.override_k_quant.is_some() {
+                    [1.0f32; N_PALETTE]
+                } else {
+                    let mut s = [1.0f32; N_PALETTE];
+                    s.copy_from_slice(&k_palette_scales[chunk_i][scale_start..scale_end]);
+                    s
+                };
+                let v_dst_scales = if policy.override_v_quant.is_some() {
+                    [1.0f32; N_PALETTE]
+                } else {
+                    let mut s = [1.0f32; N_PALETTE];
+                    s.copy_from_slice(&v_palette_scales[chunk_i][scale_start..scale_end]);
+                    s
+                };
+
+                descs.push(PalHeadDesc {
+                    k_src_arena_ptrs: k_src_ptrs,
+                    v_src_arena_ptrs: v_src_ptrs,
+                    k_src_fmts,
+                    v_src_fmts,
+                    k_src_pal_map: ident,
+                    v_src_pal_map: ident,
+                    // Source is restricted to GPU Float (F16/F32/BF16) or
+                    // Quantized(R16) by the eligibility check upstream; the
+                    // palette-4 kernel API takes 1.0 for any float source
+                    // because those formats have no outer-scale concept.
+                    k_src_scales: [1.0f32; N_PALETTE],
+                    v_src_scales: [1.0f32; N_PALETTE],
+                    k_dst_arena_ptrs: k_dst_ptrs,
+                    v_dst_arena_ptrs: v_dst_ptrs,
+                    k_dst_fmts,
+                    v_dst_fmts,
+                    k_dst_pal_map,
+                    v_dst_pal_map,
+                    k_dst_scales,
+                    v_dst_scales,
+                });
             }
+        }
         Ok(())
     })?;
 
@@ -665,43 +662,37 @@ pub fn quantize_sealed_in_place(
         // indexes them directly without a length-fallback check (unlike
         // `slot_state::from_sealed_chunk`).
         let pal_bytes_per_head = head_dim / 4;
-        let identity_head_bytes: Option<Vec<u8>> = if policy.override_k_quant.is_some()
-            || policy.override_v_quant.is_some()
-        {
-            let identity_head = identity_pal_map_128();
-            let mut buf = vec![0u8; n_kv_head * pal_bytes_per_head];
-            for h in 0..n_kv_head {
-                buf[h * pal_bytes_per_head..(h + 1) * pal_bytes_per_head]
-                    .copy_from_slice(&identity_head);
-            }
-            Some(buf)
+        let identity_head_bytes: Option<Vec<u8>> =
+            if policy.override_k_quant.is_some() || policy.override_v_quant.is_some() {
+                let identity_head = identity_pal_map_128();
+                let mut buf = vec![0u8; n_kv_head * pal_bytes_per_head];
+                for h in 0..n_kv_head {
+                    buf[h * pal_bytes_per_head..(h + 1) * pal_bytes_per_head]
+                        .copy_from_slice(&identity_head);
+                }
+                Some(buf)
+            } else {
+                None
+            };
+        let (k_pal, k_scale): (Arc<Vec<u8>>, Arc<Vec<f32>>) = if policy.override_k_quant.is_some() {
+            (
+                Arc::new(identity_head_bytes.clone().unwrap()),
+                Arc::new(Vec::new()),
+            )
         } else {
-            None
+            (
+                Arc::new(k_palette_maps[job_idx].clone()),
+                Arc::new(k_palette_scales[job_idx].clone()),
+            )
         };
-        let (k_pal, k_scale): (Arc<Vec<u8>>, Arc<Vec<f32>>) =
-            if policy.override_k_quant.is_some() {
-                (
-                    Arc::new(identity_head_bytes.clone().unwrap()),
-                    Arc::new(Vec::new()),
-                )
-            } else {
-                (
-                    Arc::new(k_palette_maps[job_idx].clone()),
-                    Arc::new(k_palette_scales[job_idx].clone()),
-                )
-            };
-        let (v_pal, v_scale): (Arc<Vec<u8>>, Arc<Vec<f32>>) =
-            if policy.override_v_quant.is_some() {
-                (
-                    Arc::new(identity_head_bytes.unwrap()),
-                    Arc::new(Vec::new()),
-                )
-            } else {
-                (
-                    Arc::new(v_palette_maps[job_idx].clone()),
-                    Arc::new(v_palette_scales[job_idx].clone()),
-                )
-            };
+        let (v_pal, v_scale): (Arc<Vec<u8>>, Arc<Vec<f32>>) = if policy.override_v_quant.is_some() {
+            (Arc::new(identity_head_bytes.unwrap()), Arc::new(Vec::new()))
+        } else {
+            (
+                Arc::new(v_palette_maps[job_idx].clone()),
+                Arc::new(v_palette_scales[job_idx].clone()),
+            )
+        };
         full_quant_chunks.insert(
             (seq_idx, chunk_idx),
             SealedChunk {
@@ -730,12 +721,12 @@ pub fn quantize_sealed_in_place(
         .enumerate()
         .map(|(seq_idx, orig)| {
             // Build partial lookup: chunk_idx → position in preserve list.
-            let partial_pos_lookup: std::collections::HashMap<usize, usize> =
-                preserve_per_seq[seq_idx]
-                    .iter()
-                    .enumerate()
-                    .map(|(pos, (chunk_idx, _))| (*chunk_idx, pos))
-                    .collect();
+            let partial_pos_lookup: std::collections::HashMap<usize, usize> = preserve_per_seq
+                [seq_idx]
+                .iter()
+                .enumerate()
+                .map(|(pos, (chunk_idx, _))| (*chunk_idx, pos))
+                .collect();
             let mut chunks: Vec<SealedChunk> = Vec::with_capacity(orig.chunks.len());
             for chunk_idx in 0..orig.chunks.len() {
                 if let Some(new_chunk) = full_quant_chunks.remove(&(seq_idx, chunk_idx)) {

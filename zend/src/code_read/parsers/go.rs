@@ -52,7 +52,14 @@ fn identifier_for(node: &Node, source: &[u8]) -> Option<String> {
                     }
                 }
             }
-            Some(slice_text(node, source).lines().next().unwrap_or("").trim().to_string())
+            Some(
+                slice_text(node, source)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            )
         }
         _ => None,
     }
@@ -123,12 +130,8 @@ mod tests {
 
     #[test]
     fn extracts_blank_receiver_method() {
-        let scopes = verify_cov(
-            "package main\n\ntype T struct{}\n\nfunc (_ T) Method() {}\n",
-        );
-        assert!(scopes
-            .iter()
-            .any(|s| s.qualified_path().contains("Method")));
+        let scopes = verify_cov("package main\n\ntype T struct{}\n\nfunc (_ T) Method() {}\n");
+        assert!(scopes.iter().any(|s| s.qualified_path().contains("Method")));
     }
 
     #[test]
@@ -183,9 +186,8 @@ mod tests {
 
     #[test]
     fn extracts_multiple_type_specs_in_block() {
-        let scopes = verify_cov(
-            "package x\n\ntype (\n    Foo string\n    Bar int\n    Baz []byte\n)\n",
-        );
+        let scopes =
+            verify_cov("package x\n\ntype (\n    Foo string\n    Bar int\n    Baz []byte\n)\n");
         assert!(scopes.iter().any(|s| s.qualified_path().contains("type")));
     }
 

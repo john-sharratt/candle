@@ -216,7 +216,7 @@ pub enum ProjectionSegment {
     Sealed(SealedKind),
     /// Live-prefilled structural template tokens (role markers, block
     /// envelopes) whose K/V is computed under the current runtime left
-    /// context and cached on the slot rather than stored in the
+    /// context, re-derived every projection rather than stored in the
     /// substrate.
     Generated {
         tokens: std::sync::Arc<Vec<u32>>,
@@ -246,8 +246,7 @@ pub enum SealedKind {
 
 /// Diagnostic identity for a [`ProjectionSegment::Generated`] run.
 ///
-/// Not part of the live-prefill cache key (the rolling-hash plus
-/// run-tokens carries that); used only for log messages and progress
+/// Does not affect assembly — used only for log messages and progress
 /// traces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedIdentity {
@@ -301,9 +300,7 @@ impl Projection {
     /// callers can distinguish the user half from the assistant half
     /// of the same turn.  Used by the projection assembler when
     /// injecting per-part residence bytes.
-    pub fn sealed_turn_segments(
-        &self,
-    ) -> impl Iterator<Item = (&ResolvedTurn, crate::Role)> + '_ {
+    pub fn sealed_turn_segments(&self) -> impl Iterator<Item = (&ResolvedTurn, crate::Role)> + '_ {
         self.segments.iter().filter_map(|seg| match seg {
             ProjectionSegment::Sealed(SealedKind::Turn(t, role)) => Some((t, *role)),
             _ => None,
@@ -745,10 +742,8 @@ fn emit_system_prompt_items<R: ContentResolver>(
     // First pass: resolve every Collection in declaration order so
     // their materialised section sets are known when we walk the
     // items for emission. Cached by CollectionId.
-    let mut collection_results: std::collections::HashMap<
-        CollectionId,
-        Vec<ProjectionSegment>,
-    > = std::collections::HashMap::new();
+    let mut collection_results: std::collections::HashMap<CollectionId, Vec<ProjectionSegment>> =
+        std::collections::HashMap::new();
     for item in &layer.system_prompt.items {
         if let SystemPromptItem::Collection(coll) = item {
             let selected = select_collection_sections(coll, layer, resolver, &scoring);

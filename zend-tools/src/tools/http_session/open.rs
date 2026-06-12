@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::HttpSessionError;
 use crate::state::sessions::{HttpEntry, SessionMeta};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::HttpSessionError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
@@ -46,14 +46,18 @@ impl Tool for HttpSessionOpen {
     type Error = HttpSessionError;
 
     fn confirmation(req: &OpenRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new("Open HTTP session")
-            .with_field("base_url", req.base_url.as_deref().unwrap_or("(none)").to_string()))
+        Some(ConfirmationDetails::new("Open HTTP session").with_field(
+            "base_url",
+            req.base_url.as_deref().unwrap_or("(none)").to_string(),
+        ))
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, HttpSessionError> {
         let mut builder = reqwest::blocking::Client::builder()
             .cookie_store(true)
-            .timeout(std::time::Duration::from_secs(req.timeout_sec.unwrap_or(30) as u64));
+            .timeout(std::time::Duration::from_secs(
+                req.timeout_sec.unwrap_or(30) as u64,
+            ));
 
         if req.follow_redirects == Some(false) {
             builder = builder.redirect(reqwest::redirect::Policy::none());
@@ -73,7 +77,9 @@ impl Tool for HttpSessionOpen {
 
         let mut credential_name = None;
         if let Some(cred_name) = &req.credential_name {
-            let cred = ctx.credentials.get_by_name(cred_name)
+            let cred = ctx
+                .credentials
+                .get_by_name(cred_name)
                 .ok_or_else(|| HttpSessionError::CredentialNotFound(cred_name.clone()))?;
             credential_name = Some(cred.name.clone());
             match cred.cred_type.as_str() {
@@ -85,13 +91,15 @@ impl Tool for HttpSessionOpen {
                     );
                     default_headers.insert(
                         reqwest::header::AUTHORIZATION,
-                        reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+                        reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}"))
+                            .unwrap(),
                     );
                 }
                 "api_key" | "bearer_token" => {
                     default_headers.insert(
                         reqwest::header::AUTHORIZATION,
-                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cred.secret)).unwrap(),
+                        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", cred.secret))
+                            .unwrap(),
                     );
                 }
                 "http_header" => {
@@ -108,7 +116,8 @@ impl Tool for HttpSessionOpen {
         }
 
         builder = builder.default_headers(default_headers);
-        let client = builder.build()
+        let client = builder
+            .build()
             .map_err(|e| HttpSessionError::ConnectionFailed(e.to_string()))?;
 
         let session_id = format!("sess_{}", Uuid::new_v4());
@@ -125,7 +134,10 @@ impl Tool for HttpSessionOpen {
         };
         ctx.sessions.insert_http(entry);
 
-        Ok(OpenResponse { session_id, base_url: req.base_url })
+        Ok(OpenResponse {
+            session_id,
+            base_url: req.base_url,
+        })
     }
 }
 

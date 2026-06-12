@@ -150,6 +150,7 @@ fn zend_startup_completes_without_stall() {
     let config = DaemonConfig {
         workspace: workspace.clone(),
         port: 0,
+        ..Default::default()
     };
     let log = LogBus::new();
 

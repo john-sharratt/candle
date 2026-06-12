@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::TlsError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RecvRequest {
@@ -37,7 +37,9 @@ impl Tool for TlsSessionRecv {
     type Error = TlsError;
 
     fn run(ctx: &ToolContext, req: RecvRequest) -> Result<RecvResponse, TlsError> {
-        let entry_arc = ctx.sessions.get_tls(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_tls(&req.session_id)
             .ok_or_else(|| TlsError::SessionNotFound(req.session_id.clone()))?;
         let mut entry = entry_arc.lock().unwrap();
 
@@ -46,8 +48,12 @@ impl Tool for TlsSessionRecv {
         let (n, eof, timed_out) = match entry.stream.read(&mut buf) {
             Ok(0) => (0, true, false),
             Ok(n) => (n, false, false),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                   || e.kind() == std::io::ErrorKind::WouldBlock => (0, false, true),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                (0, false, true)
+            }
             Err(e) => return Err(TlsError::RecvFailed(e.to_string())),
         };
 
@@ -61,7 +67,12 @@ impl Tool for TlsSessionRecv {
             }
         };
 
-        Ok(RecvResponse { data, bytes_received: n, eof, timed_out })
+        Ok(RecvResponse {
+            data,
+            bytes_received: n,
+            eof,
+            timed_out,
+        })
     }
 }
 

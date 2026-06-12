@@ -4,7 +4,10 @@ use serde_json::json;
 
 #[test]
 fn dns_lookup_localhost() {
-    let resp = harness::invoke("dns_lookup", json!({"host": "localhost", "record_type": "A"}));
+    let resp = harness::invoke(
+        "dns_lookup",
+        json!({"host": "localhost", "record_type": "A"}),
+    );
     // Either succeeds with 127.0.0.1 or gives some response
     if resp.get("error").is_none() {
         let r = harness::expect_success(resp);
@@ -76,10 +79,13 @@ fn ping_icmp_structure() {
 
 #[test]
 fn dns_lookup_localhost_a() {
-    let resp = harness::invoke("dns_lookup", json!({
-        "host": "localhost",
-        "record_type": "A"
-    }));
+    let resp = harness::invoke(
+        "dns_lookup",
+        json!({
+            "host": "localhost",
+            "record_type": "A"
+        }),
+    );
     // Either succeeds with 127.0.0.1 or no A records (IPv6 only hosts)
     if resp.get("error").is_none() {
         let r = harness::expect_success(resp);
@@ -90,10 +96,13 @@ fn dns_lookup_localhost_a() {
 
 #[test]
 fn dns_lookup_mx_not_supported() {
-    let resp = harness::expect_success(harness::invoke("dns_lookup", json!({
-        "host": "example.com",
-        "record_type": "MX"
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "dns_lookup",
+        json!({
+            "host": "example.com",
+            "record_type": "MX"
+        }),
+    ));
     // Returns records with "not_supported" message
     let records = resp["records"].as_array().unwrap();
     if !records.is_empty() {
@@ -104,11 +113,14 @@ fn dns_lookup_mx_not_supported() {
 #[test]
 fn port_scan_known_closed_port() {
     // Port 1 should be closed on most systems
-    let resp = harness::expect_success(harness::invoke("port_scan", json!({
-        "host": "127.0.0.1",
-        "ports": [1],
-        "timeout_ms": 200
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "port_scan",
+        json!({
+            "host": "127.0.0.1",
+            "ports": [1],
+            "timeout_ms": 200
+        }),
+    ));
     let results = resp["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["port"], 1);
@@ -119,11 +131,13 @@ fn port_scan_known_closed_port() {
 #[test]
 fn port_scan_too_many_ports() {
     let ports: Vec<u16> = (1..=101).collect();
-    let resp = harness::invoke("port_scan", json!({
-        "host": "127.0.0.1",
-        "ports": ports,
-        "timeout_ms": 100
-    }));
+    let resp = harness::invoke(
+        "port_scan",
+        json!({
+            "host": "127.0.0.1",
+            "ports": ports,
+            "timeout_ms": 100
+        }),
+    );
     harness::expect_error(&resp, "invalid_arguments");
 }
-

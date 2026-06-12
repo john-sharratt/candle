@@ -101,12 +101,15 @@ fn main() -> Result<()> {
         kv_caches: &mut seq2_caches,
         offset: seq2_offset,
         input_ids: &seq2_input,
-        input_len: seq2_prompt.len(),        write_offset_shift: 0,    }];
+        input_len: seq2_prompt.len(),
+        write_offset_shift: 0,
+    }];
     let offsets2: Vec<usize> = contexts.iter().map(|c| c.offset).collect();
     let seq_len2 = contexts[0].input_len;
     let meta2 = BatchedPrefillMeta::new(&offsets2, seq_len2, &device)?;
     let generation = stager.begin_generation();
-    let _outputs = model.forward_batch(&mut contexts, &generation, DecodeHeaders::Prefill(meta2))?;
+    let _outputs =
+        model.forward_batch(&mut contexts, &generation, DecodeHeaders::Prefill(meta2))?;
     println!("  Seq 2: cached with input_len={}\n", seq2_prompt.len());
 
     // Get initial tokens for generation
@@ -161,7 +164,14 @@ fn main() -> Result<()> {
             write_offset_shift: 0,
         }];
         let generation = stager.begin_generation();
-        let _ = model.forward_batch(&mut context, &generation, DecodeHeaders::Decode { buf: None, stride: 0 })?;
+        let _ = model.forward_batch(
+            &mut context,
+            &generation,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )?;
     }
     println!(
         "  Seq 1 position: {} | Seq 2 position: {} (misaligned)",
@@ -207,7 +217,14 @@ fn main() -> Result<()> {
         ];
 
         let generation = stager.begin_generation();
-        let outputs = model.forward_batch(&mut contexts, &generation, DecodeHeaders::Decode { buf: None, stride: 0 })?;
+        let outputs = model.forward_batch(
+            &mut contexts,
+            &generation,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )?;
 
         let next_token1 = outputs.get(0)?.squeeze(0)?.argmax(0)?.to_scalar::<u32>()?;
         let next_token2 = outputs.get(1)?.squeeze(0)?.argmax(0)?.to_scalar::<u32>()?;
@@ -309,7 +326,14 @@ fn main() -> Result<()> {
             write_offset_shift: 0,
         }];
         let generation = stager.begin_generation();
-        let _ = model.forward_batch(&mut context, &generation, DecodeHeaders::Decode { buf: None, stride: 0 })?;
+        let _ = model.forward_batch(
+            &mut context,
+            &generation,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )?;
     }
 
     // Parallel single-token batched generation for num_steps
@@ -341,7 +365,14 @@ fn main() -> Result<()> {
         ];
 
         let generation = stager.begin_generation();
-        let _ = model.forward_batch(&mut contexts, &generation, DecodeHeaders::Decode { buf: None, stride: 0 })?;
+        let _ = model.forward_batch(
+            &mut contexts,
+            &generation,
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            },
+        )?;
     }
     let parallel_time = start.elapsed();
 

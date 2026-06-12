@@ -2490,7 +2490,7 @@ __device__ __forceinline__ void transpose_smem_dim_pos_pal(
 }
 
 template <typename Q_T, typename T, typename O, int HEAD_DIM, int WARPS_PER_BLOCK, int TILE_K, int BLOCK_M,
-          bool HAS_PREFIX, int WARPS_TC, bool USE_TC, int NUM_STAGES = 2>
+          bool HAS_PREFIX, int WARPS_TC, bool USE_TC, int NUM_STAGES = 2, bool GAP_FILL = false>
 __global__ void __launch_bounds__(128, (HEAD_DIM <= 64) ? 8 : 4)
 paged_prefill_attn_fwd_chunks_kernel(
     const Q_T* __restrict__ q,
@@ -2510,7 +2510,22 @@ paged_prefill_attn_fwd_chunks_kernel(
     const uint32_t* __restrict__ rope_offsets,
     const float* __restrict__ rope_cs,
     int rope_interleaved,
-    const uint32_t* __restrict__ write_offset_shifts
+    const uint32_t* __restrict__ write_offset_shifts,
+    // ── GAP_FILL-only inputs (nullptr / unused when GAP_FILL == false) ────────
+    // `col_actual_pos`: every column's TRUE sequence position, flat across the
+    //   batch and indexed by `cu_kvlens[batch_idx] + k_pos`.  Sealed prefix
+    //   columns are packed (glue gaps removed) so packed index != actual
+    //   position; glue (new-region) columns carry their interleaved position.
+    //   Drives the causal mask and glue RoPE.
+    // `cu_kvlens`: exclusive prefix-sum of kv_lens [batch_size+1] — per-slot
+    //   base into `col_actual_pos`.
+    // `glue_write_slice` / `glue_write_in_blk`: per query row [total_q], the
+    //   explicit writer-chunk slice index + in-block offset (the read
+    //   `position_map` is sealed-only, so the writeback can't use resolve_pos).
+    const uint32_t* __restrict__ col_actual_pos,
+    const uint32_t* __restrict__ cu_kvlens,
+    const uint32_t* __restrict__ glue_write_slice,
+    const uint32_t* __restrict__ glue_write_in_blk
 ) {
     static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be multiple of 32");
     static_assert(HEAD_DIM >= 32 && HEAD_DIM <= 256, "HEAD_DIM must be 32-256");
@@ -2554,6 +2569,8 @@ paged_prefill_attn_fwd_chunks_kernel(
     // Batch scalars
     __shared__ int s_q_start, s_q_end, s_q_len, s_kv_len, s_prefix_len;
     __shared__ int s_max_k_max;
+    // GAP_FILL: per-slot base into the flat `col_actual_pos` array.
+    [[maybe_unused]] __shared__ int s_kv_base;
 
     // K/V tile buffers
     constexpr bool USE_FP8 = std::is_same_v<T, __nv_fp8_e4m3>;
@@ -2581,6 +2598,11 @@ paged_prefill_attn_fwd_chunks_kernel(
     __shared__ uint16_t s_q_pos[BLOCK_M];         // q_pos < q_len, fits uint16
     __shared__ uint8_t  s_write_in_blk[BLOCK_M];  // < CHUNK_SIZE = 32, fits uint8
     __shared__ uint16_t s_write_slice_idx[BLOCK_M];
+    // GAP_FILL: each glue row's TRUE sequence position, consumed by the
+    // actual-position causal mask. (The Q RoPE below rotates at the packed
+    // position; for the contiguous writer-tail glue that is the same row, so
+    // the mask is the only consumer of this true-position array.)
+    [[maybe_unused]] __shared__ uint32_t s_query_actual_pos[BLOCK_M];
 
     // Packed per-tile validity (HAS_PREFIX only)
     [[maybe_unused]] __shared__ uint32_t smem_valid_mask;
@@ -2627,6 +2649,9 @@ paged_prefill_attn_fwd_chunks_kernel(
             s_prefix_len = (pl < 0) ? 0 : pl;
         } else {
             s_prefix_len = 0;
+        }
+        if constexpr (GAP_FILL) {
+            s_kv_base = (int)cu_kvlens[batch_idx];
         }
         s_row_active_mask = 0u;
         s_write_active_mask = 0u;
@@ -2685,26 +2710,39 @@ paged_prefill_attn_fwd_chunks_kernel(
         int write_slice_idx = 0;
 
         if (row_active_v && q_len > 0 && kv_len > 0) {
-            int abs_pos = prefix_len + q_pos;
-            if (abs_pos >= 0 && abs_pos < kv_len) {
-                // Cum-token addressing: position_map covers [0, kv_len)
-                // including the write region (filled by host
-                // `extend_for_write_region`).  write_offset_shifts is no
-                // longer needed — the host's slice layout already
-                // places the writer where it belongs.
-                int blk, in_blk;
-                resolve_pos(slot_hdr, abs_pos, blk, in_blk);
-                (void)write_offset_shifts;
-                if (blk < (int)slot_hdr.n_slices) {
-                    write_active_v = true;
-                    write_in_blk = in_blk;
-                    write_slice_idx = blk;
+            if constexpr (GAP_FILL) {
+                // Glue row: its TRUE position and explicit writer-chunk target
+                // come from the host descriptor (the read `position_map` is
+                // sealed-only, so `resolve_pos` can't address the glue chunk).
+                s_query_actual_pos[tid] = col_actual_pos[s_kv_base + prefix_len + q_pos];
+                write_active_v = true;
+                write_in_blk = (int)glue_write_in_blk[t];
+                write_slice_idx = (int)glue_write_slice[t];
+            } else {
+                int abs_pos = prefix_len + q_pos;
+                if (abs_pos >= 0 && abs_pos < kv_len) {
+                    // Cum-token addressing: position_map covers [0, kv_len)
+                    // including the write region (filled by host
+                    // `extend_for_write_region`).  write_offset_shifts is no
+                    // longer needed — the host's slice layout already
+                    // places the writer where it belongs.
+                    int blk, in_blk;
+                    resolve_pos(slot_hdr, abs_pos, blk, in_blk);
+                    (void)write_offset_shifts;
+                    if (blk < (int)slot_hdr.n_slices) {
+                        write_active_v = true;
+                        write_in_blk = in_blk;
+                        write_slice_idx = blk;
+                    }
                 }
             }
         }
         if (write_active_v) atomicOr(&s_write_active_mask, 1u << tid);
         s_write_in_blk[tid] = (uint8_t)write_in_blk;
         s_write_slice_idx[tid] = (uint16_t)write_slice_idx;
+        if constexpr (GAP_FILL) {
+            if (!row_active_v) s_query_actual_pos[tid] = 0u;
+        }
     }
     __syncthreads();
 
@@ -3787,6 +3825,14 @@ paged_prefill_attn_fwd_chunks_kernel(
                         is_valid = true;
                         rope_p = k_pos + (int)rope_base_v;
                     }
+                    if constexpr (GAP_FILL) {
+                        // smem_rope_pos carries the column's TRUE sequence
+                        // position for every column — sealed columns are
+                        // packed (glue gaps removed) so packed index != real
+                        // position. This single override drives both the
+                        // actual-position causal mask and glue RoPE.
+                        if (is_valid) rope_p = (int)col_actual_pos[s_kv_base + k_pos];
+                    }
                 }
                 uint32_t bits = __ballot_sync(0xffffffffu, is_valid);
                 if (lane == 0) smem_valid_mask = bits;
@@ -3939,17 +3985,43 @@ paged_prefill_attn_fwd_chunks_kernel(
 
                         bool r0_valid = (r0 < BLOCK_M) & row_active(r0);
                         bool r1_valid = (r1 < BLOCK_M) & row_active(r1);
-                        int max_k_r0 = r0_valid ? row_max_k(r0) : 0;
-                        int max_k_r1 = r1_valid ? row_max_k(r1) : 0;
 
-                        s0_a = (r0_valid & (k_pos_a0 < max_k_r0) & valid_a0) ? s0_a : NEG_INF_F;
-                        s1_a = (r0_valid & (k_pos_a1 < max_k_r0) & valid_a1) ? s1_a : NEG_INF_F;
-                        s0_b = (r0_valid & (k_pos_b0 < max_k_r0) & valid_b0) ? s0_b : NEG_INF_F;
-                        s1_b = (r0_valid & (k_pos_b1 < max_k_r0) & valid_b1) ? s1_b : NEG_INF_F;
-                        s2_a = (r1_valid & (k_pos_a0 < max_k_r1) & valid_a0) ? s2_a : NEG_INF_F;
-                        s3_a = (r1_valid & (k_pos_a1 < max_k_r1) & valid_a1) ? s3_a : NEG_INF_F;
-                        s2_b = (r1_valid & (k_pos_b0 < max_k_r1) & valid_b0) ? s2_b : NEG_INF_F;
-                        s3_b = (r1_valid & (k_pos_b1 < max_k_r1) & valid_b1) ? s3_b : NEG_INF_F;
+                        // Causal mask bits per (column, row).  Default path
+                        // compares the packed index against row_max_k.  GAP_FILL
+                        // compares TRUE sequence positions — sealed and glue
+                        // interleave in real position, so packed index != position
+                        // (smem_rope_pos carries each column's real position;
+                        // s_query_actual_pos the row's).  `valid_*` (set/partial-
+                        // tile validity) still gates the smem reads below.
+                        bool c_a0_r0, c_a1_r0, c_b0_r0, c_b1_r0;
+                        bool c_a0_r1, c_a1_r1, c_b0_r1, c_b1_r1;
+                        if constexpr (GAP_FILL) {
+                            // Causal over TRUE positions, inclusive of self
+                            // (a token attends its own position) — matches the
+                            // default path's `k_pos <= prefix_len + q_pos`.
+                            int qp0 = (int)s_query_actual_pos[r0];
+                            int qp1 = (int)s_query_actual_pos[r1];
+                            int pa0 = smem_rope_pos[col_a0], pa1 = smem_rope_pos[col_a1];
+                            int pb0 = smem_rope_pos[col_b0], pb1 = smem_rope_pos[col_b1];
+                            c_a0_r0 = pa0 <= qp0; c_a1_r0 = pa1 <= qp0; c_b0_r0 = pb0 <= qp0; c_b1_r0 = pb1 <= qp0;
+                            c_a0_r1 = pa0 <= qp1; c_a1_r1 = pa1 <= qp1; c_b0_r1 = pb0 <= qp1; c_b1_r1 = pb1 <= qp1;
+                        } else {
+                            int max_k_r0 = r0_valid ? row_max_k(r0) : 0;
+                            int max_k_r1 = r1_valid ? row_max_k(r1) : 0;
+                            c_a0_r0 = k_pos_a0 < max_k_r0; c_a1_r0 = k_pos_a1 < max_k_r0;
+                            c_b0_r0 = k_pos_b0 < max_k_r0; c_b1_r0 = k_pos_b1 < max_k_r0;
+                            c_a0_r1 = k_pos_a0 < max_k_r1; c_a1_r1 = k_pos_a1 < max_k_r1;
+                            c_b0_r1 = k_pos_b0 < max_k_r1; c_b1_r1 = k_pos_b1 < max_k_r1;
+                        }
+
+                        s0_a = (r0_valid & c_a0_r0 & valid_a0) ? s0_a : NEG_INF_F;
+                        s1_a = (r0_valid & c_a1_r0 & valid_a1) ? s1_a : NEG_INF_F;
+                        s0_b = (r0_valid & c_b0_r0 & valid_b0) ? s0_b : NEG_INF_F;
+                        s1_b = (r0_valid & c_b1_r0 & valid_b1) ? s1_b : NEG_INF_F;
+                        s2_a = (r1_valid & c_a0_r1 & valid_a0) ? s2_a : NEG_INF_F;
+                        s3_a = (r1_valid & c_a1_r1 & valid_a1) ? s3_a : NEG_INF_F;
+                        s2_b = (r1_valid & c_b0_r1 & valid_b0) ? s2_b : NEG_INF_F;
+                        s3_b = (r1_valid & c_b1_r1 & valid_b1) ? s3_b : NEG_INF_F;
 
                         scores_reg[sub_tile][0] = s0_a; scores_reg[sub_tile][1] = s1_a;
                         scores_reg[sub_tile][2] = s2_a; scores_reg[sub_tile][3] = s3_a;
@@ -4161,7 +4233,18 @@ inline void launch_paged_prefill_chunks(
     const float* rope_cs,  // Precomputed cos/sin table [max_pos * HEAD_DIM]
     int rope_interleaved,    // 0=non-interleaved half-split (Qwen/GPT2), 1=interleaved adjacent-pairs (Llama)
     const uint32_t* write_offset_shifts = nullptr, // Per-batch write position shift [batch_size], nullable
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    // ── GAP_FILL ─────────────────────────────────────────────────────────────
+    // When `gap_fill` is true the kernel runs the GAP_FILL specialization:
+    // sealed content is the (packed) prefix read from cache, all glue is the
+    // new region in k_packed, and the causal mask compares TRUE positions from
+    // `col_actual_pos` (per-slot base `cu_kvlens[b]`). Writeback targets come
+    // from `glue_write_slice`/`glue_write_in_blk` (per query row).
+    bool gap_fill = false,
+    const uint32_t* col_actual_pos = nullptr,
+    const uint32_t* cu_kvlens = nullptr,
+    const uint32_t* glue_write_slice = nullptr,
+    const uint32_t* glue_write_in_blk = nullptr
 ) {
     int num_groups = n_head / n_kv_head;
     if (num_groups <= 0) num_groups = 1;
@@ -4277,30 +4360,68 @@ inline void launch_paged_prefill_chunks(
     bool use_triple_buffer = s_use_triple_buffer;
 
     // Launch kernel with appropriate configuration
-    #define LAUNCH_KERNEL(HAS_PREFIX, USE_TC_VAL, NUM_STAGES_VAL) \
+    #define LAUNCH_KERNEL(HAS_PREFIX, USE_TC_VAL, NUM_STAGES_VAL, GAP_FILL_VAL) \
         paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M, \
-            HAS_PREFIX, WARPS_TC_COMPUTED, USE_TC_VAL, NUM_STAGES_VAL>\
+            HAS_PREFIX, WARPS_TC_COMPUTED, USE_TC_VAL, NUM_STAGES_VAL, GAP_FILL_VAL>\
             <<<grid, block_tc, PREFILL_DYN_BYTES(NUM_STAGES_VAL), stream>>>( \
             (const Q_T*)q_ptr, (const T*)k_ptr, (const T*)v_ptr, \
             headers_ptr, cu_seqlens_q, q_lens, kv_lens, \
             (O*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head, \
-            (int)max_blocks, softmax_scale, (int)total_q, rope_offsets, rope_cs, rope_interleaved, write_offset_shifts)
+            (int)max_blocks, softmax_scale, (int)total_q, rope_offsets, rope_cs, rope_interleaved, write_offset_shifts, \
+            col_actual_pos, cu_kvlens, glue_write_slice, glue_write_in_blk)
 
-    if (use_triple_buffer) {
-        if (has_prefix) {
-            if (use_tc) { LAUNCH_KERNEL(true, true, 3); }
-            else        { LAUNCH_KERNEL(true, false, 3); }
+    if (gap_fill) {
+        // Opt the GAP_FILL=true specializations into extended dynamic smem —
+        // each template instantiation is a distinct CUDA function, so the
+        // attribute set on the GAP_FILL=false kernels above does not cover
+        // them. The ring footprint is identical, so reuse DYN_TRIPLE/DOUBLE.
+        static bool s_gap_configured = false;
+        if (!s_gap_configured) {
+            if (use_triple_buffer && DYN_TRIPLE > caps.smem_default) {
+                cudaFuncSetAttribute(
+                    paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
+                        true, WARPS_TC_COMPUTED, true, 3, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
+                cudaFuncSetAttribute(
+                    paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
+                        true, WARPS_TC_COMPUTED, false, 3, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
+            } else if (!use_triple_buffer && DYN_DOUBLE > caps.smem_default) {
+                cudaFuncSetAttribute(
+                    paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
+                        true, WARPS_TC_COMPUTED, true, 2, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_DOUBLE);
+                cudaFuncSetAttribute(
+                    paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
+                        true, WARPS_TC_COMPUTED, false, 2, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_DOUBLE);
+            }
+            cudaGetLastError();
+            s_gap_configured = true;
+        }
+        // GAP_FILL always has a (packed) sealed prefix.
+        if (use_triple_buffer) {
+            if (use_tc) { LAUNCH_KERNEL(true, true, 3, true); }
+            else        { LAUNCH_KERNEL(true, false, 3, true); }
         } else {
-            if (use_tc) { LAUNCH_KERNEL(false, true, 3); }
-            else        { LAUNCH_KERNEL(false, false, 3); }
+            if (use_tc) { LAUNCH_KERNEL(true, true, 2, true); }
+            else        { LAUNCH_KERNEL(true, false, 2, true); }
+        }
+    } else if (use_triple_buffer) {
+        if (has_prefix) {
+            if (use_tc) { LAUNCH_KERNEL(true, true, 3, false); }
+            else        { LAUNCH_KERNEL(true, false, 3, false); }
+        } else {
+            if (use_tc) { LAUNCH_KERNEL(false, true, 3, false); }
+            else        { LAUNCH_KERNEL(false, false, 3, false); }
         }
     } else {
         if (has_prefix) {
-            if (use_tc) { LAUNCH_KERNEL(true, true, 2); }
-            else        { LAUNCH_KERNEL(true, false, 2); }
+            if (use_tc) { LAUNCH_KERNEL(true, true, 2, false); }
+            else        { LAUNCH_KERNEL(true, false, 2, false); }
         } else {
-            if (use_tc) { LAUNCH_KERNEL(false, true, 2); }
-            else        { LAUNCH_KERNEL(false, false, 2); }
+            if (use_tc) { LAUNCH_KERNEL(false, true, 2, false); }
+            else        { LAUNCH_KERNEL(false, false, 2, false); }
         }
     }
 

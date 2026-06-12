@@ -229,7 +229,9 @@ mod tests {
 
     #[test]
     fn coerces_to_slice() {
-        fn takes_slice(s: &[u32]) -> usize { s.len() }
+        fn takes_slice(s: &[u32]) -> usize {
+            s.len()
+        }
         let buf = TokenBuffer::from(vec![1, 2, 3]);
         assert_eq!(takes_slice(&buf), 3);
     }

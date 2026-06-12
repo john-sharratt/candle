@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::CredError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
@@ -41,7 +41,10 @@ impl Tool for CredentialDelete {
         if !deleted {
             return Err(CredError::NotFound(req.name));
         }
-        Ok(DeleteResponse { name: req.name, deleted: true })
+        Ok(DeleteResponse {
+            name: req.name,
+            deleted: true,
+        })
     }
 }
 

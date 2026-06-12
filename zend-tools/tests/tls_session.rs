@@ -29,10 +29,7 @@ fn tls_session_send_not_found() {
 
 #[test]
 fn tls_session_recv_not_found() {
-    let resp = harness::invoke(
-        "tls_session_recv",
-        json!({"session_id": "sess_missing"}),
-    );
+    let resp = harness::invoke("tls_session_recv", json!({"session_id": "sess_missing"}));
     harness::expect_error(&resp, "session_not_found");
 }
 
@@ -55,6 +52,10 @@ fn tls_session_list_returns_sessions_field() {
 #[test]
 fn tls_session_empty_in_fresh_context() {
     let ctx = ToolContext::new();
-    let list = harness::expect_success(harness::invoke_with_ctx("tls_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "tls_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 0);
 }

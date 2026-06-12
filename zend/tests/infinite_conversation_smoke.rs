@@ -60,7 +60,10 @@ enum PlantDepth {
     /// `N - k` where N is the total grow count.
     FromEnd(usize),
     /// `N / k` — middle-ish.
-    Fraction { numerator: usize, denominator: usize },
+    Fraction {
+        numerator: usize,
+        denominator: usize,
+    },
     /// Hard turn index.
     At(usize),
 }
@@ -69,9 +72,10 @@ impl PlantDepth {
     fn resolve(self, total: usize) -> usize {
         match self {
             PlantDepth::FromEnd(k) => total.saturating_sub(k),
-            PlantDepth::Fraction { numerator, denominator } => {
-                (total * numerator) / denominator.max(1)
-            }
+            PlantDepth::Fraction {
+                numerator,
+                denominator,
+            } => (total * numerator) / denominator.max(1),
             PlantDepth::At(i) => i.min(total.saturating_sub(1)),
         }
     }
@@ -83,7 +87,8 @@ fn smoke_plants() -> Vec<Plant> {
         Plant {
             id: "P-near",
             relative_depth: PlantDepth::FromEnd(5),
-            user_text: "Quick aside: the color we picked is mauve.  Anyway, back to the topic.".into(),
+            user_text: "Quick aside: the color we picked is mauve.  Anyway, back to the topic."
+                .into(),
             fact: "mauve",
             probe: "What color did I tell you we picked?",
         },
@@ -96,15 +101,22 @@ fn smoke_plants() -> Vec<Plant> {
         },
         Plant {
             id: "P-mid",
-            relative_depth: PlantDepth::Fraction { numerator: 1, denominator: 2 },
+            relative_depth: PlantDepth::Fraction {
+                numerator: 1,
+                denominator: 2,
+            },
             user_text: "Important budget fact: the budget is 50k.  Moving on.".into(),
             fact: "50k",
             probe: "What budget did I mention?",
         },
         Plant {
             id: "P-old",
-            relative_depth: PlantDepth::Fraction { numerator: 1, denominator: 10 },
-            user_text: "Technical decision: we chose Postgres for the database.  Continuing.".into(),
+            relative_depth: PlantDepth::Fraction {
+                numerator: 1,
+                denominator: 10,
+            },
+            user_text: "Technical decision: we chose Postgres for the database.  Continuing."
+                .into(),
             fact: "Postgres",
             probe: "Which database did we choose?",
         },
@@ -117,14 +129,20 @@ fn smoke_plants() -> Vec<Plant> {
         },
         Plant {
             id: "P-topic-A",
-            relative_depth: PlantDepth::Fraction { numerator: 1, denominator: 3 },
+            relative_depth: PlantDepth::Fraction {
+                numerator: 1,
+                denominator: 3,
+            },
             user_text: "Tangent: Alice's favourite tea is earl grey.  OK back to topic.".into(),
             fact: "earl grey",
             probe: "What's Alice's favourite tea?",
         },
         Plant {
             id: "P-topic-B",
-            relative_depth: PlantDepth::Fraction { numerator: 2, denominator: 3 },
+            relative_depth: PlantDepth::Fraction {
+                numerator: 2,
+                denominator: 3,
+            },
             user_text: "Brief note: Bob's favourite tea is oolong.  OK continuing.".into(),
             fact: "oolong",
             probe: "What's Bob's favourite tea?",
@@ -209,10 +227,7 @@ fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
             conv_config,
         )
         .expect("new conv");
-    eprintln!(
-        "base conv built ({:.1}s)",
-        start.elapsed().as_secs_f64()
-    );
+    eprintln!("base conv built ({:.1}s)", start.elapsed().as_secs_f64());
     (engine, base_conv)
 }
 
@@ -280,9 +295,7 @@ fn infinite_conversation_smoke() {
         // Re-fork from the original base_conv for each probe — each
         // fork resumes the latest substrate state of `timeline_id`
         // (so plant turns embedded above are visible).
-        let mut probe_conv = base_conv
-            .fork_resuming(timeline_id)
-            .expect("fork resuming");
+        let mut probe_conv = base_conv.fork_resuming(timeline_id).expect("fork resuming");
         let response = probe_conv.send_turn(plant.probe).expect("probe send");
 
         // Algorithm-level: planted turn (or some ancestor) must be in
@@ -295,12 +308,12 @@ fn infinite_conversation_smoke() {
             .map(|d| {
                 d.selected_nodes.iter().any(|n| {
                     n.0 as usize == plant_turn
-                        // Or an ancestor — covered_by check would walk
-                        // children, but a sufficient surrogate is "the
-                        // plant turn is in chrono_normals of the
-                        // selected ancestor".  For smoke we just check
-                        // direct membership; the recall test still
-                        // gates the end-to-end semantics.
+                    // Or an ancestor — covered_by check would walk
+                    // children, but a sufficient surrogate is "the
+                    // plant turn is in chrono_normals of the
+                    // selected ancestor".  For smoke we just check
+                    // direct membership; the recall test still
+                    // gates the end-to-end semantics.
                 })
             })
             .unwrap_or(false);
@@ -309,7 +322,10 @@ fn infinite_conversation_smoke() {
         }
 
         // End-to-end: model's response contains the canonical fact.
-        let end_to_end = response.text.to_lowercase().contains(&plant.fact.to_lowercase());
+        let end_to_end = response
+            .text
+            .to_lowercase()
+            .contains(&plant.fact.to_lowercase());
         if end_to_end {
             end_to_end_pass += 1;
         }
@@ -354,9 +370,7 @@ fn infinite_conversation_negative_smoke() {
     let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
     // Grow 30 unrelated filler turns.
     for i in 0..30 {
-        let user_msg = format!(
-            "Filler turn {i}: tell me about unrelated topic {i}.",
-        );
+        let user_msg = format!("Filler turn {i}: tell me about unrelated topic {i}.",);
         let _ = conv.send_turn(&user_msg).expect("send_turn");
     }
     // Ask about something we never discussed.
@@ -394,5 +408,8 @@ fn diagnostics_struct_round_trips() {
     d.push(NodeId(2), SelectionOrigin::ProvenanceScore, 0.8, 30);
     assert_eq!(d.selected_nodes.len(), 2);
     assert!(d.contains(NodeId(1)));
-    assert_eq!(d.origin_of(NodeId(2)), Some(SelectionOrigin::ProvenanceScore));
+    assert_eq!(
+        d.origin_of(NodeId(2)),
+        Some(SelectionOrigin::ProvenanceScore)
+    );
 }

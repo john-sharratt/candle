@@ -116,21 +116,33 @@ impl Tool for WeatherTool {
             "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
             urlencoding::encode(&req.location)
         );
-        let geo_resp = ctx.http_client.get(&geo_url).send()
+        let geo_resp = ctx
+            .http_client
+            .get(&geo_url)
+            .send()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
-        let geo_json: serde_json::Value = geo_resp.json()
+        let geo_json: serde_json::Value = geo_resp
+            .json()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
 
-        let results = geo_json["results"].as_array()
+        let results = geo_json["results"]
+            .as_array()
             .and_then(|a| a.first())
             .ok_or_else(|| WeatherError::LocationNotFound(req.location.clone()))?;
 
         let lat = results["latitude"].as_f64().unwrap_or(0.0);
         let lon = results["longitude"].as_f64().unwrap_or(0.0);
-        let location_name = results["name"].as_str().unwrap_or(&req.location).to_string();
+        let location_name = results["name"]
+            .as_str()
+            .unwrap_or(&req.location)
+            .to_string();
 
         let wind_unit = if units == "imperial" { "mph" } else { "kmh" };
-        let temp_unit = if units == "imperial" { "fahrenheit" } else { "celsius" };
+        let temp_unit = if units == "imperial" {
+            "fahrenheit"
+        } else {
+            "celsius"
+        };
         let actual_days = forecast_days.max(1);
 
         let weather_url = format!(
@@ -145,9 +157,13 @@ impl Tool for WeatherTool {
              &temperature_unit={temp_unit}"
         );
 
-        let w_resp = ctx.http_client.get(&weather_url).send()
+        let w_resp = ctx
+            .http_client
+            .get(&weather_url)
+            .send()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
-        let w_json: serde_json::Value = w_resp.json()
+        let w_json: serde_json::Value = w_resp
+            .json()
             .map_err(|e| WeatherError::WeatherUnavailable(e.to_string()))?;
 
         let cur = &w_json["current"];
@@ -164,23 +180,38 @@ impl Tool for WeatherTool {
 
         let daily = &w_json["daily"];
         let dates = daily["time"].as_array().cloned().unwrap_or_default();
-        let tmax = daily["temperature_2m_max"].as_array().cloned().unwrap_or_default();
-        let tmin = daily["temperature_2m_min"].as_array().cloned().unwrap_or_default();
-        let wcodes = daily["weather_code"].as_array().cloned().unwrap_or_default();
-        let precip = daily["precipitation_sum"].as_array().cloned().unwrap_or_default();
+        let tmax = daily["temperature_2m_max"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let tmin = daily["temperature_2m_min"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let wcodes = daily["weather_code"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let precip = daily["precipitation_sum"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
 
         let forecast: Vec<DayForecast> = if forecast_days == 0 {
             vec![]
         } else {
-            (0..forecast_days as usize).filter_map(|i| {
-                Some(DayForecast {
-                    date: dates.get(i)?.as_str()?.to_string(),
-                    high: tmax.get(i)?.as_f64()?,
-                    low: tmin.get(i)?.as_f64()?,
-                    conditions: wmo_description(wcodes.get(i)?.as_i64().unwrap_or(0)).to_string(),
-                    precipitation_mm: precip.get(i)?.as_f64().unwrap_or(0.0),
+            (0..forecast_days as usize)
+                .filter_map(|i| {
+                    Some(DayForecast {
+                        date: dates.get(i)?.as_str()?.to_string(),
+                        high: tmax.get(i)?.as_f64()?,
+                        low: tmin.get(i)?.as_f64()?,
+                        conditions: wmo_description(wcodes.get(i)?.as_i64().unwrap_or(0))
+                            .to_string(),
+                        precipitation_mm: precip.get(i)?.as_f64().unwrap_or(0.0),
+                    })
                 })
-            }).collect()
+                .collect()
         };
 
         Ok(Response {

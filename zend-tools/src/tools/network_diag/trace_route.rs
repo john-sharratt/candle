@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{extract_ip, extract_rtt, DiagError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct TraceRequest {
@@ -61,7 +61,11 @@ impl Tool for TraceRoute {
 
         let hops = parse_traceroute(&raw);
 
-        Ok(TraceResponse { host: req.host, hops, raw_output: raw })
+        Ok(TraceResponse {
+            host: req.host,
+            hops,
+            raw_output: raw,
+        })
     }
 }
 
@@ -69,7 +73,9 @@ fn parse_traceroute(output: &str) -> Vec<HopInfo> {
     let mut hops = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
         if let Ok(hop_num) = parts.first().unwrap_or(&"").trim().parse::<u32>() {
             let rest = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();

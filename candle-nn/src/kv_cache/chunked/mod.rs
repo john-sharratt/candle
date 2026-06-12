@@ -44,11 +44,11 @@ mod tests;
 
 // Re-export public types
 pub use backing::ChunkedKvBacking;
+pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 #[cfg(feature = "cuda")]
 pub use compress::quantize_sealed_in_place;
-pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use compression_policy::{
     production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,
@@ -61,8 +61,8 @@ pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE
 pub use types::{SealedChunk, SealedSequence, WriterTail};
 
 // Re-export for use within submodules and tests
-pub use arena::StoragePolicy;
 pub use arena::ArenaKey;
+pub use arena::StoragePolicy;
 pub(crate) use arena::{Arena, ArenaStorage, ArenaStorageState};
 #[allow(unused_imports)]
 pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
@@ -71,3 +71,7 @@ pub(crate) use types::{BlockTableState, ChunkWindow, SequenceState};
 // `ArenaLocation` so callers can construct `SealedSequence` (whose
 // `location` field is the coarse-grained tier tag).
 pub use super::arena_table::ArenaLocation;
+
+// Accurate KV VRAM budget query for the scheduler's budget-aware eviction.
+#[cfg(feature = "cuda")]
+pub use alloc::vram_budget_available;

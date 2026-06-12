@@ -810,7 +810,9 @@ fn flip_mask(seed: u64, n_flips: u32) -> u128 {
     let mut s = seed;
     let mut count = 0u32;
     while count < n_flips {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bit = (s >> 57) as u32 & 0x7F;
         let bit_mask = 1u128 << bit;
         if mask & bit_mask == 0 {
@@ -847,8 +849,9 @@ fn generate(dir: &Path) -> anyhow::Result<Manifest> {
         // 6 positive cases
         for n in 0..6usize {
             let extra = fnv64(format!("{}+pos+{}", tool, n).as_bytes());
-            let sigs: Vec<TokenSignature> =
-                (0..TOKENS_PER_CHUNK).map(|i| make_sig(concept, 12, i, extra)).collect();
+            let sigs: Vec<TokenSignature> = (0..TOKENS_PER_CHUNK)
+                .map(|i| make_sig(concept, 12, i, extra))
+                .collect();
             let entry = pf.append(&sigs, &sigs, &sigs)?;
             let (user_prompt, assistant_prompt) = prompts(tool, CaseType::Positive, n, wrong_tool);
             scenarios.push(Scenario {
@@ -871,8 +874,12 @@ fn generate(dir: &Path) -> anyhow::Result<Manifest> {
             let extra_miss = fnv64(format!("{}+bnd_miss+{}", tool, n).as_bytes());
             let half = TOKENS_PER_CHUNK / 2;
             let mut sigs: Vec<TokenSignature> = Vec::with_capacity(TOKENS_PER_CHUNK);
-            for i in 0..half { sigs.push(make_sig(concept, 12, i, extra_hit)); }
-            for i in 0..half { sigs.push(make_sig(concept, 90, i + half, extra_miss)); }
+            for i in 0..half {
+                sigs.push(make_sig(concept, 12, i, extra_hit));
+            }
+            for i in 0..half {
+                sigs.push(make_sig(concept, 90, i + half, extra_miss));
+            }
             let entry = pf.append(&sigs, &sigs, &sigs)?;
             let (user_prompt, assistant_prompt) = prompts(tool, CaseType::Boundary, n, wrong_tool);
             scenarios.push(Scenario {
@@ -913,8 +920,7 @@ fn generate(dir: &Path) -> anyhow::Result<Manifest> {
 
         // 2 no-tool cases
         for n in 0..2usize {
-            let no_tool_concept =
-                name_concept_u128(&format!("no_tool_generic_{}_{}", tool_idx, n));
+            let no_tool_concept = name_concept_u128(&format!("no_tool_generic_{}_{}", tool_idx, n));
             let extra = fnv64(format!("{}+no_tool+{}", tool, n).as_bytes());
             let sigs: Vec<TokenSignature> = (0..TOKENS_PER_CHUNK)
                 .map(|i| make_sig(no_tool_concept, 12, i, extra))
@@ -936,8 +942,14 @@ fn generate(dir: &Path) -> anyhow::Result<Manifest> {
         }
     }
 
-    let manifest = Manifest { version: 1, scenarios };
-    std::fs::write(dir.join("MANIFEST.json"), serde_json::to_string_pretty(&manifest)?)?;
+    let manifest = Manifest {
+        version: 1,
+        scenarios,
+    };
+    std::fs::write(
+        dir.join("MANIFEST.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
     Ok(manifest)
 }
 
@@ -948,13 +960,24 @@ fn generate_append(dir: &Path) -> anyhow::Result<()> {
     let manifest_path = dir.join("MANIFEST.json");
     let prov_path = dir.join("signatures.prov");
 
-    let text = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {} — run without --append first", manifest_path.display(), e))?;
+    let text = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read {}: {} — run without --append first",
+            manifest_path.display(),
+            e
+        )
+    })?;
     let mut manifest: Manifest = serde_json::from_str(&text)?;
 
     let existing_ids: std::collections::HashSet<String> =
         manifest.scenarios.iter().map(|s| s.id.clone()).collect();
-    let mut turn_id: u64 = manifest.scenarios.iter().map(|s| s.turn_id).max().map(|x| x + 1).unwrap_or(0);
+    let mut turn_id: u64 = manifest
+        .scenarios
+        .iter()
+        .map(|s| s.turn_id)
+        .max()
+        .map(|x| x + 1)
+        .unwrap_or(0);
 
     // Open prov file in append mode (ProvenanceFile::open seeks to end automatically).
     let pf = ProvenanceFile::open(&prov_path)?;
@@ -975,8 +998,9 @@ fn generate_append(dir: &Path) -> anyhow::Result<()> {
             continue;
         }
         let extra = fnv64(format!("{}+pos+{}", tool, n).as_bytes());
-        let sigs: Vec<TokenSignature> =
-            (0..TOKENS_PER_CHUNK).map(|i| make_sig(concept, 12, i, extra)).collect();
+        let sigs: Vec<TokenSignature> = (0..TOKENS_PER_CHUNK)
+            .map(|i| make_sig(concept, 12, i, extra))
+            .collect();
         let entry = pf.append(&sigs, &sigs, &sigs)?;
         let (user_prompt, assistant_prompt) = prompts(tool, CaseType::Positive, n, wrong_tool);
         manifest.scenarios.push(Scenario {
@@ -1027,20 +1051,41 @@ fn main() -> anyhow::Result<()> {
     println!("Generating tool-provenance fixtures → {}", dir.display());
     let manifest = generate(dir)?;
 
-    let total_bytes: u64 = manifest.scenarios.iter()
+    let total_bytes: u64 = manifest
+        .scenarios
+        .iter()
         .map(|s| s.token_count as u64 * 48)
         .sum();
 
     println!(
         "  {} scenarios ({} positive, {} boundary, {} negative, {} no-tool)",
         manifest.scenarios.len(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Positive).count(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Boundary).count(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Negative).count(),
-        manifest.scenarios.iter().filter(|s| s.case_type == CaseType::NoTool).count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::Positive)
+            .count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::Boundary)
+            .count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::Negative)
+            .count(),
+        manifest
+            .scenarios
+            .iter()
+            .filter(|s| s.case_type == CaseType::NoTool)
+            .count(),
     );
     println!("  signatures.prov: {} bytes", total_bytes);
-    println!("  MANIFEST.json:   {} bytes", std::fs::metadata(dir.join("MANIFEST.json"))?.len());
+    println!(
+        "  MANIFEST.json:   {} bytes",
+        std::fs::metadata(dir.join("MANIFEST.json"))?.len()
+    );
     println!("Done.");
     Ok(())
 }

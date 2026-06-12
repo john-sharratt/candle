@@ -507,40 +507,74 @@ fn palette4_convert_r16_identity_copy_check() -> Result<()> {
 // =============================================================================
 
 // ArenaFormat code reference table (not all entries are used in every test)
-#[allow(dead_code)] const FMT_F32: u8 = 0;
-#[allow(dead_code)] const FMT_F16: u8 = 1;
-#[allow(dead_code)] const FMT_BF16: u8 = 2;
-#[allow(dead_code)] const FMT_R16: u8 = 3;
-#[allow(dead_code)] const FMT_P2: u8 = 4;
-#[allow(dead_code)] const FMT_QAWQ: u8 = 5;
-#[allow(dead_code)] const FMT_QAWQ_G64: u8 = 6;
-#[allow(dead_code)] const FMT_Q8_0: u8 = 7;
-#[allow(dead_code)] const FMT_Q8_1: u8 = 8;
-#[allow(dead_code)] const FMT_Q8_K: u8 = 9;
-#[allow(dead_code)] const FMT_Q8_KS: u8 = 10;
-#[allow(dead_code)] const FMT_Q6_K: u8 = 11;
-#[allow(dead_code)] const FMT_Q5_0: u8 = 12;
-#[allow(dead_code)] const FMT_Q5_1: u8 = 13;
-#[allow(dead_code)] const FMT_Q5_K: u8 = 14;
-#[allow(dead_code)] const FMT_Q4_0: u8 = 15;
-#[allow(dead_code)] const FMT_Q4_1: u8 = 16;
-#[allow(dead_code)] const FMT_Q4_K: u8 = 17;
-#[allow(dead_code)] const FMT_Q4_KS: u8 = 18;
-#[allow(dead_code)] const FMT_Q3_0: u8 = 19;
-#[allow(dead_code)] const FMT_Q3_1: u8 = 20;
-#[allow(dead_code)] const FMT_Q3_K: u8 = 21;
-#[allow(dead_code)] const FMT_Q2_0: u8 = 22;
-#[allow(dead_code)] const FMT_Q2_1: u8 = 23;
-#[allow(dead_code)] const FMT_Q2_K: u8 = 24;
-#[allow(dead_code)] const FMT_Q2_S: u8 = 25;
-#[allow(dead_code)] const FMT_Q2_A: u8 = 26;
-#[allow(dead_code)] const FMT_Q1_S: u8 = 27;
-#[allow(dead_code)] const FMT_Q0_V: u8 = 28;
-#[allow(dead_code)] const FMT_Q1_A: u8 = 29;
-#[allow(dead_code)] const FMT_Q0_X: u8 = 30;
-#[allow(dead_code)] const FMT_Q0_M2: u8 = 31;
-#[allow(dead_code)] const FMT_Q0_M4: u8 = 32;
-#[allow(dead_code)] const FMT_Q0: u8 = 33;
+#[allow(dead_code)]
+const FMT_F32: u8 = 0;
+#[allow(dead_code)]
+const FMT_F16: u8 = 1;
+#[allow(dead_code)]
+const FMT_BF16: u8 = 2;
+#[allow(dead_code)]
+const FMT_R16: u8 = 3;
+#[allow(dead_code)]
+const FMT_P2: u8 = 4;
+#[allow(dead_code)]
+const FMT_QAWQ: u8 = 5;
+#[allow(dead_code)]
+const FMT_QAWQ_G64: u8 = 6;
+#[allow(dead_code)]
+const FMT_Q8_0: u8 = 7;
+#[allow(dead_code)]
+const FMT_Q8_1: u8 = 8;
+#[allow(dead_code)]
+const FMT_Q8_K: u8 = 9;
+#[allow(dead_code)]
+const FMT_Q8_KS: u8 = 10;
+#[allow(dead_code)]
+const FMT_Q6_K: u8 = 11;
+#[allow(dead_code)]
+const FMT_Q5_0: u8 = 12;
+#[allow(dead_code)]
+const FMT_Q5_1: u8 = 13;
+#[allow(dead_code)]
+const FMT_Q5_K: u8 = 14;
+#[allow(dead_code)]
+const FMT_Q4_0: u8 = 15;
+#[allow(dead_code)]
+const FMT_Q4_1: u8 = 16;
+#[allow(dead_code)]
+const FMT_Q4_K: u8 = 17;
+#[allow(dead_code)]
+const FMT_Q4_KS: u8 = 18;
+#[allow(dead_code)]
+const FMT_Q3_0: u8 = 19;
+#[allow(dead_code)]
+const FMT_Q3_1: u8 = 20;
+#[allow(dead_code)]
+const FMT_Q3_K: u8 = 21;
+#[allow(dead_code)]
+const FMT_Q2_0: u8 = 22;
+#[allow(dead_code)]
+const FMT_Q2_1: u8 = 23;
+#[allow(dead_code)]
+const FMT_Q2_K: u8 = 24;
+#[allow(dead_code)]
+const FMT_Q2_S: u8 = 25;
+#[allow(dead_code)]
+const FMT_Q2_A: u8 = 26;
+#[allow(dead_code)]
+const FMT_Q1_S: u8 = 27;
+#[allow(dead_code)]
+const FMT_Q0_V: u8 = 28;
+#[allow(dead_code)]
+const FMT_Q1_A: u8 = 29;
+#[allow(dead_code)]
+const FMT_Q0_X: u8 = 30;
+#[allow(dead_code)]
+const FMT_Q0_M2: u8 = 31;
+#[allow(dead_code)]
+const FMT_Q0_M4: u8 = 32;
+#[allow(dead_code)]
+const FMT_Q0: u8 = 33;
 
 /// All quant formats supported by the palette4 kernel (32-element blocks).
 const ALL_QUANT_FMTS: &[(u8, &str, f32)] = &[
@@ -560,7 +594,7 @@ const ALL_QUANT_FMTS: &[(u8, &str, f32)] = &[
     (FMT_Q2_S, "Q2_S", 0.85),
     (FMT_Q2_A, "Q2_A", 0.85),
     (FMT_Q1_S, "Q1_S", 1.0), // sign-only; check for crash + plausible sign
-    (FMT_Q0, "Q0", 999.0),         // constant block; only verify kernel doesn't crash
+    (FMT_Q0, "Q0", 999.0),   // constant block; only verify kernel doesn't crash
     (FMT_Q0_V, "Q0_V", 999.0),
     (FMT_Q1_A, "Q1_A", 999.0),
     (FMT_Q0_X, "Q0_X", 999.0),
@@ -771,10 +805,8 @@ fn run_kernel_pass(
         Device::Cuda(d) => d,
         _ => unreachable!("run_kernel_pass requires a CUDA device"),
     };
-    let src_ptrs: [u64; N_PAL] =
-        std::array::from_fn(|p| src_arenas[p].device_ptr(stream).0 as u64);
-    let dst_ptrs: [u64; N_PAL] =
-        std::array::from_fn(|p| dst_arenas[p].device_ptr(stream).0 as u64);
+    let src_ptrs: [u64; N_PAL] = std::array::from_fn(|p| src_arenas[p].device_ptr(stream).0 as u64);
+    let dst_ptrs: [u64; N_PAL] = std::array::from_fn(|p| dst_arenas[p].device_ptr(stream).0 as u64);
     let sg: [GgmlDType; N_PAL] = std::array::from_fn(|i| fmt_code_to_ggml_dtype(src_fmts[i]));
     let dg: [GgmlDType; N_PAL] = std::array::from_fn(|i| fmt_code_to_ggml_dtype(dst_fmts[i]));
     let desc = PalHeadDesc {
@@ -2376,7 +2408,11 @@ fn buffered_api_build_kvhead_bytes_raw_layout() -> Result<()> {
         &unit_scales,
         &unit_scales,
     )?;
-    assert_eq!(bytes.len(), 168, "KvHead must be 168 bytes (HD/2 + 104 for HD=128, f32 scales)");
+    assert_eq!(
+        bytes.len(),
+        168,
+        "KvHead must be 168 bytes (HD/2 + 104 for HD=128, f32 scales)"
+    );
 
     // Pal maps should be identity
     assert_eq!(&bytes[0..32], &id[..], "k_pal_map mismatch");

@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::UdpError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {}
@@ -34,15 +34,20 @@ impl Tool for UdpSessionList {
     type Error = UdpError;
 
     fn run(ctx: &ToolContext, _req: ListRequest) -> Result<ListResponse, UdpError> {
-        let sessions = ctx.sessions.list_udp().into_iter().map(|arc| {
-            let e = arc.lock().unwrap();
-            SessionInfo {
-                session_id: e.meta.session_id.clone(),
-                local_addr: e.local_addr.clone(),
-                default_peer: e.default_peer.clone(),
-                opened_at: e.meta.opened_at.clone(),
-            }
-        }).collect();
+        let sessions = ctx
+            .sessions
+            .list_udp()
+            .into_iter()
+            .map(|arc| {
+                let e = arc.lock().unwrap();
+                SessionInfo {
+                    session_id: e.meta.session_id.clone(),
+                    local_addr: e.local_addr.clone(),
+                    default_peer: e.default_peer.clone(),
+                    opened_at: e.meta.opened_at.clone(),
+                }
+            })
+            .collect();
         Ok(ListResponse { sessions })
     }
 }

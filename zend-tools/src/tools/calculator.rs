@@ -61,7 +61,9 @@ impl Tool for CalculatorTool {
             return Err(CalcError::MathError("result is NaN".to_string()));
         }
         if result.is_infinite() {
-            return Err(CalcError::MathError("result is infinite (division by zero?)".to_string()));
+            return Err(CalcError::MathError(
+                "result is infinite (division by zero?)".to_string(),
+            ));
         }
         Ok(Response {
             expression: req.expression,

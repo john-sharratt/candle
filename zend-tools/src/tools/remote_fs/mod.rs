@@ -38,30 +38,30 @@
 //! `mkdir`, `rename`) confirm every call.  Read operations (`get`, `list_dir`,
 //! `stat`) and management operations (`list`, `close`) do not confirm.
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
-pub mod open;
-pub mod list_dir;
-pub mod stat;
-pub mod get;
-pub mod put;
-pub mod delete;
-pub mod mkdir;
-pub mod rename;
-pub mod list;
 pub mod close;
+pub mod delete;
+pub mod get;
+pub mod list;
+pub mod list_dir;
+pub mod mkdir;
+pub mod open;
+pub mod put;
+pub mod rename;
+pub mod stat;
 
-pub use open::REMOTE_FS_SESSION_OPEN;
-pub use list_dir::REMOTE_FS_SESSION_LIST_DIR;
-pub use stat::REMOTE_FS_SESSION_STAT;
-pub use get::REMOTE_FS_SESSION_GET;
-pub use put::REMOTE_FS_SESSION_PUT;
-pub use delete::REMOTE_FS_SESSION_DELETE;
-pub use mkdir::REMOTE_FS_SESSION_MKDIR;
-pub use rename::REMOTE_FS_SESSION_RENAME;
-pub use list::REMOTE_FS_SESSION_LIST;
 pub use close::REMOTE_FS_SESSION_CLOSE;
+pub use delete::REMOTE_FS_SESSION_DELETE;
+pub use get::REMOTE_FS_SESSION_GET;
+pub use list::REMOTE_FS_SESSION_LIST;
+pub use list_dir::REMOTE_FS_SESSION_LIST_DIR;
+pub use mkdir::REMOTE_FS_SESSION_MKDIR;
+pub use open::REMOTE_FS_SESSION_OPEN;
+pub use put::REMOTE_FS_SESSION_PUT;
+pub use rename::REMOTE_FS_SESSION_RENAME;
+pub use stat::REMOTE_FS_SESSION_STAT;
 
 #[derive(Debug, Error)]
 pub enum RemoteFsError {

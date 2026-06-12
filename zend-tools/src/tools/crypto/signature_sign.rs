@@ -1,14 +1,14 @@
 //! signature_sign tool.
 
-use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, CryptoError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SigSignRequest {
@@ -40,7 +40,9 @@ impl Tool for SignatureSign {
     type Error = CryptoError;
 
     fn run(ctx: &ToolContext, req: SigSignRequest) -> Result<SigSignResponse, CryptoError> {
-        let cred = ctx.credentials.get_by_name(&req.credential_name)
+        let cred = ctx
+            .credentials
+            .get_by_name(&req.credential_name)
             .ok_or_else(|| CryptoError::CredentialNotFound(req.credential_name.clone()))?;
 
         if cred.cred_type != "signing_key" {
@@ -48,8 +50,7 @@ impl Tool for SignatureSign {
         }
 
         let enc = req.data_encoding.as_deref().unwrap_or("text");
-        let data = decode_data(&req.data, enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
+        let data = decode_data(&req.data, enc).map_err(CryptoError::InvalidDataEncoding)?;
 
         let sig_hex = match req.algorithm.as_str() {
             "ed25519" => {
@@ -70,7 +71,10 @@ impl Tool for SignatureSign {
             other => return Err(CryptoError::UnknownAlgorithm(other.to_string())),
         };
 
-        Ok(SigSignResponse { signature_hex: sig_hex, algorithm: req.algorithm })
+        Ok(SigSignResponse {
+            signature_hex: sig_hex,
+            algorithm: req.algorithm,
+        })
     }
 }
 

@@ -71,7 +71,9 @@ fn innermost_identifier(node: &Node, source: &[u8]) -> Option<String> {
 
 fn enclosing_label(node: &Node, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "namespace_definition" => field_text(node, "name", source).map(|n| format!("namespace {n}")),
+        "namespace_definition" => {
+            field_text(node, "name", source).map(|n| format!("namespace {n}"))
+        }
         "class_specifier" => field_text(node, "name", source).map(|n| format!("class {n}")),
         "struct_specifier" => field_text(node, "name", source).map(|n| format!("struct {n}")),
         _ => None,
@@ -112,10 +114,7 @@ mod tests {
     fn extracts_struct_with_method() {
         verify(
             "struct S {\n    void doit() {}\n};\n",
-            &[
-                ("struct S", "struct S"),
-                ("struct S > doit()", "doit"),
-            ],
+            &[("struct S", "struct S"), ("struct S > doit()", "doit")],
         );
     }
 
@@ -133,7 +132,10 @@ mod tests {
         assert!(
             !ctor_destructor.is_empty(),
             "expected ctor or dtor scope: {:?}",
-            scopes.iter().map(|s| s.qualified_path()).collect::<Vec<_>>()
+            scopes
+                .iter()
+                .map(|s| s.qualified_path())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -257,6 +259,8 @@ mod tests {
 
     #[test]
     fn preserves_lambda_inside_function() {
-        verify_cov("void caller() {\n    auto fn = [](int x) { return x + 1; };\n    (void)fn;\n}\n");
+        verify_cov(
+            "void caller() {\n    auto fn = [](int x) { return x + 1; };\n    (void)fn;\n}\n",
+        );
     }
 }

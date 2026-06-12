@@ -40,18 +40,18 @@
 //! | `session_limit_exceeded` | 5-session-per-user cap reached |
 //! | `credential_not_found` | Named credential not in store |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
+pub mod close;
+pub mod list;
 pub mod open;
 pub mod request;
-pub mod list;
-pub mod close;
 
+pub use close::HTTP_SESSION_CLOSE;
+pub use list::HTTP_SESSION_LIST;
 pub use open::HTTP_SESSION_OPEN;
 pub use request::HTTP_SESSION_REQUEST;
-pub use list::HTTP_SESSION_LIST;
-pub use close::HTTP_SESSION_CLOSE;
 
 #[derive(Debug, Error)]
 pub enum HttpSessionError {

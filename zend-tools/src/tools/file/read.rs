@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::FileError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
@@ -38,10 +38,16 @@ impl Tool for FileRead {
     type Error = FileError;
 
     fn run(ctx: &ToolContext, req: ReadRequest) -> Result<ReadResponse, FileError> {
-        let content = ctx.vfs.read(&req.path)
+        let content = ctx
+            .vfs
+            .read(&req.path)
             .ok_or_else(|| FileError::NotFound(req.path.clone()))?;
         let lines = content.lines().count();
-        Ok(ReadResponse { path: req.path, content, lines })
+        Ok(ReadResponse {
+            path: req.path,
+            content,
+            lines,
+        })
     }
 }
 

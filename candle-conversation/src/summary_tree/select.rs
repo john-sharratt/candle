@@ -209,11 +209,7 @@ pub fn select_dense(
 /// covered) and `SummaryOfSummaries` (covered iff every of the 2
 /// summary children ∈ covered).  Normal turns have no children and are
 /// never themselves redundant.
-pub fn eliminate_redundant(
-    tree: &SummaryTree,
-    selected: &mut AHashSet<NodeId>,
-    used: &mut u32,
-) {
+pub fn eliminate_redundant(tree: &SummaryTree, selected: &mut AHashSet<NodeId>, used: &mut u32) {
     let order = tree.post_order();
     for id in order {
         if !selected.contains(&id) {
@@ -246,9 +242,7 @@ pub fn covered(tree: &SummaryTree, node: NodeId, selected: &AHashSet<NodeId>) ->
     if !n.has_children() {
         return false;
     }
-    n.children
-        .iter()
-        .all(|c| covered(tree, *c, selected))
+    n.children.iter().all(|c| covered(tree, *c, selected))
 }
 
 /// Maximal contiguous runs of uncovered Normal sub-leaves.
@@ -524,11 +518,7 @@ mod tests {
             for n in &normals {
                 tree.insert_node(Node::normal(*n, tokens_per_normal));
             }
-            let leaf = Node::summary_of_turns(
-                NodeId(leaf_id),
-                normals.clone(),
-                tokens_per_summary,
-            );
+            let leaf = Node::summary_of_turns(NodeId(leaf_id), normals.clone(), tokens_per_summary);
             tree.insert_leaf_rightmost(leaf);
             all_normals.extend(normals);
         }
@@ -578,8 +568,7 @@ mod tests {
         let sel = select_dense(&tree, &scores, RecencyConfig::default(), 10_000);
         assert!(sel.contains(NodeId(1)));
         assert_eq!(
-            sel.origins
-                [sel.selected.iter().position(|n| *n == NodeId(1)).unwrap()],
+            sel.origins[sel.selected.iter().position(|n| *n == NodeId(1)).unwrap()],
             SelectionOrigin::ProvenanceScore,
             "leaf 1 must come in via provenance, not recency",
         );
@@ -635,7 +624,10 @@ mod tests {
         sel.insert(internal);
         let mut used = 40;
         eliminate_redundant(&tree, &mut sel, &mut used);
-        assert!(sel.contains(&internal), "SoS must stay when right child uncovered");
+        assert!(
+            sel.contains(&internal),
+            "SoS must stay when right child uncovered"
+        );
         assert!(sel.contains(&NodeId(1)));
     }
 
@@ -723,12 +715,7 @@ mod tests {
         let parents = build_parent_map(&tree);
         let map = build_normal_to_leaf_map(&tree);
         // Normals 0 and 3 span all 4 leaves → LCA = root.
-        let lca = lca_of_normals(
-            &tree,
-            &[normals[0], normals[3]],
-            &parents,
-            &map,
-        );
+        let lca = lca_of_normals(&tree, &[normals[0], normals[3]], &parents, &map);
         assert_eq!(lca, tree.root());
     }
 

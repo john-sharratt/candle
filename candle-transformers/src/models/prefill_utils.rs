@@ -1,13 +1,12 @@
+#[cfg(feature = "cuda")]
+use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
-#[cfg(feature = "cuda")]
-use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use candle::*;
 pub(crate) use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 pub(crate) use candle_nn::kv_cache::CHUNK_SIZE;
-
 
 #[cfg(feature = "cuda")]
 use {
@@ -20,7 +19,6 @@ use {
 
 #[cfg(feature = "cuda")]
 use crate::models::slot_state::{SlotStateHost, TokenSliceHost};
-
 
 /// Chunked KV + paged prefill attention over chunks.
 ///
@@ -48,6 +46,11 @@ fn paged_prefill_batched_impl(
     rope_interleaved: bool,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
+    // GAP_FILL mode: `Some(col_actual_pos)` routes through the gap-fill kernel.
+    // `col_actual_pos` is the flat (per-slot kv_len) array of each column's TRUE
+    // sequence position. Sealed content is the contiguous prefix; all glue is the
+    // new region appended as the writer tail. `None` = normal contiguous prefill.
+    gap_fill: Option<&[u32]>,
 ) -> Result<Tensor> {
     // Ragged/varlen prefill. q/k/v arrive FLAT-packed:
     //   q: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
@@ -269,8 +272,21 @@ fn paged_prefill_batched_impl(
         }
     };
 
-    let (_headers_gpu_guard, _slices_gpu_guard, _pm_gpu_guard, headers_ptr):
-        (GpuBuf, GpuBuf, GpuBuf, u64) = {
+    let (
+        _headers_gpu_guard,
+        _slices_gpu_guard,
+        _pm_gpu_guard,
+        headers_ptr,
+        _gf_guards,
+        gap_fill_arg,
+    ): (
+        GpuBuf,
+        GpuBuf,
+        GpuBuf,
+        u64,
+        Vec<GpuBuf>,
+        Option<(u64, u64, u64, u64)>,
+    ) = {
         let arena_info = {
             let first = caches
                 .first()
@@ -288,10 +304,7 @@ fn paged_prefill_batched_impl(
                     .k_cache()
                     .chunked_live_chunks_as_sealed()
                     .unwrap_or_default();
-                let writer_start_idx = cache
-                    .k_cache()
-                    .chunked_writer_start_idx()
-                    .unwrap_or(0);
+                let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
                 SlotStateHost::from_sealed_chunks(
                     &chunks,
                     n_kv_head,
@@ -344,9 +357,8 @@ fn paged_prefill_batched_impl(
         let pm_byte_len = pm_buf.len() * std::mem::size_of::<u32>();
         let mut pm_pinned = generation.alloc(pm_byte_len)?;
         // SAFETY: u32 has no padding and is trivially copyable; lengths match.
-        let pm_bytes = unsafe {
-            std::slice::from_raw_parts(pm_buf.as_ptr() as *const u8, pm_byte_len)
-        };
+        let pm_bytes =
+            unsafe { std::slice::from_raw_parts(pm_buf.as_ptr() as *const u8, pm_byte_len) };
         pm_pinned.copy_from_slice(pm_bytes);
         let pm_gpu = generation.submit(pm_pinned)?;
         let pm_base_ptr = pm_gpu.dev_ptr();
@@ -367,7 +379,80 @@ fn paged_prefill_batched_impl(
         pinned.copy_from_slice(&header_buf);
         let headers_gpu = generation.submit(pinned)?;
         let headers_ptr = headers_gpu.dev_ptr();
-        (headers_gpu, slices_gpu, pm_gpu, headers_ptr)
+
+        // GAP_FILL: when `col_actual_pos` is provided, build `cu_kvlens` (each
+        // slot's exclusive-prefix-sum KV base) and the per-row glue write
+        // targets from the write region, and pass `col_actual_pos` so the
+        // kernel relabels every column with its true sequence position for the
+        // causal mask. An identity `col_actual_pos` reduces this to standard
+        // prefill — the bit-identical case the kernel-layout test gate covers.
+        let (gf_guards, gap_fill_arg): (Vec<GpuBuf>, Option<(u64, u64, u64, u64)>) =
+            if let Some(col_actual_pos) = gap_fill {
+                // cu_kvlens = exclusive prefix-sum of kv_lens (per-slot base into
+                // the caller-provided flat `col_actual_pos`).
+                let mut cu_kvlens: Vec<u32> = Vec::with_capacity(slots.len() + 1);
+                cu_kvlens.push(0);
+                for (i, &off) in offsets.iter().enumerate() {
+                    let kv_len = (off + q_lens[i]) as u32;
+                    let prev = *cu_kvlens.last().unwrap();
+                    cu_kvlens.push(prev + kv_len);
+                }
+                let expected = *cu_kvlens.last().unwrap() as usize;
+                if col_actual_pos.len() != expected {
+                    candle::bail!(
+                        "gap-fill col_actual_pos len {} != total kv_len {}",
+                        col_actual_pos.len(),
+                        expected
+                    );
+                }
+                // Per query row (cu_seqlens order): write target = the slot's
+                // position_map entry for the new token at offset+r (the appended
+                // glue writer tail).
+                let mut glue_write_slice: Vec<u32> = Vec::with_capacity(total_q);
+                let mut glue_write_in_blk: Vec<u32> = Vec::with_capacity(total_q);
+                for (i, slot) in slots.iter().enumerate() {
+                    let off = offsets[i];
+                    for r in 0..q_lens[i] {
+                        let entry = slot.position_map[off + r];
+                        glue_write_slice.push(entry >> 16);
+                        glue_write_in_blk.push(entry & 0xFFFF);
+                    }
+                }
+                let upload_u32 = |v: &[u32]| -> Result<(GpuBuf, u64)> {
+                    let bytes = v.len().max(1) * 4;
+                    let mut pinned = generation.alloc(bytes)?;
+                    let zero = [0u8; 4];
+                    let src: &[u8] = if v.is_empty() {
+                        &zero
+                    } else {
+                        // SAFETY: u32 has no padding; len matches.
+                        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+                    };
+                    pinned.copy_from_slice(src);
+                    let gpu = generation.submit(pinned)?;
+                    let ptr = gpu.dev_ptr();
+                    Ok((gpu, ptr))
+                };
+                let (cap_gpu, cap_ptr) = upload_u32(col_actual_pos)?;
+                let (cuk_gpu, cuk_ptr) = upload_u32(&cu_kvlens)?;
+                let (gws_gpu, gws_ptr) = upload_u32(&glue_write_slice)?;
+                let (gwi_gpu, gwi_ptr) = upload_u32(&glue_write_in_blk)?;
+                (
+                    vec![cap_gpu, cuk_gpu, gws_gpu, gwi_gpu],
+                    Some((cap_ptr, cuk_ptr, gws_ptr, gwi_ptr)),
+                )
+            } else {
+                (Vec::new(), None)
+            };
+
+        (
+            headers_gpu,
+            slices_gpu,
+            pm_gpu,
+            headers_ptr,
+            gf_guards,
+            gap_fill_arg,
+        )
     };
 
     profile_sync(q.device());
@@ -393,6 +478,7 @@ fn paged_prefill_batched_impl(
         rope_cs,
         rope_interleaved,
         write_offset_shifts_ptr,
+        gap_fill_arg,
     )?;
     profile_sync(q.device());
     pipeline_record("prefill:kernel", t_kernel);
@@ -467,6 +553,106 @@ pub fn paged_prefill_batched(
         rope_interleaved,
         write_offset_shifts_ptr,
         generation,
+        None, // normal contiguous prefill
+    )
+}
+
+/// Test-only: route the same batched prefill through the GAP_FILL kernel with
+/// identity `col_actual_pos` and write targets from the contiguous write region.
+/// Output must be bit-identical to [`paged_prefill_batched`] — the TDD gate that
+/// validates the gap-fill kernel reduces to standard prefill.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_batched_gap_fill_degenerate(
+    caches: &mut [&mut KvCache],
+    offsets: &[usize],
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b_sz: usize,
+    q_lens: &[usize],
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    rope_offsets: &Tensor,
+    rope_cs: &Tensor,
+    rope_interleaved: bool,
+    write_offset_shifts_ptr: u64,
+    generation: &Generation,
+) -> Result<Tensor> {
+    // Identity col_actual_pos = [0, kv_len) per slot, flat.
+    let col_actual_pos: Vec<u32> = offsets
+        .iter()
+        .zip(q_lens.iter())
+        .flat_map(|(&o, &l)| 0..(o + l) as u32)
+        .collect();
+    paged_prefill_batched_gap_fill(
+        caches,
+        offsets,
+        q,
+        k,
+        v,
+        b_sz,
+        q_lens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        prefill_meta,
+        rope_offsets,
+        rope_cs,
+        rope_interleaved,
+        write_offset_shifts_ptr,
+        generation,
+        &col_actual_pos,
+    )
+}
+
+/// Test/integration entry: route the batched prefill through the GAP_FILL kernel
+/// with an explicit `col_actual_pos` (flat, per-slot kv_len — each column's TRUE
+/// sequence position). An interleaved layout places sealed content before AND
+/// after the glue island; the glue attends only columns with a smaller actual
+/// position. Glue tokens are the new region (`q`/`k`/`v`); the sealed prefix is
+/// read from the caches.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_batched_gap_fill(
+    caches: &mut [&mut KvCache],
+    offsets: &[usize],
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    b_sz: usize,
+    q_lens: &[usize],
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    rope_offsets: &Tensor,
+    rope_cs: &Tensor,
+    rope_interleaved: bool,
+    write_offset_shifts_ptr: u64,
+    generation: &Generation,
+    col_actual_pos: &[u32],
+) -> Result<Tensor> {
+    paged_prefill_batched_impl(
+        caches,
+        offsets,
+        q,
+        k,
+        v,
+        b_sz,
+        q_lens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        prefill_meta,
+        rope_offsets,
+        rope_cs,
+        rope_interleaved,
+        write_offset_shifts_ptr,
+        generation,
+        Some(col_actual_pos),
     )
 }
 
@@ -565,6 +751,32 @@ pub fn paged_prefill_batched(
     Tensor::cat(&all_outputs, 0)
 }
 
+/// Non-CUDA stub: the gap-fill kernel is CUDA-only. The projection assembler
+/// never sets `col_actual_pos` on a CPU device, so this is never reached.
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub fn paged_prefill_batched_gap_fill(
+    _caches: &mut [&mut KvCache],
+    _offsets: &[usize],
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _b_sz: usize,
+    _q_lens: &[usize],
+    _n_head: usize,
+    _n_kv_head: usize,
+    _head_dim: usize,
+    _prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    _rope_offsets: &Tensor,
+    _rope_cs: &Tensor,
+    _rope_interleaved: bool,
+    _write_offset_shifts_ptr: u64,
+    _generation: &Generation,
+    _col_actual_pos: &[u32],
+) -> Result<Tensor> {
+    candle::bail!("gap-fill prefill requires the cuda feature")
+}
+
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
 struct PagedPrefillChunks {
@@ -596,6 +808,20 @@ struct PagedPrefillChunks {
     /// Zero values = no shift (left-packed). Non-zero = SSO right-pack offset.
     /// Raw GPU device pointer (u64) into a u32 array of length batch_size.
     write_offset_shifts_ptr: u64,
+    /// GAP_FILL mode: sealed content is the (packed) prefix; all glue is the new
+    /// region in k_packed; the causal mask compares TRUE positions. When false,
+    /// the four pointers below are 0 and the normal contiguous path runs.
+    gap_fill: bool,
+    /// Raw GPU pointer (u64) to `col_actual_pos` (flat u32, per-slot base
+    /// `cu_kvlens[b]`): every column's true sequence position.
+    col_actual_pos_ptr: u64,
+    /// Raw GPU pointer (u64) to `cu_kvlens` (u32[batch_size+1]): exclusive
+    /// prefix-sum of kv_lens — per-slot base into `col_actual_pos`.
+    cu_kvlens_ptr: u64,
+    /// Raw GPU pointers (u64) to per-query-row glue writer targets
+    /// (u32[total_q]): writer-chunk slice index + in-block offset.
+    glue_write_slice_ptr: u64,
+    glue_write_in_blk_ptr: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -766,6 +992,11 @@ impl PagedPrefillChunks {
                 rope_cs_ptr,
                 self.rope_interleaved as i32,
                 write_offset_shifts_ptr,
+                if self.gap_fill { 1 } else { 0 },
+                self.col_actual_pos_ptr as *const u32,
+                self.cu_kvlens_ptr as *const u32,
+                self.glue_write_slice_ptr as *const u32,
+                self.glue_write_in_blk_ptr as *const u32,
                 raw_stream,
             );
         }
@@ -835,6 +1066,10 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
     rope_cs: &Tensor,
     rope_interleaved: bool,
     write_offset_shifts_ptr: u64,
+    // GAP_FILL descriptor device pointers, or `None` for the normal contiguous
+    // path: `(col_actual_pos, cu_kvlens, glue_write_slice, glue_write_in_blk)`.
+    // The caller must keep the backing GPU buffers alive across this call.
+    gap_fill: Option<(u64, u64, u64, u64)>,
 ) -> Result<Tensor> {
     // HEAD_DIM must be a multiple of 32 and <= 256
     if head_dim % 32 != 0 || head_dim > 256 {
@@ -886,6 +1121,11 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
         rope_cs: rope_cs.clone(),
         rope_interleaved,
         write_offset_shifts_ptr,
+        gap_fill: gap_fill.is_some(),
+        col_actual_pos_ptr: gap_fill.map(|g| g.0).unwrap_or(0),
+        cu_kvlens_ptr: gap_fill.map(|g| g.1).unwrap_or(0),
+        glue_write_slice_ptr: gap_fill.map(|g| g.2).unwrap_or(0),
+        glue_write_in_blk_ptr: gap_fill.map(|g| g.3).unwrap_or(0),
     };
     q.apply_op1(op)
 }

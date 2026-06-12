@@ -50,7 +50,14 @@ fn file_tools_score_above_non_file_mean() {
     let (manifest, pf) = load_fixtures();
     let h = Harness::build();
 
-    const NON_FILE: &[&str] = &["weather", "web_search", "code_run", "datetime", "calculator", "random"];
+    const NON_FILE: &[&str] = &[
+        "weather",
+        "web_search",
+        "code_run",
+        "datetime",
+        "calculator",
+        "random",
+    ];
 
     for tool in &["file_read", "file_write"] {
         let probe_id = format!("{tool}_pos_1");

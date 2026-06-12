@@ -39,15 +39,15 @@
 
 use thiserror::Error;
 
-use crate::{ToolError};
+use crate::ToolError;
 
-pub mod save;
-pub mod list;
 pub mod delete;
+pub mod list;
+pub mod save;
 
-pub use save::CREDENTIAL_SAVE;
-pub use list::CREDENTIAL_LIST;
 pub use delete::CREDENTIAL_DELETE;
+pub use list::CREDENTIAL_LIST;
+pub use save::CREDENTIAL_SAVE;
 
 #[derive(Debug, Error)]
 pub enum CredError {

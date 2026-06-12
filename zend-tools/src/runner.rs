@@ -25,17 +25,8 @@ use crate::tool::ConfirmationDetails;
 /// - tool error → `{"error": "<code>", "detail": "..."}`
 /// - bad arguments → `{"error": "invalid_arguments", "detail": "..."}`
 /// - unknown tool → `{"error": "unknown_tool", "detail": "..."}`
-pub fn run(
-    tool_name: &str,
-    tool_call_id: &str,
-    args: &Value,
-    ctx: &ToolContext,
-) -> Value {
-    let span = tracing::info_span!(
-        "tool",
-        name = tool_name,
-        call_id = tool_call_id,
-    );
+pub fn run(tool_name: &str, tool_call_id: &str, args: &Value, ctx: &ToolContext) -> Value {
+    let span = tracing::info_span!("tool", name = tool_name, call_id = tool_call_id,);
     let _enter = span.enter();
 
     let Some(tool) = registry::find(tool_name) else {

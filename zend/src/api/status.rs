@@ -22,7 +22,11 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
         completed: s.completed.iter().map(|step| step.label()).collect(),
     });
     Json(StatusBody {
-        state: if loading.is_some() { "loading" } else { "ready" },
+        state: if loading.is_some() {
+            "loading"
+        } else {
+            "ready"
+        },
         started_at_ms: snap.started_at_ms,
         detail: snap.detail,
         loading,

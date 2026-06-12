@@ -25,7 +25,9 @@ impl HashInner {
             HashInner::Md5(h) => h.update(data),
             HashInner::Sha3_256(h) => h.update(data),
             HashInner::Sha3_512(h) => h.update(data),
-            HashInner::Blake3(h) => { h.update(data); }
+            HashInner::Blake3(h) => {
+                h.update(data);
+            }
         }
     }
 
@@ -140,6 +142,10 @@ impl HashStateStore {
     }
 
     pub fn get_created_at(&self, id: &str) -> Option<String> {
-        self.inner.read().unwrap().get(id).map(|e| e.created_at.clone())
+        self.inner
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|e| e.created_at.clone())
     }
 }

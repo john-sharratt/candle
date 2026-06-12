@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::HashStateError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct InitRequest {
@@ -38,16 +38,19 @@ impl Tool for HashStateInit {
 
     fn run(ctx: &ToolContext, req: InitRequest) -> Result<InitResponse, HashStateError> {
         let id = req.id.unwrap_or_else(|| format!("hs_{}", Uuid::new_v4()));
-        ctx.hash_states.create(&id, &req.algorithm)
-            .map_err(|e| {
-                if e.contains("already exists") {
-                    HashStateError::IdAlreadyExists(id.clone())
-                } else {
-                    HashStateError::UnknownAlgorithm(req.algorithm.clone())
-                }
-            })?;
+        ctx.hash_states.create(&id, &req.algorithm).map_err(|e| {
+            if e.contains("already exists") {
+                HashStateError::IdAlreadyExists(id.clone())
+            } else {
+                HashStateError::UnknownAlgorithm(req.algorithm.clone())
+            }
+        })?;
         let created_at = ctx.hash_states.get_created_at(&id).unwrap_or_default();
-        Ok(InitResponse { id, algorithm: req.algorithm, created_at })
+        Ok(InitResponse {
+            id,
+            algorithm: req.algorithm,
+            created_at,
+        })
     }
 }
 

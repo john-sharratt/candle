@@ -47,10 +47,12 @@ pub fn note_device_init_free(gpu_id: usize, free: usize) {
 
 /// Free VRAM seen at device creation for `gpu_id`, or `None` if never recorded.
 pub fn device_init_free(gpu_id: usize) -> Option<usize> {
-    DEVICE_INIT_FREE.get(gpu_id).and_then(|c| match c.load(Ordering::Relaxed) {
-        0 => None,
-        v => Some(v),
-    })
+    DEVICE_INIT_FREE
+        .get(gpu_id)
+        .and_then(|c| match c.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        })
 }
 
 /// A single memory snapshot capturing free/total GPU memory at a labeled point.

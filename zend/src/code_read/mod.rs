@@ -31,10 +31,10 @@ pub mod test_util;
 pub mod types;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::collections::HashSet;
 use std::sync::Mutex;
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem};
@@ -134,7 +134,11 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
 ) -> anyhow::Result<(usize, CodeReadState)> {
     let (per_file, state) = carve_workspace(workspace, map);
     let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
-    tracing::info!(n_files = per_file.len(), n_scopes = total, "code_read carve complete");
+    tracing::info!(
+        n_files = per_file.len(),
+        n_scopes = total,
+        "code_read carve complete"
+    );
     progress.set_step_progress(0, total as u64);
 
     let mut done = 0usize;
@@ -310,7 +314,10 @@ pub fn ingest_code_reading(
 
     // Retire conversations whose source file is gone, then snapshot the
     // surviving content hashes once for O(1) per-file resume-cache probes.
-    let present_paths: HashSet<&str> = per_file.iter().map(|(f, _, _, _)| f.path.as_str()).collect();
+    let present_paths: HashSet<&str> = per_file
+        .iter()
+        .map(|(f, _, _, _)| f.path.as_str())
+        .collect();
     reconcile_deleted(engine, &present_paths);
     let present_hashes = engine
         .lock()
@@ -538,7 +545,6 @@ fn process_one_file(
     Ok(())
 }
 
-
 /// Outcome of a [`refresh_code_reading`] call. `Replaced` carries only
 /// the new content-hash `state` — per-file conversations are freed after
 /// seal and persist in the substrate, so there's no sequence list to swap.
@@ -602,7 +608,10 @@ pub fn refresh_code_reading(
     // Tombstone conversations for deleted files, then snapshot surviving
     // hashes; changed files miss the snapshot and are re-ingested (their
     // stale conversation is tombstoned in process_one_file).
-    let present_paths: HashSet<&str> = per_file.iter().map(|(f, _, _, _)| f.path.as_str()).collect();
+    let present_paths: HashSet<&str> = per_file
+        .iter()
+        .map(|(f, _, _, _)| f.path.as_str())
+        .collect();
     reconcile_deleted(ctx.engine, &present_paths);
     let present_hashes = ctx
         .engine
@@ -627,11 +636,7 @@ pub fn refresh_code_reading(
     Ok(RefreshOutcome::Replaced { state: next })
 }
 
-fn layer_system_prompt(
-    builder: &Builder,
-    layer_name: &str,
-    config: &SequenceConfig,
-) -> String {
+fn layer_system_prompt(builder: &Builder, layer_name: &str, config: &SequenceConfig) -> String {
     let layer = builder
         .schema()
         .layers

@@ -171,7 +171,10 @@ pub fn verify_carve(
             panic!(
                 "no scope found whose qualified_path contains {name_sub:?}; \
                  paths emitted: {:?}",
-                scopes.iter().map(|s| s.qualified_path()).collect::<Vec<_>>(),
+                scopes
+                    .iter()
+                    .map(|s| s.qualified_path())
+                    .collect::<Vec<_>>(),
             )
         });
         assert_starts_with(source, scope, sig_sub);

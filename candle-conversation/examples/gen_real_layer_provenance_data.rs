@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle::Device;
+use candle_conversation::Sequence;
 use candle_conversation::{
     models::{Dialect, Model},
     provenance::{
@@ -34,7 +35,6 @@ use candle_conversation::{
     },
     ConversationEngine, ProvenanceFile, SamplingConfig, SequenceConfig, SigEntry, TurnHandle,
 };
-use candle_conversation::Sequence;
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
@@ -286,7 +286,10 @@ fn write_manifests(
             scenarios: raw_scenarios.to_vec(),
         };
         let raw_manifest_path = out_dir.join("RAW_MANIFEST.json");
-        std::fs::write(&raw_manifest_path, serde_json::to_string_pretty(&raw_manifest)?)?;
+        std::fs::write(
+            &raw_manifest_path,
+            serde_json::to_string_pretty(&raw_manifest)?,
+        )?;
     }
 
     Ok(())
@@ -301,8 +304,12 @@ fn generate_one(
     let type_name = ct.dir_name();
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let prompts_dir = crate_root.join("tests").join(format!("{}_provenance_data", type_name));
-    let default_out = crate_root.join("tests").join(format!("{}_provenance_real_data", type_name));
+    let prompts_dir = crate_root
+        .join("tests")
+        .join(format!("{}_provenance_data", type_name));
+    let default_out = crate_root
+        .join("tests")
+        .join(format!("{}_provenance_real_data", type_name));
     let out_dir = output_override.unwrap_or(&default_out);
 
     // Load synthetic prompts manifest.
@@ -310,7 +317,9 @@ fn generate_one(
     let text = std::fs::read_to_string(&prompts_path).map_err(|e| {
         anyhow::anyhow!(
             "failed to read {}: {} — run gen_layer_provenance_data --content-type {} first",
-            prompts_path.display(), e, type_name
+            prompts_path.display(),
+            e,
+            type_name
         )
     })?;
     let in_manifest: InManifest = serde_json::from_str(&text)?;
@@ -335,7 +344,11 @@ fn generate_one(
                 std::fs::remove_file(path)?;
             }
         }
-        (Vec::<OutScenario>::new(), Vec::<RawOutScenario>::new(), false)
+        (
+            Vec::<OutScenario>::new(),
+            Vec::<RawOutScenario>::new(),
+            false,
+        )
     } else if manifest_path.exists() {
         // Resume: deserialize existing manifests.
         let existing_text = std::fs::read_to_string(&manifest_path)?;
@@ -348,7 +361,11 @@ fn generate_one(
         } else {
             Vec::new()
         };
-        let msg = format!("  Resuming — {}/{} already done", existing_scenarios.len(), total);
+        let msg = format!(
+            "  Resuming — {}/{} already done",
+            existing_scenarios.len(),
+            total
+        );
         println!("{msg}");
         {
             let mut log = ctx.summary_log.lock().unwrap();
@@ -362,7 +379,11 @@ fn generate_one(
                 std::fs::remove_file(path)?;
             }
         }
-        (Vec::<OutScenario>::new(), Vec::<RawOutScenario>::new(), false)
+        (
+            Vec::<OutScenario>::new(),
+            Vec::<RawOutScenario>::new(),
+            false,
+        )
     };
 
     std::fs::create_dir_all(out_dir)?;
@@ -381,7 +402,9 @@ fn generate_one(
     let done_ids: std::collections::HashSet<String> =
         out_scenarios.iter().map(|s| s.id.clone()).collect();
 
-    let pending: Vec<(usize, &InScenario)> = in_manifest.scenarios.iter()
+    let pending: Vec<(usize, &InScenario)> = in_manifest
+        .scenarios
+        .iter()
         .enumerate()
         .filter(|(_, s)| !done_ids.contains(&s.id))
         .collect();
@@ -399,7 +422,10 @@ fn generate_one(
         let last_global = chunk.last().map(|(i, _)| i + 1).unwrap_or(1);
         let batch_msg = format!(
             "  Batch {}/{} (scenarios {}-{})",
-            batch_num + 1, n_batches, first_global, last_global,
+            batch_num + 1,
+            n_batches,
+            first_global,
+            last_global,
         );
         println!("{batch_msg}");
         {
@@ -411,7 +437,9 @@ fn generate_one(
         let mut slots: Vec<Slot> = Vec::with_capacity(chunk.len());
         for &(global_idx, s) in chunk.iter() {
             let formatted_sp = ctx.dialect.format_system_prompt(&s.system_prompt);
-            let mut conv = ctx.engine.new_conversation(&formatted_sp, ctx.conv_config.clone())?;
+            let mut conv = ctx
+                .engine
+                .new_conversation(&formatted_sp, ctx.conv_config.clone())?;
             let handle = conv.submit_turn(&s.user_prompt)?;
             slots.push(Slot {
                 global_idx,
@@ -428,7 +456,15 @@ fn generate_one(
         let pf = ctx.engine.provenance_file();
 
         for slot in slots {
-            let Slot { global_idx, id, item, case_type, user_prompt, mut conv, handle } = slot;
+            let Slot {
+                global_idx,
+                id,
+                item,
+                case_type,
+                user_prompt,
+                mut conv,
+                handle,
+            } = slot;
 
             let resp = handle.wait()?;
             conv.finish_turn(handle, &resp)?;
@@ -440,8 +476,13 @@ fn generate_one(
                     let block_range = Some((seal.block_from, seal.block_to));
                     match conv.extract_raw_kvq(ctx.unique_layers.clone(), block_range) {
                         Ok(layer_data) => {
-                            let layer_map: std::collections::HashMap<usize, &Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> =
-                                layer_data.iter().map(|(li, blocks)| (*li, blocks)).collect();
+                            let layer_map: std::collections::HashMap<
+                                usize,
+                                &Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>,
+                            > = layer_data
+                                .iter()
+                                .map(|(li, blocks)| (*li, blocks))
+                                .collect();
 
                             let n_blocks = seal.block_to.saturating_sub(seal.block_from);
                             let total_tokens = seal.turn_token_count;
@@ -453,28 +494,40 @@ fn generate_one(
                                     chunk_size
                                 } else {
                                     let rem = total_tokens % chunk_size;
-                                    if rem == 0 { chunk_size } else { rem }
+                                    if rem == 0 {
+                                        chunk_size
+                                    } else {
+                                        rem
+                                    }
                                 };
 
-                                let band_layer_data: [Vec<(&[f32], &[f32])>; 3] = std::array::from_fn(|band| {
-                                    ctx.bands[band]
-                                        .iter()
-                                        .map(|&layer_idx| {
-                                            if let Some(blocks) = layer_map.get(&layer_idx) {
-                                                let abs_block = seal.block_from + block_offset;
-                                                if let Some((_, k, _v, q)) = blocks.iter().find(|(bi, ..)| *bi == abs_block) {
-                                                    (k.as_slice(), q.as_slice())
+                                let band_layer_data: [Vec<(&[f32], &[f32])>; 3] =
+                                    std::array::from_fn(|band| {
+                                        ctx.bands[band]
+                                            .iter()
+                                            .map(|&layer_idx| {
+                                                if let Some(blocks) = layer_map.get(&layer_idx) {
+                                                    let abs_block = seal.block_from + block_offset;
+                                                    if let Some((_, k, _v, q)) = blocks
+                                                        .iter()
+                                                        .find(|(bi, ..)| *bi == abs_block)
+                                                    {
+                                                        (k.as_slice(), q.as_slice())
+                                                    } else {
+                                                        (&[][..], &[][..])
+                                                    }
                                                 } else {
                                                     (&[][..], &[][..])
                                                 }
-                                            } else {
-                                                (&[][..], &[][..])
-                                            }
-                                        })
-                                        .collect()
-                                });
+                                            })
+                                            .collect()
+                                    });
 
-                                let blob = build_token_blob(&ctx.raw_header, tokens_this_block, &band_layer_data);
+                                let blob = build_token_blob(
+                                    &ctx.raw_header,
+                                    tokens_this_block,
+                                    &band_layer_data,
+                                );
                                 all_token_bytes.extend_from_slice(&blob);
                             }
 
@@ -528,8 +581,12 @@ fn generate_one(
             let preview: String = resp.text.chars().take(55).collect();
             let scenario_msg = format!(
                 "    [{:>3}] {} ({}) — {} tok, {} blk  [{}]",
-                global_idx + 1, id, case_type,
-                out_entry.token_count, seal.block_count, preview,
+                global_idx + 1,
+                id,
+                case_type,
+                out_entry.token_count,
+                seal.block_count,
+                preview,
             );
             println!("{scenario_msg}");
             {
@@ -627,9 +684,13 @@ fn main() -> anyhow::Result<()> {
     println!("Progress log: {}", log_path.display());
 
     // Load model once; reuse for all content types.
-    println!("Loading Qwen3-30B-A3B-Q4 from {}...",
-        args.model_dir.as_deref().map(|p| p.display().to_string())
-            .unwrap_or_else(|| "HuggingFace hub".into()));
+    println!(
+        "Loading Qwen3-30B-A3B-Q4 from {}...",
+        args.model_dir
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "HuggingFace hub".into())
+    );
     let device = Device::cuda_if_available(0)?;
     println!("Device: {:?}", device);
     let t_load = Instant::now();
@@ -667,7 +728,10 @@ fn main() -> anyhow::Result<()> {
     let all_layer_indices: Vec<usize> = bands.iter().flat_map(|b| b.iter().copied()).collect();
     let unique_layers: Vec<usize> = {
         let mut seen = std::collections::HashSet::new();
-        all_layer_indices.into_iter().filter(|l| seen.insert(*l)).collect()
+        all_layer_indices
+            .into_iter()
+            .filter(|l| seen.insert(*l))
+            .collect()
     };
 
     let raw_header = RawFileHeader {

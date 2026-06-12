@@ -78,9 +78,19 @@ fn test_cuda() -> Result<()> {
     // Even indices should be 6.0, odd indices should be 2.0
     for (i, &val) in result_vec.iter().enumerate() {
         if i % 2 == 0 {
-            assert!((val - 6.0).abs() < 1e-6, "Index {}: expected 6.0, got {}", i, val);
+            assert!(
+                (val - 6.0).abs() < 1e-6,
+                "Index {}: expected 6.0, got {}",
+                i,
+                val
+            );
         } else {
-            assert!((val - 2.0).abs() < 1e-6, "Index {}: expected 2.0, got {}", i, val);
+            assert!(
+                (val - 2.0).abs() < 1e-6,
+                "Index {}: expected 2.0, got {}",
+                i,
+                val
+            );
         }
     }
     println!("  Large tensor test passed (1000 elements)");

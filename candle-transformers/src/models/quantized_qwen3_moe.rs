@@ -1484,11 +1484,10 @@ impl ModelWeights {
             // Wrap the outer callback so the cache's per-expert
             // `(done, total_experts)` ticks land on the combined
             // denominator computed above.
-            let cache_wrapper = progress
-                .map(|cb| move |done: usize, _total: usize| cb(done, total_units));
-            let cache_progress: Option<&dyn Fn(usize, usize)> = cache_wrapper
-                .as_ref()
-                .map(|f| f as &dyn Fn(usize, usize));
+            let cache_wrapper =
+                progress.map(|cb| move |done: usize, _total: usize| cb(done, total_units));
+            let cache_progress: Option<&dyn Fn(usize, usize)> =
+                cache_wrapper.as_ref().map(|f| f as &dyn Fn(usize, usize));
             let cache = ExpertCache::new(
                 mmap.clone(),
                 all_host_refs,

@@ -50,7 +50,9 @@ pub trait Map2 {
             (S::F32(s1), S::F32(s2)) => S::F32(self.f(s1, l1, s2, l2, d)?),
             (S::F64(s1), S::F64(s2)) => S::F64(self.f(s1, l1, s2, l2, d)?),
             (S::F8E4M3(s1), S::F8E4M3(s2)) => S::F8E4M3(self.f(s1, l1, s2, l2, d)?),
-            _ => Err(CudaError::InternalError("dtype mismatch in binary op".to_string()))?,
+            _ => Err(CudaError::InternalError(
+                "dtype mismatch in binary op".to_string(),
+            ))?,
         };
         Ok(out)
     }
@@ -91,7 +93,9 @@ pub trait Map3 {
             (S::F8E4M3(s1), S::F8E4M3(s2), S::F8E4M3(s3)) => {
                 S::F8E4M3(self.f(s1, l1, s2, l2, s3, l3, d)?)
             }
-            _ => Err(CudaError::InternalError("dtype mismatch in ternary op".to_string()))?,
+            _ => Err(CudaError::InternalError(
+                "dtype mismatch in ternary op".to_string(),
+            ))?,
         };
         Ok(out)
     }
@@ -124,7 +128,9 @@ pub trait Map2InPlace {
             (S::F32(dst), S::F32(src)) => self.f(dst, dst_l, src, src_l, d),
             (S::F64(dst), S::F64(src)) => self.f(dst, dst_l, src, src_l, d),
             (S::F8E4M3(dst), S::F8E4M3(src)) => self.f(dst, dst_l, src, src_l, d),
-            _ => Err(CudaError::InternalError("dtype mismatch in binary op".to_string()))?,
+            _ => Err(CudaError::InternalError(
+                "dtype mismatch in binary op".to_string(),
+            ))?,
         }
     }
 }
@@ -173,7 +179,10 @@ pub trait Map2Any {
             (S::F32(s1), S::F32(s2)) => self.f(s1, l1, s2, l2, d)?,
             (S::F64(s1), S::F64(s2)) => self.f(s1, l1, s2, l2, d)?,
             (S::F8E4M3(s1), S::F8E4M3(s2)) => self.f(s1, l1, s2, l2, d)?,
-            _ => Err(CudaError::InternalError("dtype mismatch in binary op".to_string())).w()?,
+            _ => Err(CudaError::InternalError(
+                "dtype mismatch in binary op".to_string(),
+            ))
+            .w()?,
         };
         Ok(out)
     }

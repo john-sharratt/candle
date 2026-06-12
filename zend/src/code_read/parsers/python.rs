@@ -9,9 +9,7 @@ use crate::code_read::types::{ChunkKind, Scope};
 
 pub fn carve(source: &[u8]) -> Option<Vec<Scope>> {
     let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::language())
-        .ok()?;
+    parser.set_language(&tree_sitter_python::language()).ok()?;
     let mut rules = LanguageRules {
         kind_to_chunk: HashMap::new(),
         identifier_for,
@@ -75,7 +73,10 @@ mod tests {
     fn extracts_method_with_class_in_path() {
         verify(
             "class AuthHandler:\n    def validate_token(self, token):\n        return True\n",
-            &[("class AuthHandler > def validate_token", "def validate_token")],
+            &[(
+                "class AuthHandler > def validate_token",
+                "def validate_token",
+            )],
         );
     }
 
@@ -113,7 +114,10 @@ mod tests {
             .iter()
             .filter(|s| s.qualified_path().ends_with("def value"))
             .count();
-        assert!(count >= 2, "expected ≥2 def value (getter+setter), got {count}");
+        assert!(
+            count >= 2,
+            "expected ≥2 def value (getter+setter), got {count}"
+        );
     }
 
     #[test]
@@ -225,7 +229,10 @@ mod tests {
 
     #[test]
     fn extracts_single_line_class() {
-        verify("class Empty: pass\n", &[("class Empty", "class Empty: pass")]);
+        verify(
+            "class Empty: pass\n",
+            &[("class Empty", "class Empty: pass")],
+        );
     }
 
     // ── Identifiers ──────────────────────────────────────────────────────────
@@ -269,7 +276,10 @@ mod tests {
     #[test]
     fn nested_function_scope_is_inner_only() {
         let src = "def outer():\n    def inner():\n        return 1\n    return inner()\n";
-        let scopes = verify(src, &[("def outer", "def outer"), ("def inner", "def inner")]);
+        let scopes = verify(
+            src,
+            &[("def outer", "def outer"), ("def inner", "def inner")],
+        );
         let inner = find_scope(&scopes, "def inner").unwrap();
         assert_eq!(inner.start_line, 2);
         assert_eq!(inner.end_line, 3);
@@ -314,10 +324,7 @@ mod tests {
 
     #[test]
     fn preserves_tab_indented_body() {
-        verify(
-            "def alpha():\n\treturn 1\n",
-            &[("def alpha", "def alpha")],
-        );
+        verify("def alpha():\n\treturn 1\n", &[("def alpha", "def alpha")]);
     }
 
     #[test]

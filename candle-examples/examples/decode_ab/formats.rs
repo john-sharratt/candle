@@ -23,7 +23,10 @@ pub enum ArenaFmt {
     /// `override_fmt = Some(qf)` forces a uniform format + **unity** palette;
     /// `None` uses the adaptive selection, which produces **non-unity** palette
     /// maps (the configuration that exposed the production K-decode bug).
-    RealQuant { level: u8, override_fmt: Option<QuantFormat> },
+    RealQuant {
+        level: u8,
+        override_fmt: Option<QuantFormat>,
+    },
 }
 
 impl ArenaFmt {
@@ -35,10 +38,16 @@ impl ArenaFmt {
             ArenaFmt::Float(DType::F8E4M3) => "f8e4m3".to_string(),
             ArenaFmt::Float(_) => "float?".to_string(),
             ArenaFmt::Quant(q) => quant_label(*q).to_string(),
-            ArenaFmt::RealQuant { level, override_fmt: Some(qf) } => {
+            ArenaFmt::RealQuant {
+                level,
+                override_fmt: Some(qf),
+            } => {
                 format!("rq-uni-{}-L{level}", quant_label(*qf))
             }
-            ArenaFmt::RealQuant { level, override_fmt: None } => format!("rq-adaptive-L{level}"),
+            ArenaFmt::RealQuant {
+                level,
+                override_fmt: None,
+            } => format!("rq-adaptive-L{level}"),
         }
     }
 
@@ -61,7 +70,10 @@ impl ArenaFmt {
     pub fn golden_cosine_floor(&self, default: f32) -> f32 {
         let qf = match self {
             ArenaFmt::Quant(q) => Some(*q),
-            ArenaFmt::RealQuant { override_fmt: Some(q), .. } => Some(*q),
+            ArenaFmt::RealQuant {
+                override_fmt: Some(q),
+                ..
+            } => Some(*q),
             _ => None,
         };
         match qf {
@@ -133,12 +145,23 @@ pub fn quant_formats() -> Vec<ArenaFmt> {
     let mut v = vec![ArenaFmt::Float(DType::F16)];
     for level in [0u8, 7] {
         for of in [Q8_0, Q4_0, Q2_0] {
-            v.push(ArenaFmt::RealQuant { level, override_fmt: Some(of) });
+            v.push(ArenaFmt::RealQuant {
+                level,
+                override_fmt: Some(of),
+            });
         }
-        v.push(ArenaFmt::RealQuant { level, override_fmt: None });
+        v.push(ArenaFmt::RealQuant {
+            level,
+            override_fmt: None,
+        });
     }
-    for qf in [Q5_0, Q3_0, Q4_KS, Q8_KS, Q2_S, Q1_S, Q1_A, Q0, Q0_M2, Q0_M4, Q0_X] {
-        v.push(ArenaFmt::RealQuant { level: 0, override_fmt: Some(qf) });
+    for qf in [
+        Q5_0, Q3_0, Q4_KS, Q8_KS, Q2_S, Q1_S, Q1_A, Q0, Q0_M2, Q0_M4, Q0_X,
+    ] {
+        v.push(ArenaFmt::RealQuant {
+            level: 0,
+            override_fmt: Some(qf),
+        });
     }
     v
 }
@@ -154,10 +177,22 @@ pub fn deep_formats() -> Vec<ArenaFmt> {
     use QuantFormat::*;
     vec![
         ArenaFmt::Float(DType::F16),
-        ArenaFmt::RealQuant { level: 0, override_fmt: Some(Q8_0) },
-        ArenaFmt::RealQuant { level: 7, override_fmt: Some(Q8_0) },
-        ArenaFmt::RealQuant { level: 0, override_fmt: Some(Q4_0) },
-        ArenaFmt::RealQuant { level: 7, override_fmt: Some(Q4_0) },
+        ArenaFmt::RealQuant {
+            level: 0,
+            override_fmt: Some(Q8_0),
+        },
+        ArenaFmt::RealQuant {
+            level: 7,
+            override_fmt: Some(Q8_0),
+        },
+        ArenaFmt::RealQuant {
+            level: 0,
+            override_fmt: Some(Q4_0),
+        },
+        ArenaFmt::RealQuant {
+            level: 7,
+            override_fmt: Some(Q4_0),
+        },
     ]
 }
 
@@ -182,10 +217,22 @@ pub fn all_formats() -> Vec<ArenaFmt> {
     // arena, the skip-dequant target) vs adaptive (non-unity palette). Q8_0/
     // Q4_0/Q2_0 cover 8/4/2-bit native-INT8 arenas for the memory-bound bench.
     for level in [0u8, 1, 3, 5, 7] {
-        v.push(ArenaFmt::RealQuant { level, override_fmt: Some(QuantFormat::Q8_0) });
-        v.push(ArenaFmt::RealQuant { level, override_fmt: Some(QuantFormat::Q4_0) });
-        v.push(ArenaFmt::RealQuant { level, override_fmt: Some(QuantFormat::Q2_0) });
-        v.push(ArenaFmt::RealQuant { level, override_fmt: None });
+        v.push(ArenaFmt::RealQuant {
+            level,
+            override_fmt: Some(QuantFormat::Q8_0),
+        });
+        v.push(ArenaFmt::RealQuant {
+            level,
+            override_fmt: Some(QuantFormat::Q4_0),
+        });
+        v.push(ArenaFmt::RealQuant {
+            level,
+            override_fmt: Some(QuantFormat::Q2_0),
+        });
+        v.push(ArenaFmt::RealQuant {
+            level,
+            override_fmt: None,
+        });
     }
     // Remaining read-through passthrough families (level 0; the override forces
     // the format). Exercises every BlockInt8 typed worker, not just Q8_0/Q4_0/Q2_0.
@@ -202,7 +249,10 @@ pub fn all_formats() -> Vec<ArenaFmt> {
         QuantFormat::Q0_M4,
         QuantFormat::Q0_X,
     ] {
-        v.push(ArenaFmt::RealQuant { level: 0, override_fmt: Some(qf) });
+        v.push(ArenaFmt::RealQuant {
+            level: 0,
+            override_fmt: Some(qf),
+        });
     }
     v
 }
@@ -213,7 +263,11 @@ pub fn select_formats(filter: &str) -> Result<Vec<ArenaFmt>, String> {
     let universe = all_formats();
     let mut out = Vec::new();
     let mut unknown = Vec::new();
-    for want in filter.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    for want in filter
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         match universe.iter().find(|f| f.label() == want) {
             Some(f) => out.push(*f),
             None => unknown.push(want.to_string()),

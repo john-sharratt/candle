@@ -158,12 +158,7 @@ fn compute_kernel_hash(
 /// objects can be shared across platforms.
 fn canonical_args_for_hash(args: &[String]) -> Vec<String> {
     args.iter()
-        .filter(|a| {
-            !matches!(
-                a.as_str(),
-                "-D_USE_MATH_DEFINES" | "-Xcompiler" | "-fPIC"
-            )
-        })
+        .filter(|a| !matches!(a.as_str(), "-D_USE_MATH_DEFINES" | "-Xcompiler" | "-fPIC"))
         .cloned()
         .collect()
 }

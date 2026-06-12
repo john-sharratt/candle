@@ -284,82 +284,83 @@ pub fn run_pipeline(
     // from allocator/dispatcher latency.
     let reads_done_at_ms = Arc::new(AtomicU64::new(0));
 
-    let ((htod_ms, migrate_ms), alloc_brk): ((u64, u64), AllocBreakdown) = std::thread::scope(|s| {
-        // ── Reader pool ────────────────────────────────────────────
-        for handle_idx in 0..n_readers {
-            let work_rx = work_rx.clone();
-            let done_tx = done_tx.clone();
-            let reads_done_at_ms = Arc::clone(&reads_done_at_ms);
-            s.spawn(move || {
-                while let Ok(work) = work_rx.recv() {
-                    let direct = match work.source {
-                        SourceLog::Active => persistence.active_direct_file(),
-                        SourceLog::Inherited(i) => persistence.inherited_direct_file(i),
-                    };
-                    // SAFETY: per-unit dest regions are disjoint
-                    // (units are byte ranges, not overlapping). No
-                    // other thread writes to this region until
-                    // UnitDone is sent. Going through `slice_mut`
-                    // (rather than `pinned_ptr.0.add(...)`) keeps the
-                    // closure's capture as the whole PinnedPtr.
-                    let dest = unsafe { pinned_ptr.slice_mut(work.dest_offset, work.length) };
-                    let result = direct.read_at_with_handle(handle_idx, work.file_offset, dest);
-                    // Record this reader's completion time. The
-                    // pipeline-level `reads_ms` is the max of all
-                    // readers' completion times — i.e. when the
-                    // last disk read returned.
-                    let now_ms = t_total.elapsed().as_millis() as u64;
-                    reads_done_at_ms.fetch_max(now_ms, Ordering::Relaxed);
-                    let _ = done_tx.send(UnitDone {
-                        unit_idx: work.unit_idx,
-                        error: result
-                            .err()
-                            .map(|e| candle::Error::Msg(format!("pipeline read: {e}"))),
-                    });
-                }
+    let ((htod_ms, migrate_ms), alloc_brk): ((u64, u64), AllocBreakdown) =
+        std::thread::scope(|s| {
+            // ── Reader pool ────────────────────────────────────────────
+            for handle_idx in 0..n_readers {
+                let work_rx = work_rx.clone();
+                let done_tx = done_tx.clone();
+                let reads_done_at_ms = Arc::clone(&reads_done_at_ms);
+                s.spawn(move || {
+                    while let Ok(work) = work_rx.recv() {
+                        let direct = match work.source {
+                            SourceLog::Active => persistence.active_direct_file(),
+                            SourceLog::Inherited(i) => persistence.inherited_direct_file(i),
+                        };
+                        // SAFETY: per-unit dest regions are disjoint
+                        // (units are byte ranges, not overlapping). No
+                        // other thread writes to this region until
+                        // UnitDone is sent. Going through `slice_mut`
+                        // (rather than `pinned_ptr.0.add(...)`) keeps the
+                        // closure's capture as the whole PinnedPtr.
+                        let dest = unsafe { pinned_ptr.slice_mut(work.dest_offset, work.length) };
+                        let result = direct.read_at_with_handle(handle_idx, work.file_offset, dest);
+                        // Record this reader's completion time. The
+                        // pipeline-level `reads_ms` is the max of all
+                        // readers' completion times — i.e. when the
+                        // last disk read returned.
+                        let now_ms = t_total.elapsed().as_millis() as u64;
+                        reads_done_at_ms.fetch_max(now_ms, Ordering::Relaxed);
+                        let _ = done_tx.send(UnitDone {
+                            unit_idx: work.unit_idx,
+                            error: result
+                                .err()
+                                .map(|e| candle::Error::Msg(format!("pipeline read: {e}"))),
+                        });
+                    }
+                });
+            }
+            drop(done_tx);
+
+            // Shared immutable references for both allocator & dispatcher.
+            let unit_plan_ref: &UnitPlan = &unit_plan;
+
+            // ── Allocator ──────────────────────────────────────────────
+            let alloc_handle = s.spawn(move || -> candle::Result<AllocBreakdown> {
+                allocator_worker(
+                    backings,
+                    chunk_batch,
+                    unit_plan_ref,
+                    pinned_ptr,
+                    slots,
+                    chunks_per_layer,
+                    unit_to_records,
+                    record_wait_count,
+                    done_rx,
+                    dispatch_tx,
+                )
             });
-        }
-        drop(done_tx);
 
-        // Shared immutable references for both allocator & dispatcher.
-        let unit_plan_ref: &UnitPlan = &unit_plan;
-
-        // ── Allocator ──────────────────────────────────────────────
-        let alloc_handle = s.spawn(move || -> candle::Result<AllocBreakdown> {
-            allocator_worker(
-                backings,
-                chunk_batch,
-                unit_plan_ref,
+            // ── Main thread: GPU dispatcher ────────────────────────────
+            let dispatcher_result = dispatcher_main(
+                device,
+                &stream,
                 pinned_ptr,
-                slots,
-                chunks_per_layer,
-                unit_to_records,
-                record_wait_count,
-                done_rx,
-                dispatch_tx,
-            )
-        });
+                unit_plan_ref,
+                staging_base,
+                &mut staging,
+                dispatch_rx,
+            );
 
-        // ── Main thread: GPU dispatcher ────────────────────────────
-        let dispatcher_result = dispatcher_main(
-            device,
-            &stream,
-            pinned_ptr,
-            unit_plan_ref,
-            staging_base,
-            &mut staging,
-            dispatch_rx,
-        );
+            let alloc_result = alloc_handle
+                .join()
+                .unwrap_or_else(|_| Err(candle::Error::Msg("pipeline allocator panicked".into())));
 
-        let alloc_result = alloc_handle
-            .join()
-            .unwrap_or_else(|_| Err(candle::Error::Msg("pipeline allocator panicked".into())));
-
-        match (dispatcher_result, alloc_result) {
-            (Ok(ms), Ok(brk)) => Ok((ms, brk)),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        }
-    })?;
+            match (dispatcher_result, alloc_result) {
+                (Ok(ms), Ok(brk)) => Ok((ms, brk)),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        })?;
 
     // Drop staging here — drop syncs the stream so all GPU work has
     // completed before the pinned scratch is reused by the next

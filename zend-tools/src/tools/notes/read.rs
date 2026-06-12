@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::NotesError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReadRequest {
@@ -36,7 +36,9 @@ impl Tool for NotesRead {
     type Error = NotesError;
 
     fn run(ctx: &ToolContext, req: ReadRequest) -> Result<ReadResponse, NotesError> {
-        let note = ctx.notes.read(&req.key)
+        let note = ctx
+            .notes
+            .read(&req.key)
             .ok_or_else(|| NotesError::NotFound(req.key.clone()))?;
         Ok(ReadResponse {
             key: note.key,

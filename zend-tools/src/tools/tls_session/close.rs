@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::TlsError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct CloseRequest {
@@ -31,7 +31,10 @@ impl Tool for TlsSessionClose {
 
     fn run(ctx: &ToolContext, req: CloseRequest) -> Result<CloseResponse, TlsError> {
         let closed = ctx.sessions.remove_tls(&req.session_id);
-        Ok(CloseResponse { session_id: req.session_id, closed })
+        Ok(CloseResponse {
+            session_id: req.session_id,
+            closed,
+        })
     }
 }
 

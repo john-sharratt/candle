@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 use super::TelnetError;
+use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SendRequest {
@@ -47,18 +47,25 @@ impl Tool for TelnetSessionSend {
     type Error = TelnetError;
 
     fn confirmation(req: &SendRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Send to Telnet: {:?}", req.send))
-            .with_field("session_id", req.session_id.clone()))
+        Some(
+            ConfirmationDetails::new(format!("Send to Telnet: {:?}", req.send))
+                .with_field("session_id", req.session_id.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: SendRequest) -> Result<SendResponse, TelnetError> {
-        let entry_arc = ctx.sessions.get_telnet(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_telnet(&req.session_id)
             .ok_or_else(|| TelnetError::SessionNotFound(req.session_id.clone()))?;
         let mut entry = entry_arc.lock().unwrap();
 
         let timeout_secs = req.timeout_sec.unwrap_or(30);
         let timeout = Duration::from_secs(timeout_secs as u64);
-        entry.stream.set_read_timeout(Some(Duration::from_millis(200))).ok();
+        entry
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
 
         // Append \r\n unless already present
         let line = if req.send.ends_with("\r\n") || req.send.ends_with('\n') {
@@ -66,10 +73,14 @@ impl Tool for TelnetSessionSend {
         } else {
             format!("{}\r\n", req.send)
         };
-        entry.stream.write_all(line.as_bytes())
+        entry
+            .stream
+            .write_all(line.as_bytes())
             .map_err(|e| TelnetError::SendFailed(e.to_string()))?;
 
-        let expect_pattern = req.expect.as_deref()
+        let expect_pattern = req
+            .expect
+            .as_deref()
             .unwrap_or(&entry.prompt_pattern)
             .to_string();
         let prompt_re = regex::Regex::new(&expect_pattern)
@@ -97,8 +108,10 @@ impl Tool for TelnetSessionSend {
                         break;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                       || e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
                     // poll again unless outer timeout exceeded
                 }
                 Err(_) => break,
@@ -110,7 +123,12 @@ impl Tool for TelnetSessionSend {
         let text = String::from_utf8_lossy(&response).into_owned();
         let matched = prompt_re.is_match(&text);
 
-        Ok(SendResponse { received: text, matched, duration_ms, received_truncated: truncated })
+        Ok(SendResponse {
+            received: text,
+            matched,
+            duration_ms,
+            received_truncated: truncated,
+        })
     }
 }
 

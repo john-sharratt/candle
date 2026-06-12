@@ -1,32 +1,26 @@
-﻿//! Per-slot projection assembler — full rebuild of the slot's prefix
-//! K/V on every call, with a content-addressed cache for live-prefilled
-//! structural template runs.
+//! Per-slot projection assembler — full rebuild of the slot's prefix
+//! K/V on every call.
 //!
 //! Snapshots the slot's writer tail, truncates to zero, then walks
 //! `Vec<ProjectionSegment>` in declaration order:
 //!
 //! - `Sealed(Section|Turn)` — resolve the substrate entry's per-layer
-//!   sealed K/V, Arc-clone it onto the slot.  Fold the segment's tokens
-//!   into the rolling hash.
+//!   sealed K/V, Arc-clone it onto the slot.
 //! - `Generated { tokens, .. }` — accumulate into the current run; do
-//!   not advance the slot or the rolling hash yet.  Cache keying is by
-//!   the whole run (every adjacent Generated up to the next non-Generated
-//!   segment), so partial-prefix folding would produce keys that don't
-//!   match any captured K/V.
-//! - On a non-Generated segment (or end of list), flush the current
-//!   run: compute `key = fold(rolling_hash, run_tokens)`, look up in
-//!   the slot cache.  Hit → inject the cached `Vec<SealedSequence>`.
-//!   Miss → run a synchronous forward pass over `run_tokens`, capture
-//!   the per-layer K/V from the resulting slot range, insert into the
-//!   cache.  Either way, commit `rolling_hash = key`.
+//!   not advance the slot yet. Adjacent `Generated` segments batch into
+//!   a single run so one forward pass amortises the launch cost across
+//!   all the structural/boundary tokens.
+//! - On a non-Generated segment (or end of list), flush the current run:
+//!   a synchronous forward pass over `run_tokens` writes their K/V onto
+//!   the slot.
 //!
 //! Re-attach the writer tail at the end.
 //!
-//! The cache is content-addressed (key = hash of preceding tokens plus
-//! run tokens), so stale entries miss benignly — there is no way for a
-//! wrong cache value to leak onto the slot.
+//! The prefix is re-derived from scratch every projection — there is no
+//! cross-projection memoisation, so the assembled K/V always reflects the
+//! exact segment sequence the resolver selected this call.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle::{Device, Tensor};
@@ -34,6 +28,7 @@ use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel,
 };
+use candle_transformers::models::batched_layer::GapFillDescriptor;
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
@@ -41,102 +36,24 @@ use crate::projection::{
     Conversation, GroupId, ProjectionSegment, ProjectionTarget, SealedKind, SectionId, TimelineId,
     TurnIndex,
 };
+use crate::scheduler::profile;
 use crate::sequence_handle::SequenceId;
-
-// FNV-1a constants — deterministic, dependency-free, sufficient
-// collision resistance over u64 for per-slot caches.
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
-
-/// Roll `tokens` into a 64-bit FNV-1a state.  Bytes are little-endian
-/// over each `u32` so the hash is platform-stable.
-fn fold_tokens(mut h: u64, tokens: &[u32]) -> u64 {
-    for &t in tokens {
-        for b in t.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-    }
-    h
-}
-
-/// Content-addressed cache of captured live-prefilled runs on a slot.
-///
-/// Keyed by `fold_tokens(preceding_slot_tokens ++ run_tokens)`.  Values
-/// are the per-layer `Vec<SealedSequence>` captured from the slot just
-/// after the prefill that produced them.  Lives as long as the slot;
-/// dropped wholesale when the slot is freed.
-#[derive(Debug, Default)]
-pub(super) struct SlotProjectionCache {
-    memo: HashMap<u64, Arc<Vec<SealedSequence>>>,
-}
-
-impl SlotProjectionCache {
-    fn get(&self, key: u64) -> Option<Arc<Vec<SealedSequence>>> {
-        self.memo.get(&key).cloned()
-    }
-
-    fn insert(&mut self, key: u64, value: Arc<Vec<SealedSequence>>) {
-        self.memo.insert(key, value);
-    }
-
-    /// Retain only the cache entries whose keys appear in `keep`,
-    /// dropping the rest.  The dropped `Arc<Vec<SealedSequence>>`s
-    /// release their refcount; GPU memory backing the captured
-    /// sequences is reclaimed by the arena allocator once no other
-    /// reference holds them (the slot itself was just sealed into
-    /// the substrate as one indivisible block, so its references
-    /// have already migrated to `TurnPart::sealed_gpu`).
-    pub(super) fn retain_keys(&mut self, keep: &HashSet<u64>) {
-        self.memo.retain(|k, _| keep.contains(k));
-    }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.memo.len()
-    }
-}
 
 /// Per-slot state owned by the projection assembler.
 ///
-/// `cache` memoises captured live-prefill runs for cheap reuse across
-/// reprojections.  `pending_user_part` holds the captured K/V for the
-/// in-flight turn's user message — populated when a `NewUserMessage`
-/// segment is prefilled, cleared at seal time; survives mid-decode
-/// reprojection (which truncates the slot) because it lives here on
-/// `SlotState`, not on the slot.  `last_apply_keys` records every
-/// cache key touched (hit or inserted) by the most recent
-/// `apply_segments` walk — the working set the slot's current K/V
-/// reflects, used by `trim_post_turn` to bound cache size.
+/// `pending_user_part` holds the captured K/V for the in-flight turn's user
+/// message — populated when a `NewUserMessage` segment is prefilled, cleared at
+/// seal time; survives mid-decode reprojection (which truncates the slot)
+/// because it lives here on `SlotState`, not on the slot.
 #[derive(Debug, Default)]
 pub(super) struct SlotState {
-    pub(super) cache: SlotProjectionCache,
     pub(super) pending_user_part: Option<Arc<Vec<SealedSequence>>>,
-    pub(super) last_apply_keys: HashSet<u64>,
 }
 
 impl SlotState {
-    /// Trim the slot's per-turn cache state after a successful seal —
-    /// retain only the entries whose keys were touched by the most
-    /// recent `apply_segments` (i.e. the entries that back the slot's
-    /// current sealed K/V), and drop the in-flight `NewUserMessage`
-    /// capture.  Called from the scheduler's seal path so the cache
-    /// doesn't accumulate stale entries indefinitely as a slot is
-    /// reused across many turns of the same conversation.
-    ///
-    /// Trade-off: the cache stays sized at ~one projection's worth of
-    /// boundary runs.  Next-turn reprojection with the same prefix
-    /// shape (same window of past turns) hits the kept entries
-    /// instead of re-prefilling.  Stale entries from prior turns —
-    /// generated by boundary positions that no longer appear in the
-    /// projection's window, or by prefixes that diverged when an
-    /// upstream segment changed — are released.
+    /// Drop the in-flight `NewUserMessage` capture after a successful seal.
     pub(super) fn trim_post_turn(&mut self) {
-        self.cache.retain_keys(&self.last_apply_keys);
         self.pending_user_part = None;
-        // `last_apply_keys` stays — it still describes the slot's
-        // current K/V residency.  Next `apply_segments` clears and
-        // re-populates it.
     }
 }
 
@@ -207,61 +124,78 @@ pub(super) struct ApplyContext<'a> {
     pub(super) boundary_markers: &'a BoundaryMarkers,
 }
 
-/// Apply `new_segments` onto the slot.
+/// A built-but-not-yet-fired gap-fill descriptor for one slot. Owned (no
+/// borrows) so the cross-conversation wave can collect plans from many slots,
+/// fire one batched multi-slot forward, then finish each slot independently.
+pub(super) struct GapFillPlan {
+    pub parent_id: SequenceId,
+    /// The new region: every glue island's tokens, in logical order.
+    pub glue_tokens: Vec<u32>,
+    /// Flat (kv_len) TRUE sequence position of each column (sealed prefix ++
+    /// glue), driving the gap-fill mask + RoPE.
+    pub col_actual_pos: Vec<u32>,
+    /// The in-flight user message, prefilled in `apply_segments_finish` after
+    /// the gap-fill so it lands against the full `[sealed | glue]` prefix.
+    pub deferred_user: Option<Arc<Vec<u32>>>,
+    /// The writer tail snapshotted before truncation, re-attached on finish.
+    pub tail_per_layer: Vec<WriterTail>,
+    /// Glue token count (diagnostic).
+    pub n_glue_tokens: usize,
+}
+
+/// Apply `new_segments` onto the slot (single-slot path).
 ///
-/// Post-condition: the slot's per-layer K/V is the concatenation of
-/// every `new_segments[i]`'s K/V (substrate-pinned for `Sealed`,
-/// live-prefilled or cache-loaded for `Generated`, captured to
-/// `pending_user_part` for `NewUserMessage`), in declaration order,
-/// plus the pre-existing writer tail re-attached at the end.
+/// Post-condition: the slot's per-layer K/V is `[sealed prefix | glue]` plus the
+/// re-attached writer tail and the prefilled in-flight user message. Equivalent
+/// to `apply_segments_build` + `fire_gap_fill_batch` (one slot) + `_finish`.
 pub(super) fn apply_segments(
     state: &mut SlotState,
     mut ctx: ApplyContext<'_>,
     new_segments: &[ProjectionSegment],
 ) -> Result<(), ConversationError> {
+    let plan = apply_segments_build(&mut ctx, new_segments)?;
+    fire_gap_fill_batch(ctx.session, &**ctx.model, ctx.device, &[&plan])?;
+    apply_segments_finish(state, &mut ctx, plan)
+}
+
+/// Build phase: snapshot the writer tail, truncate, then walk the segments —
+/// injecting the sealed prefix and collecting all glue as the new region with
+/// each column's TRUE logical position. Reserves the glue writer chunk but does
+/// NOT fire the forward; the caller fires (batched across slots) and then calls
+/// [`apply_segments_finish`].
+pub(super) fn apply_segments_build(
+    ctx: &mut ApplyContext<'_>,
+    new_segments: &[ProjectionSegment],
+) -> Result<GapFillPlan, ConversationError> {
     let parent_id = ctx.parent_id;
 
-    // Reset the active-key working set for this apply.  `flush_run`
-    // inserts every key it touches (hit or freshly captured) so that
-    // `trim_post_turn` can retain just this projection's working set
-    // at seal time.
-    state.last_apply_keys.clear();
+    // 1. Snapshot the writer tail (in-flight decode chunks).
+    let tail_per_layer = {
+        let _g = profile::span("apply:snapshot_tail");
+        snapshot_tail(ctx.session, parent_id)?
+    };
 
-    // 1. Snapshot the writer tail (in-flight decode chunks).  Empty at
-    //    turn-submit boundaries; non-empty during mid-decode reproject.
-    let tail_per_layer = snapshot_tail(ctx.session, parent_id)?;
-
-    // 2. Truncate the slot.  Drops Arc refs to whatever it previously
-    //    held; arenas reclaim asynchronously.
+    // 2. Truncate the slot.
     ctx.session
         .truncate_sequence_to_blocks(parent_id.0, 0)
         .map_err(ConversationError::Model)?;
 
-    // 3. Diagnostic log: full rebuild, so the slot_tokens record is
-    //    rewritten from scratch this call.
+    // 3. Full rebuild — rewrite the slot_tokens record from scratch.
     if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
         entry.clear();
     }
 
-    // 4. Walk segments in declaration order, batching adjacent
-    //    Generated entries into a single run.
-    let mut walker = SegmentWalker {
-        rolling_hash: FNV_OFFSET_BASIS,
-        run_tokens: Vec::new(),
-        last_was_sealed: false,
-        n_prefill: 0,
-        prefill_ms: 0,
-        prefill_tokens: 0,
-        n_hit: 0,
-        hit_ms: 0,
-    };
+    // 4. Walk segments: inject sealed as the contiguous prefix and collect all
+    //    glue (boundary markers + Generated) as the new region, tracking every
+    //    column's TRUE logical position. A single gap-fill forward then computes
+    //    every glue island's K/V at once — each attends only logically-earlier
+    //    columns via `col_actual_pos`. The NewUserMessage is deferred to after
+    //    the gap-fill so it prefills against the full `[sealed | glue]` prefix.
+    let mut walker = SegmentWalker::new();
 
     let mut i = 0;
     while i < new_segments.len() {
         if matches!(&new_segments[i], ProjectionSegment::Generated { .. }) {
-            // Collect every adjacent Generated into one run.  The
-            // batched forward pass amortises the per-call kernel
-            // launch overhead across all the structural tokens.
             while i < new_segments.len() {
                 let ProjectionSegment::Generated { tokens, .. } = &new_segments[i] else {
                     break;
@@ -269,134 +203,133 @@ pub(super) fn apply_segments(
                 walker.run_tokens.extend(tokens.iter().copied());
                 i += 1;
             }
-            walker.flush_run(state, &mut ctx)?;
+            walker.collect_run();
             continue;
         }
 
         match &new_segments[i] {
             ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                walker.flush_run(state, &mut ctx)?;
-                inject_sealed_section(state, &mut ctx, &mut walker, rs.id)?;
+                walker.collect_run();
+                inject_sealed_section(ctx, &mut walker, rs.id)?;
             }
             ProjectionSegment::Sealed(SealedKind::Turn(rt, part)) => {
-                // Wrap the turn in live-prefilled boundary markers:
-                // `user_start` joins the run that flushes immediately
-                // before the turn injects (batching with whatever
-                // `Generated` segments — or with the previous turn's
-                // trailing `assistant_end` — preceded it), and
-                // `assistant_end` opens a fresh run that accumulates
-                // until the next non-Generated segment (the next
-                // turn's `user_start`, or the trailing
-                // `Generated(UserStart)` the scheduler appends for
-                // the current turn's prefill).  The result is one
-                // 5-token batched prefill run at every cross-turn
-                // boundary — and at every system→turn / last-turn→
-                // current-turn-prefill boundary.
+                // Wrap the turn in its boundary markers: `user_start` joins the
+                // glue run that closes immediately before the turn injects (so
+                // it lands at a logical position just before the turn), and
+                // `assistant_end` opens the next run, accumulating until the
+                // following non-Generated segment. Both are collected into the
+                // single gap-fill new region rather than prefilled per-island.
                 walker
                     .run_tokens
                     .extend(ctx.boundary_markers.user_start.iter().copied());
-                walker.flush_run(state, &mut ctx)?;
-                inject_sealed_turn(
-                    state,
-                    &mut ctx,
-                    &mut walker,
-                    rt.group(),
-                    rt.index(),
-                    *part,
-                )?;
+                walker.collect_run();
+                inject_sealed_turn(ctx, &mut walker, rt.group(), rt.index(), *part)?;
                 walker
                     .run_tokens
                     .extend(ctx.boundary_markers.assistant_end.iter().copied());
             }
             ProjectionSegment::NewUserMessage { tokens } => {
-                walker.flush_run(state, &mut ctx)?;
-                handle_new_user_message(state, &mut ctx, &mut walker, tokens)?;
+                // The in-flight user message is the logical tail; defer it past
+                // the gap-fill so it prefills against the full [sealed | glue].
+                walker.collect_run();
+                walker.deferred_user = Some(tokens.clone());
             }
             ProjectionSegment::Generated { .. } => unreachable!("handled in run loop above"),
         }
         i += 1;
     }
-    walker.flush_run(state, &mut ctx)?;
+    walker.collect_run();
 
-    // 5. Re-attach the writer tail at the slot's current end.
-    restore_tail(ctx.session, parent_id, tail_per_layer)?;
+    // Reserve the glue's writer chunk now (before the batched forward) so the
+    // gap-fill writes don't alias the Arc-shared sealed partial tail.
+    if !walker.glue_tokens.is_empty() {
+        push_empty_if_sealed(ctx, walker.last_was_sealed)?;
+    }
 
-    tracing::info!(
-        target: "candle_conversation::scheduler::reproject",
-        n_prefill = walker.n_prefill,
-        prefill_ms = walker.prefill_ms as u64,
-        prefill_tokens = walker.prefill_tokens,
-        n_hit = walker.n_hit,
-        hit_ms = walker.hit_ms as u64,
-        "apply_segments breakdown (cache miss=prefill, hit=arc-clone)",
-    );
+    let mut col_actual_pos = Vec::with_capacity(walker.col_prefix.len() + walker.col_new.len());
+    col_actual_pos.extend_from_slice(&walker.col_prefix);
+    col_actual_pos.extend_from_slice(&walker.col_new);
 
-    Ok(())
+    Ok(GapFillPlan {
+        parent_id,
+        glue_tokens: std::mem::take(&mut walker.glue_tokens),
+        col_actual_pos,
+        deferred_user: walker.deferred_user.take(),
+        tail_per_layer,
+        n_glue_tokens: walker.n_glue_tokens,
+    })
 }
 
-/// State carried across a single `apply_segments` walk.
+/// State carried across a single `apply_segments` walk. Accumulates the gap-fill
+/// new region (every glue island) plus each column's TRUE logical position, so
+/// the walk emits one batched gap-fill forward instead of N per-island prefills.
 struct SegmentWalker {
-    rolling_hash: u64,
+    /// Glue tokens for the *current* run, drained by `collect_run`.
     run_tokens: Vec<u32>,
-    /// True if the most recent slot mutation was a Sealed inject (Arc-
-    /// shared, partial trailing chunk possible).  Set on Sealed inject,
-    /// cleared after we push a fresh writer chunk for a subsequent
-    /// prefill so the prefill doesn't write into the Arc-shared partial.
+    /// All glue tokens across every island, in logical order — the new region.
+    glue_tokens: Vec<u32>,
+    /// Logical position of each sealed (prefix) column, in inject order — must
+    /// match the position_map order the gap-fill reads the prefix in.
+    col_prefix: Vec<u32>,
+    /// Logical position of each glue (new-region) column, in collect order.
+    col_new: Vec<u32>,
+    /// Running TRUE sequence position as the walk advances through sealed+glue.
+    logical_pos: u32,
+    /// True if the most recent slot mutation was a Sealed inject (Arc-shared,
+    /// partial trailing chunk possible) — so the gap-fill pushes a fresh writer
+    /// chunk before writing.
     last_was_sealed: bool,
-    // Instrumentation: cache miss (re-prefill) vs hit (Arc-clone) accounting.
-    n_prefill: usize,
-    prefill_ms: u128,
-    prefill_tokens: usize,
-    n_hit: usize,
-    hit_ms: u128,
+    /// The deferred in-flight user message, prefilled after the gap-fill.
+    deferred_user: Option<Arc<Vec<u32>>>,
+    /// Accounting: total glue tokens collected (the reproject cost scales here).
+    n_glue_tokens: usize,
 }
 
 impl SegmentWalker {
-    fn flush_run(
-        &mut self,
-        state: &mut SlotState,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<(), ConversationError> {
+    fn new() -> Self {
+        Self {
+            run_tokens: Vec::new(),
+            glue_tokens: Vec::new(),
+            col_prefix: Vec::new(),
+            col_new: Vec::new(),
+            logical_pos: 0,
+            last_was_sealed: false,
+            deferred_user: None,
+            n_glue_tokens: 0,
+        }
+    }
+
+    /// Close the current glue run: append its tokens to the new region and stamp
+    /// each with its logical position. No forward pass — the gap-fill runs once,
+    /// after the whole walk.
+    fn collect_run(&mut self) {
         if self.run_tokens.is_empty() {
-            return Ok(());
+            return;
         }
-        let key = fold_tokens(self.rolling_hash, &self.run_tokens);
-        // Record this key as part of the current apply's working
-        // set so `trim_post_turn` can retain it.
-        state.last_apply_keys.insert(key);
-
-        if let Some(cached) = state.cache.get(key) {
-            let t = std::time::Instant::now();
-            inject_arc_sealed(ctx.session, ctx.parent_id, ctx.chunk_size, &cached)?;
-            self.hit_ms += t.elapsed().as_millis();
-            self.n_hit += 1;
-            log_injected_tokens(ctx, &self.run_tokens);
-        } else {
-            let t = std::time::Instant::now();
-            let captured =
-                drive_prefill_and_capture(ctx, &self.run_tokens, self.last_was_sealed)?;
-            self.prefill_ms += t.elapsed().as_millis();
-            self.n_prefill += 1;
-            self.prefill_tokens += self.run_tokens.len();
-            state.cache.insert(key, captured);
+        let n = self.run_tokens.len();
+        for k in 0..n {
+            self.col_new.push(self.logical_pos + k as u32);
         }
+        self.glue_tokens.append(&mut self.run_tokens);
+        self.logical_pos += n as u32;
+        self.n_glue_tokens += n;
+    }
 
-        self.rolling_hash = key;
-        self.run_tokens.clear();
-        // The slot now ends in chunks the writer just wrote (cache
-        // miss) or just Arc-cloned (cache hit).  Either way the next
-        // Sealed inject will append cleanly; the next prefill, if
-        // any, will need a fresh writer chunk because the cached run
-        // also ends in a (possibly partial) Arc-shared chunk.
+    /// Record `count` sealed (prefix) columns at the current logical position
+    /// and advance. Called by the sealed-inject helpers after a successful
+    /// inject so the prefix's `col_actual_pos` matches the position_map order.
+    fn record_sealed(&mut self, count: usize) {
+        for k in 0..count {
+            self.col_prefix.push(self.logical_pos + k as u32);
+        }
+        self.logical_pos += count as u32;
         self.last_was_sealed = true;
-        Ok(())
     }
 }
 
 // ── Sealed-segment injection ─────────────────────────────────────────────────
 
 fn inject_sealed_section(
-    _state: &mut SlotState,
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
     sid: SectionId,
@@ -418,21 +351,26 @@ fn inject_sealed_section(
 
     let toks = ctx.conversation.read().section_tokens_of(sid);
     let start_block = ctx
-        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?
+        .session
+        .sequence_block_count(parent_id.0)
+        .ok_or_else(|| {
+            ConversationError::Channel(format!(
+                "apply_projection: slot {} not in session",
+                parent_id
+            ))
+        })?
         .saturating_sub(sealed[0].chunks.len());
     let end_block = start_block + sealed[0].chunks.len();
     ctx.conversation
         .write()
         .set_section_block_range(sid, start_block as u64, end_block as u64);
 
-    walker.rolling_hash = fold_tokens(walker.rolling_hash, &toks);
     log_injected_tokens(ctx, &toks);
-    walker.last_was_sealed = true;
+    walker.record_sealed(sealed[0].token_count);
     Ok(())
 }
 
 fn inject_sealed_turn(
-    _state: &mut SlotState,
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
     group: GroupId,
@@ -478,9 +416,8 @@ fn inject_sealed_turn(
         .write()
         .set_block_range(timeline, index, start_block as u64, end_block as u64);
 
-    walker.rolling_hash = fold_tokens(walker.rolling_hash, &toks);
     log_injected_tokens(ctx, &toks);
-    walker.last_was_sealed = true;
+    walker.record_sealed(sealed[0].token_count);
     Ok(())
 }
 
@@ -490,6 +427,7 @@ fn inject_arc_sealed(
     chunk_size: usize,
     sealed: &Arc<Vec<SealedSequence>>,
 ) -> Result<(), ConversationError> {
+    let _g = profile::span("inject:arc_sealed");
     let n_layers = session.num_layers();
     if sealed.len() != n_layers {
         tracing::warn!(
@@ -532,38 +470,16 @@ fn handle_new_user_message(
         let captured = drive_prefill_and_capture(ctx, tokens, walker.last_was_sealed)?;
         state.pending_user_part = Some(captured);
     }
-    walker.rolling_hash = fold_tokens(walker.rolling_hash, tokens);
     walker.last_was_sealed = true;
     Ok(())
 }
 
-// ── Live prefill drive (cache-miss path) ─────────────────────────────────────
+// ── Live prefill drive ───────────────────────────────────────────────────────
 
-/// Run a synchronous forward pass over `tokens` on the slot, then
-/// extract the per-layer `SealedSequence` for the just-written block
-/// range.  Returns the captured K/V wrapped in an `Arc` so the cache
-/// (or `pending_user_part`) can store it without further copies.
-///
-/// `last_was_sealed` indicates whether the slot's current tail is
-/// Arc-shared with the substrate.  If so, we push a fresh writer
-/// chunk first so this prefill's writes don't alias the partial
-/// trailing chunk of the previous Sealed inject.
-fn drive_prefill_and_capture(
-    ctx: &mut ApplyContext<'_>,
-    tokens: &[u32],
-    last_was_sealed: bool,
-) -> Result<Arc<Vec<SealedSequence>>, ConversationError> {
+/// Forward `tokens` through the model on the slot, chunked by
+/// `max_prefill_chunk`, writing their K/V into the slot's writer tail.
+fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
-
-    if last_was_sealed {
-        ctx.session
-            .push_empty_writer_chunk(parent_id.0)
-            .map_err(ConversationError::Model)?;
-    }
-
-    let start_block = ctx
-        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?;
-
     let mut offset = 0;
     while offset < tokens.len() {
         let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_chunk);
@@ -571,27 +487,189 @@ fn drive_prefill_and_capture(
         let input = Tensor::new(slice, ctx.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
-        let _logits = ctx
-            .model
-            .forward_batched(ctx.session, &[parent_id.0], &[input])
-            .map_err(ConversationError::Model)?;
+        {
+            let _g = profile::span("prefill:forward");
+            let _logits = ctx
+                .model
+                .forward_batched(ctx.session, &[parent_id.0], &[input])
+                .map_err(ConversationError::Model)?;
+        }
         ctx.session
             .advance_sequence(parent_id.0, chunk_len)
             .map_err(ConversationError::Model)?;
         offset += chunk_len;
     }
+    Ok(())
+}
 
-    let end_block = ctx
-        .session.sequence_block_count(parent_id.0).ok_or_else(|| ConversationError::Channel(format!("apply_projection: slot {} not in session", parent_id)))?;
+/// If the slot's tail is Arc-shared from a prior Sealed inject, push a fresh
+/// writer chunk so this prefill's writes don't alias that partial chunk.
+fn push_empty_if_sealed(
+    ctx: &mut ApplyContext<'_>,
+    last_was_sealed: bool,
+) -> Result<(), ConversationError> {
+    if last_was_sealed {
+        let _g = profile::span("prefill:push_empty");
+        ctx.session
+            .push_empty_writer_chunk(ctx.parent_id.0)
+            .map_err(ConversationError::Model)?;
+    }
+    Ok(())
+}
 
-    let full = ctx
+/// Captures the just-written per-layer
+/// `SealedSequence` (for `pending_user_part`, which re-injects the in-flight
+/// turn's user K/V across mid-decode reprojections instead of re-prefilling it).
+fn drive_prefill_and_capture(
+    ctx: &mut ApplyContext<'_>,
+    tokens: &[u32],
+    last_was_sealed: bool,
+) -> Result<Arc<Vec<SealedSequence>>, ConversationError> {
+    let parent_id = ctx.parent_id;
+    push_empty_if_sealed(ctx, last_was_sealed)?;
+    let start_block = ctx
         .session
-        .snapshot_sequence_per_layer(parent_id.0)
-        .map_err(ConversationError::Model)?;
-    let captured = slice_per_layer_sealed(&full, start_block, end_block);
-    log_injected_tokens(ctx, tokens);
+        .sequence_block_count(parent_id.0)
+        .ok_or_else(|| {
+            ConversationError::Channel(format!(
+                "apply_projection: slot {} not in session",
+                parent_id
+            ))
+        })?;
+    forward_tokens(ctx, tokens)?;
+    let end_block = ctx
+        .session
+        .sequence_block_count(parent_id.0)
+        .ok_or_else(|| {
+            ConversationError::Channel(format!(
+                "apply_projection: slot {} not in session",
+                parent_id
+            ))
+        })?;
 
+    let captured = {
+        let _g = profile::span("prefill:snapshot");
+        let full = ctx
+            .session
+            .snapshot_sequence_per_layer(parent_id.0)
+            .map_err(ConversationError::Model)?;
+        slice_per_layer_sealed(&full, start_block, end_block)
+    };
+    log_injected_tokens(ctx, tokens);
     Ok(Arc::new(captured))
+}
+
+/// Fire ONE batched gap-fill forward over `plans` (the cross-conversation wave),
+/// then commit each slot's glue. Plans with no glue are skipped. Every slot's
+/// glue is the new region of a ragged prefill (per-slot kv_lens via cu_seqlens);
+/// a single flat `col_actual_pos` covers every slot's sealed prefix ++ glue, so
+/// each glue token attends only logically-earlier columns within its own slot.
+/// The resulting `[sealed | glue]` slot decodes correctly because attention is
+/// order-invariant over keys and K is stored un-rotated (re-RoPE'd at read).
+pub(super) fn fire_gap_fill_batch(
+    session: &mut BatchedInferenceSession,
+    model: &(dyn ManagedBatchedModel + Send),
+    device: &Device,
+    plans: &[&GapFillPlan],
+) -> Result<(), ConversationError> {
+    let active: Vec<&GapFillPlan> = plans
+        .iter()
+        .copied()
+        .filter(|p| !p.glue_tokens.is_empty())
+        .collect();
+    if active.is_empty() {
+        return Ok(());
+    }
+    let mut flat_col: Vec<u32> = Vec::new();
+    let mut ids: Vec<usize> = Vec::with_capacity(active.len());
+    let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
+    for p in &active {
+        flat_col.extend_from_slice(&p.col_actual_pos);
+        ids.push(p.parent_id.0);
+        let input = Tensor::new(p.glue_tokens.as_slice(), device)
+            .and_then(|t| t.unsqueeze(0))
+            .map_err(ConversationError::Model)?;
+        inputs.push(input);
+    }
+    session.set_gap_fill(GapFillDescriptor {
+        col_actual_pos: Arc::new(flat_col),
+    });
+    // Clear the per-op pipeline profile so the snapshot below covers only this
+    // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
+    #[cfg(feature = "profile")]
+    let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+    {
+        let _g = profile::span("prefill:gap_fill");
+        model
+            .forward_batched(session, &ids, &inputs)
+            .map_err(ConversationError::Model)?;
+    }
+    #[cfg(feature = "profile")]
+    {
+        let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+        let mut parts: Vec<String> = snap
+            .entries
+            .iter()
+            .map(|(n, ms, c)| format!("{n}={ms:.1}ms({c})"))
+            .collect();
+        parts.sort_by(|a, b| b.cmp(a));
+        tracing::info!(
+            target: "candle_conversation::scheduler::reproject",
+            n_slots = active.len(),
+            "gap-fill forward op breakdown: {}",
+            parts.join("  ")
+        );
+    }
+    // Commit each slot's glue (consecutive writer tail).
+    for p in &active {
+        session
+            .advance_sequence(p.parent_id.0, p.glue_tokens.len())
+            .map_err(ConversationError::Model)?;
+    }
+    Ok(())
+}
+
+/// Finish phase: log the glue, prefill the deferred in-flight user message
+/// against the now-committed `[sealed | glue]` prefix, and re-attach the writer
+/// tail. Call after [`fire_gap_fill_batch`] has fired + committed the glue.
+pub(super) fn apply_segments_finish(
+    state: &mut SlotState,
+    ctx: &mut ApplyContext<'_>,
+    plan: GapFillPlan,
+) -> Result<(), ConversationError> {
+    let GapFillPlan {
+        parent_id,
+        glue_tokens,
+        col_actual_pos: _,
+        deferred_user,
+        tail_per_layer,
+        n_glue_tokens,
+    } = plan;
+
+    if !glue_tokens.is_empty() {
+        log_injected_tokens(ctx, &glue_tokens);
+    }
+
+    // The in-flight user message prefills last, against [sealed | glue]. After
+    // the gap-fill the slot ends in glue writer chunks (last_was_sealed=false);
+    // with no glue it ends in the sealed inject (last_was_sealed=true).
+    if let Some(tokens) = deferred_user {
+        let mut walker = SegmentWalker::new();
+        walker.last_was_sealed = glue_tokens.is_empty();
+        handle_new_user_message(state, ctx, &mut walker, &tokens)?;
+    }
+
+    {
+        let _g = profile::span("apply:restore_tail");
+        restore_tail(ctx.session, parent_id, tail_per_layer)?;
+    }
+
+    tracing::info!(
+        target: "candle_conversation::scheduler::reproject",
+        n_glue_tokens = n_glue_tokens,
+        "apply_segments breakdown (single gap-fill glue prefill)",
+    );
+    Ok(())
 }
 
 // ── Writer-tail snapshot / restore ───────────────────────────────────────────
@@ -665,100 +743,8 @@ mod tests {
     }
 
     #[test]
-    fn fold_tokens_deterministic() {
-        let a = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
-        let b = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn fold_tokens_order_sensitive() {
-        let a = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
-        let b = fold_tokens(FNV_OFFSET_BASIS, &[3, 2, 1]);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn fold_tokens_preceding_context_matters() {
-        // Same run, different preceding hash → different key.
-        let pre_a = fold_tokens(FNV_OFFSET_BASIS, &[100]);
-        let pre_b = fold_tokens(FNV_OFFSET_BASIS, &[101]);
-        let a = fold_tokens(pre_a, &[1, 2, 3]);
-        let b = fold_tokens(pre_b, &[1, 2, 3]);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn fold_tokens_incremental_matches_one_shot() {
-        let one_shot = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3, 4, 5, 6]);
-        let h1 = fold_tokens(FNV_OFFSET_BASIS, &[1, 2, 3]);
-        let h2 = fold_tokens(h1, &[4, 5, 6]);
-        assert_eq!(one_shot, h2);
-    }
-
-    #[test]
-    fn reproject_chain_must_match_submit_for_cache_reuse() {
-        // The live-prefill cache key is a rolling hash over the *segment
-        // sequence*: `inject_sealed_*` folds each sealed unit's tokens into
-        // the chain, and `flush_run` keys each Generated/boundary run off the
-        // chain-so-far. So a boundary run's key depends on EVERY preceding
-        // segment — including the `Generated` (template) runs.
-        //
-        // This reproduces, at the key level, the bug the daemon showed as
-        // `n_hit=0`: the SubmitTurn path keeps `Generated` runs in the chain,
-        // but the reproject path used to drop them. We model the chain
-        // BASIS -> [Generated] -> [Sealed section] -> key(boundary run).
-        let generated_run: &[u32] = &[1, 2, 3]; // a template section's Generated tokens
-        let sealed_section: &[u32] = &[10, 11]; // a sealed section's folded tokens
-        let boundary_run: &[u32] = &[100]; // a user_start boundary the walker re-prefills
-
-        // Submit: Generated IS in the chain.
-        let submit_key = {
-            let h = fold_tokens(FNV_OFFSET_BASIS, generated_run); // flush_run(Generated)
-            let h = fold_tokens(h, sealed_section); // inject_sealed_section
-            fold_tokens(h, boundary_run) // flush_run(boundary)
-        };
-
-        // Reproject BEFORE the fix: Generated dropped from the chain.
-        let reproject_key_buggy = {
-            let h = fold_tokens(FNV_OFFSET_BASIS, sealed_section);
-            fold_tokens(h, boundary_run)
-        };
-        // Dropping the Generated run shifts every downstream key → cache MISS.
-        assert_ne!(
-            submit_key, reproject_key_buggy,
-            "dropping the Generated run changes the boundary key — this is the n_hit=0 bug"
-        );
-
-        // Reproject AFTER the fix: Generated kept, chain identical to submit.
-        let reproject_key_fixed = {
-            let h = fold_tokens(FNV_OFFSET_BASIS, generated_run);
-            let h = fold_tokens(h, sealed_section);
-            fold_tokens(h, boundary_run)
-        };
-        // Keys match → the reproject reuses submit's cached K/V → cache HIT.
-        assert_eq!(
-            submit_key, reproject_key_fixed,
-            "keeping the Generated run aligns the reproject key with submit — cache hit"
-        );
-    }
-
-    #[test]
-    fn cache_get_set_round_trip() {
-        let mut cache = SlotProjectionCache::default();
-        assert_eq!(cache.len(), 0);
-        let v: Arc<Vec<SealedSequence>> = Arc::new(Vec::new());
-        cache.insert(42, v.clone());
-        assert_eq!(cache.len(), 1);
-        let got = cache.get(42).unwrap();
-        assert!(Arc::ptr_eq(&got, &v));
-        assert!(cache.get(43).is_none());
-    }
-
-    #[test]
     fn slot_state_default_is_empty() {
         let s = SlotState::default();
-        assert_eq!(s.cache.len(), 0);
         assert!(s.pending_user_part.is_none());
     }
 

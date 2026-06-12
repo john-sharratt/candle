@@ -41,9 +41,7 @@
 //! - Append-only cold store for persistence
 
 mod batched_sampler;
-pub mod projection;
 mod config;
-pub mod provenance;
 mod conversation;
 pub mod conversation_log;
 mod decode_health;
@@ -53,12 +51,14 @@ mod handle;
 pub mod models;
 pub mod narrator;
 pub mod persistence;
+pub mod projection;
 pub mod prompts;
+pub mod provenance;
 pub(crate) mod scheduler;
 mod sequence_handle;
-pub mod substrate;
 mod stats;
 pub mod store;
+pub mod substrate;
 pub mod summary_tree;
 pub mod think_strip;
 mod time_source;
@@ -67,18 +67,18 @@ pub mod tree;
 pub mod turn;
 
 pub use config::{
-    pick_max_hot_turns, SequenceConfig, DecodeHealthConfig, DryConfig,
-    EngineConfig, SamplingConfig, SchedulerConfig,
+    pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
+    SchedulerConfig, SequenceConfig,
 };
 pub use conversation::Sequence;
 pub use engine::{ConversationEngine, SubstrateReloadStatus};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
-pub use sequence_handle::SequenceId;
-pub use stats::TurnStats;
 pub use provenance::{
     ProbeSignatures, ProvenanceFile, SigEntry, TokenSignature, TurnChunkRank, TurnSignatures,
 };
+pub use sequence_handle::SequenceId;
+pub use stats::TurnStats;
 pub use token_buffer::TokenBuffer;
 pub use tree::TokenizedText;
 pub use turn::{Role, Turn, TurnId, TurnOptions};

@@ -141,9 +141,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Status => cmd_status(&archive_groups, &precompiled_dir, &staged_dir, &base_dir),
-        Commands::Hash { group } => {
-            cmd_hash(&archive_groups, &base_dir, &group)
-        }
+        Commands::Hash { group } => cmd_hash(&archive_groups, &base_dir, &group),
         Commands::RebuildArchiveHashes => {
             cmd_rebuild_archive_hashes(&archive_groups, &precompiled_dir, &base_dir)
         }
@@ -156,36 +154,20 @@ fn main() -> Result<()> {
         Commands::CheckForChanges => {
             cmd_check_for_changes(&archive_groups, &precompiled_dir, &staged_dir, &base_dir)
         }
-        Commands::RebuildArchives { group } => {
-            cmd_rebuild_archives(
-                &archive_groups,
-                &staged_dir,
-                &precompiled_dir,
-                &base_dir,
-                &group,
-                is_msvc,
-            )
+        Commands::RebuildArchives { group } => cmd_rebuild_archives(
+            &archive_groups,
+            &staged_dir,
+            &precompiled_dir,
+            &base_dir,
+            &group,
+            is_msvc,
+        ),
+        Commands::Compile { group, threads } => {
+            cmd_compile(&archive_groups, &staged_dir, &base_dir, &group, threads)
         }
-        Commands::Compile {
-            group,
-            threads,
-        } => cmd_compile(
-            &archive_groups,
-            &staged_dir,
-            &base_dir,
-            &group,
-            threads,
-        ),
-        Commands::Recompile {
-            group,
-            threads,
-        } => cmd_recompile(
-            &archive_groups,
-            &staged_dir,
-            &base_dir,
-            &group,
-            threads,
-        ),
+        Commands::Recompile { group, threads } => {
+            cmd_recompile(&archive_groups, &staged_dir, &base_dir, &group, threads)
+        }
         Commands::Compress { group, build_dir } => cmd_compress(
             &archive_groups,
             &PathBuf::from(&build_dir),
@@ -210,7 +192,10 @@ fn cmd_status(
 ) -> Result<()> {
     let mut dep_cache: HashMap<String, String> = HashMap::new();
 
-    println!("{:<20} {:>8}  {:>8}  {:>8}  {}", "GROUP", "KERNELS", "CACHED", "STAGED", "STATUS");
+    println!(
+        "{:<20} {:>8}  {:>8}  {:>8}  {}",
+        "GROUP", "KERNELS", "CACHED", "STAGED", "STATUS"
+    );
     println!("{}", "-".repeat(72));
 
     let mut total_kernels = 0usize;
@@ -225,8 +210,8 @@ fn cmd_status(
         kind: StagingProblemKind,
     }
     enum StagingProblemKind {
-        MissingO,       // .o file not in staged/
-        StaleHash,      // .o exists but .sha256 is wrong or missing
+        MissingO,  // .o file not in staged/
+        StaleHash, // .o exists but .sha256 is wrong or missing
     }
 
     let mut problems: Vec<StagingProblem> = Vec::new();
@@ -328,7 +313,8 @@ fn cmd_status(
             println!("\n  To copy from last build output:");
             println!("    cargo run --bin kernel_tool -- rebuild-staging");
             println!("\n  Or compile just the affected group(s):");
-            let mut affected_groups: Vec<&str> = missing.iter().map(|p| p.group_name.as_str()).collect();
+            let mut affected_groups: Vec<&str> =
+                missing.iter().map(|p| p.group_name.as_str()).collect();
             affected_groups.sort();
             affected_groups.dedup();
             for g in &affected_groups {
@@ -338,7 +324,10 @@ fn cmd_status(
         }
 
         if !stale.is_empty() {
-            println!("Stale/missing .sha256 for staged .o files ({}):", stale.len());
+            println!(
+                "Stale/missing .sha256 for staged .o files ({}):",
+                stale.len()
+            );
             for p in &stale {
                 println!("  [{}] {} ({})", p.group_name, p.kernel_name, p.kernel_path);
             }
@@ -359,11 +348,7 @@ fn cmd_status(
     Ok(())
 }
 
-fn cmd_hash(
-    groups: &[ArchiveGroup],
-    base_dir: &Path,
-    filter_group: &[String],
-) -> Result<()> {
+fn cmd_hash(groups: &[ArchiveGroup], base_dir: &Path, filter_group: &[String]) -> Result<()> {
     let mut dep_cache: HashMap<String, String> = HashMap::new();
 
     for group in groups {
@@ -374,7 +359,11 @@ fn cmd_hash(
         let (kernel_hashes, aggregate_hash) =
             compute_group_hashes(group, base_dir, &mut dep_cache)?;
 
-        println!("=== {} (aggregate: {}) ===", group.name, &aggregate_hash[..16]);
+        println!(
+            "=== {} (aggregate: {}) ===",
+            group.name,
+            &aggregate_hash[..16]
+        );
         for (path, hash) in &kernel_hashes {
             println!("  {} {}", &hash[..16], path);
         }
@@ -529,9 +518,8 @@ fn cmd_rebuild_staging(
 
         if let Some(src) = find_newest_object(name, &build_dirs) {
             let dest = staged_dir.join(format!("{}.o", name));
-            fs::copy(&src, &dest).with_context(|| {
-                format!("Failed to copy {}.o to staged/", name)
-            })?;
+            fs::copy(&src, &dest)
+                .with_context(|| format!("Failed to copy {}.o to staged/", name))?;
             // Remove any stale hash — staging hashes must be rebuilt separately
             let hash_file = staged_dir.join(format!("{}.o.sha256", name));
             let _ = fs::remove_file(&hash_file);
@@ -585,9 +573,8 @@ fn cmd_rebuild_staging_hashes(
 
             // Write the hash file
             let hash_file = staged_dir.join(format!("{}.o.sha256", name));
-            fs::write(&hash_file, &hash).with_context(|| {
-                format!("Failed to write {}", hash_file.display())
-            })?;
+            fs::write(&hash_file, &hash)
+                .with_context(|| format!("Failed to write {}", hash_file.display()))?;
             stamped += 1;
         }
     }
@@ -619,7 +606,11 @@ fn cmd_check_for_changes(
         }
 
         any_dirty = true;
-        println!("DIRTY archive: {} ({} kernels)", group.name, group.kernels.len());
+        println!(
+            "DIRTY archive: {} ({} kernels)",
+            group.name,
+            group.kernels.len()
+        );
 
         let mut staged_hits = 0usize;
         let mut to_compile: Vec<String> = Vec::new();
@@ -646,10 +637,7 @@ fn cmd_check_for_changes(
             );
         }
         if !to_compile.is_empty() {
-            println!(
-                "  {} kernel(s) would need compilation:",
-                to_compile.len()
-            );
+            println!("  {} kernel(s) would need compilation:", to_compile.len());
             for k in &to_compile {
                 println!("    {}", k);
             }
@@ -698,9 +686,8 @@ fn cmd_rebuild_archives(
             let dest_o = link_dir.join(format!("{}.o", name));
 
             if staged_o.exists() {
-                fs::copy(&staged_o, &dest_o).with_context(|| {
-                    format!("Failed to copy staged {}.o", name)
-                })?;
+                fs::copy(&staged_o, &dest_o)
+                    .with_context(|| format!("Failed to copy staged {}.o", name))?;
                 object_files.push(dest_o);
             } else {
                 all_present = false;
@@ -792,7 +779,11 @@ fn cmd_compile(
         }
 
         if to_compile.is_empty() {
-            println!("{}: all {} kernels up-to-date in staged/", group.name, group.kernels.len());
+            println!(
+                "{}: all {} kernels up-to-date in staged/",
+                group.name,
+                group.kernels.len()
+            );
             continue;
         }
 
@@ -816,10 +807,7 @@ fn cmd_compile(
         }
 
         total_compiled += to_compile.len();
-        println!(
-            "  Done in {:.1}s",
-            start.elapsed().as_secs_f64()
-        );
+        println!("  Done in {:.1}s", start.elapsed().as_secs_f64());
     }
 
     // Clean up temp dir
@@ -877,10 +865,7 @@ fn cmd_recompile(
             save_to_staged_cache(&compile_dir, staged_dir, &name, &hash)?;
         }
 
-        println!(
-            "  Done in {:.1}s",
-            start.elapsed().as_secs_f64()
-        );
+        println!("  Done in {:.1}s", start.elapsed().as_secs_f64());
     }
 
     let _ = fs::remove_dir_all(&compile_dir);

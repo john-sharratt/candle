@@ -280,8 +280,12 @@ impl Scheduler {
             }
         };
         // Prefill batch = n_seqs sequences, Σ chunks tokens (ragged).
-        self.wave_stats
-            .record(true, n_seqs, total_tokens, t_fwd.elapsed().as_millis() as u64);
+        self.wave_stats.record(
+            true,
+            n_seqs,
+            total_tokens,
+            t_fwd.elapsed().as_millis() as u64,
+        );
 
         for ((logits, &i), &chunk) in logits_vec
             .into_iter()

@@ -105,11 +105,7 @@ fn quantize_to_cpu_basic_round_trip_shape() {
 
     // 64 tokens = 2 chunks of 32 tokens.
     let src = seed_f16_sealed(&backing, &device, 64, 1);
-    let src_bytes_per_chunk = src
-        .chunks
-        .iter()
-        .map(|c| c.byte_size as u64)
-        .sum::<u64>();
+    let src_bytes_per_chunk = src.chunks.iter().map(|c| c.byte_size as u64).sum::<u64>();
 
     let mut pinned: Option<PinnedBuf> = None;
     let warm = quantize_sealed_in_place(
@@ -207,15 +203,8 @@ fn quantize_to_cpu_empty_input_is_noop() {
     let copy_stream = cuda_stream(&device);
 
     let mut pinned: Option<PinnedBuf> = None;
-    let out = quantize_sealed_in_place(
-        &backing,
-        &[],
-        &policy,
-        &device,
-        &copy_stream,
-        &mut pinned,
-    )
-    .expect("quantize_sealed_in_place (empty)");
+    let out = quantize_sealed_in_place(&backing, &[], &policy, &device, &copy_stream, &mut pinned)
+        .expect("quantize_sealed_in_place (empty)");
     assert!(out.is_empty());
 }
 

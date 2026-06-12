@@ -39,7 +39,8 @@ use candle::quantized::pinned_staging::PinnedStager;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{ChunkedKvBacking, KvCache, CHUNK_SIZE};
 use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
+    compute_rope_cs, paged_decode_attn, paged_prefill_batched, paged_prefill_batched_gap_fill,
+    paged_prefill_batched_gap_fill_degenerate,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -137,9 +138,7 @@ const TEST_CASES: &[(&str, &[usize])] = &[
         "long_run_of_full_then_partial",
         // Sum: 14 × 32 + 9 = 457.  Stress the kernel's read scan
         // length and the very last partial.
-        &[
-            32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 9,
-        ],
+        &[32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 9],
     ),
 ];
 
@@ -263,10 +262,7 @@ fn run_decode_case(
     // backing reference.
     let _ = &mut cache_a;
 
-    let diff = max_abs_diff_f32(
-        &out_a.to_dtype(DType::F32)?,
-        &out_b.to_dtype(DType::F32)?,
-    )?;
+    let diff = max_abs_diff_f32(&out_a.to_dtype(DType::F32)?, &out_b.to_dtype(DType::F32)?)?;
     if diff >= DIFF_TOLERANCE {
         candle::bail!(
             "decode kernel diverged on layout {:?}: max abs diff = {:.6e} (expected < {:.0e})",
@@ -315,11 +311,8 @@ fn run_prefill_case(
     // Run a fresh prefill of EXTRA tokens on both slots and compare
     // the resulting attention output.  The Q/K/V are the same; the K
     // scan covers everything written before + the new range.
-    let (q_ext, k_ext, v_ext) = make_qkv(
-        EXTRA_PREFILL_TOKENS,
-        device,
-        hash_str(case_name) ^ 0xEFEFEF,
-    )?;
+    let (q_ext, k_ext, v_ext) =
+        make_qkv(EXTRA_PREFILL_TOKENS, device, hash_str(case_name) ^ 0xEFEFEF)?;
     let out_a = run_prefill(
         &mut cache_a,
         &q_ext,
@@ -346,10 +339,7 @@ fn run_prefill_case(
     let _ = &backing_a;
     let _ = &backing_b;
 
-    let diff = max_abs_diff_f32(
-        &out_a.to_dtype(DType::F32)?,
-        &out_b.to_dtype(DType::F32)?,
-    )?;
+    let diff = max_abs_diff_f32(&out_a.to_dtype(DType::F32)?, &out_b.to_dtype(DType::F32)?)?;
     if diff >= DIFF_TOLERANCE {
         candle::bail!(
             "prefill kernel diverged on layout {:?}: max abs diff = {:.6e} (expected < {:.0e})",
@@ -475,7 +465,10 @@ fn assert_slot_layouts(
     );
     // All non-empty chunks of slot A should be full except possibly
     // the very last.
-    let n_full_a = usages_a.iter().filter(|&&u| u as usize == CHUNK_SIZE).count();
+    let n_full_a = usages_a
+        .iter()
+        .filter(|&&u| u as usize == CHUNK_SIZE)
+        .count();
     let n_partial_a = usages_a
         .iter()
         .filter(|&&u| u > 0 && (u as usize) < CHUNK_SIZE)
@@ -487,10 +480,7 @@ fn assert_slot_layouts(
     let _ = n_full_a;
     // Slot B should match `segments` exactly.
     let expected_b: Vec<u16> = segments.iter().map(|&n| n as u16).collect();
-    assert_eq!(
-        usages_b, expected_b,
-        "[{case_name}] slot B layout mismatch",
-    );
+    assert_eq!(usages_b, expected_b, "[{case_name}] slot B layout mismatch",);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -508,6 +498,16 @@ fn bind_kv_cache(backing: &ChunkedKvBacking, batch_idx: usize) -> Result<KvCache
     Ok(cache)
 }
 
+/// Flatten `make_qkv`'s `[1, n_head, n_tokens, head_dim]` into the FLAT-packed
+/// `[total, n_head, head_dim]` the ragged prefill wants.
+fn flatten_qkv(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    Ok((
+        q.transpose(1, 2)?.squeeze(0)?.contiguous()?,
+        k.transpose(1, 2)?.squeeze(0)?.contiguous()?,
+        v.transpose(1, 2)?.squeeze(0)?.contiguous()?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_prefill(
     cache: &mut KvCache,
@@ -521,16 +521,17 @@ fn run_prefill(
     device: &Device,
 ) -> Result<Tensor> {
     let offset = cache.current_seq_len();
+    let (qf, kf, vf) = flatten_qkv(q, k, v)?;
     let generation = stager.begin_generation();
     let mut caches_arr: [&mut KvCache; 1] = [cache];
     let outs = paged_prefill_batched(
         &mut caches_arr[..],
         &[offset],
-        q,
-        k,
-        v,
+        &qf,
+        &kf,
+        &vf,
         1,
-        seq_len,
+        &[seq_len],
         N_HEAD,
         N_KV_HEAD,
         HEAD_DIM,
@@ -542,12 +543,10 @@ fn run_prefill(
         &generation,
     )?;
     caches_arr[0].set_current_seq_len(offset + seq_len)?;
-    let out = outs
-        .into_iter()
-        .next()
-        .ok_or_else(|| candle::Error::Msg("paged_prefill_batched returned no outputs".into()))?;
+    // `paged_prefill_batched` returns the flat attention output
+    // [total_q, n_head, head_dim] (one sequence here).
     let _ = device;
-    Ok(out)
+    Ok(outs)
 }
 
 /// Reaches into a `KvCache` bound to slot 0 of `backing`, builds the
@@ -582,13 +581,8 @@ fn decode_one_slot(
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
 
-    let mut slot = SlotStateHost::from_sealed_chunks(
-        &chunks,
-        N_KV_HEAD,
-        HEAD_DIM,
-        &arena_info,
-        writer_start,
-    );
+    let mut slot =
+        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
     slot.extend_for_write_region(1, CHUNK_SIZE);
 
     let slice_size = TokenSliceHost::serialized_size(N_KV_HEAD, HEAD_DIM);
@@ -722,4 +716,324 @@ fn max_abs_diff_f32(a: &Tensor, b: &Tensor) -> Result<f32> {
     let m = d.max(0)?;
     let m = m.to_dtype(DType::F32)?.to_scalar::<f32>()?;
     Ok(m)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// GAP_FILL kernel tests
+// ──────────────────────────────────────────────────────────────────────
+
+/// Like [`run_prefill`] but routes through the GAP_FILL kernel specialization
+/// with identity `col_actual_pos` and contiguous write targets.
+#[allow(clippy::too_many_arguments)]
+fn run_gap_fill(
+    cache: &mut KvCache,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seq_len: usize,
+    rope_cs: &Tensor,
+    rope_offsets: &Tensor,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Tensor> {
+    let offset = cache.current_seq_len();
+    // make_qkv yields [1, n_head, n_tokens, head_dim]; the ragged prefill wants
+    // FLAT-packed [total_q, n_head, head_dim].
+    let (qf, kf, vf) = flatten_qkv(q, k, v)?;
+    let generation = stager.begin_generation();
+    let mut caches_arr: [&mut KvCache; 1] = [cache];
+    let outs = paged_prefill_batched_gap_fill_degenerate(
+        &mut caches_arr[..],
+        &[offset],
+        &qf,
+        &kf,
+        &vf,
+        1,
+        &[seq_len],
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        None,
+        rope_offsets,
+        rope_cs,
+        false,
+        0,
+        &generation,
+    )?;
+    caches_arr[0].set_current_seq_len(offset + seq_len)?;
+    let _ = device;
+    Ok(outs)
+}
+
+/// TDD gate: the gap-fill kernel, fed identity `col_actual_pos` and write
+/// targets matching the contiguous write region, must reproduce the normal
+/// prefill kernel exactly. This validates the whole gap-fill path (the
+/// actual-position mask reducing to causal, RoPE, write targets, FFI) against
+/// the known-good kernel, with no separate reference.
+///
+/// Two independent slots are built with the SAME sealed prefix, then the SAME
+/// glue tokens are prefilled — normally on slot A, via gap-fill on slot B. The
+/// attention outputs must match.
+#[test]
+fn gap_fill_degenerate_matches_normal_prefill() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
+
+    // A few (sealed_prefix, glue) shapes — including a non-chunk-aligned
+    // prefix so the has-prefix read path is exercised under partial chunks.
+    let cases: &[(usize, usize)] = &[(20, 8), (32, 5), (7, 12), (64, 16)];
+    let mut failures: Vec<String> = Vec::new();
+
+    for &(sealed, glue) in cases {
+        let (q_seal, k_seal, v_seal) = make_qkv(sealed, &device, 0x5EA1ED ^ sealed as u64)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, &device, 0x61E ^ glue as u64)?;
+
+        // Slot A: sealed, then normal glue prefill.
+        let backing_a = fresh_backing(&device)?;
+        let mut cache_a = bind_kv_cache(&backing_a, 0)?;
+        let _ = run_prefill(
+            &mut cache_a,
+            &q_seal,
+            &k_seal,
+            &v_seal,
+            sealed,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        let out_a = run_prefill(
+            &mut cache_a,
+            &q_glue,
+            &k_glue,
+            &v_glue,
+            glue,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+
+        // Slot B: SAME sealed, then gap-fill glue prefill.
+        let backing_b = fresh_backing(&device)?;
+        let mut cache_b = bind_kv_cache(&backing_b, 0)?;
+        let _ = run_prefill(
+            &mut cache_b,
+            &q_seal,
+            &k_seal,
+            &v_seal,
+            sealed,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        let out_b = run_gap_fill(
+            &mut cache_b,
+            &q_glue,
+            &k_glue,
+            &v_glue,
+            glue,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        let _ = (&backing_a, &backing_b);
+
+        let diff = max_abs_diff_f32(&out_a.to_dtype(DType::F32)?, &out_b.to_dtype(DType::F32)?)?;
+        eprintln!("gap-fill degenerate (sealed={sealed}, glue={glue}): max abs diff = {diff:.6e}");
+        if diff >= DIFF_TOLERANCE {
+            failures.push(format!(
+                "(sealed={sealed}, glue={glue}): diff={diff:.6e} >= {DIFF_TOLERANCE:.0e}"
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        candle::bail!(
+            "gap-fill degenerate diverged from normal prefill in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// Like [`run_gap_fill`] but with an explicit `col_actual_pos` (the interleaved
+/// layout). `col_actual_pos.len()` must equal `offset + seq_len`.
+#[allow(clippy::too_many_arguments)]
+fn run_gap_fill_custom(
+    cache: &mut KvCache,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seq_len: usize,
+    col_actual_pos: &[u32],
+    rope_cs: &Tensor,
+    rope_offsets: &Tensor,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Tensor> {
+    let offset = cache.current_seq_len();
+    let (qf, kf, vf) = flatten_qkv(q, k, v)?;
+    let generation = stager.begin_generation();
+    let mut caches_arr: [&mut KvCache; 1] = [cache];
+    let out = paged_prefill_batched_gap_fill(
+        &mut caches_arr[..],
+        &[offset],
+        &qf,
+        &kf,
+        &vf,
+        1,
+        &[seq_len],
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        None,
+        rope_offsets,
+        rope_cs,
+        false,
+        0,
+        &generation,
+        col_actual_pos,
+    )?;
+    caches_arr[0].set_current_seq_len(offset + seq_len)?;
+    let _ = device;
+    Ok(out)
+}
+
+/// TDD gate 2: the core gap-fill feature — a glue island at a scattered actual
+/// position must attend sealed content *before* it and MASK OUT sealed content
+/// *after* it (by actual position), even though that sealed content is
+/// physically present in the cache.
+///
+/// Build: sealed A (positions [0, a)) + sealed B both in the cache, then gap-fill
+/// the glue with `col_actual_pos` placing the glue at [a, a+g) and B at
+/// [a+g, a+g+b) — i.e. B sits *after* the glue. The glue must therefore attend
+/// only A, so the output must equal a plain prefill of `[A, GLUE]` (no B).
+#[test]
+fn gap_fill_interleaved_masks_sealed_after_glue() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope_offsets = Tensor::zeros(1, DType::U32, &device)?;
+
+    let cases: &[(usize, usize, usize)] = &[(12, 10, 6), (32, 32, 8), (7, 20, 5)];
+    let mut failures: Vec<String> = Vec::new();
+
+    for &(a, b, g) in cases {
+        let (qa, ka, va) = make_qkv(a, &device, 0xA1 ^ a as u64)?;
+        let (qg, kg, vg) = make_qkv(g, &device, 0x61 ^ g as u64)?;
+        let (qb, kb, vb) = make_qkv(b, &device, 0xB1 ^ b as u64)?;
+
+        // Reference: A then GLUE — the glue attends only A.
+        let backing_r = fresh_backing(&device)?;
+        let mut cache_r = bind_kv_cache(&backing_r, 0)?;
+        let _ = run_prefill(
+            &mut cache_r,
+            &qa,
+            &ka,
+            &va,
+            a,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        let glue_ref = run_prefill(
+            &mut cache_r,
+            &qg,
+            &kg,
+            &vg,
+            g,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+
+        // Gap-fill: A + B in the cache; glue gap-filled with B placed AFTER it.
+        let backing_x = fresh_backing(&device)?;
+        let mut cache_x = bind_kv_cache(&backing_x, 0)?;
+        let _ = run_prefill(
+            &mut cache_x,
+            &qa,
+            &ka,
+            &va,
+            a,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        let _ = run_prefill(
+            &mut cache_x,
+            &qb,
+            &kb,
+            &vb,
+            b,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        // col_actual_pos over the prefix (A then B, packed) + glue (new region):
+        //   A   -> [0, a)        (before the glue)
+        //   B   -> [a+g, a+g+b)  (after the glue — must be masked)
+        //   glue-> [a, a+g)
+        let mut cap: Vec<u32> = Vec::with_capacity(a + b + g);
+        cap.extend(0..a as u32);
+        cap.extend((a + g) as u32..(a + g + b) as u32);
+        cap.extend(a as u32..(a + g) as u32);
+        let glue_gap = run_gap_fill_custom(
+            &mut cache_x,
+            &qg,
+            &kg,
+            &vg,
+            g,
+            &cap,
+            &rope_cs,
+            &rope_offsets,
+            &stager,
+            &device,
+        )?;
+        let _ = (&backing_r, &backing_x);
+
+        let diff = max_abs_diff_f32(
+            &glue_ref.to_dtype(DType::F32)?,
+            &glue_gap.to_dtype(DType::F32)?,
+        )?;
+        eprintln!("interleaved gap-fill (a={a}, b={b}, g={g}): max abs diff = {diff:.6e}");
+        if diff >= DIFF_TOLERANCE {
+            failures.push(format!(
+                "(a={a}, b={b}, g={g}): diff={diff:.6e} >= {DIFF_TOLERANCE:.0e} — sealed-after-glue not masked"
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        candle::bail!(
+            "interleaved gap-fill mismatch in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
 }

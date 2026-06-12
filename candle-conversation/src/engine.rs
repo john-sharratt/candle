@@ -156,12 +156,10 @@ impl ConversationEngine {
         // selection kernel. The model impl is the single source of truth;
         // `BatchedModelCore::*_error_threshold_factor()` returns the per-model
         // constant (e.g. `QWEN3_MOE_KV_FACTORS`).
-        config.batched_config.k_hi_error_threshold_factor =
-            model_core.k_hi_error_threshold_factor;
+        config.batched_config.k_hi_error_threshold_factor = model_core.k_hi_error_threshold_factor;
         config.batched_config.k_low_error_threshold_factor =
             model_core.k_low_error_threshold_factor;
-        config.batched_config.v_hi_error_threshold_factor =
-            model_core.v_hi_error_threshold_factor;
+        config.batched_config.v_hi_error_threshold_factor = model_core.v_hi_error_threshold_factor;
         config.batched_config.v_low_error_threshold_factor =
             model_core.v_low_error_threshold_factor;
 
@@ -183,15 +181,16 @@ impl ConversationEngine {
         // borrow of this to every `ApplyContext` so the assembler can
         // wrap every `Sealed::Turn` in live-prefilled boundary
         // markers without re-tokenising on each projection.
-        let boundary_markers = crate::scheduler::projection_assembler::BoundaryMarkers::from_dialect(
-            &config.dialect,
-            |s| {
-                let encoded = tokenizer.encode(s, false).map_err(|e| {
-                    ConversationError::Channel(format!("boundary marker tokenise: {e}"))
-                })?;
-                Ok::<_, ConversationError>(encoded.get_ids().to_vec())
-            },
-        )?;
+        let boundary_markers =
+            crate::scheduler::projection_assembler::BoundaryMarkers::from_dialect(
+                &config.dialect,
+                |s| {
+                    let encoded = tokenizer.encode(s, false).map_err(|e| {
+                        ConversationError::Channel(format!("boundary marker tokenise: {e}"))
+                    })?;
+                    Ok::<_, ConversationError>(encoded.get_ids().to_vec())
+                },
+            )?;
 
         // Create the scheduler channel (unbounded — backpressure is per-conversation
         // via the turn_in_flight guard, not at the channel level).
@@ -277,8 +276,7 @@ impl ConversationEngine {
         // persistence thread so its writes flow through the same
         // workspace handle.
         let summariser_runner = Arc::new(ChannelProbeRunner::new(tx.clone()));
-        let summariser_thread =
-            SummariserThread::spawn(conversation.clone(), summariser_runner);
+        let summariser_thread = SummariserThread::spawn(conversation.clone(), summariser_runner);
         // Hand the trigger to the scheduler so every assistant-turn
         // seal wakes the summariser immediately — design §4 step ③.
         let summariser_trigger = summariser_thread.trigger_handle();
@@ -423,21 +421,14 @@ impl ConversationEngine {
     /// [`SelectionDiagnostics`] for `timeline`, or `None` if no
     /// projection has run yet (or projection used the rule-based
     /// path).  Last-write-wins across reprojections within a turn.
-    pub fn last_selection_diagnostics(
-        &self,
-        timeline: TimelineId,
-    ) -> Option<SelectionDiagnostics> {
+    pub fn last_selection_diagnostics(&self, timeline: TimelineId) -> Option<SelectionDiagnostics> {
         self.conversation.last_selection_diagnostics(timeline)
     }
 
     /// Persist a sidebar label for `timeline` to the workspace substrate.
     /// Last-write-wins; preserves whatever `conv_id` is already known
     /// for this timeline. The daemon's titler is the typical caller.
-    pub fn set_conversation_label(
-        &self,
-        timeline: TimelineId,
-        label: &str,
-    ) -> crate::Result<()> {
+    pub fn set_conversation_label(&self, timeline: TimelineId, label: &str) -> crate::Result<()> {
         self.conversation
             .set_conversation_label(timeline, label)
             .map_err(ConversationError::Model)
@@ -510,9 +501,7 @@ impl ConversationEngine {
     /// Every conversation the workspace substrate knows about —
     /// `(timeline, conv_id, label, archived)` quads. Drives the
     /// daemon's `GET /v1/conversations` sidebar listing directly.
-    pub fn known_conversations(
-        &self,
-    ) -> Vec<(TimelineId, String, String, bool)> {
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool)> {
         self.conversation.known_conversations()
     }
 
@@ -723,7 +712,6 @@ impl ConversationEngine {
         tokens: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<String> {
-
         // 1. Allocate a sequence.
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.scheduler_tx
@@ -833,10 +821,7 @@ impl ConversationEngine {
     /// Rewrites the log to just the live record set, reclaiming the dead
     /// weight that accrues from superseded turns and tombstoned timelines.
     /// `progress` reports coarse phase progress (0..=5) for the loading screen.
-    pub fn compact_substrate(
-        &self,
-        progress: Option<&dyn Fn(usize, usize)>,
-    ) -> crate::Result<()> {
+    pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> crate::Result<()> {
         Ok(self.conversation.compact_substrate(progress)?)
     }
 

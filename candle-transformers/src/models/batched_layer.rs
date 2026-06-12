@@ -14,6 +14,7 @@ use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
 use crate::models::prefill_utils::paged_prefill_batched;
+use crate::models::prefill_utils::paged_prefill_batched_gap_fill;
 use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use crate::utils::repeat_kv;
 
@@ -110,12 +111,27 @@ impl<'a> BatchedAttentionParams<'a> {
 ///
 /// This avoids rebuilding the same small tensors (cu_seqlens, q_lens, kv_lens)
 /// for every layer during multi-token prefill.
+/// GAP_FILL descriptor: routes a prefill through the gap-fill kernel. Sealed
+/// content is the (packed) contiguous prefix; all glue is the new region,
+/// appended as the writer tail. `col_actual_pos` relabels every column with its
+/// TRUE sequence position so each glue token attends only logically-earlier
+/// columns (sealed or glue) regardless of physical packing order. The resulting
+/// `[sealed | glue]` slot decodes correctly because attention is order-invariant
+/// over keys and the glue K/V already carries its logical RoPE.
+#[derive(Clone)]
+pub struct GapFillDescriptor {
+    /// Flat (per-slot kv_len) array of each column's TRUE sequence position.
+    pub col_actual_pos: std::sync::Arc<Vec<u32>>,
+}
+
 #[derive(Clone)]
 pub struct BatchedPrefillMeta {
     pub cu_seqlens_q: Tensor,
     pub q_lens: Tensor,
     pub kv_lens: Tensor,
     pub has_prefix: bool,
+    /// `Some` → run the gap-fill kernel with this descriptor; `None` = normal.
+    pub gap_fill: Option<GapFillDescriptor>,
 }
 
 impl BatchedPrefillMeta {
@@ -171,7 +187,15 @@ impl BatchedPrefillMeta {
             q_lens: q_lens_t,
             kv_lens,
             has_prefix,
+            gap_fill: None,
         })
+    }
+
+    /// Attach the GAP_FILL descriptor — routes this prefill through the gap-fill
+    /// kernel.
+    pub fn with_gap_fill(mut self, desc: GapFillDescriptor) -> Self {
+        self.gap_fill = Some(desc);
+        self
     }
 }
 
@@ -429,11 +453,12 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
         )?;
         Ok(ret)
     } else {
-        let prefill_meta = match &params.decode_headers {
-            DecodeHeaders::Prefill(m) => {
-                Some((&m.cu_seqlens_q, &m.q_lens, &m.kv_lens, m.has_prefix))
-            }
-            _ => None,
+        let (prefill_meta, gap_fill) = match &params.decode_headers {
+            DecodeHeaders::Prefill(m) => (
+                Some((&m.cu_seqlens_q, &m.q_lens, &m.kv_lens, m.has_prefix)),
+                m.gap_fill.as_ref(),
+            ),
+            _ => (None, None),
         };
         let ret = forward_attn_batched_multi(
             layer,
@@ -448,6 +473,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
             params.rope_cs,
             write_offset_shifts_ptr,
             params.generation,
+            gap_fill,
         )?;
         Ok(ret)
     }
@@ -598,6 +624,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     rope_cs: &Tensor,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
+    gap_fill: Option<&GapFillDescriptor>,
 ) -> Result<TensorCat> {
     // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
     // against the sequence count carried by q_lens instead.
@@ -664,9 +691,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
                 candle_nn::rotary_emb::rope(&k4, cos, sin)?,
             )
         };
-        let q = q4
-            .transpose(1, 2)?
-            .reshape((total_q, n_head, head_dim))?;
+        let q = q4.transpose(1, 2)?.reshape((total_q, n_head, head_dim))?;
         let k = k4
             .transpose(1, 2)?
             .reshape((total_q, n_kv_head, head_dim))?;
@@ -677,24 +702,46 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
 
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim].
-    let out_packed = paged_prefill_batched(
-        caches,
-        offsets,
-        &q,
-        &k,
-        &v,
-        n_seqs,
-        q_lens,
-        n_head,
-        n_kv_head,
-        head_dim,
-        prefill_meta,
-        &rope_zeros,
-        rope_cs,
-        rope_interleaved,
-        write_offset_shifts_ptr,
-        generation,
-    )?;
+    let out_packed = if let Some(desc) = gap_fill {
+        paged_prefill_batched_gap_fill(
+            caches,
+            offsets,
+            &q,
+            &k,
+            &v,
+            n_seqs,
+            q_lens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            prefill_meta,
+            &rope_zeros,
+            rope_cs,
+            rope_interleaved,
+            write_offset_shifts_ptr,
+            generation,
+            &desc.col_actual_pos,
+        )?
+    } else {
+        paged_prefill_batched(
+            caches,
+            offsets,
+            &q,
+            &k,
+            &v,
+            n_seqs,
+            q_lens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            prefill_meta,
+            &rope_zeros,
+            rope_cs,
+            rope_interleaved,
+            write_offset_shifts_ptr,
+            generation,
+        )?
+    };
 
     // Project per-token: [total_q, n_head*head_dim] -> [total_q, hidden_out].
     // (n_head*head_dim may differ from n_embd, e.g. Qwen3-MoE.)
@@ -859,47 +906,47 @@ fn paged_decode_attention(
         .map(|c| c.k_cache().chunked_batch_idx().unwrap_or(0))
         .collect();
 
-    let (arena_dtype, _chunk_size) = {
-        let first = caches
-            .first()
-            .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
+    let (arena_dtype, _chunk_size) =
+        {
+            let first = caches
+                .first()
+                .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
 
-        // Get format tags for dtype dispatch from the backing's default K/V formats.
-        let (k_format_tag, v_format_tag) = first
-            .k_cache()
-            .chunked_arena_format_tags()
-            .ok_or_else(|| {
-                candle::Error::Msg("expected chunked arena format tags".into())
-            })?;
+            // Get format tags for dtype dispatch from the backing's default K/V formats.
+            let (k_format_tag, v_format_tag) = first
+                .k_cache()
+                .chunked_arena_format_tags()
+                .ok_or_else(|| candle::Error::Msg("expected chunked arena format tags".into()))?;
 
-        let dispatch_dtype = |tag: candle_nn::kv_cache::ArenaFormatTag| -> candle::Result<DType> {
-            if tag.is_quantized() {
-                Ok(first.dtype())
-            } else {
-                tag.to_dtype().ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                        "paged-decode-attention: invalid arena format tag {:?}",
-                        tag
-                    ))
-                })
-            }
-        };
-        let k_dtype = dispatch_dtype(k_format_tag)?;
-        let v_dtype = dispatch_dtype(v_format_tag)?;
-        if k_dtype != v_dtype {
-            candle::bail!(
+            let dispatch_dtype =
+                |tag: candle_nn::kv_cache::ArenaFormatTag| -> candle::Result<DType> {
+                    if tag.is_quantized() {
+                        Ok(first.dtype())
+                    } else {
+                        tag.to_dtype().ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "paged-decode-attention: invalid arena format tag {:?}",
+                                tag
+                            ))
+                        })
+                    }
+                };
+            let k_dtype = dispatch_dtype(k_format_tag)?;
+            let v_dtype = dispatch_dtype(v_format_tag)?;
+            if k_dtype != v_dtype {
+                candle::bail!(
                 "K and V arena formats require different compute dtypes: K={:?}({:?}) V={:?}({:?})",
                 k_format_tag, k_dtype, v_format_tag, v_dtype
             );
-        }
-        let dtype = k_dtype;
-        let chunk_size = first
-            .k_cache()
-            .chunked_chunk_size()
-            .unwrap_or(CHUNK_SIZE as usize);
+            }
+            let dtype = k_dtype;
+            let chunk_size = first
+                .k_cache()
+                .chunked_chunk_size()
+                .unwrap_or(CHUNK_SIZE as usize);
 
-        (dtype, chunk_size)
-    };
+            (dtype, chunk_size)
+        };
 
     // Squeeze from (B, H, 1, D) to (B, H, D) for paged decode kernel
     let q_3d = q.squeeze(2)?;
@@ -974,7 +1021,6 @@ fn paged_decode_attention(
     // After writing each decode token, eagerly quantize any newly-sealed chunk.
     Ok(out)
 }
-
 
 /// Standard (non-paged) batched attention fallback.
 fn standard_batched_attention(

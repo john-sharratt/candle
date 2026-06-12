@@ -83,7 +83,7 @@ impl candle::CustomOp3 for RotaryEmbI {
                 s3.dtype()
             ),
         }
-    }   
+    }
 
     #[cfg(feature = "cuda")]
     fn cuda_fwd(

@@ -6,9 +6,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::HttpSessionError;
 use crate::tools::web_fetch::is_private_url;
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::HttpSessionError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReqRequest {
@@ -60,29 +60,39 @@ impl Tool for HttpSessionRequest {
     fn confirmation(req: &ReqRequest) -> Option<ConfirmationDetails> {
         let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
         if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
-            Some(ConfirmationDetails::new(format!("{method} {}", req.path))
-                .with_field("session_id", req.session_id.clone())
-                .with_field("method", method))
+            Some(
+                ConfirmationDetails::new(format!("{method} {}", req.path))
+                    .with_field("session_id", req.session_id.clone())
+                    .with_field("method", method),
+            )
         } else {
             None
         }
     }
 
     fn run(ctx: &ToolContext, req: ReqRequest) -> Result<ReqResponse, HttpSessionError> {
-        let entry_arc = ctx.sessions.get_http(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_http(&req.session_id)
             .ok_or_else(|| HttpSessionError::SessionNotFound(req.session_id.clone()))?;
         let entry = entry_arc.lock().unwrap();
 
         let url = if req.path.starts_with("http://") || req.path.starts_with("https://") {
             req.path.clone()
         } else if let Some(base) = &entry.base_url {
-            format!("{}/{}", base.trim_end_matches('/'), req.path.trim_start_matches('/'))
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                req.path.trim_start_matches('/')
+            )
         } else {
             req.path.clone()
         };
 
         if is_private_url(&url) {
-            return Err(HttpSessionError::UrlBlocked("private/localhost URLs blocked".to_string()));
+            return Err(HttpSessionError::UrlBlocked(
+                "private/localhost URLs blocked".to_string(),
+            ));
         }
 
         let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
@@ -113,17 +123,19 @@ impl Tool for HttpSessionRequest {
         }
 
         let start = std::time::Instant::now();
-        let resp = builder.send()
-            .map_err(|e| if e.is_timeout() {
+        let resp = builder.send().map_err(|e| {
+            if e.is_timeout() {
                 HttpSessionError::Timeout
             } else {
                 HttpSessionError::ConnectionFailed(e.to_string())
-            })?;
+            }
+        })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let status = resp.status();
         let final_url = resp.url().to_string();
-        let content_type = resp.headers()
+        let content_type = resp
+            .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
@@ -134,7 +146,8 @@ impl Tool for HttpSessionRequest {
         }
 
         let cap = req.max_response_bytes.unwrap_or(32768).min(1048576);
-        let body_bytes = resp.bytes()
+        let body_bytes = resp
+            .bytes()
             .map_err(|e| HttpSessionError::ConnectionFailed(e.to_string()))?;
         let truncated = body_bytes.len() > cap;
         let body_slice = &body_bytes[..body_bytes.len().min(cap)];
@@ -178,13 +191,31 @@ fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        let _ = write!(out, "{}{}{}{}",
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
+        let _ = write!(
+            out,
+            "{}{}{}{}",
             CHARS[b0 >> 2] as char,
             CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char,
-            if chunk.len() > 1 { CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' },
-            if chunk.len() > 2 { CHARS[b2 & 0x3f] as char } else { '=' },
+            if chunk.len() > 1 {
+                CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+            } else {
+                '='
+            },
+            if chunk.len() > 2 {
+                CHARS[b2 & 0x3f] as char
+            } else {
+                '='
+            },
         );
     }
     out

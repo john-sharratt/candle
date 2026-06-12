@@ -1,15 +1,15 @@
 //! aead_encrypt tool.
 
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use chacha20poly1305::ChaCha20Poly1305;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, CryptoError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct AeadEncryptRequest {
@@ -44,16 +44,18 @@ impl Tool for AeadEncrypt {
     type Response = AeadEncryptResponse;
     type Error = CryptoError;
 
-    fn run(_ctx: &ToolContext, req: AeadEncryptRequest) -> Result<AeadEncryptResponse, CryptoError> {
-        let key_bytes = hex::decode(&req.key_hex)
-            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+    fn run(
+        _ctx: &ToolContext,
+        req: AeadEncryptRequest,
+    ) -> Result<AeadEncryptResponse, CryptoError> {
+        let key_bytes =
+            hex::decode(&req.key_hex).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
         if key_bytes.len() != 32 {
             return Err(CryptoError::InvalidKey("key must be 32 bytes".to_string()));
         }
 
         let enc = req.data_encoding.as_deref().unwrap_or("text");
-        let plaintext = decode_data(&req.data, enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
+        let plaintext = decode_data(&req.data, enc).map_err(CryptoError::InvalidDataEncoding)?;
         let aad = req.aad.as_deref().unwrap_or("").as_bytes().to_vec();
 
         match req.algorithm.as_str() {
@@ -66,11 +68,17 @@ impl Tool for AeadEncrypt {
                     Aes256Gcm::generate_nonce(&mut AeadOsRng).to_vec()
                 };
                 if nonce_bytes.len() != 12 {
-                    return Err(CryptoError::InvalidNonce("nonce must be 12 bytes".to_string()));
+                    return Err(CryptoError::InvalidNonce(
+                        "nonce must be 12 bytes".to_string(),
+                    ));
                 }
                 let nonce = Nonce::from_slice(&nonce_bytes);
-                let payload = aes_gcm::aead::Payload { msg: &plaintext, aad: &aad };
-                let ct = cipher.encrypt(nonce, payload)
+                let payload = aes_gcm::aead::Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                };
+                let ct = cipher
+                    .encrypt(nonce, payload)
                     .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
                 Ok(AeadEncryptResponse {
                     ciphertext_hex: hex::encode(&ct),
@@ -88,11 +96,17 @@ impl Tool for AeadEncrypt {
                     ChaCha20Poly1305::generate_nonce(&mut AeadOsRng).to_vec()
                 };
                 if nonce_bytes.len() != 12 {
-                    return Err(CryptoError::InvalidNonce("nonce must be 12 bytes".to_string()));
+                    return Err(CryptoError::InvalidNonce(
+                        "nonce must be 12 bytes".to_string(),
+                    ));
                 }
                 let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
-                let payload = chacha20poly1305::aead::Payload { msg: &plaintext, aad: &aad };
-                let ct = cipher.encrypt(nonce, payload)
+                let payload = chacha20poly1305::aead::Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                };
+                let ct = cipher
+                    .encrypt(nonce, payload)
                     .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
                 Ok(AeadEncryptResponse {
                     ciphertext_hex: hex::encode(&ct),

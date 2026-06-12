@@ -120,7 +120,9 @@ fn kernel_scatter_for_lane(pal_map: &[u8; WARP_SIZE], lane: usize) -> [u8; VEC] 
         let mut local = 0i32;
         for jj in 0..j {
             let pjj = ((my_byte >> (jj * 2)) & 3) as usize;
-            if pjj == p { local += 1; }
+            if pjj == p {
+                local += 1;
+            }
         }
         scatter[j] = (p * SUB + cross[p] as usize + local as usize) as u8;
     }

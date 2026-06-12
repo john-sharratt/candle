@@ -15,17 +15,33 @@ pub fn carve(source: &[u8]) -> Option<Vec<Scope>> {
         identifier_for,
         enclosing_label,
     };
-    rules.kind_to_chunk.insert("function_item", ChunkKind::Function);
+    rules
+        .kind_to_chunk
+        .insert("function_item", ChunkKind::Function);
     rules
         .kind_to_chunk
         .insert("function_signature_item", ChunkKind::Function);
-    rules.kind_to_chunk.insert("struct_item", ChunkKind::TypeDefinition);
-    rules.kind_to_chunk.insert("union_item", ChunkKind::TypeDefinition);
-    rules.kind_to_chunk.insert("enum_item", ChunkKind::TypeDefinition);
-    rules.kind_to_chunk.insert("trait_item", ChunkKind::TypeDefinition);
-    rules.kind_to_chunk.insert("type_item", ChunkKind::TypeDefinition);
-    rules.kind_to_chunk.insert("const_item", ChunkKind::Constants);
-    rules.kind_to_chunk.insert("static_item", ChunkKind::Constants);
+    rules
+        .kind_to_chunk
+        .insert("struct_item", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("union_item", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("enum_item", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("trait_item", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("type_item", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("const_item", ChunkKind::Constants);
+    rules
+        .kind_to_chunk
+        .insert("static_item", ChunkKind::Constants);
     rules
         .kind_to_chunk
         .insert("macro_definition", ChunkKind::TopLevel);
@@ -129,7 +145,11 @@ mod tests {
     fn extracts_struct_trait_and_enum_definitions() {
         verify(
             "struct A;\nenum B { X, Y }\ntrait C { fn d(&self); }\n",
-            &[("struct A", "struct A"), ("enum B", "enum B"), ("trait C", "trait C")],
+            &[
+                ("struct A", "struct A"),
+                ("enum B", "enum B"),
+                ("trait C", "trait C"),
+            ],
         );
     }
 
@@ -153,7 +173,10 @@ mod tests {
 
     #[test]
     fn extracts_async_unsafe_fn() {
-        verify("async unsafe fn dq() {}\n", &[("fn dq", "async unsafe fn dq")]);
+        verify(
+            "async unsafe fn dq() {}\n",
+            &[("fn dq", "async unsafe fn dq")],
+        );
     }
 
     #[test]
@@ -237,7 +260,10 @@ mod tests {
 
     #[test]
     fn extracts_unit_struct() {
-        verify("struct Sentinel;\n", &[("struct Sentinel", "struct Sentinel")]);
+        verify(
+            "struct Sentinel;\n",
+            &[("struct Sentinel", "struct Sentinel")],
+        );
     }
 
     #[test]

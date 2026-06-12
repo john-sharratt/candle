@@ -59,7 +59,10 @@ fn init_tracing() {
 fn load_engine_and_base(workspace: &Path) -> (ConversationEngine, Sequence) {
     init_tracing();
     let device = cuda_device().expect("CUDA required");
-    eprintln!("=== Loading Qwen3-30B-A3B against {} ===", workspace.display());
+    eprintln!(
+        "=== Loading Qwen3-30B-A3B against {} ===",
+        workspace.display()
+    );
     let start = std::time::Instant::now();
 
     let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
@@ -156,9 +159,13 @@ fn section_quantize_end_to_end() {
     let mut native_count = 0usize;
     let mut quantized_count = 0usize;
     for sid in &section_ids {
-        let Some(sealed) = view.section_sealed_of(*sid) else { continue };
+        let Some(sealed) = view.section_sealed_of(*sid) else {
+            continue;
+        };
         let Some(l0) = sealed.first() else { continue };
-        let Some(c0) = l0.chunks.first() else { continue };
+        let Some(c0) = l0.chunks.first() else {
+            continue;
+        };
         if c0.byte_size >= NATIVE_F16_THRESHOLD {
             native_count += 1;
         } else {
@@ -199,9 +206,8 @@ fn section_quantize_end_to_end() {
         "response too short to be coherent: {:?}",
         text
     );
-    let gibberish_score = text.matches("//").count()
-        + text.matches("\\\\").count()
-        + text.matches("\"\"").count();
+    let gibberish_score =
+        text.matches("//").count() + text.matches("\\\\").count() + text.matches("\"\"").count();
     assert!(
         gibberish_score < 3,
         "response shows the broken-quantize-path failure pattern (gibberish_score={}): {:?}",

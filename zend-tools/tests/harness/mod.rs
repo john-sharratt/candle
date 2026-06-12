@@ -30,8 +30,8 @@ pub fn invoke_with_ctx(tool: &str, args: Value, ctx: &ToolContext) -> Value {
 
 /// Fetch the JSON schema produced by schemars for a registered tool.
 pub fn schema(tool: &str) -> Value {
-    let registered = zend_tools::registry::find(tool)
-        .unwrap_or_else(|| panic!("tool {tool:?} not registered"));
+    let registered =
+        zend_tools::registry::find(tool).unwrap_or_else(|| panic!("tool {tool:?} not registered"));
     (registered.schema)()
 }
 
@@ -49,9 +49,9 @@ pub fn expect_error(response: &Value, expected_code: &str) -> String {
     let code = response
         .get("error")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!(
-            "expected error response with code {expected_code:?}, got: {response}",
-        ));
+        .unwrap_or_else(|| {
+            panic!("expected error response with code {expected_code:?}, got: {response}",)
+        });
     assert_eq!(
         code, expected_code,
         "expected error code {expected_code:?}, got {code:?}: {response}",

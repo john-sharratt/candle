@@ -40,20 +40,20 @@
 //! | `execution_failed` | Interpreter process died unexpectedly |
 //! | `session_not_found` | Session ID not in registry |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
 pub mod run;
-pub mod session_open;
+pub mod session_close;
 pub mod session_exec;
 pub mod session_list;
-pub mod session_close;
+pub mod session_open;
 
 pub use run::CODE_RUN;
-pub use session_open::CODE_SESSION_OPEN;
+pub use session_close::CODE_SESSION_CLOSE;
 pub use session_exec::CODE_SESSION_EXEC;
 pub use session_list::CODE_SESSION_LIST;
-pub use session_close::CODE_SESSION_CLOSE;
+pub use session_open::CODE_SESSION_OPEN;
 
 #[derive(Debug, Error)]
 pub enum CodeError {

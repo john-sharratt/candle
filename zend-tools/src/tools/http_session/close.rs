@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::HttpSessionError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct CloseRequest {
@@ -35,7 +35,10 @@ impl Tool for HttpSessionClose {
 
     fn run(ctx: &ToolContext, req: CloseRequest) -> Result<CloseResponse, HttpSessionError> {
         let closed = ctx.sessions.remove_http(&req.session_id);
-        Ok(CloseResponse { session_id: req.session_id, closed })
+        Ok(CloseResponse {
+            session_id: req.session_id,
+            closed,
+        })
     }
 }
 

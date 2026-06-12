@@ -105,6 +105,7 @@ mod coherence {
         let config = DaemonConfig {
             workspace: std::env::current_dir().unwrap(),
             port: 0,
+            ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
@@ -145,8 +146,9 @@ mod coherence {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let result =
-            rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), f).await });
+        let result = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), f).await
+        });
         rt.shutdown_background();
         result.unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS}s"))
     }

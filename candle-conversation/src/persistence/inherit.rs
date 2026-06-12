@@ -116,8 +116,9 @@ impl InheritedSubstrate {
         let mut file = LogFile::open(&canonical)?;
         let hint = file.superblock().latest_checkpoint_offset;
         let mut substrate = Substrate::new();
-        let recovered =
-            checkpoint::recover_with_sink(&mut file, hint, |entry| substrate.apply_walker_entry(entry))?;
+        let recovered = checkpoint::recover_with_sink(&mut file, hint, |entry| {
+            substrate.apply_walker_entry(entry)
+        })?;
         let direct = DirectFile::open(&canonical)?;
         let loaded = Arc::new(InheritedSubstrate {
             path: canonical.clone(),

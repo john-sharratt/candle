@@ -12,12 +12,7 @@ extern "C" {
     /// * `indices` - Pointer to the indices array (uint32_t)
     /// * `num_indices` - Number of indices to process
     /// * `value` - The value to multiply by
-    pub fn mul_at_indices_f32(
-        data: *mut f32,
-        indices: *const u32,
-        num_indices: usize,
-        value: f32,
-    );
+    pub fn mul_at_indices_f32(data: *mut f32, indices: *const u32, num_indices: usize, value: f32);
 
     /// Multiply at indices for f16 type using atomic operations
     ///
@@ -54,10 +49,5 @@ extern "C" {
     /// * `indices` - Pointer to the indices array (uint32_t)
     /// * `num_indices` - Number of indices to process
     /// * `value` - The value to multiply by
-    pub fn mul_at_indices_f64(
-        data: *mut f64,
-        indices: *const u32,
-        num_indices: usize,
-        value: f64,
-    );
+    pub fn mul_at_indices_f64(data: *mut f64, indices: *const u32, num_indices: usize, value: f64);
 }

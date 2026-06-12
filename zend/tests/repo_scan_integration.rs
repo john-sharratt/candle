@@ -30,7 +30,11 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 fn small_workspace() -> tempfile::TempDir {
     let dir = fixture("phase1");
     let root = dir.path().to_path_buf();
-    write(&root, "Cargo.toml", b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n");
+    write(
+        &root,
+        "Cargo.toml",
+        b"[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    );
     write(&root, "src/lib.rs", b"// lib root\npub fn hello() {}\n");
     write(&root, "src/handler.rs", b"pub fn handle() {}\n");
     write(&root, "README.md", b"# demo\n\nhello world\n");
@@ -42,15 +46,15 @@ fn small_workspace() -> tempfile::TempDir {
 fn large_workspace() -> tempfile::TempDir {
     let dir = fixture("phase1_big");
     let root = dir.path().to_path_buf();
-    write(&root, "Cargo.toml", b"[package]\nname = \"big\"\nversion = \"0.1.0\"\n");
+    write(
+        &root,
+        "Cargo.toml",
+        b"[package]\nname = \"big\"\nversion = \"0.1.0\"\n",
+    );
     for sub in &["alpha", "bravo", "charlie", "delta"] {
         for i in 0..40 {
             let body = format!("// {sub} {i}\npub fn item_{i}() {{}}\n");
-            write(
-                &root,
-                &format!("src/{sub}/file_{i:03}.rs"),
-                body.as_bytes(),
-            );
+            write(&root, &format!("src/{sub}/file_{i:03}.rs"), body.as_bytes());
         }
     }
     dir
@@ -94,8 +98,12 @@ fn repo_scan_assistant_text_lists_actual_files() {
     let progress = LoadProgress::new();
     let _ = ingest_repo_map_into_sink(&mut sink, dir.path(), &progress).unwrap();
 
-    let combined_listings: String =
-        sink.turns.iter().map(|(_, a, _)| a.as_str()).collect::<Vec<_>>().join("\n");
+    let combined_listings: String = sink
+        .turns
+        .iter()
+        .map(|(_, a, _)| a.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(combined_listings.contains("Cargo.toml"));
     assert!(combined_listings.contains("lib.rs"));
     assert!(combined_listings.contains("handler.rs"));
@@ -188,8 +196,7 @@ fn cluster_state_changed_dirs_after_rename() {
     let dir = small_workspace();
     let progress = LoadProgress::new();
     let mut sink = RecordingTurnSink::new();
-    let (_, state_before) =
-        ingest_repo_map_into_sink(&mut sink, dir.path(), &progress).unwrap();
+    let (_, state_before) = ingest_repo_map_into_sink(&mut sink, dir.path(), &progress).unwrap();
 
     // Rename README.md -> CHANGELOG.md.
     let root = dir.path().to_path_buf();

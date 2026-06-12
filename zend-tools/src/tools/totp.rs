@@ -61,7 +61,9 @@ impl Tool for TotpGenerate {
     type Error = TotpError;
 
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, TotpError> {
-        let cred = ctx.credentials.get_by_name(&req.credential_name)
+        let cred = ctx
+            .credentials
+            .get_by_name(&req.credential_name)
             .ok_or_else(|| TotpError::CredentialNotFound(req.credential_name.clone()))?;
 
         if cred.cred_type != "totp_secret" {
@@ -76,11 +78,17 @@ impl Tool for TotpGenerate {
             "sha1" => totp_rs::Algorithm::SHA1,
             "sha256" => totp_rs::Algorithm::SHA256,
             "sha512" => totp_rs::Algorithm::SHA512,
-            other => return Err(TotpError::TotpFailed(format!("unknown TOTP algorithm: {other}"))),
+            other => {
+                return Err(TotpError::TotpFailed(format!(
+                    "unknown TOTP algorithm: {other}"
+                )))
+            }
         };
 
         let secret = totp_rs::Secret::Encoded(cred.secret.clone());
-        let secret_bytes = secret.to_bytes().map_err(|e| TotpError::TotpFailed(e.to_string()))?;
+        let secret_bytes = secret
+            .to_bytes()
+            .map_err(|e| TotpError::TotpFailed(e.to_string()))?;
         let totp = totp_rs::TOTP::new(
             algo,
             digits as usize,
@@ -89,9 +97,11 @@ impl Tool for TotpGenerate {
             secret_bytes,
             None,
             cred.name.clone(),
-        ).map_err(|e| TotpError::TotpFailed(e.to_string()))?;
+        )
+        .map_err(|e| TotpError::TotpFailed(e.to_string()))?;
 
-        let code = totp.generate_current()
+        let code = totp
+            .generate_current()
             .map_err(|e| TotpError::TotpFailed(e.to_string()))?;
 
         // Calculate seconds remaining in current period

@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::{exec_simple, SshError};
 use crate::state::sessions::{SessionMeta, SshConn, SshEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::{SshError, exec_simple};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
@@ -49,17 +49,23 @@ impl Tool for SshSessionOpen {
 
     fn confirmation(req: &OpenRequest) -> Option<ConfirmationDetails> {
         let host = req.host.as_deref().unwrap_or("default");
-        Some(ConfirmationDetails::new(format!("Open SSH session to {host}"))
-            .with_field("credential_name", req.credential_name.clone())
-            .with_field("host", host.to_string())
-            .with_field("port", req.port.unwrap_or(22).to_string()))
+        Some(
+            ConfirmationDetails::new(format!("Open SSH session to {host}"))
+                .with_field("credential_name", req.credential_name.clone())
+                .with_field("host", host.to_string())
+                .with_field("port", req.port.unwrap_or(22).to_string()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, SshError> {
-        let cred = ctx.credentials.get_by_name(&req.credential_name)
+        let cred = ctx
+            .credentials
+            .get_by_name(&req.credential_name)
             .ok_or_else(|| SshError::CredentialNotFound(req.credential_name.clone()))?;
 
-        let host = req.host.as_deref()
+        let host = req
+            .host
+            .as_deref()
             .or(cred.default_host.as_deref())
             .ok_or_else(|| SshError::ConnectionFailed("no host specified".to_string()))?
             .to_string();
@@ -69,28 +75,32 @@ impl Tool for SshSessionOpen {
         let stream = TcpStream::connect(&addr)
             .map_err(|e| SshError::ConnectionFailed(format!("{addr}: {e}")))?;
 
-        let mut session = ssh2::Session::new()
-            .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
+        let mut session =
+            ssh2::Session::new().map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
         session.set_tcp_stream(stream.try_clone().unwrap());
-        session.handshake()
+        session
+            .handshake()
             .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
 
         let username = cred.username.as_deref().unwrap_or("root");
         match cred.cred_type.as_str() {
             "ssh_password" => {
-                session.userauth_password(username, &cred.secret)
+                session
+                    .userauth_password(username, &cred.secret)
                     .map_err(|e| SshError::AuthFailed(e.to_string()))?;
             }
             "ssh_key" => {
                 #[cfg(unix)]
                 {
                     let passphrase = cred.passphrase.as_deref();
-                    session.userauth_pubkey_memory(username, None, &cred.secret, passphrase)
+                    session
+                        .userauth_pubkey_memory(username, None, &cred.secret, passphrase)
                         .map_err(|e| SshError::AuthFailed(e.to_string()))?;
                 }
                 #[cfg(not(unix))]
                 {
-                    let tmp = std::env::temp_dir().join(format!("zend_key_{}.pem", uuid::Uuid::new_v4()));
+                    let tmp =
+                        std::env::temp_dir().join(format!("zend_key_{}.pem", uuid::Uuid::new_v4()));
                     std::fs::write(&tmp, cred.secret.as_bytes())
                         .map_err(|e| SshError::AuthFailed(e.to_string()))?;
                     let result = session.userauth_pubkey_file(
@@ -104,7 +114,10 @@ impl Tool for SshSessionOpen {
                 }
             }
             _ => {
-                return Err(SshError::AuthFailed(format!("unsupported credential type: {}", cred.cred_type)));
+                return Err(SshError::AuthFailed(format!(
+                    "unsupported credential type: {}",
+                    cred.cred_type
+                )));
             }
         }
 
@@ -124,7 +137,10 @@ impl Tool for SshSessionOpen {
             credential_id: cred.id,
             credential_name: cred.name,
             cwd: cwd.trim().to_string(),
-            conn: SshConn { session, _stream: stream },
+            conn: SshConn {
+                session,
+                _stream: stream,
+            },
         };
         ctx.sessions.insert_ssh(entry);
 

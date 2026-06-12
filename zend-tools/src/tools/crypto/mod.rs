@@ -50,26 +50,26 @@
 //! | `derivation_failed` | KDF parameter error |
 //! | `expand_failed` | HKDF expand error |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
-pub mod aead_encrypt;
 pub mod aead_decrypt;
-pub mod hmac_compute;
-pub mod signature_verify;
-pub mod signature_sign;
-pub mod kdf_derive;
-pub mod hkdf_extract;
+pub mod aead_encrypt;
 pub mod hkdf_expand_label;
+pub mod hkdf_extract;
+pub mod hmac_compute;
+pub mod kdf_derive;
+pub mod signature_sign;
+pub mod signature_verify;
 
-pub use aead_encrypt::AEAD_ENCRYPT;
 pub use aead_decrypt::AEAD_DECRYPT;
-pub use hmac_compute::HMAC_COMPUTE;
-pub use signature_verify::SIGNATURE_VERIFY;
-pub use signature_sign::SIGNATURE_SIGN;
-pub use kdf_derive::KDF_DERIVE;
-pub use hkdf_extract::HKDF_EXTRACT;
+pub use aead_encrypt::AEAD_ENCRYPT;
 pub use hkdf_expand_label::HKDF_EXPAND_LABEL;
+pub use hkdf_extract::HKDF_EXTRACT;
+pub use hmac_compute::HMAC_COMPUTE;
+pub use kdf_derive::KDF_DERIVE;
+pub use signature_sign::SIGNATURE_SIGN;
+pub use signature_verify::SIGNATURE_VERIFY;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -124,7 +124,9 @@ pub fn decode_data(data: &str, encoding: &str) -> Result<Vec<u8>, String> {
         "hex" => hex::decode(data).map_err(|e| e.to_string()),
         "base64" => {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| e.to_string())
         }
         other => Err(format!("unknown encoding: {other}")),
     }
