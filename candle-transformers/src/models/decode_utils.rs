@@ -403,6 +403,215 @@ mod cuda_tests {
         )
     }
 
+    // Run an INT8 decode against a *substrate-seal gap*: a sealed partial chunk 0
+    // (`p` tokens, usage `p`, physical slots 0..p) followed by a fresh writer
+    // chunk 1 (`w` tokens, physical slots 0..w) holding logical positions p..p+w.
+    // Chunk 0's slots p..32 are an addressing gap. A gap-blind chunk_div(logical)
+    // = logical/32 aliases the writer's tokens back into chunk 0's empty tail and
+    // drops them; a gap-aware per-slice walk reaches them at chunk 1's true
+    // physical position. Zero RoPE (matches reference_decode_attention).
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_decode_gap(
+        seal0: (&Tensor, &Tensor),
+        writer1: (&Tensor, &Tensor),
+        k_new: &Tensor,
+        v_new: &Tensor,
+        q: &Tensor,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_dtype: DType,
+    ) -> Result<Tensor> {
+        const CHUNK_SIZE: usize = 32;
+        let device = q.device();
+        let (hk0, hv0) = seal0;
+        let (hk1, hv1) = writer1;
+        let p = hk0.dim(2)?;
+        let w = hk1.dim(2)?;
+        assert!(
+            p < CHUNK_SIZE && p + w < CHUNK_SIZE,
+            "gap test needs p < 32 and p+w < 32"
+        );
+        let seq_offset = p + w;
+
+        let backing = ChunkedKvBacking::new(
+            1,
+            n_kv_head,
+            head_dim,
+            arena_dtype,
+            device,
+            CHUNK_SIZE + w + 1,
+        )?;
+        // Allocate two blocks, then lay chunk 0's data at logical 0 and chunk 1's
+        // at logical 32 (physical chunk 1, slot 0).
+        backing.ensure_for_offset(0, CHUNK_SIZE, 1)?;
+        backing.write_contiguous(0, 0, hk0, hv0)?;
+        backing.write_contiguous(0, CHUNK_SIZE, hk1, hv1)?;
+        // chunk 0: sealed partial (off 0, usage p); chunk 1: writer (off 0, usage
+        // w). Advancing the writer start past chunk 0 marks it sealed, so the
+        // writer-chunk resolution computes rope_base = p for chunk 1 and the gap
+        // opens between chunk 0's p-th slot and chunk 1's slot 0.
+        backing.set_block_window(0, 0, 0, p as u32)?;
+        backing.set_block_window(0, 1, 0, w as u32)?;
+        backing.test_set_writer_start(0, 1)?;
+
+        let arena_info = backing.resolve_arena_info()?;
+        let (ptrs, _) = backing.sync_decode_gpu_chunks(&[(0, seq_offset)], &arena_info)?;
+        let (ptr, n_slices, write_slice) = ptrs[0];
+
+        let stager = PinnedStager::new(device.as_cuda_device()?);
+        let gen = stager.begin_generation();
+        let mut hdr = [0u8; 16];
+        hdr[..4].copy_from_slice(&n_slices.to_le_bytes());
+        hdr[4..8].copy_from_slice(&write_slice.to_le_bytes());
+        hdr[8..16].copy_from_slice(&ptr.to_le_bytes());
+        let mut pinned = gen.alloc(16)?;
+        pinned.copy_from_slice(&hdr);
+        let _gpu_buf = gen.submit(pinned)?;
+        let headers_ptr = _gpu_buf.dev_ptr();
+
+        let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let compute_dtype = if arena_dtype == DType::F16 {
+            DType::F16
+        } else {
+            DType::BF16
+        };
+        let q_c = q.to_dtype(compute_dtype)?;
+        let k_c = k_new.to_dtype(compute_dtype)?.contiguous()?;
+        let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
+        let rope_cs = make_zero_rope_cs(head_dim, 16, device)?;
+
+        let result = paged_decode_attn_with_backend(
+            &q_c,
+            headers_ptr,
+            arena_dtype,
+            n_head,
+            n_kv_head,
+            head_dim,
+            softmax_scale,
+            &k_c,
+            &v_c,
+            &rope_cs,
+            false,
+            DecodeBackend::Int8,
+        )?;
+        drop(gen);
+        Ok(result)
+    }
+
+    // Decode correctness across a substrate-seal gap. The BMMA path (hd128,
+    // hpg<=8) is already gap-aware and is the passing control; the stripe (hd64)
+    // and warp=head (hpg>8) paths must match it once gap-fixed.
+    #[test]
+    fn correctness_decode_seal_gap() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::BF16;
+        // Small sealed chunk (p) + large writer (w): a gap-blind chunk_div drops
+        // the writer's w+1 tokens, attending only the p sealed ones — a large,
+        // unambiguous error well above the INT8 noise floor. Covers the BMMA
+        // (hd128, hpg<=8) and stripe (hd64, hpg<=8) paths; the warp=head wide
+        // path (hpg>8) is covered by the ignored test below.
+        for &(n_head, n_kv_head, head_dim, p, w, label) in &[
+            (32, 8, 128, 6, 22, "BMMA hd128 gap"),
+            (8, 8, 64, 6, 22, "stripe hd64 mha gap"),
+            (32, 8, 64, 6, 22, "stripe hd64 gqa gap"),
+        ] {
+            let mk = |len: usize| -> Result<(Tensor, Tensor)> {
+                let k = Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?
+                    .to_dtype(dtype)?;
+                let v = Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?
+                    .to_dtype(dtype)?;
+                Ok((k, v))
+            };
+            let (hk0, hv0) = mk(p)?;
+            let (hk1, hv1) = mk(w)?;
+            let k_new =
+                Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
+            let v_new =
+                Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+
+            let int8 = run_paged_decode_gap(
+                (&hk0, &hv0),
+                (&hk1, &hv1),
+                &k_new,
+                &v_new,
+                &q,
+                n_head,
+                n_kv_head,
+                head_dim,
+                dtype,
+            )?
+            .to_dtype(DType::F32)?;
+
+            // Reference attends the logical sequence: chunk0 (p) + chunk1 (w) + new.
+            let full_k = Tensor::cat(&[&hk0, &hk1, &k_new.unsqueeze(2)?], 2)?;
+            let full_v = Tensor::cat(&[&hv0, &hv1, &v_new.unsqueeze(2)?], 2)?;
+            let ref_out =
+                reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
+
+            let mae = mean_abs_error(&int8, &ref_out)?;
+            let max_err = max_abs_error(&int8, &ref_out)?;
+            assert!(
+                mae < 0.15,
+                "[{label}] seal-gap int8 vs reference mae too large: {mae}"
+            );
+            assert!(
+                max_err < 1.0,
+                "[{label}] seal-gap int8 vs reference max error too large: {max_err}"
+            );
+            println!("[{label}] seal-gap decode OK: mae={mae:.3e} max_err={max_err:.3e}");
+        }
+        Ok(())
+    }
+
+    // Seal-gap handling for the warp=head wide path (heads_per_group > 8, WARPS=16).
+    // Ignored: that kernel tiles 16 contiguous logical tokens into one 32-token
+    // chunk (chunk_div(tile_base)), an assumption a sealed partial chunk breaks.
+    // Making it gap-aware needs the per-slice retiling the stripe/BMMA paths use
+    // (each tile entirely within one slice). The wide path is non-production —
+    // no target model has hpg>8 — so this is tracked, not blocking. Un-ignore
+    // once the warp=head kernel iterates per slice.
+    #[test]
+    #[ignore = "warp=head wide-path (hpg>8) seal-gap retiling pending; non-production"]
+    fn correctness_decode_seal_gap_warp_head_wide() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::BF16;
+        let (n_head, n_kv_head, head_dim, p, w) = (16, 1, 64, 6, 22);
+        let mk = |len: usize| -> Result<(Tensor, Tensor)> {
+            let k =
+                Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?.to_dtype(dtype)?;
+            let v =
+                Tensor::randn(0f32, 1f32, (1, n_kv_head, len, head_dim), &device)?.to_dtype(dtype)?;
+            Ok((k, v))
+        };
+        let (hk0, hv0) = mk(p)?;
+        let (hk1, hv1) = mk(w)?;
+        let k_new = Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
+        let v_new = Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+
+        let int8 = run_paged_decode_gap(
+            (&hk0, &hv0),
+            (&hk1, &hv1),
+            &k_new,
+            &v_new,
+            &q,
+            n_head,
+            n_kv_head,
+            head_dim,
+            dtype,
+        )?
+        .to_dtype(DType::F32)?;
+        let full_k = Tensor::cat(&[&hk0, &hk1, &k_new.unsqueeze(2)?], 2)?;
+        let full_v = Tensor::cat(&[&hv0, &hv1, &v_new.unsqueeze(2)?], 2)?;
+        let ref_out =
+            reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
+        let mae = mean_abs_error(&int8, &ref_out)?;
+        assert!(mae < 0.15, "warp=head wide seal-gap mae too large: {mae}");
+        Ok(())
+    }
+
     // Decode correctness check: the INT8 decode kernel must match the
     // gold-standard pure-tensor attention (reference_decode_attention) within
     // INT8 quantization error. The reference is a plain matmul, so it cannot

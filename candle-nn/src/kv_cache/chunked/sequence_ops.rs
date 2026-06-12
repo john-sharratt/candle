@@ -235,6 +235,32 @@ impl ChunkedKvBacking {
         Ok(())
     }
 
+    /// Test-only: set the decode writer-start block index for `batch_idx`.
+    ///
+    /// Blocks before `writer_start` are treated as sealed (never selected as the
+    /// decode writer). Combined with [`Self::set_block_window`], this builds the
+    /// substrate-seal gap — a partial sealed chunk (`usage < CHUNK_SIZE`) followed
+    /// by a fresh writer chunk — that the decode-kernel gap-handling tests need.
+    /// Invalidates the cached GPU slot buffer so the next decode rebuilds it.
+    pub fn test_set_writer_start(&self, batch_idx: usize, writer_start: usize) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let seq = state
+            .sequences
+            .get_mut(batch_idx)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "test_set_writer_start: slot {batch_idx} not allocated"
+                ))
+            })?;
+        seq.set_writer_start_idx(writer_start);
+        seq.invalidate_gpu_chunks();
+        Ok(())
+    }
+
     /// Append borrowed chunk references to an existing sequence's block table.
     ///
     /// Unlike [`inject_prefix_chunks`] (which resets a fresh, empty slot),

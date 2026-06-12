@@ -956,24 +956,49 @@ __device__ __forceinline__ void int8_decode_stripe_impl(
     constexpr int64_t sub_head_stride = (int64_t)SUB_HEAD_DIM * CHUNK_SIZE;
     constexpr int BLOCKS_PER_DIM = CHUNK_SIZE / 32;
 
-    int n_tiles = (kv_len + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    // Per-slice token enumeration (gap-aware). Each slice contributes its
+    // slice_eff_len valid tokens (+1 for the write slice's freshly-scattered
+    // token); a global token index t maps to (slice, within = off + local) by a
+    // forward scan. Iterating valid tokens per slice — rather than a flat
+    // chunk_div(logical) that assumes 32 logical tokens per slice — skips a
+    // sealed partial chunk's empty tail (the substrate-seal gap) and reaches the
+    // writer slice at its true physical position instead of aliasing it into the
+    // gap. For a gapless sequence every slice is full so this is identical to the
+    // old flat walk.
+    auto slice_eff_len = [&](int s) -> int {
+        const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, s, n_kv_head);
+        int len = (int)slice_len(sl);
+        int off = (int)slice_offset(sl);
+        if (s == (int)write_slice_idx && len < CHUNK_SIZE && off + len < CHUNK_SIZE) len += 1;
+        return len;
+    };
+    int total_tok = 0;
+    for (int s = 0; s < (int)n_slices; ++s) total_tok += slice_eff_len(s);
+
+    int n_tiles = (total_tok + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     int tiles_per_split = (n_tiles + num_splits - 1) / num_splits;
     int tok_lo = (split_idx * tiles_per_split) * WARPS_PER_BLOCK;
     int tok_hi = (split_idx * tiles_per_split + tiles_per_split) * WARPS_PER_BLOCK;
-    if (tok_hi > kv_len) tok_hi = kv_len;
+    if (tok_hi > total_tok) tok_hi = total_tok;
 
     PalIter<VEC, HEAD_DIM> ki, vi;
     int cur_slice = -1;
+    // Forward cursor: t is monotonic within a warp's strided iteration, so the
+    // (slice, base) cursor only advances.
+    int scan_s = 0, scan_base = 0;
 
     for (int k = tok_lo + warp; k < tok_hi; k += WARPS_PER_BLOCK) {
-        int slice_idx = chunk_div(k);
-        int within = chunk_mod(k);
-        if (slice_idx >= (int)n_slices) continue;
+        while (scan_s + 1 < (int)n_slices) {
+            int e = slice_eff_len(scan_s);
+            if (scan_base + e <= k) { scan_base += e; ++scan_s; }
+            else break;
+        }
+        int slice_idx = scan_s;
         const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
-        uint32_t bv = (uint32_t)slice_len(sl);
         uint32_t off = (uint32_t)slice_offset(sl);
-        if (slice_idx == (int)write_slice_idx && bv < CHUNK_SIZE && off + bv < CHUNK_SIZE) bv += 1;
-        if (!(within >= (int)off && within < (int)(off + bv))) continue;
+        // within = off + local; slice_eff_len already accounts for the writer's
+        // +1, so (k - scan_base) reaches the freshly-scattered token's slot.
+        int within = (int)off + (k - scan_base);
         const uint8_t* head_ptr = get_head<HEAD_DIM>(sl, kv_head_idx);
 
         if (slice_idx != cur_slice) {
