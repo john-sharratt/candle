@@ -158,7 +158,7 @@ impl Fixture {
             if let Some(pol) = &policy {
                 let real_chunks = sc.ctx_len.div_ceil(CHUNK_SIZE).max(1);
                 backing.truncate_sequence_to_blocks(slot, real_chunks)?;
-                let r16 = backing.record_turn(slot, sc.ctx_len)?;
+                let r16 = backing.record_turn(slot)?;
                 let copy_stream = match device {
                     Device::Cuda(d) => d.cuda_stream(),
                     _ => candle::bail!("real-quant requires a CUDA device"),
@@ -504,7 +504,7 @@ fn run_prefill(
         k,
         v,
         1,
-        sc.ctx_len,
+        &[sc.ctx_len],
         sc.n_q_head,
         sc.n_kv_head,
         sc.head_dim,

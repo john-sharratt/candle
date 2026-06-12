@@ -924,10 +924,9 @@ pub fn compute_rope_cs(
 /// Which decode-attention kernel backend to run.
 ///
 /// `Int8` is the production decode kernel (the INT8 split-KV / warp-stripe /
-/// batched-M kernel; `run_paged_decode_*`, with head_dim=256 falling back to the
-/// legacy kernel internally). `Legacy` is the original persistent-slot-buffer FP
-/// kernel (`run_paged_decode_legacy_*`), retained as the A/B regression
-/// reference. Selecting the backend explicitly (via
+/// batched-M kernel; `run_paged_decode_*`) for head_dim 64/96/128/256. `Legacy`
+/// is the original persistent-slot-buffer FP kernel (`run_paged_decode_legacy_*`),
+/// retained as the A/B regression reference. Selecting the backend explicitly (via
 /// [`paged_decode_attn_with_backend`]) is how the A/B harness drives both kernels
 /// over identical inputs; [`paged_decode_attn`] uses the `Int8` default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

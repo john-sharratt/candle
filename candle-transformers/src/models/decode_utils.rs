@@ -716,6 +716,12 @@ mod cuda_tests {
             (14, 2, 64, 10, "GQA 14/2 hd64 hist=10"),
             (8, 1, 64, 10, "MQA hd64 hist=10"),
             (8, 1, 128, 10, "MQA hd128 hist=10"),
+            // head_dim=256. hpg<=8 takes the full-perf stripe path; the 16/1
+            // config (hpg=16>8) takes the wide warp=head path, which runs
+            // single-stage at hd256 to fit shared memory.
+            (8, 8, 256, 10, "MHA hd256 hist=10 (stripe)"),
+            (32, 8, 256, 10, "GQA 32/8 hd256 hist=10 (stripe)"),
+            (16, 1, 256, 10, "GQA 16/1 hd256 hist=10 (wide)"),
         ] {
             let hk = Tensor::randn(
                 0f32,

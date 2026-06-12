@@ -784,7 +784,14 @@ int8_decode_kernel(
     float* partial_ml
 ) {
     constexpr bool IS_HALF_TYPE = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
-    constexpr int STAGES = IS_HALF_TYPE ? 3 : 2;
+    // The warp=head (wide) kernel runs only for heads_per_group > 8 (WARPS=16).
+    // At HEAD_DIM=256 a single pipeline stage is ~27 KB but two stages is ~55 KB,
+    // which overflows the 48 KiB static shared-memory cap — so HEAD_DIM=256 runs
+    // single-stage here. This path is exotic (no target model has hpg>8 at hd256;
+    // real hd256 models like Gemma have small GQA ratios and take the full-perf
+    // stripe path), so the lost load/compute overlap is irrelevant. Every
+    // HEAD_DIM <= 128 instantiation keeps its original stage count unchanged.
+    constexpr int STAGES = (HEAD_DIM >= 256) ? 1 : (IS_HALF_TYPE ? 3 : 2);
     int8_decode_attn_impl<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, 32, STAGES, true, ROPE_INTERLEAVED>(
         q, headers_ptr, out, num_active_slots, n_q_head, n_kv_head, softmax_scale,
         k_new, v_new, rope_cs, partial_acc, partial_ml);

@@ -34,13 +34,18 @@ struct PalIter {
 
     __device__ __forceinline__ void init(const uint8_t* pal_map, int lane) {
         // pal_map stores 2-bit palette IDs packed 4 per byte, in ascending dim
-        // order.  Lane l owns dims [l*VEC .. l*VEC+VEC-1].  Locate the correct
-        // byte and bit offset for this lane's first dim so the formula is valid
-        // for any VEC (VEC=2 for HD=64, VEC=4 for HD=128).
-        int start_dim  = lane * VEC;
-        int byte_idx   = start_dim / 4;       // 4 palette entries per byte
-        int bit_shift  = (start_dim % 4) * 2; // 2 bits per entry
-        uint8_t my_byte = pal_map[byte_idx];
+        // order.  Lane l owns dims [l*VEC .. l*VEC+VEC-1].  Read each dim's
+        // palette ID straight from its own byte (`pal_of`) so the logic holds
+        // for ANY VEC: VEC=8 (HD=256) spans two bytes and VEC=3 (HD=96) straddles
+        // a byte boundary — both of which a single fixed-byte read gets wrong
+        // (the high slots shift past the byte and read 0). For VEC<=4 this is
+        // bit-for-bit identical to indexing one byte, so HD 64/128 are unchanged.
+        // `pal_of` only reads `pal_map[dim>>2]` with dim < HEAD_DIM, so it never
+        // over-reads the (HEAD_DIM/4)-byte map.
+        int start_dim = lane * VEC;
+        auto pal_of = [&](int dim) -> int {
+            return (pal_map[dim >> 2] >> ((dim & 3) * 2)) & 3;
+        };
         uint32_t lane_mask = (1u << lane) - 1;  // bits for lanes < me
 
         // Part (a): accumulate per-palette cross-lane counts.
@@ -51,7 +56,7 @@ struct PalIter {
         int cross[N_PALETTE] = {0};
         #pragma unroll
         for (int jj = 0; jj < VEC; jj++) {
-            int pjj = (my_byte >> (bit_shift + jj * 2)) & 3;
+            int pjj = pal_of(start_dim + jj);
             uint32_t b0 = __ballot_sync(0xFFFFFFFF, pjj & 1);
             uint32_t b1 = __ballot_sync(0xFFFFFFFF, pjj >> 1);
 
@@ -68,12 +73,11 @@ struct PalIter {
         // same palette), then combine with cross[p].
         #pragma unroll
         for (int j = 0; j < VEC; j++) {
-            int p = (my_byte >> (bit_shift + j * 2)) & 3;
+            int p = pal_of(start_dim + j);
             int local = 0;
             #pragma unroll
             for (int jj = 0; jj < j; jj++) {
-                int pjj = (my_byte >> (bit_shift + jj * 2)) & 3;
-                local += (pjj == p) ? 1 : 0;
+                local += (pal_of(start_dim + jj) == p) ? 1 : 0;
             }
             scatter[j] = (uint8_t)(p * SUB + cross[p] + local);
         }
