@@ -35,6 +35,7 @@ use candle_conversation::persistence::record::{ChunkPayload, Record, RecordType}
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId};
 use candle_conversation::persistence::walker;
+use candle_conversation::substrate::Substrate;
 use candle_nn::kv_cache::KvFormat;
 use tokenizers::Tokenizer;
 
@@ -130,9 +131,10 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     }
 
     let manifest = build_manifest(log)?;
-    let (turns, sections) = stream_kind_counts(&manifest);
-    let live_chunks: usize = manifest.streams.values().map(|s| s.chunks.len()).sum();
-    let dead = compaction::dead_record_ratio(log, &manifest)?;
+    let substrate = build_substrate(log)?;
+    let (turns, sections) = stream_kind_counts(&substrate);
+    let live_chunks: usize = substrate.all_streams().map(|(_, s)| s.chunks.len()).sum();
+    let dead = compaction::dead_record_ratio(log, &manifest, &substrate)?;
 
     println!("file              {}", path.display());
     println!("size              {file_len} bytes ({} KiB)", file_len / 1024);
@@ -154,7 +156,7 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
         }
     }
     println!();
-    println!("streams           {} ({turns} turn, {sections} prompt-section)", manifest.streams.len());
+    println!("streams           {} ({turns} turn, {sections} prompt-section)", substrate.all_streams().count());
     println!("live chunks       {live_chunks}");
     println!("model spec        {}", present(manifest.model_spec.is_some()));
     println!("template          {}", present(manifest.template.is_some()));
@@ -206,20 +208,20 @@ fn headers(log: &mut LogFile) -> Result<()> {
 }
 
 fn streams(log: &mut LogFile) -> Result<()> {
-    let manifest = build_manifest(log)?;
-    if manifest.streams.is_empty() {
+    let substrate = build_substrate(log)?;
+    let mut streams: Vec<(StreamId, &candle_conversation::substrate::StreamRuntime)> =
+        substrate.all_streams().collect();
+    if streams.is_empty() {
         println!("(no streams)");
         return Ok(());
     }
-    // `manifest.streams` is keyed by the stream-id hash, which is unrelated to
-    // time. Order by append order instead — the offset of each stream's first
-    // record in the log — so the listing reads oldest-first, newest-last.
+    // The substrate's stream map is keyed by the stream-id hash, which is
+    // unrelated to time. Order by append order instead — the offset of each
+    // stream's first record in the log — so the listing reads oldest-first.
     let first_seen = first_seen_offsets(log)?;
-    let mut ids: Vec<&StreamId> = manifest.streams.keys().collect();
-    ids.sort_by_key(|id| first_seen.get(*id).copied().unwrap_or(u64::MAX));
+    streams.sort_by_key(|(id, _)| first_seen.get(id).copied().unwrap_or(u64::MAX));
 
-    for (n, id) in ids.into_iter().enumerate() {
-        let entry = &manifest.streams[id];
+    for (n, (id, entry)) in streams.into_iter().enumerate() {
         let tok = if entry.tokens.is_some() { "y" } else { "n" };
         let sig = if entry.signatures.is_some() { "y" } else { "n" };
         let detail = match &entry.decl {
@@ -261,10 +263,9 @@ fn first_seen_offsets(log: &mut LogFile) -> Result<std::collections::HashMap<Str
 }
 
 fn chunks(log: &mut LogFile, stream_id: StreamId, preview: usize) -> Result<()> {
-    let manifest = build_manifest(log)?;
-    let entry = manifest
-        .streams
-        .get(&stream_id)
+    let substrate = build_substrate(log)?;
+    let entry = substrate
+        .stream_of(stream_id)
         .with_context(|| format!("no stream {} in the log", stream_hex(stream_id.0)))?;
     if entry.chunks.is_empty() {
         println!("stream {} has no chunk records", stream_hex(stream_id.0));
@@ -347,10 +348,9 @@ fn tokens(
     stream_id: StreamId,
     as_ids: bool,
 ) -> Result<()> {
-    let manifest = build_manifest(log)?;
-    let loc = manifest
-        .streams
-        .get(&stream_id)
+    let substrate = build_substrate(log)?;
+    let loc = substrate
+        .stream_of(stream_id)
         .and_then(|s| s.tokens)
         .with_context(|| format!("stream {} has no Tokens record", stream_hex(stream_id.0)))?;
     let rec = read_record_at(log, loc.offset, loc.record_size)?;
@@ -365,7 +365,6 @@ fn tokens(
     // Default: decode to text using the tokenizer sidecar next to the log.
     // Special tokens are kept so chat-format markers (`<|im_start|>` …) stay
     // visible — useful for inspecting a turn.
-    let _ = &manifest; // manifest unused now that the tokenizer lives in a sidecar
     match load_log_tokenizer(log_path)? {
         Some(tok) => {
             let text = tok
@@ -446,11 +445,15 @@ fn checkpoint_view(log: &mut LogFile) -> Result<()> {
         return Ok(());
     }
     println!("latest checkpoint at offset {hint}");
-    let recovered = checkpoint::recover(log, hint)?;
-    let (turns, sections) = stream_kind_counts(&recovered.manifest);
+    // The checkpoint payload carries only singleton offsets; streams are
+    // rebuilt by replaying the tail through the substrate sink.
+    let mut substrate = Substrate::new();
+    let recovered =
+        checkpoint::recover_with_sink(log, hint, |e| substrate.apply_walker_entry(e))?;
+    let (turns, sections) = stream_kind_counts(&substrate);
     println!(
         "recovers to: {} streams ({turns} turn, {sections} section), torn-tail={}",
-        recovered.manifest.streams.len(),
+        substrate.all_streams().count(),
         recovered.torn,
     );
     Ok(())
@@ -478,10 +481,23 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
     Ok(Manifest::build_from_walk(log, SUPERBLOCK_SIZE)?.0)
 }
 
-fn stream_kind_counts(manifest: &Manifest) -> (usize, usize) {
+/// Rebuild the in-RAM substrate from the log — the authoritative per-stream
+/// index. The manifest only carries singleton offsets (model spec, template,
+/// tokenizer, checkpoint); streams, chunks, tokens, and signatures live in the
+/// substrate, populated by the same walker pass `open_in_with_substrate` uses.
+fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
+    let mut substrate = Substrate::new();
+    let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
+    for e in &entries {
+        substrate.apply_walker_entry(e);
+    }
+    Ok(substrate)
+}
+
+fn stream_kind_counts(substrate: &Substrate) -> (usize, usize) {
     let mut turns = 0;
     let mut sections = 0;
-    for s in manifest.streams.values() {
+    for (_, s) in substrate.all_streams() {
         match &s.decl {
             Some(StreamDecl::Turn(_)) => turns += 1,
             Some(StreamDecl::PromptSection(_)) => sections += 1,

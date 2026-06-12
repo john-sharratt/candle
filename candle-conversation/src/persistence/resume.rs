@@ -22,6 +22,7 @@
 //! in `transfer.rs` — `candle-conversation` is CUDA-only so there is no
 //! non-CUDA half.
 
+use super::manifest::ChunkLoc;
 use super::record::{ChunkPayload, RecordType};
 use super::streams::{StreamDecl, StreamId, TurnDecl};
 use super::{PersistenceError, Result, SubstratePersistence};
@@ -266,13 +267,21 @@ pub fn persist_turn_chunks(
 /// `log_offset` returned by each `append_record` call so the
 /// [`StoredChunk`] reference is exact. Used by the persistence thread's
 /// warm→cold phase.
+///
+/// Also returns the `(flat_chunk_index, ChunkLoc)` pairs the caller must
+/// fold into the substrate's authoritative chunk index (`apply_chunk_loc`).
+/// Without that, `stream.chunks` is only repopulated by the walker on reload,
+/// so an in-process cold→hot elevation (a turn evicted then re-accessed within
+/// the same session) would `plan_chunked_read` an empty index and recover
+/// nothing.
 pub fn persist_turn_chunks_capture(
     p: &mut SubstratePersistence,
     stream_id: StreamId,
     layers: &TurnChunkGrid,
-) -> Result<Vec<StoredSequence>> {
+) -> Result<(Vec<StoredSequence>, Vec<(u64, ChunkLoc)>)> {
     let chunks_per_layer = layers.chunks_per_layer();
     let mut out = Vec::with_capacity(layers.n_layers());
+    let mut locs: Vec<(u64, ChunkLoc)> = Vec::new();
     for (layer_idx, layer) in layers.iter_layers().enumerate() {
         if layer.len() != chunks_per_layer {
             return Err(PersistenceError::Corrupt(format!(
@@ -286,6 +295,7 @@ pub fn persist_turn_chunks_capture(
             let flat = flat_chunk_index(layer_idx, chunk_idx, chunks_per_layer);
             let header_fmt = image.payload.k_formats.first().copied().unwrap_or(0);
             let encoded = image.payload.encode();
+            let payload_len = encoded.len() as u64;
             let (log_offset, record_len) = p.append_record(
                 RecordType::Chunk,
                 header_fmt,
@@ -299,6 +309,16 @@ pub fn persist_turn_chunks_capture(
                 record_len,
                 token_count: image.token_count,
             });
+            locs.push((
+                flat,
+                ChunkLoc {
+                    offset: log_offset,
+                    payload_len,
+                    record_size: record_len,
+                    token_count: image.token_count as u64,
+                    format: header_fmt,
+                },
+            ));
             layer_token_count += image.token_count as usize;
         }
         out.push(StoredSequence {
@@ -306,7 +326,7 @@ pub fn persist_turn_chunks_capture(
             token_count: layer_token_count,
         });
     }
-    Ok(out)
+    Ok((out, locs))
 }
 
 /// Persist a turn's `Tokens` record and the trailing `Commit`. Always called

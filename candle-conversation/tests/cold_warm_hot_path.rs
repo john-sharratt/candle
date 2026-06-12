@@ -38,7 +38,7 @@ use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::projection::{
     Conversation, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
-use candle_conversation::substrate::TierState;
+use candle_conversation::substrate::{Substrate, TierState};
 use candle_conversation::turn::Role;
 use candle_nn::kv_cache::{
     ArenaKey, ArenaLocation, ChunkedKvBacking, KvFormat, QuantFormat, SealedChunk, SealedSequence,
@@ -59,6 +59,21 @@ const ARENA_CAPACITY: usize = 256;
 /// the per-(h,p) quant blocks to land cleanly. 128 / 4 = 32 — exactly
 /// one block per sub-band, matching the R16 unit-test pattern.
 const QUANT_HEAD_DIM: usize = 128;
+
+/// Open the redo log under `dir`, driving every record through the substrate
+/// walker in one pass (exactly as the daemon does in `ConversationEngine::new`),
+/// then bind the populated substrate to a fresh conversation.
+///
+/// This is the only correct way to reopen for recovery: `open_in` with an empty
+/// `Substrate::new()` (the old `Conversation::with_persistence` path) leaves the
+/// substrate unpopulated, so `reconstruct_from_log` finds no turn decls and
+/// recovers nothing. For a fresh (empty) log the walker is simply a no-op.
+fn open_conversation(dir: &std::path::Path) -> Conversation {
+    let mut substrate = Substrate::new();
+    let persistence =
+        SubstratePersistence::open_in_with_substrate(dir, &mut substrate).unwrap();
+    Conversation::from_parts(substrate, persistence)
+}
 
 fn cuda_device_or_skip() -> Option<Device> {
     match Device::cuda_if_available(0) {
@@ -273,8 +288,7 @@ fn full_cold_warm_hot_round_trip() {
     let section_pattern_base: u32 = 7_777_777;
 
     let (snapshots, section_snapshot, turn_keys) = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings(&device);
 
         conv.register_timeline(timeline, layer_id, group_id);
@@ -431,8 +445,7 @@ fn full_cold_warm_hot_round_trip() {
     let _ = section_snapshot; // sections don't survive restart (no cold tier today).
 
     // ── Phase 6: reopen on the same tempdir, reload from log ─────────────
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings(&device);
 
     // Re-register the same timeline so the reloader can attach turns to it.
@@ -672,8 +685,7 @@ fn quant_blend_warm_round_trip() {
     ];
 
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
 
         conv.register_timeline(timeline, layer_id, group_id);
@@ -784,8 +796,7 @@ fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
     let timeline = TimelineAllocator::new().next();
 
     let snapshot = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
         conv.register_timeline(timeline, layer_id, group_id);
         let idx = seed_turn_with_format(
@@ -809,8 +820,7 @@ fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
         snap
     };
 
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
     conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
@@ -900,8 +910,7 @@ fn cold_marker_turn_passes_existence_check() {
 
     // Seed + persist + drop.
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         let _ = seed_turn(&conv, &backings, &device, timeline, 999_999);
@@ -911,8 +920,7 @@ fn cold_marker_turn_passes_existence_check() {
     }
 
     // Reopen + reload. Turn is now cold-marker only.
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings(&device);
     conv.register_timeline(timeline, layer_id, group_id);
     conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
@@ -985,8 +993,7 @@ fn cold_load_q8_single_chunk_diagnostic() {
     let timeline = TimelineAllocator::new().next();
 
     let snapshot = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
         conv.register_timeline(timeline, layer_id, group_id);
 
@@ -1032,8 +1039,7 @@ fn cold_load_q8_single_chunk_diagnostic() {
     };
 
     // Reopen + reload + cold→hot.
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
     let restored = conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
@@ -1131,8 +1137,7 @@ fn quant_blend_cold_round_trip() {
     ];
 
     let (snapshots, turn_keys) = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
         conv.register_timeline(timeline, layer_id, group_id);
 
@@ -1171,8 +1176,7 @@ fn quant_blend_cold_round_trip() {
     };
 
     // Reopen, reload from cold, elevate cold→hot+warm, byte-compare.
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
 
@@ -1234,8 +1238,7 @@ fn elevate_edge_cases() {
     let group_id = GroupId::from_raw(3).unwrap();
     let timeline = TimelineAllocator::new().next();
 
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings(&device);
     conv.register_timeline(timeline, layer_id, group_id);
 
@@ -1381,8 +1384,7 @@ fn multi_chunk_turn_round_trip() {
     let timeline = TimelineAllocator::new().next();
 
     let (snapshot, key) = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings(&device);
         conv.register_timeline(timeline, layer_id, group_id);
 
@@ -1443,8 +1445,7 @@ fn multi_chunk_turn_round_trip() {
     };
 
     // Restart + cold→hot+warm with a multi-chunk turn.
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings(&device);
     conv.register_timeline(timeline, layer_id, group_id);
     let restored = conv
@@ -1506,8 +1507,7 @@ fn archive_state_survives_restart() {
 
     // ── Phase 1: seed a turn + persist + mark archived ─────────────────
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         let _ = seed_turn(&conv, &backings, &device, timeline, 100_001);
@@ -1534,8 +1534,7 @@ fn archive_state_survives_restart() {
 
     // ── Phase 2: reopen, reload, archive state survives ────────────────
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
         assert!(
@@ -1551,8 +1550,7 @@ fn archive_state_survives_restart() {
 
     // ── Phase 3: second restart — unarchive survives ──────────────────
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
         assert!(
@@ -1617,8 +1615,7 @@ fn quantize_on_evict_full_round_trip() {
     let timeline = TimelineAllocator::new().next();
     let policy = CompressionPolicy::new(5);
 
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings_adaptive(&device, QUANT_HEAD_DIM, &policy);
     conv.register_timeline(timeline, layer_id, group_id);
 
@@ -1676,8 +1673,7 @@ fn quantize_on_evict_actually_compresses() {
     let run_cycle = |policy_opt: Option<CompressionPolicy>| -> u64 {
         let tmpdir = tempfile::tempdir().unwrap();
         let dir = tmpdir.path().to_path_buf();
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = match policy_opt {
             Some(ref p) => make_backings_adaptive(&device, QUANT_HEAD_DIM, p),
             None => make_backings_f16(&device, QUANT_HEAD_DIM),
@@ -1751,8 +1747,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
 
     // ── Phase 1: seed + persist (quantize on evict) ─────────────────
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_adaptive(&device, QUANT_HEAD_DIM, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
         let _ = seed_turn_with_format(
@@ -1777,8 +1772,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
     let log_len_before = std::fs::metadata(&log_path).unwrap().len();
 
     // ── Phase 2: drop everything, reopen, reload, then elevate ──────
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings_adaptive(&device, QUANT_HEAD_DIM, &policy);
     conv.register_timeline(timeline, layer_id, group_id);
     conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
@@ -2280,8 +2274,7 @@ fn quantize_on_evict_metadata_round_trip() {
 
     // ── Phase 1: seed F16 with varied pattern, run policy-driven persist ──
     let key = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
 
@@ -2323,8 +2316,7 @@ fn quantize_on_evict_metadata_round_trip() {
     // elevated. So Phase 2's "reference" snapshot is *the* image set
     // every subsequent transition must preserve.
     let reference = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
@@ -2360,8 +2352,7 @@ fn quantize_on_evict_metadata_round_trip() {
     // second reload from the same redo log produced even one different
     // byte / scale / format tag we'd see drift here.
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
@@ -2390,8 +2381,7 @@ fn quantize_on_evict_metadata_round_trip() {
     //            steady state when a hot residence is dropped and re-    ─
     //            elevated without restart.                                ─
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
@@ -2464,8 +2454,7 @@ fn no_policy_metadata_round_trip() {
     let timeline = TimelineAllocator::new().next();
 
     let key = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         let idx = seed_turn_varied_per_sub_band(
@@ -2488,8 +2477,7 @@ fn no_policy_metadata_round_trip() {
 
     // Reference: post-restart, post warm→hot elevation.
     let reference = {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
@@ -2513,8 +2501,7 @@ fn no_policy_metadata_round_trip() {
 
     // Warm→hot leg after evict.
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
@@ -2553,8 +2540,7 @@ fn no_policy_metadata_round_trip() {
 
     // Second cold→hot reload from the same log.
     {
-        let persistence = SubstratePersistence::open_in(&dir).unwrap();
-        let conv = Conversation::with_persistence(persistence);
+        let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
@@ -2779,8 +2765,7 @@ fn drive_section_round_trip<F>(
     };
     let tmpdir = tempfile::tempdir().unwrap();
     let dir = tmpdir.path().to_path_buf();
-    let persistence = SubstratePersistence::open_in(&dir).unwrap();
-    let conv = Conversation::with_persistence(persistence);
+    let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, head_dim);
     let section = SectionId::new(7_777);
 

@@ -453,6 +453,19 @@ impl Harness {
             tool_section_ids.insert(tool.to_string(), sid);
         }
 
+        // The projection.yaml carries `kind: template` items (ChatML dialect
+        // markers) that `project()` emits as `Generated` segments — and it
+        // panics if they were never tokenised. These calibration tests assert
+        // only on tool-section *selection* (sealed sections ranked by BDP
+        // score); they never inspect Generated template token content. A
+        // deterministic codepoint tokenisation therefore satisfies the engine
+        // without pulling a model tokenizer into the harness.
+        builder
+            .tokenize_templates::<std::convert::Infallible, _>(|s| {
+                Ok(s.chars().map(|c| c as u32).collect())
+            })
+            .expect("tokenize_templates");
+
         Self {
             builder,
             tool_section_ids,

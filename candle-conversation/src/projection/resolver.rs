@@ -965,9 +965,25 @@ impl Conversation {
         stream_id: StreamId,
         layers: &crate::persistence::resume::TurnChunkGrid,
     ) -> candle::Result<Vec<StoredSequence>> {
-        let mut p = self.persistence.lock().unwrap();
-        crate::persistence::resume::persist_turn_chunks_capture(&mut p, stream_id, layers)
-            .map_err(|e| candle::Error::Msg(format!("persist turn chunks capture: {e}")))
+        let (stored, locs) = {
+            let mut p = self.persistence.lock().unwrap();
+            crate::persistence::resume::persist_turn_chunks_capture(&mut p, stream_id, layers)
+                .map_err(|e| candle::Error::Msg(format!("persist turn chunks capture: {e}")))?
+        };
+        // Fold the freshly-written chunk locations into the substrate's
+        // authoritative chunk index so an in-process cold→hot elevation
+        // (eviction then re-access without a daemon restart) can locate them
+        // via `plan_chunked_read`. The redo-log walker only repopulates
+        // `stream.chunks` on reload; without this the index stays empty until
+        // then, and the cold-load pipeline plans zero records. The persistence
+        // lock is released above so we never hold it across the substrate write.
+        {
+            let mut view = self.write();
+            for (flat, loc) in locs {
+                view.apply_chunk_loc(stream_id, flat, loc);
+            }
+        }
+        Ok(stored)
     }
 
     /// Persist a turn's `Tokens` record and the trailing `Commit` — always
