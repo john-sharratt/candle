@@ -101,15 +101,4 @@ impl Metrics {
             worst_head_mae,
         })
     }
-
-    /// Pass criterion for "the two kernels agree". The fused Track-A path does
-    /// INT8 MMA, so bit-equality is not expected; parity is judged on MAE +
-    /// max-abs + cosine, sized to the compute dtype.
-    pub fn passes(&self, mae_tol: f32, max_abs_tol: f32, cosine_tol: f32) -> bool {
-        self.mae.is_finite()
-            && self.max_abs.is_finite()
-            && self.mae <= mae_tol
-            && self.max_abs <= max_abs_tol
-            && self.cosine >= cosine_tol
-    }
 }

@@ -169,7 +169,7 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
     use crate::models::prefill_utils::{
-        compute_rope_cs, paged_decode_attn_with_backend, DecodeBackend,
+        compute_rope_cs, paged_decode_attn,
     };
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
@@ -288,8 +288,8 @@ mod cuda_tests {
     //   BF16 | F8E4M3  → bf16 kernel; q/k_new/v_new must be BF16.
     // ------------------------------------------------------------------
 
-    fn run_paged_decode_be(
-        backend: DecodeBackend,
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_decode(
         history: Option<(&Tensor, &Tensor)>,
         k_new: &Tensor,
         v_new: &Tensor,
@@ -354,7 +354,7 @@ mod cuda_tests {
         let k_c = k_new.to_dtype(compute_dtype)?.contiguous()?;
         let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
 
-        let result = paged_decode_attn_with_backend(
+        let result = paged_decode_attn(
             &q_c,
             headers_ptr,
             arena_dtype,
@@ -366,41 +366,12 @@ mod cuda_tests {
             &v_c,
             rope_cs,
             false, // rope_interleaved
-            backend,
         )?;
 
         // `gen` drops here — Generation::drop syncs the stream then frees the
         // pinned arena, which is now safe because the kernel has completed.
         drop(gen);
         Ok(result)
-    }
-
-    // Thin Int8-default wrapper so the many smoke / rope-offset callers stay
-    // unchanged; the correctness A/B tests call run_paged_decode_be directly.
-    #[allow(clippy::too_many_arguments)]
-    fn run_paged_decode(
-        history: Option<(&Tensor, &Tensor)>,
-        k_new: &Tensor,
-        v_new: &Tensor,
-        q: &Tensor,
-        n_head: usize,
-        n_kv_head: usize,
-        head_dim: usize,
-        arena_dtype: DType,
-        rope_cs: &Tensor,
-    ) -> Result<Tensor> {
-        run_paged_decode_be(
-            DecodeBackend::Int8,
-            history,
-            k_new,
-            v_new,
-            q,
-            n_head,
-            n_kv_head,
-            head_dim,
-            arena_dtype,
-            rope_cs,
-        )
     }
 
     // Run an INT8 decode against a *substrate-seal gap*: a sealed partial chunk 0
@@ -481,7 +452,7 @@ mod cuda_tests {
         let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
         let rope_cs = make_zero_rope_cs(head_dim, 16, device)?;
 
-        let result = paged_decode_attn_with_backend(
+        let result = paged_decode_attn(
             &q_c,
             headers_ptr,
             arena_dtype,
@@ -493,7 +464,6 @@ mod cuda_tests {
             &v_c,
             &rope_cs,
             false,
-            DecodeBackend::Int8,
         )?;
         drop(gen);
         Ok(result)
@@ -633,9 +603,8 @@ mod cuda_tests {
         rope_cs: &Tensor,
         label: &str,
     ) -> Result<()> {
-        let int8 = run_paged_decode_be(
-            DecodeBackend::Int8, history, k_new, v_new, q, n_head, n_kv_head, head_dim, dtype,
-            rope_cs,
+        let int8 = run_paged_decode(
+            history, k_new, v_new, q, n_head, n_kv_head, head_dim, dtype, rope_cs,
         )?
         .to_dtype(DType::F32)?;
 
@@ -1103,8 +1072,7 @@ mod cuda_tests {
             Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
         let rope_cs = make_zero_rope_cs(head_dim, 16, &device)?;
-        let int8 = run_paged_decode_be(
-            DecodeBackend::Int8,
+        let int8 = run_paged_decode(
             Some((&hk, &hv)),
             &k_new,
             &v_new,

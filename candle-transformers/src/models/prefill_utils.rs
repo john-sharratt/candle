@@ -921,30 +921,16 @@ pub fn compute_rope_cs(
 // Decode kernel — persistent slot buffer edition
 // ============================================================================
 
-/// Which decode-attention kernel backend to run.
-///
-/// `Int8` is the production decode kernel (the INT8 split-KV / warp-stripe /
-/// batched-M kernel; `run_paged_decode_*`) for head_dim 64/96/128/256. `Legacy`
-/// is the original persistent-slot-buffer FP kernel (`run_paged_decode_legacy_*`),
-/// retained as the A/B regression reference. Selecting the backend explicitly (via
-/// [`paged_decode_attn_with_backend`]) is how the A/B harness drives both kernels
-/// over identical inputs; [`paged_decode_attn`] uses the `Int8` default.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum DecodeBackend {
-    #[default]
-    Int8,
-    Legacy,
-}
-
 /// Paged decode attention using persistent slot buffers.
 ///
 /// Takes the slot pool `headers` tensor (16 bytes × n_active per slot) instead
 /// of the old per-step chunk_meta / head_gids / kv_lens / per_head_table.
 /// The kernel self-increments ws.len after scatter, so no write_offsets needed.
 ///
-/// Uses the production `Int8` decode kernel. For deterministic A/B selection
-/// against the legacy reference, call [`paged_decode_attn_with_backend`].
+/// Runs the production INT8 split-KV / warp-stripe / batched-M decode kernel
+/// (`run_paged_decode_*`) for head_dim 64/96/128/256.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub fn paged_decode_attn(
     q: &Tensor,
     headers_ptr: u64,
@@ -957,41 +943,6 @@ pub fn paged_decode_attn(
     v_new: &Tensor,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-) -> Result<Tensor> {
-    paged_decode_attn_with_backend(
-        q,
-        headers_ptr,
-        arena_dtype,
-        n_q_head,
-        n_kv_head,
-        head_dim,
-        softmax_scale,
-        k_new,
-        v_new,
-        rope_cs,
-        rope_interleaved,
-        DecodeBackend::default(),
-    )
-}
-
-/// Like [`paged_decode_attn`], but the decode kernel backend is selected
-/// explicitly instead of from the environment. Used by the A/B harness to run
-/// both kernels over the same fixture.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub fn paged_decode_attn_with_backend(
-    q: &Tensor,
-    headers_ptr: u64,
-    arena_dtype: DType,
-    n_q_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-    softmax_scale: f32,
-    k_new: &Tensor,
-    v_new: &Tensor,
-    rope_cs: &Tensor,
-    rope_interleaved: bool,
-    backend: DecodeBackend,
 ) -> Result<Tensor> {
     let num_active_slots = q.dim(0)?;
     let k_new = k_new.contiguous()?;
@@ -1008,7 +959,6 @@ pub fn paged_decode_attn_with_backend(
         rope_cs: rope_cs.clone(),
         rope_interleaved,
         num_active_slots,
-        backend,
     };
     q.apply_op1(op)
 }
@@ -1026,7 +976,6 @@ struct PagedDecode {
     rope_cs: Tensor,
     rope_interleaved: bool,
     num_active_slots: usize,
-    backend: DecodeBackend,
 }
 
 #[cfg(feature = "cuda")]
@@ -1141,9 +1090,6 @@ impl candle::CustomOp1 for PagedDecode {
         q_l: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
         use candle_kernels::paged_decode::{run_paged_decode_bf16, run_paged_decode_fp16};
-        use candle_kernels::paged_decode_legacy::{
-            run_paged_decode_legacy_bf16, run_paged_decode_legacy_fp16,
-        };
 
         match self.head_dim {
             64 | 96 | 128 | 256 => {}
@@ -1152,20 +1098,12 @@ impl candle::CustomOp1 for PagedDecode {
             ),
         }
 
-        match (self.backend, self.arena_dtype) {
-            (DecodeBackend::Int8, DType::F16) => {
-                self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16)
-            }
-            (DecodeBackend::Int8, DType::BF16 | DType::F8E4M3) => {
+        match self.arena_dtype {
+            DType::F16 => self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16),
+            DType::BF16 | DType::F8E4M3 => {
                 self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, run_paged_decode_bf16)
             }
-            (DecodeBackend::Legacy, DType::F16) => {
-                self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_legacy_fp16)
-            }
-            (DecodeBackend::Legacy, DType::BF16 | DType::F8E4M3) => {
-                self.cuda_fwd_typed::<bf16, bf16, bf16>(q, q_l, run_paged_decode_legacy_bf16)
-            }
-            (_, dt) => candle::bail!(
+            dt => candle::bail!(
                 "paged-decode: unsupported arena dtype {:?} (only F16/BF16 supported)",
                 dt
             ),

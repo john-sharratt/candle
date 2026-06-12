@@ -20,7 +20,7 @@ use candle_nn::kv_cache::{
 };
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn_with_backend, paged_prefill_batched, DecodeBackend,
+    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
 };
 use candle_transformers::models::slot_state::{
     tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
@@ -189,16 +189,10 @@ impl Fixture {
         })
     }
 
-    /// Run a single decode step on the given backend. Rebuilds the per-slot
-    /// `SlotHeader` array fresh each call, so the call is idempotent and both
-    /// backends see identical pristine arena state. Returns the output and the
-    /// device-synchronized kernel wall time.
-    pub fn decode(
-        &self,
-        backend: DecodeBackend,
-        device: &Device,
-        stager: &PinnedStager,
-    ) -> Result<(Tensor, Duration)> {
+    /// Run a single INT8 decode step. Rebuilds the per-slot `SlotHeader` array
+    /// fresh each call, so the call is idempotent and sees pristine arena state.
+    /// Returns the output and the device-synchronized kernel wall time.
+    pub fn decode(&self, device: &Device, stager: &PinnedStager) -> Result<(Tensor, Duration)> {
         let sc = &self.scenario;
 
         // Ensure every slot's writer chunk exists BEFORE resolving arena
@@ -282,7 +276,7 @@ impl Fixture {
         let ev_err = |e| candle::Error::Msg(format!("cuda event: {e:?}"));
         device.synchronize()?;
         let start = cstream.record_event(Some(CU_EVENT_DEFAULT)).map_err(ev_err)?;
-        let out = paged_decode_attn_with_backend(
+        let out = paged_decode_attn(
             &self.q_dec,
             headers_ptr,
             self.arena_dtype,
@@ -294,7 +288,6 @@ impl Fixture {
             &self.v_new,
             &self.rope_cs,
             sc.rope_interleaved,
-            backend,
         )?;
         let stop = cstream.record_event(Some(CU_EVENT_DEFAULT)).map_err(ev_err)?;
         let ms = start.elapsed_ms(&stop).map_err(ev_err)?;
@@ -348,7 +341,7 @@ pub fn golden_decode(
     let mut out = vec![0f32; sc.num_slots * nq * hd];
     for slot in 0..sc.num_slots {
         let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
-        let (_qp, kp, vp) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?; // (1,nkv,ctx,hd)
+        let (_qp, kp, vp) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?; // (ctx, nkv, hd)
         let kpv = to_f16_vec(&kp)?;
         let vpv = to_f16_vec(&vp)?;
         let ctx = sc.ctx_len;
@@ -358,7 +351,8 @@ pub fn golden_decode(
             // logits over ctx prefill tokens + 1 decode token
             let mut logits = vec![0f32; ctx + 1];
             for (t, lg) in logits.iter_mut().enumerate().take(ctx) {
-                let kbase = (g * ctx + t) * hd;
+                // token-major (ctx, nkv, hd): token t, kv-group g.
+                let kbase = (t * nkv + g) * hd;
                 let mut dot = 0f32;
                 for d in 0..hd {
                     dot += qv[qbase + d] * kpv[kbase + d];
@@ -384,7 +378,7 @@ pub fn golden_decode(
             for d in 0..hd {
                 let mut acc = 0f32;
                 for (t, &w) in logits.iter().enumerate().take(ctx) {
-                    acc += w * vpv[(g * ctx + t) * hd + d];
+                    acc += w * vpv[(t * nkv + g) * hd + d];
                 }
                 acc += logits[ctx] * vnv[knbase + d];
                 out[obase + d] = acc * inv;
@@ -435,15 +429,12 @@ fn make_prefill_qkv(
             }
         }
     }
-    let q = Tensor::from_vec(q, (1, n_tokens, sc.n_q_head, sc.head_dim), device)?
-        .transpose(1, 2)?
-        .contiguous()?;
-    let k = Tensor::from_vec(k, (1, n_tokens, sc.n_kv_head, sc.head_dim), device)?
-        .transpose(1, 2)?
-        .contiguous()?;
-    let v = Tensor::from_vec(v, (1, n_tokens, sc.n_kv_head, sc.head_dim), device)?
-        .transpose(1, 2)?
-        .contiguous()?;
+    // Flat / ragged prefill layout: token-major (total_q, n_head, head_dim).
+    // The vec was filled token-major (t, h, d), so it maps directly with no
+    // transpose. `paged_prefill_batched` takes total_q = sum(q_lens) rows.
+    let q = Tensor::from_vec(q, (n_tokens, sc.n_q_head, sc.head_dim), device)?;
+    let k = Tensor::from_vec(k, (n_tokens, sc.n_kv_head, sc.head_dim), device)?;
+    let v = Tensor::from_vec(v, (n_tokens, sc.n_kv_head, sc.head_dim), device)?;
     Ok((q, k, v))
 }
 
