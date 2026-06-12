@@ -395,10 +395,11 @@ mod tests {
                 // turn_start carries the marker), so don't blanket-assert.
                 let _ = d.template(t);
             }
-            // Tool-block templates are empty on the Llama dialects by
-            // design; assert that explicitly so future edits notice.
-            assert_eq!(d.template(DialectTemplate::ToolBlockOpen), "");
-            assert_eq!(d.template(DialectTemplate::ToolBlockClose), "");
+            // Tool-block delimiters are uniform across all dialects; assert the
+            // Llama dialects carry them so future edits notice a divergence.
+            assert_eq!(d.template(DialectTemplate::ToolBlockOpen), "<tools>\n");
+            assert_eq!(d.template(DialectTemplate::ToolBlockClose), "</tools>\n");
+            // The Llama dialects have no dedicated no-think prefix.
             assert_eq!(d.template(DialectTemplate::NoThinkPrefix), "");
         }
     }

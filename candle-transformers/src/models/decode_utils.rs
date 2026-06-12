@@ -168,7 +168,9 @@ mod tests {
 // ============================================================================
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
-    use crate::models::prefill_utils::{compute_rope_cs, paged_decode_attn};
+    use crate::models::prefill_utils::{
+        compute_rope_cs, paged_decode_attn_with_backend, DecodeBackend,
+    };
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::ChunkedKvBacking;
@@ -286,7 +288,8 @@ mod cuda_tests {
     //   BF16 | F8E4M3  → bf16 kernel; q/k_new/v_new must be BF16.
     // ------------------------------------------------------------------
 
-    fn run_paged_decode(
+    fn run_paged_decode_be(
+        backend: DecodeBackend,
         history: Option<(&Tensor, &Tensor)>,
         k_new: &Tensor,
         v_new: &Tensor,
@@ -308,6 +311,16 @@ mod cuda_tests {
             ChunkedKvBacking::new(1, n_kv_head, head_dim, arena_dtype, device, history_len + 1)?;
         if let Some((hk, hv)) = history {
             backing.write_contiguous(0, 0, hk, hv)?;
+            // write_contiguous lays down the history *data* but leaves the
+            // cum_token `usage` metadata at 0 (production bumps it per decode
+            // step via the kernel self-increment + set_len). Without this, the
+            // writer-chunk resolution (decode_write_chunk_idx / before_wi) is
+            // only correct while history_len < CHUNK_SIZE; for chunk-spanning
+            // history it would pick the full chunk 0 as the writer and compute
+            // write_len = history_len (>= CHUNK_SIZE). set_len mirrors prefill,
+            // marking the history tokens used so the writer lands in a fresh
+            // chunk at the right slot.
+            backing.set_len(0, history_len);
         }
         backing.ensure_for_offset(0, seq_offset, 1)?;
 
@@ -341,7 +354,7 @@ mod cuda_tests {
         let k_c = k_new.to_dtype(compute_dtype)?.contiguous()?;
         let v_c = v_new.to_dtype(compute_dtype)?.contiguous()?;
 
-        let result = paged_decode_attn(
+        let result = paged_decode_attn_with_backend(
             &q_c,
             headers_ptr,
             arena_dtype,
@@ -353,12 +366,96 @@ mod cuda_tests {
             &v_c,
             rope_cs,
             false, // rope_interleaved
+            backend,
         )?;
 
         // `gen` drops here — Generation::drop syncs the stream then frees the
         // pinned arena, which is now safe because the kernel has completed.
         drop(gen);
         Ok(result)
+    }
+
+    // Thin Int8-default wrapper so the many smoke / rope-offset callers stay
+    // unchanged; the correctness A/B tests call run_paged_decode_be directly.
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_decode(
+        history: Option<(&Tensor, &Tensor)>,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        q: &Tensor,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_dtype: DType,
+        rope_cs: &Tensor,
+    ) -> Result<Tensor> {
+        run_paged_decode_be(
+            DecodeBackend::Int8,
+            history,
+            k_new,
+            v_new,
+            q,
+            n_head,
+            n_kv_head,
+            head_dim,
+            arena_dtype,
+            rope_cs,
+        )
+    }
+
+    // Decode correctness check: the INT8 decode kernel must match the
+    // gold-standard pure-tensor attention (reference_decode_attention) within
+    // INT8 quantization error. The reference is a plain matmul, so it cannot
+    // carry kernel bugs — any kernel defect (wrong GQA mapping, broken MMA
+    // fragment layout, chunk-gap miscount) pushes the error far past quant
+    // noise. Tolerances are calibrated to measured INT8 Q/K quantization error
+    // (~0.08 mae on hd64), not to FP precision. Callers pass a zero RoPE table
+    // (matches the reference, which applies no RoPE).
+    #[allow(clippy::too_many_arguments)]
+    fn assert_decode_ab(
+        history: Option<(&Tensor, &Tensor)>,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        q: &Tensor,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        dtype: DType,
+        rope_cs: &Tensor,
+        label: &str,
+    ) -> Result<()> {
+        let int8 = run_paged_decode_be(
+            DecodeBackend::Int8, history, k_new, v_new, q, n_head, n_kv_head, head_dim, dtype,
+            rope_cs,
+        )?
+        .to_dtype(DType::F32)?;
+
+        let full_k = match history {
+            Some((hk, _)) => Tensor::cat(&[hk, &k_new.unsqueeze(2)?], 2)?,
+            None => k_new.unsqueeze(2)?,
+        };
+        let full_v = match history {
+            Some((_, hv)) => Tensor::cat(&[hv, &v_new.unsqueeze(2)?], 2)?,
+            None => v_new.unsqueeze(2)?,
+        };
+        let ref_out = reference_decode_attention(q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
+
+        let i8_mae = mean_abs_error(&int8, &ref_out)?;
+        let i8_max = max_abs_error(&int8, &ref_out)?;
+        // mae is the precision gate (INT8 Q/K quantization ~0.08 on hd64). max is
+        // a single-element-outlier garbage-detector: a real kernel defect (wrong
+        // head, broken MMA layout, chunk miscount) blows max past ~2, while
+        // legitimate INT8 rounding tails reach ~0.75 on hd64 with odd group counts.
+        assert!(
+            i8_mae < 0.15,
+            "[{label}] int8 vs reference mae too large: {i8_mae}"
+        );
+        assert!(
+            i8_max < 1.0,
+            "[{label}] int8 vs reference max error too large: {i8_max}"
+        );
+        println!("[{label}] decode A/B OK: i8_mae={i8_mae:.3e} i8_max={i8_max:.3e}");
+        Ok(())
     }
 
     // ======================================================================
@@ -641,7 +738,7 @@ mod cuda_tests {
             let q =
                 Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
-            let paged_out = run_paged_decode(
+            assert_decode_ab(
                 Some((&hk, &hv)),
                 &k_new,
                 &v_new,
@@ -651,26 +748,8 @@ mod cuda_tests {
                 head_dim,
                 dtype,
                 &make_zero_rope_cs(head_dim, 16, &device)?,
+                label,
             )?;
-
-            // Reference: attend over full history + new token.
-            let full_k = Tensor::cat(&[&hk, &k_new.unsqueeze(2)?], 2)?;
-            let full_v = Tensor::cat(&[&hv, &v_new.unsqueeze(2)?], 2)?;
-            let ref_out =
-                reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
-
-            let paged_f32 = paged_out.to_dtype(DType::F32)?;
-            let mae = mean_abs_error(&paged_f32, &ref_out)?;
-            let max_err = max_abs_error(&paged_f32, &ref_out)?;
-            assert!(
-                mae < 0.05,
-                "[{label}] BF16 decode with-history mean error too large: {mae}"
-            );
-            assert!(
-                max_err < 0.2,
-                "[{label}] BF16 decode with-history max error too large: {max_err}"
-            );
-            println!("[{label}] BF16 decode with-history OK: mae={mae:.4e} max_err={max_err:.4e}");
         }
         Ok(())
     }
@@ -708,7 +787,7 @@ mod cuda_tests {
             let q =
                 Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
-            let paged_out = run_paged_decode(
+            assert_decode_ab(
                 Some((&hk, &hv)),
                 &k_new,
                 &v_new,
@@ -718,25 +797,8 @@ mod cuda_tests {
                 head_dim,
                 dtype,
                 &make_zero_rope_cs(head_dim, 16, &device)?,
+                label,
             )?;
-
-            let full_k = Tensor::cat(&[&hk, &k_new.unsqueeze(2)?], 2)?;
-            let full_v = Tensor::cat(&[&hv, &v_new.unsqueeze(2)?], 2)?;
-            let ref_out =
-                reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
-
-            let paged_f32 = paged_out.to_dtype(DType::F32)?;
-            let mae = mean_abs_error(&paged_f32, &ref_out)?;
-            let max_err = max_abs_error(&paged_f32, &ref_out)?;
-            assert!(
-                mae < 0.05,
-                "[{label}] F16 decode with-history mean error too large: {mae}"
-            );
-            assert!(
-                max_err < 0.2,
-                "[{label}] F16 decode with-history max error too large: {max_err}"
-            );
-            println!("[{label}] F16 decode with-history OK: mae={mae:.4e} max_err={max_err:.4e}");
         }
         Ok(())
     }
@@ -784,7 +846,7 @@ mod cuda_tests {
             let q =
                 Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
-            let paged_out = run_paged_decode(
+            assert_decode_ab(
                 Some((&hk, &hv)),
                 &k_new,
                 &v_new,
@@ -794,25 +856,8 @@ mod cuda_tests {
                 head_dim,
                 dtype,
                 &make_zero_rope_cs(head_dim, 16, &device)?,
+                label,
             )?;
-
-            let full_k = Tensor::cat(&[&hk, &k_new.unsqueeze(2)?], 2)?;
-            let full_v = Tensor::cat(&[&hv, &v_new.unsqueeze(2)?], 2)?;
-            let ref_out =
-                reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
-
-            let paged_f32 = paged_out.to_dtype(DType::F32)?;
-            let mae = mean_abs_error(&paged_f32, &ref_out)?;
-            let max_err = max_abs_error(&paged_f32, &ref_out)?;
-            assert!(
-                mae < 0.05,
-                "[{label}] GQA decode regression mean error too large: {mae} (may indicate head mapping overflow)"
-            );
-            assert!(
-                max_err < 0.2,
-                "[{label}] GQA decode regression max error too large: {max_err}"
-            );
-            println!("[{label}] GQA decode regression OK: mae={mae:.4e} max_err={max_err:.4e}");
         }
         Ok(())
     }
@@ -842,7 +887,9 @@ mod cuda_tests {
         let q =
             Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
-        let paged_out = run_paged_decode(
+        let rope_cs = make_zero_rope_cs(head_dim, 16, &device)?;
+        let int8 = run_paged_decode_be(
+            DecodeBackend::Int8,
             Some((&hk, &hv)),
             &k_new,
             &v_new,
@@ -851,30 +898,31 @@ mod cuda_tests {
             n_kv_head,
             head_dim,
             dtype,
-            &make_zero_rope_cs(head_dim, 16, &device)?,
-        )?;
+            &rope_cs,
+        )?
+        .to_dtype(DType::F32)?;
 
         let full_k = Tensor::cat(&[&hk, &k_new.unsqueeze(2)?], 2)?;
         let full_v = Tensor::cat(&[&hv, &v_new.unsqueeze(2)?], 2)?;
         let ref_out =
             reference_decode_attention(&q, &full_k, &full_v, n_head, n_kv_head, head_dim)?;
 
-        let paged_f32 = paged_out.to_dtype(DType::F32)?;
-
-        println!("\n=== Per-head decode error for {n_head}/{n_kv_head} (groups={num_groups}) ===");
+        // Per-head int8-vs-reference divergence: a GQA head-mapping bug shows up
+        // as one kv_group's heads diverging far beyond int8 quantization noise.
+        println!("\n=== Per-head int8-vs-reference decode error for {n_head}/{n_kv_head} (groups={num_groups}) ===");
         for h in 0..n_head {
             let kv_group = h / num_groups;
-            let paged_h = paged_f32.narrow(1, h, 1)?;
+            let int8_h = int8.narrow(1, h, 1)?;
             let ref_h = ref_out.narrow(1, h, 1)?;
-            let mae = mean_abs_error(&paged_h, &ref_h)?;
-            let marker = if mae > 0.05 { " *** HIGH ***" } else { "" };
+            let mae = mean_abs_error(&int8_h, &ref_h)?;
+            let marker = if mae > 0.15 { " *** HIGH ***" } else { "" };
             println!("  head {h:2} (kv_group {kv_group}): mae={mae:.4e}{marker}");
         }
 
-        let overall = mean_abs_error(&paged_f32, &ref_out)?;
+        let overall = mean_abs_error(&int8, &ref_out)?;
         assert!(
-            overall < 0.05,
-            "per-head diagnostic: overall mean error too large: {overall}"
+            overall < 0.15,
+            "per-head diagnostic: overall int8-vs-reference mean error too large: {overall}"
         );
         Ok(())
     }
