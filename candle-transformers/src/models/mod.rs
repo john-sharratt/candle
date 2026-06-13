@@ -93,6 +93,7 @@ pub mod phi3;
 pub mod pixtral;
 pub mod prefill_utils;
 pub mod profile;
+pub mod routing_capture;
 pub mod quantized_blip;
 pub mod quantized_blip_text;
 pub mod quantized_gemma3;

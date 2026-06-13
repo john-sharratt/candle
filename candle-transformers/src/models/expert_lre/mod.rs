@@ -16,10 +16,10 @@
 //! - **Sole ownership**: expert slots are owned directly by the pipeline thread.
 //!   No `Arc<ExpertSlot>`, no `RwLock`, no atomic reference counting.
 //!
-//! - **Score-based eviction**: each expert has a usage score (hit: +1.0,
-//!   prediction hit: +0.3, anti-prediction: −0.2, end-of-pass decay: ×0.85).
-//!   Eviction selects the lowest-scored slot — O(n) scan over contiguous
-//!   memory, roughly 1 μs.
+//! - **Score-based eviction**: each expert carries a lightly-decayed access
+//!   frequency (hit: +1.0, prediction hit: +0.3, end-of-pass decay: ×0.85).
+//!   Eviction selects the lowest-scored slot (frequency × position factor) —
+//!   an O(n) scan over contiguous memory, roughly 1 μs.
 //!
 //! - **Two-phase dispatch**: the pipeline thread partitions routed experts
 //!   into cache hits (WARM/READY) and misses (COLD→LOADING), runs hit compute
@@ -101,14 +101,13 @@
 //! an expert at layer L is followed by each expert at layer L+1.
 //!
 //! The matrix is built incrementally during inference — no calibration
-//! pass required.  After ~64 observations, predictions become reliable.
-//! At each layer, the matrix predicts the single most likely *non-cached*
-//! expert for the next layer.  If a free slot exists, that expert's DMA
-//! begins speculatively while the current layer's compute runs.
+//! pass required.  At each layer, the predictor ranks the top-`K` most likely
+//! *non-cached* experts for the next layer; their DMA begins speculatively into
+//! free slots while the current layer's compute runs.
 //!
 //! Correct predictions convert cold misses into free cache hits.
 //! Incorrect predictions harmlessly occupy a free slot until normal
-//! score-based eviction reclaims it.
+//! eviction reclaims it.
 //!
 //! ## Two operating modes
 //!
@@ -147,6 +146,8 @@
 
 mod cache;
 mod compute;
+#[cfg(test)]
+mod eval;
 mod handle;
 mod pinned;
 mod pipeline;

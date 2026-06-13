@@ -866,6 +866,10 @@ impl PipelineState {
                 .count();
             self.hint_stats.0 += spec_for_layer.len();
             self.hint_stats.1 += hits;
+            if let Ok(mut s) = self.stats.lock() {
+                s.predicted_total += spec_for_layer.len();
+                s.predicted_hits += hits;
+            }
 
             // Score boost for predictions that matched actual routing.
             for &eid in &spec_for_layer {
@@ -1008,8 +1012,8 @@ impl PipelineState {
         Ok(ys)
     }
 
-    /// Post-compute maintenance: anti-prediction scoring, prefetch,
-    /// drip eviction, end-of-pass eviction with adaptive rates.
+    /// Post-compute maintenance: speculative prefetch, drip eviction, and
+    /// end-of-pass score decay + adaptive batch eviction.
     /// Called AFTER the response has been sent to the forward thread so this
     /// work doesn't inflate submit_roundtrip.
     pub(crate) fn post_compute(&mut self, moe_layer_idx: usize, expert_ids: &[usize]) {
@@ -1018,24 +1022,6 @@ impl PipelineState {
         #[cfg(feature = "cuda")]
         if self.all_resident {
             return;
-        }
-
-        // ── Anti-prediction: penalize bottom-N least-likely experts ──
-        // Only at end-of-pass, and only when demand exceeds free headroom.
-        if moe_layer_idx + 1 == self.num_moe_layers {
-            let target_free = ((self.pass_misses as f32 * 1.15).ceil() as usize).max(1);
-            let free_slots = self.inner.free_slots.len();
-            if free_slots < target_free {
-                // Apply anti-prediction for the first few layers of the next pass.
-                for layer in 0..self.num_moe_layers.min(8) {
-                    let bottom =
-                        self.transition_matrix
-                            .predict_bottom(moe_layer_idx, expert_ids, 4);
-                    for &eid in &bottom {
-                        self.inner.record_anti_prediction(layer, eid);
-                    }
-                }
-            }
         }
 
         // ── Speculative prefetch for next MoE layer ──
@@ -1158,7 +1144,7 @@ impl PipelineState {
         let prev_layer_idx = if layer_idx > 0 { layer_idx - 1 } else { 0 };
         let predicted = self
             .transition_matrix
-            .predict(prev_layer_idx, prev_expert_ids);
+            .predict_prefetch(prev_layer_idx, prev_expert_ids);
 
         if predicted.is_empty() || layer_idx >= self.num_moe_layers {
             self.profile.record("pipe_hint", t);
@@ -1228,63 +1214,95 @@ impl PipelineState {
         }
     }
 
-    /// Speculatively prefetch a single expert for the next MoE layer.
+    /// Speculatively prefetch the confidently-predicted experts for the next MoE
+    /// layer.
     ///
-    /// Uses the transition matrix to predict the most likely expert,
-    /// then loads from pinned pool if not already cached.
-    /// Only uses free VRAM slots — never evicts for prefetch.
+    /// Uses the Markov Wave predictor's confidence-gated prediction
+    /// (`predict_prefetch` — depth adapts to demand diversity), then loads each
+    /// not-yet-resident candidate into a free slot.
+    /// Only uses free VRAM slots — never evicts for prefetch — so it consumes the
+    /// headroom created by end-of-pass eviction and stops when it runs out.
+    /// Prefetched experts are tracked in `speculative_loads` so the next layer's
+    /// work request can score prediction precision.
     fn speculative_prefetch(
         &mut self,
         moe_layer_idx: usize,
         current_expert_ids: &[usize],
     ) -> Result<CopyBatchFence> {
-        let predicted = self
-            .transition_matrix
-            .predict(moe_layer_idx, current_expert_ids);
-
-        if predicted.is_empty() {
-            return Ok(CopyBatchFence::noop());
-        }
-
         let next_moe_idx = moe_layer_idx + 1;
         if next_moe_idx >= self.num_moe_layers {
             return Ok(CopyBatchFence::noop());
         }
 
-        // Find the first predicted expert that is not already cached.
-        let target = predicted.iter().find(|&&eid| {
-            !self
+        let predicted = self
+            .transition_matrix
+            .predict_prefetch(moe_layer_idx, current_expert_ids);
+        if predicted.is_empty() {
+            return Ok(CopyBatchFence::noop());
+        }
+
+        let mut loaded = 0usize;
+        for &expert_idx in &predicted {
+            // Skip experts already resident.
+            if self
                 .inner
                 .key_to_slot
-                .get(&(next_moe_idx, eid))
+                .get(&(next_moe_idx, expert_idx))
                 .map_or(false, |&s| self.inner.slots[s].is_some())
-        });
+            {
+                continue;
+            }
 
-        let &expert_idx = match target {
-            Some(eid) => eid,
-            None => return Ok(CopyBatchFence::noop()),
-        };
+            // Free-slots-only: never evict for prefetch.
+            let slot_idx = match self.inner.free_slots.pop() {
+                Some(s) => s,
+                None => break, // no headroom left — stop prefetching
+            };
 
-        // Free-slots-only: never evict for prefetch.
-        let slot_idx = match self.inner.free_slots.pop() {
-            Some(s) => s,
-            None => return Ok(CopyBatchFence::noop()),
-        };
+            let expert_slot = {
+                #[cfg(feature = "cuda")]
+                {
+                    match self.load_from_pinned(next_moe_idx, expert_idx) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            self.inner.free_slots.push(slot_idx);
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let mmap_bytes: &[u8] = &self.mmap;
+                    let mmap_ref = &self.host_refs[next_moe_idx][expert_idx];
+                    match load_from_mmap(mmap_bytes, mmap_ref, &self.device) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            self.inner.free_slots.push(slot_idx);
+                            continue;
+                        }
+                    }
+                }
+            };
 
-        let expert_slot = {
+            self.inner
+                .install(slot_idx, next_moe_idx, expert_idx, expert_slot);
+
             #[cfg(feature = "cuda")]
             {
-                self.load_from_pinned(next_moe_idx, expert_idx)?
+                self.expert_locations[next_moe_idx][expert_idx] = ExpertLocation::Vram { slot_idx };
             }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let mmap_bytes: &[u8] = &self.mmap;
-                let mmap_ref = &self.host_refs[next_moe_idx][expert_idx];
-                load_from_mmap(mmap_bytes, mmap_ref, &self.device)?
-            }
-        };
 
-        // Record fence for the prefetch DMA.
+            // Track for prediction-precision measurement — validated when the
+            // next layer's work request arrives.
+            self.speculative_loads.insert((next_moe_idx, expert_idx));
+            loaded += 1;
+        }
+
+        if loaded == 0 {
+            return Ok(CopyBatchFence::noop());
+        }
+
+        // Record one fence covering all of this round's prefetch DMA.
         let fence = {
             #[cfg(feature = "cuda")]
             if let (Some(cs), Device::Cuda(_)) = (&self.copy_stream, &self.device) {
@@ -1297,17 +1315,8 @@ impl PipelineState {
             CopyBatchFence::noop()
         };
 
-        // Install the prefetched expert.
-        self.inner
-            .install(slot_idx, next_moe_idx, expert_idx, expert_slot);
-
-        #[cfg(feature = "cuda")]
-        {
-            self.expert_locations[next_moe_idx][expert_idx] = ExpertLocation::Vram { slot_idx };
-        }
-
         if let Ok(mut s) = self.stats.lock() {
-            s.prefetch_loads += 1;
+            s.prefetch_loads += loaded;
         }
 
         Ok(fence)
