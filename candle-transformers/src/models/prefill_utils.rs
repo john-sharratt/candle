@@ -51,6 +51,7 @@ fn build_slot_headers(
     head_dim: usize,
     generation: &Generation,
 ) -> Result<SlotHeaderUpload> {
+    let t_build = profile_now();
     let arena_info = {
         let first = caches
             .first()
@@ -87,7 +88,9 @@ fn build_slot_headers(
     for (slot, &add) in slots.iter_mut().zip(q_lens.iter()) {
         slot.extend_for_write_region(add, chunk_size);
     }
+    pipeline_record("slot:build", t_build);
 
+    let t_pack = profile_now();
     // Pack slices — upload via stager for zero-copy PCIe read.
     let slice_size = TokenSliceHost::serialized_size(n_kv_head, head_dim);
     let total_slices: usize = slots.iter().map(|s| s.slices.len()).sum();
@@ -143,6 +146,7 @@ fn build_slot_headers(
     pinned.copy_from_slice(&header_buf);
     let headers_gpu = generation.submit(pinned)?;
     let headers_ptr = headers_gpu.dev_ptr();
+    pipeline_record("slot:pack", t_pack);
 
     Ok(SlotHeaderUpload {
         headers_ptr,
@@ -1252,6 +1256,7 @@ pub fn paged_glue_attn(
         (cu_seqlens_q, q_lens_dev, kv_lens)
     };
 
+    let t_hdr = profile_now();
     let header_upload = build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation)?;
 
     // Glue write targets (flat, cu_seqlens_q order) + cu_kvlens (col_actual_pos
@@ -1280,7 +1285,10 @@ pub fn paged_glue_attn(
     let glue_write_slice = Tensor::from_vec(wslice, total_q.max(1), device)?;
     let glue_write_in_blk = Tensor::from_vec(winblk, total_q.max(1), device)?;
     let cu_kvlens = Tensor::from_vec(cu_kv, b_sz + 1, device)?;
+    profile_sync(device);
+    pipeline_record("glue:hdr_meta", t_hdr);
 
+    let t_kernel = profile_now();
     let softmax_scale = 1f32 / (head_dim as f32).sqrt();
     let op = PagedGlueChunks {
         softmax_scale,
@@ -1305,6 +1313,8 @@ pub fn paged_glue_attn(
     };
     let q_compute = q_packed.to_dtype(compute_dtype)?;
     let out = q_compute.apply_op1(op)?;
+    profile_sync(device);
+    pipeline_record("glue:kernel", t_kernel);
 
     // Advance each slot to [sealed | glue]. `header_upload` stays alive until the
     // function returns, keeping the stager-resident headers valid for the launch.

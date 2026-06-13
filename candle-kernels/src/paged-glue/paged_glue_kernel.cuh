@@ -102,22 +102,29 @@ __global__ void paged_glue_kernel(
     const uint32_t n_slices = slot.n_slices;
     const uint64_t slices_ptr = slot.slices_ptr;
 
-    // ── Dynamic shared memory ────────────────────────────────────────────
-    //   q_smem : [ROWS][HEAD_DIM]   F32  RoPE'd glue Q (int8-free; v0 manual dot)
-    //   o_smem : [ROWS][HEAD_DIM]   F32  running ΣwV per row
-    //   m_smem : [ROWS]                    F32  running max
-    //   l_smem : [ROWS]                    F32  running denom
-    //   k_col  : [WARPS][HEAD_DIM]         F32  tile columns' K (RoPE'd, logical)
-    //   v_col  : [WARPS][HEAD_DIM]         F32  tile columns' V
-    constexpr int ROWS = GLUE_G_TILE * 8;          // upper bound (hpg<=8)
+    // ── Flash-state lives in REGISTERS, not smem ─────────────────────────
+    // A row is owned by a whole warp (all 32 lanes; lane `l` owns head dims
+    // [l*VEC, l*VEC+VEC)). Warp `w` owns rows {w, w+WARPS, w+2*WARPS, …}, i.e.
+    // ROWS_PER_WARP = ROWS/WARPS = GLUE_G_TILE rows. Keeping Q + the online-
+    // softmax accumulator (O, m, l) per-lane in registers — rather than in
+    // smem like the decode/prefill never do for O — drops the per-column smem
+    // read-modify-write and shrinks dynamic smem to just the column staging,
+    // which is what frees occupancy (the kernel's real bottleneck).
+    // ROWS = GLUE_G_TILE*8 rows max (hpg<=8), split WARPS_PER_BLOCK ways.
+    constexpr int ROWS_PER_WARP = GLUE_G_TILE;     // = (GLUE_G_TILE*8) / WARPS
     constexpr int TILE_COLS = WARPS_PER_BLOCK;     // one column per warp per tile
+    // Dynamic smem: only the current tile's dequanted columns (logical order).
+    //   k_col : [TILE_COLS][HEAD_DIM] F32
+    //   v_col : [TILE_COLS][HEAD_DIM] F32
     extern __shared__ float glue_smem[];
-    float* q_smem = glue_smem;                          // ROWS*HEAD_DIM
-    float* o_smem = q_smem + ROWS * HEAD_DIM;           // ROWS*HEAD_DIM
-    float* m_smem = o_smem + ROWS * HEAD_DIM;           // ROWS
-    float* l_smem = m_smem + ROWS;                      // ROWS
-    float* k_col = l_smem + ROWS;                       // TILE_COLS*HEAD_DIM
-    float* v_col = k_col + TILE_COLS * HEAD_DIM;        // TILE_COLS*HEAD_DIM
+    float* k_col = glue_smem;                       // TILE_COLS*HEAD_DIM
+    float* v_col = k_col + TILE_COLS * HEAD_DIM;    // TILE_COLS*HEAD_DIM
+
+    // Per-lane register flash-state for this warp's rows.
+    float q_reg[ROWS_PER_WARP][VEC];
+    float o_reg[ROWS_PER_WARP][VEC];
+    float m_reg[ROWS_PER_WARP];
+    float l_reg[ROWS_PER_WARP];
 
     // ── New-token (glue) K/V scatter — one warp per glue token, mirroring the
     // decode kernel's fused scatter. Each glue token is written un-rotated into
@@ -164,44 +171,35 @@ __global__ void paged_glue_kernel(
         const int g_tile = min(GLUE_G_TILE, g_total - g0);
         const int n_rows = g_tile * hpg; // (token, head) rows in this tile
 
-        // ── Stage RoPE'd Q for every (token, head) row into smem; zero the
-        // flash-state. ──
-        for (int row = tid; row < n_rows; row += n_warps * 32) {
-            // unused at this granularity; per-element below
-        }
-        for (int idx = tid; idx < n_rows * HEAD_DIM; idx += n_warps * 32) {
-            const int row = idx / HEAD_DIM;
-            const int d = idx % HEAD_DIM;
+        // ── Load this warp's rows' Q into registers, RoPE'd at each glue token's
+        // true position; zero the register flash-state. Each lane holds VEC head
+        // dims of each of its ROWS_PER_WARP rows. No sync — registers are
+        // per-thread (the glue-scatter sync already ordered the writeback). ──
+        #pragma unroll
+        for (int rl = 0; rl < ROWS_PER_WARP; ++rl) {
+            const int row = warp + rl * n_warps;
+            m_reg[rl] = -1e38f;
+            l_reg[rl] = 0.f;
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) o_reg[rl][j] = 0.f;
+            if (row >= n_rows) {
+                #pragma unroll
+                for (int j = 0; j < VEC; ++j) q_reg[rl][j] = 0.f;
+                continue;
+            }
             const int t = g0 + row / hpg;
             const int h = row % hpg;
             const int q_head = head_base + h;
+            const int true_pos = (int)col_actual_pos[kv_base + prefix_len + t];
             const int64_t qb =
                 ((int64_t)(q_start + t) * (int64_t)n_q_head + (int64_t)q_head) * (int64_t)HEAD_DIM;
-            q_smem[row * HEAD_DIM + d] = to_f32<Q_T>(q[qb + d]);
-            o_smem[row * HEAD_DIM + d] = 0.f;
-        }
-        for (int row = tid; row < n_rows; row += n_warps * 32) {
-            m_smem[row] = -1e38f;
-            l_smem[row] = 0.f;
-        }
-        __syncthreads();
-
-        // RoPE Q in place (each (token,head) row rotated at the glue token's true
-        // position). One warp per row, lanes own dims.
-        for (int row = warp; row < n_rows; row += n_warps) {
-            const int t = g0 + row / hpg;
-            const int true_pos = (int)col_actual_pos[kv_base + prefix_len + t];
-            float qr[VEC];
             #pragma unroll
-            for (int j = 0; j < VEC; ++j) qr[j] = q_smem[row * HEAD_DIM + lane * VEC + j];
+            for (int j = 0; j < VEC; ++j) q_reg[rl][j] = to_f32<Q_T>(q[qb + lane * VEC + j]);
             if (rope_interleaved)
-                apply_rope_interleaved_f32<VEC, HEAD_DIM>(qr, lane, true_pos, rope_cs);
+                apply_rope_interleaved_f32<VEC, HEAD_DIM>(q_reg[rl], lane, true_pos, rope_cs);
             else
-                apply_rope_rotary_f32<VEC, HEAD_DIM>(qr, lane, true_pos, rope_cs);
-            #pragma unroll
-            for (int j = 0; j < VEC; ++j) q_smem[row * HEAD_DIM + lane * VEC + j] = qr[j];
+                apply_rope_rotary_f32<VEC, HEAD_DIM>(q_reg[rl], lane, true_pos, rope_cs);
         }
-        __syncthreads();
 
         // ── Stream every column [0, kv_len) in TILES of WARPS columns, packed
         // order via the slot's position_map. This covers the sealed prefix AND
@@ -275,67 +273,63 @@ __global__ void paged_glue_kernel(
 
             const int tile_cols = min(TILE_COLS, kv_len - c0);
 
-            // Score the tile's columns against this warp's rows. One warp per
-            // row; lanes own VEC dims, warp-reduce per (row,column) dot.
-            for (int row = warp; row < n_rows; row += n_warps) {
+            // Score the tile's columns against this warp's rows, accumulating the
+            // online-softmax state in registers. `m_reg`/`l_reg` stay
+            // warp-uniform (the dot is reduced across lanes), so no per-lane
+            // divergence and no smem round-trip.
+            #pragma unroll
+            for (int rl = 0; rl < ROWS_PER_WARP; ++rl) {
+                const int row = warp + rl * n_warps;
+                if (row >= n_rows) continue;
                 const int t = g0 + row / hpg;
                 const int row_pos = (int)col_actual_pos[kv_base + prefix_len + t];
-                float m_cur = m_smem[row];
-                float l_cur = l_smem[row];
                 for (int cc = 0; cc < tile_cols; ++cc) {
                     const int cpos = (int)col_actual_pos[kv_base + c0 + cc];
                     if (cpos > row_pos) continue; // causal (actual position)
                     float dot = 0.f;
                     #pragma unroll
                     for (int j = 0; j < VEC; ++j)
-                        dot += q_smem[row * HEAD_DIM + lane * VEC + j]
-                             * k_col[cc * HEAD_DIM + lane * VEC + j];
+                        dot += q_reg[rl][j] * k_col[cc * HEAD_DIM + lane * VEC + j];
                     #pragma unroll
                     for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
                     const float score = dot * softmax_scale;
 
-                    const float m_new = fmaxf(m_cur, score);
+                    const float m_new = fmaxf(m_reg[rl], score);
                     const float alpha = fast_exp::exp2<float, fast_exp::Softmax>(
-                        make_float2(m_cur - m_new, 0.f)).x;
+                        make_float2(m_reg[rl] - m_new, 0.f)).x;
                     const float beta = fast_exp::exp2<float, fast_exp::Softmax>(
                         make_float2(score - m_new, 0.f)).x;
                     #pragma unroll
-                    for (int j = 0; j < VEC; ++j) {
-                        const int d = lane * VEC + j;
-                        o_smem[row * HEAD_DIM + d] =
-                            o_smem[row * HEAD_DIM + d] * alpha + beta * v_col[cc * HEAD_DIM + d];
-                    }
-                    m_cur = m_new;
-                    l_cur = l_cur * alpha + beta;
-                }
-                if (lane == 0) {
-                    m_smem[row] = m_cur;
-                    l_smem[row] = l_cur;
+                    for (int j = 0; j < VEC; ++j)
+                        o_reg[rl][j] = o_reg[rl][j] * alpha + beta * v_col[cc * HEAD_DIM + lane * VEC + j];
+                    m_reg[rl] = m_new;
+                    l_reg[rl] = l_reg[rl] * alpha + beta;
                 }
             }
             __syncthreads(); // before the next tile overwrites k_col/v_col
         }
 
-        // ── Normalize + write out for this tile's rows. ──
-        for (int row = warp; row < n_rows; row += n_warps) {
+        // ── Normalize (register O / register l) + write out this warp's rows. ──
+        #pragma unroll
+        for (int rl = 0; rl < ROWS_PER_WARP; ++rl) {
+            const int row = warp + rl * n_warps;
+            if (row >= n_rows) continue;
             const int t = g0 + row / hpg;
             const int h = row % hpg;
             const int q_head = head_base + h;
-            const float inv = __fdividef(1.f, fmaxf(l_smem[row], 1e-10f));
+            const float inv = __fdividef(1.f, fmaxf(l_reg[rl], 1e-10f));
             const int64_t ob =
                 ((int64_t)(q_start + t) * (int64_t)n_q_head + (int64_t)q_head) * (int64_t)HEAD_DIM;
             #pragma unroll
-            for (int j = 0; j < VEC; ++j) {
-                const int d = lane * VEC + j;
-                out[ob + d] = from_f32<O>(o_smem[row * HEAD_DIM + d] * inv);
-            }
+            for (int j = 0; j < VEC; ++j)
+                out[ob + lane * VEC + j] = from_f32<O>(o_reg[rl][j] * inv);
         }
-        __syncthreads();
     }
 }
 
-// Host launcher. One block per (slot, kv_head); dynamic smem holds the
-// GLUE_G_TILE x hpg flash-state. HEAD_DIM=128 is the production path.
+// Host launcher. One block per (slot, kv_head, glue_tile); the flash-state is
+// register-resident, so dynamic smem is just the tile's dequanted K/V columns.
+// HEAD_DIM=128 is the production path.
 template <typename Q_T, typename T, typename O, int HEAD_DIM>
 inline void launch_paged_glue_attn(
     const Q_T* q,
@@ -360,10 +354,10 @@ inline void launch_paged_glue_attn(
     cudaStream_t stream
 ) {
     constexpr int WARPS_PER_BLOCK = 8;
-    constexpr int ROWS = GLUE_G_TILE * 8;
     constexpr int TILE_COLS = WARPS_PER_BLOCK;
-    const size_t smem_bytes =
-        (size_t)(2 * ROWS * HEAD_DIM + 2 * ROWS + 2 * TILE_COLS * HEAD_DIM) * sizeof(float);
+    // Flash-state is register-resident now; dynamic smem is only the tile's
+    // dequanted columns (k_col + v_col). Independent of GLUE_G_TILE.
+    const size_t smem_bytes = (size_t)(2 * TILE_COLS * HEAD_DIM) * sizeof(float);
 
     auto kern = paged_glue_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK>;
     int dev = 0;
