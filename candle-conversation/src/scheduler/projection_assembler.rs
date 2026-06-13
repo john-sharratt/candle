@@ -28,7 +28,6 @@ use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel,
 };
-use candle_transformers::models::batched_layer::GapFillDescriptor;
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
@@ -132,7 +131,9 @@ pub(super) struct GapFillPlan {
     /// The new region: every glue island's tokens, in logical order.
     pub glue_tokens: Vec<u32>,
     /// Flat (kv_len) TRUE sequence position of each column (sealed prefix ++
-    /// glue), driving the gap-fill mask + RoPE.
+    /// glue). Computed by the wave; staged on the session by
+    /// [`fire_gap_fill_batch`] and consumed by the paged-glue kernel's
+    /// actual-position mask + RoPE.
     pub col_actual_pos: Vec<u32>,
     /// The in-flight user message, prefilled in `apply_segments_finish` after
     /// the gap-fill so it lands against the full `[sealed | glue]` prefix.
@@ -580,20 +581,22 @@ pub(super) fn fire_gap_fill_batch(
     if active.is_empty() {
         return Ok(());
     }
-    let mut flat_col: Vec<u32> = Vec::new();
     let mut ids: Vec<usize> = Vec::with_capacity(active.len());
     let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
+    let mut glue_cols: Vec<Vec<u32>> = Vec::with_capacity(active.len());
     for p in &active {
-        flat_col.extend_from_slice(&p.col_actual_pos);
         ids.push(p.parent_id.0);
         let input = Tensor::new(p.glue_tokens.as_slice(), device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         inputs.push(input);
+        glue_cols.push(p.col_actual_pos.clone());
     }
-    session.set_gap_fill(GapFillDescriptor {
-        col_actual_pos: Arc::new(flat_col),
-    });
+    // Stage each slot's TRUE column positions (sealed prefix ++ glue), aligned
+    // with `ids`. The forward routes the HD128 glue to the paged-glue kernel,
+    // which streams the quantized prefix once (dequant-once) and masks every
+    // glue island by logical position via `col_actual_pos`.
+    session.set_pending_glue(glue_cols);
     // Clear the per-op pipeline profile so the snapshot below covers only this
     // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
     #[cfg(feature = "profile")]

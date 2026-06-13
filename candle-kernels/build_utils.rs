@@ -115,8 +115,8 @@ const QUANTIZED_KERNELS: [&str; 42] = [
     "src/quantized/impl/q_awq_g64_f32.cu",
 ];
 
-// Flash-attention kernels: 10 total
-const FLASH_KERNELS: [&str; 10] = [
+// Flash-attention kernels: 12 total
+const FLASH_KERNELS: [&str; 12] = [
     // Batched sampling (1 api + 4 variants)
     "src/sampling/batched_sampling_api.cu",
     "src/sampling/batched_sampling_f32.cu",
@@ -130,6 +130,9 @@ const FLASH_KERNELS: [&str; 10] = [
     "src/paged-prefill/paged_prefill_api.cu",
     "src/paged-prefill/paged_prefill_api_fp16.cu",
     "src/paged-prefill/paged_prefill_api_bf16.cu",
+    // Paged glue: reprojection glue forward (decode-derivative; fp16, bf16)
+    "src/paged-glue/paged_glue_api_fp16.cu",
+    "src/paged-glue/paged_glue_api_bf16.cu",
 ];
 
 // ============================================================================
@@ -314,6 +317,22 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
             kernels: decode_kernels,
             compile_args: decode_args.clone(),
             include_dirs: flash_includes.clone(),
+        });
+    }
+
+    // 6. Paged glue kernels (decode-derivative — shares the decode device
+    //    helpers and the same compile flags).
+    {
+        let glue_kernels: Vec<String> = FLASH_KERNELS
+            .iter()
+            .filter(|k| k.contains("paged-glue") || k.contains("paged_glue"))
+            .map(|s| s.to_string())
+            .collect();
+        groups.push(ArchiveGroup {
+            name: "paged_glue".to_string(),
+            kernels: glue_kernels,
+            compile_args: decode_args,
+            include_dirs: flash_includes,
         });
     }
 

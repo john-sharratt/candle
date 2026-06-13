@@ -23,11 +23,6 @@ extern "C" void run_paged_prefill_chunks_fp16(
     const float* rope_cs,
     int32_t rope_interleaved,
     const uint32_t* write_offset_shifts,
-    int gap_fill,
-    const uint32_t* col_actual_pos,
-    const uint32_t* cu_kvlens,
-    const uint32_t* glue_write_slice,
-    const uint32_t* glue_write_in_blk,
     cudaStream_t stream
 ) {
     #define LAUNCH_FP16(HD, WARPS, TILE) \
@@ -35,8 +30,7 @@ extern "C" void run_paged_prefill_chunks_fp16(
             q_ptr, k_ptr, v_ptr, headers_ptr, \
             cu_seqlens_q, q_lens, kv_lens, o_ptr, total_q, batch_size, \
             n_head, n_kv_head, max_blocks, softmax_scale, \
-            has_prefix, rope_offsets, rope_cs, rope_interleaved, write_offset_shifts, stream, \
-            (bool)gap_fill, col_actual_pos, cu_kvlens, glue_write_slice, glue_write_in_blk)
+            has_prefix, rope_offsets, rope_cs, rope_interleaved, write_offset_shifts, stream)
     switch (head_dim) {
         case 64:  LAUNCH_FP16(64,  4, 32); break;
         case 96:  LAUNCH_FP16(96,  4, 32); break;

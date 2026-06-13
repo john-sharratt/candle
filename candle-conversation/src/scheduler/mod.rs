@@ -490,7 +490,13 @@ struct ReprojectInFlight {
     n_turns_selected: usize,
     plan: projection_assembler::GapFillPlan,
     build_ms: u64,
-    t_swap: Instant,
+    /// Wall-clock start of the whole reproject (set at the top of `prepare`);
+    /// drives `total_ms` reported at the end of `complete`.
+    t_repro: Instant,
+    /// Pure swap work in `prepare` (tail snapshot + free + truncate) — disjoint
+    /// from `elevate_ms`/`glue_ms`/`apply_ms`, unlike the old umbrella that
+    /// spanned the whole reproject and hid the glue wave inside it.
+    swap_ms: u64,
     probe_ms: u64,
     scan_ms: u64,
     project_ms: u64,
@@ -3767,6 +3773,11 @@ impl Scheduler {
         let probe_lo = view_offset - window; // inclusive
         let probe_hi = view_offset; // exclusive
 
+        // Wall-clock start of the whole reproject — drives `total_ms` so the log
+        // reports the real end-to-end cost, not a sum of (partly overlapping)
+        // phase fields.
+        let t_repro = Instant::now();
+
         // 2. Gather live Q from a NARROW block range covering only the probe window.
         //    The fast path (CUDA) launches one kernel per layer and does a single
         //    DtoH copy, replacing O(n_head Ã— N_PALETTE Ã— n_blocks) memcpy_dtov stalls.
@@ -4226,6 +4237,12 @@ impl Scheduler {
         if let Some(toks) = self.slot_tokens.get_mut(&parent_id) {
             toks.clear();
         }
+        // The pure swap work (tail snapshot + free + truncate) ends here —
+        // captured disjoint from elevate/glue/complete so `swap_ms` reflects
+        // only the chunk-pool rebalance, not the whole reproject.
+        let swap_ms = t_swap.elapsed().as_millis() as u64;
+        record_phase(t_swap, "reproject_swap");
+
         // Select-promote (cold → warm → hot) the new working set
         // before re-applying. Same shape as the SubmitTurn path: a
         // single batched scatter per layer + per-item cold-recover
@@ -4312,7 +4329,8 @@ impl Scheduler {
             n_turns_selected,
             plan,
             build_ms,
-            t_swap,
+            t_repro,
+            swap_ms,
             probe_ms,
             scan_ms,
             project_ms,
@@ -4341,7 +4359,8 @@ impl Scheduler {
             n_turns_selected,
             plan,
             build_ms,
-            t_swap,
+            t_repro,
+            swap_ms,
             probe_ms,
             scan_ms,
             project_ms,
@@ -4428,8 +4447,11 @@ impl Scheduler {
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }
-        let swap_ms = t_swap.elapsed().as_millis() as u64;
-        record_phase(t_swap, "reproject_swap");
+        // True end-to-end wall-clock of the whole reproject (prepare → wave →
+        // complete), so the phase fields below — which are individually disjoint
+        // but separated by the shared glue wave — can be read against a real
+        // total instead of summed by eye.
+        let total_ms = t_repro.elapsed().as_millis() as u64;
 
         tracing::info!(
             target: "candle_conversation::scheduler::reproject",
@@ -4439,13 +4461,14 @@ impl Scheduler {
             tail_tokens = tail_token_count,
             parent_blocks_after = parent_block_count,
             new_borrowed = new_borrowed.0,
+            total_ms,
             probe_ms,
             scan_ms,
             project_ms,
             swap_ms,
             elevate_ms,
-            apply_ms,
             glue_ms,
+            apply_ms,
             inject_ms,
             view_ms,
             sections = sections_len,
