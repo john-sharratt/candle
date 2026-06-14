@@ -1,6 +1,9 @@
 use super::*;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 use rand::Rng;
+use half::bf16;
+use std::ffi::c_void;
+use std::time::Instant;
 
 #[test]
 fn cuda_quantize_q8_1() -> Result<()> {
@@ -2792,5 +2795,233 @@ fn kv_path_q0_m4_four_levels() -> Result<()> {
     assert_eq!(bytes[3] as i8,   95, "Q0_M4 c[3]=+0.75: expected INT8 95, got {}", bytes[3] as i8);
     let qmask = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     assert_eq!(qmask, 0xFA50_FA50, "Q0_M4 mask: expected 0xFA50FA50, got 0x{:08X}", qmask);
+    Ok(())
+}
+
+// =============================================================================
+// GROUPED EXPERT LAUNCH-COST PROBE (does N experts cost ~N launches?)
+// =============================================================================
+// The MoE pipeline dispatches all routed experts via a SINGLE run_quantized_matmul
+// call with num_segments = N_experts — but the dispatcher's segment loop issues
+// one cudaLaunchKernel PER expert. This probe measures per-call host time as N
+// grows, with M=1 token per expert (single-session decode). If time scales ~N,
+// the path is launch/host-bound and a single-launch grouped GEMM would cut it.
+//
+// All N segments point at the SAME weight (timing is pointer-independent), so
+// this isolates pure dispatch/launch cost. No per-iter sync — launches queue,
+// matching the real async path.
+//
+//   cargo test -p candle-core --release --features cuda --lib \
+//     quantized::test::expert_grouped_launch_cost -- --ignored --nocapture
+#[test]
+#[ignore = "GPU launch-cost probe; run with --ignored --nocapture"]
+fn expert_grouped_launch_cost() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let n = 768usize;
+    let k = 2048usize;
+
+    let mut rng = rand::rng();
+    let wvals: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+    let shape = Shape::from((n, k));
+    let mut xs = QCudaStorage::zeros(&dev, n * k, GgmlDType::Q4_K)?;
+    xs.quantize(&CudaStorage::wrap_cuda_slice(
+        dev.memcpy_stod(&wvals)?,
+        dev.clone(),
+    ))?;
+    let xs_repacked = xs.repack_gemx(&shape)?;
+    let qtype = dtype_to_qtype(GgmlDType::Q4_K)? as i32;
+    let m = 1usize; // tokens per expert (single-session decode)
+    let iters = 1000usize;
+
+    println!(
+        "\n=== Per-segment expert launch cost [n={n} k={k}] Q4_K, M={m}/expert, \
+         {iters} calls/sync (N launches via run_quantized_matmul) ===",
+    );
+    println!(
+        "{:>9} {:>12} {:>12}",
+        "N_experts", "us/call", "us/expert"
+    );
+
+    for &n_exp in &[1usize, 2, 4, 8, 16, 32] {
+        let total = n_exp * m;
+        let yvals: Vec<bf16> = (0..total * k)
+            .map(|_| bf16::from_f32(rng.random_range(-1.0f32..1.0)))
+            .collect();
+        let y = dev.memcpy_stod(&yvals)?;
+        let dst = unsafe { dev.alloc::<bf16>(total * n)? };
+
+        let stream = dev.cuda_stream();
+        let (wptr, _wg) = xs_repacked.data.inner.device_ptr(&stream);
+        let (yptr, _yg) = y.device_ptr(&stream);
+        let (dptr, _dg) = dst.device_ptr(&stream);
+
+        // One segment per expert, all pointing at the same weight.
+        let segments: Vec<VxSegment> = (0..n_exp)
+            .map(|_| VxSegment {
+                weights: wptr as *const c_void,
+                batch_count: m as i32,
+            })
+            .collect();
+
+        let call = || unsafe {
+            run_quantized_matmul(
+                segments.as_ptr(),
+                n_exp as i32,
+                yptr as *const c_void,
+                dptr as *mut c_void,
+                k as i32,
+                n as i32,
+                k as i32,
+                n as i32,
+                qtype,
+                YType::BF16 as i32,
+                0, // weight_bytes=0 → L2-cached assumption (matches grouped_matmul_gemx)
+            );
+        };
+
+        for _ in 0..100 {
+            call();
+        }
+        dev.synchronize()?;
+
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                call();
+            }
+            dev.synchronize()?;
+            best = best.min(t0.elapsed().as_secs_f64() / iters as f64);
+        }
+        println!(
+            "{:>9} {:>12.3} {:>12.3}",
+            n_exp,
+            best * 1e6,
+            best * 1e6 / n_exp as f64,
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
+// GROUPED SINGLE-LAUNCH COST (run_grouped_quantized_matmul: N experts, 1 launch)
+// =============================================================================
+// A/B partner for expert_grouped_launch_cost: same N-expert / M=1 sweep, but
+// all experts run in ONE grouped kernel launch instead of N. Compare us/call
+// directly against the per-segment probe to measure the launch+occupancy win.
+//
+//   cargo test -p candle-core --release --features cuda --lib \
+//     quantized::test::expert_grouped_single_launch_cost -- --ignored --nocapture
+#[test]
+#[ignore = "GPU launch-cost probe; run with --ignored --nocapture"]
+fn expert_grouped_single_launch_cost() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let n = 768usize;
+    let k = 2048usize;
+
+    let mut rng = rand::rng();
+    let wvals: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+    let shape = Shape::from((n, k));
+    let mut xs = QCudaStorage::zeros(&dev, n * k, GgmlDType::Q4_K)?;
+    xs.quantize(&CudaStorage::wrap_cuda_slice(
+        dev.memcpy_stod(&wvals)?,
+        dev.clone(),
+    ))?;
+    let xs_repacked = xs.repack_gemx(&shape)?;
+    let qtype = dtype_to_qtype(GgmlDType::Q4_K)? as i32;
+    let m = 1usize;
+    let iters = 1000usize;
+
+    println!(
+        "\n=== Grouped expert SINGLE-LAUNCH cost [n={n} k={k}] Q4_K, M={m}/expert, \
+         {iters} calls/sync ===",
+    );
+    println!("{:>9} {:>12} {:>12}", "N_experts", "us/call", "us/expert");
+
+    let stream = dev.cuda_stream();
+    let (wptr0, _wg0) = xs_repacked.data.inner.device_ptr(&stream);
+
+    for &n_exp in &[1usize, 2, 4, 8, 16, 32] {
+        let total = n_exp * m;
+        let yvals: Vec<bf16> = (0..total * k)
+            .map(|_| bf16::from_f32(rng.random_range(-1.0f32..1.0)))
+            .collect();
+        let y = dev.memcpy_stod(&yvals)?;
+        let dst = unsafe { dev.alloc::<bf16>(total * n)? };
+
+        // One tile per expert (M=1 <= 16). All experts share the same weight ptr.
+        let weight_ptrs: Vec<u64> = vec![wptr0 as u64; n_exp];
+        let tile_expert: Vec<i32> = (0..n_exp as i32).collect();
+        let tile_b_start: Vec<i32> = (0..n_exp as i32).map(|e| e * m as i32).collect();
+        let tile_b_cnt: Vec<i32> = vec![m as i32; n_exp];
+        let num_tiles = n_exp as i32;
+        let (yptr, _yg) = y.device_ptr(&stream);
+        let (dptr, _dg) = dst.device_ptr(&stream);
+
+        // Honest end-to-end cost: PACK weight_ptrs + all 3 tile tables into ONE
+        // buffer and upload with a SINGLE memcpy_stod per call (vs 4 separate
+        // copies), then the single grouped launch. weight_ptrs (u64, 8-aligned)
+        // first, then the three i32 tables — base + offsets feed the kernel.
+        let off_te = n_exp * 8; // bytes: weight_ptrs = n_exp × u64
+        let off_tbs = off_te + num_tiles as usize * 4;
+        let off_tbc = off_tbs + num_tiles as usize * 4;
+        let total_bytes = off_tbc + num_tiles as usize * 4;
+        let once = || -> Result<()> {
+            let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+            for &w in &weight_ptrs {
+                packed.extend_from_slice(&w.to_le_bytes());
+            }
+            for &x in &tile_expert {
+                packed.extend_from_slice(&x.to_le_bytes());
+            }
+            for &x in &tile_b_start {
+                packed.extend_from_slice(&x.to_le_bytes());
+            }
+            for &x in &tile_b_cnt {
+                packed.extend_from_slice(&x.to_le_bytes());
+            }
+            let dev_buf = dev.memcpy_stod(&packed)?;
+            let (base, _g) = dev_buf.device_ptr(&stream);
+            unsafe {
+                run_grouped_quantized_matmul(
+                    base as *const c_void,
+                    (base + off_te as u64) as *const c_void,
+                    (base + off_tbs as u64) as *const c_void,
+                    (base + off_tbc as u64) as *const c_void,
+                    yptr as *const c_void,
+                    dptr as *mut c_void,
+                    k as i32,
+                    n as i32,
+                    k as i32,
+                    n as i32,
+                    num_tiles,
+                    qtype,
+                    YType::BF16 as i32,
+                );
+            }
+            Ok(())
+        };
+
+        for _ in 0..100 {
+            once()?;
+        }
+        dev.synchronize()?;
+
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                once()?;
+            }
+            dev.synchronize()?;
+            best = best.min(t0.elapsed().as_secs_f64() / iters as f64);
+        }
+        println!(
+            "{:>9} {:>12.3} {:>12.3}",
+            n_exp,
+            best * 1e6,
+            best * 1e6 / n_exp as f64,
+        );
+    }
     Ok(())
 }

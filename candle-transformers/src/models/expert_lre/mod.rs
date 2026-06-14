@@ -149,6 +149,8 @@ mod compute;
 #[cfg(test)]
 mod eval;
 mod handle;
+#[cfg(all(test, feature = "cuda"))]
+mod matmul_baseline;
 mod pinned;
 mod pipeline;
 mod transition;
