@@ -933,6 +933,10 @@ pub(crate) struct Scheduler {
     /// all slots append into this same mmap-backed file.
     provenance: Arc<ProvenanceFile>,
 
+    /// Reused across reprojections so the BDP score maps keep their allocated
+    /// capacity — `scan`/`scan_sections` clear and refill rather than realloc.
+    bdp_scanner: BdpScanner,
+
     /// Static model properties captured at engine construction.
     model_core: ModelCoreProperties,
 
@@ -1107,6 +1111,7 @@ impl Scheduler {
             slot_targets: HashMap::new(),
             slot_sig_blocks_processed: HashMap::new(),
             provenance,
+            bdp_scanner: BdpScanner::new(),
             model_core,
             turn_views: HashMap::new(),
             pending_reprojections: Vec::new(),
@@ -3988,15 +3993,17 @@ impl Scheduler {
             }
         }
 
-        let mut scanner = BdpScanner::new().with_span_alpha(policy.span_alpha);
-        scanner.scan(
+        // Reuse the persistent scanner so its score maps keep their capacity
+        // across reprojections (the scan clears and refills them).
+        self.bdp_scanner.set_span_alpha(policy.span_alpha);
+        self.bdp_scanner.scan(
             &policy.provenance,
             &probe_syn,
             &probe_sem,
             &probe_prag,
             &turn_corpus,
         )?;
-        scanner.scan_sections(
+        self.bdp_scanner.scan_sections(
             &policy.provenance,
             &probe_syn,
             &probe_sem,
@@ -4006,9 +4013,9 @@ impl Scheduler {
 
         // Build a transient per-projection scores cache from the scanner
         // output. This lives on the stack for the duration of the
-        // re-projection; it is never stored in the substrate (Â§Phase-3
-        // BDP: scores are projection-local, not session-persistent).
-        let projection_scores = scanner.to_projection_scores();
+        // re-projection; it is never stored in the substrate (scores are
+        // projection-local, not session-persistent).
+        let projection_scores = self.bdp_scanner.to_projection_scores();
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_bdp_scan");
 

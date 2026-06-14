@@ -9,7 +9,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use memmap2::Mmap;
 use tempfile::tempfile;
@@ -102,6 +102,12 @@ impl SigEntry {
 struct State {
     file: File,
     write_pos: u64,
+    /// Cached read-only mapping, reused across scans so the page table and the
+    /// OS readahead stay warm. Invalidated (set to `None`) on `append`, the only
+    /// operation that grows the file — the next scan re-maps to cover new bytes.
+    /// An in-flight scan keeps its own `Arc` clone alive, so invalidation here is
+    /// safe even mid-scan (the old mapping covers the older, unchanged prefix).
+    mmap: Option<Arc<Mmap>>,
 }
 
 /// Single mmap-backed file that stores all provenance signatures for all
@@ -131,7 +137,11 @@ impl ProvenanceFile {
     pub fn new() -> crate::Result<Self> {
         let file = tempfile()?;
         Ok(Self {
-            state: Mutex::new(State { file, write_pos: 0 }),
+            state: Mutex::new(State {
+                file,
+                write_pos: 0,
+                mmap: None,
+            }),
         })
     }
 
@@ -150,7 +160,11 @@ impl ProvenanceFile {
             .open(path)?;
         let write_pos = file.metadata()?.len();
         Ok(Self {
-            state: Mutex::new(State { file, write_pos }),
+            state: Mutex::new(State {
+                file,
+                write_pos,
+                mmap: None,
+            }),
         })
     }
 
@@ -195,6 +209,11 @@ impl ProvenanceFile {
 
         let mut state = self.state.lock().unwrap();
         let byte_offset = state.write_pos;
+
+        // Drop the cached mapping before extending the file: the next scan
+        // re-maps to cover the new bytes (and on Windows an active mapping can
+        // block the file from growing). An in-flight scan holds its own Arc.
+        state.mmap = None;
 
         use std::io::Seek;
         state.file.seek(std::io::SeekFrom::Start(byte_offset))?;
@@ -254,25 +273,36 @@ impl ProvenanceFile {
         })
     }
 
-    /// Map the file read-only and hand the byte slice to `f`.  Releases the
-    /// write lock immediately after mapping so concurrent appends are not
-    /// blocked while `f` runs.  The mmap is dropped automatically when `f`
-    /// returns.
-    pub fn with_mmap<F, R>(&self, f: F) -> crate::Result<R>
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        let mmap = {
-            let state = self.state.lock().unwrap();
-            // SAFETY: the file is valid; we're creating a read-only mapping.
-            unsafe { Mmap::map(&state.file)? }
-        };
-        // MADV_SEQUENTIAL biases the OS prefetcher for our offset-sorted
-        // scan walk.  Unix-only; on Windows the OS handles read-ahead heuristically.
+    /// Return the cached read-only mapping, creating it on first use (or after
+    /// an `append` invalidated it). Holds the state lock only long enough to
+    /// clone the `Arc`, so a scan never blocks an append for its full duration,
+    /// and reusing the mapping keeps its pages warm across scans.
+    fn mapped(&self) -> crate::Result<Arc<Mmap>> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(m) = &state.mmap {
+            return Ok(Arc::clone(m));
+        }
+        // SAFETY: the file is valid; we're creating a read-only mapping.
+        let mmap = unsafe { Mmap::map(&state.file)? };
+        // MADV_SEQUENTIAL biases the OS prefetcher for our offset-sorted scan
+        // walk. Unix-only; Windows handles read-ahead heuristically.
         #[cfg(unix)]
         {
             let _ = mmap.advise(memmap2::Advice::Sequential);
         }
+        let arc = Arc::new(mmap);
+        state.mmap = Some(Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Map the file read-only and hand the byte slice to `f`. Uses the cached
+    /// mapping (see [`Self::mapped`]); the lock is released before `f` runs so
+    /// concurrent appends are not blocked while `f` scans.
+    pub fn with_mmap<F, R>(&self, f: F) -> crate::Result<R>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let mmap = self.mapped()?;
         Ok(f(&mmap[..]))
     }
 
@@ -296,13 +326,9 @@ impl ProvenanceFile {
             return Ok(Vec::new());
         }
 
-        // Map the file read-only and immediately release the write lock so
-        // concurrent appends are not blocked by the scan.
-        let mmap = {
-            let state = self.state.lock().unwrap();
-            // SAFETY: the file is valid; we're creating a read-only mapping.
-            unsafe { Mmap::map(&state.file)? }
-        };
+        // Reuse the cached read-only mapping (warm pages across scans); the
+        // lock is released before the scan loop so appends are not blocked.
+        let mmap = self.mapped()?;
 
         let mut ranks: Vec<TurnChunkRank> = Vec::new();
 
