@@ -140,9 +140,8 @@ impl SubstrateFixture {
             return Err(FixtureError::MissingSubstrate(substrate_dir));
         }
         let manifest_path = root.join("manifest.yaml");
-        let bytes = std::fs::read(&manifest_path).map_err(|e| {
-            FixtureError::ManifestRead(manifest_path.clone(), e.to_string())
-        })?;
+        let bytes = std::fs::read(&manifest_path)
+            .map_err(|e| FixtureError::ManifestRead(manifest_path.clone(), e.to_string()))?;
         let manifest: FixtureManifest = serde_yaml::from_slice(&bytes)
             .map_err(|e| FixtureError::ManifestParse(manifest_path, e.to_string()))?;
         if manifest.schema_version != 1 {
@@ -235,10 +234,7 @@ mod tests {
         assert_eq!(fixture.manifest().debug_id, "coherent-50");
         assert_eq!(fixture.manifest().n_turns_normal, 50);
         assert_eq!(fixture.manifest().plants.len(), 1);
-        assert_eq!(
-            fixture.manifest().plants[0].fact,
-            "The password is rosebud"
-        );
+        assert_eq!(fixture.manifest().plants[0].fact, "The password is rosebud");
         assert!(fixture.manifest().expected.avl_balanced);
     }
 

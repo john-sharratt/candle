@@ -4,10 +4,7 @@ use serde_json::json;
 
 #[test]
 fn remote_fs_session_not_sftp() {
-    let resp = harness::invoke(
-        "remote_fs_session_open",
-        json!({"uri": "ftp://host/path"}),
-    );
+    let resp = harness::invoke("remote_fs_session_open", json!({"uri": "ftp://host/path"}));
     harness::expect_error(&resp, "not_supported");
 }
 
@@ -37,10 +34,7 @@ fn remote_fs_session_close_noop() {
 
 #[test]
 fn remote_fs_session_nfs_not_supported() {
-    let resp = harness::invoke(
-        "remote_fs_session_open",
-        json!({"uri": "nfs://host/path"}),
-    );
+    let resp = harness::invoke("remote_fs_session_open", json!({"uri": "nfs://host/path"}));
     harness::expect_error(&resp, "not_supported");
 }
 

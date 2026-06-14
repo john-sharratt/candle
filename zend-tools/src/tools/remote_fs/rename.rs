@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::RemoteFsError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RenameRequest {
@@ -56,5 +56,4 @@ impl Tool for RemoteFsSessionRename {
     }
 }
 
-pub const REMOTE_FS_SESSION_RENAME: RegisteredTool =
-    RegisteredTool::new::<RemoteFsSessionRename>();
+pub const REMOTE_FS_SESSION_RENAME: RegisteredTool = RegisteredTool::new::<RemoteFsSessionRename>();

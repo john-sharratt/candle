@@ -66,10 +66,14 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
     Some(match u.as_str() {
         // Length (base: meter)
         "m" | "meter" | "meters" | "metre" | "metres" => (Dimension::Length, 1.0, 0.0),
-        "km" | "kilometer" | "kilometers" | "kilometre" | "kilometres" => (Dimension::Length, 1000.0, 0.0),
+        "km" | "kilometer" | "kilometers" | "kilometre" | "kilometres" => {
+            (Dimension::Length, 1000.0, 0.0)
+        }
         "cm" | "centimeter" | "centimeters" => (Dimension::Length, 0.01, 0.0),
         "mm" | "millimeter" | "millimeters" => (Dimension::Length, 0.001, 0.0),
-        "um" | "micrometer" | "micrometers" | "micron" | "microns" => (Dimension::Length, 1e-6, 0.0),
+        "um" | "micrometer" | "micrometers" | "micron" | "microns" => {
+            (Dimension::Length, 1e-6, 0.0)
+        }
         "nm" | "nanometer" | "nanometers" => (Dimension::Length, 1e-9, 0.0),
         "in" | "inch" | "inches" => (Dimension::Length, 0.0254, 0.0),
         "ft" | "foot" | "feet" => (Dimension::Length, 0.3048, 0.0),
@@ -113,8 +117,8 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
         // base: Kelvin
         "k" | "kelvin" => (Dimension::Temperature, 1.0, 0.0),
         "c" | "celsius" | "degc" | "°c" => (Dimension::Temperature, 1.0, 273.15),
-        "f" | "fahrenheit" | "degf" | "°f" => (Dimension::Temperature, 5.0/9.0, 255.372222),
-        "r" | "rankine" => (Dimension::Temperature, 5.0/9.0, 0.0),
+        "f" | "fahrenheit" | "degf" | "°f" => (Dimension::Temperature, 5.0 / 9.0, 255.372222),
+        "r" | "rankine" => (Dimension::Temperature, 5.0 / 9.0, 0.0),
 
         // Time (base: second)
         "s" | "sec" | "second" | "seconds" => (Dimension::Time, 1.0, 0.0),
@@ -126,7 +130,7 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
         "d" | "day" | "days" => (Dimension::Time, 86400.0, 0.0),
         "wk" | "week" | "weeks" => (Dimension::Time, 604800.0, 0.0),
         "mo" | "month" | "months" => (Dimension::Time, 2629800.0, 0.0), // avg
-        "yr" | "year" | "years" => (Dimension::Time, 31557600.0, 0.0), // Julian
+        "yr" | "year" | "years" => (Dimension::Time, 31557600.0, 0.0),  // Julian
 
         // Data (base: byte)
         "b" | "byte" | "bytes" => (Dimension::Data, 1.0, 0.0),
@@ -148,7 +152,13 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
     })
 }
 
-fn convert_temp(value: f64, from_factor: f64, from_offset: f64, to_factor: f64, to_offset: f64) -> f64 {
+fn convert_temp(
+    value: f64,
+    from_factor: f64,
+    from_offset: f64,
+    to_factor: f64,
+    to_offset: f64,
+) -> f64 {
     // from -> kelvin -> to
     let kelvin = value * from_factor + from_offset;
     (kelvin - to_offset) / to_factor
@@ -173,13 +183,16 @@ impl Tool for UnitConvertTool {
     type Error = UnitError;
 
     fn run(_ctx: &ToolContext, req: Request) -> Result<Response, UnitError> {
-        let (from_dim, from_factor, from_offset) = lookup_unit(&req.from)
-            .ok_or_else(|| UnitError::UnknownUnit(req.from.clone()))?;
-        let (to_dim, to_factor, to_offset) = lookup_unit(&req.to)
-            .ok_or_else(|| UnitError::UnknownUnit(req.to.clone()))?;
+        let (from_dim, from_factor, from_offset) =
+            lookup_unit(&req.from).ok_or_else(|| UnitError::UnknownUnit(req.from.clone()))?;
+        let (to_dim, to_factor, to_offset) =
+            lookup_unit(&req.to).ok_or_else(|| UnitError::UnknownUnit(req.to.clone()))?;
 
         if from_dim != to_dim {
-            return Err(UnitError::DimensionMismatch(req.from.clone(), req.to.clone()));
+            return Err(UnitError::DimensionMismatch(
+                req.from.clone(),
+                req.to.clone(),
+            ));
         }
 
         let result = if from_dim == Dimension::Temperature {

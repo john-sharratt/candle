@@ -212,7 +212,9 @@ pub(crate) fn startup_two_tier(
                                 pinned_count += 1;
                             }
                             None => {
-                                tracing::warn!("startup: pinned pool full at L{moe_idx}E{expert_idx}");
+                                tracing::warn!(
+                                    "startup: pinned pool full at L{moe_idx}E{expert_idx}"
+                                );
                                 errors += 1;
                             }
                         }
@@ -380,7 +382,9 @@ pub(crate) fn prewarm_expert_cache(
 
     tracing::info!(
         "prewarm: filling {} VRAM slots from {}×{} experts …",
-        total_slots, num_moe_layers, num_experts,
+        total_slots,
+        num_moe_layers,
+        num_experts,
     );
     let t0 = std::time::Instant::now();
     let mut loaded_count: usize = 0;

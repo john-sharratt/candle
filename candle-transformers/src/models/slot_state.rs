@@ -41,17 +41,24 @@ pub fn tensor_u8_device_ptr(_t: &Tensor) -> Result<u64> {
 ///
 /// Maps dim `d` → palette `d / (head_dim / N_PALETTE)`.  Each byte packs
 /// 4 dims in little-endian order: `(d3<<6)|(d2<<4)|(d1<<2)|d0`.
-fn build_identity_pal_map(head_dim: usize) -> Vec<u8> {
+/// Maximum bytes for an inline per-head palette map (`head_dim/4`). Sized for
+/// head_dim up to 256 so the palette lives inline in `KvHeadHost` rather than a
+/// heap `Vec` — the per-layer prefill builds ~54k of these per forward, so
+/// avoiding the allocation is ~80 ms of host CPU.
+const PAL_MAP_MAX_BYTES: usize = 64;
+
+/// Fill `pal` (zeroed, `head_dim/4` bytes) with the identity 2-bit palette map.
+///
+/// Maps dim `d` → palette `d / (head_dim / N_PALETTE)`.  Each byte packs
+/// 4 dims in little-endian order: `(d3<<6)|(d2<<4)|(d1<<2)|d0`.
+fn fill_identity_pal_map(pal: &mut [u8], head_dim: usize) {
     let sub_hd = head_dim / N_PALETTE;
-    let pal_bytes = head_dim / 4;
-    let mut pal = vec![0u8; pal_bytes];
     for d in 0..head_dim {
         let pal_idx = (d / sub_hd).min(N_PALETTE - 1) as u8;
         let byte_idx = d / 4;
         let bit_shift = (d % 4) * 2;
         pal[byte_idx] |= pal_idx << bit_shift;
     }
-    pal
 }
 
 // ---------------------------------------------------------------------------
@@ -73,10 +80,13 @@ fn build_identity_pal_map(head_dim: usize) -> Vec<u8> {
 /// ```
 #[derive(Clone)]
 pub struct KvHeadHost {
-    /// K palette map: 2 bits per dimension, packed into HEAD_DIM/4 bytes.
-    pub k_pal: Vec<u8>,
-    /// V palette map: 2 bits per dimension, packed into HEAD_DIM/4 bytes.
-    pub v_pal: Vec<u8>,
+    /// K palette map: 2 bits per dimension, packed into `head_dim/4` bytes.
+    /// Inline (no heap alloc) — only `[..pal_len]` is valid/serialized.
+    pub k_pal: [u8; PAL_MAP_MAX_BYTES],
+    /// V palette map: 2 bits per dimension, packed into `head_dim/4` bytes.
+    pub v_pal: [u8; PAL_MAP_MAX_BYTES],
+    /// Valid byte length of `k_pal`/`v_pal` (`head_dim/4`).
+    pub pal_len: u16,
     /// Pre-resolved K pointers (one per palette sub-arena), pointing to chunk start.
     pub k_ptr: [u64; N_PALETTE],
     /// Pre-resolved V pointers (one per palette sub-arena), pointing to chunk start.
@@ -120,7 +130,6 @@ impl KvHeadHost {
         k_scale_data: &[f32],
         v_scale_data: &[f32],
     ) -> Self {
-        let _pal_bytes = head_dim / N_PALETTE;
         let mut k_ptr = [0u64; N_PALETTE];
         let mut v_ptr = [0u64; N_PALETTE];
         let mut k_fmt = [0u8; N_PALETTE];
@@ -143,17 +152,26 @@ impl KvHeadHost {
             }
         }
 
-        // Palette maps: use provided data when non-empty, otherwise identity routing.
-        let k_pal = if k_pal_data.is_empty() {
-            build_identity_pal_map(head_dim)
+        // Palette maps: use provided data when non-empty, otherwise identity
+        // routing. Both live INLINE (no heap alloc) — the prefill builds ~54k of
+        // these per forward, and the heap churn was ~80 ms of host CPU.
+        let pal_bytes = head_dim / 4;
+        debug_assert!(
+            pal_bytes <= PAL_MAP_MAX_BYTES,
+            "head_dim {head_dim} => pal_bytes {pal_bytes} exceeds PAL_MAP_MAX_BYTES {PAL_MAP_MAX_BYTES}"
+        );
+        let mut k_pal = [0u8; PAL_MAP_MAX_BYTES];
+        let mut v_pal = [0u8; PAL_MAP_MAX_BYTES];
+        if k_pal_data.is_empty() {
+            fill_identity_pal_map(&mut k_pal[..pal_bytes], head_dim);
         } else {
-            k_pal_data.to_vec()
-        };
-        let v_pal = if v_pal_data.is_empty() {
-            build_identity_pal_map(head_dim)
+            k_pal[..pal_bytes].copy_from_slice(k_pal_data);
+        }
+        if v_pal_data.is_empty() {
+            fill_identity_pal_map(&mut v_pal[..pal_bytes], head_dim);
         } else {
-            v_pal_data.to_vec()
-        };
+            v_pal[..pal_bytes].copy_from_slice(v_pal_data);
+        }
 
         // Outer scales: copy from provided slice when long enough, otherwise
         // fall back to identity (1.0). Each side expects exactly N_PALETTE f32s.
@@ -169,6 +187,7 @@ impl KvHeadHost {
         Self {
             k_pal,
             v_pal,
+            pal_len: pal_bytes as u16,
             k_ptr,
             v_ptr,
             k_fmt,
@@ -180,17 +199,13 @@ impl KvHeadHost {
 
     /// Serialise this head into `buf` in the exact layout the CUDA kernel expects.
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
-        // Pal maps must be the same length (each is head_dim/4 bytes — bit-packed).
-        // If they ever differ, the byte layout shifts for every subsequent field
-        // and the kernel reads garbage. Sizes for k_scale / v_scale are encoded
-        // in the array types (`[f32; N_PALETTE]`), so they can't drift.
-        debug_assert_eq!(
-            self.k_pal.len(),
-            self.v_pal.len(),
-            "k_pal and v_pal must have the same length (head_dim/4 bytes each)"
-        );
-        buf.extend_from_slice(&self.k_pal);
-        buf.extend_from_slice(&self.v_pal);
+        // k_pal/v_pal share `pal_len` (= head_dim/4 bytes, bit-packed); only the
+        // valid prefix is serialized so the byte layout matches the CUDA struct.
+        // Sizes for k_scale / v_scale are encoded in the array types
+        // (`[f32; N_PALETTE]`), so they can't drift.
+        let pal_len = self.pal_len as usize;
+        buf.extend_from_slice(&self.k_pal[..pal_len]);
+        buf.extend_from_slice(&self.v_pal[..pal_len]);
         for &p in &self.k_ptr {
             buf.extend_from_slice(&p.to_le_bytes());
         }
@@ -252,7 +267,10 @@ impl TokenSliceHost {
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
     ) -> Self {
-        debug_assert!(head_dim >= 4, "head_dim must be >= 4 for 2-bit pal_map packing");
+        debug_assert!(
+            head_dim >= 4,
+            "head_dim must be >= 4 for 2-bit pal_map packing"
+        );
         let pal_bytes = head_dim / 4;
         let pal_total = n_kv_head * pal_bytes;
         let scale_total = n_kv_head * N_PALETTE;
@@ -331,7 +349,7 @@ impl TokenSliceHost {
         (head_dim / 4) * 2  // k_pal + v_pal
             + 32 + 32       // k_ptr + v_ptr (4 × u64 each)
             + 4 + 4         // k_fmt + v_fmt (4 × u8 each)
-            + 16 + 16       // k_scale + v_scale (4 × f32 each)
+            + 16 + 16 // k_scale + v_scale (4 × f32 each)
     }
 
     #[allow(dead_code)]
@@ -480,7 +498,11 @@ impl SlotStateHost {
             );
         }
 
-        Self { slices, write_slice, position_map }
+        Self {
+            slices,
+            write_slice,
+            position_map,
+        }
     }
 
     /// Append `seq_len` write-region entries to `position_map`, covering
@@ -533,4 +555,3 @@ impl SlotStateHost {
         }
     }
 }
-

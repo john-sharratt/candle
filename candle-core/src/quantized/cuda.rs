@@ -5,8 +5,8 @@ use crate::quantized::k_quants::GgmlType;
 use crate::{CudaDevice, CudaStorage, Result, Shape};
 use half::f16;
 
-use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
 use crate::cuda_backend::WrapErr;
+use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
 
 // Import the FFI dispatcher functions
 use candle_kernels::simple::quantized::{
@@ -1198,11 +1198,7 @@ pub fn quantize_palette4_convert_buffered(
     let base_ptr = gpu_buf.dev_ptr();
     let raw_stream = stream.cu_stream() as *mut _;
     unsafe {
-        crate::set_kernel_breadcrumb(
-            "run_quantize_palette4_convert (K)",
-            file!(),
-            line!(),
-        );
+        crate::set_kernel_breadcrumb("run_quantize_palette4_convert (K)", file!(), line!());
         run_quantize_palette4_convert(
             base_ptr as *const u8,
             n as i32,
@@ -1213,11 +1209,7 @@ pub fn quantize_palette4_convert_buffered(
             KVHEAD_HD as i32,
             raw_stream,
         );
-        crate::set_kernel_breadcrumb(
-            "run_quantize_palette4_convert (V)",
-            file!(),
-            line!(),
-        );
+        crate::set_kernel_breadcrumb("run_quantize_palette4_convert (V)", file!(), line!());
         run_quantize_palette4_convert(
             base_ptr as *const u8,
             n as i32,
@@ -1273,11 +1265,7 @@ pub unsafe fn select_kv_format_palette4_paged(
     q_relevance_out_ptr: u64,
     stream: *mut std::ffi::c_void,
 ) {
-    crate::set_kernel_breadcrumb(
-        "run_select_kv_format_palette4_paged",
-        file!(),
-        line!(),
-    );
+    crate::set_kernel_breadcrumb("run_select_kv_format_palette4_paged", file!(), line!());
     run_select_kv_format_palette4_paged(
         per_head_table_ptr as *const i64,
         head_gids_ptr as *const i64,
@@ -2124,11 +2112,7 @@ pub fn select_and_summarize_kv_winners_paged_staged(
             );
 
             // 2. Summarize K winners → kv_sums[0 .. n_k_thresholds*3].
-            crate::set_kernel_breadcrumb(
-                "run_summarize_winners_side_paged (K)",
-                file!(),
-                line!(),
-            );
+            crate::set_kernel_breadcrumb("run_summarize_winners_side_paged (K)", file!(), line!());
             run_summarize_winners_side_paged(
                 k_win_ptr as *const u8,
                 candidates_bpe_dev_ptr as *const f32,
@@ -2143,11 +2127,7 @@ pub fn select_and_summarize_kv_winners_paged_staged(
             );
 
             // 3. Summarize V winners → kv_sums[n_k_thresholds*3 ..].
-            crate::set_kernel_breadcrumb(
-                "run_summarize_winners_side_paged (V)",
-                file!(),
-                line!(),
-            );
+            crate::set_kernel_breadcrumb("run_summarize_winners_side_paged (V)", file!(), line!());
             run_summarize_winners_side_paged(
                 v_win_ptr as *const u8,
                 candidates_bpe_dev_ptr as *const f32,
@@ -2253,26 +2233,26 @@ mod select_qtype_bpe_x4_tests {
             (SELECT_FMT_F16, 64),
             (SELECT_FMT_BF16, 64),
             (QType::Q8_KS as i32, 36),
-            (QType::Q8_1  as i32, 36),
-            (QType::Q8_0  as i32, 34),
-            (QType::Q5_1  as i32, 24),
-            (QType::Q5_0  as i32, 22),
+            (QType::Q8_1 as i32, 36),
+            (QType::Q8_0 as i32, 34),
+            (QType::Q5_1 as i32, 24),
+            (QType::Q5_0 as i32, 22),
             (QType::Q4_KS as i32, 20),
-            (QType::Q4_1  as i32, 20),
-            (QType::Q4_0  as i32, 18),
-            (QType::Q3_1  as i32, 16),
-            (QType::Q3_0  as i32, 14),
-            (QType::Q2_1  as i32, 12),
-            (QType::Q2_A  as i32, 10),
-            (QType::Q2_0  as i32, 10),
-            (QType::Q2_S  as i32,  9),
-            (QType::Q0_M4 as i32,  8),
-            (QType::Q1_A  as i32,  6),
-            (QType::Q1_S  as i32,  5),
-            (QType::Q0_M2 as i32,  3),
-            (QType::Q0_V  as i32,  2),
-            (QType::Q0_X  as i32,  2),
-            (QType::Q0    as i32,  1),
+            (QType::Q4_1 as i32, 20),
+            (QType::Q4_0 as i32, 18),
+            (QType::Q3_1 as i32, 16),
+            (QType::Q3_0 as i32, 14),
+            (QType::Q2_1 as i32, 12),
+            (QType::Q2_A as i32, 10),
+            (QType::Q2_0 as i32, 10),
+            (QType::Q2_S as i32, 9),
+            (QType::Q0_M4 as i32, 8),
+            (QType::Q1_A as i32, 6),
+            (QType::Q1_S as i32, 5),
+            (QType::Q0_M2 as i32, 3),
+            (QType::Q0_V as i32, 2),
+            (QType::Q0_X as i32, 2),
+            (QType::Q0 as i32, 1),
         ];
         for &(code, expected) in cases {
             let got = select_qtype_bpe_x4(code);

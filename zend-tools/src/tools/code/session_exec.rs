@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{now, CodeError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SessionExecReq {
@@ -84,7 +84,9 @@ impl Tool for CodeSessionExec {
                     .read_line(&mut line)
                     .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
                 if line.is_empty() {
-                    return Err(CodeError::ExecutionFailed("process exited unexpectedly".into()));
+                    return Err(CodeError::ExecutionFailed(
+                        "process exited unexpectedly".into(),
+                    ));
                 }
                 let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
                 if trimmed == sentinel {
@@ -126,9 +128,14 @@ impl Tool for CodeSessionExec {
                     .read_line(&mut line)
                     .map_err(|e| CodeError::ExecutionFailed(e.to_string()))?;
                 if line.is_empty() {
-                    return Err(CodeError::ExecutionFailed("process exited unexpectedly".into()));
+                    return Err(CodeError::ExecutionFailed(
+                        "process exited unexpectedly".into(),
+                    ));
                 }
-                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                let trimmed = line
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string();
                 if let Some(rest) = trimmed.strip_prefix(&format!("{exit_sentinel}:")) {
                     exit_code = rest.parse::<i32>().ok();
                     break;

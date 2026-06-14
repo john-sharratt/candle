@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::TcpError;
 use crate::state::sessions::{SessionMeta, TcpEntry};
 use crate::tools::web_fetch::is_private_ip;
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::TcpError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
@@ -42,21 +42,27 @@ impl Tool for TcpSessionOpen {
     type Error = TcpError;
 
     fn confirmation(req: &OpenRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Open TCP to {}:{}", req.host, req.port))
-            .with_field("host", req.host.clone())
-            .with_field("port", req.port.to_string()))
+        Some(
+            ConfirmationDetails::new(format!("Open TCP to {}:{}", req.host, req.port))
+                .with_field("host", req.host.clone())
+                .with_field("port", req.port.to_string()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, TcpError> {
         if let Ok(ip) = req.host.parse::<std::net::IpAddr>() {
             if is_private_ip(ip) && req.host != "127.0.0.1" {
-                return Err(TcpError::UrlBlocked(format!("{} is a private IP", req.host)));
+                return Err(TcpError::UrlBlocked(format!(
+                    "{} is a private IP",
+                    req.host
+                )));
             }
         }
 
         let addr = format!("{}:{}", req.host, req.port);
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(5000));
-        let addr_parsed = addr.parse::<std::net::SocketAddr>()
+        let addr_parsed = addr
+            .parse::<std::net::SocketAddr>()
             .or_else(|_| {
                 use std::net::ToSocketAddrs;
                 addr.to_socket_addrs().map(|mut a| a.next().unwrap())
@@ -65,8 +71,14 @@ impl Tool for TcpSessionOpen {
 
         let stream = TcpStream::connect_timeout(&addr_parsed, timeout)
             .map_err(|e| TcpError::ConnectionFailed(e.to_string()))?;
-        let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-        let local_addr = stream.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        let peer_addr = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let local_addr = stream
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
 
         let session_id = format!("sess_{}", Uuid::new_v4());
         let entry = TcpEntry {
@@ -82,7 +94,11 @@ impl Tool for TcpSessionOpen {
         };
         ctx.sessions.insert_tcp(entry);
 
-        Ok(OpenResponse { session_id, peer_addr, local_addr })
+        Ok(OpenResponse {
+            session_id,
+            peer_addr,
+            local_addr,
+        })
     }
 }
 

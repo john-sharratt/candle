@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::FileError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
@@ -42,7 +42,8 @@ impl Tool for FileList {
         let prefix = req.prefix.as_deref().unwrap_or("");
         let entries = ctx.vfs.list(prefix);
         let total_bytes = ctx.vfs.total_bytes();
-        let files = entries.into_iter()
+        let files = entries
+            .into_iter()
             .map(|(path, bytes, lines)| FileEntry { path, bytes, lines })
             .collect();
         Ok(ListResponse { files, total_bytes })

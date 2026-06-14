@@ -104,8 +104,7 @@ impl TimeSource for FixedTimeSource {
     fn now(&self) -> SystemTime {
         // Offset from UNIX_EPOCH by the fixed day count so `now()` is
         // consistent with `days_since_reference()`.
-        SystemTime::UNIX_EPOCH
-            + std::time::Duration::from_secs(self.day as u64 * 86_400)
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(self.day as u64 * 86_400)
     }
 
     fn days_since_reference(&self) -> i32 {

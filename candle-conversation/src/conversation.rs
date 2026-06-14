@@ -363,7 +363,7 @@ impl Sequence {
                             &batch,
                             &linear_prefix,
                             true, // schema Collection: members get the
-                                  // aggressive turn-level quantize policy
+                            // aggressive turn-level quantize policy
                             |_sid, content_len| {
                                 *done_bytes_ref += content_len as u64;
                                 report_ref(*done_bytes_ref);
@@ -650,9 +650,7 @@ impl Sequence {
             // `chunks_per_layer`, so we fall through to ingest.
             let stream_id = crate::persistence::content_hash::section_stream_id(address);
             if n_layers > 0 && self.substrate.section_stream_is_persisted(stream_id) {
-                if let Some((_, _, _)) =
-                    self.substrate.section_stream_layout(stream_id, n_layers)
-                {
+                if let Some((_, _, _)) = self.substrate.section_stream_layout(stream_id, n_layers) {
                     to_restore.push(Pending {
                         section_id,
                         content,
@@ -807,9 +805,7 @@ impl Sequence {
                 let op = select.select();
                 let idx = op.index();
                 let rx = &pending[idx].3;
-                let r = op
-                    .recv(rx)
-                    .map_err(|_| ConversationError::SchedulerGone)?;
+                let r = op.recv(rx).map_err(|_| ConversationError::SchedulerGone)?;
                 (idx, r)
             };
             let (slot_id, section_id, content_len, _rx) = pending.swap_remove(idx);
@@ -1014,7 +1010,11 @@ impl Sequence {
         let disable_reprojection = self.config.disable_reprojection;
         // Append-only ingests skip the per-turn projection rebuild and also
         // suppress continuous mid-decode reprojection.
-        let reprojection = if disable_reprojection { None } else { reprojection };
+        let reprojection = if disable_reprojection {
+            None
+        } else {
+            reprojection
+        };
         let (event_tx, event_rx) = crossbeam::channel::unbounded();
         self.scheduler_tx
             .send(SchedulerRequest::SubmitTurn {

@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{NotesError, MAX_NOTE_BYTES};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
@@ -46,10 +46,18 @@ impl Tool for NotesWrite {
         }
         let tags = req.tags.unwrap_or_default();
         let (created, bytes) = ctx.notes.write(&req.key, req.content, tags.clone());
-        let updated_at = ctx.notes.read(&req.key)
+        let updated_at = ctx
+            .notes
+            .read(&req.key)
             .map(|n| n.updated_at)
             .unwrap_or_default();
-        Ok(WriteResponse { key: req.key, bytes, tags, created, updated_at })
+        Ok(WriteResponse {
+            key: req.key,
+            bytes,
+            tags,
+            created,
+            updated_at,
+        })
     }
 }
 

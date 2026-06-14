@@ -65,7 +65,9 @@ fn identifier_for(node: &Node, source: &[u8]) -> Option<String> {
         "abstract_class_declaration" => {
             field_text(node, "name", source).map(|n| format!("class {n}"))
         }
-        "interface_declaration" => field_text(node, "name", source).map(|n| format!("interface {n}")),
+        "interface_declaration" => {
+            field_text(node, "name", source).map(|n| format!("interface {n}"))
+        }
         "type_alias_declaration" => field_text(node, "name", source).map(|n| format!("type {n}")),
         "enum_declaration" => field_text(node, "name", source).map(|n| format!("enum {n}")),
         "lexical_declaration" => arrow_binding_label(node, source),
@@ -135,7 +137,10 @@ mod tests {
     fn extracts_type_alias() {
         verify(
             "type UserId = string;\nfunction lookup(id: UserId): void {}\n",
-            &[("type UserId", "type UserId"), ("function lookup", "function lookup")],
+            &[
+                ("type UserId", "type UserId"),
+                ("function lookup", "function lookup"),
+            ],
         );
     }
 
@@ -348,7 +353,10 @@ mod tests {
     fn preserves_crlf_endings() {
         verify(
             "function alpha() {}\r\nfunction beta() {}\r\n",
-            &[("function alpha", "function alpha"), ("function beta", "function beta")],
+            &[
+                ("function alpha", "function alpha"),
+                ("function beta", "function beta"),
+            ],
         );
     }
 

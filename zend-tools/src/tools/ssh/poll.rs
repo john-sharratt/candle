@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{SshError, MAX_OUTPUT};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PollRequest {
@@ -35,8 +35,7 @@ pub struct SshSessionPoll;
 
 impl Tool for SshSessionPoll {
     const NAME: &'static str = "ssh_session_poll";
-    const DESCRIPTION: &'static str =
-        "Poll a running async SSH process for output. \
+    const DESCRIPTION: &'static str = "Poll a running async SSH process for output. \
          Returns stdout/stderr chunks, running status, and exit code when done.";
 
     type Request = PollRequest;
@@ -44,7 +43,9 @@ impl Tool for SshSessionPoll {
     type Error = SshError;
 
     fn run(ctx: &ToolContext, req: PollRequest) -> Result<PollResponse, SshError> {
-        let proc_arc = ctx.sessions.get_ssh_process(&req.process_id)
+        let proc_arc = ctx
+            .sessions
+            .get_ssh_process(&req.process_id)
             .ok_or_else(|| SshError::ProcessNotFound(req.process_id.clone()))?;
         let proc = proc_arc.lock().unwrap();
 
@@ -59,12 +60,10 @@ impl Tool for SshSessionPoll {
         let stdout_truncated = stdout_all.len() > MAX_OUTPUT;
         let stderr_truncated = stderr_all.len() > MAX_OUTPUT;
 
-        let stdout_chunk = String::from_utf8_lossy(
-            &stdout_all[..stdout_all.len().min(MAX_OUTPUT)]
-        ).into_owned();
-        let stderr_chunk = String::from_utf8_lossy(
-            &stderr_all[..stderr_all.len().min(MAX_OUTPUT)]
-        ).into_owned();
+        let stdout_chunk =
+            String::from_utf8_lossy(&stdout_all[..stdout_all.len().min(MAX_OUTPUT)]).into_owned();
+        let stderr_chunk =
+            String::from_utf8_lossy(&stderr_all[..stderr_all.len().min(MAX_OUTPUT)]).into_owned();
 
         Ok(PollResponse {
             process_id: req.process_id,

@@ -40,19 +40,19 @@ use thiserror::Error;
 
 use crate::ToolError;
 
-pub mod write;
-pub mod read;
+pub mod delete;
 pub mod edit;
 pub mod list;
-pub mod delete;
 pub mod present;
+pub mod read;
+pub mod write;
 
-pub use write::FILE_WRITE;
-pub use read::FILE_READ;
+pub use delete::FILE_DELETE;
 pub use edit::FILE_EDIT;
 pub use list::FILE_LIST;
-pub use delete::FILE_DELETE;
 pub use present::FILE_PRESENT;
+pub use read::FILE_READ;
+pub use write::FILE_WRITE;
 
 #[derive(Debug, Error)]
 pub enum FileError {

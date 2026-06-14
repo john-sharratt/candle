@@ -69,6 +69,7 @@ mod conversation {
         let config = DaemonConfig {
             workspace: std::env::current_dir().unwrap(),
             port: 0, // not starting HTTP
+            ..Default::default()
         };
 
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
@@ -108,10 +109,7 @@ mod conversation {
             !status_msgs.is_empty(),
             "expected at least one StreamItem::Status during model load, got none"
         );
-        assert!(
-            !response.is_empty(),
-            "model produced no tokens"
-        );
+        assert!(!response.is_empty(), "model produced no tokens");
         assert!(
             response.contains('4'),
             "expected '4' in the response to '2+2', got: {response:?}"

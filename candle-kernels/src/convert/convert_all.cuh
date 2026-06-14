@@ -587,15 +587,23 @@ private:
         int elem_size = ArenaFormat::float_elem_size(format);
         const char* src = base + elem_off * elem_size;
 
-        #pragma unroll
-        for (int b = 0; b < NUM_BLOCKS; ++b) {
-            load_block_convert_all<T, BLOCK_SIZE>(
-                dst + b * BLOCK_SIZE,
-                src + b * BLOCK_SIZE * elem_size,
-                format,
-                lane,
-                scale
-            );
+        // Each lane converts element `lane` of a BLOCK_SIZE-wide band. When the
+        // band is narrower than the warp (a sub-head band, e.g. SUB_HEAD_DIM=16
+        // at HEAD_DIM=64), lanes >= BLOCK_SIZE own no element — guard them so the
+        // per-lane converter doesn't read `src->data[lane]` / write `dst[lane]`
+        // past the band (which runs off the arena row → illegal address for the
+        // final token). No-op when BLOCK_SIZE == 32 (full-width bands).
+        if (lane < BLOCK_SIZE) {
+            #pragma unroll
+            for (int b = 0; b < NUM_BLOCKS; ++b) {
+                load_block_convert_all<T, BLOCK_SIZE>(
+                    dst + b * BLOCK_SIZE,
+                    src + b * BLOCK_SIZE * elem_size,
+                    format,
+                    lane,
+                    scale
+                );
+            }
         }
     }
     

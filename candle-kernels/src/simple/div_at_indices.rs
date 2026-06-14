@@ -12,12 +12,7 @@ extern "C" {
     /// * `indices` - Pointer to the indices array
     /// * `num_indices` - Number of indices
     /// * `value` - Value to divide by
-    pub fn div_at_indices_f32(
-        data: *mut f32,
-        indices: *const u32,
-        num_indices: usize,
-        value: f32,
-    );
+    pub fn div_at_indices_f32(data: *mut f32, indices: *const u32, num_indices: usize, value: f32);
 
     /// Divide f16 tensor elements at specified indices by a value
     ///
@@ -54,10 +49,5 @@ extern "C" {
     /// * `indices` - Pointer to the indices array
     /// * `num_indices` - Number of indices
     /// * `value` - Value to divide by
-    pub fn div_at_indices_f64(
-        data: *mut f64,
-        indices: *const u32,
-        num_indices: usize,
-        value: f64,
-    );
+    pub fn div_at_indices_f64(data: *mut f64, indices: *const u32, num_indices: usize, value: f64);
 }

@@ -1979,39 +1979,39 @@ mod kv_qtype_lock_tests {
 
     #[test]
     fn kv_qtype_values_are_stable() {
-        assert_eq!(QType::R16       as i32, 3);
-        assert_eq!(QType::P2        as i32, 4);
-        assert_eq!(QType::QAWQ      as i32, 5);
-        assert_eq!(QType::QAWQ_G64  as i32, 6);
-        assert_eq!(QType::Q8_0      as i32, 7);
-        assert_eq!(QType::Q8_1      as i32, 8);
-        assert_eq!(QType::Q8_K      as i32, 9);
-        assert_eq!(QType::Q8_KS     as i32, 10);
-        assert_eq!(QType::Q6_K      as i32, 11);
-        assert_eq!(QType::Q5_0      as i32, 12);
-        assert_eq!(QType::Q5_1      as i32, 13);
-        assert_eq!(QType::Q5_K      as i32, 14);
-        assert_eq!(QType::Q4_0      as i32, 15);
-        assert_eq!(QType::Q4_1      as i32, 16);
-        assert_eq!(QType::Q4_K      as i32, 17);
-        assert_eq!(QType::Q4_KS     as i32, 18);
-        assert_eq!(QType::Q3_0      as i32, 19);
-        assert_eq!(QType::Q3_1      as i32, 20);
-        assert_eq!(QType::Q3_K      as i32, 21);
-        assert_eq!(QType::Q2_0      as i32, 22);
-        assert_eq!(QType::Q2_1      as i32, 23);
-        assert_eq!(QType::Q2_K      as i32, 24);
-        assert_eq!(QType::Q2_S   as i32, 25);
-        assert_eq!(QType::Q2_A   as i32, 26);
-        assert_eq!(QType::Q1_S   as i32, 27);
-        assert_eq!(QType::Q0_V      as i32, 28);
-        assert_eq!(QType::Q1_A      as i32, 29);
-        assert_eq!(QType::Q0_X      as i32, 30);
-        assert_eq!(QType::Q0_M2     as i32, 31);
-        assert_eq!(QType::Q0_M4     as i32, 32);
-        assert_eq!(QType::Q0        as i32, 33);
-        assert_eq!(QType::F8E4M3    as i32, 34);
-        assert_eq!(QType::F8E5M2    as i32, 35);
+        assert_eq!(QType::R16 as i32, 3);
+        assert_eq!(QType::P2 as i32, 4);
+        assert_eq!(QType::QAWQ as i32, 5);
+        assert_eq!(QType::QAWQ_G64 as i32, 6);
+        assert_eq!(QType::Q8_0 as i32, 7);
+        assert_eq!(QType::Q8_1 as i32, 8);
+        assert_eq!(QType::Q8_K as i32, 9);
+        assert_eq!(QType::Q8_KS as i32, 10);
+        assert_eq!(QType::Q6_K as i32, 11);
+        assert_eq!(QType::Q5_0 as i32, 12);
+        assert_eq!(QType::Q5_1 as i32, 13);
+        assert_eq!(QType::Q5_K as i32, 14);
+        assert_eq!(QType::Q4_0 as i32, 15);
+        assert_eq!(QType::Q4_1 as i32, 16);
+        assert_eq!(QType::Q4_K as i32, 17);
+        assert_eq!(QType::Q4_KS as i32, 18);
+        assert_eq!(QType::Q3_0 as i32, 19);
+        assert_eq!(QType::Q3_1 as i32, 20);
+        assert_eq!(QType::Q3_K as i32, 21);
+        assert_eq!(QType::Q2_0 as i32, 22);
+        assert_eq!(QType::Q2_1 as i32, 23);
+        assert_eq!(QType::Q2_K as i32, 24);
+        assert_eq!(QType::Q2_S as i32, 25);
+        assert_eq!(QType::Q2_A as i32, 26);
+        assert_eq!(QType::Q1_S as i32, 27);
+        assert_eq!(QType::Q0_V as i32, 28);
+        assert_eq!(QType::Q1_A as i32, 29);
+        assert_eq!(QType::Q0_X as i32, 30);
+        assert_eq!(QType::Q0_M2 as i32, 31);
+        assert_eq!(QType::Q0_M4 as i32, 32);
+        assert_eq!(QType::Q0 as i32, 33);
+        assert_eq!(QType::F8E4M3 as i32, 34);
+        assert_eq!(QType::F8E5M2 as i32, 35);
     }
 }
 

@@ -182,15 +182,11 @@ impl TokenDecoder {
 
     /// Decode token IDs into text, stripping special tokens.
     pub fn decode(&self, tokens: &[u32]) -> String {
-        self.tokenizer
-            .decode(tokens, true)
-            .unwrap_or_default()
+        self.tokenizer.decode(tokens, true).unwrap_or_default()
     }
 
     /// Decode token IDs into text, including special tokens verbatim.
     pub fn decode_with_special(&self, tokens: &[u32]) -> String {
-        self.tokenizer
-            .decode(tokens, false)
-            .unwrap_or_default()
+        self.tokenizer.decode(tokens, false).unwrap_or_default()
     }
 }

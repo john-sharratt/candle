@@ -68,7 +68,11 @@ fn sql_session_open_list_close() {
     ));
     let sid = open["session_id"].as_str().unwrap().to_string();
 
-    let list = harness::expect_success(harness::invoke_with_ctx("sql_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "sql_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
 
     harness::expect_success(harness::invoke_with_ctx(
@@ -77,7 +81,11 @@ fn sql_session_open_list_close() {
         &ctx,
     ));
 
-    let list2 = harness::expect_success(harness::invoke_with_ctx("sql_session_list", json!({}), &ctx));
+    let list2 = harness::expect_success(harness::invoke_with_ctx(
+        "sql_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list2["sessions"].as_array().unwrap().len(), 0);
 }
 
@@ -125,10 +133,7 @@ fn sql_session_not_found() {
 
 #[test]
 fn sql_session_missing_credential() {
-    let resp = harness::invoke(
-        "sql_session_open",
-        json!({"credential_name": "cred_bogus"}),
-    );
+    let resp = harness::invoke("sql_session_open", json!({"credential_name": "cred_bogus"}));
     harness::expect_error(&resp, "credential_not_found");
 }
 

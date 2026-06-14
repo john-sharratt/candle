@@ -42,15 +42,15 @@ use crate::ToolError;
 
 pub const MAX_NOTE_BYTES: usize = 1024 * 1024; // 1 MiB
 
-pub mod write;
+pub mod list;
 pub mod read;
 pub mod search;
-pub mod list;
+pub mod write;
 
-pub use write::NOTES_WRITE;
+pub use list::NOTES_LIST;
 pub use read::NOTES_READ;
 pub use search::NOTES_SEARCH;
-pub use list::NOTES_LIST;
+pub use write::NOTES_WRITE;
 
 #[derive(Debug, Error)]
 pub enum NotesError {

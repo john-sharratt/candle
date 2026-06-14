@@ -46,7 +46,10 @@ fn scan_rich(
         .find(|s| s.id == probe_id)
         .expect("probe scenario not found");
     let (probe_syn, probe_sem, probe_prag) = pf
-        .read_entry(SigEntry { byte_offset: probe.byte_offset, token_count: probe.token_count })
+        .read_entry(SigEntry {
+            byte_offset: probe.byte_offset,
+            token_count: probe.token_count,
+        })
         .expect("read probe sigs");
 
     let corpus: Vec<(SectionId, Vec<SigEntry>)> = TOOLS
@@ -61,7 +64,10 @@ fn scan_rich(
                         && s.case_type == CaseType::Positive
                         && s.id != probe_id
                 })
-                .map(|s| SigEntry { byte_offset: s.byte_offset, token_count: s.token_count })
+                .map(|s| SigEntry {
+                    byte_offset: s.byte_offset,
+                    token_count: s.token_count,
+                })
                 .collect();
             (sid, entries)
         })
@@ -216,9 +222,17 @@ fn rank<F: Fn(&Candidates) -> f32>(
             (tool, pick(&candidates(hits, depth)))
         })
         .collect();
-    let calc = scored.iter().find(|(t, _)| *t == CORRECT).map(|(_, s)| *s).unwrap_or(0.0);
+    let calc = scored
+        .iter()
+        .find(|(t, _)| *t == CORRECT)
+        .map(|(_, s)| *s)
+        .unwrap_or(0.0);
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let r = scored.iter().position(|(t, _)| *t == CORRECT).unwrap_or(usize::MAX) + 1;
+    let r = scored
+        .iter()
+        .position(|(t, _)| *t == CORRECT)
+        .unwrap_or(usize::MAX)
+        + 1;
     let (bc, bs) = scored
         .iter()
         .find(|(t, _)| *t != CORRECT)
@@ -238,28 +252,38 @@ fn run_phase(label: &str, h: &Harness, pf: &ProvenanceFile, manifest: &Manifest)
     println!("\n══ [{label}] probe_len={probe_len}  (hit log captured at threshold 70) ══");
 
     let cands: &[(&str, fn(&Candidates) -> f32)] = &[
-        ("raw_max",            |c| c.raw_max),
-        ("raw_sum",            |c| c.raw_sum),
-        ("raw_mean",           |c| c.raw_mean),
-        ("max_excess",         |c| c.max_excess),
-        ("pertok_sum_excess",  |c| c.pertok_sum_excess),
-        ("pertok_count_88",    |c| c.pertok_count_88),
-        ("pertok_count_95",    |c| c.pertok_count_95),
-        ("pertok_count_100",   |c| c.pertok_count_100),
+        ("raw_max", |c| c.raw_max),
+        ("raw_sum", |c| c.raw_sum),
+        ("raw_mean", |c| c.raw_mean),
+        ("max_excess", |c| c.max_excess),
+        ("pertok_sum_excess", |c| c.pertok_sum_excess),
+        ("pertok_count_88", |c| c.pertok_count_88),
+        ("pertok_count_95", |c| c.pertok_count_95),
+        ("pertok_count_100", |c| c.pertok_count_100),
         ("pertok_top5_excess", |c| c.pertok_top5_excess),
-        ("graded_span",        |c| c.graded_span),
+        ("graded_span", |c| c.graded_span),
     ];
 
     for depth in [1u8, 2u8] {
         let dname = if depth == 1 { "semantic" } else { "pragmatic" };
         println!("  depth = {dname}");
-        println!("    {:<20} {:>5} {:>12} {:>14} {:>12} {:>10}",
-            "candidate", "rank", "calc", "2nd tool", "2nd score", "margin");
+        println!(
+            "    {:<20} {:>5} {:>12} {:>14} {:>12} {:>10}",
+            "candidate", "rank", "calc", "2nd tool", "2nd score", "margin"
+        );
         for (name, f) in cands {
             let (r, calc, bc, bs) = rank(h, &log, depth, f);
             let flag = if r == 1 { "  WIN" } else { "" };
-            println!("    {:<20} {:>5} {:>12.2} {:>14} {:>12.2} {:>10.2}{}",
-                name, r, calc, bc, bs, calc - bs, flag);
+            println!(
+                "    {:<20} {:>5} {:>12.2} {:>14} {:>12.2} {:>10.2}{}",
+                name,
+                r,
+                calc,
+                bc,
+                bs,
+                calc - bs,
+                flag
+            );
         }
     }
 }
@@ -278,12 +302,15 @@ fn corpus_sweep(label: &str, h: &Harness, pf: &ProvenanceFile, manifest: &Manife
     }
 
     let formulas: &[(&str, fn(&Candidates) -> f32)] = &[
-        ("raw_max",           |c| c.raw_max),
+        ("raw_max", |c| c.raw_max),
         ("span_a2 (shipped)", |c| c.span90),
         ("pertok_sum_excess", |c| c.pertok_sum_excess),
     ];
 
-    println!("\n══ [{label}] full-corpus sweep — {} positive probes ══", probes.len());
+    println!(
+        "\n══ [{label}] full-corpus sweep — {} positive probes ══",
+        probes.len()
+    );
 
     for depth in [1u8, 2u8] {
         let dname = if depth == 1 { "semantic" } else { "pragmatic" };
@@ -306,31 +333,55 @@ fn corpus_sweep(label: &str, h: &Harness, pf: &ProvenanceFile, manifest: &Manife
                         (tool, pick(&candidates(hits, depth)))
                     })
                     .collect();
-                let intra = scored.iter().find(|(t, _)| *t == correct).map(|(_, s)| *s).unwrap_or(0.0);
-                let inter: f64 = scored.iter().filter(|(t, _)| *t != correct)
-                    .map(|(_, s)| *s as f64).sum::<f64>() / (TOOLS.len() - 1) as f64;
-                let ratio = if inter > 0.0 { intra as f64 / inter } else if intra > 0.0 { f64::INFINITY } else { 1.0 };
+                let intra = scored
+                    .iter()
+                    .find(|(t, _)| *t == correct)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0.0);
+                let inter: f64 = scored
+                    .iter()
+                    .filter(|(t, _)| *t != correct)
+                    .map(|(_, s)| *s as f64)
+                    .sum::<f64>()
+                    / (TOOLS.len() - 1) as f64;
+                let ratio = if inter > 0.0 {
+                    intra as f64 / inter
+                } else if intra > 0.0 {
+                    f64::INFINITY
+                } else {
+                    1.0
+                };
                 sum_ratio[fi] += if ratio.is_finite() { ratio } else { 0.0 };
-                if ratio < min_ratio[fi] { min_ratio[fi] = ratio; }
+                if ratio < min_ratio[fi] {
+                    min_ratio[fi] = ratio;
+                }
 
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let rank = scored.iter().position(|(t, _)| *t == correct).unwrap_or(99) + 1;
-                if rank == 1 { top1[fi] += 1; }
-                if rank <= 3 { top3[fi] += 1; }
+                if rank == 1 {
+                    top1[fi] += 1;
+                }
+                if rank <= 3 {
+                    top3[fi] += 1;
+                }
             }
         }
 
         let n = probes.len() as f64;
         println!("  depth = {dname}");
-        println!("    {:<22} {:>8} {:>8} {:>12} {:>11}",
-            "formula", "top-1", "top-3", "mean_ratio", "min_ratio");
+        println!(
+            "    {:<22} {:>8} {:>8} {:>12} {:>11}",
+            "formula", "top-1", "top-3", "mean_ratio", "min_ratio"
+        );
         for (fi, (fname, _)) in formulas.iter().enumerate() {
-            println!("    {:<22} {:>7.0}% {:>7.0}% {:>12.3} {:>11.3}",
+            println!(
+                "    {:<22} {:>7.0}% {:>7.0}% {:>12.3} {:>11.3}",
                 fname,
                 top1[fi] as f64 / n * 100.0,
                 top3[fi] as f64 / n * 100.0,
                 sum_ratio[fi] / n,
-                min_ratio[fi]);
+                min_ratio[fi]
+            );
         }
     }
 }

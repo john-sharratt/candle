@@ -1,4 +1,4 @@
-﻿//! Public [`Builder`] type — the projection engine's user-facing API.
+//! Public [`Builder`] type — the projection engine's user-facing API.
 //!
 //! # Lifecycle
 //!
@@ -38,16 +38,15 @@
 //!
 //! Anything that survives this is guaranteed to project without errors.
 
-
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
+use super::project::FIXED_FORMULA;
 use super::project::{run, run_with_sink, Projection, ProjectionMode, ProjectionTarget};
 use super::schema::{
     Budget, DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection,
     SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema,
 };
 use super::yaml::{from_yaml, NameMaps};
-use super::project::FIXED_FORMULA;
 use crate::provenance::DEFAULT_SPAN_ALPHA;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::SelectionDiagnostics;
@@ -126,10 +125,7 @@ fn validate(schema: &Schema) -> Result<(), ConstructionError> {
     Ok(())
 }
 
-fn validate_budget_bounds(
-    name: &str,
-    budget: &Budget,
-) -> Result<(), ConstructionError> {
+fn validate_budget_bounds(name: &str, budget: &Budget) -> Result<(), ConstructionError> {
     if let (Some(min), Some(max)) = (budget.min_percent, budget.max_percent) {
         if max < min {
             return Err(ConstructionError::MaxLessThanMin {
@@ -195,10 +191,7 @@ fn substitute_template(template: &str, vars: &[(&str, &str)]) -> Result<String, 
     Ok(out)
 }
 
-fn validate_selection(
-    name: &str,
-    rule: &SelectionRule,
-) -> Result<(), ConstructionError> {
+fn validate_selection(name: &str, rule: &SelectionRule) -> Result<(), ConstructionError> {
     use SelectionRule;
     match rule {
         SelectionRule::TopK { k } if *k == 0 => Err(ConstructionError::InvalidTopK {
@@ -444,11 +437,7 @@ impl Builder {
 
     /// Resolve a collection's name within a layer to its id.
     /// Collections are layer-scoped (analogous to sections).
-    pub fn id_for_collection_in(
-        &self,
-        layer: LayerId,
-        name: &str,
-    ) -> Option<CollectionId> {
+    pub fn id_for_collection_in(&self, layer: LayerId, name: &str) -> Option<CollectionId> {
         self.name_maps
             .collection_names
             .get(&(layer, name.to_string()))
@@ -509,17 +498,18 @@ impl Builder {
         let layer_idx = self.layer_idx(layer)?;
         self.assert_section_name_free(layer_idx, &name)?;
         let new_id = SectionId::new(self.next_section_id_raw());
-        self.schema.layers[layer_idx].system_prompt.items.push(
-            SystemPromptItem::Section(SectionSchema {
+        self.schema.layers[layer_idx]
+            .system_prompt
+            .items
+            .push(SystemPromptItem::Section(SectionSchema {
                 id: new_id,
                 name: name.clone(),
                 content,
                 priority,
                 depends_on: None,
                 is_template: false,
-                        template_tokens: None,
-            }),
-        );
+                template_tokens: None,
+            }));
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
     }
@@ -555,16 +545,17 @@ impl Builder {
             });
         }
         let new_id = CollectionId::new(self.next_collection_id_raw());
-        self.schema.layers[layer_idx].system_prompt.items.push(
-            SystemPromptItem::Collection(SectionCollection {
+        self.schema.layers[layer_idx]
+            .system_prompt
+            .items
+            .push(SystemPromptItem::Collection(SectionCollection {
                 id: new_id,
                 name: name.clone(),
                 sections: Vec::new(),
                 selection,
                 score_threshold,
                 depth_weights: None,
-            }),
-        );
+            }));
         self.name_maps
             .collection_names
             .insert((layer, name), new_id);
@@ -631,7 +622,7 @@ impl Builder {
             priority,
             depends_on: None,
             is_template: false,
-                        template_tokens: None,
+            template_tokens: None,
         });
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)

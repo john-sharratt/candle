@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, encode_output, CryptoError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HmacRequest {
@@ -45,10 +45,8 @@ impl Tool for HmacCompute {
         let key_enc = req.key_encoding.as_deref().unwrap_or("text");
         let out_enc = req.output_encoding.as_deref().unwrap_or("hex");
 
-        let data = decode_data(&req.data, data_enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
-        let key = decode_data(&req.key, key_enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
+        let data = decode_data(&req.data, data_enc).map_err(CryptoError::InvalidDataEncoding)?;
+        let key = decode_data(&req.key, key_enc).map_err(CryptoError::InvalidDataEncoding)?;
 
         let mac_bytes: Vec<u8> = match req.algorithm.as_str() {
             "sha256" => {
@@ -75,7 +73,10 @@ impl Tool for HmacCompute {
             other => return Err(CryptoError::UnknownAlgorithm(other.to_string())),
         };
 
-        Ok(HmacResponse { mac: encode_output(&mac_bytes, out_enc), algorithm: req.algorithm })
+        Ok(HmacResponse {
+            mac: encode_output(&mac_bytes, out_enc),
+            algorithm: req.algorithm,
+        })
     }
 }
 

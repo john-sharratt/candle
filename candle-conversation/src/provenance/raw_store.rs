@@ -109,7 +109,14 @@ impl RawFileHeader {
 
     /// Byte offset within the entry blob for token `t`'s `(band, layer, head, is_q)` slot.
     #[inline]
-    pub fn entry_offset(&self, t: usize, band: usize, layer: usize, head: usize, is_q: bool) -> usize {
+    pub fn entry_offset(
+        &self,
+        t: usize,
+        band: usize,
+        layer: usize,
+        head: usize,
+        is_q: bool,
+    ) -> usize {
         t * self.bytes_per_token() + self.slot_offset(band, layer, head, is_q)
     }
 
@@ -196,7 +203,10 @@ impl RawProvenanceFile {
         file.flush()?;
         Ok(Self {
             header,
-            state: Mutex::new(State { file, write_pos: RAW_HEADER_BYTES as u64 }),
+            state: Mutex::new(State {
+                file,
+                write_pos: RAW_HEADER_BYTES as u64,
+            }),
             mmap: None,
         })
     }
@@ -211,15 +221,18 @@ impl RawProvenanceFile {
         file.flush()?;
         Ok(Self {
             header,
-            state: Mutex::new(State { file, write_pos: RAW_HEADER_BYTES as u64 }),
+            state: Mutex::new(State {
+                file,
+                write_pos: RAW_HEADER_BYTES as u64,
+            }),
             mmap: None,
         })
     }
 
     /// Open an existing raw provenance file for reading (and optional appending).
     pub fn open(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
-        use std::io::Read;
         use std::fs::OpenOptions;
+        use std::io::Read;
         let path = path.as_ref();
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut header_bytes = [0u8; RAW_HEADER_BYTES];
@@ -229,7 +242,11 @@ impl RawProvenanceFile {
         // Cache the mmap once for all subsequent reads — avoids per-call
         // MapViewOfFile/UnmapViewOfFile overhead in read-only harness loops.
         let mmap = unsafe { Mmap::map(&file) }.ok();
-        Ok(Self { header, state: Mutex::new(State { file, write_pos }), mmap })
+        Ok(Self {
+            header,
+            state: Mutex::new(State { file, write_pos }),
+            mmap,
+        })
     }
 
     pub fn header(&self) -> &RawFileHeader {
@@ -245,7 +262,10 @@ impl RawProvenanceFile {
     pub fn append(&self, token_data: &[u8]) -> crate::Result<RawSigEntry> {
         let bpt = self.header.bytes_per_token();
         if bpt == 0 {
-            return Ok(RawSigEntry { byte_offset: 0, token_count: 0 });
+            return Ok(RawSigEntry {
+                byte_offset: 0,
+                token_count: 0,
+            });
         }
         assert_eq!(
             token_data.len() % bpt,
@@ -255,11 +275,17 @@ impl RawProvenanceFile {
             bpt
         );
         let token_count = token_data.len() / bpt;
-        assert!(token_count <= u16::MAX as usize, "token_count exceeds u16::MAX");
+        assert!(
+            token_count <= u16::MAX as usize,
+            "token_count exceeds u16::MAX"
+        );
 
         if token_count == 0 {
             let state = self.state.lock().unwrap();
-            return Ok(RawSigEntry { byte_offset: state.write_pos, token_count: 0 });
+            return Ok(RawSigEntry {
+                byte_offset: state.write_pos,
+                token_count: 0,
+            });
         }
 
         let mut state = self.state.lock().unwrap();
@@ -271,7 +297,10 @@ impl RawProvenanceFile {
         state.file.flush()?;
         state.write_pos += token_data.len() as u64;
 
-        Ok(RawSigEntry { byte_offset, token_count: token_count as u16 })
+        Ok(RawSigEntry {
+            byte_offset,
+            token_count: token_count as u16,
+        })
     }
 
     /// Read the raw token blob for `entry` as a byte Vec.
@@ -551,7 +580,10 @@ pub fn band_layer_indices(
     // If end was clamped, shift start back
     let start = end.saturating_sub(n_layers_per_band);
     (start..end)
-        .chain(std::iter::repeat_n(end.saturating_sub(1), n_layers_per_band.saturating_sub(end - start)))
+        .chain(std::iter::repeat_n(
+            end.saturating_sub(1),
+            n_layers_per_band.saturating_sub(end - start),
+        ))
         .take(n_layers_per_band)
         .collect()
 }
@@ -618,7 +650,9 @@ mod tests {
             for band in 0..3 {
                 for layer in 0..2usize {
                     for head in 0..2usize {
-                        let vec = pf.read_kq_vector(entry, t, band, layer, head, false).unwrap();
+                        let vec = pf
+                            .read_kq_vector(entry, t, band, layer, head, false)
+                            .unwrap();
                         let expected = (t * 100 + band * 10 + layer * 4 + head + 1) as f32;
                         assert_eq!(vec[0], expected, "t={t} b={band} l={layer} h={head}");
                     }
@@ -648,8 +682,8 @@ mod tests {
         let head_dim = 8;
         let chunk_size = 4;
         let sub_dim = head_dim / 4; // = 2
-        // q_flat layout: [head][palette][token][sub_dim]
-        // head=0, palette=0..4, token=0..4, sub_dim=0..2
+                                    // q_flat layout: [head][palette][token][sub_dim]
+                                    // head=0, palette=0..4, token=0..4, sub_dim=0..2
         let n = n_kv_heads * 4 * chunk_size * sub_dim;
         let mut q_flat = vec![0.0f32; n];
         // For token t=0, palette p=0, sub_dim d=0: index = 0*4*4*2 + 0*4*2 + 0*2 + 0 = 0

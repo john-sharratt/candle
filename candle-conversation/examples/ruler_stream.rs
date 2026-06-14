@@ -83,29 +83,13 @@ struct Args {
 /// scheduler degrades sharply once VRAM is under pressure (observed F16: 12-seq
 /// 512-token prefills going from ~3 s → ~15 s after a few free/recreate
 /// cycles). All quantized modes use the wider config.
-const CTX_CONFIG_DEFAULT: &[(usize, usize)] = &[
-    (4_096, 4),
-    (8_192, 1),
-    (16_384, 1),
-];
+const CTX_CONFIG_DEFAULT: &[(usize, usize)] = &[(4_096, 4), (8_192, 1), (16_384, 1)];
 
-const CTX_CONFIG_C5: &[(usize, usize)] = &[
-    (4_096, 6),
-    (8_192, 1),
-    (16_384, 1),
-];
+const CTX_CONFIG_C5: &[(usize, usize)] = &[(4_096, 6), (8_192, 1), (16_384, 1)];
 
-const CTX_CONFIG_C10: &[(usize, usize)] = &[
-    (4_096, 6),
-    (8_192, 1),
-    (16_384, 1),
-];
+const CTX_CONFIG_C10: &[(usize, usize)] = &[(4_096, 6), (8_192, 1), (16_384, 1)];
 
-const CTX_CONFIG_HIGH: &[(usize, usize)] = &[
-    (4_096, 12),
-    (8_192, 3),
-    (16_384, 1),
-];
+const CTX_CONFIG_HIGH: &[(usize, usize)] = &[(4_096, 12), (8_192, 3), (16_384, 1)];
 
 fn ctx_config_for(mode_label: &str) -> &'static [(usize, usize)] {
     let label = mode_label.to_ascii_uppercase();
@@ -153,8 +137,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── Benchmark mode ────────────────────────────────────────────────────────
-    let (mode, mode_label) =
-        parse_ruler_mode(&args.mode).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (mode, mode_label) = parse_ruler_mode(&args.mode).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let batched_config = match mode {
         Some(ref m) => BatchedConfig {
@@ -180,7 +163,11 @@ fn main() -> anyhow::Result<()> {
     let mut engine_config = builder.engine_config(&tokenizer);
     engine_config.batched_config = batched_config;
 
-    let engine = Arc::new(ConversationEngine::new(model, tokenizer.clone(), engine_config)?);
+    let engine = Arc::new(ConversationEngine::new(
+        model,
+        tokenizer.clone(),
+        engine_config,
+    )?);
 
     // Open the log file in append mode so repeated runs accumulate data.
     let file = std::fs::OpenOptions::new()
@@ -231,8 +218,7 @@ fn main() -> anyhow::Result<()> {
 
                 loop {
                     let task = TASKS[xorshift() as usize % TASKS.len()];
-                    let samples =
-                        generate_ruler_samples(&tokenizer, task, ctx_len, 1, sample_idx);
+                    let samples = generate_ruler_samples(&tokenizer, task, ctx_len, 1, sample_idx);
                     let sample = &samples[0];
 
                     // RULER samples are already fully formatted ChatML strings;
@@ -261,7 +247,8 @@ fn main() -> anyhow::Result<()> {
                                  \"status\":\"error\",\"elapsed\":{elapsed:.3},\
                                  \"error\":{}}}\n",
                                 task.name(),
-                                serde_json::to_string(&err_str).unwrap_or_else(|_| "\"unknown\"".into()),
+                                serde_json::to_string(&err_str)
+                                    .unwrap_or_else(|_| "\"unknown\"".into()),
                             );
                             {
                                 let mut w = writer.lock().unwrap();
@@ -287,8 +274,10 @@ fn main() -> anyhow::Result<()> {
                             task.name()
                         )
                     } else {
-                        let pred_json = serde_json::to_string(pred.trim()).unwrap_or_else(|_| "\"\"".into());
-                        let expected_json = serde_json::to_string(&sample.outputs).unwrap_or_else(|_| "[]".into());
+                        let pred_json =
+                            serde_json::to_string(pred.trim()).unwrap_or_else(|_| "\"\"".into());
+                        let expected_json =
+                            serde_json::to_string(&sample.outputs).unwrap_or_else(|_| "[]".into());
                         format!(
                             "{{\"quant\":\"{mode_label}\",\"ctx\":{ctx_len},\
                              \"task\":\"{}\",\"sample\":{sample_idx},\

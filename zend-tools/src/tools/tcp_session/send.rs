@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 use super::TcpError;
+use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SendRequest {
@@ -40,12 +40,16 @@ impl Tool for TcpSessionSend {
     type Error = TcpError;
 
     fn confirmation(req: &SendRequest) -> Option<ConfirmationDetails> {
-        let preview = req.data.as_deref()
+        let preview = req
+            .data
+            .as_deref()
             .or(req.data_hex.as_deref())
             .unwrap_or("(empty)");
-        Some(ConfirmationDetails::new("Send to TCP session")
-            .with_field("session_id", req.session_id.clone())
-            .with_field("data", preview[..preview.len().min(80)].to_string()))
+        Some(
+            ConfirmationDetails::new("Send to TCP session")
+                .with_field("session_id", req.session_id.clone())
+                .with_field("data", preview[..preview.len().min(80)].to_string()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: SendRequest) -> Result<SendResponse, TcpError> {
@@ -54,16 +58,24 @@ impl Tool for TcpSessionSend {
         } else if let Some(text) = &req.data {
             text.as_bytes().to_vec()
         } else {
-            return Err(TcpError::InvalidParams("data or data_hex required".to_string()));
+            return Err(TcpError::InvalidParams(
+                "data or data_hex required".to_string(),
+            ));
         };
 
-        let entry_arc = ctx.sessions.get_tcp(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_tcp(&req.session_id)
             .ok_or_else(|| TcpError::SessionNotFound(req.session_id.clone()))?;
         let mut entry = entry_arc.lock().unwrap();
-        entry.stream.write_all(&bytes)
+        entry
+            .stream
+            .write_all(&bytes)
             .map_err(|e| TcpError::SendFailed(e.to_string()))?;
 
-        Ok(SendResponse { bytes_written: bytes.len() })
+        Ok(SendResponse {
+            bytes_written: bytes.len(),
+        })
     }
 }
 

@@ -16,13 +16,11 @@ fn main() -> Result<()> {
 
         for vocab_size in vocab_sizes {
             println!("Testing vocab_size = {}", vocab_size);
-            
+
             // Create logits with a realistic distribution
             // Higher indices get slightly lower values
-            let logits_vec: Vec<f32> = (0..vocab_size)
-                .map(|i| 10.0 - (i as f32 * 0.01))
-                .collect();
-            
+            let logits_vec: Vec<f32> = (0..vocab_size).map(|i| 10.0 - (i as f32 * 0.01)).collect();
+
             let logits = Tensor::new(&logits_vec[..], &device)?;
 
             // Test 1: No filtering (baseline speed)
@@ -31,14 +29,14 @@ fn main() -> Result<()> {
                 let _token = logits.sample_multinomial(1.0, None, None, i as u64)?;
             }
             let no_filter_time = start.elapsed();
-            
+
             // Test 2: Top-k filtering
             let start = Instant::now();
             for i in 0..100 {
                 let _token = logits.sample_multinomial(1.0, Some(50), None, i as u64)?;
             }
             let topk_time = start.elapsed();
-            
+
             // Test 3: Top-p filtering
             let start = Instant::now();
             for i in 0..100 {
@@ -46,10 +44,19 @@ fn main() -> Result<()> {
             }
             let topp_time = start.elapsed();
 
-            println!("  No filtering: {:>6.2}ms (100 samples)", no_filter_time.as_secs_f64() * 1000.0);
-            println!("  Top-k (50):   {:>6.2}ms (100 samples)", topk_time.as_secs_f64() * 1000.0);
-            println!("  Top-p (0.9):  {:>6.2}ms (100 samples)", topp_time.as_secs_f64() * 1000.0);
-            
+            println!(
+                "  No filtering: {:>6.2}ms (100 samples)",
+                no_filter_time.as_secs_f64() * 1000.0
+            );
+            println!(
+                "  Top-k (50):   {:>6.2}ms (100 samples)",
+                topk_time.as_secs_f64() * 1000.0
+            );
+            println!(
+                "  Top-p (0.9):  {:>6.2}ms (100 samples)",
+                topp_time.as_secs_f64() * 1000.0
+            );
+
             // Verify correctness with top-k
             let mut counts = vec![0; vocab_size.min(100)];
             for i in 0..1000 {
@@ -59,9 +66,12 @@ fn main() -> Result<()> {
                     counts[idx] += 1;
                 }
             }
-            
+
             let samples_in_topk = counts[..50.min(counts.len())].iter().sum::<i32>();
-            println!("  Correctness: {}/1000 samples in top-50 ✓\n", samples_in_topk);
+            println!(
+                "  Correctness: {}/1000 samples in top-50 ✓\n",
+                samples_in_topk
+            );
         }
 
         println!("✅ Large vocabulary tests completed!");

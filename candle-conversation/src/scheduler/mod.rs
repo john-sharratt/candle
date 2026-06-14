@@ -4,6 +4,7 @@
 //! Phase 1 uses single-mode prefill (no small/large split).
 mod decode;
 mod prefill;
+pub(crate) mod profile;
 pub(crate) mod projection_assembler;
 mod run;
 mod sample;
@@ -17,11 +18,11 @@ use crate::handle::{SealResult, TurnEvent, TurnResponse};
 use crate::persistence::cold_load::{
     preallocate_pinned_scratch, ColdLoadStager, PINNED_PREALLOC_BYTES,
 };
-use crate::persistence::elevate::{elevate_to_hot, evict_from_hot};
-use crate::persistence::thread::PersistenceTrigger;
 use crate::persistence::content_hash::{section_stream_id, turn_stream_id};
+use crate::persistence::elevate::elevate_to_hot;
 use crate::persistence::resume::encode_signatures;
 use crate::persistence::streams::{ContentAddress, StreamId};
+use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
     Builder, Conversation, GeneratedIdentity, GroupId, ProjectionMode, ProjectionSegment,
     ProjectionTarget, ResolvedSection, SealedKind, SectionId, TimelineId, TurnIndex, TurnKey,
@@ -472,6 +473,30 @@ pub(crate) struct ProjectionInputs {
 // Internal state
 // ————————————————————————————————————————————————————————————————————————————
 
+/// In-flight reprojection state carried from
+/// [`Scheduler::reproject_view_prepare`] to
+/// [`Scheduler::reproject_view_complete`], so the cross-conversation wave can
+/// prepare many views (scan + project + inject sealed + build the gap-fill
+/// descriptor), fire ONE batched multi-slot gap-fill forward, then complete
+/// each view (finish + carve new view + re-key) independently.
+struct ReprojectInFlight {
+    view_id: SequenceId,
+    parent_id: SequenceId,
+    tail_per_layer: Vec<candle_nn::kv_cache::SealedSequence>,
+    decode_state: DecodeState,
+    sampling_state: Option<SequenceSamplingState>,
+    sections_len: usize,
+    segments_len: usize,
+    n_turns_selected: usize,
+    plan: projection_assembler::GapFillPlan,
+    build_ms: u64,
+    t_swap: Instant,
+    probe_ms: u64,
+    scan_ms: u64,
+    project_ms: u64,
+    elevate_ms: u64,
+}
+
 /// Per-sequence state while actively generating tokens.
 struct DecodeState {
     /// Channel back to the caller.
@@ -749,7 +774,11 @@ impl WaveStats {
     /// Record one forward. `n_tokens` is the total tokens in the batch
     /// (seqs × per-seq chunk for prefill, seqs × 1 for decode).
     fn record(&mut self, prefill: bool, n_seqs: usize, n_tokens: usize, fwd_ms: u64) {
-        let ch = if prefill { &mut self.prefill } else { &mut self.decode };
+        let ch = if prefill {
+            &mut self.prefill
+        } else {
+            &mut self.decode
+        };
         ch.fwds += 1;
         ch.seq_sum += n_seqs as u64;
         ch.seq_max = ch.seq_max.max(n_seqs);
@@ -889,12 +918,9 @@ pub(crate) struct Scheduler {
     /// builds.
     slot_tokens: HashMap<SequenceId, Vec<u32>>,
 
-    /// Per-slot projection-assembler state — content-addressed cache
-    /// of captured live-prefill runs, plus the in-flight turn's
-    /// `pending_user_part` once `NewUserMessage` segments are emitted.
-    /// Consulted by [`Self::apply_projection`] on every reprojection
-    /// so structural template runs reuse their captured K/V instead
-    /// of re-running the forward pass.  Cleared on `FreeSequence`.
+    /// Per-slot projection-assembler state — holds the in-flight turn's
+    /// `pending_user_part` capture (reserved infrastructure; no current
+    /// code path emits `NewUserMessage`).  Cleared on `FreeSequence`.
     slot_projection_state: HashMap<SequenceId, projection_assembler::SlotState>,
 
     /// Workspace-shared provenance signature file.  All seals across
@@ -1237,13 +1263,11 @@ impl Scheduler {
                 // Captured from the projection if it ran the
                 // score-density path; written to the substrate's
                 // side-channel below, after the read guard drops.
-                let mut diag_to_write: Option<(
-                    TimelineId,
-                    SelectionDiagnostics,
-                )> = None;
-                let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) =
-                    (projection_inputs.as_ref().filter(|_| !skip_projection), slot_target)
-                {
+                let mut diag_to_write: Option<(TimelineId, SelectionDiagnostics)> = None;
+                let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) = (
+                    projection_inputs.as_ref().filter(|_| !skip_projection),
+                    slot_target,
+                ) {
                     let conversation = match self.slot_conversations.get(&parent_id) {
                         Some(c) => c.clone(),
                         None => {
@@ -1414,7 +1438,7 @@ impl Scheduler {
                         // runs. Items that are about to be re-elevated
                         // are excluded so we don't churn bytes
                         // through DMA for no reason.
-                        let evicted = evict_from_hot(
+                        let evicted = self.evict_to_fit_incoming(
                             &conversation,
                             &projected_sections,
                             &turn_keys_for_elevate,
@@ -1684,9 +1708,7 @@ impl Scheduler {
                     // `inject_sealed_section` would warn-and-skip
                     // and the primed slot would be missing every
                     // persisted section from the schema's prelude.
-                    if let Some(conversation) =
-                        self.slot_conversations.get(&sequence_id).cloned()
-                    {
+                    if let Some(conversation) = self.slot_conversations.get(&sequence_id).cloned() {
                         let backings = self.session.backings().to_vec();
                         let device = self.session.device().clone();
                         let main_stream = match &device {
@@ -1732,8 +1754,7 @@ impl Scheduler {
                             if let Some(conversation) =
                                 self.slot_conversations.get(&sequence_id).cloned()
                             {
-                                let boundary_policy =
-                                    Self::section_compression_policy_boundary();
+                                let boundary_policy = Self::section_compression_policy_boundary();
                                 let member_policy =
                                     Self::section_compression_policy_member(&turn_policy);
                                 if let Err(e) = self.quantize_pending_sections(
@@ -1818,9 +1839,7 @@ impl Scheduler {
             .find(|c| c.read().timeline_target(timeline).is_some())
             .cloned()
             .ok_or_else(|| {
-                format!(
-                    "SubmitSummaryProbe: no conversation registered for timeline {timeline}"
-                )
+                format!("SubmitSummaryProbe: no conversation registered for timeline {timeline}")
             })?;
         // ~20-token summary, no KV chunks (residence cold).  The
         // summariser thread immediately overwrites the tree_meta;
@@ -1962,12 +1981,10 @@ impl Scheduler {
                 ))
             })?;
         let slot_target = self.slot_targets.get(&parent_id).copied();
-        let state = self
-            .slot_projection_state
-            .entry(parent_id)
-            .or_default();
+        let state = self.slot_projection_state.entry(parent_id).or_default();
 
-        projection_assembler::apply_segments(
+        profile::reset();
+        let r = projection_assembler::apply_segments(
             state,
             projection_assembler::ApplyContext {
                 session: &mut self.session,
@@ -1983,7 +2000,83 @@ impl Scheduler {
                 boundary_markers: &self.boundary_markers,
             },
             segments,
-        )
+        );
+        profile::report("apply_projection");
+        r
+    }
+
+    /// Build phase of [`Self::apply_projection`] for the cross-conversation wave:
+    /// inject the sealed prefix + collect the glue descriptor, but do NOT fire
+    /// the gap-fill forward. The caller fires (batched across slots via
+    /// [`projection_assembler::fire_gap_fill_batch`]) then calls
+    /// [`Self::apply_projection_finish`].
+    fn apply_projection_build(
+        &mut self,
+        parent_id: SequenceId,
+        segments: &[ProjectionSegment],
+    ) -> Result<projection_assembler::GapFillPlan, ConversationError> {
+        let conversation = self
+            .slot_conversations
+            .get(&parent_id)
+            .cloned()
+            .ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "apply_projection_build: no conversation registered for slot {parent_id}"
+                ))
+            })?;
+        let slot_target = self.slot_targets.get(&parent_id).copied();
+        profile::reset();
+        let mut ctx = projection_assembler::ApplyContext {
+            session: &mut self.session,
+            model: &mut self.model,
+            device: &self.device,
+            conversation: &conversation,
+            slot_target,
+            parent_id,
+            chunk_size: self.chunk_size,
+            max_prefill_chunk: self.max_prefill_chunk,
+            tokenizer: &self.tokenizer,
+            slot_tokens: &mut self.slot_tokens,
+            boundary_markers: &self.boundary_markers,
+        };
+        projection_assembler::apply_segments_build(&mut ctx, segments)
+    }
+
+    /// Finish phase of [`Self::apply_projection`] for the wave: prefill the
+    /// deferred user message against the now-committed `[sealed | glue]` and
+    /// re-attach the writer tail. Call after the batched fire.
+    fn apply_projection_finish(
+        &mut self,
+        parent_id: SequenceId,
+        plan: projection_assembler::GapFillPlan,
+    ) -> Result<(), ConversationError> {
+        let conversation = self
+            .slot_conversations
+            .get(&parent_id)
+            .cloned()
+            .ok_or_else(|| {
+                ConversationError::Channel(format!(
+                    "apply_projection_finish: no conversation registered for slot {parent_id}"
+                ))
+            })?;
+        let slot_target = self.slot_targets.get(&parent_id).copied();
+        let state = self.slot_projection_state.entry(parent_id).or_default();
+        let mut ctx = projection_assembler::ApplyContext {
+            session: &mut self.session,
+            model: &mut self.model,
+            device: &self.device,
+            conversation: &conversation,
+            slot_target,
+            parent_id,
+            chunk_size: self.chunk_size,
+            max_prefill_chunk: self.max_prefill_chunk,
+            tokenizer: &self.tokenizer,
+            slot_tokens: &mut self.slot_tokens,
+            boundary_markers: &self.boundary_markers,
+        };
+        let r = projection_assembler::apply_segments_finish(state, &mut ctx, plan);
+        profile::report("apply_projection");
+        r
     }
 
     /// (Dead code, retained for future use; rewritten to take a
@@ -2367,16 +2460,12 @@ impl Scheduler {
                     bytes[d * tc * n_bytes..(d + 1) * tc * n_bytes]
                         .chunks_exact(n_bytes)
                         .map(|c| {
-                            let arr: [u8; TokenSignature::BYTE_LEN] =
-                                c.try_into().unwrap();
+                            let arr: [u8; TokenSignature::BYTE_LEN] = c.try_into().unwrap();
                             TokenSignature::from_bytes(&arr)
                         })
                         .collect()
                 };
-                match self
-                    .provenance
-                    .append(&depth(0), &depth(1), &depth(2))
-                {
+                match self.provenance.append(&depth(0), &depth(1), &depth(2)) {
                     Ok(entry) => out.push(entry),
                     Err(e) => {
                         tracing::warn!("restore_section sig append failed: {e}");
@@ -2643,12 +2732,7 @@ impl Scheduler {
         // unlocked.  Pending list is partitioned into (residence,
         // sealed, in_collection); the per-layer loop below groups by
         // in_collection so each policy gets its own batched launch.
-        let pending: Vec<(
-            SectionId,
-            ResidenceIndex,
-            Vec<SealedSequence>,
-            bool,
-        )> = {
+        let pending: Vec<(SectionId, ResidenceIndex, Vec<SealedSequence>, bool)> = {
             let view = conversation.read();
             self.pending_section_quantize
                 .drain(..)
@@ -2701,8 +2785,9 @@ impl Scheduler {
         // per input SealedSequence in the same order, so the per-group
         // result slot is filled positionally before being scattered
         // back into the global `quantized_per_section` Vec.
-        let mut quantized_per_section: Vec<Vec<SealedSequence>> =
-            (0..pending.len()).map(|_| Vec::with_capacity(n_layers)).collect();
+        let mut quantized_per_section: Vec<Vec<SealedSequence>> = (0..pending.len())
+            .map(|_| Vec::with_capacity(n_layers))
+            .collect();
         let groups: [(&[usize], &candle_nn::kv_cache::CompressionPolicy); 2] = [
             (indices_boundary.as_slice(), boundary_policy),
             (indices_member.as_slice(), member_policy),
@@ -2982,10 +3067,8 @@ impl Scheduler {
                 // / asynchronous attempts corrupt sysprompt K/V.
                 if !self.pending_section_quantize.is_empty() {
                     if let Some(turn_policy) = self.session.compression_policy() {
-                        let boundary_policy =
-                            Self::section_compression_policy_boundary();
-                        let member_policy =
-                            Self::section_compression_policy_member(&turn_policy);
+                        let boundary_policy = Self::section_compression_policy_boundary();
+                        let member_policy = Self::section_compression_policy_member(&turn_policy);
                         self.quantize_pending_sections(
                             &conversation,
                             &boundary_policy,
@@ -3005,10 +3088,7 @@ impl Scheduler {
                     // only references the (ephemeral) provenance file, so
                     // read each entry's bytes and embed them in a
                     // `Signatures` record.
-                    let stream_id = turn_stream_id(
-                        target.timeline.raw(),
-                        idx.0,
-                    );
+                    let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
                     let mut sig_bytes = Vec::with_capacity(new_sig_entries.len());
                     for e in &new_sig_entries {
                         match self.provenance.read_entry(*e) {
@@ -3073,8 +3153,7 @@ impl Scheduler {
                 in_collection,
             } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
-                let stream_id =
-                    section_stream_id(*address);
+                let stream_id = section_stream_id(*address);
                 let policy_active = self.session.compression_policy().is_some();
                 {
                     let mut view = conversation.write();
@@ -3116,11 +3195,10 @@ impl Scheduler {
                 // poisoned cache.  See the bisect history in
                 // `tests/section_quantize_real_model.rs`.
                 if policy_active {
-                    self.pending_section_quantize
-                        .push(PendingSectionQuantize {
-                            section_id: *section_id,
-                            in_collection: *in_collection,
-                        });
+                    self.pending_section_quantize.push(PendingSectionQuantize {
+                        section_id: *section_id,
+                        in_collection: *in_collection,
+                    });
                 }
                 // Declare the section stream in the redo log so the
                 // manifest knows the (address, debug_name) before any
@@ -3311,12 +3389,8 @@ impl Scheduler {
         let head_dim = self.session.head_dim();
         let chunk = candle_nn::CHUNK_SIZE;
 
-        let sigs_a = extract_mh_signatures_from_r16_dump(
-            &blocks_a, n_kv_head, head_dim, chunk,
-        );
-        let sigs_b = extract_mh_signatures_from_r16_dump(
-            &blocks_b, n_kv_head, head_dim, chunk,
-        );
+        let sigs_a = extract_mh_signatures_from_r16_dump(&blocks_a, n_kv_head, head_dim, chunk);
+        let sigs_b = extract_mh_signatures_from_r16_dump(&blocks_b, n_kv_head, head_dim, chunk);
 
         let merged = sigs_a
             .iter()
@@ -3577,7 +3651,72 @@ impl Scheduler {
     ///
     /// Errors propagate from the underlying session ops; the caller
     /// (decode loop) marks the view as finished on failure.
-    fn reproject_view(&mut self, view_id: SequenceId) -> Result<SequenceId, ConversationError> {
+
+    /// Budget-aware pre-elevate eviction (replaces the unconditional
+    /// `evict_from_hot`). Frees only enough of **this** conversation's
+    /// least-recently-promoted hot KV to fit the incoming cold-load within the
+    /// *accurate* VRAM budget — so on a big GPU the working set stays resident
+    /// instead of being dropped (and reloaded from cold) every reproject.
+    ///
+    /// Order: estimate the incoming cold-load size → if it already fits the free
+    /// budget, evict nothing → otherwise reclaim partial-arena free space
+    /// (compaction, cheap unless fragmented past the 0.20 threshold) → only then
+    /// evict the oldest non-selected turns, and only as many bytes as still
+    /// needed. Per-conversation scoped: `evict_hot_to_free` walks only
+    /// `conversation`'s own residence, never a parallel conversation's hot KV.
+    fn evict_to_fit_incoming(
+        &mut self,
+        conversation: &Conversation,
+        sections: &[SectionId],
+        turns: &[TurnKey],
+    ) -> crate::substrate::EvictionReport {
+        // Incoming cold-load VRAM footprint (≈ the on-disk record size).
+        let cold_bytes: u64 = {
+            let view = conversation.read();
+            let plan = view.snapshot_promotion_state(sections, turns);
+            plan.cold_to_hot
+                .iter()
+                .flat_map(|c| c.cold.iter())
+                .flat_map(|s| s.chunks.iter())
+                .map(|c| c.record_len)
+                .sum()
+        };
+        if cold_bytes == 0 {
+            return crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        }
+        let device = self.session.device().clone();
+        let avail = match candle_nn::kv_cache::vram_budget_available(&device) {
+            // Budget unknown (non-CUDA / query failure) — don't evict on a guess.
+            None => return crate::substrate::EvictionReport { count: 0, bytes: 0 },
+            Some(a) => a as u64,
+        };
+        if cold_bytes <= avail {
+            // Ample VRAM — keep the whole working set hot.
+            return crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        }
+        // Tight: reclaim partial-arena free space first, then re-measure.
+        let _ = self.session.compact();
+        let avail = candle_nn::kv_cache::vram_budget_available(&device)
+            .map(|a| a as u64)
+            .unwrap_or(avail);
+        let needed = cold_bytes.saturating_sub(avail);
+        if needed == 0 {
+            return crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        }
+        conversation
+            .write()
+            .evict_hot_to_free(sections, turns, needed)
+    }
+
+    /// Prepare phase of reprojection: BDP scan + projection + tier elevate +
+    /// inject the sealed prefix + build the gap-fill descriptor. Returns the
+    /// in-flight state for [`Self::reproject_view_complete`] (after the caller
+    /// fires the batched gap-fill), or `None` if the view needs no reprojection.
+    /// Removes the view's `DecodeState` into the in-flight on success.
+    fn reproject_view_prepare(
+        &mut self,
+        view_id: SequenceId,
+    ) -> Result<Option<ReprojectInFlight>, ConversationError> {
         let _t_total = PhaseTimer::new("reproject_total");
         // Clone the policy out — `swap_view_with_new_ranges` mutates
         // `active_decodes` so we cannot hold a borrow over it.
@@ -3587,7 +3726,7 @@ impl Scheduler {
             .and_then(|s| s.reprojection.clone())
         {
             Some(p) => p,
-            None => return Ok(view_id),
+            None => return Ok(None),
         };
 
         // 1. Compute the probe window.
@@ -3606,7 +3745,7 @@ impl Scheduler {
         //    miss the user's intent entirely.
         let view_offset = self.session.sequence_offset(view_id.0).unwrap_or(0);
         if view_offset == 0 {
-            return Ok(view_id);
+            return Ok(None);
         }
 
         let (decoded_count, generated_tokens_snapshot, prefill_tokens_snapshot) = {
@@ -3623,7 +3762,7 @@ impl Scheduler {
         let max_probe = policy.max_probe_tokens.max(1);
         let window = max_probe.min(view_offset);
         if window == 0 {
-            return Ok(view_id);
+            return Ok(None);
         }
         let probe_lo = view_offset - window; // inclusive
         let probe_hi = view_offset; // exclusive
@@ -3663,7 +3802,7 @@ impl Scheduler {
         };
         let (raw_syn_l0, raw_syn_l4, raw_sem_l0, raw_sem_l4, raw_prag_l0, raw_prag_l4) = raw_layers;
         if raw_syn_l0.is_empty() {
-            return Ok(view_id);
+            return Ok(None);
         }
 
         let n_kv_head = self.session.n_kv_head();
@@ -3672,12 +3811,8 @@ impl Scheduler {
         let block_indices: Vec<usize> = raw_syn_l0.iter().map(|(idx, _, _, _)| *idx).collect();
 
         let merge = |a: &[_], b: &[_]| {
-            let sa = extract_mh_signatures_from_r16_dump(
-                a, n_kv_head, head_dim, chunk,
-            );
-            let sb = extract_mh_signatures_from_r16_dump(
-                b, n_kv_head, head_dim, chunk,
-            );
+            let sa = extract_mh_signatures_from_r16_dump(a, n_kv_head, head_dim, chunk);
+            let sb = extract_mh_signatures_from_r16_dump(b, n_kv_head, head_dim, chunk);
             sa.iter()
                 .zip(sb.iter())
                 .map(|(x, y)| merge_turn_signatures_xor(x, y))
@@ -3699,8 +3834,7 @@ impl Scheduler {
         //        biasing the BDP scan.
         let filter: &[u32] = &policy.probe_filter_token_ids;
         let chunk_size = self.chunk_size;
-        let extract_window = |sigs_per_block: &[TurnSignatures]|
-                              -> Vec<TokenSignature> {
+        let extract_window = |sigs_per_block: &[TurnSignatures]| -> Vec<TokenSignature> {
             let mut out: Vec<TokenSignature> = Vec::with_capacity(window);
             for (block_idx, block_sigs) in block_indices.iter().zip(sigs_per_block.iter()) {
                 let block_start = block_idx * chunk_size;
@@ -3738,7 +3872,7 @@ impl Scheduler {
         let probe_sem = extract_window(&sem_blocks);
         let probe_prag = extract_window(&prag_blocks);
         if probe_syn.is_empty() {
-            return Ok(view_id);
+            return Ok(None);
         }
         let probe_ms = t_probe.elapsed().as_millis() as u64;
         record_phase(t_probe, "reproject_probe_extract");
@@ -3777,7 +3911,7 @@ impl Scheduler {
         };
 
         if turn_corpus.is_empty() && section_corpus.is_empty() {
-            return Ok(view_id);
+            return Ok(None);
         }
 
         // —— Trace-only validation: probe health + section corpus health ————————
@@ -3923,12 +4057,9 @@ impl Scheduler {
                         // Keep prefix structural / live-prefill runs in the
                         // segment chain, exactly as the SubmitTurn path does
                         // (see the matching arm where submit builds its
-                        // `segments`). The live-prefill cache is keyed by a
-                        // rolling hash over the *segment sequence*; dropping
-                        // these here makes the reproject's chain diverge from
-                        // submit's, so every downstream boundary run misses the
-                        // cache and gets needlessly re-prefilled. Keeping them
-                        // aligns the keys so the reproject reuses the cached K/V.
+                        // `segments`). These structural tokens are part of the
+                        // assembled prefix; dropping them here would make the
+                        // reproject's rebuilt prefix diverge from submit's.
                         segments.push(seg.clone());
                     }
                     ProjectionSegment::NewUserMessage { .. } => {
@@ -3943,43 +4074,12 @@ impl Scheduler {
         let project_ms = t_project.elapsed().as_millis() as u64;
         record_phase(t_project, "reproject_project");
 
-        // Diagnostic: is the score-sort RE-ORDERING the same turns each
-        // reproject? `order_sig` hashes the sealed-turn sequence in emit order;
-        // `set_sig` hashes the SORTED set. If `set_sig` stays constant across
-        // reprojects while `order_sig` changes, identical membership is being
-        // reshuffled by the volatile `group_score` sort — exactly what stops the
-        // rolling-hash glue cache from ever hitting on the turn region.
-        {
-            let fnv = |seq: &[(u32, u32)]| -> u64 {
-                let mut h = 0xcbf2_9ce4_8422_2325u64;
-                for &(g, t) in seq {
-                    for b in g.to_le_bytes().iter().chain(t.to_le_bytes().iter()) {
-                        h ^= *b as u64;
-                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-                    }
-                }
-                h
-            };
-            let mut turns: Vec<(u32, u32)> = projected_segments
-                .iter()
-                .filter_map(|seg| match seg {
-                    ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
-                        Some((rt.group().raw(), rt.index().0))
-                    }
-                    _ => None,
-                })
-                .collect();
-            let order_sig = fnv(&turns);
-            turns.sort_unstable();
-            let set_sig = fnv(&turns);
-            tracing::info!(
-                target: "candle_conversation::scheduler::reproject",
-                n_turns = turns.len(),
-                order_sig = format!("{order_sig:016x}"),
-                set_sig = format!("{set_sig:016x}"),
-                "reproject turn-order signature (set stable + order changing = score-sort churn)",
-            );
-        }
+        // Count of sealed turns this projection selected — the reproject cost
+        // scales linearly with it (each adds one boundary-glue prefill).
+        let n_turns_selected = projected_segments
+            .iter()
+            .filter(|s| matches!(s, ProjectionSegment::Sealed(SealedKind::Turn(..))))
+            .count();
 
         // 6. Zero-copy rebuild.
         //
@@ -4144,9 +4244,10 @@ impl Scheduler {
                 Device::Cuda(d) => d.cuda_stream(),
                 _ => panic!("scheduler: requires a CUDA device"),
             };
-            // Working-set-aware evict before elevate (see SubmitTurn
-            // site for rationale).
-            let evicted = evict_from_hot(
+            // Budget-aware evict before elevate: keep the working set hot on a
+            // big GPU, evicting only enough (oldest first) to fit the incoming
+            // cold-load within the accurate VRAM budget (see SubmitTurn site).
+            let evicted = self.evict_to_fit_incoming(
                 &policy.substrate,
                 &projected_sections,
                 &turn_keys_for_elevate,
@@ -4193,10 +4294,67 @@ impl Scheduler {
 
         let elevate_ms = t_elevate.elapsed().as_millis() as u64;
 
-        let t_apply = Instant::now();
-        self.apply_projection(parent_id, BlockCount(0), &projected_segments)?;
+        // Time the per-slot apply work (segment build now + finish later),
+        // EXCLUDING the shared gap-fill wave — that wait is reported as `glue_ms`.
+        let t_build = Instant::now();
+        // Build the gap-fill descriptor + inject the sealed prefix, but DON'T
+        // fire the forward — the caller batches it across conversations.
+        let plan = self.apply_projection_build(parent_id, &projected_segments)?;
+        let build_ms = t_build.elapsed().as_millis() as u64;
+        Ok(Some(ReprojectInFlight {
+            view_id,
+            parent_id,
+            tail_per_layer,
+            decode_state,
+            sampling_state,
+            sections_len: projected_sections.len(),
+            segments_len: projected_segments.len(),
+            n_turns_selected,
+            plan,
+            build_ms,
+            t_swap,
+            probe_ms,
+            scan_ms,
+            project_ms,
+            elevate_ms,
+        }))
+    }
+
+    /// Complete phase of reprojection — runs after the batched gap-fill forward
+    /// has fired + committed every prepared slot's glue. Finishes the projection
+    /// (deferred user prefill + restore tail), appends the active turn's captured
+    /// tail, carves a fresh view from the rebuilt parent, and re-keys the
+    /// per-view maps onto the new view id.
+    fn reproject_view_complete(
+        &mut self,
+        inflight: ReprojectInFlight,
+        glue_ms: u64,
+    ) -> Result<SequenceId, ConversationError> {
+        let ReprojectInFlight {
+            view_id,
+            parent_id,
+            tail_per_layer,
+            decode_state,
+            sampling_state,
+            sections_len,
+            segments_len,
+            n_turns_selected,
+            plan,
+            build_ms,
+            t_swap,
+            probe_ms,
+            scan_ms,
+            project_ms,
+            elevate_ms,
+        } = inflight;
+
+        let t_finish = Instant::now();
+        self.apply_projection_finish(parent_id, plan)?;
         let new_prefix_block_count = self.session.sequence_block_count(parent_id.0).unwrap_or(0);
-        let apply_ms = t_apply.elapsed().as_millis() as u64;
+        // apply_ms = this slot's segment build + finish, NOT the shared gap-fill
+        // wave (reported separately as glue_ms), so it no longer absorbs the
+        // cross-slot wave wait.
+        let apply_ms = build_ms + t_finish.elapsed().as_millis() as u64;
 
         // Under the read-only projection model there's no COW prefix
         // duplication to guard against: the view never copied bytes from
@@ -4287,10 +4445,12 @@ impl Scheduler {
             swap_ms,
             elevate_ms,
             apply_ms,
+            glue_ms,
             inject_ms,
             view_ms,
-            sections = projected_sections.len(),
-            segments = projected_segments.len(),
+            sections = sections_len,
+            segments = segments_len,
+            turns = n_turns_selected,
             "reproject (zero-copy rebuild)",
         );
 

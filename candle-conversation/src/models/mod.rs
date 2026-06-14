@@ -55,7 +55,7 @@ mod qwen3_moe;
 pub use builder::ModelBuilder;
 pub use dialect::*;
 
-use crate::config::{SequenceConfig, SamplingConfig};
+use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use std::path::Path;
 

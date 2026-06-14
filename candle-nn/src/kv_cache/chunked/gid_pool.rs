@@ -51,8 +51,8 @@
 //! arena and lets drops touch a single cache line.
 
 use ahash::{AHashMap, AHashSet};
-use std::collections::BTreeMap;
 use candle::DType;
+use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
     fmt,
@@ -1157,7 +1157,11 @@ impl ChunkGidPool {
     /// Sum of live gids across all formats — for diagnostics.
     #[allow(dead_code)]
     pub(crate) fn total_live(&self) -> usize {
-        self.inner.pools.values().map(|pool| pool.total_live()).sum()
+        self.inner
+            .pools
+            .values()
+            .map(|pool| pool.total_live())
+            .sum()
     }
 }
 

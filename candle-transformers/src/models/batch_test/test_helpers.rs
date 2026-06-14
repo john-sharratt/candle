@@ -109,7 +109,10 @@ fn download_ipv4(url: &str, dest: &Path) -> candle::Result<PathBuf> {
                         .and_then(|cr| cr.rsplit('/').next())
                         .and_then(|t| t.trim().parse().ok());
                 }
-                std::fs::OpenOptions::new().create(true).append(true).open(&tmp)
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&tmp)
             }
             416 => break, // requested range past EOF → already complete
             s => return Err(err(format!("IPv4 download {url}: HTTP {s}"))),
@@ -258,7 +261,10 @@ mod tests {
     fn test_hf_ipv4_fallback() {
         // Direct IPv4 download (forces the fallback path).
         let url = format!("{}/gpt2/resolve/main/config.json", endpoint());
-        let dest = hf_fallback_cache().join("gpt2").join("main").join("config.json");
+        let dest = hf_fallback_cache()
+            .join("gpt2")
+            .join("main")
+            .join("config.json");
         let _ = std::fs::remove_file(&dest);
         let p = download_ipv4(&url, &dest).expect("download_ipv4 gpt2 config.json");
         let len = std::fs::metadata(&p).expect("metadata").len();

@@ -6,7 +6,11 @@ use zend_tools::ToolContext;
 #[test]
 fn udp_session_open_close() {
     let ctx = ToolContext::new();
-    let open = harness::expect_success(harness::invoke_with_ctx("udp_session_open", json!({}), &ctx));
+    let open = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_open",
+        json!({}),
+        &ctx,
+    ));
     let sid = open["session_id"].as_str().unwrap().to_string();
     assert!(!sid.is_empty());
 
@@ -22,14 +26,22 @@ fn udp_session_open_close() {
 fn udp_session_list_after_open() {
     let ctx = ToolContext::new();
     harness::invoke_with_ctx("udp_session_open", json!({}), &ctx);
-    let list = harness::expect_success(harness::invoke_with_ctx("udp_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
 }
 
 #[test]
 fn udp_session_list_empty_initially() {
     let ctx = ToolContext::new();
-    let list = harness::expect_success(harness::invoke_with_ctx("udp_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 0);
 }
 
@@ -45,17 +57,33 @@ fn udp_session_close_nonexistent() {
 #[test]
 fn udp_session_open_multiple_independent() {
     let ctx = ToolContext::new();
-    let s1 = harness::expect_success(harness::invoke_with_ctx("udp_session_open", json!({}), &ctx));
-    let s2 = harness::expect_success(harness::invoke_with_ctx("udp_session_open", json!({}), &ctx));
+    let s1 = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_open",
+        json!({}),
+        &ctx,
+    ));
+    let s2 = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_open",
+        json!({}),
+        &ctx,
+    ));
     assert_ne!(s1["session_id"], s2["session_id"]);
-    let list = harness::expect_success(harness::invoke_with_ctx("udp_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 2);
 }
 
 #[test]
 fn udp_session_session_id_starts_with_sess() {
     let ctx = ToolContext::new();
-    let open = harness::expect_success(harness::invoke_with_ctx("udp_session_open", json!({}), &ctx));
+    let open = harness::expect_success(harness::invoke_with_ctx(
+        "udp_session_open",
+        json!({}),
+        &ctx,
+    ));
     assert!(open["session_id"].as_str().unwrap().starts_with("sess_"));
 }
 

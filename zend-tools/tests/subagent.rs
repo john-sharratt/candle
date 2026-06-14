@@ -1,7 +1,7 @@
 mod harness;
 
-use std::sync::{Arc, Mutex};
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 use zend_tools::{SubagentRequest, SubagentResponse, SubagentRunner, ToolContext};
 
 // ── Reusable mock runners ─────────────────────────────────────────────────────
@@ -64,11 +64,8 @@ fn subagent_with_mock_runner() {
 #[test]
 fn subagent_runner_failed() {
     let ctx = ToolContext::new().with_subagent_runner(Arc::new(FailRunner));
-    let resp = harness::invoke_with_ctx(
-        "subagent_run",
-        json!({"instruction": "fail please"}),
-        &ctx,
-    );
+    let resp =
+        harness::invoke_with_ctx("subagent_run", json!({"instruction": "fail please"}), &ctx);
     harness::expect_error(&resp, "subagent_failed");
 }
 
@@ -94,7 +91,11 @@ fn subagent_max_turns_default() {
     impl SubagentRunner for TurnsCapture {
         fn run(&self, req: SubagentRequest) -> Result<SubagentResponse, String> {
             CAPTURED.store(req.max_turns, std::sync::atomic::Ordering::Relaxed);
-            Ok(SubagentResponse { result: "ok".into(), turns: 1, tool_calls_made: 0 })
+            Ok(SubagentResponse {
+                result: "ok".into(),
+                turns: 1,
+                tool_calls_made: 0,
+            })
         }
     }
 
@@ -121,11 +122,7 @@ fn subagent_custom_max_turns() {
 #[test]
 fn subagent_empty_instruction_rejected() {
     let ctx = ToolContext::new().with_subagent_runner(Arc::new(EchoRunner));
-    let resp = harness::invoke_with_ctx(
-        "subagent_run",
-        json!({"instruction": ""}),
-        &ctx,
-    );
+    let resp = harness::invoke_with_ctx("subagent_run", json!({"instruction": ""}), &ctx);
     harness::expect_error(&resp, "invalid_arguments");
 }
 
@@ -181,7 +178,10 @@ fn subagent_model_override_passed_to_runner() {
         &ctx,
     );
     let captured = runner.captured.lock().unwrap();
-    assert_eq!(captured.as_ref().unwrap().model.as_deref(), Some("claude-opus-4-7"));
+    assert_eq!(
+        captured.as_ref().unwrap().model.as_deref(),
+        Some("claude-opus-4-7")
+    );
 }
 
 #[test]
@@ -243,7 +243,11 @@ fn subagent_many_tool_calls_propagated() {
     struct HighUsageRunner;
     impl SubagentRunner for HighUsageRunner {
         fn run(&self, _req: SubagentRequest) -> Result<SubagentResponse, String> {
-            Ok(SubagentResponse { result: "done".into(), turns: 7, tool_calls_made: 50 })
+            Ok(SubagentResponse {
+                result: "done".into(),
+                turns: 7,
+                tool_calls_made: 50,
+            })
         }
     }
     let ctx = ToolContext::new().with_subagent_runner(Arc::new(HighUsageRunner));
@@ -260,10 +264,16 @@ fn subagent_many_tool_calls_propagated() {
 
 #[test]
 fn subagent_contexts_are_independent() {
-    struct IdRunner { id: &'static str }
+    struct IdRunner {
+        id: &'static str,
+    }
     impl SubagentRunner for IdRunner {
         fn run(&self, _req: SubagentRequest) -> Result<SubagentResponse, String> {
-            Ok(SubagentResponse { result: self.id.into(), turns: 1, tool_calls_made: 0 })
+            Ok(SubagentResponse {
+                result: self.id.into(),
+                turns: 1,
+                tool_calls_made: 0,
+            })
         }
     }
 
@@ -271,10 +281,14 @@ fn subagent_contexts_are_independent() {
     let ctx_b = ToolContext::new().with_subagent_runner(Arc::new(IdRunner { id: "runner_B" }));
 
     let a = harness::expect_success(harness::invoke_with_ctx(
-        "subagent_run", json!({"instruction": "x"}), &ctx_a,
+        "subagent_run",
+        json!({"instruction": "x"}),
+        &ctx_a,
     ));
     let b = harness::expect_success(harness::invoke_with_ctx(
-        "subagent_run", json!({"instruction": "x"}), &ctx_b,
+        "subagent_run",
+        json!({"instruction": "x"}),
+        &ctx_b,
     ));
     assert_eq!(a["result"], "runner_A");
     assert_eq!(b["result"], "runner_B");
@@ -284,11 +298,7 @@ fn subagent_contexts_are_independent() {
 fn subagent_no_runner_in_default_context() {
     // A fresh ToolContext without with_subagent_runner must return not_configured
     let ctx = ToolContext::new();
-    let resp = harness::invoke_with_ctx(
-        "subagent_run",
-        json!({"instruction": "anything"}),
-        &ctx,
-    );
+    let resp = harness::invoke_with_ctx("subagent_run", json!({"instruction": "anything"}), &ctx);
     harness::expect_error(&resp, "not_configured");
 }
 
@@ -299,11 +309,7 @@ fn subagent_instruction_roundtrip() {
     let runner = Arc::new(CapturingRunner::default());
     let ctx = ToolContext::new().with_subagent_runner(runner.clone());
     let instruction = "process the dataset and produce a summary";
-    harness::invoke_with_ctx(
-        "subagent_run",
-        json!({"instruction": instruction}),
-        &ctx,
-    );
+    harness::invoke_with_ctx("subagent_run", json!({"instruction": instruction}), &ctx);
     let captured = runner.captured.lock().unwrap();
     assert_eq!(captured.as_ref().unwrap().instruction, instruction);
 }

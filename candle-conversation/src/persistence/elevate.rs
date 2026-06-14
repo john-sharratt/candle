@@ -189,6 +189,28 @@ pub fn elevate_to_hot(
         turn_index: u32,
     }
     let mut pending: Vec<PendingRecall> = Vec::with_capacity(plan.cold_to_hot.len());
+
+    // Batch the turn cold-loads: scan the recovered turn-decl table and take
+    // the persistence + substrate locks ONCE for the whole set, rather than
+    // once per turn. `recovered_turn_decls` is O(total streams), so the old
+    // per-turn call made this loop O(cold_turns × total_streams) — quadratic
+    // in a deep conversation. Sections use a different content-addressed load
+    // path and stay per-entry below.
+    let turn_keys: Vec<TurnKey> = plan
+        .cold_to_hot
+        .iter()
+        .filter_map(|c| match c.kind {
+            PromotionItemKind::Turn(k) => Some(k),
+            _ => None,
+        })
+        .collect();
+    let mut loaded: std::collections::HashMap<
+        TurnKey,
+        candle::Result<Option<(Vec<SealedSequence>, u64)>>,
+    > = conversation
+        .cold_load_turns_into_hot(&turn_keys, backings, device, cold_stager)
+        .into_iter()
+        .collect();
     for cold_entry in plan.cold_to_hot {
         match cold_entry.kind {
             PromotionItemKind::Turn(key) => {
@@ -200,23 +222,17 @@ pub fn elevate_to_hot(
                 // a per-chunk `Vec<u8>` allocation for `kv_bytes` and a
                 // host-to-host memcpy from heap into the pinned scratch
                 // before HtoD.
-                let (hot_sealed, bytes_for_item) = match conversation.cold_load_turn_into_hot(
-                    key.timeline,
-                    key.index,
-                    backings,
-                    device,
-                    cold_stager,
-                ) {
-                    Ok(Some(pair)) => pair,
-                    Ok(None) => {
+                let (hot_sealed, bytes_for_item) = match loaded.remove(&key) {
+                    Some(Ok(Some(pair))) => pair,
+                    Some(Ok(None)) | None => {
                         tracing::warn!(
                             "elevate_to_hot: cold-load found no chunks for turn {key:?}"
                         );
                         report.missing += 1;
                         continue;
                     }
-                    Err(e) => {
-                        tracing::warn!("elevate_to_hot: cold_load_turn_into_hot {key:?}: {e}");
+                    Some(Err(e)) => {
+                        tracing::warn!("elevate_to_hot: cold_load_turns_into_hot {key:?}: {e}");
                         report.failed += 1;
                         continue;
                     }
@@ -238,11 +254,7 @@ pub fn elevate_to_hot(
                 // reload installs cold-markers, the next projection
                 // that depends on this section triggers the cold→hot
                 // lift here.
-                let chunks_per_layer = cold_entry
-                    .cold
-                    .first()
-                    .map(|s| s.chunks.len())
-                    .unwrap_or(0);
+                let chunks_per_layer = cold_entry.cold.first().map(|s| s.chunks.len()).unwrap_or(0);
                 if chunks_per_layer == 0 {
                     tracing::warn!(
                         "elevate_to_hot: section {sid:?} has empty cold refs — skipping"
@@ -260,9 +272,7 @@ pub fn elevate_to_hot(
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(
-                            "elevate_to_hot: cold-load section {sid:?}: {e}"
-                        );
+                        tracing::warn!("elevate_to_hot: cold-load section {sid:?}: {e}");
                         report.failed += 1;
                         continue;
                     }
@@ -763,6 +773,71 @@ mod tests {
         assert!(restored.is_some(), "post-elevate the turn must be hot");
         let restored = restored.unwrap();
         assert_eq!(restored.len(), 2, "n_layers per the test");
+    }
+
+    /// Budget-aware eviction (`evict_hot_to_free`, Fix 1) on a **real GPU
+    /// residence**, followed by the **real GPU warm→hot reload**. Seeds two
+    /// hot turns (both given warm copies), evicts the older one to warm via the
+    /// budget-aware path while the keep set protects the newer one, then
+    /// reloads the evicted turn warm→hot through `elevate_to_hot`. This is the
+    /// pair of paths that VRAM pressure can't trigger on a large card —
+    /// exercised here directly instead.
+    #[test]
+    fn budget_evict_to_warm_then_reload_restores_gpu() {
+        let Some(device) = cuda_device_or_skip() else {
+            return;
+        };
+        let (conv, backings, timeline) = fresh_setup(&device, 2);
+        let mut r = cuda_resources(&device);
+
+        // Two hot turns: a seeded first (oldest), b second (newest).
+        let idx_a = seed_turn(&conv, &backings, &device, timeline, 2, 16, 32, 7);
+        let idx_b = seed_turn(&conv, &backings, &device, timeline, 2, 16, 32, 8);
+
+        // Give each a warm (CPU) copy so eviction is hot→warm.
+        for idx in [idx_a, idx_b] {
+            let residence = conv.read().turn_residence(timeline, idx).unwrap();
+            let hot_arc = conv.read().turn_sealed_of(timeline, idx).unwrap();
+            let warm =
+                migrate_layers_to_cpu(&backings, &device, &r.copy_stream, &mut r.pinned, &hot_arc);
+            drop(hot_arc);
+            conv.write().install_warm(residence, warm);
+        }
+
+        // Budget-aware evict, protecting the newer turn via the keep set: only
+        // the older (a) is dropped from hot, and its warm copy is preserved.
+        let evicted =
+            conv.write()
+                .evict_hot_to_free(&[], &[TurnKey::new(timeline, idx_b)], u64::MAX);
+        assert_eq!(evicted.count, 1, "a (not in keep set) evicted; b kept");
+        assert!(
+            conv.read().turn_sealed_of(timeline, idx_a).is_none(),
+            "a (oldest) evicted to warm"
+        );
+        assert!(
+            conv.read().turn_sealed_of(timeline, idx_b).is_some(),
+            "b (newest) stays hot — keep set honoured"
+        );
+
+        // Reload a warm→hot through the real GPU migrate path.
+        let report = elevate_to_hot(
+            &conv,
+            &backings,
+            &device,
+            &r.copy_stream,
+            &mut r.pinned,
+            &mut r.stager,
+            &[],
+            &[TurnKey::new(timeline, idx_a)],
+        )
+        .unwrap();
+        assert_eq!(report.warm_to_hot, 1, "a reloaded from warm, not cold");
+        assert_eq!(report.cold_to_hot, 0);
+        assert_eq!(report.failed, 0);
+        assert!(
+            conv.read().turn_sealed_of(timeline, idx_a).is_some(),
+            "a hot again after warm→hot reload"
+        );
     }
 
     /// A batch mixing already-hot turns, a warm-only turn, and a

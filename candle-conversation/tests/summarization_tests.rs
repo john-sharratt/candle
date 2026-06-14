@@ -18,8 +18,7 @@
 
 use candle_conversation::{
     models::{Model, ModelBuilder},
-    SequenceConfig, ConversationEngine, ConversationNode, ConversationTreeConfig,
-    SamplingConfig,
+    ConversationEngine, ConversationNode, ConversationTreeConfig, SamplingConfig, SequenceConfig,
 };
 use std::time::{Duration, Instant};
 
@@ -39,11 +38,13 @@ fn summ_builder() -> ModelBuilder {
 }
 
 fn engine() -> ConversationEngine {
-    let device = candle::Device::cuda_if_available(0)
-        .expect("CUDA device required for integration tests");
+    let device =
+        candle::Device::cuda_if_available(0).expect("CUDA device required for integration tests");
     eprintln!("\n=== Loading {} ===", SUMM_MODEL);
     let start = Instant::now();
-    let e = summ_builder().engine(&device).expect("failed to load model");
+    let e = summ_builder()
+        .engine(&device)
+        .expect("failed to load model");
     eprintln!("   Loaded in {:.2}s\n", start.elapsed().as_secs_f64());
     e
 }
@@ -113,10 +114,7 @@ fn last_segment(
 /// completes (via `run_task_blocking_inner`), the segment is normally present
 /// the instant `send` returns.  This helper guards against regressions where
 /// the synchronous drain is accidentally removed, preventing a test hang.
-fn wait_for_any_segment(
-    conv: &candle_conversation::Sequence,
-    timeout: Duration,
-) -> bool {
+fn wait_for_any_segment(conv: &candle_conversation::Sequence, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if segment_count(conv) > 0 {
@@ -183,10 +181,7 @@ fn test_summarization_segment_text_is_nonempty() {
     let text = seg.inner().summary_text.text().to_string();
     eprintln!("Summary text ({} chars): {:?}", text.len(), text);
 
-    assert!(
-        !text.is_empty(),
-        "segment summary_text should not be empty"
-    );
+    assert!(!text.is_empty(), "segment summary_text should not be empty");
     conv.close().ok();
 }
 
@@ -294,10 +289,7 @@ fn test_summarization_turn_nodes_preserved_after_segment() {
                 );
                 for (j, child) in s.inner().children.iter().enumerate() {
                     if let ConversationNode::Turn(ct) = child {
-                        eprintln!(
-                            "       child[{}] Turn(seq={})",
-                            j, ct.inner().turn_id.seq
-                        );
+                        eprintln!("       child[{}] Turn(seq={})", j, ct.inner().turn_id.seq);
                     }
                 }
             }
@@ -306,7 +298,8 @@ fn test_summarization_turn_nodes_preserved_after_segment() {
 
     // Top-level list: exactly 1 node (the segment).
     assert_eq!(
-        nodes.len(), 1,
+        nodes.len(),
+        1,
         "expected 1 top-level node (segment), got {}",
         nodes.len()
     );
@@ -339,14 +332,16 @@ fn test_summarization_segment_is_parent_of_turns() {
         .expect("new_conversation failed");
 
     for i in 1..=3u32 {
-        conv.send_turn(&format!("Message number {i}.")).expect("send failed");
+        conv.send_turn(&format!("Message number {i}."))
+            .expect("send failed");
     }
 
     let nodes: Vec<_> = conv.tree().nodes().collect();
 
     // One top-level node: the segment.
     assert_eq!(
-        nodes.len(), 1,
+        nodes.len(),
+        1,
         "expected 1 top-level node after summarisation, got {}",
         nodes.len()
     );
@@ -357,7 +352,8 @@ fn test_summarization_segment_is_parent_of_turns() {
     let children = &seg.inner().children;
 
     assert_eq!(
-        children.len(), 3,
+        children.len(),
+        3,
         "segment should have exactly 3 child nodes, got {}",
         children.len()
     );
@@ -394,14 +390,12 @@ fn test_summarization_does_not_trigger_early() {
 
     // Only 2 turns — below threshold of 3.
     for i in 1..=2u32 {
-        conv.send_turn(&format!("Early turn {i}.")).expect("send failed");
+        conv.send_turn(&format!("Early turn {i}."))
+            .expect("send failed");
     }
 
     let segs = segment_count(&conv);
-    eprintln!(
-        "Segment count after {} / {} turns: {}",
-        2, 3, segs
-    );
+    eprintln!("Segment count after {} / {} turns: {}", 2, 3, segs);
     assert_eq!(
         segs, 0,
         "no segment should appear before reaching summarize_every=3 turns"
@@ -464,7 +458,8 @@ fn test_summarization_segment_ordering_seq() {
         .expect("new_conversation failed");
 
     for i in 1..=3u32 {
-        conv.send_turn(&format!("Order test turn {i}.")).expect("send failed");
+        conv.send_turn(&format!("Order test turn {i}."))
+            .expect("send failed");
     }
 
     let seg = last_segment(&conv).expect("no segment node found");
@@ -593,9 +588,7 @@ fn test_summarization_every_one_trigger() {
         .new_conversation(&system_prompt(), config_with_every(1))
         .expect("new_conversation failed");
 
-    let resp = conv
-        .send_turn("Hello world.")
-        .expect("send failed");
+    let resp = conv.send_turn("Hello world.").expect("send failed");
     eprintln!("Response: {}", resp.text);
 
     let found = wait_for_any_segment(&conv, Duration::from_secs(30));
@@ -605,10 +598,7 @@ fn test_summarization_every_one_trigger() {
     );
 
     let seg = last_segment(&conv).unwrap();
-    eprintln!(
-        "Segment text: {:?}",
-        seg.inner().summary_text.text()
-    );
+    eprintln!("Segment text: {:?}", seg.inner().summary_text.text());
     assert!(!seg.inner().summary_text.text().is_empty());
 
     conv.close().ok();
@@ -658,10 +648,7 @@ fn test_summarization_disabled_when_every_zero() {
 fn test_recursive_summarization_two_levels() {
     let eng = engine();
     let mut conv = eng
-        .new_conversation(
-            &system_prompt(),
-            config_with_every_and_segment_every(3, 2),
-        )
+        .new_conversation(&system_prompt(), config_with_every_and_segment_every(3, 2))
         .expect("new_conversation failed");
 
     // Use insert_turn (prefill-only, no decode) so the 6 setup turns are fast.
@@ -678,7 +665,8 @@ fn test_recursive_summarization_two_levels() {
 
     // Exactly one top-level node: the level-2 segment.
     assert_eq!(
-        nodes.len(), 1,
+        nodes.len(),
+        1,
         "expected 1 top-level node (level-2 segment), got {}",
         nodes.len()
     );
@@ -701,7 +689,8 @@ fn test_recursive_summarization_two_levels() {
     // Level-2 should have exactly 2 Segment children (the level-1 segments).
     let l2_children = &level2.inner().children;
     assert_eq!(
-        l2_children.len(), 2,
+        l2_children.len(),
+        2,
         "level-2 segment should have 2 children, got {}",
         l2_children.len()
     );
@@ -722,7 +711,8 @@ fn test_recursive_summarization_two_levels() {
         assert_eq!(l1.inner().segment_id.start_turn.seq, expected_start);
         assert_eq!(l1.inner().segment_id.end_turn.seq, expected_end);
         assert_eq!(
-            l1.inner().children.len(), 3,
+            l1.inner().children.len(),
+            3,
             "level-1 child[{}] should have 3 turn children",
             ci
         );
@@ -730,10 +720,7 @@ fn test_recursive_summarization_two_levels() {
             let turn = tc
                 .as_turn()
                 .expect("level-1 child's children should be Turns");
-            assert_eq!(
-                turn.inner().turn_id.seq,
-                expected_start + ti as u32
-            );
+            assert_eq!(turn.inner().turn_id.seq, expected_start + ti as u32);
         }
     }
 

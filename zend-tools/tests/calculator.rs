@@ -54,13 +54,19 @@ fn calculator_floor_ceil() {
 
 #[test]
 fn calculator_basic_arithmetic() {
-    let resp = harness::expect_success(harness::invoke("calculator", json!({"expression": "2 + 3 * 4"})));
+    let resp = harness::expect_success(harness::invoke(
+        "calculator",
+        json!({"expression": "2 + 3 * 4"}),
+    ));
     assert_eq!(resp["result"].as_f64().unwrap(), 14.0);
 }
 
 #[test]
 fn calculator_power() {
-    let resp = harness::expect_success(harness::invoke("calculator", json!({"expression": "2 ^ 10"})));
+    let resp = harness::expect_success(harness::invoke(
+        "calculator",
+        json!({"expression": "2 ^ 10"}),
+    ));
     assert!((resp["result"].as_f64().unwrap() - 1024.0).abs() < 1e-9);
 }
 

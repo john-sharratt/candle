@@ -40,7 +40,11 @@ fn http_session_open_list_close() {
     ));
     let sid = open["session_id"].as_str().unwrap().to_string();
 
-    let list = harness::expect_success(harness::invoke_with_ctx("http_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "http_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
 
     let closed = harness::expect_success(harness::invoke_with_ctx(
@@ -50,7 +54,11 @@ fn http_session_open_list_close() {
     ));
     assert_eq!(closed["closed"], true);
 
-    let list2 = harness::expect_success(harness::invoke_with_ctx("http_session_list", json!({}), &ctx));
+    let list2 = harness::expect_success(harness::invoke_with_ctx(
+        "http_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list2["sessions"].as_array().unwrap().len(), 0);
 }
 

@@ -8,7 +8,7 @@ use std::io::Write;
 
 use crate::{
     handle::{TokenDecoder, TurnEvent},
-    Sequence, SequenceConfig, ConversationEngine, ConversationError,
+    ConversationEngine, ConversationError, Sequence, SequenceConfig,
 };
 
 use super::error::ConvertError;
@@ -99,10 +99,7 @@ fn send_to_converter_streaming(
 fn sanitize_json_output(raw: &str) -> std::borrow::Cow<'_, str> {
     let s = raw.trim();
     // Strip code fences.
-    let s = if let Some(inner) = s
-        .strip_prefix("```json")
-        .or_else(|| s.strip_prefix("```"))
-    {
+    let s = if let Some(inner) = s.strip_prefix("```json").or_else(|| s.strip_prefix("```")) {
         inner.trim_start()
     } else {
         s

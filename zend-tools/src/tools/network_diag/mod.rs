@@ -20,22 +20,22 @@
 //! - [`extract_ip`] — pulls the first IPv4 address out of subprocess output
 //! - [`extract_rtt`] — extracts the first round-trip time value (ms) from output
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
 pub mod dns_lookup;
-pub mod ping_icmp;
-pub mod trace_route;
-pub mod port_scan;
-pub mod ip_scan;
 pub mod host_info;
+pub mod ip_scan;
+pub mod ping_icmp;
+pub mod port_scan;
+pub mod trace_route;
 
 pub use dns_lookup::DNS_LOOKUP;
-pub use ping_icmp::PING_ICMP;
-pub use trace_route::TRACE_ROUTE;
-pub use port_scan::PORT_SCAN;
-pub use ip_scan::IP_SCAN;
 pub use host_info::HOST_INFO;
+pub use ip_scan::IP_SCAN;
+pub use ping_icmp::PING_ICMP;
+pub use port_scan::PORT_SCAN;
+pub use trace_route::TRACE_ROUTE;
 
 #[derive(Debug, Error)]
 pub enum DiagError {

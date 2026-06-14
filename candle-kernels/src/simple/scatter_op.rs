@@ -165,7 +165,15 @@ impl ScatterDispatcher {
         value: V,
         stride: usize,
     ) {
-        Self::scatter_op(ScatterOp::Add, dtype, data, indices, num_indices, value, stride)
+        Self::scatter_op(
+            ScatterOp::Add,
+            dtype,
+            data,
+            indices,
+            num_indices,
+            value,
+            stride,
+        )
     }
 
     /// Perform scatter sub operation
@@ -213,13 +221,7 @@ impl ScatterDispatcher {
         values: *const c_void,
         num_indices: usize,
     ) {
-        run_sub_at_indices_with_values(
-            dtype as i32,
-            data,
-            indices,
-            values,
-            num_indices,
-        )
+        run_sub_at_indices_with_values(dtype as i32, data, indices, values, num_indices)
     }
 }
 

@@ -46,6 +46,9 @@ fn harness_builds_with_all_tool_sections() {
     let h = Harness::build();
     assert_eq!(h.tool_section_ids.len(), TOOLS.len());
     for &tool in TOOLS {
-        assert!(h.tool_section_ids.contains_key(tool), "missing section for {tool}");
+        assert!(
+            h.tool_section_ids.contains_key(tool),
+            "missing section for {tool}"
+        );
     }
 }

@@ -79,8 +79,16 @@ mod cuda_tests {
         );
 
         // 4-bit quantization should have reasonable error
-        assert!(max_diff < 0.5, "Q_AWQ max quantization error too high: {}", max_diff);
-        assert!(mean_diff < 0.1, "Q_AWQ mean quantization error too high: {}", mean_diff);
+        assert!(
+            max_diff < 0.5,
+            "Q_AWQ max quantization error too high: {}",
+            max_diff
+        );
+        assert!(
+            mean_diff < 0.1,
+            "Q_AWQ mean quantization error too high: {}",
+            mean_diff
+        );
 
         Ok(())
     }
@@ -132,8 +140,16 @@ mod cuda_tests {
         );
 
         // G64 should have similar or better precision than G128
-        assert!(max_diff < 0.5, "Q_AWQ_G64 max quantization error too high: {}", max_diff);
-        assert!(mean_diff < 0.1, "Q_AWQ_G64 mean quantization error too high: {}", mean_diff);
+        assert!(
+            max_diff < 0.5,
+            "Q_AWQ_G64 max quantization error too high: {}",
+            max_diff
+        );
+        assert!(
+            mean_diff < 0.1,
+            "Q_AWQ_G64 mean quantization error too high: {}",
+            mean_diff
+        );
 
         Ok(())
     }
@@ -143,7 +159,7 @@ mod cuda_tests {
     // =========================================================================
 
     // =========================================================================
-    // Q_AWQ GEMV (single-vector) tests  
+    // Q_AWQ GEMV (single-vector) tests
     // =========================================================================
     // Note: The all_dtypes tests already test batch_size=1 (GEMV path).
     // These tests verify GEMV specifically with different matrix dimensions.
@@ -158,29 +174,31 @@ mod cuda_tests {
 
         // Test various non-square dimensions that exercise GEMV path
         let configs = [
-            (256, 512),   // wide matrix
-            (512, 256),   // tall matrix  
-            (1024, 256),  // very tall
-            (256, 1024),  // very wide
+            (256, 512),  // wide matrix
+            (512, 256),  // tall matrix
+            (1024, 256), // very tall
+            (256, 1024), // very wide
         ];
 
         for (nrows, ncols) in configs {
             let weights = common::create_test_weights(nrows, ncols, &device)?;
-            
+
             // Quantize
             let qtensor = QTensor::quantize(&weights, GgmlDType::QAWQ)?;
-            
+
             // Dequantize to verify roundtrip
             let dequant = qtensor.dequantize(&device)?;
-            
+
             // Compare stats
             let stats = common::compare_tensors(&weights, &dequant)?;
-            
+
             // Q_AWQ is 4-bit asymmetric, expect some error
             assert!(
                 stats.max_diff < 0.3,
                 "Q_AWQ quantize roundtrip error too high for {}x{}: {}",
-                nrows, ncols, stats.max_diff
+                nrows,
+                ncols,
+                stats.max_diff
             );
         }
 
@@ -196,23 +214,20 @@ mod cuda_tests {
             Err(_) => return Ok(()),
         };
 
-        let configs = [
-            (256, 512),
-            (512, 256),
-            (1024, 256),
-            (256, 1024),
-        ];
+        let configs = [(256, 512), (512, 256), (1024, 256), (256, 1024)];
 
         for (nrows, ncols) in configs {
             let weights = common::create_test_weights(nrows, ncols, &device)?;
             let qtensor = QTensor::quantize(&weights, GgmlDType::QAWQ_G64)?;
             let dequant = qtensor.dequantize(&device)?;
             let stats = common::compare_tensors(&weights, &dequant)?;
-            
+
             assert!(
                 stats.max_diff < 0.3,
                 "Q_AWQ_G64 quantize roundtrip error too high for {}x{}: {}",
-                nrows, ncols, stats.max_diff
+                nrows,
+                ncols,
+                stats.max_diff
             );
         }
 
@@ -223,7 +238,6 @@ mod cuda_tests {
     // =========================================================================
     // Q_AWQ Tests (group size 128)
     // =========================================================================
-
 
     /// Test Q_AWQ with all supported input dtypes
     #[test]

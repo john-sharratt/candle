@@ -122,9 +122,7 @@ fn infinite_conversation_cruise() {
     let mut conv = base_conv.fork_resuming(timeline_id).expect("fork");
     // Plant a marker turn early.
     let _ = conv
-        .send_turn(
-            "Important early marker: the safe combination is 17-42-9.  Anyway, continuing.",
-        )
+        .send_turn("Important early marker: the safe combination is 17-42-9.  Anyway, continuing.")
         .expect("plant");
     for i in 1..GROWTH {
         let user_msg = format!(
@@ -163,9 +161,7 @@ fn infinite_conversation_cruise() {
     // because the cruise harness is the regression detector, not a
     // strict gate.
     if !recalled {
-        eprintln!(
-            "WARNING: cruise recall MISS for safe combination (depth {GROWTH})"
-        );
+        eprintln!("WARNING: cruise recall MISS for safe combination (depth {GROWTH})");
     }
 }
 
@@ -204,9 +200,7 @@ fn infinite_conversation_stress() {
         .expect("probe");
     eprintln!("stress recall: {:?}", response.text);
     let recalled = response.text.to_lowercase().contains("bluebird");
-    eprintln!(
-        "stress CSV: depth={GROWTH} recalled={recalled}"
-    );
+    eprintln!("stress CSV: depth={GROWTH} recalled={recalled}");
     probe_conv.close().expect("close probe");
     if !recalled {
         eprintln!("WARNING: stress recall MISS at depth {GROWTH}");

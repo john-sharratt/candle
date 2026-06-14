@@ -91,7 +91,9 @@ impl TokenSignature {
     /// Construct from a raw u128.
     #[inline]
     pub fn from_u128(v: u128) -> Self {
-        Self { bits: v.to_le_bytes() }
+        Self {
+            bits: v.to_le_bytes(),
+        }
     }
 
     /// Raw byte slice (`BYTE_LEN` bytes, LSB-first).
@@ -125,7 +127,9 @@ pub struct TurnSignatures {
 
 impl TurnSignatures {
     pub fn from_sigs(it: impl IntoIterator<Item = TokenSignature>) -> Self {
-        Self { sigs: it.into_iter().collect() }
+        Self {
+            sigs: it.into_iter().collect(),
+        }
     }
 
     /// Build from raw Q float data for a block of tokens.
@@ -208,8 +212,7 @@ pub fn r16_block_to_turn_signatures_mh(
     let n_tokens = n_tokens_in_block.min(CHUNK_SIZE);
 
     // Scratch buffers — one per head, reused across tokens.
-    let mut head_bufs: Vec<Vec<f32>> =
-        (0..n_heads).map(|_| Vec::with_capacity(head_dim)).collect();
+    let mut head_bufs: Vec<Vec<f32>> = (0..n_heads).map(|_| Vec::with_capacity(head_dim)).collect();
 
     let mut sigs = Vec::with_capacity(n_tokens);
     for t in 0..n_tokens {
@@ -260,7 +263,9 @@ pub fn extract_signatures_from_r16_dump(
 ) -> Vec<TurnSignatures> {
     blocks
         .iter()
-        .map(|(_, _k, _v, q)| r16_block_to_turn_signatures(q, n_kv_head, head_dim, tokens_per_block))
+        .map(|(_, _k, _v, q)| {
+            r16_block_to_turn_signatures(q, n_kv_head, head_dim, tokens_per_block)
+        })
         .collect()
 }
 
@@ -280,7 +285,6 @@ pub fn extract_mh_signatures_from_r16_dump(
         })
         .collect()
 }
-
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
@@ -302,15 +306,21 @@ mod tests {
 
     #[test]
     fn agreement_with_self_is_128() {
-        let q: Vec<f32> = (0..128).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let q: Vec<f32> = (0..128)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let sig = TokenSignature::from_q_flat(&q);
         assert_eq!(sig.agreement(&sig), 128);
     }
 
     #[test]
     fn agreement_plus_distance_is_128() {
-        let q1: Vec<f32> = (0..128).map(|i| if i % 3 == 0 { 1.0 } else { -1.0 }).collect();
-        let q2: Vec<f32> = (0..128).map(|i| if i % 5 == 0 { 1.0 } else { -1.0 }).collect();
+        let q1: Vec<f32> = (0..128)
+            .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let q2: Vec<f32> = (0..128)
+            .map(|i| if i % 5 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let s1 = TokenSignature::from_q_flat(&q1);
         let s2 = TokenSignature::from_q_flat(&q2);
         assert_eq!(s1.agreement(&s2) + s1.hamming_distance(&s2), 128);

@@ -43,7 +43,9 @@
 ///
 /// `TurnType` determines how a turn is weighted in summarization, how it
 /// appears in debug output, and which async pipeline owns it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnType {
     /// Live interaction in the character's active world — the normal
@@ -268,7 +270,10 @@ impl NodeId {
 
     /// Convenience constructor: `NodeId::Segment(SegmentId { start_turn, end_turn })`.
     pub fn segment(start_turn: TurnId, end_turn: TurnId) -> Self {
-        NodeId::Segment(SegmentId { start_turn, end_turn })
+        NodeId::Segment(SegmentId {
+            start_turn,
+            end_turn,
+        })
     }
 
     /// Seq coordinate for timeline ordering.

@@ -17,9 +17,7 @@ mod persistence {
 
     use futures::StreamExt;
 
-    use candle_conversation::persistence::{
-        SubstratePersistence, ACTIVE_LOG_NAME, SUBSTRATE_DIR,
-    };
+    use candle_conversation::persistence::{SubstratePersistence, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
     use candle_conversation::substrate::Substrate;
     use zend::config::DaemonConfig;
     use zend::log_broadcast::LogBus;
@@ -116,16 +114,30 @@ mod persistence {
 
     async fn run_session(workspace: std::path::PathBuf) {
         let log = LogBus::new();
-        let config = DaemonConfig { workspace, port: 0 };
+        let config = DaemonConfig {
+            workspace,
+            port: 0,
+            ..Default::default()
+        };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
 
         // Two turns on one conversation — the multi-turn continuity case.
-        let r1 = run_turn(&session, "p8-conv", "What is 2 + 2? Reply with just the number.").await;
+        let r1 = run_turn(
+            &session,
+            "p8-conv",
+            "What is 2 + 2? Reply with just the number.",
+        )
+        .await;
         eprintln!("[TURN 1] {r1}");
         assert!(!r1.is_empty(), "turn 1 produced no tokens");
 
-        let r2 = run_turn(&session, "p8-conv", "Now add 3 to that. Reply with just the number.").await;
+        let r2 = run_turn(
+            &session,
+            "p8-conv",
+            "Now add 3 to that. Reply with just the number.",
+        )
+        .await;
         eprintln!("[TURN 2] {r2}");
         assert!(!r2.is_empty(), "turn 2 produced no tokens");
 

@@ -75,6 +75,11 @@ large_enum_variant = "allow"
 
 [features]
 default = []
+# Feature-gated, zero-cost scoped timing of the projection / reproject hot path
+# (see `scheduler::profile`). Emits an aggregated, sorted-by-cost breakdown.
+# Also enables candle-transformers' per-op pipeline profile (attn_core, mlp_ffn,
+# gemm_*) so the gap-fill forward's internal breakdown can be dumped.
+profile = ["candle-transformers/profile"]
 sig-trace = []   # enables per-chunk BDP signature tracing (TRACE level, high volume)
 # Records the per-slot token stream (every injected section, every
 # projected turn, prefilled user text, decoded tokens, post-decode

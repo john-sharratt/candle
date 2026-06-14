@@ -24,9 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::state::{
-    CredentialStore, HashStateStore, NotesStore, SessionRegistry, VfsStore,
-};
+use crate::state::{CredentialStore, HashStateStore, NotesStore, SessionRegistry, VfsStore};
 
 /// Read-only handle bundle passed by the runner into each tool invocation.
 /// All stores are wrapped in `Arc` so cloning the context is cheap.

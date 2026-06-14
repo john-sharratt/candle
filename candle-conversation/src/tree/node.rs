@@ -19,8 +19,8 @@
 
 use std::sync::Arc;
 
-use super::types::{NodeId, SegmentId, TurnId, TurnType};
 use super::token_text::TokenizedText;
+use super::types::{NodeId, SegmentId, TurnId, TurnType};
 
 // ────────────────────────────────────────────────────────────────────────────
 // ConversationTurnInner / ConversationTurn
@@ -135,10 +135,7 @@ pub struct ConversationSegment(pub Arc<ConversationSegmentInner>);
 
 impl ConversationSegment {
     /// Create a new segment. `decode_context` and `children` start empty.
-    pub fn new(
-        segment_id: SegmentId,
-        summary_text: impl Into<TokenizedText>,
-    ) -> Self {
+    pub fn new(segment_id: SegmentId, summary_text: impl Into<TokenizedText>) -> Self {
         ConversationSegment(Arc::new(ConversationSegmentInner {
             segment_id,
             summary_text: summary_text.into(),
@@ -154,8 +151,8 @@ impl ConversationSegment {
     /// which would indicate an unexpected shared alias at this early stage of
     /// the segment's life.
     pub fn with_children(self, children: Vec<ConversationNode>) -> Self {
-        let inner = Arc::try_unwrap(self.0)
-            .expect("with_children called on a shared ConversationSegment");
+        let inner =
+            Arc::try_unwrap(self.0).expect("with_children called on a shared ConversationSegment");
         ConversationSegment(Arc::new(ConversationSegmentInner {
             segment_id: inner.segment_id,
             summary_text: inner.summary_text,

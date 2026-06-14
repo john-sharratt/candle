@@ -65,9 +65,12 @@ fn random_integer_default() {
 
 #[test]
 fn random_integer_range() {
-    let resp = harness::expect_success(harness::invoke("random", json!({
-        "kind": "integer", "min": 10.0, "max": 20.0, "count": 5
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "random",
+        json!({
+            "kind": "integer", "min": 10.0, "max": 20.0, "count": 5
+        }),
+    ));
     let arr = resp["result"].as_array().unwrap();
     assert_eq!(arr.len(), 5);
     for v in arr {
@@ -78,36 +81,48 @@ fn random_integer_range() {
 
 #[test]
 fn random_float() {
-    let resp = harness::expect_success(harness::invoke("random", json!({
-        "kind": "float", "min": 0.0, "max": 1.0
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "random",
+        json!({
+            "kind": "float", "min": 0.0, "max": 1.0
+        }),
+    ));
     let f = resp["result"].as_f64().unwrap();
     assert!(f >= 0.0 && f < 1.0);
 }
 
 #[test]
 fn random_choice() {
-    let resp = harness::expect_success(harness::invoke("random", json!({
-        "kind": "choice", "choices": ["a", "b", "c"]
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "random",
+        json!({
+            "kind": "choice", "choices": ["a", "b", "c"]
+        }),
+    ));
     let s = resp["result"].as_str().unwrap();
     assert!(["a", "b", "c"].contains(&s));
 }
 
 #[test]
 fn random_shuffle() {
-    let resp = harness::expect_success(harness::invoke("random", json!({
-        "kind": "shuffle", "choices": ["x", "y", "z"]
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "random",
+        json!({
+            "kind": "shuffle", "choices": ["x", "y", "z"]
+        }),
+    ));
     let arr = resp["result"].as_array().unwrap();
     assert_eq!(arr.len(), 3);
 }
 
 #[test]
 fn random_dice() {
-    let resp = harness::expect_success(harness::invoke("random", json!({
-        "kind": "dice", "sides": 6
-    })));
+    let resp = harness::expect_success(harness::invoke(
+        "random",
+        json!({
+            "kind": "dice", "sides": 6
+        }),
+    ));
     let n = resp["result"].as_u64().unwrap();
     assert!(n >= 1 && n <= 6);
 }
@@ -120,8 +135,11 @@ fn random_invalid_kind() {
 
 #[test]
 fn random_count_too_large() {
-    let resp = harness::invoke("random", json!({
-        "kind": "integer", "count": 1001
-    }));
+    let resp = harness::invoke(
+        "random",
+        json!({
+            "kind": "integer", "count": 1001
+        }),
+    );
     harness::expect_error(&resp, "invalid_arguments");
 }

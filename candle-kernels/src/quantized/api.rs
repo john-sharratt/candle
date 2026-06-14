@@ -304,19 +304,19 @@ mod matmul_qtype_lock_tests {
 
     #[test]
     fn matmul_qtype_values_are_stable() {
-        assert_eq!(QType::Q_AWQ     as i32, 5);
+        assert_eq!(QType::Q_AWQ as i32, 5);
         assert_eq!(QType::Q_AWQ_G64 as i32, 6);
-        assert_eq!(QType::Q8_0      as i32, 7);
-        assert_eq!(QType::Q8_1      as i32, 8);
-        assert_eq!(QType::Q8_K      as i32, 9);
-        assert_eq!(QType::Q6_K      as i32, 11);
-        assert_eq!(QType::Q5_0      as i32, 12);
-        assert_eq!(QType::Q5_1      as i32, 13);
-        assert_eq!(QType::Q5_K      as i32, 14);
-        assert_eq!(QType::Q4_0      as i32, 15);
-        assert_eq!(QType::Q4_1      as i32, 16);
-        assert_eq!(QType::Q4_K      as i32, 17);
-        assert_eq!(QType::Q3_K      as i32, 21);
-        assert_eq!(QType::Q2_K      as i32, 24);
+        assert_eq!(QType::Q8_0 as i32, 7);
+        assert_eq!(QType::Q8_1 as i32, 8);
+        assert_eq!(QType::Q8_K as i32, 9);
+        assert_eq!(QType::Q6_K as i32, 11);
+        assert_eq!(QType::Q5_0 as i32, 12);
+        assert_eq!(QType::Q5_1 as i32, 13);
+        assert_eq!(QType::Q5_K as i32, 14);
+        assert_eq!(QType::Q4_0 as i32, 15);
+        assert_eq!(QType::Q4_1 as i32, 16);
+        assert_eq!(QType::Q4_K as i32, 17);
+        assert_eq!(QType::Q3_K as i32, 21);
+        assert_eq!(QType::Q2_K as i32, 24);
     }
 }

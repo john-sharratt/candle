@@ -27,18 +27,18 @@
 //! | `query_failed` | SQL execution error (syntax, constraint, etc.) |
 //! | `session_limit_exceeded` | 5-session-per-user cap reached |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
+pub mod close;
+pub mod list;
 pub mod open;
 pub mod query;
-pub mod list;
-pub mod close;
 
+pub use close::SQL_SESSION_CLOSE;
+pub use list::SQL_SESSION_LIST;
 pub use open::SQL_SESSION_OPEN;
 pub use query::SQL_SESSION_QUERY;
-pub use list::SQL_SESSION_LIST;
-pub use close::SQL_SESSION_CLOSE;
 
 #[derive(Debug, Error)]
 pub enum SqlError {

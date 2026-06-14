@@ -90,7 +90,9 @@ fn empty_content_field(input: &NarratorInput) -> Option<&'static str> {
     match input {
         NarratorInput::Say { text, .. } if text.trim().is_empty() => Some("text"),
         NarratorInput::Act { action, .. } if action.trim().is_empty() => Some("action"),
-        NarratorInput::Scene { description } if description.trim().is_empty() => Some("description"),
+        NarratorInput::Scene { description } if description.trim().is_empty() => {
+            Some("description")
+        }
         NarratorInput::Cue { action, .. } if action.trim().is_empty() => Some("action"),
         NarratorInput::Beat { description } if description.trim().is_empty() => Some("description"),
         _ => None,

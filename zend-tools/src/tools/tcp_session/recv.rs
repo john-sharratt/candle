@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::TcpError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RecvRequest {
@@ -59,7 +59,9 @@ impl Tool for TcpSessionRecv {
             _ => {}
         }
 
-        let entry_arc = ctx.sessions.get_tcp(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_tcp(&req.session_id)
             .ok_or_else(|| TcpError::SessionNotFound(req.session_id.clone()))?;
         let mut entry = entry_arc.lock().unwrap();
 
@@ -75,8 +77,12 @@ impl Tool for TcpSessionRecv {
         let (n, eof, timed_out) = match entry.stream.read(&mut buf) {
             Ok(0) => (0, true, false),
             Ok(n) => (n, false, false),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                   || e.kind() == std::io::ErrorKind::WouldBlock => (0, false, true),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                (0, false, true)
+            }
             Err(e) => return Err(TcpError::RecvFailed(e.to_string())),
         };
 
@@ -85,15 +91,13 @@ impl Tool for TcpSessionRecv {
 
         let (data, data_hex, had_invalid) = match format {
             "hex" => (None, Some(hex::encode(bytes)), None),
-            "text" => {
-                match std::str::from_utf8(bytes) {
-                    Ok(s) => (Some(s.to_string()), None, Some(false)),
-                    Err(_) => {
-                        let s = String::from_utf8_lossy(bytes).into_owned();
-                        (Some(s), None, Some(true))
-                    }
+            "text" => match std::str::from_utf8(bytes) {
+                Ok(s) => (Some(s.to_string()), None, Some(false)),
+                Err(_) => {
+                    let s = String::from_utf8_lossy(bytes).into_owned();
+                    (Some(s), None, Some(true))
                 }
-            }
+            },
             _ => {
                 // auto: text if valid UTF-8, else hex
                 match std::str::from_utf8(bytes) {
@@ -103,7 +107,14 @@ impl Tool for TcpSessionRecv {
             }
         };
 
-        Ok(RecvResponse { data, data_hex, bytes_received: n, eof, timed_out, had_invalid_bytes: had_invalid })
+        Ok(RecvResponse {
+            data,
+            data_hex,
+            bytes_received: n,
+            eof,
+            timed_out,
+            had_invalid_bytes: had_invalid,
+        })
     }
 }
 

@@ -983,7 +983,6 @@ impl KvCache {
         Ok(())
     }
 
-
     /// Finalize sequences after generation completes.
     /// Get the current K cache data (narrowed to current_seq_len).
     pub fn k(&self) -> Result<Option<Tensor>> {

@@ -11,15 +11,20 @@
 //!
 //! Exits non-zero if any check fails.
 
-use candle_conversation::{ProvenanceFile, SigEntry, TokenSignature};
 use candle_conversation::provenance::store::ENTRY_BYTES_PER_TOKEN;
+use candle_conversation::{ProvenanceFile, SigEntry, TokenSignature};
 use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
-enum CaseType { Positive, Boundary, Negative, NoTool }
+enum CaseType {
+    Positive,
+    Boundary,
+    Negative,
+    NoTool,
+}
 
 #[derive(Debug, Deserialize)]
 struct Scenario {
@@ -37,7 +42,9 @@ struct Manifest {
 }
 
 fn bit_density(sigs: &[TokenSignature]) -> f64 {
-    if sigs.is_empty() { return 0.0; }
+    if sigs.is_empty() {
+        return 0.0;
+    }
     let ones: u32 = sigs.iter().map(|s| s.as_u128().count_ones()).sum();
     ones as f64 / (sigs.len() as f64 * 128.0)
 }
@@ -48,9 +55,8 @@ fn main() -> anyhow::Result<()> {
         "/tests/tool_provenance_real_data"
     ));
 
-    let manifest: Manifest = serde_json::from_str(
-        &std::fs::read_to_string(dir.join("MANIFEST.json"))?,
-    )?;
+    let manifest: Manifest =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("MANIFEST.json"))?)?;
     let sig_path = dir.join("signatures.prov");
     let file_bytes = std::fs::metadata(&sig_path)?.len();
     let pf = ProvenanceFile::open(&sig_path)?;
@@ -75,7 +81,10 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let entry = SigEntry { byte_offset: s.byte_offset, token_count: s.token_count };
+        let entry = SigEntry {
+            byte_offset: s.byte_offset,
+            token_count: s.token_count,
+        };
 
         // ── 2. Byte range within file ──────────────────────────────────────
         use ENTRY_BYTES_PER_TOKEN;
@@ -103,7 +112,11 @@ fn main() -> anyhow::Result<()> {
         {
             errors.push(format!(
                 "[{}] token_count={} but read back syn={} sem={} prag={}",
-                s.id, s.token_count, syn.len(), sem.len(), prag.len()
+                s.id,
+                s.token_count,
+                syn.len(),
+                sem.len(),
+                prag.len()
             ));
             continue;
         }
@@ -116,7 +129,8 @@ fn main() -> anyhow::Result<()> {
                 zero_tok_total += zeros;
                 errors.push(format!(
                     "[{}] {name}: {zeros}/{} tokens are all-zero (padding artifact)",
-                    s.id, sigs.len()
+                    s.id,
+                    sigs.len()
                 ));
             }
         }
@@ -130,13 +144,15 @@ fn main() -> anyhow::Result<()> {
                 density_lo_total += 1;
                 errors.push(format!(
                     "[{}] {name}: bit density {:.1}% < 25% (Q vectors look degenerate)",
-                    s.id, d * 100.0
+                    s.id,
+                    d * 100.0
                 ));
             } else if d > 0.75 {
                 density_hi_total += 1;
                 errors.push(format!(
                     "[{}] {name}: bit density {:.1}% > 75% (Q vectors look degenerate)",
-                    s.id, d * 100.0
+                    s.id,
+                    d * 100.0
                 ));
             }
         }
@@ -147,12 +163,20 @@ fn main() -> anyhow::Result<()> {
     println!("── Density summary (all scenarios) ──────────────────────────");
     let labels = ["syn", "sem", "prag"];
     for i in 0..3 {
-        let avg = if sum_n[i] > 0 { sum_den[i] / sum_n[i] as f64 } else { 0.0 };
+        let avg = if sum_n[i] > 0 {
+            sum_den[i] / sum_n[i] as f64
+        } else {
+            0.0
+        };
         println!("  {}: avg bit density {:.2}%", labels[i], avg * 100.0);
     }
 
     // Total token + file stats.
-    let total_tokens: u64 = manifest.scenarios.iter().map(|s| s.token_count as u64).sum();
+    let total_tokens: u64 = manifest
+        .scenarios
+        .iter()
+        .map(|s| s.token_count as u64)
+        .sum();
     let expected_bytes = total_tokens * ENTRY_BYTES_PER_TOKEN as u64;
     println!();
     println!("── Token / file stats ───────────────────────────────────────");
@@ -163,7 +187,10 @@ fn main() -> anyhow::Result<()> {
     if file_bytes == expected_bytes {
         println!("  file size     : OK (exact match)");
     } else {
-        println!("  file size     : MISMATCH (delta = {})", file_bytes as i64 - expected_bytes as i64);
+        println!(
+            "  file size     : MISMATCH (delta = {})",
+            file_bytes as i64 - expected_bytes as i64
+        );
         errors.push(format!(
             "file size mismatch: expected {expected_bytes}, got {file_bytes}"
         ));
@@ -178,12 +205,18 @@ fn main() -> anyhow::Result<()> {
     println!("  token_count   : min={min_tc}  median={med_tc}  max={max_tc}");
 
     // Scenarios with very short generated text (potential quality concern).
-    let short: Vec<&str> = manifest.scenarios.iter()
+    let short: Vec<&str> = manifest
+        .scenarios
+        .iter()
         .filter(|s| s.token_count < 4)
         .map(|s| s.id.as_str())
         .collect();
     if !short.is_empty() {
-        println!("  WARNING: {} scenarios have < 4 tokens: {:?}", short.len(), short);
+        println!(
+            "  WARNING: {} scenarios have < 4 tokens: {:?}",
+            short.len(),
+            short
+        );
     }
 
     println!();

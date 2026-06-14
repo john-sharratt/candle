@@ -7,9 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
+use super::SqlError;
 use crate::state::sessions::SqlConn;
 use crate::{RegisteredTool, Tool, ToolContext};
-use super::SqlError;
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -21,9 +21,9 @@ fn sql_to_json(v: SqlValue) -> serde_json::Value {
         SqlValue::Integer(i) => serde_json::Value::Number(i.into()),
         SqlValue::Real(f) => serde_json::json!(f),
         SqlValue::Text(s) => serde_json::Value::String(s),
-        SqlValue::Blob(b) => serde_json::Value::String(
-            base64::engine::general_purpose::STANDARD.encode(&b),
-        ),
+        SqlValue::Blob(b) => {
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&b))
+        }
     }
 }
 
@@ -94,11 +94,7 @@ impl Tool for SqlSessionQuery {
             .prepare(&req.query)
             .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
-        let col_names: Vec<String> = stmt
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
         let is_select = req.query.trim().to_uppercase().starts_with("SELECT")
             || req.query.trim().to_uppercase().starts_with("WITH");

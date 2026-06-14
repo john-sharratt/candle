@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::TcpError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {}
@@ -35,16 +35,21 @@ impl Tool for TcpSessionList {
     type Error = TcpError;
 
     fn run(ctx: &ToolContext, _req: ListRequest) -> Result<ListResponse, TcpError> {
-        let sessions = ctx.sessions.list_tcp().into_iter().map(|arc| {
-            let e = arc.lock().unwrap();
-            SessionInfo {
-                session_id: e.meta.session_id.clone(),
-                peer_addr: e.peer_addr.clone(),
-                local_addr: e.local_addr.clone(),
-                opened_at: e.meta.opened_at.clone(),
-                alive: e.meta.alive,
-            }
-        }).collect();
+        let sessions = ctx
+            .sessions
+            .list_tcp()
+            .into_iter()
+            .map(|arc| {
+                let e = arc.lock().unwrap();
+                SessionInfo {
+                    session_id: e.meta.session_id.clone(),
+                    peer_addr: e.peer_addr.clone(),
+                    local_addr: e.local_addr.clone(),
+                    opened_at: e.meta.opened_at.clone(),
+                    alive: e.meta.alive,
+                }
+            })
+            .collect();
         Ok(ListResponse { sessions })
     }
 }

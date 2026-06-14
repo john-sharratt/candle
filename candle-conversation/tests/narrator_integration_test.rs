@@ -18,7 +18,7 @@ use candle_conversation::{
     narrator::{
         parse_turn, text_to_inputs, ConverterMode, NarratorEngine, NarratorInput, SessionConfig,
     },
-    SequenceConfig, ConversationEngine, SamplingConfig,
+    ConversationEngine, SamplingConfig, SequenceConfig,
 };
 
 const TEST_MODEL: Model = Model::Hermes3_3B_Q6;

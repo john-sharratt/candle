@@ -363,9 +363,8 @@ impl QStorage {
             (QStorage::Cuda(dst), QStorage::Cpu(src)) => {
                 let device = dst.device().clone();
                 let src_ptr = src.as_ptr();
-                let src_bytes = unsafe {
-                    std::slice::from_raw_parts(src_ptr.add(src_byte_offset), byte_len)
-                };
+                let src_bytes =
+                    unsafe { std::slice::from_raw_parts(src_ptr.add(src_byte_offset), byte_len) };
                 let mut dst_view = dst
                     .bytes_mut()
                     .slice_mut(dst_byte_offset..dst_byte_offset + byte_len);
@@ -1185,9 +1184,9 @@ impl QTensor {
                 stream.memcpy_htod(bytes, &mut dst_view).w()?;
                 Ok(())
             }
-            QStorage::Cpu(_) => crate::bail!(
-                "write_bytes_at_async: CPU storage — use the sync `write_bytes_at`"
-            ),
+            QStorage::Cpu(_) => {
+                crate::bail!("write_bytes_at_async: CPU storage — use the sync `write_bytes_at`")
+            }
             _ => crate::bail!(
                 "write_bytes_at_async: only CUDA storage supported (got {:?})",
                 self.storage.device()
@@ -1222,15 +1221,13 @@ impl QTensor {
         }
         match &self.storage {
             QStorage::Cuda(storage) => {
-                let src_view = storage
-                    .bytes()
-                    .slice(byte_offset..byte_offset + dst.len());
+                let src_view = storage.bytes().slice(byte_offset..byte_offset + dst.len());
                 stream.memcpy_dtoh(&src_view, dst).w()?;
                 Ok(())
             }
-            QStorage::Cpu(_) => crate::bail!(
-                "read_bytes_at_async: CPU storage — use the sync `read_bytes_at`"
-            ),
+            QStorage::Cpu(_) => {
+                crate::bail!("read_bytes_at_async: CPU storage — use the sync `read_bytes_at`")
+            }
             _ => crate::bail!(
                 "read_bytes_at_async: only CUDA storage supported (got {:?})",
                 self.storage.device()

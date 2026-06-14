@@ -227,7 +227,7 @@ mod tests {
     fn arena_reusable_after_flush() {
         let dev = cuda_dev();
         let stager = PinnedStager::with_arena_size(&dev, 1024 * 1024); // 1 MB
-        // Fill, flush, fill again
+                                                                       // Fill, flush, fill again
         for _ in 0..3 {
             let mut bufs = Vec::new();
             for _ in 0..10 {
@@ -355,7 +355,11 @@ mod tests {
         // Drop inner generation — arena should NOT reset (gen1 still alive)
         let used_before = stager.arena_used();
         drop(gen2);
-        assert_eq!(stager.arena_used(), used_before, "arena should not reset while gen1 alive");
+        assert_eq!(
+            stager.arena_used(),
+            used_before,
+            "arena should not reset while gen1 alive"
+        );
         assert_eq!(stager.arena_count(), 1);
 
         // Drop outer generation — now arena resets
@@ -373,7 +377,12 @@ mod tests {
             let buf = stager.alloc(4096).unwrap();
             let _gpu = stager.submit(buf).unwrap();
             drop(gen);
-            assert_eq!(stager.arena_used(), 0, "arena not reset after generation {}", i);
+            assert_eq!(
+                stager.arena_used(),
+                0,
+                "arena not reset after generation {}",
+                i
+            );
         }
     }
 
@@ -449,9 +458,16 @@ mod tests {
         ptrs.sort();
         let len_before = ptrs.len();
         ptrs.dedup();
-        assert_eq!(ptrs.len(), len_before, "duplicate dev_ptrs found across overflow arenas");
+        assert_eq!(
+            ptrs.len(),
+            len_before,
+            "duplicate dev_ptrs found across overflow arenas"
+        );
 
-        assert!(stager.arena_count() >= 3, "expected 3+ arenas for 30 allocs in 32KB arenas");
+        assert!(
+            stager.arena_count() >= 3,
+            "expected 3+ arenas for 30 allocs in 32KB arenas"
+        );
 
         drop(gen);
         assert_eq!(stager.arena_count(), 1);
@@ -621,7 +637,12 @@ mod tests {
         for size in [1, 16, 100, 4096, 65536, 1024 * 1024] {
             let buf = stager.alloc(size).unwrap();
             let gpu = stager.submit(buf).unwrap();
-            assert_eq!(gpu.len(), size, "GpuBuf len mismatch for alloc size {}", size);
+            assert_eq!(
+                gpu.len(),
+                size,
+                "GpuBuf len mismatch for alloc size {}",
+                size
+            );
         }
         stager.flush().unwrap();
     }
@@ -794,11 +815,7 @@ mod tests {
             gpus.push(stager.submit(buf).unwrap());
         }
         let count = stager.arena_count();
-        assert!(
-            count >= 20,
-            "expected many overflow arenas, got {}",
-            count
-        );
+        assert!(count >= 20, "expected many overflow arenas, got {}", count);
 
         drop(gen);
         assert_eq!(stager.arena_count(), 1);

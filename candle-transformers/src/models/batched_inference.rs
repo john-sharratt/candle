@@ -31,11 +31,11 @@ use candle_nn::kv_cache::{
 };
 use std::collections::{HashMap, HashSet};
 
-use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
+use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders, GapFillDescriptor};
 use super::batched_model::{BatchedInference, BatchedModelCore};
-use crate::models::profile::{pipeline_record, profile_now};
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
+use crate::models::profile::{pipeline_record, profile_now};
 
 /// Inference mode specifying both compute dtype and KV cache storage format.
 ///
@@ -447,6 +447,10 @@ pub struct BatchedInferenceSession {
     num_layers: usize,
     /// Device the session is on.
     device: Device,
+    /// Transient GAP_FILL descriptor for the *next* prefill forward — set by the
+    /// projection assembler before a batched glue prefill, consumed (taken) when
+    /// the prefill meta is built. `None` = normal contiguous prefill.
+    gap_fill: Option<GapFillDescriptor>,
 }
 
 impl BatchedInferenceSession {
@@ -485,7 +489,21 @@ impl BatchedInferenceSession {
             config,
             num_layers,
             device: device.clone(),
+            gap_fill: None,
         })
+    }
+
+    /// Set the GAP_FILL descriptor for the *next* prefill forward. Consumed when
+    /// the prefill meta is built. Set by the projection assembler before a
+    /// batched glue prefill; `col_actual_pos` is the flat (per-slot kv_len) array
+    /// of each column's true sequence position.
+    pub fn set_gap_fill(&mut self, desc: GapFillDescriptor) {
+        self.gap_fill = Some(desc);
+    }
+
+    /// Take (and clear) the pending GAP_FILL descriptor.
+    pub fn take_gap_fill(&mut self) -> Option<GapFillDescriptor> {
+        self.gap_fill.take()
     }
 
     /// Create a session that shares the KV arena pool with an existing session.
@@ -511,6 +529,7 @@ impl BatchedInferenceSession {
             config,
             num_layers,
             device: device.clone(),
+            gap_fill: None,
         }
     }
 
@@ -689,7 +708,8 @@ impl BatchedInferenceSession {
                 );
             }
             debug_assert_eq!(
-                pm_flat.len() - entry_start, seq_offset,
+                pm_flat.len() - entry_start,
+                seq_offset,
                 "decode position_map: cum_tokens {} != state.offset {seq_offset} for seq {seq_idx}",
                 pm_flat.len() - entry_start,
             );
@@ -1429,18 +1449,12 @@ impl BatchedInferenceSession {
 
     /// Number of KV heads in this session's backing.
     pub fn n_kv_head(&self) -> usize {
-        self.backings
-            .first()
-            .map(|b| b.n_kv_head())
-            .unwrap_or(0)
+        self.backings.first().map(|b| b.n_kv_head()).unwrap_or(0)
     }
 
     /// Head dimension in this session's backing.
     pub fn head_dim(&self) -> usize {
-        self.backings
-            .first()
-            .map(|b| b.head_dim())
-            .unwrap_or(0)
+        self.backings.first().map(|b| b.head_dim()).unwrap_or(0)
     }
 
     /// Print a compact per-chunk palette4 format distribution for layer 0 of the given sequence.
@@ -2208,10 +2222,10 @@ pub struct ViewSequence {
 /// single 128-bit signature per token (`MH_XOR_QQ_l0xl4`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProvenanceLayerIndices {
-    pub syn_l0:  usize,
-    pub syn_l4:  usize,
-    pub sem_l0:  usize,
-    pub sem_l4:  usize,
+    pub syn_l0: usize,
+    pub syn_l4: usize,
+    pub sem_l0: usize,
+    pub sem_l4: usize,
     pub prag_l0: usize,
     pub prag_l4: usize,
 }
@@ -2219,7 +2233,14 @@ pub struct ProvenanceLayerIndices {
 impl ProvenanceLayerIndices {
     /// Flat array form `[syn_l0, syn_l4, sem_l0, sem_l4, prag_l0, prag_l4]`.
     pub fn as_array(self) -> [usize; 6] {
-        [self.syn_l0, self.syn_l4, self.sem_l0, self.sem_l4, self.prag_l0, self.prag_l4]
+        [
+            self.syn_l0,
+            self.syn_l4,
+            self.sem_l0,
+            self.sem_l4,
+            self.prag_l0,
+            self.prag_l4,
+        ]
     }
 }
 
@@ -2269,16 +2290,23 @@ pub trait ManagedBatchedModel {
     fn model_core_properties(&self) -> ModelCoreProperties {
         let n = self.num_layers();
         let provenance_layer_indices = if n == 0 {
-            ProvenanceLayerIndices { syn_l0: 0, syn_l4: 0, sem_l0: 0, sem_l4: 0, prag_l0: 0, prag_l4: 0 }
+            ProvenanceLayerIndices {
+                syn_l0: 0,
+                syn_l4: 0,
+                sem_l0: 0,
+                sem_l4: 0,
+                prag_l0: 0,
+                prag_l4: 0,
+            }
         } else {
-            let syn  = (n * 15 / 100).max(1);
-            let sem  = n / 2;
+            let syn = (n * 15 / 100).max(1);
+            let sem = n / 2;
             let prag = (n * 85 / 100).min(n - 1);
             ProvenanceLayerIndices {
-                syn_l0:  syn.saturating_sub(4),
-                syn_l4:  syn,
-                sem_l0:  sem.saturating_sub(4),
-                sem_l4:  sem,
+                syn_l0: syn.saturating_sub(4),
+                syn_l4: syn,
+                sem_l0: sem.saturating_sub(4),
+                sem_l4: sem,
                 prag_l0: prag.saturating_sub(4),
                 prag_l4: prag,
             }
@@ -2342,7 +2370,7 @@ pub trait ManagedBatchedModel {
         let props = self.model_core_properties();
         config.k_hi_error_threshold_factor *= props.k_hi_error_threshold_factor;
         config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
-        config.v_hi_error_threshold_factor  *= props.v_hi_error_threshold_factor;
+        config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         BatchedInferenceSession::new(
             props.num_layers,
@@ -2373,7 +2401,7 @@ pub trait ManagedBatchedModel {
         let props = self.model_core_properties();
         config.k_hi_error_threshold_factor *= props.k_hi_error_threshold_factor;
         config.k_low_error_threshold_factor *= props.k_low_error_threshold_factor;
-        config.v_hi_error_threshold_factor  *= props.v_hi_error_threshold_factor;
+        config.v_hi_error_threshold_factor *= props.v_hi_error_threshold_factor;
         config.v_low_error_threshold_factor *= props.v_low_error_threshold_factor;
         let backings = source.backings().iter().cloned().collect();
         Ok(BatchedInferenceSession::new_with_backings(
@@ -2431,16 +2459,23 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
     fn model_core_properties(&self) -> ModelCoreProperties {
         let n = self.model().num_layers();
         let provenance_layer_indices = if n == 0 {
-            ProvenanceLayerIndices { syn_l0: 0, syn_l4: 0, sem_l0: 0, sem_l4: 0, prag_l0: 0, prag_l4: 0 }
+            ProvenanceLayerIndices {
+                syn_l0: 0,
+                syn_l4: 0,
+                sem_l0: 0,
+                sem_l4: 0,
+                prag_l0: 0,
+                prag_l4: 0,
+            }
         } else {
-            let syn  = (n * 15 / 100).max(1);
-            let sem  = n / 2;
+            let syn = (n * 15 / 100).max(1);
+            let sem = n / 2;
             let prag = (n * 85 / 100).min(n - 1);
             ProvenanceLayerIndices {
-                syn_l0:  syn.saturating_sub(4),
-                syn_l4:  syn,
-                sem_l0:  sem.saturating_sub(4),
-                sem_l4:  sem,
+                syn_l0: syn.saturating_sub(4),
+                syn_l4: syn,
+                sem_l0: sem.saturating_sub(4),
+                sem_l4: sem,
                 prag_l0: prag.saturating_sub(4),
                 prag_l4: prag,
             }
@@ -2452,7 +2487,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             provenance_layer_indices,
             k_hi_error_threshold_factor: self.model().k_hi_error_threshold_factor(),
             k_low_error_threshold_factor: self.model().k_low_error_threshold_factor(),
-            v_hi_error_threshold_factor:  self.model().v_hi_error_threshold_factor(),
+            v_hi_error_threshold_factor: self.model().v_hi_error_threshold_factor(),
             v_low_error_threshold_factor: self.model().v_low_error_threshold_factor(),
         }
     }
@@ -2516,6 +2551,12 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             (pm_guard, DecodeHeaders::Decode { buf, stride })
         } else {
             let meta = BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
+            // GAP_FILL: if the assembler set a descriptor for this prefill, attach
+            // it so `forward_attn_batched` routes through the gap-fill kernel.
+            let meta = match session.take_gap_fill() {
+                Some(desc) => meta.with_gap_fill(desc),
+                None => meta,
+            };
             (None, DecodeHeaders::Prefill(meta))
         };
         #[cfg(not(feature = "cuda"))]

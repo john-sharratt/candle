@@ -43,17 +43,17 @@ pub use cache::{Cache, CacheIntegrityResult, KvCache};
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
-pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
 pub use chunked::quantize_sealed_in_place;
+pub use chunked::sampled_selection::SampleFormat;
+#[cfg(feature = "cuda")]
+pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
-pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
-pub use chunked::{ArenaKey, StoragePolicy};
 pub use chunked::{
-    arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, WriterTail,
-    CHUNK_SIZE,
+    arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
+pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunked::{
     production_adaptive_candidates, BlockAllocSpec, ChunkGid, ChunkGidPool, ChunkMeta,
     ChunkedKvBacking, CompressionPolicy, HeadGids, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
@@ -61,6 +61,7 @@ pub use chunked::{
     PRODUCTION_V_QREL_HIGH_THRESHOLDS, PRODUCTION_V_QREL_LOW_THRESHOLDS, QWEN3_8B_KV_FACTORS,
     QWEN3_MOE_KV_FACTORS,
 };
+pub use chunked::{ArenaKey, StoragePolicy};
 pub use rotating::{
     IndicesAndMask, RotatingCache, RotatingKvCache, ScatteredCacheBuilder, ScatteredKvCache,
 };
@@ -361,8 +362,7 @@ impl KvFormat {
     /// even if `from_kv_format` / the tag discriminants change.
     pub fn from_tag(tag: u8) -> Option<KvFormat> {
         use strum::IntoEnumIterator;
-        const FLOAT_DTYPES: [DType; 4] =
-            [DType::F32, DType::F16, DType::BF16, DType::F8E4M3];
+        const FLOAT_DTYPES: [DType; 4] = [DType::F32, DType::F16, DType::BF16, DType::F8E4M3];
         FLOAT_DTYPES
             .into_iter()
             .map(KvFormat::Float)

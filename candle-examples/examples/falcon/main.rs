@@ -40,8 +40,12 @@ impl TextGeneration {
         seed: u64,
         device: &Device,
     ) -> Self {
-        let logits_processor =
-            LogitsProcessor::new(seed, generation_options.temp, generation_options.top_p, None);
+        let logits_processor = LogitsProcessor::new(
+            seed,
+            generation_options.temp,
+            generation_options.top_p,
+            None,
+        );
         let repeat_penalty = generation_options.repeat_penalty;
         let repeat_last_n = generation_options.repeat_last_n;
         Self {

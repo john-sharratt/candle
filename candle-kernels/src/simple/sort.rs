@@ -89,100 +89,30 @@ extern "C" {
     // =========================================================================
 
     // bf16 argsort kernels (CUDA_ARCH >= 800)
-    pub fn asort_asc_bf16(
-        x: *const c_void,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_bf16(
-        x: *const c_void,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_bf16(x: *const c_void, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_bf16(x: *const c_void, dst: *mut u32, ncols: i32, ncols_pad: i32);
 
     // f16 argsort kernels (CUDA_ARCH >= 530)
-    pub fn asort_asc_f16(
-        x: *const c_void,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_f16(
-        x: *const c_void,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_f16(x: *const c_void, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_f16(x: *const c_void, dst: *mut u32, ncols: i32, ncols_pad: i32);
 
     // f32 argsort kernels
-    pub fn asort_asc_f32(
-        x: *const f32,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_f32(
-        x: *const f32,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_f32(x: *const f32, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_f32(x: *const f32, dst: *mut u32, ncols: i32, ncols_pad: i32);
 
     // f64 argsort kernels
-    pub fn asort_asc_f64(
-        x: *const f64,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_f64(
-        x: *const f64,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_f64(x: *const f64, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_f64(x: *const f64, dst: *mut u32, ncols: i32, ncols_pad: i32);
 
     // u8 argsort kernels
-    pub fn asort_asc_u8(
-        x: *const u8,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_u8(
-        x: *const u8,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_u8(x: *const u8, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_u8(x: *const u8, dst: *mut u32, ncols: i32, ncols_pad: i32);
 
     // u32 argsort kernels
-    pub fn asort_asc_u32(
-        x: *const u32,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_u32(
-        x: *const u32,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_u32(x: *const u32, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_u32(x: *const u32, dst: *mut u32, ncols: i32, ncols_pad: i32);
 
     // i64 argsort kernels
-    pub fn asort_asc_i64(
-        x: *const i64,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
-    pub fn asort_desc_i64(
-        x: *const i64,
-        dst: *mut u32,
-        ncols: i32,
-        ncols_pad: i32,
-    );
+    pub fn asort_asc_i64(x: *const i64, dst: *mut u32, ncols: i32, ncols_pad: i32);
+    pub fn asort_desc_i64(x: *const i64, dst: *mut u32, ncols: i32, ncols_pad: i32);
 }

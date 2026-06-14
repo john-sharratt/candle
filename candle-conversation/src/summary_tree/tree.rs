@@ -58,7 +58,10 @@ impl TurnKind {
     /// True when this kind participates in the binary AVL structure
     /// (i.e. summary nodes — not Normal sub-leaves).
     pub fn is_summary(self) -> bool {
-        matches!(self, TurnKind::SummaryOfTurns | TurnKind::SummaryOfSummaries)
+        matches!(
+            self,
+            TurnKind::SummaryOfTurns | TurnKind::SummaryOfSummaries
+        )
     }
 }
 
@@ -522,7 +525,10 @@ impl SummaryTree {
             None => return 0,
         };
         let l = node.children[0];
-        self.nodes.get(&l).map(|n| n.tree_height as i16).unwrap_or(0)
+        self.nodes
+            .get(&l)
+            .map(|n| n.tree_height as i16)
+            .unwrap_or(0)
     }
 
     fn child_right_height(&self, id: NodeId) -> i16 {
@@ -532,7 +538,10 @@ impl SummaryTree {
             None => return 0,
         };
         let r = node.children[1];
-        self.nodes.get(&r).map(|n| n.tree_height as i16).unwrap_or(0)
+        self.nodes
+            .get(&r)
+            .map(|n| n.tree_height as i16)
+            .unwrap_or(0)
     }
 
     /// Left rotation at `a`:
@@ -838,11 +847,23 @@ mod tests {
         //          ╱ ╲
         //         x   y
         let mut t = SummaryTree::new();
-        t.insert_node(leaf(10, 20));   // x
-        t.insert_node(leaf(11, 20));   // y
-        t.insert_node(leaf(12, 20));   // z
-        t.insert_node(Node::summary_of_summaries(NodeId(20), NodeId(11), NodeId(12), 2, 0)); // b
-        t.insert_node(Node::summary_of_summaries(NodeId(21), NodeId(10), NodeId(20), 3, 0)); // a
+        t.insert_node(leaf(10, 20)); // x
+        t.insert_node(leaf(11, 20)); // y
+        t.insert_node(leaf(12, 20)); // z
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(20),
+            NodeId(11),
+            NodeId(12),
+            2,
+            0,
+        )); // b
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(21),
+            NodeId(10),
+            NodeId(20),
+            3,
+            0,
+        )); // a
         t.root = Some(NodeId(21));
 
         let mut dirty = Vec::new();
@@ -871,11 +892,23 @@ mod tests {
         //               ╱ ╲
         //              y   z
         let mut t = SummaryTree::new();
-        t.insert_node(leaf(10, 20));   // x
-        t.insert_node(leaf(11, 20));   // y
-        t.insert_node(leaf(12, 20));   // z
-        t.insert_node(Node::summary_of_summaries(NodeId(20), NodeId(10), NodeId(11), 2, 0)); // b
-        t.insert_node(Node::summary_of_summaries(NodeId(21), NodeId(20), NodeId(12), 3, 0)); // a
+        t.insert_node(leaf(10, 20)); // x
+        t.insert_node(leaf(11, 20)); // y
+        t.insert_node(leaf(12, 20)); // z
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(20),
+            NodeId(10),
+            NodeId(11),
+            2,
+            0,
+        )); // b
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(21),
+            NodeId(20),
+            NodeId(12),
+            3,
+            0,
+        )); // a
         t.root = Some(NodeId(21));
 
         let mut dirty = Vec::new();
@@ -906,11 +939,29 @@ mod tests {
             t.insert_node(leaf(id, tk));
         }
         // c = SoS(1, 2)
-        t.insert_node(Node::summary_of_summaries(NodeId(10), NodeId(1), NodeId(2), 2, 0));
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(10),
+            NodeId(1),
+            NodeId(2),
+            2,
+            0,
+        ));
         // b = SoS(c, 3)
-        t.insert_node(Node::summary_of_summaries(NodeId(11), NodeId(10), NodeId(3), 3, 0));
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(11),
+            NodeId(10),
+            NodeId(3),
+            3,
+            0,
+        ));
         // a = SoS(b, 4)
-        t.insert_node(Node::summary_of_summaries(NodeId(12), NodeId(11), NodeId(4), 4, 0));
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(12),
+            NodeId(11),
+            NodeId(4),
+            4,
+            0,
+        ));
         t.root = Some(NodeId(12));
         // Balance factor at a = 3 - 1 = 2 → LL.
         let mut dirty = Vec::new();
@@ -937,11 +988,29 @@ mod tests {
             t.insert_node(leaf(id, 20));
         }
         // c = SoS(1, 2)
-        t.insert_node(Node::summary_of_summaries(NodeId(10), NodeId(1), NodeId(2), 2, 0));
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(10),
+            NodeId(1),
+            NodeId(2),
+            2,
+            0,
+        ));
         // b = SoS(c, 3)
-        t.insert_node(Node::summary_of_summaries(NodeId(11), NodeId(10), NodeId(3), 3, 0));
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(11),
+            NodeId(10),
+            NodeId(3),
+            3,
+            0,
+        ));
         // a = SoS(4, b)
-        t.insert_node(Node::summary_of_summaries(NodeId(12), NodeId(4), NodeId(11), 4, 0));
+        t.insert_node(Node::summary_of_summaries(
+            NodeId(12),
+            NodeId(4),
+            NodeId(11),
+            4,
+            0,
+        ));
         t.root = Some(NodeId(12));
         let mut dirty = Vec::new();
         let new_root = t.rebalance(NodeId(12), &mut dirty);
@@ -960,6 +1029,9 @@ mod tests {
         t.mark_dirty(NodeId(1));
         t.mark_dirty(NodeId(100));
         assert!(t.get(NodeId(1)).unwrap().dirty);
-        assert!(!t.get(NodeId(100)).unwrap().dirty, "Normal must never be dirty");
+        assert!(
+            !t.get(NodeId(100)).unwrap().dirty,
+            "Normal must never be dirty"
+        );
     }
 }

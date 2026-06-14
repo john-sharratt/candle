@@ -103,11 +103,7 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
 }
 
 /// Count lines + extract any manifest hint.  Returns `(line_count, hint)`.
-fn describe_file(
-    path: &Path,
-    language: Language,
-    size_bytes: u64,
-) -> (u32, Option<ModuleHint>) {
+fn describe_file(path: &Path, language: Language, size_bytes: u64) -> (u32, Option<ModuleHint>) {
     // Single read — we already know the file is ≤ 256 KB so the
     // allocation is bounded.
     let bytes = match fs::read(path) {
@@ -407,14 +403,14 @@ version = "0.1.0"
     fn walk_extracts_node_package_hint() {
         let dir = fixture("node");
         let root = dir.path().to_path_buf();
-        write(&root, "package.json", br#"{"name":"my-app","version":"1.0.0"}"#);
+        write(
+            &root,
+            "package.json",
+            br#"{"name":"my-app","version":"1.0.0"}"#,
+        );
 
         let map = walk_workspace(&root);
-        let entry = map
-            .files
-            .iter()
-            .find(|f| f.path == "package.json")
-            .unwrap();
+        let entry = map.files.iter().find(|f| f.path == "package.json").unwrap();
         assert_eq!(
             entry.module_hint,
             Some(ModuleHint::NodePackage {
@@ -427,11 +423,7 @@ version = "0.1.0"
     fn walk_extracts_go_module_hint() {
         let dir = fixture("go");
         let root = dir.path().to_path_buf();
-        write(
-            &root,
-            "go.mod",
-            b"module example.com/me/widget\ngo 1.22\n",
-        );
+        write(&root, "go.mod", b"module example.com/me/widget\ngo 1.22\n");
 
         let map = walk_workspace(&root);
         let entry = map.files.iter().find(|f| f.path == "go.mod").unwrap();

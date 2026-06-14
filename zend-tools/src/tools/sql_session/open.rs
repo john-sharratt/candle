@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::SqlError;
 use crate::state::sessions::{SessionMeta, SqlConn, SqlEntry};
 use crate::{RegisteredTool, Tool, ToolContext};
-use super::SqlError;
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()

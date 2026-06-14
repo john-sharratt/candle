@@ -131,10 +131,7 @@ pub fn collect_live_records(
             payload,
         ));
         if archived {
-            let cs_payload = encode_conv_state_payload(
-                timeline_id,
-                ConvState { archived: true },
-            );
+            let cs_payload = encode_conv_state_payload(timeline_id, ConvState { archived: true });
             out.push((
                 RecordHeader {
                     record_type: RecordType::ConvState,
@@ -368,10 +365,9 @@ mod tests {
         // live streams + chunks as the source.
         let hint = new_log.superblock().latest_checkpoint_offset;
         let mut after_sub = Substrate::new();
-        let _ = checkpoint::recover_with_sink(&mut new_log, hint, |e| {
-            after_sub.apply_walker_entry(e)
-        })
-        .unwrap();
+        let _ =
+            checkpoint::recover_with_sink(&mut new_log, hint, |e| after_sub.apply_walker_entry(e))
+                .unwrap();
         assert_eq!(before_sub.live_chunk_count(), after_sub.live_chunk_count());
         assert_eq!(after_sub.live_chunk_count(), 2);
         std::fs::remove_file(&path).ok();
@@ -469,7 +465,12 @@ mod tests {
         ));
         blob.extend_from_slice(&record(RecordType::StreamDecl, 100, 0, &dead_decl.encode()));
         blob.extend_from_slice(&record(RecordType::Chunk, 100, 0, b"dead-chunk-payload"));
-        blob.extend_from_slice(&record(RecordType::StreamDecl, 200, 0, &alive_decl.encode()));
+        blob.extend_from_slice(&record(
+            RecordType::StreamDecl,
+            200,
+            0,
+            &alive_decl.encode(),
+        ));
         blob.extend_from_slice(&record(RecordType::Chunk, 200, 0, b"alive-chunk-payload"));
         blob.extend_from_slice(&record(
             RecordType::Tombstone,

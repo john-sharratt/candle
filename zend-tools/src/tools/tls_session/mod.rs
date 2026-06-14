@@ -31,20 +31,20 @@
 //! | `invalid_params` | Malformed address or invalid credential type |
 //! | `credential_not_found` | Named credential not in store |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
-pub mod open;
-pub mod send;
-pub mod recv;
-pub mod list;
 pub mod close;
+pub mod list;
+pub mod open;
+pub mod recv;
+pub mod send;
 
-pub use open::TLS_SESSION_OPEN;
-pub use send::TLS_SESSION_SEND;
-pub use recv::TLS_SESSION_RECV;
-pub use list::TLS_SESSION_LIST;
 pub use close::TLS_SESSION_CLOSE;
+pub use list::TLS_SESSION_LIST;
+pub use open::TLS_SESSION_OPEN;
+pub use recv::TLS_SESSION_RECV;
+pub use send::TLS_SESSION_SEND;
 
 #[derive(Debug, Error)]
 pub enum TlsError {

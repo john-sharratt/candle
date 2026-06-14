@@ -25,7 +25,11 @@ fn intra_tool_score_exceeds_inter_tool_mean() {
         if intra <= inter_mean {
             failures.push(format!(
                 "{probe_tool}: intra={intra:.2}  inter_mean={inter_mean:.2}  ratio={:.2}",
-                if inter_mean > 0.0 { intra / inter_mean } else { f32::INFINITY }
+                if inter_mean > 0.0 {
+                    intra / inter_mean
+                } else {
+                    f32::INFINITY
+                }
             ));
         }
     }

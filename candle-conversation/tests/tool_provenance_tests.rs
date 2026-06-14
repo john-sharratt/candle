@@ -760,7 +760,9 @@ fn flip_mask(seed: u64, n_flips: u32) -> u128 {
     let mut s = seed;
     let mut count = 0u32;
     while count < n_flips {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bit = (s >> 57) as u32 & 0x7F;
         let bit_mask = 1u128 << bit;
         if mask & bit_mask == 0 {
@@ -798,17 +800,18 @@ fn generate_fixtures(dir: &Path) {
     let mut turn_id: u64 = 0;
 
     for (tool_idx, &tool) in TOOLS.iter().enumerate() {
-        let concept       = name_concept_u128(tool);
+        let concept = name_concept_u128(tool);
         // neg 0/1 use offset+4; neg 2/3 use offset+4 same concept, different seed.
-        let wrong_tool    = TOOLS[(tool_idx + 4) % TOOLS.len()];
+        let wrong_tool = TOOLS[(tool_idx + 4) % TOOLS.len()];
         let wrong_concept = name_concept_u128(wrong_tool);
         let sys = system_prompt_for_tool(tool);
 
         // 6 positive cases
         for n in 0..6usize {
             let extra = fnv64(format!("{}+pos+{}", tool, n).as_bytes());
-            let sigs: Vec<TokenSignature> =
-                (0..TOKENS_PER_CHUNK).map(|i| make_sig(concept, 12, i, extra)).collect();
+            let sigs: Vec<TokenSignature> = (0..TOKENS_PER_CHUNK)
+                .map(|i| make_sig(concept, 12, i, extra))
+                .collect();
             let entry = pf.append(&sigs, &sigs, &sigs).unwrap();
             let (user_prompt, assistant_prompt) = prompts(tool, CaseType::Positive, n, wrong_tool);
             scenarios.push(Scenario {
@@ -827,12 +830,16 @@ fn generate_fixtures(dir: &Path) {
 
         // 4 boundary cases
         for n in 0..4usize {
-            let extra_hit  = fnv64(format!("{}+bnd_hit+{}", tool, n).as_bytes());
+            let extra_hit = fnv64(format!("{}+bnd_hit+{}", tool, n).as_bytes());
             let extra_miss = fnv64(format!("{}+bnd_miss+{}", tool, n).as_bytes());
             let half = TOKENS_PER_CHUNK / 2;
             let mut sigs: Vec<TokenSignature> = Vec::with_capacity(TOKENS_PER_CHUNK);
-            for i in 0..half { sigs.push(make_sig(concept, 12, i, extra_hit)); }
-            for i in 0..half { sigs.push(make_sig(concept, 90, i + half, extra_miss)); }
+            for i in 0..half {
+                sigs.push(make_sig(concept, 12, i, extra_hit));
+            }
+            for i in 0..half {
+                sigs.push(make_sig(concept, 90, i + half, extra_miss));
+            }
             let entry = pf.append(&sigs, &sigs, &sigs).unwrap();
             let (user_prompt, assistant_prompt) = prompts(tool, CaseType::Boundary, n, wrong_tool);
             scenarios.push(Scenario {
@@ -873,8 +880,7 @@ fn generate_fixtures(dir: &Path) {
 
         // 2 no-tool cases
         for n in 0..2usize {
-            let no_tool_concept =
-                name_concept_u128(&format!("no_tool_generic_{}_{}", tool_idx, n));
+            let no_tool_concept = name_concept_u128(&format!("no_tool_generic_{}_{}", tool_idx, n));
             let extra = fnv64(format!("{}+no_tool+{}", tool, n).as_bytes());
             let sigs: Vec<TokenSignature> = (0..TOKENS_PER_CHUNK)
                 .map(|i| make_sig(no_tool_concept, 12, i, extra))
@@ -896,7 +902,10 @@ fn generate_fixtures(dir: &Path) {
         }
     }
 
-    let manifest = Manifest { version: 1, scenarios };
+    let manifest = Manifest {
+        version: 1,
+        scenarios,
+    };
     std::fs::write(
         dir.join("MANIFEST.json"),
         serde_json::to_string_pretty(&manifest).unwrap(),
@@ -911,8 +920,7 @@ static INIT: OnceLock<()> = OnceLock::new();
 fn ensure_fixtures() {
     INIT.get_or_init(|| {
         let dir = fixture_dir();
-        let missing =
-            !dir.join("MANIFEST.json").exists() || !dir.join("signatures.prov").exists();
+        let missing = !dir.join("MANIFEST.json").exists() || !dir.join("signatures.prov").exists();
         if missing {
             generate_fixtures(&dir);
         }
@@ -941,14 +949,30 @@ fn all_scenarios_loadable() {
 fn scenario_counts_by_type() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
-    let pos = manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Positive).count();
-    let bnd = manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Boundary).count();
-    let neg = manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Negative).count();
-    let nt  = manifest.scenarios.iter().filter(|s| s.case_type == CaseType::NoTool).count();
+    let pos = manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::Positive)
+        .count();
+    let bnd = manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::Boundary)
+        .count();
+    let neg = manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::Negative)
+        .count();
+    let nt = manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::NoTool)
+        .count();
     assert_eq!(pos, 48); // 8 × 6
     assert_eq!(bnd, 32); // 8 × 4
     assert_eq!(neg, 32); // 8 × 4
-    assert_eq!(nt,  16); // 8 × 2
+    assert_eq!(nt, 16); // 8 × 2
 }
 
 #[test]
@@ -965,9 +989,13 @@ fn all_scenarios_have_non_empty_prompts() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
     for s in &manifest.scenarios {
-        assert!(!s.system_prompt.is_empty(),    "{}: empty system_prompt",    s.id);
-        assert!(!s.user_prompt.is_empty(),      "{}: empty user_prompt",      s.id);
-        assert!(!s.assistant_prompt.is_empty(), "{}: empty assistant_prompt", s.id);
+        assert!(!s.system_prompt.is_empty(), "{}: empty system_prompt", s.id);
+        assert!(!s.user_prompt.is_empty(), "{}: empty user_prompt", s.id);
+        assert!(
+            !s.assistant_prompt.is_empty(),
+            "{}: empty assistant_prompt",
+            s.id
+        );
     }
 }
 
@@ -975,7 +1003,11 @@ fn all_scenarios_have_non_empty_prompts() {
 fn tool_scenarios_have_system_prompt_with_tool_json() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
-    for s in manifest.scenarios.iter().filter(|s| s.case_type != CaseType::NoTool) {
+    for s in manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type != CaseType::NoTool)
+    {
         let tool = s.tool.as_deref().unwrap();
         assert!(
             s.system_prompt.contains(&format!(r#""name":"{tool}""#)),
@@ -989,7 +1021,11 @@ fn tool_scenarios_have_system_prompt_with_tool_json() {
 fn positive_assistant_prompts_contain_tool_call_tag() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
-    for s in manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Positive) {
+    for s in manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::Positive)
+    {
         assert!(
             s.assistant_prompt.contains("<tool_call>"),
             "scenario '{}': positive assistant_prompt missing <tool_call> tag",
@@ -1002,7 +1038,11 @@ fn positive_assistant_prompts_contain_tool_call_tag() {
 fn positive_assistant_prompts_reference_correct_tool() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
-    for s in manifest.scenarios.iter().filter(|s| s.case_type == CaseType::Positive) {
+    for s in manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::Positive)
+    {
         let tool = s.tool.as_deref().unwrap();
         assert!(
             s.assistant_prompt.contains(&format!(r#""name":"{tool}""#)),
@@ -1016,8 +1056,17 @@ fn positive_assistant_prompts_reference_correct_tool() {
 fn no_tool_cases_have_no_tool_field_and_no_system_prompt_tools_block() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
-    for s in manifest.scenarios.iter().filter(|s| s.case_type == CaseType::NoTool) {
-        assert!(s.tool.is_none(), "no-tool scenario '{}' has tool={:?}", s.id, s.tool);
+    for s in manifest
+        .scenarios
+        .iter()
+        .filter(|s| s.case_type == CaseType::NoTool)
+    {
+        assert!(
+            s.tool.is_none(),
+            "no-tool scenario '{}' has tool={:?}",
+            s.id,
+            s.tool
+        );
         assert!(
             !s.system_prompt.contains("<tools>"),
             "no-tool scenario '{}': system_prompt contains unexpected <tools> block",
@@ -1045,8 +1094,12 @@ fn sig_entry_byte_offsets_are_sequential() {
 fn prov_file_size_matches_total_scenario_data() {
     ensure_fixtures();
     let (manifest, _pf) = open_fixtures();
-    let actual = std::fs::metadata(fixture_dir().join("signatures.prov")).unwrap().len();
-    let expected: u64 = manifest.scenarios.iter()
+    let actual = std::fs::metadata(fixture_dir().join("signatures.prov"))
+        .unwrap()
+        .len();
+    let expected: u64 = manifest
+        .scenarios
+        .iter()
         .map(|s| s.token_count as u64 * ENTRY_BYTES_PER_TOKEN as u64)
         .sum();
     assert_eq!(actual, expected);
@@ -1057,10 +1110,13 @@ fn read_entry_returns_correct_token_count_for_every_scenario() {
     ensure_fixtures();
     let (manifest, pf) = open_fixtures();
     for s in &manifest.scenarios {
-        let entry = SigEntry { byte_offset: s.byte_offset, token_count: s.token_count };
+        let entry = SigEntry {
+            byte_offset: s.byte_offset,
+            token_count: s.token_count,
+        };
         let (syn, sem, prag) = pf.read_entry(entry).unwrap();
-        assert_eq!(syn.len(),  TOKENS_PER_CHUNK, "scenario '{}': syn",  s.id);
-        assert_eq!(sem.len(),  TOKENS_PER_CHUNK, "scenario '{}': sem",  s.id);
+        assert_eq!(syn.len(), TOKENS_PER_CHUNK, "scenario '{}': syn", s.id);
+        assert_eq!(sem.len(), TOKENS_PER_CHUNK, "scenario '{}': sem", s.id);
         assert_eq!(prag.len(), TOKENS_PER_CHUNK, "scenario '{}': prag", s.id);
     }
 }
@@ -1071,7 +1127,10 @@ fn all_real_tool_names_covered() {
     let (manifest, _pf) = open_fixtures();
     for &tool in TOOLS {
         assert!(
-            manifest.scenarios.iter().any(|s| s.tool.as_deref() == Some(tool)),
+            manifest
+                .scenarios
+                .iter()
+                .any(|s| s.tool.as_deref() == Some(tool)),
             "tool '{tool}' has no scenario in the manifest"
         );
     }
@@ -1091,9 +1150,12 @@ fn three_depths_are_symmetric_in_generated_data() {
     ensure_fixtures();
     let (manifest, pf) = open_fixtures();
     for s in manifest.scenarios.iter().take(16) {
-        let entry = SigEntry { byte_offset: s.byte_offset, token_count: s.token_count };
+        let entry = SigEntry {
+            byte_offset: s.byte_offset,
+            token_count: s.token_count,
+        };
         let (syn, sem, prag) = pf.read_entry(entry).unwrap();
-        assert_eq!(syn, sem,  "scenario '{}': syntactic ≠ semantic",  s.id);
+        assert_eq!(syn, sem, "scenario '{}': syntactic ≠ semantic", s.id);
         assert_eq!(sem, prag, "scenario '{}': semantic ≠ pragmatic", s.id);
     }
 }

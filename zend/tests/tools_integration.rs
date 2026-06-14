@@ -69,6 +69,7 @@ mod tool_scenarios {
         let config = DaemonConfig {
             workspace: std::env::current_dir().unwrap(),
             port: 0,
+            ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));
         session.start_loading();
@@ -100,9 +101,7 @@ mod tool_scenarios {
         response
     }
 
-    fn run_with_timeout<F: std::future::Future<Output = String> + Send + 'static>(
-        f: F,
-    ) -> String {
+    fn run_with_timeout<F: std::future::Future<Output = String> + Send + 'static>(f: F) -> String {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -111,9 +110,7 @@ mod tool_scenarios {
             tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), f).await
         });
         rt.shutdown_background();
-        result.unwrap_or_else(|_| {
-            panic!("test timed out after {TIMEOUT_SECS}s")
-        })
+        result.unwrap_or_else(|_| panic!("test timed out after {TIMEOUT_SECS}s"))
     }
 
     // ── Scenario 1: simple datetime query ────────────────────────────────────
@@ -128,10 +125,7 @@ mod tool_scenarios {
             "What's today's date? Give me just the ISO date.",
             "test-datetime",
         ));
-        assert!(
-            !response.is_empty(),
-            "datetime query produced no response"
-        );
+        assert!(!response.is_empty(), "datetime query produced no response");
         // The final answer should contain a date — at minimum a 4-digit year.
         let has_year = response.contains("2024")
             || response.contains("2025")
@@ -148,8 +142,7 @@ mod tool_scenarios {
     #[test]
     fn calculator_query_calls_calculator_tool() {
         init_tracing();
-        let response =
-            run_with_timeout(run_query("Calculate 17 times 23.", "test-calc"));
+        let response = run_with_timeout(run_query("Calculate 17 times 23.", "test-calc"));
         assert!(!response.is_empty(), "calc produced no response");
         // 17 × 23 = 391.  Accept either as a numeral or close variants.
         assert!(
@@ -179,8 +172,7 @@ mod tool_scenarios {
     #[test]
     fn unit_convert_query_uses_unit_convert_tool() {
         init_tracing();
-        let response =
-            run_with_timeout(run_query("Convert 100 km to miles.", "test-units"));
+        let response = run_with_timeout(run_query("Convert 100 km to miles.", "test-units"));
         assert!(!response.is_empty(), "unit_convert produced no response");
         // 100 km ≈ 62.137 miles.  Look for "62" prefix as a sanity check.
         assert!(
@@ -266,9 +258,9 @@ mod tool_scenarios {
         assert!(!response.is_empty());
         // SHA256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         // Accept any 64-hex-character substring as evidence of a real hash.
-        let has_long_hex = response.split_whitespace().any(|tok| {
-            tok.len() >= 32 && tok.chars().all(|c| c.is_ascii_hexdigit())
-        });
+        let has_long_hex = response
+            .split_whitespace()
+            .any(|tok| tok.len() >= 32 && tok.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(
             has_long_hex
                 || response
@@ -283,8 +275,10 @@ mod tool_scenarios {
     #[test]
     fn weather_query_uses_weather_tool() {
         init_tracing();
-        let response =
-            run_with_timeout(run_query("What's the weather in London right now?", "test-weather"));
+        let response = run_with_timeout(run_query(
+            "What's the weather in London right now?",
+            "test-weather",
+        ));
         // Weather tool may fail (network unavailable in CI), but the model
         // should still surface the right tool.  The response should mention
         // London or a temperature/condition word.

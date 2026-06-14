@@ -63,7 +63,9 @@ impl Tool for WebSearchTool {
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, SearchError> {
         let api_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
         if api_key.is_empty() {
-            return Err(SearchError::SearchUnavailable("TAVILY_API_KEY not set".to_string()));
+            return Err(SearchError::SearchUnavailable(
+                "TAVILY_API_KEY not set".to_string(),
+            ));
         }
 
         let max_results = req.max_results.unwrap_or(5);
@@ -75,27 +77,35 @@ impl Tool for WebSearchTool {
             "include_answer": false,
         });
 
-        let resp = ctx.http_client
+        let resp = ctx
+            .http_client
             .post("https://api.tavily.com/search")
             .json(&body)
             .send()
             .map_err(|e| SearchError::SearchUnavailable(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(SearchError::SearchUnavailable(format!("HTTP {}", resp.status())));
+            return Err(SearchError::SearchUnavailable(format!(
+                "HTTP {}",
+                resp.status()
+            )));
         }
 
-        let json: serde_json::Value = resp.json()
+        let json: serde_json::Value = resp
+            .json()
             .map_err(|e| SearchError::SearchUnavailable(e.to_string()))?;
 
-        let results = json["results"].as_array()
+        let results = json["results"]
+            .as_array()
             .map(|arr| {
-                arr.iter().map(|r| SearchResult {
-                    title: r["title"].as_str().unwrap_or("").to_string(),
-                    url: r["url"].as_str().unwrap_or("").to_string(),
-                    snippet: r["content"].as_str().unwrap_or("").to_string(),
-                    score: r["score"].as_f64().unwrap_or(0.0),
-                }).collect()
+                arr.iter()
+                    .map(|r| SearchResult {
+                        title: r["title"].as_str().unwrap_or("").to_string(),
+                        url: r["url"].as_str().unwrap_or("").to_string(),
+                        snippet: r["content"].as_str().unwrap_or("").to_string(),
+                        score: r["score"].as_f64().unwrap_or(0.0),
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 

@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{encode_bytes, pack_field, parse_format, BytesError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PackRequest {
@@ -39,19 +39,22 @@ impl Tool for BytesPack {
         if fields.len() != req.values.len() {
             return Err(BytesError::PackFailed(format!(
                 "format has {} fields but {} values provided",
-                fields.len(), req.values.len()
+                fields.len(),
+                req.values.len()
             )));
         }
 
         let mut buf: Vec<u8> = Vec::new();
         for (field, val) in fields.iter().zip(req.values.iter()) {
-            pack_field(&mut buf, field, val, big_endian)
-                .map_err(BytesError::PackFailed)?;
+            pack_field(&mut buf, field, val, big_endian).map_err(BytesError::PackFailed)?;
         }
 
         let enc = req.output_encoding.as_deref().unwrap_or("hex");
         let encoded = encode_bytes(&buf, enc)?;
-        Ok(PackResponse { data: encoded, bytes_packed: buf.len() })
+        Ok(PackResponse {
+            data: encoded,
+            bytes_packed: buf.len(),
+        })
     }
 }
 

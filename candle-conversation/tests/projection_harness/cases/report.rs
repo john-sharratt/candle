@@ -16,10 +16,12 @@ fn score_matrix_and_ratio_report() {
     let resolvers = h.scan_all_pos1(&pf, &manifest);
 
     let print_matrix = |use_max: bool| {
-        let label = if use_max { "max-agreement" } else { "mean-agreement" };
-        println!(
-            "\n── BDP section score matrix [{label}]  (probe _pos_1, corpus _pos_0,2–5) ──"
-        );
+        let label = if use_max {
+            "max-agreement"
+        } else {
+            "mean-agreement"
+        };
+        println!("\n── BDP section score matrix [{label}]  (probe _pos_1, corpus _pos_0,2–5) ──");
         let header: String = TOOLS
             .iter()
             .map(|t| format!("{:>11}", &t[..t.len().min(11)]))
@@ -41,7 +43,10 @@ fn score_matrix_and_ratio_report() {
         }
 
         println!("\n── Intra / inter-tool ratio [{label}] ─────────────────────────────────");
-        println!("{:<14} {:>10} {:>12} {:>9}", "tool", "intra", "inter_avg", "ratio");
+        println!(
+            "{:<14} {:>10} {:>12} {:>9}",
+            "tool", "intra", "inter_avg", "ratio"
+        );
         for (probe_tool, resolver) in &resolvers {
             let intra = h.section_score_formula(resolver, probe_tool, use_max);
             let inter: Vec<f32> = TOOLS
@@ -50,7 +55,11 @@ fn score_matrix_and_ratio_report() {
                 .map(|&t| h.section_score_formula(resolver, t, use_max))
                 .collect();
             let inter_avg = inter.iter().sum::<f32>() / inter.len() as f32;
-            let ratio = if inter_avg > 0.0 { intra / inter_avg } else { f32::INFINITY };
+            let ratio = if inter_avg > 0.0 {
+                intra / inter_avg
+            } else {
+                f32::INFINITY
+            };
             println!(
                 "{:<14} {:>10.2} {:>12.2} {:>9.2}",
                 probe_tool, intra, inter_avg, ratio
@@ -69,7 +78,9 @@ fn score_matrix_and_ratio_report() {
         let hit = emitted.contains(probe_tool);
         println!(
             "{:<14} {:>6}  {:?}",
-            probe_tool, if hit { "✓" } else { "✗" }, emitted
+            probe_tool,
+            if hit { "✓" } else { "✗" },
+            emitted
         );
     }
     println!();
@@ -103,9 +114,7 @@ fn hit_token_report() {
         .copied()
         .unwrap();
 
-    println!(
-        "\n── Hit token report: {probe_id} probe ─────────────────────────────────"
-    );
+    println!("\n── Hit token report: {probe_id} probe ─────────────────────────────────");
     println!(
         "  intra tool : {probe_tool}  score={:.2}",
         h.section_score(&resolver, probe_tool)
@@ -127,7 +136,10 @@ fn hit_token_report() {
             }
         };
 
-        println!("\n  ── [{focus_tool}]  {} total hits ─────────────────", hits.len());
+        println!(
+            "\n  ── [{focus_tool}]  {} total hits ─────────────────",
+            hits.len()
+        );
 
         for depth in 0u8..3 {
             let depth_hits: Vec<&TokenHit> = hits.iter().filter(|h| h.depth == depth).collect();
@@ -149,7 +161,12 @@ fn hit_token_report() {
                 corpus_freq[hit.corpus_tok as usize] += 1;
             }
 
-            let max_freq = probe_freq.iter().chain(corpus_freq.iter()).copied().max().unwrap_or(1);
+            let max_freq = probe_freq
+                .iter()
+                .chain(corpus_freq.iter())
+                .copied()
+                .max()
+                .unwrap_or(1);
             let bar_scale = 30.0 / max_freq as f32;
 
             println!(
@@ -163,14 +180,18 @@ fn hit_token_report() {
 
             println!("    probe_tok hit freq:");
             for (tok, &freq) in probe_freq.iter().enumerate() {
-                if freq == 0 { continue; }
+                if freq == 0 {
+                    continue;
+                }
                 let bar = "#".repeat((freq as f32 * bar_scale).round() as usize);
                 println!("      tok {:>3}: {:<30} {}", tok, bar, freq);
             }
 
             println!("    corpus_tok hit freq:");
             for (tok, &freq) in corpus_freq.iter().enumerate() {
-                if freq == 0 { continue; }
+                if freq == 0 {
+                    continue;
+                }
                 let bar = "#".repeat((freq as f32 * bar_scale).round() as usize);
                 println!("      tok {:>3}: {:<30} {}", tok, bar, freq);
             }

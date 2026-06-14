@@ -901,8 +901,7 @@ impl TestParams {
         pipeline_record("bench:bulk_total", t_prompt_total);
         let _ = session.compact_check()?;
         let prompt_duration = prompt_start.elapsed();
-        let prompt_tokens =
-            user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
+        let prompt_tokens = user_lens.iter().sum::<usize>() * config.num_repeats.max(1);
         let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
 
         // Snapshot bulk profile at prompt→generate boundary
@@ -1016,9 +1015,7 @@ impl TestParams {
         // Note: empty k_pal / v_pal is valid and means "use the shared identity palette".
         for &seq_idx in &sequence_indices {
             if let Some(backing) = session.backings().first() {
-                let arena_infos = backing
-                    .resolve_arena_info()
-                    .expect("resolve_arena_info");
+                let arena_infos = backing.resolve_arena_info().expect("resolve_arena_info");
                 if let Some(chunks) = backing.live_chunks_as_sealed(seq_idx, &arena_infos) {
                     for (ci, chunk) in chunks.iter().enumerate() {
                         if !chunk.k_pal.is_empty() && chunk.k_pal.iter().all(|&b| b == 0) {
@@ -1050,35 +1047,6 @@ impl TestParams {
 
         // Snapshot single (generate) profile
         let single_profile = model.snapshot_profiles();
-        #[cfg(feature = "profile")]
-        {
-            println!(
-                "── Decode speed — {:?} ctx×{} rep×{}: {:.1} gen tok/s  ({:.1} ms/token) ──",
-                config.mode,
-                config.num_contexts,
-                config.num_repeats,
-                generate_tokens_per_sec,
-                if generate_tokens_per_sec > 0.0 {
-                    1000.0 * config.num_contexts.max(1) as f64 / generate_tokens_per_sec
-                } else {
-                    0.0
-                },
-            );
-        }
-        #[cfg(feature = "profile")]
-        if !single_profile.entries.is_empty() {
-            println!("── Decode profile — {:?} ──", config.mode);
-            for (name, total_ms, count) in &single_profile.entries {
-                let avg = if *count > 0 {
-                    total_ms / *count as f64
-                } else {
-                    0.0
-                };
-                println!(
-                    "  {name:<26} total={total_ms:>9.2}ms count={count:>6} avg={avg:>7.3}ms"
-                );
-            }
-        }
 
         // Success path: disarm the error guard so it doesn't fire on normal drop.
         arena_guard.fire = false;

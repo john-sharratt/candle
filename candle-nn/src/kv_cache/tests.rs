@@ -1,4 +1,4 @@
-﻿//! Unit tests for KV cache types.
+//! Unit tests for KV cache types.
 
 use super::*;
 use candle::{DType, Device, IndexOp, Result, Tensor};
@@ -2176,11 +2176,10 @@ fn kv_format_tag_round_trips() {
     use crate::kv_cache::{KvFormat, QuantFormat};
     use strum::IntoEnumIterator;
 
-    let mut formats: Vec<KvFormat> =
-        [DType::F32, DType::F16, DType::BF16, DType::F8E4M3]
-            .into_iter()
-            .map(KvFormat::Float)
-            .collect();
+    let mut formats: Vec<KvFormat> = [DType::F32, DType::F16, DType::BF16, DType::F8E4M3]
+        .into_iter()
+        .map(KvFormat::Float)
+        .collect();
     formats.extend(QuantFormat::iter().map(KvFormat::Quantized));
 
     let mut seen_tags = std::collections::HashSet::new();

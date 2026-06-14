@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::TlsError;
 use crate::state::sessions::{SessionMeta, TlsEntry};
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::TlsError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
@@ -46,14 +46,17 @@ impl Tool for TlsSessionOpen {
     type Error = TlsError;
 
     fn confirmation(req: &OpenRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Open TLS to {}:{}", req.host, req.port))
-            .with_field("host", req.host.clone()))
+        Some(
+            ConfirmationDetails::new(format!("Open TLS to {}:{}", req.host, req.port))
+                .with_field("host", req.host.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, TlsError> {
         let addr = format!("{}:{}", req.host, req.port);
         let timeout = Duration::from_millis(req.timeout_ms.unwrap_or(5000));
-        let addr_parsed: std::net::SocketAddr = addr.parse()
+        let addr_parsed: std::net::SocketAddr = addr
+            .parse()
             .or_else(|_| {
                 use std::net::ToSocketAddrs;
                 addr.to_socket_addrs().map(|mut a| a.next().unwrap())
@@ -62,16 +65,21 @@ impl Tool for TlsSessionOpen {
 
         let stream = TcpStream::connect_timeout(&addr_parsed, timeout)
             .map_err(|e| TlsError::ConnectionFailed(e.to_string()))?;
-        let local_addr = stream.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        let local_addr = stream
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
 
         let mut connector_builder = TlsConnector::builder();
         if req.accept_invalid_certs == Some(true) {
             connector_builder.danger_accept_invalid_certs(true);
         }
-        let connector = connector_builder.build()
+        let connector = connector_builder
+            .build()
             .map_err(|e| TlsError::HandshakeFailed(e.to_string()))?;
 
-        let tls_stream = connector.connect(&req.host, stream)
+        let tls_stream = connector
+            .connect(&req.host, stream)
             .map_err(|e| TlsError::HandshakeFailed(e.to_string()))?;
 
         let session_id = format!("sess_{}", Uuid::new_v4());
@@ -89,7 +97,12 @@ impl Tool for TlsSessionOpen {
         };
         ctx.sessions.insert_tls(entry);
 
-        Ok(OpenResponse { session_id, host: req.host, port: req.port, local_addr })
+        Ok(OpenResponse {
+            session_id,
+            host: req.host,
+            port: req.port,
+            local_addr,
+        })
     }
 }
 

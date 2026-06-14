@@ -1,9 +1,7 @@
 use crate::{
     handle::TokenDecoder,
-    narrator::{
-        narrate_system_prompt, text_to_inputs_streaming, ConverterMode, NarratorInput,
-    },
-    Sequence, SequenceConfig, ConversationEngine,
+    narrator::{narrate_system_prompt, text_to_inputs_streaming, ConverterMode, NarratorInput},
+    ConversationEngine, Sequence, SequenceConfig,
 };
 
 pub struct NarratorEngine {
@@ -11,10 +9,7 @@ pub struct NarratorEngine {
 }
 
 impl NarratorEngine {
-    pub fn new(
-        engine: &ConversationEngine,
-        mut config: SequenceConfig,
-    ) -> anyhow::Result<Self> {
+    pub fn new(engine: &ConversationEngine, mut config: SequenceConfig) -> anyhow::Result<Self> {
         let system_prompt = narrate_system_prompt();
         config.context_window_turns = 4;
 

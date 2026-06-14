@@ -1,4 +1,4 @@
-﻿//! YAML deserialisation for [`super::Schema`].
+//! YAML deserialisation for [`super::Schema`].
 //!
 //! # Pipeline
 //!
@@ -341,7 +341,7 @@ fn build(
                 priority,
                 depends_on: None,
                 is_template: false,
-                        template_tokens: None,
+                template_tokens: None,
             }));
         }
 
@@ -485,7 +485,7 @@ fn build(
                             priority: pri,
                             depends_on: None,
                             is_template: false,
-                        template_tokens: None,
+                            template_tokens: None,
                         });
                     }
 

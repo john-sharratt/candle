@@ -24,10 +24,7 @@ fn main() -> Result<()> {
     // Example 1: Basic sampling with temperature
     println!("\n🌡️  Example 1: Temperature sampling");
     let token1 = logits_tensor.sample_multinomial(0.8, None, None, 42)?;
-    println!(
-        "   Temperature 0.8, seed 42: token {}",
-        token1
-    );
+    println!("   Temperature 0.8, seed 42: token {}", token1);
 
     let token2 = logits_tensor.sample_multinomial(0.1, None, None, 42)?;
     println!(

@@ -41,7 +41,5 @@ pub use fixture::{
 pub use probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner, SUMMARISER_SYSTEM_PROMPT};
 pub use recency::{recency_score, RecencyConfig};
 pub use select::{select_dense, Selection};
-pub use summariser::{
-    ChannelProbeRunner, MockProbeRunner, SummariserThread, SummariserTrigger,
-};
+pub use summariser::{ChannelProbeRunner, MockProbeRunner, SummariserThread, SummariserTrigger};
 pub use tree::{Node, NodeId, SummaryTree, TurnKind};

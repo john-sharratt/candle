@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::DiagError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PingRequest {
@@ -59,12 +59,24 @@ impl Tool for PingIcmp {
 
         #[cfg(target_os = "windows")]
         let output = std::process::Command::new("ping")
-            .args(["-n", &count.to_string(), "-w", &(timeout * 1000).to_string(), &req.host])
+            .args([
+                "-n",
+                &count.to_string(),
+                "-w",
+                &(timeout * 1000).to_string(),
+                &req.host,
+            ])
             .output();
 
         #[cfg(not(target_os = "windows"))]
         let output = std::process::Command::new("ping")
-            .args(["-c", &count.to_string(), "-W", &timeout.to_string(), &req.host])
+            .args([
+                "-c",
+                &count.to_string(),
+                "-W",
+                &timeout.to_string(),
+                &req.host,
+            ])
             .output();
 
         let output = output.map_err(|e| DiagError::Failed(e.to_string()))?;
@@ -116,7 +128,8 @@ fn parse_ping_output(output: &str) -> (u32, f64, f64, f64) {
             }
         }
         if l.contains("min/avg/max") || l.contains("minimum") {
-            let nums: Vec<f64> = l.split(&['/', '=', ' ', ','][..])
+            let nums: Vec<f64> = l
+                .split(&['/', '=', ' ', ','][..])
                 .filter_map(|s| s.trim().trim_end_matches("ms").parse::<f64>().ok())
                 .collect();
             if nums.len() >= 3 {
@@ -124,9 +137,15 @@ fn parse_ping_output(output: &str) -> (u32, f64, f64, f64) {
                 avg = nums[1];
                 max = nums[2];
             } else if nums.len() >= 1 {
-                if l.contains("minimum") { min = nums[0]; }
-                if l.contains("maximum") { max = *nums.last().unwrap_or(&0.0); }
-                if l.contains("average") { avg = *nums.last().unwrap_or(&0.0); }
+                if l.contains("minimum") {
+                    min = nums[0];
+                }
+                if l.contains("maximum") {
+                    max = *nums.last().unwrap_or(&0.0);
+                }
+                if l.contains("average") {
+                    avg = *nums.last().unwrap_or(&0.0);
+                }
             }
         }
     }
@@ -137,7 +156,10 @@ fn parse_ping_output(output: &str) -> (u32, f64, f64, f64) {
 fn extract_number_after(s: &str, after: &str) -> Option<f64> {
     let pos = s.find(after)?;
     let rest = &s[pos + after.len()..];
-    rest.split(|c: char| !c.is_numeric() && c != '.').next()?.parse().ok()
+    rest.split(|c: char| !c.is_numeric() && c != '.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 pub const PING_ICMP: RegisteredTool = RegisteredTool::new::<PingIcmp>();

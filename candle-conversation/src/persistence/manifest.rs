@@ -508,7 +508,8 @@ mod tests {
             &encode_conv_state_payload(99, ConvState { archived: true }),
         ));
         let mut mem = MemLog::with_records(&blob);
-        let (_, mut substrate, _) = Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (_, mut substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         // Timeline 99 isn't registered during the walk; the three
         // ConvState records are stashed pending registration.  Drain
         // them by registering the timeline, then verify the
@@ -537,8 +538,7 @@ mod tests {
             &TombstonePayload { timeline_id: 77 }.encode(),
         ));
         let mut mem = MemLog::with_records(&blob);
-        let (_, substrate, _) =
-            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let (_, substrate, _) = Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
         let tl = TimelineId::from_raw(77).unwrap();
         // Pending until register_timeline drains, but `is_tombstoned`
         // sees the pending entry immediately.
@@ -602,7 +602,10 @@ mod tests {
         assert_eq!(tl, 9);
         assert!(meta.conv_id.is_empty());
         assert!(meta.label.is_empty());
-        assert!(meta.custom.is_empty(), "missing custom must default to empty");
+        assert!(
+            meta.custom.is_empty(),
+            "missing custom must default to empty"
+        );
     }
 
     /// The `custom` key/value bag round-trips through encode → decode.
@@ -635,7 +638,10 @@ mod tests {
     fn label_payload_omits_empty_custom() {
         let bytes = encode_label_payload(1, "c", "L", &BTreeMap::new());
         let s = String::from_utf8(bytes).unwrap();
-        assert!(!s.contains("custom"), "empty custom must not be serialized: {s}");
+        assert!(
+            !s.contains("custom"),
+            "empty custom must not be serialized: {s}"
+        );
     }
 
     /// The Manifest itself must tolerate added/removed top-level

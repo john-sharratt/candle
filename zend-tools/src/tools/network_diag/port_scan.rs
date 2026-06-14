@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::DiagError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PortScanRequest {
@@ -62,7 +62,9 @@ impl Tool for PortScan {
                         Ok(mut addrs) => {
                             if let Some(sa) = addrs.next() {
                                 TcpStream::connect_timeout(&sa, timeout).is_ok()
-                            } else { false }
+                            } else {
+                                false
+                            }
                         }
                         Err(_) => false,
                     }
@@ -71,7 +73,10 @@ impl Tool for PortScan {
             results.push(PortResult { port: *port, open });
         }
 
-        Ok(PortScanResponse { host: req.host, results })
+        Ok(PortScanResponse {
+            host: req.host,
+            results,
+        })
     }
 }
 

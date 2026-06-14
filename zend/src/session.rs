@@ -9,9 +9,7 @@ use notify::RecommendedWatcher;
 
 use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
-use candle_conversation::projection::{
-    self, Builder, Reserved, SystemPromptItem, TimelineId,
-};
+use candle_conversation::projection::{self, Builder, Reserved, SystemPromptItem, TimelineId};
 use candle_conversation::{ConversationEngine, Sequence, TokenDecoder, TurnEvent};
 
 use crate::code_read::CodeReadState;
@@ -282,13 +280,12 @@ impl InferenceState {
         // these tokens; the assembler then runs (or caches) a live
         // prefill against them under the current runtime left context.
         let tokenizer = engine.tokenizer();
-        proj_builder
-            .tokenize_templates::<anyhow::Error, _>(|s| {
-                let encoded = tokenizer
-                    .encode(s, false)
-                    .map_err(|e| anyhow::anyhow!("template tokenise: {e}"))?;
-                Ok(encoded.get_ids().to_vec())
-            })?;
+        proj_builder.tokenize_templates::<anyhow::Error, _>(|s| {
+            let encoded = tokenizer
+                .encode(s, false)
+                .map_err(|e| anyhow::anyhow!("template tokenise: {e}"))?;
+            Ok(encoded.get_ids().to_vec())
+        })?;
 
         progress.set_step(LoadStep::Sections);
         // Per-section progress callback — bytes ingested out of total
@@ -347,11 +344,7 @@ impl InferenceState {
             .dialect
             .format_system_prompt(TITLER_SYSTEM_PROMPT);
         let titler = engine
-            .new_reserved_conversation(
-                &titler_formatted,
-                Reserved::Titler,
-                conv_config.clone(),
-            )
+            .new_reserved_conversation(&titler_formatted, Reserved::Titler, conv_config.clone())
             .map_err(|e| anyhow::anyhow!("titler create: {e}"))?;
         let titler_timeline = titler.timeline_id();
         let tokenizer = Arc::new(engine.tokenizer().clone());
@@ -454,10 +447,7 @@ impl InferenceState {
     /// instead of doing its own — the watcher callback walks once
     /// per filesystem-event burst and shares the result with both
     /// refresh paths.
-    pub(crate) fn refresh_repo_map(
-        &self,
-        map: Option<RepoMap>,
-    ) -> anyhow::Result<bool> {
+    pub(crate) fn refresh_repo_map(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
         let progress = LoadProgress::new();
         let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
         let (old_timeline, prior_state) = {
@@ -489,10 +479,7 @@ impl InferenceState {
     ///
     /// When `map` is `Some`, the refresh reuses that workspace walk
     /// instead of doing its own.
-    pub(crate) fn refresh_code_reading(
-        &self,
-        map: Option<RepoMap>,
-    ) -> anyhow::Result<bool> {
+    pub(crate) fn refresh_code_reading(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
         let progress = LoadProgress::new();
         let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
         let prior_state = self.code_read_conv.lock().unwrap().state.clone();
@@ -769,11 +756,7 @@ fn run_inference_stream(
 /// as the main conversation's sidebar label. Runs on a detached thread so
 /// the user-facing SSE stream isn't blocked. Errors are logged and dropped
 /// — the worst case is a missing sidebar label, never a failed response.
-fn generate_and_set_title(
-    state: Arc<InferenceState>,
-    timeline: TimelineId,
-    user_message: String,
-) {
+fn generate_and_set_title(state: Arc<InferenceState>, timeline: TimelineId, user_message: String) {
     use candle_conversation::{TurnEvent, TurnOptions};
 
     let truncated = head_tail_truncate(
@@ -1071,148 +1054,150 @@ impl ZendSession {
         std::thread::Builder::new()
             .name("zend-loader".into())
             .spawn(move || {
-            load_progress.set_step(LoadStep::Model);
-            status_tx.send("Checking for model…".into()).ok();
+                load_progress.set_step(LoadStep::Model);
+                status_tx.send("Checking for model…".into()).ok();
 
-            // The download path is async (hf-hub, tokio::fs, reqwest);
-            // build a tiny current-thread runtime so we can `block_on`
-            // it without requiring the caller to be on Tokio.
-            let download_runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    tracing::warn!("local tokio runtime for download failed: {e:#}");
-                    status_tx.send(format!("Runtime build failed: {e}")).ok();
-                    load_progress.mark_ready();
-                    ready_tx.send(true).ok();
-                    return;
-                }
-            };
-            let (model_path, tok_path) =
-                match download_runtime.block_on(crate::download::ensure_model(&status_tx)) {
-                    Ok(p) => p,
+                // The download path is async (hf-hub, tokio::fs, reqwest);
+                // build a tiny current-thread runtime so we can `block_on`
+                // it without requiring the caller to be on Tokio.
+                let download_runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
                     Err(e) => {
-                        tracing::warn!("model download failed: {e:#}");
-                        status_tx.send(format!("Download failed: {e}")).ok();
-                        // Surface the error to anyone waiting on ready
-                        // by flipping into the ready state with the
-                        // error detail still visible — the chat will
-                        // fail loudly when the user actually submits.
+                        tracing::warn!("local tokio runtime for download failed: {e:#}");
+                        status_tx.send(format!("Runtime build failed: {e}")).ok();
                         load_progress.mark_ready();
                         ready_tx.send(true).ok();
                         return;
                     }
                 };
-            // Drop the runtime; the model load below is sync.
-            drop(download_runtime);
-
-            // Re-enter the main Tokio runtime for the rest of this thread so the
-            // workspace watcher's `tokio::spawn` has a runtime context. Must come
-            // *after* the download runtime is dropped (no nested `block_on`).
-            // The model load is synchronous, so holding the enter guard is safe.
-            let _rt_guard = rt_handle.as_ref().map(|h| h.enter());
-
-            status_tx.send("Loading model…".into()).ok();
-            tracing::info!("loading inference engine (Qwen3-30B-A3B) …");
-            let load_progress_for_blocking = Arc::clone(&load_progress);
-            // `InferenceState::load` is fully synchronous (CUDA model
-            // load + substrate recovery + ingestion).  Call directly
-            // on this thread — no `spawn_blocking` needed.
-            match InferenceState::load(
-                proj_builder,
-                model_path,
-                tok_path,
-                workspace,
-                skip_code_read,
-                compact_substrate,
-                load_progress_for_blocking,
-            ) {
-                Ok(state) => {
-                    *slot.write().unwrap() = Some(Arc::clone(&state));
-                    tracing::info!("inference engine ready");
-                    status_tx.send(String::new()).ok();
-                    // Substrate persistence runs in the engine's own
-                    // thread (`PersistenceThread`) — 5 s tick + per-turn
-                    // trigger from the scheduler — so no periodic-flush
-                    // task is needed at the daemon level here.
-                    //
-                    // `LoadStep::RepoScan` and `LoadStep::CodeRead`
-                    // are advanced inside `InferenceState::load`
-                    // itself — the ingestion passes own those steps
-                    // and report sub-step progress through the same
-                    // `LoadProgress` handle.
-
-                    // Arm the workspace watcher.  Filesystem events
-                    // debounce into a single refresh call covering
-                    // BOTH layers — name-relevant events (create /
-                    // remove / rename) can move the repo-map
-                    // cluster hashes, and content edits can move
-                    // the code-reading file-content hashes.  Each
-                    // refresh path short-circuits internally when
-                    // its hash record is unchanged, so the work is
-                    // bounded.
-                    let inference_for_watcher = Arc::clone(&slot);
-                    let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                        let Some(state) = inference_for_watcher
-                            .read()
-                            .unwrap()
-                            .as_ref()
-                            .map(Arc::clone)
-                        else {
+                let (model_path, tok_path) =
+                    match download_runtime.block_on(crate::download::ensure_model(&status_tx)) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("model download failed: {e:#}");
+                            status_tx.send(format!("Download failed: {e}")).ok();
+                            // Surface the error to anyone waiting on ready
+                            // by flipping into the ready state with the
+                            // error detail still visible — the chat will
+                            // fail loudly when the user actually submits.
+                            load_progress.mark_ready();
+                            ready_tx.send(true).ok();
                             return;
-                        };
-                        // Walk the workspace once per event burst and
-                        // share the result between both refresh paths.
-                        // Walks are the dominant cost on workspaces
-                        // with tens of thousands of files; doing it
-                        // twice per burst is wasted work.
-                        let map = crate::repo_scan::walk_workspace(&state.workspace);
-                        match state.refresh_repo_map(Some(map.clone())) {
-                            Ok(true) => {
-                                tracing::info!("repo map refreshed after fs event burst")
-                            }
-                            Ok(false) => tracing::debug!(
-                                "fs event burst saw no cluster hash change — repo map skipped"
-                            ),
-                            Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
                         }
-                        // Honour --skip-code-read for the watcher too: with code
-                        // reading disabled the per-file content state is empty,
-                        // so a refresh would treat every file as changed and
-                        // re-ingest the whole repo (flooding the scheduler and
-                        // starving interactive chat).
-                        if skip_code_read {
-                            tracing::debug!(
-                                "--skip-code-read: watcher code-reading refresh suppressed"
-                            );
-                        } else {
-                            match state.refresh_code_reading(Some(map)) {
+                    };
+                // Drop the runtime; the model load below is sync.
+                drop(download_runtime);
+
+                // Re-enter the main Tokio runtime for the rest of this thread so the
+                // workspace watcher's `tokio::spawn` has a runtime context. Must come
+                // *after* the download runtime is dropped (no nested `block_on`).
+                // The model load is synchronous, so holding the enter guard is safe.
+                let _rt_guard = rt_handle.as_ref().map(|h| h.enter());
+
+                status_tx.send("Loading model…".into()).ok();
+                tracing::info!("loading inference engine (Qwen3-30B-A3B) …");
+                let load_progress_for_blocking = Arc::clone(&load_progress);
+                // `InferenceState::load` is fully synchronous (CUDA model
+                // load + substrate recovery + ingestion).  Call directly
+                // on this thread — no `spawn_blocking` needed.
+                match InferenceState::load(
+                    proj_builder,
+                    model_path,
+                    tok_path,
+                    workspace,
+                    skip_code_read,
+                    compact_substrate,
+                    load_progress_for_blocking,
+                ) {
+                    Ok(state) => {
+                        *slot.write().unwrap() = Some(Arc::clone(&state));
+                        tracing::info!("inference engine ready");
+                        status_tx.send(String::new()).ok();
+                        // Substrate persistence runs in the engine's own
+                        // thread (`PersistenceThread`) — 5 s tick + per-turn
+                        // trigger from the scheduler — so no periodic-flush
+                        // task is needed at the daemon level here.
+                        //
+                        // `LoadStep::RepoScan` and `LoadStep::CodeRead`
+                        // are advanced inside `InferenceState::load`
+                        // itself — the ingestion passes own those steps
+                        // and report sub-step progress through the same
+                        // `LoadProgress` handle.
+
+                        // Arm the workspace watcher.  Filesystem events
+                        // debounce into a single refresh call covering
+                        // BOTH layers — name-relevant events (create /
+                        // remove / rename) can move the repo-map
+                        // cluster hashes, and content edits can move
+                        // the code-reading file-content hashes.  Each
+                        // refresh path short-circuits internally when
+                        // its hash record is unchanged, so the work is
+                        // bounded.
+                        let inference_for_watcher = Arc::clone(&slot);
+                        let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                            let Some(state) = inference_for_watcher
+                                .read()
+                                .unwrap()
+                                .as_ref()
+                                .map(Arc::clone)
+                            else {
+                                return;
+                            };
+                            // Walk the workspace once per event burst and
+                            // share the result between both refresh paths.
+                            // Walks are the dominant cost on workspaces
+                            // with tens of thousands of files; doing it
+                            // twice per burst is wasted work.
+                            let map = crate::repo_scan::walk_workspace(&state.workspace);
+                            match state.refresh_repo_map(Some(map.clone())) {
                                 Ok(true) => {
-                                    tracing::info!("code reading refreshed after fs event burst")
+                                    tracing::info!("repo map refreshed after fs event burst")
                                 }
                                 Ok(false) => tracing::debug!(
+                                    "fs event burst saw no cluster hash change — repo map skipped"
+                                ),
+                                Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
+                            }
+                            // Honour --skip-code-read for the watcher too: with code
+                            // reading disabled the per-file content state is empty,
+                            // so a refresh would treat every file as changed and
+                            // re-ingest the whole repo (flooding the scheduler and
+                            // starving interactive chat).
+                            if skip_code_read {
+                                tracing::debug!(
+                                    "--skip-code-read: watcher code-reading refresh suppressed"
+                                );
+                            } else {
+                                match state.refresh_code_reading(Some(map)) {
+                                    Ok(true) => {
+                                        tracing::info!(
+                                            "code reading refreshed after fs event burst"
+                                        )
+                                    }
+                                    Ok(false) => tracing::debug!(
                                     "fs event burst saw no file content change — code read skipped"
                                 ),
-                                Err(e) => tracing::warn!("code read refresh failed: {e:#}"),
+                                    Err(e) => tracing::warn!("code read refresh failed: {e:#}"),
+                                }
                             }
+                        });
+                        match crate::watcher::spawn(&state.workspace, on_refresh) {
+                            Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
+                            Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
                         }
-                    });
-                    match crate::watcher::spawn(&state.workspace, on_refresh) {
-                        Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
-                        Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
+                    }
+                    Err(e) => {
+                        tracing::warn!("inference engine failed to load: {e:#}");
+                        status_tx.send(format!("Load failed: {e}")).ok();
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("inference engine failed to load: {e:#}");
-                    status_tx.send(format!("Load failed: {e}")).ok();
-                }
-            }
-            load_progress.mark_ready();
-            ready_tx.send(true).ok();
-        })
-        .expect("spawn zend-loader thread");
+                load_progress.mark_ready();
+                ready_tx.send(true).ok();
+            })
+            .expect("spawn zend-loader thread");
     }
 
     /// Graceful shutdown: durably checkpoint the substrate redo log, then
@@ -1370,9 +1355,7 @@ fn head_tail_truncate(
     if ids.len() <= head + tail {
         return text.to_string();
     }
-    let head_text = tokenizer
-        .decode(&ids[..head], false)
-        .unwrap_or_default();
+    let head_text = tokenizer.decode(&ids[..head], false).unwrap_or_default();
     let tail_text = tokenizer
         .decode(&ids[ids.len() - tail..], false)
         .unwrap_or_default();
@@ -1384,8 +1367,14 @@ fn head_tail_truncate(
 fn clean_title(raw: &str) -> String {
     let s = raw.trim();
     let s = s.strip_prefix("Title:").unwrap_or(s).trim();
-    let s = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')).unwrap_or(s);
-    let s = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')).unwrap_or(s);
+    let s = s
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(s);
+    let s = s
+        .strip_prefix('\'')
+        .and_then(|r| r.strip_suffix('\''))
+        .unwrap_or(s);
     let s = s.trim_end_matches(['.', '!', '?']);
     s.trim().to_string()
 }

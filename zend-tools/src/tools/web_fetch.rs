@@ -55,7 +55,9 @@ impl ToolError for FetchError {
 }
 
 pub fn is_private_url(url_str: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url_str) else { return true; };
+    let Ok(parsed) = url::Url::parse(url_str) else {
+        return true;
+    };
     let host = parsed.host_str().unwrap_or("");
     if host == "localhost" || host == "127.0.0.1" || host == "::1" {
         return true;
@@ -105,7 +107,13 @@ fn html_to_text(html: &str) -> (String, String) {
             if let Some(elem) = node.value().as_element() {
                 match elem.name() {
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        let level = elem.name().chars().nth(1).unwrap_or('1').to_digit(10).unwrap_or(1) as usize;
+                        let level = elem
+                            .name()
+                            .chars()
+                            .nth(1)
+                            .unwrap_or('1')
+                            .to_digit(10)
+                            .unwrap_or(1) as usize;
                         let hashes = "#".repeat(level);
                         if let Some(t) = scraper::ElementRef::wrap(node) {
                             let content: String = t.text().collect();
@@ -164,13 +172,18 @@ impl Tool for WebFetchTool {
 
     fn run(ctx: &ToolContext, req: Request) -> Result<Response, FetchError> {
         if !req.url.starts_with("http://") && !req.url.starts_with("https://") {
-            return Err(FetchError::UrlBlocked("URL must start with http:// or https://".to_string()));
+            return Err(FetchError::UrlBlocked(
+                "URL must start with http:// or https://".to_string(),
+            ));
         }
         if is_private_url(&req.url) {
-            return Err(FetchError::UrlBlocked("private/localhost URLs are not allowed".to_string()));
+            return Err(FetchError::UrlBlocked(
+                "private/localhost URLs are not allowed".to_string(),
+            ));
         }
 
-        let resp = ctx.http_client
+        let resp = ctx
+            .http_client
             .get(&req.url)
             .header("User-Agent", "Mozilla/5.0 (compatible; zend-tools/0.1)")
             .send()
@@ -186,7 +199,9 @@ impl Tool for WebFetchTool {
             });
         }
 
-        let html = resp.text().map_err(|e| FetchError::FetchFailed(e.to_string()))?;
+        let html = resp
+            .text()
+            .map_err(|e| FetchError::FetchFailed(e.to_string()))?;
         let (title, content) = html_to_text(&html);
 
         let max_chars = (req.max_tokens.unwrap_or(4000) * 4) as usize;

@@ -63,8 +63,16 @@ fn init_tracing() {
 fn build_fixture_workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
-    write(&root, "Cargo.toml", b"[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n");
-    write(&root, "src/lib.rs", b"pub mod widget;\n\npub fn hello() -> &'static str { \"hi\" }\n");
+    write(
+        &root,
+        "Cargo.toml",
+        b"[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        &root,
+        "src/lib.rs",
+        b"pub mod widget;\n\npub fn hello() -> &'static str { \"hi\" }\n",
+    );
     write(
         &root,
         "src/widget/mod.rs",
@@ -117,7 +125,10 @@ struct LoadedDaemon {
 fn load_daemon(workspace: &Path) -> LoadedDaemon {
     init_tracing();
     let device = cuda_device().expect("CUDA required for Tier-3 phase12 smoke");
-    eprintln!("=== Loading Qwen3-30B-A3B against {} ===", workspace.display());
+    eprintln!(
+        "=== Loading Qwen3-30B-A3B against {} ===",
+        workspace.display()
+    );
     let start = std::time::Instant::now();
 
     let dialect = Model::Qwen3_30B_A3B_Q4.spec().dialect.clone();
@@ -167,7 +178,10 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             conv_config.clone(),
         )
         .expect("new dialogue conv");
-    eprintln!("dialogue base built ({:.1}s)", start.elapsed().as_secs_f64());
+    eprintln!(
+        "dialogue base built ({:.1}s)",
+        start.elapsed().as_secs_f64()
+    );
 
     let progress = LoadProgress::new();
     let (repo_map, walked, _cluster_state) = zend::repo_scan::ingest_repo_map(

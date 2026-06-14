@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle::Device;
+use candle_conversation::Sequence;
 use candle_conversation::{
     models::{Dialect, Model},
     provenance::{
@@ -46,7 +47,6 @@ use candle_conversation::{
     },
     ProvenanceFile, SamplingConfig, SigEntry, TurnHandle,
 };
-use candle_conversation::Sequence;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
@@ -253,9 +253,13 @@ fn main() -> anyhow::Result<()> {
             let text = std::fs::read_to_string(&manifest_out)?;
             // OutManifest has a `scenarios` array; parse just enough.
             #[derive(serde::Deserialize)]
-            struct MinScenario { id: String }
+            struct MinScenario {
+                id: String,
+            }
             #[derive(serde::Deserialize)]
-            struct MinManifest { scenarios: Vec<MinScenario> }
+            struct MinManifest {
+                scenarios: Vec<MinScenario>,
+            }
             let m: MinManifest = serde_json::from_str(&text)?;
             m.scenarios.into_iter().map(|s| s.id).collect()
         } else {
@@ -267,7 +271,9 @@ fn main() -> anyhow::Result<()> {
 
     // In append mode, only process scenarios not yet in the output manifest.
     let scenarios_to_run: Vec<&InScenario> = if args.append && !existing_ids.is_empty() {
-        in_manifest.scenarios.iter()
+        in_manifest
+            .scenarios
+            .iter()
             .filter(|s| !existing_ids.contains(&s.id))
             .collect()
     } else {
@@ -275,10 +281,16 @@ fn main() -> anyhow::Result<()> {
     };
     let total = scenarios_to_run.len();
     if args.append {
-        println!("Loaded {all_count} scenarios from {}; {total} new (skipping {} already done)",
-            prompts_manifest.display(), all_count - total);
+        println!(
+            "Loaded {all_count} scenarios from {}; {total} new (skipping {} already done)",
+            prompts_manifest.display(),
+            all_count - total
+        );
     } else {
-        println!("Loaded {total} scenarios from {}", prompts_manifest.display());
+        println!(
+            "Loaded {total} scenarios from {}",
+            prompts_manifest.display()
+        );
     }
 
     if !args.append {
@@ -299,7 +311,13 @@ fn main() -> anyhow::Result<()> {
 
     // ── Load model ────────────────────────────────────────────────────────────
 
-    println!("Loading model from {}...", args.model_dir.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "HuggingFace hub".into()));
+    println!(
+        "Loading model from {}...",
+        args.model_dir
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "HuggingFace hub".into())
+    );
     let device = Device::cuda_if_available(0)?;
     println!("Device: {:?}", device);
     let t_load = Instant::now();
@@ -341,12 +359,19 @@ fn main() -> anyhow::Result<()> {
         std::collections::HashMap::new();
     for (band, band_layers) in bands.iter().enumerate() {
         for (slot, &layer_idx) in band_layers.iter().enumerate() {
-            layer_to_band_slot.entry(layer_idx).or_default().push((band, slot));
+            layer_to_band_slot
+                .entry(layer_idx)
+                .or_default()
+                .push((band, slot));
         }
     }
     let unique_layers: Vec<usize> = {
         let mut seen = std::collections::HashSet::new();
-        all_layer_indices.iter().copied().filter(|l| seen.insert(*l)).collect()
+        all_layer_indices
+            .iter()
+            .copied()
+            .filter(|l| seen.insert(*l))
+            .collect()
     };
 
     // Build raw file header.
@@ -424,7 +449,15 @@ fn main() -> anyhow::Result<()> {
         let pf = engine.provenance_file();
 
         for slot in slots {
-            let Slot { global_idx, id, tool, case_type, user_prompt, mut conv, handle } = slot;
+            let Slot {
+                global_idx,
+                id,
+                tool,
+                case_type,
+                user_prompt,
+                mut conv,
+                handle,
+            } = slot;
 
             let resp = handle.wait()?;
             conv.finish_turn(handle, &resp)?;
@@ -437,8 +470,13 @@ fn main() -> anyhow::Result<()> {
                     match conv.extract_raw_kvq(unique_layers.clone(), block_range) {
                         Ok(layer_data) => {
                             // Build a (layer_idx → blocks) map.
-                            let layer_map: std::collections::HashMap<usize, &Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>> =
-                                layer_data.iter().map(|(li, blocks)| (*li, blocks)).collect();
+                            let layer_map: std::collections::HashMap<
+                                usize,
+                                &Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>)>,
+                            > = layer_data
+                                .iter()
+                                .map(|(li, blocks)| (*li, blocks))
+                                .collect();
 
                             // Collect per-band-layer raw block data for build_token_blob.
                             let n_blocks = seal.block_to.saturating_sub(seal.block_from);
@@ -452,30 +490,42 @@ fn main() -> anyhow::Result<()> {
                                     chunk_size
                                 } else {
                                     let rem = total_tokens % chunk_size;
-                                    if rem == 0 { chunk_size } else { rem }
+                                    if rem == 0 {
+                                        chunk_size
+                                    } else {
+                                        rem
+                                    }
                                 };
 
                                 // Build band_layer_data for this block: [band][layer_in_band] → (k, q)
-                                let band_layer_data: [Vec<(&[f32], &[f32])>; 3] = std::array::from_fn(|band| {
-                                    bands[band]
-                                        .iter()
-                                        .map(|&layer_idx| {
-                                            if let Some(blocks) = layer_map.get(&layer_idx) {
-                                                // Find the block at block_offset within the seal range.
-                                                let abs_block = seal.block_from + block_offset;
-                                                if let Some((_, k, _v, q)) = blocks.iter().find(|(bi, ..)| *bi == abs_block) {
-                                                    (k.as_slice(), q.as_slice())
+                                let band_layer_data: [Vec<(&[f32], &[f32])>; 3] =
+                                    std::array::from_fn(|band| {
+                                        bands[band]
+                                            .iter()
+                                            .map(|&layer_idx| {
+                                                if let Some(blocks) = layer_map.get(&layer_idx) {
+                                                    // Find the block at block_offset within the seal range.
+                                                    let abs_block = seal.block_from + block_offset;
+                                                    if let Some((_, k, _v, q)) = blocks
+                                                        .iter()
+                                                        .find(|(bi, ..)| *bi == abs_block)
+                                                    {
+                                                        (k.as_slice(), q.as_slice())
+                                                    } else {
+                                                        (&[][..], &[][..])
+                                                    }
                                                 } else {
                                                     (&[][..], &[][..])
                                                 }
-                                            } else {
-                                                (&[][..], &[][..])
-                                            }
-                                        })
-                                        .collect()
-                                });
+                                            })
+                                            .collect()
+                                    });
 
-                                let blob = build_token_blob(&raw_header, tokens_this_block, &band_layer_data);
+                                let blob = build_token_blob(
+                                    &raw_header,
+                                    tokens_this_block,
+                                    &band_layer_data,
+                                );
                                 all_token_bytes.extend_from_slice(&blob);
                             }
 
@@ -685,7 +735,10 @@ fn main() -> anyhow::Result<()> {
             scenarios: final_raw_scenarios,
         };
         let raw_manifest_out = args.output.join("RAW_MANIFEST.json");
-        std::fs::write(&raw_manifest_out, serde_json::to_string_pretty(&raw_manifest)?)?;
+        std::fs::write(
+            &raw_manifest_out,
+            serde_json::to_string_pretty(&raw_manifest)?,
+        )?;
         println!(
             "  raw_kvq.prov    : {} bytes",
             std::fs::metadata(&raw_path)?.len()
@@ -701,8 +754,14 @@ fn main() -> anyhow::Result<()> {
         "\nDone — {completed}/{total} scenarios in {elapsed:.1}s ({:.1} s/scenario avg)",
         elapsed / completed.max(1) as f64,
     );
-    println!("  signatures.prov : {} bytes", std::fs::metadata(&sig_path)?.len());
-    println!("  MANIFEST.json   : {} bytes", std::fs::metadata(&manifest_out)?.len());
+    println!(
+        "  signatures.prov : {} bytes",
+        std::fs::metadata(&sig_path)?.len()
+    );
+    println!(
+        "  MANIFEST.json   : {} bytes",
+        std::fs::metadata(&manifest_out)?.len()
+    );
 
     Ok(())
 }

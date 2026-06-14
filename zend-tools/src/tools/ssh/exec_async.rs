@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::SshError;
 use crate::state::sessions::SshProcess;
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::SshError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ExecAsyncRequest {
@@ -46,12 +46,16 @@ impl Tool for SshSessionExecAsync {
     type Error = SshError;
 
     fn confirmation(req: &ExecAsyncRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Start async: {}", req.command))
-            .with_field("session_id", req.session_id.clone()))
+        Some(
+            ConfirmationDetails::new(format!("Start async: {}", req.command))
+                .with_field("session_id", req.session_id.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: ExecAsyncRequest) -> Result<ExecAsyncResponse, SshError> {
-        let entry_arc = ctx.sessions.get_ssh(&req.session_id)
+        let entry_arc = ctx
+            .sessions
+            .get_ssh(&req.session_id)
             .ok_or_else(|| SshError::SessionNotFound(req.session_id.clone()))?;
         let entry = entry_arc.lock().unwrap();
 

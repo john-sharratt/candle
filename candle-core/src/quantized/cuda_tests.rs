@@ -2525,7 +2525,11 @@ fn kv_path_quantize_one_block(
     dtype: GgmlDType,
     dev: &CudaDevice,
 ) -> Result<Vec<u8>> {
-    assert_eq!(src_data.len(), 32, "KV-path tests require exactly 32 elements");
+    assert_eq!(
+        src_data.len(),
+        32,
+        "KV-path tests require exactly 32 elements"
+    );
     assert_eq!(dtype.block_size(), 32, "dtype must have 32-element blocks");
 
     let quant_size = dtype.type_size();
@@ -2675,16 +2679,24 @@ fn kv_path_int8_roundtrip_q2_s() -> Result<()> {
 fn kv_path_int8_roundtrip_q2_a() -> Result<()> {
     let dev = CudaDevice::new(0)?;
     let mut src = vec![-0.31f32; 32];
-    src[0] = 1.1875;   // sets vmax
+    src[0] = 1.1875; // sets vmax
     src[1] = -0.59375; // sets vmin
 
     let bytes = kv_path_quantize_one_block(&src, GgmlDType::Q2_A, &dev)?;
 
     // Q2_A block: [scale: i8, bias: i8, qs: [u8;8]]
     let scale = bytes[0] as i8;
-    let bias  = bytes[1] as i8;
-    assert_eq!(scale, 75,  "Q2_A INT8 scale: expected round(delta*127)=75, got {}", scale);
-    assert_eq!(bias,  -75, "Q2_A INT8 bias:  expected round(vmin*127)=-75, got {}", bias);
+    let bias = bytes[1] as i8;
+    assert_eq!(
+        scale, 75,
+        "Q2_A INT8 scale: expected round(delta*127)=75, got {}",
+        scale
+    );
+    assert_eq!(
+        bias, -75,
+        "Q2_A INT8 bias:  expected round(vmin*127)=-75, got {}",
+        bias
+    );
     Ok(())
 }
 
@@ -2699,17 +2711,43 @@ fn kv_path_int8_roundtrip_q2_a() -> Result<()> {
 fn kv_path_q1_a_asymmetric() -> Result<()> {
     let dev = CudaDevice::new(0)?;
     let mut src = [-0.25f32; 32];
-    for v in &mut src[..16] { *v = 1.0; }
+    for v in &mut src[..16] {
+        *v = 1.0;
+    }
 
     let bytes = kv_path_quantize_one_block(&src, GgmlDType::Q1_A, &dev)?;
 
     assert_eq!(bytes.len(), 6, "Q1_A block must be 6 bytes");
-    assert_eq!(bytes[0] as i8, 127, "Q1_A scale_pos (mean(+) = 1.0): expected 127, got {}", bytes[0] as i8);
-    assert_eq!(bytes[1] as i8,  32, "Q1_A scale_neg (mean(|-|) = 0.25): expected 32, got {}", bytes[1] as i8);
-    assert_eq!(bytes[2], 0xFF, "Q1_A qs[0] (lanes 0-7 positive): expected 0xFF, got 0x{:02X}", bytes[2]);
-    assert_eq!(bytes[3], 0xFF, "Q1_A qs[1] (lanes 8-15 positive): expected 0xFF, got 0x{:02X}", bytes[3]);
-    assert_eq!(bytes[4], 0x00, "Q1_A qs[2] (lanes 16-23 negative): expected 0x00, got 0x{:02X}", bytes[4]);
-    assert_eq!(bytes[5], 0x00, "Q1_A qs[3] (lanes 24-31 negative): expected 0x00, got 0x{:02X}", bytes[5]);
+    assert_eq!(
+        bytes[0] as i8, 127,
+        "Q1_A scale_pos (mean(+) = 1.0): expected 127, got {}",
+        bytes[0] as i8
+    );
+    assert_eq!(
+        bytes[1] as i8, 32,
+        "Q1_A scale_neg (mean(|-|) = 0.25): expected 32, got {}",
+        bytes[1] as i8
+    );
+    assert_eq!(
+        bytes[2], 0xFF,
+        "Q1_A qs[0] (lanes 0-7 positive): expected 0xFF, got 0x{:02X}",
+        bytes[2]
+    );
+    assert_eq!(
+        bytes[3], 0xFF,
+        "Q1_A qs[1] (lanes 8-15 positive): expected 0xFF, got 0x{:02X}",
+        bytes[3]
+    );
+    assert_eq!(
+        bytes[4], 0x00,
+        "Q1_A qs[2] (lanes 16-23 negative): expected 0x00, got 0x{:02X}",
+        bytes[4]
+    );
+    assert_eq!(
+        bytes[5], 0x00,
+        "Q1_A qs[3] (lanes 24-31 negative): expected 0x00, got 0x{:02X}",
+        bytes[5]
+    );
     Ok(())
 }
 
@@ -2732,10 +2770,16 @@ fn kv_path_q0_x_outlier() -> Result<()> {
     let bytes = kv_path_quantize_one_block(&src, GgmlDType::Q0_X, &dev)?;
 
     assert_eq!(bytes.len(), 2, "Q0_X block must be 2 bytes");
-    assert_eq!(bytes[0] as i8, 4,
-        "Q0_X bulk_anchor (mean=1/32 → INT8 4): got {}", bytes[0] as i8);
-    assert_eq!(bytes[1], 0x67,
-        "Q0_X outlier_packed (idx=7, delta=3): expected 0x67, got 0x{:02X}", bytes[1]);
+    assert_eq!(
+        bytes[0] as i8, 4,
+        "Q0_X bulk_anchor (mean=1/32 → INT8 4): got {}",
+        bytes[0] as i8
+    );
+    assert_eq!(
+        bytes[1], 0x67,
+        "Q0_X outlier_packed (idx=7, delta=3): expected 0x67, got 0x{:02X}",
+        bytes[1]
+    );
     Ok(())
 }
 
@@ -2753,7 +2797,7 @@ fn kv_path_q0_m2_alternating() -> Result<()> {
     for i in 0..8 {
         let base = i * 4;
         let val = if i % 2 == 0 { -1.0 } else { 1.0 };
-        src[base..base+4].fill(val);
+        src[base..base + 4].fill(val);
     }
 
     let bytes = kv_path_quantize_one_block(&src, GgmlDType::Q0_M2, &dev)?;
@@ -2761,9 +2805,21 @@ fn kv_path_q0_m2_alternating() -> Result<()> {
     assert_eq!(bytes.len(), 3, "Q0_M2 block must be 3 bytes");
     // Quartet assignments: [0→c0, 1→c1, 2→c0, 3→c1, 4→c0, 5→c1, 6→c0, 7→c1]
     // qmask bit k = assignment of quartet k: 0b10101010 = 0xAA
-    assert_eq!(bytes[0] as i8, -127, "Q0_M2 c0 (-1.0): expected INT8 -127, got {}", bytes[0] as i8);
-    assert_eq!(bytes[1] as i8,  127, "Q0_M2 c1 (+1.0): expected INT8 127, got {}", bytes[1] as i8);
-    assert_eq!(bytes[2], 0xAA, "Q0_M2 mask: expected 0xAA (alternating), got 0x{:02X}", bytes[2]);
+    assert_eq!(
+        bytes[0] as i8, -127,
+        "Q0_M2 c0 (-1.0): expected INT8 -127, got {}",
+        bytes[0] as i8
+    );
+    assert_eq!(
+        bytes[1] as i8, 127,
+        "Q0_M2 c1 (+1.0): expected INT8 127, got {}",
+        bytes[1] as i8
+    );
+    assert_eq!(
+        bytes[2], 0xAA,
+        "Q0_M2 mask: expected 0xAA (alternating), got 0x{:02X}",
+        bytes[2]
+    );
     Ok(())
 }
 
@@ -2782,19 +2838,39 @@ fn kv_path_q0_m4_four_levels() -> Result<()> {
     let mut src = [0.0f32; 32];
     for i in 0..8 {
         let val = [-0.75f32, -0.25, 0.25, 0.75][i % 4];
-        src[i*4..i*4+4].fill(val);
+        src[i * 4..i * 4 + 4].fill(val);
     }
 
     let bytes = kv_path_quantize_one_block(&src, GgmlDType::Q0_M4, &dev)?;
 
     assert_eq!(bytes.len(), 8, "Q0_M4 block must be 8 bytes");
     // INT8: round(v*127) — all within [-127,127] so no clamping
-    assert_eq!(bytes[0] as i8,  -95, "Q0_M4 c[0]=-0.75: expected INT8 -95, got {}", bytes[0] as i8);
-    assert_eq!(bytes[1] as i8,  -32, "Q0_M4 c[1]=-0.25: expected INT8 -32, got {}", bytes[1] as i8);
-    assert_eq!(bytes[2] as i8,   32, "Q0_M4 c[2]=+0.25: expected INT8 32, got {}", bytes[2] as i8);
-    assert_eq!(bytes[3] as i8,   95, "Q0_M4 c[3]=+0.75: expected INT8 95, got {}", bytes[3] as i8);
+    assert_eq!(
+        bytes[0] as i8, -95,
+        "Q0_M4 c[0]=-0.75: expected INT8 -95, got {}",
+        bytes[0] as i8
+    );
+    assert_eq!(
+        bytes[1] as i8, -32,
+        "Q0_M4 c[1]=-0.25: expected INT8 -32, got {}",
+        bytes[1] as i8
+    );
+    assert_eq!(
+        bytes[2] as i8, 32,
+        "Q0_M4 c[2]=+0.25: expected INT8 32, got {}",
+        bytes[2] as i8
+    );
+    assert_eq!(
+        bytes[3] as i8, 95,
+        "Q0_M4 c[3]=+0.75: expected INT8 95, got {}",
+        bytes[3] as i8
+    );
     let qmask = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    assert_eq!(qmask, 0xFA50_FA50, "Q0_M4 mask: expected 0xFA50FA50, got 0x{:08X}", qmask);
+    assert_eq!(
+        qmask, 0xFA50_FA50,
+        "Q0_M4 mask: expected 0xFA50FA50, got 0x{:08X}",
+        qmask
+    );
     Ok(())
 }
 

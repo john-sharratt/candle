@@ -51,7 +51,10 @@ fn code_read_emits_one_prefill_per_part_plus_one_summary() {
     let progress = LoadProgress::new();
     let (n_scopes, _state) =
         ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
-    assert!(n_scopes >= 2, "expected ≥2 scopes (alpha + beta), got {n_scopes}");
+    assert!(
+        n_scopes >= 2,
+        "expected ≥2 scopes (alpha + beta), got {n_scopes}"
+    );
 
     // Single file → n_scopes prefills + exactly one decoded summary.
     let decoded = sink.turns.iter().filter(|(_, _, d)| *d).count();
@@ -65,7 +68,11 @@ fn code_read_emits_one_prefill_per_part_plus_one_summary() {
 fn code_read_summary_is_the_last_turn_and_only_decode() {
     let dir = fixture("summary_last");
     let root = dir.path().to_path_buf();
-    write(&root, "src/lib.rs", b"pub fn alpha() {}\npub fn beta() {}\n");
+    write(
+        &root,
+        "src/lib.rs",
+        b"pub fn alpha() {}\npub fn beta() {}\n",
+    );
     let map = walk_workspace(&root);
 
     let mut sink = RecordingTurnSink::new();

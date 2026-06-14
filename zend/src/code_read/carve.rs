@@ -151,7 +151,9 @@ mod tests {
         let src = b"fn alpha() {}\n";
         let scopes = carve(src, Language::Rust, false);
         assert!(!scopes.is_empty());
-        assert!(scopes.iter().any(|s| s.path.last().is_some_and(|n| n == "fn alpha")));
+        assert!(scopes
+            .iter()
+            .any(|s| s.path.last().is_some_and(|n| n == "fn alpha")));
     }
 
     #[test]
@@ -283,7 +285,13 @@ mod tests {
         let filled = fill_gaps(scopes, 20);
         assert!(every_line_covered(&filled, 20));
         // No gaps inserted between or after the overlapping pair.
-        assert_eq!(filled.iter().filter(|s| s.path[0].starts_with("uncovered")).count(), 0);
+        assert_eq!(
+            filled
+                .iter()
+                .filter(|s| s.path[0].starts_with("uncovered"))
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -303,7 +311,10 @@ fn alpha() { let _ = (HashMap::<String, u32>::new(), Arc::new(0), Path::new(".")
         assert!(
             every_line_covered(&scopes, total),
             "module-level use statements must survive carve: {:?}",
-            scopes.iter().map(|s| (s.start_line, s.end_line)).collect::<Vec<_>>()
+            scopes
+                .iter()
+                .map(|s| (s.start_line, s.end_line))
+                .collect::<Vec<_>>()
         );
     }
 

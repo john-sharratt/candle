@@ -12,7 +12,7 @@ use candle::Device;
 use candle_conversation::{
     conversation_log::{load_resume_log, truncate_for_display},
     models::{Model, ModelBuilder},
-    narrator, SequenceConfig, ConversationEngine, DecodeHealthConfig, Role, SamplingConfig,
+    narrator, ConversationEngine, DecodeHealthConfig, Role, SamplingConfig, SequenceConfig,
     TokenDecoder, TurnEvent,
 };
 use clap::Parser;
@@ -167,8 +167,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             narrator::character_system_prompt(persona, protagonist)
         };
-        let narrator_state =
-            setup_narrator(&engine, &builder, protagonist, persona, &char_system)?;
+        let narrator_state = setup_narrator(&engine, &builder, protagonist, persona, &char_system)?;
         Mode::Narrator(narrator_state)
     } else {
         let (conv, token_file) = setup_chat(&engine, &builder, &args, resume_log)?;
@@ -515,7 +514,14 @@ fn handle_chat_turn(
 
     let show_special = args.show_hidden;
     let line_prefix = if show_special { "" } else { "Assistant: " };
-    match stream_turn(c, handle, decoder, line_prefix, show_special, token_file.as_mut()) {
+    match stream_turn(
+        c,
+        handle,
+        decoder,
+        line_prefix,
+        show_special,
+        token_file.as_mut(),
+    ) {
         Ok((_, boundary)) if args.show_hidden => {
             print!("{boundary}");
             io::stdout().flush().ok();
@@ -544,29 +550,49 @@ fn apply_model_dir(mut builder: ModelBuilder, model_path: &str) -> anyhow::Resul
             }
         }
     }
-    let model_file = model_file
-        .ok_or_else(|| anyhow::anyhow!("No .gguf model found in {model_path}"))?;
-    let tokenizer_file = tokenizer_file
-        .ok_or_else(|| anyhow::anyhow!("No tokenizer.json found in {model_path}"))?;
+    let model_file =
+        model_file.ok_or_else(|| anyhow::anyhow!("No .gguf model found in {model_path}"))?;
+    let tokenizer_file =
+        tokenizer_file.ok_or_else(|| anyhow::anyhow!("No tokenizer.json found in {model_path}"))?;
     println!(" Model Path: {model_file}");
     println!(" Tokenizer Path: {tokenizer_file}");
-    builder = builder.model_path(model_file).tokenizer_path(tokenizer_file);
+    builder = builder
+        .model_path(model_file)
+        .tokenizer_path(tokenizer_file);
     Ok(builder)
 }
 
 fn apply_sampling_overrides(mut builder: ModelBuilder, args: &Args) -> ModelBuilder {
-    if let Some(t) = args.temperature        { builder = builder.temperature(t); }
-    if let Some(p) = args.top_p             { builder = builder.top_p(p); }
-    if let Some(k) = args.top_k             { builder = builder.top_k(k as i32); }
-    if let Some(p) = args.repeat_penalty    { builder = builder.repeat_penalty(p); }
-    if let Some(p) = args.presence_penalty  { builder = builder.presence_penalty(p); }
-    if let Some(s) = args.seed              { builder = builder.seed(s); }
-    if args.thinking        { builder = builder.thinking(true); }
-    else if args.no_thinking { builder = builder.thinking(false); }
+    if let Some(t) = args.temperature {
+        builder = builder.temperature(t);
+    }
+    if let Some(p) = args.top_p {
+        builder = builder.top_p(p);
+    }
+    if let Some(k) = args.top_k {
+        builder = builder.top_k(k as i32);
+    }
+    if let Some(p) = args.repeat_penalty {
+        builder = builder.repeat_penalty(p);
+    }
+    if let Some(p) = args.presence_penalty {
+        builder = builder.presence_penalty(p);
+    }
+    if let Some(s) = args.seed {
+        builder = builder.seed(s);
+    }
+    if args.thinking {
+        builder = builder.thinking(true);
+    } else if args.no_thinking {
+        builder = builder.thinking(false);
+    }
     if let Some(ref preset) = args.sampler {
         let names = SamplingConfig::preset_names();
         if SamplingConfig::preset(preset).is_none() {
-            eprintln!("Unknown sampler preset '{preset}'. Available: {}", names.join(", "));
+            eprintln!(
+                "Unknown sampler preset '{preset}'. Available: {}",
+                names.join(", ")
+            );
             std::process::exit(1);
         }
         builder = builder.sampler_preset(preset);
@@ -604,8 +630,8 @@ fn verbosity_to_level(v: &Verbosity<InfoLevel>) -> tracing::Level {
         clap_verbosity_flag::LevelFilter::Off | clap_verbosity_flag::LevelFilter::Error => {
             tracing::Level::ERROR
         }
-        clap_verbosity_flag::LevelFilter::Warn  => tracing::Level::WARN,
-        clap_verbosity_flag::LevelFilter::Info  => tracing::Level::INFO,
+        clap_verbosity_flag::LevelFilter::Warn => tracing::Level::WARN,
+        clap_verbosity_flag::LevelFilter::Info => tracing::Level::INFO,
         clap_verbosity_flag::LevelFilter::Debug => tracing::Level::DEBUG,
         clap_verbosity_flag::LevelFilter::Trace => tracing::Level::TRACE,
     }
@@ -642,7 +668,10 @@ fn stream_turn(
                     io::stdout().flush().ok();
                 }
             }
-            TurnEvent::PrefillProgress { tokens_done, tokens_total } => {
+            TurnEvent::PrefillProgress {
+                tokens_done,
+                tokens_total,
+            } => {
                 if tokens_total > 50 {
                     eprint!("\r  [prefill {tokens_done}/{tokens_total}]");
                     if tokens_done == tokens_total {
@@ -818,15 +847,15 @@ pub struct Args {
 
 fn parse_model(name: &str) -> anyhow::Result<Model> {
     match name.to_lowercase().as_str() {
-        "qwen3-8b-q4"          => Ok(Model::Qwen3_8B_Q4),
-        "qwen3-8b-q6"          => Ok(Model::Qwen3_8B_Q6),
-        "qwen3-14b-q4"         => Ok(Model::Qwen3_14B_Q4),
-        "qwen3-14b-q5"         => Ok(Model::Qwen3_14B_Q5),
-        "qwen3-14b-q6"         => Ok(Model::Qwen3_14B_Q6),
+        "qwen3-8b-q4" => Ok(Model::Qwen3_8B_Q4),
+        "qwen3-8b-q6" => Ok(Model::Qwen3_8B_Q6),
+        "qwen3-14b-q4" => Ok(Model::Qwen3_14B_Q4),
+        "qwen3-14b-q5" => Ok(Model::Qwen3_14B_Q5),
+        "qwen3-14b-q6" => Ok(Model::Qwen3_14B_Q6),
         "qwen3-30b-a3b-q4" | "qwen3-moe" => Ok(Model::Qwen3_30B_A3B_Q4),
-        "qwen2-0.5b"           => Ok(Model::Qwen2_0_5B),
-        "hermes3-3b-q6"        => Ok(Model::Hermes3_3B_Q6),
-        "hermes3-70b-q4"       => Ok(Model::Hermes3_70B_Q4),
+        "qwen2-0.5b" => Ok(Model::Qwen2_0_5B),
+        "hermes3-3b-q6" => Ok(Model::Hermes3_3B_Q6),
+        "hermes3-70b-q4" => Ok(Model::Hermes3_70B_Q4),
         _ => anyhow::bail!(
             "Unknown model '{name}'. Available: qwen3-8b-q4, qwen3-8b-q6, qwen3-14b-q4, \
              qwen3-14b-q5, qwen3-14b-q6, qwen3-30b-a3b-q4, qwen2-0.5b, hermes3-3b-q6, \

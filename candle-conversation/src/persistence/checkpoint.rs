@@ -159,8 +159,7 @@ mod tests {
         let mut mem = MemLog::with_records(&blob);
 
         let mut substrate = Substrate::new();
-        let rec =
-            recover_with_sink(&mut mem, 0, |e| substrate.apply_walker_entry(e)).unwrap();
+        let rec = recover_with_sink(&mut mem, 0, |e| substrate.apply_walker_entry(e)).unwrap();
         assert!(!rec.torn);
         // Chunk count is on the substrate now.
         assert_eq!(substrate.live_chunk_count(), 2);
@@ -185,7 +184,8 @@ mod tests {
         full.extend_from_slice(&record(RecordType::Chunk, 2, 0, b"d0"));
 
         let mut mem_a = MemLog::with_records(&full);
-        let (_, sub_a, out_a) = Manifest::build_with_substrate(&mut mem_a, SUPERBLOCK_SIZE).unwrap();
+        let (_, sub_a, out_a) =
+            Manifest::build_with_substrate(&mut mem_a, SUPERBLOCK_SIZE).unwrap();
 
         let mut mem_b = MemLog::with_records(&full);
         let from_checkpoint = recover(&mut mem_b, checkpoint_offset).unwrap();
@@ -209,8 +209,7 @@ mod tests {
         let _rec = recover(&mut mem, SUPERBLOCK_SIZE + 999_999).unwrap();
         // Chunk count is on the substrate now.
         let mut mem2 = MemLog::with_records(&blob);
-        let (_, substrate, _) =
-            Manifest::build_with_substrate(&mut mem2, SUPERBLOCK_SIZE).unwrap();
+        let (_, substrate, _) = Manifest::build_with_substrate(&mut mem2, SUPERBLOCK_SIZE).unwrap();
         assert_eq!(substrate.live_chunk_count(), 1);
     }
 
@@ -244,8 +243,8 @@ mod tests {
             let mut log = LogFile::open(&path).unwrap();
             let hint = log.superblock().latest_checkpoint_offset;
             let mut substrate = Substrate::new();
-            let rec = recover_with_sink(&mut log, hint, |e| substrate.apply_walker_entry(e))
-                .unwrap();
+            let rec =
+                recover_with_sink(&mut log, hint, |e| substrate.apply_walker_entry(e)).unwrap();
             assert!(rec.torn, "the truncated third record must be detected");
             assert_eq!(rec.tail_offset, good_records);
             assert_eq!(substrate.live_chunk_count(), 2);
@@ -285,6 +284,9 @@ mod tests {
         assert_eq!(decoded.model_spec, manifest.model_spec);
         assert_eq!(decoded.template, manifest.template);
         assert_eq!(decoded.tokenizer, manifest.tokenizer);
-        assert_eq!(decoded.last_checkpoint_offset, manifest.last_checkpoint_offset);
+        assert_eq!(
+            decoded.last_checkpoint_offset,
+            manifest.last_checkpoint_offset
+        );
     }
 }

@@ -36,14 +36,16 @@ pub struct LanguageRules {
 
 /// Parse `source` and emit scopes using the supplied rules.  Returns
 /// `None` if the tree-sitter parse fails outright.
-pub fn carve_tree(
-    parser: &mut Parser,
-    source: &[u8],
-    rules: &LanguageRules,
-) -> Option<Vec<Scope>> {
+pub fn carve_tree(parser: &mut Parser, source: &[u8], rules: &LanguageRules) -> Option<Vec<Scope>> {
     let tree: Tree = parser.parse(source, None)?;
     let mut scopes = Vec::new();
-    walk(tree.root_node(), source, rules, &mut Vec::new(), &mut scopes);
+    walk(
+        tree.root_node(),
+        source,
+        rules,
+        &mut Vec::new(),
+        &mut scopes,
+    );
     Some(scopes)
 }
 
@@ -131,4 +133,3 @@ pub fn slice_text(node: &Node, source: &[u8]) -> String {
         .trim()
         .to_string()
 }
-

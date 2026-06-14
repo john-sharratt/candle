@@ -148,7 +148,10 @@ mod tests {
     fn extracts_struct_and_union() {
         verify(
             "struct Point { int x; int y; };\nunion Value { int i; float f; };\n",
-            &[("struct Point", "struct Point"), ("union Value", "union Value")],
+            &[
+                ("struct Point", "struct Point"),
+                ("union Value", "union Value"),
+            ],
         );
     }
 
@@ -193,7 +196,10 @@ mod tests {
         let scopes = verify(src, &[("struct Foo", "struct Foo")]);
         let foo = find_scope(&scopes, "struct Foo").unwrap();
         assert_eq!(foo.start_line, 1);
-        assert!(foo.end_line >= 4, "struct should span through closing brace");
+        assert!(
+            foo.end_line >= 4,
+            "struct should span through closing brace"
+        );
     }
 
     // ── Partial / malformed file resilience ──────────────────────────────────

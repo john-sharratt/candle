@@ -10,7 +10,7 @@
 
 use candle_conversation::{
     models::{Model, ModelBuilder},
-    SequenceConfig, ConversationEngine, ConversationError, ConversationNode, SamplingConfig,
+    ConversationEngine, ConversationError, ConversationNode, SamplingConfig, SequenceConfig,
     TurnEvent, TurnType,
 };
 
@@ -363,7 +363,9 @@ fn test_conversation_with_cold_store() {
         .new_conversation(&system_prompt(), chatml_config())
         .expect("new_conversation failed");
 
-    let resp = conv.send_turn("Remember: the code is 42.").expect("send failed");
+    let resp = conv
+        .send_turn("Remember: the code is 42.")
+        .expect("send failed");
     eprintln!("Response: {}", resp.text);
 
     conv.close().expect("close failed");
@@ -723,7 +725,9 @@ fn test_tree_turn_ids_are_monotonic() {
         .expect("new_conversation failed");
 
     for i in 0..3u32 {
-        let _ = conv.send_turn(&format!("Turn {}.", i + 1)).expect("send failed");
+        let _ = conv
+            .send_turn(&format!("Turn {}.", i + 1))
+            .expect("send failed");
     }
 
     let nodes: Vec<_> = conv.tree().nodes().collect();
@@ -797,9 +801,15 @@ fn test_tree_fork_clones_node_history() {
     let _ = conv
         .send_turn("Original side.")
         .expect("original diverge failed");
-    let _ = forked.send_turn("Forked side.").expect("fork diverge failed");
+    let _ = forked
+        .send_turn("Forked side.")
+        .expect("fork diverge failed");
 
-    assert_eq!(conv.tree().nodes().count(), 3, "original should have 3 nodes");
+    assert_eq!(
+        conv.tree().nodes().count(),
+        3,
+        "original should have 3 nodes"
+    );
     assert_eq!(forked.tree().nodes().count(), 3, "fork should have 3 nodes");
 
     // The third turn texts diverge.
@@ -974,7 +984,6 @@ fn test_fork_insert_then_send() {
         )
         .expect("new_conversation failed");
 
-
     // Fork, inject background via insert_turn, then ask a question.
     let mut fork = base.fork().expect("fork failed");
 
@@ -986,7 +995,9 @@ fn test_fork_insert_then_send() {
     .expect("insert_turn failed");
 
     // Now ask a question that requires the injected context.
-    let resp = fork.send_turn("What is the protagonist's name?").expect("send failed");
+    let resp = fork
+        .send_turn("What is the protagonist's name?")
+        .expect("send failed");
     eprintln!("Response after insert: {}", resp.text);
 
     assert!(!resp.text.is_empty());
@@ -1016,7 +1027,6 @@ fn test_sequential_forks_with_different_context() {
         )
         .expect("new_conversation failed");
 
-
     // Fork 1: inject context about cats.
     let mut fork1 = base.fork().expect("fork 1 failed");
     fork1
@@ -1025,7 +1035,9 @@ fn test_sequential_forks_with_different_context() {
             "OK, topic noted: cats.",
         )
         .expect("fork1 insert failed");
-    let r1 = fork1.send_turn("What is the topic?").expect("fork1 send failed");
+    let r1 = fork1
+        .send_turn("What is the topic?")
+        .expect("fork1 send failed");
     eprintln!("Fork 1: {}", r1.text);
     fork1.close().ok();
 
@@ -1037,7 +1049,9 @@ fn test_sequential_forks_with_different_context() {
             "OK, topic noted: dogs.",
         )
         .expect("fork2 insert failed");
-    let r2 = fork2.send_turn("What is the topic?").expect("fork2 send failed");
+    let r2 = fork2
+        .send_turn("What is the topic?")
+        .expect("fork2 send failed");
     eprintln!("Fork 2: {}", r2.text);
     fork2.close().ok();
 
@@ -1053,7 +1067,9 @@ fn test_sequential_forks_with_different_context() {
     assert!(!r3.text.is_empty());
 
     // Base remains usable after all forks are closed.
-    let base_resp = base.send_turn("Are you still there?").expect("base send failed");
+    let base_resp = base
+        .send_turn("Are you still there?")
+        .expect("base send failed");
     assert!(!base_resp.text.is_empty());
     eprintln!("Base after forks: {}", base_resp.text);
 
@@ -1074,7 +1090,6 @@ fn test_fork_insert_then_stream() {
             chatml_config(),
         )
         .expect("new_conversation failed");
-
 
     let mut fork = base.fork().expect("fork failed");
 
@@ -1127,21 +1142,14 @@ fn test_fork_insert_then_stream() {
 fn test_fork_close_does_not_affect_base() {
     let eng = engine();
     let mut base = eng
-        .new_conversation(
-            "You are a concise assistant.",
-            chatml_config(),
-        )
+        .new_conversation("You are a concise assistant.", chatml_config())
         .expect("new_conversation failed");
-
 
     // Create and destroy 3 forks in sequence.
     for i in 0..3 {
         let mut fork = base.fork().expect("fork failed");
-        fork.insert_turn(
-            &format!("Round {}.", i),
-            &format!("Noted round {}.", i),
-        )
-        .expect("insert_turn failed");
+        fork.insert_turn(&format!("Round {}.", i), &format!("Noted round {}.", i))
+            .expect("insert_turn failed");
         let resp = fork.send_turn("Which round?").expect("send failed");
         eprintln!("Fork {}: {}", i, resp.text);
         assert!(!resp.text.is_empty());
@@ -1223,8 +1231,16 @@ fn test_boundary_injection_fidelity() {
     conv_plain.close().expect("close plain conv failed");
 
     // ── Compare ───────────────────────────────────────────────────────────
-    eprintln!("Injection tokens ({} total): {:?}", tokens_inj.len(), tokens_inj);
-    eprintln!("Plain tokens     ({} total): {:?}", tokens_plain.len(), tokens_plain);
+    eprintln!(
+        "Injection tokens ({} total): {:?}",
+        tokens_inj.len(),
+        tokens_inj
+    );
+    eprintln!(
+        "Plain tokens     ({} total): {:?}",
+        tokens_plain.len(),
+        tokens_plain
+    );
 
     assert!(
         !tokens_inj.is_empty(),
@@ -1235,12 +1251,15 @@ fn test_boundary_injection_fidelity() {
         "plain path should generate at least one token"
     );
     assert_eq!(
-        tokens_inj, tokens_plain,
+        tokens_inj,
+        tokens_plain,
         "boundary injection produced different tokens than plain prefill\n\
          injection ({} tokens): {:?}\n\
          plain     ({} tokens): {:?}",
-        tokens_inj.len(), tokens_inj,
-        tokens_plain.len(), tokens_plain,
+        tokens_inj.len(),
+        tokens_inj,
+        tokens_plain.len(),
+        tokens_plain,
     );
     eprintln!(
         "✓ boundary injection fidelity verified: {} tokens match exactly",
@@ -1287,8 +1306,7 @@ For each tool call, output a single JSON object inside <tool_call></tool_call>:
 fn test_tool_call_weather_pos1() {
     init_tracing();
 
-    let device = candle::Device::cuda_if_available(0)
-        .expect("CUDA device required");
+    let device = candle::Device::cuda_if_available(0).expect("CUDA device required");
 
     eprintln!("\n=== Loading Qwen3-30B-A3B-Q4 ===");
     let t0 = std::time::Instant::now();
@@ -1314,7 +1332,10 @@ fn test_tool_call_weather_pos1() {
         .expect("new_conversation failed");
 
     eprintln!("\n--- system_prompt() stored in tree (first 200 chars) ---");
-    eprintln!("{:?}", &conv.system_prompt()[..conv.system_prompt().len().min(200)]);
+    eprintln!(
+        "{:?}",
+        &conv.system_prompt()[..conv.system_prompt().len().min(200)]
+    );
     eprintln!("\n--- system_prompt() ends with (last 80 chars) ---");
     let sp = conv.system_prompt();
     eprintln!("{:?}", &sp[sp.len().saturating_sub(80)..]);
@@ -1332,7 +1353,10 @@ fn test_tool_call_weather_pos1() {
                 eprintln!("\n--- Prefill text sent to model ---");
                 eprintln!("{:?}", text);
             }
-            TurnEvent::PrefillProgress { tokens_done, tokens_total } => {
+            TurnEvent::PrefillProgress {
+                tokens_done,
+                tokens_total,
+            } => {
                 eprintln!("Prefill progress: {tokens_done}/{tokens_total}");
             }
             TurnEvent::Token(id) => {

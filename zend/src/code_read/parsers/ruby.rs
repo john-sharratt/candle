@@ -19,8 +19,12 @@ pub fn carve(source: &[u8]) -> Option<Vec<Scope>> {
     rules
         .kind_to_chunk
         .insert("singleton_method", ChunkKind::Function);
-    rules.kind_to_chunk.insert("class", ChunkKind::TypeDefinition);
-    rules.kind_to_chunk.insert("module", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("class", ChunkKind::TypeDefinition);
+    rules
+        .kind_to_chunk
+        .insert("module", ChunkKind::TypeDefinition);
     carve_tree(&mut parser, source, &rules)
 }
 
@@ -62,7 +66,10 @@ mod tests {
 
     #[test]
     fn extracts_top_level_method() {
-        verify("def hello\n  puts 'hi'\nend\n", &[("def hello", "def hello")]);
+        verify(
+            "def hello\n  puts 'hi'\nend\n",
+            &[("def hello", "def hello")],
+        );
     }
 
     #[test]
@@ -174,10 +181,7 @@ mod tests {
 
     #[test]
     fn preserves_crlf_endings() {
-        verify(
-            "def alpha\r\n  1\r\nend\r\n",
-            &[("def alpha", "def alpha")],
-        );
+        verify("def alpha\r\n  1\r\nend\r\n", &[("def alpha", "def alpha")]);
     }
 
     #[test]

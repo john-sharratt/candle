@@ -15,9 +15,9 @@ use std::time::Instant;
 use candle::quantized::QTensor;
 use candle::{DType, Device, Result, Tensor};
 
-use super::backing::{request_global_compact, ChunkedKvBacking};
 #[cfg(feature = "cuda")]
 use super::backing::KV_DEVICE_OOM_MARKER;
+use super::backing::{request_global_compact, ChunkedKvBacking};
 use super::gid_pool::ChunkGid;
 use super::head_gids::{HeadGids, GIDS_PER_HEAD};
 use super::types::{arena_chunks_for_format, ChunkWindow, CHUNK_SIZE};
@@ -128,6 +128,29 @@ fn vram_has_room(device: &Device, want: usize) -> bool {
         );
     }
     ok
+}
+
+/// Accurate "how many bytes of KV VRAM budget are free right now", for the
+/// scheduler's budget-aware eviction. Returns `init_free − pool_used − reserve`
+/// — the same primary budget [`vram_has_room`] gates on (so
+/// `want <= vram_budget_available(d)` ⟺ `vram_has_room(d, want)` on the primary
+/// budget; the driver-free floor is an extra allocation-time safety, not part of
+/// the steady-state budget). `None` on non-CUDA / query failure (caller should
+/// treat that as "unknown — don't evict on a guess").
+#[cfg(feature = "cuda")]
+pub fn vram_budget_available(device: &Device) -> Option<usize> {
+    let Device::Cuda(d) = device else {
+        return None;
+    };
+    let gpu_id = match device.location() {
+        candle::DeviceLocation::Cuda { gpu_id } => gpu_id,
+        _ => return None,
+    };
+    let used = d.pool_used_bytes().ok()?;
+    let (_free, total) = d.mem_get_info().ok()?;
+    let reserve = vram_reserve_bytes(total);
+    let ceiling = candle::gpu_memory::device_init_free(gpu_id).unwrap_or(total);
+    Some(ceiling.saturating_sub(used).saturating_sub(reserve))
 }
 
 /// Gate a GPU arena allocation of `arena_bytes` on the VRAM budget. When the
@@ -388,9 +411,13 @@ impl BackingInner {
         // from the ggml block layout, not a plain dtype width.
         let block_size = k_ggml.block_size().max(1);
         let arena_bytes = (total_elems / block_size).saturating_mul(k_ggml.type_size());
-        if let Err(e) =
-            ensure_vram_budget(device, location, arena_bytes, retry_after_compact, "quantized")
-        {
+        if let Err(e) = ensure_vram_budget(
+            device,
+            location,
+            arena_bytes,
+            retry_after_compact,
+            "quantized",
+        ) {
             record_arena_create("quantized", location, index, t0.elapsed().as_nanos() as u64);
             return Err(e);
         }

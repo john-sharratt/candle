@@ -178,7 +178,9 @@ impl LoadProgress {
     pub fn set_step_progress(&self, current: u64, total: u64) {
         let mut guard = self.inner.lock().unwrap();
         if let Inner::Loading {
-            progressed, total: t, ..
+            progressed,
+            total: t,
+            ..
         } = &mut *guard
         {
             *progressed = current.min(total);

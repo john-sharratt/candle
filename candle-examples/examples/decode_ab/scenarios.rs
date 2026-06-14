@@ -285,7 +285,11 @@ pub fn select_scenarios(filter: &str) -> Result<Vec<Scenario>, String> {
     universe.extend(suite_deep_scenarios());
     let mut out = Vec::new();
     let mut unknown = Vec::new();
-    for want in filter.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    for want in filter
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         match universe.iter().find(|s| s.name == want) {
             Some(s) => out.push(s.clone()),
             None => unknown.push(want.to_string()),

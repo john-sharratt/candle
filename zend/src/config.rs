@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 /// Runtime configuration for the zend daemon.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DaemonConfig {
     /// Absolute path to the root of the workspace being served.
     pub workspace: PathBuf,

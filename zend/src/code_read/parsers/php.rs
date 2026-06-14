@@ -52,7 +52,9 @@ fn identifier_for(node: &Node, source: &[u8]) -> Option<String> {
 
 fn enclosing_label(node: &Node, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "namespace_definition" => field_text(node, "name", source).map(|n| format!("namespace {n}")),
+        "namespace_definition" => {
+            field_text(node, "name", source).map(|n| format!("namespace {n}"))
+        }
         "class_declaration" => field_text(node, "name", source).map(|n| format!("class {n}")),
         "interface_declaration" => {
             field_text(node, "name", source).map(|n| format!("interface {n}"))

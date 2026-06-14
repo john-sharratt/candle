@@ -22,7 +22,7 @@ mod cuda_impl {
         kv_migrate, ArenaLocation, ChunkedKvBacking, MigrationPlan, SealedSequence,
     };
 
-    use crate::persistence::cold_load::ColdLoadStager;
+    use crate::persistence::cold_load::{ColdLoadStager, PINNED_PREALLOC_BYTES};
     use crate::persistence::resume::ChunkImage;
     use crate::persistence::streams::{StreamId, TurnDecl};
     use crate::persistence::SubstratePersistence;
@@ -301,12 +301,19 @@ mod cuda_impl {
 
         let t_total = Instant::now();
 
-        // Build the chunk plan up front. The plan sizes each chunk to
-        // fit in the stager's buffer; if the buffer is unallocated
-        // (the unit-test `::new()` path) we fall back to processing
-        // the whole turn as one chunk by using a very large size —
-        // production always has `with_preallocation` capacity.
-        let buffer_size = stager.capacity().max(1 << 30);
+        // Build the chunk plan up front, sized to the stager's ACTUAL pinned
+        // buffer so large turns (>64 MB) partition into batches that each fit —
+        // the `for batch in &plan.chunks` loop below streams them. `0` means the
+        // buffer is not yet allocated (unit-test `::new()` path): plan for the
+        // prealloc size the first `buffer_mut()` will lazily allocate.
+        //
+        // NB: the previous `.max(1 << 30)` planned 1 GB batches against a fixed
+        // 64 MB buffer, so any turn over 64 MB became one oversized batch and
+        // overflowed `buffer_mut` (the chunked-read assert).
+        let buffer_size = match stager.capacity() {
+            0 => PINNED_PREALLOC_BYTES,
+            cap => cap,
+        };
         let plan = persistence.plan_chunked_read(substrate, stream_id, buffer_size);
 
         // Empty turn — no chunks. Build empty sealed sequences per

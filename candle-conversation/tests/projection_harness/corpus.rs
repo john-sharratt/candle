@@ -8,8 +8,14 @@ use serde::Deserialize;
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 pub const TOOLS: &[&str] = &[
-    "weather", "web_search", "file_write", "file_read",
-    "code_run", "datetime",  "calculator", "random",
+    "weather",
+    "web_search",
+    "file_write",
+    "file_read",
+    "code_run",
+    "datetime",
+    "calculator",
+    "random",
 ];
 
 // ── Manifest types ─────────────────────────────────────────────────────────────
@@ -81,8 +87,8 @@ pub fn load_fixtures() -> (Manifest, ProvenanceFile) {
     let json = std::fs::read_to_string(dir.join("MANIFEST.json"))
         .expect("tool_provenance_real_data/MANIFEST.json not found");
     let manifest: Manifest = serde_json::from_str(&json).expect("MANIFEST.json parse failed");
-    let pf = ProvenanceFile::open(dir.join("signatures.prov"))
-        .expect("signatures.prov open failed");
+    let pf =
+        ProvenanceFile::open(dir.join("signatures.prov")).expect("signatures.prov open failed");
     (manifest, pf)
 }
 
@@ -130,7 +136,12 @@ pub fn try_load_prefill_fixtures() -> Option<(Manifest, ProvenanceFile)> {
     }
 
     let pf = ProvenanceFile::open(prefill_prov).expect("prefill_signatures.prov open failed");
-    Some((Manifest { scenarios: remapped }, pf))
+    Some((
+        Manifest {
+            scenarios: remapped,
+        },
+        pf,
+    ))
 }
 
 pub fn try_load_raw_fixtures() -> Option<(RawManifest, RawProvenanceFile)> {
@@ -149,7 +160,6 @@ pub fn try_load_raw_fixtures() -> Option<(RawManifest, RawProvenanceFile)> {
     let pf = RawProvenanceFile::open(raw_prov).expect("raw_kvq.prov open failed");
     Some((manifest, pf))
 }
-
 
 pub fn projection_yaml_text() -> String {
     std::fs::read_to_string(concat!(

@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::{now, RemoteFsError};
 use crate::state::sessions::{RemoteFsConn, RemoteFsEntry, SessionMeta, SshConn};
 use crate::{RegisteredTool, Tool, ToolContext};
-use super::{now, RemoteFsError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
@@ -42,8 +42,8 @@ impl Tool for RemoteFsSessionOpen {
     type Error = RemoteFsError;
 
     fn run(ctx: &ToolContext, req: OpenRequest) -> Result<OpenResponse, RemoteFsError> {
-        let parsed = url::Url::parse(&req.uri)
-            .map_err(|e| RemoteFsError::NotSupported(e.to_string()))?;
+        let parsed =
+            url::Url::parse(&req.uri).map_err(|e| RemoteFsError::NotSupported(e.to_string()))?;
 
         match parsed.scheme() {
             "sftp" => {}
@@ -71,8 +71,8 @@ impl Tool for RemoteFsSessionOpen {
         let stream = std::net::TcpStream::connect(&addr)
             .map_err(|e| RemoteFsError::ConnectionFailed(e.to_string()))?;
 
-        let mut session = ssh2::Session::new()
-            .map_err(|e| RemoteFsError::ConnectionFailed(e.to_string()))?;
+        let mut session =
+            ssh2::Session::new().map_err(|e| RemoteFsError::ConnectionFailed(e.to_string()))?;
         session.set_tcp_stream(stream.try_clone().unwrap());
         session
             .handshake()

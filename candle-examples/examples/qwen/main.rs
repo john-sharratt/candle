@@ -9,8 +9,12 @@ use clap::Parser;
 
 use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
 use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
-use candle_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3, InstanceForCausalLM as Instance3};
-use candle_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3, InstanceForCausalLM as InstanceMoe3};
+use candle_transformers::models::qwen3::{
+    Config as Config3, InstanceForCausalLM as Instance3, ModelForCausalLM as Model3,
+};
+use candle_transformers::models::qwen3_moe::{
+    Config as ConfigMoe3, InstanceForCausalLM as InstanceMoe3, ModelForCausalLM as ModelMoe3,
+};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;

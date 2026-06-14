@@ -63,17 +63,18 @@ fn tcp_session_close_returns_session_id() {
 #[test]
 fn tcp_session_list_empty_after_context_create() {
     let ctx = ToolContext::new();
-    let list = harness::expect_success(harness::invoke_with_ctx("tcp_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "tcp_session_list",
+        json!({}),
+        &ctx,
+    ));
     assert_eq!(list["sessions"].as_array().unwrap().len(), 0);
 }
 
 #[test]
 fn tcp_session_recv_missing_recv_mode() {
     // Neither recv_amt nor recv_wait → missing_recv_mode
-    let resp = harness::invoke(
-        "tcp_session_recv",
-        json!({"session_id": "sess_missing"}),
-    );
+    let resp = harness::invoke("tcp_session_recv", json!({"session_id": "sess_missing"}));
     harness::expect_error(&resp, "missing_recv_mode");
 }
 

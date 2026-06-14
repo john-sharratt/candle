@@ -28,8 +28,8 @@ pub mod signature;
 pub mod store;
 
 pub use raw_store::{
-    band_layer_indices, build_token_blob, extract_k_vector, extract_q_vector_r16,
-    RawFileHeader, RawProvenanceFile, RawSigEntry,
+    band_layer_indices, build_token_blob, extract_k_vector, extract_q_vector_r16, RawFileHeader,
+    RawProvenanceFile, RawSigEntry,
 };
 pub use scan::{BdpScanner, TokenHit, DEFAULT_HIT_THRESHOLD, DEFAULT_SPAN_ALPHA, DEFAULT_TOP_K};
 pub use signature::{

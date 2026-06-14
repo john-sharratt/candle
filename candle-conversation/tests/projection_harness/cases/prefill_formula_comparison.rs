@@ -27,7 +27,11 @@ use candle_conversation::projection::{ContentResolver, DepthWeights, ScoreFormul
 use candle_conversation::provenance::ProvenanceFile;
 
 fn ratio(intra: f32, inter_mean: f32) -> f32 {
-    if inter_mean > 0.0 { intra / inter_mean } else { f32::INFINITY }
+    if inter_mean > 0.0 {
+        intra / inter_mean
+    } else {
+        f32::INFINITY
+    }
 }
 
 /// Per-config evaluation: discrimination ratios + rank accuracy across the
@@ -55,7 +59,12 @@ fn evaluate(
         // Score every tool section for this probe.
         let mut scored: Vec<(&str, f32)> = TOOLS
             .iter()
-            .map(|&t| (t, resolver.section_score(h.tool_section_ids[t], formula, weights)))
+            .map(|&t| {
+                (
+                    t,
+                    resolver.section_score(h.tool_section_ids[t], formula, weights),
+                )
+            })
             .collect();
 
         let intra = scored
@@ -73,7 +82,10 @@ fn evaluate(
 
         // Rank accuracy: sort descending, find the probe tool's rank.
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let rank = scored.iter().position(|(t, _)| t == probe_tool).unwrap_or(usize::MAX);
+        let rank = scored
+            .iter()
+            .position(|(t, _)| t == probe_tool)
+            .unwrap_or(usize::MAX);
         if rank == 0 {
             top1_hits += 1;
         }
@@ -123,20 +135,23 @@ fn prefill_content_type_calibration_sweep() {
     // Open-minded formula set: run-rewarding Span at several alphas alongside
     // flat-counting formulas that suit scattered prefill signal.
     let formulas: &[(&str, ScoreFormula)] = &[
-        ("max",          ScoreFormula::Max),
-        ("mean",         ScoreFormula::Mean),
-        ("sum",          ScoreFormula::Sum),
-        ("count",        ScoreFormula::Count),
+        ("max", ScoreFormula::Max),
+        ("mean", ScoreFormula::Mean),
+        ("sum", ScoreFormula::Sum),
+        ("count", ScoreFormula::Count),
         ("top_k_mean_8", ScoreFormula::TopKMean { k: 8 }),
-        ("span_a1.0",    ScoreFormula::Span { alpha: 1.0 }),
-        ("span_a1.5",    ScoreFormula::Span { alpha: 1.5 }),
-        ("span_a2.0",    ScoreFormula::Span { alpha: 2.0 }),
+        ("span_a1.0", ScoreFormula::Span { alpha: 1.0 }),
+        ("span_a1.5", ScoreFormula::Span { alpha: 1.5 }),
+        ("span_a2.0", ScoreFormula::Span { alpha: 2.0 }),
     ];
 
     println!("\n════════════════════════════════════════════════════════════════════════════");
     println!("  PREFILL-phase calibration sweep — corpus: 8 tools × positive scenarios");
     println!("  Primary metric: top-1 rank accuracy (did the correct tool score highest)");
-    println!("  Probe scenarios: {} (prefill Q vectors only)", resolvers.len());
+    println!(
+        "  Probe scenarios: {} (prefill Q vectors only)",
+        resolvers.len()
+    );
     println!("════════════════════════════════════════════════════════════════════════════");
 
     // (formula_name, formula, best Eval, best weights)
@@ -147,7 +162,11 @@ fn prefill_content_type_calibration_sweep() {
         let mut rows: Vec<(Eval, (f32, f32, f32))> = grid
             .iter()
             .map(|&(s, e, p)| {
-                let w = DepthWeights { syntactic: s, semantic: e, pragmatic: p };
+                let w = DepthWeights {
+                    syntactic: s,
+                    semantic: e,
+                    pragmatic: p,
+                };
                 (evaluate(&h, &resolvers, *formula, &w), (s, e, p))
             })
             .collect();
@@ -155,19 +174,29 @@ fn prefill_content_type_calibration_sweep() {
         // Rank by top-1 accuracy, then top-3, then min_ratio — production
         // cares about getting the right tool ranked, not raw ratio.
         rows.sort_by(|a, b| {
-            b.0.top1_acc.partial_cmp(&a.0.top1_acc).unwrap()
+            b.0.top1_acc
+                .partial_cmp(&a.0.top1_acc)
+                .unwrap()
                 .then(b.0.top3_acc.partial_cmp(&a.0.top3_acc).unwrap())
                 .then(b.0.min_ratio.partial_cmp(&a.0.min_ratio).unwrap())
         });
 
         println!("\n── [{fname}] top-5 weight configs ───────────────────────────────────────");
-        println!("{:<6} {:<6} {:<6} {:>8} {:>8} {:>10} {:>11}",
-            "syn", "sem", "prag", "top1", "top3", "min_ratio", "mean_ratio");
+        println!(
+            "{:<6} {:<6} {:<6} {:>8} {:>8} {:>10} {:>11}",
+            "syn", "sem", "prag", "top1", "top3", "min_ratio", "mean_ratio"
+        );
         for (ev, (s, e, p)) in rows.iter().take(5) {
-            println!("{:<6.2} {:<6.2} {:<6.2} {:>7.0}% {:>7.0}% {:>10.3} {:>11.3}",
-                s, e, p,
-                ev.top1_acc * 100.0, ev.top3_acc * 100.0,
-                ev.min_ratio, ev.mean_ratio);
+            println!(
+                "{:<6.2} {:<6.2} {:<6.2} {:>7.0}% {:>7.0}% {:>10.3} {:>11.3}",
+                s,
+                e,
+                p,
+                ev.top1_acc * 100.0,
+                ev.top3_acc * 100.0,
+                ev.min_ratio,
+                ev.mean_ratio
+            );
         }
 
         let (best_ev, best_w) = rows.into_iter().next().unwrap();
@@ -176,17 +205,29 @@ fn prefill_content_type_calibration_sweep() {
 
     // ── Cross-formula summary ─────────────────────────────────────────────────
     println!("\n── Cross-formula summary (best config per formula) ──────────────────────────");
-    println!("{:<14} {:>8} {:>8} {:>10} {:>11}  weights (syn/sem/prag)",
-        "formula", "top1", "top3", "min_ratio", "mean_ratio");
+    println!(
+        "{:<14} {:>8} {:>8} {:>10} {:>11}  weights (syn/sem/prag)",
+        "formula", "top1", "top3", "min_ratio", "mean_ratio"
+    );
     for (name, _, ev, (s, e, p)) in &best_per_formula {
-        println!("{:<14} {:>7.0}% {:>7.0}% {:>10.3} {:>11.3}  {:.2}/{:.2}/{:.2}",
-            name, ev.top1_acc * 100.0, ev.top3_acc * 100.0,
-            ev.min_ratio, ev.mean_ratio, s, e, p);
+        println!(
+            "{:<14} {:>7.0}% {:>7.0}% {:>10.3} {:>11.3}  {:.2}/{:.2}/{:.2}",
+            name,
+            ev.top1_acc * 100.0,
+            ev.top3_acc * 100.0,
+            ev.min_ratio,
+            ev.mean_ratio,
+            s,
+            e,
+            p
+        );
     }
 
     // Recommend by top-1 accuracy, then min_ratio.
     let best = best_per_formula.iter().max_by(|a, b| {
-        a.2.top1_acc.partial_cmp(&b.2.top1_acc).unwrap()
+        a.2.top1_acc
+            .partial_cmp(&b.2.top1_acc)
+            .unwrap()
             .then(a.2.min_ratio.partial_cmp(&b.2.min_ratio).unwrap())
     });
 
@@ -198,7 +239,10 @@ fn prefill_content_type_calibration_sweep() {
         println!("  Formula: {name}");
         println!("  top-1 accuracy : {:.0}%", ev.top1_acc * 100.0);
         println!("  top-3 accuracy : {:.0}%", ev.top3_acc * 100.0);
-        println!("  min_ratio      : {:.3}   mean_ratio: {:.3}", ev.min_ratio, ev.mean_ratio);
+        println!(
+            "  min_ratio      : {:.3}   mean_ratio: {:.3}",
+            ev.min_ratio, ev.mean_ratio
+        );
         println!("  depth_weights  : syn={yn:.3} sem={ye:.3} prag={yp:.3}");
         println!();
         println!("  NOTE: this is the *initial guess* config used before the decode");

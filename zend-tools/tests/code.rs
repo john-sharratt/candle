@@ -8,7 +8,11 @@ fn ctx() -> ToolContext {
 }
 
 fn python_available() -> bool {
-    let exe = if cfg!(windows) { "python.exe" } else { "python3" };
+    let exe = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python3"
+    };
     std::process::Command::new(exe)
         .arg("--version")
         .output()
@@ -20,10 +24,7 @@ fn code_run_bash_exit_code() {
     if cfg!(windows) {
         return; // bash may not be available on Windows
     }
-    let resp = harness::invoke(
-        "code_run",
-        json!({"language": "bash", "code": "exit 42"}),
-    );
+    let resp = harness::invoke("code_run", json!({"language": "bash", "code": "exit 42"}));
     if resp.get("error").is_none() {
         let r = harness::expect_success(resp);
         assert_eq!(r["exit_code"], 42);
@@ -118,7 +119,10 @@ fn code_session_exec_python() {
     ));
     assert_eq!(exec["ok"], true);
     assert!(
-        exec["stdout"].as_str().unwrap().contains("hello from session"),
+        exec["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("hello from session"),
         "stdout: {}",
         exec["stdout"]
     );
@@ -177,7 +181,11 @@ fn code_session_list_shows_open_sessions() {
     ));
     let sid = open["session_id"].as_str().unwrap().to_string();
 
-    let list = harness::expect_success(harness::invoke_with_ctx("code_session_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_list",
+        json!({}),
+        &ctx,
+    ));
     let sessions = list["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["language"], "python");
@@ -198,10 +206,13 @@ fn code_session_exec_not_found() {
 
 #[test]
 fn code_run_python_echo() {
-    let resp = harness::invoke("code_run", json!({
-        "language": "python",
-        "code": "print('hello from python')"
-    }));
+    let resp = harness::invoke(
+        "code_run",
+        json!({
+            "language": "python",
+            "code": "print('hello from python')"
+        }),
+    );
     // If python is available, check output; otherwise expect interpreter_not_found
     if resp.get("error").is_none() {
         let r = harness::expect_success(resp);
@@ -215,10 +226,13 @@ fn code_run_python_echo() {
 
 #[test]
 fn code_run_unknown_language() {
-    let resp = harness::invoke("code_run", json!({
-        "language": "cobol",
-        "code": "DISPLAY 'HELLO'"
-    }));
+    let resp = harness::invoke(
+        "code_run",
+        json!({
+            "language": "cobol",
+            "code": "DISPLAY 'HELLO'"
+        }),
+    );
     harness::expect_error(&resp, "interpreter_not_found");
 }
 

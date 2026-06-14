@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_bytes, encode_bytes, BytesError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct XorRequest {
@@ -54,7 +54,10 @@ impl Tool for BytesXor {
         }
 
         let encoded = encode_bytes(&result, out_enc)?;
-        Ok(XorResponse { result: encoded, bytes: result.len() })
+        Ok(XorResponse {
+            result: encoded,
+            bytes: result.len(),
+        })
     }
 }
 

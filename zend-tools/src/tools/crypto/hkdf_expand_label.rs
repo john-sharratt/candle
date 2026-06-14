@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::CryptoError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HkdfExpandLabelRequest {
@@ -31,8 +31,7 @@ pub struct HkdfExpandLabel;
 
 impl Tool for HkdfExpandLabel {
     const NAME: &'static str = "hkdf_expand_label";
-    const DESCRIPTION: &'static str =
-        "HKDF-Expand-Label from the TLS 1.3 key schedule: expand a \
+    const DESCRIPTION: &'static str = "HKDF-Expand-Label from the TLS 1.3 key schedule: expand a \
          pseudorandom key into named traffic secrets using a labeled, \
          versioned context. Use for TLS 1.3 key-schedule analysis.";
 
@@ -40,9 +39,11 @@ impl Tool for HkdfExpandLabel {
     type Response = HkdfExpandLabelResponse;
     type Error = CryptoError;
 
-    fn run(_ctx: &ToolContext, req: HkdfExpandLabelRequest) -> Result<HkdfExpandLabelResponse, CryptoError> {
-        let prk = hex::decode(&req.prk_hex)
-            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+    fn run(
+        _ctx: &ToolContext,
+        req: HkdfExpandLabelRequest,
+    ) -> Result<HkdfExpandLabelResponse, CryptoError> {
+        let prk = hex::decode(&req.prk_hex).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
         let ctx = if let Some(c) = &req.context_hex {
             hex::decode(c).map_err(|e| CryptoError::InvalidDataEncoding(e.to_string()))?
         } else {

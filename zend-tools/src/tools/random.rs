@@ -1,7 +1,7 @@
 //! `random` tool — generate random values.
 
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,7 +75,11 @@ impl Tool for RandomTool {
                 if count == 1 {
                     Value::Number(rng.random_range(min..=max).into())
                 } else {
-                    Value::Array((0..count).map(|_| Value::Number(rng.random_range(min..=max).into())).collect())
+                    Value::Array(
+                        (0..count)
+                            .map(|_| Value::Number(rng.random_range(min..=max).into()))
+                            .collect(),
+                    )
                 }
             }
             "float" => {
@@ -86,7 +90,9 @@ impl Tool for RandomTool {
                 }
                 let gen_float = || -> Value {
                     let f: f64 = rand::rng().random_range(min..max);
-                    serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
+                    serde_json::Number::from_f64(f)
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null)
                 };
                 if count == 1 {
                     gen_float()
@@ -95,10 +101,13 @@ impl Tool for RandomTool {
                 }
             }
             "choice" => {
-                let choices = req.choices.as_ref()
-                    .ok_or_else(|| RandomError::InvalidParams("choices required for kind=choice".to_string()))?;
+                let choices = req.choices.as_ref().ok_or_else(|| {
+                    RandomError::InvalidParams("choices required for kind=choice".to_string())
+                })?;
                 if choices.is_empty() {
-                    return Err(RandomError::InvalidParams("choices must not be empty".to_string()));
+                    return Err(RandomError::InvalidParams(
+                        "choices must not be empty".to_string(),
+                    ));
                 }
                 let pick = || -> Value {
                     let i = rand::rng().random_range(0..choices.len());
@@ -111,8 +120,9 @@ impl Tool for RandomTool {
                 }
             }
             "shuffle" => {
-                let mut choices = req.choices.clone()
-                    .ok_or_else(|| RandomError::InvalidParams("choices required for kind=shuffle".to_string()))?;
+                let mut choices = req.choices.clone().ok_or_else(|| {
+                    RandomError::InvalidParams("choices required for kind=shuffle".to_string())
+                })?;
                 choices.shuffle(&mut rng);
                 Value::Array(choices.into_iter().map(Value::String).collect())
             }
@@ -121,9 +131,8 @@ impl Tool for RandomTool {
                 if sides < 2 {
                     return Err(RandomError::InvalidParams("sides must be >= 2".to_string()));
                 }
-                let roll = || -> Value {
-                    Value::Number(rand::rng().random_range(1u32..=sides).into())
-                };
+                let roll =
+                    || -> Value { Value::Number(rand::rng().random_range(1u32..=sides).into()) };
                 if count == 1 {
                     roll()
                 } else {

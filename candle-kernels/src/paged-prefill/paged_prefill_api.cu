@@ -15,6 +15,7 @@ using paged_prefill_dtype_fn_t = void (*) (
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
     float, bool, const uint32_t*, const float*, int32_t, const uint32_t*,
+    int, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*,
     cudaStream_t);
 
 extern "C" void run_paged_prefill_chunks_fp16(
@@ -22,6 +23,7 @@ extern "C" void run_paged_prefill_chunks_fp16(
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
     float, bool, const uint32_t*, const float*, int32_t, const uint32_t*,
+    int, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*,
     cudaStream_t);
 
 extern "C" void run_paged_prefill_chunks_bf16(
@@ -29,6 +31,7 @@ extern "C" void run_paged_prefill_chunks_bf16(
     const uint32_t*, const uint32_t*, const uint32_t*, void*,
     int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
     float, bool, const uint32_t*, const float*, int32_t, const uint32_t*,
+    int, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*,
     cudaStream_t);
 
 // ============================================================================
@@ -56,6 +59,11 @@ extern "C" void run_paged_prefill_chunks(
     const float* rope_cs,
     int32_t rope_interleaved,
     const uint32_t* write_offset_shifts,
+    int gap_fill,
+    const uint32_t* col_actual_pos,
+    const uint32_t* cu_kvlens,
+    const uint32_t* glue_write_slice,
+    const uint32_t* glue_write_in_blk,
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
@@ -69,6 +77,7 @@ extern "C" void run_paged_prefill_chunks(
         fn(q_ptr, k_ptr, v_ptr, headers_ptr, cu_seqlens_q,
            q_lens, kv_lens, o_ptr, total_q, batch_size, n_head, n_kv_head,
            head_dim, max_blocks, softmax_scale, (bool)has_prefix,
-           rope_offsets, rope_cs, rope_interleaved, write_offset_shifts, stream);
+           rope_offsets, rope_cs, rope_interleaved, write_offset_shifts,
+           gap_fill, col_actual_pos, cu_kvlens, glue_write_slice, glue_write_in_blk, stream);
     }
 }

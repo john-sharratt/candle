@@ -1,14 +1,14 @@
 //! signature_verify tool.
 
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::{decode_data, CryptoError};
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SigVerifyRequest {
@@ -43,8 +43,7 @@ impl Tool for SignatureVerify {
 
     fn run(_ctx: &ToolContext, req: SigVerifyRequest) -> Result<SigVerifyResponse, CryptoError> {
         let enc = req.data_encoding.as_deref().unwrap_or("text");
-        let data = decode_data(&req.data, enc)
-            .map_err(CryptoError::InvalidDataEncoding)?;
+        let data = decode_data(&req.data, enc).map_err(CryptoError::InvalidDataEncoding)?;
         let sig_bytes = hex::decode(&req.signature_hex)
             .map_err(|e| CryptoError::SigningFailed(e.to_string()))?;
 
@@ -69,7 +68,10 @@ impl Tool for SignatureVerify {
             other => return Err(CryptoError::UnknownAlgorithm(other.to_string())),
         };
 
-        Ok(SigVerifyResponse { valid, algorithm: req.algorithm })
+        Ok(SigVerifyResponse {
+            valid,
+            algorithm: req.algorithm,
+        })
     }
 }
 

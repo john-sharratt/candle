@@ -34,16 +34,16 @@
 //! | `not_found` | Context ID not in store (`update`, `finalize`) |
 //! | `invalid_data_encoding` | Bad hex or base64 chunk data |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
+pub mod finalize;
 pub mod init;
 pub mod update;
-pub mod finalize;
 
+pub use finalize::HASH_STATE_FINALIZE;
 pub use init::HASH_STATE_INIT;
 pub use update::HASH_STATE_UPDATE;
-pub use finalize::HASH_STATE_FINALIZE;
 
 #[derive(Debug, Error)]
 pub enum HashStateError {
@@ -78,6 +78,8 @@ pub fn decode_data(data: &str, encoding: &str) -> Result<Vec<u8>, HashStateError
                 .decode(data)
                 .map_err(|e| HashStateError::InvalidDataEncoding(e.to_string()))
         }
-        other => Err(HashStateError::InvalidDataEncoding(format!("unknown encoding: {other}"))),
+        other => Err(HashStateError::InvalidDataEncoding(format!(
+            "unknown encoding: {other}"
+        ))),
     }
 }

@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::DiagError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct IpScanRequest {
@@ -49,13 +49,17 @@ impl Tool for IpScan {
         if parts.len() != 2 {
             return Err(DiagError::Failed("invalid CIDR notation".to_string()));
         }
-        let base_ip: std::net::Ipv4Addr = parts[0].parse()
+        let base_ip: std::net::Ipv4Addr = parts[0]
+            .parse()
             .map_err(|e| DiagError::Failed(format!("invalid IP: {e}")))?;
-        let prefix_len: u8 = parts[1].parse()
+        let prefix_len: u8 = parts[1]
+            .parse()
             .map_err(|_| DiagError::Failed("invalid prefix length".to_string()))?;
 
         if base_ip.octets()[0] == 169 && base_ip.octets()[1] == 254 {
-            return Err(DiagError::Failed("169.254.x.x link-local subnet blocked".to_string()));
+            return Err(DiagError::Failed(
+                "169.254.x.x link-local subnet blocked".to_string(),
+            ));
         }
 
         let host_bits = 32u32.saturating_sub(prefix_len as u32);
@@ -67,10 +71,16 @@ impl Tool for IpScan {
             let ip = std::net::Ipv4Addr::from(base_u32 + i);
             let addr: std::net::SocketAddr = format!("{}:80", ip).parse().unwrap();
             let alive = TcpStream::connect_timeout(&addr, timeout).is_ok();
-            hosts.push(HostAlive { ip: ip.to_string(), alive });
+            hosts.push(HostAlive {
+                ip: ip.to_string(),
+                alive,
+            });
         }
 
-        Ok(IpScanResponse { subnet: req.subnet, hosts })
+        Ok(IpScanResponse {
+            subnet: req.subnet,
+            hosts,
+        })
     }
 }
 

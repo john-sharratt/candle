@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::HashStateError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct FinalizeRequest {
@@ -37,7 +37,9 @@ impl Tool for HashStateFinalize {
     type Error = HashStateError;
 
     fn run(ctx: &ToolContext, req: FinalizeRequest) -> Result<FinalizeResponse, HashStateError> {
-        let (digest_bytes, algo) = ctx.hash_states.finalize(&req.id)
+        let (digest_bytes, algo) = ctx
+            .hash_states
+            .finalize(&req.id)
             .ok_or_else(|| HashStateError::NotFound(req.id.clone()))?;
 
         let enc = req.output_encoding.as_deref().unwrap_or("hex");
@@ -53,7 +55,12 @@ impl Tool for HashStateFinalize {
             ctx.hash_states.delete(&req.id);
         }
 
-        Ok(FinalizeResponse { id: req.id, digest, algorithm: algo, output_encoding: enc.to_string() })
+        Ok(FinalizeResponse {
+            id: req.id,
+            digest,
+            algorithm: algo,
+            output_encoding: enc.to_string(),
+        })
     }
 }
 

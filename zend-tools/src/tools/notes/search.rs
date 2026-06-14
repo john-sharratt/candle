@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::NotesError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SearchRequest {
@@ -51,14 +51,20 @@ impl Tool for NotesSearch {
         }
         let max = req.max_results.unwrap_or(10) as usize;
         let (results, total) = ctx.notes.search(query, tags, max);
-        let entries = results.into_iter().map(|r| SearchEntry {
-            key: r.key,
-            snippet: r.snippet,
-            tags: r.tags,
-            updated_at: r.updated_at,
-            rank: r.rank,
-        }).collect();
-        Ok(SearchResponse { results: entries, total_matches: total })
+        let entries = results
+            .into_iter()
+            .map(|r| SearchEntry {
+                key: r.key,
+                snippet: r.snippet,
+                tags: r.tags,
+                updated_at: r.updated_at,
+                rank: r.rank,
+            })
+            .collect();
+        Ok(SearchResponse {
+            results: entries,
+            total_matches: total,
+        })
     }
 }
 

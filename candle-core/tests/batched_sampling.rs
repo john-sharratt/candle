@@ -954,10 +954,10 @@ fn qwen3_recommended_full_combination() {
 
     // token_counts: loop_tok and prior_tok both seen THIS turn (presence penalty applies).
     let mut token_counts = vec![0i32; vocab];
-    token_counts[loop_tok] = 3;   // seen 3 times this turn
-    token_counts[prior_tok] = 1;  // seen once this turn
-    // cross_tok count = 0 this turn (but was used in a prior turn)
-    // fresh_tok count = 0.
+    token_counts[loop_tok] = 3; // seen 3 times this turn
+    token_counts[prior_tok] = 1; // seen once this turn
+                                 // cross_tok count = 0 this turn (but was used in a prior turn)
+                                 // fresh_tok count = 0.
 
     // Cross-turn counts: cross_tok was used 2 times in prior turns.
     let mut cross_turn_counts = vec![0i32; vocab];
@@ -1069,7 +1069,11 @@ fn qwen3_recommended_full_combination() {
     };
 
     // GPU and CPU must agree
-    assert_gpu_cpu_match(&stream, &p_det, "qwen3_recommended_full_combination_deterministic");
+    assert_gpu_cpu_match(
+        &stream,
+        &p_det,
+        "qwen3_recommended_full_combination_deterministic",
+    );
 
     // Argmax should select fresh_tok (highest effective logit = 6.0, unpenalized)
     let det_result = run_gpu(&stream, &p_det);
@@ -1225,10 +1229,10 @@ fn eot_boost_disabled_when_not_thinking() {
         temperature: 0.0,
         eot_boost: 1.0,
         eot_token_id: eot_id,
-        eot_ramp_start: 0,  // would give t=1.0 if thinking_len > 0
+        eot_ramp_start: 0, // would give t=1.0 if thinking_len > 0
         eot_ramp_len: 1,
-        eot_boost_max_multiplier: 100.0,  // huge multiplier to ensure failure if applied
-        thinking_lens: vec![0], // NOT in thinking mode
+        eot_boost_max_multiplier: 100.0, // huge multiplier to ensure failure if applied
+        thinking_lens: vec![0],          // NOT in thinking mode
         ..Default::default()
     };
 

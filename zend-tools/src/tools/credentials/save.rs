@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use super::CredError;
 use crate::state::credentials::Credential;
 use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
-use super::CredError;
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SaveRequest {
@@ -54,18 +54,29 @@ impl Tool for CredentialSave {
     type Error = CredError;
 
     fn confirmation(req: &SaveRequest) -> Option<ConfirmationDetails> {
-        Some(ConfirmationDetails::new(format!("Save credential {:?}", req.name))
-            .with_field("type", req.cred_type.clone())
-            .with_field("name", req.name.clone()))
+        Some(
+            ConfirmationDetails::new(format!("Save credential {:?}", req.name))
+                .with_field("type", req.cred_type.clone())
+                .with_field("name", req.name.clone()),
+        )
     }
 
     fn run(ctx: &ToolContext, req: SaveRequest) -> Result<SaveResponse, CredError> {
         const VALID_TYPES: &[&str] = &[
-            "ssh_key", "ssh_password", "telnet_password", "http_bearer", "http_basic",
-            "http_header", "totp_secret", "sql_password", "remote_fs_password",
-            "tls_client_cert", "signing_key",
+            "ssh_key",
+            "ssh_password",
+            "telnet_password",
+            "http_bearer",
+            "http_basic",
+            "http_header",
+            "totp_secret",
+            "sql_password",
+            "remote_fs_password",
+            "tls_client_cert",
+            "signing_key",
             // aliases accepted for compatibility
-            "api_key", "ed25519_key",
+            "api_key",
+            "ed25519_key",
         ];
         if !VALID_TYPES.contains(&req.cred_type.as_str()) {
             return Err(CredError::InvalidType(format!(
@@ -75,9 +86,15 @@ impl Tool for CredentialSave {
             )));
         }
 
-        let needs_username = matches!(req.cred_type.as_str(),
-            "ssh_key" | "ssh_password" | "http_basic" | "sql_password"
-            | "telnet_password" | "remote_fs_password");
+        let needs_username = matches!(
+            req.cred_type.as_str(),
+            "ssh_key"
+                | "ssh_password"
+                | "http_basic"
+                | "sql_password"
+                | "telnet_password"
+                | "remote_fs_password"
+        );
         let needs_header_name = req.cred_type == "http_header";
 
         if needs_username && req.username.is_none() {
@@ -88,7 +105,7 @@ impl Tool for CredentialSave {
         }
         if needs_header_name && req.header_name.is_none() {
             return Err(CredError::MissingField(
-                "header_name required for type http_header (e.g. \"X-API-Key\")".to_string()
+                "header_name required for type http_header (e.g. \"X-API-Key\")".to_string(),
             ));
         }
 
@@ -99,7 +116,8 @@ impl Tool for CredentialSave {
         {
             return Err(CredError::InvalidKey(
                 "ssh_key secret must be a PEM or OpenSSH private key (should begin with \
-                 '-----BEGIN ... PRIVATE KEY-----' or 'openssh-key-v1')".to_string()
+                 '-----BEGIN ... PRIVATE KEY-----' or 'openssh-key-v1')"
+                    .to_string(),
             ));
         }
 
@@ -118,10 +136,15 @@ impl Tool for CredentialSave {
             default_database: req.default_database,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        ctx.credentials.save(cred)
+        ctx.credentials
+            .save(cred)
             .map_err(|e| CredError::DuplicateName(e))?;
 
-        Ok(SaveResponse { id, name: req.name, created: true })
+        Ok(SaveResponse {
+            id,
+            name: req.name,
+            created: true,
+        })
     }
 }
 

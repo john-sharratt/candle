@@ -26,8 +26,8 @@ pub fn llama_inv_freq(
         Some(rope_scaling) => {
             use std::f32::consts::PI;
 
-            let low_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
-                / rope_scaling.low_freq_factor;
+            let low_freq_wavelen =
+                rope_scaling.original_max_position_embeddings as f32 / rope_scaling.low_freq_factor;
             let high_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
                 / rope_scaling.high_freq_factor;
 
@@ -40,7 +40,8 @@ pub fn llama_inv_freq(
                     } else if wavelen > low_freq_wavelen {
                         freq / rope_scaling.factor
                     } else {
-                        let smooth = (rope_scaling.original_max_position_embeddings as f32 / wavelen
+                        let smooth = (rope_scaling.original_max_position_embeddings as f32
+                            / wavelen
                             - rope_scaling.low_freq_factor)
                             / (rope_scaling.high_freq_factor - rope_scaling.low_freq_factor);
                         (1. - smooth) * freq / rope_scaling.factor + smooth * freq

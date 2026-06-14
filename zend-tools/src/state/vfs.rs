@@ -97,7 +97,9 @@ impl VfsStore {
         for segment in path.split('/') {
             match segment {
                 "" | "." => {}
-                ".." => { parts.pop(); }
+                ".." => {
+                    parts.pop();
+                }
                 s => parts.push(s),
             }
         }

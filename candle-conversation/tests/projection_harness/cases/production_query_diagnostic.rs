@@ -41,11 +41,24 @@ fn rank_calculator(
 ) -> (usize, f32, &'static str, f32) {
     let mut scored: Vec<(&'static str, f32)> = TOOLS
         .iter()
-        .map(|&t| (t, resolver.section_score(h.tool_section_ids[t], formula, weights)))
+        .map(|&t| {
+            (
+                t,
+                resolver.section_score(h.tool_section_ids[t], formula, weights),
+            )
+        })
         .collect();
-    let calc = scored.iter().find(|(t, _)| *t == CORRECT).map(|(_, s)| *s).unwrap_or(0.0);
+    let calc = scored
+        .iter()
+        .find(|(t, _)| *t == CORRECT)
+        .map(|(_, s)| *s)
+        .unwrap_or(0.0);
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let rank = scored.iter().position(|(t, _)| *t == CORRECT).unwrap_or(usize::MAX) + 1;
+    let rank = scored
+        .iter()
+        .position(|(t, _)| *t == CORRECT)
+        .unwrap_or(usize::MAX)
+        + 1;
     let (bc, bs) = scored
         .iter()
         .find(|(t, _)| *t != CORRECT)
@@ -54,12 +67,7 @@ fn rank_calculator(
     (rank, calc, bc, bs)
 }
 
-fn sweep_phase(
-    label: &str,
-    h: &Harness,
-    pf: &ProvenanceFile,
-    manifest: &Manifest,
-) {
+fn sweep_phase(label: &str, h: &Harness, pf: &ProvenanceFile, manifest: &Manifest) {
     if !manifest.scenarios.iter().any(|s| s.id == PROBE) {
         println!("  [{label}] probe scenario {PROBE} not in manifest — skipping");
         return;
@@ -67,9 +75,30 @@ fn sweep_phase(
     let (resolver, hit_log) = h.scan_with_hits(pf, manifest, PROBE);
 
     let weights: &[(&str, DepthWeights)] = &[
-        ("semantic", DepthWeights { syntactic: 0.0, semantic: 1.0, pragmatic: 0.0 }),
-        ("pragmatic", DepthWeights { syntactic: 0.0, semantic: 0.0, pragmatic: 1.0 }),
-        ("equal", DepthWeights { syntactic: 1.0, semantic: 1.0, pragmatic: 1.0 }),
+        (
+            "semantic",
+            DepthWeights {
+                syntactic: 0.0,
+                semantic: 1.0,
+                pragmatic: 0.0,
+            },
+        ),
+        (
+            "pragmatic",
+            DepthWeights {
+                syntactic: 0.0,
+                semantic: 0.0,
+                pragmatic: 1.0,
+            },
+        ),
+        (
+            "equal",
+            DepthWeights {
+                syntactic: 1.0,
+                semantic: 1.0,
+                pragmatic: 1.0,
+            },
+        ),
     ];
     let formulas: &[(&str, ScoreFormula)] = &[
         ("max", ScoreFormula::Max),
@@ -85,14 +114,25 @@ fn sweep_phase(
     println!("\n══ [{label}] formula sweep — calculator rank among 8 tools ══");
     for (wname, w) in weights {
         println!("  depth weights = {wname}");
-        println!("    {:<14} {:>6} {:>10} {:>10}  {:<14} {:>10}  {:>8}",
-            "formula", "rank", "calc", "2nd", "(2nd tool)", "score", "margin");
+        println!(
+            "    {:<14} {:>6} {:>10} {:>10}  {:<14} {:>10}  {:>8}",
+            "formula", "rank", "calc", "2nd", "(2nd tool)", "score", "margin"
+        );
         for (fname, formula) in formulas {
             let (rank, calc, bc, bs) = rank_calculator(h, &resolver, *formula, w);
             let margin = calc - bs;
             let flag = if rank == 1 { " <-- win" } else { "" };
-            println!("    {:<14} {:>6} {:>10.3} {:>10} {:<14} {:>10.3}  {:>8.3}{}",
-                fname, rank, calc, "", format!("({bc})"), bs, margin, flag);
+            println!(
+                "    {:<14} {:>6} {:>10.3} {:>10} {:<14} {:>10.3}  {:>8.3}{}",
+                fname,
+                rank,
+                calc,
+                "",
+                format!("({bc})"),
+                bs,
+                margin,
+                flag
+            );
         }
     }
 
@@ -129,15 +169,20 @@ fn sweep_phase(
         .filter(|(_, set)| set.len() == 1 && set.contains(CORRECT))
         .map(|(t, _)| *t)
         .collect();
-    println!("    probe tokens hitting ONLY calculator: {} {:?}",
-        discriminative.len(), {
+    println!(
+        "    probe tokens hitting ONLY calculator: {} {:?}",
+        discriminative.len(),
+        {
             let mut d = discriminative.clone();
             d.sort_unstable();
             d
-        });
+        }
+    );
     // Best agreement among calculator-exclusive tokens vs promiscuous tokens.
-    let excl_best: Vec<u32> = discriminative.iter()
-        .filter_map(|t| tok_best.get(t).map(|(a, _)| *a)).collect();
+    let excl_best: Vec<u32> = discriminative
+        .iter()
+        .filter_map(|t| tok_best.get(t).map(|(a, _)| *a))
+        .collect();
     if !excl_best.is_empty() {
         let mx = excl_best.iter().copied().max().unwrap();
         let mn = excl_best.iter().copied().min().unwrap();

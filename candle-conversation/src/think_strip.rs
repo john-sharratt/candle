@@ -102,11 +102,7 @@ fn find_tag(haystack: &str, needle: &str) -> Option<usize> {
 /// left untouched; only runs of two or more are squashed.
 fn collapse_whitespace(s: &str) -> String {
     // Fast path: no double-whitespace at all.
-    if !s.contains("  ")
-        && !s.contains('\n')
-        && !s.contains('\t')
-        && !s.contains("\r")
-    {
+    if !s.contains("  ") && !s.contains('\n') && !s.contains('\t') && !s.contains("\r") {
         return s.to_string();
     }
 

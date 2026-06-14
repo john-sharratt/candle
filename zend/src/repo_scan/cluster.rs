@@ -360,7 +360,10 @@ fn render_node_files(node: &DirNode<'_>) -> String {
         return String::new();
     }
     for f in &node.files {
-        let mut bits = vec![format!("{} lines", f.line_count), f.language.label().to_string()];
+        let mut bits = vec![
+            format!("{} lines", f.line_count),
+            f.language.label().to_string(),
+        ];
         if let Some(h) = &f.module_hint {
             bits.push(h.render());
         }
@@ -490,10 +493,7 @@ mod tests {
 
     #[test]
     fn cluster_hash_changes_on_file_rename() {
-        let m_before = map(
-            "rh",
-            vec![entry("src/lib.rs", 5), entry("src/util.rs", 5)],
-        );
+        let m_before = map("rh", vec![entry("src/lib.rs", 5), entry("src/util.rs", 5)]);
         let m_after = map(
             "rh",
             vec![entry("src/lib.rs", 5), entry("src/helper.rs", 5)],
@@ -593,7 +593,10 @@ mod tests {
             flat_clusters.len() >= 2,
             "flat directory should split into >=2 chunks, got {} (roots: {:?})",
             flat_clusters.len(),
-            flat_clusters.iter().map(|c| &c.root_dir).collect::<Vec<_>>(),
+            flat_clusters
+                .iter()
+                .map(|c| &c.root_dir)
+                .collect::<Vec<_>>(),
         );
         for c in &flat_clusters {
             assert!(

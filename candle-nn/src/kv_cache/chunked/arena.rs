@@ -554,7 +554,6 @@ fn quant_chunk_byte_range(
 struct _ArenaImplContinues; // syntactic anchor: more `impl Arena` items follow below.
 
 impl Arena {
-
     /// Return the raw device pointer and byte stride for one logical chunk in
     /// this arena. Returns `None` for CPU-backed or tombstoned arenas.
     #[allow(dead_code)]

@@ -509,10 +509,7 @@ impl SubstrateStore {
         system_prompt: Vec<SystemPromptSegment>,
     ) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let file = File::options().write(true).create_new(true).open(&path)?;
         let mut store = Self {
             writer: BufWriter::new(file),
             path,

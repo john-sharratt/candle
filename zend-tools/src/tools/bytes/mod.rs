@@ -44,16 +44,16 @@
 //! | `pack_failed` | Value does not fit the format field type |
 //! | `unpack_failed` | Buffer too short for the format or read error |
 
-use thiserror::Error;
 use crate::ToolError;
+use thiserror::Error;
 
-pub mod transcode;
 pub mod pack;
+pub mod transcode;
 pub mod unpack;
 pub mod xor;
 
-pub use transcode::BYTES_TRANSCODE;
 pub use pack::BYTES_PACK;
+pub use transcode::BYTES_TRANSCODE;
 pub use unpack::BYTES_UNPACK;
 pub use xor::BYTES_XOR;
 
@@ -91,16 +91,20 @@ pub fn decode_bytes(data: &str, encoding: &str) -> Result<Vec<u8>, BytesError> {
         "hex" => hex::decode(data).map_err(|e| BytesError::DecodeFailed(e.to_string())),
         "base64" => {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.decode(data)
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
                 .map_err(|e| BytesError::DecodeFailed(e.to_string()))
         }
         "base64url" => {
             use base64::Engine;
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data)
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(data)
                 .map_err(|e| BytesError::DecodeFailed(e.to_string()))
         }
         "utf8" => Ok(data.as_bytes().to_vec()),
-        other => Err(BytesError::InvalidEncoding(format!("unknown encoding: {other}"))),
+        other => Err(BytesError::InvalidEncoding(format!(
+            "unknown encoding: {other}"
+        ))),
     }
 }
 
@@ -118,7 +122,9 @@ pub fn encode_bytes(bytes: &[u8], encoding: &str) -> Result<String, BytesError> 
         "utf8" => std::str::from_utf8(bytes)
             .map(|s| s.to_string())
             .map_err(|e| BytesError::EncodeFailed(e.to_string())),
-        other => Err(BytesError::InvalidEncoding(format!("unknown encoding: {other}"))),
+        other => Err(BytesError::InvalidEncoding(format!(
+            "unknown encoding: {other}"
+        ))),
     }
 }
 
@@ -126,17 +132,30 @@ pub fn encode_bytes(bytes: &[u8], encoding: &str) -> Result<String, BytesError> 
 
 #[derive(Debug)]
 pub enum FormatField {
-    U8, U16, U32, U64,
-    I8, I16, I32, I64,
-    F32, F64,
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
     Bytes(usize),
 }
 
 pub fn parse_format(fmt: &str) -> Result<(bool, Vec<FormatField>), BytesError> {
     let mut chars = fmt.chars().peekable();
     let big_endian = match chars.peek() {
-        Some('>') => { chars.next(); true }
-        Some('<') => { chars.next(); false }
+        Some('>') => {
+            chars.next();
+            true
+        }
+        Some('<') => {
+            chars.next();
+            false
+        }
         _ => true,
     };
 
@@ -148,44 +167,109 @@ pub fn parse_format(fmt: &str) -> Result<(bool, Vec<FormatField>), BytesError> {
             num_str.push(c);
             continue;
         }
-        let n: usize = if num_str.is_empty() { 1 } else {
-            num_str.parse().map_err(|_| BytesError::InvalidFormat("bad number in format".to_string()))?
+        let n: usize = if num_str.is_empty() {
+            1
+        } else {
+            num_str
+                .parse()
+                .map_err(|_| BytesError::InvalidFormat("bad number in format".to_string()))?
         };
         num_str.clear();
 
         match c {
-            'B' => for _ in 0..n { fields.push(FormatField::U8) },
-            'H' => for _ in 0..n { fields.push(FormatField::U16) },
-            'I' | 'L' => for _ in 0..n { fields.push(FormatField::U32) },
-            'Q' => for _ in 0..n { fields.push(FormatField::U64) },
-            'b' => for _ in 0..n { fields.push(FormatField::I8) },
-            'h' => for _ in 0..n { fields.push(FormatField::I16) },
-            'i' | 'l' => for _ in 0..n { fields.push(FormatField::I32) },
-            'q' => for _ in 0..n { fields.push(FormatField::I64) },
-            'f' => for _ in 0..n { fields.push(FormatField::F32) },
-            'd' => for _ in 0..n { fields.push(FormatField::F64) },
+            'B' => {
+                for _ in 0..n {
+                    fields.push(FormatField::U8)
+                }
+            }
+            'H' => {
+                for _ in 0..n {
+                    fields.push(FormatField::U16)
+                }
+            }
+            'I' | 'L' => {
+                for _ in 0..n {
+                    fields.push(FormatField::U32)
+                }
+            }
+            'Q' => {
+                for _ in 0..n {
+                    fields.push(FormatField::U64)
+                }
+            }
+            'b' => {
+                for _ in 0..n {
+                    fields.push(FormatField::I8)
+                }
+            }
+            'h' => {
+                for _ in 0..n {
+                    fields.push(FormatField::I16)
+                }
+            }
+            'i' | 'l' => {
+                for _ in 0..n {
+                    fields.push(FormatField::I32)
+                }
+            }
+            'q' => {
+                for _ in 0..n {
+                    fields.push(FormatField::I64)
+                }
+            }
+            'f' => {
+                for _ in 0..n {
+                    fields.push(FormatField::F32)
+                }
+            }
+            'd' => {
+                for _ in 0..n {
+                    fields.push(FormatField::F64)
+                }
+            }
             's' => fields.push(FormatField::Bytes(n)),
-            other => return Err(BytesError::InvalidFormat(format!("unknown format char: {other}"))),
+            other => {
+                return Err(BytesError::InvalidFormat(format!(
+                    "unknown format char: {other}"
+                )))
+            }
         }
     }
 
     Ok((big_endian, fields))
 }
 
-pub fn pack_field(buf: &mut Vec<u8>, field: &FormatField, val: &serde_json::Value, big: bool) -> Result<(), String> {
+pub fn pack_field(
+    buf: &mut Vec<u8>,
+    field: &FormatField,
+    val: &serde_json::Value,
+    big: bool,
+) -> Result<(), String> {
     use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
 
-    macro_rules! get_int { ($t:ty) => { val.as_i64().ok_or_else(|| "expected integer".to_string())? as $t } }
-    macro_rules! get_uint { ($t:ty) => { val.as_u64().ok_or_else(|| "expected integer".to_string())? as $t } }
-    macro_rules! get_float { ($t:ty) => { val.as_f64().ok_or_else(|| "expected float".to_string())? as $t } }
+    macro_rules! get_int {
+        ($t:ty) => {
+            val.as_i64().ok_or_else(|| "expected integer".to_string())? as $t
+        };
+    }
+    macro_rules! get_uint {
+        ($t:ty) => {
+            val.as_u64().ok_or_else(|| "expected integer".to_string())? as $t
+        };
+    }
+    macro_rules! get_float {
+        ($t:ty) => {
+            val.as_f64().ok_or_else(|| "expected float".to_string())? as $t
+        };
+    }
 
     if big {
         match field {
-            FormatField::U8  => buf.write_u8(get_uint!(u8)).unwrap(),
+            FormatField::U8 => buf.write_u8(get_uint!(u8)).unwrap(),
             FormatField::U16 => buf.write_u16::<BigEndian>(get_uint!(u16)).unwrap(),
             FormatField::U32 => buf.write_u32::<BigEndian>(get_uint!(u32)).unwrap(),
             FormatField::U64 => buf.write_u64::<BigEndian>(get_uint!(u64)).unwrap(),
-            FormatField::I8  => buf.write_i8(get_int!(i8)).unwrap(),
+            FormatField::I8 => buf.write_i8(get_int!(i8)).unwrap(),
             FormatField::I16 => buf.write_i16::<BigEndian>(get_int!(i16)).unwrap(),
             FormatField::I32 => buf.write_i32::<BigEndian>(get_int!(i32)).unwrap(),
             FormatField::I64 => buf.write_i64::<BigEndian>(get_int!(i64)).unwrap(),
@@ -202,11 +286,11 @@ pub fn pack_field(buf: &mut Vec<u8>, field: &FormatField, val: &serde_json::Valu
         }
     } else {
         match field {
-            FormatField::U8  => buf.write_u8(get_uint!(u8)).unwrap(),
+            FormatField::U8 => buf.write_u8(get_uint!(u8)).unwrap(),
             FormatField::U16 => buf.write_u16::<LittleEndian>(get_uint!(u16)).unwrap(),
             FormatField::U32 => buf.write_u32::<LittleEndian>(get_uint!(u32)).unwrap(),
             FormatField::U64 => buf.write_u64::<LittleEndian>(get_uint!(u64)).unwrap(),
-            FormatField::I8  => buf.write_i8(get_int!(i8)).unwrap(),
+            FormatField::I8 => buf.write_i8(get_int!(i8)).unwrap(),
             FormatField::I16 => buf.write_i16::<LittleEndian>(get_int!(i16)).unwrap(),
             FormatField::I32 => buf.write_i32::<LittleEndian>(get_int!(i32)).unwrap(),
             FormatField::I64 => buf.write_i64::<LittleEndian>(get_int!(i64)).unwrap(),
@@ -234,16 +318,36 @@ pub fn unpack_field(
 
     let v = if big {
         match field {
-            FormatField::U8  => serde_json::json!(cursor.read_u8().map_err(|e| e.to_string())?),
-            FormatField::U16 => serde_json::json!(cursor.read_u16::<BigEndian>().map_err(|e| e.to_string())?),
-            FormatField::U32 => serde_json::json!(cursor.read_u32::<BigEndian>().map_err(|e| e.to_string())?),
-            FormatField::U64 => serde_json::json!(cursor.read_u64::<BigEndian>().map_err(|e| e.to_string())?),
-            FormatField::I8  => serde_json::json!(cursor.read_i8().map_err(|e| e.to_string())?),
-            FormatField::I16 => serde_json::json!(cursor.read_i16::<BigEndian>().map_err(|e| e.to_string())?),
-            FormatField::I32 => serde_json::json!(cursor.read_i32::<BigEndian>().map_err(|e| e.to_string())?),
-            FormatField::I64 => serde_json::json!(cursor.read_i64::<BigEndian>().map_err(|e| e.to_string())?),
-            FormatField::F32 => serde_json::Number::from_f64(cursor.read_f32::<BigEndian>().map_err(|e| e.to_string())? as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
-            FormatField::F64 => serde_json::Number::from_f64(cursor.read_f64::<BigEndian>().map_err(|e| e.to_string())?).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+            FormatField::U8 => serde_json::json!(cursor.read_u8().map_err(|e| e.to_string())?),
+            FormatField::U16 => {
+                serde_json::json!(cursor.read_u16::<BigEndian>().map_err(|e| e.to_string())?)
+            }
+            FormatField::U32 => {
+                serde_json::json!(cursor.read_u32::<BigEndian>().map_err(|e| e.to_string())?)
+            }
+            FormatField::U64 => {
+                serde_json::json!(cursor.read_u64::<BigEndian>().map_err(|e| e.to_string())?)
+            }
+            FormatField::I8 => serde_json::json!(cursor.read_i8().map_err(|e| e.to_string())?),
+            FormatField::I16 => {
+                serde_json::json!(cursor.read_i16::<BigEndian>().map_err(|e| e.to_string())?)
+            }
+            FormatField::I32 => {
+                serde_json::json!(cursor.read_i32::<BigEndian>().map_err(|e| e.to_string())?)
+            }
+            FormatField::I64 => {
+                serde_json::json!(cursor.read_i64::<BigEndian>().map_err(|e| e.to_string())?)
+            }
+            FormatField::F32 => serde_json::Number::from_f64(
+                cursor.read_f32::<BigEndian>().map_err(|e| e.to_string())? as f64,
+            )
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+            FormatField::F64 => serde_json::Number::from_f64(
+                cursor.read_f64::<BigEndian>().map_err(|e| e.to_string())?,
+            )
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
             FormatField::Bytes(n) => {
                 use std::io::Read;
                 let mut buf = vec![0u8; *n];
@@ -253,16 +357,40 @@ pub fn unpack_field(
         }
     } else {
         match field {
-            FormatField::U8  => serde_json::json!(cursor.read_u8().map_err(|e| e.to_string())?),
-            FormatField::U16 => serde_json::json!(cursor.read_u16::<LittleEndian>().map_err(|e| e.to_string())?),
-            FormatField::U32 => serde_json::json!(cursor.read_u32::<LittleEndian>().map_err(|e| e.to_string())?),
-            FormatField::U64 => serde_json::json!(cursor.read_u64::<LittleEndian>().map_err(|e| e.to_string())?),
-            FormatField::I8  => serde_json::json!(cursor.read_i8().map_err(|e| e.to_string())?),
-            FormatField::I16 => serde_json::json!(cursor.read_i16::<LittleEndian>().map_err(|e| e.to_string())?),
-            FormatField::I32 => serde_json::json!(cursor.read_i32::<LittleEndian>().map_err(|e| e.to_string())?),
-            FormatField::I64 => serde_json::json!(cursor.read_i64::<LittleEndian>().map_err(|e| e.to_string())?),
-            FormatField::F32 => serde_json::Number::from_f64(cursor.read_f32::<LittleEndian>().map_err(|e| e.to_string())? as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
-            FormatField::F64 => serde_json::Number::from_f64(cursor.read_f64::<LittleEndian>().map_err(|e| e.to_string())?).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+            FormatField::U8 => serde_json::json!(cursor.read_u8().map_err(|e| e.to_string())?),
+            FormatField::U16 => serde_json::json!(cursor
+                .read_u16::<LittleEndian>()
+                .map_err(|e| e.to_string())?),
+            FormatField::U32 => serde_json::json!(cursor
+                .read_u32::<LittleEndian>()
+                .map_err(|e| e.to_string())?),
+            FormatField::U64 => serde_json::json!(cursor
+                .read_u64::<LittleEndian>()
+                .map_err(|e| e.to_string())?),
+            FormatField::I8 => serde_json::json!(cursor.read_i8().map_err(|e| e.to_string())?),
+            FormatField::I16 => serde_json::json!(cursor
+                .read_i16::<LittleEndian>()
+                .map_err(|e| e.to_string())?),
+            FormatField::I32 => serde_json::json!(cursor
+                .read_i32::<LittleEndian>()
+                .map_err(|e| e.to_string())?),
+            FormatField::I64 => serde_json::json!(cursor
+                .read_i64::<LittleEndian>()
+                .map_err(|e| e.to_string())?),
+            FormatField::F32 => serde_json::Number::from_f64(
+                cursor
+                    .read_f32::<LittleEndian>()
+                    .map_err(|e| e.to_string())? as f64,
+            )
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+            FormatField::F64 => serde_json::Number::from_f64(
+                cursor
+                    .read_f64::<LittleEndian>()
+                    .map_err(|e| e.to_string())?,
+            )
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
             FormatField::Bytes(n) => {
                 use std::io::Read;
                 let mut buf = vec![0u8; *n];

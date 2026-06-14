@@ -1,15 +1,15 @@
 //! aead_decrypt tool.
 
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
 use chacha20poly1305::ChaCha20Poly1305;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::CryptoError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct AeadDecryptRequest {
@@ -34,8 +34,7 @@ pub struct AeadDecrypt;
 
 impl Tool for AeadDecrypt {
     const NAME: &'static str = "aead_decrypt";
-    const DESCRIPTION: &'static str =
-        "Decrypt and authenticate AEAD ciphertext — AES-256-GCM or \
+    const DESCRIPTION: &'static str = "Decrypt and authenticate AEAD ciphertext — AES-256-GCM or \
          ChaCha20-Poly1305 — verifying the integrity tag and rejecting any \
          tampered input. Returns recovered plaintext as text when valid \
          UTF-8, otherwise hex.";
@@ -44,11 +43,14 @@ impl Tool for AeadDecrypt {
     type Response = AeadDecryptResponse;
     type Error = CryptoError;
 
-    fn run(_ctx: &ToolContext, req: AeadDecryptRequest) -> Result<AeadDecryptResponse, CryptoError> {
-        let key_bytes = hex::decode(&req.key_hex)
-            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
-        let nonce_bytes = hex::decode(&req.nonce_hex)
-            .map_err(|e| CryptoError::InvalidNonce(e.to_string()))?;
+    fn run(
+        _ctx: &ToolContext,
+        req: AeadDecryptRequest,
+    ) -> Result<AeadDecryptResponse, CryptoError> {
+        let key_bytes =
+            hex::decode(&req.key_hex).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let nonce_bytes =
+            hex::decode(&req.nonce_hex).map_err(|e| CryptoError::InvalidNonce(e.to_string()))?;
         let ct = hex::decode(&req.ciphertext_hex)
             .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
         let aad = req.aad.as_deref().unwrap_or("").as_bytes().to_vec();
@@ -58,8 +60,12 @@ impl Tool for AeadDecrypt {
                 let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
                 let cipher = Aes256Gcm::new(key);
                 let nonce = Nonce::from_slice(&nonce_bytes);
-                let payload = aes_gcm::aead::Payload { msg: &ct, aad: &aad };
-                cipher.decrypt(nonce, payload)
+                let payload = aes_gcm::aead::Payload {
+                    msg: &ct,
+                    aad: &aad,
+                };
+                cipher
+                    .decrypt(nonce, payload)
                     .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?
             }
             "chacha20poly1305" => {
@@ -67,8 +73,12 @@ impl Tool for AeadDecrypt {
                 let key = chacha20poly1305::Key::from_slice(&key_bytes);
                 let cipher = ChaCha20Poly1305::new(key);
                 let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
-                let payload = chacha20poly1305::aead::Payload { msg: &ct, aad: &aad };
-                cipher.decrypt(nonce, payload)
+                let payload = chacha20poly1305::aead::Payload {
+                    msg: &ct,
+                    aad: &aad,
+                };
+                cipher
+                    .decrypt(nonce, payload)
                     .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?
             }
             other => return Err(CryptoError::InvalidAlgorithm(other.to_string())),
@@ -79,7 +89,10 @@ impl Tool for AeadDecrypt {
             Err(_) => (hex::encode(&plaintext), "hex"),
         };
 
-        Ok(AeadDecryptResponse { plaintext: text, plaintext_encoding: encoding.to_string() })
+        Ok(AeadDecryptResponse {
+            plaintext: text,
+            plaintext_encoding: encoding.to_string(),
+        })
     }
 }
 

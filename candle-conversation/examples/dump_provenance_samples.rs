@@ -138,8 +138,16 @@ fn intra_inter(
             inter.push(r.score);
         }
     }
-    let intra_avg = if intra.is_empty() { 0.0 } else { intra.iter().sum::<f64>() / intra.len() as f64 };
-    let inter_avg = if inter.is_empty() { 0.0 } else { inter.iter().sum::<f64>() / inter.len() as f64 };
+    let intra_avg = if intra.is_empty() {
+        0.0
+    } else {
+        intra.iter().sum::<f64>() / intra.len() as f64
+    };
+    let inter_avg = if inter.is_empty() {
+        0.0
+    } else {
+        inter.iter().sum::<f64>() / inter.len() as f64
+    };
     Ok((intra_avg, inter_avg))
 }
 
@@ -150,13 +158,16 @@ fn main() -> anyhow::Result<()> {
     let sig_path = args.data_dir.join("signatures.prov");
     let prefill_sig_path = args.data_dir.join("prefill_signatures.prov");
 
-    let manifest: Manifest =
-        serde_json::from_str(&std::fs::read_to_string(&manifest_path).map_err(|e| {
-            anyhow::anyhow!("failed to read {}: {}", manifest_path.display(), e)
-        })?)?;
+    let manifest: Manifest = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", manifest_path.display(), e))?,
+    )?;
 
     let has_prefill = prefill_sig_path.exists()
-        && manifest.scenarios.iter().any(|s| s.prefill_byte_offset.is_some());
+        && manifest
+            .scenarios
+            .iter()
+            .any(|s| s.prefill_byte_offset.is_some());
 
     println!("=== Provenance Sample Dump ===");
     println!("Model  : {}", manifest.model);
@@ -166,8 +177,10 @@ fn main() -> anyhow::Result<()> {
     if has_prefill {
         println!("Prefill file: {}", prefill_sig_path.display());
         println!("Mode: two-round (prefill → decode)");
-        println!("  prefill threshold = {}  decode threshold = {}",
-            args.prefill_threshold, args.decode_threshold);
+        println!(
+            "  prefill threshold = {}  decode threshold = {}",
+            args.prefill_threshold, args.decode_threshold
+        );
     } else {
         println!("Mode: decode-only (no prefill_signatures.prov or missing prefill fields)");
         println!("  decode threshold = {}", args.decode_threshold);
@@ -183,9 +196,15 @@ fn main() -> anyhow::Result<()> {
 
     // ── Per-scenario header dump ──────────────────────────────────────────────
 
-    println!("── Signature samples (first {} scenarios) ──────────────", args.show_n);
+    println!(
+        "── Signature samples (first {} scenarios) ──────────────",
+        args.show_n
+    );
     for s in manifest.scenarios.iter().take(args.show_n) {
-        let entry = SigEntry { byte_offset: s.byte_offset, token_count: s.token_count };
+        let entry = SigEntry {
+            byte_offset: s.byte_offset,
+            token_count: s.token_count,
+        };
         let (syn, sem, prag) = pf.read_entry(entry)?;
 
         if syn.is_empty() {
@@ -218,7 +237,10 @@ fn main() -> anyhow::Result<()> {
         if let (Some(ppf), Some(off), Some(tc)) =
             (&prefill_pf, s.prefill_byte_offset, s.prefill_token_count)
         {
-            let pe = SigEntry { byte_offset: off, token_count: tc };
+            let pe = SigEntry {
+                byte_offset: off,
+                token_count: tc,
+            };
             if let Ok((ps, _, _)) = ppf.read_entry(pe) {
                 println!(
                     "  prefill_density syn={:.1}%  ({} tokens)",
@@ -234,7 +256,15 @@ fn main() -> anyhow::Result<()> {
         .scenarios
         .iter()
         .enumerate()
-        .map(|(i, s)| (i as u64, SigEntry { byte_offset: s.byte_offset, token_count: s.token_count }))
+        .map(|(i, s)| {
+            (
+                i as u64,
+                SigEntry {
+                    byte_offset: s.byte_offset,
+                    token_count: s.token_count,
+                },
+            )
+        })
         .collect();
 
     let prefill_entries: Vec<(u64, SigEntry)> = manifest
@@ -242,10 +272,13 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .enumerate()
         .filter_map(|(i, s)| {
-            Some((i as u64, SigEntry {
-                byte_offset: s.prefill_byte_offset?,
-                token_count: s.prefill_token_count?,
-            }))
+            Some((
+                i as u64,
+                SigEntry {
+                    byte_offset: s.prefill_byte_offset?,
+                    token_count: s.prefill_token_count?,
+                },
+            ))
         })
         .collect();
 
@@ -261,13 +294,19 @@ fn main() -> anyhow::Result<()> {
 
     // ── Similarity scan per tool ──────────────────────────────────────────────
 
-    println!("\n── Similarity scan (top_k={}) ──────────────────────────", args.top_k);
+    println!(
+        "\n── Similarity scan (top_k={}) ──────────────────────────",
+        args.top_k
+    );
 
     for tool in &seen_tools {
-        let first_pos = manifest.scenarios.iter().enumerate().find(|(_, s)| {
-            s.tool.as_deref() == Some(tool) && s.case_type == CaseType::Positive
-        });
-        let Some((probe_idx, probe_s)) = first_pos else { continue };
+        let first_pos =
+            manifest.scenarios.iter().enumerate().find(|(_, s)| {
+                s.tool.as_deref() == Some(tool) && s.case_type == CaseType::Positive
+            });
+        let Some((probe_idx, probe_s)) = first_pos else {
+            continue;
+        };
 
         println!("\nTool: {tool}");
         let probe_user_preview: String = probe_s.user_prompt.chars().take(60).collect();
@@ -275,7 +314,9 @@ fn main() -> anyhow::Result<()> {
 
         // Round 1: prefill probe (if available).
         if let (Some(ppf), true) = (&prefill_pf, !prefill_entries.is_empty()) {
-            if let Some(&(_, pre_entry)) = prefill_entries.iter().find(|(i, _)| *i == probe_idx as u64) {
+            if let Some(&(_, pre_entry)) =
+                prefill_entries.iter().find(|(i, _)| *i == probe_idx as u64)
+            {
                 let (syn, sem, prag) = ppf.read_entry(pre_entry)?;
                 if !syn.is_empty() {
                     let probe = ProbeSignatures {
@@ -283,14 +324,23 @@ fn main() -> anyhow::Result<()> {
                         semantic: *sem.last().unwrap(),
                         pragmatic: *prag.last().unwrap(),
                     };
-                    let ranks = ppf.scan_entries(&prefill_entries, &probe, args.prefill_threshold, args.top_k)?;
+                    let ranks = ppf.scan_entries(
+                        &prefill_entries,
+                        &probe,
+                        args.prefill_threshold,
+                        args.top_k,
+                    )?;
                     println!("  [prefill  thr={}]", args.prefill_threshold);
                     if ranks.is_empty() {
                         println!("    (no results above threshold)");
                     } else {
                         for r in &ranks {
                             let m = &manifest.scenarios[r.turn_id as usize];
-                            let mark = if m.tool.as_deref() == Some(tool) { "✓" } else { "✗" };
+                            let mark = if m.tool.as_deref() == Some(tool) {
+                                "✓"
+                            } else {
+                                "✗"
+                            };
                             println!("    {} [{:6.2}]  {}", mark, r.score, m.id);
                         }
                     }
@@ -307,14 +357,19 @@ fn main() -> anyhow::Result<()> {
                 semantic: *sem.last().unwrap(),
                 pragmatic: *prag.last().unwrap(),
             };
-            let ranks = pf.scan_entries(&decode_entries, &probe, args.decode_threshold, args.top_k)?;
+            let ranks =
+                pf.scan_entries(&decode_entries, &probe, args.decode_threshold, args.top_k)?;
             println!("  [decode   thr={}]", args.decode_threshold);
             if ranks.is_empty() {
                 println!("    (no results above threshold)");
             } else {
                 for r in &ranks {
                     let m = &manifest.scenarios[r.turn_id as usize];
-                    let mark = if m.tool.as_deref() == Some(tool) { "✓" } else { "✗" };
+                    let mark = if m.tool.as_deref() == Some(tool) {
+                        "✓"
+                    } else {
+                        "✗"
+                    };
                     println!("    {} [{:6.2}]  {}", mark, r.score, m.id);
                 }
             }
@@ -325,36 +380,68 @@ fn main() -> anyhow::Result<()> {
 
     if has_prefill {
         println!("\n── Intra vs inter-tool score summary (prefill | decode) ─");
-        println!("{:<14} {:>10} {:>10} {:>8}  {:>10} {:>10} {:>8}",
-            "tool",
-            "pre-intra", "pre-inter", "pre-ratio",
-            "dec-intra", "dec-inter", "dec-ratio");
+        println!(
+            "{:<14} {:>10} {:>10} {:>8}  {:>10} {:>10} {:>8}",
+            "tool", "pre-intra", "pre-inter", "pre-ratio", "dec-intra", "dec-inter", "dec-ratio"
+        );
 
         for tool in &seen_tools {
             let ppf = prefill_pf.as_ref().unwrap();
             let (pre_intra, pre_inter) = intra_inter(
-                ppf, &manifest.scenarios, &prefill_entries, tool, args.prefill_threshold)?;
-            let (dec_intra, dec_inter) = intra_inter(
-                &pf, &manifest.scenarios, &decode_entries, tool, args.decode_threshold)?;
-            let pre_ratio = if pre_inter > 0.0 { pre_intra / pre_inter } else { f64::INFINITY };
-            let dec_ratio = if dec_inter > 0.0 { dec_intra / dec_inter } else { f64::INFINITY };
-            println!("{:<14} {:>10.3} {:>10.3} {:>8.2}  {:>10.3} {:>10.3} {:>8.2}",
+                ppf,
+                &manifest.scenarios,
+                &prefill_entries,
                 tool,
-                pre_intra, pre_inter, pre_ratio,
-                dec_intra, dec_inter, dec_ratio);
+                args.prefill_threshold,
+            )?;
+            let (dec_intra, dec_inter) = intra_inter(
+                &pf,
+                &manifest.scenarios,
+                &decode_entries,
+                tool,
+                args.decode_threshold,
+            )?;
+            let pre_ratio = if pre_inter > 0.0 {
+                pre_intra / pre_inter
+            } else {
+                f64::INFINITY
+            };
+            let dec_ratio = if dec_inter > 0.0 {
+                dec_intra / dec_inter
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "{:<14} {:>10.3} {:>10.3} {:>8.2}  {:>10.3} {:>10.3} {:>8.2}",
+                tool, pre_intra, pre_inter, pre_ratio, dec_intra, dec_inter, dec_ratio
+            );
         }
     } else {
         println!("\n── Intra vs inter-tool score summary ────────────────────");
-        println!("{:<14} {:>12} {:>12} {:>10}", "tool", "intra avg", "inter avg", "ratio");
+        println!(
+            "{:<14} {:>12} {:>12} {:>10}",
+            "tool", "intra avg", "inter avg", "ratio"
+        );
 
         for tool in &seen_tools {
             let (intra_avg, inter_avg) = intra_inter(
-                &pf, &manifest.scenarios, &decode_entries, tool, args.decode_threshold)?;
-            let ratio = if inter_avg > 0.0 { intra_avg / inter_avg } else { f64::INFINITY };
-            println!("{:<14} {:>12.3} {:>12.3} {:>10.2}", tool, intra_avg, inter_avg, ratio);
+                &pf,
+                &manifest.scenarios,
+                &decode_entries,
+                tool,
+                args.decode_threshold,
+            )?;
+            let ratio = if inter_avg > 0.0 {
+                intra_avg / inter_avg
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "{:<14} {:>12.3} {:>12.3} {:>10.2}",
+                tool, intra_avg, inter_avg, ratio
+            );
         }
     }
 
     Ok(())
 }
-

@@ -33,7 +33,10 @@ pub fn carve(source: &[u8]) -> Vec<Scope> {
         }
         // YAML top-level key: at column 0, ends with `:`.
         if !line.is_empty()
-            && line.chars().next().is_some_and(|c| !c.is_whitespace() && c != '#')
+            && line
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace() && c != '#')
         {
             if let Some(colon) = trimmed.find(':') {
                 let key = trimmed[..colon].trim();
@@ -178,10 +181,7 @@ mod tests {
     #[test]
     fn preamble_before_first_section() {
         let src = "# header comment\n# more\n\n[section]\nx = 1\n";
-        let scopes = verify_toml(
-            src,
-            &[("preamble", "# header"), ("section", "[section]")],
-        );
+        let scopes = verify_toml(src, &[("preamble", "# header"), ("section", "[section]")]);
         let preamble = find_scope(&scopes, "preamble").unwrap();
         assert_eq!(preamble.start_line, 1);
         assert_eq!(preamble.end_line, 3);
@@ -216,9 +216,7 @@ mod tests {
 
     #[test]
     fn preserves_array_of_tables() {
-        verify_cov_toml(
-            "[[fruits]]\nname = \"apple\"\n\n[[fruits]]\nname = \"banana\"\n",
-        );
+        verify_cov_toml("[[fruits]]\nname = \"apple\"\n\n[[fruits]]\nname = \"banana\"\n");
     }
 
     #[test]

@@ -36,11 +36,7 @@ pub trait InsertTurnSink {
     /// supplied `max_tokens` cap.  Returns the decoded text so the
     /// caller can inspect it; the summary's K/V lands on the
     /// sequence automatically as part of `finish_turn`.
-    fn decode_summary_turn(
-        &mut self,
-        user: &str,
-        max_tokens: usize,
-    ) -> anyhow::Result<String>;
+    fn decode_summary_turn(&mut self, user: &str, max_tokens: usize) -> anyhow::Result<String>;
 
     /// Restart-resume cache probe: whether some conversation in the
     /// substrate already carries `key == value` in its `custom` metadata
@@ -91,11 +87,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         result
     }
 
-    fn decode_summary_turn(
-        &mut self,
-        user: &str,
-        max_tokens: usize,
-    ) -> anyhow::Result<String> {
+    fn decode_summary_turn(&mut self, user: &str, max_tokens: usize) -> anyhow::Result<String> {
         let options = TurnOptions {
             max_tokens: Some(max_tokens),
             sampling: Some(SamplingConfig::argmax()),
@@ -143,7 +135,10 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                         "decode_summary_turn: Prefill event",
                     );
                 }
-                TurnEvent::PrefillProgress { tokens_done, tokens_total } => {
+                TurnEvent::PrefillProgress {
+                    tokens_done,
+                    tokens_total,
+                } => {
                     tracing::debug!(
                         target: "zend::turn_sink",
                         gap_ms = gap_ms,
@@ -179,9 +174,8 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
                 _ => {}
             }
         }
-        let resp = done.ok_or_else(|| {
-            anyhow::anyhow!("decode_summary_turn: scheduler closed without Done")
-        })?;
+        let resp = done
+            .ok_or_else(|| anyhow::anyhow!("decode_summary_turn: scheduler closed without Done"))?;
         let text = resp.text.clone();
 
         let finish_start = std::time::Instant::now();
@@ -248,11 +242,7 @@ impl InsertTurnSink for RecordingTurnSink {
         Ok(())
     }
 
-    fn decode_summary_turn(
-        &mut self,
-        user: &str,
-        _max_tokens: usize,
-    ) -> anyhow::Result<String> {
+    fn decode_summary_turn(&mut self, user: &str, _max_tokens: usize) -> anyhow::Result<String> {
         self.turns
             .push((user.to_string(), self.summary_stub.clone(), true));
         Ok(self.summary_stub.clone())

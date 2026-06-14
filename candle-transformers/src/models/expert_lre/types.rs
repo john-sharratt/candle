@@ -60,7 +60,9 @@ impl PipelineStats {
 
     /// Snapshot the current counters (clone under lock).
     pub fn snapshot(shared: &Arc<Mutex<Self>>) -> Self {
-        shared.lock().map_or_else(|_| Self::default(), |s| s.clone())
+        shared
+            .lock()
+            .map_or_else(|_| Self::default(), |s| s.clone())
     }
 
     /// Reset all counters to zero.

@@ -4,8 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::NotesError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
@@ -47,13 +47,19 @@ impl Tool for NotesList {
         let tags = req.tags.as_deref().unwrap_or(&[]);
         let max = req.max_results.unwrap_or(50) as usize;
         let (entries, total) = ctx.notes.list(prefix, tags, max);
-        let notes = entries.into_iter().map(|e| ListEntry {
-            key: e.key,
-            bytes: e.bytes,
-            tags: e.tags,
-            updated_at: e.updated_at,
-        }).collect();
-        Ok(ListResponse { notes, total_matches: total })
+        let notes = entries
+            .into_iter()
+            .map(|e| ListEntry {
+                key: e.key,
+                bytes: e.bytes,
+                tags: e.tags,
+                updated_at: e.updated_at,
+            })
+            .collect();
+        Ok(ListResponse {
+            notes,
+            total_matches: total,
+        })
     }
 }
 

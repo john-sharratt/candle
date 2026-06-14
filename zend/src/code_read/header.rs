@@ -94,12 +94,7 @@ pub fn render_tool_call(path: &str, scope: &Scope) -> String {
 /// numbers — appended after [`render_tool_call`] to form the part
 /// turn's assistant message.  `body` is the verbatim source slice for
 /// `scope.start_line..=scope.end_line`.
-pub fn render_tool_response(
-    path: &str,
-    scope: &Scope,
-    language: Language,
-    body: &str,
-) -> String {
+pub fn render_tool_response(path: &str, scope: &Scope, language: Language, body: &str) -> String {
     let max_line = scope.end_line;
     let width = digit_width(max_line);
     let mut numbered = String::with_capacity(body.len() + (max_line as usize) * (width + 4));

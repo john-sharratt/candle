@@ -2197,12 +2197,8 @@ fn zend_projection_yaml_parses() {
     use candle_transformers::models::dialect::Dialect;
     let yaml = include_str!("../../../zend/src/prompts/projection.yaml");
     let dlct = Dialect::chat_ml();
-    let b = Builder::from_yaml_with_vars_and_dialect(
-        yaml,
-        &[("workspace", "candle")],
-        Some(&dlct),
-    )
-    .expect("zend projection.yaml must parse");
+    let b = Builder::from_yaml_with_vars_and_dialect(yaml, &[("workspace", "candle")], Some(&dlct))
+        .expect("zend projection.yaml must parse");
 
     let expected_layers = [
         "repo_map",

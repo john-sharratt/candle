@@ -209,9 +209,8 @@ impl PinnedPool {
 impl Drop for PinnedPool {
     fn drop(&mut self) {
         if !self.base.is_null() {
-            let result = unsafe {
-                cudarc::driver::sys::cuMemFreeHost(self.base as *mut std::ffi::c_void)
-            };
+            let result =
+                unsafe { cudarc::driver::sys::cuMemFreeHost(self.base as *mut std::ffi::c_void) };
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 tracing::warn!("PinnedPool: cuMemFreeHost failed: {:?}", result);
             }

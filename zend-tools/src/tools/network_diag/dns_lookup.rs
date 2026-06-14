@@ -6,8 +6,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use crate::{RegisteredTool, Tool, ToolContext};
 use super::DiagError;
+use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DnsRequest {
@@ -48,29 +48,42 @@ impl Tool for DnsLookup {
             "A" | "AAAA" => {
                 let ips = dns_lookup::lookup_host(&req.host)
                     .map_err(|e| DiagError::HostNotFound(format!("{}: {}", req.host, e)))?;
-                let records: Vec<String> = ips.into_iter()
+                let records: Vec<String> = ips
+                    .into_iter()
                     .filter(|ip| {
-                        if record_type == "A" { ip.is_ipv4() }
-                        else { ip.is_ipv6() }
+                        if record_type == "A" {
+                            ip.is_ipv4()
+                        } else {
+                            ip.is_ipv6()
+                        }
                     })
                     .map(|ip| ip.to_string())
                     .collect();
-                Ok(DnsResponse { host: req.host, record_type, records })
-            }
-            "PTR" => {
-                let ip: IpAddr = req.host.parse()
-                    .map_err(|_| DiagError::HostNotFound(format!("{} is not an IP address", req.host)))?;
-                let name = dns_lookup::lookup_addr(&ip)
-                    .map_err(|e| DiagError::HostNotFound(e.to_string()))?;
-                Ok(DnsResponse { host: req.host, record_type, records: vec![name] })
-            }
-            other => {
                 Ok(DnsResponse {
                     host: req.host,
-                    record_type: other.to_string(),
-                    records: vec!["not_supported: Only A/AAAA/PTR lookups supported via OS resolver".to_string()],
+                    record_type,
+                    records,
                 })
             }
+            "PTR" => {
+                let ip: IpAddr = req.host.parse().map_err(|_| {
+                    DiagError::HostNotFound(format!("{} is not an IP address", req.host))
+                })?;
+                let name = dns_lookup::lookup_addr(&ip)
+                    .map_err(|e| DiagError::HostNotFound(e.to_string()))?;
+                Ok(DnsResponse {
+                    host: req.host,
+                    record_type,
+                    records: vec![name],
+                })
+            }
+            other => Ok(DnsResponse {
+                host: req.host,
+                record_type: other.to_string(),
+                records: vec![
+                    "not_supported: Only A/AAAA/PTR lookups supported via OS resolver".to_string(),
+                ],
+            }),
         }
     }
 }

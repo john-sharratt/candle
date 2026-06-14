@@ -115,9 +115,7 @@ impl SystemPromptSchema {
     /// that existing approximation.
     pub fn is_collection_member(&self, section_id: super::ids::SectionId) -> bool {
         self.items.iter().any(|it| match it {
-            SystemPromptItem::Collection(c) => {
-                c.sections.iter().any(|s| s.id == section_id)
-            }
+            SystemPromptItem::Collection(c) => c.sections.iter().any(|s| s.id == section_id),
             _ => false,
         })
     }
