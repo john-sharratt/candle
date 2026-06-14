@@ -22,7 +22,8 @@ use candle_kernels::simple::quantized::{
 // Import the new quantized matmul dispatcher
 // K/128 blocks have embedded scales, no external scale extraction needed.
 use candle_kernels::quantized::{
-    dispatch_info, flush_l2_cache, run_quantized_matmul, VxSegment, YType,
+    dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_quantized_matmul, VxSegment,
+    YType,
 };
 
 // Import GEMX repacking dispatcher
@@ -3809,6 +3810,11 @@ pub fn grouped_matmul_gemx(
     if num_experts == 0 {
         crate::bail!("grouped_matmul_gemx: no experts provided");
     }
+    // The grouped kernel writes full 32-row (N_TILE) blocks with no partial-row
+    // guard, so nrows must be a multiple of 32 (all MoE expert dims are).
+    if nrows % 32 != 0 {
+        crate::bail!("grouped_matmul_gemx: nrows={nrows} must be a multiple of 32");
+    }
     if expert_offsets.len() != num_experts + 1 {
         crate::bail!(
             "grouped_matmul_gemx: expert_offsets.len() = {} but expected {} (num_experts + 1)",
@@ -3875,24 +3881,60 @@ pub fn grouped_matmul_gemx(
         YType::F32 => OutputSlice::F32(unsafe { device.alloc::<f32>(nrows * total_batch)? }),
     };
 
-    // Segmented dispatch: build VxSegment array (one per expert), single call.
-    // No device table allocation, no memcpy â€” segment descriptors are host-side.
+    // Grouped dispatch: split each expert's [offset..offset+cnt) batch range into
+    // <=16-token MMA tiles, then run ALL experts in ONE kernel launch. The kernel
+    // grid (num_tiles x row_tiles) spans every expert at once, so both the launch
+    // count (N -> 1 per projection) and per-expert occupancy are fixed together.
+    let mut tile_expert: Vec<i32> = Vec::new();
+    let mut tile_b_start: Vec<i32> = Vec::new();
+    let mut tile_b_cnt: Vec<i32> = Vec::new();
+    for e in 0..num_experts {
+        let mut s = expert_offsets[e];
+        let end = expert_offsets[e + 1];
+        while s < end {
+            let cnt = (end - s).min(16);
+            tile_expert.push(e as i32);
+            tile_b_start.push(s);
+            tile_b_cnt.push(cnt);
+            s += cnt;
+        }
+    }
+    let num_tiles = tile_expert.len();
+
     {
         let stream = device.cuda_stream();
 
-        // Build VxSegment array: one entry per expert
-        let segments: Vec<VxSegment> = (0..num_experts)
-            .map(|e| {
-                let expert_batch = expert_offsets[e + 1] - expert_offsets[e];
-                VxSegment {
-                    weights: weight_ptrs[e] as *const std::ffi::c_void,
-                    batch_count: expert_batch,
-                }
-            })
-            .collect();
+        // Pack the weight-pointer array + all 3 i32 tile tables into ONE buffer
+        // and upload with a SINGLE memcpy — 4 tiny H2D copies collapse to 1,
+        // which is where most of the per-call dispatch overhead lives at small
+        // token counts. weight_ptrs (u64) go first (8-aligned at the cudaMalloc
+        // base); the three i32 tables follow at 4-aligned offsets. The kernel
+        // reads each table via base + offset.
+        let off_te = num_experts * 8;
+        let off_tbs = off_te + num_tiles * 4;
+        let off_tbc = off_tbs + num_tiles * 4;
+        let total_bytes = off_tbc + num_tiles * 4;
+        let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+        for &w in weight_ptrs {
+            packed.extend_from_slice(&w.to_le_bytes());
+        }
+        for &x in &tile_expert {
+            packed.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &tile_b_start {
+            packed.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &tile_b_cnt {
+            packed.extend_from_slice(&x.to_le_bytes());
+        }
+        let tables_dev = device.memcpy_stod(&packed)?;
+        let (base, _tg) = tables_dev.device_ptr(&stream);
+        let wptr_ptr = base;
+        let te_ptr = base + off_te as u64;
+        let tbs_ptr = base + off_tbs as u64;
+        let tbc_ptr = base + off_tbc as u64;
 
-        // Helper macro to extract pointers and call run_quantized_matmul
-        macro_rules! dispatch_segments {
+        macro_rules! dispatch_grouped {
             ($y_data:expr, $dst:expr) => {{
                 let y_view = match act_layout.contiguous_offsets() {
                     Some((o1, o2)) => $y_data.slice(o1..o2),
@@ -3906,18 +3948,20 @@ pub fn grouped_matmul_gemx(
                 let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
                 let (dst_ptr, _dst_guard) = $dst.device_ptr(&stream);
                 unsafe {
-                    run_quantized_matmul(
-                        segments.as_ptr(),
-                        num_experts as i32,
+                    run_grouped_quantized_matmul(
+                        wptr_ptr as *const std::ffi::c_void,
+                        te_ptr as *const std::ffi::c_void,
+                        tbs_ptr as *const std::ffi::c_void,
+                        tbc_ptr as *const std::ffi::c_void,
                         y_ptr as *const std::ffi::c_void,
                         dst_ptr as *mut std::ffi::c_void,
-                        ncols as i32,
-                        nrows as i32,
-                        k as i32,
-                        nrows as i32,
+                        k as i32,     // ncols_x = K
+                        nrows as i32, // nrows_x = N
+                        k as i32,     // y_stride = K (stacked activations)
+                        nrows as i32, // dst_stride = N (stacked output)
+                        num_tiles as i32,
                         qtype,
                         ytype as i32,
-                        0, // weight_bytes: 0 â†’ assume L2-cached (small expert weights)
                     );
                 }
             }};
@@ -3925,13 +3969,13 @@ pub fn grouped_matmul_gemx(
 
         match (&activations.slice, &dst_slice) {
             (CudaStorageSlice::F16(y_data), OutputSlice::F16(dst)) => {
-                dispatch_segments!(y_data, dst);
+                dispatch_grouped!(y_data, dst);
             }
             (CudaStorageSlice::BF16(y_data), OutputSlice::BF16(dst)) => {
-                dispatch_segments!(y_data, dst);
+                dispatch_grouped!(y_data, dst);
             }
             (CudaStorageSlice::F32(y_data), OutputSlice::F32(dst)) => {
-                dispatch_segments!(y_data, dst);
+                dispatch_grouped!(y_data, dst);
             }
             _ => unreachable!("ytype and activation slice should match"),
         }

@@ -6,27 +6,28 @@
 //!
 //! ## Eviction policy
 //!
-//! See the module-level docs in [`super`] for the full policy description.
-//! In brief:
+//! Frequency-dominated, layer-aware, with pinning.  In brief:
 //!
-//! 1. **End-of-pass batch eviction** — after the last MoE layer, evict
-//!    the lowest-scored occupied slots.
-//! 2. **Layer-aware forced eviction** — prefer evicting behind-layer
-//!    experts with low scores, then fall back to global score-based.
-//! 3. **Early-layer pinning** — first [`PINNED_LAYERS`] layers are
-//!    never evicted.
+//! 1. **End-of-pass batch eviction** — after the last MoE layer, evict the
+//!    lowest-scored occupied slots to create free headroom for the next pass.
+//! 2. **Layer-aware forced eviction** — on a miss with no free slot, prefer
+//!    evicting a low-scored expert from a layer already executed this pass
+//!    (behind the wave, so it can never cascade), then fall back to the global
+//!    lowest-scored victim.
+//! 3. **Early-layer pinning** — the first [`PINNED_LAYERS`] layers are never
+//!    evicted (they run first every pass with no compute to hide a reload).
 //! 4. **Free-slot-only prefetch** — speculative prefetch never evicts
 //!    (enforced by the pipeline, not this module).
 //!
 //! ## Score table
 //!
-//! A flat `Vec<f32>` indexed by `layer * experts_per_layer + expert`.
+//! A flat `Vec<f32>` indexed by `layer * experts_per_layer + expert` records a
+//! lightly-decayed access frequency: higher = more valuable = evicted last.
 //! Updated by pipeline events:
 //!
 //! - **Cache hit**: +1.0
-//! - **Prediction hit**: +0.3 (speculative load that was actually needed)
-//! - **Anti-prediction**: −0.2 (bottom-N from transition matrix, clamped ≥ 0)
-//! - **End-of-pass decay**: ×0.85 (exponential forgetting)
+//! - **Prediction hit**: +0.3 (a speculative load the layer actually routed to)
+//! - **End-of-pass decay**: ×0.85 (recency-weighting of the frequency)
 
 use super::types::ExpertSlot;
 use candle::Result;
@@ -73,7 +74,7 @@ pub struct ExpertCacheInner {
 
     // ── Score-based eviction state ──
     /// Flat score table: `expert_scores[layer * experts_per_layer + expert]`.
-    /// Higher score = more valuable = evicted last.
+    /// A lightly-decayed access frequency — higher = more valuable = evicted last.
     pub(crate) expert_scores: Vec<f32>,
     /// Number of MoE layers (e.g. 48).
     pub(crate) num_moe_layers: usize,
@@ -153,13 +154,6 @@ impl ExpertCacheInner {
         self.expert_scores[idx] += 0.3;
     }
 
-    /// Anti-prediction penalty: −0.2, clamped at 0.0.
-    #[inline]
-    pub(crate) fn record_anti_prediction(&mut self, layer: usize, expert: usize) {
-        let idx = self.score_idx(layer, expert);
-        self.expert_scores[idx] = (self.expert_scores[idx] - 0.2).max(0.0);
-    }
-
     /// End-of-pass exponential decay: multiply all scores by `factor` (e.g. 0.85).
     pub(crate) fn decay_scores(&mut self, factor: f32) {
         for s in self.expert_scores.iter_mut() {
@@ -169,6 +163,12 @@ impl ExpertCacheInner {
 
     /// Combined eviction score for a slot: `base_score × position_factor`.
     /// Lower = more likely to be evicted.
+    ///
+    /// `base_score` is the lightly-decayed access frequency — the dominant term,
+    /// so frequently-reused experts stay resident (the cache is effectively LFU
+    /// with a recency decay).  `position_factor` is a mild multiplier in
+    /// `[0.5, 1.0]` that rises with reuse distance, gently preferring to evict
+    /// experts whose next use is sooner among equally-cold candidates.
     #[inline]
     fn slot_eviction_score(&self, slot_idx: usize, current_layer: usize) -> f32 {
         if let Some(&(layer, expert)) = self.slot_to_key[slot_idx].as_ref() {
@@ -194,7 +194,7 @@ impl ExpertCacheInner {
     /// 2. **Behind-layer bias** — prefer evicting experts from layers that
     ///    have already executed in this pass (`PINNED_LAYERS <= layer < current_layer`).
     ///    Among those, pick the one with the lowest `slot_eviction_score`
-    ///    (score × position_factor), with recency as tie-breaker.
+    ///    (frequency × position factor), with recency as tie-breaker.
     /// 3. **Global score-based fallback** — if no behind-layer candidate exists
     ///    (e.g. early in the pass), fall back to the global lowest-score victim,
     ///    but still never evict pinned layers (0..PINNED_LAYERS-1).
@@ -268,9 +268,9 @@ impl ExpertCacheInner {
     /// available for both real misses and speculative prefetch without
     /// any eviction during the pass.
     ///
-    /// Uses `slot_eviction_score` (base_score × position_factor) at
-    /// `current_layer = 0` (start of next pass) so that behind-layer
-    /// experts from the end of the previous pass get lower priority.
+    /// Uses `slot_eviction_score` (frequency × position factor) at
+    /// `current_layer = 0` (start of next pass) so that behind-layer experts
+    /// from the end of the previous pass get lower priority.
     ///
     /// Respects pinning: experts in layers 0..PINNED_LAYERS-1 are never
     /// evicted.
@@ -338,5 +338,110 @@ impl ExpertCacheInner {
         self.key_to_slot.insert((moe_idx, expert_idx), slot_idx);
         self.slot_to_key[slot_idx] = Some((moe_idx, expert_idx));
         self.promote(slot_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mark a slot occupied by `(layer, expert)` without a real `ExpertSlot`
+    /// (eviction selection reads only the bookkeeping tables, never the VRAM
+    /// buffers), so the policy can be exercised with no GPU or model load.
+    fn occupy(
+        inner: &mut ExpertCacheInner,
+        slot: usize,
+        layer: usize,
+        expert: usize,
+        last_used: u32,
+        freq: f32,
+    ) {
+        inner.free_slots.retain(|&s| s != slot);
+        inner.slot_to_key[slot] = Some((layer, expert));
+        inner.key_to_slot.insert((layer, expert), slot);
+        inner.last_used[slot] = last_used;
+        inner.expert_scores[layer * inner.experts_per_layer + expert] = freq;
+    }
+
+    #[test]
+    fn forced_eviction_targets_lowest_frequency() {
+        // Four behind-the-wave experts at the same layer; the least-frequently
+        // used (lowest score) is evicted, keeping the hot experts resident.
+        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        occupy(&mut inner, 0, 10, 100, 1, 8.0);
+        occupy(&mut inner, 1, 10, 101, 2, 3.0);
+        occupy(&mut inner, 2, 10, 102, 3, 0.5); // coldest
+        occupy(&mut inner, 3, 10, 103, 4, 5.0);
+        assert!(inner.free_slots.is_empty());
+
+        let (slot, evicted_key, _) = inner.allocate_slot(20).unwrap();
+        assert_eq!(evicted_key, Some((10, 102)));
+        assert_eq!(slot, 2);
+    }
+
+    #[test]
+    fn end_of_pass_evicts_lowest_scored() {
+        // End-of-pass drops the lowest-scored non-pinned slot and keeps the hot
+        // ones; pinned layers are never considered.
+        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        occupy(&mut inner, 0, 1, 100, 1, 0.1); // pinned (layer < PINNED_LAYERS)
+        occupy(&mut inner, 1, 10, 101, 2, 5.0);
+        occupy(&mut inner, 2, 20, 102, 3, 0.2); // coldest non-pinned
+        occupy(&mut inner, 3, 30, 103, 4, 4.0);
+
+        let _ = inner.end_of_pass_eviction(0.1); // ceil(3 × 0.1) = 1 of 3 non-pinned
+        assert!(
+            !inner.key_to_slot.contains_key(&(20, 102)),
+            "coldest non-pinned expert not evicted"
+        );
+        assert!(inner.key_to_slot.contains_key(&(10, 101)));
+        assert!(inner.key_to_slot.contains_key(&(30, 103)));
+        assert!(
+            inner.key_to_slot.contains_key(&(1, 100)),
+            "pinned layer was evicted"
+        );
+    }
+
+    #[test]
+    fn pinned_layers_never_evicted() {
+        let mut inner = ExpertCacheInner::new(3, 48, 128);
+        occupy(&mut inner, 0, 0, 100, 1, 0.0);
+        occupy(&mut inner, 1, 1, 101, 2, 0.0);
+        occupy(&mut inner, 2, 2, 102, 3, 0.0);
+        // Every resident expert is pinned → no legal victim → error.
+        assert!(inner.allocate_slot(5).is_err());
+    }
+
+    #[test]
+    fn hot_expert_survives_a_cold_one() {
+        // Same layer (same position factor): the frequently-used expert is kept
+        // and the cold one evicted — the cache is frequency-dominated.
+        let mut inner = ExpertCacheInner::new(2, 48, 128);
+        occupy(&mut inner, 0, 10, 50, 9, 9.0);
+        occupy(&mut inner, 1, 10, 51, 1, 0.0);
+
+        let (_, evicted_key, _) = inner.allocate_slot(20).unwrap();
+        assert_eq!(
+            evicted_key,
+            Some((10, 51)),
+            "cold expert was not evicted in preference to the hot one"
+        );
+    }
+
+    #[test]
+    fn behind_layer_preferred_over_ahead() {
+        // A (hot) expert behind the wave is still evicted in preference to a
+        // (cold) one ahead of it — never drop an expert not yet executed this
+        // pass, so eviction can never cascade into later layers.
+        let mut inner = ExpertCacheInner::new(2, 48, 128);
+        occupy(&mut inner, 0, 10, 50, 5, 5.0); // behind, hot
+        occupy(&mut inner, 1, 30, 51, 0, 0.0); // ahead, cold
+
+        let (_, evicted_key, _) = inner.allocate_slot(20).unwrap();
+        assert_eq!(
+            evicted_key,
+            Some((10, 50)),
+            "evicted an expert that is still ahead of the wave"
+        );
     }
 }

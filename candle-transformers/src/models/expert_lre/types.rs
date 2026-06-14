@@ -40,6 +40,12 @@ pub struct PipelineStats {
     pub prefetch_loads: usize,
     /// Hint-driven speculative loads.
     pub hint_loads: usize,
+    /// Speculatively loaded experts that the layer actually routed to.
+    /// Numerator of prediction precision.
+    pub predicted_hits: usize,
+    /// Total speculatively loaded experts evaluated against actual routing.
+    /// Denominator of prediction precision.
+    pub predicted_total: usize,
     /// Number of times `fence_wait` blocked (non-zero wait).
     pub fence_stalls: usize,
     /// Total MoE work requests processed.
@@ -73,6 +79,18 @@ impl PipelineStats {
             100.0
         } else {
             (self.expert_hits as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Prediction precision as a percentage (0.0–100.0): of all
+    /// speculatively loaded experts, the fraction the layer actually routed
+    /// to.  This isolates the transition-matrix predictor's quality from the
+    /// overall cache hit rate.  Returns 0.0 when no speculative loads occurred.
+    pub fn prediction_precision(&self) -> f64 {
+        if self.predicted_total == 0 {
+            0.0
+        } else {
+            (self.predicted_hits as f64 / self.predicted_total as f64) * 100.0
         }
     }
 }

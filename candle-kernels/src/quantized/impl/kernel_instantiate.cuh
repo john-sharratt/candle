@@ -23,9 +23,11 @@
 // =============================================================================
 
 // =============================================================================
-// REGISTER-ONLY KERNELS (memory-bound, batch 1-8)
-// No TC variants - at small batch, memory bandwidth is the bottleneck,
-// tensor cores provide no benefit over CUDA cores.
+// REGISTER-ONLY GEMV KERNELS (batch 1-8) — pre-SM80 fallback only
+// These CUDA-core kernels are NOT used on tensor-core hardware: benchmarking
+// found the TC kernels (tc16_N) faster than the GEMV path in every measured
+// case, even single-token decode. On SM80+ the dispatcher routes all batch
+// sizes to tensor cores; these remain solely for GPUs without tensor cores.
 // =============================================================================
 
 // Single-batch specialist (BATCH_TILE=1)
@@ -341,6 +343,25 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC32 name##_tc32_##N( \
         vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst, batch_size, row_groups); \
 }
 
+// =============================================================================
+// GROUPED KERNEL - all MoE experts in one launch (grid = total_tiles × row_tiles)
+// =============================================================================
+// Single launch over a device-side (tile → expert, batch-slice) table; collapses
+// the per-expert segment loop into one kernel that also fills the SMs across
+// experts. See grouped_tc::quantized_matmul_grouped_entry in kernel.cuh.
+#define INSTANTIATE_KERNEL_GROUPED(name, qk, qi, block_type, vdr, act_t, dst_t) \
+extern "C" __global__ void LAUNCH_BOUNDS_TC16 name##_grouped( \
+    const uint64_t* __restrict__ weight_ptrs, \
+    const int* __restrict__ tile_expert, \
+    const int* __restrict__ tile_b_start, \
+    const int* __restrict__ tile_b_cnt, \
+    const act_t* __restrict__ vy, dst_t* __restrict__ dst, \
+    const int ncols_x, const int nrows_x, const int y_stride, const int dst_stride) { \
+    grouped_tc::quantized_matmul_grouped_entry<qk, qi, block_type, vdr, act_t, dst_t>( \
+        weight_ptrs, tile_expert, tile_b_start, tile_b_cnt, \
+        vy, dst, ncols_x, nrows_x, y_stride, dst_stride); \
+}
+
 // Generate all 16 TC32 kernels (tc32_0 through tc32_15)
 #define INSTANTIATE_KERNEL_TC32(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_TC32_N(name, qk, qi, block_type, vdr, act_t, dst_t, 0) \
@@ -377,6 +398,7 @@ extern "C" __global__ void LAUNCH_BOUNDS_TC32 name##_tc32_##N( \
     INSTANTIATE_KERNEL_S8(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_TC16(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_TC32(name, qk, qi, block_type, vdr, act_t, dst_t) \
+    INSTANTIATE_KERNEL_GROUPED(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_S2_ITER2(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_S2_ITER3(name, qk, qi, block_type, vdr, act_t, dst_t) \
     INSTANTIATE_KERNEL_S2_ITER4(name, qk, qi, block_type, vdr, act_t, dst_t) \

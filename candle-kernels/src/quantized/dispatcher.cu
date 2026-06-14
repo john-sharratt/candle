@@ -11,22 +11,20 @@
 // Tensor core usage is determined automatically from SM version:
 //   - SM80+ (Ampere/Ada): TC enabled for F16/BF16/F32
 //
-// Dispatch paths:
-//   - GEMV path (batch < 3): s1/s2 kernels
-//   - TC16 path (batch 3-31): tc16_N kernels with internal tiling
-//   - TC32 path (batch 32+): tc32_N kernels with greedy decomposition
+// Dispatch paths (SM80+):
+//   - TC16 path (batch 1-31): tc16_N kernels with internal tiling
+//   - TC32 path (batch 32+):  tc32_N kernels with greedy decomposition
 //
-// Uses greedy batch decomposition for 100% efficiency:
-//   batch = (n_s8 × 8) + remainder (0-7)
-//   Remainder handled by exact-fit kernels: s7, s6, s5, s4, s3, s2, s1
-//   At most 2 kernel launches for any batch size < 16.
+// Tensor cores are used for ALL batch sizes >= 1, including batch 1-2.
+// Benchmarking found the TC kernels faster than the CUDA-core GEMV (s1..s8)
+// kernels in every measured case — even single-token decode — so there is no
+// CUDA-core fast path on TC-capable hardware. The s1..s8 GEMV kernels remain
+// only as the fallback for pre-SM80 GPUs without tensor cores.
 //
-// Example for batch=11:
-//   - _s8: batches 0-7 (1×8)
-//   - _s3: batches 8-10 (1×3)
-//
-// Example for batch=7:
-//   - _s7: batches 0-6 (1×7) - single kernel launch!
+// At small batch a single weight's TC grid under-fills the SMs. For MoE the
+// grouped path (run_grouped_quantized_matmul) fixes this by running all experts
+// in one launch so their tiles together fill the machine; the per-weight path
+// here just accepts the lower occupancy.
 // =============================================================================
 
 #include <cuda.h>
@@ -675,17 +673,17 @@ inline void launch_tc16(
     // Use compute_grid_config for unified grid sizing logic
     // TILE_BATCH=16 for tc16 kernels
     GridConfig cfg = compute_grid_config(row_tiles, total_batch_tiles, 16, ncols_x);
-    
+
     dim3 block(WARP_SIZE, 4, 1);  // 32 threads/warp × 4 warps = 128 threads
-    
+
     // Pass hierarchical params to kernel for decode
-    void* args[] = { 
+    void* args[] = {
         (void*)&vx, (void*)&vy, (void*)&dst,
-        (void*)&ncols_x, (void*)&nrows_x, (void*)&nrows_y, 
+        (void*)&ncols_x, (void*)&nrows_x, (void*)&nrows_y,
         (void*)&nrows_dst, (void*)&batch_size,
         (void*)&cfg.row_groups  // For z-decode: row_group = z % row_groups
     };
-    
+
     cudaLaunchKernel(kernel_fn, cfg.grid, block, args, 0, nullptr);
 }
 
@@ -819,10 +817,12 @@ inline void launch_kernel_by_type(
 // qtype: 0=Q4_0, 1=Q4_1, 2=Q5_0, 3=Q5_1, 4=Q8_0, 5=Q2_K, 6=Q3_K, 7=Q4_K, 8=Q5_K, 9=Q6_K
 // ytype: 0=F16, 1=BF16, 2=F32
 //
-// Dispatch flow:
-// 1. TC path for batch 3+ using tc16/tc32 kernels
-// 2. GEMV path for batch 1-2
-// 3. Bulk reduction for batch >= 64 using workhorse kernels
+// Dispatch flow (SM80+):
+// 1. TC path for ALL batch >= 1 (tc16 for 1-31, tc32 for 32+). TC beat the
+//    CUDA-core GEMV kernels in every measured case, batch 1-2 included.
+// 2. CUDA-core GEMV (s1..s8) only on pre-SM80 GPUs without tensor cores.
+// (MoE callers should prefer run_grouped_quantized_matmul, which fuses all
+//  experts into one launch instead of looping this per-expert.)
 
 // Segment descriptor: one per expert (MoE) or one total (non-MoE)
 typedef struct {
@@ -1060,6 +1060,91 @@ extern "C" void run_quantized_matmul(
         
         batch_offset += seg_batch;
     }
+}
+
+// =============================================================================
+// GROUPED MATMUL — all MoE experts in a single launch
+// =============================================================================
+// One kernel over a device-side (tile → expert, batch-slice) table. Collapses
+// the per-expert segment loop above into a single cudaLaunchKernel whose grid
+// (total_tiles × row_tiles) spans all experts at once, fixing both the launch
+// count and the per-expert occupancy starvation. The tile tables + weight
+// pointer array are built and uploaded by the caller (candle-core).
+
+#define DECLARE_GROUPED(name) \
+    extern "C" __global__ void name##_grouped( \
+        const void*, const void*, const void*, const void*, \
+        const void*, void*, int, int, int, int);
+#define DECLARE_GROUPED3(base) \
+    DECLARE_GROUPED(base##_f16) DECLARE_GROUPED(base##_bf16) DECLARE_GROUPED(base##_f32)
+
+DECLARE_GROUPED3(q4_0)  DECLARE_GROUPED3(q4_1)  DECLARE_GROUPED3(q5_0)
+DECLARE_GROUPED3(q5_1)  DECLARE_GROUPED3(q8_0)  DECLARE_GROUPED3(q2_K)
+DECLARE_GROUPED3(q3_k)  DECLARE_GROUPED3(q4_k)  DECLARE_GROUPED3(q5_k)
+DECLARE_GROUPED3(q6_k)  DECLARE_GROUPED3(q8_1)  DECLARE_GROUPED3(q8_k)
+DECLARE_GROUPED3(q_awq) DECLARE_GROUPED3(q_awq_g64)
+
+#undef DECLARE_GROUPED3
+#undef DECLARE_GROUPED
+
+#define GROUPED_ROW(base) \
+    { (void*)base##_f16_grouped, (void*)base##_bf16_grouped, (void*)base##_f32_grouped }
+
+// [qtype_kernel_row][ytype] — same ordering as the kernels[14][3] table above.
+static void* grouped_kernels[14][3] = {
+    GROUPED_ROW(q4_0),  GROUPED_ROW(q4_1),  GROUPED_ROW(q5_0),  GROUPED_ROW(q5_1),
+    GROUPED_ROW(q8_0),  GROUPED_ROW(q2_K),  GROUPED_ROW(q3_k),  GROUPED_ROW(q4_k),
+    GROUPED_ROW(q5_k),  GROUPED_ROW(q6_k),  GROUPED_ROW(q8_1),  GROUPED_ROW(q8_k),
+    GROUPED_ROW(q_awq), GROUPED_ROW(q_awq_g64),
+};
+
+#undef GROUPED_ROW
+
+/// Single-launch grouped matmul over all expert tiles.
+///
+/// All pointer arguments are DEVICE pointers, prepared by the caller:
+/// - weight_ptrs:  uint64_t[num_experts] — each expert's K/128 weight pointer
+/// - tile_expert:  int[num_tiles] — owning expert id per tile
+/// - tile_b_start: int[num_tiles] — stacked-batch start row per tile
+/// - tile_b_cnt:   int[num_tiles] — tokens in the tile (1..16)
+/// - vy:           stacked activations [total_batch, K]
+/// - dst:          stacked output [total_batch, N]
+///
+/// ncols_x = K, nrows_x = N, y_stride = K, dst_stride = N.
+extern "C" void run_grouped_quantized_matmul(
+    const void* weight_ptrs,
+    const void* tile_expert,
+    const void* tile_b_start,
+    const void* tile_b_cnt,
+    const void* vy,
+    void* dst,
+    int32_t ncols_x,
+    int32_t nrows_x,
+    int32_t y_stride,
+    int32_t dst_stride,
+    int32_t num_tiles,
+    int32_t qtype,
+    int32_t ytype)
+{
+    int kernel_row = qtype_to_matmul_kernel_index(qtype);
+    if (kernel_row < 0 || ytype < 0 || ytype > 2 || num_tiles <= 0) {
+        return;
+    }
+    void* kfn = grouped_kernels[kernel_row][ytype];
+    if (kfn == nullptr) {
+        return;
+    }
+
+    const int row_tiles = (nrows_x + 31) / 32;  // N_TILE = 32
+    dim3 grid(num_tiles, row_tiles, 1);
+    dim3 block(WARP_SIZE, 4, 1);  // 128 threads (4 warps × 32)
+
+    void* args[] = {
+        (void*)&weight_ptrs, (void*)&tile_expert, (void*)&tile_b_start, (void*)&tile_b_cnt,
+        (void*)&vy, (void*)&dst,
+        (void*)&ncols_x, (void*)&nrows_x, (void*)&y_stride, (void*)&dst_stride,
+    };
+    cudaLaunchKernel(kfn, grid, block, args, 0, nullptr);
 }
 
 // =============================================================================

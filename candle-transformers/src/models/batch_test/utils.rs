@@ -54,6 +54,17 @@ pub struct TestParams {
     pub suppress_thinking: bool,
     pub prompt_system: String, // System prompt text
     pub prompt_user: String,   // User prompt text
+    /// Optional per-config user-prompt overrides, indexed by config position.
+    /// A non-empty entry at index `n` replaces `prompt_user` for the n-th
+    /// config in `run()`.  Empty string or missing index keeps `prompt_user`.
+    /// Used by the routing-trace capture to drive diverse prompts through a
+    /// single model load.
+    pub per_config_prompts: Vec<String>,
+    /// Token IDs that end generation early when sampled (e.g. EOS).  Empty =
+    /// always generate the full `generate_token_count` (benchmark behaviour).
+    /// When set, the batched generate loop stops once every session has emitted
+    /// a stop token.  Used by capture to avoid post-EOS degenerate routing.
+    pub stop_on_eos: Vec<u32>,
     pub names: Vec<String>,
     pub generate_token_count: usize, // Number of tokens to generate in generate phase
     pub tokenizer: Tokenizer,        // Tokenizer for text-to-token conversion
@@ -90,6 +101,8 @@ impl TestParams {
             prompt_user: include_str!("story.md")
                 .replace("\r\n", "\n")
                 .replace("\r", "\n"),
+            per_config_prompts: Vec::new(),
+            stop_on_eos: Vec::new(),
             names: include_str!("names.md")
                 .lines()
                 .map(|s| s.to_string())
@@ -133,6 +146,20 @@ impl TestParams {
     /// For larger models or slower hardware, increase this value.
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Provide per-config user-prompt overrides (indexed by config position).
+    /// A non-empty entry replaces `prompt_user` for that config in `run()`.
+    pub fn with_per_config_prompts(mut self, prompts: Vec<String>) -> Self {
+        self.per_config_prompts = prompts;
+        self
+    }
+
+    /// Stop batched generation early once every session emits one of these
+    /// token IDs (e.g. EOS).  Empty keeps the fixed-length benchmark behaviour.
+    pub fn with_stop_on_eos(mut self, tokens: Vec<u32>) -> Self {
+        self.stop_on_eos = tokens;
         self
     }
 
@@ -406,7 +433,7 @@ impl TestParams {
     /// * `sequential` - Callbacks for non-batched mode (individual caches per sequence)
     /// * `model` - The model implementing ManagedBatchedModel for batched mode
     pub fn run<C, F, S, M>(
-        self,
+        mut self,
         configs: Vec<TestConfig>,
         load_model: impl Fn() -> Result<M>,
         mut sequential: SequentialCallbacks<C, F, S>,
@@ -457,8 +484,19 @@ impl TestParams {
         let model_bytes = free_before.saturating_sub(free_after);
         candle::gpu_memory::register("model weights", model_bytes);
 
-        for (_n, config) in configs.into_iter().enumerate() {
+        for (n, config) in configs.into_iter().enumerate() {
             println!("\n=== Running tests for config: {:?} ===", config);
+
+            // Per-config user-prompt override (used by routing-trace capture).
+            if let Some(p) = self.per_config_prompts.get(n) {
+                if !p.is_empty() {
+                    self.prompt_user = p.clone();
+                    println!("  - Prompt override ({} chars)", self.prompt_user.len());
+                }
+            }
+
+            // Tag any captured routing records with this config index.
+            crate::models::routing_capture::begin_config(n);
 
             // Prune cached embedding variants before each config
             model.prune()?;
@@ -882,25 +920,40 @@ impl TestParams {
         // Generate phase
         let mut remaining_steps = self.generate_token_count;
 
+        // Early-stop predicate: every session has emitted a stop token.
+        let all_stopped = |toks: &[u32]| -> bool {
+            !self.stop_on_eos.is_empty() && toks.iter().all(|t| self.stop_on_eos.contains(t))
+        };
+
         // Warmup step (step 0)
+        let mut stopped = false;
         if remaining_steps > 0 {
-            self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
+            let toks = self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
             self.device.synchronize()?;
             remaining_steps -= 1;
+            stopped = all_stopped(&toks);
         }
 
         self.device.synchronize()?;
         let generate_start = std::time::Instant::now();
         let t_decode_total = profile_now();
-        for _step_num in 0..remaining_steps {
-            self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
+        let mut steps_run = 0usize;
+        if !stopped {
+            for _step_num in 0..remaining_steps {
+                let toks =
+                    self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
+                steps_run += 1;
+                if all_stopped(&toks) {
+                    break;
+                }
+            }
         }
         self.device.synchronize()?;
         pipeline_record("bench:decode_total", t_decode_total);
         let _ = session.compact_check()?;
 
         let generate_duration = generate_start.elapsed();
-        let generate_tokens = remaining_steps * config.num_contexts;
+        let generate_tokens = steps_run * config.num_contexts;
         let generate_tokens_per_sec = if generate_tokens == 0 {
             0.0
         } else {
@@ -1105,7 +1158,7 @@ impl TestParams {
         sequence_indices: &[usize],
         runs: &mut [TestRun],
         model: &M,
-    ) -> Result<()>
+    ) -> Result<Vec<u32>>
     where
         M: ManagedBatchedModel,
     {
@@ -1190,7 +1243,7 @@ impl TestParams {
         }
         pipeline_record("bench:decode_advance", t_advance);
 
-        Ok(())
+        Ok(sampled_tokens)
     }
 
     /// Validate results and print comparison table
@@ -1225,9 +1278,10 @@ impl TestParams {
                     }
                 };
 
-                // Check token count
+                // Check token count.  Skipped when EOS early-stop is enabled,
+                // since a short generation is the correct outcome there.
                 let min_expected_tokens = self.generate_token_count.saturating_sub(5);
-                if session.output.len() < min_expected_tokens {
+                if self.stop_on_eos.is_empty() && session.output.len() < min_expected_tokens {
                     println!(
                         "\n❌ Session {} FAILED: Generated only {} tokens, expected at least {}",
                         i,
@@ -1747,6 +1801,14 @@ impl TestParams {
             (
                 "Hint loads",
                 Box::new(|s: &PipelineStats| format!("{}", s.hint_loads)),
+            ),
+            (
+                "Predicted loads",
+                Box::new(|s: &PipelineStats| format!("{}", s.predicted_total)),
+            ),
+            (
+                "Prediction prec.",
+                Box::new(|s: &PipelineStats| format!("{:.1}%", s.prediction_precision())),
             ),
             (
                 "Fence stalls",

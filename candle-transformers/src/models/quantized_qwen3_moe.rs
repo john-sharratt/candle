@@ -532,6 +532,23 @@ impl SparseMoeBlock {
         // Store this layer's expert set for the next layer's speculative hint
         self.cache.set_prev_layer_experts(expert_ids.clone());
 
+        // ── Routing-trace capture (inert unless explicitly enabled) ──
+        // Records the active expert set + per-expert routing mass for offline
+        // predictor evaluation.  The mass DtoH only happens while capturing.
+        if crate::models::routing_capture::is_enabled() {
+            if let Ok(w) = weights_flat.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                let mut mass = vec![0f32; expert_ids.len()];
+                for &(eid, _tok, widx) in &assignments {
+                    if let Ok(pos) = expert_ids.binary_search(&(eid as usize)) {
+                        if let Some(&wv) = w.get(widx as usize) {
+                            mass[pos] += wv;
+                        }
+                    }
+                }
+                crate::models::routing_capture::record(self.moe_layer_idx, &expert_ids, &mass);
+            }
+        }
+
         // ── 3. Submit to pipeline (threaded or inline) ──
         //
         // `submit_moe_work` handles both modes:
@@ -2060,6 +2077,24 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            // BF16 single context (after everything is warm)
+            TestConfig {
+                mode: InferenceMode::BF16,
+                use_batched: true,
+                num_contexts: 1,
+                num_repeats: 1,
+                generate_max_len: 20,
+                test_mode: Some(TestMode::StoryRewrite),
+            },
+            // Q8 (after everything is warm)
+            TestConfig {
+                mode: InferenceMode::Q4_0,
+                use_batched: true,
+                num_contexts: 20,
+                num_repeats: 1,
+                generate_max_len: 20,
+                test_mode: Some(TestMode::Skip),
+            },
         ];
 
         let make_sampler = || {
@@ -2098,6 +2133,189 @@ mod tests {
         params.run(configs, load_model, sequential)?;
 
         Ok(())
+    }
+
+    /// Capture a real MoE routing trace for offline predictor evaluation.
+    ///
+    /// Runs a single BF16×1 StoryRewrite generation against Qwen3-30B-A3B with
+    /// routing capture enabled, then bincode + gzip the trace to the checked-in
+    /// fixture ([`routing_capture::FIXTURE_PATH`]).  The offline eval
+    /// (`expert_lre::eval`) replays that fixture on CPU in milliseconds.
+    ///
+    /// Run with:
+    ///   cargo test --release --features cuda --lib --package candle-transformers \
+    ///     quantized_qwen3_moe::tests::capture_routing_trace -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn capture_routing_trace() -> Result<()> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            println!("⚠ This test requires --features cuda");
+            return Ok(());
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use crate::models::routing_capture;
+            use std::io::Write;
+
+            println!("\n=== Capturing Qwen3-30B-A3B MoE routing trace ===\n");
+
+            let dialect = Dialect::chat_ml();
+            use crate::models::batch_test::test_helpers::hf_get;
+            let tokenizer_path = hf_get(
+                "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                hf_hub::RepoType::Model,
+                "main",
+                "tokenizer.json",
+            )
+            .map_err(|e| candle::Error::Msg(format!("Failed to download tokenizer.json: {}", e)))?;
+            let tokenizer_json = std::fs::read_to_string(&tokenizer_path)
+                .map_err(|e| candle::Error::Msg(format!("Failed to read tokenizer.json: {}", e)))?;
+
+            // Diverse prompts driven through a single model load.  Config 0
+            // keeps the default StoryRewrite prompt; the rest override it.
+            let prompts: Vec<String> = [
+                "", // config 0 → story.md (StoryRewrite default)
+                "Tell me about the candle repository and how it works",
+                "How does AI implement inference in modern engines",
+                "Output me a rust program example the is a basic API skeleton",
+                "Write example code for a bubble sort of Int64 numbers",
+                "Give me a list of jobs that are safe from AI automation",
+                "Explain how a B-tree database index works and when to use one",
+                "Write a Python function that merges two sorted linked lists",
+                "What caused the fall of the Western Roman Empire?",
+                "Summarize the key differences between TCP and UDP",
+                "Write a haiku about a thunderstorm over the ocean",
+                "Implement a least-recently-used cache in Rust with a fixed capacity",
+                "Describe how photosynthesis converts sunlight into chemical energy",
+                "Compare and contrast supervised and unsupervised machine learning",
+                "Give me a step-by-step recipe for a classic margherita pizza",
+                "Explain the difference between mutexes and semaphores in concurrency",
+                "What are the tradeoffs between monolithic and microservice architectures?",
+                "Write a SQL query to find the second highest salary in an employees table",
+                "Explain how vaccines train the human immune system",
+                "Describe the plot of a short mystery story set on a moving train",
+                "List strategies for reducing tail latency in a distributed web service",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+            // Stop each generation at EOS to avoid post-EOS degenerate routing.
+            let eos_tokens: Vec<u32> = {
+                let tok = tokenizers::Tokenizer::from_bytes(tokenizer_json.as_bytes()).unwrap();
+                ["<|im_end|>", "<|endoftext|>"]
+                    .iter()
+                    .filter_map(|s| tok.token_to_id(s))
+                    .collect()
+            };
+
+            let params = TestParams::new(256, &tokenizer_json, dialect)
+                .map_err(|e| candle::Error::Msg(format!("Failed to create TestParams: {}", e)))?
+                .with_suppress_thinking(true)
+                .with_print_outputs(false)
+                .with_timeout_secs(3600)
+                .with_per_config_prompts(prompts.clone())
+                .with_stop_on_eos(eos_tokens);
+
+            let model_path = hf_get(
+                "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
+                hf_hub::RepoType::Model,
+                "main",
+                "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+            )
+            .map_err(|e| candle::Error::Msg(format!("Failed to download model: {}", e)))?;
+
+            let device = Device::new_cuda(0)
+                .map_err(|e| candle::Error::Msg(format!("CUDA required: {}", e)))?;
+
+            // One config per prompt: BF16, single context, no validation.
+            let configs: Vec<TestConfig> = (0..prompts.len())
+                .map(|_| TestConfig {
+                    mode: InferenceMode::BF16,
+                    use_batched: true,
+                    num_contexts: 1,
+                    num_repeats: 1,
+                    generate_max_len: 256,
+                    test_mode: Some(TestMode::Skip),
+                })
+                .collect();
+
+            let make_sampler = || {
+                use crate::generation::{LogitsProcessor, Sampling};
+                let mut lp = LogitsProcessor::from_sampling(299792458, Sampling::ArgMax);
+                move |logits: &Tensor| {
+                    let logits = logits.squeeze(0)?;
+                    lp.sample(&logits)
+                }
+            };
+
+            use crate::models::batched_model::BatchedInference;
+            type WrappedModel = BatchedInference<ModelWeights>;
+            let sequential = SequentialCallbacks {
+                create_cache: |config: &TestConfig, model: &WrappedModel| {
+                    let mut caches = model.model().create_kv_caches(512);
+                    caches.force_dtype(config.mode.compute_dtype());
+                    Ok(caches)
+                },
+                forward: |ctx: SequenceContext, model: &WrappedModel| {
+                    model.model().forward_with_context(ctx)
+                },
+                sample: make_sampler(),
+            };
+
+            let load_model = || {
+                let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+                let inv_freq = model
+                    .rope_inv_freq()
+                    .ok_or_else(|| candle::Error::Msg("model has no inv_freq".into()))?;
+                BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
+            };
+
+            // Capture every config (each is a distinct prompt, tagged by index).
+            // Validation outcome is irrelevant here — we only want the routing
+            // trace, so a harness validation error must not lose captured data.
+            routing_capture::enable_all();
+            let run_result = params.run(configs, load_model, sequential);
+            routing_capture::disable();
+            if let Err(e) = &run_result {
+                println!("(harness reported: {e} — ignored; writing captured trace)");
+            }
+
+            let records = routing_capture::take();
+            println!("Captured {} routing records", records.len());
+            assert!(!records.is_empty(), "no routing records captured");
+
+            // bincode → gzip → fixture.
+            let raw = bincode::serialize(&records)
+                .map_err(|e| candle::Error::Msg(format!("bincode serialize failed: {}", e)))?;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&raw)
+                .map_err(|e| candle::Error::Msg(format!("gzip write failed: {}", e)))?;
+            let compressed = encoder
+                .finish()
+                .map_err(|e| candle::Error::Msg(format!("gzip finish failed: {}", e)))?;
+
+            let path = std::path::Path::new(routing_capture::FIXTURE_PATH);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| candle::Error::Msg(format!("mkdir fixtures failed: {}", e)))?;
+            }
+            std::fs::write(path, &compressed)
+                .map_err(|e| candle::Error::Msg(format!("write fixture failed: {}", e)))?;
+
+            println!(
+                "Wrote {} records → {} ({} bytes raw, {} bytes gzip)",
+                records.len(),
+                routing_capture::FIXTURE_PATH,
+                raw.len(),
+                compressed.len(),
+            );
+            Ok(())
+        }
     }
 
     /// KV-cache dump for offline selection analysis (Qwen3-MoE).

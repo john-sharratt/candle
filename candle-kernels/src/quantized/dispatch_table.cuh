@@ -370,8 +370,13 @@ inline int get_tc32_remainder(kernel_type_t kt) {
 // =============================================================================
 // TC PATH: Tensor core dispatch for batch 1-31 (uses tc16 kernels)
 // =============================================================================
-// Strategy: Use GEMV for batch 1-2 (faster), tc16 for batch 3+
-// - Batch 1-2: GEMV kernels (standalone GEMV is faster than TC overhead)
+// Strategy: tc16 for ALL batch 1-31. Benchmarking found the TC kernels faster
+// than the CUDA-core GEMV (s1/s2) path in every case, batch 1-2 included, so
+// get_dispatch_plan() routes every batch >= 1 to tc16. This static table is the
+// legacy pre-SM80 mapping and is no longer consulted on the TC path;
+// get_dispatch_plan() is the source of truth. The batch 1-2 K_S1/K_S2 entries
+// below apply only to GPUs without tensor cores.
+//
 // - Batch 3-15: tc16_N where N = batch_size (single kernel)
 // - Batch 16-31: tc16_N where N = batch_size % 16 (single kernel, internal tiling)
 //
@@ -380,8 +385,8 @@ inline int get_tc32_remainder(kernel_type_t kt) {
 static const dispatch_entry_t TC_DISPATCH_TABLE[32] = {
     // Batch 0: nothing to do
     /*  0 */ { K_NONE,      0,  K_NONE,  0 },
-    
-    // Batch 1-2: GEMV (standalone GEMV is faster than TC for tiny batches)
+
+    // Batch 1-2: GEMV only on pre-SM80 GPUs; TC hardware uses tc16_1/tc16_2.
     /*  1 */ { K_S1,        1,  K_NONE,  0 },
     /*  2 */ { K_S2,        2,  K_NONE,  0 },
     
@@ -523,8 +528,9 @@ constexpr int TC_MIN_BATCH = 1;        // TC kernels available for batch >= 1
 inline dispatch_plan_t get_dispatch_plan(int batch_size, bool use_l2_path, bool use_tc) {
     dispatch_plan_t plan = { K_NONE, 0, K_NONE, 0, K_NONE, 0, K_NONE, 0 };
     
-    // TC path: use tc16/tc32 kernels which compute tiling internally
-    // Now includes batch 1 and 2 to test if tc16_1/tc16_2 are faster than s1/s2
+    // TC path: use tc16/tc32 kernels which compute tiling internally.
+    // ALL batch >= 1 goes through tensor cores, including batch 1-2: benchmarking
+    // found tc16_1/tc16_2 faster than the CUDA-core s1/s2 GEMV in every case.
     if (use_tc && batch_size >= 1) {
         if (batch_size >= 32) {
             // Use tc32 - kernel computes tc32 + tc16 + tcR internally

@@ -94,6 +94,34 @@ extern "C" {
         weight_bytes: usize,
     );
 
+    /// Single-launch grouped matmul over all MoE expert tiles.
+    ///
+    /// All pointer arguments are DEVICE pointers prepared by the caller:
+    /// - `weight_ptrs`: `u64[num_experts]` — each expert's K/128 weight pointer
+    /// - `tile_expert`: `i32[num_tiles]` — owning expert id per tile
+    /// - `tile_b_start`: `i32[num_tiles]` — stacked-batch start row per tile
+    /// - `tile_b_cnt`: `i32[num_tiles]` — tokens in the tile (1..16)
+    /// - `vy`: stacked activations `[total_batch, K]`
+    /// - `dst`: stacked output `[total_batch, N]`
+    ///
+    /// `ncols_x = K`, `nrows_x = N`, `y_stride = K`, `dst_stride = N`. The grid is
+    /// `(num_tiles, ceil(N/32))` — one block per (expert-tile, row-tile), one launch.
+    pub fn run_grouped_quantized_matmul(
+        weight_ptrs: *const c_void,
+        tile_expert: *const c_void,
+        tile_b_start: *const c_void,
+        tile_b_cnt: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        y_stride: i32,
+        dst_stride: i32,
+        num_tiles: i32,
+        qtype: i32,
+        ytype: i32,
+    );
+
     /// Repack quantized weights to GEMX format (K/128 with embedded scales).
     ///
     /// This removes scale data from the weights (scales should be extracted

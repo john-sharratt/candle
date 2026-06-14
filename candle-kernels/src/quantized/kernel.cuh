@@ -1543,6 +1543,243 @@ __device__ void tc16_kernel(
 } // namespace s16_tc
 
 // =============================================================================
+// GROUPED TENSOR-CORE GEMM — all MoE experts in a SINGLE kernel launch
+// =============================================================================
+// The per-expert path dispatches N experts as N separate launches (one per
+// segment). At small tokens-per-expert that is both launch-bound AND occupancy-
+// starved: each expert's matmul fills only ceil(N/32) row-blocks, so a handful
+// of blocks idle most of the GPU. This kernel processes ALL experts' tiles in
+// one launch — grid = (total_tiles, row_tiles). A device-side table maps
+// blockIdx.x → the owning expert's weight pointer and its [b_start,b_start+b_cnt)
+// slice of the stacked activations/output (b_cnt ≤ 16, one MMA M-tile). The
+// combined expert tiles fill the SMs, so occupancy and launch count improve
+// together. Reuses the tc16 MMA inner loop verbatim.
+//
+// TILE WIDTH: this kernel only emits 16-wide (tc16-style) MMA tiles — an expert
+// with M tokens becomes ceil(M/16) tiles. That is optimal for MoE decode, where
+// tokens-per-expert is small (1 single-session, ~4-16 wave-batched). For very
+// large M-per-expert (>= ~32) the per-weight path would escalate to the 32-wide
+// tc32 kernel, which re-reads each weight block half as often; so a single
+// expert carrying hundreds of tokens (a regime MoE decode does not hit) would
+// run marginally faster through the per-segment path than through this one. A
+// 32-wide grouped tile variant would close that gap if such a workload appears.
+//
+// PRECONDITION: nrows (output features) must be a multiple of N_TILE (32) — the
+// row-tile writes a full 32-row block with no partial-row guard, same as the
+// tc16 path. All MoE expert dims (768 / 2048) satisfy this; grouped_matmul_gemx
+// enforces it host-side.
+namespace grouped_tc {
+using namespace tc_common;
+
+// Runtime-batch activation load: BATCH_TILE×K_TILE into smem, rows >= b_cnt
+// zeroed (M-dim padding). Mirrors s16_tc::load_activations but bounds at runtime
+// so a tile may carry 1..16 tokens without reading past its expert's slice.
+template <typename compute_t, typename act_t>
+__device__ __forceinline__ void load_activations_runtime(
+    compute_t smem_A[BATCH_TILE][K_STRIDE],
+    const act_t* __restrict__ vy,
+    int b_start, int b_cnt, int k_offset, int y_stride, int tid)
+{
+    if constexpr ((std::is_same_v<act_t, half> && std::is_same_v<compute_t, half>) ||
+                  (std::is_same_v<act_t, __nv_bfloat16> &&
+                   std::is_same_v<compute_t, __nv_bfloat16>)) {
+        constexpr int4 ZERO4 = {0, 0, 0, 0};
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int elem_idx = (tid + i * NUM_THREADS) * 8;
+            const int b = elem_idx / K_TILE;
+            const int k = elem_idx % K_TILE;
+            int4 data = (b < b_cnt)
+                ? *reinterpret_cast<const int4*>(&vy[(b_start + b) * y_stride + k_offset + k])
+                : ZERO4;
+            *reinterpret_cast<int4*>(&smem_A[b][k]) = data;
+        }
+    } else if constexpr (std::is_same_v<act_t, float> && std::is_same_v<compute_t, half>) {
+        const half2 ZERO2 = {__float2half(0.f), __float2half(0.f)};
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int elem_idx = (tid + i * NUM_THREADS) * 4;
+            const int b = elem_idx / K_TILE;
+            const int k = elem_idx % K_TILE;
+            half2 h0 = ZERO2, h1 = ZERO2;
+            if (b < b_cnt) {
+                float4 f4 = *reinterpret_cast<const float4*>(
+                    &vy[(b_start + b) * y_stride + k_offset + k]);
+                h0 = __floats2half2_rn(f4.x, f4.y);
+                h1 = __floats2half2_rn(f4.z, f4.w);
+            }
+            *reinterpret_cast<half2*>(&smem_A[b][k]) = h0;
+            *reinterpret_cast<half2*>(&smem_A[b][k + 2]) = h1;
+        }
+    } else if constexpr (std::is_same_v<act_t, float> &&
+                         std::is_same_v<compute_t, __nv_bfloat16>) {
+        const __nv_bfloat162 ZERO2 = {__float2bfloat16(0.f), __float2bfloat16(0.f)};
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int elem_idx = (tid + i * NUM_THREADS) * 4;
+            const int b = elem_idx / K_TILE;
+            const int k = elem_idx % K_TILE;
+            __nv_bfloat162 h0 = ZERO2, h1 = ZERO2;
+            if (b < b_cnt) {
+                float4 f4 = *reinterpret_cast<const float4*>(
+                    &vy[(b_start + b) * y_stride + k_offset + k]);
+                h0 = __floats2bfloat162_rn(f4.x, f4.y);
+                h1 = __floats2bfloat162_rn(f4.z, f4.w);
+            }
+            *reinterpret_cast<__nv_bfloat162*>(&smem_A[b][k]) = h0;
+            *reinterpret_cast<__nv_bfloat162*>(&smem_A[b][k + 2]) = h1;
+        }
+    } else {
+        // Scalar fallback (fp8 / mixed); zero rows beyond b_cnt.
+        constexpr int TOTAL = BATCH_TILE * K_TILE;
+        for (int idx = tid; idx < TOTAL; idx += NUM_THREADS) {
+            const int b = idx / K_TILE;
+            const int k = idx % K_TILE;
+            float val = 0.f;
+            if (b < b_cnt) {
+                const int off = (b_start + b) * y_stride + k_offset + k;
+                if constexpr (std::is_same_v<act_t, float>) val = vy[off];
+                else if constexpr (std::is_same_v<act_t, half>) val = __half2float(vy[off]);
+                else if constexpr (std::is_same_v<act_t, __nv_bfloat16>) val = __bfloat162float(vy[off]);
+                else if constexpr (std::is_same_v<act_t, __nv_fp8_e4m3>) val = to_f32(vy[off]);
+            }
+            if constexpr (std::is_same_v<compute_t, half>) smem_A[b][k] = __float2half(val);
+            else if constexpr (std::is_same_v<compute_t, __nv_bfloat16>) smem_A[b][k] = __float2bfloat16(val);
+            else if constexpr (std::is_same_v<compute_t, __nv_fp8_e4m3>) smem_A[b][k] = __nv_fp8_e4m3(__float2half(val));
+        }
+    }
+}
+
+// One (expert-tile, row-tile): MMA over K for up to 16 tokens × 32 rows.
+// Identical inner loop to s16_tc::tc16_kernel_impl, but the weight pointer is
+// the per-expert pointer and the batch slice is [b_start, b_start+b_cnt).
+template <typename block_c_t, typename compute_t, typename act_t, typename output_t>
+__device__ void grouped_matmul_impl(
+    const block_c_t* __restrict__ weights,
+    const act_t* __restrict__ activations,
+    output_t* __restrict__ dst,
+    int ncols, int nrows, int y_stride, int dst_stride,
+    int b_start, int b_cnt, int row_tile_idx,
+    compute_t smem_A[BATCH_TILE][K_STRIDE], uint8_t* smem_W_flat)
+{
+    const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+    const int warp_id = tid / WARP_SIZE_TC;
+    const int lane = tid % WARP_SIZE_TC;
+    const int row0 = row_tile_idx * N_TILE;
+    if (row0 >= nrows || b_cnt <= 0) return;
+
+    constexpr int K128_BYTES = sizeof(block_c_t);
+    const int warp_row_base = row0 + warp_id * 8;
+    uint8_t* smem_W = smem_W_flat + warp_id * 8 * K128_BYTES;
+
+    float frag_c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int k_blocks = ncols / K_TILE;
+
+    for (int k_blk = 0; k_blk < k_blocks; ++k_blk) {
+        load_activations_runtime<compute_t, act_t>(
+            smem_A, activations, b_start, b_cnt, k_blk * K_TILE, y_stride, tid);
+        load_weights_async_coop<block_c_t>(smem_W_flat, weights, row0, k_blk, nrows, k_blocks, tid);
+        cp_async_commit();
+        cp_async_wait_all();
+        __syncthreads();
+
+        {
+            uint32_t frag_b[8];
+            dequant_weights_4x_k16<block_c_t, compute_t, 0>(smem_W, lane, frag_b);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint32_t frag_a[4];
+                load_frag_a<compute_t>(frag_a, smem_A, i * MMA_K, lane);
+                mma_m16n8k16<compute_t>(frag_a, frag_b + i * 2, frag_c);
+            }
+        }
+        {
+            uint32_t frag_b[8];
+            dequant_weights_4x_k16<block_c_t, compute_t, 1>(smem_W, lane, frag_b);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint32_t frag_a[4];
+                load_frag_a<compute_t>(frag_a, smem_A, (4 + i) * MMA_K, lane);
+                mma_m16n8k16<compute_t>(frag_a, frag_b + i * 2, frag_c);
+            }
+        }
+        __syncthreads();
+    }
+
+    const int groupID = lane / 4;
+    const int threadID_in_group = lane % 4;
+    const int out_row = warp_row_base + threadID_in_group * 2;
+    const int bend = b_start + b_cnt;
+    const int b0 = b_start + groupID;
+    const int b1 = b_start + groupID + 8;
+
+    if (b0 < bend) {
+        if constexpr (std::is_same_v<output_t, float>) {
+            *reinterpret_cast<float2*>(&dst[b0 * dst_stride + out_row]) = make_float2(frag_c[0], frag_c[1]);
+        } else if constexpr (std::is_same_v<output_t, half>) {
+            *reinterpret_cast<half2*>(&dst[b0 * dst_stride + out_row]) = __floats2half2_rn(frag_c[0], frag_c[1]);
+        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
+            *reinterpret_cast<__nv_bfloat162*>(&dst[b0 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[0], frag_c[1]);
+        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
+            dst[b0 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[0]);
+            dst[b0 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[1]);
+        }
+    }
+    if (b1 < bend) {
+        if constexpr (std::is_same_v<output_t, float>) {
+            *reinterpret_cast<float2*>(&dst[b1 * dst_stride + out_row]) = make_float2(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, half>) {
+            *reinterpret_cast<half2*>(&dst[b1 * dst_stride + out_row]) = __floats2half2_rn(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
+            *reinterpret_cast<__nv_bfloat162*>(&dst[b1 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
+            dst[b1 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[2]);
+            dst[b1 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[3]);
+        }
+    }
+}
+
+// Grouped entry: decode (expert, batch-slice) from device tables and run one tile.
+//   grid = (total_tiles, row_tiles), block = 128 threads (4 warps × 32).
+template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t>
+static __device__ void quantized_matmul_grouped_entry(
+    const uint64_t* __restrict__ weight_ptrs,  // [num_experts] device weight pointers
+    const int* __restrict__ tile_expert,       // [total_tiles] owning expert
+    const int* __restrict__ tile_b_start,      // [total_tiles] stacked batch start
+    const int* __restrict__ tile_b_cnt,        // [total_tiles] tokens in tile (1..16)
+    const act_t* __restrict__ vy,
+    output_t* __restrict__ dst,
+    int ncols_x, int nrows_x, int y_stride, int dst_stride)
+{
+    using compute_t = std::conditional_t<
+        std::is_same_v<act_t, float>, half,
+        std::conditional_t<
+            std::is_same_v<act_t, half>, half,
+            std::conditional_t<
+                std::is_same_v<act_t, __nv_bfloat16>, __nv_bfloat16,
+                std::conditional_t<
+                    std::is_same_v<act_t, __nv_fp8_e4m3>, __nv_fp8_e4m3, half>>>>;
+    using block_c_t = block_compact_t<block_q_t>;
+
+    const int tile = blockIdx.x;
+    const int expert = tile_expert[tile];
+    const block_c_t* weights =
+        reinterpret_cast<const block_c_t*>(static_cast<uintptr_t>(weight_ptrs[expert]));
+    const int b_start = tile_b_start[tile];
+    const int b_cnt = tile_b_cnt[tile];
+    const int row_tile_idx = blockIdx.y;
+
+    __shared__ compute_t smem_A[BATCH_TILE][K_STRIDE];
+    __shared__ uint8_t smem_W_flat[N_TILE * sizeof(block_c_t)];
+
+    grouped_matmul_impl<block_c_t, compute_t, act_t, output_t>(
+        weights, vy, dst, ncols_x, nrows_x, y_stride, dst_stride,
+        b_start, b_cnt, row_tile_idx, smem_A, smem_W_flat);
+}
+
+} // namespace grouped_tc
+
+// =============================================================================
 // SN_TC: TENSOR CORE KERNEL FOR BATCH 5-15 (RUNTIME PADDED MMA)
 // =============================================================================
 //
