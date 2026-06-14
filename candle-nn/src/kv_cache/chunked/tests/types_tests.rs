@@ -25,6 +25,7 @@ mod tests {
             v_pal: std::sync::Arc::new(Vec::new()),
             k_scale: std::sync::Arc::new(Vec::new()),
             v_scale: std::sync::Arc::new(Vec::new()),
+            meta: None,
         }
     }
 

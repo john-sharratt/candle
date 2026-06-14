@@ -386,6 +386,7 @@ impl ChunkedKvBacking {
                 v_pal: donors[i].v_pal.clone(),
                 k_scale: donors[i].k_scale.clone(),
                 v_scale: donors[i].v_scale.clone(),
+                meta: None,
             });
         }
         if n > 0 {
@@ -397,6 +398,7 @@ impl ChunkedKvBacking {
                 v_pal: donors[n - 1].v_pal.clone(),
                 k_scale: donors[n - 1].k_scale.clone(),
                 v_scale: donors[n - 1].v_scale.clone(),
+                meta: None,
             });
         }
 
@@ -640,6 +642,7 @@ impl ChunkedKvBacking {
                 v_pal: rb.v_pal.clone(),
                 k_scale: rb.k_scale.clone(),
                 v_scale: rb.v_scale.clone(),
+                meta: None,
             });
         }
         if need_blocks > 0 {
@@ -653,6 +656,7 @@ impl ChunkedKvBacking {
                 v_pal: rb.v_pal.clone(),
                 k_scale: rb.k_scale.clone(),
                 v_scale: rb.v_scale.clone(),
+                meta: None,
             });
         }
 
@@ -761,6 +765,9 @@ impl ChunkedKvBacking {
                         v_pal: cw.v_pal.clone(),
                         k_scale: cw.k_scale.clone(),
                         v_scale: cw.v_scale.clone(),
+                        // Fork shares the source chunk's GIDs (Arc bump), so its
+                        // resident record's pointers stay valid — share it too.
+                        meta: cw.meta.clone(),
                     }
                 })
                 .collect();
@@ -889,6 +896,9 @@ impl ChunkedKvBacking {
                         v_pal: cw.v_pal.clone(),
                         k_scale: cw.k_scale.clone(),
                         v_scale: cw.v_scale.clone(),
+                        // Fork shares the source chunk's GIDs (Arc bump), so its
+                        // resident record's pointers stay valid — share it too.
+                        meta: cw.meta.clone(),
                     }
                 })
                 .collect();
@@ -1065,6 +1075,9 @@ impl ChunkedKvBacking {
                     v_pal: source_v_pal,
                     k_scale: source_k_scale,
                     v_scale: source_v_scale,
+                    // CoW partial: freshly-allocated GIDs (copied data) → no
+                    // resident record; falls back to per-forward scratch heads.
+                    meta: None,
                 });
         }
 
@@ -1356,6 +1369,7 @@ impl ChunkedKvBacking {
             Arc<Vec<u8>>,
             Arc<Vec<f32>>,
             Arc<Vec<f32>>,
+            Option<super::meta_pool::MetaGid>,
         )> = {
             let ps = state.sequences[parent_batch].as_ref().unwrap();
             parent_blocks
@@ -1385,6 +1399,11 @@ impl ChunkedKvBacking {
                             self.inner.identity_scale.clone(),
                         ),
                     };
+                    // The view borrows the parent block's GIDs by Arc clone — same
+                    // physical placement — so the parent's resident record (if any)
+                    // is valid for the view too. Propagate the handle so the
+                    // reproject glue reads the resident record instead of rebuilding.
+                    let meta = cw.and_then(|cw| cw.meta.clone());
                     (
                         gids,
                         usage,
@@ -1394,6 +1413,7 @@ impl ChunkedKvBacking {
                         v_pal,
                         k_scale,
                         v_scale,
+                        meta,
                     )
                 })
                 .collect()
@@ -1432,6 +1452,7 @@ impl ChunkedKvBacking {
                 source_v_pal,
                 source_k_scale,
                 source_v_scale,
+                source_meta,
             ) in borrowed_meta.into_iter()
             {
                 vs.push_chunk(ChunkWindow {
@@ -1442,6 +1463,9 @@ impl ChunkedKvBacking {
                     v_pal: source_v_pal,
                     k_scale: source_k_scale,
                     v_scale: source_v_scale,
+                    // Shares the parent's GIDs/placement, so the parent's
+                    // resident record applies — read it instead of rebuilding.
+                    meta: source_meta,
                 });
             }
         }
@@ -1640,6 +1664,9 @@ impl ChunkedKvBacking {
                     k_scale: cw.k_scale.clone(),
                     v_scale: cw.v_scale.clone(),
                     byte_size,
+                    // Snapshot shares the live chunk's GIDs, so its record (if
+                    // resident) stays valid — propagate the handle.
+                    meta: cw.meta.clone(),
                 }
             })
             .collect();
@@ -1952,6 +1979,9 @@ impl ChunkedKvBacking {
                 v_pal: Arc::clone(&sc.v_pal),
                 k_scale: Arc::clone(&sc.k_scale),
                 v_scale: Arc::clone(&sc.v_scale),
+                // Injected chunk Arc-shares the sealed chunk's GIDs, so its
+                // resident record stays valid — share the handle into the slot.
+                meta: sc.meta.clone(),
             })
             .collect();
         slot.extend_chunks(windows);

@@ -70,6 +70,7 @@ pub fn arena_gid_stride() -> usize {
 use super::gid_pool::ChunkGid;
 use super::gpu_chunks::GpuChunks;
 use super::head_gids::HeadGids;
+use super::meta_pool::MetaGid;
 use crate::kv_cache::arena_table::ResolvedArenaInfo;
 #[cfg(feature = "cuda")]
 use candle::cuda_backend::cudarc::driver::CudaStream;
@@ -212,6 +213,13 @@ pub struct SealedChunk {
     /// Preserved unchanged through CPU↔GPU migration (format is identical, only
     /// location differs).  Zero for diagnostic/test-only chunks.
     pub byte_size: u64,
+    /// Co-resident KV-head metadata record handle. `Some` when this chunk's
+    /// `KvHead[n_kv_head]` record is resident in a device meta-pool slab (built
+    /// at quantize / GPU migration); the attention kernels read it via the
+    /// slice's `kvheads_ptr`. `None` ⇒ no resident record (float/transient or a
+    /// not-yet-promoted chunk); the host serializer builds per-forward scratch
+    /// heads instead. See [`super::meta_pool`].
+    pub meta: Option<MetaGid>,
 }
 
 impl SealedChunk {
@@ -229,6 +237,7 @@ impl SealedChunk {
             k_scale: Arc::new(Vec::new()),
             v_scale: Arc::new(Vec::new()),
             byte_size: 0,
+            meta: None,
         }
     }
 }
@@ -335,6 +344,11 @@ pub(crate) struct ChunkWindow {
     pub(crate) k_scale: Arc<Vec<f32>>,
     /// Outer V scales: `n_kv_head × N_PALETTE` f32 values. Same convention as k_scale.
     pub(crate) v_scale: Arc<Vec<f32>>,
+    /// Co-resident KV-head metadata record handle, propagated from the
+    /// `SealedChunk` this window was injected from (`Some`) or `None` for a
+    /// freshly-allocated float writer chunk. Cloned with the window so every
+    /// slot referencing the chunk shares one record. See [`super::meta_pool`].
+    pub(crate) meta: Option<MetaGid>,
 }
 
 impl ChunkWindow {}
@@ -474,6 +488,11 @@ impl SequenceState {
             cw.v_pal = v_pal;
             cw.k_scale = k_scale;
             cw.v_scale = v_scale;
+            // Any GID mutation (defrag remap, cold-load reinjection) invalidates
+            // the resident record's per-palette pointers. Drop it so the host
+            // serializer falls back to per-forward scratch heads rather than
+            // emitting a stale `kvheads_ptr`.
+            cw.meta = None;
         }
     }
 

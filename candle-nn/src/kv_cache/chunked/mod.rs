@@ -34,6 +34,7 @@ mod gpu_chunks;
 mod gpu_chunks;
 mod head_gids;
 mod io;
+mod meta_pool;
 pub mod migrate;
 pub mod sampled_selection;
 mod sequence_ops;
@@ -57,6 +58,7 @@ pub use compression_policy::{
 };
 pub use gid_pool::{ChunkGid, ChunkGidPool};
 pub use head_gids::HeadGids;
+pub use meta_pool::MetaGid;
 pub use types::{arena_chunks_for_format, arena_gid_stride, ChunkMeta, CHUNK_SIZE};
 pub use types::{SealedChunk, SealedSequence, WriterTail};
 

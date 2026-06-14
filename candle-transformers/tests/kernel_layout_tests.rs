@@ -584,10 +584,24 @@ fn decode_one_slot(
         SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
     slot.extend_for_write_region(1, CHUNK_SIZE);
 
-    let slice_size = TokenSliceHost::serialized_size(N_KV_HEAD, HEAD_DIM);
-    let mut slice_buf = Vec::with_capacity(slot.slices.len() * slice_size);
+    // Two-section layout: out-of-line KvHead records first, then 16-byte slice
+    // headers whose kvheads_ptr points into the records tensor.
+    let rec_bytes = TokenSliceHost::record_size(N_KV_HEAD, HEAD_DIM);
+    let mut records_buf = Vec::with_capacity(slot.slices.len() * rec_bytes);
     for s in &slot.slices {
-        s.serialize_into(&mut slice_buf);
+        s.serialize_record(&mut records_buf);
+    }
+    let records_tensor = if records_buf.is_empty() {
+        Tensor::zeros(1, DType::U8, device)?
+    } else {
+        Tensor::from_slice(&records_buf, records_buf.len(), device)?
+    };
+    let records_base = tensor_u8_device_ptr(&records_tensor)?;
+
+    let mut slice_buf = Vec::with_capacity(slot.slices.len() * TokenSliceHost::SLICE_HEADER_SIZE);
+    for (i, s) in slot.slices.iter().enumerate() {
+        let kvheads_ptr = records_base + (i * rec_bytes) as u64;
+        s.serialize_slice_header(&mut slice_buf, kvheads_ptr);
     }
     let slices_tensor = if slice_buf.is_empty() {
         Tensor::zeros(1, DType::U8, device)?

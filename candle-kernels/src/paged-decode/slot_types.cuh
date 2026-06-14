@@ -18,13 +18,19 @@
 //                                        Replaces chunk_div/chunk_mod
 //                                        positional math.)
 //
-// TokenSlice (8 + n_kv_head * kv_head_byte_size(HD) bytes):
+// TokenSlice (16 bytes, fixed stride):
 //   [0..2)   uint16_t offset
 //   [2..4)   uint16_t len        ← committed on-device after each decode step
 //   [4..8)   uint32_t rope
-//   [8..)    KvHead head[n_kv_head]
+//   [8..16)  uint64_t kvheads_ptr ← device pointer to this chunk's
+//                                   KvHead[n_kv_head] record (a resident meta
+//                                   slab for sealed chunks, or a separate
+//                                   records region the host uploaded alongside
+//                                   the slices for transient/float chunks).
 //
-// KvHead (HD/2 + 104 bytes for HEAD_DIM HD):
+// KvHead (HD/2 + 104 bytes for HEAD_DIM HD) — out-of-line, pointed to by
+// kvheads_ptr; byte layout unchanged so kvhead_* accessors / palette4_convert
+// keep reading it identically:
 //   [0..HD/4)           uint8_t  k_pal[HD/4]
 //   [HD/4..HD/2)        uint8_t  v_pal[HD/4]
 //   [HD/2..HD/2+32)     uint64_t k_ptr[4]
@@ -82,10 +88,12 @@ __device__ __host__ constexpr int kv_head_byte_size() {
     return HD / 2 + 104;  // k_pal[HD/4] + v_pal[HD/4] + k_ptr[4]*8 + v_ptr[4]*8 + k_fmt[4] + v_fmt[4] + k_scale[4]*4 + v_scale[4]*4
 }
 
-// Byte size of one TokenSlice for a given (HEAD_DIM, n_kv_head).
+// Byte size of one TokenSlice — fixed at 16 (offset/len/rope + kvheads_ptr).
+// The KvHead[n_kv_head] record is out-of-line behind kvheads_ptr. The n_kv_head
+// parameter is kept so the (many) get_slice call sites need no change.
 template <int HD>
-__device__ __forceinline__ int token_slice_byte_size(int n_kv_head) {
-    return 8 + n_kv_head * kv_head_byte_size<HD>();
+__device__ __forceinline__ int token_slice_byte_size(int /*n_kv_head*/) {
+    return 16;
 }
 
 // ============================================================================
@@ -131,16 +139,22 @@ __device__ __forceinline__ void slice_increment_len(uint8_t* slice) {
 // KvHead field accessors
 // ============================================================================
 
-// Get a pointer to KvHead[head_idx] within a slice.
+// Get a pointer to KvHead[head_idx] for a slice. The slice stores a device
+// pointer to its KvHead[n_kv_head] record at byte offset 8; dereference and
+// index by head.
 template <int HD>
 __device__ __forceinline__ const uint8_t* get_head(const uint8_t* slice, int head_idx) {
-    return slice + 8 + (int64_t)head_idx * kv_head_byte_size<HD>();
+    uint64_t kvheads_ptr = *reinterpret_cast<const uint64_t*>(slice + 8);
+    return reinterpret_cast<const uint8_t*>(kvheads_ptr)
+        + (int64_t)head_idx * kv_head_byte_size<HD>();
 }
 
 // Mutable version.
 template <int HD>
 __device__ __forceinline__ uint8_t* get_head_mut(uint8_t* slice, int head_idx) {
-    return slice + 8 + (int64_t)head_idx * kv_head_byte_size<HD>();
+    uint64_t kvheads_ptr = *reinterpret_cast<const uint64_t*>(slice + 8);
+    return reinterpret_cast<uint8_t*>(kvheads_ptr)
+        + (int64_t)head_idx * kv_head_byte_size<HD>();
 }
 
 // k_pal map: HD/4 bytes at offset 0 within the head entry.

@@ -280,11 +280,43 @@ fn run_glue(
         SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
     slot.extend_for_write_region(glue, CHUNK_SIZE);
 
-    // Slices → device.
-    let slice_size = TokenSliceHost::serialized_size(N_KV_HEAD, HEAD_DIM);
-    let mut slice_buf = Vec::with_capacity(slot.slices.len() * slice_size);
+    // Two-section layout, mirroring build_slot_headers: resident slices
+    // (meta=Some, quantized prefix) point kvheads_ptr at their device meta-pool
+    // record; scratch slices (meta=None) serialize into a records buffer. This
+    // exercises the resident-record device_addr path on GPU.
+    enum KvSrc {
+        Resident(u64),
+        Scratch(usize),
+    }
+    let mut records_buf: Vec<u8> = Vec::new();
+    let mut srcs: Vec<KvSrc> = Vec::with_capacity(slot.slices.len());
     for s in &slot.slices {
-        s.serialize_into(&mut slice_buf);
+        match &s.meta {
+            Some(meta) => {
+                let addr = cache.k_cache().chunked_meta_device_addr(meta);
+                assert_ne!(addr, 0, "resident slice has no device record");
+                srcs.push(KvSrc::Resident(addr));
+            }
+            None => {
+                let off = records_buf.len();
+                s.serialize_record(&mut records_buf);
+                srcs.push(KvSrc::Scratch(off));
+            }
+        }
+    }
+    if records_buf.is_empty() {
+        records_buf.push(0u8);
+    }
+    let records_tensor = Tensor::from_slice(&records_buf, records_buf.len(), device)?;
+    let records_base = tensor_u8_device_ptr(&records_tensor)?;
+
+    let mut slice_buf = Vec::with_capacity(slot.slices.len() * TokenSliceHost::SLICE_HEADER_SIZE);
+    for (i, s) in slot.slices.iter().enumerate() {
+        let kvheads_ptr = match srcs[i] {
+            KvSrc::Resident(addr) => addr,
+            KvSrc::Scratch(off) => records_base + off as u64,
+        };
+        s.serialize_slice_header(&mut slice_buf, kvheads_ptr);
     }
     let slices_tensor = Tensor::from_slice(&slice_buf, slice_buf.len(), device)?;
     let slices_ptr = tensor_u8_device_ptr(&slices_tensor)?;

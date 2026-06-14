@@ -109,6 +109,10 @@ pub(crate) struct BackingInner {
     pub(crate) identity_scale: Arc<Vec<f32>>,
     /// Reusable pinned-memory stager for async H2D metadata uploads.
     pub(crate) pinned_stager: PinnedStager,
+    /// Device-resident per-chunk KV-head metadata records. Built at quantize,
+    /// cold-load, and warm→hot elevate; read by the attention kernels via each
+    /// slice's `kvheads_ptr`. Shared across all layers of this group.
+    pub(crate) meta_pool: super::meta_pool::MetaPool,
 }
 
 impl BackingInner {
@@ -694,6 +698,10 @@ impl ChunkedKvBacking {
                 Arc::new(vec![1.0f32; n_kv_head * N_PALETTE])
             },
             pinned_stager,
+            meta_pool: super::meta_pool::MetaPool::new(
+                super::meta_pool::chunk_record_bytes(n_kv_head, head_dim),
+                device.clone(),
+            ),
         });
 
         // Register for cooperative compaction
@@ -743,6 +751,60 @@ impl ChunkedKvBacking {
     /// Clone the pinned stager for use by a sibling worker.
     pub fn pinned_stager(&self) -> candle::quantized::pinned_staging::PinnedStager {
         self.inner.pinned_stager.clone()
+    }
+
+    /// Device address of a resident KV-head record, for embedding into a slice's
+    /// `kvheads_ptr`. Returns 0 for a CPU/host-only pool (no device residence).
+    /// The address is cached on the handle at allocation, so this is a field read.
+    pub fn meta_device_addr(&self, meta: &super::meta_pool::MetaGid) -> u64 {
+        meta.device_addr()
+    }
+
+    /// Build device-resident KV-head metadata records for a batch of chunks and
+    /// return one handle per input. Serializes each `KvHead[n_kv_head]` record
+    /// (pal/scale/fmt + the 8 per-palette pointers resolved against `arena_info`
+    /// at the chunk's current placement) and uploads them in **one coalesced
+    /// transfer** (a single `memcpy_htod` per contiguous slab run) rather than a
+    /// tiny copy per chunk. Called at the finalization sites — quantize,
+    /// cold-load, and warm→hot elevate — so a resident record always matches the
+    /// bytes it describes.
+    ///
+    /// Returns `None` for every input when the pool has no device residence
+    /// (CPU / host-only tier): there is no readable record address, so the
+    /// caller must keep `meta = None` and fall back to per-forward scratch heads.
+    /// This preserves the invariant `meta.is_some() ⇒ device_addr != 0` that the
+    /// prefill/glue serializer relies on (it builds no scratch heads for resident
+    /// chunks). Each handle is stored on the `SealedChunk`/`ChunkWindow` and
+    /// shared by every slot that references the chunk.
+    #[allow(dead_code)] // callers are cuda-gated; a pure-CPU build sees none
+    pub(crate) fn build_meta_records(
+        &self,
+        chunks: &[(
+            &super::head_gids::HeadGids,
+            &[u8],
+            &[u8],
+            &[f32],
+            &[f32],
+        )],
+        arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
+    ) -> Result<Vec<Option<super::meta_pool::MetaGid>>> {
+        if !self.inner.meta_pool.is_device_resident() {
+            return Ok(vec![None; chunks.len()]);
+        }
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        let rb = super::meta_pool::chunk_record_bytes(n_kv_head, head_dim);
+        let mut items: Vec<(super::meta_pool::MetaGid, Vec<u8>)> = Vec::with_capacity(chunks.len());
+        for (gids, k_pal, v_pal, k_scale, v_scale) in chunks {
+            let handle = self.inner.meta_pool.allocate()?;
+            let mut bytes = vec![0u8; rb];
+            super::meta_pool::serialize_kv_heads(
+                &mut bytes, gids, k_pal, v_pal, k_scale, v_scale, n_kv_head, head_dim, arena_info,
+            );
+            items.push((handle, bytes));
+        }
+        self.inner.meta_pool.write_records_batched(&items)?;
+        Ok(items.into_iter().map(|(h, _)| Some(h)).collect())
     }
 
     /// Returns true if this backing has enough reclaimable/tombstoned work to
@@ -872,6 +934,10 @@ impl ChunkedKvBacking {
                     k_scale: cw.k_scale.clone(),
                     v_scale: cw.v_scale.clone(),
                     byte_size,
+                    // Live snapshot shares the chunk's GIDs — propagate the
+                    // resident record handle so the prefill/glue serializer can
+                    // emit its `kvheads_ptr` instead of rebuilding heads.
+                    meta: cw.meta.clone(),
                 }
             })
             .collect();

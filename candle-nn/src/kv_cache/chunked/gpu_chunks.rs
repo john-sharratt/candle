@@ -1,12 +1,17 @@
 //! GPU-side slot-state cache for a single sequence.
 //!
-//! Holds a pinned host buffer of serialised `TokenSliceHost` bytes and a
-//! matching device-side backing allocation.  Dirty chunk indices accumulate
-//! on the [`GpuChunksGuard`]; on drop the guard coalesces adjacent indices
-//! into contiguous byte ranges and issues one `stream.memcpy_htod` per run.
+//! Holds a pinned host buffer and a matching device backing allocation, laid out
+//! in two sections — `[ slice headers (16 B) | KvHead records ]` — so the slice
+//! headers stay a contiguous 16-byte-stride array (what the kernel's `get_slice`
+//! indexes) while each header's `kvheads_ptr` points into the records section.
+//! Dirty chunk indices accumulate on the [`GpuChunksGuard`]; on drop the guard
+//! coalesces adjacent indices into runs and, because of the two sections, issues
+//! two `stream.memcpy_htod` per run (the headers range + the records range).
 
 use super::types::ChunkWindow;
-use crate::kv_cache::arena_table::{ArenaFormatTag, ResolvedArenaInfo, N_PALETTE};
+use crate::kv_cache::arena_table::ResolvedArenaInfo;
+#[cfg(test)]
+use crate::kv_cache::arena_table::N_PALETTE;
 use candle::cuda_backend::cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use candle::cuda_backend::WrapErr;
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -157,9 +162,34 @@ impl GpuChunksGuard<'_> {
                 "update_chunk: index {chunk_idx} out of range (buf holds {current_n} chunks)"
             );
         }
-        let bs = chunk_idx * chunk_byte_size;
-        let slot = &mut self.inner.buf.as_mut_slice()[bs..bs + chunk_byte_size];
-        serialize_chunk_window(chunk, n_kv_head, head_dim, rope_base, arena_info, slot);
+        let rec_bytes = record_bytes(n_kv_head, head_dim);
+        let records_off = current_n * SLICE_HEADER_BYTES;
+        let base = self.inner.raw_device_ptr();
+        let len = chunk.usage as u16;
+        // Resident chunk: point at its meta-pool record; else inline (see
+        // rebuild_decode for the rationale).
+        let kvheads_ptr = match chunk.meta.as_ref().map(|m| m.device_addr()) {
+            Some(addr) if addr != 0 => addr,
+            _ => {
+                let r0 = records_off + chunk_idx * rec_bytes;
+                write_record_for_chunk(
+                    &mut self.inner.buf.as_mut_slice()[r0..r0 + rec_bytes],
+                    chunk,
+                    n_kv_head,
+                    head_dim,
+                    arena_info,
+                );
+                base + (records_off + chunk_idx * rec_bytes) as u64
+            }
+        };
+        let s0 = chunk_idx * SLICE_HEADER_BYTES;
+        write_slice_header(
+            &mut self.inner.buf.as_mut_slice()[s0..s0 + SLICE_HEADER_BYTES],
+            chunk.offset,
+            len,
+            rope_base,
+            kvheads_ptr,
+        );
         self.dirty_chunks.push(chunk_idx);
         Ok(())
     }
@@ -186,13 +216,19 @@ impl GpuChunksGuard<'_> {
             return Ok(());
         }
         self.dirty_chunks.clear();
+        let n = chunks.len();
         let chunk_byte_size = token_slice_serialized_size(n_kv_head, head_dim);
-        self.resize(chunks.len(), chunk_byte_size)?;
+        self.resize(n, chunk_byte_size)?;
+
+        // Two sections: slice headers [0 .. n*16), then records. Resolve the GPU
+        // base once (the allocation is fixed for the buffer's lifetime) so each
+        // header's kvheads_ptr can point into the records section.
+        let rec_bytes = record_bytes(n_kv_head, head_dim);
+        let records_off = n * SLICE_HEADER_BYTES;
+        let base = self.inner.raw_device_ptr();
 
         let mut rope_base = 0u32;
         for (i, chunk) in chunks.iter().enumerate() {
-            let bs = i * chunk_byte_size;
-            let slot = &mut self.inner.buf.as_mut_slice()[bs..bs + chunk_byte_size];
             // The writer chunk gets the seq_offset-derived `write_len`; every
             // other chunk (including trailing empties past the writer) keeps its
             // own stored usage.
@@ -201,8 +237,30 @@ impl GpuChunksGuard<'_> {
             } else {
                 chunk.usage as u16
             };
-            serialize_chunk_window_with_len(
-                chunk, n_kv_head, head_dim, rope_base, len, arena_info, slot,
+            // Resident chunk: point at its co-resident record in the meta-pool
+            // slab and skip serializing a record here. Otherwise serialize an
+            // inline record into this chunk's records-section slot and point at it.
+            let kvheads_ptr = match chunk.meta.as_ref().map(|m| m.device_addr()) {
+                Some(addr) if addr != 0 => addr,
+                _ => {
+                    let r0 = records_off + i * rec_bytes;
+                    write_record_for_chunk(
+                        &mut self.inner.buf.as_mut_slice()[r0..r0 + rec_bytes],
+                        chunk,
+                        n_kv_head,
+                        head_dim,
+                        arena_info,
+                    );
+                    base + (records_off + i * rec_bytes) as u64
+                }
+            };
+            let s0 = i * SLICE_HEADER_BYTES;
+            write_slice_header(
+                &mut self.inner.buf.as_mut_slice()[s0..s0 + SLICE_HEADER_BYTES],
+                chunk.offset,
+                len,
+                rope_base,
+                kvheads_ptr,
             );
             self.dirty_chunks.push(i);
             rope_base += chunk.usage;
@@ -262,33 +320,44 @@ impl Drop for GpuChunksGuard<'_> {
         };
         let host: &[u8] = buf.as_slice();
 
-        // Walk dirty_chunks (ascending) and coalesce adjacent indices into
-        // contiguous byte ranges, issuing one memcpy_htod per run.
+        // Two-section buffer: slice headers [0 .. n*16), then records. A
+        // coalesced run of adjacent chunk indices is contiguous in *both*
+        // sections, so each run uploads two ranges: the 16-byte headers and the
+        // records. n_chunks / records_off / rec_bytes are derived from the
+        // stored per-chunk footprint.
+        let n_chunks = host.len() / chunk_byte_size;
+        let rec_bytes = chunk_byte_size - SLICE_HEADER_BYTES;
+        let records_off = n_chunks * SLICE_HEADER_BYTES;
+        let upload_run = |start: usize, end: usize, gpu: &mut CudaSlice<u8>| {
+            // Slice-header region.
+            let (hs, he) = (start * SLICE_HEADER_BYTES, end * SLICE_HEADER_BYTES);
+            if let Err(e) = stream.memcpy_htod(&host[hs..he], &mut gpu.slice_mut(hs..he)).w() {
+                log::warn!("GpuChunksGuard: header memcpy_htod [{hs}..{he}] error: {e:?}");
+            }
+            // Records region.
+            if rec_bytes > 0 {
+                let (rs, re) = (
+                    records_off + start * rec_bytes,
+                    records_off + end * rec_bytes,
+                );
+                if let Err(e) = stream.memcpy_htod(&host[rs..re], &mut gpu.slice_mut(rs..re)).w() {
+                    log::warn!("GpuChunksGuard: record memcpy_htod [{rs}..{re}] error: {e:?}");
+                }
+            }
+        };
+
         let mut start = self.dirty_chunks[0];
         let mut end = start + 1;
         for &idx in &self.dirty_chunks[1..] {
             if idx == end {
                 end += 1;
             } else {
-                let (bs, be) = (start * chunk_byte_size, end * chunk_byte_size);
-                if let Err(e) = stream
-                    .memcpy_htod(&host[bs..be], &mut gpu.slice_mut(bs..be))
-                    .w()
-                {
-                    log::warn!("GpuChunksGuard: memcpy_htod [{bs}..{be}] error: {e:?}");
-                }
+                upload_run(start, end, gpu);
                 start = idx;
                 end = idx + 1;
             }
         }
-        // Flush the final (or only) contiguous run.
-        let (bs, be) = (start * chunk_byte_size, end * chunk_byte_size);
-        if let Err(e) = stream
-            .memcpy_htod(&host[bs..be], &mut gpu.slice_mut(bs..be))
-            .w()
-        {
-            log::warn!("GpuChunksGuard: memcpy_htod [{bs}..{be}] error: {e:?}");
-        }
+        upload_run(start, end, gpu);
     }
 }
 
@@ -342,9 +411,59 @@ pub(crate) fn kv_head_serialized_size(head_dim: usize) -> usize {
         + 16 // v_scale: 4 × f32 (outer scale per palette)
 }
 
-/// Returns the serialised byte-size of one `TokenSlice` entry.
+/// Fixed byte-size of one `TokenSlice` header: offset(2) + len(2) + rope(4) +
+/// kvheads_ptr(8). The KvHead record lives out-of-line (see [`record_bytes`]).
+pub(crate) const SLICE_HEADER_BYTES: usize = 16;
+
+/// Byte-size of one chunk's out-of-line `KvHead[n_kv_head]` record.
+pub(crate) fn record_bytes(n_kv_head: usize, head_dim: usize) -> usize {
+    n_kv_head * kv_head_serialized_size(head_dim)
+}
+
+/// Per-chunk footprint in the `GpuChunks` buffer: the 16-byte slice header plus
+/// its out-of-line record. The buffer is laid out in two sections —
+/// `[ slice_header × n_chunks | record × n_chunks ]` — so slice headers stay a
+/// contiguous 16-byte-stride array (what the kernel's `get_slice` indexes) while
+/// each header's `kvheads_ptr` points into the records section.
 pub(crate) fn token_slice_serialized_size(n_kv_head: usize, head_dim: usize) -> usize {
-    8 + n_kv_head * kv_head_serialized_size(head_dim)
+    SLICE_HEADER_BYTES + record_bytes(n_kv_head, head_dim)
+}
+
+/// Write a 16-byte slice header (`offset`, `len`, `rope`, `kvheads_ptr`).
+pub(crate) fn write_slice_header(
+    dst: &mut [u8],
+    offset: u16,
+    len: u16,
+    rope: u32,
+    kvheads_ptr: u64,
+) {
+    dst[0..2].copy_from_slice(&offset.to_le_bytes());
+    dst[2..4].copy_from_slice(&len.to_le_bytes());
+    dst[4..8].copy_from_slice(&rope.to_le_bytes());
+    dst[8..16].copy_from_slice(&kvheads_ptr.to_le_bytes());
+}
+
+/// Serialize one chunk's `KvHead[n_kv_head]` record into `dst` (length
+/// [`record_bytes`]). Delegates to the shared record serializer so the decode
+/// buffer and the resident meta-pool produce byte-identical records.
+fn write_record_for_chunk(
+    dst: &mut [u8],
+    chunk: &ChunkWindow,
+    n_kv_head: usize,
+    head_dim: usize,
+    arena_info: &[ResolvedArenaInfo],
+) {
+    super::meta_pool::serialize_kv_heads(
+        dst,
+        &chunk.gids,
+        chunk.k_pal.as_slice(),
+        chunk.v_pal.as_slice(),
+        chunk.k_scale.as_slice(),
+        chunk.v_scale.as_slice(),
+        n_kv_head,
+        head_dim,
+        arena_info,
+    );
 }
 
 /// Write the identity 2-bit palette map for the given head dimension into `dst`.
@@ -362,219 +481,6 @@ pub(crate) fn write_identity_pal_map(head_dim: usize, dst: &mut [u8]) {
         let byte_idx = d / 4;
         let bit_shift = (d % 4) * 2;
         dst[byte_idx] |= pal_idx << bit_shift;
-    }
-}
-
-/// Serialise one `ChunkWindow` into `dst` with an explicit `len` override.
-///
-/// Identical to [`serialize_chunk_window`] except that `len` replaces
-/// `chunk.usage as u16`.  Used by [`GpuChunksGuard::rebuild_decode`] to
-/// supply the true sequence-offset-derived length for the write chunk.
-pub(crate) fn serialize_chunk_window_with_len(
-    chunk: &ChunkWindow,
-    n_kv_head: usize,
-    head_dim: usize,
-    rope_base: u32,
-    len: u16,
-    arena_info: &[ResolvedArenaInfo],
-    dst: &mut [u8],
-) {
-    debug_assert!(
-        head_dim >= 4,
-        "head_dim must be >= 4 for 2-bit pal_map packing"
-    );
-    let pal_total = n_kv_head * (head_dim / 4);
-    let scale_total = n_kv_head * N_PALETTE;
-    debug_assert!(
-        chunk.k_pal.is_empty() || chunk.k_pal.len() == pal_total,
-        "k_pal length must be 0 or {pal_total}, got {}",
-        chunk.k_pal.len()
-    );
-    debug_assert!(
-        chunk.v_pal.is_empty() || chunk.v_pal.len() == pal_total,
-        "v_pal length must be 0 or {pal_total}, got {}",
-        chunk.v_pal.len()
-    );
-    debug_assert!(
-        chunk.k_scale.is_empty() || chunk.k_scale.len() == scale_total,
-        "k_scale length must be 0 or {scale_total}, got {}",
-        chunk.k_scale.len()
-    );
-    debug_assert!(
-        chunk.v_scale.is_empty() || chunk.v_scale.len() == scale_total,
-        "v_scale length must be 0 or {scale_total}, got {}",
-        chunk.v_scale.len()
-    );
-    let mut pos = 0;
-
-    macro_rules! put {
-        ($b:expr) => {{
-            let b: &[u8] = $b;
-            dst[pos..pos + b.len()].copy_from_slice(b);
-            pos += b.len();
-        }};
-    }
-
-    put!(&chunk.offset.to_le_bytes());
-    put!(&len.to_le_bytes());
-    put!(&rope_base.to_le_bytes());
-
-    let pal_bytes = head_dim / 4;
-
-    for h in 0..n_kv_head {
-        dst[pos..pos + pal_bytes].copy_from_slice(&chunk.k_pal[h * pal_bytes..(h + 1) * pal_bytes]);
-        pos += pal_bytes;
-        dst[pos..pos + pal_bytes].copy_from_slice(&chunk.v_pal[h * pal_bytes..(h + 1) * pal_bytes]);
-        pos += pal_bytes;
-
-        let mut k_ptr = [0u64; N_PALETTE];
-        let mut v_ptr = [0u64; N_PALETTE];
-        let mut k_fmt = [ArenaFormatTag::BF16.as_u8(); N_PALETTE];
-        let mut v_fmt = [ArenaFormatTag::BF16.as_u8(); N_PALETTE];
-
-        for p in 0..N_PALETTE {
-            let k_gid = chunk.gids.k_gid_pal(h, p);
-            let v_gid = chunk.gids.v_gid_pal(h, p);
-            if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
-                k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                k_fmt[p] = ai.k_format_tag.as_u8();
-            }
-            if let Some(ai) = arena_info.get(v_gid.arena_idx()) {
-                v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                v_fmt[p] = ai.v_format_tag.as_u8();
-            }
-        }
-
-        for &ptr in &k_ptr {
-            put!(&ptr.to_le_bytes());
-        }
-        for &ptr in &v_ptr {
-            put!(&ptr.to_le_bytes());
-        }
-        put!(&k_fmt);
-        put!(&v_fmt);
-        // k_scale[4] and v_scale[4]: f32 outer scale per palette (encoder *,
-        // decoder /), default 1.0
-        let scale_base = h * N_PALETTE;
-        for p in 0..N_PALETTE {
-            let s = chunk.k_scale.get(scale_base + p).copied().unwrap_or(1.0);
-            put!(&s.to_le_bytes());
-        }
-        for p in 0..N_PALETTE {
-            let s = chunk.v_scale.get(scale_base + p).copied().unwrap_or(1.0);
-            put!(&s.to_le_bytes());
-        }
-    }
-}
-
-/// Serialise one `ChunkWindow` into `dst` in the `TokenSlice` layout the CUDA
-/// kernel expects:
-///
-/// ```text
-///   offset:  u16  (LE)
-///   len:     u16  (LE)   ← chunk.usage truncated to u16
-///   rope:    u32  (LE)
-///   for each KV head:
-///     k_pal[head_dim/4]        2-bit packed, identity routing
-///     v_pal[head_dim/4]        same
-///     k_ptr[N_PALETTE]  u64×4  resolved K device pointers
-///     v_ptr[N_PALETTE]  u64×4  resolved V device pointers
-///     k_fmt[N_PALETTE]  u8×4   K format tags
-///     v_fmt[N_PALETTE]  u8×4   V format tags
-/// ```
-pub(crate) fn serialize_chunk_window(
-    chunk: &ChunkWindow,
-    n_kv_head: usize,
-    head_dim: usize,
-    rope_base: u32,
-    arena_info: &[ResolvedArenaInfo],
-    dst: &mut [u8],
-) {
-    debug_assert!(
-        head_dim >= 4,
-        "head_dim must be >= 4 for 2-bit pal_map packing"
-    );
-    let pal_total = n_kv_head * (head_dim / 4);
-    let scale_total = n_kv_head * N_PALETTE;
-    debug_assert!(
-        chunk.k_pal.is_empty() || chunk.k_pal.len() == pal_total,
-        "k_pal length must be 0 or {pal_total}, got {}",
-        chunk.k_pal.len()
-    );
-    debug_assert!(
-        chunk.v_pal.is_empty() || chunk.v_pal.len() == pal_total,
-        "v_pal length must be 0 or {pal_total}, got {}",
-        chunk.v_pal.len()
-    );
-    debug_assert!(
-        chunk.k_scale.is_empty() || chunk.k_scale.len() == scale_total,
-        "k_scale length must be 0 or {scale_total}, got {}",
-        chunk.k_scale.len()
-    );
-    debug_assert!(
-        chunk.v_scale.is_empty() || chunk.v_scale.len() == scale_total,
-        "v_scale length must be 0 or {scale_total}, got {}",
-        chunk.v_scale.len()
-    );
-    let mut pos = 0;
-
-    macro_rules! put {
-        ($b:expr) => {{
-            let b: &[u8] = $b;
-            dst[pos..pos + b.len()].copy_from_slice(b);
-            pos += b.len();
-        }};
-    }
-
-    put!(&chunk.offset.to_le_bytes());
-    put!(&(chunk.usage as u16).to_le_bytes());
-    put!(&rope_base.to_le_bytes());
-
-    let pal_bytes = head_dim / 4;
-
-    for h in 0..n_kv_head {
-        dst[pos..pos + pal_bytes].copy_from_slice(&chunk.k_pal[h * pal_bytes..(h + 1) * pal_bytes]);
-        pos += pal_bytes;
-        dst[pos..pos + pal_bytes].copy_from_slice(&chunk.v_pal[h * pal_bytes..(h + 1) * pal_bytes]);
-        pos += pal_bytes;
-
-        let mut k_ptr = [0u64; N_PALETTE];
-        let mut v_ptr = [0u64; N_PALETTE];
-        let mut k_fmt = [ArenaFormatTag::BF16.as_u8(); N_PALETTE];
-        let mut v_fmt = [ArenaFormatTag::BF16.as_u8(); N_PALETTE];
-
-        for p in 0..N_PALETTE {
-            let k_gid = chunk.gids.k_gid_pal(h, p);
-            let v_gid = chunk.gids.v_gid_pal(h, p);
-            if let Some(ai) = arena_info.get(k_gid.arena_idx()) {
-                k_ptr[p] = ai.base_ptr + k_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                k_fmt[p] = ai.k_format_tag.as_u8();
-            }
-            if let Some(ai) = arena_info.get(v_gid.arena_idx()) {
-                v_ptr[p] = ai.base_ptr + v_gid.chunk_idx() as u64 * ai.chunk_byte_stride as u64;
-                v_fmt[p] = ai.v_format_tag.as_u8();
-            }
-        }
-
-        for &ptr in &k_ptr {
-            put!(&ptr.to_le_bytes());
-        }
-        for &ptr in &v_ptr {
-            put!(&ptr.to_le_bytes());
-        }
-        put!(&k_fmt);
-        put!(&v_fmt);
-        // k_scale[4] and v_scale[4]: f32 outer scale per palette (encoder *,
-        // decoder /), default 1.0
-        let scale_base = h * N_PALETTE;
-        for p in 0..N_PALETTE {
-            let s = chunk.k_scale.get(scale_base + p).copied().unwrap_or(1.0);
-            put!(&s.to_le_bytes());
-        }
-        for p in 0..N_PALETTE {
-            let s = chunk.v_scale.get(scale_base + p).copied().unwrap_or(1.0);
-            put!(&s.to_le_bytes());
-        }
     }
 }
 

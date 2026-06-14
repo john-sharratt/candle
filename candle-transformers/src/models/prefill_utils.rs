@@ -36,7 +36,9 @@ struct SlotHeaderUpload {
     /// Per-slot host slot state, write region extended; `position_map[off+t]`
     /// locates glue token `t`'s writer slice/in-block offset.
     slots: Vec<SlotStateHost>,
-    _guards: (GpuBuf, GpuBuf, GpuBuf),
+    /// Keeps the stager uploads (headers, slices, position_maps, records) alive
+    /// for the duration of the kernel launch.
+    _guards: (GpuBuf, GpuBuf, GpuBuf, GpuBuf),
 }
 
 /// Build + upload the per-slot `SlotHeader` payloads (slices, position_map,
@@ -67,7 +69,7 @@ fn build_slot_headers(
         .map(|cache| {
             let chunks = cache
                 .k_cache()
-                .chunked_live_chunks_as_sealed()
+                .chunked_live_chunks_as_sealed_with(&arena_info)
                 .unwrap_or_default();
             let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
             SlotStateHost::from_sealed_chunks(
@@ -91,15 +93,73 @@ fn build_slot_headers(
     pipeline_record("slot:build", t_build);
 
     let t_pack = profile_now();
-    // Pack slices — upload via stager for zero-copy PCIe read.
-    let slice_size = TokenSliceHost::serialized_size(n_kv_head, head_dim);
+    // Two-section upload. A records buffer (each *scratch* slice's out-of-line
+    // KvHead[n_kv_head] record) is submitted FIRST so the slice headers can
+    // embed each record's device address without self-referencing a single
+    // buffer (the stager only yields a device pointer at submit). Resident
+    // slices (`meta.is_some()`) skip the records buffer entirely and point their
+    // `kvheads_ptr` at the device meta-pool slab — the residence win: no per-
+    // forward head rebuild, no scratch upload for the sealed prefix.
+    let rec_bytes = TokenSliceHost::record_size(n_kv_head, head_dim);
     let total_slices: usize = slots.iter().map(|s| s.slices.len()).sum();
-    let mut slice_buf: Vec<u8> = Vec::with_capacity(total_slices * slice_size);
+
+    /// Where a slice's KvHead record lives: a resident device address, or a
+    /// byte offset into the per-forward scratch records buffer.
+    enum KvSrc {
+        Resident(u64),
+        Scratch(usize),
+    }
+    let mut records_buf: Vec<u8> = Vec::with_capacity(total_slices * rec_bytes);
+    let mut srcs: Vec<KvSrc> = Vec::with_capacity(total_slices);
+    for (slot, cache) in slots.iter().zip(caches.iter()) {
+        for slice in &slot.slices {
+            match &slice.meta {
+                Some(meta) => {
+                    let addr = cache.k_cache().chunked_meta_device_addr(meta);
+                    // Invariant (enforced by `build_meta_records`, which returns
+                    // None on a host-only pool): meta=Some ⇒ device_addr != 0.
+                    // A resident slice has empty heads (no scratch fallback), so a
+                    // 0 here would be a null `kvheads_ptr` — fail loudly in release
+                    // rather than let the kernel deref null.
+                    if addr == 0 {
+                        candle::bail!(
+                            "resident slice (meta=Some) resolved to device_addr 0 — \
+                             record not device-resident"
+                        );
+                    }
+                    srcs.push(KvSrc::Resident(addr));
+                }
+                None => {
+                    let off = records_buf.len();
+                    slice.serialize_record(&mut records_buf);
+                    srcs.push(KvSrc::Scratch(off));
+                }
+            }
+        }
+    }
+    if records_buf.is_empty() {
+        records_buf.push(0u8);
+    }
+    let mut records_pinned = generation.alloc(records_buf.len())?;
+    records_pinned.copy_from_slice(&records_buf);
+    let records_gpu = generation.submit(records_pinned)?;
+    let records_base = records_gpu.dev_ptr();
+
+    // Slice headers (16 bytes each), in slot order, each pointing at its record
+    // (resident address as-is, scratch offset rebased onto `records_base`).
+    let mut slice_buf: Vec<u8> =
+        Vec::with_capacity(total_slices * TokenSliceHost::SLICE_HEADER_SIZE);
     let mut slot_byte_offsets: Vec<usize> = Vec::with_capacity(slots.len());
+    let mut k = 0usize;
     for slot in &slots {
         slot_byte_offsets.push(slice_buf.len());
         for slice in &slot.slices {
-            slice.serialize_into(&mut slice_buf);
+            let kvheads_ptr = match srcs[k] {
+                KvSrc::Resident(addr) => addr,
+                KvSrc::Scratch(off) => records_base + off as u64,
+            };
+            slice.serialize_slice_header(&mut slice_buf, kvheads_ptr);
+            k += 1;
         }
     }
     if slice_buf.is_empty() {
@@ -151,7 +211,7 @@ fn build_slot_headers(
     Ok(SlotHeaderUpload {
         headers_ptr,
         slots,
-        _guards: (headers_gpu, slices_gpu, pm_gpu),
+        _guards: (headers_gpu, slices_gpu, pm_gpu, records_gpu),
     })
 }
 

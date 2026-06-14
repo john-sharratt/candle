@@ -651,6 +651,9 @@ pub fn quantize_sealed_in_place(
     // identity + 1.0 fallbacks when the corresponding override is set).
     let mut full_quant_chunks: std::collections::HashMap<(usize, usize), SealedChunk> =
         std::collections::HashMap::with_capacity(seq_chunk_map.len());
+    // Keys in build order, so the batched record build below can map each
+    // returned handle back to its chunk.
+    let mut quant_keys: Vec<(usize, usize)> = Vec::with_capacity(seq_chunk_map.len());
     for (job_idx, &(seq_idx, chunk_idx)) in seq_chunk_map.iter().enumerate() {
         let new_gids = HeadGids::from_vec(new_gids_per_chunk[job_idx].clone());
         let byte_size = new_gids.arena_byte_size(&arena_infos);
@@ -693,6 +696,9 @@ pub fn quantize_sealed_in_place(
                 Arc::new(v_palette_scales[job_idx].clone()),
             )
         };
+        // The co-resident KV-head record is built in one batched pass after the
+        // loop (below), so all quantized placements are known and the device
+        // upload coalesces into a single transfer.
         full_quant_chunks.insert(
             (seq_idx, chunk_idx),
             SealedChunk {
@@ -704,8 +710,37 @@ pub fn quantize_sealed_in_place(
                 k_scale,
                 v_scale,
                 byte_size,
+                meta: None,
             },
         );
+        quant_keys.push((seq_idx, chunk_idx));
+    }
+
+    // Build the co-resident KV-head records at the quantized placement — pal/scale
+    // as selected + the 8 per-palette pointers resolved against the new quant
+    // arenas — in one batched, coalesced upload.
+    {
+        let metas = {
+            let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = quant_keys
+                .iter()
+                .map(|key| {
+                    let c = &full_quant_chunks[key];
+                    (
+                        &c.gids,
+                        c.k_pal.as_slice(),
+                        c.v_pal.as_slice(),
+                        c.k_scale.as_slice(),
+                        c.v_scale.as_slice(),
+                    )
+                })
+                .collect();
+            backing.build_meta_records(&refs, &arena_infos)?
+        };
+        for (key, meta) in quant_keys.iter().zip(metas) {
+            if let Some(c) = full_quant_chunks.get_mut(key) {
+                c.meta = meta;
+            }
+        }
     }
 
     // ── Merge: kernel-quantized chunks + preserve-bucket chunks ──────

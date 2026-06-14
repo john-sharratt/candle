@@ -382,6 +382,19 @@ impl Cache {
         }
     }
 
+    /// Like [`Self::chunked_live_chunks_as_sealed`] but reuses an already-resolved
+    /// `arena_info` instead of resolving it again — the caller (e.g.
+    /// `build_slot_headers`) resolves it once per forward and passes it per cache.
+    pub fn chunked_live_chunks_as_sealed_with(
+        &self,
+        arena_info: &[super::ResolvedArenaInfo],
+    ) -> Option<Vec<super::SealedChunk>> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.live_chunks_as_sealed(c.batch_idx, arena_info),
+            CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
     /// First chunk index that is writer-owned for the slot bound to
     /// this cache.  Chunks before this index are Arc-shared with
     /// substrate/parent and immutable; chunks at or after it are
@@ -393,6 +406,15 @@ impl Cache {
         match &self.storage {
             CacheStorage::Chunked(c) => c.backing.writer_start_idx_for_seq(c.batch_idx),
             CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
+    /// Device address of a resident KV-head record (for a slice's `kvheads_ptr`).
+    /// `0` if there is no chunked backing or no device residence (CPU pool).
+    pub fn chunked_meta_device_addr(&self, meta: &super::MetaGid) -> u64 {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.meta_device_addr(meta),
+            CacheStorage::Contiguous { .. } => 0,
         }
     }
 
