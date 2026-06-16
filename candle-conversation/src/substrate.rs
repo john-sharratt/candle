@@ -49,7 +49,7 @@
 use std::sync::{OnceLock, RwLockReadGuard, RwLockWriteGuard};
 
 use ahash::AHashMap;
-use candle_nn::kv_cache::SealedSequence;
+use candle_nn::kv_cache::{QuantFormat, SealedSequence};
 use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
@@ -222,14 +222,24 @@ pub struct ResidenceIndex(pub usize);
 /// Per-conversation KV-compression override, resolved from the owning
 /// timeline's [`SequenceConfig`] at residence-allocation time and read by
 /// the persistence thread's hot→warm quantize pass. `None` on a residence
-/// means "use the engine-wide turn policy"; `Some` replaces the level and,
-/// when `disable_k_override` is set, drops the global K-format override so
-/// K is adaptively quantized like V. Used to compress utility layers
-/// (e.g. `code_reading`) harder than live dialogue.
+/// means "use the engine-wide turn policy"; `Some` applies the overrides
+/// below. Used to compress utility layers (e.g. `code_reading`) harder than
+/// live dialogue, or to pin dialogue turns to a fixed near-lossless format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConvCompression {
-    pub level: u8,
+    /// Adaptive compression level override. `Some` replaces the engine-wide
+    /// turn level; `None` keeps it (used when only the forced formats below
+    /// are set).
+    pub level: Option<u8>,
+    /// Drop the global K-format override (Q4_KS) so K is adaptively quantized
+    /// per-block like V.
     pub disable_k_override: bool,
+    /// Force every K block of this conversation's turns to a single uniform
+    /// quant format, bypassing adaptive per-block selection (and the global
+    /// Q4_KS K override). `None` keeps the engine-wide K behaviour.
+    pub force_k: Option<QuantFormat>,
+    /// V counterpart to [`Self::force_k`].
+    pub force_v: Option<QuantFormat>,
 }
 
 #[derive(Debug)]
@@ -886,6 +896,13 @@ pub struct TimelineEntry {
     /// `SummaryOfTurns` leaf covering them).  Drained in FIFO order by
     /// the summariser's `pop_pending_turn` API.
     pub pending_summary_queue: std::collections::VecDeque<TurnIndex>,
+    /// Whether this timeline's turns are fed to the summariser at all.
+    /// `true` for dialogue; `false` for append-only utility/reference layers
+    /// (repo_map, code_reading) — they are background reference, summarising
+    /// them is pointless work that storms the summariser during repo
+    /// ingest/scan. When `false`, turns are never pushed onto
+    /// `pending_summary_queue`, so the summariser never touches this timeline.
+    pub summarize: bool,
     /// Summary nodes whose stored Q-fingerprint is stale because their
     /// children changed (most commonly after an AVL rotation).  The
     /// summariser sweep regenerates one per pass (§7.3).
@@ -981,6 +998,7 @@ impl TimelineEntry {
             tree_root: None,
             debug_id: None,
             pending_summary_queue: std::collections::VecDeque::new(),
+            summarize: true,
             dirty_summary_set: std::collections::BTreeSet::new(),
             last_selection: None,
         }
@@ -1042,6 +1060,16 @@ impl Substrate {
             None => {
                 self.timeline_compression.remove(&timeline);
             }
+        }
+    }
+
+    /// Mark whether `timeline`'s turns should be summarised. Set `false` for
+    /// append-only utility/reference layers (repo_map, code_reading) so their
+    /// turns never enter the summariser's pending queue. Must run after the
+    /// timeline is registered and before its first turn seals.
+    pub fn set_timeline_summarize(&mut self, timeline: TimelineId, summarize: bool) {
+        if let Some(tl) = self.timelines.get_mut(&timeline) {
+            tl.summarize = summarize;
         }
     }
 
@@ -1876,6 +1904,9 @@ impl Substrate {
     /// summary parent didn't survive a crash.
     pub fn push_pending_summary(&mut self, timeline: TimelineId, idx: TurnIndex) {
         if let Some(tl) = self.timelines.get_mut(&timeline) {
+            if !tl.summarize {
+                return;
+            }
             tl.pending_summary_queue.push_back(idx);
         }
     }
@@ -2432,9 +2463,12 @@ impl Substrate {
         // Every persisted turn carries a parallel `TreeNodeMeta`.  New
         // turns default to a `Normal` content sub-leaf and are pushed
         // onto the summariser's pending queue so the async thread can
-        // absorb them into a `SummaryOfTurns` leaf.
+        // absorb them into a `SummaryOfTurns` leaf — unless this timeline
+        // opts out of summarisation (utility/reference layers).
         tl.tree_meta.insert(idx, TreeNodeMeta::default());
-        tl.pending_summary_queue.push_back(idx);
+        if tl.summarize {
+            tl.pending_summary_queue.push_back(idx);
+        }
         idx
     }
 
@@ -2489,7 +2523,9 @@ impl Substrate {
                 },
             );
             tl.tree_meta.insert(idx, TreeNodeMeta::default());
-            tl.pending_summary_queue.push_back(idx);
+            if tl.summarize {
+                tl.pending_summary_queue.push_back(idx);
+            }
         }
         if !sealed_cpu.is_empty() {
             self.install_hot(residence, sealed_cpu);
@@ -2545,15 +2581,20 @@ impl Substrate {
                     },
                 },
             );
-            // Tree metadata defaults to a Normal sub-leaf — a
-            // subsequent `TreeMetadata` redo-log record (if present)
-            // overwrites this with the persisted kind / children /
-            // height during cold-load.  Restored turns are NOT pushed
-            // onto the pending queue: that queue captures only fresh
-            // turns the live summariser hasn't seen yet.  The
-            // missing-child reload sweep in §10.6 re-enqueues anything
-            // the persisted tree records as still-orphan.
-            tl.tree_meta.insert(idx, TreeNodeMeta::default());
+            // Tree metadata: the `TreeMetadata` redo-log records were
+            // already replayed during the walker's open pass (see
+            // `apply_tree_metadata_payload`), so a summary node's
+            // `SummaryOfTurns` / `SummaryOfSummaries` kind is ALREADY set
+            // here. Only seed a default `Normal` when this turn has no
+            // persisted tree meta at all — using `insert` unconditionally
+            // would clobber every reloaded summary node back to `Normal`,
+            // which collapses the summary tree on restart (the node spine
+            // fills with `Normal` turns → AVL invariant violation), re-enqueues
+            // the whole history for re-summarisation, and re-summarises prior
+            // summaries into garbage. Restored turns are NOT pushed onto the
+            // pending queue: that captures only fresh turns the live summariser
+            // hasn't seen yet.
+            tl.tree_meta.entry(idx).or_insert_with(TreeNodeMeta::default);
         }
         if let Some(cold_seqs) = cold {
             if !cold_seqs.is_empty() {
@@ -4041,6 +4082,67 @@ mod tests {
         assert_eq!(report.count, 0);
         assert_eq!(report.bytes, 0);
         assert!(sub.residence[a.0].hot.is_some());
+    }
+
+    /// On reload, `TreeMetadata` records are replayed (summary-node kinds set)
+    /// during the walker open pass, BEFORE the per-turn `restore_turn` loop.
+    /// `restore_turn` must not clobber a reloaded summary node's kind back to
+    /// `Normal` — that collapse re-enqueued the whole history, re-summarised
+    /// prior summaries into garbage, and broke the tree's AVL invariant on
+    /// restart.
+    #[test]
+    fn restore_turn_preserves_reloaded_tree_meta() {
+        let (_, _, timeline, mut sub) = make_timeline();
+
+        // Stand in for the open-pass replay: index 0 is a SummaryOfTurns leaf.
+        let leaf = TurnIndex(0);
+        sub.set_tree_meta(
+            timeline,
+            leaf,
+            TreeNodeMeta {
+                kind: TurnKind::SummaryOfTurns,
+                children: vec![TurnIndex(7)],
+                tree_height: 1,
+                dirty: false,
+            },
+        );
+
+        // The reconstruct loop then restores turn 0.
+        let idx = sub.restore_turn(
+            timeline,
+            String::new(),
+            String::new(),
+            TokenBuffer::default(),
+            20,
+            None,
+            0,
+            0,
+        );
+        assert_eq!(idx, leaf, "first restored turn lands at index 0");
+        let meta = sub.tree_meta_of(timeline, leaf).expect("tree meta present");
+        assert_eq!(
+            meta.kind,
+            TurnKind::SummaryOfTurns,
+            "restore_turn must preserve the reloaded summary-node kind",
+        );
+        assert_eq!(meta.children, vec![TurnIndex(7)], "children preserved");
+
+        // A turn with no prior tree meta still defaults to Normal.
+        let idx2 = sub.restore_turn(
+            timeline,
+            String::new(),
+            String::new(),
+            TokenBuffer::default(),
+            10,
+            None,
+            0,
+            0,
+        );
+        assert_eq!(
+            sub.tree_meta_of(timeline, idx2).map(|m| m.kind),
+            Some(TurnKind::Normal),
+            "a freshly restored turn with no tree meta defaults to Normal",
+        );
     }
 
     /// `restore_turn` with `cold = Some(...)` lands the residence as

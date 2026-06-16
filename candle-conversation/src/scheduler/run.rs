@@ -6,9 +6,24 @@ const DECODE_BUDGET: usize = 32;
 const PREFILL_BUDGET: usize = 1;
 
 impl Scheduler {
-    /// Number of currently-active decode sequences.
+    /// Number of currently-active decode sequences (including summary probes).
+    /// Used as the "is there decode work to run" guard.
     fn decode_width(&self) -> usize {
         self.active_decodes.values().filter(|s| !s.finished).count()
+    }
+
+    /// Active *foreground* decode sequences — excludes summary probes.
+    ///
+    /// Summary decodes ride the decode batch opportunistically, but must not
+    /// feed the prefill/decode flip heuristic: if they counted, a lingering
+    /// summary would keep the loop in decode-first mode and starve prefills
+    /// that would add more throughput. They still decode (via `decode_width`'s
+    /// guard) — they just don't bias the phase ordering.
+    fn foreground_decode_width(&self) -> usize {
+        self.active_decodes
+            .iter()
+            .filter(|(id, s)| !s.finished && !self.summary_completions.contains_key(id))
+            .count()
     }
 
     /// Run decode steps until the budget is reached or decode is empty.
@@ -94,7 +109,9 @@ impl Scheduler {
             }
 
             // 4. Always run all quanta each iteration; order by current width.
-            let dw = self.decode_width();
+            // Summary decodes are excluded from the flip count so they never
+            // hold the loop in decode-first mode at the expense of prefills.
+            let dw = self.foreground_decode_width();
             let pw = self.prefill_width();
             let sw = self.section_ingest_width();
             if dw >= pw.max(sw) {

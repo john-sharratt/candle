@@ -15,12 +15,30 @@ use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
+use candle::Device;
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use crossbeam::channel;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// How many summary probes the summariser submits per batch, chosen by total
+/// VRAM at engine init. Their decodes batch in the scheduler's wave loop, so a
+/// bigger card can keep more summaries in flight: 16 above 32 GB, 4 at or below
+/// (and on CPU, where there's no device VRAM to read).
+fn summary_probe_concurrency(device: &Device) -> usize {
+    const VRAM_32_GIB: usize = 32 * 1024 * 1024 * 1024;
+    let total_vram = match device {
+        Device::Cuda(d) => d.mem_get_info().map(|(_free, total)| total).unwrap_or(0),
+        _ => 0,
+    };
+    if total_vram > VRAM_32_GIB {
+        16
+    } else {
+        4
+    }
+}
 
 /// Live progress of the startup substrate reload (redo-log replay), shared
 /// between the scheduler thread (writer) and the daemon's load-state machine
@@ -276,7 +294,16 @@ impl ConversationEngine {
         // persistence thread so its writes flow through the same
         // workspace handle.
         let summariser_runner = Arc::new(ChannelProbeRunner::new(tx.clone()));
-        let summariser_thread = SummariserThread::spawn(conversation.clone(), summariser_runner);
+        let summary_concurrency = summary_probe_concurrency(session.device());
+        tracing::info!(
+            summary_concurrency,
+            "summariser probe-batch concurrency set from total VRAM"
+        );
+        let summariser_thread = SummariserThread::spawn(
+            conversation.clone(),
+            summariser_runner,
+            summary_concurrency,
+        );
         // Hand the trigger to the scheduler so every assistant-turn
         // seal wakes the summariser immediately — design §4 step ③.
         let summariser_trigger = summariser_thread.trigger_handle();
@@ -636,14 +663,30 @@ impl ConversationEngine {
         let timeline = self.conversation.mint_timeline(layer, group);
         // Register this conversation's per-conversation KV-compression
         // override (if any) before the first turn seals, so each turn
-        // residence inherits it at alloc time. Utility layers (code_reading)
-        // set a level + drop the K override via their SequenceConfig.
-        let compression = config.kv_compression_level.map(|level| ConvCompression {
-            level,
-            disable_k_override: config.kv_disable_k_override,
-        });
+        // residence inherits it at alloc time. Utility layers set a
+        // compression level (and may drop the K override or pin forced K/V
+        // formats) via their SequenceConfig.
+        let compression = if config.kv_compression_level.is_some()
+            || config.kv_force_k_format.is_some()
+            || config.kv_force_v_format.is_some()
+        {
+            Some(ConvCompression {
+                level: config.kv_compression_level,
+                disable_k_override: config.kv_disable_k_override,
+                force_k: config.kv_force_k_format,
+                force_v: config.kv_force_v_format,
+            })
+        } else {
+            None
+        };
         self.conversation
             .set_timeline_compression(timeline, compression);
+        // Utility/reference layers (repo_map, code_reading) are append-only and
+        // must not be summarised — summarising them is pointless work that
+        // storms the summariser during repo ingest/scan. `disable_reprojection`
+        // is exactly the utility-layer marker; reuse it as the summarise gate.
+        self.conversation
+            .set_timeline_summarize(timeline, !config.disable_reprojection);
         let target = ProjectionTarget {
             layer,
             group,

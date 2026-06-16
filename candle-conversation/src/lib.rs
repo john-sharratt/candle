@@ -100,6 +100,7 @@ pub use candle_transformers::generation::Sampling;
 pub use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
+pub use candle_nn::kv_cache::{KvFormat, QuantFormat};
 
 /// Convenience type alias for Results in this crate.
 pub type Result<T> = std::result::Result<T, ConversationError>;

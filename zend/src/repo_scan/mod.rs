@@ -47,6 +47,11 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     // parallel workers' prefills/decodes actually batch instead of serialising
     // behind reprojection.
     config.disable_reprojection = true;
+    // Utility ingests are cold reference context the dialogue layer retrieves
+    // rarely, so they compress their V harder than dialogue's C5 — C6 adaptive
+    // selection, with the engine-wide K→Q4_KS override left on. The code-reading
+    // layer inherits this same C6 level via `code_read_config`.
+    config.kv_compression_level = Some(6);
     config
 }
 

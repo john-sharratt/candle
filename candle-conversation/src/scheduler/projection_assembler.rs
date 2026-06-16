@@ -74,13 +74,20 @@ impl SlotState {
 pub(crate) struct BoundaryMarkers {
     pub(crate) user_start: Arc<Vec<u32>>,
     pub(crate) assistant_end: Arc<Vec<u32>>,
+    /// Intra-turn markers — `user_end` closes the user message and
+    /// `assistant_start` opens the assistant reply. Not used by the
+    /// assembler (they stay baked into persisted turn bytes), but the
+    /// summary probe needs them to frame its synthetic user→assistant
+    /// exchange so the model *responds* rather than continuing the prompt.
+    pub(crate) user_end: Arc<Vec<u32>>,
+    pub(crate) assistant_start: Arc<Vec<u32>>,
 }
 
 impl BoundaryMarkers {
-    /// Pre-tokenise the dialect's `user_start` and `assistant_end`
-    /// strings via the caller-supplied closure.  The closure form
-    /// keeps this module tokenizer-agnostic — callers (the engine)
-    /// wrap their `tokenizers::Tokenizer::encode`.
+    /// Pre-tokenise the dialect's role-marker strings via the
+    /// caller-supplied closure.  The closure form keeps this module
+    /// tokenizer-agnostic — callers (the engine) wrap their
+    /// `tokenizers::Tokenizer::encode`.
     pub(crate) fn from_dialect<E, F>(
         dialect: &candle_transformers::models::dialect::Dialect,
         mut tokenize: F,
@@ -90,9 +97,13 @@ impl BoundaryMarkers {
     {
         let user_start = Arc::new(tokenize(dialect.user_start)?);
         let assistant_end = Arc::new(tokenize(dialect.assistant_end)?);
+        let user_end = Arc::new(tokenize(dialect.user_end)?);
+        let assistant_start = Arc::new(tokenize(dialect.assistant_start)?);
         Ok(Self {
             user_start,
             assistant_end,
+            user_end,
+            assistant_start,
         })
     }
 }
@@ -247,6 +258,26 @@ pub(super) fn apply_segments_build(
         push_empty_if_sealed(ctx, walker.last_was_sealed)?;
     }
 
+    // Assembly summary: how much selected history actually reached the slot.
+    // `skipped_*` > 0 means the model will decode against a context missing
+    // turns/sections the resolver chose — the first thing to check when a
+    // response can't see its own recent history. The skip cases also emit a
+    // dedicated `warn!` below; this per-reproject line stays at `debug` so it
+    // doesn't flood production logs.
+    tracing::debug!(
+        target: "candle_conversation::scheduler::reproject",
+        slot = parent_id.0,
+        segments = new_segments.len(),
+        sealed_turns = walker.sealed_turns,
+        sealed_sections = walker.sealed_sections,
+        sealed_tokens = walker.sealed_tokens,
+        skipped_turns = walker.skipped_turns,
+        skipped_sections = walker.skipped_sections,
+        glue_tokens = walker.n_glue_tokens,
+        deferred_user = walker.deferred_user.is_some(),
+        "apply_segments: assembled slot prefix"
+    );
+
     let mut col_actual_pos = Vec::with_capacity(walker.col_prefix.len() + walker.col_new.len());
     col_actual_pos.extend_from_slice(&walker.col_prefix);
     col_actual_pos.extend_from_slice(&walker.col_new);
@@ -284,6 +315,16 @@ struct SegmentWalker {
     deferred_user: Option<Arc<Vec<u32>>>,
     /// Accounting: total glue tokens collected (the reproject cost scales here).
     n_glue_tokens: usize,
+    /// Accounting: sealed turn / section segments actually injected into the
+    /// slot, the tokens they carried, and any that were resolved-but-dropped.
+    /// A non-zero `skipped_*` means the model is decoding against a context
+    /// that is missing selected history — surfaced in the assembly summary so
+    /// a dropped turn never goes unnoticed.
+    sealed_turns: usize,
+    sealed_sections: usize,
+    sealed_tokens: usize,
+    skipped_turns: usize,
+    skipped_sections: usize,
 }
 
 impl SegmentWalker {
@@ -297,6 +338,11 @@ impl SegmentWalker {
             last_was_sealed: false,
             deferred_user: None,
             n_glue_tokens: 0,
+            sealed_turns: 0,
+            sealed_sections: 0,
+            sealed_tokens: 0,
+            skipped_turns: 0,
+            skipped_sections: 0,
         }
     }
 
@@ -339,6 +385,7 @@ fn inject_sealed_section(
     let sealed = match ctx.conversation.read().section_sealed_of(sid) {
         Some(s) => s,
         None => {
+            walker.skipped_sections += 1;
             tracing::warn!(
                 target: "candle_conversation::persistence::tier",
                 section = sid.raw(),
@@ -367,6 +414,8 @@ fn inject_sealed_section(
         .set_section_block_range(sid, start_block as u64, end_block as u64);
 
     log_injected_tokens(ctx, &toks);
+    walker.sealed_sections += 1;
+    walker.sealed_tokens += sealed[0].token_count;
     walker.record_sealed(sealed[0].token_count);
     Ok(())
 }
@@ -385,14 +434,72 @@ fn inject_sealed_turn(
         _ => ctx.conversation.read().timelines_for_group(group).next(),
     };
     let Some(timeline) = timeline else {
+        walker.skipped_turns += 1;
+        tracing::warn!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            group = group.raw(),
+            index = index.0,
+            "apply_projection: no timeline for group; dropping selected turn"
+        );
         return Ok(());
     };
 
     let sealed = match ctx.conversation.read().turn_sealed_of(timeline, index) {
         Some(s) => s,
-        None => return Ok(()),
+        None => {
+            walker.skipped_turns += 1;
+            // Distinguish the two failure modes:
+            //   entry_exists = false → the turn does not exist under the
+            //     timeline we resolved → timeline mismatch (the assembler used
+            //     `slot_target.timeline`; the elevate-set builder used
+            //     `timelines_for_group(group).next()` — if the group has >1
+            //     timeline these disagree).
+            //   entry_exists = true  → the turn exists here but its residence
+            //     hot is None → elevate promoted a different (timeline, index)
+            //     so this one was never lifted into VRAM.
+            let conv = ctx.conversation.read();
+            let group_timelines: Vec<u64> =
+                conv.timelines_for_group(group).map(|t| t.raw()).collect();
+            let entry_exists = conv.turn_indices(timeline).any(|i| i == index);
+            // Tier flags distinguish the two root causes:
+            //   all false (tier_less) → the turn has no K/V in any tier, so the
+            //     projection selected an empty ghost/anchor (or a turn whose K/V
+            //     was lost on replay) — nothing elevate could ever inject.
+            //   warm/cold true → the K/V exists but wasn't promoted → elevate gap.
+            let (tier_hot, tier_warm, tier_cold) = match conv.turn_tier_state(timeline, index) {
+                Some(t) => (Some(t.hot), Some(t.warm), Some(t.cold)),
+                None => (None, None, None),
+            };
+            let tok_count = conv.turn_token_count_of(timeline, index);
+            drop(conv);
+            tracing::warn!(
+                target: "candle_conversation::scheduler::reproject",
+                slot = parent_id.0,
+                group = group.raw(),
+                index = index.0,
+                used_timeline = timeline.raw(),
+                slot_timeline = ?ctx.slot_target.map(|t| t.timeline.raw()),
+                group_timelines = ?group_timelines,
+                entry_exists,
+                tier_hot = ?tier_hot,
+                tier_warm = ?tier_warm,
+                tier_cold = ?tier_cold,
+                tok_count,
+                "apply_projection: selected turn has no hot sealed K/V; dropping it"
+            );
+            return Ok(());
+        }
     };
     if sealed.is_empty() {
+        walker.skipped_turns += 1;
+        tracing::warn!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            group = group.raw(),
+            index = index.0,
+            "apply_projection: selected turn sealed K/V is empty; dropping it"
+        );
         return Ok(());
     }
     inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
@@ -418,6 +525,8 @@ fn inject_sealed_turn(
         .set_block_range(timeline, index, start_block as u64, end_block as u64);
 
     log_injected_tokens(ctx, &toks);
+    walker.sealed_turns += 1;
+    walker.sealed_tokens += sealed[0].token_count;
     walker.record_sealed(sealed[0].token_count);
     Ok(())
 }

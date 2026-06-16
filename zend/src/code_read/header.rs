@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! Part turn (user, prefilled):
-//!   Read `src/auth/handler.rs` lines 47-93.
+//!   Source excerpt — `src/auth/handler.rs` lines 47-93:
 //!
 //! Part turn (assistant, prefilled — tool call):
 //!   <tool_call>{"name":"read_file","arguments":{"path":"src/auth/handler.rs",
@@ -53,12 +53,16 @@ use crate::repo_scan::Language;
 /// caps the model at 200 words; ~1.4 tokens/word leaves headroom.
 pub const FILE_SUMMARY_MAX_TOKENS: usize = 300;
 
-/// Per-part user prompt for the one-conversation-per-file layout: just
-/// asks the model to read the part (no per-part summary — the whole file
-/// is summarised in the final turn instead).
+/// Per-part user prompt for the one-conversation-per-file layout: a
+/// labelled reference header naming the file and line range (no per-part
+/// summary — the whole file is summarised in the final turn instead).
 pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
+    // Reference header, not a first-person request: this prefill turn is
+    // context-stuffed source the model attends to as background, so framing it
+    // as "Read X" would make it read as a user question in conversation-history
+    // recall. A labelled excerpt header reads as injected reference instead.
     format!(
-        "Read `{path}` lines {start}-{end}.",
+        "Source excerpt — `{path}` lines {start}-{end}:",
         path = path,
         start = scope.start_line,
         end = scope.end_line,
@@ -161,7 +165,7 @@ mod tests {
     #[test]
     fn part_user_prompt_reads_range_without_summary_instruction() {
         let p = render_part_user_prompt("src/lib.rs", &scope(10, 20));
-        assert_eq!(p, "Read `src/lib.rs` lines 10-20.");
+        assert_eq!(p, "Source excerpt — `src/lib.rs` lines 10-20:");
         // The per-part turn is prefill-only; the summary happens once at
         // the end of the file conversation, not per part.
         assert!(!p.to_lowercase().contains("summarize"));

@@ -692,6 +692,18 @@ pub fn run_with_sink<R: ContentResolver>(
             group_turns.sort();
 
             for idx in group_turns {
+                // Ghost summary turns (`record_summary_turn` →
+                // `append_with_blocks(0..0)`) are zero-token tree-meta anchors
+                // with no K/V in any tier. They must never become a
+                // `Sealed(Turn)` segment: there is nothing to inject, so
+                // emitting one only wastes a window slot and makes the
+                // assembler wrap empty boundary markers around no content
+                // (which then drops at inject time). Skip them at the
+                // projection source so every consumer — the elevate set and the
+                // assembler alike — sees only turns that carry injectable K/V.
+                if resolver.turn_token_count(gs.schema.id, idx) == 0 {
+                    continue;
+                }
                 // Prefer the producer's `layer_id` from the resolver
                 // record; fall back to projector context if the
                 // resolver doesn't track origins (e.g. test mocks).

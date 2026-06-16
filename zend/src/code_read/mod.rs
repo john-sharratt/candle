@@ -176,13 +176,8 @@ pub const MAX_DECODE_FAILURES: usize = 16;
 /// the budget instead of relying on backpressure.
 pub const CODE_READ_PARALLELISM: usize = 128;
 
-/// KV compression level for `code_reading` turns. Dialogue runs at C4;
-/// code_reading is cold reference context the dialogue layer retrieves
-/// rarely, so it compresses its V harder (C8 adaptive selection).
-pub const CODE_READ_COMPRESSION_LEVEL: u8 = 8;
-
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
-/// (no reprojection) plus the per-conversation C8 compression override.
+/// (no reprojection), inheriting the utility C6 compression level.
 ///
 /// **K override stays on.** Ideally code_reading would also drop the
 /// engine-wide K→Q4_KS override so K is fully adaptively quantized, but the
@@ -190,11 +185,11 @@ pub const CODE_READ_COMPRESSION_LEVEL: u8 = 8;
 /// non-unit outer scales (see `CompressionPolicy::override_k_quant` /
 /// `ModelBuilder::engine`). Dropping it would corrupt code_reading recall
 /// the moment dialogue attends back over it. So K stays Q4_KS (identity)
-/// and only V gets the harder C8 selection. Flip `kv_disable_k_override` to
-/// `true` once the decode K-path is fixed.
+/// and only V gets the harder C6 selection. `kv_disable_k_override = false`
+/// is the engine default; set explicitly here to document the deliberate
+/// choice — flip it to `true` once the decode K-path is fixed.
 fn code_read_config(config: SequenceConfig) -> SequenceConfig {
     let mut cfg = utility_config(config);
-    cfg.kv_compression_level = Some(CODE_READ_COMPRESSION_LEVEL);
     cfg.kv_disable_k_override = false;
     cfg
 }

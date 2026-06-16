@@ -474,6 +474,8 @@ impl ModelBuilder {
             // K override dropped) via `repo_scan::utility_config` callers.
             kv_compression_level: None,
             kv_disable_k_override: false,
+            kv_force_k_format: None,
+            kv_force_v_format: None,
         }
     }
 

@@ -88,13 +88,21 @@ impl SummariserThread {
     /// Spawn the thread.  `runner` is the probe execution backend —
     /// either [`ChannelProbeRunner`] (production, scheduler-backed)
     /// or [`MockProbeRunner`] (tests).
-    pub fn spawn(conversation: Conversation, runner: Arc<dyn ProbeRunner>) -> Self {
+    /// `max_concurrent` is how many probes a single pass submits at once
+    /// (their decodes batch in the scheduler's wave loop). Chosen by total
+    /// VRAM at engine init — see `summary_probe_concurrency`.
+    pub fn spawn(
+        conversation: Conversation,
+        runner: Arc<dyn ProbeRunner>,
+        max_concurrent: usize,
+    ) -> Self {
         let (trigger_tx, trigger_rx) = channel::bounded::<()>(1);
         let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
 
+        let max_concurrent = max_concurrent.max(1);
         let handle = std::thread::Builder::new()
             .name("substrate-summariser".into())
-            .spawn(move || run_loop(conversation, runner, trigger_rx, shutdown_rx))
+            .spawn(move || run_loop(conversation, runner, max_concurrent, trigger_rx, shutdown_rx))
             .expect("failed to spawn substrate-summariser thread");
 
         Self {
@@ -135,6 +143,7 @@ impl Drop for SummariserThread {
 fn run_loop(
     conversation: Conversation,
     runner: Arc<dyn ProbeRunner>,
+    max_concurrent: usize,
     trigger_rx: Receiver<()>,
     shutdown_rx: Receiver<()>,
 ) {
@@ -146,11 +155,26 @@ fn run_loop(
             default(SUMMARISER_TICK) => {}
         }
 
-        if let Err(e) = run_pass(&conversation, runner.as_ref()) {
-            // Hard error → exit the loop.  Soft errors are handled
-            // inline in run_pass (re-enqueue + continue).
-            tracing::warn!(target: "candle_conversation::summariser", "summariser stopped: {e}");
-            return;
+        match run_pass(&conversation, runner.as_ref(), max_concurrent) {
+            Ok(()) => {}
+            // Only a hard error (GPU fault, scheduler shutdown) stops the
+            // thread. A soft error means one timeline's pass couldn't
+            // complete this round; it's already logged per-timeline in
+            // run_pass — keep the loop alive so every other conversation
+            // (and the next tick) still gets summarised.
+            Err(ProbeError::Hard(msg)) => {
+                tracing::warn!(
+                    target: "candle_conversation::summariser",
+                    "summariser stopped (hard error): {msg}"
+                );
+                return;
+            }
+            Err(ProbeError::Soft(msg)) => {
+                tracing::warn!(
+                    target: "candle_conversation::summariser",
+                    "summariser pass soft-failed, continuing: {msg}"
+                );
+            }
         }
 
         if shutting_down {
@@ -159,17 +183,49 @@ fn run_loop(
     }
 }
 
-/// One full summariser pass: drain pending + at most one dirty
-/// regeneration per timeline.
+/// One full summariser pass: drain pending turns into the summary tree,
+/// then clear at most one dirty bit per timeline.
 ///
 /// Returns `Err(ProbeError::Hard(...))` to abort the run loop.
-/// Soft probe failures are logged and the affected children are
-/// re-queued onto `pending` for the next pass.
-pub fn run_pass(conversation: &Conversation, runner: &dyn ProbeRunner) -> Result<(), ProbeError> {
+/// Soft probe failures are logged and the affected turns are re-queued
+/// onto the pending queue for the next pass.
+pub fn run_pass(
+    conversation: &Conversation,
+    runner: &dyn ProbeRunner,
+    max_concurrent: usize,
+) -> Result<(), ProbeError> {
     let timeline_ids: Vec<TimelineId> = conversation.read().all_timeline_ids().collect();
+    for timeline in &timeline_ids {
+        let pending = conversation.read().pending_summary_len(*timeline);
+        if pending > 0 {
+            tracing::debug!(
+                target: "candle_conversation::summariser",
+                timeline = %timeline,
+                pending,
+                "run_pass: timeline has pending normal turns to absorb",
+            );
+        }
+    }
     for timeline in timeline_ids {
-        absorb_pending_turns(conversation, runner, timeline)?;
-        sweep_one_dirty(conversation, runner, timeline)?;
+        // Per-timeline isolation: a soft failure on one timeline (e.g. a
+        // corrupt summary tree from an older run hitting an AVL invariant)
+        // must not abort the whole pass — it would starve every other
+        // timeline, including freshly-started conversations. Log it and move
+        // on; only a hard error propagates and stops the thread.
+        if let Err(e) = absorb_pending_turns(conversation, runner, timeline, max_concurrent) {
+            match e {
+                ProbeError::Hard(_) => return Err(e),
+                ProbeError::Soft(msg) => {
+                    tracing::warn!(
+                        target: "candle_conversation::summariser",
+                        timeline = %timeline,
+                        "absorb soft-failed, skipping timeline this pass: {msg}"
+                    );
+                    continue;
+                }
+            }
+        }
+        sweep_one_dirty(conversation, timeline);
     }
     Ok(())
 }
@@ -189,48 +245,102 @@ fn absorb_pending_turns(
     conversation: &Conversation,
     runner: &dyn ProbeRunner,
     timeline: TimelineId,
+    max_concurrent: usize,
 ) -> Result<(), ProbeError> {
     loop {
-        let normal_idx = match conversation.write().pop_pending_summary(timeline) {
-            Some(idx) => idx,
-            None => return Ok(()),
-        };
-        // Skip if a previous pass already absorbed this index (e.g. via
-        // restart-reload's re-enqueue + a partially-applied tree).
-        let already_in_tree = conversation
-            .read()
-            .tree_meta_of(timeline, normal_idx)
-            .map(|m| m.kind != TurnKind::Normal)
-            .unwrap_or(false);
-        if already_in_tree {
-            continue;
-        }
-        let probe = ProbeRequest {
-            timeline,
-            kind: TurnKind::SummaryOfTurns,
-            children: vec![normal_idx],
-        };
-        let sealed = match runner.run(probe) {
-            Ok(r) => r,
-            Err(ProbeError::Soft(msg)) => {
-                tracing::warn!(
+        // Collect up to `max_concurrent` eligible pending Normal turns, so
+        // their SoT probes can be submitted together and their decodes batch
+        // in the scheduler's wave loop instead of running one at a time.
+        let mut batch: Vec<TurnIndex> = Vec::with_capacity(max_concurrent);
+        while batch.len() < max_concurrent {
+            let normal_idx = match conversation.write().pop_pending_summary(timeline) {
+                Some(idx) => idx,
+                None => break,
+            };
+            // Skip if a previous pass already absorbed this index (e.g. via
+            // restart-reload's re-enqueue + a partially-applied tree).
+            let already_in_tree = conversation
+                .read()
+                .tree_meta_of(timeline, normal_idx)
+                .map(|m| m.kind != TurnKind::Normal)
+                .unwrap_or(false);
+            if already_in_tree {
+                tracing::debug!(
                     target: "candle_conversation::summariser",
                     timeline = %timeline,
                     normal = %normal_idx,
-                    "soft probe error: {msg}; re-enqueueing"
+                    "absorb: turn already in tree, skipping",
                 );
-                conversation
-                    .write()
-                    .push_pending_summary(timeline, normal_idx);
-                // One soft failure per pass — don't burn the queue in
-                // a tight loop.  Next tick / trigger will try again.
-                return Ok(());
+                continue;
             }
-            Err(e @ ProbeError::Hard(_)) => return Err(e),
-        };
-        // Seal the new SoT leaf and AVL-insert it.  This may emit
-        // probes for new SoS internals.
-        seal_leaf_and_avl_insert(conversation, runner, timeline, sealed, vec![normal_idx])?;
+            batch.push(normal_idx);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        tracing::debug!(
+            target: "candle_conversation::summariser",
+            timeline = %timeline,
+            batch = batch.len(),
+            "absorb: probing SoT leaves for pending normal turns",
+        );
+
+        let requests: Vec<ProbeRequest> = batch
+            .iter()
+            .map(|&normal_idx| ProbeRequest {
+                timeline,
+                kind: TurnKind::SummaryOfTurns,
+                children: vec![normal_idx],
+            })
+            .collect();
+        let results = runner.run_batch(requests);
+
+        // Insert the sealed leaves into the AVL tree.  The probe decodes ran
+        // concurrently; the tree mutation (which may emit serial SoS-allocation
+        // probes) is applied one leaf at a time, in batch order — ascending
+        // chronological order among the turns that succeeded.
+        //
+        // A soft-failed probe re-enqueues only that turn, to the *back* of the
+        // pending queue so a persistently-failing turn can't head-of-line block
+        // newer ones.  We still insert the later successes in this pass rather
+        // than deferring them: their summary turns are already sealed in the
+        // substrate, so deferring would leave them with default `Normal` tree
+        // meta — orphans that pollute projections and get re-summarised.  The
+        // re-enqueued turn is retried on a later pass and inserted then, which
+        // can place its leaf after a younger sibling; that bounded local disorder
+        // is the accepted cost of liveness + no orphans.
+        let mut soft_failed = false;
+        for (&normal_idx, result) in batch.iter().zip(results) {
+            match result {
+                Ok(sealed) => {
+                    seal_leaf_and_avl_insert(
+                        conversation,
+                        runner,
+                        timeline,
+                        sealed,
+                        vec![normal_idx],
+                    )?;
+                }
+                Err(ProbeError::Soft(msg)) => {
+                    tracing::warn!(
+                        target: "candle_conversation::summariser",
+                        timeline = %timeline,
+                        normal = %normal_idx,
+                        "soft probe error: {msg}; re-enqueueing"
+                    );
+                    conversation
+                        .write()
+                        .push_pending_summary(timeline, normal_idx);
+                    soft_failed = true;
+                }
+                Err(e @ ProbeError::Hard(_)) => return Err(e),
+            }
+        }
+        // Don't burn the queue in a tight loop on persistent soft failures —
+        // the next tick / trigger retries the re-enqueued turns.
+        if soft_failed {
+            return Ok(());
+        }
     }
 }
 
@@ -721,63 +831,20 @@ fn commit_tree_to_substrate(
     view.set_tree_root(timeline, tree.root().map(|r| TurnIndex(r.0)));
 }
 
-/// Pop one dirty node and regenerate its summary via a §6 probe.
-/// At most one per pass — amortises against foreground turn cadence
-/// (§7.3).
-fn sweep_one_dirty(
-    conversation: &Conversation,
-    runner: &dyn ProbeRunner,
-    timeline: TimelineId,
-) -> Result<(), ProbeError> {
-    let dirty_idx = match conversation.write().pop_oldest_dirty(timeline) {
-        Some(idx) => idx,
-        None => return Ok(()),
-    };
-    let meta = match conversation
-        .read()
-        .tree_meta_of(timeline, dirty_idx)
-        .cloned()
-    {
-        Some(m) => m,
-        None => return Ok(()),
-    };
-    // Re-probe over the current children — produces a fresh summary
-    // turn whose Q-fingerprint reflects the new subtree.  The
-    // dirty-node identity (`dirty_idx`) stays put structurally;
-    // tier-level content gets regenerated by the runner inline.
-    let probe = ProbeRequest {
-        timeline,
-        kind: meta.kind,
-        children: meta.children.clone(),
-    };
-    match runner.run(probe) {
-        Ok(_resp) => {
-            // The runner's contract is "produce a fresh summary turn
-            // at some new TurnIndex".  For regeneration we don't
-            // actually re-link the tree to the new index — the SoS
-            // identity stays put; the new content is captured by the
-            // runner's substrate write, and the OLD turn at dirty_idx
-            // is left as-is (with its stale Q).  This means the new
-            // turn is "orphaned" from the tree but its existence is
-            // benign.  A more sophisticated impl re-points the parent;
-            // for v1 we just clear the dirty bit.
-            conversation
-                .write()
-                .clear_summary_dirty(timeline, dirty_idx);
-            Ok(())
-        }
-        Err(ProbeError::Soft(msg)) => {
-            tracing::warn!(
-                target: "candle_conversation::summariser",
-                timeline = %timeline,
-                dirty = %dirty_idx,
-                "dirty-regen probe soft-failed: {msg}; will retry"
-            );
-            // Re-mark dirty so the next sweep tries again.
-            conversation.write().mark_summary_dirty(timeline, dirty_idx);
-            Ok(())
-        }
-        Err(e @ ProbeError::Hard(_)) => Err(e),
+/// Clear the oldest dirty node's dirty bit. At most one per pass.
+///
+/// A `SummaryOfSummaries` node is marked dirty when an AVL rotation rewrites
+/// its children, so its summary content is now a summary of a shifted span.
+/// Clearing the bit — rather than regenerating the content — is deliberate:
+/// re-probing would mint a fresh summary turn with no way to re-link it into
+/// the tree, leaving an orphan that the model-backed probe path drops onto the
+/// pending queue as a `Normal` turn and re-summarises, cascading into an
+/// unbounded loop of summary-of-summary turns. The SoS node keeps its
+/// (slightly stale but valid) summary of the shifted span, which is correct
+/// for retrieval, and no orphan turns are created.
+fn sweep_one_dirty(conversation: &Conversation, timeline: TimelineId) {
+    if let Some(dirty_idx) = conversation.write().pop_oldest_dirty(timeline) {
+        conversation.write().clear_summary_dirty(timeline, dirty_idx);
     }
 }
 
@@ -819,6 +886,44 @@ impl ProbeRunner for ChannelProbeRunner {
             Ok(Err(msg)) => Err(ProbeError::Soft(msg)),
             Err(e) => Err(ProbeError::Hard(format!("scheduler response channel: {e}"))),
         }
+    }
+
+    fn run_batch(&self, requests: Vec<ProbeRequest>) -> Vec<Result<ProbeResponse, ProbeError>> {
+        // Submit every probe first (non-blocking sends) so the scheduler
+        // registers all their decodes before the next decode quantum — they
+        // then batch into a single forward instead of running one at a time.
+        let mut receivers: Vec<Result<Receiver<Result<TurnIndex, String>>, ProbeError>> =
+            Vec::with_capacity(requests.len());
+        for request in requests {
+            let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+            let scheduler_request = SchedulerRequest::SubmitSummaryProbe {
+                timeline: request.timeline,
+                kind: request.kind,
+                children: request.children.clone(),
+                response_tx,
+            };
+            match self.request_tx.send(scheduler_request) {
+                Ok(()) => receivers.push(Ok(response_rx)),
+                Err(e) => {
+                    receivers.push(Err(ProbeError::Hard(format!("scheduler channel closed: {e}"))))
+                }
+            }
+        }
+        // Then collect, in submission order. Each `recv` blocks only until that
+        // probe's batched decode completes.
+        receivers
+            .into_iter()
+            .map(|r| match r {
+                Ok(rx) => match rx.recv() {
+                    Ok(Ok(turn_idx)) => Ok(ProbeResponse {
+                        sealed_turn: turn_idx,
+                    }),
+                    Ok(Err(msg)) => Err(ProbeError::Soft(msg)),
+                    Err(e) => Err(ProbeError::Hard(format!("scheduler response channel: {e}"))),
+                },
+                Err(e) => Err(e),
+            })
+            .collect()
     }
 }
 
@@ -914,6 +1019,96 @@ mod tests {
         assert_eq!(resp.sealed_turn.0, 1);
     }
 
+    /// Test runner that soft-fails the `SummaryOfTurns` probe whose first
+    /// child is `fail_on`, delegating every other probe to a real
+    /// [`MockProbeRunner`].  Used to exercise a mid-batch soft failure.
+    struct FailOnChildRunner {
+        inner: MockProbeRunner,
+        fail_on: TurnIndex,
+    }
+
+    impl ProbeRunner for FailOnChildRunner {
+        fn run(&self, request: ProbeRequest) -> Result<ProbeResponse, ProbeError> {
+            if request.kind == TurnKind::SummaryOfTurns
+                && request.children.first() == Some(&self.fail_on)
+            {
+                return Err(ProbeError::Soft("injected mid-batch failure".into()));
+            }
+            self.inner.run(request)
+        }
+    }
+
+    /// A soft failure on the *middle* turn of a batch must not orphan the
+    /// later successes.  Their summary turns are already sealed, so they have
+    /// to be AVL-inserted (kind = SoT) this pass; deferring them would leave
+    /// them with default `Normal` meta — stray turns that pollute projections
+    /// and get re-summarised.  Only the failed turn is re-enqueued.
+    #[test]
+    fn absorb_mid_batch_soft_failure_does_not_orphan_successes() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        let n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        let n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        let n2 = conv.write().append_with_blocks(timeline, 10, 2, 3);
+        assert_eq!(conv.pending_summary_len(timeline), 3);
+
+        let runner = FailOnChildRunner {
+            inner: MockProbeRunner::new(conv.clone()),
+            fail_on: n1,
+        };
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
+
+        // Every SoT leaf's children, across the whole tree.
+        let mut summarised: Vec<TurnIndex> = Vec::new();
+        for i in 0..16u32 {
+            if let Some(meta) = conv.read().tree_meta_of(timeline, TurnIndex(i)) {
+                if meta.kind == TurnKind::SummaryOfTurns {
+                    summarised.extend(meta.children.iter().copied());
+                }
+            }
+        }
+        assert!(summarised.contains(&n0), "n0 succeeded → must have a SoT leaf");
+        assert!(summarised.contains(&n2), "n2 succeeded → must have a SoT leaf");
+        assert!(
+            !summarised.contains(&n1),
+            "n1 failed → must not appear in any leaf"
+        );
+
+        // The failed turn is back on the pending queue for a later pass.
+        let mut requeued_n1 = false;
+        while let Some(idx) = conv.write().pop_pending_summary(timeline) {
+            if idx == n1 {
+                requeued_n1 = true;
+            }
+        }
+        assert!(requeued_n1, "failed turn n1 must be re-enqueued");
+    }
+
+    /// A timeline with `summarize = false` — the gate set for utility/reference
+    /// layers (repo_map, code_reading) — must not enqueue its sealed turns onto
+    /// the pending-summary queue, so the summariser never touches them. A
+    /// timeline left at the default (`true`) does enqueue.
+    #[test]
+    fn summarize_gate_off_skips_pending_enqueue() {
+        let tmp = ephemeral_workspace();
+        let (conv, timeline) = fresh_conversation(tmp.path());
+        conv.write().set_timeline_summarize(timeline, false);
+        let _n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
+        assert_eq!(
+            conv.pending_summary_len(timeline),
+            0,
+            "summarize=false must not enqueue pending summaries"
+        );
+
+        let (conv2, timeline2) = fresh_conversation(tmp.path());
+        let _m0 = conv2.write().append_with_blocks(timeline2, 10, 0, 1);
+        assert_eq!(
+            conv2.pending_summary_len(timeline2),
+            1,
+            "default summarize=true must enqueue"
+        );
+    }
+
     #[test]
     fn absorb_pending_creates_leaf_with_normal_child() {
         let tmp = ephemeral_workspace();
@@ -922,7 +1117,7 @@ mod tests {
         // pending_summary_queue now has 1 entry.
         assert_eq!(conv.pending_summary_len(timeline), 1);
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
         // The pending queue is drained.
         assert_eq!(conv.pending_summary_len(timeline), 0);
         // A SummaryOfTurns leaf now exists at index 1.
@@ -945,7 +1140,7 @@ mod tests {
         let _n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
         let _n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
         // Index 0 = Normal, 1 = first SoT, 2 = Normal, 3 = second SoT,
         // 4 = SoS parent (allocated by the alloc closure).
         // Order is determined by `append_with_blocks` ordering inside
@@ -970,7 +1165,7 @@ mod tests {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline).expect("absorb ok");
+        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
         // Build the in-memory tree from the substrate state and
         // verify it's balanced.
         let tree = conv.read().build_summary_tree_in_memory(timeline);

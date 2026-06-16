@@ -217,11 +217,11 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
-            // Normal (dialogue) conversation turns compress at C4. The library
-            // default is C5, tuned for non-zend model consumers; zend sets its
-            // own dialogue level explicitly and overrides code_reading to C8
-            // per-conversation (see `code_read`'s sequence config).
-            .compression_level(4)
+            // Normal (dialogue) conversation turns compress at C5 — the same as
+            // the library default, but zend sets it explicitly. The utility
+            // layers (repo_map, code_reading) override to C6 per-conversation
+            // (see `repo_scan::utility_config` / `code_read`'s sequence config).
+            .compression_level(5)
             .thinking(false);
         let conv_config = builder.conversation_config();
 

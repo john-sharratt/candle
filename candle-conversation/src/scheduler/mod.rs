@@ -33,7 +33,9 @@ use crate::provenance::{
 };
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::substrate::{ResidenceIndex, TurnPartWrite};
-use crate::summary_tree::{SelectionDiagnostics, SummariserTrigger, TurnKind};
+use crate::summary_tree::{
+    SelectionDiagnostics, SummariserTrigger, TurnKind, SUMMARISER_SYSTEM_PROMPT,
+};
 use crate::think_strip::strip_think_blocks;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
@@ -592,6 +594,10 @@ struct ViewState {
     turn_start_parent_blocks: usize,
 }
 
+/// Token cap for a single summary-probe decode. Summaries are short prose
+/// digests; this bounds the batched decode the scheduler runs for the probe.
+const SUMMARY_MAX_TOKENS: usize = 192;
+
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
 /// just before sending `Done`.
 ///
@@ -830,6 +836,19 @@ pub(crate) struct Scheduler {
     device: Device,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
+    /// Slots that are summary probes in flight. Presence here marks a decode
+    /// as a summary (vs. a dialogue turn): `cleanup_finished` routes it to the
+    /// summary seal + fires this channel with the new `TurnIndex` instead of
+    /// streaming `TurnEvent`s. The summariser thread blocks on the matching
+    /// receiver. Lets a summary decode batch with foreground decodes in the
+    /// wave loop instead of monopolising the scheduler thread.
+    summary_completions: HashMap<SequenceId, Sender<Result<TurnIndex, String>>>,
+    /// Keeps each in-flight summary slot's token-event receiver alive. The
+    /// decode loop treats a failed `event_tx.send` as "caller hung up, stop"
+    /// — so a dropped receiver would terminate the summary after one token.
+    /// We never read these; the receiver is dropped in `free_summary_slot`
+    /// once the decode completes.
+    summary_event_rx: HashMap<SequenceId, Receiver<TurnEvent>>,
     /// Persistent sampling state per sequence ID (survives across turns).
     /// DRY penalty needs the recent-token window to span turn boundaries.
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
@@ -1098,6 +1117,8 @@ impl Scheduler {
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
+            summary_completions: HashMap::new(),
+            summary_event_rx: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
@@ -1811,8 +1832,15 @@ impl Scheduler {
                 children,
                 response_tx,
             } => {
-                let result = self.handle_summary_probe(timeline, kind, children);
-                let _ = response_tx.send(result);
+                // Setup-only: registers a batched decode and stashes
+                // `response_tx` in `summary_completions`; the response is fired
+                // later from `cleanup_finished` when the decode finishes. Only
+                // a setup failure replies synchronously here.
+                if let Err(e) =
+                    self.handle_summary_probe(timeline, kind, children, response_tx.clone())
+                {
+                    let _ = response_tx.send(Err(e));
+                }
                 true
             }
 
@@ -1820,30 +1848,37 @@ impl Scheduler {
         }
     }
 
-    /// Execute a §6 summary probe.  Phase-1 implementation: append a
-    /// placeholder summary turn directly to the substrate (zero-block
-    /// extent, no KV chunks) and return its TurnIndex.  Real
-    /// model-driven probes hook into this site — the slot construction
-    /// (synthetic system section + injected children K/V + structured
-    /// JSON decode) runs as an in-line scheduler request similar to
-    /// `SubmitTurn` but with a different post-decode handler.  The
-    /// substrate write path is identical (record_summary_turn → tree_meta
-    /// set), so the summariser thread sees the same interface.
+    /// Execute a §6 summary probe: render the children into a prompt, prefill
+    /// it on a scratch slot, sample the first token, and register a batched
+    /// decode so the summary generates alongside ordinary decodes in the wave
+    /// loop. The caller's `response_tx` is stashed in `summary_completions` and
+    /// the decode's event receiver in `summary_event_rx`; this returns `Ok(())`
+    /// as soon as the decode is registered.
     ///
-    /// The append goes through [`Conversation::record_summary_turn`],
-    /// which persists a `TurnDecl` to the redo log alongside the
-    /// in-memory insert.  Without that, the tree's `TreeMetadata`
-    /// records would replay on reopen with no matching turn, leaving
-    /// orphan nodes that score-density would happily pick and
-    /// elevate would warn about.
+    /// Completion is asynchronous: when the decode finishes, `cleanup_finished`
+    /// routes it to `complete_summary_decode` → `seal_summary_turn`, which
+    /// writes the sealed summary turn (with its decoded KV and BDP signatures)
+    /// to the substrate and the redo log, then fires `response_tx` with the new
+    /// `TurnIndex`. The summariser thread attaches the tree metadata from there.
+    ///
+    /// On any setup error (prefill, sampling, or an immediate EOS) the scratch
+    /// slot is freed and `Err` is returned for a soft retry on the next pass.
     fn handle_summary_probe(
         &mut self,
         timeline: TimelineId,
-        _kind: TurnKind,
-        _children: Vec<TurnIndex>,
-    ) -> Result<TurnIndex, String> {
-        // Resolve which conversation owns this timeline.  We look up
-        // through any slot that's registered against the same target.
+        kind: TurnKind,
+        children: Vec<TurnIndex>,
+        response_tx: Sender<Result<TurnIndex, String>>,
+    ) -> Result<(), String> {
+        tracing::debug!(
+            target: "candle_conversation::summariser",
+            timeline = %timeline,
+            ?kind,
+            children = ?children,
+            "summary probe: summarising children",
+        );
+        // Resolve the conversation + projection target that own this timeline.
+        // We look up through any slot registered against the same target.
         let conv = self
             .slot_conversations
             .values()
@@ -1852,11 +1887,362 @@ impl Scheduler {
             .ok_or_else(|| {
                 format!("SubmitSummaryProbe: no conversation registered for timeline {timeline}")
             })?;
-        // ~20-token summary, no KV chunks (residence cold).  The
-        // summariser thread immediately overwrites the tree_meta;
-        // either way the substrate turn exists and is persisted.
-        conv.record_summary_turn(timeline, 20)
-            .map_err(|e| format!("SubmitSummaryProbe: persist failed: {e}"))
+        let (layer, group) = conv
+            .read()
+            .timeline_target(timeline)
+            .ok_or_else(|| format!("SubmitSummaryProbe: timeline {timeline} has no target"))?;
+        let target = ProjectionTarget {
+            layer,
+            group,
+            timeline,
+        };
+
+        // Render the children into the prompt body. A turn's stored `token_ids`
+        // are the whole exchange (user + assistant), so decoding them gives the
+        // full content to summarise; for an SoS node the children are
+        // themselves prose summary turns.
+        let mut body = String::new();
+        for (i, &child) in children.iter().enumerate() {
+            let toks = conv.read().assistant_token_ids_of(timeline, child).to_vec();
+            if toks.is_empty() {
+                continue;
+            }
+            let text = self
+                .tokenizer
+                .decode(&toks, true)
+                .map_err(|e| format!("SubmitSummaryProbe: decode child {child}: {e}"))?;
+            body.push_str(&format!("--- Turn {i} ---\n{}\n\n", text.trim()));
+        }
+        // Frame as a real user→assistant exchange using the dialect's role
+        // markers, so the model *answers* (then emits its end-of-turn token)
+        // instead of continuing the prompt text. Layout:
+        //   [user_start] system + children + "Summarise…" [user_end][assistant_start]
+        let inner = format!("{SUMMARISER_SYSTEM_PROMPT}\n\n{body}Summarise the above turns.");
+        let inner_tokens: Vec<u32> = self
+            .tokenizer
+            .encode(inner, false)
+            .map_err(|e| format!("SubmitSummaryProbe: encode prompt: {e}"))?
+            .get_ids()
+            .to_vec();
+        let mut prompt_tokens: Vec<u32> = Vec::new();
+        prompt_tokens.extend_from_slice(&self.boundary_markers.user_start);
+        prompt_tokens.extend_from_slice(&inner_tokens);
+        prompt_tokens.extend_from_slice(&self.boundary_markers.user_end);
+        prompt_tokens.extend_from_slice(&self.boundary_markers.assistant_start);
+
+        // Scratch slot bound to the dialogue timeline — the seal lands a turn
+        // there. Freed when the decode completes (or on any setup error here).
+        let slot = self
+            .create_sequence(conv.clone(), Some(target))
+            .map_err(|e| format!("SubmitSummaryProbe: create slot: {e}"))?;
+
+        // Prefill the prompt synchronously (a single bounded forward — far
+        // cheaper than the decode) to get the logits for the first token.
+        let prefill_logits = match self.run_prefill_with_shift(slot, &prompt_tokens, 0) {
+            Ok(l) => l,
+            Err(e) => {
+                self.free_summary_slot(slot);
+                return Err(format!("SubmitSummaryProbe: prefill: {e}"));
+            }
+        };
+        // Sample the first token using the slot's sampling state, then put the
+        // state back so `batch_decode_step` continues from it.
+        let config = SamplingConfig::argmax();
+        let mut sstate = match self.sampling_states.remove(&slot) {
+            Some(s) => s,
+            None => {
+                self.free_summary_slot(slot);
+                return Err("SubmitSummaryProbe: missing sampling state".to_string());
+            }
+        };
+        let first_token = match self.sample_single(&prefill_logits, &config, &mut sstate) {
+            Ok(t) => t,
+            Err(e) => {
+                self.sampling_states.insert(slot, sstate);
+                self.free_summary_slot(slot);
+                return Err(format!("SubmitSummaryProbe: sample: {e}"));
+            }
+        };
+        self.sampling_states.insert(slot, sstate);
+        if self.is_eos(first_token) {
+            self.free_summary_slot(slot);
+            return Err("SubmitSummaryProbe: summary produced no tokens (immediate EOS)".to_string());
+        }
+
+        // Register the summary as a normal batched decode so it rides the wave
+        // loop alongside foreground decodes instead of blocking the scheduler.
+        // Completion is routed via `summary_completions` ⇒ the summary seal in
+        // `cleanup_finished`, not the normal turn seal, so `seal_action` is
+        // `None`. The decode loop stops on a *failed* token send (it reads that
+        // as "caller hung up"), so `event_tx`'s receiver must stay alive for the
+        // slot's whole decode — kept in `summary_event_rx`, dropped in
+        // `free_summary_slot`. Unbounded so sends never block; we never read it.
+        let (event_tx, event_rx) = crossbeam::channel::unbounded::<TurnEvent>();
+        let prompt_len = prompt_tokens.len();
+        let mut health = crate::decode_health::DecodeHealthState::new(
+            self.health_config.repetition_window,
+            self.health_config.health_log_capacity,
+        );
+        health.apply_baseline_config(
+            self.health_config.entropy_baseline_window,
+            self.health_config.entropy_trend_relative_factor,
+            self.health_config.entropy_trend_absolute_min_nats,
+        );
+        // Summaries decode with argmax — inherently near-zero-entropy. The
+        // entropy-collapse health check would otherwise fire on the very first
+        // step and kill the decode after one token (producing a one-word "The"
+        // summary). The normal decode path skips entropy checks for argmax for
+        // exactly this reason; mirror it here.
+        health.skip_entropy_checks = true;
+        self.active_decodes.insert(
+            slot,
+            DecodeState {
+                event_tx,
+                generated_tokens: TokenBuffer::from(vec![first_token]),
+                max_tokens: SUMMARY_MAX_TOKENS,
+                sampling_config: config,
+                seal_action: SealAction::None,
+                post_decode_tokens: TokenBuffer::from(Vec::new()),
+                prefill_tokens: TokenBuffer::from(prompt_tokens),
+                user_text: String::new(),
+                finished: false,
+                decode_start: Instant::now(),
+                prefill_ms: 0.0,
+                prefill_token_count: prompt_len,
+                turn_start: Instant::now(),
+                health,
+                reprojection: None,
+                prov_sig_entries: Vec::new(),
+            },
+        );
+        self.summary_completions.insert(slot, response_tx);
+        self.summary_event_rx.insert(slot, event_rx);
+        Ok(())
+    }
+
+    /// Free a summary scratch slot and its per-slot bookkeeping. Used on
+    /// setup-error paths and after a summary decode completes.
+    fn free_summary_slot(&mut self, slot: SequenceId) {
+        let _ = self.session.free_sequence(slot.0);
+        self.slot_conversations.remove(&slot);
+        self.slot_targets.remove(&slot);
+        self.sampling_states.remove(&slot);
+        self.slot_sig_blocks_processed.remove(&slot);
+        self.summary_event_rx.remove(&slot);
+    }
+
+    /// Completion path for a finished summary decode (called from
+    /// `cleanup_finished`): seal the decoded prose as a summary turn, fire the
+    /// summariser's response channel with the result, and free the scratch
+    /// slot. The channel is fired on every path so the summariser thread never
+    /// blocks forever.
+    fn complete_summary_decode(
+        &mut self,
+        slot: SequenceId,
+        state: DecodeState,
+        response_tx: Sender<Result<TurnIndex, String>>,
+    ) {
+        let result = self.try_seal_summary(slot, &state);
+        let _ = response_tx.send(result);
+        self.free_summary_slot(slot);
+    }
+
+    /// Seal the finished summary decode on `slot` into its timeline as a turn,
+    /// returning the new `TurnIndex`. The last sampled token was never
+    /// forwarded (no K/V), so it's dropped — exactly as the normal turn seal
+    /// drops its trailing unforwarded token.
+    fn try_seal_summary(
+        &mut self,
+        slot: SequenceId,
+        state: &DecodeState,
+    ) -> Result<TurnIndex, String> {
+        let conv = self
+            .slot_conversations
+            .get(&slot)
+            .cloned()
+            .ok_or_else(|| "SubmitSummaryProbe: no conversation for summary slot".to_string())?;
+        let target = self
+            .slot_targets
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| "SubmitSummaryProbe: no target for summary slot".to_string())?;
+        let n = state.generated_tokens.len();
+        let forwarded = &state.generated_tokens[..n.saturating_sub(1)];
+        if forwarded.is_empty() {
+            return Err("SubmitSummaryProbe: summary decoded to zero tokens".to_string());
+        }
+        self.seal_summary_turn(&conv, target, slot, &state.prefill_tokens[..], forwarded)
+    }
+
+    /// Extract BDP provenance signatures for the freshly-decoded blocks
+    /// `[block_from, block_to)` of `slot` (still R16 — just decoded, the
+    /// bg_quantizer hasn't touched them) and append them to the provenance
+    /// file. Mirrors the seal-time extraction in `perform_seal_and_write`,
+    /// scoped to a summary probe's decoded range. Without this a summary turn
+    /// scores 0.0 in score-density selection and can only be picked by
+    /// recency/coverage, never by relevance to the live decode.
+    fn capture_turn_sigs(
+        &mut self,
+        slot: SequenceId,
+        block_from: usize,
+        block_to: usize,
+    ) -> Vec<SigEntry> {
+        if block_to <= block_from {
+            return Vec::new();
+        }
+        let snapshot = match self.session.snapshot_sequence(slot.0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("summary sig snapshot failed: {e}");
+                return Vec::new();
+            }
+        };
+        // Strip zero-padded sigs the gather kernel reads from the partial
+        // tail block's uninitialized arena slots.
+        let tail_tokens = snapshot
+            .chunks
+            .get(block_to.saturating_sub(1))
+            .map(|c| c.token_count as usize)
+            .filter(|&t| t > 0)
+            .unwrap_or(candle_nn::CHUNK_SIZE);
+        let ProvenanceLayerIndices {
+            syn_l0,
+            syn_l4,
+            sem_l0,
+            sem_l4,
+            prag_l0,
+            prag_l4,
+        } = self.model_core.provenance_layer_indices;
+        let range = (block_from, block_to);
+        let mut entries: Vec<SigEntry> = Vec::new();
+        let syn = self.handle_extract_mh_dual_signatures(slot.0, syn_l0, syn_l4, Some(range));
+        let sem = self.handle_extract_mh_dual_signatures(slot.0, sem_l0, sem_l4, Some(range));
+        let prag = self.handle_extract_mh_dual_signatures(slot.0, prag_l0, prag_l4, Some(range));
+        if let (Ok(syn_b), Ok(sem_b), Ok(prag_b)) = (syn, sem, prag) {
+            let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
+            for j in 0..total {
+                let raw_n = syn_b[j]
+                    .sigs
+                    .len()
+                    .min(sem_b[j].sigs.len())
+                    .min(prag_b[j].sigs.len());
+                let n = if j + 1 == total {
+                    raw_n.min(tail_tokens)
+                } else {
+                    raw_n
+                };
+                match self.provenance.append(
+                    &syn_b[j].sigs[..n],
+                    &sem_b[j].sigs[..n],
+                    &prag_b[j].sigs[..n],
+                ) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        tracing::warn!("summary sig append failed for block {}: {e}", block_from + j)
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// Seal the decoded summary's K/V as a turn in `target.timeline`. Only the
+    /// summary blocks are sealed: the prompt context sits in the earlier
+    /// prefill blocks, excluded by `block_from`. If the prompt didn't end on a
+    /// chunk boundary, the boundary block also holds the prompt tail, so those
+    /// tail tokens are included in `token_ids` to keep the grid 1:1.
+    fn seal_summary_turn(
+        &mut self,
+        conv: &Conversation,
+        target: ProjectionTarget,
+        slot: SequenceId,
+        prompt_tokens: &[u32],
+        generated: &[u32],
+    ) -> Result<TurnIndex, String> {
+        let chunk_size = self.chunk_size;
+        let full_prompt_blocks = prompt_tokens.len() / chunk_size;
+        let block_from = full_prompt_blocks;
+        let block_to = self
+            .session
+            .sequence_block_count(slot.0)
+            .ok_or_else(|| "SubmitSummaryProbe: seal block_count: slot not in session".to_string())?;
+        if block_to <= block_from {
+            return Err("SubmitSummaryProbe: summary produced no sealed blocks".to_string());
+        }
+
+        let sealed_per_layer = self
+            .session
+            .snapshot_sequence_per_layer(slot.0)
+            .map(Arc::new)
+            .map_err(|e| format!("SubmitSummaryProbe: seal snapshot: {e}"))?;
+        let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
+
+        let prompt_tail = &prompt_tokens[full_prompt_blocks * chunk_size..];
+        let mut token_ids: Vec<u32> = Vec::with_capacity(prompt_tail.len() + generated.len());
+        token_ids.extend_from_slice(prompt_tail);
+        token_ids.extend_from_slice(generated);
+        let token_count = token_ids.len();
+
+        let assistant_text = self
+            .tokenizer
+            .decode(generated, true)
+            .map_err(|e| format!("SubmitSummaryProbe: seal decode text: {e}"))?;
+
+        let write = TurnPartWrite {
+            user_text: String::new(),
+            assistant_text: assistant_text.clone(),
+            token_ids: TokenBuffer::from(token_ids),
+            token_count,
+            block_start: block_from as u64,
+            block_end: block_to as u64,
+            sealed_gpu: Some(Arc::new(delta_gpu)),
+        };
+        let idx = conv
+            .record_turn(target.timeline, Role::Assistant, write, |seqs| Ok(seqs.to_vec()))
+            .map_err(|e| format!("SubmitSummaryProbe: seal record_turn: {e}"))?;
+
+        // Capture BDP signatures over the summary's decoded blocks so the
+        // score-density selector can retrieve this summary by relevance, not
+        // just recency/coverage. Same path the normal seal uses; persisted to
+        // the redo log so retrieval survives a restart.
+        let sigs = self.capture_turn_sigs(slot, block_from, block_to);
+        if !sigs.is_empty() {
+            {
+                let mut view = conv.write();
+                view.set_sig_entries(target.timeline, idx, sigs.clone());
+            }
+            let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
+            let mut sig_bytes = Vec::with_capacity(sigs.len());
+            for e in &sigs {
+                match self.provenance.read_entry(*e) {
+                    Ok((syn, sem, prag)) => {
+                        let mut bytes = Vec::with_capacity(e.byte_len());
+                        for s in syn.iter().chain(sem.iter()).chain(prag.iter()) {
+                            bytes.extend_from_slice(s.as_bytes());
+                        }
+                        sig_bytes.push((e.token_count, bytes));
+                    }
+                    Err(err) => tracing::warn!("summary read provenance entry: {err}"),
+                }
+            }
+            let payload = encode_signatures(&sig_bytes);
+            if let Err(e) = conv.persist_signatures(stream_id, &payload) {
+                tracing::warn!("summary persist signatures failed: {e}");
+            }
+        }
+
+        // Full summary text, once, after the turn is sealed.
+        tracing::debug!(
+            target: "candle_conversation::summariser",
+            timeline = %target.timeline,
+            index = idx.0,
+            tokens = generated.len(),
+            blocks = block_to - block_from,
+            sigs = sigs.len(),
+            summary = %assistant_text,
+            "summary probe: produced summary",
+        );
+        Ok(idx)
     }
 
     // —— Sequence creation ——————————————————————————————————————————
@@ -2183,6 +2569,13 @@ impl Scheduler {
 
         for seq_id in finished_seq_ids {
             if let Some(state) = self.active_decodes.remove(&seq_id) {
+                // Summary probes complete out-of-band: seal as a summary turn
+                // and fire the summariser's response channel, rather than the
+                // normal turn seal + `Done` event stream.
+                if let Some(response_tx) = self.summary_completions.remove(&seq_id) {
+                    self.complete_summary_decode(seq_id, state, response_tx);
+                    continue;
+                }
                 let decode_ms = state.decode_start.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = state.turn_start.elapsed().as_secs_f64() * 1000.0;
                 let tokens_generated = state.generated_tokens.len();
