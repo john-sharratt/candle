@@ -1,13 +1,12 @@
+#[cfg(feature = "cuda")]
+use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use candle::quantized::pinned_staging::Generation;
 #[cfg(feature = "cuda")]
 use candle::quantized::pinned_staging::GpuBuf;
-#[cfg(feature = "cuda")]
-use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use candle::*;
 pub(crate) use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 pub(crate) use candle_nn::kv_cache::CHUNK_SIZE;
-
 
 #[cfg(feature = "cuda")]
 use {
@@ -20,6 +19,8 @@ use {
     half::{bf16, f16},
 };
 
+#[cfg(feature = "cuda")]
+use crate::models::prefill_capture::maybe_capture;
 #[cfg(feature = "cuda")]
 use crate::models::slot_state::{SlotStateHost, TokenSliceHost};
 
@@ -36,9 +37,34 @@ struct SlotHeaderUpload {
     /// Per-slot host slot state, write region extended; `position_map[off+t]`
     /// locates glue token `t`'s writer slice/in-block offset.
     slots: Vec<SlotStateHost>,
-    /// Keeps the stager uploads (headers, slices, position_maps, records) alive
-    /// for the duration of the kernel launch.
-    _guards: (GpuBuf, GpuBuf, GpuBuf, GpuBuf),
+    /// Keeps the stager uploads (headers, slices, records) alive for the
+    /// duration of the kernel launch. The position_map upload is layer-invariant
+    /// and held separately in the per-forward [`SharedPm`] cache.
+    _guards: (GpuBuf, GpuBuf, GpuBuf),
+}
+
+/// Per-forward cache of the layer-invariant uploaded `position_map`.
+///
+/// The position_map maps each token position to its `(slice_idx, in-block
+/// offset)`, which depends only on the chunk token layout — **identical across
+/// every layer of a forward** (a sequence's chunks seal at the same boundaries
+/// in all layers; only the K/V values + arena pointers differ per layer). So the
+/// first layer builds + uploads it and every later layer reuses the same device
+/// buffer + per-slot byte offsets, eliminating the dominant per-layer host build
+/// and PCIe upload. Built once per (prefill) forward and dropped with it.
+///
+/// The type is named in the CPU-fallback `paged_prefill_batched` signature too,
+/// so it exists on both targets; only the GPU-buffer guard is CUDA-gated and the
+/// cache is only ever populated on the CUDA path.
+#[allow(dead_code)]
+pub struct SharedPm {
+    /// Keeps the uploaded position_map buffer alive for the whole forward.
+    #[cfg(feature = "cuda")]
+    _gpu: GpuBuf,
+    /// Device base address of the packed position_map buffer.
+    base_ptr: u64,
+    /// Per-slot byte offset into the packed buffer, in slot order.
+    byte_offsets: Vec<usize>,
 }
 
 /// Build + upload the per-slot `SlotHeader` payloads (slices, position_map,
@@ -52,6 +78,7 @@ fn build_slot_headers(
     n_kv_head: usize,
     head_dim: usize,
     generation: &Generation,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<SlotHeaderUpload> {
     let t_build = profile_now();
     let arena_info = {
@@ -63,6 +90,12 @@ fn build_slot_headers(
             .chunked_resolve_arena_info()
             .ok_or_else(|| candle::Error::Msg("expected chunked resolve_arena_info".into()))??
     };
+
+    // The position_map is layer-invariant (see [`SharedPm`]). The first layer of
+    // a forward populates `shared_pm` and uploads it; later layers reuse it and
+    // skip both the host build and the PCIe upload. When already cached we build
+    // each slot's slices WITHOUT its position_map.
+    let pm_cached = shared_pm.borrow().is_some();
 
     let mut slots: Vec<SlotStateHost> = caches
         .iter()
@@ -78,6 +111,7 @@ fn build_slot_headers(
                 head_dim,
                 &arena_info,
                 writer_start_idx,
+                !pm_cached,
             )
         })
         .collect();
@@ -85,10 +119,13 @@ fn build_slot_headers(
     // Extend each slot's position_map to cover the write region. Ragged: slot i
     // writes q_lens[i] new tokens, so after this `position_map.len() ==
     // offsets[i] + q_lens[i] == kv_lens[i]`, letting the kernel resolve any
-    // k_pos in `[0, kv_lens[i])` via a single lookup.
+    // k_pos in `[0, kv_lens[i])` via a single lookup. Skipped on a cache hit —
+    // the cached upload already covers the (layer-invariant) write region.
     let chunk_size = CHUNK_SIZE;
-    for (slot, &add) in slots.iter_mut().zip(q_lens.iter()) {
-        slot.extend_for_write_region(add, chunk_size);
+    if !pm_cached {
+        for (slot, &add) in slots.iter_mut().zip(q_lens.iter()) {
+            slot.extend_for_write_region(add, chunk_size);
+        }
     }
     pipeline_record("slot:build", t_build);
 
@@ -170,25 +207,48 @@ fn build_slot_headers(
     let slices_gpu = generation.submit(slices_pinned)?;
     let slices_base_ptr = slices_gpu.dev_ptr();
 
-    // Pack position_maps — upload via stager, same path.
-    let total_pm_entries: usize = slots.iter().map(|s| s.position_map.len()).sum();
-    let mut pm_buf: Vec<u32> = Vec::with_capacity(total_pm_entries.max(1));
-    let mut pm_byte_offsets: Vec<usize> = Vec::with_capacity(slots.len());
-    for slot in &slots {
-        pm_byte_offsets.push(pm_buf.len() * 4);
-        pm_buf.extend_from_slice(&slot.position_map);
-    }
-    if pm_buf.is_empty() {
-        pm_buf.push(0u32);
-    }
-    let pm_byte_len = pm_buf.len() * std::mem::size_of::<u32>();
-    let mut pm_pinned = generation.alloc(pm_byte_len)?;
-    // SAFETY: u32 has no padding and is trivially copyable; lengths match.
-    let pm_bytes =
-        unsafe { std::slice::from_raw_parts(pm_buf.as_ptr() as *const u8, pm_byte_len) };
-    pm_pinned.copy_from_slice(pm_bytes);
-    let pm_gpu = generation.submit(pm_pinned)?;
-    let pm_base_ptr = pm_gpu.dev_ptr();
+    // Position_map: layer-invariant, so build + upload it only on the first
+    // layer of the forward and reuse the device buffer + per-slot byte offsets
+    // for the rest (see [`SharedPm`]). On a cache hit the slots carry no
+    // position_map (built with `build_position_map = false`), so the cached
+    // offsets are authoritative.
+    let pm_byte_offsets: Vec<usize> = if pm_cached {
+        let cache = shared_pm.borrow();
+        let s = cache
+            .as_ref()
+            .expect("pm_cached implies shared_pm is populated");
+        s.byte_offsets.clone()
+    } else {
+        let total_pm_entries: usize = slots.iter().map(|s| s.position_map.len()).sum();
+        let mut pm_buf: Vec<u32> = Vec::with_capacity(total_pm_entries.max(1));
+        let mut byte_offsets: Vec<usize> = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            byte_offsets.push(pm_buf.len() * 4);
+            pm_buf.extend_from_slice(&slot.position_map);
+        }
+        if pm_buf.is_empty() {
+            pm_buf.push(0u32);
+        }
+        let pm_byte_len = pm_buf.len() * std::mem::size_of::<u32>();
+        let mut pm_pinned = generation.alloc(pm_byte_len)?;
+        // SAFETY: u32 has no padding and is trivially copyable; lengths match.
+        let pm_bytes =
+            unsafe { std::slice::from_raw_parts(pm_buf.as_ptr() as *const u8, pm_byte_len) };
+        pm_pinned.copy_from_slice(pm_bytes);
+        let pm_gpu = generation.submit(pm_pinned)?;
+        let base_ptr = pm_gpu.dev_ptr();
+        *shared_pm.borrow_mut() = Some(SharedPm {
+            _gpu: pm_gpu,
+            base_ptr,
+            byte_offsets: byte_offsets.clone(),
+        });
+        byte_offsets
+    };
+    let pm_base_ptr = shared_pm
+        .borrow()
+        .as_ref()
+        .expect("position_map cache populated above")
+        .base_ptr;
 
     let mut header_buf: Vec<u8> = Vec::with_capacity(slots.len() * 24);
     for (i, slot) in slots.iter().enumerate() {
@@ -211,10 +271,9 @@ fn build_slot_headers(
     Ok(SlotHeaderUpload {
         headers_ptr,
         slots,
-        _guards: (headers_gpu, slices_gpu, pm_gpu, records_gpu),
+        _guards: (headers_gpu, slices_gpu, records_gpu),
     })
 }
-
 
 /// Chunked KV + paged prefill attention over chunks.
 ///
@@ -242,6 +301,7 @@ fn paged_prefill_batched_impl(
     rope_interleaved: bool,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     // Ragged/varlen prefill. q/k/v arrive FLAT-packed:
     //   q: [total_q, n_head, head_dim], k/v: [total_q, n_kv_head, head_dim]
@@ -463,11 +523,30 @@ fn paged_prefill_batched_impl(
         }
     };
 
-    let header_upload = build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation)?;
+    let header_upload =
+        build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation, shared_pm)?;
     let headers_ptr = header_upload.headers_ptr;
 
     profile_sync(q.device());
     pipeline_record("prefill:pack", t_pack);
+
+    // Optional kernel-replay capture: dumps this call's packed Q/K/V + cached KV
+    // chunks + geometry to a fixture. No-op unless `ZEND_PREFILL_CAPTURE` is set;
+    // fires once, on the first call past the kv_len threshold (one layer).
+    maybe_capture(
+        caches,
+        offsets,
+        &q_packed,
+        &k_packed,
+        &v_packed,
+        q_lens,
+        n_head,
+        n_kv_head,
+        head_dim,
+        rope_offsets,
+        rope_cs,
+        rope_interleaved,
+    );
 
     let t_kernel = profile_now();
     let out_packed = paged_prefill_attn_varlen_chunks(
@@ -545,6 +624,7 @@ pub fn paged_prefill_batched(
     rope_interleaved: bool,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     paged_prefill_batched_impl(
         caches,
@@ -563,6 +643,7 @@ pub fn paged_prefill_batched(
         rope_interleaved,
         write_offset_shifts_ptr,
         generation,
+        shared_pm,
     )
 }
 
@@ -585,6 +666,7 @@ pub fn paged_prefill_batched(
     _rope_interleaved: bool,
     _write_offset_shifts_ptr: u64,
     _generation: &Generation,
+    _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
     // CPU fallback: per-sequence standard attention. The paged CUDA kernel is
     // the production path; this exists only for non-chunked CPU caches.
@@ -1317,7 +1399,12 @@ pub fn paged_glue_attn(
     };
 
     let t_hdr = profile_now();
-    let header_upload = build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation)?;
+    // Glue derives each row's writer slot from the host `position_map` below, so
+    // it must be built every call — a fresh (always-miss) cache forces that and
+    // never reuses, unlike the per-forward sharing on the plain prefill path.
+    let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
+    let header_upload =
+        build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation, &glue_pm)?;
 
     // Glue write targets (flat, cu_seqlens_q order) + cu_kvlens (col_actual_pos
     // offsets). Each glue row's writer slot is its slot's position_map entry at
@@ -1671,6 +1758,7 @@ mod tests {
             rope_interleaved,
             write_offset_shifts_ptr,
             generation,
+            &std::cell::RefCell::new(None),
         )?;
         // Flat [total_q, n_head, head_dim] -> per-seq [1, n_head, seq_len, head_dim].
         let mut per_seq = Vec::with_capacity(b_sz);

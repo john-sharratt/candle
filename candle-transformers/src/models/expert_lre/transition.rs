@@ -177,7 +177,11 @@ impl TransitionMatrix {
     ///   `to`?", i.e. how *confident* the model is that `to` is genuinely coming.
     ///   The max (not a sum) keeps it batch-invariant; it decides *how many*
     ///   experts are worth prefetching.
-    fn score_and_conf(&self, moe_layer_idx: usize, expert_ids: &[usize]) -> Option<(Vec<f32>, Vec<f32>)> {
+    fn score_and_conf(
+        &self,
+        moe_layer_idx: usize,
+        expert_ids: &[usize],
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
         if moe_layer_idx + 1 >= self.num_moe_layers || moe_layer_idx >= self.pairs {
             return None;
         }
@@ -238,15 +242,35 @@ impl TransitionMatrix {
 
     /// Predict the experts worth *prefetching* for layer `moe_layer_idx + 1`.
     ///
-    /// The fan-out is not fixed: an expert is returned only if its confidence is
-    /// within [`PREFETCH_REL_CONF`] of the most confident candidate's, capped at
-    /// [`PREFETCH_MAX_K`] and ranked by PMI.  Depth therefore tracks demand
-    /// diversity (see the module docs).
-    pub(crate) fn predict_prefetch(&self, moe_layer_idx: usize, expert_ids: &[usize]) -> Vec<usize> {
+    /// Depth scales with demand **density**:
+    /// - A **dense** source — the prefill regime, where the next layer routes
+    ///   ~all experts and the arrival-specialised matrix emits almost nothing —
+    ///   prefetches the *whole* next layer (`0..e`) so it can be double-buffered
+    ///   during this layer's compute. No warmup gate: density is observed, not
+    ///   predicted.
+    /// - A **sparse** source (decode) uses the confidence-gated transition
+    ///   prediction: an expert is returned only if its confidence is within
+    ///   [`PREFETCH_REL_CONF`] of the most confident candidate's, capped at
+    ///   [`PREFETCH_MAX_K`] and ranked by PMI, so depth tracks demand diversity.
+    pub(crate) fn predict_prefetch(
+        &self,
+        moe_layer_idx: usize,
+        expert_ids: &[usize],
+    ) -> Vec<usize> {
+        if moe_layer_idx + 1 >= self.num_moe_layers {
+            return vec![];
+        }
+        if expert_ids.len() * 2 >= self.e {
+            return (0..self.e).collect();
+        }
         match self.score_and_conf(moe_layer_idx, expert_ids) {
-            Some((scores, conf)) => {
-                top_k_gated(&scores, &conf, expert_ids, PREFETCH_MAX_K, PREFETCH_REL_CONF)
-            }
+            Some((scores, conf)) => top_k_gated(
+                &scores,
+                &conf,
+                expert_ids,
+                PREFETCH_MAX_K,
+                PREFETCH_REL_CONF,
+            ),
             None => vec![],
         }
     }
@@ -343,6 +367,25 @@ mod tests {
             m.observe(l, from);
             m.observe(l + 1, to);
         }
+    }
+
+    #[test]
+    fn dense_source_prefetches_whole_next_layer() {
+        // A dense source (> E/2 routed) prefetches all E experts of the next
+        // layer, with no warmup gate — density is observed, not predicted.
+        let m = TransitionMatrix::new(4, E);
+        let dense: Vec<usize> = (0..E).collect();
+        assert_eq!(m.predict_prefetch(0, &dense), (0..E).collect::<Vec<_>>());
+        // Still respects the no-successor bound at the last layer.
+        assert!(m.predict_prefetch(3, &dense).is_empty());
+    }
+
+    #[test]
+    fn sparse_source_uses_gated_prediction() {
+        // A sparse source stays on the capped, warmup-gated transition path:
+        // a cold model predicts nothing.
+        let m = TransitionMatrix::new(4, E);
+        assert!(m.predict_prefetch(0, &[1, 2]).is_empty());
     }
 
     #[test]

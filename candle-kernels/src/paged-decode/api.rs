@@ -45,10 +45,5 @@ extern "C" {
     /// `C`) via `load_a_frag_m16k32` / `load_b_frag_n8k32` / `mma_int8_m16n8k32`
     /// — the exact path the int8 decode QK dot uses. A fragment-layout
     /// regression makes `C` disagree with a CPU reference. Single warp; test-only.
-    pub fn mma_int8_m16n8k32_test(
-        a: *const i8,
-        b: *const i8,
-        c: *mut i32,
-        stream: *mut c_void,
-    );
+    pub fn mma_int8_m16n8k32_test(a: *const i8, b: *const i8, c: *mut i32, stream: *mut c_void);
 }

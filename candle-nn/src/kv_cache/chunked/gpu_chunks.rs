@@ -331,7 +331,10 @@ impl Drop for GpuChunksGuard<'_> {
         let upload_run = |start: usize, end: usize, gpu: &mut CudaSlice<u8>| {
             // Slice-header region.
             let (hs, he) = (start * SLICE_HEADER_BYTES, end * SLICE_HEADER_BYTES);
-            if let Err(e) = stream.memcpy_htod(&host[hs..he], &mut gpu.slice_mut(hs..he)).w() {
+            if let Err(e) = stream
+                .memcpy_htod(&host[hs..he], &mut gpu.slice_mut(hs..he))
+                .w()
+            {
                 log::warn!("GpuChunksGuard: header memcpy_htod [{hs}..{he}] error: {e:?}");
             }
             // Records region.
@@ -340,7 +343,10 @@ impl Drop for GpuChunksGuard<'_> {
                     records_off + start * rec_bytes,
                     records_off + end * rec_bytes,
                 );
-                if let Err(e) = stream.memcpy_htod(&host[rs..re], &mut gpu.slice_mut(rs..re)).w() {
+                if let Err(e) = stream
+                    .memcpy_htod(&host[rs..re], &mut gpu.slice_mut(rs..re))
+                    .w()
+                {
                     log::warn!("GpuChunksGuard: record memcpy_htod [{rs}..{re}] error: {e:?}");
                 }
             }

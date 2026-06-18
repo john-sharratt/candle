@@ -1,7 +1,7 @@
 use super::*;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
-use rand::Rng;
 use half::bf16;
+use rand::Rng;
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -2913,10 +2913,7 @@ fn expert_grouped_launch_cost() -> Result<()> {
         "\n=== Per-segment expert launch cost [n={n} k={k}] Q4_K, M={m}/expert, \
          {iters} calls/sync (N launches via run_quantized_matmul) ===",
     );
-    println!(
-        "{:>9} {:>12} {:>12}",
-        "N_experts", "us/call", "us/expert"
-    );
+    println!("{:>9} {:>12} {:>12}", "N_experts", "us/call", "us/expert");
 
     for &n_exp in &[1usize, 2, 4, 8, 16, 32] {
         let total = n_exp * m;

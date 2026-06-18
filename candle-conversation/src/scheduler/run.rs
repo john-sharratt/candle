@@ -1,8 +1,9 @@
 use super::*;
+use std::time::Instant;
 
 /// Maximum decode steps per decode quantum (matches `CHUNK_SIZE`).
 const DECODE_BUDGET: usize = 32;
-/// Maximum prefill chunks per prefill quantum.
+/// Maximum prefill passes per prefill quantum.
 const PREFILL_BUDGET: usize = 1;
 
 impl Scheduler {
@@ -44,18 +45,23 @@ impl Scheduler {
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that
             // re-keys an active_decodes entry doesn't race with finalize.
+            // Timed separately (a sub-slice of the decode quantum) because the
+            // BDP scan + glue gap-fill here is a prime "grows over time" suspect.
+            let t_reproj = Instant::now();
             self.drain_pending_reprojections();
+            self.wave_stats
+                .add_phase(WavePhase::Reproject, t_reproj.elapsed().as_millis() as u64);
             self.cleanup_finished();
         }
     }
 
-    /// Run prefill chunks until the budget is reached or prefill is empty.
+    /// Run prefill passes until the budget is reached or prefill is empty.
     fn run_prefill_until_budget(&mut self) {
         for _ in 0..PREFILL_BUDGET {
             if self.prefill_width() == 0 {
                 return;
             }
-            self.run_one_prefill_chunk();
+            self.run_one_prefill_pass();
             self.promote_finished_prefills_to_decodes();
         }
     }
@@ -75,7 +81,7 @@ impl Scheduler {
 
     /// Main scheduler loop. Runs on the scheduler thread until shutdown.
     ///
-    /// Each iteration runs one prefill quantum (PREFILL_BUDGET chunks) and
+    /// Each iteration runs one prefill quantum (PREFILL_BUDGET passes) and
     /// one decode quantum (DECODE_BUDGET steps). The wider phase runs first
     /// so freshly-arrived prefills don't have to wait an entire decode
     /// budget when there's no decode work yet.
@@ -83,13 +89,23 @@ impl Scheduler {
         tracing::info!("scheduler started");
 
         loop {
-            // 1. Drain pending submissions (non-blocking).
-            if !self.drain_submissions() {
+            // 1. Drain pending submissions (non-blocking). This synchronously
+            // handles SubmitTurn (projection + elevate + apply_segments gap-fill
+            // + view create) on the scheduler thread — a prime suspect for the
+            // wall-clock that is NOT a forward, so time it.
+            let t_drain = Instant::now();
+            let cont = self.drain_submissions();
+            self.wave_stats
+                .add_phase(WavePhase::Drain, t_drain.elapsed().as_millis() as u64);
+            if !cont {
                 break; // Shutdown requested or channel closed.
             }
 
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
+            let t_promote = Instant::now();
             self.promote_new_prefills();
+            self.wave_stats
+                .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
 
             // 3. If idle, block waiting for work.
             if self.active_decodes.is_empty()
@@ -115,20 +131,55 @@ impl Scheduler {
             let pw = self.prefill_width();
             let sw = self.section_ingest_width();
             if dw >= pw.max(sw) {
-                self.run_decode_until_budget();
-                self.run_prefill_until_budget();
-                self.run_section_ingest_until_budget();
+                self.timed_decode();
+                self.timed_prefill();
+                self.timed_section();
             } else if sw >= pw {
-                self.run_section_ingest_until_budget();
-                self.run_prefill_until_budget();
-                self.run_decode_until_budget();
+                self.timed_section();
+                self.timed_prefill();
+                self.timed_decode();
             } else {
-                self.run_prefill_until_budget();
-                self.run_section_ingest_until_budget();
-                self.run_decode_until_budget();
+                self.timed_prefill();
+                self.timed_section();
+                self.timed_decode();
             }
+
+            // Flush the wave summary + phase breakdown if its 2 s window
+            // elapsed — even when no forward ran this iteration, so stalls still
+            // surface their phase split. (The expert-DMA delta and cumulative
+            // op-profile dumps were removed once measurement ruled the expert
+            // path out — dma_loads stays 0; the prefill cost is the attention
+            // kernel, seen in the per-forward `code-read prefill` breakdown.)
+            self.wave_stats.flush_if_due();
         }
 
         tracing::info!("scheduler shut down");
+    }
+
+    /// Run the decode quantum, attributing its wall-clock to [`WavePhase::Decode`]
+    /// (the reprojection drain inside it is separately attributed to
+    /// [`WavePhase::Reproject`] as a sub-slice).
+    fn timed_decode(&mut self) {
+        let t = Instant::now();
+        self.run_decode_until_budget();
+        self.wave_stats
+            .add_phase(WavePhase::Decode, t.elapsed().as_millis() as u64);
+    }
+
+    /// Run the prefill quantum, attributing its wall-clock to [`WavePhase::Prefill`].
+    fn timed_prefill(&mut self) {
+        let t = Instant::now();
+        self.run_prefill_until_budget();
+        self.wave_stats
+            .add_phase(WavePhase::Prefill, t.elapsed().as_millis() as u64);
+    }
+
+    /// Run the section-ingest quantum, attributing its wall-clock to
+    /// [`WavePhase::Section`].
+    fn timed_section(&mut self) {
+        let t = Instant::now();
+        self.run_section_ingest_until_budget();
+        self.wave_stats
+            .add_phase(WavePhase::Section, t.elapsed().as_millis() as u64);
     }
 }

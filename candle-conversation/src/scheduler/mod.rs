@@ -772,6 +772,19 @@ struct WaveStats {
     window_start: std::time::Instant,
     prefill: WaveChannel,
     decode: WaveChannel,
+    /// Per-phase wall-clock spent on the scheduler thread this window, in ms.
+    /// These account for where the wall-clock goes when it is NOT a forward:
+    /// `drain` includes the synchronous per-turn SubmitTurn handling
+    /// (projection + elevate + apply_segments gap-fill + view create), `reproj`
+    /// is the mid-decode continuous reprojection drain, the rest are the
+    /// forward quanta themselves. A wave whose elapsed ≫ Σ(phase) was blocked
+    /// off-thread (e.g. waiting on the persistence thread / a lock).
+    drain_ms: u64,
+    promote_ms: u64,
+    decode_ms: u64,
+    prefill_ms: u64,
+    section_ms: u64,
+    reproj_ms: u64,
 }
 
 impl WaveStats {
@@ -780,6 +793,12 @@ impl WaveStats {
             window_start: std::time::Instant::now(),
             prefill: WaveChannel::default(),
             decode: WaveChannel::default(),
+            drain_ms: 0,
+            promote_ms: 0,
+            decode_ms: 0,
+            prefill_ms: 0,
+            section_ms: 0,
+            reproj_ms: 0,
         }
     }
 
@@ -796,23 +815,89 @@ impl WaveStats {
         ch.seq_max = ch.seq_max.max(n_seqs);
         ch.tok_sum += n_tokens as u64;
         ch.ms_sum += fwd_ms;
-        let elapsed = self.window_start.elapsed();
-        if elapsed >= std::time::Duration::from_secs(2) {
-            let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
-            let p = &self.prefill;
-            let d = &self.decode;
-            tracing::info!(
-                "wave {:.1}s: prefill fwds={} seqs avg={:.1} max={} tok/fwd avg={:.0} fwd avg={:.0}ms \
-                 | decode fwds={} seqs avg={:.1} max={} fwd avg={:.0}ms",
-                elapsed.as_secs_f64(),
-                p.fwds, avg(p.seq_sum, p.fwds), p.seq_max, avg(p.tok_sum, p.fwds), avg(p.ms_sum, p.fwds),
-                d.fwds, avg(d.seq_sum, d.fwds), d.seq_max, avg(d.ms_sum, d.fwds),
-            );
-            self.window_start = std::time::Instant::now();
-            self.prefill = WaveChannel::default();
-            self.decode = WaveChannel::default();
+        // NB: do NOT flush here. Flushing mid-forward (record runs inside the
+        // forward) would fire before the enclosing `timed_*` wrapper attributes
+        // the phase ms, leaking the forward's wall-clock into `unaccounted`.
+        // The run loop calls `flush_if_due` once per iteration, after all phase
+        // attribution for that iteration is complete.
+    }
+
+    /// Accumulate wall-clock spent in a named scheduler-loop phase.
+    fn add_phase(&mut self, phase: WavePhase, ms: u64) {
+        match phase {
+            WavePhase::Drain => self.drain_ms += ms,
+            WavePhase::Promote => self.promote_ms += ms,
+            WavePhase::Decode => self.decode_ms += ms,
+            WavePhase::Prefill => self.prefill_ms += ms,
+            WavePhase::Section => self.section_ms += ms,
+            WavePhase::Reproject => self.reproj_ms += ms,
         }
     }
+
+    /// Emit the wave summary + phase breakdown if the 2 s window elapsed, then
+    /// reset. Called at the end of each scheduler-loop iteration, so windows
+    /// with NO forwards still flush.
+    fn flush_if_due(&mut self) {
+        let elapsed = self.window_start.elapsed();
+        if elapsed < std::time::Duration::from_secs(2) {
+            return;
+        }
+        let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
+        let p = &self.prefill;
+        let d = &self.decode;
+        let phase_sum =
+            self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
+        let unaccounted = (elapsed.as_millis() as u64).saturating_sub(phase_sum);
+        tracing::info!(
+            "wave {:.1}s: prefill fwds={} seqs avg={:.1} max={} tok/fwd avg={:.0} fwd avg={:.0}ms \
+             | decode fwds={} seqs avg={:.1} max={} fwd avg={:.0}ms",
+            elapsed.as_secs_f64(),
+            p.fwds,
+            avg(p.seq_sum, p.fwds),
+            p.seq_max,
+            avg(p.tok_sum, p.fwds),
+            avg(p.ms_sum, p.fwds),
+            d.fwds,
+            avg(d.seq_sum, d.fwds),
+            d.seq_max,
+            avg(d.ms_sum, d.fwds),
+        );
+        // Phase breakdown: where the wall-clock went on the scheduler thread.
+        // `drain` rising over the run ⇒ per-turn reprojection/elevate growing;
+        // `reproj` rising ⇒ continuous-reproject (BDP scan/glue) growing;
+        // `unaccounted` large ⇒ blocked off-thread (persistence thread / lock).
+        tracing::info!(
+            target: "candle_conversation::scheduler::timing",
+            drain_ms = self.drain_ms,
+            promote_ms = self.promote_ms,
+            decode_ms = self.decode_ms,
+            prefill_ms = self.prefill_ms,
+            section_ms = self.section_ms,
+            reproj_ms = self.reproj_ms,
+            unaccounted_ms = unaccounted,
+            "wave phase breakdown (scheduler-thread wall-clock; watch which grows)"
+        );
+        self.window_start = std::time::Instant::now();
+        self.prefill = WaveChannel::default();
+        self.decode = WaveChannel::default();
+        self.drain_ms = 0;
+        self.promote_ms = 0;
+        self.decode_ms = 0;
+        self.prefill_ms = 0;
+        self.section_ms = 0;
+        self.reproj_ms = 0;
+    }
+}
+
+/// Named scheduler-loop phases for [`WaveStats::add_phase`].
+#[derive(Clone, Copy)]
+enum WavePhase {
+    Drain,
+    Promote,
+    Decode,
+    Prefill,
+    Section,
+    Reproject,
 }
 
 /// Runs a continuous loop:
@@ -878,7 +963,7 @@ pub(crate) struct Scheduler {
     /// Maximum tokens per prefill chunk (chunked prefill).
     /// When a submission exceeds this, it is split into multiple forward passes
     /// so intermediate activation buffers stay bounded.
-    max_prefill_chunk: usize,
+    max_prefill_pass_tokens: usize,
     /// Per-turn view ownership: `view_id → ViewState`.
     ///
     /// Populated when [`SchedulerRequest::SubmitTurn`] creates a view
@@ -1078,7 +1163,7 @@ impl Scheduler {
         show_special_tokens: bool,
         penalty_log_path: Option<PathBuf>,
         health_config: DecodeHealthConfig,
-        max_prefill_chunk: usize,
+        max_prefill_pass_tokens: usize,
         provenance: Arc<ProvenanceFile>,
         model_core: ModelCoreProperties,
         persist_trigger: PersistenceTrigger,
@@ -1127,7 +1212,7 @@ impl Scheduler {
             show_special_tokens,
             health_config,
             chunk_size,
-            max_prefill_chunk,
+            max_prefill_pass_tokens,
             slot_conversations: HashMap::new(),
             slot_targets: HashMap::new(),
             slot_sig_blocks_processed: HashMap::new(),
@@ -1476,7 +1561,7 @@ impl Scheduler {
                             &turn_keys_for_elevate,
                         );
                         if evicted.count > 0 {
-                            tracing::debug!(
+                            tracing::trace!(
                                 target: "candle_conversation::persistence::tier",
                                 count = evicted.count,
                                 bytes = evicted.bytes,
@@ -1494,7 +1579,7 @@ impl Scheduler {
                             &turn_keys_for_elevate,
                         ) {
                             Ok(report) => {
-                                tracing::debug!(
+                                tracing::trace!(
                                     target: "candle_conversation::persistence::tier",
                                     already_hot = report.already_hot,
                                     warm_to_hot = report.warm_to_hot,
@@ -1542,7 +1627,7 @@ impl Scheduler {
                 let parent_block_count =
                     self.session.sequence_block_count(parent_id.0).unwrap_or(0);
                 let parent_offset_for_log = self.session.sequence_offset(parent_id.0).unwrap_or(0);
-                tracing::info!(
+                tracing::trace!(
                     target: "candle_conversation::scheduler::view_create",
                     parent = parent_id.0,
                     parent_block_count,
@@ -1966,7 +2051,9 @@ impl Scheduler {
         self.sampling_states.insert(slot, sstate);
         if self.is_eos(first_token) {
             self.free_summary_slot(slot);
-            return Err("SubmitSummaryProbe: summary produced no tokens (immediate EOS)".to_string());
+            return Err(
+                "SubmitSummaryProbe: summary produced no tokens (immediate EOS)".to_string(),
+            );
         }
 
         // Register the summary as a normal batched decode so it rides the wave
@@ -2056,11 +2143,10 @@ impl Scheduler {
         slot: SequenceId,
         state: &DecodeState,
     ) -> Result<TurnIndex, String> {
-        let conv = self
-            .slot_conversations
-            .get(&slot)
-            .cloned()
-            .ok_or_else(|| "SubmitSummaryProbe: no conversation for summary slot".to_string())?;
+        let conv =
+            self.slot_conversations.get(&slot).cloned().ok_or_else(|| {
+                "SubmitSummaryProbe: no conversation for summary slot".to_string()
+            })?;
         let target = self
             .slot_targets
             .get(&slot)
@@ -2138,7 +2224,10 @@ impl Scheduler {
                 ) {
                     Ok(entry) => entries.push(entry),
                     Err(e) => {
-                        tracing::warn!("summary sig append failed for block {}: {e}", block_from + j)
+                        tracing::warn!(
+                            "summary sig append failed for block {}: {e}",
+                            block_from + j
+                        )
                     }
                 }
             }
@@ -2162,10 +2251,9 @@ impl Scheduler {
         let chunk_size = self.chunk_size;
         let full_prompt_blocks = prompt_tokens.len() / chunk_size;
         let block_from = full_prompt_blocks;
-        let block_to = self
-            .session
-            .sequence_block_count(slot.0)
-            .ok_or_else(|| "SubmitSummaryProbe: seal block_count: slot not in session".to_string())?;
+        let block_to = self.session.sequence_block_count(slot.0).ok_or_else(|| {
+            "SubmitSummaryProbe: seal block_count: slot not in session".to_string()
+        })?;
         if block_to <= block_from {
             return Err("SubmitSummaryProbe: summary produced no sealed blocks".to_string());
         }
@@ -2198,7 +2286,9 @@ impl Scheduler {
             sealed_gpu: Some(Arc::new(delta_gpu)),
         };
         let idx = conv
-            .record_turn(target.timeline, Role::Assistant, write, |seqs| Ok(seqs.to_vec()))
+            .record_turn(target.timeline, Role::Assistant, write, |seqs| {
+                Ok(seqs.to_vec())
+            })
             .map_err(|e| format!("SubmitSummaryProbe: seal record_turn: {e}"))?;
 
         // Capture BDP signatures over the summary's decoded blocks so the
@@ -2391,7 +2481,7 @@ impl Scheduler {
                 slot_target,
                 parent_id,
                 chunk_size: self.chunk_size,
-                max_prefill_chunk: self.max_prefill_chunk,
+                max_prefill_pass_tokens: self.max_prefill_pass_tokens,
                 tokenizer: &self.tokenizer,
                 slot_tokens: &mut self.slot_tokens,
                 boundary_markers: &self.boundary_markers,
@@ -2431,7 +2521,7 @@ impl Scheduler {
             slot_target,
             parent_id,
             chunk_size: self.chunk_size,
-            max_prefill_chunk: self.max_prefill_chunk,
+            max_prefill_pass_tokens: self.max_prefill_pass_tokens,
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
@@ -2466,7 +2556,7 @@ impl Scheduler {
             slot_target,
             parent_id,
             chunk_size: self.chunk_size,
-            max_prefill_chunk: self.max_prefill_chunk,
+            max_prefill_pass_tokens: self.max_prefill_pass_tokens,
             tokenizer: &self.tokenizer,
             slot_tokens: &mut self.slot_tokens,
             boundary_markers: &self.boundary_markers,
@@ -4670,7 +4760,7 @@ impl Scheduler {
                 &turn_keys_for_elevate,
             );
             if evicted.count > 0 {
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::persistence::tier",
                     count = evicted.count,
                     bytes = evicted.bytes,
@@ -4688,7 +4778,7 @@ impl Scheduler {
                 &turn_keys_for_elevate,
             ) {
                 Ok(report) => {
-                    tracing::debug!(
+                    tracing::trace!(
                         target: "candle_conversation::persistence::tier",
                         already_hot = report.already_hot,
                         warm_to_hot = report.warm_to_hot,
@@ -5041,7 +5131,7 @@ mod tests {
             false,             // show_special_tokens
             None,              // penalty_log_path
             DecodeHealthConfig::default(),
-            512, // max_prefill_chunk
+            512, // max_prefill_pass_tokens
             Arc::new(ProvenanceFile::new().unwrap()),
             ModelCoreProperties {
                 num_layers: 6,

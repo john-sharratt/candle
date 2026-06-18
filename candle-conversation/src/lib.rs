@@ -96,11 +96,11 @@ pub use tree::{
 pub use batched_sampler::{BatchedSampler, SequenceSamplingState};
 
 // Re-export types callers need from our dependencies.
+pub use candle_nn::kv_cache::{KvFormat, QuantFormat};
 pub use candle_transformers::generation::Sampling;
 pub use candle_transformers::models::batched_inference::{
     BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
 };
-pub use candle_nn::kv_cache::{KvFormat, QuantFormat};
 
 /// Convenience type alias for Results in this crate.
 pub type Result<T> = std::result::Result<T, ConversationError>;

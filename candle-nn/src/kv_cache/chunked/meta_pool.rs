@@ -560,7 +560,11 @@ impl MetaPool {
 
     #[allow(dead_code)]
     pub fn slab_count(&self) -> usize {
-        self.slabs.lock().expect("meta pool lock poisoned").refs.len()
+        self.slabs
+            .lock()
+            .expect("meta pool lock poisoned")
+            .refs
+            .len()
     }
 
     #[cfg(feature = "cuda")]
@@ -690,7 +694,15 @@ mod tests {
 
         let mut dst = vec![0u8; rec];
         serialize_kv_heads(
-            &mut dst, &gids, &[], &[], &[], &[], n_kv_head, head_dim, &arena_info,
+            &mut dst,
+            &gids,
+            &[],
+            &[],
+            &[],
+            &[],
+            n_kv_head,
+            head_dim,
+            &arena_info,
         );
 
         let mut exp: Vec<u8> = Vec::new();
@@ -758,7 +770,15 @@ mod tests {
         ];
         let mut dst = vec![0u8; rec];
         serialize_kv_heads(
-            &mut dst, &gids, &[], &[], &[], &[], n_kv_head, head_dim, &arena_info,
+            &mut dst,
+            &gids,
+            &[],
+            &[],
+            &[],
+            &[],
+            n_kv_head,
+            head_dim,
+            &arena_info,
         );
         // k_ptr[0] = 0x1000 + 1*256 = 0x1100; k_ptr[1] = 0x9000 + 2*128 = 0x9100.
         let kptr0 = u64::from_le_bytes(dst[2..10].try_into().unwrap());

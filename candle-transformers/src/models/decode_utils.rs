@@ -168,9 +168,7 @@ mod tests {
 // ============================================================================
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
-    use crate::models::prefill_utils::{
-        compute_rope_cs, paged_decode_attn,
-    };
+    use crate::models::prefill_utils::{compute_rope_cs, paged_decode_attn};
     use candle::quantized::pinned_staging::PinnedStager;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::ChunkedKvBacking;
@@ -192,11 +190,21 @@ mod cuda_tests {
     }
 
     fn make_test_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
-        compute_rope_cs(&make_test_inv_freq(head_dim, device)?, max_blocks, head_dim, device)
+        compute_rope_cs(
+            &make_test_inv_freq(head_dim, device)?,
+            max_blocks,
+            head_dim,
+            device,
+        )
     }
 
     fn make_zero_rope_cs(head_dim: usize, max_blocks: usize, device: &Device) -> Result<Tensor> {
-        compute_rope_cs(&make_zero_inv_freq(head_dim, device)?, max_blocks, head_dim, device)
+        compute_rope_cs(
+            &make_zero_inv_freq(head_dim, device)?,
+            max_blocks,
+            head_dim,
+            device,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -301,10 +309,7 @@ mod cuda_tests {
         rope_cs: &Tensor,
     ) -> Result<Tensor> {
         let device = q.device();
-        let history_len = history
-            .map(|(k, _)| k.dim(2))
-            .transpose()?
-            .unwrap_or(0);
+        let history_len = history.map(|(k, _)| k.dim(2)).transpose()?.unwrap_or(0);
         let seq_offset = history_len;
 
         let backing =
@@ -347,7 +352,11 @@ mod cuda_tests {
 
         let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
         // Compute dtype must match the kernel dispatched by arena_dtype.
-        let compute_dtype = if arena_dtype == DType::F16 { DType::F16 } else { DType::BF16 };
+        let compute_dtype = if arena_dtype == DType::F16 {
+            DType::F16
+        } else {
+            DType::BF16
+        };
         let q_c = q.to_dtype(compute_dtype)?;
         // k_new/v_new are passed as compute_dtype (the kernel receives BF16/F16 new tokens
         // and writes them to the arena with any necessary conversion internally).
@@ -603,8 +612,7 @@ mod cuda_tests {
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (8, 8, 64);
 
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
         let k_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
         let v_new =
@@ -640,16 +648,14 @@ mod cuda_tests {
     fn test_fp8_hd128_paged_decode() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let (n_head, n_kv_head, head_dim) = (32, 8, 128);
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
         let k_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(DType::BF16)?;
         let v_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(DType::BF16)?;
         // Small history so the arena actually contains data in F8E4M3 format.
-        let hk =
-            Tensor::randn(0f32, 1f32, (1, n_kv_head, 8, head_dim), &device)?
-                .to_dtype(DType::BF16)?;
+        let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, 8, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
         let hv = hk.zeros_like()?;
 
         let out = run_paged_decode(
@@ -679,15 +685,13 @@ mod cuda_tests {
     fn test_fp8_hd64_paged_decode() -> Result<()> {
         let device = Device::new_cuda(0)?;
         let (n_head, n_kv_head, head_dim) = (32, 8, 64);
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
         let k_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(DType::BF16)?;
         let v_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(DType::BF16)?;
-        let hk =
-            Tensor::randn(0f32, 1f32, (1, n_kv_head, 8, head_dim), &device)?
-                .to_dtype(DType::BF16)?;
+        let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, 8, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
         let hv = hk.zeros_like()?;
 
         let out = run_paged_decode(
@@ -736,8 +740,7 @@ mod cuda_tests {
             (8, 1, 64, "MQA hd64"),
             (8, 1, 128, "MQA hd128"),
         ] {
-            let q =
-                Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
             let k_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
             let v_new =
@@ -789,8 +792,7 @@ mod cuda_tests {
             (14, 2, 64, "GQA 14/2 hd64"),
             (8, 1, 64, "MQA hd64"),
         ] {
-            let q =
-                Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
             let k_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
             let v_new =
@@ -858,26 +860,15 @@ mod cuda_tests {
             (32, 8, 256, 10, "GQA 32/8 hd256 hist=10 (stripe)"),
             (16, 1, 256, 10, "GQA 16/1 hd256 hist=10 (wide)"),
         ] {
-            let hk = Tensor::randn(
-                0f32,
-                1f32,
-                (1, n_kv_head, history_len, head_dim),
-                &device,
-            )?
-            .to_dtype(dtype)?;
-            let hv = Tensor::randn(
-                0f32,
-                1f32,
-                (1, n_kv_head, history_len, head_dim),
-                &device,
-            )?
-            .to_dtype(dtype)?;
+            let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
+                .to_dtype(dtype)?;
+            let hv = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
+                .to_dtype(dtype)?;
             let k_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
             let v_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-            let q =
-                Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
             assert_decode_ab(
                 Some((&hk, &hv)),
@@ -907,26 +898,15 @@ mod cuda_tests {
             (14, 2, 64, 10, "GQA 14/2 hd64 hist=10"),
             (8, 1, 64, 10, "MQA hd64 hist=10"),
         ] {
-            let hk = Tensor::randn(
-                0f32,
-                1f32,
-                (1, n_kv_head, history_len, head_dim),
-                &device,
-            )?
-            .to_dtype(dtype)?;
-            let hv = Tensor::randn(
-                0f32,
-                1f32,
-                (1, n_kv_head, history_len, head_dim),
-                &device,
-            )?
-            .to_dtype(dtype)?;
+            let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
+                .to_dtype(dtype)?;
+            let hv = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
+                .to_dtype(dtype)?;
             let k_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
             let v_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-            let q =
-                Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
             assert_decode_ab(
                 Some((&hk, &hv)),
@@ -958,34 +938,23 @@ mod cuda_tests {
         let dtype = DType::BF16;
         let history_len = 10usize;
         for &(n_head, n_kv_head, head_dim, label) in &[
-            (40, 8, 64, "40/8 hd64"),   // num_groups=5
+            (40, 8, 64, "40/8 hd64"), // num_groups=5
             (40, 8, 128, "40/8 hd128"),
-            (28, 4, 64, "28/4 hd64"),   // num_groups=7
-            (48, 8, 64, "48/8 hd64"),   // num_groups=6
-            (56, 8, 64, "56/8 hd64"),   // num_groups=7
+            (28, 4, 64, "28/4 hd64"), // num_groups=7
+            (48, 8, 64, "48/8 hd64"), // num_groups=6
+            (56, 8, 64, "56/8 hd64"), // num_groups=7
             (56, 8, 128, "56/8 hd128"),
-            (12, 4, 64, "12/4 hd64"),   // num_groups=3
+            (12, 4, 64, "12/4 hd64"), // num_groups=3
         ] {
-            let hk = Tensor::randn(
-                0f32,
-                1f32,
-                (1, n_kv_head, history_len, head_dim),
-                &device,
-            )?
-            .to_dtype(dtype)?;
-            let hv = Tensor::randn(
-                0f32,
-                1f32,
-                (1, n_kv_head, history_len, head_dim),
-                &device,
-            )?
-            .to_dtype(dtype)?;
+            let hk = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
+                .to_dtype(dtype)?;
+            let hv = Tensor::randn(0f32, 1f32, (1, n_kv_head, history_len, head_dim), &device)?
+                .to_dtype(dtype)?;
             let k_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
             let v_new =
                 Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-            let q =
-                Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+            let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
             assert_decode_ab(
                 Some((&hk, &hv)),
@@ -1025,8 +994,7 @@ mod cuda_tests {
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
         let v_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
         let rope_cs = make_zero_rope_cs(head_dim, 16, &device)?;
         let int8 = run_paged_decode(
@@ -1077,8 +1045,7 @@ mod cuda_tests {
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (8, 8, 64);
 
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
         let k_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
         let v_new =
@@ -1128,8 +1095,7 @@ mod cuda_tests {
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
         let v_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
 
         let out_zero = run_paged_decode(
             Some((&hk, &hv)),
@@ -1157,22 +1123,18 @@ mod cuda_tests {
 
         let zero_f32 = out_zero.to_dtype(DType::F32)?;
         let real_f32 = out_real.to_dtype(DType::F32)?;
-        assert!(
-            zero_f32
-                .abs()?
-                .flatten_all()?
-                .max(0)?
-                .to_vec0::<f32>()?
-                .is_finite()
-        );
-        assert!(
-            real_f32
-                .abs()?
-                .flatten_all()?
-                .max(0)?
-                .to_vec0::<f32>()?
-                .is_finite()
-        );
+        assert!(zero_f32
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?
+            .is_finite());
+        assert!(real_f32
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?
+            .is_finite());
 
         let mae = mean_abs_error(&zero_f32, &real_f32)?;
         println!("rope_offset_decode_real_vs_zero_differs: mae={mae:.4e}");
@@ -1194,8 +1156,7 @@ mod cuda_tests {
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim) = (4, 4, 64);
 
-        let q =
-            Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
+        let q = Tensor::randn(0f32, 1f32, (1, n_head, head_dim), &device)?.to_dtype(dtype)?;
         let k_new =
             Tensor::randn(0f32, 1f32, (1, n_kv_head, head_dim), &device)?.to_dtype(dtype)?;
         let v_new =
@@ -1227,7 +1188,9 @@ mod cuda_tests {
             &out_kernel.to_dtype(DType::F32)?,
             &out_ref.to_dtype(DType::F32)?,
         )?;
-        println!("rope_offset_decode_functional: mae(kernel+zero_rope vs manual_rot@pos0)={mae:.4e}");
+        println!(
+            "rope_offset_decode_functional: mae(kernel+zero_rope vs manual_rot@pos0)={mae:.4e}"
+        );
         assert!(
             mae < 0.05,
             "fused-RoPE decode functional mismatch: mae={mae}"

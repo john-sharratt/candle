@@ -91,9 +91,9 @@ pub mod persimmon;
 pub mod phi;
 pub mod phi3;
 pub mod pixtral;
+pub mod prefill_capture;
 pub mod prefill_utils;
 pub mod profile;
-pub mod routing_capture;
 pub mod quantized_blip;
 pub mod quantized_blip_text;
 pub mod quantized_gemma3;
@@ -120,6 +120,7 @@ pub mod qwen2_moe;
 pub mod qwen3;
 pub mod qwen3_moe;
 pub mod rope_tables;
+pub mod routing_capture;
 
 #[cfg(any(test, feature = "ruler-bench"))]
 pub mod batch_test;

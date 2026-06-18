@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
+use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::{
     quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat, CHUNK_SIZE,
 };
-use candle::quantized::pinned_staging::PinnedBuf;
 use candle_transformers::models::prefill_utils::{
     compute_rope_cs, paged_decode_attn, paged_prefill_batched,
 };
@@ -81,13 +81,18 @@ impl Fixture {
         // candidate arenas are pre-warmed, then quantizes the sealed sequence
         // after prefill (see below). Palette4 quant requires head_dim==128.
         let policy: Option<CompressionPolicy> = match fmt {
-            ArenaFmt::RealQuant { level, override_fmt } => {
+            ArenaFmt::RealQuant {
+                level,
+                override_fmt,
+            } => {
                 if sc.head_dim != 128 {
                     candle::bail!("real-quant requires head_dim=128, got {}", sc.head_dim);
                 }
                 let mut p = CompressionPolicy::new(level);
                 if let Some(qf) = override_fmt {
-                    p = p.with_override_k_quant(Some(qf)).with_override_v_quant(Some(qf));
+                    p = p
+                        .with_override_k_quant(Some(qf))
+                        .with_override_v_quant(Some(qf));
                 }
                 Some(p)
             }
@@ -139,16 +144,7 @@ impl Fixture {
             cache.set_chunked_backing(&backing, slot, None)?;
             let seed = 0x51A7_0000u64 ^ (slot as u64).wrapping_mul(0x9E37_79B9);
             let (q, k, v) = make_prefill_qkv(sc, sc.ctx_len, seed, device)?;
-            run_prefill(
-                &mut cache,
-                &q,
-                &k,
-                &v,
-                sc,
-                &rope_cs,
-                &rope_offsets,
-                stager,
-            )?;
+            run_prefill(&mut cache, &q, &k, &v, sc, &rope_cs, &rope_offsets, stager)?;
 
             // RealQuant: convert the freshly-sealed R16 sequence into genuine
             // palette4-quantized chunks via the production quantize-on-evict
@@ -164,8 +160,14 @@ impl Fixture {
                     _ => candle::bail!("real-quant requires a CUDA device"),
                 };
                 let mut scratch: Option<PinnedBuf> = None;
-                let warm =
-                    quantize_sealed_in_place(&backing, &[&r16], pol, device, &copy_stream, &mut scratch)?;
+                let warm = quantize_sealed_in_place(
+                    &backing,
+                    &[&r16],
+                    pol,
+                    device,
+                    &copy_stream,
+                    &mut scratch,
+                )?;
                 backing.truncate_sequence_to_blocks(slot, 0)?;
                 backing.inject_sealed_at_tail(slot, &warm[0])?;
                 cache.set_current_seq_len(sc.ctx_len)?;
@@ -275,7 +277,9 @@ impl Fixture {
         };
         let ev_err = |e| candle::Error::Msg(format!("cuda event: {e:?}"));
         device.synchronize()?;
-        let start = cstream.record_event(Some(CU_EVENT_DEFAULT)).map_err(ev_err)?;
+        let start = cstream
+            .record_event(Some(CU_EVENT_DEFAULT))
+            .map_err(ev_err)?;
         let out = paged_decode_attn(
             &self.q_dec,
             headers_ptr,
@@ -289,7 +293,9 @@ impl Fixture {
             &self.rope_cs,
             sc.rope_interleaved,
         )?;
-        let stop = cstream.record_event(Some(CU_EVENT_DEFAULT)).map_err(ev_err)?;
+        let stop = cstream
+            .record_event(Some(CU_EVENT_DEFAULT))
+            .map_err(ev_err)?;
         let ms = start.elapsed_ms(&stop).map_err(ev_err)?;
         let elapsed = Duration::from_secs_f64(ms as f64 / 1000.0);
 
@@ -321,16 +327,16 @@ fn make_inv_freq(head_dim: usize, device: &Device) -> Result<Tensor> {
 /// K/V are F16-rounded to match the arena storage precision; for real-quant
 /// arenas a kernel that reads K correctly lands within quant precision of this,
 /// while a structural (e.g. palette) K-read bug diverges far more.
-pub fn golden_decode(
-    sc: &Scenario,
-    device: &Device,
-) -> Result<Tensor> {
+pub fn golden_decode(sc: &Scenario, device: &Device) -> Result<Tensor> {
     let (nq, nkv, hd) = (sc.n_q_head, sc.n_kv_head, sc.head_dim);
     let group = nq / nkv;
     let scale = 1.0f32 / (hd as f32).sqrt();
 
     let to_f16_vec = |t: &Tensor| -> Result<Vec<f32>> {
-        Ok(t.to_dtype(DType::F16)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)
+        Ok(t.to_dtype(DType::F16)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?)
     };
     // Decode-step Q/k_new/v_new (num_slots, n_head, hd), F16-rounded.
     let (q_d, k_d, v_d) = make_decode_qkv(sc, DType::F16, device)?;

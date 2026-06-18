@@ -112,7 +112,7 @@
  * REVISION HISTORY
  * ============================================================================
  *
- * v5 - Current version with register-based P values and triple-buffering
+ * v5 - Register-based P values, double-buffered K/V/Q rings
  *
  * ============================================================================
  */
@@ -2363,7 +2363,9 @@ __device__ __forceinline__ void compute_pv_from_regs_dispatch(
  * @tparam HAS_PREFIX   Whether prefix KV cache exists
  * @tparam WARPS_TC     Active warps for tensor core compute
  * @tparam USE_TC       Use tensor cores (SM80+) vs scalar fallback
- * @tparam NUM_STAGES   Pipeline stages (2=double, 3=triple buffer)
+ * @tparam NUM_STAGES   Pipeline ring-buffer stages — always 2 (double-buffer);
+ *                      triple-buffering was removed (it capped occupancy at
+ *                      1 block/SM on shared-constrained SMs for no benefit).
  */
 
 // Helper: cp.async one R16 palette (d[] halfs) in [dim][position] order.
@@ -2557,8 +2559,8 @@ paged_prefill_attn_fwd_chunks_kernel(
 
     // K/V tile buffers
     constexpr bool USE_FP8 = std::is_same_v<T, __nv_fp8_e4m3>;
-    // K/V/Q rings live in dynamic shared memory so triple-buffering can opt into
-    // the >48 KB budget on SM80+ (size + cudaFuncSetAttribute handled by
+    // K/V/Q rings live in dynamic shared memory (double-buffered; the >48 KB
+    // budget on SM80+ is opted into via size + cudaFuncSetAttribute in
     // launch_paged_prefill_chunks). Contiguous layout, each region 128-B aligned
     // (per-stage TILE_K·HEAD_DIM·sizeof(T) is a multiple of 128 for every
     // supported HEAD_DIM/TILE_K, so the offsets below stay aligned):
@@ -2878,15 +2880,7 @@ paged_prefill_attn_fwd_chunks_kernel(
             cp_async_commit<USE_TC>();
             tiles_loaded = 2;
         }
-        if constexpr (NUM_STAGES == 3) {
-            if (last_tile_k0 - 2 * TILE_K >= 0) {
-                load_tile(last_tile_k0 - 2 * TILE_K, 2);
-                cp_async_commit<USE_TC>();
-                tiles_loaded = 3;
-            }
-        }
         if (tiles_loaded >= NUM_STAGES) cp_async_wait<NUM_STAGES - 1, USE_TC>();
-        else if (tiles_loaded == 2)     cp_async_wait<1, USE_TC>();
         else                            cp_async_wait<0, USE_TC>();
         __syncthreads();
 
@@ -3741,15 +3735,7 @@ paged_prefill_attn_fwd_chunks_kernel(
             cp_async_commit<USE_TC>();
             tiles_loaded = 2;
         }
-        if constexpr (NUM_STAGES == 3) {
-            if (last_tile_k0_prefix - 2 * TILE_K >= 0) {
-                load_tile_prefix(last_tile_k0_prefix - 2 * TILE_K, 2);
-                cp_async_commit<USE_TC>();
-                tiles_loaded = 3;
-            }
-        }
         if (tiles_loaded >= NUM_STAGES) cp_async_wait<NUM_STAGES - 1, USE_TC>();
-        else if (tiles_loaded == 2)     cp_async_wait<1, USE_TC>();
         else                            cp_async_wait<0, USE_TC>();
         __syncthreads();
         postprocess_tile_prefix(0);
@@ -4198,25 +4184,14 @@ inline void launch_paged_prefill_chunks(
 #define PREFILL_DYN_BYTES(NSV) \
     ( (size_t)sizeof(T)   * 2 * (NSV) * TILE_K * HEAD_DIM \
     + (size_t)sizeof(Q_T) * WARPS_TC_COMPUTED * BLOCK_M * HEAD_DIM )
-    constexpr size_t DYN_TRIPLE = PREFILL_DYN_BYTES(3);
     constexpr size_t DYN_DOUBLE = PREFILL_DYN_BYTES(2);
 
-    static size_t s_smem_triple_actual = 0;
     static size_t s_smem_double_actual = 0;
-    static bool   s_use_triple_buffer = true;
     static bool   s_configured = false;
     if (!s_configured) {
         // sharedSizeBytes is now just the small static bookkeeping; total smem a
         // launch needs is that plus the dynamic ring.
         cudaFuncAttributes attrs;
-        cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
-            TILE_K, BLOCK_M, true, WARPS_TC_COMPUTED, true, 3>);
-        s_smem_triple_actual = attrs.sharedSizeBytes;
-        cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
-            TILE_K, BLOCK_M, false, WARPS_TC_COMPUTED, true, 3>);
-        if (attrs.sharedSizeBytes > s_smem_triple_actual) s_smem_triple_actual = attrs.sharedSizeBytes;
-        s_smem_triple_actual += DYN_TRIPLE;
-
         cudaFuncGetAttributes(&attrs, paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK,
             TILE_K, BLOCK_M, true, WARPS_TC_COMPUTED, true, 2>);
         s_smem_double_actual = attrs.sharedSizeBytes;
@@ -4225,35 +4200,14 @@ inline void launch_paged_prefill_chunks(
         if (attrs.sharedSizeBytes > s_smem_double_actual) s_smem_double_actual = attrs.sharedSizeBytes;
         s_smem_double_actual += DYN_DOUBLE;
 
-        constexpr size_t SMEM_RESERVE = 2048;
-        s_use_triple_buffer = true;
+        // Force double-buffering. Triple-buffering's third K/V ring stage
+        // (~65 KB/block) exceeds what shared-constrained SMs — e.g. consumer
+        // Blackwell at ~100 KB/SM — can fit more than ONE block of, capping
+        // occupancy at 1 block/SM. Double-buffering (~49 KB/block) keeps the
+        // load/compute overlap while letting 2 blocks co-reside, which this
+        // latency-bound kernel benefits from more than the deeper pipeline.
         // cudaFuncSetAttribute takes the *dynamic* cap (DYN_*), not the total.
-        if (s_smem_triple_actual + SMEM_RESERVE > caps.smem_optin) {
-            s_use_triple_buffer = false;
-        } else if (s_smem_triple_actual > caps.smem_default) {
-            cudaError_t err1 = cudaFuncSetAttribute(
-                paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
-                    true, WARPS_TC_COMPUTED, true, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
-            cudaError_t err2 = cudaFuncSetAttribute(
-                paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
-                    true, WARPS_TC_COMPUTED, false, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
-            cudaError_t err3 = cudaFuncSetAttribute(
-                paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
-                    false, WARPS_TC_COMPUTED, true, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
-            cudaError_t err4 = cudaFuncSetAttribute(
-                paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
-                    false, WARPS_TC_COMPUTED, false, 3>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)DYN_TRIPLE);
-            if (!(err1 == cudaSuccess && err2 == cudaSuccess &&
-                  err3 == cudaSuccess && err4 == cudaSuccess)) {
-                cudaGetLastError();
-                s_use_triple_buffer = false;
-            }
-        }
-        if (!s_use_triple_buffer && s_smem_double_actual > caps.smem_default) {
+        if (s_smem_double_actual > caps.smem_default) {
             cudaFuncSetAttribute(
                 paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M,
                     true, WARPS_TC_COMPUTED, true, 2>,
@@ -4274,9 +4228,7 @@ inline void launch_paged_prefill_chunks(
         }
         s_configured = true;
     }
-    bool use_triple_buffer = s_use_triple_buffer;
-
-    // Launch kernel with appropriate configuration
+    // Launch kernel (double-buffered — see the buffer-selection note above).
     #define LAUNCH_KERNEL(HAS_PREFIX, USE_TC_VAL, NUM_STAGES_VAL) \
         paged_prefill_attn_fwd_chunks_kernel<Q_T, T, O, HEAD_DIM, WARPS_PER_BLOCK, TILE_K, BLOCK_M, \
             HAS_PREFIX, WARPS_TC_COMPUTED, USE_TC_VAL, NUM_STAGES_VAL>\
@@ -4286,22 +4238,12 @@ inline void launch_paged_prefill_chunks(
             (O*)o_ptr, (int)batch_size, (int)n_head, (int)n_kv_head, \
             (int)max_blocks, softmax_scale, (int)total_q, rope_offsets, rope_cs, rope_interleaved, write_offset_shifts)
 
-    if (use_triple_buffer) {
-        if (has_prefix) {
-            if (use_tc) { LAUNCH_KERNEL(true, true, 3); }
-            else        { LAUNCH_KERNEL(true, false, 3); }
-        } else {
-            if (use_tc) { LAUNCH_KERNEL(false, true, 3); }
-            else        { LAUNCH_KERNEL(false, false, 3); }
-        }
+    if (has_prefix) {
+        if (use_tc) { LAUNCH_KERNEL(true, true, 2); }
+        else        { LAUNCH_KERNEL(true, false, 2); }
     } else {
-        if (has_prefix) {
-            if (use_tc) { LAUNCH_KERNEL(true, true, 2); }
-            else        { LAUNCH_KERNEL(true, false, 2); }
-        } else {
-            if (use_tc) { LAUNCH_KERNEL(false, true, 2); }
-            else        { LAUNCH_KERNEL(false, false, 2); }
-        }
+        if (use_tc) { LAUNCH_KERNEL(false, true, 2); }
+        else        { LAUNCH_KERNEL(false, false, 2); }
     }
 
     #undef LAUNCH_KERNEL

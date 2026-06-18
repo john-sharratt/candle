@@ -83,11 +83,26 @@ fn reference_attn(
 ) -> Result<Tensor> {
     let hpg = N_HEAD / N_KV_HEAD;
     let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
-    let qd = q_glue.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?; // [glue,N_HEAD,HD]
-    let ks = k_seal.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?; // [sealed,N_KV,HD]
-    let vs = v_seal.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let kg = k_glue.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?; // [glue,N_KV,HD]
-    let vg = v_glue.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let qd = q_glue
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?; // [glue,N_HEAD,HD]
+    let ks = k_seal
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?; // [sealed,N_KV,HD]
+    let vs = v_seal
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let kg = k_glue
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?; // [glue,N_KV,HD]
+    let vg = v_glue
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let kv_at = |col: usize, kvh: usize, d: usize, src: &[f32], srcg: &[f32]| -> f32 {
         if col < sealed {
             src[(col * N_KV_HEAD + kvh) * HEAD_DIM + d]
@@ -249,7 +264,9 @@ fn dev_ptr_f16(t: &Tensor) -> Result<u64> {
         _ => candle::bail!("expected cuda tensor"),
     };
     let stream = cs.device().cuda_stream();
-    let s = cs.as_cuda_slice::<half::f16>()?.slice(layout.start_offset()..);
+    let s = cs
+        .as_cuda_slice::<half::f16>()?
+        .slice(layout.start_offset()..);
     let (p, _g) = s.device_ptr(&stream);
     Ok(p)
 }
@@ -276,8 +293,14 @@ fn run_glue(
         .chunked_live_chunks_as_sealed()
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-    let mut slot =
-        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    let mut slot = SlotStateHost::from_sealed_chunks(
+        &chunks,
+        N_KV_HEAD,
+        HEAD_DIM,
+        &arena_info,
+        writer_start,
+        true,
+    );
     slot.extend_for_write_region(glue, CHUNK_SIZE);
 
     // Two-section layout, mirroring build_slot_headers: resident slices
@@ -342,8 +365,11 @@ fn run_glue(
     let q_lens = Tensor::from_vec(vec![glue as u32], 1, device)?;
     let kv_lens = Tensor::from_vec(vec![kv_len as u32], 1, device)?;
     let cu_kvlens = Tensor::from_vec(vec![0u32, kv_len as u32], 2, device)?;
-    let col_actual_pos =
-        Tensor::from_vec((0..kv_len as u32).collect::<Vec<_>>(), kv_len.max(1), device)?;
+    let col_actual_pos = Tensor::from_vec(
+        (0..kv_len as u32).collect::<Vec<_>>(),
+        kv_len.max(1),
+        device,
+    )?;
 
     // 24-byte SlotHeader.
     let mut hdr = Vec::with_capacity(24);
@@ -458,7 +484,15 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
         let mut cache_b = bind_cache(&backing_b, 0)?;
         build_sealed_arena(&backing_b, &mut cache_b, &k_seal, &v_seal, sealed)?;
         let (out_b, _ms) = run_glue(
-            &backing_b, &mut cache_b, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
+            &backing_b,
+            &mut cache_b,
+            &q_glue,
+            &k_glue,
+            &v_glue,
+            glue,
+            &rope_cs,
+            &stager,
+            &device,
         )?;
 
         let diff = max_abs_diff(&out_a, &out_b)?;
@@ -506,7 +540,9 @@ fn paged_glue_kernel_timing() -> Result<()> {
         let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ glue as u64, &device)?;
         let backing = fresh_quant_backing(&device, &policy)?;
         let mut cache = bind_cache(&backing, 0)?;
-        build_sealed_arena_quant(&backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device)?;
+        build_sealed_arena_quant(
+            &backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device,
+        )?;
         let (_out, ms) = run_glue(
             &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
         )?;
@@ -531,7 +567,10 @@ fn paged_glue_kernel_timing() -> Result<()> {
         let sealed = 2048;
         let ms = time_one(sealed, glue)?;
         let tiles = glue.div_ceil(8);
-        eprintln!("  glue={glue:4} kv_len={}  tiles={tiles:2}  ->  {ms:8.3} ms", sealed + glue);
+        eprintln!(
+            "  glue={glue:4} kv_len={}  tiles={tiles:2}  ->  {ms:8.3} ms",
+            sealed + glue
+        );
     }
     Ok(())
 }
@@ -561,12 +600,15 @@ fn paged_glue_matches_golden_quant() -> Result<()> {
     for &(sealed, glue) in cases {
         let (_q_seal, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ sealed as u64, &device)?;
         let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ glue as u64, &device)?;
-        let out_ref =
-            reference_attn(&q_glue, &k_seal, &v_seal, &k_glue, &v_glue, sealed, glue, &device)?;
+        let out_ref = reference_attn(
+            &q_glue, &k_seal, &v_seal, &k_glue, &v_glue, sealed, glue, &device,
+        )?;
 
         let backing = fresh_quant_backing(&device, &policy)?;
         let mut cache = bind_cache(&backing, 0)?;
-        build_sealed_arena_quant(&backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device)?;
+        build_sealed_arena_quant(
+            &backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device,
+        )?;
         let (out, _ms) = run_glue(
             &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
         )?;

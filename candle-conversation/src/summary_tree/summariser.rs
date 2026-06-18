@@ -102,7 +102,15 @@ impl SummariserThread {
         let max_concurrent = max_concurrent.max(1);
         let handle = std::thread::Builder::new()
             .name("substrate-summariser".into())
-            .spawn(move || run_loop(conversation, runner, max_concurrent, trigger_rx, shutdown_rx))
+            .spawn(move || {
+                run_loop(
+                    conversation,
+                    runner,
+                    max_concurrent,
+                    trigger_rx,
+                    shutdown_rx,
+                )
+            })
             .expect("failed to spawn substrate-summariser thread");
 
         Self {
@@ -844,7 +852,9 @@ fn commit_tree_to_substrate(
 /// for retrieval, and no orphan turns are created.
 fn sweep_one_dirty(conversation: &Conversation, timeline: TimelineId) {
     if let Some(dirty_idx) = conversation.write().pop_oldest_dirty(timeline) {
-        conversation.write().clear_summary_dirty(timeline, dirty_idx);
+        conversation
+            .write()
+            .clear_summary_dirty(timeline, dirty_idx);
     }
 }
 
@@ -904,9 +914,9 @@ impl ProbeRunner for ChannelProbeRunner {
             };
             match self.request_tx.send(scheduler_request) {
                 Ok(()) => receivers.push(Ok(response_rx)),
-                Err(e) => {
-                    receivers.push(Err(ProbeError::Hard(format!("scheduler channel closed: {e}"))))
-                }
+                Err(e) => receivers.push(Err(ProbeError::Hard(format!(
+                    "scheduler channel closed: {e}"
+                )))),
             }
         }
         // Then collect, in submission order. Each `recv` blocks only until that
@@ -1067,8 +1077,14 @@ mod tests {
                 }
             }
         }
-        assert!(summarised.contains(&n0), "n0 succeeded → must have a SoT leaf");
-        assert!(summarised.contains(&n2), "n2 succeeded → must have a SoT leaf");
+        assert!(
+            summarised.contains(&n0),
+            "n0 succeeded → must have a SoT leaf"
+        );
+        assert!(
+            summarised.contains(&n2),
+            "n2 succeeded → must have a SoT leaf"
+        );
         assert!(
             !summarised.contains(&n1),
             "n1 failed → must not appear in any leaf"

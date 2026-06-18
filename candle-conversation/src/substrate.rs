@@ -2594,7 +2594,9 @@ impl Substrate {
             // summaries into garbage. Restored turns are NOT pushed onto the
             // pending queue: that captures only fresh turns the live summariser
             // hasn't seen yet.
-            tl.tree_meta.entry(idx).or_insert_with(TreeNodeMeta::default);
+            tl.tree_meta
+                .entry(idx)
+                .or_insert_with(TreeNodeMeta::default);
         }
         if let Some(cold_seqs) = cold {
             if !cold_seqs.is_empty() {

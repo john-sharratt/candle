@@ -299,11 +299,8 @@ impl ConversationEngine {
             summary_concurrency,
             "summariser probe-batch concurrency set from total VRAM"
         );
-        let summariser_thread = SummariserThread::spawn(
-            conversation.clone(),
-            summariser_runner,
-            summary_concurrency,
-        );
+        let summariser_thread =
+            SummariserThread::spawn(conversation.clone(), summariser_runner, summary_concurrency);
         // Hand the trigger to the scheduler so every assistant-turn
         // seal wakes the summariser immediately — design §4 step ③.
         let summariser_trigger = summariser_thread.trigger_handle();

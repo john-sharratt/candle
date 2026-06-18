@@ -112,7 +112,7 @@ impl BoundaryMarkers {
 ///
 /// `model` and `device` are required so cache-miss runs can drive a
 /// synchronous `forward_batched` to compute and capture the missing
-/// K/V; `max_prefill_chunk` caps the per-pass token count to keep
+/// K/V; `max_prefill_pass_tokens` caps the per-pass token count to keep
 /// activation buffers bounded.
 pub(super) struct ApplyContext<'a> {
     pub(super) session: &'a mut BatchedInferenceSession,
@@ -122,7 +122,7 @@ pub(super) struct ApplyContext<'a> {
     pub(super) slot_target: Option<ProjectionTarget>,
     pub(super) parent_id: SequenceId,
     pub(super) chunk_size: usize,
-    pub(super) max_prefill_chunk: usize,
+    pub(super) max_prefill_pass_tokens: usize,
     /// Used only under `feature = "context-dump"`; kept unconditionally
     /// so the public shape stays stable across feature toggles.
     #[cfg_attr(not(feature = "context-dump"), allow(dead_code))]
@@ -264,7 +264,7 @@ pub(super) fn apply_segments_build(
     // response can't see its own recent history. The skip cases also emit a
     // dedicated `warn!` below; this per-reproject line stays at `debug` so it
     // doesn't flood production logs.
-    tracing::debug!(
+    tracing::trace!(
         target: "candle_conversation::scheduler::reproject",
         slot = parent_id.0,
         segments = new_segments.len(),
@@ -587,12 +587,12 @@ fn handle_new_user_message(
 // ── Live prefill drive ───────────────────────────────────────────────────────
 
 /// Forward `tokens` through the model on the slot, chunked by
-/// `max_prefill_chunk`, writing their K/V into the slot's writer tail.
+/// `max_prefill_pass_tokens`, writing their K/V into the slot's writer tail.
 fn forward_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
     let mut offset = 0;
     while offset < tokens.len() {
-        let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_chunk);
+        let chunk_len = (tokens.len() - offset).min(ctx.max_prefill_pass_tokens);
         let slice = &tokens[offset..offset + chunk_len];
         let input = Tensor::new(slice, ctx.device)
             .and_then(|t| t.unsqueeze(0))
@@ -776,7 +776,7 @@ pub(super) fn apply_segments_finish(
         restore_tail(ctx.session, parent_id, tail_per_layer)?;
     }
 
-    tracing::info!(
+    tracing::trace!(
         target: "candle_conversation::scheduler::reproject",
         n_glue_tokens = n_glue_tokens,
         "apply_segments breakdown (single gap-fill glue prefill)",

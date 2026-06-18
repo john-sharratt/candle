@@ -928,7 +928,8 @@ impl TestParams {
         // Warmup step (step 0)
         let mut stopped = false;
         if remaining_steps > 0 {
-            let toks = self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
+            let toks =
+                self.decode_step_batched(&mut session, &sequence_indices, &mut runs, model)?;
             self.device.synchronize()?;
             remaining_steps -= 1;
             stopped = all_stopped(&toks);

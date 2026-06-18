@@ -1787,10 +1787,7 @@ impl ChunkedKvBacking {
     ///
     /// At turn-boundary projection (the common case) the tail is empty
     /// and this is effectively a no-op.
-    pub fn split_off_writer_tail(
-        &self,
-        batch_idx: usize,
-    ) -> Result<super::types::WriterTail> {
+    pub fn split_off_writer_tail(&self, batch_idx: usize) -> Result<super::types::WriterTail> {
         let batch = self.batch_capacity();
         if batch_idx >= batch {
             candle::bail!(

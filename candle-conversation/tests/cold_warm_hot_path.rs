@@ -70,8 +70,7 @@ const QUANT_HEAD_DIM: usize = 128;
 /// recovers nothing. For a fresh (empty) log the walker is simply a no-op.
 fn open_conversation(dir: &std::path::Path) -> Conversation {
     let mut substrate = Substrate::new();
-    let persistence =
-        SubstratePersistence::open_in_with_substrate(dir, &mut substrate).unwrap();
+    let persistence = SubstratePersistence::open_in_with_substrate(dir, &mut substrate).unwrap();
     Conversation::from_parts(substrate, persistence)
 }
 
@@ -284,7 +283,9 @@ fn full_cold_warm_hot_round_trip() {
 
     // Per-turn pattern bases, chosen so each turn's bytes are disjoint
     // and a stale read from any one would surface as a hard mismatch.
-    let pattern_bases: Vec<u32> = (0..N_TURNS).map(|i| 1000 + (i as u32) * 1_000_000).collect();
+    let pattern_bases: Vec<u32> = (0..N_TURNS)
+        .map(|i| 1000 + (i as u32) * 1_000_000)
+        .collect();
     let section_pattern_base: u32 = 7_777_777;
 
     let (snapshots, section_snapshot, turn_keys) = {
@@ -310,7 +311,12 @@ fn full_cold_warm_hot_round_trip() {
         // the canonical reference for every later byte check.
         let snapshots: Vec<(TurnKey, Vec<Vec<u8>>)> = turn_keys
             .iter()
-            .map(|&k| (k, snapshot_turn_bytes(&conv, &backings, &device, k.timeline, k.index)))
+            .map(|&k| {
+                (
+                    k,
+                    snapshot_turn_bytes(&conv, &backings, &device, k.timeline, k.index),
+                )
+            })
             .collect();
         let section_snapshot = snapshot_section_bytes(&conv, &backings, &device, section);
 
@@ -418,12 +424,8 @@ fn full_cold_warm_hot_round_trip() {
                 st.hot && st.warm && st.cold,
                 "post warm→hot {key:?} should be hot+warm+cold, got {st:?}"
             );
-            let now =
-                snapshot_turn_bytes(&conv, &backings, &device, key.timeline, key.index);
-            assert_eq!(
-                &now, original,
-                "warm→hot leg corrupted bytes for {key:?}"
-            );
+            let now = snapshot_turn_bytes(&conv, &backings, &device, key.timeline, key.index);
+            assert_eq!(&now, original, "warm→hot leg corrupted bytes for {key:?}");
         }
         // Section bytes also still intact.
         assert_eq!(
@@ -681,7 +683,11 @@ fn quant_blend_warm_round_trip() {
             Some(KvFormat::Quantized(QuantFormat::Q8_0)),
             "Q8_0 quant",
         ),
-        (20_002, Some(KvFormat::Quantized(QuantFormat::R16)), "R16 raw"),
+        (
+            20_002,
+            Some(KvFormat::Quantized(QuantFormat::R16)),
+            "R16 raw",
+        ),
     ];
 
     {
@@ -734,8 +740,12 @@ fn quant_blend_warm_round_trip() {
         }
 
         // Persistence cycle → all three tiers populated.
-        let persist =
-            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+        );
         persist.shutdown();
 
         for &key in &turn_keys {
@@ -823,7 +833,8 @@ fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
     let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
-    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
+    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
+        .unwrap();
 
     let key = TurnKey::new(timeline, TurnIndex(0));
     let main_stream = cuda_stream(&device);
@@ -914,8 +925,12 @@ fn cold_marker_turn_passes_existence_check() {
         let backings = make_backings(&device);
         conv.register_timeline(timeline, layer_id, group_id);
         let _ = seed_turn(&conv, &backings, &device, timeline, 999_999);
-        let persist =
-            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+        );
         persist.shutdown();
     }
 
@@ -923,7 +938,8 @@ fn cold_marker_turn_passes_existence_check() {
     let conv = open_conversation(&dir);
     let backings = make_backings(&device);
     conv.register_timeline(timeline, layer_id, group_id);
-    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
+    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
+        .unwrap();
 
     let key = TurnKey::new(timeline, TurnIndex(0));
 
@@ -1016,7 +1032,10 @@ fn cold_load_q8_single_chunk_diagnostic() {
             &snap[0][..16.min(snap[0].len())]
         );
         let nonzero = snap[0].iter().filter(|b| **b != 0).count();
-        eprintln!("seed-time layer 0 nonzero bytes: {nonzero}/{}", snap[0].len());
+        eprintln!(
+            "seed-time layer 0 nonzero bytes: {nonzero}/{}",
+            snap[0].len()
+        );
 
         let persist = PersistenceThread::spawn(
             conv.clone(),
@@ -1042,7 +1061,9 @@ fn cold_load_q8_single_chunk_diagnostic() {
     let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
-    let restored = conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
+    let restored = conv
+        .reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
+        .unwrap();
     assert_eq!(restored, 1);
 
     // Inspect the recovered chunk grid before elevation runs.
@@ -1050,8 +1071,11 @@ fn cold_load_q8_single_chunk_diagnostic() {
         .recover_turn_chunks(timeline, TurnIndex(0), N_LAYERS)
         .unwrap()
         .expect("Some");
-    let layer0_kv_bytes_len: usize =
-        recovered.layer(0).iter().map(|c| c.payload.kv_bytes.len()).sum();
+    let layer0_kv_bytes_len: usize = recovered
+        .layer(0)
+        .iter()
+        .map(|c| c.payload.kv_bytes.len())
+        .sum();
     eprintln!(
         "recovered layer 0 has {} chunks, total kv_bytes = {}",
         recovered.layer(0).len(),
@@ -1090,7 +1114,10 @@ fn cold_load_q8_single_chunk_diagnostic() {
         &post_cold[0][..16.min(post_cold[0].len())]
     );
     let nonzero = post_cold[0].iter().filter(|b| **b != 0).count();
-    eprintln!("post cold→hot layer 0 nonzero bytes: {nonzero}/{}", post_cold[0].len());
+    eprintln!(
+        "post cold→hot layer 0 nonzero bytes: {nonzero}/{}",
+        post_cold[0].len()
+    );
 
     assert_eq!(
         post_cold, snapshot,
@@ -1133,7 +1160,11 @@ fn quant_blend_cold_round_trip() {
             Some(KvFormat::Quantized(QuantFormat::Q8_0)),
             "Q8_0 quant",
         ),
-        (20_002, Some(KvFormat::Quantized(QuantFormat::R16)), "R16 raw"),
+        (
+            20_002,
+            Some(KvFormat::Quantized(QuantFormat::R16)),
+            "R16 raw",
+        ),
     ];
 
     let (snapshots, turn_keys) = {
@@ -1168,8 +1199,12 @@ fn quant_blend_cold_round_trip() {
             })
             .collect();
 
-        let persist =
-            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+        );
         persist.shutdown();
 
         (snapshots, turn_keys)
@@ -1199,7 +1234,11 @@ fn quant_blend_cold_round_trip() {
         &turn_keys,
     )
     .unwrap();
-    assert_eq!(report.cold_to_hot, formats.len(), "all turns took cold path");
+    assert_eq!(
+        report.cold_to_hot,
+        formats.len(),
+        "all turns took cold path"
+    );
     assert_eq!(report.failed, 0);
     assert_eq!(report.missing, 0);
 
@@ -1245,7 +1284,13 @@ fn elevate_edge_cases() {
     // Seed 3 turns, run one persistence cycle, then evict to warm-only.
     let keys: Vec<TurnKey> = (0..3)
         .map(|i| {
-            let idx = seed_turn(&conv, &backings, &device, timeline, 50_000 + i as u32 * 7_777);
+            let idx = seed_turn(
+                &conv,
+                &backings,
+                &device,
+                timeline,
+                50_000 + i as u32 * 7_777,
+            );
             TurnKey::new(timeline, idx)
         })
         .collect();
@@ -1254,7 +1299,12 @@ fn elevate_edge_cases() {
         .map(|k| snapshot_turn_bytes(&conv, &backings, &device, k.timeline, k.index))
         .collect();
 
-    let persist = PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+    let persist = PersistenceThread::spawn(
+        conv.clone(),
+        Arc::new(backings.clone()),
+        device.clone(),
+        None,
+    );
     persist.shutdown();
     // With install_warm_and_hot, hot stays populated after persist.
     // Explicitly evict to set up the warm→hot promotion scenario the
@@ -1317,9 +1367,15 @@ fn elevate_edge_cases() {
     // Drop hot for everyone EXCEPT keys[0]. evict_from_hot's keep set
     // protects the listed residences.
     let evicted = evict_from_hot(&conv, &[], &[keys[0]]);
-    assert_eq!(evicted.count, 1, "only key 1 evicted (key 0 kept, key 2 was already warm-only)");
+    assert_eq!(
+        evicted.count, 1,
+        "only key 1 evicted (key 0 kept, key 2 was already warm-only)"
+    );
     assert!(turn_state(&conv, keys[0]).hot, "keep-set protected key 0");
-    assert!(!turn_state(&conv, keys[1]).hot, "key 1 evicted to warm-only");
+    assert!(
+        !turn_state(&conv, keys[1]).hot,
+        "key 1 evicted to warm-only"
+    );
     assert!(!turn_state(&conv, keys[2]).hot, "key 2 still warm-only");
 
     // ── Case 4: partial elevate after keep-set evict ─────────────────────
@@ -1391,14 +1447,7 @@ fn multi_chunk_turn_round_trip() {
         // Seed one turn with 2 chunks per layer. Use the parameterised
         // seed helper so the block-range math is right.
         let idx = seed_turn_with_format(
-            &conv,
-            &backings,
-            &device,
-            timeline,
-            HEAD_DIM,
-            n_tokens,
-            123_456,
-            None,
+            &conv, &backings, &device, timeline, HEAD_DIM, n_tokens, 123_456, None,
         );
         let key = TurnKey::new(timeline, idx);
 
@@ -1412,8 +1461,12 @@ fn multi_chunk_turn_round_trip() {
             );
         }
 
-        let persist =
-            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+        );
         persist.shutdown();
 
         let st = turn_state(&conv, key);
@@ -1514,8 +1567,12 @@ fn archive_state_survives_restart() {
 
         // Drive the persistence thread once so the turn's records
         // are durable before we test reload.
-        let persist =
-            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+        );
         persist.shutdown();
 
         // Initially the conversation is not archived.
@@ -1536,7 +1593,8 @@ fn archive_state_survives_restart() {
     {
         let conv = open_conversation(&dir);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
+            .unwrap();
         assert!(
             conv.is_conversation_archived(timeline),
             "archived flag must survive the restart-reload"
@@ -1552,7 +1610,8 @@ fn archive_state_survives_restart() {
     {
         let conv = open_conversation(&dir);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
+            .unwrap();
         assert!(
             !conv.is_conversation_archived(timeline),
             "unarchive must also survive — last-writer-wins on ConvState"
@@ -1775,7 +1834,8 @@ fn quantize_on_evict_cold_reload_round_trip() {
     let conv = open_conversation(&dir);
     let backings = make_backings_adaptive(&device, QUANT_HEAD_DIM, &policy);
     conv.register_timeline(timeline, layer_id, group_id);
-    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None).unwrap();
+    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
+        .unwrap();
 
     // Pre-elevate: cold-marker only.
     let key = TurnKey::new(timeline, TurnIndex(0));
@@ -1891,10 +1951,7 @@ const N_KV_HEAD_METADATA: usize = 4;
 /// round-trip tests. Uses `head_dim = QUANT_HEAD_DIM` (= 128) so the
 /// palette-4 selection kernel's `head_dim = 128` shape constraint is
 /// satisfied.
-fn make_backings_metadata(
-    device: &Device,
-    policy: &CompressionPolicy,
-) -> Vec<ChunkedKvBacking> {
+fn make_backings_metadata(device: &Device, policy: &CompressionPolicy) -> Vec<ChunkedKvBacking> {
     (0..N_LAYERS_METADATA)
         .map(|_| {
             ChunkedKvBacking::new_with_format_adaptive(
@@ -1954,11 +2011,7 @@ fn snapshot_turn_images(
 /// records and the cold-load path must rebuild faithfully. Emits a
 /// pinpoint message naming the exact field that drifted so the
 /// failure mode is unambiguous.
-fn assert_chunk_images_eq(
-    left: &[Vec<ChunkImage>],
-    right: &[Vec<ChunkImage>],
-    where_: &str,
-) {
+fn assert_chunk_images_eq(left: &[Vec<ChunkImage>], right: &[Vec<ChunkImage>], where_: &str) {
     assert_eq!(
         left.len(),
         right.len(),
@@ -2139,8 +2192,8 @@ fn seed_turn_varied_per_sub_band(
                     // chunk would catch a reorder bug; diversity across
                     // K vs V alone (guaranteed by the C2 candidate sets)
                     // catches an inter-side swap.
-                    let pseudo = ((t.wrapping_mul(2654435761) ^ d.wrapping_mul(40503))
-                        & 0xFFFF) as f32
+                    let pseudo = ((t.wrapping_mul(2654435761) ^ d.wrapping_mul(40503)) & 0xFFFF)
+                        as f32
                         / 65535.0
                         - 0.5;
                     let (class, head_offset) = key;
@@ -2151,7 +2204,13 @@ fn seed_turn_varied_per_sub_band(
                         // low-bit quantizers.
                         1 => pseudo * 4.0 + head_offset,
                         // Sparse spikes — heavy tail blows out the per-block scale.
-                        2 => if (t + d) % 5 == 0 { 7.0 + head_offset } else { 0.001 },
+                        2 => {
+                            if (t + d) % 5 == 0 {
+                                7.0 + head_offset
+                            } else {
+                                0.001
+                            }
+                        }
                         // High-frequency sinusoid — needs more bits to stay
                         // within the cosine-distance threshold.
                         3 => ((t * 13 + d * 11) as f32 * 0.83).sin() * 2.0 + head_offset,
@@ -2165,7 +2224,13 @@ fn seed_turn_varied_per_sub_band(
                             step + ((d as f32) * 0.71).cos() * 1.5 + head_offset
                         }
                         // Bimodal: alternating extreme values across tokens.
-                        _ => if t % 2 == 0 { 5.0 + head_offset } else { -5.0 + head_offset },
+                        _ => {
+                            if t % 2 == 0 {
+                                5.0 + head_offset
+                            } else {
+                                -5.0 + head_offset
+                            }
+                        }
                     };
                     data.push(f16::from_f32(value));
                 }
@@ -2186,8 +2251,7 @@ fn seed_turn_varied_per_sub_band(
             for t in 0..n_tokens {
                 for d in 0..head_dim {
                     let p = d / sub_head_dim;
-                    let pseudo = ((t.wrapping_mul(2246822519)
-                        ^ d.wrapping_mul(3266489917))
+                    let pseudo = ((t.wrapping_mul(2246822519) ^ d.wrapping_mul(3266489917))
                         & 0xFFFF) as f32
                         / 65535.0
                         - 0.5;
@@ -2198,10 +2262,22 @@ fn seed_turn_varied_per_sub_band(
                     let head_offset = (h as f32) * 0.23;
                     let value = match class {
                         0 => pseudo * 6.0 + head_offset,
-                        1 => if (t + d) % 4 == 0 { -6.0 + head_offset } else { 0.01 },
+                        1 => {
+                            if (t + d) % 4 == 0 {
+                                -6.0 + head_offset
+                            } else {
+                                0.01
+                            }
+                        }
                         2 => ((d as f32) * 0.04).powi(3) - 0.5 + head_offset,
                         3 => ((t * 11 + d * 5) as f32 * 1.13).cos() * 0.3 + head_offset,
-                        4 => if t % 3 == 0 { 4.5 + head_offset } else { -4.5 + head_offset },
+                        4 => {
+                            if t % 3 == 0 {
+                                4.5 + head_offset
+                            } else {
+                                -4.5 + head_offset
+                            }
+                        }
                         5 => (d as f32) * 0.002 + (layer_idx as f32) * 0.01 + head_offset,
                         6 => pseudo * 0.8 + head_offset,
                         _ => ((t as f32) * 0.31).sin() * 2.5 + head_offset,
@@ -2319,7 +2395,8 @@ fn quantize_on_evict_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
+            .unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2355,7 +2432,8 @@ fn quantize_on_evict_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
+            .unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2384,7 +2462,8 @@ fn quantize_on_evict_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
+            .unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2403,7 +2482,10 @@ fn quantize_on_evict_metadata_round_trip() {
         .unwrap();
         // Drop hot — turn is now warm+cold only.
         let purged = evict_from_hot(&conv, &[], &[]);
-        assert_eq!(purged.count, 1, "hot must be evictable to exercise warm→hot");
+        assert_eq!(
+            purged.count, 1,
+            "hot must be evictable to exercise warm→hot"
+        );
         // Second elevate now takes the warm→hot path.
         let report = elevate_to_hot(
             &conv,
@@ -2469,8 +2551,12 @@ fn no_policy_metadata_round_trip() {
         );
         let key = TurnKey::new(timeline, idx);
 
-        let persist =
-            PersistenceThread::spawn(conv.clone(), Arc::new(backings.clone()), device.clone(), None);
+        let persist = PersistenceThread::spawn(
+            conv.clone(),
+            Arc::new(backings.clone()),
+            device.clone(),
+            None,
+        );
         persist.shutdown();
         key
     };
@@ -2480,7 +2566,8 @@ fn no_policy_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
+            .unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2504,7 +2591,8 @@ fn no_policy_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
+            .unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2543,7 +2631,8 @@ fn no_policy_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None).unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
+            .unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2697,11 +2786,7 @@ fn gather_sealed_bytes(
 /// two snapshots disagree.  Without this, `assert_eq!` on
 /// `Vec<Vec<u8>>` just dumps both blobs; the diagnostic value of the
 /// round-trip test is in knowing *where* the bytes drifted.
-fn assert_section_bytes_eq(
-    expected: &[Vec<u8>],
-    actual: &[Vec<u8>],
-    context: &str,
-) {
+fn assert_section_bytes_eq(expected: &[Vec<u8>], actual: &[Vec<u8>], context: &str) {
     assert_eq!(
         expected.len(),
         actual.len(),
@@ -2776,8 +2861,14 @@ fn drive_section_round_trip<F>(
     // deterministic StreamId from them.
     use candle_conversation::persistence::content_hash::ContentHash;
     let address = ContentAddress {
-        prefix_hash: ContentHash { lo: 0xabcd_1234, hi: 0x5678_dead },
-        section_hash: ContentHash { lo: 0xfeed_face, hi: 0xcafe_babe },
+        prefix_hash: ContentHash {
+            lo: 0xabcd_1234,
+            hi: 0x5678_dead,
+        },
+        section_hash: ContentHash {
+            lo: 0xfeed_face,
+            hi: 0xcafe_babe,
+        },
     };
     let stream_id = conv
         .declare_section_stream(address, "test-section")
@@ -2838,9 +2929,7 @@ fn drive_section_round_trip<F>(
         layers.push(seal_to_chunk_images(backing, &device, seq).unwrap());
     }
     let grid = TurnChunkGrid::new(layers);
-    let stored = conv
-        .persist_turn_chunks_capture(stream_id, &grid)
-        .unwrap();
+    let stored = conv.persist_turn_chunks_capture(stream_id, &grid).unwrap();
     assert!(!stored.is_empty(), "{label}: persist produced no chunks");
     let total_chunks: usize = stored.iter().map(|s| s.chunks.len()).sum();
     let through = (total_chunks.max(1) - 1) as u64;
@@ -2883,13 +2972,15 @@ fn drive_section_round_trip<F>(
 
 #[test]
 fn section_no_compress_round_trip() {
-    drive_section_round_trip::<fn(
-        &Conversation,
-        &[ChunkedKvBacking],
-        &Device,
-        &Arc<CudaStream>,
-        SectionId,
-    ) -> Vec<SealedSequence>>(
+    drive_section_round_trip::<
+        fn(
+            &Conversation,
+            &[ChunkedKvBacking],
+            &Device,
+            &Arc<CudaStream>,
+            SectionId,
+        ) -> Vec<SealedSequence>,
+    >(
         "F16 no-compress",
         QUANT_HEAD_DIM,
         N_TOKENS_PER_TURN,
@@ -2911,8 +3002,7 @@ fn section_c0_q8ks_round_trip() {
                        copy_stream: &Arc<CudaStream>,
                        section: SectionId|
      -> Vec<SealedSequence> {
-        let policy = CompressionPolicy::default()
-            .with_override_k_quant(Some(QuantFormat::Q8_KS));
+        let policy = CompressionPolicy::default().with_override_k_quant(Some(QuantFormat::Q8_KS));
         let policy = CompressionPolicy {
             compression_level: 0,
             ..policy

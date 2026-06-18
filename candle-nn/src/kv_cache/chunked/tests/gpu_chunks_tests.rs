@@ -45,7 +45,11 @@ mod tests {
     fn test_serialize_header() {
         let mut buf = vec![0u8; SLICE_HEADER_BYTES];
         write_slice_header(&mut buf, 3, 20, 0xDEAD_BEEF, 0x1234_5678_9ABC_DEF0);
-        assert_eq!(u16::from_le_bytes(buf[0..2].try_into().unwrap()), 3, "offset");
+        assert_eq!(
+            u16::from_le_bytes(buf[0..2].try_into().unwrap()),
+            3,
+            "offset"
+        );
         assert_eq!(u16::from_le_bytes(buf[2..4].try_into().unwrap()), 20, "len");
         assert_eq!(
             u32::from_le_bytes(buf[4..8].try_into().unwrap()),

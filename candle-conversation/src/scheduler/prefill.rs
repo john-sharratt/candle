@@ -106,7 +106,7 @@ impl Scheduler {
             })
             .min()
             .unwrap()
-            .min(self.max_prefill_chunk);
+            .min(self.max_prefill_pass_tokens);
 
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
@@ -202,15 +202,15 @@ impl Scheduler {
         }
     }
 
-    /// Run **one** prefill chunk across every still-active in-flight
-    /// prefill. The chunk length equals `min(remaining across active)`
-    /// capped by `max_prefill_chunk`. All inputs in the call are
-    /// guaranteed to share the same dim-1 size.
+    /// Run **one** prefill pass across every still-active in-flight prefill.
+    /// Each prefill advances by its own `min(remaining, max_prefill_pass_tokens)`
+    /// tokens; the varlen forward packs the ragged lengths flat into a single
+    /// batched call.
     ///
-    /// Sequences whose offset reaches `tokens.len()` after this chunk have
+    /// Sequences whose offset reaches `tokens.len()` after this pass have
     /// their `final_logits` recorded; they will be promoted to decode by
     /// `promote_finished_prefills_to_decodes`.
-    pub(super) fn run_one_prefill_chunk(&mut self) {
+    pub(super) fn run_one_prefill_pass(&mut self) {
         // Collect indices of still-active prefills.
         let active: Vec<usize> = (0..self.active_prefills.len())
             .filter(|&i| {
@@ -225,25 +225,25 @@ impl Scheduler {
         // Ragged batch: each prefill advances by its OWN min(remaining, cap).
         // The varlen forward packs the heterogeneous lengths flat, so a short
         // scope no longer collapses the whole wave to the batch minimum.
-        let cap = self.max_prefill_chunk;
+        let cap = self.max_prefill_pass_tokens;
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
         let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
-        let mut chunks: Vec<usize> = Vec::with_capacity(active.len());
+        let mut advances: Vec<usize> = Vec::with_capacity(active.len());
         for &i in &active {
             let p = &mut self.active_prefills[i];
             if p.prefill_start.is_none() {
                 p.prefill_start = Some(Instant::now());
             }
             let off = p.offset;
-            let chunk = (p.work.tokens.len() - off).min(cap);
-            let tokens = &p.work.tokens[off..off + chunk];
+            let advance = (p.work.tokens.len() - off).min(cap);
+            let tokens = &p.work.tokens[off..off + advance];
             match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
                     seq_ids.push(p.work.sequence_id.0);
                     inputs.push(t);
                     group_idxs.push(i);
-                    chunks.push(chunk);
+                    advances.push(advance);
                 }
                 Err(e) => {
                     p.error = Some(ConversationError::Model(e));
@@ -254,7 +254,7 @@ impl Scheduler {
             return;
         }
 
-        let total_tokens: usize = chunks.iter().sum();
+        let total_tokens: usize = advances.iter().sum();
         tracing::debug!(
             target: "sched",
             "prefill batch={} tokens={} decode_active={} seq_ids={:?}",
@@ -265,6 +265,22 @@ impl Scheduler {
         );
 
         let n_seqs = seq_ids.len();
+        // Clear the per-op pipeline profile so the snapshot after the forward
+        // covers only THIS prefill pass (attn:core / ffn / qkv / out_proj / the
+        // paged-prefill kernel, summed over layers) — the code-read prefill is
+        // the dominant wave cost and this is the only place its internal split
+        // is exposed.
+        #[cfg(feature = "profile")]
+        let _ = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+        // Capture each sequence's attended context length (prefix + new tokens)
+        // BEFORE the forward advances it, so the breakdown can tie the
+        // attention-kernel time to the kv_len it actually sweeps — the deciding
+        // number for prefix-bound vs kernel-inefficiency.
+        #[cfg(feature = "profile")]
+        let kv_prefixes: Vec<usize> = seq_ids
+            .iter()
+            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
+            .collect();
         let t_fwd = Instant::now();
         let logits_vec = match self
             .model
@@ -279,34 +295,63 @@ impl Scheduler {
                 return;
             }
         };
-        // Prefill batch = n_seqs sequences, Σ chunks tokens (ragged).
-        self.wave_stats.record(
-            true,
-            n_seqs,
-            total_tokens,
-            t_fwd.elapsed().as_millis() as u64,
-        );
+        // Prefill batch = n_seqs sequences, Σ advances tokens (ragged).
+        let fwd_ms = t_fwd.elapsed().as_millis() as u64;
+        self.wave_stats.record(true, n_seqs, total_tokens, fwd_ms);
+        #[cfg(feature = "profile")]
+        {
+            let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
+            let mut parts: Vec<String> = snap
+                .entries
+                .iter()
+                .map(|(n, ms, c)| format!("{n}={ms:.1}ms({c})"))
+                .collect();
+            parts.sort_by(|a, b| b.cmp(a));
+            let max_prefix = kv_prefixes.iter().copied().max().unwrap_or(0);
+            let max_kv = kv_prefixes
+                .iter()
+                .zip(advances.iter())
+                .map(|(&p, &a)| p + a)
+                .max()
+                .unwrap_or(0);
+            let sum_kv: usize = kv_prefixes
+                .iter()
+                .zip(advances.iter())
+                .map(|(&p, &a)| p + a)
+                .sum();
+            tracing::info!(
+                target: "candle_conversation::scheduler::timing",
+                n_seqs,
+                total_tokens,
+                fwd_ms,
+                max_prefix,
+                max_kv,
+                sum_kv,
+                "code-read prefill forward op breakdown: {}",
+                parts.join("  ")
+            );
+        }
 
-        for ((logits, &i), &chunk) in logits_vec
+        for ((logits, &i), &advance) in logits_vec
             .into_iter()
             .zip(group_idxs.iter())
-            .zip(chunks.iter())
+            .zip(advances.iter())
         {
             let p = &mut self.active_prefills[i];
-            if let Err(e) = self.session.advance_sequence(p.work.sequence_id.0, chunk) {
+            if let Err(e) = self.session.advance_sequence(p.work.sequence_id.0, advance) {
                 p.error = Some(ConversationError::Model(e));
                 continue;
             }
             // Mirror the just-prefilled tokens into the diagnostic
             // log so the turn-complete dump can reconstruct the
-            // exact context the kernel saw — `run_one_prefill_chunk`
+            // exact context the kernel saw — `run_one_prefill_pass`
             // is the SubmitTurn prefill path, parallel to
             // `run_prefill_with_shift`'s synchronous path.
             let seq_id = p.work.sequence_id;
             let off = p.offset;
-            let chunk_tokens = p.work.tokens[off..off + chunk].to_vec();
-            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
-            p.offset += chunk;
+            let advance_tokens = p.work.tokens[off..off + advance].to_vec();
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &advance_tokens);
+            p.offset += advance;
             let total = p.work.tokens.len();
             let _ = p.work.event_tx.send(TurnEvent::PrefillProgress {
                 tokens_done: p.offset,
@@ -570,9 +615,9 @@ impl Scheduler {
         // intermediate activation buffers from growing unboundedly.
         // Boundary-injection shifts are always small partial blocks and are
         // handled as a single pass.
-        if write_offset_shift == 0 && tokens.len() > self.max_prefill_chunk {
+        if write_offset_shift == 0 && tokens.len() > self.max_prefill_pass_tokens {
             let mut last_logits: Option<Tensor> = None;
-            for chunk in tokens.chunks(self.max_prefill_chunk) {
+            for chunk in tokens.chunks(self.max_prefill_pass_tokens) {
                 let input = Tensor::new(chunk, &self.device)
                     .and_then(|t| t.unsqueeze(0))
                     .map_err(ConversationError::Model)?;

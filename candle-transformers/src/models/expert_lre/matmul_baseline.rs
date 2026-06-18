@@ -190,9 +190,7 @@ fn expert_matmul_baseline_bench() -> Result<()> {
     let (n, k) = w_deq.dims2()?;
     let weight_bytes = weight_bytes as f64;
 
-    println!(
-        "\n=== Expert matmul baseline — Qwen3-30B-A3B gate_proj [{n}x{k}] (captured) ===",
-    );
+    println!("\n=== Expert matmul baseline — Qwen3-30B-A3B gate_proj [{n}x{k}] (captured) ===",);
     println!("weight = {:.0} KB\n", weight_bytes / 1024.0);
 
     for in_dtype in [candle::DType::F32, candle::DType::BF16] {

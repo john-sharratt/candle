@@ -1527,7 +1527,13 @@ impl ChunkedKvBacking {
             let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = record_srcs
                 .iter()
                 .map(|(_, g, kp, vp, ks, vs)| {
-                    (g, kp.as_slice(), vp.as_slice(), ks.as_slice(), vs.as_slice())
+                    (
+                        g,
+                        kp.as_slice(),
+                        vp.as_slice(),
+                        ks.as_slice(),
+                        vs.as_slice(),
+                    )
                 })
                 .collect();
             let metas = self.build_meta_records(&refs, &arena_info)?;
@@ -2336,7 +2342,11 @@ impl ChunkedKvBacking {
                 let mapped: Vec<HeadGids> = seq
                     .chunks
                     .iter()
-                    .map(|chunk| chunk.gids.map_unique(|gid| Ok(new_gids[&gid.raw()].clone())))
+                    .map(|chunk| {
+                        chunk
+                            .gids
+                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))
+                    })
                     .collect::<candle::Result<_>>()?;
                 let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = seq
                     .chunks

@@ -779,13 +779,7 @@ impl ChunkedKvBacking {
     #[allow(dead_code)] // callers are cuda-gated; a pure-CPU build sees none
     pub(crate) fn build_meta_records(
         &self,
-        chunks: &[(
-            &super::head_gids::HeadGids,
-            &[u8],
-            &[u8],
-            &[f32],
-            &[f32],
-        )],
+        chunks: &[(&super::head_gids::HeadGids, &[u8], &[u8], &[f32], &[f32])],
         arena_info: &[crate::kv_cache::arena_table::ResolvedArenaInfo],
     ) -> Result<Vec<Option<super::meta_pool::MetaGid>>> {
         if !self.inner.meta_pool.is_device_resident() {

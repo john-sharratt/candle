@@ -1232,15 +1232,25 @@ impl Sequence {
             // `Conversation::record_turn`.  Persistence is per-
             // workspace now, not per-Sequence; nothing for this
             // method to forward.
-            // Refresh BDP scores using the just-finished turn's
-            // chunk-group as probe.  The substrate already has the
-            // turn (the scheduler wrote it before sending Done), so
-            // the new turn's index is the current timeline tail minus 1.
-            let timeline_count = self.substrate.read().turn_count(self.target.timeline);
-            if timeline_count > 0 {
-                let last_idx = TurnIndex(timeline_count - 1);
-                if let Err(e) = self.run_bdp_scan(self.target.timeline, last_idx) {
-                    tracing::warn!("BDP scan failed: {e}");
+            // Refresh BDP scores using the just-finished turn's chunk-group as
+            // probe — but ONLY for layers that actually reproject/retrieve.
+            //
+            // `run_bdp_scan` scans the just-finished turn against the WHOLE
+            // substrate corpus (`all_turns` + `all_sections`), so running it on
+            // every insert is O(n) per turn → O(n²) over an ingest. Utility /
+            // reference layers (repo_map, code_reading: `disable_reprojection`)
+            // are append-only and never queried during ingest, so that scan is
+            // pure waste there — it's what made code-reading slow to a crawl as
+            // the corpus grew. Cross-layer retrieval (the dialogue layer scoring
+            // these turns) still happens via the dialogue layer's own scans,
+            // which are not gated.
+            if !self.config.disable_reprojection {
+                let timeline_count = self.substrate.read().turn_count(self.target.timeline);
+                if timeline_count > 0 {
+                    let last_idx = TurnIndex(timeline_count - 1);
+                    if let Err(e) = self.run_bdp_scan(self.target.timeline, last_idx) {
+                        tracing::warn!("BDP scan failed: {e}");
+                    }
                 }
             }
         }

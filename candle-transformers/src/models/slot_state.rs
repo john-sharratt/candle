@@ -443,6 +443,7 @@ impl SlotStateHost {
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
         writer_start_idx: usize,
+        build_position_map: bool,
     ) -> Self {
         let mut cum_tokens: u32 = 0;
         let slices: Vec<TokenSliceHost> = chunks
@@ -487,14 +488,26 @@ impl SlotStateHost {
         // entries — they're invisible to the prefix read scan because no
         // cum_token positions live in them yet.  The total length equals
         // the slot's logical token count (= sum of slice.len).
-        let total_tokens: usize = slices.iter().map(|s| s.len as usize).sum();
-        let mut position_map: Vec<u32> = Vec::with_capacity(total_tokens);
-        for (idx, slice) in slices.iter().enumerate() {
-            let slice_off = slice.offset as u32;
-            for i in 0..(slice.len as u32) {
-                position_map.push(pack_position_entry(idx as u32, slice_off + i));
+        // Layer-invariant: the position_map depends only on the chunk token
+        // layout (slice offsets/lengths), which is identical across every layer
+        // of a forward (a sequence's chunks are sealed at the same boundaries in
+        // all layers; only the K/V values + arena pointers differ). The prefill
+        // caller therefore builds it on the first layer and reuses it for the
+        // rest — layers after the first pass `build_position_map = false` to skip
+        // this entirely (the dominant per-layer host cost).
+        let position_map: Vec<u32> = if build_position_map {
+            let total_tokens: usize = slices.iter().map(|s| s.len as usize).sum();
+            let mut pm = Vec::with_capacity(total_tokens);
+            for (idx, slice) in slices.iter().enumerate() {
+                let slice_off = slice.offset as u32;
+                for i in 0..(slice.len as u32) {
+                    pm.push(pack_position_entry(idx as u32, slice_off + i));
+                }
             }
-        }
+            pm
+        } else {
+            Vec::new()
+        };
 
         // Per-slot trace of the kernel-visible slice layout.  Enable
         // with `RUST_LOG=candle_transformers::models::slot_state=trace`.

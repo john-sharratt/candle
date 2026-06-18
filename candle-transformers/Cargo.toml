@@ -29,6 +29,9 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_plain = { workspace = true }
+# Binary fixture (de)serialization: the offline MoE-predictor routing-trace eval
+# and the paged-prefill kernel-replay capture (models::prefill_capture).
+bincode = "1.3"
 tracing = { workspace = true }
 tokenizers = { workspace = true, optional = true }
 
@@ -36,8 +39,6 @@ tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
 tracing-subscriber = { workspace = true }
-# Routing-trace fixture (de)serialization for the offline MoE-predictor eval.
-bincode = "1.3"
 flate2 = "1.1"
 # Direct HTTP client for the IPv6->IPv4 download fallback (test_helpers::hf_get).
 # native-tls matches hf-hub's backend (uses the system cert store).

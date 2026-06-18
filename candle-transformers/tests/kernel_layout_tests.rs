@@ -205,6 +205,124 @@ fn kernel_layout_prefill_matches_full_vs_partial() -> Result<()> {
     Ok(())
 }
 
+/// Byte-exact gate for the prefill position_map hoist.
+///
+/// The per-forward `SharedPm` cache reuses the first layer's uploaded
+/// position_map for every later layer. That is sound only if two invariants of
+/// `from_sealed_chunks` hold, which this test pins as raw-byte equalities:
+///   1. The serialized slices (out-of-line KvHead records + 16-byte slice
+///      headers) — the part re-uploaded per layer — are byte-identical whether
+///      or not the position_map is built. So later layers can rebuild slices
+///      while reusing the first layer's position_map without disagreement.
+///   2. The position_map is a deterministic function of the chunk token layout
+///      (which is identical across every layer of a forward), before and after
+///      the write-region extension the prefill path applies.
+#[test]
+fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
+    use candle_transformers::models::slot_state::{SlotStateHost, TokenSliceHost};
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+
+    // Multi-chunk slot so slices + position_map are non-trivial.
+    let segments: &[usize] = &[40, 40, 24];
+    let total: usize = segments.iter().sum();
+    let (q_master, k_master, v_master) = make_qkv(total, &device, 0xB17E_EAC7)?;
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, &device)?;
+    let (backing, cache) = build_segmented_slot(
+        segments,
+        &q_master,
+        &k_master,
+        &v_master,
+        &rope_cs,
+        &rope_offsets_b1,
+        &stager,
+        &device,
+    )?;
+
+    let arena_info = backing.resolve_arena_info()?;
+    let chunks = cache
+        .k_cache()
+        .chunked_live_chunks_as_sealed()
+        .unwrap_or_default();
+    let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
+
+    // Serialize a slot's per-layer payload with slice headers rebased onto a
+    // fixed origin, so the comparison is independent of allocation address.
+    let serialize_slices = |slot: &SlotStateHost| -> Vec<u8> {
+        let rec_bytes = TokenSliceHost::record_size(N_KV_HEAD, HEAD_DIM);
+        let mut buf = Vec::new();
+        for (i, s) in slot.slices.iter().enumerate() {
+            s.serialize_record(&mut buf);
+            s.serialize_slice_header(&mut buf, (i * rec_bytes) as u64);
+        }
+        buf
+    };
+
+    let with_pm = SlotStateHost::from_sealed_chunks(
+        &chunks,
+        N_KV_HEAD,
+        HEAD_DIM,
+        &arena_info,
+        writer_start,
+        true,
+    );
+    let no_pm = SlotStateHost::from_sealed_chunks(
+        &chunks,
+        N_KV_HEAD,
+        HEAD_DIM,
+        &arena_info,
+        writer_start,
+        false,
+    );
+
+    // (1) The per-layer slices must not depend on whether the map was built.
+    assert_eq!(
+        serialize_slices(&with_pm),
+        serialize_slices(&no_pm),
+        "slice bytes must be independent of build_position_map",
+    );
+    assert!(
+        !with_pm.position_map.is_empty(),
+        "expected a non-empty position_map when requested",
+    );
+    assert!(
+        no_pm.position_map.is_empty(),
+        "expected an empty position_map when skipped",
+    );
+
+    // (2) Deterministic build — the layer-invariance the cache relies on.
+    let mut a = with_pm;
+    let mut b = SlotStateHost::from_sealed_chunks(
+        &chunks,
+        N_KV_HEAD,
+        HEAD_DIM,
+        &arena_info,
+        writer_start,
+        true,
+    );
+    assert_eq!(
+        a.position_map, b.position_map,
+        "position_map must be deterministic across builds",
+    );
+    a.extend_for_write_region(7, CHUNK_SIZE);
+    b.extend_for_write_region(7, CHUNK_SIZE);
+    assert_eq!(
+        a.position_map, b.position_map,
+        "write-region-extended position_map must be deterministic",
+    );
+
+    let _ = &backing;
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Per-case runners
 // ──────────────────────────────────────────────────────────────────────
@@ -540,6 +658,7 @@ fn run_prefill(
         false,
         0,
         &generation,
+        &std::cell::RefCell::new(None),
     )?;
     caches_arr[0].set_current_seq_len(offset + seq_len)?;
     // `paged_prefill_batched` returns the flat attention output
@@ -580,8 +699,14 @@ fn decode_one_slot(
         .unwrap_or_default();
     let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
 
-    let mut slot =
-        SlotStateHost::from_sealed_chunks(&chunks, N_KV_HEAD, HEAD_DIM, &arena_info, writer_start);
+    let mut slot = SlotStateHost::from_sealed_chunks(
+        &chunks,
+        N_KV_HEAD,
+        HEAD_DIM,
+        &arena_info,
+        writer_start,
+        true,
+    );
     slot.extend_for_write_region(1, CHUNK_SIZE);
 
     // Two-section layout: out-of-line KvHead records first, then 16-byte slice
@@ -730,4 +855,3 @@ fn max_abs_diff_f32(a: &Tensor, b: &Tensor) -> Result<f32> {
     let m = m.to_dtype(DType::F32)?.to_scalar::<f32>()?;
     Ok(m)
 }
-

@@ -13,7 +13,7 @@ use candle_nn::kv_cache::KvCache;
 
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
-use crate::models::prefill_utils::{paged_glue_attn, paged_prefill_batched};
+use crate::models::prefill_utils::{paged_glue_attn, paged_prefill_batched, SharedPm};
 use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use crate::utils::repeat_kv;
 
@@ -76,6 +76,11 @@ pub struct BatchedAttentionParams<'a> {
     /// Pinned-stager generation guard for quantization kernel metadata allocations.
     /// Threaded from forward_batched through to reconcile → quantize_palette4_convert_buffered.
     pub generation: &'a Generation,
+    /// Per-forward cache of the layer-invariant prefill `position_map`. The first
+    /// layer of a prefill forward populates it; later layers reuse the uploaded
+    /// buffer instead of rebuilding + re-uploading it. Empty (`None`) at forward
+    /// start; unused on the decode and CPU paths.
+    pub shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
 }
 
 impl<'a> BatchedAttentionParams<'a> {
@@ -92,6 +97,7 @@ impl<'a> BatchedAttentionParams<'a> {
         decode_headers: DecodeHeaders,
         q_lens: &'a [usize],
         generation: &'a Generation,
+        shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
     ) -> Self {
         Self {
             rope_cos: cos,
@@ -102,6 +108,7 @@ impl<'a> BatchedAttentionParams<'a> {
             decode_headers,
             q_lens,
             generation,
+            shared_prefill_pm,
         }
     }
 }
@@ -468,6 +475,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
             params.rope_cs,
             write_offset_shifts_ptr,
             params.generation,
+            params.shared_prefill_pm,
         )?;
         Ok(ret)
     }
@@ -619,6 +627,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     rope_cs: &Tensor,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<TensorCat> {
     // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
     // against the sequence count carried by q_lens instead.
@@ -735,6 +744,7 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             rope_interleaved,
             write_offset_shifts_ptr,
             generation,
+            shared_pm,
         )?,
     };
 

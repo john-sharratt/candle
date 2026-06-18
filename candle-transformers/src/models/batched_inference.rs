@@ -31,9 +31,9 @@ use candle_nn::kv_cache::{
 };
 use std::collections::{HashMap, HashSet};
 
-use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
 #[cfg(feature = "cuda")]
 use super::batched_layer::GlueMeta;
+use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
 use super::batched_model::{BatchedInference, BatchedModelCore};
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
@@ -2613,8 +2613,7 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
             // the session; attach them so the layer routes HD128 to the paged-glue
             // kernel. Consumed once — ordinary prefills leave `glue` None.
             if let Some(glue_cols) = session.take_pending_glue() {
-                meta.glue =
-                    build_glue_meta(glue_cols, &seq_offsets, &input_lens, self.device())?;
+                meta.glue = build_glue_meta(glue_cols, &seq_offsets, &input_lens, self.device())?;
             }
             (None, DecodeHeaders::Prefill(meta))
         };

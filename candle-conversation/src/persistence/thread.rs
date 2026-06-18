@@ -455,7 +455,6 @@ fn run_pass(
             &mut installs,
         );
     }
-
     // Primary-stream sync after ALL groups/layers complete.
     //
     // `quantize_sealed_in_place` and the format-preserving DtoH leave
@@ -480,7 +479,6 @@ fn run_pass(
             installs.clear();
         }
     }
-
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;
     if !installs.is_empty() {
@@ -491,7 +489,7 @@ fn run_pass(
                 .flat_map(|s| s.chunks.iter())
                 .map(|c| c.byte_size)
                 .sum();
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 residence = idx.0,
                 bytes,
@@ -564,7 +562,7 @@ fn run_pass(
             .flat_map(|s| s.chunks.iter())
             .map(|c| c.record_len)
             .sum();
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::persistence::tier",
             residence = idx.0,
             stream_id = stream_id.0,
@@ -641,7 +639,7 @@ fn run_pass(
                 .flat_map(|s| s.chunks.iter())
                 .map(|c| c.record_len)
                 .sum();
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 residence = idx.0,
                 stream_id = stream_id.0,
@@ -671,7 +669,7 @@ fn run_pass(
 
     // Per-pass aggregate. Only logged when something actually moved.
     if hot_to_warm_count > 0 || warm_to_cold_count > 0 || section_to_cold_count > 0 {
-        tracing::info!(
+        tracing::trace!(
             target: "candle_conversation::persistence::tier",
             hot_to_warm_count,
             hot_to_warm_bytes,
