@@ -1352,4 +1352,14 @@ pub struct SequenceConfig {
     /// meaningful alongside `kv_compression_level`. Set for `code_reading`
     /// so its K and V are both fully quantized. **Default: `false`.**
     pub kv_disable_k_override: bool,
+
+    /// Pin this conversation's turns to a single uniform K quant format,
+    /// bypassing adaptive per-block selection *and* the engine-wide Q4_KS K
+    /// override. `None` keeps the adaptive/level path. Reserved for layers that
+    /// want a fixed near-lossless seal (e.g. summary turns); currently unset by
+    /// all callers. **Default: `None`.**
+    pub kv_force_k_format: Option<QuantFormat>,
+
+    /// V counterpart to [`Self::kv_force_k_format`]. **Default: `None`.**
+    pub kv_force_v_format: Option<QuantFormat>,
 }

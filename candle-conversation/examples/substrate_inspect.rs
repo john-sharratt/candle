@@ -105,7 +105,9 @@ fn main() -> Result<()> {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::Headers => headers(&mut log)?,
         Cmd::Streams => streams(&mut log)?,
-        Cmd::Chunks { stream_id, preview } => chunks(&mut log, parse_stream_id(&stream_id)?, preview)?,
+        Cmd::Chunks { stream_id, preview } => {
+            chunks(&mut log, parse_stream_id(&stream_id)?, preview)?
+        }
         Cmd::Tokens { stream_id, ids } => {
             tokens(&mut log, &log_path, parse_stream_id(&stream_id)?, ids)?
         }
@@ -137,7 +139,10 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     let dead = compaction::dead_record_ratio(log, &manifest, &substrate)?;
 
     println!("file              {}", path.display());
-    println!("size              {file_len} bytes ({} KiB)", file_len / 1024);
+    println!(
+        "size              {file_len} bytes ({} KiB)",
+        file_len / 1024
+    );
     println!("format version    {}", sb.format_version);
     println!(
         "latest checkpoint {}",
@@ -148,7 +153,11 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
         }
     );
     println!();
-    println!("records           {} ({} payload bytes)", entries.len(), payload_bytes);
+    println!(
+        "records           {} ({} payload bytes)",
+        entries.len(),
+        payload_bytes
+    );
     for rt in ALL_TYPES {
         let n = counts[type_index(rt)];
         if n > 0 {
@@ -156,9 +165,15 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
         }
     }
     println!();
-    println!("streams           {} ({turns} turn, {sections} prompt-section)", substrate.all_streams().count());
+    println!(
+        "streams           {} ({turns} turn, {sections} prompt-section)",
+        substrate.all_streams().count()
+    );
     println!("live chunks       {live_chunks}");
-    println!("model spec        {}", present(manifest.model_spec.is_some()));
+    println!(
+        "model spec        {}",
+        present(manifest.model_spec.is_some())
+    );
     println!("template          {}", present(manifest.template.is_some()));
     println!(
         "tokenizer         {}",
@@ -180,7 +195,11 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
         Err(_) => format!("{} (missing)", sidecar_path.display()),
     };
     println!("tokenizer sidecar {sidecar_status}");
-    println!("dead-record ratio {:.1}% {}", dead * 100.0, compaction_hint(dead));
+    println!(
+        "dead-record ratio {:.1}% {}",
+        dead * 100.0,
+        compaction_hint(dead)
+    );
     Ok(())
 }
 
@@ -448,8 +467,7 @@ fn checkpoint_view(log: &mut LogFile) -> Result<()> {
     // The checkpoint payload carries only singleton offsets; streams are
     // rebuilt by replaying the tail through the substrate sink.
     let mut substrate = Substrate::new();
-    let recovered =
-        checkpoint::recover_with_sink(log, hint, |e| substrate.apply_walker_entry(e))?;
+    let recovered = checkpoint::recover_with_sink(log, hint, |e| substrate.apply_walker_entry(e))?;
     let (turns, sections) = stream_kind_counts(&substrate);
     println!(
         "recovers to: {} streams ({turns} turn, {sections} section), torn-tail={}",
@@ -507,11 +525,7 @@ fn stream_kind_counts(substrate: &Substrate) -> (usize, usize) {
     (turns, sections)
 }
 
-fn print_singleton(
-    log: &mut LogFile,
-    label: &str,
-    loc: Option<(u64, u64)>,
-) -> Result<()> {
+fn print_singleton(log: &mut LogFile, label: &str, loc: Option<(u64, u64)>) -> Result<()> {
     match loc {
         None => println!("{label:<11} (none)"),
         Some((off, size)) => {

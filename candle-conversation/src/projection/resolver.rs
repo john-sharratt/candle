@@ -143,6 +143,17 @@ impl Conversation {
             .set_timeline_compression(timeline, compression);
     }
 
+    /// Set whether `timeline`'s turns are summarised. `false` for append-only
+    /// utility/reference layers (repo_map, code_reading) so their turns never
+    /// enter the summariser. Called at conversation creation, before the first
+    /// turn seals.
+    pub fn set_timeline_summarize(&self, timeline: TimelineId, summarize: bool) {
+        self.inner
+            .write()
+            .unwrap()
+            .set_timeline_summarize(timeline, summarize);
+    }
+
     /// Acquire an unscored read guard.  The returned guard implements
     /// [`ContentResolver`] but every score lookup returns zero —
     /// appropriate for callers reading structural fields (turn counts,
@@ -465,62 +476,17 @@ impl Conversation {
             }
             restored += 1;
         }
-        // Post-walker sweeps on substrate state (no manifest reads —
-        // all per-entity state was written during the open-time
-        // walker pass into `substrate.apply_walker_entry`).
-        //
-        // 1. Re-enqueue orphan Normal turns onto the summariser's
-        //    pending queue.  An orphan is any Normal turn whose index
-        //    is NOT in any SummaryOfTurns leaf's children list — i.e.
-        //    a crash interrupted its absorption before a leaf was
-        //    sealed over it.  Compute the "covered" set by walking
-        //    summary nodes' children.
-        // 2. Re-seed the `dirty_summary_set` from `dirty: true`
-        //    `TreeNodeMeta` entries — the apply path writes the flag
-        //    but doesn't index into the dirty set; this sweep does.
-        let n_meta_records = 0usize;
-        let n_state_records = 0usize;
-        let n_meta_applied = 0usize;
-        let n_meta_dropped_unregistered = 0usize;
-        let n_state_applied = 0usize;
-        {
-            let mut view = self.write();
-            let timeline_ids: Vec<TimelineId> = view.all_timeline_ids().collect();
-            for timeline in timeline_ids {
-                // Build the "covered by a summary leaf" set from the
-                // substrate's tree_meta — every Normal turn that's a
-                // child of some SoT leaf is covered; every Normal
-                // outside that set is orphaned.
-                let mut covered: std::collections::BTreeSet<u32> =
-                    std::collections::BTreeSet::new();
-                for leaf_idx in view.summary_leaves_chrono(timeline) {
-                    if let Some(meta) = view.tree_meta_of(timeline, leaf_idx) {
-                        for c in &meta.children {
-                            covered.insert(c.0);
-                        }
-                    }
-                }
-                for normal_idx in view.normal_turns_chrono(timeline) {
-                    if !covered.contains(&normal_idx.0) {
-                        view.push_pending_summary(timeline, normal_idx);
-                    }
-                }
-                // Re-seed the dirty set from `dirty: true` meta entries.
-                let dirty_ids: Vec<TurnIndex> = view
-                    .summary_leaves_chrono(timeline)
-                    .into_iter()
-                    .chain(view.summary_internals_chrono(timeline).into_iter())
-                    .filter(|idx| {
-                        view.tree_meta_of(timeline, *idx)
-                            .map(|m| m.dirty)
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                for id in dirty_ids {
-                    view.mark_summary_dirty(timeline, id);
-                }
-            }
-        }
+        // Reload re-summarises nothing. The summary tree is persisted
+        // (`TreeMetadata` records, replayed during the open pass) and reloaded
+        // as-is — it is authoritative, not rebuilt. A clean restart must
+        // therefore generate ZERO summary probes. We deliberately do NOT
+        // re-enqueue "uncovered" Normal turns or re-seed the dirty set: turns
+        // left un-summarised at shutdown simply stay raw (the projection covers
+        // recent turns by recency regardless), and dirty nodes keep their
+        // existing (valid) summary. Only genuinely new turns sealed after
+        // restart enqueue — live, and only on summarisable timelines. (The
+        // earlier "re-enqueue the orphan tail" sweep flooded the summariser at
+        // startup and was the root of the restart hangs.)
         if let Some(p) = progress {
             p(total, total);
         }
@@ -535,11 +501,6 @@ impl Conversation {
             conversations = n_conversations,
             turns = restored,
             skipped_corrupt = skipped_corrupt,
-            label_records = n_meta_records,
-            label_records_applied = n_meta_applied,
-            label_records_dropped = n_meta_dropped_unregistered,
-            conv_state_records = n_state_records,
-            conv_state_records_applied = n_state_applied,
             "substrate reload complete",
         );
         Ok(restored)

@@ -68,7 +68,7 @@ fn repo_scan_emits_one_turn_pair_per_cluster() {
     let _ = ingest_repo_map_into_sink(&mut sink, dir.path(), &progress).unwrap();
     // Small workspace collapses to one cluster.
     assert_eq!(sink.turns.len(), 1);
-    assert!(sink.turns[0].0.starts_with("Tell me what is in"));
+    assert!(sink.turns[0].0.starts_with("Repository index — "));
 }
 
 #[test]

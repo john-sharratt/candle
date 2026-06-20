@@ -445,27 +445,53 @@ impl SparseMoeBlock {
         k: usize,
         _routing_start: ProfileMark,
     ) -> Result<Tensor> {
-        // ── 2. Build flat assignment array sorted by expert ──
-        // Pure CPU bookkeeping — trivial cost (< 0.01ms for k=8 single-token).
-        // Each entry: (expert_id, token_idx, flat_weight_idx)
-        // Sorting by expert_id groups same-expert tokens contiguously,
-        // ready for dispatch without any HashMap allocation.
+        // ── 2. Group assignments by expert via a counting sort ──
+        // Each entry: (expert_id, token_idx, flat_weight_idx). Same-expert tokens
+        // must be contiguous for the grouped-GEMM dispatch. Expert id is a small
+        // bounded integer, so we bucket by it in **O(A + E)** (A = token→expert
+        // assignments, E = experts) — no comparison sort — keeping the cost
+        // linear even for large prefill batches (a sort here is O(A log A) and
+        // scaled badly with the batch size we want for expert-stream amortization).
         let t = profile_now();
-        let num_assignments = idx_cpu.len() * k;
-        let mut assignments: Vec<(u32, u32, u32)> = Vec::with_capacity(num_assignments);
-        for (tok, idxs) in idx_cpu.iter().enumerate() {
-            for (slot_k, &eid) in idxs.iter().enumerate() {
-                assignments.push((eid, tok as u32, (tok * k + slot_k) as u32));
+        let k_u = k as u32;
+        // Bucket count = highest routed expert id + 1.
+        let n_experts = idx_cpu
+            .iter()
+            .flat_map(|idxs| idxs.iter())
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
+
+        // Pass 1: count assignments per expert.
+        let mut counts = vec![0u32; n_experts];
+        for idxs in &idx_cpu {
+            for &eid in idxs {
+                counts[eid as usize] += 1;
             }
         }
-        assignments.sort_unstable_by_key(|a| a.0);
-
-        // Collect unique expert IDs (already sorted)
+        // Prefix-sum into per-expert bucket starts; collect the ascending active
+        // expert ids in the same pass.
+        let mut cursor = vec![0u32; n_experts];
         let mut expert_ids: Vec<usize> = Vec::new();
-        for &(eid, _, _) in &assignments {
-            let eid = eid as usize;
-            if expert_ids.last() != Some(&eid) {
-                expert_ids.push(eid);
+        let mut running = 0u32;
+        for (e, &c) in counts.iter().enumerate() {
+            cursor[e] = running;
+            running += c;
+            if c > 0 {
+                expert_ids.push(e);
+            }
+        }
+        // Pass 2: scatter each assignment into its expert's bucket (stable in
+        // token order) → assignments grouped by ascending expert id, exactly as
+        // a sort-by-expert would produce.
+        let num_assignments = running as usize;
+        let mut assignments: Vec<(u32, u32, u32)> = vec![(0, 0, 0); num_assignments];
+        for (tok, idxs) in idx_cpu.iter().enumerate() {
+            let tok_u = tok as u32;
+            for (slot_k, &eid) in idxs.iter().enumerate() {
+                let pos = cursor[eid as usize] as usize;
+                assignments[pos] = (eid, tok_u, tok_u * k_u + slot_k as u32);
+                cursor[eid as usize] += 1;
             }
         }
         self.cache.record_profile("fwd_cpu_assign", t);

@@ -239,13 +239,19 @@ fn visit(node: &DirNode<'_>, _parent: &str, out: &mut Vec<Cluster>) {
     }
 }
 
+/// User-side text for a repo-map prefill turn. Framed as a **reference
+/// header**, not a first-person question: these turns are context-stuffed
+/// background (the listing is the payload), and the model would otherwise
+/// report "Tell me what is in …" as something the *user* asked when queried
+/// about conversation history. A labelled index header reads as injected
+/// reference material instead.
 fn user_prompt_for(rel_path: &str) -> String {
     if rel_path.is_empty() {
-        "Tell me what is in the workspace root.".to_string()
+        "Repository index — workspace root:".to_string()
     } else {
-        // Drop trailing slash for a more natural prompt.
+        // Drop trailing slash for a cleaner header.
         let clean = rel_path.trim_end_matches('/');
-        format!("Tell me what is in `{clean}`.")
+        format!("Repository index — `{clean}`:")
     }
 }
 
@@ -547,7 +553,7 @@ mod tests {
             .find(|c| c.root_dir == "src/auth/")
             .expect("src/auth cluster present");
         assert!(auth_cluster.user_prompt.contains("src/auth"));
-        assert!(auth_cluster.user_prompt.starts_with("Tell me what is in"));
+        assert!(auth_cluster.user_prompt.starts_with("Repository index"));
     }
 
     #[test]

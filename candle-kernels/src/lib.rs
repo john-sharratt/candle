@@ -20,3 +20,6 @@ pub mod paged_decode;
 
 #[path = "paged-prefill/api.rs"]
 pub mod paged_prefill;
+
+#[path = "paged-glue/api.rs"]
+pub mod paged_glue;

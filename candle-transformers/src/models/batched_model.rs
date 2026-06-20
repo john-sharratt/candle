@@ -49,6 +49,7 @@ use super::batched_layer::{
 use super::expert_lre::PipelineStats;
 use super::expert_lre::ProfileSnapshot;
 use super::kv_cache_utils::SequenceContext;
+use super::prefill_utils::SharedPm;
 use super::profile::{pipeline_record, profile_now, profile_sync};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
@@ -385,6 +386,11 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             }
         };
 
+        // Per-forward cache for the layer-invariant prefill position_map: the
+        // first layer builds + uploads it, every later layer reuses it. Lives for
+        // the whole forward (all layers share it), then drops here.
+        let shared_prefill_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
+
         // Build params for batched attention
         let params = BatchedAttentionParams::new(
             &rope_cos_sin.0,
@@ -395,6 +401,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
             decode_headers,
             &q_lens,
             generation,
+            &shared_prefill_pm,
         );
 
         // Convert to activation dtype before entering layers

@@ -1,7 +1,7 @@
 //! Host-side slot state for paged attention kernels (decode and prefill).
 
 use candle::{Result, Tensor};
-use candle_nn::kv_cache::{HeadGids, ResolvedArenaInfo, SealedChunk, N_PALETTE};
+use candle_nn::kv_cache::{HeadGids, MetaGid, ResolvedArenaInfo, SealedChunk, N_PALETTE};
 
 // ---------------------------------------------------------------------------
 // Device pointer extraction
@@ -244,8 +244,14 @@ pub struct TokenSliceHost {
     pub len: u16,
     /// Absolute RoPE position of the first token in this slice.
     pub rope: u32,
-    /// Per-head palette/pointer state.
+    /// Per-head palette/pointer state. **Empty when `meta` is `Some`** — a
+    /// resident record already holds these bytes, so they are not rebuilt here.
     pub heads: Vec<KvHeadHost>,
+    /// Resident KV-head record handle. `Some` ⇒ the kernel reads the chunk's
+    /// heads from the device meta-pool slab at `device_addr(meta)`, and the host
+    /// skips serializing a scratch record for it. `None` ⇒ scratch record built
+    /// from `heads`.
+    pub meta: Option<MetaGid>,
 }
 
 impl TokenSliceHost {
@@ -294,52 +300,66 @@ impl TokenSliceHost {
             "v_scale length must be 0 or {scale_total}, got {}",
             chunk.v_scale.len()
         );
-        let heads: Vec<KvHeadHost> = (0..n_kv_head)
-            .map(|h| {
-                let k_pal_head = if chunk.k_pal.len() >= (h + 1) * pal_bytes {
-                    &chunk.k_pal[h * pal_bytes..(h + 1) * pal_bytes]
-                } else {
-                    &[]
-                };
-                let v_pal_head = if chunk.v_pal.len() >= (h + 1) * pal_bytes {
-                    &chunk.v_pal[h * pal_bytes..(h + 1) * pal_bytes]
-                } else {
-                    &[]
-                };
-                let k_scale_head = if chunk.k_scale.len() >= (h + 1) * N_PALETTE {
-                    &chunk.k_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
-                } else {
-                    &[][..]
-                };
-                let v_scale_head = if chunk.v_scale.len() >= (h + 1) * N_PALETTE {
-                    &chunk.v_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
-                } else {
-                    &[][..]
-                };
-                KvHeadHost::from_gids(
-                    h,
-                    head_dim,
-                    &chunk.gids,
-                    arena_info,
-                    k_pal_head,
-                    v_pal_head,
-                    k_scale_head,
-                    v_scale_head,
-                )
-            })
-            .collect();
+        // A chunk with a resident record (`meta.is_some()`) already has its
+        // KvHead[n_kv_head] bytes in a device meta-pool slab — built once at
+        // quantize and kept in sync across migrations. Skip rebuilding them here
+        // (the dominant per-layer-per-forward cost); the slice will carry the
+        // record's device address as `kvheads_ptr`. Only transient/float chunks
+        // (`meta.is_none()`) build a scratch record from `heads`.
+        let heads: Vec<KvHeadHost> = if chunk.meta.is_some() {
+            Vec::new()
+        } else {
+            (0..n_kv_head)
+                .map(|h| {
+                    let k_pal_head = if chunk.k_pal.len() >= (h + 1) * pal_bytes {
+                        &chunk.k_pal[h * pal_bytes..(h + 1) * pal_bytes]
+                    } else {
+                        &[]
+                    };
+                    let v_pal_head = if chunk.v_pal.len() >= (h + 1) * pal_bytes {
+                        &chunk.v_pal[h * pal_bytes..(h + 1) * pal_bytes]
+                    } else {
+                        &[]
+                    };
+                    let k_scale_head = if chunk.k_scale.len() >= (h + 1) * N_PALETTE {
+                        &chunk.k_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
+                    } else {
+                        &[][..]
+                    };
+                    let v_scale_head = if chunk.v_scale.len() >= (h + 1) * N_PALETTE {
+                        &chunk.v_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
+                    } else {
+                        &[][..]
+                    };
+                    KvHeadHost::from_gids(
+                        h,
+                        head_dim,
+                        &chunk.gids,
+                        arena_info,
+                        k_pal_head,
+                        v_pal_head,
+                        k_scale_head,
+                        v_scale_head,
+                    )
+                })
+                .collect()
+        };
 
         Self {
             offset: chunk.offset,
             len: chunk.token_count,
             rope: rope_base,
             heads,
+            meta: chunk.meta.clone(),
         }
     }
 
-    #[allow(dead_code)]
-    pub fn serialized_size(n_kv_head: usize, head_dim: usize) -> usize {
-        8 + n_kv_head * Self::kv_head_size(head_dim)
+    /// Fixed bytes of the 16-byte slice header (offset/len/rope + kvheads_ptr).
+    pub const SLICE_HEADER_SIZE: usize = 16;
+
+    /// Bytes of this slice's out-of-line `KvHead[n_kv_head]` record.
+    pub fn record_size(n_kv_head: usize, head_dim: usize) -> usize {
+        n_kv_head * Self::kv_head_size(head_dim)
     }
 
     fn kv_head_size(head_dim: usize) -> usize {
@@ -352,14 +372,21 @@ impl TokenSliceHost {
             + 16 + 16 // k_scale + v_scale (4 × f32 each)
     }
 
-    #[allow(dead_code)]
-    pub fn serialize_into(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.offset.to_le_bytes());
-        buf.extend_from_slice(&self.len.to_le_bytes());
-        buf.extend_from_slice(&self.rope.to_le_bytes());
+    /// Serialize this slice's out-of-line `KvHead[n_kv_head]` record (the bytes
+    /// `kvheads_ptr` points at). Length is [`record_size`].
+    pub fn serialize_record(&self, buf: &mut Vec<u8>) {
         for head in &self.heads {
             head.serialize_into(buf);
         }
+    }
+
+    /// Serialize the 16-byte slice header with the resolved device address of
+    /// this slice's record.
+    pub fn serialize_slice_header(&self, buf: &mut Vec<u8>, kvheads_ptr: u64) {
+        buf.extend_from_slice(&self.offset.to_le_bytes());
+        buf.extend_from_slice(&self.len.to_le_bytes());
+        buf.extend_from_slice(&self.rope.to_le_bytes());
+        buf.extend_from_slice(&kvheads_ptr.to_le_bytes());
     }
 }
 
@@ -416,6 +443,7 @@ impl SlotStateHost {
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
         writer_start_idx: usize,
+        build_position_map: bool,
     ) -> Self {
         let mut cum_tokens: u32 = 0;
         let slices: Vec<TokenSliceHost> = chunks
@@ -460,14 +488,26 @@ impl SlotStateHost {
         // entries — they're invisible to the prefix read scan because no
         // cum_token positions live in them yet.  The total length equals
         // the slot's logical token count (= sum of slice.len).
-        let total_tokens: usize = slices.iter().map(|s| s.len as usize).sum();
-        let mut position_map: Vec<u32> = Vec::with_capacity(total_tokens);
-        for (idx, slice) in slices.iter().enumerate() {
-            let slice_off = slice.offset as u32;
-            for i in 0..(slice.len as u32) {
-                position_map.push(pack_position_entry(idx as u32, slice_off + i));
+        // Layer-invariant: the position_map depends only on the chunk token
+        // layout (slice offsets/lengths), which is identical across every layer
+        // of a forward (a sequence's chunks are sealed at the same boundaries in
+        // all layers; only the K/V values + arena pointers differ). The prefill
+        // caller therefore builds it on the first layer and reuses it for the
+        // rest — layers after the first pass `build_position_map = false` to skip
+        // this entirely (the dominant per-layer host cost).
+        let position_map: Vec<u32> = if build_position_map {
+            let total_tokens: usize = slices.iter().map(|s| s.len as usize).sum();
+            let mut pm = Vec::with_capacity(total_tokens);
+            for (idx, slice) in slices.iter().enumerate() {
+                let slice_off = slice.offset as u32;
+                for i in 0..(slice.len as u32) {
+                    pm.push(pack_position_entry(idx as u32, slice_off + i));
+                }
             }
-        }
+            pm
+        } else {
+            Vec::new()
+        };
 
         // Per-slot trace of the kernel-visible slice layout.  Enable
         // with `RUST_LOG=candle_transformers::models::slot_state=trace`.

@@ -31,7 +31,9 @@ use candle_nn::kv_cache::{
 };
 use std::collections::{HashMap, HashSet};
 
-use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders, GapFillDescriptor};
+#[cfg(feature = "cuda")]
+use super::batched_layer::GlueMeta;
+use super::batched_layer::{BatchedPrefillMeta, DecodeHeaders};
 use super::batched_model::{BatchedInference, BatchedModelCore};
 #[cfg(feature = "cuda")]
 use crate::models::profile::pipeline_record_duration;
@@ -433,6 +435,59 @@ struct SequenceState {
     caches: KvCaches,
 }
 
+/// Assemble a [`GlueMeta`] from the wave's per-slot column positions for a
+/// gap-fill forward. `col_per_seq[i]` must have length `seq_offsets[i] +
+/// input_lens[i]` (sealed prefix ++ glue) — the kernel reads it as the flat
+/// `col_actual_pos` over every slot's `[0, kv_len)`. Returns `None` (falls back
+/// to plain prefill) only when no slot actually carries glue.
+#[cfg(feature = "cuda")]
+fn build_glue_meta(
+    col_per_seq: Vec<Vec<u32>>,
+    seq_offsets: &[usize],
+    input_lens: &[usize],
+    device: &Device,
+) -> Result<Option<GlueMeta>> {
+    if col_per_seq.len() != seq_offsets.len() || col_per_seq.len() != input_lens.len() {
+        candle::bail!(
+            "build_glue_meta: {} col vecs vs {} offsets / {} input_lens",
+            col_per_seq.len(),
+            seq_offsets.len(),
+            input_lens.len()
+        );
+    }
+    let mut flat: Vec<u32> = Vec::with_capacity(col_per_seq.iter().map(|c| c.len()).sum());
+    for (i, cols) in col_per_seq.iter().enumerate() {
+        let expected = seq_offsets[i] + input_lens[i];
+        if cols.len() != expected {
+            candle::bail!(
+                "build_glue_meta: slot {i} col_actual_pos len {} != kv_len {} (offset {} + glue {})",
+                cols.len(),
+                expected,
+                seq_offsets[i],
+                input_lens[i]
+            );
+        }
+        flat.extend_from_slice(cols);
+    }
+    if flat.is_empty() {
+        return Ok(None);
+    }
+    let n = flat.len();
+    let col_actual_pos = Tensor::from_vec(flat, n, device)?;
+    // Confirms the gap-fill forward took the paged-glue route (HD128) rather than
+    // plain prefill, with the glue shape — one line per reproject. Logged under
+    // the scheduler's reproject target so it rides alongside the reproject
+    // summary in the normal log view.
+    tracing::info!(
+        target: "candle_conversation::scheduler::reproject",
+        slots = col_per_seq.len(),
+        total_glue = input_lens.iter().sum::<usize>(),
+        max_prefix = seq_offsets.iter().copied().max().unwrap_or(0),
+        "paged-glue route active"
+    );
+    Ok(Some(GlueMeta { col_actual_pos }))
+}
+
 /// Batched inference session that manages KV cache state for multiple sequences.
 ///
 /// This is the main interface for batched inference. It:
@@ -452,10 +507,12 @@ pub struct BatchedInferenceSession {
     num_layers: usize,
     /// Device the session is on.
     device: Device,
-    /// Transient GAP_FILL descriptor for the *next* prefill forward — set by the
-    /// projection assembler before a batched glue prefill, consumed (taken) when
-    /// the prefill meta is built. `None` = normal contiguous prefill.
-    gap_fill: Option<GapFillDescriptor>,
+    /// Pending reprojection-glue column positions, set by the wave immediately
+    /// before its gap-fill `forward_batched`. One entry per sequence (in the
+    /// forward's `seq_indices` order); each is that slot's flat `col_actual_pos`
+    /// (sealed prefix ++ glue, TRUE sequence positions). Taken + cleared inside
+    /// `forward_batched`, which routes HD128 glue to the paged-glue kernel.
+    pending_glue: Option<Vec<Vec<u32>>>,
 }
 
 impl BatchedInferenceSession {
@@ -494,21 +551,8 @@ impl BatchedInferenceSession {
             config,
             num_layers,
             device: device.clone(),
-            gap_fill: None,
+            pending_glue: None,
         })
-    }
-
-    /// Set the GAP_FILL descriptor for the *next* prefill forward. Consumed when
-    /// the prefill meta is built. Set by the projection assembler before a
-    /// batched glue prefill; `col_actual_pos` is the flat (per-slot kv_len) array
-    /// of each column's true sequence position.
-    pub fn set_gap_fill(&mut self, desc: GapFillDescriptor) {
-        self.gap_fill = Some(desc);
-    }
-
-    /// Take (and clear) the pending GAP_FILL descriptor.
-    pub fn take_gap_fill(&mut self) -> Option<GapFillDescriptor> {
-        self.gap_fill.take()
     }
 
     /// Create a session that shares the KV arena pool with an existing session.
@@ -534,8 +578,21 @@ impl BatchedInferenceSession {
             config,
             num_layers,
             device: device.clone(),
-            gap_fill: None,
+            pending_glue: None,
         }
+    }
+
+    /// Stage reprojection-glue column positions for the next `forward_batched`.
+    /// `col_actual_pos_per_seq[i]` is sequence `i`'s flat `col_actual_pos`
+    /// (sealed prefix ++ glue), aligned with the `seq_indices` of the imminent
+    /// gap-fill forward. Consumed (and cleared) by that single forward.
+    pub fn set_pending_glue(&mut self, col_actual_pos_per_seq: Vec<Vec<u32>>) {
+        self.pending_glue = Some(col_actual_pos_per_seq);
+    }
+
+    /// Take + clear the staged glue column positions (one forward's worth).
+    pub fn take_pending_glue(&mut self) -> Option<Vec<Vec<u32>>> {
+        self.pending_glue.take()
     }
 
     /// Get the configuration used for this session.
@@ -2562,13 +2619,14 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 session.build_decode_metadata(seq_indices, &stager_generation)?;
             (pm_guard, DecodeHeaders::Decode { buf, stride })
         } else {
-            let meta = BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
-            // GAP_FILL: if the assembler set a descriptor for this prefill, attach
-            // it so `forward_attn_batched` routes through the gap-fill kernel.
-            let meta = match session.take_gap_fill() {
-                Some(desc) => meta.with_gap_fill(desc),
-                None => meta,
-            };
+            let mut meta =
+                BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
+            // A reprojection-glue forward stages its per-slot column positions on
+            // the session; attach them so the layer routes HD128 to the paged-glue
+            // kernel. Consumed once — ordinary prefills leave `glue` None.
+            if let Some(glue_cols) = session.take_pending_glue() {
+                meta.glue = build_glue_meta(glue_cols, &seq_offsets, &input_lens, self.device())?;
+            }
             (None, DecodeHeaders::Prefill(meta))
         };
         #[cfg(not(feature = "cuda"))]

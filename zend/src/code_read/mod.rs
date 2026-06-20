@@ -165,24 +165,21 @@ pub const MAX_DECODE_FAILURES: usize = 16;
 /// these concurrent sessions, so the effective decode rate scales
 /// near-linearly until the model's expert-cache hot set saturates.
 ///
-/// Default is 128 — intentionally high to exercise the VRAM-pressure path.
-/// Each concurrent worker pins a whole per-file conversation's KV in VRAM, so
-/// at 128 a large repo's combined working set will push device VRAM toward the
-/// budget. That now triggers backpressure rather than a spill: the scheduler's
-/// admission gate stops promoting new prefills + force-compacts under pressure,
-/// and the per-arena VRAM budget (`CANDLE_KV_VRAM_RESERVE_MB`) fails fast +
-/// compacts instead of letting the driver page KV to host memory. Lower it via
-/// `ZEND_CODE_READ_PARALLELISM` if you'd rather keep the live set well clear of
-/// the budget instead of relying on backpressure.
-pub const CODE_READ_PARALLELISM: usize = 128;
-
-/// KV compression level for `code_reading` turns. Dialogue runs at C4;
-/// code_reading is cold reference context the dialogue layer retrieves
-/// rarely, so it compresses its V harder (C8 adaptive selection).
-pub const CODE_READ_COMPRESSION_LEVEL: u8 = 8;
+/// Default is 16 — matched to the scheduler's prefill admission cap
+/// (`MAX_ACTIVE_PREFILLS = 16`). Ingest is prefill-bound, and the scheduler only
+/// ever has 16 prefills in flight, so workers beyond 16 cannot add prefill
+/// throughput — they just queue while still pinning their per-file conversation
+/// KV in VRAM and running per-turn post-processing on their own thread (extra
+/// CPU contention). Matching the two keeps the live working set and the
+/// per-insert CPU load bounded while keeping the prefill pipe full. Raise it via
+/// `ZEND_CODE_READ_PARALLELISM` to lean on the VRAM-pressure backpressure path:
+/// the admission gate stops promoting new prefills + force-compacts under
+/// pressure, and the per-arena VRAM budget (`CANDLE_KV_VRAM_RESERVE_MB`) fails
+/// fast + compacts rather than letting the driver page KV to host memory.
+pub const CODE_READ_PARALLELISM: usize = 16;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
-/// (no reprojection) plus the per-conversation C8 compression override.
+/// (no reprojection), inheriting the utility C6 compression level.
 ///
 /// **K override stays on.** Ideally code_reading would also drop the
 /// engine-wide K→Q4_KS override so K is fully adaptively quantized, but the
@@ -190,11 +187,11 @@ pub const CODE_READ_COMPRESSION_LEVEL: u8 = 8;
 /// non-unit outer scales (see `CompressionPolicy::override_k_quant` /
 /// `ModelBuilder::engine`). Dropping it would corrupt code_reading recall
 /// the moment dialogue attends back over it. So K stays Q4_KS (identity)
-/// and only V gets the harder C8 selection. Flip `kv_disable_k_override` to
-/// `true` once the decode K-path is fixed.
+/// and only V gets the harder C6 selection. `kv_disable_k_override = false`
+/// is the engine default; set explicitly here to document the deliberate
+/// choice — flip it to `true` once the decode K-path is fixed.
 fn code_read_config(config: SequenceConfig) -> SequenceConfig {
     let mut cfg = utility_config(config);
-    cfg.kv_compression_level = Some(CODE_READ_COMPRESSION_LEVEL);
     cfg.kv_disable_k_override = false;
     cfg
 }

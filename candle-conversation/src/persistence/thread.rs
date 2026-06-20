@@ -244,9 +244,10 @@ fn run_loop(
 /// Resolve the effective hot→warm quantize policy for a residence group.
 ///
 /// `base` is the engine-wide turn policy. `cc` is the group's
-/// per-conversation override (from [`ConvCompression`]): when present it
-/// replaces the compression level and, if `disable_k_override` is set,
-/// drops the global K-format override so K is adaptively quantized like V.
+/// per-conversation override (from [`ConvCompression`]): when present it may
+/// replace the compression level, drop the global K-format override so K is
+/// adaptively quantized like V (`disable_k_override`), and/or pin K and V to
+/// fixed uniform formats (`force_k` / `force_v`), bypassing adaptive selection.
 /// Returns `None` (no quantization) only when the engine itself has no
 /// policy — a per-conversation override never *introduces* quantization on
 /// an otherwise-float engine.
@@ -257,9 +258,19 @@ fn effective_turn_policy(
     match (base, cc) {
         (Some(b), Some(c)) => {
             let mut p = b.clone();
-            p.compression_level = c.level;
+            if let Some(level) = c.level {
+                p.compression_level = level;
+            }
             if c.disable_k_override {
                 p.override_k_quant = None;
+            }
+            // Forced formats win last: they pin the uniform dst format and
+            // re-enable the K override path even when `disable_k_override` set it.
+            if let Some(k) = c.force_k {
+                p.override_k_quant = Some(k);
+            }
+            if let Some(v) = c.force_v {
+                p.override_v_quant = Some(v);
             }
             Some(p)
         }
@@ -444,7 +455,6 @@ fn run_pass(
             &mut installs,
         );
     }
-
     // Primary-stream sync after ALL groups/layers complete.
     //
     // `quantize_sealed_in_place` and the format-preserving DtoH leave
@@ -469,7 +479,6 @@ fn run_pass(
             installs.clear();
         }
     }
-
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;
     if !installs.is_empty() {
@@ -480,7 +489,7 @@ fn run_pass(
                 .flat_map(|s| s.chunks.iter())
                 .map(|c| c.byte_size)
                 .sum();
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 residence = idx.0,
                 bytes,
@@ -553,7 +562,7 @@ fn run_pass(
             .flat_map(|s| s.chunks.iter())
             .map(|c| c.record_len)
             .sum();
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::persistence::tier",
             residence = idx.0,
             stream_id = stream_id.0,
@@ -630,7 +639,7 @@ fn run_pass(
                 .flat_map(|s| s.chunks.iter())
                 .map(|c| c.record_len)
                 .sum();
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::persistence::tier",
                 residence = idx.0,
                 stream_id = stream_id.0,
@@ -660,7 +669,7 @@ fn run_pass(
 
     // Per-pass aggregate. Only logged when something actually moved.
     if hot_to_warm_count > 0 || warm_to_cold_count > 0 || section_to_cold_count > 0 {
-        tracing::info!(
+        tracing::trace!(
             target: "candle_conversation::persistence::tier",
             hot_to_warm_count,
             hot_to_warm_bytes,

@@ -68,7 +68,7 @@
 //! when the mmap is *not* fully pinned (e.g. insufficient system RAM to
 //! pin the entire file).
 
-use super::cache::ExpertCacheInner;
+use super::cache::{ExpertCacheInner, PINNED_LAYERS};
 #[cfg(not(feature = "cuda"))]
 use super::compute::compute_expert_contribution_gpu_weights;
 #[cfg(feature = "cuda")]
@@ -1248,23 +1248,34 @@ impl PipelineState {
         }
     }
 
-    /// Speculatively prefetch the confidently-predicted experts for the next MoE
-    /// layer.
+    /// Speculatively prefetch the experts the next MoE layer will need.
     ///
-    /// Uses the Markov Wave predictor's confidence-gated prediction
-    /// (`predict_prefetch` — depth adapts to demand diversity), then loads each
-    /// not-yet-resident candidate into a free slot.
-    /// Only uses free VRAM slots — never evicts for prefetch — so it consumes the
-    /// headroom created by end-of-pass eviction and stops when it runs out.
-    /// Prefetched experts are tracked in `speculative_loads` so the next layer's
-    /// work request can score prediction precision.
+    /// `predict_prefetch` chooses the set — the confidence-gated transition
+    /// prediction for a sparse (decode) source, or the *whole* next layer for a
+    /// dense (prefill) source so it can be double-buffered during this layer's
+    /// compute. Misses are loaded into free slots; when the cache is full, ONE
+    /// batched eviction (`evict_for_prefetch_batch`) frees the deficit from the
+    /// safest furthest-window victims (the just-computed "behind" layers / the
+    /// wave tail at the pinned boundary), D2H-ing each to the pinned pool. The
+    /// pinned head layers (`< PINNED_LAYERS`) are never prefetched — they are
+    /// always resident. Prefetched experts are tracked in `speculative_loads` so
+    /// the next layer's work request can score prediction precision.
     fn speculative_prefetch(
         &mut self,
         moe_layer_idx: usize,
         current_expert_ids: &[usize],
     ) -> Result<CopyBatchFence> {
-        let next_moe_idx = moe_layer_idx + 1;
-        if next_moe_idx >= self.num_moe_layers {
+        let target_layer = moe_layer_idx + 1;
+        if target_layer >= self.num_moe_layers {
+            return Ok(CopyBatchFence::noop());
+        }
+
+        // Don't prefetch a pinned layer — its experts are always resident, so the
+        // load would be a NOOP. Layers 0..PINNED_LAYERS run first every pass with
+        // no compute to hide a reload, so they stay permanently pinned and are
+        // never prefetched. The first real prefetch is the pinned boundary: at
+        // layer PINNED_LAYERS-1 we prefetch layer PINNED_LAYERS.
+        if target_layer < PINNED_LAYERS {
             return Ok(CopyBatchFence::noop());
         }
 
@@ -1275,28 +1286,59 @@ impl PipelineState {
             return Ok(CopyBatchFence::noop());
         }
 
-        let mut loaded = 0usize;
-        for &expert_idx in &predicted {
-            // Skip experts already resident.
-            if self
-                .inner
-                .key_to_slot
-                .get(&(next_moe_idx, expert_idx))
-                .map_or(false, |&s| self.inner.slots[s].is_some())
-            {
-                continue;
-            }
+        // Misses: predicted experts not already resident in VRAM.
+        let misses: Vec<usize> = predicted
+            .iter()
+            .copied()
+            .filter(|&e| {
+                !self
+                    .inner
+                    .key_to_slot
+                    .get(&(target_layer, e))
+                    .map_or(false, |&s| self.inner.slots[s].is_some())
+            })
+            .collect();
+        if misses.is_empty() {
+            return Ok(CopyBatchFence::noop());
+        }
 
-            // Free-slots-only: never evict for prefetch.
+        // Make room in ONE batched eviction: free the deficit between the misses
+        // and the current free slots by evicting the safest furthest-window
+        // victims — the just-computed "behind" layers (the double-buffer; the
+        // wave tail at the pinned boundary). One scan, not one per victim.
+        // Evicted experts are D2H'd to the pinned pool exactly as the demand-miss
+        // path does; their slots then join the free list for the load loop.
+        #[cfg(feature = "cuda")]
+        {
+            let need = misses.len().saturating_sub(self.inner.free_slots.len());
+            if need > 0 {
+                for (slot_idx, evicted_key, evicted_slot) in
+                    self.inner.evict_for_prefetch_batch(moe_layer_idx, need)
+                {
+                    if let (Some((evict_moe, evict_exp)), Some(slot)) = (evicted_key, evicted_slot)
+                    {
+                        // Pinned-pool full → evicted expert is lost; acceptable,
+                        // same as the demand-miss eviction path.
+                        let _ = self.evict_to_pinned(evict_moe, evict_exp, &slot);
+                    }
+                    self.inner.free_slots.push(slot_idx);
+                }
+            }
+        }
+
+        // Load each miss into a (now-provisioned) free slot. Stops early if the
+        // window couldn't supply enough room — the demand path loads the rest.
+        let mut loaded = 0usize;
+        for &expert_idx in &misses {
             let slot_idx = match self.inner.free_slots.pop() {
                 Some(s) => s,
-                None => break, // no headroom left — stop prefetching
+                None => break,
             };
 
             let expert_slot = {
                 #[cfg(feature = "cuda")]
                 {
-                    match self.load_from_pinned(next_moe_idx, expert_idx) {
+                    match self.load_from_pinned(target_layer, expert_idx) {
                         Ok(s) => s,
                         Err(_) => {
                             self.inner.free_slots.push(slot_idx);
@@ -1307,7 +1349,7 @@ impl PipelineState {
                 #[cfg(not(feature = "cuda"))]
                 {
                     let mmap_bytes: &[u8] = &self.mmap;
-                    let mmap_ref = &self.host_refs[next_moe_idx][expert_idx];
+                    let mmap_ref = &self.host_refs[target_layer][expert_idx];
                     match load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode) {
                         Ok(s) => s,
                         Err(_) => {
@@ -1319,16 +1361,16 @@ impl PipelineState {
             };
 
             self.inner
-                .install(slot_idx, next_moe_idx, expert_idx, expert_slot);
+                .install(slot_idx, target_layer, expert_idx, expert_slot);
 
             #[cfg(feature = "cuda")]
             {
-                self.expert_locations[next_moe_idx][expert_idx] = ExpertLocation::Vram { slot_idx };
+                self.expert_locations[target_layer][expert_idx] = ExpertLocation::Vram { slot_idx };
             }
 
             // Track for prediction-precision measurement — validated when the
             // next layer's work request arrives.
-            self.speculative_loads.insert((next_moe_idx, expert_idx));
+            self.speculative_loads.insert((target_layer, expert_idx));
             loaded += 1;
         }
 

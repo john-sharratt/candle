@@ -491,7 +491,7 @@ pub fn elevate_to_hot(
     // Aggregate summary — RUST_LOG=substrate::tier=info catches just
     // these lines without the per-item detail.
     if report.total() > 0 {
-        tracing::info!(
+        tracing::trace!(
             target: "candle_conversation::persistence::tier",
             already_hot = report.already_hot,
             warm_to_hot = report.warm_to_hot,

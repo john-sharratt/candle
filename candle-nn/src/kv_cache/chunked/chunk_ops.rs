@@ -1436,6 +1436,18 @@ impl ChunkedKvBacking {
         // it to the caller (immediately reused by
         // `resolve_block_ptrs_from_hgids` to skip its own arena walk).
         let arena_info: Vec<crate::kv_cache::arena_table::ResolvedArenaInfo>;
+        // Per-block snapshots (blk + frozen fields) for the resident-record build,
+        // captured under the state lock but built/uploaded AFTER it is released so
+        // the device upload never serializes the per-forward readers.
+        type RecordSrc = (
+            usize,
+            HeadGids,
+            std::sync::Arc<Vec<u8>>,
+            std::sync::Arc<Vec<u8>>,
+            std::sync::Arc<Vec<f32>>,
+            std::sync::Arc<Vec<f32>>,
+        );
+        let mut record_srcs: Vec<RecordSrc> = Vec::new();
         let mut per_spec_iter = per_spec_gids.into_iter();
         {
             let mut state = self
@@ -1485,6 +1497,57 @@ impl ChunkedKvBacking {
                 slot.update_gpu_chunks_bulk(&updated_blocks, n_kv_head, head_dim, &arena_info)?;
             }
             *gpu_push_us_out += t_gpu_push.elapsed().as_micros() as u64;
+
+            // Snapshot the frozen fields of each loaded chunk while we hold the
+            // lock; the actual record serialize + device upload happens below,
+            // off the lock.
+            if let Some(slot) = state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
+                for &blk in &updated_blocks {
+                    if let Some(cw) = slot.chunk_at(blk) {
+                        record_srcs.push((
+                            blk,
+                            cw.gids.clone(),
+                            cw.k_pal.clone(),
+                            cw.v_pal.clone(),
+                            cw.k_scale.clone(),
+                            cw.v_scale.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Build resident KV-head records at the loaded chunks' GPU placement.
+        // Cold-load (and warm→hot elevate that routes through here) is the point
+        // at which these sealed chunks become device-resident; building the record
+        // once here lets every subsequent reproject glue forward read it via
+        // `kvheads_ptr` instead of rebuilding heads per layer. Done OFF the state
+        // lock and as a single coalesced upload.
+        if !record_srcs.is_empty() {
+            let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = record_srcs
+                .iter()
+                .map(|(_, g, kp, vp, ks, vs)| {
+                    (
+                        g,
+                        kp.as_slice(),
+                        vp.as_slice(),
+                        ks.as_slice(),
+                        vs.as_slice(),
+                    )
+                })
+                .collect();
+            let metas = self.build_meta_records(&refs, &arena_info)?;
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
+                for ((blk, ..), meta) in record_srcs.iter().zip(metas) {
+                    if let Some(cw) = slot.chunk_at_mut(*blk) {
+                        cw.meta = meta;
+                    }
+                }
+            }
         }
         Ok((hgids_per_block, arena_info))
     }
@@ -1568,6 +1631,10 @@ impl ChunkedKvBacking {
                 })?;
                 Ok(SealedChunk {
                     gids: new_gids,
+                    // Demote (GPU→CPU): the CPU/warm tier has no device-resident
+                    // record, so drop the handle. The record is rebuilt at the
+                    // next elevate; while warm the chunk uses scratch heads.
+                    meta: None,
                     ..chunk.clone()
                 })
             })
@@ -1725,6 +1792,9 @@ impl ChunkedKvBacking {
                             .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
                         Ok(SealedChunk {
                             gids: mapped,
+                            // Demote (GPU→CPU): no device-resident record on the
+                            // CPU tier; the chunk uses scratch heads while warm.
+                            meta: None,
                             ..chunk.clone()
                         })
                     })
@@ -1960,6 +2030,9 @@ impl ChunkedKvBacking {
                             .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
                         Ok(SealedChunk {
                             gids: mapped,
+                            // Demote (GPU→CPU): no device-resident record on the
+                            // CPU tier; the chunk uses scratch heads while warm.
+                            meta: None,
                             ..chunk.clone()
                         })
                     })
@@ -2260,24 +2333,49 @@ impl ChunkedKvBacking {
         drop(staging);
 
         // ── Phase 6: rebuild SealedSequences with mapped GIDs ──────────
+        // Warm→hot elevate rebuilds each chunk's resident KV-head record at its
+        // new GPU placement, batched per sequence (one coalesced upload), so a
+        // subsequent reproject glue forward reads it instead of rebuilding heads.
         sequences
             .iter()
             .map(|seq| -> candle::Result<SealedSequence> {
-                let new_chunks: candle::Result<Vec<SealedChunk>> = seq
+                let mapped: Vec<HeadGids> = seq
                     .chunks
                     .iter()
                     .map(|chunk| {
-                        let mapped = chunk
+                        chunk
                             .gids
-                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))?;
-                        Ok(SealedChunk {
-                            gids: mapped,
-                            ..chunk.clone()
-                        })
+                            .map_unique(|gid| Ok(new_gids[&gid.raw()].clone()))
+                    })
+                    .collect::<candle::Result<_>>()?;
+                let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = seq
+                    .chunks
+                    .iter()
+                    .zip(&mapped)
+                    .map(|(chunk, m)| {
+                        (
+                            m,
+                            chunk.k_pal.as_slice(),
+                            chunk.v_pal.as_slice(),
+                            chunk.k_scale.as_slice(),
+                            chunk.v_scale.as_slice(),
+                        )
+                    })
+                    .collect();
+                let metas = self.build_meta_records(&refs, &gpu_arena_info)?;
+                let new_chunks: Vec<SealedChunk> = seq
+                    .chunks
+                    .iter()
+                    .zip(mapped)
+                    .zip(metas)
+                    .map(|((chunk, m), meta)| SealedChunk {
+                        gids: m,
+                        meta,
+                        ..chunk.clone()
                     })
                     .collect();
                 Ok(SealedSequence {
-                    chunks: new_chunks?,
+                    chunks: new_chunks,
                     token_count: seq.token_count,
                     chunk_size: seq.chunk_size,
                     location: ArenaLocation::Gpu,
@@ -2313,6 +2411,11 @@ impl ChunkedKvBacking {
                 })?;
                 Ok(SealedChunk {
                     gids: new_gids,
+                    // Single-sequence elevate keeps meta=None by design — the
+                    // batched elevate (`migrate_sealed_to_gpu_batch_async`) is the
+                    // one that rebuilds the resident record. This rarely-used path
+                    // uses per-forward scratch heads at the new placement.
+                    meta: None,
                     ..chunk.clone()
                 })
             })
@@ -3012,6 +3115,8 @@ mod tests {
                 .expect("F16 → GPU R16 migrate must succeed");
             r16_chunks.push(SealedChunk {
                 gids: new_gids,
+                // Re-placed bytes → drop the resident record (scratch fallback).
+                meta: None,
                 ..chunk.clone()
             });
         }
@@ -3110,6 +3215,8 @@ mod tests {
                 .expect("Float → GPU Q8_0 migrate must succeed for fused path");
             quant_chunks.push(SealedChunk {
                 gids: new_gids,
+                // Re-placed bytes → drop the resident record (scratch fallback).
+                meta: None,
                 ..chunk.clone()
             });
         }

@@ -94,6 +94,7 @@ pub mod persimmon;
 pub mod phi;
 pub mod phi3;
 pub mod pixtral;
+pub mod prefill_capture;
 pub mod prefill_utils;
 pub mod profile;
 pub mod quantized_blip;

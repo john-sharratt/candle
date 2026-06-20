@@ -1,22 +1,20 @@
 //! The §6 summary probe — slot recipe + runner abstraction.
 //!
 //! A "summary probe" is the §6 forward-continuation that produces a
-//! summary turn over a set of children K/V chunks:
+//! summary turn over a set of children:
 //!
 //! ```text
 //!     ┌─────────────────────────────────────────────────────────┐
-//!     │  Synthetic "summariser" system section (pinned)          │
-//!     ├─────────────────────────────────────────────────────────┤
-//!     │  inject_sealed_at_tail: child K/V chunks                 │
+//!     │  "summariser" system prompt + the children's text        │
 //!     ├─────────────────────────────────────────────────────────┤
 //!     │  Prefill:  "Summarise the above turns."                  │
-//!     │  Decode:   structured-JSON summary content               │
+//!     │  Decode:   plain prose summary                           │
 //!     └─────────────────────────────────────────────────────────┘
 //!                              │
 //!                              ▼
 //!     A new substrate turn is sealed with `kind = SummaryOfTurns`
-//!     (or `SummaryOfSummaries`), carrying the decoded content + the
-//!     Q sign-bits captured during decode.
+//!     (or `SummaryOfSummaries`), carrying the decoded prose summary's
+//!     K/V (so a later projection can inject it).
 //! ```
 //!
 //! The probe execution itself happens on the GPU via the scheduler.
@@ -102,22 +100,26 @@ pub trait ProbeRunner: Send + Sync + 'static {
     /// `sealed_turn` MUST refer to a substrate turn the summariser
     /// can immediately attach tree metadata to.
     fn run(&self, request: ProbeRequest) -> Result<ProbeResponse, ProbeError>;
+
+    /// Execute several probes with as much concurrency as the runner
+    /// supports, returning results in request order.  The scheduler-backed
+    /// runner submits them all up front so their decodes batch together in
+    /// the wave loop; the default is a serial fallback for runners (mock)
+    /// that have no concurrency.
+    fn run_batch(&self, requests: Vec<ProbeRequest>) -> Vec<Result<ProbeResponse, ProbeError>> {
+        requests.into_iter().map(|r| self.run(r)).collect()
+    }
 }
 
 /// Standard "summariser" system prompt text — the §6.1 recipe's
-/// `①` block.  Tokenised once at engine init and pinned as a
-/// substrate section so every probe replays it as a cached prefix
-/// (zero per-probe cost).
+/// `①` block, prefixed to every probe's prefill.
 ///
-/// The prompt mandates exact JSON output; the structured-output
-/// grammar enforces it on the sampling side.  Kept short so the
-/// pinned section's K/V is cheap.
+/// Plain prose output: the probe decodes the summary like any normal
+/// assistant turn and seals it. Kept short so the prefill is cheap.
 pub const SUMMARISER_SYSTEM_PROMPT: &str =
-    "You are a summariser.  Read the turns above and produce a one-line digest.  \
-     Output JSON only, in exactly one of these shapes:\n\
-     {\"coherent\": true, \"summary\": \"<one-line digest of the turns>\"}\n\
-     {\"coherent\": false, \"split_at\": <index of the first turn of the new topic>}\n\
-     Default to coherent=true unless the turns clearly span unrelated topics.";
+    "You are a summariser. Read the conversation turns above and write a concise prose \
+     summary of what was discussed, asked, and decided. Write two to four plain sentences. \
+     Do not add headings, lists, commentary, or quotation — just the summary itself.";
 
 #[cfg(test)]
 mod tests {
@@ -134,9 +136,11 @@ mod tests {
     }
 
     #[test]
-    fn summariser_prompt_demands_json() {
-        assert!(SUMMARISER_SYSTEM_PROMPT.contains("JSON"));
-        assert!(SUMMARISER_SYSTEM_PROMPT.contains("coherent"));
-        assert!(SUMMARISER_SYSTEM_PROMPT.contains("split_at"));
+    fn summariser_prompt_is_prose() {
+        // Prose, not structured output: no JSON / schema framing.
+        assert!(!SUMMARISER_SYSTEM_PROMPT.contains("JSON"));
+        assert!(!SUMMARISER_SYSTEM_PROMPT.contains("coherent"));
+        assert!(!SUMMARISER_SYSTEM_PROMPT.contains("split_at"));
+        assert!(SUMMARISER_SYSTEM_PROMPT.contains("summar"));
     }
 }

@@ -41,6 +41,8 @@ pub use arena_table::{
 };
 pub use cache::{Cache, CacheIntegrityResult, KvCache};
 #[cfg(feature = "cuda")]
+pub use chunked::migrate::HostSealedChunk;
+#[cfg(feature = "cuda")]
 pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 #[cfg(feature = "cuda")]
@@ -50,7 +52,8 @@ pub use chunked::sampled_selection::SampleFormat;
 pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::{
-    arena_chunks_for_format, arena_gid_stride, SealedChunk, SealedSequence, WriterTail, CHUNK_SIZE,
+    arena_chunks_for_format, arena_gid_stride, MetaGid, SealedChunk, SealedSequence, WriterTail,
+    CHUNK_SIZE,
 };
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};

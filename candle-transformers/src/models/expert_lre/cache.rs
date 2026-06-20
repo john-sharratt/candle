@@ -41,6 +41,14 @@ use std::collections::HashMap;
 /// negligible fraction of the 2,805 slot budget.
 pub(crate) const PINNED_LAYERS: usize = 3;
 
+/// How many of the furthest (just-behind, wrapping) layers are eligible as
+/// prefetch make-room victims. Caps how far back eviction reaches from the
+/// current layer (`current-1 .. current-PREFETCH_EVICT_WINDOW`), keeping it off
+/// the near-future layers about to be used. At the pinned boundary this window
+/// lands on the wave's tail. See [`ExpertCacheInner::evict_for_prefetch_batch`].
+#[cfg(any(feature = "cuda", test))]
+pub(crate) const PREFETCH_EVICT_WINDOW: usize = 5;
+
 /// Mutable bookkeeping owned exclusively by the pipeline thread (threaded
 /// mode) or the Mutex (inline mode).
 ///
@@ -261,6 +269,80 @@ impl ExpertCacheInner {
         Ok((victim, evicted_key, evicted_slot))
     }
 
+    /// Free one slot to make room for a *prefetch*, choosing the safest victim
+    /// among the **furthest** non-pinned layers.
+    ///
+    /// "Furthest" is relative with wraparound: forward distance is largest for
+    /// the just-executed layer `current-1`, then `current-2`, … (the existing
+    /// `slot_eviction_score` metric). Only the [`PREFETCH_EVICT_WINDOW`] furthest
+    /// layers are eligible, so eviction never reaches the near-future layers
+    /// about to be used — it stays within ~`current-1 .. current-PREFETCH_EVICT_WINDOW`
+    /// (wrapping; at the pinned boundary that lands on the wave's tail).
+    ///
+    /// Within that window the choice is **frequency-dominated**: the
+    /// least-used expert goes first (a never-used `L-3` is evicted before a hot
+    /// `L-1`), then the farther one, then the LRU. Repeated calls therefore
+    /// spread evictions across the window rather than draining one layer.
+    ///
+    /// Returns up to `count` `(slot_idx, evicted_key, evicted_slot)` tuples (like
+    /// [`Self::allocate_slot`]), fewer when the window is exhausted, empty if no
+    /// eligible expert is resident.
+    ///
+    /// Batched on purpose: it scans the slot table **once** and partial-sorts the
+    /// eligible candidates, rather than rescanning per victim. A dense prefill
+    /// prefetch needs a whole layer's worth of slots, so the per-victim rescan
+    /// would be O(slots × experts-per-layer) of pure CPU per layer.
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn evict_for_prefetch_batch(
+        &mut self,
+        current_layer: usize,
+        count: usize,
+    ) -> Vec<(usize, Option<(usize, usize)>, Option<ExpertSlot>)> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let n = self.num_moe_layers;
+        let min_dist = n.saturating_sub(PREFETCH_EVICT_WINDOW);
+        // One scan: collect eligible (in-window, non-pinned) candidates with
+        // their sort keys.
+        let mut cands: Vec<(usize, f32, usize, u32)> = self
+            .slot_to_key
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, key)| {
+                key.and_then(|(layer, expert)| {
+                    if layer < PINNED_LAYERS {
+                        return None;
+                    }
+                    let dist = if layer >= current_layer {
+                        layer - current_layer
+                    } else {
+                        n - current_layer + layer
+                    };
+                    if dist < min_dist {
+                        return None; // too near — protect the upcoming layers
+                    }
+                    Some((idx, self.score(layer, expert), dist, self.last_used[idx]))
+                })
+            })
+            .collect();
+        // Best victims first: least-used, then farthest, then LRU.
+        cands.sort_by(|&(_, sa, da, la), &(_, sb, db, lb)| {
+            sa.partial_cmp(&sb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(db.cmp(&da))
+                .then(la.cmp(&lb))
+        });
+        cands.truncate(count);
+        cands
+            .into_iter()
+            .map(|(idx, _, _, _)| {
+                let (key, slot) = self.evict(idx);
+                (idx, key, slot)
+            })
+            .collect()
+    }
+
     /// Evict the bottom `fraction` of occupied slots by eviction score.
     ///
     /// Called at the end of each forward pass (after the last MoE layer)
@@ -400,6 +482,98 @@ mod tests {
             inner.key_to_slot.contains_key(&(1, 100)),
             "pinned layer was evicted"
         );
+    }
+
+    #[test]
+    fn prefetch_evict_is_frequency_dominated_in_window() {
+        // current=10, n=48, window=5 → eligible layers 5..9 (the 5 just-behind).
+        // A never-used expert at L-3 (layer 7) is evicted before a hot expert at
+        // the furthest L-1 (layer 9): usage dominates distance.
+        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        occupy(&mut inner, 0, 9, 100, 5, 8.0); // L-1, furthest, but hot
+        occupy(&mut inner, 1, 7, 102, 5, 0.0); // L-3, never used
+        occupy(&mut inner, 2, 30, 103, 5, 9.0); // out of window (dist 20)
+        let (slot, key, _) = inner
+            .evict_for_prefetch_batch(10, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(key, Some((7, 102)), "never-used L-3 evicted over hot L-1");
+        assert_eq!(slot, 1);
+    }
+
+    #[test]
+    fn prefetch_evict_prefers_farther_among_equally_cold() {
+        // Two never-used experts in-window → the farther (L-1) goes first.
+        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1 (dist 47), cold
+        occupy(&mut inner, 1, 6, 101, 5, 0.0); // L-4 (dist 44), cold
+        let (_, key, _) = inner
+            .evict_for_prefetch_batch(10, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(key, Some((9, 100)), "farther of two cold experts evicted");
+    }
+
+    #[test]
+    fn prefetch_evict_protects_near_future_even_if_unused() {
+        // current=10, window=5: a never-used near-future expert (layer 12, dist 2)
+        // is OUT of window and must be protected; only the in-window (hot) expert
+        // is eligible.
+        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        occupy(&mut inner, 0, 12, 200, 5, 0.0); // near-future, never used — protected
+        occupy(&mut inner, 1, 8, 201, 5, 9.0); // L-2, in window, hot
+        let (_, key, _) = inner
+            .evict_for_prefetch_batch(10, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            key,
+            Some((8, 201)),
+            "near-future layer never evicted for prefetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_evict_at_pinned_boundary_lands_on_tail() {
+        // current=2, n=62, window=5: the window (L-1..L-5 = layers 1,0,61,60,59)
+        // has only the tail layers 59..61 non-pinned. A never-used near-future
+        // layer (5, dist 3) is out of window and protected.
+        let mut inner = ExpertCacheInner::new(4, 62, 128);
+        occupy(&mut inner, 0, 61, 100, 5, 1.0); // tail, in window
+        occupy(&mut inner, 1, 5, 101, 5, 0.0); // near-future (dist 3), protected
+        let (_, key, _) = inner
+            .evict_for_prefetch_batch(2, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(key, Some((61, 100)), "pinned boundary evicts the tail");
+    }
+
+    #[test]
+    fn prefetch_evict_batch_returns_victims_in_priority_order() {
+        // One scan yields multiple victims, best-first: equally-cold L-1 then L-2;
+        // the hot L-3 is left resident. Exercises the dense double-buffer path.
+        let mut inner = ExpertCacheInner::new(4, 48, 128);
+        occupy(&mut inner, 0, 9, 100, 5, 0.0); // L-1, cold
+        occupy(&mut inner, 1, 8, 101, 5, 0.0); // L-2, cold
+        occupy(&mut inner, 2, 7, 102, 5, 5.0); // L-3, hot — kept
+        let victims = inner.evict_for_prefetch_batch(10, 2);
+        assert_eq!(victims.len(), 2);
+        assert_eq!(victims[0].1, Some((9, 100)));
+        assert_eq!(victims[1].1, Some((8, 101)));
+        assert!(inner.key_to_slot.contains_key(&(7, 102)), "hot expert kept");
+    }
+
+    #[test]
+    fn prefetch_evict_none_when_all_pinned() {
+        let mut inner = ExpertCacheInner::new(3, 48, 128);
+        occupy(&mut inner, 0, 0, 100, 1, 0.0);
+        occupy(&mut inner, 1, 1, 101, 2, 0.0);
+        occupy(&mut inner, 2, 2, 102, 3, 0.0);
+        assert!(inner.evict_for_prefetch_batch(5, 1).is_empty());
     }
 
     #[test]

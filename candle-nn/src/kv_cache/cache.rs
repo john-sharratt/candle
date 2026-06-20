@@ -382,6 +382,41 @@ impl Cache {
         }
     }
 
+    /// Gather this slot's live sealed chunks off the GPU into portable host
+    /// [`HostSealedChunk`]s — used by the prefill-capture fixture tooling to
+    /// snapshot the cached KV a kernel call attends. Returns `None` for
+    /// contiguous caches or when the slot has no live chunks.
+    #[cfg(feature = "cuda")]
+    pub fn chunked_dump_sealed_to_host(
+        &self,
+        device: &candle::Device,
+    ) -> Option<candle::Result<Vec<super::HostSealedChunk>>> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => {
+                let arena_info = match c.backing.resolve_arena_info() {
+                    Ok(a) => a,
+                    Err(e) => return Some(Err(e)),
+                };
+                let chunks = c.backing.live_chunks_as_sealed(c.batch_idx, &arena_info)?;
+                Some(c.backing.dump_sealed_to_host(&chunks, device))
+            }
+            CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
+    /// Like [`Self::chunked_live_chunks_as_sealed`] but reuses an already-resolved
+    /// `arena_info` instead of resolving it again — the caller (e.g.
+    /// `build_slot_headers`) resolves it once per forward and passes it per cache.
+    pub fn chunked_live_chunks_as_sealed_with(
+        &self,
+        arena_info: &[super::ResolvedArenaInfo],
+    ) -> Option<Vec<super::SealedChunk>> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.live_chunks_as_sealed(c.batch_idx, arena_info),
+            CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
     /// First chunk index that is writer-owned for the slot bound to
     /// this cache.  Chunks before this index are Arc-shared with
     /// substrate/parent and immutable; chunks at or after it are
@@ -393,6 +428,15 @@ impl Cache {
         match &self.storage {
             CacheStorage::Chunked(c) => c.backing.writer_start_idx_for_seq(c.batch_idx),
             CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
+    /// Device address of a resident KV-head record (for a slice's `kvheads_ptr`).
+    /// `0` if there is no chunked backing or no device residence (CPU pool).
+    pub fn chunked_meta_device_addr(&self, meta: &super::MetaGid) -> u64 {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.meta_device_addr(meta),
+            CacheStorage::Contiguous { .. } => 0,
         }
     }
 

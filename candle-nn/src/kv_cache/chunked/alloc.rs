@@ -596,6 +596,9 @@ impl ChunkedKvBacking {
             v_pal: self.inner.identity_pal.clone(),
             k_scale: self.inner.identity_scale.clone(),
             v_scale: self.inner.identity_scale.clone(),
+            // Fresh float writer chunk: transient, no resident record. The host
+            // serializer builds per-forward scratch heads for it.
+            meta: None,
         })
     }
 

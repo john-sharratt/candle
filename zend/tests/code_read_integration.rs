@@ -4,7 +4,7 @@
 //! Each file becomes ONE conversation:
 //!
 //!   * one prefill turn per carved part —
-//!       user      : "Read `X` lines N-M."
+//!       user      : "Source excerpt — `X` lines N-M:"
 //!       assistant : `<tool_call>{...}</tool_call>\n<tool_response>...`
 //!   * one final DECODED turn —
 //!       user      : "Summarize the entire file `X` in no more than 200 words…"
@@ -91,7 +91,7 @@ fn code_read_summary_is_the_last_turn_and_only_decode() {
     for (user, _, decoded) in &sink.turns[..sink.turns.len() - 1] {
         assert!(!decoded, "part turns are prefills, not decodes");
         assert!(
-            user.starts_with("Read `src/lib.rs` lines "),
+            user.starts_with("Source excerpt — `src/lib.rs` lines "),
             "part user prompt reads a line range, got: {user:?}"
         );
         assert!(
@@ -149,8 +149,8 @@ fn code_read_part_assistant_is_tool_response_with_fenced_code() {
     assert!(tr.1.contains("```rust"));
     assert!(tr.1.contains("pub fn two() {"));
     assert!(tr.1.contains("let x = 42;"));
-    // The part-read user prompt is the plain line-range instruction.
-    assert!(tr.0.starts_with("Read `src/lib.rs` lines "));
+    // The part-read user prompt is the labelled excerpt header.
+    assert!(tr.0.starts_with("Source excerpt — `src/lib.rs` lines "));
 }
 
 #[test]
@@ -212,12 +212,12 @@ fn code_read_falls_back_to_fixed_window_on_unknown_language() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    // Part reads start with "Read"; the trailing summary starts with
-    // "Summarize", so it's excluded from the window count.
+    // Part reads start with "Source excerpt"; the trailing summary starts
+    // with "Summarize", so it's excluded from the window count.
     let part_reads: Vec<&str> = sink
         .turns
         .iter()
-        .filter(|(u, _, _)| u.contains("notes.txt") && u.starts_with("Read"))
+        .filter(|(u, _, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
         .map(|(u, _, _)| u.as_str())
         .collect();
     assert!(

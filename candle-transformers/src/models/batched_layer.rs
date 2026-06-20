@@ -18,8 +18,7 @@ use candle_nn::kv_cache::KvCache;
 use crate::models::prefill_utils::paged_decode_attn;
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn_q8;
-use crate::models::prefill_utils::paged_prefill_batched;
-use crate::models::prefill_utils::paged_prefill_batched_gap_fill;
+use crate::models::prefill_utils::{paged_glue_attn, paged_prefill_batched, SharedPm};
 use crate::models::profile::{pipeline_record, profile_now, profile_sync};
 use crate::models::quantized_matmul::QMatMul;
 use crate::utils::repeat_kv;
@@ -83,6 +82,11 @@ pub struct BatchedAttentionParams<'a> {
     /// Pinned-stager generation guard for quantization kernel metadata allocations.
     /// Threaded from forward_batched through to reconcile → quantize_palette4_convert_buffered.
     pub generation: &'a Generation,
+    /// Per-forward cache of the layer-invariant prefill `position_map`. The first
+    /// layer of a prefill forward populates it; later layers reuse the uploaded
+    /// buffer instead of rebuilding + re-uploading it. Empty (`None`) at forward
+    /// start; unused on the decode and CPU paths.
+    pub shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
 }
 
 impl<'a> BatchedAttentionParams<'a> {
@@ -99,6 +103,7 @@ impl<'a> BatchedAttentionParams<'a> {
         decode_headers: DecodeHeaders,
         q_lens: &'a [usize],
         generation: &'a Generation,
+        shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
     ) -> Self {
         Self {
             rope_cos: cos,
@@ -109,35 +114,35 @@ impl<'a> BatchedAttentionParams<'a> {
             decode_headers,
             q_lens,
             generation,
+            shared_prefill_pm,
         }
     }
+}
+
+/// Reprojection-glue metadata. Present only when the multi-token forward is a
+/// gap-fill (glue) pass: it routes the layer's attention to the paged-glue
+/// kernel instead of plain prefill. `col_actual_pos` is the flat `[Σ kv_lens]`
+/// U32 of every column's TRUE sequence position (sealed prefix ++ glue), in
+/// `cu_seqlens_q` slot order — the kernel masks + RoPEs by logical position so
+/// scattered glue islands attend only logically-earlier columns.
+#[derive(Clone)]
+pub struct GlueMeta {
+    pub col_actual_pos: Tensor,
 }
 
 /// Precomputed metadata for paged prefill attention.
 ///
 /// This avoids rebuilding the same small tensors (cu_seqlens, q_lens, kv_lens)
 /// for every layer during multi-token prefill.
-/// GAP_FILL descriptor: routes a prefill through the gap-fill kernel. Sealed
-/// content is the (packed) contiguous prefix; all glue is the new region,
-/// appended as the writer tail. `col_actual_pos` relabels every column with its
-/// TRUE sequence position so each glue token attends only logically-earlier
-/// columns (sealed or glue) regardless of physical packing order. The resulting
-/// `[sealed | glue]` slot decodes correctly because attention is order-invariant
-/// over keys and the glue K/V already carries its logical RoPE.
-#[derive(Clone)]
-pub struct GapFillDescriptor {
-    /// Flat (per-slot kv_len) array of each column's TRUE sequence position.
-    pub col_actual_pos: std::sync::Arc<Vec<u32>>,
-}
-
 #[derive(Clone)]
 pub struct BatchedPrefillMeta {
     pub cu_seqlens_q: Tensor,
     pub q_lens: Tensor,
     pub kv_lens: Tensor,
     pub has_prefix: bool,
-    /// `Some` → run the gap-fill kernel with this descriptor; `None` = normal.
-    pub gap_fill: Option<GapFillDescriptor>,
+    /// Set when this prefill is a reprojection-glue forward (HD128 routes to the
+    /// paged-glue kernel). `None` for an ordinary prefill.
+    pub glue: Option<GlueMeta>,
 }
 
 impl BatchedPrefillMeta {
@@ -193,15 +198,8 @@ impl BatchedPrefillMeta {
             q_lens: q_lens_t,
             kv_lens,
             has_prefix,
-            gap_fill: None,
+            glue: None,
         })
-    }
-
-    /// Attach the GAP_FILL descriptor — routes this prefill through the gap-fill
-    /// kernel.
-    pub fn with_gap_fill(mut self, desc: GapFillDescriptor) -> Self {
-        self.gap_fill = Some(desc);
-        self
     }
 }
 
@@ -452,12 +450,15 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
         )?;
         Ok(ret)
     } else {
-        let (prefill_meta, gap_fill) = match &params.decode_headers {
-            DecodeHeaders::Prefill(m) => (
-                Some((&m.cu_seqlens_q, &m.q_lens, &m.kv_lens, m.has_prefix)),
-                m.gap_fill.as_ref(),
-            ),
-            _ => (None, None),
+        let prefill_meta = match &params.decode_headers {
+            DecodeHeaders::Prefill(m) => {
+                Some((&m.cu_seqlens_q, &m.q_lens, &m.kv_lens, m.has_prefix))
+            }
+            _ => None,
+        };
+        let glue_meta = match &params.decode_headers {
+            DecodeHeaders::Prefill(m) => m.glue.as_ref(),
+            _ => None,
         };
         let ret = forward_attn_batched_multi(
             layer,
@@ -469,10 +470,11 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
             params.rope_sin,
             params.rope_interleaved,
             prefill_meta,
+            glue_meta,
             params.rope_cs,
             write_offset_shifts_ptr,
             params.generation,
-            gap_fill,
+            params.shared_prefill_pm,
         )?;
         Ok(ret)
     }
@@ -625,10 +627,11 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     sin: &Tensor,
     rope_interleaved: bool,
     prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    glue_meta: Option<&GlueMeta>,
     rope_cs: &Tensor,
     write_offset_shifts_ptr: u64,
     generation: &Generation,
-    gap_fill: Option<&GapFillDescriptor>,
+    shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<TensorCat> {
     // The flat-packed activation has leading dim 1 (x.len() == 1), so validate
     // against the sequence count carried by q_lens instead.
@@ -710,9 +713,30 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     truncate_caches_to_offset(caches, offsets);
 
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
-    // Flat attention output: [total_q, n_head, head_dim].
-    let out_packed = if let Some(desc) = gap_fill {
-        paged_prefill_batched_gap_fill(
+    // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
+    // forward (HD128, chunked) routes to the paged-glue kernel — it streams the
+    // quantized prefix once and reuses it across all glue rows (dequant-once),
+    // masking by TRUE sequence position via `col_actual_pos`. Everything else
+    // (ordinary prefill, non-128 head dims) stays on the plain prefill kernel.
+    let out_packed = match glue_meta {
+        Some(g) if is_cuda_paged && head_dim == 128 => paged_glue_attn(
+            caches,
+            offsets,
+            &q,
+            &k,
+            &v,
+            n_seqs,
+            q_lens,
+            n_head,
+            n_kv_head,
+            head_dim,
+            prefill_meta,
+            &g.col_actual_pos,
+            rope_cs,
+            rope_interleaved,
+            generation,
+        )?,
+        _ => paged_prefill_batched(
             caches,
             offsets,
             &q,
@@ -729,27 +753,8 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             rope_interleaved,
             write_offset_shifts_ptr,
             generation,
-            &desc.col_actual_pos,
-        )?
-    } else {
-        paged_prefill_batched(
-            caches,
-            offsets,
-            &q,
-            &k,
-            &v,
-            n_seqs,
-            q_lens,
-            n_head,
-            n_kv_head,
-            head_dim,
-            prefill_meta,
-            &rope_zeros,
-            rope_cs,
-            rope_interleaved,
-            write_offset_shifts_ptr,
-            generation,
-        )?
+            shared_pm,
+        )?,
     };
 
     // Project per-token: [total_q, n_head*head_dim] -> [total_q, hidden_out].

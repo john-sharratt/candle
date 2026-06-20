@@ -129,7 +129,7 @@ mod cuda_impl {
     ) -> Result<Vec<ChunkImage>> {
         use crate::persistence::record::ChunkPayload;
 
-        let ptrs = backing.resolve_sealed_chunk_ptrs(seq)?;
+        let ptrs = backing.resolve_sealed_chunk_ptrs(&seq.chunks)?;
         let blob = gather_chunks(device, &ptrs)?;
         let mut cursor = 0usize;
         let mut images = Vec::with_capacity(seq.chunks.len());

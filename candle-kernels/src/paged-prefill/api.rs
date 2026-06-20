@@ -30,13 +30,6 @@ extern "C" {
         rope_cs: *const f32,
         rope_interleaved: i32,
         write_offset_shifts: *const u32,
-        // GAP_FILL: gap_fill flag + sealed/glue descriptors. Pass gap_fill=0
-        // and nullptrs for the normal contiguous-prefill path.
-        gap_fill: i32,
-        col_actual_pos: *const u32,
-        cu_kvlens: *const u32,
-        glue_write_slice: *const u32,
-        glue_write_in_blk: *const u32,
         stream: *mut c_void,
     );
 }
