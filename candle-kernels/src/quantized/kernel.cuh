@@ -66,6 +66,7 @@ struct YTiles {
 #include "loader/gemx_dequant.cuh"  // gemx_dequant_traits base template
 #include "mma_dequant.cuh"
 #include "../dequant/dequant.cuh"
+#include "../mma/mma_wrappers.cuh"  // fused_attn INT8 MMA wrappers + frag loaders (grouped_tc int8 path)
 
 // =============================================================================
 // FORWARD DECLARATIONS - Optimized standalone dequant functions
@@ -726,9 +727,23 @@ __device__ __forceinline__ void final_output_tc(
 namespace tc_common {
 
 // Configuration constants shared by s16_tc and sN_tc
-constexpr int BATCH_TILE = 16;      // 16 batches per MMA (M dimension)
+constexpr int BATCH_TILE = 16;      // 16 batches per MMA (M dimension) — FP16 path
+// INT8 path token tile. N_SUBTILES_I8 = BATCH_TILE_I8/16 m16 token sub-tiles run per
+// weight load, the weight k-block staged ONCE in smem and reused across them. At 16
+// (single sub-tile) this is the plain per-tile schedule; at 32 it trades doubled
+// activation smem for halved weight-L2 re-reads — a net win only when the weight bytes
+// dominate (measured: Q8 only; light formats regress on the occupancy hit). Only the int8
+// impl/entries use this constant directly; the dense grid (dispatcher.cu) and the MoE
+// tiler (cuda.rs grouped_matmul_gemx_q8a128) carry the matching token count as literals —
+// keep all three in sync. FP16 stays at BATCH_TILE = 16.
+constexpr int BATCH_TILE_I8 = 16;
+constexpr int N_SUBTILES_I8 = BATCH_TILE_I8 / 16;  // m16 token sub-tiles per block
 constexpr int N_TILE = 32;          // 32 rows per block (4 warps × 8 rows)
 constexpr int K_TILE = 128;         // K/128 block size
+// INT8 activation smem row stride: K_TILE + 16B pad. The pad shifts each row's bank
+// by 4 (stride 144B → (144/4)%32 = 4) so the 8 rows ldmatrix reads per tile land in
+// distinct banks — conflict-free, the int8 analogue of the FP path's K_STRIDE pad.
+constexpr int KI8_STRIDE = K_TILE + 16;
 constexpr int MMA_M = 16;
 constexpr int MMA_N = 8;
 constexpr int MMA_K = 16;
@@ -972,6 +987,33 @@ __device__ __forceinline__ void cp_async_wait_all() {
 template<int N>
 __device__ __forceinline__ void cp_async_wait_group() {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+// 16-byte cg cp.async (global → shared). The q8a128 qs is 16-aligned within its
+// block, so each thread's chunk is a single wide async copy.
+__device__ __forceinline__ void cp_async_cg16(void* sdst, const void* gsrc) {
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(sdst))), "l"(gsrc));
+}
+
+// 16-byte ca cp.async (global → shared) — caches the line in L1 as well as L2.
+// Used for activations: each expert-token-tile's activation is re-read by every
+// row-tile block (grid.y), so keeping it L1-resident turns those re-reads into L1
+// hits instead of L2 traffic. (The .cg variant bypasses L1 and made the int8 path
+// L2-bandwidth-bound while the LDG-based FP path stayed DRAM-bound.) Weights keep
+// .cg: they are streamed with little intra-SM reuse and would only thrash L1.
+__device__ __forceinline__ void cp_async_ca16(void* sdst, const void* gsrc) {
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(sdst))), "l"(gsrc));
+}
+
+// 4-byte ca cp.async (global → shared) — for the per-token activation (scale,sum) half2.
+__device__ __forceinline__ void cp_async_ca4(void* sdst, const void* gsrc) {
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(sdst))), "l"(gsrc));
 }
 
 // Legacy sync load for fallback (pre-Ampere)
@@ -1650,6 +1692,47 @@ __device__ __forceinline__ void load_activations_runtime(
     }
 }
 
+// Shared tile-output store: the accumulated frag_c[4] → dst for the two token
+// rows (b0, b1) this lane owns, at columns out_row / out_row+1. The (batch,row)
+// mapping is identical for the FP and INT8 grouped impls, so both call this.
+template <typename output_t>
+__device__ __forceinline__ void store_tile_output(
+    output_t* __restrict__ dst, const float frag_c[4],
+    int dst_stride, int warp_row_base, int b_start, int b_cnt, int lane)
+{
+    const int groupID = lane / 4;
+    const int threadID_in_group = lane % 4;
+    const int out_row = warp_row_base + threadID_in_group * 2;
+    const int bend = b_start + b_cnt;
+    const int b0 = b_start + groupID;
+    const int b1 = b_start + groupID + 8;
+
+    if (b0 < bend) {
+        if constexpr (std::is_same_v<output_t, float>) {
+            *reinterpret_cast<float2*>(&dst[b0 * dst_stride + out_row]) = make_float2(frag_c[0], frag_c[1]);
+        } else if constexpr (std::is_same_v<output_t, half>) {
+            *reinterpret_cast<half2*>(&dst[b0 * dst_stride + out_row]) = __floats2half2_rn(frag_c[0], frag_c[1]);
+        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
+            *reinterpret_cast<__nv_bfloat162*>(&dst[b0 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[0], frag_c[1]);
+        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
+            dst[b0 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[0]);
+            dst[b0 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[1]);
+        }
+    }
+    if (b1 < bend) {
+        if constexpr (std::is_same_v<output_t, float>) {
+            *reinterpret_cast<float2*>(&dst[b1 * dst_stride + out_row]) = make_float2(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, half>) {
+            *reinterpret_cast<half2*>(&dst[b1 * dst_stride + out_row]) = __floats2half2_rn(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
+            *reinterpret_cast<__nv_bfloat162*>(&dst[b1 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[2], frag_c[3]);
+        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
+            dst[b1 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[2]);
+            dst[b1 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[3]);
+        }
+    }
+}
+
 // One (expert-tile, row-tile): MMA over K for up to 16 tokens × 32 rows.
 // Identical inner loop to s16_tc::tc16_kernel_impl, but the weight pointer is
 // the per-expert pointer and the batch slice is [b_start, b_start+b_cnt).
@@ -1706,59 +1789,253 @@ __device__ void grouped_matmul_impl(
         __syncthreads();
     }
 
-    const int groupID = lane / 4;
-    const int threadID_in_group = lane % 4;
-    const int out_row = warp_row_base + threadID_in_group * 2;
-    const int bend = b_start + b_cnt;
-    const int b0 = b_start + groupID;
-    const int b1 = b_start + groupID + 8;
+    store_tile_output<output_t>(dst, frag_c, dst_stride, warp_row_base, b_start, b_cnt, lane);
+}
 
-    if (b0 < bend) {
-        if constexpr (std::is_same_v<output_t, float>) {
-            *reinterpret_cast<float2*>(&dst[b0 * dst_stride + out_row]) = make_float2(frag_c[0], frag_c[1]);
-        } else if constexpr (std::is_same_v<output_t, half>) {
-            *reinterpret_cast<half2*>(&dst[b0 * dst_stride + out_row]) = __floats2half2_rn(frag_c[0], frag_c[1]);
-        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
-            *reinterpret_cast<__nv_bfloat162*>(&dst[b0 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[0], frag_c[1]);
-        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
-            dst[b0 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[0]);
-            dst[b0 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[1]);
+// =============================================================================
+// INT8 q8a128 PATH — same grid / entry / store machinery as the FP grouped impl
+// above; only the activation load, weight unpack, and MMA+fold differ. The
+// contraction runs on the INT8 m16n8k32 tensor core: q8a128 activations (raw int8
+// qs) × quantized weights (raw integers), int32 accumulate, deferred-scale fold to
+// F32 with the per-sub {scale, min}. Per-16-scale K-quants split the k32 MMA in two
+// (Q6_K/Q3_K symmetric; Q2_K affine + an all-ones MMA for per-16 activation sums).
+// See docs/q8_matmul_pipeline.md.
+// =============================================================================
+
+// Activation tile load: global → shared via cp.async (.ca, L1-resident — the tile is re-read
+// by every grid.y row-tile). Issues the async copies ONLY; the caller commits them in the same
+// cp.async group as the weight chunk and waits later, so the activation load pipelines a tile
+// ahead of compute (its latency hides under the prior tile's MMA). qs: 128 threads × 16 B
+// (token = tid>>3, kchunk = (tid&7)*16); ds: one (scale,sum) half2 per token. Rows ≥ b_cnt are
+// zero-padded with a plain smem store (no global read, not part of the cp.async group).
+template <int N_SUB = 1>
+__device__ __forceinline__ void load_q8a128_activations(
+    const block_q8a128* __restrict__ act, int b_start, int b_cnt, int k_blk,
+    int tiles_per_row, int tid,
+    int8_t smem_A_i8[N_SUB * 16][KI8_STRIDE],
+    half2 smem_A_ds[N_SUB * 16])
+{
+    // q8a1024 flat-grouped activation: flat_tile = token*tiles_per_row + k_blk locates
+    // the tile's de-interleaved qs (128-aligned line) and ds within its super-block.
+    const uint8_t* abytes = reinterpret_cast<const uint8_t*>(act);
+    const int kchunk = (tid & 7) * 16;
+    #pragma unroll
+    for (int thalf = 0; thalf < N_SUB; ++thalf) {
+        const int token = (tid >> 3) + thalf * 16;
+        if (token < b_cnt) {
+            const int64_t flat = (int64_t)(b_start + token) * tiles_per_row + k_blk;
+            cp_async_ca16(&smem_A_i8[token][kchunk], abytes + q8a1024_qs_off(flat) + kchunk);
+        } else {
+            *reinterpret_cast<int4*>(&smem_A_i8[token][kchunk]) = make_int4(0, 0, 0, 0);
         }
     }
-    if (b1 < bend) {
-        if constexpr (std::is_same_v<output_t, float>) {
-            *reinterpret_cast<float2*>(&dst[b1 * dst_stride + out_row]) = make_float2(frag_c[2], frag_c[3]);
-        } else if constexpr (std::is_same_v<output_t, half>) {
-            *reinterpret_cast<half2*>(&dst[b1 * dst_stride + out_row]) = __floats2half2_rn(frag_c[2], frag_c[3]);
-        } else if constexpr (std::is_same_v<output_t, __nv_bfloat16>) {
-            *reinterpret_cast<__nv_bfloat162*>(&dst[b1 * dst_stride + out_row]) = __floats2bfloat162_rn(frag_c[2], frag_c[3]);
-        } else if constexpr (std::is_same_v<output_t, __nv_fp8_e4m3>) {
-            dst[b1 * dst_stride + out_row] = from_f32<__nv_fp8_e4m3>(frag_c[2]);
-            dst[b1 * dst_stride + out_row + 1] = from_f32<__nv_fp8_e4m3>(frag_c[3]);
+    // ds: one (scale, sum) per token (per-128). One thread per token; threads past the tile idle.
+    // 128 threads cover up to 128 tokens, so one pass handles N_SUB*16 (N_SUB ≤ 8).
+    {
+        const int t2 = tid;   // token
+        if (t2 < N_SUB * 16) {
+            if (t2 < b_cnt) {
+                const int64_t flat = (int64_t)(b_start + t2) * tiles_per_row + k_blk;
+                cp_async_ca4(&smem_A_ds[t2], abytes + q8a1024_ds_off(flat));   // (scale,sum) fp16
+            } else {
+                smem_A_ds[t2] = make_half2(__float2half(1.f), __float2half(0.f));
+            }
         }
+    }
+}
+
+// One (expert-tile, row-tile) on the INT8 tensor core. Same single-stage load loop
+// and store as grouped_matmul_impl: load_q8a128_activations + a single per-warp weight
+// slot, in 8-row chunks. Each warp streams its row-group's chunks through ONE slot — the
+// dequant drains the loaded chunk to registers, freeing the slot for the next prefetch, so
+// no ring/ping-pong is needed (the double-buffered activations provide the load/compute
+// overlap). RING_I8 stays at 1 and sizes the single weight slot in shared memory.
+constexpr int RING_I8 = 1;
+
+// Load this warp's own k1024 weight chunk for `k_blk` into `slot_ptr` with its 32 lanes.
+// `weights` is an array of k1024 chunks laid out [k_blk][row-group of 8]; the chunk carries
+// its quants AND its inline scales, so this single contiguous coalesced cp.async brings the
+// whole chunk in (no separate scale stream). Caller commits the group.
+template <typename block_c_t>
+__device__ __forceinline__ void load_warp_chunk_int8(
+    uint8_t* slot_ptr, const block_c_t* __restrict__ weights, int k_blk,
+    int warp_row_base, int nrows, int lane)
+{
+    constexpr int N16 = int8_chunk_bytes<block_c_t>::value / 16;   // 16B units in the chunk
+    const uint8_t* sbytes;
+    if constexpr (is_scale_separate<block_c_t>::value) {
+        // KO k1024: one 8-row chunk, indexed [k_blk][row-group of 8].
+        sbytes = reinterpret_cast<const uint8_t*>(&weights[(int64_t)k_blk * (nrows / 8) + warp_row_base / 8]);
+    } else {
+        // Legacy non-KO: 8 contiguous per-row blocks at [k_blk][row].
+        sbytes = reinterpret_cast<const uint8_t*>(&weights[(int64_t)k_blk * nrows + warp_row_base]);
+    }
+    for (int i = lane; i < N16; i += WARP_SIZE_TC) {
+        cp_async_cg16(slot_ptr + i * 16, sbytes + i * 16);   // quants (+ inline scales for KO)
+    }
+}
+
+// load_warp_chunk_int8 weight stage, then the int8 MMA + deferred fold per sub.
+// N_SUB = m16 token sub-tiles per block. Mode-1 = 1 (Bm 16); mode-2 = larger Bm so each
+// weight chunk's dequant is reused across N_SUB token sub-tiles (fewer weight re-reads).
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
+__device__ void grouped_matmul_impl_int8(
+    const block_compact_t<block_q_t>* __restrict__ weights,
+    const block_q8a128* __restrict__ act,
+    output_t* __restrict__ dst,
+    int ncols, int nrows, int y_stride, int dst_stride,
+    int b_start, int b_cnt, int row_tile_idx,
+    int8_t smem_A_i8[][N_SUB * 16][KI8_STRIDE],
+    half2 smem_A_ds[][N_SUB * 16],
+    uint8_t* smem_W_flat)
+{
+    using block_c_t = block_compact_t<block_q_t>;
+    const int tid = threadIdx.y * WARP_SIZE_TC + threadIdx.x;
+    const int warp_id = tid / WARP_SIZE_TC;
+    const int lane = tid % WARP_SIZE_TC;
+    const int row0 = row_tile_idx * N_TILE;
+    if (row0 >= nrows || b_cnt <= 0) return;
+
+    const int warp_row_base = row0 + warp_id * 8;
+    const int tiles_per_row = ncols / K_TILE;  // block_q8a128 tiles per activation row
+
+    // N_SUB m16 token sub-tiles per block: frag_c[t*4 .. t*4+3] = tokens [t*16, t*16+16).
+    // The weight (and its dequant) is shared across them — dequanted once per k_blk, reused.
+    float frag_c[4 * N_SUB] = {};
+    const int k_blocks = ncols / K_TILE;
+
+    const int groupID  = lane >> 2;
+    const int threadID = lane & 3;
+
+    // Software-pipelined load. Per-warp weight slot (RING_I8=1, reused — the dequant drains it to
+    // registers, freeing it for the next prefetch) + double-buffered activations (ping-pong). Each
+    // iteration prefetches tile k+1's weight chunk AND activation tile in ONE cp.async group, so
+    // their loads run during tile k's MMA; the activation barrier then waits only for warp skew,
+    // not load latency. No WAR barrier — the next tile lands in the other activation buffer.
+    // (Single-buffering mode-2's larger activation was measured to regress 7–14% at M=4096 — the
+    // intra-block overlap beats the occupancy it would buy back, so both modes double-buffer.)
+    constexpr int CB = int8_chunk_bytes<block_c_t>::value;   // one 8-row chunk
+    uint8_t* my_slot = smem_W_flat + warp_id * CB;
+
+    // Prologue: tile 0 — weight chunk 0 + activation tile 0 (buffer 0), one cp.async group.
+    if (k_blocks > 0) {
+        load_warp_chunk_int8<block_c_t>(my_slot, weights, 0, warp_row_base, nrows, lane);
+        load_q8a128_activations<N_SUB>(act, b_start, b_cnt, 0, tiles_per_row, tid,
+                                       smem_A_i8[0], smem_A_ds[0]);
+        cp_async_commit();
+    }
+
+    for (int k_blk = 0; k_blk < k_blocks; ++k_blk) {
+        const int ab = k_blk & 1;        // this tile's activation buffer
+        const int nb = (k_blk + 1) & 1;  // next tile's buffer (held tile k-1, already consumed)
+        cp_async_wait_group<0>();        // tile k_blk (weight + activation) resident
+
+        // Inline scales + up-front dequant: read this warp's chunk into registers. Intra-warp
+        // (no barrier needed); frees the weight slot for the next prefetch. The (scale,min) live
+        // in blk.dm[row]; this thread owns rows (threadID*2, threadID*2+1).
+        const block_c_t* blk = reinterpret_cast<const block_c_t*>(my_slot);
+        const int rl = threadID * 2;
+        // dm[rl] and dm[rl+1] are adjacent half2 (8 B, rl*4 is 8-aligned) → ONE int2 LDS.64.
+        const int2 dd = *reinterpret_cast<const int2*>(&blk->dm[rl]);
+        const float2 d0 = __half22float2(*reinterpret_cast<const half2*>(&dd.x));  // (d, m) row rl
+        const float2 d1 = __half22float2(*reinterpret_cast<const half2*>(&dd.y));  // (d, m) row rl+1
+        // Lane-major dequant: this lane's 4 subs are stored contiguously, so each stream is
+        // pulled in ONE wide LDS (ql int4, plus crumb/hi for Q5/Q6, or 2 int4 for Q8) instead
+        // of 4 per-sub loads — fewer MIO instructions, still bank-conflict-free.
+        uint32_t b_frags[4][2];
+        gemx_dequant_traits<block_c_t, half, half>::dequant_all_subs_int8(my_slot, lane, b_frags);
+
+        __syncthreads();  // RAW: tile k activation visible to all warps; also guarantees tile
+                          // k-1's MMA (which read buffer nb) finished before we prefetch into nb.
+
+        // Prefetch tile k+1: weight chunk into the freed slot + activation into buffer nb, ONE
+        // cp.async group. Both overlap the MMA below (registers + buffer ab only). WAR-safe:
+        // slot freed by the dequant above; buffer nb consumed before the barrier above.
+        if (k_blk + 1 < k_blocks) {
+            load_warp_chunk_int8<block_c_t>(my_slot, weights, k_blk + 1, warp_row_base, nrows, lane);
+            load_q8a128_activations<N_SUB>(act, b_start, b_cnt, k_blk + 1, tiles_per_row, tid,
+                                           smem_A_i8[nb], smem_A_ds[nb]);
+            cp_async_commit();
+        }
+
+        // Per-128 collapse, per token sub-tile. The dequanted weight (b_frags, d0/d1) is REUSED
+        // across all N_SUB sub-tiles — that's the mode-2 win (one weight dequant amortized over
+        // N_SUB·16 tokens). Each sub-tile t has its own activation (smem at t*16) and output
+        // frag_c[t*4..]. Two accumulators break the C-dependency chain per sub-tile.
+        #pragma unroll
+        for (int t = 0; t < N_SUB; ++t) {
+            const float2 a0 = __half22float2(smem_A_ds[ab][t * 16 + groupID]);      // token-half A
+            const float2 a1 = __half22float2(smem_A_ds[ab][t * 16 + groupID + 8]);  // token-half B
+            int32_t C0[4] = {0, 0, 0, 0};
+            int32_t C1[4] = {0, 0, 0, 0};
+            #pragma unroll
+            for (int sub = 0; sub < 4; sub += 2) {
+                uint32_t a0f[4], a1f[4];
+                fused_attn::load_a_frag_m16k32_ldmatrix(a0f, &smem_A_i8[ab][t * 16][sub * 32], KI8_STRIDE, lane);
+                fused_attn::load_a_frag_m16k32_ldmatrix(a1f, &smem_A_i8[ab][t * 16][(sub + 1) * 32], KI8_STRIDE, lane);
+                fused_attn::mma_int8_m16n8k32(C0, a0f, b_frags[sub], C0);
+                fused_attn::mma_int8_m16n8k32(C1, a1f, b_frags[sub + 1], C1);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) C0[i] += C1[i];
+            frag_c[t * 4 + 0] += d0.x * a0.x * (float)C0[0] + d0.y * a0.y;
+            frag_c[t * 4 + 1] += d1.x * a0.x * (float)C0[1] + d1.y * a0.y;
+            frag_c[t * 4 + 2] += d0.x * a1.x * (float)C0[2] + d0.y * a1.y;
+            frag_c[t * 4 + 3] += d1.x * a1.x * (float)C0[3] + d1.y * a1.y;
+        }
+    }
+
+    // One store per sub-tile: tile t → tokens [b_start+t*16, +16). store_tile_output
+    // clamps via the token count, so partial/empty tiles write nothing.
+    #pragma unroll
+    for (int t = 0; t < N_SUB; ++t) {
+        const int rem = b_cnt - t * 16;
+        const int cnt = rem < 0 ? 0 : (rem > 16 ? 16 : rem);
+        store_tile_output<output_t>(dst, &frag_c[t * 4], dst_stride, warp_row_base,
+                                    b_start + t * 16, cnt, lane);
+    }
+}
+
+// INT8 dense entry (regular non-MoE QMatMul): one weight, implicit tile schedule —
+// blockIdx.x → the ≤16-token batch slice, blockIdx.y → the 32-row tile. Launched
+// from run_quantized_matmul on ytype==3.
+template <int qk, int qi, typename block_q_t, int vdr, typename output_t, int N_SUB = 1>
+static __device__ void quantized_matmul_dense_entry_int8(
+    const block_compact_t<block_q_t>* __restrict__ weights,
+    const block_q8a128* __restrict__ act,
+    output_t* __restrict__ dst,
+    int ncols_x, int nrows_x, int total_batch, int y_stride, int dst_stride)
+{
+    constexpr int BATCH = N_SUB * 16;   // tokens per block (mode-1: 16, mode-2: 16·N_SUB)
+    const int b_start = blockIdx.x * BATCH;
+    const int b_cnt = min(BATCH, total_batch - b_start);
+    const int row_tile_idx = blockIdx.y;
+
+    __shared__ __align__(16) int8_t smem_A_i8[2][BATCH][KI8_STRIDE];   // double-buffered
+    __shared__ __align__(16) half2 smem_A_ds[2][BATCH];
+    __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_compact_t<block_q_t>>::value];
+
+    // The int8 impl is KO-only (inline-scale k1024 chunks). Only instantiate it for KO; for
+    // any non-KO type the call is discarded so the kernel is a no-op (never dispatched to).
+    if constexpr (is_scale_separate<block_compact_t<block_q_t>>::value) {
+        grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+            weights, act, dst, ncols_x, nrows_x, y_stride, dst_stride,
+            b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat);
     }
 }
 
 // Grouped entry: decode (expert, batch-slice) from device tables and run one tile.
 //   grid = (total_tiles, row_tiles), block = 128 threads (4 warps × 32).
-template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t>
+template <int qk, int qi, typename block_q_t, int vdr, typename act_t, typename output_t, int N_SUB = 1>
 static __device__ void quantized_matmul_grouped_entry(
     const uint64_t* __restrict__ weight_ptrs,  // [num_experts] device weight pointers
     const int* __restrict__ tile_expert,       // [total_tiles] owning expert
     const int* __restrict__ tile_b_start,      // [total_tiles] stacked batch start
-    const int* __restrict__ tile_b_cnt,        // [total_tiles] tokens in tile (1..16)
+    const int* __restrict__ tile_b_cnt,        // [total_tiles] tokens in tile (1..16·N_SUB)
     const act_t* __restrict__ vy,
     output_t* __restrict__ dst,
     int ncols_x, int nrows_x, int y_stride, int dst_stride)
 {
-    using compute_t = std::conditional_t<
-        std::is_same_v<act_t, float>, half,
-        std::conditional_t<
-            std::is_same_v<act_t, half>, half,
-            std::conditional_t<
-                std::is_same_v<act_t, __nv_bfloat16>, __nv_bfloat16,
-                std::conditional_t<
-                    std::is_same_v<act_t, __nv_fp8_e4m3>, __nv_fp8_e4m3, half>>>>;
     using block_c_t = block_compact_t<block_q_t>;
 
     const int tile = blockIdx.x;
@@ -1769,12 +2046,36 @@ static __device__ void quantized_matmul_grouped_entry(
     const int b_cnt = tile_b_cnt[tile];
     const int row_tile_idx = blockIdx.y;
 
-    __shared__ compute_t smem_A[BATCH_TILE][K_STRIDE];
-    __shared__ uint8_t smem_W_flat[N_TILE * sizeof(block_c_t)];
-
-    grouped_matmul_impl<block_c_t, compute_t, act_t, output_t>(
-        weights, vy, dst, ncols_x, nrows_x, y_stride, dst_stride,
-        b_start, b_cnt, row_tile_idx, smem_A, smem_W_flat);
+    // Same decode / grid / store for every activation type; only the smem layout and
+    // the per-tile compute differ. q8a128 → INT8 m16n8k32; FP → FP16 m16n8k16. N_SUB
+    // scales the int8 token tile (mode-1: 16, mode-2: 32 weight-reuse); the impl sweeps
+    // the once-loaded weight over each 16-row sub-tile, partial sub-tiles writing nothing.
+    if constexpr (std::is_same_v<act_t, block_q8a128>) {
+        constexpr int BATCH_I8 = N_SUB * 16;
+        __shared__ __align__(16) int8_t smem_A_i8[2][BATCH_I8][KI8_STRIDE];   // double-buffered
+        __shared__ __align__(16) half2 smem_A_ds[2][BATCH_I8];
+        __shared__ uint8_t smem_W_flat[(N_TILE / 8) * RING_I8 * int8_chunk_bytes<block_c_t>::value];
+        // KO-only int8 impl (inline-scale k1024). Non-KO → discarded (no-op kernel).
+        if constexpr (is_scale_separate<block_c_t>::value) {
+            grouped_matmul_impl_int8<qk, qi, block_q_t, vdr, output_t, N_SUB>(
+                weights, vy, dst, ncols_x, nrows_x, y_stride, dst_stride,
+                b_start, b_cnt, row_tile_idx, smem_A_i8, smem_A_ds, smem_W_flat);
+        }
+    } else {
+        using compute_t = std::conditional_t<
+            std::is_same_v<act_t, float>, half,
+            std::conditional_t<
+                std::is_same_v<act_t, half>, half,
+                std::conditional_t<
+                    std::is_same_v<act_t, __nv_bfloat16>, __nv_bfloat16,
+                    std::conditional_t<
+                        std::is_same_v<act_t, __nv_fp8_e4m3>, __nv_fp8_e4m3, half>>>>;
+        __shared__ compute_t smem_A[BATCH_TILE][K_STRIDE];
+        __shared__ uint8_t smem_W_flat[N_TILE * sizeof(block_c_t)];
+        grouped_matmul_impl<block_c_t, compute_t, act_t, output_t>(
+            weights, vy, dst, ncols_x, nrows_x, y_stride, dst_stride,
+            b_start, b_cnt, row_tile_idx, smem_A, smem_W_flat);
+    }
 }
 
 } // namespace grouped_tc

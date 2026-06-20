@@ -217,7 +217,10 @@ impl InferenceMode {
             Self::Q2_0 => vec![Q(Q2_0)],
             Self::R16 => vec![Q(QuantFormat::R16)],
             // ── Float modes ──
-            Self::F32 => vec![Float(DType::F32)],
+            // Paged attention kernels store/read F16/BF16 only, so F32 KV is unrepresentable. The
+            // F32 reference mode stores BF16 — matching the F32→BF16 compute collapse already in the
+            // prefill/decode paths. Model compute follows the arena dtype (caches.dtype()).
+            Self::F32 => vec![Float(DType::BF16)],
             Self::F16 => vec![Float(DType::F16)],
             Self::BF16 => vec![Float(DType::BF16)],
             _ => vec![Float(DType::F16)],
@@ -256,7 +259,9 @@ impl InferenceMode {
             // R16 is K-only (K@F16 + Q-capture space). V uses plain F16.
             Self::R16 => vec![Float(DType::F16)],
             // ── Float modes ──
-            Self::F32 => vec![Float(DType::F32)],
+            // F32 KV is unrepresentable in the paged kernels (F16/BF16 only); store BF16 to match
+            // the F32→BF16 compute collapse.
+            Self::F32 => vec![Float(DType::BF16)],
             Self::F16 => vec![Float(DType::F16)],
             Self::BF16 => vec![Float(DType::BF16)],
             _ => vec![Float(DType::F16)],

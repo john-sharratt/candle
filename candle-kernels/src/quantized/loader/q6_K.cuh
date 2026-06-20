@@ -537,7 +537,52 @@ struct gemx_dequant_traits<block_c_q6_K, compute_t, scale_t> {
     static constexpr bool implemented = true;
     static constexpr bool has_min = false;
     static constexpr int K112_BYTES = 112;  // Compact 112-byte layout
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 6-bit = 4-bit nibble (ql) + 2-bit crumb (qh), symmetric (value = scale·(q6-32)).
+    // Q6_K scales are per-16, but the k32 MMA folds one scale per 32-K sub; we re-bin
+    // the two per-16 scales to one per-32 scale (average) in sub_dm. Feeding CENTERED
+    // signed int8 (c = q6-32) makes the format symmetric, so neg_min = 0 and no
+    // per-16 activation sum is needed — the existing single-scale fold applies.
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K112_BYTES;
+        const int sh = (q3 & 1) * 4;
+        const int m0 = sub * 4 + (q3 >> 1);
+        const int m1 = m0 + 2;
+        // ql nibbles (low 4 bits) → natural order via prmt 0x3120.
+        const int v0 = *reinterpret_cast<const int*>(rb + m0 * 4);
+        const int v1 = *reinterpret_cast<const int*>(rb + m1 * 4);
+        const uint32_t nib0 = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t nib1 = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        // qh crumbs (2 bits): field m's 16-bit qh at byte 64 + (m>>1)*4 + (m&1)*2.
+        const uint32_t qh0 = *reinterpret_cast<const uint16_t*>(rb + 64 + (m0 >> 1) * 4 + (m0 & 1) * 2);
+        const uint32_t qh1 = *reinterpret_cast<const uint16_t*>(rb + 64 + (m1 >> 1) * 4 + (m1 & 1) * 2);
+        const uint32_t cr0 = (qh0 >> ((q3 & 1) * 8)) & 0xFFu;
+        const uint32_t cr1 = (qh1 >> ((q3 & 1) * 8)) & 0xFFu;
+        // Spread crumb i (2 bits) into bits 4-5 of byte i → unsigned q6 in 0..63.
+        uint32_t q6_0 = nib0 | ((cr0 & 0x03u) << 4) | ((cr0 & 0x0Cu) << 10)
+                             | ((cr0 & 0x30u) << 16) | ((cr0 & 0xC0u) << 22);
+        uint32_t q6_1 = nib1 | ((cr1 & 0x03u) << 4) | ((cr1 & 0x0Cu) << 10)
+                             | ((cr1 & 0x30u) << 16) | ((cr1 & 0xC0u) << 22);
+        // Center by -32: offset-binary → two's complement (flip bit 5, sign-extend 6-7).
+        q6_0 ^= 0x20202020u; q6_0 |= ((q6_0 & 0x20202020u) << 1) | ((q6_0 & 0x20202020u) << 2);
+        q6_1 ^= 0x20202020u; q6_1 |= ((q6_1 & 0x20202020u) << 1) | ((q6_1 & 0x20202020u) << 2);
+        b_frag[0] = q6_0;
+        b_frag[1] = q6_1;
+    }
+    // Two per-16 scales {scale_lo (K[0,16)), scale_hi (K[16,32))} for the split
+    // 2-MMA fold (int8_scales_per_sub == 2). scales[2s] covers K-groups 4s,4s+1;
+    // scales[2s+1] covers 4s+2,4s+3; they are contiguous halves at byte 96+4s.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        return *reinterpret_cast<const half2*>(row_block + 96 + 4 * sub);
+    }
+
     using Frags = GemxFragmentTypes<compute_t>;
     using FragB = typename Frags::FragB;
     
@@ -1029,6 +1074,77 @@ struct gemx_dequant_traits<block_c_q6_K, compute_t, scale_t> {
         
         #undef CRUMB_EX_FP16
         #undef CRUMB_EX_BF16
+    }
+};
+
+// Q6_KO: Q6_K's compact block is already in ordered form (ql contiguous, qh
+// contiguous, scales at the tail), so the KO twin inherits the entire Q6_K trait and
+// only overrides the int8 ql load to exploit the contiguous layout — the sub's 4 ql
+// ints load in ONE int4 (broadcast across the k-group) instead of two int loads. The
+// qh-crumb spread + center math is identical to Q6_K. Byte-identical result.
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q6_KO, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q6_K, compute_t, scale_t> {
+    using base = gemx_dequant_traits<block_c_q6_K, compute_t, scale_t>;
+
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        // De-interleaved Q6_KO block is 96B (quant only); scales are in the separate region.
+        const uint8_t* rb = warp_rows + row * smem_row_stride<block_c_q6_KO_k128>::value;
+        const int sh = (q3 & 1) * 4;
+        const int m0 = sub * 4 + (q3 >> 1);
+        const int m1 = m0 + 2;
+        // int4 over the sub's 4 ql ints (contiguous at sub*16); pick m0/m1 from regs.
+        const int4 v = *reinterpret_cast<const int4*>(rb + sub * 16);
+        const int v0 = (q3 < 2) ? v.x : v.y;
+        const int v1 = (q3 < 2) ? v.z : v.w;
+        const uint32_t nib0 = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t nib1 = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t qh0 = *reinterpret_cast<const uint16_t*>(rb + 64 + (m0 >> 1) * 4 + (m0 & 1) * 2);
+        const uint32_t qh1 = *reinterpret_cast<const uint16_t*>(rb + 64 + (m1 >> 1) * 4 + (m1 & 1) * 2);
+        const uint32_t cr0 = (qh0 >> ((q3 & 1) * 8)) & 0xFFu;
+        const uint32_t cr1 = (qh1 >> ((q3 & 1) * 8)) & 0xFFu;
+        // Per-32 AFFINE Q6_KO: the 6-bit value stays UNSIGNED (0..63, fits int8 positive) —
+        // the per-32 (scale,min) fold handles the offset. No ^0x20 centering / sign-extend.
+        b_frag[0] = nib0 | ((cr0 & 0x03u) << 4) | ((cr0 & 0x0Cu) << 10)
+                        | ((cr0 & 0x30u) << 16) | ((cr0 & 0xC0u) << 22);
+        b_frag[1] = nib1 | ((cr1 & 0x03u) << 4) | ((cr1 & 0x0Cu) << 10)
+                        | ((cr1 & 0x30u) << 16) | ((cr1 & 0xC0u) << 22);
+    }
+};
+
+// Q6_KO K/1024 chunk — WAVEFRONT-OPTIMAL dequant, LANE-MAJOR. The 768 B quant region splits
+// into a 512 B ql stream (lane's 4 subs at lane*16+sub*4, like Q4) and a 256 B qh crumb stream
+// (lane's 4 subs' uint16s at 512+lane*8+sub*2). ONE int4 LDS at lane*16 pulls all 4 subs' ql,
+// ONE int2 LDS at 512+lane*8 pulls all 4 subs' crumb-uint16s — both conflict-free. Per sub: low
+// nibbles = b_frag[0] low4 (K[q3*4..+3]), high nibbles = b_frag[1] low4 (K[q3*4+16..+19]); the
+// uint16's cr0/cr1 spread into bits 4-5 of each output byte (Q6_K math). Values UNSIGNED
+// (0..63); the per-32 (scale,min) fold handles the offset. dm at 768.
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q6_KO_k1024, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q6_KO, compute_t, scale_t> {
+    __device__ __forceinline__ static void dequant_all_subs_int8(
+        const uint8_t* __restrict__ chunk, int lane, uint32_t (&b_frags)[4][2])
+    {
+        const int4 vv = *reinterpret_cast<const int4*>(chunk + lane * 16);
+        const uint32_t s4[4] = {(uint32_t)vv.x, (uint32_t)vv.y, (uint32_t)vv.z, (uint32_t)vv.w};
+        const int2 cc = *reinterpret_cast<const int2*>(chunk + 512 + lane * 8);
+        const uint32_t c2[2] = {(uint32_t)cc.x, (uint32_t)cc.y};   // c2[0]: subs 0,1  c2[1]: subs 2,3
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const uint32_t nib0 = s4[sub] & 0x0F0F0F0Fu;
+            const uint32_t nib1 = (s4[sub] >> 4) & 0x0F0F0F0Fu;
+            const uint32_t qh16 = (c2[sub >> 1] >> ((sub & 1) * 16)) & 0xFFFFu;
+            const uint32_t cr0 = qh16 & 0xFFu;
+            const uint32_t cr1 = (qh16 >> 8) & 0xFFu;
+            b_frags[sub][0] = nib0 | ((cr0 & 0x03u) << 4) | ((cr0 & 0x0Cu) << 10)
+                                  | ((cr0 & 0x30u) << 16) | ((cr0 & 0xC0u) << 22);
+            b_frags[sub][1] = nib1 | ((cr1 & 0x03u) << 4) | ((cr1 & 0x0Cu) << 10)
+                                  | ((cr1 & 0x30u) << 16) | ((cr1 & 0xC0u) << 22);
+        }
     }
 };
 

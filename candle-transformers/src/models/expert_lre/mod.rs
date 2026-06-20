@@ -159,4 +159,6 @@ mod types;
 // Re-exports — the public API of this module.
 pub use crate::models::profile::ProfileSnapshot;
 pub use handle::ExpertCache;
-pub use types::{CopyBatchFence, ExpertSlot, MmapExpertRef, MoeWorkRequest, PipelineStats};
+pub use types::{
+    CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest, PipelineStats,
+};

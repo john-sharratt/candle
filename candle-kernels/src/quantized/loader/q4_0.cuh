@@ -363,7 +363,34 @@ struct gemx_dequant_traits<block_c_q4_0, compute_t, scale_t> {
     // Scale byte offsets: d0|d1 at data[5]=bytes 20-23, d2|d3 at data[14]=bytes 56-59
     // d0 = byte 20, d1 = byte 22, d2 = byte 56, d3 = byte 58
     static constexpr int scale_byte_offset[4] = {20, 22, 56, 58};
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 4-bit nibbles → n8k32 B-fragment. Nibble byte order {n0,n2,n1,n3} (low) /
+    // {n4,n6,n5,n7} (high); one mask + prmt 0x3120 reorders to natural {0,1,2,3}.
+    // b_frag[0]/[1] come from two qs ints. The fold applies d·C + m·Σx with
+    // m = -8·d (Q4_0 centers nibbles by -8).
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        constexpr int QS_OFF[16] = {0, 4, 8, 12, 16, 24, 28, 32, 44, 48, 52, 60, 64, 68, 72, 76};
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int sh = (q3 & 1) * 4;
+        const int v0 = *reinterpret_cast<const int*>(rb + QS_OFF[sub * 4 + (q3 >> 1)]);
+        const int v1 = *reinterpret_cast<const int*>(rb + QS_OFF[sub * 4 + 2 + (q3 >> 1)]);
+        b_frag[0] = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        b_frag[1] = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+    }
+    // Per-sub {scale d (low), neg_min = -8·d (high)}.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int SCALE_OFF[4] = {20, 22, 56, 58};
+        const half d = *reinterpret_cast<const half*>(row_block + SCALE_OFF[sub]);
+        return __halves2half2(d, __hmul(d, __float2half(-8.0f)));
+    }
+
     // -------------------------------------------------------------------------
     // COMPILE-TIME LANE PARAMETERS
     // -------------------------------------------------------------------------

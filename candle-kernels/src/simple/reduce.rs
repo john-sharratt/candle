@@ -199,6 +199,27 @@ extern "C" {
         eps: f32,
     );
 
+    /// Fused RMSNorm → q8a128: normalizes each row and writes the q8a128 activation
+    /// block directly (producer epilogue for B1/B3/B5). `out` is the flat-grouped
+    /// q8a1024 buffer. Requires `n_cols % 128 == 0` and `n_cols <= 8192`.
+    ///
+    /// # Parameters
+    /// - `dtype`: input/alpha dtype (0=f32, 2=f16, 3=bf16)
+    /// - `src`: source activations `[n_rows × n_cols]`
+    /// - `out`: q8a1024 output buffer
+    /// - `alpha`: RMSNorm weight `[n_cols]`
+    /// - `n_rows` / `n_cols`: row count / normalization size
+    /// - `eps`: epsilon
+    pub fn run_rmsnorm_q8a128_op(
+        dtype: i32,
+        src: *const c_void,
+        out: *mut c_void,
+        alpha: *const c_void,
+        n_rows: i32,
+        n_cols: i32,
+        eps: f32,
+    );
+
     // =========================================================================
     // LayerNorm dispatcher
     // =========================================================================

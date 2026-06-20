@@ -27,3 +27,11 @@ INSTANTIATE_KERNELS(
     QK3_K_K128, QI3_K_K128, block_c_q3_K, VDR_Q3_K_K128,
     float, float
 )
+
+// q8a128 TC path — INT8-MMA grouped matmul for Q3_K (3-bit symmetric weights, per-16
+// scales via split 2-MMA, centered int8, F32 output). See grouped_tc_int8.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q3_k_int8_f32,
+    QK3_K_K128, QI3_K_K128, block_c_q3_K, VDR_Q3_K_K128,
+    float
+)

@@ -334,7 +334,32 @@ struct gemx_dequant_traits<block_c_q8_K, compute_t, scale_t> {
     // =========================================================================
     
     static constexpr int K128_BYTES = 160;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 8-bit symmetric (value = d·q8): qs are natural-K-order int8, fed straight to the
+    // n8k32 B-fragment. One scale per 256 elements (d0..d3 hold the same value);
+    // symmetric → neg_min = 0.
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        constexpr int QS_OFF[16] =
+            {0, 8, 16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 120, 128, 136};
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int byte_off = (q3 & 1) * 4;
+        b_frag[0] = *reinterpret_cast<const uint32_t*>(rb + QS_OFF[sub * 4 + (q3 >> 1)] + byte_off);
+        b_frag[1] = *reinterpret_cast<const uint32_t*>(rb + QS_OFF[sub * 4 + 2 + (q3 >> 1)] + byte_off);
+    }
+    // Block scale {d, 0} from d0..d3 at byte 24/112/116/144 (all equal).
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int DM_OFF[4] = {24, 112, 116, 144};
+        const half d = *reinterpret_cast<const half*>(row_block + DM_OFF[sub]);
+        return __halves2half2(d, __float2half(0.f));
+    }
+
     // =========================================================================
     // RUNTIME DEQUANT FOR MMA K=16 (for TC kernel with runtime k_iter, lane)
     // =========================================================================
@@ -440,5 +465,52 @@ struct gemx_dequant_traits<block_c_q8_K, compute_t, scale_t> {
                 frag_b[i * 2 + 1] = *reinterpret_cast<uint32_t*>(&r1);
             }
         }
+    }
+};
+
+// Q8_KO: byte-permuted twin of Q8_K — qs contiguous (field m at m*8), the four equal
+// block scales grouped at the tail (128-143). Inherits Q8_K and overrides only the
+// two int8 accessors with the regularized offsets; identical 8-bit symmetric math.
+// The FP accessors are inherited (Q8_KO is int8-only; no FP KO kernel is built).
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q8_KO, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q8_K, compute_t, scale_t> {
+    using base = gemx_dequant_traits<block_c_q8_K, compute_t, scale_t>;
+
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        // De-interleaved Q8_KO block is 128B (quant only); scale is in the separate region.
+        const uint8_t* rb = warp_rows + row * smem_row_stride<block_c_q8_KO_k128>::value;
+        const int byte_off = (q3 & 1) * 4;
+        b_frag[0] = *reinterpret_cast<const uint32_t*>(rb + (sub * 4 + (q3 >> 1)) * 8 + byte_off);
+        b_frag[1] = *reinterpret_cast<const uint32_t*>(rb + (sub * 4 + 2 + (q3 >> 1)) * 8 + byte_off);
+    }
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        const half d = *reinterpret_cast<const half*>(row_block + 128 + 4 * sub);
+        return __halves2half2(d, __float2half(0.f));
+    }
+};
+
+// Q8_KO K/1024 chunk — WAVEFRONT-OPTIMAL int8 dequant, LANE-MAJOR. Q8 is full bytes: each lane
+// needs 8 uint32 (4 subs × b_frag[0]/b_frag[1]). They're laid in two 512 B regions — all subs'
+// b_frag[0] at lane*16+sub*4 ([0,512)), all subs' b_frag[1] at 512+lane*16+sub*4 ([512,1024)) —
+// so TWO int4 LDS (at lane*16 and 512+lane*16) pull all 8 (vs 8 separate uint32 LDS). Both
+// regions conflict-free (lane*16, like Q4's ql; 512 is bank-aligned). b_frag[0] = K[q3*4..+3],
+// b_frag[1] = K[q3*4+16..+19]. Inline scales blk.dm[row] read in the kernel (min = 0).
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q8_KO_k1024, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q8_KO, compute_t, scale_t> {
+    __device__ __forceinline__ static void dequant_all_subs_int8(
+        const uint8_t* __restrict__ chunk, int lane, uint32_t (&b_frags)[4][2])
+    {
+        const int4 v0 = *reinterpret_cast<const int4*>(chunk + lane * 16);          // 4 subs' b_frag[0]
+        const int4 v1 = *reinterpret_cast<const int4*>(chunk + 512 + lane * 16);    // 4 subs' b_frag[1]
+        b_frags[0][0] = (uint32_t)v0.x; b_frags[1][0] = (uint32_t)v0.y;
+        b_frags[2][0] = (uint32_t)v0.z; b_frags[3][0] = (uint32_t)v0.w;
+        b_frags[0][1] = (uint32_t)v1.x; b_frags[1][1] = (uint32_t)v1.y;
+        b_frags[2][1] = (uint32_t)v1.z; b_frags[3][1] = (uint32_t)v1.w;
     }
 };

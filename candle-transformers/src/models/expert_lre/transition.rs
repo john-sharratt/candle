@@ -177,7 +177,11 @@ impl TransitionMatrix {
     ///   `to`?", i.e. how *confident* the model is that `to` is genuinely coming.
     ///   The max (not a sum) keeps it batch-invariant; it decides *how many*
     ///   experts are worth prefetching.
-    fn score_and_conf(&self, moe_layer_idx: usize, expert_ids: &[usize]) -> Option<(Vec<f32>, Vec<f32>)> {
+    fn score_and_conf(
+        &self,
+        moe_layer_idx: usize,
+        expert_ids: &[usize],
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
         if moe_layer_idx + 1 >= self.num_moe_layers || moe_layer_idx >= self.pairs {
             return None;
         }
@@ -242,11 +246,19 @@ impl TransitionMatrix {
     /// within [`PREFETCH_REL_CONF`] of the most confident candidate's, capped at
     /// [`PREFETCH_MAX_K`] and ranked by PMI.  Depth therefore tracks demand
     /// diversity (see the module docs).
-    pub(crate) fn predict_prefetch(&self, moe_layer_idx: usize, expert_ids: &[usize]) -> Vec<usize> {
+    pub(crate) fn predict_prefetch(
+        &self,
+        moe_layer_idx: usize,
+        expert_ids: &[usize],
+    ) -> Vec<usize> {
         match self.score_and_conf(moe_layer_idx, expert_ids) {
-            Some((scores, conf)) => {
-                top_k_gated(&scores, &conf, expert_ids, PREFETCH_MAX_K, PREFETCH_REL_CONF)
-            }
+            Some((scores, conf)) => top_k_gated(
+                &scores,
+                &conf,
+                expert_ids,
+                PREFETCH_MAX_K,
+                PREFETCH_REL_CONF,
+            ),
             None => vec![],
         }
     }

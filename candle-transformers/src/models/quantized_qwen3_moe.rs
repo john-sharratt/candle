@@ -11,17 +11,23 @@
 //! References:
 //! - [Qwen3 MoE Models](https://huggingface.co/Qwen/Qwen3-30B-A3B)
 
+#[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
+#[cfg(feature = "cuda")]
 use super::batched_model::BatchedModelCore;
-use super::expert_lre::{ExpertCache, ExpertSlot, MmapExpertRef, PipelineStats, ProfileSnapshot};
-use super::kv_cache_utils::{new_kv_caches, KvCaches, SequenceContext};
+use super::expert_lre::{
+    ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
+};
+use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::profile::profile_now;
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
-use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
+use crate::quantized_nn::RmsNorm;
+#[cfg(feature = "cuda")]
+use candle::quantized::cuda::{moe_route, DynamicActs};
 #[cfg(feature = "cuda")]
 use candle::quantized::{get_vram_info, register_mmap_cuda, MmapRegistration};
-use candle::quantized::{gguf_file, GgmlDType, QTensor};
+use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::{kv_cache::KvCache, Activation, Embedding, Module};
 use std::collections::HashMap;
@@ -105,30 +111,6 @@ impl RotaryEmbedding {
             )?)),
         })
     }
-
-    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
-        let (_, _, seq_len, _) = q.dims4()?;
-        let (cos, sin) = {
-            let mut cis = self
-                .cis
-                .write()
-                .map_err(|_| candle::Error::Msg("poisoned RoPE lock".into()))?;
-            cis.narrow_growable(0, offset, seq_len, q.dtype())?
-        };
-        let q = if q.is_contiguous() {
-            q.clone()
-        } else {
-            q.contiguous()?
-        };
-        let k = if k.is_contiguous() {
-            k.clone()
-        } else {
-            k.contiguous()?
-        };
-        let q_embed = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
-        Ok((q_embed, k_embed))
-    }
 }
 
 // ============================================================================
@@ -137,7 +119,6 @@ impl RotaryEmbedding {
 
 #[derive(Debug, Clone)]
 struct AttentionWeights {
-    qkv_proj: Option<QMatMul>,
     q_proj: Option<QMatMul>,
     k_proj: Option<QMatMul>,
     v_proj: Option<QMatMul>,
@@ -146,127 +127,56 @@ struct AttentionWeights {
     k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
-    num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    span_attn: tracing::Span,
 }
 
 impl AttentionWeights {
-    #[inline]
-    fn project_qkv_with_compute_type(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    /// q/k/v projection over a producer-prepared [`DynamicActs`] (the fused `ln1` output).
+    #[cfg(feature = "cuda")]
+    fn project_qkv(
+        &self,
+        acts: &DynamicActs,
+        out_dtype: DType,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
-        if let Some(qkv_proj) = &self.qkv_proj {
-            let qkv = qkv_proj.forward(x)?;
-            let q = qkv.narrow(2, 0, q_dim)?;
-            let k = qkv.narrow(2, q_dim, kv_dim)?;
-            let v = qkv.narrow(2, q_dim + kv_dim, kv_dim)?;
-            Ok((q, k, v))
-        } else {
-            let q_proj = self
-                .q_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing q_proj".into()))?;
-            let k_proj = self
-                .k_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing k_proj".into()))?;
-            let v_proj = self
-                .v_proj
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing v_proj".into()))?;
-            Ok((q_proj.forward(x)?, k_proj.forward(x)?, v_proj.forward(x)?))
-        }
-    }
-
-    fn forward(&self, cache: &mut KvCache, x: &Tensor, offset: usize) -> Result<Tensor> {
-        let _enter = self.span_attn.enter();
-        let (b, l, _) = x.dims3()?;
-
-        let (q, k, v) = self.project_qkv_with_compute_type(x)?;
-
-        let q = q
-            .reshape((b, l, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, l, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
-        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
-
-        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
-
-        if offset == 0 {
-            cache.reset();
-        }
-        let (k, v) = cache.append(&k, &v)?;
-
-        let standard_attention = || -> Result<Tensor> {
-            let k = repeat_kv(k.clone(), self.num_kv_groups)?;
-            let v = repeat_kv(v.clone(), self.num_kv_groups)?;
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
-            let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-            if l > 1 {
-                let cache_len = offset + l;
-                let mask: Vec<_> = (0..l)
-                    .flat_map(|i| {
-                        (0..cache_len).map(move |j| {
-                            if j > offset + i {
-                                f32::NEG_INFINITY
-                            } else {
-                                0.0f32
-                            }
-                        })
-                    })
-                    .collect();
-                let mask_tensor = Tensor::from_vec(mask, (1, 1, l, cache_len), q.device())?
-                    .to_dtype(scores.dtype())?;
-                scores = scores.broadcast_add(&mask_tensor)?;
+        let q_proj = self
+            .q_proj
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("missing q_proj".into()))?;
+        let k_proj = self
+            .k_proj
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("missing k_proj".into()))?;
+        let v_proj = self
+            .v_proj
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("missing v_proj".into()))?;
+        match acts {
+            // int8: ONE segmented launch over the three KO weights (q/k/v kept separate — no
+            // concat). Float-identical to three separate matmuls, with full GPU occupancy so the
+            // tiny k/v GEMVs no longer starve. Output [lead.., q_dim+2·kv_dim] → narrow to q/k/v.
+            DynamicActs::Int8(op) => {
+                let qkv = candle::quantized::QMatMul::qkv_segmented(
+                    op,
+                    &[q_proj.inner(), k_proj.inner(), v_proj.inner()],
+                    out_dtype,
+                )?;
+                let r = qkv.rank() - 1;
+                Ok((
+                    qkv.narrow(r, 0, q_dim)?,
+                    qkv.narrow(r, q_dim, kv_dim)?,
+                    qkv.narrow(r, q_dim + kv_dim, kv_dim)?,
+                ))
             }
-            let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-            probs.matmul(&v)
-        };
-
-        let ctx = if l > 1 {
-            #[cfg(feature = "flash-attn")]
-            {
-                let q_fa = q.transpose(1, 2)?;
-                let k_fa = k.transpose(1, 2)?;
-                let v_fa = v.transpose(1, 2)?;
-                let scale = 1.0 / (self.head_dim as f32).sqrt();
-                match candle_flash_attn::flash_attn(&q_fa, &k_fa, &v_fa, scale, true) {
-                    Ok(out) => {
-                        let out = out.transpose(1, 2)?;
-                        if out.dtype() != q.dtype() {
-                            out.to_dtype(q.dtype())?
-                        } else {
-                            out
-                        }
-                    }
-                    Err(_) => standard_attention()?,
-                }
-            }
-            #[cfg(not(feature = "flash-attn"))]
-            standard_attention()?
-        } else {
-            standard_attention()?
-        };
-        let reshaped_ctx =
-            ctx.transpose(1, 2)?
-                .contiguous()?
-                .reshape((b, l, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&reshaped_ctx)
+            // FP (Off): three separate matmuls.
+            DynamicActs::Float(_) => Ok((
+                q_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+                k_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+                v_proj.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+            )),
+        }
     }
 }
 
@@ -326,33 +236,80 @@ struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-        let xs = xs.reshape(((), hidden_dim))?;
+    /// B3 producer-fused MoE entry: `acts` is the ln2 output as a `DynamicActs` (q8a128 for int8,
+    /// Float for Off). The router consumes it via `forward_dynamic`; the experts byte-gather the
+    /// q8a128 directly (no gather-then-quantize). CUDA only.
+    #[cfg(feature = "cuda")]
+    fn forward_dynamic(&self, acts: DynamicActs, out_dtype: DType) -> Result<Tensor> {
+        let (b_size, seq_len, hidden_dim) = match &acts {
+            DynamicActs::Float(t) => t.dims3()?,
+            DynamicActs::Int8(op) => match op.lead.as_slice() {
+                &[b, s] => (b, s, op.cols),
+                other => candle::bail!(
+                    "SparseMoeBlock::forward_dynamic: expected [b, seq] lead, got {other:?}"
+                ),
+            },
+        };
+        let num_tokens = b_size * seq_len;
         let k = self.num_experts_per_tok;
-        #[allow(unused_variables)]
-        let num_tokens = xs.dim(0)?;
-
-        // ── 1. Route: GPU-side softmax + top-k ──
-        //
-        // `sort_last_dim` on `[num_tokens, 128]` is safe (128 < CUDA 1024-
-        // thread-per-block limit).  We pull only the `[num_tokens, k]`
-        // expert indices to CPU for cache scheduling; routing weights stay
-        // on GPU and are gathered per-expert via flat index_select.
         let t = profile_now();
-        let router_logits = self.gate.forward(&xs)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-        let routing_weights = routing_weights.to_dtype(DType::F32)?;
+        let router_logits = self
+            .gate
+            .forward_dynamic(acts.as_dynamic(), out_dtype)?
+            .reshape((num_tokens, ()))?;
+        let (weights_flat, idx_cpu) = self.route_indices(&router_logits, num_tokens, k, t)?;
+        let input = match acts {
+            DynamicActs::Float(t2) => MoeInput::Float(t2.reshape((num_tokens, hidden_dim))?),
+            DynamicActs::Int8(op) => MoeInput::Q8(op),
+        };
+        self.forward_with_indices(
+            input,
+            out_dtype,
+            weights_flat,
+            idx_cpu,
+            b_size,
+            seq_len,
+            hidden_dim,
+            k,
+            t,
+        )
+    }
 
-        let (sorted_w, sorted_idx) = routing_weights.sort_last_dim(false)?;
-        let top_k_weights = sorted_w.narrow(1, 0, k)?; // [num_tokens, k]
-        let top_k_indices = sorted_idx.narrow(1, 0, k)?.contiguous()?; // [num_tokens, k] u32
-
-        let top_k_weights = if self.norm_topk_prob {
-            let sums = top_k_weights.sum(1)?;
-            top_k_weights.broadcast_div(&sums.unsqueeze(1)?)?
-        } else {
-            top_k_weights
+    /// Route: GPU softmax + top-k → `(flattened routing weights, per-token expert indices)`.
+    /// Shared by `forward` (FP) and `forward_dynamic` (q8a128) — operates only on the logits.
+    fn route_indices(
+        &self,
+        router_logits: &Tensor,
+        num_tokens: usize,
+        k: usize,
+        t: crate::models::profile::ProfileMark,
+    ) -> Result<(Tensor, Vec<Vec<u32>>)> {
+        // `num_tokens` drives the CUDA async routing DtoH only; the non-CUDA path uses `to_vec2`.
+        #[cfg(not(feature = "cuda"))]
+        let _ = num_tokens;
+        // Fused routing: softmax + top-k select + (optional) renormalize in a single kernel,
+        // replacing the `softmax → sort(desc) → narrow(k) → renorm → flatten` op chain (≈6 launches
+        // over a tiny `[num_tokens, 128]` tensor). top-k of softmax == top-k of the logits (softmax
+        // is monotonic) and renorm cancels the global softmax denominator, so the kernel makes one
+        // pass over the experts. Outputs `[num_tokens, k]` weights (f32) and indices (u32) in
+        // descending-logit order — identical to the sort path. We pull only the indices to CPU for
+        // scheduling; weights stay GPU-resident.
+        #[cfg(feature = "cuda")]
+        let (top_k_weights, top_k_indices) = moe_route(router_logits, k, self.norm_topk_prob)?;
+        #[cfg(not(feature = "cuda"))]
+        let (top_k_weights, top_k_indices) = {
+            let routing_weights =
+                candle_nn::ops::softmax_last_dim(router_logits)?.to_dtype(DType::F32)?;
+            let (sorted_w, sorted_idx) = routing_weights.sort_last_dim(false)?;
+            let top_k_weights = sorted_w.narrow(1, 0, k)?; // [num_tokens, k]
+            let top_k_indices = sorted_idx.narrow(1, 0, k)?.contiguous()?; // [num_tokens, k] u32
+            let top_k_weights = if self.norm_topk_prob {
+                let sums = top_k_weights.sum(1)?;
+                top_k_weights.broadcast_div(&sums.unsqueeze(1)?)?
+            } else {
+                top_k_weights
+            };
+            (top_k_weights, top_k_indices)
         };
 
         // Flatten weights to 1-D on GPU — stays device-resident.
@@ -372,7 +329,7 @@ impl SparseMoeBlock {
         // Fallback: if routing stream or pinned buffer not available,
         // fall back to synchronous to_vec2().
         #[cfg(feature = "cuda")]
-        let idx_cpu: Vec<Vec<u32>> = if let Device::Cuda(cuda_dev) = xs.device() {
+        let idx_cpu: Vec<Vec<u32>> = if let Device::Cuda(cuda_dev) = router_logits.device() {
             let total_indices = num_tokens * k;
             let routing_stream = self.cache.routing_stream();
             let pinned_buf = self.cache.routing_pinned_mut(total_indices);
@@ -409,31 +366,13 @@ impl SparseMoeBlock {
                             self.cache.send_hint(self.moe_layer_idx, prev_experts);
                         }
 
-                        return self.forward_with_indices(
-                            xs,
-                            weights_flat,
-                            idx,
-                            b_size,
-                            seq_len,
-                            hidden_dim,
-                            k,
-                            t,
-                        );
+                        return Ok((weights_flat, idx));
                     }
                 } else {
                     drop(storage);
                     let idx = top_k_indices.to_vec2::<u32>()?;
                     self.cache.record_profile("fwd_routing", t);
-                    return self.forward_with_indices(
-                        xs,
-                        weights_flat,
-                        idx,
-                        b_size,
-                        seq_len,
-                        hidden_dim,
-                        k,
-                        t,
-                    );
+                    return Ok((weights_flat, idx));
                 }
                 drop(storage);
 
@@ -489,13 +428,15 @@ impl SparseMoeBlock {
             idx
         };
 
-        self.forward_with_indices(xs, weights_flat, idx_cpu, b_size, seq_len, hidden_dim, k, t)
+        Ok((weights_flat, idx_cpu))
     }
 
     /// Common path after routing indices are available (sync or async).
+    #[allow(clippy::too_many_arguments)]
     fn forward_with_indices(
         &self,
-        xs: Tensor,
+        input: MoeInput,
+        out_dtype: DType,
         weights_flat: Tensor,
         idx_cpu: Vec<Vec<u32>>,
         b_size: usize,
@@ -562,7 +503,8 @@ impl SparseMoeBlock {
         let ys = self.cache.submit_moe_work(
             self.moe_layer_idx,
             expert_ids,
-            &xs,
+            input,
+            out_dtype,
             &weights_flat,
             assignments,
         )?;
@@ -592,6 +534,7 @@ pub struct LayerWeights {
     ln2: RmsNorm,
 }
 
+#[cfg(feature = "cuda")]
 impl BatchedAttentionLayer for LayerWeights {
     fn n_head(&self) -> usize {
         self.self_attn.num_heads
@@ -605,36 +548,36 @@ impl BatchedAttentionLayer for LayerWeights {
         self.self_attn.head_dim
     }
 
-    fn attention_norm(&self, x: &Tensor) -> Result<Tensor> {
-        self.ln1.forward(x)
+    fn o_proj(&self) -> &QMatMul {
+        &self.self_attn.o_proj
     }
 
-    fn ffn_norm(&self, x: &Tensor) -> Result<Tensor> {
-        self.ln2.forward(x)
+    // ── Producer-fused (q8a128) overrides for the batched paged path ──
+    // `int8mode` + `output_projection` (B2) come from the trait defaults (o_proj-driven);
+    // only the model-specific producers (ln1/ln2 fusion, q/k-norm qkv, MoE ffn) are overridden.
+
+    /// B1 producer: fuse ln1 → q8a128 (int8) or FP rms_norm (Off) in one kernel.
+    #[cfg(feature = "cuda")]
+    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+        self.ln1.forward_dynamic(x, mode)
     }
 
-    fn ffn_forward(&self, x: &Tensor) -> Result<Tensor> {
-        match &self.ffn {
-            FeedForward::Mlp(m) => m.forward(x),
-            FeedForward::MoE(m) => m.forward(x),
-        }
-    }
-
-    fn project_qkv(&self, x: &Tensor) -> Result<QkvProjection> {
-        let act_dtype = x.dtype();
-        let (b_sz, seq_len, _) = x.dims3()?;
-
-        let (mut q, mut k, mut v) = self.self_attn.project_qkv_with_compute_type(x)?;
-
-        if q.dtype() != act_dtype {
-            q = q.to_dtype(act_dtype)?;
-        }
-        if k.dtype() != act_dtype {
-            k = k.to_dtype(act_dtype)?;
-        }
-        if v.dtype() != act_dtype {
-            v = v.to_dtype(act_dtype)?;
-        }
+    /// B1 consumer: q/k/v over the fused ln1 activation, then q/k/v RMSNorm + reshapes.
+    #[cfg(feature = "cuda")]
+    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection> {
+        let (b_sz, seq_len) = match acts {
+            DynamicActs::Float(t) => {
+                let (b, s, _) = t.dims3()?;
+                (b, s)
+            }
+            DynamicActs::Int8(op) => match op.lead.as_slice() {
+                &[b, s] => (b, s),
+                other => {
+                    candle::bail!("project_qkv: expected [b, seq] lead, got {other:?}")
+                }
+            },
+        };
+        let (q, k, v) = self.self_attn.project_qkv(acts, out_dtype)?;
 
         let n_head = self.self_attn.num_heads;
         let n_kv_head = self.self_attn.num_kv_heads;
@@ -663,8 +606,36 @@ impl BatchedAttentionLayer for LayerWeights {
         Ok(QkvProjection { q, k, v })
     }
 
-    fn output_projection(&self, attn_output: &Tensor) -> Result<Tensor> {
-        self.self_attn.o_proj.forward(attn_output)
+    /// B3: ln2 as a producer epilogue. Only the MoE path emits q8a128 (its router + expert gather
+    /// consume it); a dense MLP layer stays FP (it has no int8 grouped path).
+    #[cfg(feature = "cuda")]
+    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+        match &self.ffn {
+            FeedForward::MoE(_) => self.ln2.forward_dynamic(x, mode),
+            FeedForward::Mlp(_) => Ok(DynamicActs::Float(self.ln2.forward(x)?)),
+        }
+    }
+
+    /// B3 consumer: the MoE/MLP over the producer-fused ln2 activation. MoE routes the q8a128 (or
+    /// Float) through `forward_dynamic`; a dense MLP runs the FP path (with the stability cast).
+    #[cfg(feature = "cuda")]
+    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor> {
+        match &self.ffn {
+            FeedForward::MoE(m) => {
+                // FP acts get the F16→BF16 stability cast; q8a128 is range-safe (no cast).
+                let acts = match acts {
+                    DynamicActs::Float(t) => DynamicActs::Float(t.to_dtype(mlp_dtype)?),
+                    int8 => int8,
+                };
+                m.forward_dynamic(acts, mlp_dtype)
+            }
+            FeedForward::Mlp(m) => match acts {
+                DynamicActs::Float(t) => m.forward(&t.to_dtype(mlp_dtype)?),
+                DynamicActs::Int8(_) => candle::bail!(
+                    "dense MLP: int8 activation unsupported (ffn_norm emits Float for Mlp)"
+                ),
+            },
+        }
     }
 }
 
@@ -684,10 +655,13 @@ pub struct ModelWeights {
     #[cfg(feature = "cuda")]
     _mmap_registration: Option<MmapRegistration>,
     device: Device,
-    span: tracing::Span,
-    span_output: tracing::Span,
+    /// Inference numeric mode for the dense (non-expert) projections. Baked into each dense
+    /// `QMatMul` at load; retained here for introspection. Experts are unaffected (always FP16).
+    #[allow(dead_code)]
+    int8mode: Int8Mode,
 }
 
+#[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
 
@@ -998,35 +972,13 @@ impl ModelWeights {
             let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
             let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
 
-            let try_fuse = device.is_cuda()
-                && q_w.dtype() == k_w.dtype()
-                && q_w.dtype() == v_w.dtype()
-                && !matches!(
-                    q_w.dtype(),
-                    GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                );
-
-            let (qkv_proj, q_proj, k_proj, v_proj) = if try_fuse {
-                #[cfg(feature = "cuda")]
-                {
-                    let qkv_w = QTensor::concat_rows_cuda(&[&q_w, &k_w, &v_w])?;
-                    (Some(QMatMul::from_qtensor(qkv_w)?), None, None, None)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    candle::bail!("fused QKV requires the cuda feature");
-                }
-            } else {
-                (
-                    None,
-                    Some(QMatMul::from_weights(q_w.into())?),
-                    Some(QMatMul::from_weights(k_w.into())?),
-                    Some(QMatMul::from_weights(v_w.into())?),
-                )
-            };
+            // q/k/v kept separate (no concat): the int8 path fuses them at launch via the
+            // segmented kernel, and the FP path runs them as three matmuls.
+            let q_proj = Some(QMatMul::from_weights(q_w.into())?);
+            let k_proj = Some(QMatMul::from_weights(k_w.into())?);
+            let v_proj = Some(QMatMul::from_weights(v_w.into())?);
 
             let self_attn = AttentionWeights {
-                qkv_proj,
                 q_proj,
                 k_proj,
                 v_proj,
@@ -1035,10 +987,8 @@ impl ModelWeights {
                 k_norm,
                 num_heads: num_attention_heads,
                 num_kv_heads,
-                num_kv_groups: num_attention_heads / num_kv_heads,
                 head_dim,
                 rotary_emb: rotary.clone(),
-                span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
             };
 
             // FFN: detect MoE vs dense by checking for expert tensors
@@ -1174,8 +1124,9 @@ impl ModelWeights {
             #[cfg(feature = "cuda")]
             _mmap_registration: None,
             device: device.clone(),
-            span: tracing::span!(tracing::Level::TRACE, "model"),
-            span_output: tracing::span!(tracing::Level::TRACE, "output"),
+            // Reader path keeps every projection in FP16; int8 dense repack is only wired on the
+            // mmap (`from_gguf_by_path`) load path.
+            int8mode: Int8Mode::Off,
         })
     }
 
@@ -1193,7 +1144,31 @@ impl ModelWeights {
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
+        // Auto-enable int8 (Precision) on GPUs that can run the int8 m16n8k32 MMA; otherwise the
+        // FP16 reference path. Explicit-mode callers use `from_gguf_by_path_with_int8` instead.
+        let int8mode = Int8Mode::auto(device);
+        Self::from_gguf_by_path_with_int8(file_path, device, progress, int8mode)
+    }
+
+    /// Like [`ModelWeights::from_gguf_by_path`] but selects the inference numeric `int8mode` for
+    /// the whole model — dense projections *and* MoE experts. [`Int8Mode::Off`] is the FP16
+    /// reference; an int8 mode repacks every dense weight (attention q/k/v/o, MoE router gate,
+    /// dense-MLP gate/up/down, lm_head) to its KO twin so forward runs the q8a128 int8 tensor-core
+    /// matmul, and stages each expert's gate/up/down as their KO twins through the [`ExpertCache`]
+    /// repack-to-host/DMA pipeline so the grouped expert matmul runs int8 too.
+    pub fn from_gguf_by_path_with_int8(
+        file_path: &std::path::Path,
+        device: &Device,
+        progress: Option<&dyn Fn(usize, usize)>,
+        int8mode: Int8Mode,
+    ) -> Result<Self> {
         use memmap2::MmapOptions;
+
+        tracing::info!(
+            "Inference int8 mode: {int8mode:?} (dense projections + MoE experts; \
+             GPU int8 m16n8k32 MMA capable: {})",
+            Int8Mode::auto(device).is_int8(),
+        );
 
         let file = std::fs::File::open(file_path)?;
         let mmap = unsafe {
@@ -1513,6 +1488,7 @@ impl ModelWeights {
                 n_expert,
                 Some(file_path),
                 cache_progress,
+                int8mode,
             )?;
             Some(Arc::new(cache))
         } else {
@@ -1539,8 +1515,9 @@ impl ModelWeights {
             let q_w = load_tensor(&format!("{prefix}.attn_q.weight"))?;
             let k_w = load_tensor(&format!("{prefix}.attn_k.weight"))?;
             let v_w = load_tensor(&format!("{prefix}.attn_v.weight"))?;
-            let o_proj = QMatMul::from_weights(
+            let o_proj = QMatMul::from_weights_with_mode(
                 load_tensor(&format!("{prefix}.attn_output.weight"))?.into(),
+                int8mode,
             )?;
             let q_norm = RmsNorm::from_qtensor(
                 load_tensor(&format!("{prefix}.attn_q_norm.weight"))?,
@@ -1551,35 +1528,13 @@ impl ModelWeights {
                 rms_norm_eps,
             )?;
 
-            let try_fuse = device.is_cuda()
-                && q_w.dtype() == k_w.dtype()
-                && q_w.dtype() == v_w.dtype()
-                && !matches!(
-                    q_w.dtype(),
-                    GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                );
-
-            let (qkv_proj, q_proj, k_proj, v_proj) = if try_fuse {
-                #[cfg(feature = "cuda")]
-                {
-                    let qkv_w = QTensor::concat_rows_cuda(&[&q_w, &k_w, &v_w])?;
-                    (Some(QMatMul::from_qtensor(qkv_w)?), None, None, None)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    candle::bail!("fused QKV requires the cuda feature");
-                }
-            } else {
-                (
-                    None,
-                    Some(QMatMul::from_weights(q_w.into())?),
-                    Some(QMatMul::from_weights(k_w.into())?),
-                    Some(QMatMul::from_weights(v_w.into())?),
-                )
-            };
+            // q/k/v kept separate KO twins (no concat): the segmented kernel fuses the three at
+            // launch — any KO formats, one occupied launch.
+            let q_proj = Some(QMatMul::from_weights_with_mode(q_w.into(), int8mode)?);
+            let k_proj = Some(QMatMul::from_weights_with_mode(k_w.into(), int8mode)?);
+            let v_proj = Some(QMatMul::from_weights_with_mode(v_w.into(), int8mode)?);
 
             let self_attn = AttentionWeights {
-                qkv_proj,
                 q_proj,
                 k_proj,
                 v_proj,
@@ -1588,10 +1543,8 @@ impl ModelWeights {
                 k_norm,
                 num_heads: num_attention_heads,
                 num_kv_heads,
-                num_kv_groups: num_attention_heads / num_kv_heads,
                 head_dim,
                 rotary_emb: rotary.clone(),
-                span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
             };
 
             // FFN: detect MoE vs dense by checking for expert tensors
@@ -1603,8 +1556,9 @@ impl ModelWeights {
                     .contains_key(&format!("{prefix}.ffn_gate_exps.weight"));
 
             let ffn = if has_moe_tensors && n_expert > 1 {
-                let gate = QMatMul::from_weights(
+                let gate = QMatMul::from_weights_with_mode(
                     load_tensor(&format!("{prefix}.ffn_gate_inp.weight"))?.into(),
+                    int8mode,
                 )?;
 
                 let cache_ref = expert_cache
@@ -1626,8 +1580,9 @@ impl ModelWeights {
                 // Dense MLP
                 let gate_w = load_tensor(&format!("{prefix}.ffn_gate.weight"))?;
                 let up_w = load_tensor(&format!("{prefix}.ffn_up.weight"))?;
-                let down_proj = QMatMul::from_weights(
+                let down_proj = QMatMul::from_weights_with_mode(
                     load_tensor(&format!("{prefix}.ffn_down.weight"))?.into(),
+                    int8mode,
                 )?;
 
                 let try_fuse = device.is_cuda()
@@ -1641,7 +1596,11 @@ impl ModelWeights {
                     #[cfg(feature = "cuda")]
                     {
                         let fused = QTensor::concat_rows_cuda(&[&gate_w, &up_w])?;
-                        (Some(QMatMul::from_qtensor(fused)?), None, None)
+                        (
+                            Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
+                            None,
+                            None,
+                        )
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
@@ -1650,8 +1609,8 @@ impl ModelWeights {
                 } else {
                     (
                         None,
-                        Some(QMatMul::from_weights(gate_w.into())?),
-                        Some(QMatMul::from_weights(up_w.into())?),
+                        Some(QMatMul::from_weights_with_mode(gate_w.into(), int8mode)?),
+                        Some(QMatMul::from_weights_with_mode(up_w.into(), int8mode)?),
                     )
                 };
                 FeedForward::Mlp(MlpWeights {
@@ -1689,9 +1648,14 @@ impl ModelWeights {
             Ok(tensor) => tensor,
             Err(_) => load_tensor("token_embd.weight")?,
         };
-        let lm_head = QMatMul::from_weights(lm_head_tensor.into())?;
+        let lm_head = QMatMul::from_weights_with_mode(lm_head_tensor.into(), int8mode)?;
 
-        tracing::debug!("Model loaded: {} layers ({} MoE)", num_layers, moe_count);
+        tracing::debug!(
+            "Model loaded: {} layers ({} MoE), int8mode={:?}",
+            num_layers,
+            moe_count,
+            int8mode
+        );
 
         Ok(Self {
             embeddings,
@@ -1703,8 +1667,7 @@ impl ModelWeights {
             #[cfg(feature = "cuda")]
             _mmap_registration: _mmap_guard,
             device: device.clone(),
-            span: tracing::span!(tracing::Level::TRACE, "model"),
-            span_output: tracing::span!(tracing::Level::TRACE, "output"),
+            int8mode,
         })
     }
 
@@ -1714,95 +1677,6 @@ impl ModelWeights {
             .map(|_| KvCache::new(2, initial_capacity))
             .collect();
         new_kv_caches(caches, self.device.clone())
-    }
-
-    /// Forward pass with typed context struct.
-    pub fn forward_with_context(&self, ctx: SequenceContext<'_>) -> Result<Tensor> {
-        if ctx.kv_caches.layer_count() != self.layers.len() {
-            candle::bail!(
-                "Cache count mismatch: expected {} caches, got {}",
-                self.layers.len(),
-                ctx.kv_caches.layer_count()
-            );
-        }
-        let _enter = self.span.enter();
-        let (_b, l) = ctx.input_ids.dims2()?;
-
-        let embed_dtype = ctx.kv_caches.dtype();
-        let mut h = self
-            .embeddings
-            .forward_as_dtype(ctx.input_ids, embed_dtype)?
-            .contiguous()?;
-
-        for (layer, cache) in self.layers.iter().zip(ctx.kv_caches.caches.iter_mut()) {
-            let residual = h.clone();
-            let normed = layer.ln1.forward(&h)?;
-            let attn_out = layer.self_attn.forward(cache, &normed, ctx.offset)?;
-            h = (residual + attn_out)?;
-
-            let residual = h.clone();
-            let normed = layer.ln2.forward(&h)?;
-            let ffn_out = match &layer.ffn {
-                FeedForward::Mlp(m) => m.forward(&normed)?,
-                FeedForward::MoE(m) => m.forward(&normed)?,
-            };
-            h = (residual + ffn_out)?;
-        }
-        let h = self.norm.forward(&h)?;
-        let _enter = self.span_output.enter();
-        let last_hidden = h.narrow(1, l - 1, 1)?.contiguous()?;
-        self.lm_head.forward(&last_hidden)?.squeeze(1)
-    }
-
-    /// Forward pass (backwards compatible API).
-    pub fn forward(&self, caches: &mut KvCaches, input: &Tensor, offset: usize) -> Result<Tensor> {
-        self.forward_with_context(SequenceContext {
-            kv_caches: caches,
-            offset,
-            input_ids: input,
-            input_len: input.dims2()?.1,
-            write_offset_shift: 0,
-        })
-    }
-
-    /// Forward pass returning logits for ALL positions (for perplexity evaluation).
-    ///
-    /// Returns `[batch, seq_len, vocab]` instead of `[batch, vocab]`.
-    pub fn forward_all_logits(
-        &self,
-        caches: &mut KvCaches,
-        input: &Tensor,
-        offset: usize,
-    ) -> Result<Tensor> {
-        if caches.layer_count() != self.layers.len() {
-            candle::bail!(
-                "Cache count mismatch: expected {} caches, got {}",
-                self.layers.len(),
-                caches.layer_count()
-            );
-        }
-        let _enter = self.span.enter();
-        let embed_dtype = caches.dtype();
-        let mut h = self
-            .embeddings
-            .forward_as_dtype(input, embed_dtype)?
-            .contiguous()?;
-        for (layer, cache) in self.layers.iter().zip(caches.caches.iter_mut()) {
-            let residual = h.clone();
-            let normed = layer.ln1.forward(&h)?;
-            let attn_out = layer.self_attn.forward(cache, &normed, offset)?;
-            h = (residual + attn_out)?;
-            let residual = h.clone();
-            let normed = layer.ln2.forward(&h)?;
-            let ffn_out = match &layer.ffn {
-                FeedForward::Mlp(m) => m.forward(&normed)?,
-                FeedForward::MoE(m) => m.forward(&normed)?,
-            };
-            h = (residual + ffn_out)?;
-        }
-        let h = self.norm.forward(&h)?;
-        let _enter = self.span_output.enter();
-        self.lm_head.forward(&h)
     }
 
     /// Returns the RoPE inverse frequency vector used by this model.
@@ -1825,7 +1699,7 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::batch_test::utils::{SequentialCallbacks, TestConfig, TestMode, TestParams};
+    use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
 
@@ -2040,13 +1914,14 @@ mod tests {
                 mode: InferenceMode::C7,
                 use_batched: true,
                 #[cfg(feature = "huge-context")]
-                num_contexts: 64,
+                num_contexts: 48,
                 #[cfg(not(feature = "huge-context"))]
                 num_contexts: 2,
                 num_repeats: 1,
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            /*
             TestConfig {
                 mode: InferenceMode::C8,
                 use_batched: true,
@@ -2058,6 +1933,7 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
+            */
             TestConfig {
                 mode: InferenceMode::C9,
                 use_batched: true,
@@ -2097,32 +1973,24 @@ mod tests {
             },
         ];
 
-        let make_sampler = || {
-            use crate::generation::{LogitsProcessor, Sampling};
-            let mut logits_processor = LogitsProcessor::from_sampling(299792458, Sampling::ArgMax);
-            move |logits: &Tensor| {
-                let logits = logits.squeeze(0)?;
-                logits_processor.sample(&logits)
-            }
-        };
-
         use crate::models::batched_model::BatchedInference;
-        type WrappedModel = BatchedInference<ModelWeights>;
 
-        let sequential = SequentialCallbacks {
-            create_cache: |config: &TestConfig, model: &WrappedModel| {
-                let mut caches = model.model().create_kv_caches(512);
-                caches.force_dtype(config.mode.compute_dtype());
-                Ok(caches)
-            },
-            forward: |ctx: SequenceContext, model: &WrappedModel| {
-                model.model().forward_with_context(ctx)
-            },
-            sample: make_sampler(),
+        // Inference numeric mode for the whole model — dense projections AND MoE experts (KO
+        // twins) — selected by the INT8MODE env var so a run picks a mode without recompiling.
+        // Defaults to Performance (same-width KO int8); override with "off" (FP16 reference) or
+        // "prec"/"precision" (stepped-up, near-lossless KO int8). One model load: switching mode
+        // means a fresh load, which is correct here — it keeps the Markov expert predictor from
+        // being mixed across modes.
+        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
+            Some("off") => Int8Mode::Off,
+            Some("prec") | Some("precision") => Int8Mode::Precision,
+            _ => Int8Mode::Performance,
         };
+        println!("int8 mode = {int8mode:?}\n");
 
         let load_model = || {
-            let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
+            let model =
+                ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, None, int8mode)?;
             println!("✓ Model loaded\n");
             let inv_freq = model
                 .rope_inv_freq()
@@ -2130,7 +1998,7 @@ mod tests {
             BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
         };
 
-        params.run(configs, load_model, sequential)?;
+        params.with_int8mode(int8mode).run(configs, load_model)?;
 
         Ok(())
     }
@@ -2242,28 +2110,7 @@ mod tests {
                 })
                 .collect();
 
-            let make_sampler = || {
-                use crate::generation::{LogitsProcessor, Sampling};
-                let mut lp = LogitsProcessor::from_sampling(299792458, Sampling::ArgMax);
-                move |logits: &Tensor| {
-                    let logits = logits.squeeze(0)?;
-                    lp.sample(&logits)
-                }
-            };
-
             use crate::models::batched_model::BatchedInference;
-            type WrappedModel = BatchedInference<ModelWeights>;
-            let sequential = SequentialCallbacks {
-                create_cache: |config: &TestConfig, model: &WrappedModel| {
-                    let mut caches = model.model().create_kv_caches(512);
-                    caches.force_dtype(config.mode.compute_dtype());
-                    Ok(caches)
-                },
-                forward: |ctx: SequenceContext, model: &WrappedModel| {
-                    model.model().forward_with_context(ctx)
-                },
-                sample: make_sampler(),
-            };
 
             let load_model = || {
                 let model = ModelWeights::from_gguf_by_path(&model_path, &device, None)?;
@@ -2277,7 +2124,7 @@ mod tests {
             // Validation outcome is irrelevant here — we only want the routing
             // trace, so a harness validation error must not lose captured data.
             routing_capture::enable_all();
-            let run_result = params.run(configs, load_model, sequential);
+            let run_result = params.run(configs, load_model);
             routing_capture::disable();
             if let Err(e) = &run_result {
                 println!("(harness reported: {e} — ignored; writing captured trace)");

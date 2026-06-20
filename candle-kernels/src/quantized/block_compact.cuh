@@ -698,6 +698,25 @@ typedef struct __align__(16) {
 } block_c_q4_K_k128;
 static_assert(sizeof(block_c_q4_K_k128) == 80, "block_c_q4_K_k128 must be 80 bytes");
 
+// Q4_KO K/128: byte-permuted twin of Q4_K. DE-INTERLEAVED q8a128 int8 path: this
+// 64-byte block is the QUANT half only — the 16 qs ints (0-63), each sub's four ints
+// stored INTERLEAVED as [I0,I2,I1,I3] so a lane's qlo (K[0:16]) and qhi (K[16:32]) are
+// adjacent (one int2 LDS.64). The four per-32 (scale,-min) pairs are pulled out into a
+// separate 16B scale region at the tensor tail (one dm block per quant block, same
+// block index) and read straight from global in the fold — never staged. Keeps the
+// cp.async weight stream pure quants. See is_scale_separate + the dm-hoist in kernel.cuh.
+typedef struct __align__(16) {
+    int qs[16];   // 0-63: [I0,I2,I1,I3] per sub
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) d[i] = s[i];
+    }
+} block_c_q4_KO_k128;
+static_assert(sizeof(block_c_q4_KO_k128) == 64, "block_c_q4_KO_k128 must be 64 bytes (quant only; scales separate)");
+
 // Q5_K K/128: 16 threads × 8 elements, 4 scale pairs (32-elem groups)
 // Same layout as Q5_1 - 4 threads share a scale pair
 typedef struct __align__(16) {
@@ -739,6 +758,31 @@ typedef struct __align__(16) {
 } block_c_q5_K_k128;
 static_assert(sizeof(block_c_q5_K_k128) == 112, "block_c_q5_K_k128 must be 112 bytes");
 
+// Q5_KO: byte-permuted twin of Q5_K. Same data — 128 low-nibbles, four 5th-bit
+// ints, four (scale,-min) pairs — reordered so the qs occupy 0-63, the qh ints
+// contiguous (64-79) and the scales grouped at the tail (80-95). Within each sub the
+// four qs ints are interleaved [I0,I2,I1,I3] (so the int8 path loads them with one
+// int2). A pure permutation for the q8a128 int8 path. 112 bytes / 128 elements.
+// DE-INTERLEAVED q8a128 int8 path: this 80-byte block is the QUANT half only
+// (qs + qh). The per-32 scales (dm) are pulled out into a separate scale region at
+// the tail of the weight tensor (one 16B dm block per quant block, same block index)
+// and read straight from global in the fold — never staged. This keeps the cp.async
+// weight stream pure quants (the MMA skips the float sectors), drops the old 16B pad,
+// and shrinks the weight smem. See is_scale_separate (gemx_dequant.cuh) + the
+// dm-hoist in kernel.cuh.
+typedef struct __align__(16) {
+    int qs[16];   // 0-63:  [I0,I2,I1,I3] per sub
+    int qh[4];    // 64-79: 5th-bit ints, one per thread-quad
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 5; i++) d[i] = s[i];
+    }
+} block_c_q5_KO_k128;
+static_assert(sizeof(block_c_q5_KO_k128) == 80, "block_c_q5_KO_k128 must be 80 bytes (quant only; scales separate)");
+
 // Q6_K K/128: 16 threads × 8 elements, 8 scales (16-elem groups)
 // 6-bit: each thread needs int (4B) low + uint16_t (2B) high
 // 
@@ -770,6 +814,25 @@ typedef struct __align__(16) {
     }
 } block_c_q6_K_k128;
 static_assert(sizeof(block_c_q6_K_k128) == 112, "block_c_q6_K_k128 must be 112 bytes");
+
+// Q6_KO: DE-INTERLEAVED q8a128 int8 path. The Q6_K compact block is ql (0-63), qh
+// (64-95), scales (96-111); this 96-byte block is the QUANT half only (ql + qh). The
+// 8 per-16 scales (16B) are pulled out into a separate scale region at the tensor tail
+// (one 16B scale block per quant block, same block index, read as 4 half2 in the fold)
+// — never staged. Keeps the cp.async weight stream pure quants. See is_scale_separate +
+// the dm-hoist in kernel.cuh.
+typedef struct __align__(16) {
+    int ql[16];      // 0-63
+    int qh[8];       // 64-95
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 6; i++) d[i] = s[i];
+    }
+} block_c_q6_KO_k128;
+static_assert(sizeof(block_c_q6_KO_k128) == 96, "block_c_q6_KO_k128 must be 96 bytes (quant only; scales separate)");
 
 // Q8_K K/128: 16 threads × 8 elements, 1 scale for entire block
 // Q8_K is the simplest K-quant: 8-bit quants with a single float scale per 256 elements.
@@ -817,6 +880,52 @@ typedef struct __align__(16) {
     }
 } block_c_q8_K_k128;
 static_assert(sizeof(block_c_q8_K_k128) == 160, "block_c_q8_K_k128 must be 160 bytes");
+
+// Q8_KO: DE-INTERLEAVED q8a128 int8 path. The 16 qs int2 made contiguous (0-127); this
+// 128-byte block is the QUANT half only. The (replicated) block scale is pulled out into
+// a separate 16B scale region at the tensor tail (one per quant block, same block index,
+// read as 4 half2 in the fold — Q8 is symmetric so the high half / min is 0). Drops the
+// old 16B pad AND keeps the cp.async weight stream pure quants. See is_scale_separate +
+// the dm-hoist in kernel.cuh.
+typedef struct __align__(16) {
+    int2 qs[16];  // 0-127:  thread t's 8 int8
+    template<typename T>
+    __device__ __forceinline__ void copy_from(const T& src) {
+        const int4* s = reinterpret_cast<const int4*>(&src);
+        int4* d = reinterpret_cast<int4*>(this);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) d[i] = s[i];
+    }
+} block_c_q8_KO_k128;
+static_assert(sizeof(block_c_q8_KO_k128) == 128, "block_c_q8_KO_k128 must be 128 bytes (quant only; scales separate)");
+
+// =============================================================================
+// KO K/1024 CHUNK BLOCKS — the strongly-typed unit the int8 (q8a128) path streams.
+// =============================================================================
+// One block = one 8-row weight chunk (8 rows × 128 K = 1024 elements) carrying its OWN
+// scales inline: the 8 per-row quant sub-blocks followed by the 32 per-(row,sub)
+// (scale, min) half2 pairs. This replaces the old "quant-only k128 block + separate
+// scale region at the tensor tail" layout: now the chunk's scales ride the same cp.async
+// as its quants and are read straight from the prefetched smem chunk in the fold — no
+// dm-hoist, no second DRAM stream, one unified read path. `q[row]` is the existing k128
+// quant block (bit-layout unchanged); `dm[row][sub]` is its (scale, min).
+template <typename QuantRow>
+struct block_c_KO_k1024 {
+    QuantRow q[8];        // 8 rows of quants (8 * sizeof(QuantRow) bytes); 16-aligned
+    half2    dm[8];       // (scale, min) per row — ONE per 128 (per-128 collapse), 32 bytes
+};
+typedef block_c_KO_k1024<block_c_q4_KO_k128> block_c_q4_KO_k1024;
+typedef block_c_KO_k1024<block_c_q5_KO_k128> block_c_q5_KO_k1024;
+typedef block_c_KO_k1024<block_c_q6_KO_k128> block_c_q6_KO_k1024;
+typedef block_c_KO_k1024<block_c_q8_KO_k128> block_c_q8_KO_k1024;
+
+// Bytes per warp weight chunk (8 rows) in the int8 path. KO k1024 blocks ARE the 8-row
+// chunk (quants + inline scales) → sizeof. Legacy non-KO int8 blocks are per-row → ×8.
+template <typename T> struct int8_chunk_bytes { static constexpr int value = 8 * (int)sizeof(T); };
+template <> struct int8_chunk_bytes<block_c_q4_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q4_KO_k1024); };
+template <> struct int8_chunk_bytes<block_c_q5_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q5_KO_k1024); };
+template <> struct int8_chunk_bytes<block_c_q6_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q6_KO_k1024); };
+template <> struct int8_chunk_bytes<block_c_q8_KO_k1024> { static constexpr int value = (int)sizeof(block_c_q8_KO_k1024); };
 
 // =============================================================================
 // AWQ (ACTIVATION-AWARE WEIGHT QUANTIZATION) - K/128 FORMAT
@@ -905,6 +1014,19 @@ struct gemx_tile_traits<block_c_q4_K_k128> {
     static constexpr int scales_per_ktile = 4;    // 1 scale per 32 elements
 };
 
+// Q4_KO: de-interleaved total footprint = 64B quant (this struct) + 16B scale (separate
+// scale region at the tensor tail). The kernel stages only the 64B quant block (sizeof)
+// and reads the 16B scale by block index; this stride sizes the whole [quant | scale]
+// buffer.
+template<>
+struct gemx_tile_traits<block_c_q4_KO_k128> {
+    static constexpr bool is_ktile_major = true;
+    static constexpr int stride = 80;             // 64 quant + 16 scale
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 4;
+    static constexpr int scales_per_ktile = 4;    // 1 scale per 32 elements
+};
+
 template<>
 struct gemx_tile_traits<block_c_q5_K_k128> {
     static constexpr bool is_ktile_major = true;
@@ -921,6 +1043,37 @@ struct gemx_tile_traits<block_c_q6_K_k128> {
     static constexpr int elements_per_tile = 128;
     static constexpr int bits_per_element = 6;
     static constexpr int scales_per_ktile = 8;    // 1 scale per 16 elements
+};
+
+// KO twins — identical metadata to their K counterparts (only the in-block byte
+// order differs; Q6_KO is byte-identical to Q6_K).
+template<>
+struct gemx_tile_traits<block_c_q5_KO_k128> {
+    static constexpr bool is_ktile_major = true;
+    // De-interleaved total footprint per block: 80B quant (this struct) + 16B scale
+    // (separate scale region at the tensor tail). The kernel stages only the 80B quant
+    // block (sizeof) and reads the 16B scale by block index; this stride sizes the
+    // whole [quant | scale] buffer.
+    static constexpr int stride = 96;
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 5;
+    static constexpr int scales_per_ktile = 4;
+};
+template<>
+struct gemx_tile_traits<block_c_q6_KO_k128> {
+    static constexpr bool is_ktile_major = true;
+    static constexpr int stride = 112;            // 96 quant + 16 scale
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 6;
+    static constexpr int scales_per_ktile = 8;
+};
+template<>
+struct gemx_tile_traits<block_c_q8_KO_k128> {
+    static constexpr bool is_ktile_major = true;
+    static constexpr int stride = 144;            // 128 quant + 16 scale (old 16B pad removed)
+    static constexpr int elements_per_tile = 128;
+    static constexpr int bits_per_element = 8;
+    static constexpr int scales_per_ktile = 4;
 };
 
 template<>
@@ -1056,8 +1209,28 @@ enum QType {
     QTYPE_Q0 = 33,
     QTYPE_F8E4M3 = 34,
     QTYPE_F8E5M2 = 35,
+    // Kernel-only QTypes past the GgmlDType-aligned range (no GgmlDType mirror).
+    // q8a128 is the contiguous q8 *activation* block (block_q8a128, 144B) — the
+    // activation-ordered twin of the q8_1 weight block. It is not a stored-weight
+    // dtype, so it has no GgmlDType; 36 is the first slot beyond the mirror.
+    // Two qtypes for the two matmul modes — SAME block_q8a128, (eventually) different
+    // tile layouts: V = mode-1 (Bm=16, decode), X = mode-2 (Bm=32 weight-reuse, prefill).
+    QTYPE_Q8A128V = 36,
+    QTYPE_Q8A128X = 37,
 
-    QTYPE_COUNT   = 36
+    // Byte-permuted ("ordered") twins of the K-quant compact blocks — qs made
+    // contiguous and the per-sub scales grouped at the tail — for the q8a128 int8
+    // matmul path. Weight-only kernel formats produced by an on-GPU permutation of
+    // the corresponding K block; they mirror GgmlDType but never hit disk. Values
+    // start at 45 because GgmlDType 36-44 are the raw storage dtypes (U8..F64),
+    // which this quant-only enum doesn't carry — so KO is the first slot free in
+    // BOTH enums, preserving the GgmlDType-as-u32 == QTYPE invariant.
+    QTYPE_Q4_KO  = 45,
+    QTYPE_Q5_KO  = 46,
+    QTYPE_Q6_KO  = 47,
+    QTYPE_Q8_KO  = 48,
+
+    QTYPE_COUNT   = 49
 };
 
 // =============================================================================
@@ -1103,7 +1276,13 @@ static_assert(QTYPE_Q0_M4   == 32, "QTYPE_Q0_M4 must be 32");
 static_assert(QTYPE_Q0      == 33, "QTYPE_Q0 must be 33");
 static_assert(QTYPE_F8E4M3  == 34, "QTYPE_F8E4M3 must be 34");
 static_assert(QTYPE_F8E5M2  == 35, "QTYPE_F8E5M2 must be 35");
-static_assert(QTYPE_COUNT   == 36, "QTYPE_COUNT must be 36");
+static_assert(QTYPE_Q8A128V == 36, "QTYPE_Q8A128V must be 36 (first kernel-only QType)");
+static_assert(QTYPE_Q8A128X == 37, "QTYPE_Q8A128X must be 37 (q8a128 mode-2)");
+static_assert(QTYPE_Q4_KO   == 45, "QTYPE_Q4_KO must be 45");
+static_assert(QTYPE_Q5_KO   == 46, "QTYPE_Q5_KO must be 46");
+static_assert(QTYPE_Q6_KO   == 47, "QTYPE_Q6_KO must be 47");
+static_assert(QTYPE_Q8_KO   == 48, "QTYPE_Q8_KO must be 48");
+static_assert(QTYPE_COUNT   == 49, "QTYPE_COUNT must be 49");
 
 // =============================================================================
 // QType -> matmul kernel index
@@ -1133,6 +1312,13 @@ __host__ __device__ inline int qtype_to_matmul_kernel_index(int qtype) {
         case QTYPE_Q8_K:     return 11;
         case QTYPE_QAWQ:     return 12;
         case QTYPE_QAWQ_G64: return 13;
+        // KO byte-permuted twins: own int8 kernels (different in-block offsets), so
+        // own rows past the 14 base formats. FP tables don't have these rows — KO is
+        // dispatched only via the q8a128 int8 path (ytype==3).
+        case QTYPE_Q4_KO:    return 14;
+        case QTYPE_Q5_KO:    return 15;
+        case QTYPE_Q6_KO:    return 16;
+        case QTYPE_Q8_KO:    return 17;
         default:             return -1;
     }
 }
@@ -1209,6 +1395,10 @@ __host__ __device__ inline int qtype_output_block_size(int qtype) {
         case QTYPE_Q8_K:     return gemx_tile_traits<block_c_q8_K_k128>::stride;
         case QTYPE_QAWQ:     return gemx_tile_traits<block_c_q_awq_k128>::stride;
         case QTYPE_QAWQ_G64: return gemx_tile_traits<block_c_q_awq_g64_k128>::stride;
+        case QTYPE_Q4_KO:    return gemx_tile_traits<block_c_q4_KO_k128>::stride;
+        case QTYPE_Q5_KO:    return gemx_tile_traits<block_c_q5_KO_k128>::stride;
+        case QTYPE_Q6_KO:    return gemx_tile_traits<block_c_q6_KO_k128>::stride;
+        case QTYPE_Q8_KO:    return gemx_tile_traits<block_c_q8_KO_k128>::stride;
         default:             return -1;   // Unsupported by GEMX output layout
     }
 }
@@ -1241,9 +1431,21 @@ typedef block_c_q8_1_k128 block_c_q8_1;
 typedef block_c_q2_K_k128 block_c_q2_K;
 typedef block_c_q3_K_k128 block_c_q3_K;
 typedef block_c_q4_K_k128 block_c_q4_K;
+typedef block_c_q4_KO_k128 block_c_q4_KO;
 typedef block_c_q5_K_k128 block_c_q5_K;
+typedef block_c_q5_KO_k128 block_c_q5_KO;
 typedef block_c_q6_K_k128 block_c_q6_K;
+typedef block_c_q6_KO_k128 block_c_q6_KO;
+typedef block_c_q8_KO_k128 block_c_q8_KO;
 typedef block_c_q8_K_k128 block_c_q8_K;
+
+// Per-row smem stride for the INT8 weight slot = the block byte size (rows packed
+// contiguously). A +16B-per-row pad was measured to eliminate the dequant shared-load
+// bank conflicts (Q8: 22.1M → 62K) but moved wall-clock by zero — those conflicts were
+// latency hidden by TLP, not a throughput bound — while the padded (scattered) cp.async
+// destination hurt the single-slot prefetch (Q5 −1.5%→−10%). So: no pad. The trait is
+// kept as the single source of truth for the smem row stride.
+template <typename T> struct smem_row_stride { static constexpr int value = (int)sizeof(T); };
 
 // Default 4-bit block for gemx_launch_simple
 typedef block_c_q4_0_k128 block_c_4bit_default;

@@ -607,16 +607,16 @@ template <int FMT, bool IS_K>
 __device__ __forceinline__ void quantize_block_for_fmt(
     const float* src, uint8_t* dst)
 {
-    if      constexpr (FMT == SELECT_FMT_Q8_KS)  quantize_block_q8_ks  (src, (block_q8_ks*)  dst);
-    else if constexpr (FMT == SELECT_FMT_Q8_0)   quantize_block_q8_0   (src, (block_q8_0*)   dst);
+    if      constexpr (FMT == SELECT_FMT_Q8_KS)  quantize_block_q8_ks_vec(src, (block_q8_ks*) dst);
+    else if constexpr (FMT == SELECT_FMT_Q8_0)   quantize_block_q8_0_vec(src, (block_q8_0*)  dst);
     else if constexpr (FMT == SELECT_FMT_Q8_1)   quantize_block_q8_1   (src, (block_q8_1*)   dst);
-    else if constexpr (FMT == SELECT_FMT_Q4_KS)  quantize_block_q4_ks  (src, (block_q4_ks*)  dst);
+    else if constexpr (FMT == SELECT_FMT_Q4_KS)  quantize_block_q4_ks_vec(src, (block_q4_ks*) dst);
     else if constexpr (FMT == SELECT_FMT_Q4_1)   quantize_block_q4_1   (src, (block_q4_1*)   dst);
-    else if constexpr (FMT == SELECT_FMT_Q4_0)   quantize_block_q4_0   (src, (block_q4_0*)   dst);
+    else if constexpr (FMT == SELECT_FMT_Q4_0)   quantize_block_q4_0_vec(src, (block_q4_0*)  dst);
     else if constexpr (FMT == SELECT_FMT_Q3_1)   quantize_block_q3_1   (src, (block_q3_1*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q3_0)   quantize_block_q3_0   (src, (block_q3_0*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q2_1)   quantize_block_q2_1   (src, (block_q2_1*)   dst);
-    else if constexpr (FMT == SELECT_FMT_Q2_0)   quantize_block_q2_0   (src, (block_q2_0*)   dst);
+    else if constexpr (FMT == SELECT_FMT_Q2_0)   quantize_block_q2_0_vec(src, (block_q2_0*)  dst);
     else if constexpr (FMT == SELECT_FMT_Q2_A)   quantize_block_q2_a   (src, (block_q2_a*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q2_S)   quantize_block_q2_s   (src, (block_q2_s*)   dst);
     else if constexpr (FMT == SELECT_FMT_Q1_S)   quantize_block_q1_s   (src, (block_q1_s*)   dst);
@@ -1395,7 +1395,10 @@ __device__ __forceinline__ int quant_block_bytes(int fmt) {
         case ArenaFormat::Q1_A: return 6;
         case ArenaFormat::Q0_X: return 2;
         case ArenaFormat::Q0: return 1;
-        default: return 32;
+        // Non-arena format reached arena block addressing — fail loud rather than
+        // mis-address with a guessed size. K-quants/AWQ/q8a128 use non-32-element
+        // blocks and are not arena-storable, so this is always a programming error.
+        default: __trap(); return 0;
     }
 }
 

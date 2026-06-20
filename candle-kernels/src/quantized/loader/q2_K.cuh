@@ -414,7 +414,43 @@ struct gemx_dequant_traits<block_c_q2_K, compute_t, scale_t> {
     // =========================================================================
     
     static constexpr int K128_BYTES = 64;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH (affine per-16; int8_affine_per16 == true)
+    // -------------------------------------------------------------------------
+    // 2-bit unsigned (value = d·q + m, q in 0..3), natural bit order (element j at
+    // qs bits 2j). Weights stay UNSIGNED; per-16 {d,m} applied by the split affine
+    // fold (the min term uses in-kernel per-16 activation sums). Layout: group g
+    // (bytes 8g..8g+7) = {qs_even@0, qs_odd@2, dm@4 (half2 {d,m})}.
+    __device__ __forceinline__ static uint32_t unpack_field_int8(
+        const uint8_t* __restrict__ rb, int field, int p)
+    {
+        const int pr = field >> 1, ip = field & 1;
+        const uint32_t qs = *reinterpret_cast<const uint16_t*>(rb + 8 * pr + (ip ? 2 : 0));
+        const uint32_t qss = (qs >> (2 * p)) & 0xFFu;  // 4 × 2-bit
+        return ((qss & 0x03u) << 0) | ((qss & 0x0Cu) << 6)
+             | ((qss & 0x30u) << 12) | ((qss & 0xC0u) << 18);
+    }
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int p = (q3 & 1) * 4;
+        const int m0 = sub * 4 + (q3 >> 1);
+        b_frag[0] = unpack_field_int8(rb, m0, p);
+        b_frag[1] = unpack_field_int8(rb, m0 + 2, p);
+    }
+    // {d,m} for the lo 16-group (pair 2s, dm at byte 16s+4) and hi 16-group
+    // (pair 2s+1, dm at byte 16s+12).
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        return *reinterpret_cast<const half2*>(row_block + 16 * sub + 4);
+    }
+    __device__ __forceinline__ static half2 sub_dm_hi(const uint8_t* __restrict__ row_block, int sub) {
+        return *reinterpret_cast<const half2*>(row_block + 16 * sub + 12);
+    }
+
     // Compile-time lane parameter extraction
     template <int LANE>
     struct lane_params {

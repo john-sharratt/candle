@@ -313,7 +313,13 @@ impl MatrixPredictor {
 
     /// `group` = source layers sharing one matrix (1 = per-pair).  `decay` =
     /// per-pass multiplicative count decay (1.0 = none / stationary).
-    fn new_cfg(num_layers: usize, num_experts: usize, scoring: Scoring, group: usize, decay: f64) -> Self {
+    fn new_cfg(
+        num_layers: usize,
+        num_experts: usize,
+        scoring: Scoring,
+        group: usize,
+        decay: f64,
+    ) -> Self {
         let group = group.max(1);
         let pairs = num_layers.saturating_sub(1);
         let groups = pairs.div_ceil(group).max(1);
@@ -462,7 +468,13 @@ impl MatrixPredictor {
     }
 
     /// Score the top-`k` successors under an arbitrary `scoring` rule.
-    fn score_topk(&self, layer: usize, experts: &[usize], k: usize, scoring: Scoring) -> Vec<usize> {
+    fn score_topk(
+        &self,
+        layer: usize,
+        experts: &[usize],
+        k: usize,
+        scoring: Scoring,
+    ) -> Vec<usize> {
         match self.score_vec(layer, experts, scoring) {
             Some(s) => top_k_excluding(&s, experts, k),
             None => vec![],
@@ -612,12 +624,25 @@ fn recurrence() {
         "layers={}  experts={}  adjacent-token steps measured={}",
         trace.num_layers, e, next_n
     );
-    println!("base rate  P(e routed next token at L)          = {:.1}%", base_rate * 100.0);
-    println!("stickiness P(e next | e active now)             = {:.1}%", stickiness * 100.0);
-    println!("arrival    P(e next | e NOT active now)         = {:.2}%", arrival * 100.0);
+    println!(
+        "base rate  P(e routed next token at L)          = {:.1}%",
+        base_rate * 100.0
+    );
+    println!(
+        "stickiness P(e next | e active now)             = {:.1}%",
+        stickiness * 100.0
+    );
+    println!(
+        "arrival    P(e next | e NOT active now)         = {:.2}%",
+        arrival * 100.0
+    );
     println!(
         "lift (stickiness / base rate)                  = {:.1}×",
-        if base_rate > 0.0 { stickiness / base_rate } else { 0.0 }
+        if base_rate > 0.0 {
+            stickiness / base_rate
+        } else {
+            0.0
+        }
     );
     println!(
         "of experts needed next token, share already active = {:.1}%",
@@ -753,7 +778,10 @@ impl Sim {
     fn touch(&mut self, key: usize, keep: f64) {
         self.clock += 1;
         let c = self.clock;
-        self.resident.entry(key).and_modify(|v| *v = (c, keep)).or_insert((c, keep));
+        self.resident
+            .entry(key)
+            .and_modify(|v| *v = (c, keep))
+            .or_insert((c, keep));
     }
 
     /// Insert `key`, evicting the worst victim under `policy` if full.
@@ -805,13 +833,7 @@ fn global_stickiness(trace: &Trace, decode_max: usize) -> f64 {
 }
 
 /// Run one full cache simulation over the trace; returns the miss rate.
-fn simulate(
-    trace: &Trace,
-    budget: usize,
-    policy: Evict,
-    prefetch_pmi_k: usize,
-    prior: f64,
-) -> f64 {
+fn simulate(trace: &Trace, budget: usize, policy: Evict, prefetch_pmi_k: usize, prior: f64) -> f64 {
     let e = trace.num_experts;
     let mut sim = Sim::new(budget);
     let mut recur = RecurrenceModel::new(trace.num_layers, e);
@@ -892,8 +914,24 @@ fn cache_sim() {
         let budget = ((distinct as f64) * frac).ceil() as usize;
         let lru = simulate(&trace, budget, Evict::Lru, 0, prior);
         let b1 = simulate(&trace, budget, Evict::Blend { scale: cohort }, 0, prior);
-        let b4 = simulate(&trace, budget, Evict::Blend { scale: cohort * 4.0 }, 0, prior);
-        let b4_pmi = simulate(&trace, budget, Evict::Blend { scale: cohort * 4.0 }, 4, prior);
+        let b4 = simulate(
+            &trace,
+            budget,
+            Evict::Blend {
+                scale: cohort * 4.0,
+            },
+            0,
+            prior,
+        );
+        let b4_pmi = simulate(
+            &trace,
+            budget,
+            Evict::Blend {
+                scale: cohort * 4.0,
+            },
+            4,
+            prior,
+        );
         println!(
             "{:>6.0}% {:>8.1}% {:>11.1}% {:>12.1}% {:>12.1}% {:>+13.1}",
             frac * 100.0,
@@ -927,7 +965,8 @@ fn per_config() {
     for c in trace.configs() {
         let sub = trace.for_config(c);
         let records: usize = sub.passes.iter().map(|p| p.layers.len()).sum();
-        let mut pmi = MatrixPredictor::new(sub.num_layers, sub.num_experts, Scoring::Pmi { alpha: 0.5 });
+        let mut pmi =
+            MatrixPredictor::new(sub.num_layers, sub.num_experts, Scoring::Pmi { alpha: 0.5 });
         let (_, d) = replay(&sub, &mut pmi, 4, DECODE_MAX, 0);
         let stick = global_stickiness(&sub, DECODE_MAX);
         println!(
@@ -1043,21 +1082,35 @@ fn loocv_prefetch() {
         "\n=== Promote: 21-fold leave-one-out CV (train_epochs={EPOCHS}) ===\n\
          held-out decode coverage — every prompt tested on a model that never saw it"
     );
-    for (mode, name) in [(0usize, "frozen (pure generalization)"), (1, "+online (realistic)")] {
+    for (mode, name) in [
+        (0usize, "frozen (pure generalization)"),
+        (1, "+online (realistic)"),
+    ] {
         println!("\n── {name} ──");
-        println!("{:<14} {:>3} {:>8} {:>10} {:>12}", "predictor", "k", "top1", "precision", "decode-cov");
+        println!(
+            "{:<14} {:>3} {:>8} {:>10} {:>12}",
+            "predictor", "k", "top1", "precision", "decode-cov"
+        );
         println!("{}", "-".repeat(52));
         for ki in 0..ks.len() {
             let pm = &mpop[mode][ki];
             println!(
                 "{:<14} {:>3} {:>7.1}% {:>9.1}% {:>11.1}%",
-                "popularity", ks[ki], pm.top1() * 100.0, pm.precision() * 100.0, pm.coverage() * 100.0
+                "popularity",
+                ks[ki],
+                pm.top1() * 100.0,
+                pm.precision() * 100.0,
+                pm.coverage() * 100.0
             );
             for si in 0..scorings.len() {
                 let mm = &m[mode][si][ki];
                 println!(
                     "{:<14} {:>3} {:>7.1}% {:>9.1}% {:>11.1}%",
-                    scorings[si].0, ks[ki], mm.top1() * 100.0, mm.precision() * 100.0, mm.coverage() * 100.0
+                    scorings[si].0,
+                    ks[ki],
+                    mm.top1() * 100.0,
+                    mm.precision() * 100.0,
+                    mm.coverage() * 100.0
                 );
             }
             println!();
@@ -1121,7 +1174,12 @@ impl MultiSource {
 
     /// Source expert set for a channel predicting `target`, given the current
     /// layer context.  Returns up to two source slices (pinned spans layers).
-    fn sources<'a>(&'a self, ch: Channel, target: usize, cur_layer_experts: &'a [usize]) -> Vec<&'a [usize]> {
+    fn sources<'a>(
+        &'a self,
+        ch: Channel,
+        target: usize,
+        cur_layer_experts: &'a [usize],
+    ) -> Vec<&'a [usize]> {
         let get = |layer: usize, store: &'a [Option<Vec<usize>>]| -> Option<&'a [usize]> {
             store.get(layer).and_then(|o| o.as_deref())
         };
@@ -1162,7 +1220,12 @@ impl Predictor for MultiSource {
                     .and_then(|l| self.cur.get(l).and_then(|o| o.clone()))
                     .into_iter()
                     .collect(),
-                Channel::Recur => self.prev.get(layer).and_then(|o| o.clone()).into_iter().collect(),
+                Channel::Recur => self
+                    .prev
+                    .get(layer)
+                    .and_then(|o| o.clone())
+                    .into_iter()
+                    .collect(),
                 Channel::Pinned => (0..PINNED)
                     .filter_map(|l| self.cur.get(l).and_then(|o| o.clone()))
                     .collect(),
@@ -1262,7 +1325,12 @@ struct SessionPrior {
 impl SessionPrior {
     fn new(prior: MatrixPredictor, beta: f64, alpha: f64) -> Self {
         let session = MatrixPredictor::new(prior.num_layers, prior.e, Scoring::Raw);
-        Self { prior, session, beta, alpha }
+        Self {
+            prior,
+            session,
+            beta,
+            alpha,
+        }
     }
 }
 
@@ -1295,8 +1363,16 @@ impl SessionPrior {
         }
         let e = self.prior.e;
         let g = self.prior.gidx(layer);
-        let (pc, prt, pcol) = (&self.prior.counts[g], &self.prior.row_total[g], &self.prior.col_total[g]);
-        let (sc, srt, scol) = (&self.session.counts[g], &self.session.row_total[g], &self.session.col_total[g]);
+        let (pc, prt, pcol) = (
+            &self.prior.counts[g],
+            &self.prior.row_total[g],
+            &self.prior.col_total[g],
+        );
+        let (sc, srt, scol) = (
+            &self.session.counts[g],
+            &self.session.row_total[g],
+            &self.session.col_total[g],
+        );
         let tot = (b * self.prior.grp_total[g] + self.session.grp_total[g]).max(1.0);
 
         let mut scores = vec![0.0f64; e];
@@ -1343,7 +1419,12 @@ impl Velocity {
         fast.decay = fast_d;
         let mut slow = MatrixPredictor::new(l, e, Scoring::Raw);
         slow.decay = slow_d;
-        Self { sp, fast, slow, gamma }
+        Self {
+            sp,
+            fast,
+            slow,
+            gamma,
+        }
     }
 }
 
@@ -1371,8 +1452,16 @@ impl Predictor for Velocity {
             let base = from * e;
             let (frt, srt) = (self.fast.row_total[g][from], self.slow.row_total[g][from]);
             for to in 0..e {
-                let pf = if frt > 0.0 { self.fast.counts[g][base + to] / frt } else { 0.0 };
-                let ps = if srt > 0.0 { self.slow.counts[g][base + to] / srt } else { 0.0 };
+                let pf = if frt > 0.0 {
+                    self.fast.counts[g][base + to] / frt
+                } else {
+                    0.0
+                };
+                let ps = if srt > 0.0 {
+                    self.slow.counts[g][base + to] / srt
+                } else {
+                    0.0
+                };
                 let vel = pf - ps;
                 if vel > 0.0 {
                     scores[to] += self.gamma * vel;
@@ -1446,11 +1535,23 @@ struct TwoStage {
 }
 
 impl TwoStage {
-    fn new(base: MatrixPredictor, sc_base: Scoring, sc_session: Scoring, w_session: f64, decay: f64) -> Self {
+    fn new(
+        base: MatrixPredictor,
+        sc_base: Scoring,
+        sc_session: Scoring,
+        w_session: f64,
+        decay: f64,
+    ) -> Self {
         let mut session = MatrixPredictor::new(base.num_layers, base.e, Scoring::Raw);
         session.decay = decay;
         session.min_obs = 8; // engage the fork as soon as a little session data exists
-        Self { base, session, sc_base, sc_session, w_session }
+        Self {
+            base,
+            session,
+            sc_base,
+            sc_session,
+            w_session,
+        }
     }
 }
 
@@ -1515,7 +1616,8 @@ fn loocv_twostage() {
         for (di, &decay) in decays.iter().enumerate() {
             for (fi, &(_, fsc)) in forks.iter().enumerate() {
                 for (wi, &w) in weights.iter().enumerate() {
-                    let mut ts = TwoStage::new(base.clone(), Scoring::Pmi { alpha: 0.5 }, fsc, w, decay);
+                    let mut ts =
+                        TwoStage::new(base.clone(), Scoring::Pmi { alpha: 0.5 }, fsc, w, decay);
                     let mut m = vec![Metrics::default(); ks.len()];
                     score_into(&mut ts, &test, &ks, 4, true, &mut m);
                     grid[di][fi][wi].pred_total += m[0].pred_total;
@@ -1543,7 +1645,10 @@ fn loocv_twostage() {
                 let cov = grid[di][fi][wi].coverage() * 100.0;
                 print!("{:>7.1}%", cov);
                 if cov > best.0 {
-                    best = (cov, format!("decay={decay} fork={flabel} w={}", weights[wi]));
+                    best = (
+                        cov,
+                        format!("decay={decay} fork={flabel} w={}", weights[wi]),
+                    );
                 }
             }
             println!();
@@ -1553,7 +1658,14 @@ fn loocv_twostage() {
 }
 
 /// Build the champion predictor at given hyperparameters.
-fn champion(prior: MatrixPredictor, beta: f64, alpha: f64, gamma: f64, fast: f64, slow: f64) -> Velocity {
+fn champion(
+    prior: MatrixPredictor,
+    beta: f64,
+    alpha: f64,
+    gamma: f64,
+    fast: f64,
+    slow: f64,
+) -> Velocity {
     let mut sp = SessionPrior::new(prior, beta, alpha);
     sp.session.arrivals_only = true;
     Velocity::new_decays(sp, gamma, fast, slow)
@@ -1569,7 +1681,11 @@ fn tune_vel() {
     let trace = Trace::from_records(&records);
     let (l, e) = (trace.num_layers, trace.num_experts);
     let gammas = [0.0f64, 1.0, 2.0, 3.0, 4.0];
-    let decays = [("0.7/0.95", 0.7, 0.95), ("0.6/0.92", 0.6, 0.92), ("0.8/0.97", 0.8, 0.97)];
+    let decays = [
+        ("0.7/0.95", 0.7, 0.95),
+        ("0.6/0.92", 0.6, 0.92),
+        ("0.8/0.97", 0.8, 0.97),
+    ];
     let mut grid = vec![vec![Metrics::default(); gammas.len()]; decays.len()];
     for &c in &trace.configs() {
         let mut prior = MatrixPredictor::new(l, e, Scoring::Raw);
@@ -1661,13 +1777,25 @@ fn champion_kcurve() {
         prior.arrivals_only = true;
         train_predictor(&mut prior, &trace.for_configs_except(c), 2);
         let mut v = champion(prior, 0.01, 0.5, 2.0, 0.7, 0.95);
-        score_into(&mut v, &trace.for_config(c), &ks, *ks.iter().max().unwrap(), true, &mut out);
+        score_into(
+            &mut v,
+            &trace.for_config(c),
+            &ks,
+            *ks.iter().max().unwrap(),
+            true,
+            &mut out,
+        );
     }
     println!("\n=== §9.4 Locked champion — coverage & precision vs k ===");
     println!("{:<6} {:>10} {:>12}", "k", "cov", "precision");
     println!("{}", "-".repeat(30));
     for (ki, &k) in ks.iter().enumerate() {
-        println!("{:<6} {:>9.1}% {:>11.1}%", k, out[ki].coverage() * 100.0, out[ki].precision() * 100.0);
+        println!(
+            "{:<6} {:>9.1}% {:>11.1}%",
+            k,
+            out[ki].coverage() * 100.0,
+            out[ki].precision() * 100.0
+        );
     }
     println!();
 }
@@ -1710,21 +1838,41 @@ fn tune_demote() {
         for (bi, &frac) in budgets.iter().enumerate() {
             let budget = ((distinct as f64) * frac).ceil() as usize;
             for (mi, &mult) in mults.iter().enumerate() {
-                let pol = if mult == 0.0 { Demote::Lru } else { Demote::Lfru };
+                let pol = if mult == 0.0 {
+                    Demote::Lru
+                } else {
+                    Demote::Lfru
+                };
                 let mut r = recur0.clone();
                 let mut p = pmi0.clone();
-                let (misses, accesses, _, _) =
-                    demote_sim(&test, budget, pol, &mut r, prior, 0.05, 8, &mut p, base_cohort * mult);
+                let (misses, accesses, _, _) = demote_sim(
+                    &test,
+                    budget,
+                    pol,
+                    &mut r,
+                    prior,
+                    0.05,
+                    8,
+                    &mut p,
+                    base_cohort * mult,
+                );
                 acc[mi][bi].0 += misses;
                 acc[mi][bi].1 += accesses;
             }
         }
     }
     println!("\n=== §9.5 Demote LFRU freq-bonus scale (miss-rate, lower better) ===");
-    println!("{:<14} {:>12} {:>12}", "scale(×cohort)", "budget=50%", "budget=70%");
+    println!(
+        "{:<14} {:>12} {:>12}",
+        "scale(×cohort)", "budget=50%", "budget=70%"
+    );
     println!("{}", "-".repeat(40));
     for (mi, &mult) in mults.iter().enumerate() {
-        let tag = if mult == 0.0 { "LRU".to_string() } else { format!("LFRU×{mult}") };
+        let tag = if mult == 0.0 {
+            "LRU".to_string()
+        } else {
+            format!("LFRU×{mult}")
+        };
         println!(
             "{:<14} {:>11.1}% {:>11.1}%",
             tag,
@@ -1738,10 +1886,10 @@ fn tune_demote() {
 /// Outcome of the end-to-end cache simulation (counts over decode accesses).
 #[derive(Clone, Copy, Default)]
 struct Outcome {
-    hit: u64,         // resident, never evicted
-    soft: u64,        // resident only via prefetch (overlapped load)
-    hard: u64,        // demand-load on the critical path (stall)
-    prefetch: u64,    // total experts speculatively loaded (used + wasted)
+    hit: u64,      // resident, never evicted
+    soft: u64,     // resident only via prefetch (overlapped load)
+    hard: u64,     // demand-load on the critical path (stall)
+    prefetch: u64, // total experts speculatively loaded (used + wasted)
 }
 
 impl Outcome {
@@ -1750,7 +1898,8 @@ impl Outcome {
     }
     /// Stall-weighted cost per 100 accesses: hard×`w_hard` + soft×`w_soft`.
     fn stall_cost(&self, w_hard: f64, w_soft: f64) -> f64 {
-        100.0 * (self.hard as f64 * w_hard + self.soft as f64 * w_soft) / self.accesses().max(1) as f64
+        100.0 * (self.hard as f64 * w_hard + self.soft as f64 * w_soft)
+            / self.accesses().max(1) as f64
     }
     /// PCIe transfers per 100 accesses (bandwidth): demand loads + all prefetch.
     fn bandwidth(&self) -> f64 {
@@ -2013,10 +2162,18 @@ fn cost_optimize() {
     };
 
     println!("\n=== §11 Cost optimisation (60% VRAM; hard×10 + soft×1) ===");
-    grid("-- stall cost / 100 accesses (LOWER = better) --", &|o| o.stall_cost(W_HARD, W_SOFT));
-    grid("-- hard-miss % (the stalls) --", &|o| 100.0 * o.hard as f64 / o.accesses().max(1) as f64);
-    grid("-- soft-miss % (overlapped) --", &|o| 100.0 * o.soft as f64 / o.accesses().max(1) as f64);
-    grid("-- bandwidth: PCIe transfers / 100 accesses --", &|o| o.bandwidth());
+    grid("-- stall cost / 100 accesses (LOWER = better) --", &|o| {
+        o.stall_cost(W_HARD, W_SOFT)
+    });
+    grid("-- hard-miss % (the stalls) --", &|o| {
+        100.0 * o.hard as f64 / o.accesses().max(1) as f64
+    });
+    grid("-- soft-miss % (overlapped) --", &|o| {
+        100.0 * o.soft as f64 / o.accesses().max(1) as f64
+    });
+    grid("-- bandwidth: PCIe transfers / 100 accesses --", &|o| {
+        o.bandwidth()
+    });
     grid("-- prefetch waste % (loaded, never used) --", &|o| {
         100.0 * (o.prefetch.saturating_sub(o.soft)) as f64 / o.prefetch.max(1) as f64
     });
@@ -2025,7 +2182,10 @@ fn cost_optimize() {
     // fits a budget B (transfers / 100 accesses).  Maps the sweet spot to the
     // hardware's available PCIe bandwidth.
     println!("\n-- bandwidth-constrained sweet spot (min stall cost s.t. transfers/100acc ≤ B) --");
-    println!("{:>8} {:>8} {:>5} {:>10} {:>9} {:>9}", "B", "churn", "K", "stallcost", "hard%", "soft%");
+    println!(
+        "{:>8} {:>8} {:>5} {:>10} {:>9} {:>9}",
+        "B", "churn", "K", "stallcost", "hard%", "soft%"
+    );
     for &cap in &[11.0f64, 12.0, 14.0, 17.0, 21.0, 99.0] {
         let mut best = (f64::MAX, 0.0f64, 0usize, 0.0f64, 0.0f64);
         for (ci, &ch) in churns.iter().enumerate() {
@@ -2035,15 +2195,30 @@ fn cost_optimize() {
                     let cost = o.stall_cost(W_HARD, W_SOFT);
                     if cost < best.0 {
                         let acc = o.accesses().max(1) as f64;
-                        best = (cost, ch, k, 100.0 * o.hard as f64 / acc, 100.0 * o.soft as f64 / acc);
+                        best = (
+                            cost,
+                            ch,
+                            k,
+                            100.0 * o.hard as f64 / acc,
+                            100.0 * o.soft as f64 / acc,
+                        );
                     }
                 }
             }
         }
-        let tag = if cap >= 99.0 { "∞".to_string() } else { format!("{cap:.0}") };
+        let tag = if cap >= 99.0 {
+            "∞".to_string()
+        } else {
+            format!("{cap:.0}")
+        };
         println!(
             "{:>8} {:>7.1}% {:>5} {:>10.2} {:>8.2}% {:>8.2}%",
-            tag, best.1 * 100.0, best.2, best.0, best.3, best.4
+            tag,
+            best.1 * 100.0,
+            best.2,
+            best.0,
+            best.3,
+            best.4
         );
     }
     println!();
@@ -2214,7 +2389,11 @@ fn loocv_sessiondecay() {
     println!("{:<14} {:>10}", "session decay", "k=4 cov");
     println!("{}", "-".repeat(26));
     for (di, &sd) in decays.iter().enumerate() {
-        println!("{:<14} {:>9.1}%", format!("{sd}"), out[di].coverage() * 100.0);
+        println!(
+            "{:<14} {:>9.1}%",
+            format!("{sd}"),
+            out[di].coverage() * 100.0
+        );
     }
     println!();
 }
@@ -2242,10 +2421,17 @@ fn loocv_velocity() {
         }
     }
     println!("\n=== §7.6 Velocity boost (SessionPrior β=0.02 α=0.5, +online) ===");
-    println!("{:<14} {:>10} {:>10} {:>10}", "γ (velocity)", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<14} {:>10} {:>10} {:>10}",
+        "γ (velocity)", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(48));
     for (gi, &gamma) in gammas.iter().enumerate() {
-        let tag = if gamma == 0.0 { "0 (sp only)".to_string() } else { format!("{gamma}") };
+        let tag = if gamma == 0.0 {
+            "0 (sp only)".to_string()
+        } else {
+            format!("{gamma}")
+        };
         println!(
             "{:<14} {:>9.1}% {:>9.1}% {:>9.1}%",
             tag,
@@ -2403,7 +2589,10 @@ fn loocv_mass() {
     }
 
     println!("\n=== §7.3 Mass-weighted observations (SessionPrior β=0.02 α=0.5, +online) ===");
-    println!("{:<16} {:>10} {:>10} {:>10}", "variant", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<16} {:>10} {:>10} {:>10}",
+        "variant", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(50));
     for (vi, &(label, _)) in variants.iter().enumerate() {
         println!(
@@ -2444,7 +2633,10 @@ fn loocv_arrivals() {
     }
 
     println!("\n=== §7.4 Arrival-specialised training (SessionPrior β=0.02 α=0.5, +online) ===");
-    println!("{:<16} {:>10} {:>10} {:>10}", "training", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<16} {:>10} {:>10} {:>10}",
+        "training", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(50));
     for (vi, &(label, _)) in variants.iter().enumerate() {
         println!(
@@ -2472,7 +2664,12 @@ struct Recency {
 impl Recency {
     fn new(sp: SessionPrior, decay: f64, gamma: f64) -> Self {
         let (l, e) = (sp.prior.num_layers, sp.prior.e);
-        Self { sp, ema: vec![vec![0.0; e]; l], decay, gamma }
+        Self {
+            sp,
+            ema: vec![vec![0.0; e]; l],
+            decay,
+            gamma,
+        }
     }
 }
 
@@ -2515,7 +2712,9 @@ impl Predictor for Recency {
         }
         let mut v: Vec<(usize, f64)> = fused.into_iter().collect();
         v.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
         });
         v.into_iter().take(k).map(|(i, _)| i).collect()
     }
@@ -2546,10 +2745,17 @@ fn loocv_combo() {
     }
 
     println!("\n=== §7.5 Recency-fusion (SessionPrior + same-layer recency, +online) ===");
-    println!("{:<14} {:>10} {:>10} {:>10}", "γ (recency)", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<14} {:>10} {:>10} {:>10}",
+        "γ (recency)", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(48));
     for (gi, &gamma) in gammas.iter().enumerate() {
-        let tag = if gamma == 0.0 { "0 (sp only)".to_string() } else { format!("{gamma}") };
+        let tag = if gamma == 0.0 {
+            "0 (sp only)".to_string()
+        } else {
+            format!("{gamma}")
+        };
         println!(
             "{:<14} {:>9.1}% {:>9.1}% {:>9.1}%",
             tag,
@@ -2654,11 +2860,20 @@ fn loocv_inputs() {
         ("all", vec![Prev, Prev2, Recur, Pinned]),
     ];
     println!("\n=== Promote input ablation (pmi 0.5, +online, train_epochs=2) ===");
-    println!("{:<14} {:>10} {:>10} {:>10}", "inputs", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<14} {:>10} {:>10} {:>10}",
+        "inputs", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(48));
     for (label, chans) in &configs {
         let chans = chans.clone();
-        let m = loocv_metric(&trace, || MultiSource::new(l, e, chans.clone()), 2, &ks, true);
+        let m = loocv_metric(
+            &trace,
+            || MultiSource::new(l, e, chans.clone()),
+            2,
+            &ks,
+            true,
+        );
         println!(
             "{:<14} {:>9.1}% {:>9.1}% {:>9.1}%",
             label,
@@ -2737,10 +2952,24 @@ fn loocv_size() {
     let ks = [1usize, 2, 4];
     let sc = Scoring::Pmi { alpha: 0.5 };
     println!("\n=== Promote size ablation (pmi 0.5, +online, train_epochs=2) ===");
-    println!("{:<12} {:>10} {:>10} {:>10}", "resolution", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<12} {:>10} {:>10} {:>10}",
+        "resolution", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(46));
-    for (label, group) in [("per-pair", 1usize), ("group-4", 4), ("group-8", 8), ("shared", l)] {
-        let m = loocv_metric(&trace, || MatrixPredictor::new_cfg(l, e, sc, group, 1.0), 2, &ks, true);
+    for (label, group) in [
+        ("per-pair", 1usize),
+        ("group-4", 4),
+        ("group-8", 8),
+        ("shared", l),
+    ] {
+        let m = loocv_metric(
+            &trace,
+            || MatrixPredictor::new_cfg(l, e, sc, group, 1.0),
+            2,
+            &ks,
+            true,
+        );
         println!(
             "{:<12} {:>9.1}% {:>9.1}% {:>9.1}%",
             label,
@@ -2788,7 +3017,12 @@ fn loocv_formula() {
             p.reset_pass();
             let mut preds: Vec<Vec<Vec<usize>>> = Vec::with_capacity(pass.layers.len());
             for (li, ex) in &pass.layers {
-                preds.push(transforms.iter().map(|&(_, s)| p.score_topk(*li, ex, maxk, s)).collect());
+                preds.push(
+                    transforms
+                        .iter()
+                        .map(|&(_, s)| p.score_topk(*li, ex, maxk, s))
+                        .collect(),
+                );
                 p.observe(*li, ex); // +online
             }
             for i in 0..pass.layers.len().saturating_sub(1) {
@@ -2818,11 +3052,22 @@ fn loocv_formula() {
     ];
     let mom_metrics: Vec<Vec<Metrics>> = momentum
         .iter()
-        .map(|&(_, d)| loocv_metric(&trace, || MatrixPredictor::new_cfg(l, e, sc, 1, d), 2, &ks, true))
+        .map(|&(_, d)| {
+            loocv_metric(
+                &trace,
+                || MatrixPredictor::new_cfg(l, e, sc, 1, d),
+                2,
+                &ks,
+                true,
+            )
+        })
         .collect();
 
     println!("\n=== Promote formula sweep (+online, train_epochs=2) ===");
-    println!("{:<16} {:>10} {:>10} {:>10}", "formula", "k=1 cov", "k=2 cov", "k=4 cov");
+    println!(
+        "{:<16} {:>10} {:>10} {:>10}",
+        "formula", "k=1 cov", "k=2 cov", "k=4 cov"
+    );
     println!("{}", "-".repeat(50));
     for ti in 0..transforms.len() {
         println!(
@@ -3041,8 +3286,9 @@ fn loocv_demote() {
             for (pi, &(_, pol)) in policies.iter().enumerate() {
                 let mut r = recur0.clone();
                 let mut p = pmi0.clone();
-                let (mi, ac, ev, rq) =
-                    demote_sim(&test, budget, pol, &mut r, prior, EVICT_FRAC, REGRET_W, &mut p, cohort);
+                let (mi, ac, ev, rq) = demote_sim(
+                    &test, budget, pol, &mut r, prior, EVICT_FRAC, REGRET_W, &mut p, cohort,
+                );
                 let s = &mut acc[pi][bi];
                 s.0 += mi;
                 s.1 += ac;
@@ -3057,10 +3303,16 @@ fn loocv_demote() {
         EVICT_FRAC * 100.0,
         REGRET_W
     );
-    println!("prior(stickiness)={:.1}%   lower miss-rate and group-regret are better", prior * 100.0);
+    println!(
+        "prior(stickiness)={:.1}%   lower miss-rate and group-regret are better",
+        prior * 100.0
+    );
     for (bi, &frac) in budgets.iter().enumerate() {
         println!("\n── VRAM budget = {:.0}% of working set ──", frac * 100.0);
-        println!("{:<12} {:>12} {:>14}", "policy", "miss-rate", "group-regret");
+        println!(
+            "{:<12} {:>12} {:>14}",
+            "policy", "miss-rate", "group-regret"
+        );
         println!("{}", "-".repeat(40));
         for (pi, &(label, _)) in policies.iter().enumerate() {
             let (mi, ac, ev, rq) = acc[pi][bi];
@@ -3099,12 +3351,12 @@ const TC_MS: f64 = (1000.0 / 30.0) / WAVE_LAYERS as f64;
 
 #[derive(Clone, Copy, Default)]
 struct WaveResult {
-    rate: f64,    // estimated tokens/sec
-    hit: f64,     // % resident & ready, never prefetched (always-warm)
-    soft: f64,    // % prefetched & ready in time (latency hidden)
-    late: f64,    // % prefetched but not finished → partial stall
-    hard: f64,    // % not resident → emergency load stall
-    pcie_util: f64, // fraction of wall-time the PCIe link was busy
+    rate: f64,           // estimated tokens/sec
+    hit: f64,            // % resident & ready, never prefetched (always-warm)
+    soft: f64,           // % prefetched & ready in time (latency hidden)
+    late: f64,           // % prefetched but not finished → partial stall
+    hard: f64,           // % not resident → emergency load stall
+    pcie_util: f64,      // fraction of wall-time the PCIe link was busy
     stream_per_tok: f64, // experts transferred per token
 }
 
@@ -3138,9 +3390,7 @@ fn build_wave_demand(trace: &Trace, b: usize, max_tokens: usize) -> Vec<Vec<Vec<
     let nc = seqs.len().max(1);
     // Each slot: (config index, token offset).  Distinct offsets per repeat give
     // diverse routings so the union grows with B beyond the config count.
-    let slots: Vec<(usize, usize)> = (0..b.max(1))
-        .map(|i| (i % nc, (i / nc) * 13))
-        .collect();
+    let slots: Vec<(usize, usize)> = (0..b.max(1)).map(|i| (i % nc, (i / nc) * 13)).collect();
     let ntok = max_tokens;
     let mut demand: Vec<Vec<Vec<usize>>> = Vec::with_capacity(ntok);
     for t in 0..ntok {
@@ -3178,8 +3428,7 @@ fn wave_sim(
     // (recurrence covers the sticky experts; the champion covers cold arrivals).
     let mut champ = MatrixPredictor::new(WAVE_LAYERS, WAVE_E, Scoring::Pmi { alpha: 0.5 });
     // resident[layer] = { expert : (ready_at_ms, prefetched_flag) }
-    let mut resident: Vec<HashMap<usize, (f64, bool)>> =
-        vec![HashMap::new(); WAVE_LAYERS];
+    let mut resident: Vec<HashMap<usize, (f64, bool)>> = vec![HashMap::new(); WAVE_LAYERS];
     let mut count = 0usize;
     let mut clock = 0.0f64;
     let mut pcie_free = 0.0f64;
@@ -3397,7 +3646,15 @@ fn wave_optimize() {
         // stall) / hard (demand stall) — the full four-way access classification.
         println!(
             "{:>5} {:>8.1} {:>8.0} {:>9.1} {:>11.0} {:>6.0} {:>6.0} {:>6.0} {:>6.0}",
-            bsz, dpl, r.stream_per_tok, rate, rate * bsz as f64, r.hit, r.soft, r.late, r.hard
+            bsz,
+            dpl,
+            r.stream_per_tok,
+            rate,
+            rate * bsz as f64,
+            r.hit,
+            r.soft,
+            r.late,
+            r.hard
         );
     }
 
@@ -3438,8 +3695,13 @@ fn wave_optimize() {
     // Compare the fully tuned optimum against the simple deterministic policy
     // (L+1 ahead, prefetch all missing — cap=E, no champion).  At/above the
     // streaming-saturation batch they should coincide (bandwidth-bound).
-    println!("-- saturation regime: tuned optimum vs prefetch-all-missing (depth=1, cap=E, kc=0) --");
-    println!("{:>5} {:>5} {:>10} {:>14} {:>8}", "res%", "B", "tuned t/s", "prefetch-all", "stream");
+    println!(
+        "-- saturation regime: tuned optimum vs prefetch-all-missing (depth=1, cap=E, kc=0) --"
+    );
+    println!(
+        "{:>5} {:>5} {:>10} {:>14} {:>8}",
+        "res%", "B", "tuned t/s", "prefetch-all", "stream"
+    );
     for &res in &[0.60f64, 0.80] {
         let bud = (res * total).round() as usize;
         for &bsz in &[64usize, 256] {
@@ -3518,7 +3780,10 @@ fn report() {
         );
     };
 
-    for (title, warmup) in [("cold-start (online from zero)", 0usize), ("converged (~25 epochs)", 25)] {
+    for (title, warmup) in [
+        ("cold-start (online from zero)", 0usize),
+        ("converged (~25 epochs)", 25),
+    ] {
         println!("\n── {title} ──");
         println!(
             "{:<14} {:>3} {:>8} {:>10} {:>10} {:>12}",

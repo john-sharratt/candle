@@ -93,7 +93,6 @@ pub mod phi3;
 pub mod pixtral;
 pub mod prefill_utils;
 pub mod profile;
-pub mod routing_capture;
 pub mod quantized_blip;
 pub mod quantized_blip_text;
 pub mod quantized_gemma3;
@@ -109,6 +108,7 @@ pub mod quantized_phi;
 pub mod quantized_phi3;
 pub mod quantized_qwen2;
 pub mod quantized_qwen3;
+#[cfg(feature = "cuda")]
 pub mod quantized_qwen3_moe;
 pub mod quantized_recurrent_gemma;
 pub mod quantized_rwkv_v5;
@@ -120,6 +120,7 @@ pub mod qwen2_moe;
 pub mod qwen3;
 pub mod qwen3_moe;
 pub mod rope_tables;
+pub mod routing_capture;
 
 #[cfg(any(test, feature = "ruler-bench"))]
 pub mod batch_test;

@@ -4,9 +4,9 @@
 //! loading, pipeline dispatch, and the public API.
 
 use super::compute::QMatMul;
-use crate::models::profile::ProfileSnapshot;
+use crate::models::profile::{ProfileMark, ProfileSnapshot};
 use candle::quantized::GgmlDType;
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -202,20 +202,49 @@ pub struct ClassifiedExperts {
 /// Contains everything the thread needs to perform the full MoE dispatch:
 /// routing assignments, input tensor, and routing weights.  The thread
 /// does classify → DMA → compute → return output.
+/// The MoE input activation `[num_tokens, hidden_dim]`, threaded through the pipeline. `Q8` is the
+/// B3 int8 path — the ln2-fused q8a1024 router input that the experts byte-gather directly (no
+/// gather-then-quantize). It's cuda-only (the operand holds a `CudaSlice`); the non-CUDA pipeline
+/// only ever sees `Float`. Defined here (not in candle-core) so the int8 arm can be cfg-gated
+/// without dragging the cuda-only `Q8a128Operand` into the shared, non-cuda-gated pipeline structs.
+pub enum MoeInput {
+    Float(Tensor),
+    #[cfg(feature = "cuda")]
+    Q8(candle::quantized::cuda::Q8a128Operand),
+}
+
+impl MoeInput {
+    /// `(num_tokens, hidden)` of the activation.
+    pub fn shape(&self) -> Result<(usize, usize)> {
+        match self {
+            MoeInput::Float(t) => t.dims2(),
+            #[cfg(feature = "cuda")]
+            MoeInput::Q8(op) => Ok((op.rows, op.cols)),
+        }
+    }
+}
+
 pub struct MoeWorkRequest {
     /// Which MoE layer (0..num_moe_layers).
     pub moe_layer_idx: usize,
     /// Unique expert IDs selected by the router (sorted, deduplicated).
     pub expert_ids: Vec<usize>,
-    /// Input hidden states `[num_tokens, hidden_dim]` (GPU tensor).
-    pub xs: Tensor,
+    /// Input hidden states `[num_tokens, hidden_dim]` — `Float` (Off) or the q8a1024 router
+    /// input (int8). The experts gather from it per expert.
+    pub input: MoeInput,
+    /// Compute dtype of the expert output `ys` (a q8a1024 operand carries no dtype).
+    pub out_dtype: DType,
     /// Flattened routing weights `[num_tokens * k]` (GPU tensor, F32).
     pub weights_flat: Tensor,
     /// Flat assignment array sorted by expert ID.
     /// Each entry: `(expert_id, token_idx, flat_weight_idx)`.
     pub assignments: Vec<(u32, u32, u32)>,
-    /// Channel to send the result back to the caller.
-    pub response_tx: mpsc::SyncSender<Result<Tensor>>,
+    /// Timestamp captured by the forward thread just before `send` — lets the worker measure the
+    /// inbound handoff latency (`submit_inbound` = pickup − submit). Zero-sized off-`profile`.
+    pub submitted_at: ProfileMark,
+    /// Channel for the result + the worker's completion timestamp (`worker_done_at`), so the
+    /// forward thread can measure the outbound handoff latency (`submit_outbound` = recv − done).
+    pub response_tx: mpsc::SyncSender<(Result<Tensor>, ProfileMark)>,
 }
 
 // ============================================================================

@@ -902,6 +902,11 @@ extern "C" __global__ void fused_silu_mul_f8_e4m3_vec4(const unsigned int, const
 extern "C" __global__ void moe_gather_bf16(__nv_bfloat16*, const __nv_bfloat16*, const uint32_t*, size_t, size_t);
 extern "C" __global__ void moe_gather_f16(__half*, const __half*, const uint32_t*, size_t, size_t);
 extern "C" __global__ void moe_gather_f32(float*, const float*, const uint32_t*, size_t, size_t);
+extern "C" __global__ void moe_gather_u8(uint8_t*, const uint8_t*, const uint32_t*, size_t, size_t);
+// Fused router: softmax + top-k select + (optional) renormalize, one thread per token
+extern "C" __global__ void moe_route_f32(const float*, uint32_t*, float*, int, int, int, int);
+extern "C" __global__ void moe_route_f16(const __half*, uint32_t*, float*, int, int, int, int);
+extern "C" __global__ void moe_route_bf16(const __nv_bfloat16*, uint32_t*, float*, int, int, int, int);
 // Deterministic scatter (sequential per-token reduce, no atomicAdd, variable k via prefix sum)
 extern "C" __global__ void deterministic_scatter_bf16(__nv_bfloat16*, const __nv_bfloat16*, const uint32_t*, const float*, const uint32_t*, const int*, int, int);
 extern "C" __global__ void deterministic_scatter_f16(__half*, const __half*, const uint32_t*, const float*, const uint32_t*, const int*, int, int);
@@ -1390,6 +1395,32 @@ void run_fused_silu_mul(int32_t dtype, size_t numel, size_t num_dims, const size
     }
 }
 
+// Fused SwiGLU → q8a128 (producer epilogue B4): out = quantize(silu(gate)*up).
+extern "C" __global__ void silu_mul_q8a128_f32(const float*, const float*, void*, int, int);
+extern "C" __global__ void silu_mul_q8a128_f16(const __half*, const __half*, void*, int, int);
+extern "C" __global__ void silu_mul_q8a128_bf16(const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int);
+
+void run_silu_mul_q8a128_op(int32_t dtype, const void* gate, const void* up, void* out, int rows, int cols) {
+    long long total_tiles = ((long long)rows * cols) / 128;
+    if (total_tiles <= 0) return;
+    const int threads = 256;
+    const int warps_per_block = threads / 32;
+    long long blocks = (total_tiles + warps_per_block - 1) / warps_per_block;
+    if (blocks > 65535) blocks = 65535; // grid-stride covers the remainder
+    dim3 grid((unsigned)blocks, 1, 1), block(threads, 1, 1);
+    switch (dtype) {
+        case 0: // f32
+            silu_mul_q8a128_f32<<<grid, block>>>((const float*)gate, (const float*)up, out, rows, cols);
+            break;
+        case 1: // f16
+            silu_mul_q8a128_f16<<<grid, block>>>((const __half*)gate, (const __half*)up, out, rows, cols);
+            break;
+        case 2: // bf16
+            silu_mul_q8a128_bf16<<<grid, block>>>((const __nv_bfloat16*)gate, (const __nv_bfloat16*)up, out, rows, cols);
+            break;
+    }
+}
+
 // =============================================================================
 // FUSED MoE GATHER / WEIGHTED SCATTER-ADD
 // =============================================================================
@@ -1409,6 +1440,33 @@ void run_moe_gather(int32_t dtype, void* out, const void* xs,
             break;
         case 2: // bf16
             moe_gather_bf16<<<grid, BLOCK_SIZE>>>((__nv_bfloat16*)out, (const __nv_bfloat16*)xs, token_ids, total_rows, hidden_dim);
+            break;
+        case 3: // u8 (q8a1024 byte-row gather; hidden_dim = per-token byte count)
+            moe_gather_u8<<<grid, BLOCK_SIZE>>>((uint8_t*)out, (const uint8_t*)xs, token_ids, total_rows, hidden_dim);
+            break;
+    }
+}
+
+// Fused router. One thread per token (grid-stride). `logits` is [num_tokens, n_experts]
+// in `dtype` (0=f32,1=f16,2=bf16); writes top-k expert indices (u32) and routing weights
+// (f32), both [num_tokens, k] in descending-logit order. `norm_topk` selects renormalized
+// top-k softmax (1) vs plain full-softmax weights (0).
+void run_moe_route(int32_t dtype, const void* logits, uint32_t* out_idx, float* out_weights,
+                   int num_tokens, int n_experts, int k, int norm_topk) {
+    if (num_tokens == 0) return;
+    // One warp per token; 256-thread blocks pack 8 warps (= 8 tokens) each.
+    const int tpb = 256;
+    const int warps_per_block = tpb / 32;
+    const int blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
+    switch (dtype) {
+        case 0: // f32
+            moe_route_f32<<<blocks, tpb>>>((const float*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            break;
+        case 1: // f16
+            moe_route_f16<<<blocks, tpb>>>((const __half*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
+            break;
+        case 2: // bf16
+            moe_route_bf16<<<blocks, tpb>>>((const __nv_bfloat16*)logits, out_idx, out_weights, num_tokens, n_experts, k, norm_topk);
             break;
     }
 }

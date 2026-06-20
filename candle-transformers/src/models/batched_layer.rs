@@ -7,15 +7,21 @@
 //! that transformer layers must implement to support batched attention processing.
 //! The actual batched attention computation is implemented generically in this module.
 
+#[cfg(feature = "cuda")]
+use candle::quantized::cuda::{DynamicActs, Q8a128Operand};
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
+use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 
 #[cfg(feature = "cuda")]
 use crate::models::prefill_utils::paged_decode_attn;
+#[cfg(feature = "cuda")]
+use crate::models::prefill_utils::paged_decode_attn_q8;
 use crate::models::prefill_utils::paged_prefill_batched;
 use crate::models::prefill_utils::paged_prefill_batched_gap_fill;
 use crate::models::profile::{pipeline_record, profile_now, profile_sync};
+use crate::models::quantized_matmul::QMatMul;
 use crate::utils::repeat_kv;
 
 #[cfg(feature = "cuda")]
@@ -232,37 +238,50 @@ pub trait BatchedAttentionLayer {
     /// Dimension of each attention head.
     fn head_dim(&self) -> usize;
 
-    /// Apply attention layer normalization.
-    fn attention_norm(&self, x: &Tensor) -> Result<Tensor>;
+    /// Attention layer norm (ln1) as a producer epilogue (B1): returns the matmul-ready
+    /// `DynamicActs` — q8a128 for an int8 `mode` (fused RMSNorm→quant in one kernel), `Float` for
+    /// `Off`. Every layer fuses its own ln1.
+    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs>;
 
-    /// Apply FFN layer normalization.
-    fn ffn_norm(&self, x: &Tensor) -> Result<Tensor>;
+    /// FFN layer norm (ln2) as a producer epilogue (B3): q8a128 for an int8 `mode`, `Float` for
+    /// `Off`.
+    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs>;
 
-    /// Apply the FFN/MoE module.
-    fn ffn_forward(&self, x: &Tensor) -> Result<Tensor>;
+    /// FFN/MoE module consuming the producer-prepared `DynamicActs` (the fused `ffn_norm`): the
+    /// router + expert gather take the q8a128 directly (no standalone quantize). `mlp_dtype` is the
+    /// FP-stable accumulation dtype for the `Float` path.
+    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor>;
 
-    /// Project input to Q, K, V tensors.
-    ///
-    /// Implementations should include any Q/K/V biases in the projection output.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape (batch, seq_len, hidden_dim)
+    /// Project Q/K/V over the producer-prepared `DynamicActs` (the fused `attention_norm`), folding
+    /// in any Q/K/V bias and q/k-norm. q/k/v share the single quantize (B1).
     ///
     /// # Returns
     /// QkvProjection containing Q, K, V tensors.
     /// - Q shape: (batch, seq_len, n_head * head_dim)
     /// - K shape: (batch, seq_len, n_kv_head * head_dim)
     /// - V shape: (batch, seq_len, n_kv_head * head_dim)
-    fn project_qkv(&self, x: &Tensor) -> Result<QkvProjection>;
+    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection>;
 
-    /// Project attention output back to hidden dimension.
-    ///
-    /// # Arguments
-    /// * `attn_output` - Attention output of shape (batch, seq_len, n_head * head_dim)
-    ///
-    /// # Returns
-    /// Projected output of shape (batch, seq_len, hidden_dim)
-    fn output_projection(&self, attn_output: &Tensor) -> Result<Tensor>;
+    /// The output-projection weight (`attention_wo` / `self_attn.o_proj`). Backs the generalized
+    /// `int8mode` + `output_projection` defaults so any KO-loaded model gets B2 + the mode for free
+    /// — the weight already carries its numeric mode.
+    fn o_proj(&self) -> &QMatMul;
+
+    /// Numeric mode for this layer's dense projections (q/k/v/o), read straight off the o_proj
+    /// weight: `Off` (FP16) for an FP-loaded model, an int8 mode for a KO-loaded one. Drives the
+    /// producer-fused q8a128 path (B1/B2).
+    fn int8mode(&self) -> Int8Mode {
+        self.o_proj().int8mode()
+    }
+
+    /// Output projection (B2) consuming the attention context as a `DynamicActs` — q8a1024 (decode,
+    /// fused by the paged kernel) or `Float` (prefill/glue, quantized at the matmul). Default runs
+    /// `forward_dynamic` off the o_proj weight: an `Int8` operand (decode) goes straight to the KO
+    /// matmul; a `Float` operand is the FP path (or quantized at the matmul for a KO weight).
+    /// Generic across all models.
+    fn output_projection(&self, attn: DynamicActs, out_dtype: DType) -> Result<Tensor> {
+        self.o_proj().forward_dynamic(attn.as_dynamic(), out_dtype)
+    }
 }
 
 // ============================================================================
@@ -322,16 +341,15 @@ pub fn forward_layer_batched<L: BatchedAttentionLayer>(
     let t_attn_total = profile_now();
     let orig_dtype = x.dtype();
 
-    let t_attn_norm = profile_now();
-    let h = x.transform(|t, _| layer.attention_norm(t))?;
-    profile_sync(h.as_cat_tensor().device());
-    pipeline_record(attn_norm_name, t_attn_norm);
-
+    // B1: attention_norm (ln1) is fused into the attention via `attention_norm_dynamic` inside
+    // `forward_attn_batched`, so we hand it the PRE-norm `x` (same shape) and never materialize
+    // the FP normed activation on the int8 path. `attn_norm_name` timing folds into attn:core.
+    let _ = attn_norm_name;
     let t_attn_core = profile_now();
     let h_attn = forward_attn_batched(
         layer,
         caches,
-        h,
+        &*x,
         offsets,
         params,
         write_offset_shifts_ptr,
@@ -356,16 +374,6 @@ pub fn forward_layer_batched<L: BatchedAttentionLayer>(
     } else {
         "prefill:model:mlp:total"
     };
-    let mlp_norm_name = if stage_is_decode {
-        "decode:model:mlp:norm"
-    } else {
-        "prefill:model:mlp:norm"
-    };
-    let mlp_cast_name = if stage_is_decode {
-        "decode:model:mlp:cast"
-    } else {
-        "prefill:model:mlp:cast"
-    };
     let mlp_ffn_name = if stage_is_decode {
         "decode:model:ffn:total"
     } else {
@@ -378,29 +386,20 @@ pub fn forward_layer_batched<L: BatchedAttentionLayer>(
     };
 
     let t_mlp_total = profile_now();
-    // FFN: h2 = ffn(ffn_norm(x))
-    let t_mlp_norm = profile_now();
-    let mut h2 = layer.ffn_norm(x.as_cat_tensor())?;
-    profile_sync(h2.device());
-    pipeline_record(mlp_norm_name, t_mlp_norm);
-
-    // F16 has limited dynamic range and can overflow in MLP intermediate values.
-    // F16 max ~65504 - insufficient for MLP intermediates that can reach 10000+.
-    // Use BF16 for MLP computation when activation dtype is F16.
-    // Note: FP8 already uses BF16 internally via QMatMul, so no conversion needed.
+    // FFN: h2 = ffn(ffn_norm(x)). B3 (CUDA): `ffn_norm_dynamic` fuses ln2→q8a128 for an int8 layer
+    // so the router and expert gather consume the quantized activation directly — no standalone
+    // quantize. FP keeps the F16→BF16 cast (MLP intermediates can exceed F16's ~65504 range).
     let mlp_dtype = if act_dtype == DType::F16 {
         DType::BF16
     } else {
         act_dtype
     };
 
-    let t_mlp_cast_up = profile_now();
-    h2.to_dtype_mut(mlp_dtype)?; // MLP in safe dtype for numerical stability
-    profile_sync(h2.device());
-    pipeline_record(mlp_cast_name, t_mlp_cast_up);
-
     let t_mlp_ffn = profile_now();
-    h2 = layer.ffn_forward(&h2)?;
+    let mut h2 = {
+        let acts = layer.ffn_norm(x.as_cat_tensor(), layer.int8mode())?;
+        layer.ffn_forward(acts, mlp_dtype)?
+    };
     profile_sync(h2.device());
     pipeline_record(mlp_ffn_name, t_mlp_ffn);
 
@@ -423,7 +422,7 @@ pub fn forward_layer_batched<L: BatchedAttentionLayer>(
 pub fn forward_attn_batched<L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
-    x: TensorCat,
+    x: &TensorCat,
     offsets: &[usize],
     params: &BatchedAttentionParams<'_>,
     write_offset_shifts_ptr: u64,
@@ -484,7 +483,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
 fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
-    x: TensorCat,
+    x: &TensorCat,
     offsets: &[usize],
     cos: &Tensor,
     sin: &Tensor,
@@ -496,14 +495,18 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
 ) -> Result<TensorCat> {
     validate_batch_sizes(caches.len(), offsets.len(), x.len())?;
 
+    // `x` is the PRE-norm activation; B1 fuses ln1 → q/k/v here. Shapes are norm-invariant.
     let x_tensor = x.as_cat_tensor();
     let (b_sz, seq_len, _n_embd) = x_tensor.dims3()?;
     debug_assert_eq!(seq_len, 1);
     let _act_dtype = x_tensor.dtype();
 
-    // Project Q/K/V
+    // Project Q/K/V over the fused attention_norm (q8a128 on int8, FP on Off / non-CUDA).
     let t_qkv = profile_now();
-    let QkvProjection { q, k, v } = layer.project_qkv(x_tensor)?;
+    let QkvProjection { q, k, v } = {
+        let acts = layer.attention_norm(x_tensor, layer.int8mode())?;
+        layer.project_qkv(&acts, x_tensor.dtype())?
+    };
 
     // Reshape for attention: (B, seq_len, H*D) -> (B, H, seq_len, D)
     // For seq_len=1, we can reshape directly without transpose
@@ -524,13 +527,10 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
     // Check for chunked (paged) KV cache BEFORE applying model-side RoPE.
     // For the paged path the decode kernel handles RoPE internally (via zeros rope_offsets
     // meaning natural positions), so we must NOT pre-rotate Q/K here.
-    #[cfg(feature = "cuda")]
     let use_paged = caches
         .first()
         .and_then(|c| c.k_cache().chunked_arena_chunks())
         .is_some();
-    #[cfg(not(feature = "cuda"))]
-    let use_paged = false;
 
     // Apply model-side RoPE only for the non-paged path.
     // Paged kernel always applies RoPE internally â€” applying it here would double-rotate.
@@ -570,39 +570,43 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
 
     reset_caches_at_zero(caches, offsets);
 
+    // B2: emit the decode context directly as q8a1024 (head_dim 128 only) so o_proj runs int8
+    // with no standalone quantize. Only on the paged CUDA decode path; false → FP context.
+    let want_q8 = layer.int8mode().is_int8() && use_paged && seq_len == 1 && head_dim == 128;
+
     let outputs = if use_paged && seq_len == 1 {
-        #[cfg(feature = "cuda")]
-        {
-            paged_decode_attention(
-                caches,
-                offsets,
-                &q,
-                &k,
-                &v,
-                n_head,
-                n_kv_head,
-                head_dim,
-                rope_cs,
-                rope_interleaved,
-                generation,
-                decode_headers_ptr,
-            )?
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            standard_batched_attention(caches, &q, &k, &v, head_dim, n_head, n_kv_head)?
-        }
+        paged_decode_attention(
+            caches,
+            offsets,
+            &q,
+            &k,
+            &v,
+            n_head,
+            n_kv_head,
+            head_dim,
+            rope_cs,
+            rope_interleaved,
+            generation,
+            decode_headers_ptr,
+            want_q8,
+        )?
     } else {
         // Non-chunked fallback: standard per-sequence attention
         standard_batched_attention(caches, &q, &k, &v, head_dim, n_head, n_kv_head)?
     };
 
-    // Project back: attention output is (B, H, 1, D) => (B, 1, H*D)
-    // Note: n_head*head_dim may differ from n_embd (e.g. Qwen3-MoE)
-    let out = outputs.reshape((b_sz, 1, n_head * head_dim))?;
-
+    // B2: o_proj over the attention context. On CUDA, `want_q8` → `outputs` is the flat U8 q8a1024
+    // context wrapped (no copy) into an int8 operand; otherwise the FP context (the int8 override,
+    // if any, quantizes it at the matmul). Non-CUDA never sets `want_q8` and has no dynamic o_proj.
     let t_out_proj = profile_now();
-    let attn_out = layer.output_projection(&out)?;
+    let attn_out = if want_q8 {
+        let op = Q8a128Operand::from_tensor(outputs, b_sz, n_head * head_dim)
+            .with_lead(vec![b_sz, seq_len]);
+        layer.output_projection(DynamicActs::Int8(op), x_tensor.dtype())?
+    } else {
+        let out = outputs.reshape((b_sz, 1, n_head * head_dim))?;
+        layer.output_projection(DynamicActs::Float(out), x_tensor.dtype())?
+    };
     profile_sync(attn_out.device());
     pipeline_record("decode:out_proj", t_out_proj);
 
@@ -614,7 +618,7 @@ fn forward_attn_batched_single<L: BatchedAttentionLayer>(
 fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     layer: &L,
     caches: &mut [&mut KvCache],
-    x: TensorCat,
+    x: &TensorCat,
     offsets: &[usize],
     q_lens: &[usize],
     cos: &Tensor,
@@ -638,9 +642,13 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     let x_tensor = x.as_cat_tensor();
     let (_one, total_q, _n_embd) = x_tensor.dims3()?;
 
-    // Project Q/K/V
+    // Project Q/K/V over the fused attention_norm (B1). Prefill is high-M (compute-bound), so
+    // the fused ln1→q8a128 still saves a launch; the per-matmul cost dominates.
     let t_qkv = profile_now();
-    let QkvProjection { q, k, v } = layer.project_qkv(x_tensor)?;
+    let QkvProjection { q, k, v } = {
+        let acts = layer.attention_norm(x_tensor, layer.int8mode())?;
+        layer.project_qkv(&acts, x_tensor.dtype())?
+    };
 
     let n_head = layer.n_head();
     let n_kv_head = layer.n_kv_head();
@@ -658,13 +666,10 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     // Check for paged (chunked) CUDA path BEFORE applying model-side RoPE.
     // The paged prefill kernel applies RoPE internally; applying it here first
     // would double-rotate Q/K.
-    #[cfg(feature = "cuda")]
     let is_cuda_paged = caches
         .first()
         .and_then(|c| c.k_cache().chunked_arena_chunks())
         .is_some();
-    #[cfg(not(feature = "cuda"))]
-    let is_cuda_paged = false;
 
     // Model-side RoPE only on the non-paged (CPU) path. rope() wants [B, H, L, D];
     // for the flat layout that's [1, n_head, total_q, head_dim], with cos/sin
@@ -748,8 +753,13 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     let reshaped_ctx = out_packed
         .contiguous()?
         .reshape((total_q, n_head * head_dim))?;
+    // B2: prefill/glue feed the FP context as `Float`; the int8 override quantizes at the matmul
+    // (launch amortized against the large prefill GEMM).
     let t_out_proj = profile_now();
-    let output = layer.output_projection(&reshaped_ctx)?;
+    let output = {
+        let dt = reshaped_ctx.dtype();
+        layer.output_projection(DynamicActs::Float(reshaped_ctx), dt)?
+    };
     profile_sync(output.device());
     pipeline_record("prefill:out_proj", t_out_proj);
     // Restore the flat-packed [1, total_q, hidden_out] activation.
@@ -894,6 +904,9 @@ fn paged_decode_attention(
     rope_interleaved: bool,
     _generation: &Generation,
     decode_headers_ptr: u64,
+    // B2: emit the attention context as q8a1024 (returns a flat U8 tensor) instead of an FP
+    // context, so o_proj runs int8 with no standalone quantize. Head_dim 128 only.
+    emit_q8: bool,
 ) -> Result<Tensor> {
     let t_alloc = profile_now();
     KvCache::validate_chunked_decode_batch(caches, offsets)?;
@@ -992,23 +1005,41 @@ fn paged_decode_attention(
         pipeline_record("decode:meta", t_meta);
 
         let t_kernel = profile_now();
-        let raw_out = paged_decode_attn(
-            &q_kernel,
-            decode_headers_ptr,
-            arena_dtype,
-            n_head,
-            n_kv_head,
-            head_dim,
-            softmax_scale,
-            &k_kernel,
-            &v_kernel,
-            rope_cs,
-            rope_interleaved,
-        )?;
+        // B2: emit q8a1024 (flat U8 tensor) instead of the FP context when requested. The U8
+        // bytes are the operand for o_proj's int8 matmul — never dtype-converted.
+        let raw_out = if emit_q8 {
+            paged_decode_attn_q8(
+                &q_kernel,
+                decode_headers_ptr,
+                arena_dtype,
+                n_head,
+                n_kv_head,
+                head_dim,
+                softmax_scale,
+                &k_kernel,
+                &v_kernel,
+                rope_cs,
+                rope_interleaved,
+            )?
+        } else {
+            paged_decode_attn(
+                &q_kernel,
+                decode_headers_ptr,
+                arena_dtype,
+                n_head,
+                n_kv_head,
+                head_dim,
+                softmax_scale,
+                &k_kernel,
+                &v_kernel,
+                rope_cs,
+                rope_interleaved,
+            )?
+        };
         profile_sync(q_kernel.device());
         pipeline_record("decode:kernel", t_kernel);
 
-        if q_dtype != arena_dtype {
+        if !emit_q8 && q_dtype != arena_dtype {
             raw_out.to_dtype(q_dtype)?
         } else {
             raw_out

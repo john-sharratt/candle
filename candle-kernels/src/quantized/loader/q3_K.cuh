@@ -493,7 +493,53 @@ struct gemx_dequant_traits<block_c_q3_K, compute_t, scale_t> {
     // =========================================================================
     
     static constexpr int K128_BYTES = 96;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH (per-16 split fold; int8_scales_per_sub == 2)
+    // -------------------------------------------------------------------------
+    // 3-bit = 2-bit low (qs) + 1 high bit (qh), symmetric (value = d·(ql+4·qh-4)).
+    // Natural bit order (element j at qs bits 2j, qh bit j). Feed CENTERED signed
+    // int8 (c = ql+4·qh-4 ∈ -4..3); the per-16 scales are applied by the split
+    // 2-MMA fold, so no min/sum term. Interleaved per-pair layout: group g (bytes
+    // 12g..12g+11) holds {qs_even@0, qh_even@2, dm@4, qh_odd@8, qs_odd@10}.
+    __device__ __forceinline__ static uint32_t unpack_field_int8(
+        const uint8_t* __restrict__ rb, int field, int p)
+    {
+        const int pr = field >> 1, ip = field & 1;
+        const uint32_t qs = *reinterpret_cast<const uint16_t*>(rb + 12 * pr + (ip ? 10 : 0));
+        const uint32_t qh = *(rb + 12 * pr + (ip ? 8 : 2));
+        const uint32_t qss = (qs >> (2 * p)) & 0xFFu;  // 4 × 2-bit low
+        const uint32_t qhs = (qh >> p) & 0xFu;          // 4 × 1-bit high
+        // Spread 2-bit ql into byte bits 0-1, the high bit (×4) into byte bit 2.
+        uint32_t ql = ((qss & 0x03u) << 0) | ((qss & 0x0Cu) << 6)
+                    | ((qss & 0x30u) << 12) | ((qss & 0xC0u) << 18);
+        uint32_t hb = ((qhs * 0x00204081u) & 0x01010101u) << 2;
+        uint32_t q3u = ql | hb;  // bits 0-2, value 0..7
+        // Center by -4: flip bit 2, sign-extend into bits 3-7.
+        q3u ^= 0x04040404u;
+        const uint32_t sgn = q3u & 0x04040404u;
+        q3u |= (sgn << 1) | (sgn << 2) | (sgn << 3) | (sgn << 4) | (sgn << 5);
+        return q3u;
+    }
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int p = (q3 & 1) * 4;
+        const int m0 = sub * 4 + (q3 >> 1);
+        b_frag[0] = unpack_field_int8(rb, m0, p);
+        b_frag[1] = unpack_field_int8(rb, m0 + 2, p);
+    }
+    // Two per-16 scales {d(pair 2s), d(pair 2s+1)} = low halves of dm at byte
+    // 12·(2s)+4 and 12·(2s+1)+4 → {scale_lo, scale_hi} for the split fold.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        const half slo = *reinterpret_cast<const half*>(row_block + 24 * sub + 4);
+        const half shi = *reinterpret_cast<const half*>(row_block + 24 * sub + 16);
+        return __halves2half2(slo, shi);
+    }
+
     // Q3_K byte offsets for each thread (0-15) within K/128 block
     // qs is 2 bytes (uint16_t), qh is 1 byte (uint8_t)
     static constexpr int qs_byte_offset[16] = {

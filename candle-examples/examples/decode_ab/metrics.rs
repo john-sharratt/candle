@@ -30,11 +30,7 @@ impl Metrics {
         let va = a.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let vb = b.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         if va.len() != vb.len() {
-            candle::bail!(
-                "metrics: shape mismatch a={:?} b={:?}",
-                a.dims(),
-                b.dims()
-            );
+            candle::bail!("metrics: shape mismatch a={:?} b={:?}", a.dims(), b.dims());
         }
 
         let n = va.len().max(1);
@@ -82,16 +78,20 @@ impl Metrics {
                 per_head_mae[h] = (per_head_sum[h] / denom) as f32;
             }
         }
-        let (worst_head, worst_head_mae) = per_head_mae
-            .iter()
-            .enumerate()
-            .fold((0usize, 0f32), |(bi, bm), (i, &m)| {
-                if m > bm {
-                    (i, m)
-                } else {
-                    (bi, bm)
-                }
-            });
+        let (worst_head, worst_head_mae) =
+            per_head_mae
+                .iter()
+                .enumerate()
+                .fold(
+                    (0usize, 0f32),
+                    |(bi, bm), (i, &m)| {
+                        if m > bm {
+                            (i, m)
+                        } else {
+                            (bi, bm)
+                        }
+                    },
+                );
 
         Ok(Metrics {
             mae,

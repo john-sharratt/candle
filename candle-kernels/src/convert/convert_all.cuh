@@ -40,6 +40,7 @@
 #include "block_q5_1.cuh"
 #include "block_q8_0.cuh"
 #include "block_q8_1.cuh"
+#include "block_q8a128.cuh"
 #include "block_q4_ks.cuh"
 #include "block_q8_ks.cuh"
 #include "block_q2_0.cuh"
@@ -499,7 +500,11 @@ struct ArenaAccessor {
             case ArenaFormat::Q0_X:  return 2;
             case ArenaFormat::Q0_M2: return 3;
             case ArenaFormat::Q0_M4: return 8;
-            default: return 32;
+            // A non-arena format reached arena block addressing. Any guessed size
+            // would silently mis-address and corrupt memory — K-quants, AWQ and
+            // q8a128 use non-32-element blocks and are NOT arena-storable — so fail
+            // loud (matches the __trap() idiom used elsewhere in this file).
+            default: __trap(); return 0;
         }
     }
     

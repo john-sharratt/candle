@@ -408,7 +408,43 @@ struct gemx_dequant_traits<block_c_q5_0, compute_t, scale_t> {
     // =========================================================================
     
     static constexpr int K128_BYTES = 112;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 5-bit = 4-bit nibble (qs) + 1 high bit (qh). Nibbles unpack like Q4_0 (mask +
+    // prmt 0x3120 → natural {0,1,2,3}); the high bit per element is spread into bit 4
+    // of each output byte via (hb·0x00204081 & 0x01010101)<<4. The fold applies
+    // d·C + m·Σx with m = -16·d (Q5_0 centers the 5-bit value by -16).
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        constexpr int QS_OFF[16] = {0, 4, 8, 12, 28, 32, 36, 40, 56, 60, 64, 68, 80, 84, 88, 92};
+        constexpr int QH_BASE[4] = {16, 44, 52, 96};
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int sh = (q3 & 1) * 4;
+        const int m0 = sub * 4 + (q3 >> 1);
+        const int m1 = m0 + 2;
+        const int v0 = *reinterpret_cast<const int*>(rb + QS_OFF[m0]);
+        const int v1 = *reinterpret_cast<const int*>(rb + QS_OFF[m1]);
+        const uint32_t nib0 = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t nib1 = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t qh0 = *(rb + QH_BASE[m0 >> 2] + (m0 & 3));
+        const uint32_t qh1 = *(rb + QH_BASE[m1 >> 2] + (m1 & 3));
+        const uint32_t hb0 = (qh0 >> sh) & 0xF;
+        const uint32_t hb1 = (qh1 >> sh) & 0xF;
+        b_frag[0] = nib0 | (((hb0 * 0x00204081u) & 0x01010101u) << 4);
+        b_frag[1] = nib1 | (((hb1 * 0x00204081u) & 0x01010101u) << 4);
+    }
+    // Per-sub {scale d (low), neg_min = -16·d (high)}.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int SCALE_OFF[4] = {20, 48, 50, 76};
+        const half d = *reinterpret_cast<const half*>(row_block + SCALE_OFF[sub]);
+        return __halves2half2(d, __hmul(d, __float2half(-16.0f)));
+    }
+
     // -------------------------------------------------------------------------
     // COMPILE-TIME LANE PARAMETERS
     // -------------------------------------------------------------------------

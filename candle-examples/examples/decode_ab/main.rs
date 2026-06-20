@@ -29,7 +29,7 @@ use clap::{Parser, Subcommand};
 
 use fixture::Fixture;
 use formats::{
-    all_formats, default_formats, deep_formats, quant_formats, select_formats, ArenaFmt,
+    all_formats, deep_formats, default_formats, quant_formats, select_formats, ArenaFmt,
 };
 use metrics::Metrics;
 use report::{render_bench, render_golden, BenchRow, GoldenOutcome, GoldenRow};

@@ -285,8 +285,27 @@ impl CudaDevice {
         Ok(size as usize)
     }
 
+    /// Streaming-multiprocessor count — the occupancy target for the int8 dense tiling heuristic.
+    pub fn multiprocessor_count(&self) -> Result<usize> {
+        use cudarc::driver::sys::CUdevice_attribute;
+        let n = self
+            .context
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .w()?;
+        Ok(n as usize)
+    }
+
     /// Returns true if this device supports tensor cores (SM >= 8.0, i.e., Ampere or newer).
     pub fn supports_tensor_cores(&self) -> bool {
+        self.compute_capability()
+            .map(|(major, _minor)| major >= 8)
+            .unwrap_or(false)
+    }
+
+    /// Returns true if this device can run the int8 `m16n8k32` tensor-core MMA used by the
+    /// q8a128 × KO matmul — i.e. compute capability >= 8.0 (Ampere/Ada/Hopper). On older GPUs
+    /// the int8 path has no kernel, so callers fall back to the FP16 reference path.
+    pub fn supports_int8_mma(&self) -> bool {
         self.compute_capability()
             .map(|(major, _minor)| major >= 8)
             .unwrap_or(false)

@@ -77,11 +77,15 @@ use super::compute::QMatMul;
 #[cfg(feature = "cuda")]
 use super::pinned::{ExpertLocation, LayerGeometry, PinnedPool};
 use super::transition::TransitionMatrix;
+#[cfg(not(feature = "cuda"))]
+use super::types::MoeInput;
 use super::types::{
     ClassifiedExperts, CopyBatchFence, ExpertSlot, MmapExpertRef, MoeWorkRequest, PipelineMessage,
     PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator};
+#[cfg(not(feature = "cuda"))]
+use candle::quantized::Int8Mode;
 use candle::{Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
@@ -266,11 +270,14 @@ fn repack_expert_projections(
     let up_ggml = &mmap[r.up_offset..r.up_offset + r.up_len];
     let down_ggml = &mmap[r.down_offset..r.down_offset + r.down_len];
 
+    // `r.*_dtype` is the compact GGUF source; `geom.*_dtype` is the target the pinned pool caches
+    // (== source for gemx; the KO twin for int8). For KO this repacks Q4_K→KO ONCE per expert.
     let gate_repacked = candle::quantized::repack_to_host(
         cuda_dev,
         gate_ggml,
         geom.gate_shape[0],
         geom.gate_shape[1],
+        r.gate_dtype,
         geom.gate_dtype,
     )?;
     let up_repacked = candle::quantized::repack_to_host(
@@ -278,6 +285,7 @@ fn repack_expert_projections(
         up_ggml,
         geom.up_shape[0],
         geom.up_shape[1],
+        r.up_dtype,
         geom.up_dtype,
     )?;
     let down_repacked = candle::quantized::repack_to_host(
@@ -285,6 +293,7 @@ fn repack_expert_projections(
         down_ggml,
         geom.down_shape[0],
         geom.down_shape[1],
+        r.down_dtype,
         geom.down_dtype,
     )?;
 
@@ -360,13 +369,15 @@ fn build_slot_from_repacked_on_stream(
     Ok(slot)
 }
 
-/// Non-CUDA prewarm: fill VRAM from mmap (legacy path).
+/// Device-direct prewarm: fill VRAM slots straight from the mmap. Non-CUDA-only — under CUDA the
+/// int8/KO experts are staged through `startup_two_tier`'s gemx pinned pool, so this is unused.
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn prewarm_expert_cache(
     inner: &mut ExpertCacheInner,
     mmap: &Arc<memmap2::Mmap>,
     host_refs: &[Vec<MmapExpertRef>],
     device: &Device,
+    mode: Int8Mode,
 ) {
     let num_moe_layers = host_refs.len();
     let num_experts = if num_moe_layers > 0 {
@@ -396,7 +407,7 @@ pub(crate) fn prewarm_expert_cache(
             }
             let slot_idx = inner.free_slots.pop().unwrap();
             let mmap_bytes: &[u8] = mmap;
-            let result = load_from_mmap(mmap_bytes, &host_refs[moe_idx][expert_idx], device);
+            let result = load_from_mmap(mmap_bytes, &host_refs[moe_idx][expert_idx], device, mode);
             match result {
                 Ok(expert_slot) => {
                     inner.install(slot_idx, moe_idx, expert_idx, expert_slot);
@@ -424,10 +435,17 @@ pub(crate) fn prewarm_expert_cache(
 // DMA loading — non-CUDA mmap path (legacy)
 // ============================================================================
 
-/// Build an `ExpertSlot` from mmap data on the default stream.
-/// Only used on non-CUDA builds.
+/// Build an expert slot directly from the GGUF mmap. `mode` selects the weight form via
+/// `QMatMul::from_weights_with_mode`: `Off` → FP GEMX (the dequant-weight grouped path); an int8
+/// mode → the KO twin (device-direct `repack_ko`). Non-CUDA-only: under CUDA the experts (FP and
+/// int8/KO alike) are staged through `startup_two_tier`'s gemx pinned pool, so this is unused.
 #[cfg(not(feature = "cuda"))]
-fn load_from_mmap(mmap: &[u8], r: &MmapExpertRef, device: &Device) -> Result<ExpertSlot> {
+fn load_from_mmap(
+    mmap: &[u8],
+    r: &MmapExpertRef,
+    device: &Device,
+    mode: Int8Mode,
+) -> Result<ExpertSlot> {
     let gate_data = &mmap[r.gate_offset..r.gate_offset + r.gate_len];
     let gate_proj = candle::quantized::ggml_file::qtensor_from_ggml(
         r.gate_dtype,
@@ -453,9 +471,9 @@ fn load_from_mmap(mmap: &[u8], r: &MmapExpertRef, device: &Device) -> Result<Exp
     )?;
 
     Ok(ExpertSlot {
-        gate_proj: QMatMul::from_weights(gate_proj.into())?,
-        up_proj: QMatMul::from_weights(up_proj.into())?,
-        down_proj: QMatMul::from_weights(down_proj.into())?,
+        gate_proj: QMatMul::from_weights_with_mode(gate_proj.into(), mode)?,
+        up_proj: QMatMul::from_weights_with_mode(up_proj.into(), mode)?,
+        down_proj: QMatMul::from_weights_with_mode(down_proj.into(), mode)?,
     })
 }
 
@@ -557,11 +575,18 @@ pub(crate) struct PipelineState {
     pub(crate) eviction_rate: f32,
     /// EMA-smoothed drip headroom fraction.  Seed 0.02.
     pub(crate) drip_headroom: f32,
-    // ── Non-CUDA fields (legacy mmap path) ──
+    // ── Non-CUDA legacy device-direct mmap path ──
+    // Under CUDA every expert (FP and int8/KO) is staged through `startup_two_tier`'s gemx pinned
+    // pool, so these fields back only the non-CUDA `load_from_mmap` reload path.
+    /// GGUF mmap, retained for non-CUDA device-direct slot builds.
     #[cfg(not(feature = "cuda"))]
     pub(crate) mmap: Arc<memmap2::Mmap>,
+    /// Per-`[moe_layer][expert]` mmap offset/shape descriptors.
     #[cfg(not(feature = "cuda"))]
     pub(crate) host_refs: Vec<Vec<MmapExpertRef>>,
+    /// Expert numeric mode (`Off` → FP, an int8 mode → KO twin) for `load_from_mmap`.
+    #[cfg(not(feature = "cuda"))]
+    pub(crate) int8mode: Int8Mode,
 }
 
 impl PipelineState {
@@ -645,7 +670,8 @@ impl PipelineState {
             let mmap_bytes: &[u8] = &self.mmap;
             for &(expert_idx, slot_idx) in &to_load {
                 let mmap_ref = &self.host_refs[moe_idx][expert_idx];
-                let expert_slot = load_from_mmap(mmap_bytes, mmap_ref, &self.device)?;
+                let expert_slot =
+                    load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode)?;
                 loaded_slots.push((expert_idx, slot_idx, expert_slot));
             }
         }
@@ -906,7 +932,11 @@ impl PipelineState {
             (toks, wids)
         };
 
-        let mut ys = req.xs.zeros_like()?;
+        let (num_tokens, hidden) = req.input.shape()?;
+        let mut ys = Tensor::zeros((num_tokens, hidden), req.out_dtype, &self.device)?;
+        // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
+        #[cfg(not(feature = "cuda"))]
+        let MoeInput::Float(xs_float) = &req.input;
 
         // ── Compute hit experts (overlaps with DMA for misses) ──
         let t = profile_now();
@@ -928,7 +958,7 @@ impl PipelineState {
                 .collect();
             if !experts_vec.is_empty() {
                 compute_experts_grouped(
-                    &req.xs,
+                    &req.input,
                     &mut ys,
                     &experts_vec,
                     &req.weights_flat,
@@ -944,7 +974,7 @@ impl PipelineState {
                 })?;
                 let (toks, w_ids) = expert_group(eidx);
                 compute_expert_contribution_gpu_weights(
-                    &req.xs,
+                    xs_float,
                     &mut ys,
                     slot,
                     &toks,
@@ -986,7 +1016,7 @@ impl PipelineState {
                 .collect();
             if !experts_vec.is_empty() {
                 compute_experts_grouped(
-                    &req.xs,
+                    &req.input,
                     &mut ys,
                     &experts_vec,
                     &req.weights_flat,
@@ -1002,7 +1032,7 @@ impl PipelineState {
                 })?;
                 let (toks, w_ids) = expert_group(eidx);
                 compute_expert_contribution_gpu_weights(
-                    &req.xs,
+                    xs_float,
                     &mut ys,
                     slot,
                     &toks,
@@ -1278,7 +1308,7 @@ impl PipelineState {
                 {
                     let mmap_bytes: &[u8] = &self.mmap;
                     let mmap_ref = &self.host_refs[next_moe_idx][expert_idx];
-                    match load_from_mmap(mmap_bytes, mmap_ref, &self.device) {
+                    match load_from_mmap(mmap_bytes, mmap_ref, &self.device, self.int8mode) {
                         Ok(s) => s,
                         Err(_) => {
                             self.inner.free_slots.push(slot_idx);
@@ -1344,8 +1374,15 @@ pub(crate) fn spawn_pipeline_thread(mut state: PipelineState) -> mpsc::SyncSende
                         let response_tx = req.response_tx.clone();
                         let moe_layer_idx = req.moe_layer_idx;
                         let expert_ids = req.expert_ids.clone();
+                        // Inbound handoff latency: forward-thread `send` → worker pickup here.
+                        state.profile.record("submit_inbound", req.submitted_at);
+                        let wt = profile_now();
                         let result = state.process_request(req);
-                        let _ = response_tx.send(result);
+                        // Whole-request work (classify + DMA + compute), so the forward thread can
+                        // subtract it from submit_roundtrip to isolate the channel handoff tax.
+                        state.profile.record("pipe_worker_total", wt);
+                        // Stamp completion before send so the forward thread can measure outbound.
+                        let _ = response_tx.send((result, profile_now()));
                         // Post-response: prefetch + eviction (off critical path)
                         state.post_compute(moe_layer_idx, &expert_ids);
                     }

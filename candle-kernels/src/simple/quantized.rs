@@ -1462,6 +1462,47 @@ extern "C" {
     /// Handles grid/block dimensions internally based on elem_count.
     pub fn run_quantize_q8_1(src: *const f32, dst: *mut c_void, elem_count: c_int, ky: c_int);
 
+    /// Quantize act[rows][cols] (dtype 0=F16,1=BF16,2=F32) → block_q8a128
+    /// [rows][cols/128] (the contiguous q8 activation block, 144 B each).
+    pub fn run_quantize_q8a128(
+        act: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        cols: c_int,
+        dtype: c_int,
+    );
+
+    /// Dequantize block_q8a128[rows][cols/128] → out[rows][cols]
+    /// (dtype 0=F16,1=BF16,2=F32).
+    pub fn run_dequantize_q8a128(
+        inp: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        cols: c_int,
+        dtype: c_int,
+    );
+
+    /// Quantize f32 weights `[nrows × ncols]` (row-major) → the lane-major per-128 KO
+    /// chunk tensor. `qtype` = QTYPE_Q{4,5,6,8}_KO (45..48); `nrows` a multiple of 8,
+    /// `ncols` a multiple of 128. Byte-identical to the CPU `ko_quant::quantize_ko`.
+    pub fn run_quantize_ko(
+        w: *const f32,
+        out: *mut c_void,
+        nrows: c_int,
+        ncols: c_int,
+        qtype: c_int,
+    );
+
+    /// Dequantize a lane-major KO chunk tensor → f32 `[nrows × ncols]` (row-major).
+    /// `qtype` = QTYPE_Q{4,5,6,8}_KO. Inverse of [`run_quantize_ko`].
+    pub fn run_dequantize_ko(
+        inp: *const c_void,
+        out: *mut f32,
+        nrows: c_int,
+        ncols: c_int,
+        qtype: c_int,
+    );
+
     /// Quantize f32 to any supported quantized format
     ///
     /// # Parameters
@@ -1966,6 +2007,19 @@ pub enum QType {
     Q0 = 33,
     F8E4M3 = 34,
     F8E5M2 = 35,
+    // Kernel-only activation QType past the GgmlDType-aligned range (no GgmlDType
+    // counterpart, so it is absent from the GgmlDType lock). q8a128 is the contiguous
+    // q8 activation block; mirrors QTYPE_Q8A128V/X in block_compact.cuh. Two modes,
+    // same block, (eventually) different layouts: V = mode-1, X = mode-2 (weight-reuse).
+    Q8A128V = 36,
+    Q8A128X = 37,
+    // Lane-major per-128 affine ("ordered") weight twins of the K-quant blocks for the
+    // q8a128 int8 path. GPU-only weight layouts; mirror QTYPE_Q*_KO in block_compact.cuh.
+    // All four have standalone quantize/dequant kernels (run_quantize_ko/run_dequantize_ko).
+    Q4_KO = 45,
+    Q5_KO = 46,
+    Q6_KO = 47,
+    Q8_KO = 48,
 }
 
 #[cfg(test)]
@@ -2012,6 +2066,14 @@ mod kv_qtype_lock_tests {
         assert_eq!(QType::Q0 as i32, 33);
         assert_eq!(QType::F8E4M3 as i32, 34);
         assert_eq!(QType::F8E5M2 as i32, 35);
+        // Kernel-only activation QType (no GgmlDType counterpart).
+        assert_eq!(QType::Q8A128V as i32, 36);
+        assert_eq!(QType::Q8A128X as i32, 37);
+        // KO byte-permuted twins — mirror QTYPE_Q*_KO / GgmlDType::Q*_KO.
+        assert_eq!(QType::Q4_KO as i32, 45);
+        assert_eq!(QType::Q5_KO as i32, 46);
+        assert_eq!(QType::Q6_KO as i32, 47);
+        assert_eq!(QType::Q8_KO as i32, 48);
     }
 }
 

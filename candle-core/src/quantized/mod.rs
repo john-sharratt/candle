@@ -9,7 +9,9 @@ mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
+pub mod int8_matmul_mode;
 pub mod k_quants;
+pub mod ko_quant;
 // Note: the previous `q0_v_test` module has been removed — it tested the OLD
 // (sign + shape + curve_pos) Q0_V format that no longer exists. The new
 // (curve + scale + centroid) format will get a fresh test suite.
@@ -498,6 +500,49 @@ impl QStorage {
     }
 }
 
+/// Inference numeric mode for the q8a128 int8 tensor-core matmul path.
+///
+/// A single knob selecting both halves of the int8 pairing (weight repack via
+/// [`QMatMul::repack_for_optimization`] and activation conversion via `cuda::to_dynamic`):
+///
+/// - [`Int8Mode::Off`] — FP16 GEMM. Weights repack to the gemx float layout, activations stay
+///   float. The numeric reference path; no int8 anywhere.
+/// - [`Int8Mode::Performance`] — int8 with the *same-width* KO weight twin (`Q4_K`→`Q4_KO`,
+///   `Q5_K`→`Q5_KO`, …). Fastest and smallest; takes the per-128 granularity hit on the weight.
+/// - [`Int8Mode::Precision`] — int8 with the *stepped-up* KO weight twin (`Q4_K`→`Q5_KO`,
+///   `Q5_K`→`Q6_KO`, …). The extra weight bit absorbs the per-128 re-quant error, leaving int8
+///   near-lossless versus the source quant. Activations (q8a128) are identical to Performance —
+///   only the weight twin differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Int8Mode {
+    /// FP16 GEMM — no int8. The numeric reference.
+    #[default]
+    Off,
+    /// int8 with the same-width KO weight twin. Fastest, lossier.
+    Performance,
+    /// int8 with the stepped-up KO weight twin. Near-lossless versus the source quant.
+    Precision,
+}
+
+impl Int8Mode {
+    /// True when the int8 tensor-core path is active (any mode other than [`Int8Mode::Off`]).
+    pub fn is_int8(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Auto-select the numeric mode for `device`: [`Int8Mode::Precision`] when the device can run
+    /// the int8 `m16n8k32` tensor-core MMA (CUDA, compute capability >= 8.0 / Ampere+), otherwise
+    /// [`Int8Mode::Off`] (the FP16 reference). Precision is chosen over Performance because its
+    /// stepped-up KO twin is near-lossless versus the source quant at no measurable decode cost.
+    pub fn auto(device: &crate::Device) -> Self {
+        match device {
+            #[cfg(feature = "cuda")]
+            crate::Device::Cuda(d) if d.supports_int8_mma() => Self::Precision,
+            _ => Self::Off,
+        }
+    }
+}
+
 #[repr(u32)]
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -560,9 +605,66 @@ pub enum GgmlDType {
     U64 = 42,
     I64 = 43,
     F64 = 44,
+
+    /// Lane-major per-128 affine weight format for the q8a128 int8 tensor-core matmul.
+    /// NOT a byte-permute of a stored K-quant: it carries its own per-128 `(scale, min)`
+    /// (one pair per 128 K per row) and is re-quantized straight from F32 (see
+    /// `ko_quant::quantize_ko`), so it is lossy vs the source — not bit-identical. Q4_KO is
+    /// 4-bit; the de-interleaved lane-major layout lets each int8-matmul lane pull its 4
+    /// sub-uint32s in one wide LDS. Value 45 mirrors `QTYPE_Q4_KO` / `QType::Q4_KO`; the
+    /// Q5/Q6/Q8_KO twins follow at 46-48.
+    Q4_KO = 45,
+    /// Lane-major per-128 affine KO twins (5/6/8-bit) — the same re-quantized-from-F32 format
+    /// as Q4_KO, NOT a permutation of Q5_K/Q6_K/Q8_K. GPU-only weight formats; mirror
+    /// `QTYPE_Q*_KO` / `QType::Q*_KO`.
+    Q5_KO = 46,
+    Q6_KO = 47,
+    Q8_KO = 48,
 }
 
 impl GgmlDType {
+    /// True for the lane-major per-128 KO weight formats (`Q4_KO`/`Q5_KO`/`Q6_KO`/`Q8_KO`).
+    /// These are the only weight layouts the q8a128 int8 tensor-core matmul can read, so the
+    /// `DynamicTensor::Int8` matmul path guards on this.
+    pub fn is_ko(self) -> bool {
+        matches!(self, Self::Q4_KO | Self::Q5_KO | Self::Q6_KO | Self::Q8_KO)
+    }
+
+    /// The KO weight twin used for int8 optimization, selected by [`Int8Mode`].
+    ///
+    /// [`Int8Mode::Performance`] picks the **same-width** twin (4-bit→`Q4_KO`, 5-bit→`Q5_KO`,
+    /// 6-bit→`Q6_KO`, 8-bit→`Q8_KO`; ≤3-bit→`Q4_KO`, the smallest KO form). It takes the
+    /// per-32→per-128 granularity hit on the weight but is the fastest and smallest.
+    ///
+    /// [`Int8Mode::Precision`] steps the source one notch up the ladder
+    /// (`Q4_KO` < `Q5_KO` < `Q6_KO` < `Q8_KO`): 4-bit→`Q5_KO`, 5-bit→`Q6_KO`, ≤3-bit→`Q4_KO`. The
+    /// extra bit absorbs the granularity loss so the re-quant of the already-quantized weight is
+    /// near-lossless. At the top of the ladder there is no finer twin, so 6-bit→`Q6_KO` and
+    /// 8-bit→`Q8_KO` are same-width in both modes.
+    ///
+    /// Errors for [`Int8Mode::Off`] (no KO twin) and for dtypes with no KO form.
+    pub fn to_ko(self, mode: Int8Mode) -> Result<Self> {
+        match mode {
+            Int8Mode::Off => crate::bail!("to_ko: Int8Mode::Off has no KO weight twin"),
+            Int8Mode::Performance => Ok(match self {
+                Self::Q2_K | Self::Q3_K => Self::Q4_KO,
+                Self::Q4_0 | Self::Q4_1 | Self::Q4_K => Self::Q4_KO,
+                Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q5_KO,
+                Self::Q6_K => Self::Q6_KO,
+                Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
+                other => crate::bail!("no KO weight form for {other:?}"),
+            }),
+            Int8Mode::Precision => Ok(match self {
+                Self::Q2_K | Self::Q3_K => Self::Q4_KO,
+                Self::Q4_0 | Self::Q4_1 | Self::Q4_K => Self::Q5_KO,
+                Self::Q5_0 | Self::Q5_1 | Self::Q5_K => Self::Q6_KO,
+                Self::Q6_K => Self::Q6_KO,
+                Self::Q8_0 | Self::Q8_1 | Self::Q8_K => Self::Q8_KO,
+                other => crate::bail!("no KO weight form for {other:?}"),
+            }),
+        }
+    }
+
     /// Map an in-workspace integer (`GgmlDType as u32` discriminant) back to
     /// the corresponding `GgmlDType` variant.  This is the identity mapping —
     /// `from_u32(Self::Q4_K as u32)` returns `Self::Q4_K`.
@@ -624,6 +726,10 @@ impl GgmlDType {
             42 => Self::U64,
             43 => Self::I64,
             44 => Self::F64,
+            45 => Self::Q4_KO,
+            46 => Self::Q5_KO,
+            47 => Self::Q6_KO,
+            48 => Self::Q8_KO,
             _ => crate::bail!("unknown dtype discriminant {u}"),
         };
         Ok(dtype)
@@ -690,6 +796,12 @@ impl GgmlDType {
             216 => Self::Q0_M4,
             217 => Self::F8E4M3,
             218 => Self::F8E5M2,
+            // KO byte-permuted twins — never actually on disk, but kept round-trippable
+            // with `to_gguf_file_code` for consistency.
+            219 => Self::Q4_KO,
+            220 => Self::Q5_KO,
+            221 => Self::Q6_KO,
+            222 => Self::Q8_KO,
             230 => Self::F64,
             231 => Self::U8,
             232 => Self::I8,
@@ -756,6 +868,12 @@ impl GgmlDType {
             Self::I32 => 236,
             Self::U64 => 237,
             Self::I64 => 238,
+            // KO twins are GPU-only and never actually written to disk; codes kept for
+            // exhaustiveness / round-trip with `from_gguf_file_code`.
+            Self::Q4_KO => 219,
+            Self::Q5_KO => 220,
+            Self::Q6_KO => 221,
+            Self::Q8_KO => 222,
         }
     }
 
@@ -816,6 +934,22 @@ impl GgmlDType {
             Self::Q0_X => Box::new(vec![BlockQ0X::zeros(); elem_count / BlockQ0X::BLCK_SIZE]),
             Self::Q0_M2 => Box::new(vec![BlockQ0M2::zeros(); elem_count / BlockQ0M2::BLCK_SIZE]),
             Self::Q0_M4 => Box::new(vec![BlockQ0M4::zeros(); elem_count / BlockQ0M4::BLCK_SIZE]),
+            Self::Q4_KO => Box::new(vec![
+                BlockQ4_KO::zeros();
+                elem_count / BlockQ4_KO::BLCK_SIZE
+            ]),
+            Self::Q5_KO => Box::new(vec![
+                BlockQ5_KO::zeros();
+                elem_count / BlockQ5_KO::BLCK_SIZE
+            ]),
+            Self::Q6_KO => Box::new(vec![
+                BlockQ6_KO::zeros();
+                elem_count / BlockQ6_KO::BLCK_SIZE
+            ]),
+            Self::Q8_KO => Box::new(vec![
+                BlockQ8_KO::zeros();
+                elem_count / BlockQ8_KO::BLCK_SIZE
+            ]),
         }
     }
     /// The type size for blocks in bytes.
@@ -867,6 +1001,11 @@ impl GgmlDType {
             Self::Q0_X => std::mem::size_of::<BlockQ0X>(),
             Self::Q0_M2 => std::mem::size_of::<BlockQ0M2>(),
             Self::Q0_M4 => std::mem::size_of::<BlockQ0M4>(),
+            // KO compact blocks: same byte size as their K counterpart, just reordered.
+            Self::Q4_KO => std::mem::size_of::<BlockQ4_KO>(),
+            Self::Q5_KO => std::mem::size_of::<BlockQ5_KO>(),
+            Self::Q6_KO => std::mem::size_of::<BlockQ6_KO>(),
+            Self::Q8_KO => std::mem::size_of::<BlockQ8_KO>(),
         }
     }
 
@@ -913,6 +1052,11 @@ impl GgmlDType {
             Self::Q0_X => k_quants::QK_Q0_X,
             Self::Q0_M2 => k_quants::QK_Q0_M2,
             Self::Q0_M4 => k_quants::QK_Q0_M4,
+            // KO compact blocks hold 128 elements (K/128 granularity).
+            Self::Q4_KO => BlockQ4_KO::BLCK_SIZE,
+            Self::Q5_KO => BlockQ5_KO::BLCK_SIZE,
+            Self::Q6_KO => BlockQ6_KO::BLCK_SIZE,
+            Self::Q8_KO => BlockQ8_KO::BLCK_SIZE,
         }
     }
 }
@@ -1968,6 +2112,43 @@ impl QMatMul {
         Self::from_arc(std::sync::Arc::new(qtensor))
     }
 
+    /// Repack the weight for the inference numeric mode selected by `mode`: any int8 mode → the
+    /// lane-major KO format read by the q8a128 int8 tensor-core matmul (`repack_ko`, twin chosen
+    /// by [`GgmlDType::to_ko`]); [`Int8Mode::Off`] → the FP GEMX repack read by the dequant-weight
+    /// float matmul (`repack_gemx`). The weight-side half of the single `int8mode` knob (paired
+    /// with `cuda::to_dynamic` on the activation side); the matmul's KO⇔int8 pairing guard keeps
+    /// the two consistent. Requires the quantized (`QTensor`) variant on CUDA.
+    #[cfg(feature = "cuda")]
+    pub fn repack_for_optimization(&self, mode: Int8Mode) -> Result<QMatMul> {
+        let qt = self
+            .qtensor()
+            .ok_or_else(|| crate::Error::Msg("repack_for_optimization: not a QTensor".into()))?;
+        // Expects a COMPACT source weight: re-running on an already-KO-optimized weight would
+        // double-process it (and `to_ko`/`repack_gemx` have no KO source). Guard explicitly.
+        if qt.dtype().is_ko() {
+            crate::bail!(
+                "repack_for_optimization: weight is already KO-optimized ({:?}); call on the \
+                 compact source weight once",
+                qt.dtype()
+            );
+        }
+        let shape = qt.shape().clone();
+        let new_storage = match &qt.storage {
+            QStorage::Cuda(cs) => {
+                if mode.is_int8() {
+                    QStorage::Cuda(cs.repack_ko(&shape, qt.dtype().to_ko(mode)?)?)
+                } else {
+                    QStorage::Cuda(cs.repack_gemx(&shape)?)
+                }
+            }
+            _ => crate::bail!("repack_for_optimization requires CUDA storage"),
+        };
+        QMatMul::from_qtensor(QTensor {
+            storage: new_storage,
+            shape,
+        })
+    }
+
     #[allow(unused_variables)]
     pub fn forward_via_gemx(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
@@ -2020,6 +2201,80 @@ impl QMatMul {
                 xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
             }
         }
+    }
+
+    /// Matmul over an already-built [`cuda::DynamicTensor`] activation — the keystone the fused
+    /// producers feed: an `Int8` operand carries **pre-quantized** q8a128 (emitted directly by a
+    /// fused RMSNorm/SwiGLU/attention epilogue, so no standalone quantize launch), a `Float`
+    /// operand is a plain FP tensor. Dispatches to [`cuda::dense_qmatmul`], which forks the int8
+    /// KO tensor-core path vs the FP path and enforces the KO⇔int8 pairing against this weight.
+    /// Returns an F32 result of shape `[lead.., N]`; callers cast back to the compute dtype.
+    #[cfg(feature = "cuda")]
+    pub fn forward_dynamic(&self, input: cuda::DynamicTensor) -> Result<Tensor> {
+        let t = match self {
+            Self::QTensor(t) => t,
+            _ => crate::bail!("forward_dynamic requires a QTensor weight"),
+        };
+        let cs = match &t.storage {
+            QStorage::Cuda(cs) => cs,
+            _ => crate::bail!("forward_dynamic requires CUDA storage"),
+        };
+        let device = cs.device().clone();
+        // Weight is row-major [N, K]; nrows = N is the matmul's output width.
+        let nrows = t.shape().dims()[0];
+        let wptr = cs.data_ptr();
+        let wlen = cs.storage_size_in_bytes();
+        let wdtype = t.dtype();
+        cuda::dense_qmatmul(input, wptr, wdtype, nrows, wlen, &device)
+    }
+
+    /// Fused q/k/v projection in ONE launch: the shared q8a128 activation `op` × the separate KO
+    /// weights `q/k/v` (any KO formats — no weight concatenation needed), returning the concatenated
+    /// `[lead.., Nq+Nk+Nv]` output cast to `out_dtype`. Float-identical to three separate
+    /// [`forward_dynamic`] calls but with full GPU occupancy. Each weight must be a KO QTensor on
+    /// CUDA (the int8 twin). See [`cuda::qkv_segmented_matmul`].
+    #[cfg(feature = "cuda")]
+    pub fn qkv_segmented(
+        op: &cuda::Q8a128Operand,
+        weights: &[&QMatMul],
+        out_dtype: crate::DType,
+    ) -> Result<Tensor> {
+        let mut segs = Vec::with_capacity(weights.len());
+        let mut device = None;
+        for w in weights {
+            let t = match w {
+                Self::QTensor(t) => t,
+                _ => crate::bail!("qkv_segmented requires KO QTensor weights"),
+            };
+            let cs = match &t.storage {
+                QStorage::Cuda(cs) => cs,
+                _ => crate::bail!("qkv_segmented requires CUDA storage"),
+            };
+            device = Some(cs.device().clone());
+            segs.push((cs.data_ptr(), t.dtype(), t.shape().dims()[0]));
+        }
+        let device = device.ok_or_else(|| crate::Error::Msg("qkv_segmented: no weights".into()))?;
+        let out = cuda::qkv_segmented_matmul(op, &segs, &device)?;
+        out.to_dtype(out_dtype)
+    }
+
+    /// Int8 tensor-core matmul: q8a128 activations × KO weights. The weight must already be the
+    /// KO twin QTensor on CUDA (produced by [`QMatMul::repack_for_optimization`] with an int8
+    /// `mode`) — the twin choice was baked in at repack time, so here `mode` only selects the
+    /// activation form (q8a128 for any non-`Off` mode). Quantizes the activation here (the
+    /// **unfused** path, one standalone launch) then runs [`QMatMul::forward_dynamic`]; the fused
+    /// producers bypass this by emitting q8a128 themselves and calling `forward_dynamic` directly.
+    #[cfg(feature = "cuda")]
+    pub fn forward_via_int8(&self, xs: &Tensor, mode: Int8Mode) -> Result<Tensor> {
+        let device = match self {
+            Self::QTensor(t) => match &t.storage {
+                QStorage::Cuda(cs) => cs.device().clone(),
+                _ => crate::bail!("forward_via_int8 requires CUDA storage"),
+            },
+            _ => crate::bail!("forward_via_int8 requires a KO QTensor weight"),
+        };
+        let acts = cuda::to_dynamic(xs, mode, &device)?;
+        self.forward_dynamic(acts.as_dynamic())
     }
 }
 
@@ -2164,5 +2419,10 @@ mod ggml_dtype_lock_tests {
         assert_eq!(GgmlDType::Q0 as u32, 33);
         assert_eq!(GgmlDType::F8E4M3 as u32, 34);
         assert_eq!(GgmlDType::F8E5M2 as u32, 35);
+        // KO byte-permuted twins — must match QTYPE_Q*_KO / QType::Q*_KO (45-48).
+        assert_eq!(GgmlDType::Q4_KO as u32, 45);
+        assert_eq!(GgmlDType::Q5_KO as u32, 46);
+        assert_eq!(GgmlDType::Q6_KO as u32, 47);
+        assert_eq!(GgmlDType::Q8_KO as u32, 48);
     }
 }

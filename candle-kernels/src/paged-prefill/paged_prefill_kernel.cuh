@@ -417,7 +417,13 @@ __device__ __forceinline__ int get_quant_block_bytes(int fmt) {
         case ArenaFormat::Q0_X: return 2;
         case ArenaFormat::Q0_M2: return 3;
         case ArenaFormat::Q0_M4: return 8;
-        default: return 32;
+        // Non-arena format reached arena block addressing: fail loud (a guessed size
+        // would silently corrupt memory). K-quants/AWQ/q8a128 are not arena-storable.
+        // printf+__trap matches arena_load_element's idiom in this file.
+        default:
+            printf("get_quant_block_bytes: non-arena format %d (not arena-storable)\n", fmt);
+            __trap();
+            return 0;
     }
 }
 

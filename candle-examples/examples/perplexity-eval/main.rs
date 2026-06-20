@@ -245,7 +245,8 @@ impl Model {
     fn load(arch: &ModelArch, model_path: &std::path::Path, device: &Device) -> Result<Self> {
         match arch {
             ModelArch::Qwen3Moe => {
-                let m = quantized_qwen3_moe::ModelWeights::from_gguf_by_path(model_path, device)?;
+                let m =
+                    quantized_qwen3_moe::ModelWeights::from_gguf_by_path(model_path, device, None)?;
                 Ok(Model::Qwen3Moe(m))
             }
             _ => {
@@ -282,20 +283,6 @@ impl Model {
             Model::Qwen3Moe(m) => m.create_kv_caches(capacity),
             Model::Qwen2(m) => m.create_kv_caches(capacity),
             Model::Llama(m) => m.create_kv_caches(capacity),
-        }
-    }
-
-    fn forward_all_logits(
-        &self,
-        caches: &mut candle_transformers::models::kv_cache_utils::KvCaches,
-        input: &Tensor,
-        offset: usize,
-    ) -> Result<Tensor> {
-        match self {
-            Model::Qwen3(m) => m.forward_all_logits(caches, input, offset),
-            Model::Qwen3Moe(m) => m.forward_all_logits(caches, input, offset),
-            Model::Qwen2(m) => m.forward_all_logits(caches, input, offset),
-            Model::Llama(m) => m.forward_all_logits(caches, input, offset),
         }
     }
 }
@@ -458,77 +445,6 @@ struct Args {
     /// Requires exactly one model in --sweep-models.
     #[arg(long, value_delimiter = ',')]
     sweep_contexts: Vec<usize>,
-}
-
-/// Evaluate perplexity without compression (original path, full-chunk forward).
-fn eval_baseline(
-    model: &Model,
-    tokens: &[u32],
-    context_size: usize,
-    stride: usize,
-    device: &Device,
-) -> anyhow::Result<(f64, u64)> {
-    let n_tokens = tokens.len();
-    let mut total_nll = 0.0f64;
-    let mut total_count = 0u64;
-    let mut chunk_idx = 0u32;
-
-    let start_positions: Vec<usize> = (0..n_tokens.saturating_sub(1)).step_by(stride).collect();
-    let n_chunks = start_positions.len();
-
-    println!(
-        "Evaluating {} chunks (context={}, stride={})...\n",
-        n_chunks, context_size, stride
-    );
-
-    for &begin in &start_positions {
-        let end = (begin + context_size).min(n_tokens);
-        if end - begin < 2 {
-            break;
-        }
-
-        let input_tokens = &tokens[begin..end - 1];
-        let target_tokens = &tokens[begin + 1..end];
-
-        let loss_start = if begin == 0 || stride >= context_size {
-            0
-        } else {
-            context_size.saturating_sub(stride).saturating_sub(1)
-        };
-        let loss_start = loss_start.min(input_tokens.len().saturating_sub(1));
-
-        let mut caches = model.create_kv_caches(context_size);
-
-        let input = Tensor::new(input_tokens, device)?.unsqueeze(0)?;
-        let logits = model.forward_all_logits(&mut caches, &input, 0)?;
-        let logits = logits.squeeze(0)?;
-
-        let scoring_logits = if loss_start > 0 {
-            logits.narrow(0, loss_start, logits.dim(0)? - loss_start)?
-        } else {
-            logits
-        };
-        let scoring_targets = &target_tokens[loss_start..];
-        let targets_tensor = Tensor::new(scoring_targets, device)?;
-
-        let loss = candle_nn::loss::cross_entropy(&scoring_logits, &targets_tensor)?;
-        let loss_val = loss.to_vec0::<f32>()? as f64;
-        let n_scored = scoring_targets.len() as u64;
-
-        total_nll += loss_val * n_scored as f64;
-        total_count += n_scored;
-
-        chunk_idx += 1;
-        if chunk_idx % 10 == 0 || chunk_idx == n_chunks as u32 {
-            let running_ppl = (total_nll / total_count as f64).exp();
-            println!(
-                "  Chunk {}/{}: loss={:.4}, running PPL={:.2} ({} tokens scored)",
-                chunk_idx, n_chunks, loss_val, running_ppl, total_count
-            );
-        }
-    }
-
-    Ok((total_nll, total_count))
 }
 
 /// Context window size for compressed evaluation, sized to fit RTX 4090 Mobile 16 GB VRAM
@@ -750,7 +666,15 @@ fn run_model_all_modes(
     if has_baseline {
         println!("\n  [{}] mode=none", family.name());
         let model = Model::load(&family.arch(), &model_path, device)?;
-        match eval_baseline(&model, tokens, context_size, stride, device) {
+        let batched = BatchedModel::from_model(model, device)?;
+        match eval_compressed(
+            &batched,
+            InferenceMode::BF16,
+            tokens,
+            Some(context_size),
+            stride,
+            device,
+        ) {
             Ok((nll, count)) => {
                 let ppl = (nll / count as f64).exp();
                 results.push(("none".to_string(), format!("{:.2}", ppl)));
@@ -984,7 +908,15 @@ fn main() -> anyhow::Result<()> {
                 if matches!(mode_arg, CompressionArg::None) {
                     for (ri, &ctx) in args.sweep_contexts.iter().enumerate() {
                         let baseline_model = Model::load(&family.arch(), &model_path, &device)?;
-                        match eval_baseline(&baseline_model, &tokens, ctx, ctx, &device) {
+                        let baseline_batched = BatchedModel::from_model(baseline_model, &device)?;
+                        match eval_compressed(
+                            &baseline_batched,
+                            InferenceMode::BF16,
+                            &tokens,
+                            Some(ctx),
+                            ctx,
+                            &device,
+                        ) {
                             Ok((nll, count)) => {
                                 let ppl = (nll / count as f64).exp();
                                 ctx_matrix.insert((ri, ci), format!("{:.2}", ppl));
@@ -1146,7 +1078,15 @@ fn main() -> anyhow::Result<()> {
             &device,
         )?
     } else {
-        eval_baseline(&model, &tokens, args.context_size, stride, &device)?
+        let batched = BatchedModel::from_model(model, &device)?;
+        eval_compressed(
+            &batched,
+            InferenceMode::BF16,
+            &tokens,
+            Some(args.context_size),
+            stride,
+            &device,
+        )?
     };
 
     let final_ppl = (total_nll / total_count as f64).exp();

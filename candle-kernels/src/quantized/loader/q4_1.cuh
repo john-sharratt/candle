@@ -336,7 +336,34 @@ struct gemx_dequant_traits<block_c_q4_1, compute_t, scale_t> {
     // =========================================================================
     
     static constexpr int K128_BYTES = 80;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 4-bit nibbles → n8k32 B-fragment (same LOP3 nibble order as Q4_0; one mask +
+    // prmt 0x3120 → natural {0,1,2,3}). b_frag[0]/[1] come from two qs ints. The
+    // fold applies d·C + m·Σx with the explicit affine {d, m} (value = d·q + m).
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        // data int index per qs field: qs0-3=data[0-3], qs4-7=data[5-8],
+        // qs8-11=data[11-14], qs12-15=data[16-19].
+        constexpr int QS_IDX[16] = {0, 1, 2, 3, 5, 6, 7, 8, 11, 12, 13, 14, 16, 17, 18, 19};
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const int* data = reinterpret_cast<const int*>(warp_rows + row * K128_BYTES);
+        const int sh = (q3 & 1) * 4;
+        const int v0 = data[QS_IDX[sub * 4 + (q3 >> 1)]];
+        const int v1 = data[QS_IDX[sub * 4 + 2 + (q3 >> 1)]];
+        b_frag[0] = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        b_frag[1] = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+    }
+    // Per-sub affine {d (low), m (high)} from dm0..dm3 at data[4,9,10,15].
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int DM_OFF[4] = {16, 36, 40, 60};
+        return *reinterpret_cast<const half2*>(row_block + DM_OFF[sub]);
+    }
+
     // -------------------------------------------------------------------------
     // COMPILE-TIME LANE PARAMETERS
     // -------------------------------------------------------------------------
