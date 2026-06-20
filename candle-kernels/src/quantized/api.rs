@@ -115,12 +115,13 @@ extern "C" {
 
     /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO
     /// weights of possibly-different formats, writing the concatenated `[M, N_total]` F32 output.
-    /// - `d_segs`: DEVICE pointer to a `num_segs`-long `qkv_seg_t` array (24 bytes each).
+    /// - `h_segs`: HOST pointer to a `num_segs`-long (≤3) `qkv_seg_t` array (24 bytes each); the
+    ///   launcher copies it into by-value kernel params, so there is no per-call device upload.
     /// - `act`: device pointer to the shared q8a128 activation.
     /// - `total_n_tiles`: Σ ceil(seg_n/32) (= grid.y); `dst_stride` = N_total.
     /// - `mode2`: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32).
     pub fn run_qkv_segmented_matmul(
-        d_segs: *const c_void,
+        h_segs: *const c_void,
         num_segs: i32,
         act: *const c_void,
         dst: *mut c_void,

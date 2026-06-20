@@ -1056,10 +1056,17 @@ impl BatchedInferenceSession {
                 copy_stream
                     .synchronize()
                     .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+                // Quantized modes must replace the float chunks with the quantized
+                // bytes: truncate the live float layout and re-inject the sealed
+                // quantized chunks.
+                self.truncate_sequence_to_blocks(seq_idx, 0)?;
+                self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
             }
-
-            self.truncate_sequence_to_blocks(seq_idx, 0)?;
-            self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
+            // Uncompressed (F16/BF16) modes keep their float chunks in place — the
+            // prefill's `truncate_caches_to_offset` already collapses phantom
+            // chunks from repeated re-prefill, so the record_turn/truncate/re-inject
+            // round-trip is unnecessary (and re-injecting Arc-shared chunks under a
+            // lone sequence corrupted the decode read). Just open a fresh writer.
             if start_new_chunk {
                 self.push_empty_writer_chunk(seq_idx)?;
             }

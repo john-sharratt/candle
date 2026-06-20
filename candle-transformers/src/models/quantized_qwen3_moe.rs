@@ -19,7 +19,7 @@ use super::expert_lre::{
     ExpertCache, ExpertSlot, MmapExpertRef, MoeInput, PipelineStats, ProfileSnapshot,
 };
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
-use super::profile::profile_now;
+use super::profile::{profile_now, ProfileMark};
 use super::quantized_matmul::QMatMul;
 use super::rope_tables::CisPrecomputations;
 use crate::quantized_nn::RmsNorm;
@@ -276,13 +276,13 @@ impl SparseMoeBlock {
     }
 
     /// Route: GPU softmax + top-k → `(flattened routing weights, per-token expert indices)`.
-    /// Shared by `forward` (FP) and `forward_dynamic` (q8a128) — operates only on the logits.
+    /// Used by both the FP and q8a128 arms of `forward_dynamic` — operates only on the logits.
     fn route_indices(
         &self,
         router_logits: &Tensor,
         num_tokens: usize,
         k: usize,
-        t: crate::models::profile::ProfileMark,
+        t: ProfileMark,
     ) -> Result<(Tensor, Vec<Vec<u32>>)> {
         // `num_tokens` drives the CUDA async routing DtoH only; the non-CUDA path uses `to_vec2`.
         #[cfg(not(feature = "cuda"))]
@@ -443,7 +443,7 @@ impl SparseMoeBlock {
         seq_len: usize,
         hidden_dim: usize,
         k: usize,
-        _routing_start: crate::models::profile::ProfileMark,
+        _routing_start: ProfileMark,
     ) -> Result<Tensor> {
         // ── 2. Build flat assignment array sorted by expert ──
         // Pure CPU bookkeeping — trivial cost (< 0.01ms for k=8 single-token).
@@ -1921,19 +1921,6 @@ mod tests {
                 generate_max_len: 40,
                 test_mode: Some(TestMode::StoryRewrite),
             },
-            /*
-            TestConfig {
-                mode: InferenceMode::C8,
-                use_batched: true,
-                #[cfg(feature = "huge-context")]
-                num_contexts: 120,
-                #[cfg(not(feature = "huge-context"))]
-                num_contexts: 2,
-                num_repeats: 1,
-                generate_max_len: 40,
-                test_mode: Some(TestMode::StoryRewrite),
-            },
-            */
             TestConfig {
                 mode: InferenceMode::C9,
                 use_batched: true,

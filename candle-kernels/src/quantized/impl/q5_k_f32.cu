@@ -39,7 +39,8 @@ INSTANTIATE_KERNEL_GROUPED_INT8(
     float
 )
 
-// Mode-2 dense variant (N_SUB=2, Bm=32): weight-reuse loop for large-M (prefill); selected by ytype==4.
+// Mode-2 dense variant (N_SUB=2, Bm=32): weight-reuse loop for large-M (prefill); selected when the
+// host passes force_mode2=1 (grid.x = ceil(total_batch/32)).
 extern "C" __global__ void LAUNCH_BOUNDS_TC16 q5_ko_int8_f32_dense_m2(
     const void* __restrict__ weights,
     const block_q8a128* __restrict__ vy, float* __restrict__ dst,

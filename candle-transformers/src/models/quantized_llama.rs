@@ -67,6 +67,10 @@ impl Mlp {
         feed_forward_w2: QTensor,
         feed_forward_w3: QTensor,
         device_is_cuda: bool,
+        // The dense MLP's `ffn_norm` emits int8 (q8a128) activations in int8 mode, so its
+        // weights must be the matching KO twins. MoE experts receive FP activations and pass
+        // `Int8Mode::Off`. The fused gate+up weight is repacked to a single KO twin too.
+        int8mode: Int8Mode,
     ) -> Result<Self> {
         let try_fuse = device_is_cuda
             && feed_forward_w1.dtype() == feed_forward_w3.dtype()
@@ -90,7 +94,11 @@ impl Mlp {
                     );
                 }
                 let fused = QTensor::concat_rows_cuda(&[&feed_forward_w1, &feed_forward_w3])?;
-                (Some(QMatMul::from_qtensor(fused)?), None, None)
+                (
+                    Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
+                    None,
+                    None,
+                )
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -99,15 +107,15 @@ impl Mlp {
         } else {
             (
                 None,
-                Some(QMatMul::from_qtensor(feed_forward_w1)?),
-                Some(QMatMul::from_qtensor(feed_forward_w3)?),
+                Some(QMatMul::from_qtensor_with_mode(feed_forward_w1, int8mode)?),
+                Some(QMatMul::from_qtensor_with_mode(feed_forward_w3, int8mode)?),
             )
         };
 
         Ok(Self {
             feed_forward_gate_up,
             feed_forward_w1,
-            feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,
+            feed_forward_w2: QMatMul::from_qtensor_with_mode(feed_forward_w2, int8mode)?,
             feed_forward_w3,
         })
     }
@@ -214,7 +222,12 @@ impl Mlp {
     #[cfg(feature = "cuda")]
     fn forward_dynamic(&self, acts: &DynamicActs, out_dtype: DType) -> Result<Tensor> {
         let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
+            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free.
+            // Casting the two aliasing narrows separately instead forces two fallback allocations
+            // (an in-place cast on a shared view is unsafe — see `Tensor::to_dtype_mut`).
+            gu.to_dtype_mut(out_dtype)?;
             let last = gu.rank() - 1;
             let half = gu.dim(last)? / 2;
             (gu.narrow(last, 0, half)?, gu.narrow(last, half, half)?)
@@ -232,8 +245,9 @@ impl Mlp {
             (w1, w3)
         };
         // Run silu/mul/down in out_dtype: the Float path returns the activation dtype (F16), but
-        // MLP intermediates can exceed F16's ~65504 range, so compute in out_dtype (BF16). The int8
-        // path already returns out_dtype, making these coercions no-ops there.
+        // MLP intermediates can exceed F16's ~65504 range, so compute in out_dtype (BF16). The
+        // fused path already coerced `gu` above and the int8 path already returns out_dtype, so
+        // these are no-ops except on the separate-weight Float path.
         w1.to_dtype_mut(out_dtype)?;
         w3.to_dtype_mut(out_dtype)?;
         let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
@@ -826,6 +840,7 @@ impl ModelWeights {
                     feed_forward_w2,
                     feed_forward_w3,
                     matches!(ct.device, Device::Cuda(_)),
+                    Int8Mode::Off,
                 )?)
             };
             let attention_norm = ct.remove(&format!("{prefix}.attention_norm.weight"))?;
@@ -975,6 +990,7 @@ impl ModelWeights {
                     feed_forward_w2,
                     feed_forward_w3,
                     matches!(device, Device::Cuda(_)),
+                    Int8Mode::Off,
                 )?)
             } else {
                 let feed_forward_gate_inp =
@@ -992,6 +1008,7 @@ impl ModelWeights {
                         feed_forward_w2,
                         feed_forward_w3,
                         matches!(device, Device::Cuda(_)),
+                        Int8Mode::Off,
                     )?)
                 }
                 MlpOrMoe::MoE {
@@ -1206,6 +1223,7 @@ impl ModelWeights {
                     feed_forward_w2,
                     feed_forward_w3,
                     matches!(device, Device::Cuda(_)),
+                    int8mode,
                 )?)
             } else {
                 let feed_forward_gate_inp = load_tensor(&format!("{prefix}.ffn_gate_inp.weight"))?;
@@ -1219,6 +1237,7 @@ impl ModelWeights {
                         feed_forward_w2,
                         feed_forward_w3,
                         matches!(device, Device::Cuda(_)),
+                        Int8Mode::Off,
                     )?)
                 }
                 MlpOrMoe::MoE {
@@ -1483,7 +1502,7 @@ impl ModelWeights {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};

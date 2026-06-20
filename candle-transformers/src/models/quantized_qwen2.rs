@@ -124,7 +124,11 @@ impl Mlp {
     #[cfg(feature = "cuda")]
     fn forward_dynamic(&self, acts: &DynamicActs, out_dtype: DType) -> Result<Tensor> {
         let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
-            let gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
+            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free, whereas
+            // casting the two aliasing narrows separately forces two fallback allocations.
+            gu.to_dtype_mut(out_dtype)?;
             let last = gu.rank() - 1;
             let half = gu.dim(last)? / 2;
             (gu.narrow(last, 0, half)?, gu.narrow(last, half, half)?)
@@ -142,6 +146,7 @@ impl Mlp {
                 w3.forward_dynamic(acts.as_dynamic(), out_dtype)?,
             )
         };
+        // Fused path already coerced `gu`; the separate path coerces here (no-op in int8 mode).
         w1.to_dtype_mut(out_dtype)?;
         w3.to_dtype_mut(out_dtype)?;
         let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
@@ -221,9 +226,9 @@ impl BiasTensors {
 
 #[derive(Debug, Clone)]
 pub struct LayerWeights {
-    attention_wq: Option<QMatMul>,
-    attention_wk: Option<QMatMul>,
-    attention_wv: Option<QMatMul>,
+    attention_wq: QMatMul,
+    attention_wk: QMatMul,
+    attention_wv: QMatMul,
     attention_bq: BiasTensors,
     attention_bk: BiasTensors,
     attention_bv: BiasTensors,
@@ -249,22 +254,11 @@ impl LayerWeights {
 
     #[inline]
     fn project_qkv_with_compute_type(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let q_dim = self.n_head * self.head_dim;
-        let kv_dim = self.n_kv_head * self.head_dim;
-        let _ = (q_dim, kv_dim);
-        let wq = self
-            .attention_wq
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing attention_wq".into()))?;
-        let wk = self
-            .attention_wk
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing attention_wk".into()))?;
-        let wv = self
-            .attention_wv
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing attention_wv".into()))?;
-        Ok((wq.forward(x)?, wk.forward(x)?, wv.forward(x)?))
+        Ok((
+            self.attention_wq.forward(x)?,
+            self.attention_wk.forward(x)?,
+            self.attention_wv.forward(x)?,
+        ))
     }
 
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -437,18 +431,9 @@ impl BatchedAttentionLayer for LayerWeights {
     fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection> {
         let q_dim = self.n_head * self.head_dim;
         let kv_dim = self.n_kv_head * self.head_dim;
-        let wq = self
-            .attention_wq
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing attention_wq".into()))?;
-        let wk = self
-            .attention_wk
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing attention_wk".into()))?;
-        let wv = self
-            .attention_wv
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing attention_wv".into()))?;
+        let wq = &self.attention_wq;
+        let wk = &self.attention_wk;
+        let wv = &self.attention_wv;
         let (mut q, mut k, mut v) = match acts {
             // int8: ONE segmented launch over the three KO weights (no concat); biases added below.
             DynamicActs::Int8(op) => {
@@ -729,9 +714,9 @@ impl ModelWeights {
 
             // Fuse QKV projections when possible for better performance
             // q/k/v kept separate KO twins (no concat): the segmented kernel fuses them at launch.
-            let attention_wq = Some(QMatMul::from_qtensor_with_mode(q_w, int8mode)?);
-            let attention_wk = Some(QMatMul::from_qtensor_with_mode(k_w, int8mode)?);
-            let attention_wv = Some(QMatMul::from_qtensor_with_mode(v_w, int8mode)?);
+            let attention_wq = QMatMul::from_qtensor_with_mode(q_w, int8mode)?;
+            let attention_wk = QMatMul::from_qtensor_with_mode(k_w, int8mode)?;
+            let attention_wv = QMatMul::from_qtensor_with_mode(v_w, int8mode)?;
 
             let attention_bq = load_tensor(&format!("{prefix}.attn_q.bias"))?;
             let attention_bk = load_tensor(&format!("{prefix}.attn_k.bias"))?;
@@ -909,9 +894,9 @@ impl ModelWeights {
             let v_w = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
 
             // q/k/v kept separate (no concat): int8 fuses them at launch via the segmented kernel.
-            let attention_wq = Some(QMatMul::from_qtensor(q_w)?);
-            let attention_wk = Some(QMatMul::from_qtensor(k_w)?);
-            let attention_wv = Some(QMatMul::from_qtensor(v_w)?);
+            let attention_wq = QMatMul::from_qtensor(q_w)?;
+            let attention_wk = QMatMul::from_qtensor(k_w)?;
+            let attention_wv = QMatMul::from_qtensor(v_w)?;
 
             let attention_bq = ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?;
             let attention_bk = ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?;
@@ -1129,7 +1114,7 @@ impl ModelWeights {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};

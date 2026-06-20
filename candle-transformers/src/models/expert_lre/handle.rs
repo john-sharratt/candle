@@ -152,7 +152,6 @@ impl ExpertCache {
     ///
     /// **Non-CUDA path:** fills VRAM from mmap (legacy GGML path).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mmap: Arc<memmap2::Mmap>,
         host_refs: Vec<Vec<MmapExpertRef>>,
@@ -301,13 +300,14 @@ impl ExpertCache {
 
                 let mut pool = PinnedPool::new(num_pinned, slot_size)?;
 
-                // Initialize location tracking.
+                // Initialize location tracking. Every expert starts as `Pinned { slot_idx: 0 }`;
+                // `startup_two_tier` below overwrites each entry with its real resident-VRAM or
+                // pinned-slot location as it repacks the weights.
                 let mut locations: Vec<Vec<ExpertLocation>> = Vec::with_capacity(num_moe_layers);
                 for _ in 0..num_moe_layers {
                     let mut layer_locs = Vec::with_capacity(experts_per_layer);
                     for _ in 0..experts_per_layer {
                         layer_locs.push(ExpertLocation::Pinned { slot_idx: 0 });
-                        // placeholder
                     }
                     locations.push(layer_locs);
                 }

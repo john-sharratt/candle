@@ -703,7 +703,11 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
         (ensure_contiguous(&q)?, ensure_contiguous(&k)?)
     };
 
-    reset_caches_at_zero(caches, offsets);
+    // Truncate each sequence to its prefill offset first: a fresh sequence is
+    // untouched, but a re-prefill at the same offset (the bench harness's repeat
+    // loop) discards the stale tail chunks the previous run left — otherwise they
+    // stack up and push the decode writer past a gap of empty chunks.
+    truncate_caches_to_offset(caches, offsets);
 
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim].
@@ -1102,6 +1106,18 @@ pub fn reset_caches_at_zero(caches: &mut [&mut KvCache], offsets: &[usize]) {
         if offset == 0 {
             cache.reset();
         }
+    }
+}
+
+/// Prefill idempotency: truncate each sequence's KV to exactly its `offset`
+/// cum-tokens before the prefill writes its tokens. A fresh sequence (or offset
+/// 0) is a no-op / full clear; a re-prefill at the same offset (e.g. the bench
+/// harness's repeat loop) discards the stale tail chunks the previous run left,
+/// so the prefill never stacks duplicate chunks (which would push the decode
+/// writer past a gap of empty chunks and corrupt attention).
+pub fn truncate_caches_to_offset(caches: &mut [&mut KvCache], offsets: &[usize]) {
+    for (cache, &offset) in caches.iter_mut().zip(offsets.iter()) {
+        cache.truncate_to_offset(offset);
     }
 }
 

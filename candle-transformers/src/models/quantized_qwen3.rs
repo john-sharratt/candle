@@ -190,11 +190,15 @@ impl MlpWeights {
     #[cfg(feature = "cuda")]
     fn forward_dynamic(&self, acts: &DynamicActs, out_dtype: DType) -> Result<Tensor> {
         let (mut gate, mut up) = if let Some(w) = &self.gate_up_proj {
-            let gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
             let (_, _, out_dim) = gu.dims3()?;
             if out_dim % 2 != 0 {
                 candle::bail!("unexpected fused gate+up output dim {out_dim} (not even)");
             }
+            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
+            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free, whereas
+            // casting the two aliasing narrows separately forces two fallback allocations.
+            gu.to_dtype_mut(out_dtype)?;
             let half = out_dim / 2;
             (gu.narrow(2, 0, half)?, gu.narrow(2, half, half)?)
         } else {
@@ -212,8 +216,9 @@ impl MlpWeights {
             )
         };
         // Run silu/mul/down in out_dtype: the Float path returns the activation dtype (F16), but
-        // MLP intermediates can exceed F16's ~65504 range, so compute in out_dtype (BF16). The int8
-        // path already returns out_dtype, making these coercions no-ops there.
+        // MLP intermediates can exceed F16's ~65504 range, so compute in out_dtype (BF16). The fused
+        // path already coerced `gu` above and the int8 path already returns out_dtype, so these are
+        // no-ops except on the separate-weight Float path.
         gate.to_dtype_mut(out_dtype)?;
         up.to_dtype_mut(out_dtype)?;
         let gated = (&gate.apply(&self.act_fn)? * &up)?;
@@ -275,11 +280,11 @@ impl RotaryEmbedding {
 
 #[derive(Debug, Clone)]
 struct AttentionWeights {
-    // Llama-style optimization: when running on CUDA and Q/K/V are compatible quantized weights,
-    // fuse them into a single matmul and split the result.
-    q_proj: Option<QMatMul>,
-    k_proj: Option<QMatMul>,
-    v_proj: Option<QMatMul>,
+    // Separate q/k/v weights. On the int8 path one segmented kernel launch covers all three (no
+    // weight stitching); the FP path runs them as three matmuls.
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
     o_proj: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -308,9 +313,9 @@ impl AttentionWeights {
         let v_w = gg.tensor(&format!("{prefix}.attn_v.weight"))?;
 
         // q/k/v kept separate (no concat): int8 fuses them at launch via the segmented kernel.
-        let q_proj = Some(QMatMul::from_qtensor(q_w)?);
-        let k_proj = Some(QMatMul::from_qtensor(k_w)?);
-        let v_proj = Some(QMatMul::from_qtensor(v_w)?);
+        let q_proj = QMatMul::from_qtensor(q_w)?;
+        let k_proj = QMatMul::from_qtensor(k_w)?;
+        let v_proj = QMatMul::from_qtensor(v_w)?;
         let o_proj = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
 
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), rms_norm_eps)?;
@@ -336,22 +341,11 @@ impl AttentionWeights {
 
     #[inline]
     fn project_qkv_with_compute_type(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let q_dim = self.num_heads * self.head_dim;
-        let kv_dim = self.num_kv_heads * self.head_dim;
-        let _ = (q_dim, kv_dim);
-        let q_proj = self
-            .q_proj
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing q_proj".into()))?;
-        let k_proj = self
-            .k_proj
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing k_proj".into()))?;
-        let v_proj = self
-            .v_proj
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing v_proj".into()))?;
-        Ok((q_proj.forward(x)?, k_proj.forward(x)?, v_proj.forward(x)?))
+        Ok((
+            self.q_proj.forward(x)?,
+            self.k_proj.forward(x)?,
+            self.v_proj.forward(x)?,
+        ))
     }
 
     /// B1 consumer: q/k/v over a producer-prepared (fused ln1) activation.
@@ -363,18 +357,9 @@ impl AttentionWeights {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let q_dim = self.num_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
-        let q = self
-            .q_proj
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing q_proj".into()))?;
-        let k = self
-            .k_proj
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing k_proj".into()))?;
-        let v = self
-            .v_proj
-            .as_ref()
-            .ok_or_else(|| candle::Error::Msg("missing v_proj".into()))?;
+        let q = &self.q_proj;
+        let k = &self.k_proj;
+        let v = &self.v_proj;
         match acts {
             // int8: ONE segmented launch over the three KO weights (no concat) — float-identical
             // to three separate matmuls, with full GPU occupancy so the tiny k/v stop starving.
@@ -981,9 +966,9 @@ impl ModelWeights {
             let k_norm = load_rms_norm(&format!("{prefix}.attn_k_norm.weight"), rms_norm_eps)?;
 
             // q/k/v kept separate KO twins (no concat): the segmented kernel fuses them at launch.
-            let q_proj = Some(QMatMul::from_weights_with_mode(q_w.into(), int8mode)?);
-            let k_proj = Some(QMatMul::from_weights_with_mode(k_w.into(), int8mode)?);
-            let v_proj = Some(QMatMul::from_weights_with_mode(v_w.into(), int8mode)?);
+            let q_proj = QMatMul::from_weights_with_mode(q_w.into(), int8mode)?;
+            let k_proj = QMatMul::from_weights_with_mode(k_w.into(), int8mode)?;
+            let v_proj = QMatMul::from_weights_with_mode(v_w.into(), int8mode)?;
 
             let self_attn = AttentionWeights {
                 q_proj,
@@ -1240,7 +1225,7 @@ impl ModelWeights {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};

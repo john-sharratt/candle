@@ -15,8 +15,11 @@
 //! on each model see the model's module docs in the links below.
 
 pub mod based;
+#[cfg(feature = "cuda")]
 pub mod batched_inference;
+#[cfg(feature = "cuda")]
 pub mod batched_layer;
+#[cfg(feature = "cuda")]
 pub mod batched_model;
 pub mod beit;
 pub mod bert;
@@ -122,7 +125,9 @@ pub mod qwen3_moe;
 pub mod rope_tables;
 pub mod routing_capture;
 
-#[cfg(any(test, feature = "ruler-bench"))]
+// The batched-test harness drives the cuda-only batched/paged inference path (batched_inference,
+// DynamicActs, paged attention), so it is gated on cuda like those modules.
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
 pub mod batch_test;
 pub mod recurrent_gemma;
 pub mod repvgg;

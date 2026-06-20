@@ -853,12 +853,9 @@ extern "C" __global__ void q4_ko_int8_f32_dense(const void*, const void*, void*,
 extern "C" __global__ void q5_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
 extern "C" __global__ void q6_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
 extern "C" __global__ void q8_ko_int8_f32_dense(const void*, const void*, void*, int, int, int, int, int);
-// q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) crossover. The DENSE crossover is now decided in
-// Rust (a weight-aware closed-form fit, see q8a128_dense_use_mode2) and passed in as `force_mode2`,
-// since the optimal point depends on weight bytes vs L2, not token count alone. The grouped path
-// still derives its own per-expert crossover here (Bm=32 already halves weight reads at ~32
-// tokens/expert, so it crosses lower than the dense case).
-#define Q8A128_GROUPED_M2_MIN_M 32
+// q8a128 mode-1 → mode-2 (Bm=32 weight-reuse) crossover. The DENSE crossover is decided in Rust
+// (a weight-aware closed-form fit, see q8a128_dense_use_mode2) and passed in as `force_mode2`,
+// since the optimal point depends on weight bytes vs L2, not token count alone.
 
 // Mode-2 KO dense (N_SUB=2, Bm=32): weight-reuse loop for large-M (prefill).
 extern "C" __global__ void q4_ko_int8_f32_dense_m2(const void*, const void*, void*, int, int, int, int, int);
@@ -1216,7 +1213,7 @@ static void* grouped_kernels[14][3] = {
 // against Q4_K weights (raw 4-bit nibbles) on the m16n8k32 int8 tensor core, with
 // the deferred-scale fold (d_w·s_a·C + m_w·Σx) applied post-MMA and F32 output.
 // See grouped_tc_int8 in kernel.cuh. Same launch ABI as the FP grouped kernels
-// (one block_q8a128 activation pointer). Only Q4_K is populated; ytype==3 →
+// (one block_q8a128 activation pointer). Registered for ytype==3 →
 // grouped_kernels_int8[row].
 extern "C" __global__ void q4_k_int8_f32_grouped(
     const void*, const void*, const void*, const void*, const void*,

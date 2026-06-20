@@ -2407,7 +2407,7 @@ __device__ void tcN_kernel_impl(
     const int b1_local = groupID + 8;
     const int b0 = batch_offset + b0_local;
     const int b1 = batch_offset + b1_local;
-    
+
     if constexpr (BATCH_SIZE >= 8) {
         if constexpr (std::is_same_v<output_t, float>) {
             *reinterpret_cast<float2*>(&dst[b0 * dst_stride + out_row]) = make_float2(frag_c[0], frag_c[1]);

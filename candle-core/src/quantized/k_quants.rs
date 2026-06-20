@@ -450,14 +450,19 @@ pub struct BlockQAWQ_G64 {
 }
 const _: () = assert!(std::mem::size_of::<BlockQAWQ_G64>() == 80);
 
-/// BlockQ4_KO: byte-permuted twin of the Q4_K compact (K/128) block, for the
-/// q8a128 int8 matmul path. Holds the SAME data as Q4_K's compact block — 128 ×
-/// 4-bit weights (interleaved nibble order {n0,n4,n2,n6,n1,n5,n3,n7} within each
-/// int) plus four per-32 (scale, neg_min) f16 pairs — reordered so the 16 qs ints
-/// occupy bytes 0-63 and the scale pairs group at the tail (bytes 64-79). Within
-/// each 32-element sub the four qs ints are stored INTERLEAVED as [I0,I2,I1,I3]
-/// (so the GPU loads each sub's weights with one int2); element nibbles otherwise
-/// dequantize identically: `value = scale_s * q + neg_min_s`, sub `s = element/32`.
+/// BlockQ4_KO: the **CPU-side** per-32 codec — a byte-permuted twin of the Q4_K compact (K/128)
+/// block. Holds the SAME data as Q4_K's compact block — 128 × 4-bit weights (interleaved nibble
+/// order {n0,n4,n2,n6,n1,n5,n3,n7} within each int) plus four per-32 (scale, neg_min) f16 pairs —
+/// reordered so the 16 qs ints occupy bytes 0-63 and the scale pairs group at the tail (bytes
+/// 64-79). Within each 32-element sub the four qs ints are stored INTERLEAVED as [I0,I2,I1,I3];
+/// element nibbles dequantize as `value = scale_s * q + neg_min_s`, sub `s = element/32`. Used only
+/// for CPU reference / roundtrip tests, and for `type_size`/`block_size`.
+///
+/// IMPORTANT — this is NOT the layout the int8 matmul consumes. GPU-produced `Q4_KO` weights (the
+/// matmul inputs, built by `ko_quant`/`QStorage::repack_ko`) use a distinct **per-128 affine,
+/// re-quantized-from-F32** chunk layout (8 rows × 128 K per chunk, 68 B/row — see `ko_quant` and
+/// `dequant_ko.cuh`). The two share the `GgmlDType::Q4_KO` discriminant but are NOT byte-compatible
+/// and carry different granularity, so a GPU KO weight must not be dequantized through this codec.
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C, align(16))]
 pub struct BlockQ4_KO {
@@ -577,9 +582,10 @@ impl GgmlType for BlockQ4_KO {
 }
 
 // ===========================================================================
-// Q5_KO / Q6_KO / Q8_KO — byte-permuted twins of the Q5_K/Q6_K/Q8_K compact
-// blocks for the q8a128 int8 path. CPU codecs mirror the corresponding GPU
-// loader's element extraction (shared {n0,n4,n2,n6,n1,n5,n3,n7} nibble order).
+// Q5_KO / Q6_KO / Q8_KO — CPU-side per-32 codecs (byte-permuted twins of the
+// Q5_K/Q6_K/Q8_K compact blocks). As with BlockQ4_KO above, these are CPU
+// reference/roundtrip codecs only; the int8 matmul consumes the distinct
+// per-128 from-F32 `ko_quant` layout under the same GgmlDType discriminant.
 // ===========================================================================
 
 /// BlockQ5_KO: Q5_K twin — qs (low nibbles) contiguous, qh (5th bits) contiguous,
@@ -1385,8 +1391,21 @@ impl GgmlType for BlockQ8_1 {
         }
     }
 
-    fn to_float(_xs: &[Self], _ys: &mut [f32]) {
-        unimplemented!("no support for vec-dot on Q8_1")
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK8_1),
+            "dequantize_row_q8_1: {k} is not divisible by {QK8_1}"
+        );
+        // Dequant is `qs * d`; the per-block sum `s` is only an auxiliary term for
+        // the int8 dot product, not part of the reconstructed values.
+        let nb = k / QK8_1;
+        for i in 0..nb {
+            let d = xs[i].d.to_f32();
+            for j in 0..QK8_1 {
+                ys[i * QK8_1 + j] = xs[i].qs[j] as f32 * d;
+            }
+        }
     }
 }
 
@@ -3884,11 +3903,10 @@ pub mod q0_v_tables {
 
     ];
 
-    /// Production CENTROID_TABLE_BITS_K with 16 entries per scale row. The
-    /// 8-entry calibration is pasted into adjacent slot pairs (j → 2j, 2j+1)
-    /// as a placeholder; recalibrating with 16-entry resolution is a
-    /// separate calibration job. The kernel reads `[16]` rows so the type
-    /// must match.
+    /// CENTROID_TABLE_BITS_K with 16 entries per scale row. Currently built by
+    /// duplicating the calibrated 8-entry table into adjacent slot pairs
+    /// (j → 2j, 2j+1); a full 16-entry recalibration is a separate measurement
+    /// task. The kernel reads `[16]` rows so the type must match.
     pub const CENTROID_TABLE_BITS_K: [[u16; 16]; 32] = {
         let mut out = [[0u16; 16]; 32];
         let mut s = 0;
@@ -4248,8 +4266,8 @@ pub mod q0_v_tables {
 
     ];
 
-    /// Production CENTROID_TABLE_BITS_V — 16-entry placeholder built by
-    /// duplicating the 8-entry calibration. See note on K-side equivalent.
+    /// CENTROID_TABLE_BITS_V — 16-entry table built by duplicating the 8-entry
+    /// calibration. See the note on the K-side equivalent.
     pub const CENTROID_TABLE_BITS_V: [[u16; 16]; 32] = {
         let mut out = [[0u16; 16]; 32];
         let mut s = 0;
@@ -5973,7 +5991,7 @@ pub fn matmul<T: GgmlType>(
     );
     let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
 
-    // TODO: Pre-allocate this.
+    // Scratch buffer holding the LHS pre-quantized to the weight's vec-dot type.
     let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_blocks];
     // f32, f16, and bf16 support direct copy
     if T::DIRECT_COPY {

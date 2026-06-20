@@ -5,6 +5,134 @@ use rand::Rng;
 use std::ffi::c_void;
 use std::time::Instant;
 
+/// Guards the large-N (2*ffn) gemx matmul at batch=1: a fused ffn_gate+ffn_up
+/// weight has distinct gate (rows 0..N/2) and up (rows N/2..N) halves, and the
+/// kernel must not collapse the up half onto the gate half. This path was the
+/// prime suspect while chasing a decode `up == gate` corruption at N=16384 — the
+/// kernel was exonerated here (the real bug was an aliased `to_dtype_mut`, see
+/// `cuda_to_dtype_mut_respects_start_offset`); this test pins the kernel so a
+/// future regression in the large-N batch=1 gemx path is caught directly.
+#[test]
+fn cuda_mm_gemx_large_n_batch1_no_row_aliasing() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let ncols = 3072usize; // K (hidden)
+    let half_n = 8192usize; // ffn
+    let nrows = 2 * half_n; // N = 2*ffn (the failing size)
+    let device = crate::Device::Cuda(dev.clone());
+
+    // Build the gate (rows 0..ffn) and up (rows ffn..2ffn) weights SEPARATELY,
+    // quantize each, then fuse via concat_rows_cuda — exactly how the MLP builds
+    // its fused ffn_gate+ffn_up weight. Distinct patterns so the halves differ.
+    let gate_w: Vec<f32> = (0..ncols * half_n)
+        .map(|v| (((v / ncols) as f32 * 7.0 + (v % ncols) as f32 * 11.0) * 0.001).sin())
+        .collect();
+    let up_w: Vec<f32> = (0..ncols * half_n)
+        .map(|v| (((v / ncols) as f32 * 13.0 + (v % ncols) as f32 * 5.0) * 0.001).cos())
+        .collect();
+    let gate_t = crate::Tensor::from_vec(gate_w, (half_n, ncols), &device)?;
+    let up_t = crate::Tensor::from_vec(up_w, (half_n, ncols), &device)?;
+    let wg = crate::quantized::QTensor::quantize(&gate_t, GgmlDType::Q4_K)?;
+    let wu = crate::quantized::QTensor::quantize(&up_t, GgmlDType::Q4_K)?;
+    let fused = crate::quantized::QTensor::concat_rows_cuda(&[&wg, &wu])?;
+    let fused_shape = fused.shape().clone();
+    let xs_repacked = match fused.storage() {
+        crate::quantized::QStorage::Cuda(s) => s.repack_gemx(&fused_shape)?,
+        _ => unreachable!(),
+    };
+    let qtype = dtype_to_qtype(GgmlDType::Q4_K)? as i32;
+
+    // Reference (batch>=2 is known-good) up value, filled on the y_cols=2 pass.
+    let mut ref_up: Option<f32> = None;
+    for &y_cols in &[2usize, 1, 4] {
+        let y_data: Vec<f16> = vec![f16::from_f32(1.0); ncols * y_cols];
+        let y = dev.memcpy_stod(&y_data)?;
+        let dst = unsafe { dev.alloc::<f16>(nrows * y_cols)? };
+        {
+            let stream = dev.cuda_stream();
+            let (data_ptr, _g) = xs_repacked.data.inner.device_ptr(&stream);
+            let segment = VxSegment {
+                weights: data_ptr as *const std::ffi::c_void,
+                batch_count: y_cols as i32,
+            };
+            let (y_ptr, _gy) = y.device_ptr(&stream);
+            let (dst_ptr, _gd) = dst.device_ptr(&stream);
+            unsafe {
+                run_quantized_matmul(
+                    &segment as *const VxSegment,
+                    1,
+                    y_ptr as *const std::ffi::c_void,
+                    dst_ptr as *mut std::ffi::c_void,
+                    ncols as i32,
+                    nrows as i32,
+                    ncols as i32,
+                    nrows as i32,
+                    qtype,
+                    YType::F16 as i32,
+                    xs_repacked.data.len,
+                    0,
+                );
+            }
+        }
+        dev.synchronize()?;
+        let res = dev.memcpy_dtov(&dst.slice(..))?;
+        // batch 0 occupies dst[0..nrows].
+        let gate0 = f16::to_f32(res[0]);
+        let up0 = f16::to_f32(res[nrows / 2]);
+        println!("y_cols={y_cols}: gate[0]={gate0:.3}  up[N/2]={up0:.3}");
+        if y_cols == 2 {
+            ref_up = Some(up0);
+        }
+        // The up row and gate row use different weight patterns, so their sums differ.
+        assert!(
+            (up0 - gate0).abs() > 0.5,
+            "y_cols={y_cols}: UP ROW ALIASED TO GATE: up={up0} ~= gate={gate0}"
+        );
+        // And the up value must match the known-good (batch>=2) reference.
+        if let Some(r) = ref_up {
+            assert!(
+                (up0 - r).abs() < 0.5,
+                "y_cols={y_cols}: up row wrong: {up0} vs reference {r}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Regression: `to_dtype_mut` on a *contiguous view with a non-zero start offset*
+/// (e.g. the second half of a last-dim `narrow`) must cast the offset slice, not
+/// the buffer start. The fused ffn_gate+ffn_up MLP hit this: at decode M=1 the
+/// `up = gu.narrow(last, ffn, ffn)` view is contiguous (offset ffn); the in-place
+/// cast ignored the offset and produced `up == gate`, corrupting decode.
+#[test]
+fn cuda_to_dtype_mut_respects_start_offset() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let n = 256usize;
+    // [1, 1, 2n]: first half = 1.0, second half = 2.0.
+    let data: Vec<f32> = (0..2 * n).map(|i| if i < n { 1.0 } else { 2.0 }).collect();
+    let gu = crate::Tensor::from_vec(data, (1, 1, 2 * n), &device)?.to_dtype(crate::DType::F16)?;
+
+    let mut up = gu.narrow(2, n, n)?; // contiguous, start_offset = n
+    assert!(up.is_contiguous());
+    up.to_dtype_mut(crate::DType::BF16)?;
+    let up_v = up.flatten_all()?.to_dtype(crate::DType::F32)?.to_vec1::<f32>()?;
+    assert!(
+        up_v.iter().all(|&x| (x - 2.0).abs() < 1e-3),
+        "up half aliased to gate: got {:?}",
+        &up_v[..4]
+    );
+
+    let mut gate = gu.narrow(2, 0, n)?; // contiguous, start_offset = 0
+    gate.to_dtype_mut(crate::DType::BF16)?;
+    let gate_v = gate.flatten_all()?.to_dtype(crate::DType::F32)?.to_vec1::<f32>()?;
+    assert!(
+        gate_v.iter().all(|&x| (x - 1.0).abs() < 1e-3),
+        "gate half wrong: got {:?}",
+        &gate_v[..4]
+    );
+    Ok(())
+}
+
 #[test]
 fn cuda_quantize_q8_1() -> Result<()> {
     let dev = CudaDevice::new(0)?;
@@ -2100,8 +2228,8 @@ fn quantize_kernel_byte_accuracy() -> Result<()> {
     println!("Q2K:  exact_bytes={}, rmse={:.2e}", q2k_exact, q2k_rmse);
     println!("Q4K:  exact_bytes={}, rmse={:.2e}", q4k_exact, q4k_rmse);
 
-    // For now, just report - don't fail the test since we're debugging
-    // Later we can add: assert!(q4_0_exact && q8_0_exact && q2k_exact);
+    // Reporting diagnostic: prints per-format exact-byte counts and RMSE for a quick
+    // overview. Strict byte-exactness is asserted by the dedicated per-format tests.
 
     Ok(())
 }
@@ -3718,8 +3846,8 @@ fn dense_qmatmul_float_matches_grouped() -> Result<()> {
 /// contiguous, the four (scale,-min) pairs grouped at the tail. Reading a permuted
 /// Q4_KO weight through the int8 q8a128 matmul must produce the BIT-IDENTICAL result
 /// of reading the original Q4_K weight, proving the KO layout + loader + dispatch are
-/// correct end to end. The permutation is done on the host here; Phase 2 replaces it
-/// with an on-GPU conversion kernel.
+/// correct end to end. This test permutes on the host; the production path repacks on
+/// the GPU (`QCudaStorage::repack_ko`).
 #[test]
 #[ignore = "retired: per-32 sub-major path superseded by the per-128 collapse"]
 fn q4_ko_matches_q4_k_int8() -> Result<()> {
@@ -7121,7 +7249,14 @@ fn qkv_segmented_vs_concat_same_format() -> Result<()> {
             Ok(s[s.len() / 2])
         };
         let us_concat = time(&|| {
-            let _ = dense_qmatmul(DynamicTensor::Int8(&op), concat_ptr, GgmlDType::Q4_KO, n_total, 0, &dev)?;
+            let _ = dense_qmatmul(
+                DynamicTensor::Int8(&op),
+                concat_ptr,
+                GgmlDType::Q4_KO,
+                n_total,
+                0,
+                &dev,
+            )?;
             Ok(())
         })?;
         let us_seg = time(&|| {

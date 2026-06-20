@@ -2702,6 +2702,15 @@ impl CudaStorage {
             return Ok(false);
         }
 
+        // The in-place cast reads/writes from the buffer's base pointer (no offset) and
+        // the caller resets the layout to `contiguous(offset 0)` afterwards. A contiguous
+        // *view* with a non-zero start offset (e.g. the second half of a last-dim
+        // `narrow`) would therefore cast the wrong elements and report the wrong region.
+        // Fall back to the allocating `to_dtype`, which honours the offset.
+        if layout.start_offset() != 0 {
+            return Ok(false);
+        }
+
         let elem_count = layout.shape().elem_count();
         let src_size = src_dtype.size_in_bytes();
         let dst_size = dtype.size_in_bytes();

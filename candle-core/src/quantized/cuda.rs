@@ -2762,15 +2762,11 @@ impl QCudaStorage {
             }
         }
 
-        // Wrap the pinned host buffer as a CudaSlice via device H2D copy.
-        // Note: we still need a CudaSlice for the QCudaStorage API.
-        // We allocate VRAM and copy â€” but the data also lives in pinned host
-        // memory for future zero-copy patterns.
-        //
-        // TODO(perf): When cudarc supports wrapping an external device pointer
-        // (from cuMemHostGetDevicePointer) into a CudaSlice without ownership,
-        // we can eliminate this VRAM copy entirely. For now, the HostMappedAlloc
-        // guard keeps the pinned buffer alive as a correctness guarantee.
+        // Wrap the pinned host buffer as a CudaSlice via a device H2D copy: the
+        // QCudaStorage API needs an owned CudaSlice, and cudarc has no way to wrap an
+        // external device pointer (from cuMemHostGetDevicePointer) into a CudaSlice
+        // without ownership, so the mapped-host zero-copy path is not expressible here.
+        // The HostMappedAlloc guard keeps the pinned buffer alive alongside the VRAM copy.
         let pinned_slice = unsafe { std::slice::from_raw_parts(host_ptr, size_in_bytes) };
         let mut inner = unsafe { device.alloc::<u8>(padded_size_in_bytes)? };
         device.memcpy_htod(pinned_slice, &mut inner.slice_mut(..size_in_bytes))?;
@@ -3601,6 +3597,14 @@ impl QCudaStorage {
     /// [`Self::repack_gemx`] used by `QMatMul::repack_for_optimization`.
     pub fn repack_ko(&self, shape: &Shape, ko_dtype: GgmlDType) -> Result<Self> {
         let (nrows, ncols) = shape.dims2()?;
+        // The KO chunk layout packs 8 rows × 128 K per chunk; unaligned dims would under-size the
+        // output buffer below while the kernel writes the full N×K → OOB device write. Match the
+        // CPU twin's invariants (ko_quant::quantize_ko).
+        if nrows % 8 != 0 || ncols % 128 != 0 {
+            crate::bail!(
+                "repack_ko: shape [{nrows}, {ncols}] must have nrows % 8 == 0 and ncols % 128 == 0"
+            );
+        }
         let qtype = dtype_to_qtype(ko_dtype)? as i32;
         let bytes =
             (nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype);
@@ -4231,8 +4235,8 @@ impl Q8a128Operand {
 /// A qmatmul activation/LHS that is either a plain float tensor (F16/BF16/F32 — the
 /// dequant-weight float path) or pre-quantized q8a1024 int8 blocks (the int8 tensor-core
 /// path). Threading one type through the matmul hides whether it runs in float or int8
-/// mode: the int8 arm carries its own mode (`Q8a128Operand::ytype`), the float arm derives
-/// it from the tensor's dtype.
+/// mode: the int8 arm runs the q8a128 tensor-core path (mode-1/mode-2 chosen by the occupancy
+/// formula `q8a128_dense_use_mode2` at dispatch), the float arm derives it from the tensor's dtype.
 pub enum DynamicTensor<'a> {
     Float(&'a crate::Tensor),
     Int8(&'a Q8a128Operand),
@@ -4314,8 +4318,8 @@ pub fn to_dynamic(xs: &crate::Tensor, mode: Int8Mode, device: &CudaDevice) -> Re
 
 /// Quantize activations `[rows, cols]` (dtype 0=F16,1=BF16,2=F32 at `act_ptr`) →
 /// q8a1024 flat-grouped blocks (8 × 128-tiles per 1152-byte super-block; qs
-/// de-interleaved from the per-32 ds — see blocks.cuh), paired with the matmul mode
-/// the quantizer selects from the token count M (= `rows`) at the `M ≥ 64` crossover.
+/// de-interleaved from the per-32 ds — see blocks.cuh). The matmul mode is not chosen here; it is
+/// derived later by the occupancy formula `q8a128_dense_use_mode2` at dispatch.
 pub fn quantize_acts_q8a128(
     act_ptr: u64,
     dtype: i32,
@@ -4830,8 +4834,8 @@ pub fn grouped_qmatmul(
 /// Dense (non-MoE) quantized matmul over a [`DynamicTensor`] activation: a single weight
 /// `[nrows(N) × ncols(K)]` (KO format for the `Int8` arm, FP GEMX K/128-repack for the
 /// `Float` arm) × the activation `[.. × K]` → `[.., N]` (leading dims preserved on both arms).
-/// `Int8` runs the q8a128 tensor-core path carrying the operand's own mode (`op.ytype` —
-/// no re-derivation), output F32; `Float` runs the dequant-weight float path
+/// `Int8` runs the q8a128 tensor-core path (mode-1/mode-2 chosen by `q8a128_dense_use_mode2` at
+/// dispatch), output F32; `Float` runs the dequant-weight float path
 /// ([`dense_qmatmul_float`]), output matching the activation dtype. The caller stays
 /// agnostic to which numeric mode runs. `weight_len` is the quantized-weight byte length
 /// used by the float path; the int8 path ignores it. See docs/q8_matmul_pipeline.md.
