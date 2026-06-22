@@ -219,7 +219,10 @@ impl InferenceMode {
             Self::Q2_0 => vec![Q(Q2_0)],
             Self::R16 => vec![Q(QuantFormat::R16)],
             // ── Float modes ──
-            Self::F32 => vec![Float(DType::F32)],
+            // Paged attention kernels store/read F16/BF16 only, so F32 KV is unrepresentable. The
+            // F32 reference mode stores BF16 — matching the F32→BF16 compute collapse already in the
+            // prefill/decode paths. Model compute follows the arena dtype (caches.dtype()).
+            Self::F32 => vec![Float(DType::BF16)],
             Self::F16 => vec![Float(DType::F16)],
             Self::BF16 => vec![Float(DType::BF16)],
             _ => vec![Float(DType::F16)],
@@ -258,7 +261,9 @@ impl InferenceMode {
             // R16 is K-only (K@F16 + Q-capture space). V uses plain F16.
             Self::R16 => vec![Float(DType::F16)],
             // ── Float modes ──
-            Self::F32 => vec![Float(DType::F32)],
+            // F32 KV is unrepresentable in the paged kernels (F16/BF16 only); store BF16 to match
+            // the F32→BF16 compute collapse.
+            Self::F32 => vec![Float(DType::BF16)],
             Self::F16 => vec![Float(DType::F16)],
             Self::BF16 => vec![Float(DType::BF16)],
             _ => vec![Float(DType::F16)],
@@ -1108,10 +1113,17 @@ impl BatchedInferenceSession {
                 copy_stream
                     .synchronize()
                     .map_err(|e| candle::Error::Msg(format!("quantize sync: {e}")))?;
+                // Quantized modes must replace the float chunks with the quantized
+                // bytes: truncate the live float layout and re-inject the sealed
+                // quantized chunks.
+                self.truncate_sequence_to_blocks(seq_idx, 0)?;
+                self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
             }
-
-            self.truncate_sequence_to_blocks(seq_idx, 0)?;
-            self.inject_sealed_at_tail(seq_idx, &quantized_per_layer)?;
+            // Uncompressed (F16/BF16) modes keep their float chunks in place — the
+            // prefill's `truncate_caches_to_offset` already collapses phantom
+            // chunks from repeated re-prefill, so the record_turn/truncate/re-inject
+            // round-trip is unnecessary (and re-injecting Arc-shared chunks under a
+            // lone sequence corrupted the decode read). Just open a fresh writer.
             if start_new_chunk {
                 self.push_empty_writer_chunk(seq_idx)?;
             }
@@ -1160,6 +1172,18 @@ impl BatchedInferenceSession {
         Ok(total_freed)
     }
 
+    /// Release fully-empty KV arenas across all backings **without** the
+    /// chunk-moving defrag — cheap VRAM relief for the scheduler's pressure
+    /// path (the costly speculative defrag is left to the allocation-time OOM
+    /// retry). Returns arenas freed.
+    pub fn release_empty_arenas(&self) -> Result<usize> {
+        let mut total_freed = 0;
+        for backing in &self.backings {
+            total_freed += backing.release_empty_arenas()?;
+        }
+        Ok(total_freed)
+    }
+
     /// Device VRAM `(free, total)` in bytes, or `None` on non-CUDA devices /
     /// query failure. Drives the scheduler's VRAM-pressure admission gate.
     pub fn vram_free_total(&self) -> Option<(usize, usize)> {
@@ -1167,6 +1191,47 @@ impl BatchedInferenceSession {
         {
             if let Device::Cuda(d) = &self.device {
                 return d.mem_get_info().ok();
+            }
+        }
+        None
+    }
+
+    /// Pool-aware KV-VRAM budget headroom in bytes (`init_free - pool_used -
+    /// reserve`), or `None` on non-CUDA / query failure. Unlike
+    /// [`Self::vram_free_total`] (the volatile driver `cuMemGetInfo` free, which
+    /// our stream-ordered pool's reserved-but-free memory hides from and which
+    /// WDDM pollutes with other processes' resident memory), this counts only
+    /// *our* live footprint — so KV freed back into the pool registers as
+    /// headroom. This is the number the per-arena budget gate already uses.
+    pub fn vram_budget_available(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        return candle_nn::kv_cache::vram_budget_available(&self.device);
+        #[cfg(not(feature = "cuda"))]
+        return None;
+    }
+
+    /// True when a forced compaction could free at least one whole arena from
+    /// any KV backing. When false, the cache is packed to within a single arena
+    /// of free space and compaction would reclaim nothing — the scheduler uses
+    /// this to skip a futile compaction pass under VRAM pressure.
+    pub fn can_reclaim_arena(&self) -> bool {
+        self.backings.iter().any(|b| b.can_reclaim_arena())
+    }
+
+    /// Our CUDA memory pool's `(used, reserved)` bytes — what our allocations
+    /// actually occupy (model weights + KV + activations) vs the high-water
+    /// bytes the pool has reserved from the OS. `reserved - used` is held but
+    /// reusable; `reserved` is why the driver's `free` reads near zero. The
+    /// real diagnostic for "what's using VRAM". `None` on non-CUDA / failure.
+    pub fn vram_pool_stats(&self) -> Option<(usize, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(d) = &self.device {
+                if let (Ok(used), Ok(reserved)) =
+                    (d.pool_used_bytes(), d.pool_reserved_bytes())
+                {
+                    return Some((used, reserved));
+                }
             }
         }
         None

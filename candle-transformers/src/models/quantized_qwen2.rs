@@ -15,15 +15,19 @@
 
 use std::sync::{Arc, RwLock};
 
+#[cfg(feature = "cuda")]
 use super::batched_layer::{BatchedAttentionLayer, QkvProjection};
+#[cfg(feature = "cuda")]
 use super::batched_model::BatchedModelCore;
 use super::kv_cache_utils::{new_kv_caches, KvCaches};
 use super::rope_tables::CisPrecomputations;
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
 #[cfg(feature = "cuda")]
+use candle::quantized::cuda::DynamicActs;
+#[cfg(feature = "cuda")]
 use candle::quantized::register_mmap_cuda;
 use candle::{
-    quantized::{gguf_file, GgmlDType},
+    quantized::{gguf_file, GgmlDType, Int8Mode},
     DType, Device, IndexOp, Result, Tensor,
 };
 use candle_nn::{kv_cache::KvCache, Embedding, Module};
@@ -114,6 +118,44 @@ impl Mlp {
     }
 }
 
+impl Mlp {
+    /// B3 consumer: gate/up over a producer-prepared (fused ffn_norm) activation, shared across
+    /// both projections; Qwen2 down-proj closes the block. CUDA only.
+    #[cfg(feature = "cuda")]
+    fn forward_dynamic(&self, acts: &DynamicActs, out_dtype: DType) -> Result<Tensor> {
+        let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
+            let mut gu = w.forward_dynamic(acts.as_dynamic(), out_dtype)?;
+            // Coerce the fused output to out_dtype ONCE, in place, before splitting it into the
+            // gate/up views: `gu` is owned + contiguous here so the cast is allocation-free, whereas
+            // casting the two aliasing narrows separately forces two fallback allocations.
+            gu.to_dtype_mut(out_dtype)?;
+            let last = gu.rank() - 1;
+            let half = gu.dim(last)? / 2;
+            (gu.narrow(last, 0, half)?, gu.narrow(last, half, half)?)
+        } else {
+            let w1 = self
+                .feed_forward_w1
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w1".into()))?;
+            let w3 = self
+                .feed_forward_w3
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg("missing feed_forward_w3".into()))?;
+            (
+                w1.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+                w3.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+            )
+        };
+        // Fused path already coerced `gu`; the separate path coerces here (no-op in int8 mode).
+        w1.to_dtype_mut(out_dtype)?;
+        w3.to_dtype_mut(out_dtype)?;
+        let intermediate = (candle_nn::ops::silu(&w1)? * w3)?;
+        let mut out = self.feed_forward_w2.forward(&intermediate)?;
+        out.to_dtype_mut(out_dtype)?;
+        Ok(out)
+    }
+}
+
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (mut w1, mut w3) = if let Some(w) = &self.feed_forward_gate_up {
@@ -184,10 +226,9 @@ impl BiasTensors {
 
 #[derive(Debug, Clone)]
 pub struct LayerWeights {
-    attention_qkv: Option<QMatMul>,
-    attention_wq: Option<QMatMul>,
-    attention_wk: Option<QMatMul>,
-    attention_wv: Option<QMatMul>,
+    attention_wq: QMatMul,
+    attention_wk: QMatMul,
+    attention_wv: QMatMul,
     attention_bq: BiasTensors,
     attention_bk: BiasTensors,
     attention_bv: BiasTensors,
@@ -213,34 +254,11 @@ impl LayerWeights {
 
     #[inline]
     fn project_qkv_with_compute_type(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let q_dim = self.n_head * self.head_dim;
-        let kv_dim = self.n_kv_head * self.head_dim;
-        if let Some(qkv_proj) = &self.attention_qkv {
-            let qkv = qkv_proj.forward(x)?;
-            let q = qkv.narrow(2, 0, q_dim)?;
-            let k = qkv.narrow(2, q_dim, kv_dim)?;
-            let v = qkv.narrow(2, q_dim + kv_dim, kv_dim)?;
-            Ok((q, k, v))
-        } else {
-            let wq = self
-                .attention_wq
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing attention_wq".into()))?;
-            let wk = self
-                .attention_wk
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing attention_wk".into()))?;
-            let wv = self
-                .attention_wv
-                .as_ref()
-                .ok_or_else(|| candle::Error::Msg("missing attention_wv".into()))?;
-
-            let q = wq.forward(x)?;
-            let k = wk.forward(x)?;
-            let v = wv.forward(x)?;
-
-            Ok((q, k, v))
-        }
+        Ok((
+            self.attention_wq.forward(x)?,
+            self.attention_wk.forward(x)?,
+            self.attention_wv.forward(x)?,
+        ))
     }
 
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -372,6 +390,7 @@ impl LayerWeights {
 /// Implement the `BatchedAttentionLayer` trait for Qwen2 layers.
 ///
 /// This enables the use of generic batched layer processing from `batched_layer` module.
+#[cfg(feature = "cuda")]
 impl BatchedAttentionLayer for LayerWeights {
     fn n_head(&self) -> usize {
         self.n_head
@@ -385,25 +404,58 @@ impl BatchedAttentionLayer for LayerWeights {
         self.head_dim
     }
 
-    fn attention_norm(&self, x: &Tensor) -> Result<Tensor> {
-        self.attention_norm.forward(x)
+    fn o_proj(&self) -> &QMatMul {
+        &self.attention_wo
     }
 
-    fn ffn_norm(&self, x: &Tensor) -> Result<Tensor> {
-        self.ffn_norm.forward(x)
+    /// B3 producer: fuse ffn_norm -> q8a128 (int8) or FP rms_norm (Off).
+    #[cfg(feature = "cuda")]
+    fn ffn_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+        self.ffn_norm.forward_dynamic(x, mode)
     }
 
-    fn ffn_forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.mlp.forward(x)
+    /// B3 consumer: dense MLP over the fused ffn_norm activation.
+    #[cfg(feature = "cuda")]
+    fn ffn_forward(&self, acts: DynamicActs, mlp_dtype: DType) -> Result<Tensor> {
+        self.mlp.forward_dynamic(&acts, mlp_dtype)
     }
 
-    fn project_qkv(&self, x: &Tensor) -> Result<QkvProjection> {
-        let act_dtype = x.dtype();
+    /// B1 producer: fuse attention_norm -> q8a128 (int8) or FP rms_norm (Off).
+    #[cfg(feature = "cuda")]
+    fn attention_norm(&self, x: &Tensor, mode: Int8Mode) -> Result<DynamicActs> {
+        self.attention_norm.forward_dynamic(x, mode)
+    }
 
-        // Project Q/K/V (handles fused or separate)
-        let (mut q, mut k, mut v) = self.project_qkv_with_compute_type(x)?;
-
-        // Convert to activation dtype if needed
+    /// B1 consumer: q/k/v over the fused activation, then Qwen2 QKV biases.
+    #[cfg(feature = "cuda")]
+    fn project_qkv(&self, acts: &DynamicActs, out_dtype: DType) -> Result<QkvProjection> {
+        let q_dim = self.n_head * self.head_dim;
+        let kv_dim = self.n_kv_head * self.head_dim;
+        let wq = &self.attention_wq;
+        let wk = &self.attention_wk;
+        let wv = &self.attention_wv;
+        let (mut q, mut k, mut v) = match acts {
+            // int8: ONE segmented launch over the three KO weights (no concat); biases added below.
+            DynamicActs::Int8(op) => {
+                let qkv = candle::quantized::QMatMul::qkv_segmented(
+                    op,
+                    &[wq.inner(), wk.inner(), wv.inner()],
+                    out_dtype,
+                )?;
+                let r = qkv.rank() - 1;
+                (
+                    qkv.narrow(r, 0, q_dim)?,
+                    qkv.narrow(r, q_dim, kv_dim)?,
+                    qkv.narrow(r, q_dim + kv_dim, kv_dim)?,
+                )
+            }
+            DynamicActs::Float(_) => (
+                wq.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+                wk.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+                wv.forward_dynamic(acts.as_dynamic(), out_dtype)?,
+            ),
+        };
+        let act_dtype = out_dtype;
         if q.dtype() != act_dtype {
             q = q.to_dtype(act_dtype)?;
         }
@@ -413,17 +465,10 @@ impl BatchedAttentionLayer for LayerWeights {
         if v.dtype() != act_dtype {
             v = v.to_dtype(act_dtype)?;
         }
-
-        // Apply QKV biases (Qwen2-specific)
         let q = q.broadcast_add(self.attention_bq.get_for_dtype(act_dtype))?;
         let k = k.broadcast_add(self.attention_bk.get_for_dtype(act_dtype))?;
         let v = v.broadcast_add(self.attention_bv.get_for_dtype(act_dtype))?;
-
         Ok(QkvProjection { q, k, v })
-    }
-
-    fn output_projection(&self, attn_output: &Tensor) -> Result<Tensor> {
-        self.attention_wo.forward(attn_output)
     }
 }
 
@@ -442,6 +487,7 @@ pub struct ModelWeights {
 ///
 /// This is the new recommended way to use batched inference. The `BatchedInference`
 /// wrapper handles RoPE caching at the model level, so this implementation is simpler.
+#[cfg(feature = "cuda")]
 impl BatchedModelCore for ModelWeights {
     type Layer = LayerWeights;
 
@@ -530,7 +576,16 @@ impl ModelWeights {
     /// # Ok::<(), candle::Error>(())
     /// ```
     pub fn from_gguf_by_path(file_path: &std::path::Path, device: &Device) -> Result<Self> {
-        Self::from_gguf_by_path_with_options(file_path, device, None)
+        Self::from_gguf_by_path_with_options(file_path, device, None, Int8Mode::auto(device))
+    }
+
+    /// Like from_gguf_by_path but with an explicit int8mode (test path selects from INT8MODE).
+    pub fn from_gguf_by_path_with_int8(
+        file_path: &std::path::Path,
+        device: &Device,
+        int8mode: Int8Mode,
+    ) -> Result<Self> {
+        Self::from_gguf_by_path_with_options(file_path, device, None, int8mode)
     }
 
     /// Load model from GGUF file using memory-mapped I/O with custom options.
@@ -538,6 +593,7 @@ impl ModelWeights {
         file_path: &std::path::Path,
         device: &Device,
         max_kv_cache_len: Option<usize>,
+        int8mode: Int8Mode,
     ) -> Result<Self> {
         use memmap2::MmapOptions;
 
@@ -633,7 +689,7 @@ impl ModelWeights {
         let tok_embeddings = tok_embeddings.dequantize(device)?;
         let norm = RmsNorm::from_qtensor(load_tensor("output_norm.weight")?, rms_norm_eps)?;
         let output = match load_tensor("output.weight") {
-            Ok(v) => QMatMul::from_qtensor(v)?,
+            Ok(v) => QMatMul::from_qtensor_with_mode(v, int8mode)?,
             _ => {
                 // use tie_word_embeddings
                 QMatMul::from_qtensor(load_tensor("token_embd.weight")?)?
@@ -657,32 +713,10 @@ impl ModelWeights {
             let v_w = load_tensor(&format!("{prefix}.attn_v.weight"))?;
 
             // Fuse QKV projections when possible for better performance
-            let try_fuse = device.is_cuda()
-                && q_w.dtype() == k_w.dtype()
-                && q_w.dtype() == v_w.dtype()
-                && !matches!(
-                    q_w.dtype(),
-                    GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                );
-
-            let (attention_qkv, attention_wq, attention_wk, attention_wv) = if try_fuse {
-                #[cfg(feature = "cuda")]
-                {
-                    let qkv_w = candle::quantized::QTensor::concat_rows_cuda(&[&q_w, &k_w, &v_w])?;
-                    (Some(QMatMul::from_qtensor(qkv_w)?), None, None, None)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    candle::bail!("fused QKV requires the cuda feature");
-                }
-            } else {
-                (
-                    None,
-                    Some(QMatMul::from_qtensor(q_w)?),
-                    Some(QMatMul::from_qtensor(k_w)?),
-                    Some(QMatMul::from_qtensor(v_w)?),
-                )
-            };
+            // q/k/v kept separate KO twins (no concat): the segmented kernel fuses them at launch.
+            let attention_wq = QMatMul::from_qtensor_with_mode(q_w, int8mode)?;
+            let attention_wk = QMatMul::from_qtensor_with_mode(k_w, int8mode)?;
+            let attention_wv = QMatMul::from_qtensor_with_mode(v_w, int8mode)?;
 
             let attention_bq = load_tensor(&format!("{prefix}.attn_q.bias"))?;
             let attention_bk = load_tensor(&format!("{prefix}.attn_k.bias"))?;
@@ -710,15 +744,19 @@ impl ModelWeights {
                         if gate_n != up_n || gate_k != up_k {
                             (
                                 None,
-                                Some(QMatMul::from_qtensor(feed_forward_w1)?),
-                                Some(QMatMul::from_qtensor(feed_forward_w3)?),
+                                Some(QMatMul::from_qtensor_with_mode(feed_forward_w1, int8mode)?),
+                                Some(QMatMul::from_qtensor_with_mode(feed_forward_w3, int8mode)?),
                             )
                         } else {
                             let fused = candle::quantized::QTensor::concat_rows_cuda(&[
                                 &feed_forward_w1,
                                 &feed_forward_w3,
                             ])?;
-                            (Some(QMatMul::from_qtensor(fused)?), None, None)
+                            (
+                                Some(QMatMul::from_qtensor_with_mode(fused, int8mode)?),
+                                None,
+                                None,
+                            )
                         }
                     }
                     #[cfg(not(feature = "cuda"))]
@@ -728,14 +766,14 @@ impl ModelWeights {
                 } else {
                     (
                         None,
-                        Some(QMatMul::from_qtensor(feed_forward_w1)?),
-                        Some(QMatMul::from_qtensor(feed_forward_w3)?),
+                        Some(QMatMul::from_qtensor_with_mode(feed_forward_w1, int8mode)?),
+                        Some(QMatMul::from_qtensor_with_mode(feed_forward_w3, int8mode)?),
                     )
                 };
                 Mlp {
                     feed_forward_gate_up,
                     feed_forward_w1,
-                    feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,
+                    feed_forward_w2: QMatMul::from_qtensor_with_mode(feed_forward_w2, int8mode)?,
                     feed_forward_w3,
                 }
             };
@@ -748,14 +786,13 @@ impl ModelWeights {
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
 
             layers.push(LayerWeights {
-                attention_qkv,
                 attention_wq,
                 attention_wk,
                 attention_wv,
                 attention_bq: BiasTensors::new(attention_bq.dequantize(device)?),
                 attention_bk: BiasTensors::new(attention_bk.dequantize(device)?),
                 attention_bv: BiasTensors::new(attention_bv.dequantize(device)?),
-                attention_wo: QMatMul::from_qtensor(attention_wo)?,
+                attention_wo: QMatMul::from_qtensor_with_mode(attention_wo, int8mode)?,
                 attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 cis: cis.clone(),
                 mlp,
@@ -856,32 +893,10 @@ impl ModelWeights {
             let k_w = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
             let v_w = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
 
-            let try_fuse = device.is_cuda()
-                && q_w.dtype() == k_w.dtype()
-                && q_w.dtype() == v_w.dtype()
-                && !matches!(
-                    q_w.dtype(),
-                    GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
-                );
-
-            let (attention_qkv, attention_wq, attention_wk, attention_wv) = if try_fuse {
-                #[cfg(feature = "cuda")]
-                {
-                    let qkv_w = candle::quantized::QTensor::concat_rows_cuda(&[&q_w, &k_w, &v_w])?;
-                    (Some(QMatMul::from_qtensor(qkv_w)?), None, None, None)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    candle::bail!("fused QKV requires the cuda feature");
-                }
-            } else {
-                (
-                    None,
-                    Some(QMatMul::from_qtensor(q_w)?),
-                    Some(QMatMul::from_qtensor(k_w)?),
-                    Some(QMatMul::from_qtensor(v_w)?),
-                )
-            };
+            // q/k/v kept separate (no concat): int8 fuses them at launch via the segmented kernel.
+            let attention_wq = QMatMul::from_qtensor(q_w)?;
+            let attention_wk = QMatMul::from_qtensor(k_w)?;
+            let attention_wv = QMatMul::from_qtensor(v_w)?;
 
             let attention_bq = ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?;
             let attention_bk = ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?;
@@ -952,7 +967,6 @@ impl ModelWeights {
             let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
 
             layers.push(LayerWeights {
-                attention_qkv,
                 attention_wq,
                 attention_wk,
                 attention_wv,
@@ -1100,10 +1114,10 @@ impl ModelWeights {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use crate::models::batch_test::utils::{SequentialCallbacks, TestConfig, TestMode, TestParams};
+    use crate::models::batch_test::utils::{TestConfig, TestMode, TestParams};
     use crate::models::batched_inference::InferenceMode;
     use crate::models::dialect::Dialect;
 
@@ -1518,35 +1532,22 @@ mod tests {
         let params = make_params()?;
 
         // Create a logits processor for sampling
-        let make_sampler = || {
-            use crate::generation::{LogitsProcessor, Sampling};
-            let mut logits_processor = LogitsProcessor::from_sampling(299792458, Sampling::ArgMax);
-            move |logits: &Tensor| {
-                let logits = logits.squeeze(0)?;
-                logits_processor.sample(&logits)
-            }
-        };
-
         // Use BatchedInference wrapper type
         use crate::models::batched_model::BatchedInference;
-        type WrappedModel = BatchedInference<ModelWeights>;
 
         // Sequential (non-batched) callbacks - access inner model via .model()
-        let sequential = SequentialCallbacks {
-            create_cache: |config: &TestConfig, model: &WrappedModel| {
-                let mut caches = model.model().create_kv_caches(512);
-                caches.force_dtype(config.mode.compute_dtype());
-                Ok(caches)
-            },
-            forward: |ctx: SequenceContext, model: &WrappedModel| {
-                model.model().forward_with_context(ctx)
-            },
-            sample: make_sampler(),
-        };
-
         // Loads the model wrapped in BatchedInference with proper inv_freq
+        let int8mode = match std::env::var("INT8MODE").ok().as_deref() {
+            Some("off") => candle::quantized::Int8Mode::Off,
+            Some("prec") | Some("precision") => candle::quantized::Int8Mode::Precision,
+            _ => candle::quantized::Int8Mode::Performance,
+        };
+        println!(
+            "int8 mode = {int8mode:?}
+"
+        );
         let load_model = || {
-            let model = ModelWeights::from_gguf_by_path(&model_path, &device)?;
+            let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, int8mode)?;
             println!("✓ Model loaded\n");
             // Get the custom inv_freq (includes rope scaling if configured)
             let inv_freq = model
@@ -1556,6 +1557,6 @@ mod tests {
             BatchedInference::new_with_inv_freq(model, inv_freq, 4096, &device)
         };
 
-        params.run(full_configs, load_model, sequential)
+        params.run(full_configs, load_model)
     }
 }

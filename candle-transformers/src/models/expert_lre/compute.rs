@@ -12,6 +12,8 @@ pub(crate) use crate::models::quantized_matmul::QMatMul;
 
 use super::types::ExpertSlot;
 #[cfg(feature = "cuda")]
+use super::types::MoeInput;
+#[cfg(feature = "cuda")]
 use crate::models::profile::{profile_now, ProfileAccumulator};
 use candle::{Result, Tensor};
 #[cfg(not(feature = "cuda"))]
@@ -104,7 +106,7 @@ fn extract_weight_info(
 /// The `token_ids` index into `xs` and `ys`; `weight_ids` index into `weights_flat`.
 #[cfg(feature = "cuda")]
 pub fn compute_experts_grouped(
-    xs: &Tensor,
+    input: &MoeInput,
     ys: &mut Tensor,
     experts: &[(&ExpertSlot, &[u32], &[u32])],
     weights_flat: &Tensor,
@@ -114,7 +116,8 @@ pub fn compute_experts_grouped(
         return Ok(());
     }
 
-    let dev = xs.device();
+    // Device from the output tensor — a q8a128 `input` carries no device.
+    let dev = ys.device();
     let num_experts = experts.len();
 
     // ── Get CUDA device (needed for fused kernels) ──
@@ -147,12 +150,6 @@ pub fn compute_experts_grouped(
 
     // ── Upload token_ids once (shared by gather + scatter) ──
     let tok_ids_dev = cuda_dev.memcpy_stod(&all_token_ids)?;
-
-    // ── Gather stacked activations (fused kernel) ──
-    let t = profile_now();
-    let stacked_xs =
-        candle::quantized::cuda::fused_moe_gather(xs, &tok_ids_dev, total_batch, cuda_dev)?; // [total_batch, K]
-    profile.record("gemm_gather", t);
 
     // ── Extract weight pointers for each projection ──
     let mut gate_ptrs: Vec<u64> = Vec::with_capacity(num_experts);
@@ -188,71 +185,122 @@ pub fn compute_experts_grouped(
     // Down shape: [hidden_dim, intermediate_dim] → nrows=hidden_dim, ncols=intermediate_dim
     let (down_nrows, down_ncols) = down_shape.dims2()?;
 
-    // ── Grouped gate matmul ──
-    // stacked_xs [total_batch, K] × gate_proj [intermediate_dim, K]^T → [total_batch, intermediate_dim]
-    let act_storage = stacked_xs.storage_and_layout().0;
-    let act_cuda = match &*act_storage {
-        candle::Storage::Cuda(s) => s,
-        _ => {
-            return Err(candle::Error::Msg(
-                "expected CUDA storage for activations".into(),
-            ))
+    // ── Gather + grouped gate/up/down → down_out. B3 int8: byte-gather the already-quantized
+    // q8a1024 router input (no gather-then-quantize); Off: float-gather then FP gemx. ──
+    let down_out = match input {
+        MoeInput::Q8(op) => {
+            use candle::quantized::cuda::{
+                fused_moe_gather_q8a128, grouped_qmatmul, silu_mul_q8a128, DynamicTensor,
+            };
+            let t = profile_now();
+            let stacked_q8 = fused_moe_gather_q8a128(op, &tok_ids_dev, total_batch, cuda_dev)?;
+            profile.record("gemm_gather", t);
+            let t = profile_now();
+            let gate_out = grouped_qmatmul(
+                DynamicTensor::Int8(&stacked_q8),
+                &gate_ptrs,
+                gate_dtype, // KO twin
+                gate_nrows,
+                &expert_offsets,
+                cuda_dev,
+            )?;
+            profile.record("gemm_gate", t);
+            let t = profile_now();
+            let up_out = grouped_qmatmul(
+                DynamicTensor::Int8(&stacked_q8),
+                &up_ptrs,
+                gate_dtype, // up shares gate's KO dtype
+                gate_nrows,
+                &expert_offsets,
+                cuda_dev,
+            )?;
+            profile.record("gemm_up", t);
+            // B4: fused SwiGLU → q8a128 (silu(gate)·up quantized in one kernel), feeds the down GEMM.
+            let t = profile_now();
+            let inter_acts = silu_mul_q8a128(&gate_out, &up_out, cuda_dev)?;
+            profile.record("gemm_silu_mul", t);
+            let t = profile_now();
+            let down_out = grouped_qmatmul(
+                DynamicTensor::Int8(&inter_acts),
+                &down_ptrs,
+                down_dtype, // KO twin
+                down_nrows,
+                &expert_offsets,
+                cuda_dev,
+            )?;
+            profile.record("gemm_down", t);
+            // The int8 matmul emits F32; the fused scatter requires the compute dtype (= ys).
+            down_out.to_dtype(ys.dtype())?
+        }
+        MoeInput::Float(xs) => {
+            let t = profile_now();
+            let stacked_xs =
+                candle::quantized::cuda::fused_moe_gather(xs, &tok_ids_dev, total_batch, cuda_dev)?;
+            profile.record("gemm_gather", t);
+            // stacked_xs [total_batch, K] × gate_proj [intermediate_dim, K]^T → [total_batch, intermediate_dim]
+            let act_storage = stacked_xs.storage_and_layout().0;
+            let act_cuda = match &*act_storage {
+                candle::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle::Error::Msg(
+                        "expected CUDA storage for activations".into(),
+                    ))
+                }
+            };
+            let act_layout = stacked_xs.layout().clone();
+
+            let t = profile_now();
+            let gate_out = candle::quantized::cuda::grouped_matmul_gemx(
+                &gate_ptrs,
+                gate_dtype,
+                gate_nrows,
+                gate_ncols,
+                act_cuda,
+                &act_layout,
+                &expert_offsets,
+                cuda_dev,
+            )?;
+            profile.record("gemm_gate", t);
+
+            let t = profile_now();
+            let up_out = candle::quantized::cuda::grouped_matmul_gemx(
+                &up_ptrs,
+                gate_dtype, // up_proj has same dtype as gate_proj
+                gate_nrows, // up has same shape as gate
+                gate_ncols,
+                act_cuda,
+                &act_layout,
+                &expert_offsets,
+                cuda_dev,
+            )?;
+            profile.record("gemm_up", t);
+
+            let t = profile_now();
+            let intermediate = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
+            profile.record("gemm_silu_mul", t);
+
+            // intermediate [total_batch, intermediate_dim] × down_proj [hidden_dim, intermediate_dim]^T → [total_batch, hidden_dim]
+            let inter_storage = intermediate.storage_and_layout().0;
+            let inter_cuda = match &*inter_storage {
+                candle::Storage::Cuda(s) => s,
+                _ => unreachable!("intermediate should be CUDA"),
+            };
+            let inter_layout = intermediate.layout().clone();
+            let t = profile_now();
+            let down_out = candle::quantized::cuda::grouped_matmul_gemx(
+                &down_ptrs,
+                down_dtype,
+                down_nrows,
+                down_ncols,
+                inter_cuda,
+                &inter_layout,
+                &expert_offsets,
+                cuda_dev,
+            )?;
+            profile.record("gemm_down", t);
+            down_out
         }
     };
-    let act_layout = stacked_xs.layout().clone();
-
-    let t = profile_now();
-    let gate_out = candle::quantized::cuda::grouped_matmul_gemx(
-        &gate_ptrs,
-        gate_dtype,
-        gate_nrows,
-        gate_ncols,
-        act_cuda,
-        &act_layout,
-        &expert_offsets,
-        cuda_dev,
-    )?;
-    profile.record("gemm_gate", t);
-
-    // ── Grouped up matmul ──
-    let t = profile_now();
-    let up_out = candle::quantized::cuda::grouped_matmul_gemx(
-        &up_ptrs,
-        gate_dtype, // up_proj has same dtype as gate_proj
-        gate_nrows, // up has same shape as gate
-        gate_ncols,
-        act_cuda,
-        &act_layout,
-        &expert_offsets,
-        cuda_dev,
-    )?;
-    profile.record("gemm_up", t);
-
-    // ── Fused SiLU-Mul ──
-    let t = profile_now();
-    let intermediate = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
-    profile.record("gemm_silu_mul", t);
-
-    // ── Grouped down matmul ──
-    // intermediate [total_batch, intermediate_dim] × down_proj [hidden_dim, intermediate_dim]^T → [total_batch, hidden_dim]
-    let inter_storage = intermediate.storage_and_layout().0;
-    let inter_cuda = match &*inter_storage {
-        candle::Storage::Cuda(s) => s,
-        _ => unreachable!("intermediate should be CUDA"),
-    };
-    let inter_layout = intermediate.layout().clone();
-    let t = profile_now();
-    let down_out = candle::quantized::cuda::grouped_matmul_gemx(
-        &down_ptrs,
-        down_dtype,
-        down_nrows,
-        down_ncols,
-        inter_cuda,
-        &inter_layout,
-        &expert_offsets,
-        cuda_dev,
-    )?;
-    profile.record("gemm_down", t);
 
     // ── Deterministic scatter: token-major reorder + sequential k-expert reduce ──
     //
@@ -264,7 +312,7 @@ pub fn compute_experts_grouped(
     // Variable-k: when called from the two-call pipeline (hits + misses), different
     // tokens may have different numbers of expert contributions per call. We use
     // per-token prefix-sum offsets instead of assuming uniform k.
-    let num_tokens = xs.dim(0)?; // = b_size * seq_len (or b_size for decode)
+    let num_tokens = input.shape()?.0; // = b_size * seq_len (or b_size for decode)
 
     // Build permutation: sort expert-major indices by (token_id, original_pos).
     let mut perm: Vec<u32> = (0..total_batch as u32).collect();

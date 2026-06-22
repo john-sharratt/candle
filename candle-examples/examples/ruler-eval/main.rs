@@ -207,7 +207,8 @@ impl Model {
     fn load(arch: &ModelArch, model_path: &std::path::Path, device: &Device) -> Result<Self> {
         match arch {
             ModelArch::Qwen3Moe => {
-                let m = quantized_qwen3_moe::ModelWeights::from_gguf_by_path(model_path, device)?;
+                let m =
+                    quantized_qwen3_moe::ModelWeights::from_gguf_by_path(model_path, device, None)?;
                 Ok(Model::Qwen3Moe(m))
             }
             _ => {

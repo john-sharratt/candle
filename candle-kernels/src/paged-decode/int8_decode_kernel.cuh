@@ -23,12 +23,13 @@
 #include "../arena_table.cuh"
 #include "../simple/warp_reduce.cuh"
 #include "../convert/convert_all.cuh"
+#include "../blocks.cuh"
 #include "slot_types.cuh"
 #include "pal_iter.cuh"
 // Shared decode helpers (vec2_traits, load_vec2, cp_async_*, RoPE, scatter,
 // write-len commit) — formerly inline in the V2 paged_decode_kernel.cuh.
 #include "decode_helpers.cuh"
-#include "mma_wrappers.cuh"
+#include "../mma/mma_wrappers.cuh"
 
 namespace fused_attn {
 
@@ -1531,7 +1532,8 @@ __global__ void int8_decode_combine_kernel(
     const float* __restrict__ partial_acc,   // [row][split][HEAD_DIM]
     const float* __restrict__ partial_ml,    // [row][split][2]
     int num_rows,
-    int num_splits
+    int num_splits,
+    uint8_t* __restrict__ q8_out             // non-null → emit q8a128 (B2; HEAD_DIM==128 only)
 ) {
     int row = (int)blockIdx.x;
     if (row >= num_rows) return;
@@ -1551,7 +1553,62 @@ __global__ void int8_decode_combine_kernel(
         L   += ml[s * 2 + 1] * w;
     }
     float inv = __fdividef(1.f, fmaxf(L, 1e-10f));
-    out[(int64_t)row * HEAD_DIM + d] = from_f32<O>(acc * inv);
+    float val = acc * inv;
+
+    // B2: fused attention → q8a128 context emit. At HEAD_DIM==128 one block (one
+    // query head, 128 threads) is exactly one q8a128 128-tile; the context row for
+    // a token is n_q_head heads × 128 = hidden, so flat_tile = row (= token*n_q_head
+    // + qh = token*tiles_per_row + qh). Block-reduce amax/Σx over the 128 dims, then
+    // thread d writes its quant byte and thread 0 the per-128 {scale,sum}. The value
+    // is rounded through O first to mirror the unfused FP store + re-quant.
+    //
+    // These bytes are MODE-AGNOSTIC: the q8a1024 flat-grouped layout is byte-identical
+    // for the matmul's V (mode-1, Bm=16) and X (mode-2, Bm=32) variants — the mode only
+    // changes how the matmul tiles the SAME bytes. So this kernel never decides V vs X.
+    // That choice rides in the `Q8a128Operand.ytype`, derived from the token count M via
+    // `q8a128_mode_for_m()` when the rust side wraps `q8_out` into the operand (M ≥ 64 →
+    // X). Hard-coding a mode here would be wrong; it is carried in the DynamicTensor.
+    if constexpr (HEAD_DIM == 128) {
+        if (q8_out != nullptr) {
+            const float vr = to_f32<O>(from_f32<O>(val));
+            float amax = fabsf(vr);
+            float s = vr;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
+                s += __shfl_xor_sync(0xffffffff, s, off, 32);
+            }
+            __shared__ float sh_amax[HEAD_DIM / 32];
+            __shared__ float sh_sum[HEAD_DIM / 32];
+            const int warp = d >> 5;
+            const int lane = d & 31;
+            if (lane == 0) { sh_amax[warp] = amax; sh_sum[warp] = s; }
+            __syncthreads();
+            if (warp == 0) {
+                float a = (lane < HEAD_DIM / 32) ? sh_amax[lane] : 0.f;
+                float ss = (lane < HEAD_DIM / 32) ? sh_sum[lane] : 0.f;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off, 32));
+                    ss += __shfl_xor_sync(0xffffffff, ss, off, 32);
+                }
+                if (lane == 0) { sh_amax[0] = a; sh_sum[0] = ss; }
+            }
+            __syncthreads();
+            const float tile_amax = sh_amax[0];
+            const float tile_sum = sh_sum[0];
+            const float id = (tile_amax != 0.f) ? 127.f / tile_amax : 0.f;
+            uint8_t* obytes = q8_out;
+            const int64_t flat = row;
+            obytes[q8a1024_qs_off(flat) + d] = (int8_t)__float2int_rn(vr * id);
+            if (d == 0) {
+                half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
+                ds[0] = make_half2(__float2half_rn(tile_amax / 127.f), __float2half_rn(tile_sum));
+            }
+            return;
+        }
+    }
+    out[(int64_t)row * HEAD_DIM + d] = from_f32<O>(val);
 }
 
 // SM count (cached) — used to size the split-KV factor to fill the device.
@@ -1610,7 +1667,8 @@ void launch_int8_decode_attn(
     const T* v_new,
     const float* rope_cs,
     int rope_interleaved,
-    cudaStream_t stream = nullptr
+    cudaStream_t stream = nullptr,
+    uint8_t* q8_out = nullptr   // non-null → B2 fused q8a128 context (combine path, HEAD_DIM==128)
 ) {
     int heads_per_group = (n_kv_head > 0) ? (n_q_head / n_kv_head) : 1;
     if (heads_per_group < 1) heads_per_group = 1;
@@ -1714,7 +1772,7 @@ void launch_int8_decode_attn(
         if (pa != nullptr && (use_stripe || num_splits > 1)) {
             int num_rows = num_active_slots * n_q_head;
             int8_decode_combine_kernel<O, HEAD_DIM><<<num_rows, HEAD_DIM, 0, stream>>>(
-                out, pa, pm, num_rows, partials_per_row);
+                out, pa, pm, num_rows, partials_per_row, q8_out);
         }
 
         constexpr int COMMIT_THREADS = 128;

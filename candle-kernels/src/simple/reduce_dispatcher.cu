@@ -157,6 +157,11 @@ extern "C" __global__ void rmsnorm_f16(const void*, void*, const void*, int, int
 extern "C" __global__ void rmsnorm_bf16(const void*, void*, const void*, int, int, float);
 extern "C" __global__ void rmsnorm_f8_e4m3(const void*, void*, const void*, int, int, float);
 
+// Fused RMSNorm → q8a128 (producer epilogue). `out` is the flat-grouped q8a1024 buffer.
+extern "C" __global__ void rmsnorm_q8a128_f32(const void*, void*, const void*, int, int, float);
+extern "C" __global__ void rmsnorm_q8a128_f16(const void*, void*, const void*, int, int, float);
+extern "C" __global__ void rmsnorm_q8a128_bf16(const void*, void*, const void*, int, int, float);
+
 // =============================================================================
 // LAYERNORM kernels
 // =============================================================================
@@ -311,6 +316,42 @@ extern "C" void run_rmsnorm_op(
             break;
         case 4: // F8E4M3
             rmsnorm_f8_e4m3<<<grid, block, shared_mem_size>>>((const __nv_fp8_e4m3*)src, (__nv_fp8_e4m3*)dst, (const __nv_fp8_e4m3*)alpha, n_cols, block_size, eps);
+            break;
+    }
+}
+
+// =============================================================================
+// Dispatcher for fused RMSNorm → q8a128 (producer epilogue B1/B3/B5)
+// =============================================================================
+// Caches the whole row in shared memory, so requires n_cols <= MAX_CACHED_COLS
+// and n_cols % 128 == 0. block_size is the largest power of two <= min(n_cols,
+// 1024) so it matches both the launched blockDim and the impl's BLOCK_SIZE
+// template (and thus block_reduce_sum<BLOCK_SIZE>).
+extern "C" void run_rmsnorm_q8a128_op(
+    int32_t dtype,   // 0=f32, 2=f16, 3=bf16
+    const void* src,
+    void* out,       // flat-grouped q8a1024 buffer
+    const void* alpha,
+    int n_rows,
+    int n_cols,
+    float eps
+) {
+    int cap = n_cols < 1024 ? n_cols : 1024;
+    int block_size = 32;
+    while (block_size * 2 <= cap) block_size *= 2;
+    dim3 grid(n_rows, 1, 1);
+    dim3 block(block_size, 1, 1);
+    size_t shared_mem_size = (size_t)n_cols * sizeof(float);
+
+    switch (dtype) {
+        case 0: // F32
+            rmsnorm_q8a128_f32<<<grid, block, shared_mem_size>>>((const float*)src, out, (const float*)alpha, n_cols, block_size, eps);
+            break;
+        case 2: // F16
+            rmsnorm_q8a128_f16<<<grid, block, shared_mem_size>>>((const __half*)src, out, (const __half*)alpha, n_cols, block_size, eps);
+            break;
+        case 3: // BF16
+            rmsnorm_q8a128_bf16<<<grid, block, shared_mem_size>>>((const __nv_bfloat16*)src, out, (const __nv_bfloat16*)alpha, n_cols, block_size, eps);
             break;
     }
 }

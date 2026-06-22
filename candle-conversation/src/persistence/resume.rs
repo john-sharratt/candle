@@ -802,6 +802,70 @@ mod tests {
     }
 
     #[test]
+    fn projection_events_persist_and_recover() {
+        use crate::projection::{
+            decode_events, encode_events, BucketKind, ProjectionBucket, ProjectionEvent, TimelineId,
+            TurnIndex,
+        };
+        let dir = tmp_dir("proj_events");
+        let decl = turn_decl(7, 0, 2);
+        let stream_id = StreamDecl::Turn(decl.clone()).stream_id();
+
+        // A two-event timeline for the turn.
+        let events = vec![
+            ProjectionEvent {
+                start_token: 0,
+                end_token: 120,
+                seconds: 3.0,
+                tokens_per_second: 40.0,
+                materialized_tokens: 1120,
+                substrate_tokens: 42_000,
+                buckets: vec![
+                    ProjectionBucket { label: "system".into(), kind: BucketKind::System, tokens: 320 },
+                    ProjectionBucket { label: "code_read".into(), kind: BucketKind::Section, tokens: 800 },
+                ],
+                selection: Default::default(),
+            },
+            ProjectionEvent {
+                start_token: 120,
+                end_token: 512,
+                seconds: 8.0,
+                tokens_per_second: 49.0,
+                materialized_tokens: 540,
+                substrate_tokens: 42_000,
+                buckets: vec![ProjectionBucket {
+                    label: "conversation".into(),
+                    kind: BucketKind::Turns,
+                    tokens: 540,
+                }],
+                selection: Default::default(),
+            },
+        ];
+        let payload = encode_events(&events);
+
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
+            sp.append_projection_events(stream_id, &payload).unwrap();
+            sp.commit().unwrap();
+            sp.checkpoint().unwrap();
+        }
+        // Reopen — a simulated daemon restart — and recover the timeline.
+        {
+            let mut substrate = Substrate::new();
+            let _sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
+            let blob = substrate
+                .projection_events_blob(tl, TurnIndex(decl.turn_index))
+                .expect("projection events recovered after restart");
+            assert_eq!(blob, payload.as_slice());
+            assert_eq!(decode_events(blob), events);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn recover_turn_demux_fails_on_wrong_layer_count() {
         let dir = tmp_dir("wrong_layers");
         let decl = turn_decl(9, 0, 2);

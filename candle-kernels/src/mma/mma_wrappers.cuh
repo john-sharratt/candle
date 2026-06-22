@@ -111,6 +111,33 @@ __device__ __forceinline__ void load_a_frag_m16k32(
     a[3] = *reinterpret_cast<const uint32_t*>(smem_a + (int64_t)(row_base + 8) * lda_bytes + col_base + 16);
 }
 
+// ldmatrix variant of the 16x32 INT8 A load (sm_75+). The m16n8k32 s8 A operand is
+// 16 rows × 32 int8 = 16 × 16 b16 = exactly ldmatrix.x4's four 8×8 b16 tiles:
+//   tile0 = rows 0-7  / K 0-15  -> a[0]   tile2 = rows 0-7  / K 16-31 -> a[2]
+//   tile1 = rows 8-15 / K 0-15  -> a[1]   tile3 = rows 8-15 / K 16-31 -> a[3]
+// Within a tile ldmatrix hands thread t the two contiguous b16 (= 4 contiguous int8)
+// at (row t>>2, K (t&3)*4..+3) — byte-identical to the strided loader's a[i], no
+// permute. smem_a must be PADDED (stride not a multiple of 128B) and 16B-aligned so
+// the 8 tile rows land in distinct banks (else the conflict just moves to ldmatrix).
+__device__ __forceinline__ void load_a_frag_m16k32_ldmatrix(
+    uint32_t      (&a)[4],
+    const int8_t* smem_a,
+    int           lda_bytes,
+    int           lane
+) {
+    const int tile_idx    = lane >> 3;           // 0..3 (lanes 0-7,8-15,16-23,24-31)
+    const int row_in_tile = lane & 7;            // 0..7
+    const int m_offset = (tile_idx & 1) * 8;     // rows 0-7 or 8-15
+    const int k_offset = (tile_idx >> 1) * 16;   // int8 K 0-15 or 16-31
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+        smem_a + (int64_t)(m_offset + row_in_tile) * lda_bytes + k_offset));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+        : "r"(addr)
+    );
+}
+
 // Load an 8x32 INT8 B fragment. Per PTX ISA m16n8k32 the B operand uses the
 // SAME (groupID, threadID) lane decomposition as A — groupID = laneid>>2 selects
 // the column n (0..7), threadID = laneid&3 selects the k-quad — NOT (lane%8,

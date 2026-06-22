@@ -26,6 +26,17 @@
 // Include adaptive per-block format selection kernel
 #include "../quantize/select_kv_format.cuh"
 
+// q8a128 activation-block quantize/dequant kernel templates (definitions must be
+// visible here for the run_quantize_q8a128 / run_dequantize_q8a128 instantiations
+// and the unified run_*_block dispatch cases below).
+#include "../quantize/quantize_q8a128.cuh"
+#include "../dequant/dequant_q8a128.cuh"
+
+// KO weight quantize/dequant kernel templates (F32 ↔ lane-major per-128 KO chunks),
+// for the run_quantize_ko / run_dequantize_ko entry points below.
+#include "../quantize/quantize_ko.cuh"
+#include "../dequant/dequant_ko.cuh"
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -226,8 +237,86 @@ extern "C" void run_quantize_q8_1(
     
     dim3 grid(num_blocks, ky, 1);
     dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
-    
+
     quantize_q8_1<<<grid, block>>>(src, dst, kx, kx_padded);
+}
+
+
+// Q8A128 activation block. The quantize_q8a128_kernel / dequantize_q8a128_kernel
+// templates are defined in quantize/quantize_q8a128.cuh and
+// dequant/dequant_q8a128.cuh (included at the top of this file); the extern "C"
+// dispatch wrappers + the unified run_*_block cases live here.
+
+// dtype: 0=F16, 1=BF16, 2=F32 (YType ordering).
+extern "C" void run_quantize_q8a128(
+    const void* act, void* out, int32_t rows, int32_t cols, int32_t dtype)
+{
+    // One warp per 128-tile; 8 warps/block, grid-strided over all tiles.
+    const int total_tiles = (int)(((int64_t)rows * cols) / 128);
+    const int block_dim = 256;
+    const int grid = (total_tiles + 7) / 8;
+    dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
+    dim3 block(block_dim, 1, 1);
+    switch (dtype) {
+        case 0: quantize_q8a128_kernel<half><<<grid_dim, block>>>(
+            (const half*)act, (block_q8a128*)out, rows, cols); break;
+        case 1: quantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block>>>(
+            (const __nv_bfloat16*)act, (block_q8a128*)out, rows, cols); break;
+        case 2: quantize_q8a128_kernel<float><<<grid_dim, block>>>(
+            (const float*)act, (block_q8a128*)out, rows, cols); break;
+    }
+}
+
+extern "C" void run_dequantize_q8a128(
+    const void* in, void* out, int32_t rows, int32_t cols, int32_t dtype)
+{
+    const int total_tiles = (int)(((int64_t)rows * cols) / 128);
+    const int grid = (total_tiles + 7) / 8;
+    dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
+    dim3 block(256, 1, 1);  // 8 warps, grid-strided
+    switch (dtype) {
+        case 0: dequantize_q8a128_kernel<half><<<grid_dim, block>>>(
+            (const block_q8a128*)in, (half*)out, rows, cols); break;
+        case 1: dequantize_q8a128_kernel<__nv_bfloat16><<<grid_dim, block>>>(
+            (const block_q8a128*)in, (__nv_bfloat16*)out, rows, cols); break;
+        case 2: dequantize_q8a128_kernel<float><<<grid_dim, block>>>(
+            (const block_q8a128*)in, (float*)out, rows, cols); break;
+    }
+}
+
+// KO weight quantize/dequant: F32 [nrows × ncols] (row-major) ↔ lane-major per-128 KO
+// chunks. qtype = QTYPE_Q{4,5,6,8}_KO. One warp per 1024-weight chunk (8 rows × 128 K),
+// 8 warps/block, grid-strided. nrows must be a multiple of 8, ncols a multiple of 128.
+extern "C" void run_quantize_ko(
+    const float* w, void* out, int32_t nrows, int32_t ncols, int32_t qtype)
+{
+    const int total_chunks = (nrows / 8) * (ncols / 128);
+    const int grid = (total_chunks + 7) / 8;
+    dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
+    dim3 block(256, 1, 1);
+    uint8_t* ob = (uint8_t*)out;
+    switch (qtype) {
+        case QTYPE_Q4_KO: quantize_ko_affine_kernel<15, 0, 0><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q5_KO: quantize_ko_affine_kernel<31, 0, 128><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q6_KO: quantize_ko_affine_kernel<63, 256, 0><<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+        case QTYPE_Q8_KO: quantize_q8_ko_kernel<<<grid_dim, block>>>(w, ob, nrows, ncols); break;
+    }
+}
+
+extern "C" void run_dequantize_ko(
+    const void* in, float* out, int32_t nrows, int32_t ncols, int32_t qtype)
+{
+    const int total_chunks = (nrows / 8) * (ncols / 128);
+    const int grid = (total_chunks + 7) / 8;
+    dim3 grid_dim(grid > 0 ? grid : 1, 1, 1);
+    dim3 block(256, 1, 1);
+    const uint8_t* ib = (const uint8_t*)in;
+    switch (qtype) {
+        case QTYPE_Q4_KO: dequantize_ko_affine_kernel<0, 0><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q5_KO: dequantize_ko_affine_kernel<0, 128><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q6_KO: dequantize_ko_affine_kernel<256, 0><<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+        case QTYPE_Q8_KO: dequantize_q8_ko_kernel<<<grid_dim, block>>>(ib, out, nrows, ncols); break;
+    }
 }
 
 // =============================================================================
@@ -244,6 +333,20 @@ extern "C" void run_quantize_block(
     int32_t elem_count,
     int32_t qtype
 ) {
+    // q8a128: q8 activation, packed into q8a1024 flat-grouped blocks (8 × 128-tiles
+    // per 1152B super-block, qs de-interleaved from the per-32 ds; see blocks.cuh).
+    // One warp per 128-tile, 8 warps/block grid-strided — different from the generic
+    // per-warp-block geometry below, so dispatch it directly. The flat placement is
+    // position-independent (rows=1 here matches any (rows,cols) split with the same
+    // tile count). f32-in; the typed (bf16/f16) path is run_quantize_q8a128.
+    if (qtype == QTYPE_Q8A128V || qtype == QTYPE_Q8A128X) {
+        const int ntile = ceil_div(elem_count, QK8A128);
+        const int grid = (ntile + 7) / 8;
+        quantize_q8a128_kernel<float><<<dim3(grid > 0 ? grid : 1, 1, 1), dim3(256, 1, 1)>>>(
+            src, (block_q8a128*)dst, 1, ntile * QK8A128);
+        return;
+    }
+
     // Calculate number of quantized blocks based on format
     int num_blocks;
     int block_size;  // elements per quantized block
@@ -371,6 +474,23 @@ extern "C" void run_dequantize_block(
     int32_t qtype,
     int32_t out_dtype
 ) {
+    // q8a128: q8 activation in q8a1024 flat-grouped blocks. out_dtype here is the
+    // unified ordering 0=F32, 1=F16, 2=BF16 (NB: the typed run_dequantize_q8a128 uses
+    // the YType ordering 0=F16,1=BF16,2=F32 instead). One warp per 128-tile.
+    if (qtype == QTYPE_Q8A128V || qtype == QTYPE_Q8A128X) {
+        const int ntile = ceil_div(elem_count, QK8A128);
+        const int grid = (ntile + 7) / 8;
+        const dim3 g(grid > 0 ? grid : 1, 1, 1), b(256, 1, 1);  // 8 warps, grid-strided
+        const int cols = ntile * QK8A128;
+        if (out_dtype == 0)
+            dequantize_q8a128_kernel<float><<<g, b>>>((const block_q8a128*)src, (float*)dst, 1, cols);
+        else if (out_dtype == 1)
+            dequantize_q8a128_kernel<half><<<g, b>>>((const block_q8a128*)src, (half*)dst, 1, cols);
+        else
+            dequantize_q8a128_kernel<__nv_bfloat16><<<g, b>>>((const block_q8a128*)src, (__nv_bfloat16*)dst, 1, cols);
+        return;
+    }
+
     // Determine grid/block dimensions based on quant type
     int block_dim;
     int num_blocks;

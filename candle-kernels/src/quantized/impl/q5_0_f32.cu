@@ -21,6 +21,14 @@ INSTANTIATE_KERNELS(
     float, float
 )
 
+// q8a128 TC path — INT8-MMA grouped matmul for Q5_0 (5-bit weights × q8a128 int8
+// activations, deferred {d, -16d} fold, F32 output). See grouped_tc_int8 in kernel.cuh.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q5_0_int8_f32,
+    QK5_0_KTILE, QI5_0_KTILE, block_c_q5_0, VDR_Q5_0_KTILE,
+    float
+)
+
 // DISABLED: dequant_k64 not yet implemented for this quant type
 // MARLIN TENSOR CORE KERNEL
 // #include "../marlin.cuh"

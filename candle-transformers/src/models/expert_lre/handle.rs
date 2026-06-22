@@ -22,11 +22,11 @@ use super::pipeline::startup_two_tier;
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 use super::transition::TransitionMatrix;
 use super::types::{
-    ClassifiedExperts, CopyBatchFence, ExpertSlot, MmapExpertRef, MoeWorkRequest, PipelineMessage,
-    PipelineStats,
+    ClassifiedExperts, CopyBatchFence, ExpertSlot, MmapExpertRef, MoeInput, MoeWorkRequest,
+    PipelineMessage, PipelineStats,
 };
 use crate::models::profile::{profile_now, ProfileAccumulator, ProfileMark, ProfileSnapshot};
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaStream;
 use std::collections::{HashMap, HashSet};
@@ -160,6 +160,7 @@ impl ExpertCache {
         experts_per_layer: usize,
         _gguf_path: Option<&std::path::Path>,
         progress: Option<&dyn Fn(usize, usize)>,
+        int8mode: candle::quantized::Int8Mode,
     ) -> Result<Self> {
         let num_moe_layers = host_refs.len();
         let mut inner = ExpertCacheInner::new(num_slots, num_moe_layers, experts_per_layer);
@@ -231,34 +232,46 @@ impl ExpertCache {
         #[cfg(feature = "cuda")]
         let (pinned_pool, expert_locations, layer_geometries, all_resident) =
             if let Device::Cuda(cuda_dev) = device {
-                // Build per-layer geometry from the first expert's shapes + dtypes.
+                // Build per-layer geometry. The pinned pool caches the *target* format: for Off
+                // that is the gemx K/128 repack of the source dtype; for int8 it is the KO twin
+                // (repacked once per expert, then DMA-reloaded on a miss — no per-miss re-quant).
                 let mut geoms: Vec<LayerGeometry> = Vec::with_capacity(num_moe_layers);
                 for moe_idx in 0..num_moe_layers {
                     let r = &host_refs[moe_idx][0];
+                    let tko = |d: candle::quantized::GgmlDType| {
+                        if int8mode.is_int8() {
+                            d.to_ko(int8mode)
+                        } else {
+                            Ok(d)
+                        }
+                    };
+                    let gate_dtype = tko(r.gate_dtype)?;
+                    let up_dtype = tko(r.up_dtype)?;
+                    let down_dtype = tko(r.down_dtype)?;
                     let gate_repacked_size = candle::quantized::repacked_size_bytes(
                         r.gate_shape[0],
                         r.gate_shape[1],
-                        r.gate_dtype,
+                        gate_dtype,
                     )?;
                     let up_repacked_size = candle::quantized::repacked_size_bytes(
                         r.up_shape[0],
                         r.up_shape[1],
-                        r.up_dtype,
+                        up_dtype,
                     )?;
                     let down_repacked_size = candle::quantized::repacked_size_bytes(
                         r.down_shape[0],
                         r.down_shape[1],
-                        r.down_dtype,
+                        down_dtype,
                     )?;
                     geoms.push(LayerGeometry {
                         gate_shape: r.gate_shape.clone(),
-                        gate_dtype: r.gate_dtype,
+                        gate_dtype,
                         gate_repacked_size,
                         up_shape: r.up_shape.clone(),
-                        up_dtype: r.up_dtype,
+                        up_dtype,
                         up_repacked_size,
                         down_shape: r.down_shape.clone(),
-                        down_dtype: r.down_dtype,
+                        down_dtype,
                         down_repacked_size,
                         total_repacked_size: gate_repacked_size
                             + up_repacked_size
@@ -287,13 +300,14 @@ impl ExpertCache {
 
                 let mut pool = PinnedPool::new(num_pinned, slot_size)?;
 
-                // Initialize location tracking.
+                // Initialize location tracking. Every expert starts as `Pinned { slot_idx: 0 }`;
+                // `startup_two_tier` below overwrites each entry with its real resident-VRAM or
+                // pinned-slot location as it repacks the weights.
                 let mut locations: Vec<Vec<ExpertLocation>> = Vec::with_capacity(num_moe_layers);
                 for _ in 0..num_moe_layers {
                     let mut layer_locs = Vec::with_capacity(experts_per_layer);
                     for _ in 0..experts_per_layer {
                         layer_locs.push(ExpertLocation::Pinned { slot_idx: 0 });
-                        // placeholder
                     }
                     locations.push(layer_locs);
                 }
@@ -324,7 +338,7 @@ impl ExpertCache {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = progress; // not yet wired into the legacy prewarm path
-            prewarm_expert_cache(&mut inner, &mmap, &host_refs, device);
+            prewarm_expert_cache(&mut inner, &mmap, &host_refs, device, int8mode);
         }
 
         // Non-CUDA: all_resident is always false (no VRAM cache to fill).
@@ -361,6 +375,8 @@ impl ExpertCache {
             mmap,
             #[cfg(not(feature = "cuda"))]
             host_refs,
+            #[cfg(not(feature = "cuda"))]
+            int8mode,
         };
 
         let tx = spawn_pipeline_thread(state);
@@ -439,11 +455,13 @@ impl ExpertCache {
     /// # Returns
     ///
     /// Output tensor `[num_tokens, hidden_dim]` — the weighted sum of expert outputs.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_moe_work(
         &self,
         moe_layer_idx: usize,
         expert_ids: Vec<usize>,
-        xs: &Tensor,
+        input: MoeInput,
+        out_dtype: DType,
         weights_flat: &Tensor,
         assignments: Vec<(u32, u32, u32)>,
     ) -> Result<Tensor> {
@@ -457,9 +475,13 @@ impl ExpertCache {
                 let request = MoeWorkRequest {
                     moe_layer_idx,
                     expert_ids,
-                    xs: xs.clone(),
+                    input,
+                    out_dtype,
                     weights_flat: weights_flat.clone(),
                     assignments,
+                    // Captured right before `send` so the worker can split the inbound handoff
+                    // (channel wakeup) out of the actual work.
+                    submitted_at: profile_now(),
                     response_tx: resp_tx,
                 };
 
@@ -467,13 +489,17 @@ impl ExpertCache {
                     candle::Error::Msg("Expert pipeline thread died — channel closed".into())
                 })?;
 
-                // Block until the pipeline thread returns the result.
-                let result = resp_rx.recv().map_err(|_| {
+                // Block until the pipeline thread returns the result + its completion timestamp.
+                let (result, worker_done_at) = resp_rx.recv().map_err(|_| {
                     candle::Error::Msg(
                         "Expert pipeline thread died — response channel closed".into(),
                     )
                 })?;
 
+                // submit_roundtrip = submit_inbound (worker) + pipe_worker_total (worker) +
+                // submit_outbound (here). The two handoffs are the reclaimable threading tax;
+                // pipe_worker_total is the irreducible classify + DMA + compute.
+                self.record_profile("submit_outbound", worker_done_at);
                 self.record_profile("submit_roundtrip", t);
                 result
             }
@@ -484,7 +510,8 @@ impl ExpertCache {
                     device,
                     moe_layer_idx,
                     &expert_ids,
-                    xs,
+                    input,
+                    out_dtype,
                     weights_flat,
                     &assignments,
                 )
@@ -496,13 +523,15 @@ impl ExpertCache {
     ///
     /// All experts are already resident — no DMA, no copy stream.
     /// Lock the Mutex (uncontended), compute all experts by slot index.
+    #[allow(clippy::too_many_arguments)]
     fn submit_inline(
         &self,
         mutex: &Mutex<ExpertCacheInner>,
-        _device: &Device,
+        device: &Device,
         moe_layer_idx: usize,
         expert_ids: &[usize],
-        xs: &Tensor,
+        input: MoeInput,
+        out_dtype: DType,
         weights_flat: &Tensor,
         assignments: &[(u32, u32, u32)],
     ) -> Result<Tensor> {
@@ -532,7 +561,8 @@ impl ExpertCache {
             (toks, wids)
         };
 
-        let mut ys = xs.zeros_like()?;
+        let (num_tokens, hidden) = input.shape()?;
+        let mut ys = Tensor::zeros((num_tokens, hidden), out_dtype, device)?;
         let mut _inline_prof = ProfileAccumulator::new();
         #[cfg(feature = "cuda")]
         {
@@ -548,7 +578,7 @@ impl ExpertCache {
                 .collect();
             if !experts_vec.is_empty() {
                 compute_experts_grouped(
-                    xs,
+                    &input,
                     &mut ys,
                     &experts_vec,
                     weights_flat,
@@ -558,6 +588,8 @@ impl ExpertCache {
         }
         #[cfg(not(feature = "cuda"))]
         {
+            // Non-CUDA only ever sees `Float` (int8/q8a128 is cuda-only).
+            let MoeInput::Float(xs) = &input;
             for &(eidx, slot_idx) in &hits {
                 let slot = inner.slots[slot_idx].as_ref().ok_or_else(|| {
                     candle::Error::Msg(format!("inline slot {slot_idx} unexpectedly empty"))

@@ -26,3 +26,11 @@ INSTANTIATE_KERNELS(
     QK8_1_KTILE, QI8_1_KTILE, block_c_q8_1, VDR_Q8_1_KTILE,
     float, float
 )
+
+// q8a128 TC path — INT8-MMA grouped matmul for Q8_1 (8-bit symmetric weights, per-32
+// scale, F32 output). See grouped_tc_int8.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q8_1_int8_f32,
+    QK8_1_KTILE, QI8_1_KTILE, block_c_q8_1, VDR_Q8_1_KTILE,
+    float
+)

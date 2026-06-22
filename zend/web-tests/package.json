@@ -1,0 +1,13 @@
+{
+  "name": "zend-ui-tests",
+  "private": true,
+  "description": "Playwright acceptance suite for the Zend UI (Phase 1 against the mock, Phase 2 against a live/stub daemon). Test-only; not part of the daemon build.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "install:browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0"
+  }
+}

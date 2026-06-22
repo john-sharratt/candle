@@ -20,3 +20,11 @@ INSTANTIATE_KERNELS(
     QK4_0_KTILE, QI4_0_KTILE, block_c_q4_0, VDR_Q4_0_KTILE,
     float, float
 )
+
+// q8a128 TC path — INT8-MMA grouped matmul for Q4_0 (4-bit weights × q8a128 int8
+// activations, deferred {d, -8d} fold, F32 output). See grouped_tc_int8 in kernel.cuh.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q4_0_int8_f32,
+    QK4_0_KTILE, QI4_0_KTILE, block_c_q4_0, VDR_Q4_0_KTILE,
+    float
+)

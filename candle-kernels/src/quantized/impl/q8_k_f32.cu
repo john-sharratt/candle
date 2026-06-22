@@ -26,3 +26,31 @@ INSTANTIATE_KERNELS(
     QK8_K_KTILE, QI8_K_KTILE, block_c_q8_K, VDR_Q8_K_KTILE,
     float, float
 )
+
+// q8a128 TC path — INT8-MMA grouped matmul for Q8_K (8-bit symmetric weights, single
+// block scale, F32 output). See grouped_tc_int8.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q8_k_int8_f32,
+    QK8_K_KTILE, QI8_K_KTILE, block_c_q8_K, VDR_Q8_K_KTILE,
+    float
+)
+
+// Q8_KO TC path — same INT8-MMA kernels reading the byte-permuted Q8_KO block.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q8_ko_int8_f32,
+    QK8_K_KTILE, QI8_K_KTILE, block_c_q8_KO, VDR_Q8_K_KTILE,
+    float
+)
+
+// Mode-2 dense variant (N_SUB=2, Bm=32): weight-reuse loop for large-M (prefill); selected when the
+// host passes force_mode2=1 (grid.x = ceil(total_batch/32)).
+extern "C" __global__ void LAUNCH_BOUNDS_TC16 q8_ko_int8_f32_dense_m2(
+    const void* __restrict__ weights,
+    const block_q8a128* __restrict__ vy, float* __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int total_batch,
+    const int y_stride, const int dst_stride) {
+    grouped_tc::quantized_matmul_dense_entry_int8<QK8_K_KTILE, QI8_K_KTILE, block_c_q8_KO,
+                                                  VDR_Q8_K_KTILE, float, 2>(
+        reinterpret_cast<const block_compact_t<block_c_q8_KO>*>(weights),
+        vy, dst, ncols_x, nrows_x, total_batch, y_stride, dst_stride);
+}

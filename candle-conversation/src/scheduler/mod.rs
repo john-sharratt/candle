@@ -37,7 +37,7 @@ use crate::substrate::{ResidenceIndex, TurnContentBounds, TurnPartWrite};
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, SelectionDiagnostics, SummariserTrigger, TurnKind,
 };
-use crate::think_strip::strip_think_blocks;
+use crate::think_strip::{strip_think_blocks, strip_think_blocks_keep_layout};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::{ProvenanceFile, SubstrateReloadStatus, TurnStats};
@@ -161,6 +161,12 @@ pub(crate) enum SchedulerRequest {
         /// compressor can window content-only halves. See
         /// [`TurnContentBounds`].
         content_bounds: TurnContentBounds,
+        /// The assistant half supplied by a PREFILL turn (e.g. repo_map /
+        /// code_reading ingest), stored verbatim as `TurnPart::assistant_text`
+        /// at seal time. A prefill never decodes, so the seal's decoded `text`
+        /// is empty; this carries the real content. Empty for decode turns,
+        /// where the seal uses the decoded text instead.
+        prefill_assistant_text: String,
         /// Trailing structural tokens written into the slot **after**
         /// decode finishes, before the seal.  The model didn't emit
         /// these — the scheduler appends them as if they were part of
@@ -502,6 +508,11 @@ struct ReprojectInFlight {
     sections_len: usize,
     segments_len: usize,
     n_turns_selected: usize,
+    /// The materialized-context composition this reprojection selected
+    /// (buckets + materialized/substrate totals; the decode-span timing is
+    /// filled in at `complete` from the per-sequence anchor). Emitted as a
+    /// [`TurnEvent::Projection`] so the GUI drops a timeline dot per reproject.
+    composition: crate::projection::ProjectionEvent,
     plan: projection_assembler::GapFillPlan,
     build_ms: u64,
     /// Wall-clock start of the whole reproject (set at the top of `prepare`);
@@ -584,6 +595,10 @@ struct DecodeState {
     /// into `TurnPart::content_bounds` at seal time so the compressor can
     /// window content-only halves on demand. See [`TurnContentBounds`].
     content_bounds: TurnContentBounds,
+    /// The prefilled assistant half (repo_map / code_reading ingest), stored
+    /// verbatim as `TurnPart::assistant_text` at seal time. Empty for decode
+    /// turns, where the seal uses the model's decoded text instead.
+    prefill_assistant_text: String,
 }
 
 /// Per-turn view bookkeeping carried in the scheduler's `turn_views` map.
@@ -787,6 +802,8 @@ pub(super) struct PrefillWork {
     pub(super) user_text: String,
     /// Content boundaries — see [`DecodeState::content_bounds`].
     pub(super) content_bounds: TurnContentBounds,
+    /// Prefilled assistant half — see [`DecodeState::prefill_assistant_text`].
+    pub(super) prefill_assistant_text: String,
     pub(super) event_tx: Sender<TurnEvent>,
     pub(super) max_decode_tokens: usize,
     pub(super) sampling: SamplingConfig,
@@ -860,6 +877,10 @@ struct WaveChannel {
     seq_sum: u64,
     seq_max: usize,
     tok_sum: u64,
+    /// Σ attended-KV length (each forward's prefix/context length, summed over
+    /// the batch) over the window. `kv_sum/fwds` is the avg KV a forward swept
+    /// — the number to watch for a context-growth slowdown.
+    kv_sum: u64,
     ms_sum: u64,
 }
 
@@ -871,6 +892,10 @@ struct WaveStats {
     window_start: std::time::Instant,
     prefill: WaveChannel,
     decode: WaveChannel,
+    /// Section-ingest forwards (startup code-read / repo-map prefill). These run
+    /// through `forward_batched` like prefills but on the section-ingest path, so
+    /// they get their own channel rather than being invisible behind `section_ms`.
+    section: WaveChannel,
     /// Per-phase wall-clock spent on the scheduler thread this window, in ms.
     /// These account for where the wall-clock goes when it is NOT a forward:
     /// `drain` includes the synchronous per-turn SubmitTurn handling
@@ -892,6 +917,7 @@ impl WaveStats {
             window_start: std::time::Instant::now(),
             prefill: WaveChannel::default(),
             decode: WaveChannel::default(),
+            section: WaveChannel::default(),
             drain_ms: 0,
             promote_ms: 0,
             decode_ms: 0,
@@ -902,8 +928,10 @@ impl WaveStats {
     }
 
     /// Record one forward. `n_tokens` is the total tokens in the batch
-    /// (seqs × per-seq chunk for prefill, seqs × 1 for decode).
-    fn record(&mut self, prefill: bool, n_seqs: usize, n_tokens: usize, fwd_ms: u64) {
+    /// (seqs × per-seq chunk for prefill, seqs × 1 for decode). `kv_len` is the
+    /// total attended-KV length the forward swept (Σ per-seq prefix/context
+    /// length, captured before the forward advanced the sequences).
+    fn record(&mut self, prefill: bool, n_seqs: usize, n_tokens: usize, kv_len: usize, fwd_ms: u64) {
         let ch = if prefill {
             &mut self.prefill
         } else {
@@ -913,12 +941,25 @@ impl WaveStats {
         ch.seq_sum += n_seqs as u64;
         ch.seq_max = ch.seq_max.max(n_seqs);
         ch.tok_sum += n_tokens as u64;
+        ch.kv_sum += kv_len as u64;
         ch.ms_sum += fwd_ms;
         // NB: do NOT flush here. Flushing mid-forward (record runs inside the
         // forward) would fire before the enclosing `timed_*` wrapper attributes
         // the phase ms, leaking the forward's wall-clock into `unaccounted`.
         // The run loop calls `flush_if_due` once per iteration, after all phase
         // attribution for that iteration is complete.
+    }
+
+    /// Record one section-ingest forward (startup code-read / repo-map prefill).
+    /// Kept separate so the section phase isn't invisible behind `section_ms`.
+    fn record_section(&mut self, n_seqs: usize, n_tokens: usize, kv_len: usize, fwd_ms: u64) {
+        let ch = &mut self.section;
+        ch.fwds += 1;
+        ch.seq_sum += n_seqs as u64;
+        ch.seq_max = ch.seq_max.max(n_seqs);
+        ch.tok_sum += n_tokens as u64;
+        ch.kv_sum += kv_len as u64;
+        ch.ms_sum += fwd_ms;
     }
 
     /// Accumulate wall-clock spent in a named scheduler-loop phase.
@@ -933,34 +974,71 @@ impl WaveStats {
         }
     }
 
-    /// Emit the wave summary + phase breakdown if the 2 s window elapsed, then
-    /// reset. Called at the end of each scheduler-loop iteration, so windows
-    /// with NO forwards still flush.
-    fn flush_if_due(&mut self) {
+    /// Whether the 2 s wave window has elapsed and [`Self::flush`] should run.
+    /// Split from `flush` so the caller only pays for the VRAM query (a couple
+    /// of CUDA driver calls) on the wave it actually emits, not every loop
+    /// iteration.
+    fn due(&self) -> bool {
+        self.window_start.elapsed() >= std::time::Duration::from_secs(2)
+    }
+
+    /// Emit the wave summary + phase breakdown, then reset. `kv_vram` is
+    /// `(pool_budget_available, pool_used)` in bytes — the pool-accounting
+    /// numbers our eviction gate keys on (NOT the driver's raw free, which the
+    /// pool's retained reservation pins low). `None` on non-CUDA / query miss.
+    /// Call only when [`Self::due`] — windows with NO forwards still flush so
+    /// stalls surface their phase split.
+    fn flush(&mut self, kv_vram: Option<(usize, usize)>) {
         let elapsed = self.window_start.elapsed();
-        if elapsed < std::time::Duration::from_secs(2) {
-            return;
-        }
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
-        let p = &self.prefill;
-        let d = &self.decode;
         let phase_sum =
             self.drain_ms + self.promote_ms + self.decode_ms + self.prefill_ms + self.section_ms;
         let unaccounted = (elapsed.as_millis() as u64).saturating_sub(phase_sum);
-        tracing::info!(
-            "wave {:.1}s: prefill fwds={} seqs avg={:.1} max={} tok/fwd avg={:.0} fwd avg={:.0}ms \
-             | decode fwds={} seqs avg={:.1} max={} fwd avg={:.0}ms",
-            elapsed.as_secs_f64(),
-            p.fwds,
-            avg(p.seq_sum, p.fwds),
-            p.seq_max,
-            avg(p.tok_sum, p.fwds),
-            avg(p.ms_sum, p.fwds),
-            d.fwds,
-            avg(d.seq_sum, d.fwds),
-            d.seq_max,
-            avg(d.ms_sum, d.fwds),
-        );
+        // Only emit channels that actually ran this window — an all-zero
+        // `decode`/`section` block during a pure-prefill insert was just noise.
+        // `tok total` is the tokens fed this window; `kv/fwd avg` is the
+        // attended-KV length each forward swept — watch it climb to spot a
+        // context-growth slowdown (vs. a fixed paged-glue prefix staying flat).
+        let mut parts: Vec<String> = Vec::new();
+        let p = &self.prefill;
+        if p.fwds > 0 {
+            parts.push(format!(
+                "prefill fwds={} seqs avg={:.1} max={} tok/fwd avg={:.0} tok total={} kv/fwd avg={:.0} kv total={} fwd avg={:.0}ms",
+                p.fwds, avg(p.seq_sum, p.fwds), p.seq_max,
+                avg(p.tok_sum, p.fwds), p.tok_sum, avg(p.kv_sum, p.fwds), p.kv_sum, avg(p.ms_sum, p.fwds),
+            ));
+        }
+        let d = &self.decode;
+        if d.fwds > 0 {
+            parts.push(format!(
+                "decode fwds={} seqs avg={:.1} max={} kv/fwd avg={:.0} fwd avg={:.0}ms",
+                d.fwds, avg(d.seq_sum, d.fwds), d.seq_max, avg(d.kv_sum, d.fwds), avg(d.ms_sum, d.fwds),
+            ));
+        }
+        let s = &self.section;
+        if s.fwds > 0 {
+            parts.push(format!(
+                "section fwds={} seqs avg={:.1} max={} tok/fwd avg={:.0} tok total={} kv/fwd avg={:.0} kv total={} fwd avg={:.0}ms",
+                s.fwds, avg(s.seq_sum, s.fwds), s.seq_max, avg(s.tok_sum, s.fwds), s.tok_sum, avg(s.kv_sum, s.fwds), s.kv_sum, avg(s.ms_sum, s.fwds),
+            ));
+        }
+        let body = if parts.is_empty() {
+            "(no forwards)".to_string()
+        } else {
+            parts.join(" | ")
+        };
+        // The pool budget our eviction defends and our pool_used — watch
+        // `budget` fall toward the band (eviction fires) and `used` cap out
+        // rather than climb unbounded.
+        let vram = match kv_vram {
+            Some((budget, used)) => format!(
+                " | kv-vram budget={}MiB used={}MiB",
+                budget / (1 << 20),
+                used / (1 << 20),
+            ),
+            None => String::new(),
+        };
+        tracing::info!("wave {:.1}s: {body}{vram}", elapsed.as_secs_f64());
         // Phase breakdown: where the wall-clock went on the scheduler thread.
         // `drain` rising over the run ⇒ per-turn reprojection/elevate growing;
         // `reproj` rising ⇒ continuous-reproject (BDP scan/glue) growing;
@@ -979,6 +1057,7 @@ impl WaveStats {
         self.window_start = std::time::Instant::now();
         self.prefill = WaveChannel::default();
         self.decode = WaveChannel::default();
+        self.section = WaveChannel::default();
         self.drain_ms = 0;
         self.promote_ms = 0;
         self.decode_ms = 0;
@@ -1020,6 +1099,25 @@ pub(crate) struct Scheduler {
     device: Device,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
+    /// Per-decode projection-span anchor, keyed by the decode's parent
+    /// sequence (stable across reprojections): `(generated-token index, time)`
+    /// of the last projection event. Each reproject (and the final seal) closes
+    /// the span `[anchor.token, now]` and re-anchors. Drives the t/s on each
+    /// `TurnEvent::Projection`. Pruned in `cleanup_finished`.
+    reproj_anchor: HashMap<SequenceId, (u32, Instant)>,
+    /// Slots that are summary probes in flight. Presence here marks a decode
+    /// as a summary (vs. a dialogue turn): `cleanup_finished` routes it to the
+    /// summary seal + fires this channel with the new `TurnIndex` instead of
+    /// streaming `TurnEvent`s. The summariser thread blocks on the matching
+    /// receiver. Lets a summary decode batch with foreground decodes in the
+    /// wave loop instead of monopolising the scheduler thread.
+    summary_completions: HashMap<SequenceId, Sender<Result<TurnIndex, String>>>,
+    /// Keeps each in-flight summary slot's token-event receiver alive. The
+    /// decode loop treats a failed `event_tx.send` as "caller hung up, stop"
+    /// — so a dropped receiver would terminate the summary after one token.
+    /// We never read these; the receiver is dropped in `free_summary_slot`
+    /// once the decode completes.
+    summary_event_rx: HashMap<SequenceId, Receiver<TurnEvent>>,
     /// Persistent sampling state per sequence ID (survives across turns).
     /// DRY penalty needs the recent-token window to span turn boundaries.
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
@@ -1316,6 +1414,9 @@ impl Scheduler {
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
+            reproj_anchor: HashMap::new(),
+            summary_completions: HashMap::new(),
+            summary_event_rx: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
@@ -1442,6 +1543,7 @@ impl Scheduler {
                 prefill_text,
                 user_text,
                 content_bounds,
+                prefill_assistant_text,
                 post_decode_tokens,
                 max_decode_tokens,
                 sampling,
@@ -1807,6 +1909,7 @@ impl Scheduler {
                     prefill_text,
                     user_text,
                     content_bounds,
+                    prefill_assistant_text,
                     event_tx,
                     max_decode_tokens,
                     sampling,
@@ -2595,6 +2698,7 @@ impl Scheduler {
                 max_tokens,
                 sampling_config: config,
                 seal_action: SealAction::CompressionPass { job_id, half: role },
+                prefill_assistant_text: String::new(),
                 finished: false,
                 decode_start: Instant::now(),
                 prefill_ms,
@@ -3382,6 +3486,8 @@ impl Scheduler {
             .collect();
 
         for seq_id in finished_seq_ids {
+            // Drop the projection-span anchor for this finished decode.
+            self.reproj_anchor.remove(&seq_id);
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // Compression half-passes complete through the job registry,
                 // not the substrate seal path: slice the decoded delta, deposit
@@ -3407,7 +3513,10 @@ impl Scheduler {
                     .tokenizer
                     .decode(&state.generated_tokens, skip)
                     .unwrap_or_default();
-                let text = strip_think_blocks(&text);
+                // Keep the reply's line structure (paragraphs, lists, code
+                // indentation) so it re-renders correctly on substrate reload;
+                // only the <think> reasoning is removed.
+                let text = strip_think_blocks_keep_layout(&text);
                 // Snapshot stats before any view finalize, since the view
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
@@ -3566,10 +3675,19 @@ impl Scheduler {
                             full_tokens.extend_from_slice(forwarded_generated);
                             full_tokens.extend_from_slice(&state.post_decode_tokens);
 
+                            // Prefill turns (repo_map / code_reading) supply the
+                            // assistant half verbatim and never decode, so `text`
+                            // is empty — store the supplied content. Decode turns
+                            // leave it empty and fall back to the decoded `text`.
+                            let assistant_text = if state.prefill_assistant_text.is_empty() {
+                                text.clone()
+                            } else {
+                                state.prefill_assistant_text.clone()
+                            };
                             Some(TurnContent {
                                 role: Role::Assistant,
                                 user_text: state.user_text.clone(),
-                                assistant_text: text.clone(),
+                                assistant_text,
                                 token_ids: TokenBuffer::from(full_tokens),
                                 content_bounds: state.content_bounds,
                             })
@@ -5298,7 +5416,7 @@ impl Scheduler {
         })?;
         let parent_id = view_state.parent_id;
         let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
-        let (projected_sections, projected_segments) = {
+        let (projected_sections, projected_segments, composition) = {
             let view = policy
                 .substrate
                 .read_for_scored(policy.target, &projection_scores);
@@ -5355,7 +5473,27 @@ impl Scheduler {
                     }
                 }
             }
-            (sections, segments)
+            // Bucket the materialized segments by category (system / section
+            // groups / turns) for the GUI. Timing is zeroed here and filled in
+            // at `complete` from the per-sequence span anchor.
+            //
+            // Build the GUI composition from the FULL `projection.segments`, not
+            // the tier-filtered `segments` used for apply: the filtered list
+            // drops the active turn's user message (captured as the writer tail,
+            // not re-injected) and any tier-less turn, which would leave the
+            // panel's conversation section empty on a first turn. The decode-end
+            // path (`projection_event`) buckets the full segments too, so this
+            // keeps the live reproject view consistent with it.
+            let composition = crate::projection::from_projection(
+                &projection.segments,
+                policy.projection.schema(),
+                &view,
+                view.total_token_count(policy.target.timeline) as u32,
+                0,
+                0,
+                0.0,
+            );
+            (sections, segments, composition)
         };
         let project_ms = t_project.elapsed().as_millis() as u64;
         record_phase(t_project, "reproject_project");
@@ -5602,6 +5740,7 @@ impl Scheduler {
             sections_len: projected_sections.len(),
             segments_len: projected_segments.len(),
             n_turns_selected,
+            composition,
             plan,
             build_ms,
             t_repro,
@@ -5632,6 +5771,7 @@ impl Scheduler {
             sections_len,
             segments_len,
             n_turns_selected,
+            composition,
             plan,
             build_ms,
             t_repro,
@@ -5641,6 +5781,31 @@ impl Scheduler {
             project_ms,
             elevate_ms,
         } = inflight;
+
+        // Close the decode span that ran under the *previous* projection and
+        // emit it as a timeline event: `[anchor.token, now]` tokens at the
+        // measured t/s, paired with the composition this reprojection selected.
+        // The anchor is keyed by view id and migrated to `new_view_id` below
+        // (like the decode state), so the next reproject / final seal measures
+        // from here. First reproject has no anchor → measures from decode start.
+        let repro_now = Instant::now();
+        let repro_gen = decode_state.generated_tokens.len() as u32;
+        {
+            let (from_token, since) = self
+                .reproj_anchor
+                .remove(&view_id)
+                .unwrap_or((0, decode_state.decode_start));
+            let seconds = repro_now.duration_since(since).as_secs_f64();
+            let span = repro_gen.saturating_sub(from_token);
+            let event = crate::projection::ProjectionEvent {
+                start_token: from_token,
+                end_token: repro_gen,
+                seconds,
+                tokens_per_second: if seconds > 0.0 { span as f64 / seconds } else { 0.0 },
+                ..composition
+            };
+            let _ = decode_state.event_tx.send(TurnEvent::Projection(event));
+        }
 
         let t_finish = Instant::now();
         self.apply_projection_finish(parent_id, plan)?;
@@ -5722,6 +5887,9 @@ impl Scheduler {
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }
+        // Migrate the projection-span anchor onto the new view id so the next
+        // reproject / final seal measures its span from this reprojection.
+        self.reproj_anchor.insert(new_view_id, (repro_gen, repro_now));
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real

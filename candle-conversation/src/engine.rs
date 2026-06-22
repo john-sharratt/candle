@@ -776,6 +776,7 @@ impl ConversationEngine {
                 prefill_text: String::new(),
                 user_text: String::new(),
                 content_bounds: TurnContentBounds::default(),
+                prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens,
                 sampling: SamplingConfig::argmax(),

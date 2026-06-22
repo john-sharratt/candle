@@ -270,15 +270,15 @@ __device__ __noinline__ void p4c_encode_quant_block(
 ) {
     switch (fmt) {
         case ArenaFormat::R16:     quantize_block_r16(src32, (block_r16*)dst_block); break;
-        case ArenaFormat::Q4_0:    quantize_block_q4_0(src32, (block_q4_0*)dst_block); break;
+        case ArenaFormat::Q4_0:    quantize_block_q4_0_vec(src32, (block_q4_0*)dst_block); break;
         case ArenaFormat::Q4_1:    quantize_block_q4_1(src32, (block_q4_1*)dst_block); break;
         case ArenaFormat::Q5_0:    quantize_block_q5_0(src32, (block_q5_0*)dst_block); break;
         case ArenaFormat::Q5_1:    quantize_block_q5_1(src32, (block_q5_1*)dst_block); break;
-        case ArenaFormat::Q8_0:    quantize_block_q8_0(src32, (block_q8_0*)dst_block); break;
+        case ArenaFormat::Q8_0:    quantize_block_q8_0_vec(src32, (block_q8_0*)dst_block); break;
         case ArenaFormat::Q8_1:    quantize_block_q8_1(src32, (block_q8_1*)dst_block); break;
-        case ArenaFormat::Q4_KS:   quantize_block_q4_ks(src32, (block_q4_ks*)dst_block); break;
-        case ArenaFormat::Q8_KS:   quantize_block_q8_ks(src32, (block_q8_ks*)dst_block); break;
-        case ArenaFormat::Q2_0:    quantize_block_q2_0(src32, (block_q2_0*)dst_block); break;
+        case ArenaFormat::Q4_KS:   quantize_block_q4_ks_vec(src32, (block_q4_ks*)dst_block); break;
+        case ArenaFormat::Q8_KS:   quantize_block_q8_ks_vec(src32, (block_q8_ks*)dst_block); break;
+        case ArenaFormat::Q2_0:    quantize_block_q2_0_vec(src32, (block_q2_0*)dst_block); break;
         case ArenaFormat::Q3_0:    quantize_block_q3_0(src32, (block_q3_0*)dst_block); break;
         case ArenaFormat::Q0:      quantize_block_q0(src32, (block_q0*)dst_block); break;
         case ArenaFormat::Q1_S:    quantize_block_q1_s_vec(src32, (block_q1_s*)dst_block); break;

@@ -1896,6 +1896,58 @@ impl ChunkedKvBacking {
         Ok(new_tokens)
     }
 
+    /// Truncate the sequence to exactly `target_tokens` cum-tokens, freeing any
+    /// writer-owned chunks/usage beyond it. Makes an offset-`N` re-prefill
+    /// idempotent: a caller (e.g. the bench harness's repeat loop) that re-runs a
+    /// prefill at the same offset must not stack stale tail chunks on top of the
+    /// previous run. Arc-shared prefix chunks (below `writer_start_idx`) are never
+    /// shrunk — `target_tokens` always covers them (it is ≥ the shared prefix
+    /// length). No-op when the sequence already holds ≤ `target_tokens` tokens
+    /// (growth is handled by `set_len`).
+    pub fn truncate_sequence_to_tokens(&self, batch_idx: usize, target_tokens: usize) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let slot = match state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let n = slot.block_count();
+        if n == 0 {
+            return Ok(());
+        }
+        let total: usize = slot.chunks_slice().iter().map(|c| c.usage as usize).sum();
+        if total <= target_tokens {
+            return Ok(());
+        }
+        let writer_start = slot.writer_start_idx();
+        let mut cum = 0usize;
+        for i in 0..n {
+            let usage = slot.chunks_slice()[i].usage as usize;
+            if cum + usage >= target_tokens {
+                let keep = target_tokens - cum;
+                if i < writer_start && keep < usage {
+                    candle::bail!(
+                        "truncate_sequence_to_tokens: target {target_tokens} cuts into the \
+                         Arc-shared prefix (chunk {i}, writer_start {writer_start})"
+                    );
+                }
+                // Keep chunks 0..=i (chunk i trimmed to `keep` tokens, possibly 0 →
+                // it becomes the empty writer chunk) and free everything after.
+                slot.chunk_at_mut(i).unwrap().usage = keep as u32;
+                slot.truncate_chunks(i + 1);
+                if slot.writer_start_idx() > slot.block_count() {
+                    slot.set_writer_start_idx(slot.block_count());
+                }
+                slot.invalidate_gpu_chunks();
+                return Ok(());
+            }
+            cum += usage;
+        }
+        Ok(())
+    }
+
     /// Append the sealed chunks of `sealed` onto the tail of the
     /// sequence at `batch_idx` as live `ChunkWindow`s.
     ///

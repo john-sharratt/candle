@@ -411,6 +411,32 @@ struct vec_dot_loader_for<block_c_q4_K, vdr, act_t> {
 // Include the base gemx_dequant infrastructure
 #include "gemx_dequant.cuh"
 
+// Shared Q4_K / Q4_KO int8 weight unpack. The two formats hold identical qs nibbles
+// and (scale,-min) pairs; they differ ONLY in where a sub's 4 qs ints and its scale
+// pair sit inside the 80-byte block (Q4_KO groups qs contiguously and the scales at
+// the tail). Both traits delegate here with their own offset tables — the nibble
+// gather (mask + prmt 0x3120) is byte-identical. `sub` is a compile-time unroll
+// index at the call site, so qs_base[sub]/dm_off[sub] fold to constants.
+__device__ __forceinline__ void q4k_dequant_to_b_frag_int8(
+    const uint8_t* __restrict__ warp_rows, int sub, int lane,
+    uint32_t (&b_frag)[2], const int (&qs_base)[4], int block_bytes)
+{
+    const int row = lane >> 2;
+    const int q3  = lane & 3;
+    const uint8_t* rb = warp_rows + row * block_bytes;
+    const int qlo = *reinterpret_cast<const int*>(rb + qs_base[sub] + (q3 >> 1) * 4);
+    const int qhi = *reinterpret_cast<const int*>(rb + qs_base[sub] + (2 + (q3 >> 1)) * 4);
+    const int sh = (q3 & 1) * 4;  // 0 = low nibbles (n0..n3), 4 = high (n4..n7)
+    b_frag[0] = __byte_perm((qlo >> sh) & 0x0F0F0F0F, 0, 0x3120);
+    b_frag[1] = __byte_perm((qhi >> sh) & 0x0F0F0F0F, 0, 0x3120);
+}
+
+__device__ __forceinline__ half2 q4k_sub_dm(
+    const uint8_t* __restrict__ row_block, int sub, const int (&dm_off)[4])
+{
+    return *reinterpret_cast<const half2*>(row_block + dm_off[sub]);
+}
+
 template <typename compute_t, typename scale_t>
 struct gemx_dequant_traits<block_c_q4_K, compute_t, scale_t> {
     static constexpr bool implemented = true;
@@ -452,6 +478,33 @@ struct gemx_dequant_traits<block_c_q4_K, compute_t, scale_t> {
     // K/128 block byte offsets (compile-time constants)
     static constexpr int K128_BYTES = 80;
     static constexpr int QS_STRIDE = 4;  // 4 bytes per thread's qs
+
+    // -------------------------------------------------------------------------
+    // INT8 PATH (grouped_tc_int8): register-direct n8k32 B-fragment, no smem
+    // staging. lane provides output-row n=(lane>>2)'s Q4_K weights for sub-block
+    // `sub`, packed exactly in the load_b_frag_n8k32 layout:
+    //   b_frag[0] = 4 int8 at K_local (lane&3)*4 + {0..3}
+    //   b_frag[1] = 4 int8 at K_local (lane&3)*4 + 16 + {0..3}
+    // Unsigned nibbles (0..15); the fold applies w = d·nibble + m as d·C + m·Σâ,
+    // reading d/m via sub_dm() below — i.e. the FP loader's
+    // __hfma2(scale, nibble, neg_min) with the multiply moved past the MMA.
+    // Nibble bit-positions n0..n7 match extract_4_elements.
+    // -------------------------------------------------------------------------
+    // Q4_K layout: each sub's 4 qs ints are split around the interspersed scales
+    // ({0,24,40,64}); the four (scale,-min) pairs live at {16,20,56,60}.
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows,  // this warp's 8 raw Q4_K rows
+        int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        constexpr int QS_BASE[4] = {0, 24, 40, 64};  // byte offset of the sub's 4 qs ints
+        q4k_dequant_to_b_frag_int8(warp_rows, sub, lane, b_frag, QS_BASE, K128_BYTES);
+    }
+
+    // Per-sub {scale d (low), neg_min m (high)} for one weight row's raw block.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int DM_OFF[4] = {16, 20, 56, 60};
+        return q4k_sub_dm(row_block, sub, DM_OFF);
+    }
     
     // Thread-to-qs mapping: which qs field does MMA lane's row correspond to?
     // Lane's N (0-7) maps to qs{N*2} and qs{N*2+1} for the two halves of the row's data
@@ -995,6 +1048,68 @@ struct gemx_dequant_traits<block_c_q4_K, compute_t, scale_t> {
                     frag_b[7] = *reinterpret_cast<uint32_t*>(&w1);
                 }
             }
+        }
+    }
+};
+
+// =============================================================================
+// GEMX DEQUANT TRAITS - Q4_KO (byte-permuted Q4_K for the q8a128 int8 path)
+// =============================================================================
+// Q4_KO holds the same nibbles and scales as Q4_K, only reordered: qs contiguous
+// (per-sub at {0,16,32,48}), the four (scale,-min) pairs grouped at the tail
+// ({64,68,72,76}). It inherits the entire Q4_K trait and overrides ONLY the two
+// int8 accessors with the permuted offsets — the int8 m16n8k32 path is the only
+// consumer (no FP KO kernel is instantiated). The inherited FP accessors still
+// assume the Q4_K byte order, so a KO FP kernel would need them overridden too.
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q4_KO, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q4_K, compute_t, scale_t> {
+    using base = gemx_dequant_traits<block_c_q4_K, compute_t, scale_t>;
+
+    // Q4_KO interleaves each sub's 4 qs ints as [I0,I2,I1,I3] so the lane's qlo (the
+    // K[0:16] int) and qhi (the K[16:32] int) sit ADJACENT: one int2 (LDS.64) then
+    // loads exactly the 8 bytes the lane needs — halving the qs LSU instructions vs
+    // two int loads, with none of the int4 bandwidth waste (which read 16B to use 8).
+    //   q3<2 → int2 at sub*16+0 = {I0,I2} = {qlo,qhi};  q3>=2 → sub*16+8 = {I1,I3}.
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        // De-interleaved Q4_KO block is 64B (quant only); scales are in the separate region.
+        const uint8_t* rb = warp_rows + row * smem_row_stride<block_c_q4_KO_k128>::value;
+        const int2 qv = *reinterpret_cast<const int2*>(rb + sub * 16 + (q3 >> 1) * 8);
+        const int sh = (q3 & 1) * 4;
+        b_frag[0] = __byte_perm((qv.x >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        b_frag[1] = __byte_perm((qv.y >> sh) & 0x0F0F0F0F, 0, 0x3120);
+    }
+
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int DM_OFF[4] = {64, 68, 72, 76};  // scales grouped at the tail
+        return q4k_sub_dm(row_block, sub, DM_OFF);
+    }
+};
+
+// Q4_KO K/1024 chunk — WAVEFRONT-OPTIMAL ("perfect") int8 dequant, LANE-MAJOR. The 512 B quant
+// region stores each lane's 4 sub-uint32s contiguously: byte for (lane, sub, i) at lane*16 +
+// sub*4 + i, where the uint32 still packs nibbles as K[p] | (K[p+16]<<4). So ONE int4 LDS at
+// lane*16 pulls all 4 subs (vs 4 separate uint32 LDS) — a quarter of the MIO instructions.
+// Bank-conflict-free: an LDS.128 services the warp in 4 quarter-warp phases (8 lanes × 16 B =
+// 128 B = 32 banks); lane L touches banks {4L..4L+3}, and each phase covers banks 0-31 exactly
+// once. Per sub, low nibbles ARE b_frag[0] (K[q3*4..+3]) and high nibbles ARE b_frag[1]
+// (K[q3*4+16..+19]) — no byte_perm. The inline scales blk.dm[row] are read in the kernel.
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q4_KO_k1024, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q4_KO, compute_t, scale_t> {
+    __device__ __forceinline__ static void dequant_all_subs_int8(
+        const uint8_t* __restrict__ chunk, int lane, uint32_t (&b_frags)[4][2])
+    {
+        const int4 vv = *reinterpret_cast<const int4*>(chunk + lane * 16);
+        const uint32_t s4[4] = {(uint32_t)vv.x, (uint32_t)vv.y, (uint32_t)vv.z, (uint32_t)vv.w};
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            b_frags[sub][0] = s4[sub] & 0x0F0F0F0Fu;          // low nibbles  → K[q3*4 .. +3]
+            b_frags[sub][1] = (s4[sub] >> 4) & 0x0F0F0F0Fu;   // high nibbles → K[q3*4+16 .. +19]
         }
     }
 };

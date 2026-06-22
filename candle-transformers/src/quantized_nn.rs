@@ -131,3 +131,34 @@ impl Module for RmsNorm {
         candle_nn::ops::rms_norm(x, &weight, self.eps as f32)
     }
 }
+
+impl RmsNorm {
+    /// RMSNorm as a producer epilogue: returns the matmul-ready [`DynamicActs`]. For an int8
+    /// `mode` it runs the fused `rms_norm_q8a128` kernel — normalize + quantize in one launch,
+    /// no FP store/re-read — and returns `Int8(q8a128)`; for [`Int8Mode::Off`] it runs the plain
+    /// FP `rms_norm` and returns `Float`. The downstream matmul consumes the result via
+    /// `QMatMul::forward_dynamic`, so for int8 the activation never materializes in FP. CUDA only.
+    #[cfg(feature = "cuda")]
+    pub fn forward_dynamic(
+        &self,
+        x: &Tensor,
+        mode: candle::quantized::Int8Mode,
+    ) -> Result<candle::quantized::cuda::DynamicActs> {
+        use candle::quantized::cuda::DynamicActs;
+        if !mode.is_int8() {
+            return Ok(DynamicActs::Float(self.forward(x)?));
+        }
+        let _enter = self.span.enter();
+        let weight = if x.dtype() == self.weight.dtype() {
+            self.weight.clone()
+        } else {
+            self.weight.to_dtype(x.dtype())?
+        };
+        let dev = match x.device() {
+            candle::Device::Cuda(d) => d.clone(),
+            _ => candle::bail!("RmsNorm::forward_dynamic(int8) requires a CUDA tensor"),
+        };
+        let op = candle::quantized::cuda::rms_norm_q8a128(x, &weight, self.eps as f32, &dev)?;
+        Ok(DynamicActs::Int8(op))
+    }
+}

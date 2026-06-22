@@ -340,7 +340,34 @@ struct gemx_dequant_traits<block_c_q8_0, compute_t, scale_t> {
     // =========================================================================
     
     static constexpr int K128_BYTES = 144;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 PATH (grouped_tc_int8): raw signed int8 quants → n8k32 B-fragment. Q8_0
+    // stores q8 as signed int8 (value = d·q8), so there is NO nibble extraction or
+    // centering — the 4 contiguous int8 go straight into the fragment and the fold
+    // applies d·C (neg_min = 0). qs are natural-K-order within each 8-element field;
+    // QS_BYTE accounts for the d|d + pad gaps in the K/128 layout.
+    // -------------------------------------------------------------------------
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        constexpr int QS_BYTE[16] =
+            {0, 8, 16, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 120, 128, 136};
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int byte_off = (q3 & 1) * 4;  // which int of the 8-elem qs field
+        b_frag[0] = *reinterpret_cast<const uint32_t*>(rb + QS_BYTE[sub * 4 + (q3 >> 1)] + byte_off);
+        b_frag[1] = *reinterpret_cast<const uint32_t*>(rb + QS_BYTE[sub * 4 + 2 + (q3 >> 1)] + byte_off);
+    }
+
+    // Per-sub {scale d (low), neg_min (high) = 0} — Q8_0 is symmetric.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int SCALE_OFF[4] = {24, 26, 112, 114};  // byte offset of d0..d3
+        const half d = *reinterpret_cast<const half*>(row_block + SCALE_OFF[sub]);
+        return __halves2half2(d, __float2half(0.f));
+    }
+
     // =========================================================================
     // SHARED LOOKUP TABLES - Used by both k16 and 2x_k16 dequant functions
     // =========================================================================

@@ -53,6 +53,15 @@ pub enum QType {
     Q4_K = 17,
     Q3_K = 21,
     Q2_K = 24,
+    // Byte-permuted ("ordered") twins of the K-quant compact blocks for the q8a128
+    // int8 path: qs made contiguous, per-sub scales grouped at the tail. GPU-only
+    // weight layouts (produced by an on-GPU permutation of the K block) — not
+    // GgmlDTypes, so they have no on-disk / CPU form. Values mirror QTYPE_* in
+    // block_compact.cuh (45-48, the first slots free past GgmlDType's storage dtypes).
+    Q4_KO = 45,
+    Q5_KO = 46,
+    Q6_KO = 47,
+    Q8_KO = 48,
 }
 
 /// Y vector type enum (matches dispatcher ytype parameter).
@@ -63,6 +72,13 @@ pub enum YType {
     F16 = 0,
     BF16 = 1,
     F32 = 2,
+    /// q8a128 activations → INT8-MMA path (tensor-core only, F32 output). `vy` is a
+    /// `block_q8a128` buffer rather than an FP tensor. No FP fallback — callers only select this
+    /// when tensor cores are available. There is ONE activation type: the q8a1024 byte layout is
+    /// position-independent and identical for both matmul modes. The dispatcher picks mode-1
+    /// (Bm=16) vs mode-2 (Bm=32 weight-reuse) from the token count at a threshold — the mode is a
+    /// kernel/tiling property, not an attribute of the activation.
+    Q8A128 = 3,
 }
 
 extern "C" {
@@ -79,7 +95,9 @@ extern "C" {
     /// - `nrows_dst`: Number of rows in output
     /// - `qtype`: Quantization type (0-9, see QType enum)
     /// - `ytype`: Y vector type (0-2, see YType enum). Note: F32 (2) only for Q4_K.
-    /// - `weight_bytes`: Weight tensor size in bytes (for L2 cache dispatch decision)
+    /// - `weight_bytes`: Weight tensor size in bytes (for L2 cache dispatch decision, FP path)
+    /// - `force_mode2`: int8 dense tiling select — 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32
+    ///   weight-reuse). Decided in Rust by [`q8a128_dense_use_mode2`]; ignored by the FP path.
     pub fn run_quantized_matmul(
         segments: *const VxSegment,
         num_segments: i32,
@@ -92,6 +110,26 @@ extern "C" {
         qtype: i32,
         ytype: i32,
         weight_bytes: usize,
+        force_mode2: i32,
+    );
+
+    /// Segmented qkv int8 dense matmul: one launch over a shared q8a128 activation × up to 3 KO
+    /// weights of possibly-different formats, writing the concatenated `[M, N_total]` F32 output.
+    /// - `h_segs`: HOST pointer to a `num_segs`-long (≤3) `qkv_seg_t` array (24 bytes each); the
+    ///   launcher copies it into by-value kernel params, so there is no per-call device upload.
+    /// - `act`: device pointer to the shared q8a128 activation.
+    /// - `total_n_tiles`: Σ ceil(seg_n/32) (= grid.y); `dst_stride` = N_total.
+    /// - `mode2`: 0 = mode-1 (Bm=16), 1 = mode-2 (Bm=32).
+    pub fn run_qkv_segmented_matmul(
+        h_segs: *const c_void,
+        num_segs: i32,
+        act: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        total_n_tiles: i32,
+        total_batch: i32,
+        dst_stride: i32,
+        mode2: i32,
     );
 
     /// Single-launch grouped matmul over all MoE expert tiles.
@@ -318,5 +356,10 @@ mod matmul_qtype_lock_tests {
         assert_eq!(QType::Q4_K as i32, 17);
         assert_eq!(QType::Q3_K as i32, 21);
         assert_eq!(QType::Q2_K as i32, 24);
+        // KO byte-permuted twins — mirror QTYPE_Q*_KO in block_compact.cuh.
+        assert_eq!(QType::Q4_KO as i32, 45);
+        assert_eq!(QType::Q5_KO as i32, 46);
+        assert_eq!(QType::Q6_KO as i32, 47);
+        assert_eq!(QType::Q8_KO as i32, 48);
     }
 }

@@ -807,6 +807,13 @@ impl ChunkedKvBacking {
         self.inner.needs_compaction(DEFAULT_DEFRAG_THRESHOLD)
     }
 
+    /// True when a forced compaction of this backing could free at least one
+    /// whole arena. When false, the backing is packed to within a single arena
+    /// of free space and a compaction pass would reclaim nothing.
+    pub fn can_reclaim_arena(&self) -> bool {
+        self.inner.pool.can_reclaim_arena()
+    }
+
     /// Defragment and compact the backing when the reclaimable-arena ratio for
     /// any key exceeds `fragmentation_threshold`.
     pub fn defragment(&self, fragmentation_threshold: f32) -> Result<usize> {
@@ -826,6 +833,16 @@ impl ChunkedKvBacking {
     /// waiting for the steady-state fragmentation threshold.
     pub fn compact_forced(&self) -> Result<usize> {
         self.inner.compact_arenas_forced()
+    }
+
+    /// Release any fully-empty arenas back to the pool **without** the
+    /// expensive chunk-moving defrag — the cheap half of compaction. Returns
+    /// arenas freed. Used by the scheduler's pressure path so it never spends
+    /// seconds on a speculative defrag (which, during active prefills, is
+    /// usually futile — the free space sits in protected arenas); the costly
+    /// defrag stays on the reactive allocation-time OOM retry.
+    pub fn release_empty_arenas(&self) -> Result<usize> {
+        self.inner.release_empty_arenas()
     }
 
     /// Get the current batch capacity (number of sequence slots).

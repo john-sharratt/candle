@@ -1,9 +1,15 @@
+pub mod api;
+pub mod chatml;
 pub mod code_read;
 pub mod config;
+pub mod conv_file_store;
+pub mod conv_files;
 pub mod loading;
+pub mod log_line;
 pub mod log_broadcast;
 pub mod refresh_ctx;
 pub mod repo_scan;
+pub mod projection_event;
 pub mod session;
 pub mod tool_summary;
 pub mod tools;

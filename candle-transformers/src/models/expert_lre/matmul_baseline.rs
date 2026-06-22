@@ -143,7 +143,7 @@ fn load_expert(dev: &Device) -> Result<Option<(QMatMul, Tensor, usize)>> {
         Device::Cuda(d) => d,
         _ => candle::bail!("expert matmul baseline requires a CUDA device"),
     };
-    let repacked = candle::quantized::repack_to_host(cuda_dev, &fx.ggml, n, k, dtype)?;
+    let repacked = candle::quantized::repack_to_host(cuda_dev, &fx.ggml, n, k, dtype, dtype)?;
     let storage = candle::quantized::load_repacked(cuda_dev, &repacked, dtype)?;
     let qt = QTensor::new(storage, vec![n, k])?;
     let qmm = QMatMul::from_qtensor_repacked(qt)?;
@@ -176,6 +176,138 @@ fn expert_matmul_matches_dequant_reference() -> Result<()> {
             "M={m}: expert matmul diverged from dequant reference (rel L2 = {err:.4})"
         );
     }
+    Ok(())
+}
+
+/// Real-weight precision of the Q4_K → KO conversion. Loads the captured Qwen3-30B-A3B gate
+/// expert (Q4_K), dequantizes to f32 (the reference), and re-quantizes **per-128 affine
+/// (scale + min)** at 4-bit (Q4_KO) and 5-bit (Q5_KO). Reports rel_l2 vs the Q4_K-dequant —
+/// the EXTRA error the per-128 collapse adds. The affine min focuses the (K+1)-bit grid on
+/// each group's actual [min,max], so this checks whether the +1 bit re-represents the 4-bit
+/// source ~losslessly while same-bit per-128 loses — on a *real* weight distribution.
+#[test]
+fn q4ko_q5ko_real_expert_precision() -> Result<()> {
+    let path = fixture_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        println!(
+            "[precision] no fixture at {} — run extract_expert_weight_fixture first",
+            path.display()
+        );
+        return Ok(());
+    };
+    let fx: ExpertProj =
+        bincode::deserialize(&bytes).map_err(|e| candle::Error::Msg(format!("bincode: {e}")))?;
+    let dtype = dtype_from_u32(fx.dtype)?;
+    let (n, k) = (fx.shape[0], fx.shape[1]);
+    let cpu_qt =
+        candle::quantized::ggml_file::qtensor_from_ggml(dtype, &fx.ggml, vec![n, k], &Device::Cpu)?;
+    let w = cpu_qt.dequantize(&Device::Cpu)?; // [n, k] f32 — the Q4_K reference
+    let wv = w.flatten_all()?.to_vec1::<f32>()?;
+
+    // Per-group affine (scale + min) quant→dequant along K (groups within each output row).
+    let qd = |group: usize, maxq: i32| -> Vec<f32> {
+        let mut out = vec![0f32; n * k];
+        for row in 0..n {
+            for g in (0..k).step_by(group) {
+                let base = row * k + g;
+                let s = &wv[base..base + group];
+                let mn = s.iter().cloned().fold(f32::INFINITY, f32::min);
+                let mx = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let scale = ((mx - mn) / maxq as f32).max(1e-12);
+                for i in 0..group {
+                    let q = (((wv[base + i] - mn) / scale).round() as i32).clamp(0, maxq);
+                    out[base + i] = scale * q as f32 + mn;
+                }
+            }
+        }
+        out
+    };
+    let rel = |a: &[f32]| -> f32 {
+        let num: f32 = a.iter().zip(&wv).map(|(x, y)| (x - y) * (x - y)).sum();
+        let den: f32 = wv.iter().map(|y| y * y).sum::<f32>().max(1e-12);
+        (num / den).sqrt()
+    };
+    println!(
+        "=== REAL Qwen3-30B-A3B gate expert [{n}x{k}] {dtype:?}: per-128 affine re-quant (rel_l2 vs dequant) ==="
+    );
+    let r_q4_per32 = rel(&qd(32, 15));
+    let r_q4ko = rel(&qd(128, 15));
+    let r_q5ko = rel(&qd(128, 31));
+    println!("  Q4 per-32,  4-bit (≈ re-Q4_K):  {r_q4_per32:.6}");
+    println!("  Q4_KO per-128, 4-bit:           {r_q4ko:.6}");
+    println!("  Q5_KO per-128, 5-bit (+1 bit):  {r_q5ko:.6}");
+    println!("  (Q6  per-128, 6-bit, ref):      {:.6}", rel(&qd(128, 63)));
+    // Verify the claims on the real weight: the +1 bit beats same-bit per-128, the per-128
+    // collapse loses vs per-32 at the same 4 bits, and Q5_KO ~recovers per-32 precision.
+    assert!(
+        r_q5ko < r_q4ko,
+        "Q5_KO (+1 bit) must beat same-bit Q4_KO per-128 ({r_q5ko:.6} vs {r_q4ko:.6})"
+    );
+    assert!(
+        r_q4ko > r_q4_per32,
+        "per-128 collapse must lose vs per-32 at 4 bits ({r_q4ko:.6} vs {r_q4_per32:.6})"
+    );
+    assert!(
+        r_q5ko < r_q4_per32 * 2.0,
+        "Q5_KO should ~recover per-32 4-bit precision ({r_q5ko:.6} vs {r_q4_per32:.6})"
+    );
+
+    // Shared per-128 SCALE + N mins per 128 (the scale stays one → accumulation collapse intact;
+    // only the epilogue min term grows). The shared scale must span the widest min-subgroup, so
+    // finer mins shrink it toward the per-sub range — recovering Q4_K's per-32 offset structure.
+    let qd_nmin = |n_mins: usize, maxq: i32| -> Vec<f32> {
+        let mut out = vec![0f32; n * k];
+        let sub = 128 / n_mins;
+        for row in 0..n {
+            for g128 in (0..k).step_by(128) {
+                let b = row * k + g128;
+                let mut mins = vec![0f32; n_mins];
+                let mut max_range = 0f32;
+                for s in 0..n_mins {
+                    let sl = &wv[b + s * sub..b + s * sub + sub];
+                    let mn = sl.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let mx = sl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    mins[s] = mn;
+                    max_range = max_range.max(mx - mn);
+                }
+                let scale = (max_range / maxq as f32).max(1e-12);
+                for s in 0..n_mins {
+                    let base = b + s * sub;
+                    for i in 0..sub {
+                        let q = (((wv[base + i] - mins[s]) / scale).round() as i32).clamp(0, maxq);
+                        out[base + i] = scale * q as f32 + mins[s];
+                    }
+                }
+            }
+        }
+        out
+    };
+    println!("=== shared per-128 SCALE + N mins (accumulation stays collapsed) ===");
+    println!(
+        "  Q4_KO 4-bit, 1 min  (per-128):   {:.6}",
+        rel(&qd_nmin(1, 15))
+    );
+    println!(
+        "  Q4_KO 4-bit, 2 mins (per-64):    {:.6}",
+        rel(&qd_nmin(2, 15))
+    );
+    println!(
+        "  Q4_KO 4-bit, 4 mins (per-32):    {:.6}",
+        rel(&qd_nmin(4, 15))
+    );
+    println!(
+        "  Q4_KO 4-bit, 8 mins (per-16):    {:.6}",
+        rel(&qd_nmin(8, 15))
+    );
+    println!(
+        "  Q5_KO 5-bit, 1 min  (per-128):   {:.6}",
+        rel(&qd_nmin(1, 31))
+    );
+    println!(
+        "  Q5_KO 5-bit, 4 mins (per-32):    {:.6}",
+        rel(&qd_nmin(4, 31))
+    );
+    println!("  full per-32, 4-bit (4 scale+min):{:.6}", rel(&qd(32, 15)));
     Ok(())
 }
 

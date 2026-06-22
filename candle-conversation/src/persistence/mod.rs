@@ -391,6 +391,12 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Append a turn's `ProjectionEvents` record (opaque JSON payload).
+    pub fn append_projection_events(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
+        self.append_record(RecordType::ProjectionEvents, 0, stream_id.0, 0, 0, payload)?;
+        Ok(())
+    }
+
     /// Append a `Commit` record marking `stream_id` durable through
     /// `through_index`.
     pub fn commit_stream(&mut self, stream_id: StreamId, through_index: u64) -> Result<()> {

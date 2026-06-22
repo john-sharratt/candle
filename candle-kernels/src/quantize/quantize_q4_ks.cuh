@@ -66,6 +66,59 @@ __device__ __forceinline__ void quantize_block_q4_ks(
 }
 
 // =============================================================================
+// VECTORIZED SINGLE-BLOCK (float4 loads, 8 active lanes) — byte-identical to scalar.
+// Sub-block A = elements 0-3 (lane 0); B = elements 4-31 (lanes 1-7). The GGML nibble pack
+// `qs[k] = q[k] | q[k+16]<<4` pairs lane L (elems 4L..4L+3, all < 16) with lane L+4 (elems
+// 4L+16..4L+19), so lane L<4 gathers L+4's four quants via one packed shuffle.
+// =============================================================================
+__device__ __forceinline__ void quantize_block_q4_ks_vec(
+    const float* __restrict__ src,
+    block_q4_ks* __restrict__ dst)
+{
+    const int lane = threadIdx.x % WARP_SIZE;
+    float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+    float local_max = 0.0f;
+    if (lane < 8) {
+        v = reinterpret_cast<const float4*>(src)[lane];
+        local_max = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+    }
+    const float amax_a = quantize_warp_reduce_max((lane == 0) ? local_max : 0.0f);
+    const float amax_b = quantize_warp_reduce_max((lane >= 1 && lane < 8) ? local_max : 0.0f);
+    const float amax = fmaxf(amax_a, amax_b);
+    const float coarse_d = (amax != 0.0f) ? amax / 7.0f : 0.0f;
+    uint8_t sa, sb;
+    if (amax == 0.0f) {
+        sa = 255; sb = 255;
+    } else {
+        sa = (uint8_t)fmaxf(1.0f, fminf(255.0f, roundf(amax_a / amax * 255.0f)));
+        sb = (uint8_t)fmaxf(1.0f, fminf(255.0f, roundf(amax_b / amax * 255.0f)));
+    }
+    const float actual_d = (lane == 0) ? (coarse_d * sa / 255.0f) : (coarse_d * sb / 255.0f);
+    // Four biased nibbles for this lane's elements, packed into one int for the cross-lane gather.
+    uint8_t b0 = 8, b1 = 8, b2 = 8, b3 = 8;
+    if (lane < 8 && actual_d != 0.0f) {
+        b0 = (uint8_t)((int)(int8_t)fminf(7.0f, fmaxf(-7.0f, roundf(v.x / actual_d))) + 8);
+        b1 = (uint8_t)((int)(int8_t)fminf(7.0f, fmaxf(-7.0f, roundf(v.y / actual_d))) + 8);
+        b2 = (uint8_t)((int)(int8_t)fminf(7.0f, fmaxf(-7.0f, roundf(v.z / actual_d))) + 8);
+        b3 = (uint8_t)((int)(int8_t)fminf(7.0f, fmaxf(-7.0f, roundf(v.w / actual_d))) + 8);
+    }
+    const unsigned myq = (unsigned)b0 | ((unsigned)b1 << 8) | ((unsigned)b2 << 16) | ((unsigned)b3 << 24);
+    // lane L<4 reads lane L+4's quants (the high nibbles for qs[4L..4L+3]). All lanes participate.
+    const unsigned hiq = __shfl_sync(0xffffffff, myq, lane + 4, 32);
+    if (lane < 4) {
+        dst->qs[lane * 4 + 0] = (uint8_t)(b0 | (((hiq) & 0xff) << 4));
+        dst->qs[lane * 4 + 1] = (uint8_t)(b1 | (((hiq >> 8) & 0xff) << 4));
+        dst->qs[lane * 4 + 2] = (uint8_t)(b2 | (((hiq >> 16) & 0xff) << 4));
+        dst->qs[lane * 4 + 3] = (uint8_t)(b3 | (((hiq >> 24) & 0xff) << 4));
+    }
+    if (lane == 0) {
+        dst->d  = __float2half_rn(coarse_d);
+        dst->sa = sa;
+        dst->sb = sb;
+    }
+}
+
+// =============================================================================
 // MULTI-BLOCK QUANTIZATION (grid-stride, 1 warp per block)
 // =============================================================================
 

@@ -15,6 +15,7 @@
 
 #include "binary_op_macros.cuh"
 #include "../fast_exp.cuh"
+#include "../blocks.cuh"
 #include <stdint.h>
 
 // silu_fwd template — same as in unary.cu but needed here since it's not in a header
@@ -191,3 +192,92 @@ __device__ __forceinline__ __nv_fp8_e4m3 f8_silu_mul(__nv_fp8_e4m3 a, __nv_fp8_e
 }
 
 BINARY_OP_F8E4M3_VEC4(fused_silu_mul_f8_e4m3, f8_silu_mul)
+
+// =============================================================================
+// FUSED SwiGLU → q8a128 (producer epilogue B4)
+// =============================================================================
+// out[i] = silu(gate[i]) * up[i], quantized directly to q8a128 — one kernel that
+// replaces silu_mul (FP store) + quantize_acts_q8a128 (re-read). One warp per
+// 128-tile: lane owns 4 contiguous elements; the SwiGLU result is rounded through
+// the store dtype T (mirrors the FP store), then the per-128 amax/Σx butterfly +
+// char4 store + lane-0 ds write the q8a1024 flat-grouped block (see blocks.cuh),
+// identical to quantize_q8a128_kernel on the SwiGLU output. silu uses the same
+// fused_silu_fwd<float> (fast_exp) as the unfused kernel, so the result tracks the
+// two-call path within float margin. Requires (rows*cols) % 128 == 0.
+
+template <typename T>
+__device__ __forceinline__ void smq8_load4(const T* p, float& a, float& b, float& c, float& d);
+template <>
+__device__ __forceinline__ void smq8_load4<float>(const float* p, float& a, float& b, float& c, float& d) {
+    const float4 v = *reinterpret_cast<const float4*>(p);
+    a = v.x; b = v.y; c = v.z; d = v.w;
+}
+template <>
+__device__ __forceinline__ void smq8_load4<__half>(const __half* p, float& a, float& b, float& c, float& d) {
+    const __half2* h = reinterpret_cast<const __half2*>(p);
+    const float2 lo = __half22float2(h[0]);
+    const float2 hi = __half22float2(h[1]);
+    a = lo.x; b = lo.y; c = hi.x; d = hi.y;
+}
+template <>
+__device__ __forceinline__ void smq8_load4<__nv_bfloat16>(const __nv_bfloat16* p, float& a, float& b, float& c, float& d) {
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(p);
+    const float2 lo = __bfloat1622float2(h[0]);
+    const float2 hi = __bfloat1622float2(h[1]);
+    a = lo.x; b = lo.y; c = hi.x; d = hi.y;
+}
+
+// Round a float through the store dtype T and back (mirrors silu_mul's FP store).
+template <typename T> __device__ __forceinline__ float smq8_round(float v);
+template <> __device__ __forceinline__ float smq8_round<float>(float v) { return v; }
+template <> __device__ __forceinline__ float smq8_round<__half>(float v) { return __half2float(__float2half_rn(v)); }
+template <> __device__ __forceinline__ float smq8_round<__nv_bfloat16>(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
+template <typename T>
+__device__ void silu_mul_q8a128_impl(
+    const T* __restrict__ gate, const T* __restrict__ up,
+    block_q8a128* __restrict__ out, int rows, int cols)
+{
+    const int total_tiles = (int)(((int64_t)rows * cols) / 128);
+    const int total_warps = (gridDim.x * blockDim.x) >> 5;
+    const int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int lane = threadIdx.x & 31;
+    uint8_t* obytes = reinterpret_cast<uint8_t*>(out);
+    for (int tile = warp; tile < total_tiles; tile += total_warps) {
+        const int64_t base = (int64_t)tile * 128 + (int64_t)lane * 4;
+        float g0, g1, g2, g3; smq8_load4<T>(gate + base, g0, g1, g2, g3);
+        float u0, u1, u2, u3; smq8_load4<T>(up + base, u0, u1, u2, u3);
+        const float n0 = smq8_round<T>(fused_silu_fwd<float>(g0) * u0);
+        const float n1 = smq8_round<T>(fused_silu_fwd<float>(g1) * u1);
+        const float n2 = smq8_round<T>(fused_silu_fwd<float>(g2) * u2);
+        const float n3 = smq8_round<T>(fused_silu_fwd<float>(g3) * u3);
+
+        float amax = fmaxf(fmaxf(fabsf(n0), fabsf(n1)), fmaxf(fabsf(n2), fabsf(n3)));
+        float s = n0 + n1 + n2 + n3;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
+            s += __shfl_xor_sync(0xffffffff, s, off, 32);
+        }
+        const float id = (amax != 0.f) ? 127.f / amax : 0.f;
+        *reinterpret_cast<char4*>(obytes + q8a1024_qs_off(tile) + lane * 4) = make_char4(
+            (int8_t)__float2int_rn(n0 * id),
+            (int8_t)__float2int_rn(n1 * id),
+            (int8_t)__float2int_rn(n2 * id),
+            (int8_t)__float2int_rn(n3 * id));
+        if (lane == 0) {
+            half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(tile));
+            ds[0] = make_half2(__float2half_rn(amax / 127.f), __float2half_rn(s));
+        }
+    }
+}
+
+#define SILU_MUL_Q8A128_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME( \
+      const TYPENAME* gate, const TYPENAME* up, void* out, int rows, int cols) { \
+    silu_mul_q8a128_impl<TYPENAME>(gate, up, reinterpret_cast<block_q8a128*>(out), rows, cols); \
+  }
+
+SILU_MUL_Q8A128_OP(float, silu_mul_q8a128_f32)
+SILU_MUL_Q8A128_OP(__half, silu_mul_q8a128_f16)
+SILU_MUL_Q8A128_OP(__nv_bfloat16, silu_mul_q8a128_bf16)

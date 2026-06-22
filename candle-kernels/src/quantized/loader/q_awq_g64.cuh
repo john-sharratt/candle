@@ -315,7 +315,35 @@ struct gemx_dequant_traits<block_c_q_awq_g64, compute_t, scale_t> {
     
     // K/128 block byte size (80 = 64 qs + 4 scales + 4 zeros + 8 padding)
     static constexpr int K128_BYTES = 80;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 4-bit unsigned asymmetric (w = scale·q + neg_sz), group size 64 → 2 groups per
+    // K/128 block. LOP3 nibble order (mask + prmt 0x3120). Fields 0-7 use group 0,
+    // 8-15 group 1, so each 32-K sub falls entirely in one group (sub>>1): subs 0,1
+    // → scales/zeros[0], subs 2,3 → [1]. One scale per sub, fits the single-scale fold.
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int sh = (q3 & 1) * 4;
+        const int v0 = *reinterpret_cast<const int*>(rb + (sub * 4 + (q3 >> 1)) * 4);
+        const int v1 = *reinterpret_cast<const int*>(rb + (sub * 4 + 2 + (q3 >> 1)) * 4);
+        b_frag[0] = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        b_frag[1] = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+    }
+    // Affine {scale, neg_sz = -scale·zero} for the sub's 64-group g = sub>>1;
+    // scales[g]@byte 64+2g, zeros[g]@byte 68+2g.
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        const int g = sub >> 1;
+        const float scale = __half2float(*reinterpret_cast<const half*>(row_block + 64 + g * 2));
+        const float zero = __half2float(*reinterpret_cast<const half*>(row_block + 68 + g * 2));
+        return __halves2half2(__float2half(scale), __float2half(-scale * zero));
+    }
+
     // =========================================================================
     // RUNTIME DEQUANT FOR MMA m16n8k16
     // =========================================================================

@@ -26,3 +26,11 @@ INSTANTIATE_KERNELS(
     QK_Q_AWQ_G64_KTILE, QI_Q_AWQ_G64_KTILE, block_c_q_awq_g64, VDR_Q_AWQ_G64_KTILE,
     float, float
 )
+
+// q8a128 TC path — INT8-MMA grouped matmul for AWQ g64 (4-bit affine weights, one
+// scale/zero per 64-group, F32 output). See grouped_tc_int8.
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q_awq_g64_int8_f32,
+    QK_Q_AWQ_G64_KTILE, QI_Q_AWQ_G64_KTILE, block_c_q_awq_g64, VDR_Q_AWQ_G64_KTILE,
+    float
+)

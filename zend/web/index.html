@@ -1,1516 +1,1626 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Zend</title>
-  <script src="/marked.min.js"></script>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    :root {
-      --bg:          #1c1917;
-      --bg-sidebar:  #131210;
-      --bg-surface:  #26231f;
-      --bg-hover:    #2c2926;
-      --bg-user:     #2f2c29;
-      --bg-input:    #232120;
-      --bg-code:     #161412;
-      --bg-code-hdr: #1e1b19;
-      --bg-log:      #0f0e0d;
-      --border:      #38342f;
-      --border-dim:  #252220;
-      --border-code: #2e2b27;
-      --text:        #ece8e4;
-      --text-dim:    #9a9490;
-      --text-muted:  #5a5652;
-      --text-code:   #b8d4a4;
-      --accent:      #c98a3e;
-      --accent-dim:  #8c5f28;
-    }
-
-    html, body {
-      height: 100%;
-      overflow: hidden;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      font-size: 16px;
-      line-height: 1.65;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    /* ── Three-column layout ───────────────────────────────────────────────── */
-
-    #layout { display: flex; height: 100vh; width: 100vw; }
-
-    /* ── Left sidebar — conversation list ─────────────────────────────────── */
-
-    #sidebar {
-      width: 220px;
-      flex-shrink: 0;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-sidebar);
-    }
-
-    .col-resizer {
-      flex-shrink: 0;
-      width: 5px;
-      height: 100%;
-      cursor: col-resize;
-      position: relative;
-      background: transparent;
-      z-index: 20;
-    }
-    .col-resizer::after {
-      content: '';
-      position: absolute;
-      left: 2px; top: 0; bottom: 0;
-      width: 1px;
-      background: var(--border-dim);
-      transition: background 0.15s, width 0.15s, left 0.15s;
-    }
-    .col-resizer:hover::after,
-    .col-resizer.dragging::after {
-      background: var(--accent-dim);
-      width: 2px;
-      left: 1.5px;
-    }
-
-    /* ── Sidebar — cool blue-grey theme ───────────────────────────────────── */
-
-    #sidebar { background: #1e2a3a; color: #c0ccd8; }
-
-    #sidebar-header {
-      flex-shrink: 0;
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 0.9rem 0.8rem 0.75rem;
-      border-bottom: 1px solid #2a3848;
-      background: #19222f;
-    }
-
-    .brand { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; font-weight: 650; letter-spacing: 0.01em; color: #d0dae4; }
-    .brand-logo { flex-shrink: 0; display: block; }
-
-    #new-chat-btn {
-      width: 27px; height: 27px; border-radius: 6px;
-      border: 1px solid #334455; background: transparent; color: #6a8098;
-      cursor: pointer; display: flex; align-items: center; justify-content: center;
-      transition: background 0.13s, color 0.13s, border-color 0.13s;
-    }
-    #new-chat-btn:hover { background: #253245; color: #c0ccd8; border-color: #445870; }
-    #new-chat-btn svg { width: 12px; height: 12px; }
-
-    .conv-section-label {
-      padding: 0.75rem 0.85rem 0.3rem;
-      font-size: 0.68rem; font-weight: 600; letter-spacing: 0.08em;
-      text-transform: uppercase; color: #4a6278;
-    }
-
-    #conv-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 0.4rem 0.5rem; }
-    #conv-list::-webkit-scrollbar { width: 3px; }
-    #conv-list::-webkit-scrollbar-thumb { background: #2e3f52; border-radius: 2px; }
-
-    .conv-item {
-      position: relative;
-      display: flex; align-items: center;
-      width: 100%; padding: 0.45rem 0.7rem 0.45rem 0.9rem;
-      border-radius: 7px; border: none;
-      background: transparent; color: #7a90a8;
-      font: inherit; font-size: 0.8rem; line-height: 1.35;
-      cursor: pointer; text-align: left;
-      transition: background 0.12s, color 0.12s;
-      min-width: 0;
-    }
-    .conv-item::before {
-      content: ""; position: absolute; left: 0; top: 20%; bottom: 20%;
-      width: 2px; border-radius: 1px; background: transparent; transition: background 0.15s;
-    }
-    .conv-item:hover  { background: #253245; color: #c0ccd8; }
-    .conv-item.active { background: #2c3d52; color: #d0dae4; font-weight: 500; }
-    .conv-item.active::before { background: var(--accent); }
-
-    .conv-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-    .conv-close {
-      flex-shrink: 0; width: 18px; height: 18px; border-radius: 4px;
-      border: none; background: none; color: #4a6278;
-      font-size: 14px; line-height: 1; cursor: pointer;
-      display: none; align-items: center; justify-content: center; padding: 0;
-      margin-left: 3px; transition: color 0.12s, background 0.12s;
-    }
-    .conv-item:hover .conv-close,
-    .conv-item.active .conv-close { display: flex; }
-    .conv-close:hover { color: #e07070; background: rgba(220,80,80,0.12); }
-
-    /* Archived rows are visually muted so they read as "tucked away" rather
-       than active — only ever visible when "show archived" is on. */
-    .conv-item.archived .conv-title { color: #5a7088; font-style: italic; }
-    .conv-item.archived:hover .conv-title { color: #c0ccd8; font-style: normal; }
-
-    #sidebar-empty { padding: 1rem 0.9rem; font-size: 0.775rem; color: #4a6278; line-height: 1.6; }
-
-    /* ── Sidebar footer — show-archived toggle ─────────────────────────────── */
-
-    #sidebar-footer {
-      flex-shrink: 0;
-      padding: 0.55rem 0.85rem 0.65rem;
-      border-top: 1px solid #2a3848;
-      background: #19222f;
-    }
-    #show-archived-label {
-      display: flex; align-items: center; gap: 0.45rem;
-      font-size: 0.72rem; color: #6a8098; cursor: pointer;
-      user-select: none;
-      transition: color 0.12s;
-    }
-    #show-archived-label:hover { color: #c0ccd8; }
-    #show-archived {
-      width: 13px; height: 13px;
-      accent-color: var(--accent);
-      cursor: pointer;
-    }
-
-    /* ── Resizer contrast overrides ────────────────────────────────────────── */
-
-    /* left resizer sits between dark-blue sidebar and dark-warm center */
-    #resizer-l::after { background: #2a3848; }
-    #resizer-l:hover::after, #resizer-l.dragging::after { background: #4a7aaa; }
-
-    /* right resizer sits between dark-warm center and very dark log pane */
-    #resizer-r::after { background: #3a3530; }
-    #resizer-r:hover::after, #resizer-r.dragging::after { background: var(--accent); }
-
-    /* ── Middle column — chat ──────────────────────────────────────────────── */
-
-    #main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
-
-    #app {
-      flex: 1; min-height: 0;
-      display: flex; flex-direction: column;
-      width: 100%;
-      position: relative;
-    }
-
-    /* ── Empty state ───────────────────────────────────────────────────────── */
-
-    #empty-state {
-      flex: 1; min-height: 0;
-      display: flex; flex-direction: column;
-      align-items: center; justify-content: center;
-      gap: 2.25rem; padding: 0 2.5rem 3rem;
-    }
-
-    .logo-area { display: flex; flex-direction: column; align-items: center; gap: 1.25rem; }
-    /* .logo-ring replaced by inline SVG */
-    #greeting { font-size: 1.9rem; font-weight: 600; letter-spacing: -0.4px; text-align: center; line-height: 1.2; color: var(--text); }
-
-    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; width: 100%; max-width: 500px; }
-
-    .card {
-      display: flex; flex-direction: column; gap: 0.3rem;
-      background: var(--bg-surface); border: 1px solid var(--border-dim); border-radius: 10px;
-      padding: 0.9rem 1rem; cursor: pointer; text-align: left;
-      transition: background 0.13s, border-color 0.13s, box-shadow 0.13s;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.25);
-    }
-    .card:hover {
-      background: var(--bg-hover); border-color: var(--border);
-      box-shadow: 0 3px 10px rgba(0,0,0,0.35);
-    }
-    .card:active { box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
-    .card-title { font-size: 0.84rem; font-weight: 600; color: var(--text); }
-    .card-sub   { font-size: 0.76rem; color: var(--text-dim); line-height: 1.4; }
-
-    /* ── Chat view ─────────────────────────────────────────────────────────── */
-
-    /* ── Loading overlay ──────────────────────────────────────────────────── */
-    #loading-overlay {
-      position: absolute; inset: 0; z-index: 50;
-      display: none;
-      align-items: center; justify-content: center;
-      /* Semi-opaque dark layer over whatever was behind (chat view of
-         the selected conversation, empty state, etc.) — dims the content
-         so the loading card stands out but you can still glimpse the
-         chrome behind it. */
-      background: rgba(15, 13, 12, 0.55);
-      backdrop-filter: blur(2px);
-    }
-    #loading-overlay.active { display: flex; }
-
-    /* While the daemon is loading, hide the chrome that doesn't make
-       sense yet — sidebar, its resizer, the welcome card behind the
-       overlay, and the chat input. The log pane stays visible since
-       it's the easiest way to see what the daemon is doing. */
-    body.loading #sidebar,
-    body.loading #resizer-l,
-    body.loading #empty-state,
-    body.loading #input-bar { display: none; }
-    .loading-card {
-      width: min(520px, 90%);
-      padding: 2rem 2.25rem;
-      background: #1c1a18;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      box-shadow: 0 10px 32px rgba(0,0,0,0.45);
-    }
-    .loading-title {
-      font-size: 0.78rem; font-weight: 650;
-      color: #8a7b6a; letter-spacing: 0.08em; text-transform: uppercase;
-      margin: 0 0 1.2rem 0;
-    }
-    .loading-current-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.85rem; }
-    .loading-spinner {
-      width: 14px; height: 14px; border-radius: 50%;
-      border: 2px solid #c98a3e; border-top-color: transparent;
-      animation: spin 0.9s linear infinite;
-      flex-shrink: 0;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .loading-current { font-size: 1.05rem; font-weight: 500; color: var(--text); }
-    .loading-progress-track {
-      height: 6px; background: #2a2724; border-radius: 3px; overflow: hidden;
-      margin-bottom: 1.1rem;
-    }
-    .loading-progress-bar {
-      height: 100%; background: linear-gradient(90deg, #c98a3e, #e0a85a);
-      width: 0%;
-      transition: width 0.25s ease-out;
-    }
-    .loading-completed-list { list-style: none; padding: 0; margin: 0 0 0.9rem 0; }
-    .loading-completed-list li {
-      font-size: 0.88rem; color: #7c736a; padding: 0.2rem 0;
-      display: flex; align-items: center; gap: 0.6rem;
-    }
-    .loading-completed-list li::before {
-      content: '✓'; color: #34d399; font-weight: 700;
-    }
-    .loading-detail {
-      font-size: 0.82rem; color: #5e554c; margin-top: 0.6rem;
-      min-height: 1.2em; font-variant-numeric: tabular-nums;
-    }
-
-    #chat-view {
-      display: none; flex-direction: column;
-      flex: 1; min-height: 0; overflow-y: auto;
-      padding: 2rem 2rem 0.5rem;
-      scroll-behavior: auto;
-    }
-    #chat-view.active { display: flex; }
-    #chat-view::-webkit-scrollbar { width: 4px; }
-    #chat-view::-webkit-scrollbar-thumb { background: var(--border-dim); border-radius: 2px; }
-
-    .turn { display: flex; gap: 0.85rem; margin-bottom: 2rem; }
-
-    .turn.user { flex-direction: row-reverse; padding-left: 3rem; }
-    .turn.user .bubble {
-      background: var(--bg-user); border: 1px solid var(--border-dim);
-      border-radius: 16px 16px 3px 16px;
-      padding: 0.65rem 1.05rem; white-space: pre-wrap; word-break: break-word; line-height: 1.6;
-    }
-
-    .turn.assistant { align-items: flex-start; padding-right: 2rem; }
-    .asst-icon {
-      flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%;
-      background: var(--bg-surface); border: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: center;
-      color: var(--bg-surface); margin-top: 3px;
-    }
-    .turn.assistant .bubble { flex: 1; min-width: 0; word-break: break-word; line-height: 1.7; }
-
-    /* ── Markdown ──────────────────────────────────────────────────────────── */
-
-    .bubble p            { margin-bottom: 0.85rem; }
-    .bubble p:last-child { margin-bottom: 0; }
-    .bubble strong       { font-weight: 650; }
-    .bubble em           { font-style: italic; color: var(--text-dim); }
-    .bubble h1, .bubble h2, .bubble h3 { font-weight: 650; margin: 1.1rem 0 0.5rem; line-height: 1.3; }
-    .bubble h1 { font-size: 1.35rem; }
-    .bubble h2 { font-size: 1.15rem; }
-    .bubble h3 { font-size: 1.05rem; }
-    .bubble ul  { padding-left: 1.5rem; margin-bottom: 0.85rem; list-style-position: outside; }
-    .bubble ol  { padding-left: 1.75rem; margin-bottom: 0.85rem; list-style-position: outside; }
-    .bubble li  { margin-bottom: 0.25rem; }
-    .bubble code {
-      font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace;
-      font-size: 0.82em; background: var(--bg-code); border: 1px solid var(--border-code);
-      border-radius: 4px; padding: 0.1em 0.38em; color: var(--text-code);
-    }
-    .code-block { margin: 0.9rem 0; border: 1px solid var(--border-code); border-radius: 9px; overflow: hidden; background: var(--bg-code); }
-    .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 0.4rem 0.85rem; background: var(--bg-code-hdr); border-bottom: 1px solid var(--border-code); }
-    .code-lang { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-muted); }
-    .copy-btn { font-size: 0.72rem; color: var(--text-muted); background: none; border: none; cursor: pointer; padding: 0.1rem 0.35rem; border-radius: 4px; transition: color 0.13s, background 0.13s; font-family: inherit; }
-    .copy-btn:hover { color: var(--text); background: var(--bg-hover); }
-    .code-block pre { margin: 0; padding: 0.75rem 1rem; overflow-x: auto; font-size: 0.8rem; line-height: 1.5; }
-    .code-block pre code { background: none; border: none; padding: 0; font-size: inherit; color: var(--text); font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace; }
-
-    .cursor { display: inline-block; width: 2px; height: 0.85em; background: var(--text-dim); vertical-align: text-bottom; margin-left: 1px; animation: blink 0.85s step-end infinite; }
-    @keyframes blink { 50% { opacity: 0; } }
-
-    .error-turn {
-      display: inline-flex; align-items: center; gap: 0.45rem;
-      font-size: 0.83rem; color: #c96060;
-      background: rgba(200,80,80,0.08); border: 1px solid rgba(200,80,80,0.18);
-      border-radius: 8px; padding: 0.4rem 0.75rem;
-    }
-
-    /* ── Loading dots (shown while model is still loading) ────────────────── */
-    .loading-dots { display: inline-flex; gap: 5px; align-items: center; }
-    .loading-dots span:not(.status-text) {
-      flex-shrink: 0; width: 7px; height: 7px; border-radius: 50%;
-      background: var(--text-muted);
-      animation: dot-bounce 1.3s ease-in-out infinite;
-    }
-    .loading-dots span:nth-child(2) { animation-delay: 0.22s; }
-    .loading-dots span:nth-child(3) { animation-delay: 0.44s; }
-    @keyframes dot-bounce {
-      0%, 65%, 100% { transform: translateY(0);   opacity: 0.35; }
-      32%            { transform: translateY(-6px); opacity: 1; }
-    }
-
-    /* ── Status message (shown during model load / processing phases) ──────── */
-    .loading-dots .status-text {
-      font-size: 0.82rem; color: var(--text-muted);
-      font-style: italic; margin-left: 0.75rem; white-space: nowrap;
-      line-height: 1; align-self: center;
-    }
-
-    /* ── Input bar ─────────────────────────────────────────────────────────── */
-
-    #input-bar { flex-shrink: 0; position: relative; padding: 0 2rem 1.5rem; background: var(--bg); }
-    #input-bar::before { content: ""; position: absolute; top: -3rem; left: 0; right: 0; height: 3rem; background: linear-gradient(to bottom, transparent, var(--bg)); pointer-events: none; }
-    #input-bar.archived .input-wrap { display: none; }
-    #archived-notice {
-      display: none; text-align: center; color: var(--text-muted);
-      font-size: 0.85rem; font-style: italic; padding: 0.9rem 1rem;
-      border: 1px dashed var(--border); border-radius: 14px;
-      background: color-mix(in srgb, var(--bg-input) 60%, transparent);
-    }
-    #input-bar.archived #archived-notice { display: block; }
-
-    .input-wrap {
-      display: flex; align-items: flex-end; gap: 0.55rem;
-      background: var(--bg-input); border: 1px solid var(--border); border-radius: 14px;
-      padding: 0.8rem 0.75rem 0.8rem 1.1rem;
-      transition: border-color 0.15s, box-shadow 0.15s;
-    }
-    .input-wrap:focus-within { border-color: #504c47; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 6%, transparent); }
-
-    #prompt { flex: 1; background: none; border: none; outline: none; color: var(--text); font: inherit; font-size: 0.95rem; resize: none; min-height: 24px; max-height: 200px; line-height: 1.55; overflow-y: auto; }
-    #prompt::placeholder { color: var(--text-muted); }
-
-    #send-btn {
-      flex-shrink: 0; width: 34px; height: 34px; border-radius: 50%; border: none;
-      background: var(--accent); color: #fff; cursor: pointer;
-      display: flex; align-items: center; justify-content: center;
-      opacity: 0.3; transition: opacity 0.15s, background 0.15s, transform 0.1s; padding: 0;
-    }
-    #send-btn.ready       { opacity: 1; }
-    #send-btn.ready:hover { background: #d4923f; transform: scale(1.06); }
-    #send-btn:disabled    { cursor: default; }
-    #send-btn svg         { width: 14px; height: 14px; }
-
-    /* ── Right column — live log pane ──────────────────────────────────────── */
-
-    #log-pane {
-      flex-shrink: 0;
-      width: 310px;
-      height: 100%;
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-log);
-      overflow: hidden;
-    }
-
-    #log-header {
-      flex-shrink: 0;
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 0.9rem 0.75rem 0.75rem;
-      border-bottom: 1px solid var(--border-dim);
-      background: var(--bg-log);
-    }
-
-    .log-title { font-size: 0.78rem; font-weight: 650; color: #5a5450; letter-spacing: 0.06em; text-transform: uppercase; }
-
-    .log-hdr-right { display: flex; align-items: center; gap: 0.55rem; }
-
-    .log-dot {
-      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
-      transition: background 0.3s, box-shadow 0.3s;
-    }
-    .log-dot.ok   { background: #34d399; box-shadow: 0 0 5px #34d39966; }
-    .log-dot.wait { background: #fbbf24; }
-    .log-dot.err  { background: #f87171; }
-
-    .log-btn {
-      font-size: 0.68rem; color: var(--text-muted); background: none;
-      border: 1px solid var(--border-dim); border-radius: 4px;
-      padding: 0.12rem 0.45rem; cursor: pointer; font-family: inherit;
-      transition: color 0.12s, border-color 0.12s;
-    }
-    .log-btn:hover { color: var(--text); border-color: var(--border); }
-
-    #log-entries {
-      flex: 1; min-height: 0;
-      overflow-y: auto;
-      font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace;
-      font-size: 11px;
-      line-height: 1.55;
-      padding: 0.3rem 0;
-    }
-    #log-entries::-webkit-scrollbar { width: 3px; }
-    #log-entries::-webkit-scrollbar-thumb { background: #2a2724; border-radius: 2px; }
-
-    .le {
-      display: grid;
-      grid-template-columns: 54px 42px 1fr;
-      gap: 0 0.4rem;
-      padding: 0.12rem 0.65rem;
-      align-items: center;
-      min-width: 0;
-    }
-    .le:hover { background: #181614; }
-
-    .le-ts {
-      color: #4a4540; white-space: nowrap; overflow: hidden; user-select: none;
-      font-size: 10px; letter-spacing: 0.02em;
-    }
-    .le-level {
-      font-size: 9px; font-weight: 700; letter-spacing: 0.06em;
-      text-transform: uppercase; white-space: nowrap;
-      padding: 0.15em 0.4em; border-radius: 3px;
-      display: inline-block; text-align: center;
-    }
-    .le-body  { min-width: 0; color: #8a8580; word-break: break-word; white-space: pre-wrap; }
-    .le-target { color: #56504a; }
-    .le-msg    { color: #c0bbb6; }
-
-    .lv-TRACE { color: #9b8fdf; background: rgba(124,111,207,0.13); }
-    .lv-DEBUG { color: #5e9cd8; background: rgba(78,140,200,0.13); }
-    .lv-INFO  { color: #38b285; background: rgba(45,154,114,0.14); }
-    .lv-WARN  { color: #d4a020; background: rgba(212,160,32,0.14); }
-    .lv-ERROR { color: #e05555; background: rgba(224,85,85,0.14); }
-
-    /* ── Tool call card ───────────────────────────────────────────────── */
-    .tool-call-card {
-      margin: 0.5rem 0;
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-left: 3px solid var(--accent-dim);
-      border-radius: 8px;
-      overflow: hidden;
-      font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace;
-      font-size: 0.82rem;
-    }
-    .tool-call-card.tool-call-pending { border-left-color: var(--text-muted); }
-    .tool-call-header {
-      display: flex; align-items: center; gap: 0.5rem;
-      padding: 0.4rem 0.75rem;
-      background: var(--bg-code-hdr);
-      border-bottom: 1px solid var(--border-code);
-    }
-    .tool-call-icon { color: var(--accent-dim); font-size: 0.8rem; }
-    .tool-call-name { font-weight: 600; color: var(--accent); letter-spacing: 0.02em; }
-    .tool-call-card.tool-call-pending .tool-call-name {
-      color: var(--text-muted);
-      animation: tool-pulse 1.5s ease-in-out infinite;
-    }
-    @keyframes tool-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
-    .tool-call-args { padding: 0.4rem 0.75rem 0.5rem; display: flex; flex-direction: column; gap: 0.15rem; }
-    .tool-call-arg  { display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; }
-    .tool-call-arg-key { color: var(--text-dim); white-space: nowrap; }
-    .tool-call-arg-sep { color: var(--text-muted); }
-    .tool-call-arg-val { color: var(--text-code); word-break: break-word; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zend</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif; background: #1c1917; color: #ece8e4; font-size: 16px; line-height: 1.65; -webkit-font-smoothing: antialiased; }
+  #zend-prompt::placeholder { color: #5a5652; }
+  .zscroll { scrollbar-width: thin; scrollbar-color: #4a443e transparent; }
+  .zscroll::-webkit-scrollbar { width: 11px; }
+  .zscroll::-webkit-scrollbar-track { background: transparent; }
+  .zscroll::-webkit-scrollbar-thumb { background: #4a443e; border-radius: 6px; border: 3px solid #1c1917; background-clip: padding-box; min-height: 40px; }
+  .zscroll::-webkit-scrollbar-thumb:hover { background: #6b635b; border: 3px solid #1c1917; background-clip: padding-box; }
+  .zscroll-wide { scrollbar-width: auto; }
+  .zscroll-wide::-webkit-scrollbar { width: 16px; }
+  .zscroll-wide::-webkit-scrollbar-thumb { background: #4a443e; border-radius: 8px; border: 4px solid #1c1917; background-clip: padding-box; }
+  .zscroll-wide::-webkit-scrollbar-thumb:hover { background: #6b635b; border: 4px solid #1c1917; background-clip: padding-box; }
+  .zscroll-blue::-webkit-scrollbar { width: 3px; }
+  .zscroll-blue::-webkit-scrollbar-thumb { background: #2e3f52; border-radius: 2px; }
+  .zscroll-log::-webkit-scrollbar { width: 3px; }
+  .zscroll-log::-webkit-scrollbar-thumb { background: #2a2724; border-radius: 2px; }
+  @keyframes zblink { 50% { opacity: 0; } }
+  @keyframes zdot { 0%,65%,100% { transform: translateY(0); opacity: .35; } 32% { transform: translateY(-6px); opacity: 1; } }
+  @keyframes zpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  @keyframes zspin { to { transform: rotate(360deg); } }
+  .zspin { display:inline-block; width:13px; height:13px; border:2px solid #3a352f; border-top-color:#c7b89a; border-radius:50%; animation: zspin .7s linear infinite; }
+  .zsub-hdr { transition: background .12s; } .zsub-hdr:hover { background:#272320 !important; }
+  .zsub-row { transition: background .12s; } .zsub-row:hover { background:#211e1b; }
+  .zsub-chev { display:inline-block; transition: transform .15s ease; } .zsub-chev.open { transform: rotate(90deg); }
+  .zmd p { margin-bottom: .85rem; } .zmd > p:last-child { margin-bottom: 0; }
+  .zmd strong { font-weight: 650; } .zmd em { font-style: italic; color: #9a9490; }
+  .zmd h1,.zmd h2,.zmd h3 { font-weight: 650; margin: 1.1rem 0 .5rem; line-height: 1.3; }
+  .zmd h1 { font-size: 1.35rem; } .zmd h2 { font-size: 1.15rem; } .zmd h3 { font-size: 1.05rem; }
+  .zmd ul { padding-left: 1.5rem; margin-bottom: .85rem; } .zmd ol { padding-left: 1.75rem; margin-bottom: .85rem; }
+  .zmd li { margin-bottom: .25rem; }
+  .zmd li > ul, .zmd li > ol { margin-bottom: 0; margin-top: .25rem; }
+  .zmd code { font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .82em; background: #161412; border: 1px solid #2e2b27; border-radius: 4px; padding: .1em .38em; color: #b8d4a4; }
+  .zmd .code-block { margin: .9rem 0; border: 1px solid #2e2b27; border-radius: 9px; overflow: hidden; background: #161412; }
+  .zmd .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: .4rem .85rem; background: #1e1b19; border-bottom: 1px solid #2e2b27; }
+  .zmd .code-lang { font-size: .72rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: #5a5652; }
+  .zmd .copy-btn { font-size: .72rem; color: #5a5652; background: none; border: none; cursor: pointer; padding: .1rem .35rem; border-radius: 4px; font-family: inherit; transition: color .13s, background .13s; }
+  .zmd .copy-btn:hover { color: #ece8e4; background: #2c2926; }
+  .zmd .code-block pre { margin: 0; padding: .75rem 1rem; overflow-x: auto; font-size: .8rem; line-height: 1.5; }
+  .zmd .code-block pre code { background: none; border: none; padding: 0; font-size: inherit; color: #ece8e4; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; }
+  .zmd .zcursor { display: inline-block; width: 2px; height: .85em; background: #9a9490; vertical-align: text-bottom; margin-left: 1px; animation: zblink .85s step-end infinite; }
+  .zmd .tool-call-card { margin: .5rem 0; background: #26231f; border: 1px solid #38342f; border-left: 3px solid #8c5f28; border-radius: 8px; overflow: hidden; font-family: "Cascadia Code","Fira Code","JetBrains Mono",Consolas,monospace; font-size: .82rem; }
+  .zmd .tool-call-card.pending { border-left-color: #5a5652; }
+  .zmd .tool-call-header { display: flex; align-items: center; gap: .5rem; padding: .4rem .75rem; background: #1e1b19; border-bottom: 1px solid #2e2b27; }
+  .zmd .tool-call-icon { color: #8c5f28; font-size: .8rem; }
+  .zmd .tool-call-name { font-weight: 600; color: #c98a3e; letter-spacing: .02em; }
+  .zmd .tool-call-card.pending .tool-call-name { color: #5a5652; animation: zpulse 1.5s ease-in-out infinite; }
+  .zmd .tool-call-args { padding: .4rem .75rem .5rem; display: flex; flex-direction: column; gap: .15rem; }
+  .zmd .tool-call-arg { display: flex; gap: .4rem; align-items: baseline; flex-wrap: wrap; }
+  .zmd .tool-call-arg-key { color: #9a9490; white-space: nowrap; }
+  .zmd .tool-call-arg-sep { color: #5a5652; }
+  .zmd .tool-call-arg-val { color: #b8d4a4; word-break: break-word; }
+  .zmd .think-block { margin: .1rem 0 .9rem; }
+  .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
+  .zmd .think-summary:hover { color: #9a9490; }
+  .zmd .think-summary::-webkit-details-marker { display: none; }
+  .zmd .think-brain { width: 24px; height: 24px; color: #e08aa6; flex-shrink: 0; }
+  .zmd .think-chevron { width: 9px; height: 9px; color: #5a5652; transition: transform .18s; flex-shrink: 0; }
+  .zmd details[open] .think-chevron { transform: rotate(90deg); }
+  .zmd .think-label.think-pulse { animation: zpulse 1.5s ease-in-out infinite; }
+  .zmd .think-body { margin: .45rem 0 .2rem .15rem; padding-left: .9rem; border-left: 2px solid #2e2b27; color: #8a8074; font-size: .9em; line-height: 1.65; }
+  .zmd .think-body p { margin-bottom: .5rem; } .zmd .think-body p:last-child { margin-bottom: 0; }
+  .zmd .think-body code { font-size: .8em; }
+  .zmd .zdots { display: inline-flex; gap: 5px; align-items: center; margin-left: 6px; }
+  .zmd .zdots i { width: 7px; height: 7px; border-radius: 50%; background: #5a5652; display: inline-block; animation: zdot 1.3s ease-in-out infinite; }
+  .zmd .zdots i:nth-child(2) { animation-delay: .22s; } .zmd .zdots i:nth-child(3) { animation-delay: .44s; }
+  .zmd .zstatus { font-size: .82rem; color: #5a5652; font-style: italic; margin-left: .75rem; }
+  /* ── Ring spinner + loading card (startup overlay + in-chat waiting) ───── */
+  @keyframes zspin { to { transform: rotate(360deg); } }
+  .z-spin { width: 15px; height: 15px; border-radius: 50%; border: 2px solid #c98a3e; border-top-color: transparent; animation: zspin .9s linear infinite; flex-shrink: 0; box-sizing: border-box; }
+  .z-load-card { width: min(520px, 90%); padding: 2rem 2.25rem; background: #1c1a18; border: 1px solid #38342f; border-radius: 14px; box-shadow: 0 10px 32px rgba(0,0,0,0.45); }
+  .z-load-eyebrow { font-size: .78rem; font-weight: 650; color: #8a7b6a; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 1.2rem; }
+  .z-load-row { display: flex; align-items: center; gap: .75rem; margin-bottom: .95rem; }
+  .z-load-cur { font-size: 1.05rem; font-weight: 500; color: #ece8e4; }
+  .z-load-track { height: 6px; background: #2a2724; border-radius: 3px; overflow: hidden; margin-bottom: 1.1rem; }
+  .z-load-bar { height: 100%; background: linear-gradient(90deg, #c98a3e, #e0a85a); width: 0%; transition: width .25s ease-out; }
+  .z-load-list { list-style: none; padding: 0; margin: 0 0 .4rem; }
+  .z-load-list li { font-size: .88rem; color: #7c736a; padding: .2rem 0; display: flex; align-items: center; gap: .6rem; }
+  .z-load-list li::before { content: '✓'; color: #34d399; font-weight: 700; }
+  .z-load-detail { font-size: .82rem; color: #5e554c; margin-top: .6rem; min-height: 1.2em; font-variant-numeric: tabular-nums; }
+  @media (max-width: 1024px) { .z-logs { width: 280px !important; } }
+  @media (max-width: 720px) {
+    .z-sb { position: fixed !important; left: 0; top: 0; bottom: 0; width: 82vw !important; max-width: 320px; z-index: 130 !important; box-shadow: 6px 0 34px rgba(0,0,0,0.55); }
+    .z-rsz-l, .z-rsz-r { display: none !important; }
+    .z-logs { position: fixed !important; inset: 0 !important; width: auto !important; z-index: 140 !important; }
+    .z-files { width: 100% !important; }
+    .z-modal-ov { padding: 0 !important; }
+    .z-modal { width: 100% !important; max-width: none !important; height: 100% !important; max-height: 100% !important; border-radius: 0 !important; border: none !important; }
+  }
+  @media (max-width: 560px) { .z-dial-label { display: none !important; } }
+  .z-chatscroll > div:last-child { margin-bottom: 2.5rem !important; }
+</style>
 </head>
 <body>
-<div id="layout">
+<div id="app"></div>
 
-  <!-- ── Left sidebar — conversations ───────────────────────────────────── -->
-  <div id="sidebar">
-    <div id="sidebar-header">
-      <div class="brand">
-        <svg class="brand-logo" width="22" height="22" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
-          <defs>
-            <radialGradient id="lg" cx="50%" cy="50%" r="50%">
-              <stop offset="0%"   stop-color="#c98a3e" stop-opacity="0.22"/>
-              <stop offset="100%" stop-color="#c98a3e" stop-opacity="0"/>
-            </radialGradient>
-          </defs>
-          <rect width="32" height="32" rx="7.5" fill="#1a1714"/>
-          <rect width="32" height="32" rx="7.5" fill="url(#lg)"/>
-          <path d="M16 2.5 C 16.4,9.8 22.2,15.6 29.5,16 C 22.2,16.4 16.4,22.2 16,29.5 C 15.6,22.2 9.8,16.4 2.5,16 C 9.8,15.6 15.6,9.8 16,2.5 Z" fill="#c98a3e"/>
-          <circle cx="16" cy="16" r="3.2" fill="#1a1714" opacity="0.55"/>
-        </svg>
-        Zend
-      </div>
-      <button id="new-chat-btn" title="New conversation">
-        <svg viewBox="0 0 14 14" fill="none"><path d="M7 2v10M2 7h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-      </button>
-    </div>
-    <div id="conv-list">
-      <div id="sidebar-empty">No conversations yet.</div>
-    </div>
-    <div id="sidebar-footer">
-      <label id="show-archived-label" for="show-archived">
-        <input type="checkbox" id="show-archived" />
-        Show archived
-      </label>
-    </div>
-  </div>
-
-  <div class="col-resizer" id="resizer-l"></div>
-
-  <!-- ── Middle column — chat ───────────────────────────────────────────── -->
-  <div id="main">
-    <div id="app">
-      <div id="loading-overlay">
-        <div class="loading-card">
-          <h2 class="loading-title">Starting up</h2>
-          <div class="loading-current-row">
-            <div class="loading-spinner"></div>
-            <span class="loading-current" id="loading-current">Loading model</span>
-          </div>
-          <div class="loading-progress-track">
-            <div class="loading-progress-bar" id="loading-progress"></div>
-          </div>
-          <ul class="loading-completed-list" id="loading-completed"></ul>
-          <div class="loading-detail" id="loading-detail"></div>
-        </div>
-      </div>
-      <div id="empty-state">
-        <div class="logo-area">
-          <svg width="52" height="52" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" style="display:block">
-            <defs>
-              <radialGradient id="lg2" cx="50%" cy="50%" r="50%">
-                <stop offset="0%"   stop-color="#c98a3e" stop-opacity="0.22"/>
-                <stop offset="100%" stop-color="#c98a3e" stop-opacity="0"/>
-              </radialGradient>
-            </defs>
-            <rect width="32" height="32" rx="9" fill="#26231f"/>
-            <rect width="32" height="32" rx="9" fill="url(#lg2)"/>
-            <path d="M16 2.5 C 16.4,9.8 22.2,15.6 29.5,16 C 22.2,16.4 16.4,22.2 16,29.5 C 15.6,22.2 9.8,16.4 2.5,16 C 9.8,15.6 15.6,9.8 16,2.5 Z" fill="#c98a3e"/>
-            <circle cx="16" cy="16" r="3.2" fill="#26231f" opacity="0.55"/>
-          </svg>
-          <h1 id="greeting"></h1>
-        </div>
-        <div class="cards">
-          <button class="card" data-prompt="Give me a tour of the codebase — main crates, key files, and how everything connects.">
-            <span class="card-title">Explore codebase</span>
-            <span class="card-sub">Architecture overview and key components</span>
-          </button>
-          <button class="card" data-prompt="What are the most fragile or risky areas in the current implementation?">
-            <span class="card-title">Find weak spots</span>
-            <span class="card-sub">Fragile code, edge cases, tech debt</span>
-          </button>
-          <button class="card" data-prompt="Review the most recent commits and flag anything that looks incomplete or risky.">
-            <span class="card-title">Review changes</span>
-            <span class="card-sub">Critique the latest work on this branch</span>
-          </button>
-          <button class="card" data-prompt="What should I work on next for the most meaningful progress on this project?">
-            <span class="card-title">What's next</span>
-            <span class="card-sub">Highest-leverage next steps</span>
-          </button>
-        </div>
-      </div>
-      <div id="chat-view"></div>
-      <div id="input-bar">
-        <div class="input-wrap">
-          <textarea id="prompt" rows="1" placeholder="Message Zend…" autocomplete="off" spellcheck="true"></textarea>
-          <button id="send-btn" aria-label="Send" disabled>
-            <svg viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-        </div>
-        <div id="archived-notice">This conversation is archived.</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="col-resizer" id="resizer-r"></div>
-
-  <!-- ── Right column — live daemon log ─────────────────────────────────── -->
-  <div id="log-pane">
-    <div id="log-header">
-      <span class="log-title">Logs</span>
-      <div class="log-hdr-right">
-        <span id="log-dot" class="log-dot wait" title="connecting"></span>
-        <button id="log-clear" class="log-btn">Clear</button>
-      </div>
-    </div>
-    <div id="log-entries"></div>
-  </div>
-
-</div>
+<script src="zend-api.mock.js"></script>
+<script src="zend-api.live.js"></script>
+<script src="zend-api.js"></script>
 <script>
-'use strict';
+/* ============================================================================
+ * Zend UI — vanilla single-file app (plain DOM, no framework).
+ * Talks only to window.ZendAPI (the seam); never calls fetch directly.
+ * See docs/zend_ui_redesign.md.
+ * ========================================================================== */
+(function () {
+  'use strict';
+  const API = window.ZendAPI;
+  const ACCENT = '#c98a3e';
+  const PROJ_PALETTE = ['#c98a3e', '#6f9ed8', '#6cb39a', '#9b8fdf', '#d08a8a', '#cdb24a'];
+  // Below this viewport width the left pane forces to its rail and the
+  // projection timeline gutter is hidden, reclaiming horizontal space.
+  const NARROW_W = 820;
+  // At/above this width the chat reserves a right margin so its content stops
+  // left of the floating Logs/Files pills instead of running under them.
+  const WIDE_W = 1100;
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-// ── Chat state ─────────────────────────────────────────────────────────────────
-
-const conversations = [];
-let activeId = null;
-let chatAutoScroll = true;
-
-const emptyState   = document.getElementById('empty-state');
-const chatView     = document.getElementById('chat-view');
-const promptEl     = document.getElementById('prompt');
-const sendBtn      = document.getElementById('send-btn');
-const inputBar     = document.getElementById('input-bar');
-const convList     = document.getElementById('conv-list');
-const sidebarEmpty = document.getElementById('sidebar-empty');
-
-{
-  const h = new Date().getHours();
-  document.getElementById('greeting').textContent =
-    `Good ${h < 12 ? 'Morning' : h < 17 ? 'Afternoon' : 'Evening'}.`;
-}
-
-// When false the sidebar filters archived rows out. Toggled by the
-// "Show archived" checkbox at the bottom of the sidebar; persisted
-// across page loads via localStorage so a refresh keeps the user's
-// chosen view.
-let showArchived = (() => {
-  try { return localStorage.getItem('zend.showArchived') === '1'; }
-  catch (_) { return false; }
-})();
-
-// Drafts (local conv with no history yet) are hidden from the
-// sidebar until the user actually sends a message; only then does
-// the row appear. Archived rows are hidden unless "Show archived"
-// is on.
-function isDraft(conv) {
-  return !conv.remote && conv.history.length === 0 && !conv.pending;
-}
-function visibleConversations() {
-  return conversations.filter(c => !isDraft(c) && (showArchived || !c.archived));
-}
-
-function renderSidebar() {
-  const visible = visibleConversations();
-  sidebarEmpty.style.display = visible.length ? 'none' : '';
-  convList.querySelectorAll('.conv-item').forEach(el => el.remove());
-  for (const conv of visible) {
-    const btn = document.createElement('button');
-    const cls = ['conv-item'];
-    if (conv.id === activeId) cls.push('active');
-    if (conv.archived) cls.push('archived');
-    btn.className = cls.join(' ');
-    btn.innerHTML = `<span class="conv-title">${esc(conv.title)}</span>
-      <span class="conv-close" title="Close">✕</span>`;
-    btn.addEventListener('click', () => switchTo(conv.id));
-    btn.querySelector('.conv-close').addEventListener('click', e => {
-      e.stopPropagation();
-      closeConversation(conv.id);
-    });
-    convList.appendChild(btn);
-  }
-}
-
-// Archive a conversation: POST the archive endpoint and mark
-// archived locally. Any conv visible in the sidebar has at least
-// one message (drafts are filtered out by `isDraft`) and therefore
-// exists on the daemon, regardless of whether `conv.remote` was
-// set — that flag means "needs hydration from server" and is only
-// set on conversations recovered via the list endpoint, NOT on
-// ones created during this session. If the archive request fails
-// (daemon unreachable, model not loaded) leave the local state
-// alone so the user can retry.
-async function closeConversation(id) {
-  const idx = conversations.findIndex(c => c.id === id);
-  if (idx === -1) return;
-  const conv = conversations[idx];
-
-  try {
-    const res = await fetch(
-      `/v1/conversations/${encodeURIComponent(conv.id)}/archive`,
-      { method: 'POST' },
-    );
-    if (!res.ok) return;
-  } catch (_) { return; }
-  conv.archived = true;
-
-  // If we just hid the active conv, switch to the next visible one
-  // (or open a fresh local one if nothing's visible).
-  if (activeId === id) {
-    const visible = visibleConversations();
-    if (visible.length === 0) {
-      activeId = null;
-      newConversation();
-      return;
+  // ── tiny hyperscript: real event listeners, html via {html} ──────────────
+  function h(tag, props) {
+    const el = document.createElement(tag);
+    props = props || {};
+    for (const k in props) {
+      const v = props[k];
+      if (v == null || v === false) continue;
+      if (k === 'style') el.setAttribute('style', v);
+      else if (k === 'class') el.className = v;
+      else if (k === 'html') el.innerHTML = v;
+      else if (k === 'ref' && typeof v === 'function') v(el);
+      else if (k.length > 2 && k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
+      else if (v === true) el.setAttribute(k, '');
+      else el.setAttribute(k, v);
     }
-    switchTo(visible[Math.min(idx, visible.length - 1)].id);
-  } else {
-    renderSidebar();
-  }
-}
-
-function switchTo(id) {
-  activeId = id;
-  const conv = conversations.find(c => c.id === id);
-  if (!conv) return;
-  renderSidebar();
-  rebuildChatView(conv);
-  updateInputBarForActive();
-  updateSendBtn();
-  if (!conv.archived) promptEl.focus();
-}
-
-function rebuildChatView(conv) {
-  if (conv.history.length === 0 && !conv.pending) {
-    emptyState.style.display = '';
-    chatView.classList.remove('active');
-    chatView.innerHTML = '';
-  } else {
-    emptyState.style.display = 'none';
-    chatView.innerHTML = '';
-    for (const msg of conv.history) {
-      if (msg.role === 'user') appendUserTurn(msg.content);
-      else {
-        const { bubble, cursor } = appendAssistantTurn();
-        bubble.innerHTML = renderContent(msg.content, false);
-        cursor.remove();
-      }
-    }
-    // Re-attach the in-progress streaming turn if one exists.
-    if (conv.pending) chatView.appendChild(conv.pending);
-    chatView.classList.add('active');
-    chatAutoScroll = true;
-    requestAnimationFrame(() => { chatView.scrollTop = chatView.scrollHeight; });
-  }
-}
-
-// Reset to the home view (greeting + four prompt cards). No draft
-// row is created in the sidebar — a conversation only materialises
-// there once the user actually sends a first message via send().
-function newConversation() {
-  activeId = null;
-  emptyState.style.display = '';
-  chatView.classList.remove('active');
-  chatView.innerHTML = '';
-  promptEl.value = '';
-  promptEl.style.height = 'auto';
-  inputBar.classList.remove('archived');
-  renderSidebar();
-  updateSendBtn();
-  promptEl.focus();
-}
-
-document.getElementById('new-chat-btn').addEventListener('click', newConversation);
-document.querySelectorAll('.card').forEach(c =>
-  c.addEventListener('click', () => { send(c.dataset.prompt); promptEl.focus(); }));
-newConversation();
-
-// "Show archived" checkbox — toggles whether archived conversations
-// appear in the sidebar. Local-only filter; the conversations array
-// already holds both kinds (we always fetch with include_archived=
-// true). Choice persists in localStorage so a refresh keeps the
-// user's view.
-{
-  const cb = document.getElementById('show-archived');
-  cb.checked = showArchived;
-  cb.addEventListener('change', () => {
-    showArchived = cb.checked;
-    try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); }
-    catch (_) { /* localStorage disabled — accept the loss */ }
-    // If the currently-active conversation just became hidden,
-    // switch to the first visible one (or open a fresh local one).
-    if (activeId !== null) {
-      const active = conversations.find(c => c.id === activeId);
-      if (active && active.archived && !showArchived) {
-        const visible = visibleConversations();
-        if (visible.length === 0) {
-          activeId = null;
-          newConversation();
-          return;
-        }
-        switchTo(visible[0].id);
-        return;
-      }
-    }
-    renderSidebar();
-  });
-}
-
-// ── Recovered conversations sidebar ────────────────────────────────────────────
-//
-// Once the daemon finishes loading its substrate redo log it can list the
-// conversations it recovered. We poll `/v1/status` until ready, then fetch
-// `/v1/conversations` and merge those entries into the sidebar. Clicking a
-// recovered entry lazily lifts its turns off disk via
-// `/v1/conversations/{id}` and renders them like any in-memory conversation.
-
-// Conv IDs we have already pulled history for — keyed by string form of id.
-const loadedRemote = new Set();
-
-// Last daemon boot timestamp we've observed via `/v1/status`. When the
-// daemon restarts this changes, which is the trigger to re-fetch the
-// conversations sidebar. `null` until the first successful status call.
-let lastDaemonStartedAt = null;
-
-async function refreshRecoveredConversations() {
-  let body;
-  // Always ask the daemon for archived rows too — we keep both
-  // archived and non-archived in the local store and filter at
-  // render time via `showArchived`. This lets the checkbox toggle
-  // be instant (no extra round-trip) and lets the archive POST
-  // flow update local state without re-fetching.
-  try {
-    const res = await fetch('/v1/conversations?include_archived=true');
-    if (!res.ok) return;
-    body = await res.json();
-  } catch (_) { return; }
-  if (!body || !Array.isArray(body.conversations)) return;
-
-  // The server is authoritative on daemon restart — anything the
-  // server no longer knows about (e.g. a wiped redo log) must be
-  // dropped locally too, including archived rows. Without this the
-  // sidebar accumulates stale entries that only F5 can clear.
-  const serverIds = new Set(body.conversations.map(e => String(e.id)));
-  let mutated = false;
-  for (let i = conversations.length - 1; i >= 0; i--) {
-    const c = conversations[i];
-    // Keep fresh local drafts (no history yet) — the daemon doesn't
-    // know about them until the first send, but the user is still
-    // composing.
-    if (isDraft(c)) continue;
-    if (!serverIds.has(String(c.id))) {
-      conversations.splice(i, 1);
-      loadedRemote.delete(String(c.id));
-      if (activeId === c.id) activeId = null;
-      mutated = true;
-    }
-  }
-
-  for (const entry of body.conversations) {
-    const existing = conversations.find(c => String(c.id) === entry.id);
-    if (existing) {
-      // Keep the local copy in sync with server state — archive
-      // status can change from another client / a manual API call.
-      if (existing.archived !== !!entry.archived) {
-        existing.archived = !!entry.archived;
-        mutated = true;
-      }
-      continue;
-    }
-    conversations.push({
-      id: entry.id,
-      title: entry.label || 'Conversation',
-      history: [],
-      remote: true,           // hydrate from server on first switchTo
-      updated_ms: entry.updated_ms ?? 0,
-      archived: !!entry.archived,
-    });
-    mutated = true;
-  }
-  if (mutated) {
-    // Newest-first by updated_ms; the unsaved local "New conversation" has
-    // no updated_ms and stays at the top.
-    conversations.sort((a, b) => {
-      const aTime = a.updated_ms ?? Number.MAX_SAFE_INTEGER;
-      const bTime = b.updated_ms ?? Number.MAX_SAFE_INTEGER;
-      return bTime - aTime;
-    });
-    // If the previously-active conv was dropped, drop the chat view
-    // back to home so the user isn't staring at orphan history.
-    if (activeId === null) newConversation();
-    renderSidebar();
-    updateInputBarForActive();
-  }
-}
-
-async function hydrateConversation(conv) {
-  if (!conv.remote || loadedRemote.has(String(conv.id))) return;
-  loadedRemote.add(String(conv.id));
-  try {
-    const res = await fetch(`/v1/conversations/${encodeURIComponent(conv.id)}`);
-    if (!res.ok) return;
-    const body = await res.json();
-    if (!body || !Array.isArray(body.messages)) return;
-    // Each substrate "turn" stores one iteration's full ChatML stream
-    // (`<|im_start|>user\n…<|im_end|><|im_start|>assistant\n…`). The
-    // tokenizer's decoder strips the special tokens, leaving literal
-    // `user\n` / `assistant\n` role markers on their own lines. Split
-    // each fetched message on those markers so each role becomes its
-    // own bubble.
-    conv.history = body.messages
-      .flatMap(m => splitChatMLTurn(m.role, m.content))
-      .filter(m => m.role === 'user' || m.role === 'assistant');
-    if (activeId === conv.id) rebuildChatView(conv);
-  } catch (_) { /* leave history empty — user can still send a new turn */ }
-}
-
-// Split a single substrate-stored turn's content into role-attributed
-// sub-messages. Lines that are exactly `user`, `assistant`, or
-// `system` (no other text) mark role boundaries. Within a user
-// segment, strip the `/no_think` dialect prefix; drop the segment
-// entirely if it's just a `<tool_response>…</tool_response>` wrapper
-// (those are tool-loop scaffolding, not human content). Assistant
-// segments pass through untouched — `renderContent` already turns
-// `<tool_call>…</tool_call>` into the inline tool-call card.
-function splitChatMLTurn(fallbackRole, content) {
-  const lines = content.split('\n');
-  const segments = [];
-  let role = fallbackRole;
-  let buf = [];
-
-  const flush = () => {
-    let text = buf.join('\n').trim();
-    if (role === 'user') {
-      text = text.replace(/^\/no_think\s*/, '').trim();
-      if (text.startsWith('<tool_response>') && text.endsWith('</tool_response>')) {
-        buf = [];
-        return;
-      }
-    }
-    if (text) segments.push({ role, content: text });
-    buf = [];
-  };
-
-  for (const line of lines) {
-    const t = line.trim();
-    if (t === 'user' || t === 'assistant' || t === 'system') {
-      flush();
-      role = t;
-    } else {
-      buf.push(line);
-    }
-  }
-  flush();
-  return segments;
-}
-
-// Hook switchTo: when the user picks a remote conv, hydrate it on demand.
-{
-  const origSwitchTo = switchTo;
-  switchTo = function(id) {
-    const conv = conversations.find(c => c.id === id);
-    origSwitchTo(id);
-    if (conv && conv.remote && !loadedRemote.has(String(conv.id))) {
-      hydrateConversation(conv).then(() => {
-        if (activeId === conv.id) rebuildChatView(conv);
+    for (let i = 2; i < arguments.length; i++) {
+      const kids = arguments[i];
+      (Array.isArray(kids) ? kids : [kids]).forEach((kid) => {
+        if (kid == null || kid === false) return;
+        el.appendChild(kid.nodeType ? kid : document.createTextNode(String(kid)));
       });
     }
+    return el;
+  }
+
+  // ── state ────────────────────────────────────────────────────────────────
+  const now = Date.now();
+  const S = {
+    conversations: [],   // filled by the async seed at boot (mock is sync, live fetches)
+    activeId: null,
+    loaded: {},
+    showArchived: (function () { try { return localStorage.getItem('zend.showArchived') === '1'; } catch (_) { return false; } })(),
+    sidebarCollapsed: false,
+    narrow: (typeof window !== 'undefined' && window.innerWidth < NARROW_W),
+    wide: (typeof window !== 'undefined' && window.innerWidth >= WIDE_W),
+    sidebarW: 220,
+    logW: 310,
+    dragging: null,
+    promptValue: '',
+    logsOpen: false,
+    effortLevel: 2,
+    verbosityLevel: 2,
+    openMenu: null,
+    theme: (function () { try { return localStorage.getItem('zend.theme') || 'dark'; } catch (_) { return 'dark'; } })(),
+    themeMenuOpen: false,
+    substrateOpen: false,
+    substrateNode: null,
+    substrateMsg: null,            // the assistant bubble the panel was opened from (decoded tail)
+    substrateUserMsg: null,        // the user message preceding it (the active turn body)
+    substrateHistory: [],          // prior conversation messages (verbatim, with roles)
+    substrateContent: null,        // name → authored section text (fetched lazily)
+    substrateTurnContent: {},      // "group::index" → { user, assistant } memory-tier body
+    substrateTargetLayer: '',      // the dialogue/target layer name (for message prefixes)
+    substrateGlue: null,           // dialect framing markers (system/user/assistant start/end)
+    substrateGroupOpen: {},        // group key → open? (default closed/collapsed)
+    substrateExpanded: {},         // section key → expanded (show content)?
+    filesOpen: false,
+    dragActive: false,
+    lastUploadedId: null,
+    fileView: null,
+    thinkOpen: {},
+    upload: null,
+    boot: { state: 'loading', detail: '', loading: { current: 'Starting', progress: 0, completed: [] } },
   };
-}
 
-// Loading overlay elements.
-const loadingOverlay  = document.getElementById('loading-overlay');
-const loadingCurrent  = document.getElementById('loading-current');
-const loadingProgress = document.getElementById('loading-progress');
-const loadingComplete = document.getElementById('loading-completed');
-const loadingDetail   = document.getElementById('loading-detail');
+  let chatEl = null, logEl = null, promptEl = null, filesListEl = null, substrateEl = null;
+  let stream = null, logUnsub = null, hlTimer = null;
+  let savedChatScroll = null, savedSubstrateScroll = null;
+  // Follow the bottom while streaming, but the instant the user scrolls UP they
+  // take over and we leave the scroll alone until they return to the bottom.
+  // `stick` is driven solely by the scroller's own scroll events (buildChat);
+  // every programmatic scroll keeps `lastScrollTop` in sync right after, so it
+  // can never be mistaken for a user scroll-up. (Safe now that streaming patches
+  // in place and no longer resets scrollTop with a full rebuild.)
+  let stick = true, lastScrollTop = 0, logStick = true;
+  const nearBottom = (el) => !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 24;
 
-function renderLoadingState(body) {
-  if (body.state === 'ready') {
-    loadingOverlay.classList.remove('active');
-    document.body.classList.remove('loading');
-    return;
+  // ── navigation tag ───────────────────────────────────────────────────────
+  // The active conversation lives in the URL hash, so a forced reload (after a
+  // daemon rebuild) lands the user back on the same conversation. The chat
+  // scroll position rides across the reload in sessionStorage.
+  function readHashConv() { const m = (location.hash || '').match(/conv=([^&]+)/); return m ? decodeURIComponent(m[1]) : null; }
+  function writeHashConv(id) {
+    try { const want = id ? ('#conv=' + encodeURIComponent(id)) : ''; if (location.hash !== want) history.replaceState(null, '', location.pathname + location.search + want); } catch (_) {}
   }
-  // body.state === 'loading'
-  loadingOverlay.classList.add('active');
-  document.body.classList.add('loading');
-  const info = body.loading || { current: '', progress: 0, completed: [] };
-  loadingCurrent.textContent  = info.current || 'Starting…';
-  loadingProgress.style.width = Math.round((info.progress || 0) * 100) + '%';
-  loadingDetail.textContent   = body.detail || '';
-  // Render completed list (idempotent — we just rewrite it).
-  loadingComplete.innerHTML = '';
-  for (const label of info.completed || []) {
-    const li = document.createElement('li');
-    li.textContent = label;
-    loadingComplete.appendChild(li);
+  let pendingScroll = (function () { try { const v = sessionStorage.getItem('zend.reload'); sessionStorage.removeItem('zend.reload'); return v ? JSON.parse(v) : null; } catch (_) { return null; } })();
+  function saveScrollForReload() { try { sessionStorage.setItem('zend.reload', JSON.stringify({ conv: S.activeId, scroll: chatEl ? chatEl.scrollTop : 0 })); } catch (_) {} }
+  // Capture the build on first sighting; force a reload when it changes.
+  function checkBuild(st) {
+    if (!st || !st.build) return false;
+    if (!window.ZEND_BUILD) { window.ZEND_BUILD = st.build; return false; }
+    if (st.build !== window.ZEND_BUILD) { saveScrollForReload(); location.reload(); return true; }
+    return false;
   }
-}
 
-// Continuous status poll. Drives both the loading overlay (during
-// startup) and the daemon-restart detector (whenever `started_at_ms`
-// changes, we re-fetch the conversations sidebar).
-(async function pollDaemonStatus() {
-  while (true) {
-    try {
-      const res = await fetch('/v1/status');
-      if (res.ok) {
-        const body = await res.json();
-        renderLoadingState(body);
-        const startedAt = body.started_at_ms;
-        const isReady = body.state === 'ready';
-        if (isReady && startedAt !== lastDaemonStartedAt) {
-          lastDaemonStartedAt = startedAt;
-          await refreshRecoveredConversations();
-        }
-      }
-    } catch (_) { /* network blip — retry */ }
-    await new Promise(r => setTimeout(r, 1000));
+  function setState(patch, cb) { Object.assign(S, patch); render(); if (cb) cb(); }
+  // Streaming updates (tokens / projections) patch ONLY the streaming message's
+  // content in place — they never rebuild the whole chat, so the scroller's
+  // `scrollTop` is never reset. That's the structural fix for jerky scrolling:
+  // with nothing resetting the scroll there's nothing to restore, so the user's
+  // scroll is left completely free; we only pin to the bottom when they're
+  // already there. Falls back to a full render if the message isn't in the DOM
+  // yet (first paint of the turn) or the target conversation isn't on screen.
+  let _livePending = false;
+  function scheduleLiveUpdate(convId) {
+    if (convId !== S.activeId) return;   // off-screen conversation: state is enough
+    if (_livePending) return;
+    _livePending = true;
+    requestAnimationFrame(() => { _livePending = false; liveUpdateStreaming(); });
   }
-})();
-
-function updateSendBtn() {
-  const conv  = conversations.find(c => c.id === activeId);
-  const ready = promptEl.value.trim().length > 0 && !conv?.streaming;
-  sendBtn.disabled = !ready;
-  sendBtn.classList.toggle('ready', ready);
-}
-
-// Hide the message textarea + send button for archived conversations
-// so the user can't extend them. The history still renders; only the
-// input affordance is suppressed.
-function updateInputBarForActive() {
-  const conv = conversations.find(c => c.id === activeId);
-  inputBar.classList.toggle('archived', !!conv?.archived);
-}
-
-promptEl.addEventListener('input', () => {
-  promptEl.style.height = 'auto';
-  promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
-  updateSendBtn();
-});
-promptEl.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!sendBtn.disabled) send(promptEl.value.trim()); }
-});
-sendBtn.addEventListener('click', () => { if (!sendBtn.disabled) send(promptEl.value.trim()); });
-
-// ── Markdown renderer ──────────────────────────────────────────────────────────
-
-{
-  const renderer = new marked.Renderer();
-  // marked.use wraps renderer methods with a compat shim that converts the token
-  // object to old-style (text, lang, escaped) args unless useNewRenderer:true.
-  // Use the old-style signature to avoid the shim rewriting our arguments.
-  renderer.code = (text, lang) => {
-    const langLabel = esc((lang || '').replace(/\s.*/, '') || 'text');
-    const code = esc(text || '');
-    return `<div class="code-block"><div class="code-block-header"><span class="code-lang">${langLabel}</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div><pre><code>${code}</code></pre></div>`;
-  };
-  marked.use({ renderer, breaks: false, gfm: true });
-}
-
-// Detect lines containing box-drawing or ASCII tree characters and wrap runs of
-// them in a fenced code block so marked treats them as preformatted text.
-// Matches: ├ └ ─ │ ┐ ┘ ┤ ╴ and the ASCII equivalents |-- +-- \-- used by
-// tools like `tree`. A run of 2+ such lines (or 1 line surrounded by tree lines)
-// that is not already inside a code fence gets wrapped in ```text ... ```.
-function preprocess(raw) {
-  const TREE_LINE = /[├└│┼┤┬┴─╴]|^\s*[|+\\`][-─ ]/;
-  const lines = raw.split('\n');
-  const out = [];
-  let i = 0;
-  while (i < lines.length) {
-    // Skip existing fenced code blocks unchanged.
-    if (/^```/.test(lines[i])) {
-      out.push(lines[i++]);
-      while (i < lines.length && !/^```/.test(lines[i])) out.push(lines[i++]);
-      if (i < lines.length) out.push(lines[i++]);
-      continue;
+  function liveUpdateStreaming() {
+    // Never rebuild the message DOM out from under an active text selection in
+    // the chat — doing so collapses the user's selection mid-copy (and the
+    // follow-to-bottom would yank the viewport). The streamed content is held in
+    // state, so the next token/projection re-fires this once the selection
+    // clears; nothing is lost, the live view just pauses while you select.
+    const seln = window.getSelection && window.getSelection();
+    if (seln && !seln.isCollapsed && seln.rangeCount && chatEl &&
+        chatEl.contains(seln.getRangeAt(0).commonAncestorContainer)) return;
+    const conv = activeConv();
+    if (!conv || !chatEl) { render(); return; }
+    let idx = -1, m = null;
+    for (let i = conv.history.length - 1; i >= 0; i--) {
+      if (conv.history[i].role === 'assistant') { idx = i; m = conv.history[i]; break; }
     }
-    // Collect a run of tree-like lines (allow blank lines within the run).
-    if (TREE_LINE.test(lines[i])) {
-      const run = [];
-      let j = i;
-      while (j < lines.length && !(/^```/.test(lines[j]))) {
-        if (TREE_LINE.test(lines[j]) || (lines[j].trim() === '' && run.length > 0)) {
-          run.push(lines[j++]);
-        } else {
-          break;
-        }
-      }
-      // Trim trailing blank lines from the run.
-      while (run.length && run[run.length - 1].trim() === '') run.pop();
-      if (run.length >= 2) {
-        out.push('```text', ...run, '```');
-        i = j;
+    const row = idx >= 0 && chatEl.querySelector('[data-msg="' + idx + '"]');
+    const zmd = row && row.querySelector('.zmd');
+    if (!zmd) { render(); return; }   // not laid out yet — fall back to full render
+    const open = !!S.thinkOpen[conv.id + ':' + idx];
+    zmd.innerHTML = nodeHtml(m, open);
+    if (!S.narrow) applyProjSegments(zmd, m);
+    // Follow the bottom only while the user hasn't scrolled away; keep
+    // lastScrollTop in sync so this programmatic move isn't read as a scroll-up.
+    if (stick) { chatEl.scrollTop = chatEl.scrollHeight; lastScrollTop = chatEl.scrollTop; }
+  }
+  function activeConv() { return S.conversations.find((c) => c.id === S.activeId) || null; }
+
+  // ── content rendering (markdown + think + tool calls) ───────────────────
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function mdInline(s) {
+    s = esc(s);
+    s = s.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    return s;
+  }
+  // Auto-wrap runs of ASCII-tree / box-drawing lines (├└│─ etc.) in a ```text
+  // fence so file trees and diagrams render monospace instead of ragged prose.
+  function preprocess(raw) {
+    const TREE_LINE = /[├└│┼┤┬┴─╴]|^\s*[|+\\`][-─ ]/;
+    const lines = raw.split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      if (/^```/.test(lines[i])) {
+        out.push(lines[i++]);
+        while (i < lines.length && !/^```/.test(lines[i])) out.push(lines[i++]);
+        if (i < lines.length) out.push(lines[i++]);
         continue;
       }
+      if (TREE_LINE.test(lines[i])) {
+        const run = [];
+        let j = i;
+        while (j < lines.length && !/^```/.test(lines[j])) {
+          if (TREE_LINE.test(lines[j]) || (lines[j].trim() === '' && run.length > 0)) run.push(lines[j++]);
+          else break;
+        }
+        while (run.length && run[run.length - 1].trim() === '') run.pop();
+        if (run.length >= 2) { out.push('```text'); for (const r of run) out.push(r); out.push('```'); i = j; continue; }
+      }
+      out.push(lines[i++]);
     }
-    out.push(lines[i++]);
+    return out.join('\n');
   }
-  return out.join('\n');
-}
 
-function renderMd(raw) {
-  return marked.parse(preprocess(raw));
-}
-
-function renderToolCallCard({ complete, json }) {
-  if (!complete) {
-    return '<div class="tool-call-card tool-call-pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
+  // A list item: leading indent, ordered (`1.`) vs unordered (`-`/`*`), content.
+  function listItemMatch(line) {
+    const m = line.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/);
+    return m ? { indent: m[1].length, ordered: /\d/.test(m[2]), content: m[3] } : null;
   }
-  let parsed;
-  try { parsed = JSON.parse(json.trim()); } catch {
-    return `<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">tool call</span></div><div class="tool-call-args"><div class="tool-call-arg"><span class="tool-call-arg-val">${esc(json.trim())}</span></div></div></div>`;
+  // Parse a list (with nested sub-lists) starting at lines[i]. Indentation drives
+  // nesting: a deeper-indented item becomes a sub-list inside the preceding item;
+  // a shallower item ends this level. Blank lines between items are tolerated.
+  // Returns [html, nextIndex].
+  function renderListBlock(lines, i) {
+    const first = listItemMatch(lines[i]);
+    const indent = first.indent, ordered = first.ordered;
+    let html = ordered ? '<ol>' : '<ul>';
+    while (i < lines.length) {
+      if (lines[i].trim() === '') {
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim() === '') j++;
+        const nm = j < lines.length ? listItemMatch(lines[j]) : null;
+        if (nm && nm.indent >= indent) { i = j; continue; }
+        break;
+      }
+      const m = listItemMatch(lines[i]);
+      if (!m || m.indent < indent) break;
+      if (m.indent > indent) {
+        const nested = renderListBlock(lines, i);
+        html = html.replace(/<\/li>$/, nested[0] + '</li>');
+        i = nested[1];
+        continue;
+      }
+      html += '<li>' + mdInline(m.content) + '</li>';
+      i++;
+    }
+    return [html + (ordered ? '</ol>' : '</ul>'), i];
   }
-  const name = parsed.name || '(unknown)';
-  const args = parsed.arguments ?? parsed.params ?? {};
-  const argsHtml = Object.entries(args).map(([k, v]) =>
-    `<div class="tool-call-arg"><span class="tool-call-arg-key">${esc(k)}</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">${esc(typeof v === 'string' ? v : JSON.stringify(v))}</span></div>`
-  ).join('');
-  return `<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">${esc(name)}</span></div>${argsHtml ? `<div class="tool-call-args">${argsHtml}</div>` : ''}</div>`;
-}
 
-function renderContent(text, streaming) {
-  const segments = [];
-  let remaining = text;
+  function renderMd(text) {
+    const lines = preprocess(text).split('\n');
+    let html = '', i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^```/.test(line)) {
+        const lang = line.slice(3).trim() || 'text';
+        const body = []; i++;
+        while (i < lines.length && !/^```/.test(lines[i])) { body.push(lines[i]); i++; }
+        i++;
+        html += '<div class="code-block"><div class="code-block-header"><span class="code-lang">' + esc(lang.replace(/\s.*/, '')) + '</span><button class="copy-btn">Copy</button></div><pre><code>' + esc(body.join('\n')) + '</code></pre></div>';
+        continue;
+      }
+      if (/^(#{1,3})\s+/.test(line)) {
+        const m = line.match(/^(#{1,3})\s+(.*)/);
+        html += '<h' + m[1].length + '>' + mdInline(m[2]) + '</h' + m[1].length + '>';
+        i++; continue;
+      }
+      if (listItemMatch(line)) {
+        const r = renderListBlock(lines, i);
+        html += r[0]; i = r[1];
+        continue;
+      }
+      if (line.trim() === '') { i++; continue; }
+      const para = [];
+      while (i < lines.length && lines[i].trim() !== '' && !/^```/.test(lines[i]) && !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\d+\.\s+/.test(lines[i]) && !/^#{1,3}\s+/.test(lines[i])) { para.push(lines[i]); i++; }
+      html += '<p>' + mdInline(para.join(' ')) + '</p>';
+    }
+    return html;
+  }
+  function toolCard(json, complete) {
+    if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
+    let parsed;
+    try { parsed = JSON.parse(json.trim()); } catch (e) {
+      return '<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">tool call</span></div></div>';
+    }
+    const name = parsed.name || '(unknown)';
+    const args = parsed.arguments || parsed.params || {};
+    const argsHtml = Object.entries(args).map(([k, v]) =>
+      '<div class="tool-call-arg"><span class="tool-call-arg-key">' + esc(k) + '</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">' + esc(typeof v === 'string' ? v : JSON.stringify(v)) + '</span></div>'
+    ).join('');
+    return '<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span></div>' + (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + '</div>';
+  }
+  function renderThink(seg, open) {
+    const words = (seg.body || '').trim().split(/\s+/).filter(Boolean).length;
+    const label = (seg.complete ? 'Thought process' : 'Thinking…') + ' · ' + words + (words === 1 ? ' word' : ' words');
+    const labelCls = seg.complete ? '' : ' think-pulse';
+    const body = renderMd((seg.body || '').trim());
+    return '<details class="think-block"' + (open ? ' open' : '') + '>' +
+      '<summary class="think-summary">' +
+      '<svg class="think-brain" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M12.4 18.4C12.5 19.8 12.2 21 12.6 22L13.8 22C14 21 13.8 19.6 14 18.4 15.1 18.8 16.4 18.6 17 17.6 18.4 17.6 19.4 16.3 19.2 14.9 20.3 14.4 20.6 13 19.8 12.1 20.5 11.2 20.4 9.8 19.3 9.4 19.3 7.9 18 6.8 16.5 7 16 5.9 14.6 5.4 13.4 5.9 12.7 5 11.3 5 10.5 5.7 9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 11 18.5 11.8 18.4 12.4 18.4Z" fill="#f3d2bd" stroke="#3f2c25" stroke-width="0.9"/>' +
+      '<path d="M10.5 5.7C9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 10.7 14.5 10.6 9.4 10.5 5.7Z" fill="#e8917f" stroke="#3f2c25" stroke-width="0.9"/>' +
+      '</svg>' +
+      '<span class="think-label' + labelCls + '">' + label + '</span>' +
+      '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+      '</summary><div class="think-body">' + body + '</div></details>';
+  }
+  function renderContent(text, streaming, open) {
+    const segs = [];
+    let rem = text;
+    rem = rem.replace(/<think>([\s\S]*?)<\/think>/g, (m, body) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: true, body }); return mk; });
+    rem = rem.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (m, json) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'tool', complete: true, json }); return mk; });
+    let openIdx = rem.lastIndexOf('<think>');
+    if (openIdx !== -1) {
+      if (streaming) { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: false, body: rem.slice(openIdx + 7) }); rem = rem.slice(0, openIdx) + mk; }
+      else rem = rem.slice(0, openIdx);
+    }
+    openIdx = rem.lastIndexOf('<tool_call>');
+    if (openIdx !== -1) {
+      if (streaming) { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'tool', complete: false, json: rem.slice(openIdx + 11) }); rem = rem.slice(0, openIdx) + mk; }
+      else rem = rem.slice(0, openIdx);
+    }
+    const parts = rem.split(/ SEG:(\d+) /);
+    let html = '';
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) { if (parts[i]) html += renderMd(parts[i]); }
+      else { const s = segs[parseInt(parts[i], 10)]; html += s.kind === 'think' ? renderThink(s, open) : toolCard(s.json, s.complete); }
+    }
+    return html;
+  }
+  function nodeHtml(msg, open) {
+    if (msg.streaming && !msg.content) {
+      // Bouncing dots while waiting; the italic word only appears if the daemon
+      // emits a status event (e.g. "retrieving context").
+      const status = msg.status ? '<span class="zstatus">' + esc(msg.status) + '</span>' : '';
+      return '<span class="zdots"><i></i><i></i><i></i>' + status + '</span>';
+    }
+    let html = renderContent(msg.content, !!msg.streaming, open);
+    if (msg.streaming) html += '<span class="zcursor"></span>';
+    return html;
+  }
 
-  // Complete tool calls with opener: <tool_call>JSON</tool_call>
-  remaining = remaining.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (_, json) => {
-    const marker = `\x00TC:${segments.length}\x00`;
-    segments.push({ complete: true, json });
-    return marker;
+  // ── projection display derivation (raw core -> display) ─────────────────
+  // The timeline dot's color (by span id). Bar-map colors are derived per
+  // bucket in buildProjPopover.
+  function projDisplay(sp) {
+    return { color: PROJ_PALETTE[(sp.id - 1) % PROJ_PALETTE.length] };
+  }
+  // Compact token count: 1.2k / 18.4k, bare integer below 1000.
+  function fmtTok(n) {
+    n = n || 0;
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+
+  function logColors(level) {
+    return ({
+      TRACE: ['#9b8fdf', 'rgba(124,111,207,0.13)'], DEBUG: ['#5e9cd8', 'rgba(78,140,200,0.13)'],
+      INFO: ['#38b285', 'rgba(45,154,114,0.14)'], WARN: ['#d4a020', 'rgba(212,160,32,0.14)'],
+      ERROR: ['#e05555', 'rgba(224,85,85,0.14)'],
+    })[level] || ['#38b285', 'rgba(45,154,114,0.14)'];
+  }
+  const fileColors = {
+    code: ['#6cb39a', 'rgba(108,179,154,0.14)'], log: ['#d4a020', 'rgba(212,160,32,0.14)'],
+    doc: ['#6f9ed8', 'rgba(111,158,216,0.14)'], text: ['#9a9490', 'rgba(154,148,144,0.14)'],
+    img: ['#e08aa6', 'rgba(224,138,166,0.14)'],
+  };
+
+  // ── logs state buffer ────────────────────────────────────────────────────
+  let logs = API.seedLogs();
+  function addLog(line) { if (!line) return; logs = logs.concat([line]).slice(-600); renderLogsOnly(); }
+
+  // ── actions ──────────────────────────────────────────────────────────────
+  function selectConv(id) { writeHashConv(id); setState({ activeId: id }, () => { hydrateIfNeeded(id); scrollChat(); focusPrompt(); }); }
+  function hydrateIfNeeded(id) {
+    const conv = S.conversations.find((c) => c.id === id);
+    if (!conv || S.loaded[id]) return;
+    S.loaded[id] = true;
+    API.getConversation(id).then((full) => {
+      const patch = { history: full.history || [] };
+      if (full.title != null) patch.title = full.title;
+      if (full.turn_count != null) patch.turn_count = full.turn_count;
+      S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, patch) : c);
+      // Glue + section content are workspace-wide — store globally so the
+      // projection panel renders the framing and expands sections with no fetch.
+      if (full.sectionContent) S.substrateContent = full.sectionContent;
+      if (full.turnContent) S.substrateTurnContent = full.turnContent;
+      if (full.targetLayer) S.substrateTargetLayer = full.targetLayer;
+      if (full.glue) S.substrateGlue = full.glue;
+      render();
+      if (S.activeId === id) scrollChat();
+    });
+  }
+  function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '' }, focusPrompt); }
+  function archiveConv(id, e) {
+    if (e) e.stopPropagation();
+    API.archiveConversation(id);
+    let conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: true }) : c);
+    let activeId = S.activeId;
+    if (activeId === id && !S.showArchived) {
+      const vis = conversations.filter((c) => !c.archived && (c.turn_count > 0 || c.history.length));
+      activeId = vis.length ? vis[0].id : null;
+    }
+    setState({ conversations, activeId }, focusPrompt);
+  }
+  function unarchiveConv(id, e) {
+    if (e) e.stopPropagation();
+    API.unarchiveConversation(id);
+    setState({ conversations: S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: false }) : c) }, focusPrompt);
+  }
+  function toggleArchived() {
+    const showArchived = !S.showArchived;
+    try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); } catch (_) {}
+    let activeId = S.activeId;
+    if (!showArchived) { const a = S.conversations.find((c) => c.id === activeId); if (a && a.archived) activeId = null; }
+    setState({ showArchived, activeId }, focusPrompt);
+  }
+
+  function send(text) {
+    text = (text || '').trim();
+    if (!text) return;
+    const conv = activeConv();
+    if (conv && conv.streaming) return;
+    let conversations = S.conversations.slice();
+    let activeId = S.activeId;
+    let target;
+    const titleOf = (t) => t.length > 44 ? t.slice(0, 42) + '…' : t;
+    if (activeId === null) {
+      const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now();
+      target = { id, title: titleOf(text), archived: false, updated_ms: Date.now(), turn_count: 0, history: [] };
+      conversations = [target].concat(conversations);
+      activeId = id;
+      S.loaded[id] = true;
+    } else {
+      target = conversations.find((c) => c.id === activeId);
+      if (target.history.length === 0) target.title = titleOf(text);
+    }
+    target.history = target.history.concat([
+      { role: 'user', content: text },
+      { role: 'assistant', content: '', streaming: true, status: '' },
+    ]);
+    target.streaming = true;
+    setState({ conversations, activeId, promptValue: '' }, () => {
+      writeHashConv(activeId);
+      scrollChat();
+      addLog(API.nextLogLine());
+      startStream(activeId, text);
+    });
+    if (promptEl) promptEl.style.height = 'auto';
+  }
+
+  function patchStream(convId, fn) {
+    S.conversations = S.conversations.map((c) => {
+      if (c.id !== convId) return c;
+      const history = c.history.slice();
+      const last = Object.assign({}, history[history.length - 1]);
+      fn(last);
+      history[history.length - 1] = last;
+      return Object.assign({}, c, { history });
+    });
+    scheduleLiveUpdate(convId);
+  }
+  function appendProjection(convId, span) {
+    S.conversations = S.conversations.map((c) => {
+      if (c.id !== convId) return c;
+      const history = c.history.slice();
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role === 'assistant') {
+          const m = Object.assign({}, history[i]);
+          // Freeze the content-block COUNT at this projection's boundary —
+          // computed by rendering the current content into a DETACHED node, so
+          // it's layout-free and scroll-independent (the old offsetHeight read
+          // was neither, which is why it was unreliable). The bar later wraps
+          // exactly the blocks [previous._blockEnd, this._blockEnd), pinning it
+          // to in-flow content at both ends.
+          const tmp = document.createElement('div');
+          tmp.innerHTML = renderContent(m.content || '', true, false);
+          span._blockEnd = tmp.children.length;
+          m.spans = (m.spans || []).concat([span]);
+          history[i] = m; break;
+        }
+      }
+      return Object.assign({}, c, { history });
+    });
+    scheduleLiveUpdate(convId);
+  }
+  function startStream(convId, userText) {
+    if (stream) stream.cancel();
+    const conv = S.conversations.find((c) => c.id === convId);
+    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel };
+    stream = API.streamChatCompletion(conv, userText, opts, {
+      onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
+      onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; }); },
+      onProjection: (span) => appendProjection(convId, span),
+      onLog: () => addLog(API.nextLogLine()),
+      onDone: () => {
+        patchStream(convId, (m) => { m.streaming = false; });
+        S.conversations = S.conversations.map((c) => c.id === convId ? Object.assign({}, c, { streaming: false }) : c);
+        render();
+        addLog(API.mkLog('INFO', 'zend::http', 'POST /v1/chat/completions conv_id=' + convId + ' 200 stream=done'));
+      },
+    });
+  }
+
+  // ── files / upload ───────────────────────────────────────────────────────
+  function startUpload(fileList) {
+    const conv = activeConv();
+    if (!conv || !fileList.length) return;
+    // Pass the real File objects: the mock reads .name/.size; the live adapter
+    // POSTs the bytes as multipart.
+    const items = [];
+    const handle = API.uploadFiles(conv.id, fileList, {
+      onFileStart: (fileId, name, totalParts) => { items.push({ fileId, name, totalParts, part: 0, done: false, error: null }); render(); },
+      onPart: (fileId, partIndex) => { const it = items.find((x) => x.fileId === fileId); if (it) it.part = partIndex + 1; render(); },
+      onFileDone: (fileId) => { const it = items.find((x) => x.fileId === fileId); if (it) { it.part = it.totalParts; it.done = true; } render(); },
+      onError: (fileId, message) => { const it = items.find((x) => x.fileId === fileId); if (it) it.error = message; render(); },
+      onAllDone: (metas) => {
+        S.conversations = S.conversations.map((c) => c.id === conv.id ? Object.assign({}, c, { files: (c.files || []).concat(metas) }) : c);
+        const lastId = metas.length ? metas[metas.length - 1].id : null;
+        setState({ upload: null, filesOpen: true, lastUploadedId: lastId }, () => {
+          requestAnimationFrame(() => { if (filesListEl) filesListEl.scrollTop = filesListEl.scrollHeight; });
+        });
+        clearTimeout(hlTimer);
+        hlTimer = setTimeout(() => setState({ lastUploadedId: null }), 2600);
+      },
+    });
+    setState({ upload: { items, handle }, dragActive: false });
+  }
+  function cancelUpload() { if (S.upload && S.upload.handle) S.upload.handle.cancel(); setState({ upload: null }); }
+
+  function openFile(file) {
+    setState({ fileView: Object.assign({}, file) });
+    if (file.content == null || file.content === '') {
+      API.getFileContent(S.activeId, file.id).then((content) => {
+        if (S.fileView && S.fileView.id === file.id) { S.fileView = Object.assign({}, S.fileView, { content }); render(); }
+      });
+    }
+  }
+  function deleteFile(file) {
+    if (!file) return;
+    API.deleteFile(S.activeId, file.id);
+    S.conversations = S.conversations.map((c) => (c.files && c.files.some((f) => f.id === file.id)) ? Object.assign({}, c, { files: c.files.filter((f) => f.id !== file.id) }) : c);
+    setState({ fileView: null });
+  }
+
+  function openSubstrate(node, msg) {
+    // The projection node carries its own `selection` (what provenance picked
+    // AND skipped, per section). The glue markers and section content are loaded
+    // with the conversation (hydrateIfNeeded → S.substrateGlue/substrateContent),
+    // so the panel renders the framing and expands sections with no extra fetch.
+    // `msg` is the assistant bubble the dot sits on. The conversation part of
+    // the materialized context is the real exchanges that precede it — the GUI
+    // holds them verbatim (with roles + content), whereas `sel.turns` carries no
+    // bodies and tags every sealed turn `assistant`. So render from the GUI
+    // history: everything up to (and including) this bubble, the trailing
+    // assistant being the response decoded so far.
+    let userMsg = null, hist = [];
+    const conv = activeConv();
+    if (conv && msg && conv.history) {
+      const i = conv.history.indexOf(msg);
+      let uk = -1;
+      for (let k = i - 1; k >= 0; k--) { if (conv.history[k].role === 'user') { userMsg = conv.history[k]; uk = k; break; } }
+      hist = conv.history.slice(0, uk >= 0 ? uk : (i >= 0 ? i : 0));
+    }
+    savedSubstrateScroll = null;   // a fresh open starts at the top, not last session's offset
+    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg || null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {} });
+    // Fallback: if a panel opens before any conversation hydrated (e.g. a brand
+    // new chat), pull the workspace-wide glue + content via the main GET.
+    if (S.substrateContent == null) {
+      const conv = activeConv();
+      if (conv) API.getConversation(conv.id)
+        .then((full) => setState({ substrateContent: full.sectionContent || {}, substrateTurnContent: full.turnContent || {}, substrateTargetLayer: full.targetLayer || S.substrateTargetLayer, substrateGlue: full.glue || S.substrateGlue }))
+        .catch(() => setState({ substrateContent: {} }));
+    }
+  }
+
+  // ── helpers ────────────────────────────────────────────────────────────
+  function focusPrompt() { requestAnimationFrame(() => { if (promptEl) promptEl.focus(); }); }
+  function scrollChat() { stick = true; requestAnimationFrame(() => { if (chatEl) { chatEl.scrollTop = chatEl.scrollHeight; lastScrollTop = chatEl.scrollTop; } }); }
+  function scrollLog() { requestAnimationFrame(() => { if (logEl) logEl.scrollTop = logEl.scrollHeight; }); }
+  function visibleConvs() {
+    return S.conversations
+      .filter((c) => (c.turn_count > 0 || c.history.length > 0 || c.id === S.activeId) && (S.showArchived || !c.archived))
+      .sort((a, b) => b.updated_ms - a.updated_ms);
+  }
+
+  function startResize(which, e) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = which === 'l' ? S.sidebarW : S.logW;
+    const invert = which === 'r';
+    const min = which === 'l' ? 120 : 160, max = which === 'l' ? 420 : 560;
+    setState({ dragging: which });
+    const move = (mv) => { const dx = (mv.clientX - startX) * (invert ? -1 : 1); const w = Math.max(min, Math.min(max, startW + dx)); setState(which === 'l' ? { sidebarW: w } : { logW: w }); };
+    const up = () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); document.body.style.cursor = ''; document.body.style.userSelect = ''; setState({ dragging: null }); };
+    document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
+    document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // RENDER
+  // ───────────────────────────────────────────────────────────────────────
+  function render() {
+    const root = document.getElementById('app');
+    // A re-render rebuilds the dots, so drop any open hover popover — it would
+    // otherwise dangle, anchored to a destroyed dot.
+    hideProjPopover();
+    // Startup: while the daemon loads the model, show the loading overlay only.
+    if (S.boot && S.boot.state !== 'ready') {
+      promptEl = chatEl = logEl = filesListEl = null;
+      root.innerHTML = '';
+      root.appendChild(buildLoadingScreen(S.boot));
+      return;
+    }
+    const hadFocus = promptEl && document.activeElement === promptEl;
+    const caret = hadFocus ? promptEl.selectionStart : null;
+    // Capture the exact pre-rebuild scroll so we can put the user back precisely
+    // (or pin to the bottom if `stick` says they were following).
+    if (chatEl) savedChatScroll = chatEl.scrollTop;
+    // Same for the substrate modal's scroll body, so expanding a section in place
+    // doesn't jump the panel back to the top.
+    if (substrateEl) savedSubstrateScroll = substrateEl.scrollTop;
+    promptEl = chatEl = logEl = filesListEl = substrateEl = null;
+
+    const themeFilter = S.theme === 'light' ? 'invert(1) hue-rotate(180deg)' : S.theme === 'vivid' ? 'saturate(1.75) contrast(1.06)' : 'none';
+    const layout = h('div', { style: 'display:flex; height:100vh; width:100vw; overflow:hidden; filter:' + themeFilter + ';' });
+
+    if (!S.sidebarCollapsed && !S.narrow) { layout.appendChild(buildSidebarExpanded()); layout.appendChild(buildResizer('l')); }
+    else layout.appendChild(buildSidebarRail());
+
+    layout.appendChild(buildCenter());
+
+    if (S.logsOpen) { layout.appendChild(buildResizer('r')); layout.appendChild(buildLogs()); }
+
+    const overlays = [];
+    if (S.fileView) overlays.push(buildFileViewer());
+    if (S.substrateOpen) overlays.push(buildSubstrate());
+    if (S.upload) overlays.push(buildUploadModal());
+
+    root.innerHTML = '';
+    root.appendChild(layout);
+    overlays.forEach((o) => root.appendChild(o));
+
+    if (substrateEl && savedSubstrateScroll != null) substrateEl.scrollTop = savedSubstrateScroll;
+
+    if (chatEl) {
+      if (stick) chatEl.scrollTop = chatEl.scrollHeight;
+      else if (savedChatScroll != null) chatEl.scrollTop = savedChatScroll;
+      lastScrollTop = chatEl.scrollTop;   // resync so the async scroll event isn't read as user input
+    }
+    // After a forced reload, restore the saved scroll once the active
+    // conversation's content has hydrated (tall enough to scroll).
+    if (chatEl && pendingScroll && String(S.activeId) === String(pendingScroll.conv) && chatEl.scrollHeight > chatEl.clientHeight + 8) {
+      chatEl.scrollTop = pendingScroll.scroll;
+      pendingScroll = null;
+    }
+    if (hadFocus && promptEl) { promptEl.focus(); if (caret != null) try { promptEl.setSelectionRange(caret, caret); } catch (_) {} }
+  }
+
+  // ── sidebar (expanded) ──────────────────────────────────────────────────
+  function buildSidebarExpanded() {
+    const convs = visibleConvs();
+    const rows = convs.map((c) => {
+      const active = c.id === S.activeId;
+      return h('button', {
+        onClick: () => selectConv(c.id),
+        style: 'position:relative; display:flex; align-items:center; width:100%; padding:0.45rem 0.7rem 0.45rem 0.9rem; border-radius:7px; border:none; background:' + (active ? '#2c3d52' : 'transparent') + '; color:' + (active ? '#d0dae4' : '#7a90a8') + '; font:inherit; font-size:0.8rem; line-height:1.35; cursor:pointer; text-align:left; min-width:0; font-weight:' + (active ? '500' : '400') + '; margin-bottom:1px;',
+      },
+        h('span', { style: 'position:absolute; left:0; top:20%; bottom:20%; width:2px; border-radius:1px; background:' + (active ? ACCENT : 'transparent') + ';' }),
+        h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-style:' + (c.archived ? 'italic' : 'normal') + '; color:' + (c.archived ? '#5a7088' : 'inherit') + ';' }, c.title),
+        c.archived
+          ? h('span', { 'data-act': 'unarchive', title: 'Restore conversation', onClick: (e) => unarchiveConv(c.id, e), style: 'flex-shrink:0; width:20px; height:20px; border-radius:4px; color:#8197ad; font-size:13px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; margin-left:3px; opacity:0.85;' }, '↺')
+          : h('span', { 'data-act': 'archive', title: 'Archive conversation', onClick: (e) => archiveConv(c.id, e), style: 'flex-shrink:0; width:20px; height:20px; border-radius:4px; color:#8197ad; font-size:14px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; margin-left:3px; opacity:0.85;' }, '×')
+      );
+    });
+    return h('div', { class: 'zscroll-blue z-sb', style: 'width:' + S.sidebarW + 'px; flex-shrink:0; height:100%; display:flex; flex-direction:column; background:#1e2a3a; color:#c0ccd8;' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:0.9rem 0.8rem 0.75rem; border-bottom:1px solid #2a3848; background:#19222f;' },
+        h('div', { style: 'display:flex; align-items:center; gap:0.5rem; font-size:0.82rem; font-weight:650; color:#d0dae4;', html: starLogo(22, '#1a1714') + '<span>&nbsp;Zend</span>' }),
+        h('div', { style: 'display:flex; align-items:center; gap:5px;' },
+          iconBtn('M7 2v10M2 7h10', 'New conversation', newConv, 27),
+          iconBtn('M9 2L4 7l5 5', 'Collapse sidebar', () => setState({ sidebarCollapsed: true }), 27))),
+      h('div', { class: 'zscroll-blue', style: 'flex:1; min-height:0; overflow-y:auto; padding:0 0.4rem 0.5rem;' },
+        convs.length ? rows : [h('div', { style: 'padding:1rem 0.9rem; font-size:0.775rem; color:#4a6278;' }, 'No conversations yet.')]),
+      h('div', { style: 'flex-shrink:0; padding:0.55rem 0.85rem 0.65rem; border-top:1px solid #2a3848; background:#19222f;' },
+        h('label', { onClick: toggleArchived, style: 'display:flex; align-items:center; gap:0.45rem; font-size:0.72rem; color:#6a8098; cursor:pointer; user-select:none;' },
+          h('span', { style: 'width:13px; height:13px; border-radius:3px; border:1px solid #445870; background:' + (S.showArchived ? ACCENT : 'transparent') + '; display:flex; align-items:center; justify-content:center; color:#fff; font-size:9px;' }, S.showArchived ? '✓' : ''),
+          'Show archived')));
+  }
+  function buildSidebarRail() {
+    const convs = visibleConvs();
+    return h('div', { class: 'z-rail', style: 'width:56px; flex-shrink:0; height:100%; display:flex; flex-direction:column; align-items:center; gap:7px; padding:0.7rem 0; background:#1e2a3a; color:#c0ccd8; border-right:1px solid #2a3848;' },
+      iconBtn('M2 4h12M2 8h12M2 12h12', 'Expand sidebar', () => setState({ sidebarCollapsed: false }), 34),
+      iconBtn('M7 2v10M2 7h10', 'New conversation', newConv, 34),
+      h('div', { style: 'width:24px; height:1px; background:#2a3848; flex-shrink:0; margin:1px 0 2px;' }),
+      h('div', { class: 'zscroll-blue', style: 'flex:1; min-height:0; width:100%; overflow-y:auto; display:flex; flex-direction:column; align-items:center; gap:6px;' },
+        convs.map((c) => {
+          const active = c.id === S.activeId;
+          return h('button', { title: c.title, onClick: () => selectConv(c.id), style: 'flex-shrink:0; width:36px; height:36px; border-radius:9px; border:1.5px solid ' + (active ? ACCENT : '#2a3848') + '; background:' + (active ? '#2c3d52' : '#223141') + '; color:' + (active ? '#e6edf4' : '#8ba0b6') + '; font:inherit; font-size:0.86rem; font-weight:650; cursor:pointer; display:flex; align-items:center; justify-content:center;' },
+            ((c.title || '?').trim().charAt(0) || '#').toUpperCase());
+        })));
+  }
+  function buildResizer(which) {
+    const isL = which === 'l';
+    const w = S.dragging === which ? 2 : 1;
+    const col = S.dragging === which ? (isL ? '#4a7aaa' : ACCENT) : (isL ? '#2a3848' : '#3a3530');
+    return h('div', { class: isL ? 'z-rsz-l' : 'z-rsz-r', onMouseDown: (e) => startResize(which, e), style: 'flex-shrink:0; width:5px; height:100%; cursor:col-resize; position:relative; background:transparent; z-index:20;' },
+      h('div', { style: 'position:absolute; left:2px; top:0; bottom:0; width:' + w + 'px; background:' + col + ';' }));
+  }
+
+  // ── center column ────────────────────────────────────────────────────────
+  function buildCenter() {
+    const conv = activeConv();
+    const isEmpty = !conv || conv.history.length === 0;
+    const inner = h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative;' },
+      isEmpty ? buildEmptyState() : buildChat(conv));
+
+    const dropZone = h('div', {
+      onDragEnter: onChatDragEnter, onDragOver: onChatDragOver, onDragLeave: onChatDragLeave, onDrop: onChatDrop,
+      style: 'flex:1; min-height:0; display:flex; position:relative;',
+    });
+    if (S.themeMenuOpen) dropZone.appendChild(h('div', { onClick: () => setState({ themeMenuOpen: false }), style: 'position:absolute; inset:0; z-index:31;' }));
+    dropZone.appendChild(buildAppearance());
+    dropZone.appendChild(inner);
+    dropZone.appendChild(buildTopRight());
+    if (S.filesOpen) dropZone.appendChild(buildFilesPane());
+    if (S.dragActive) dropZone.appendChild(buildDragOverlay());
+
+    return h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; background:#1c1917;' },
+      dropZone, buildComposer());
+  }
+
+  function buildAppearance() {
+    const meta = { dark: ['Dark', '#1c1917'], light: ['Light', '#efe6d6'], vivid: ['Vivid', ACCENT] };
+    const wrap = h('div', { style: 'position:absolute; top:12px; left:12px; z-index:32;' },
+      h('button', { onClick: () => setState({ themeMenuOpen: !S.themeMenuOpen }), title: 'Appearance', style: 'display:flex; align-items:center; gap:7px; height:30px; padding:0 0.55rem 0 0.5rem; border-radius:8px; border:1px solid #50493f; background:#2e2a26; color:#cfc8c0; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:600; box-shadow:0 8px 20px rgba(0,0,0,0.5);' },
+        h('span', { style: 'width:13px; height:13px; border-radius:50%; background:' + meta[S.theme][1] + '; border:1px solid rgba(255,255,255,0.18);' }),
+        meta[S.theme][0],
+        h('span', { html: '<svg viewBox="0 0 10 10" fill="none" style="width:8px;height:8px;color:#8a8074;"><path d="M2 3.5l3 3 3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' })));
+    if (S.themeMenuOpen) {
+      wrap.appendChild(h('div', { style: 'position:absolute; top:calc(100% + 6px); left:0; min-width:144px; background:#26231f; border:1px solid #4a443e; border-radius:9px; box-shadow:0 10px 28px rgba(0,0,0,0.55); padding:4px;' },
+        ['light', 'dark', 'vivid'].map((k) => h('button', {
+          onClick: () => { try { localStorage.setItem('zend.theme', k); } catch (_) {} setState({ theme: k, themeMenuOpen: false }); },
+          style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (S.theme === k ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (S.theme === k ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left;' },
+          h('span', { style: 'width:12px; height:12px; border-radius:50%; background:' + meta[k][1] + '; border:1px solid rgba(255,255,255,0.2);' }), meta[k][0]))));
+    }
+    return wrap;
+  }
+
+  function buildEmptyState() {
+    const hr = new Date().getHours();
+    const greeting = 'Good ' + (hr < 12 ? 'Morning' : hr < 17 ? 'Afternoon' : 'Evening') + '.';
+    const cards = [
+      { title: 'Explore codebase', sub: 'Architecture overview and key components', prompt: 'Give me a tour of the codebase — main crates, key files, and how everything connects.' },
+      { title: 'Find weak spots', sub: 'Fragile code, edge cases, tech debt', prompt: 'What are the most fragile or risky areas in the current implementation?' },
+      { title: 'Review changes', sub: 'Critique the latest work on this branch', prompt: 'Review the most recent commits and flag anything that looks incomplete or risky.' },
+      { title: "What's next", sub: 'Highest-leverage next steps', prompt: 'What should I work on next for the most meaningful progress on this project?' },
+    ];
+    return h('div', { style: 'flex:1; min-height:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2.25rem; padding:0 2.5rem 3rem;' },
+      h('div', { style: 'display:flex; flex-direction:column; align-items:center; gap:1.25rem;' },
+        h('div', { html: starLogo(52, '#26231f', 9) }),
+        h('h1', { style: 'font-size:1.9rem; font-weight:600; letter-spacing:-0.4px; text-align:center; color:#ece8e4;' }, greeting)),
+      h('div', { style: 'display:grid; grid-template-columns:1fr 1fr; gap:0.5rem; width:100%; max-width:500px;' },
+        cards.map((card) => h('button', { onClick: () => send(card.prompt), style: 'display:flex; flex-direction:column; gap:0.3rem; background:#26231f; border:1px solid #252220; border-radius:10px; padding:0.9rem 1rem; cursor:pointer; text-align:left;' },
+          h('span', { style: 'font-size:0.84rem; font-weight:600; color:#ece8e4;' }, card.title),
+          h('span', { style: 'font-size:0.76rem; color:#9a9490; line-height:1.4;' }, card.sub)))));
+  }
+
+  function buildChat(conv) {
+    // Non-narrow: the projection-bar gutter is an inline flex sibling of each
+    // message (not an absolute overlay), so the scroller only needs a small
+    // left pad; the gutter itself supplies the rest of the left offset.
+    const leftPad = S.narrow ? '2rem' : '1.5rem';
+    // When wide, keep content left of the top-right Logs/Files pills (~112px).
+    const rightPad = S.wide ? '8rem' : '2rem';
+    const scroller = h('div', { class: 'zscroll zscroll-wide z-chatscroll', ref: (el) => { chatEl = el; }, onScroll: (e) => { const st = e.currentTarget.scrollTop; if (st < lastScrollTop - 1) stick = false; else if (nearBottom(e.currentTarget)) stick = true; lastScrollTop = st; }, style: 'display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:2rem ' + rightPad + ' 0.5rem ' + leftPad + '; position:relative;' });
+    conv.history.forEach((m, idx) => {
+      if (m.role === 'user') {
+        scroller.appendChild(h('div', { style: 'display:flex; flex-direction:row-reverse; gap:0.85rem; margin-bottom:2rem; padding-left:3rem;' },
+          h('div', { style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content)));
+      } else {
+        const open = !!S.thinkOpen[conv.id + ':' + idx];
+        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtml(m, open) });
+        // Wrap the content blocks into per-projection segments, each carrying an
+        // in-flow colored bar — pinned to the text at both ends, reflows with it.
+        if (!S.narrow) applyProjSegments(zmd, m);
+        scroller.appendChild(h('div', { 'data-msg': idx, style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd));
+      }
+    });
+    return scroller;
+  }
+
+  // The palette color a projection bar uses, keyed by its ORDER in the message
+  // (not its span id): adjacent bars always land on consecutive, contrasting
+  // palette entries, and the mapping is stable across streaming → finalize so
+  // colors don't shift. Shared with the popover so its accent matches the bar.
+  function projBarColor(order) { return PROJ_PALETTE[order % PROJ_PALETTE.length]; }
+
+  // Wrap each projection's run of content blocks in an IN-FLOW segment carrying
+  // a thin colored bar. The bar is an absolutely-positioned child of the wrapper
+  // (top:0 → bottom:0), so it spans exactly from the start of the projection's
+  // first block to the end of its last — both ends pinned to in-flow text. It
+  // therefore reflows with the content on every render, resize, and
+  // think-toggle, with NO measurement and nothing that can drift.
+  //
+  // Block membership is frozen per projection: `_blockEnd` is the content-block
+  // count captured (layout-free) the instant each projection fired (see
+  // appendProjection). Projection i owns blocks [prev._blockEnd, this._blockEnd);
+  // blocks past the last boundary are the not-yet-projected tail (kept aligned
+  // via the same left pad, just no bar). Reloaded conversations have no
+  // `_blockEnd`, so boundaries fall back to a token-fraction of the block count
+  // (stable there, since reloaded content is static).
+  function applyProjSegments(zmd, m) {
+    const spans = (m.spans || []).slice().sort((a, b) => (a.end_token || 0) - (b.end_token || 0));
+    if (!spans.length) return;
+    const isCursor = (el) => el.classList && el.classList.contains('zcursor');
+    const all = Array.from(zmd.children);
+    const cursor = all.find(isCursor);
+    const blocks = all.filter((el) => !isCursor(el));
+    if (!blocks.length) return;
+    const maxTok = Math.max(1, ...spans.map((s) => s.end_token || 0));
+    const boundary = (s) => s._blockEnd != null ? s._blockEnd : Math.round((s.end_token || 0) / maxTok * blocks.length);
+    const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(spans[i]) > bi) return i; } return -1; };
+    const frag = document.createDocumentFragment();
+    const segs = [];
+    let gi = 0;
+    while (gi < blocks.length) {
+      const a = projOf(gi);
+      let gj = gi;
+      while (gj < blocks.length && projOf(gj) === a) gj++;
+      // Same left pad whether or not this run has a bar, so content never shifts
+      // horizontally when the not-yet-projected tail later gains a bar.
+      const seg = h('div', { style: 'position:relative; padding-left:1.15rem;' });
+      if (a >= 0) {
+        const sp = spans[a];
+        seg.appendChild(h('div', {
+          onMouseEnter: (e) => { e.currentTarget.style.filter = 'brightness(1.4)'; showProjPopover(sp, e.currentTarget); },
+          onMouseLeave: (e) => { e.currentTarget.style.filter = 'none'; hideProjPopover(); },
+          onClick: () => { hideProjPopover(); openSubstrate(sp, m); },
+          style: 'position:absolute; left:0; top:1px; bottom:1px; width:5px; border-radius:3px; background:' + projBarColor(a) + '; cursor:pointer; transition:filter .12s;',
+        }));
+      }
+      for (let k = gi; k < gj; k++) seg.appendChild(blocks[k]);
+      // Zero this span's last block so its in-paragraph margin doesn't collapse
+      // through the seg and dictate the inter-span gap — the gap is set on the
+      // seg itself below. Within-span paragraph gaps (non-last blocks) are
+      // untouched. The final span gets no gap, so the bubble keeps a clean bottom.
+      blocks[gj - 1].style.marginBottom = '0';
+      segs.push(seg);
+      frag.appendChild(seg);
+      gi = gj;
+    }
+    // Inter-span gap: ~30% tighter than the in-paragraph gap (.85rem → .6rem).
+    for (let s = 0; s < segs.length - 1; s++) segs[s].style.marginBottom = '0.6rem';
+    if (cursor) frag.appendChild(cursor);
+    zmd.innerHTML = '';
+    zmd.appendChild(frag);
+  }
+
+  function buildTopRight() {
+    const conv = activeConv();
+    const filesCount = (conv && conv.files) ? conv.files.length : 0;
+    const wrap = h('div', { style: 'position:absolute; top:14px; right:20px; z-index:30; display:flex; flex-direction:column; gap:8px; align-items:flex-end;' });
+    if (!S.logsOpen) wrap.appendChild(h('button', { onClick: () => setState({ logsOpen: true }), title: 'Show logs', style: pillStyle(false), html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M1.5 3.5h11M1.5 7h11M1.5 10.5h7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><span>&nbsp;Logs</span>' }));
+    const filesBtn = h('button', { onClick: () => setState({ filesOpen: !S.filesOpen }), title: 'Conversation files', style: pillStyle(S.filesOpen) },
+      h('span', { html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:12px;"><path d="M3 1.2h4.4l3 3v8.6H3z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M7.2 1.4v3h3" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>' }),
+      h('span', {}, ' Files'),
+      filesCount ? h('span', { style: 'font-size:0.66rem; color:#9a9490;' }, ' ' + filesCount) : null);
+    wrap.appendChild(filesBtn);
+    return wrap;
+  }
+  function pillStyle(activeOn) {
+    return 'display:flex; align-items:center; justify-content:flex-start; gap:0.4rem; width:98px; height:30px; padding:0 0.7rem; border-radius:8px; border:1px solid ' + (activeOn ? '#6a6258' : '#50493f') + '; background:' + (activeOn ? '#37322d' : '#2e2a26') + '; color:' + (activeOn ? '#ece8e4' : '#cfc8c0') + '; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:600; box-shadow:0 12px 30px rgba(0,0,0,0.72), 0 3px 8px rgba(0,0,0,0.5);';
+  }
+
+  // ── composer ─────────────────────────────────────────────────────────────
+  function buildComposer() {
+    const conv = activeConv();
+    const inputArchived = !!(conv && conv.archived);
+    const wrap = h('div', { style: 'flex-shrink:0; position:relative; padding:0 2rem 1.5rem; background:#1c1917;' },
+      h('div', { style: 'position:absolute; top:-2rem; left:0; right:0; height:2rem; background:linear-gradient(to bottom, transparent, #1c1917); pointer-events:none;' }));
+    if (inputArchived) {
+      wrap.appendChild(h('div', { style: 'text-align:center; color:#5a5652; font-size:0.85rem; font-style:italic; padding:0.9rem 1rem; border:1px dashed #38342f; border-radius:14px; background:rgba(35,33,32,0.6);' }, 'This conversation is archived.'));
+      return wrap;
+    }
+    const streaming = !!(conv && conv.streaming);
+    const ready = S.promptValue.trim().length > 0 && !streaming;
+    const sendHint = streaming ? 'Generating…' : (ready ? '↵ send' : '');
+
+    const ta = h('textarea', {
+      id: 'zend-prompt', rows: '1', placeholder: 'Message…   ↵ to send · ⇧↵ for newline', autocomplete: 'off', spellcheck: 'true',
+      ref: (el) => { promptEl = el; el.value = S.promptValue; },
+      onInput: onPromptInput, onKeyDown: onPromptKeyDown,
+      style: 'width:100%; background:none; border:none; outline:none; color:#ece8e4; font:inherit; font-size:0.95rem; resize:none; min-height:24px; max-height:200px; line-height:1.55; overflow-y:hidden; padding:0.15rem 0 0.4rem;',
+    });
+    const sendBtn = h('button', { 'aria-label': 'Send', onClick: () => send(S.promptValue), disabled: !ready, style: 'flex-shrink:0; width:34px; height:34px; border-radius:9px; border:none; background:' + ACCENT + '; color:#fff; cursor:' + (ready ? 'pointer' : 'default') + '; display:flex; align-items:center; justify-content:center; opacity:' + (ready ? 1 : 0.3) + '; padding:0;', html: '<svg viewBox="0 0 16 16" fill="none" style="width:14px;height:14px;"><path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
+
+    const box = h('div', { style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
+      ta,
+      h('div', { style: 'display:flex; align-items:center; justify-content:space-between; gap:0.5rem; margin-top:0.3rem;' },
+        h('div', { style: 'display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;' },
+          h('span', { class: 'z-dial-label', style: 'font-size:0.72rem; color:#6a625a;' }, 'think'),
+          buildDial('effort'),
+          h('span', { class: 'z-dial-label', style: 'font-size:0.72rem; color:#6a625a;' }, 'answer'),
+          buildDial('verbosity')),
+        h('div', { style: 'display:flex; align-items:center; gap:0.65rem;' },
+          h('span', { class: 'z-sendhint', style: 'font-size:0.72rem; color:#5a5652; white-space:nowrap;' }, sendHint),
+          sendBtn)));
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  const DIALS = {
+    effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', ticksGrow: true },
+    verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', ticksGrow: false },
+  };
+  function buildDial(which) {
+    const d = DIALS[which];
+    const lvl = S[d.key];
+    const open = S.openMenu === which;
+    const ticks = [];
+    for (let i = 0; i < 5; i++) {
+      const ht = d.ticksGrow ? (4 + i * 1.8) : 10;
+      ticks.push(h('span', { style: 'width:2.5px; height:' + ht + 'px; border-radius:1px; background:' + (i <= lvl ? ACCENT : '#3a352f') + ';' }));
+    }
+    const btn = h('button', { onClick: () => setState({ openMenu: open ? null : which }), title: d.label, style: 'display:inline-flex; align-items:center; gap:0.42rem; height:27px; padding:0 0.62rem; border-radius:8px; border:1px solid #38342f; background:#1c1a18; color:#cfc8c0; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:500;' },
+      h('span', { style: 'display:inline-flex; align-items:' + (d.ticksGrow ? 'flex-end' : 'center') + '; gap:1.5px; height:11px;' }, ticks),
+      d.names[lvl]);
+    const wrap = h('span', { style: 'position:relative; z-index:50;' }, btn);
+    if (open) {
+      wrap.appendChild(h('div', { style: 'position:absolute; bottom:calc(100% + 7px); left:0; min-width:200px; background:#26231f; border:1px solid #4a443e; border-radius:10px; box-shadow:0 -10px 30px rgba(0,0,0,0.55); padding:5px;' },
+        h('div', { style: 'font-size:0.62rem; text-transform:uppercase; letter-spacing:0.07em; color:#7c736a; padding:5px 8px 4px;' }, d.label),
+        d.names.map((name, i) => h('button', { onClick: () => setState({ ['' + d.key]: i, openMenu: null }), style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
+          h('span', { style: 'width:7px; height:7px; border-radius:50%; background:' + (i === lvl ? ACCENT : '#3a352f') + ';' }),
+          h('span', { style: 'flex:1;' }, name),
+          h('span', { style: 'font-size:0.66rem; color:#7c736a;' }, d.subs[i])))));
+    }
+    return wrap;
+  }
+
+  function onPromptInput(e) {
+    S.promptValue = e.target.value;
+    e.target.style.height = 'auto';
+    const ht = e.target.scrollHeight;
+    e.target.style.height = Math.min(ht, 200) + 'px';
+    e.target.style.overflowY = ht > 200 ? 'auto' : 'hidden';
+    const conv = activeConv();
+    const streaming = !!(conv && conv.streaming);
+    const ready = S.promptValue.trim().length > 0 && !streaming;
+    const box = e.target.parentNode;
+    const btn = box.querySelector('button[aria-label="Send"]');
+    if (btn) { btn.disabled = !ready; btn.style.opacity = ready ? 1 : 0.3; btn.style.cursor = ready ? 'pointer' : 'default'; }
+    const hint = box.querySelector('.z-sendhint');
+    if (hint) hint.textContent = streaming ? 'Generating…' : (ready ? '↵ send' : '');
+  }
+  function onPromptKeyDown(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(S.promptValue); } }
+
+  // ── drag & drop ──────────────────────────────────────────────────────────
+  let dragDepth = 0;
+  function hasFileDrag(e) { return !!(e.dataTransfer && [].slice.call(e.dataTransfer.types || []).indexOf('Files') !== -1); }
+  function onChatDragEnter(e) { if (!hasFileDrag(e)) return; e.preventDefault(); dragDepth += 1; if (!S.dragActive) setState({ dragActive: true }); }
+  function onChatDragOver(e) { if (!hasFileDrag(e)) return; e.preventDefault(); try { e.dataTransfer.dropEffect = 'copy'; } catch (_) {} }
+  function onChatDragLeave(e) { dragDepth -= 1; if (dragDepth <= 0) { dragDepth = 0; if (S.dragActive) setState({ dragActive: false }); } }
+  function onChatDrop(e) { e.preventDefault(); dragDepth = 0; const list = e.dataTransfer ? [].slice.call(e.dataTransfer.files) : []; if (list.length) startUpload(list); else setState({ dragActive: false }); }
+  function buildDragOverlay() {
+    return h('div', { style: 'position:absolute; inset:14px; z-index:60; border:2px dashed #7a6f60; border-radius:16px; background:rgba(26,23,20,0.86); display:flex; align-items:center; justify-content:center; pointer-events:none;', html:
+      '<div style="text-align:center; color:#cfc8c0;"><svg viewBox="0 0 24 24" fill="none" style="width:34px;height:34px;margin-bottom:8px;"><path d="M12 4v11M7 10l5 5 5-5M5 19h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><div style="font-size:0.95rem; font-weight:600;">Drop files to upload</div><div style="font-size:0.76rem; color:#8a8074; margin-top:3px;">to this conversation</div></div>' });
+  }
+
+  // ── upload modal ─────────────────────────────────────────────────────────
+  function buildUploadModal() {
+    const items = S.upload.items;
+    const allDone = items.length && items.every((x) => x.done);
+    const rows = items.map((it) => {
+      const pct = it.totalParts ? Math.round((it.part / it.totalParts) * 100) : 0;
+      return h('div', { style: 'margin-bottom:0.85rem;' },
+        h('div', { style: 'display:flex; justify-content:space-between; font-size:0.8rem; color:#cfc8c0; margin-bottom:5px;' },
+          h('span', { style: 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, it.name),
+          h('span', { class: 'z-upstat', style: 'font-family:ui-monospace,monospace; font-size:0.72rem; color:' + (it.done ? '#6cb39a' : '#7c736a') + ';' }, it.error ? 'error' : (it.done ? '✓ done' : 'prefilling part ' + it.part + '/' + it.totalParts))),
+        h('div', { style: 'position:relative; height:8px; background:#161412; border:1px solid #2e2b27; border-radius:4px; overflow:hidden;' },
+          h('div', { class: 'z-upbar', style: 'position:absolute; top:0; bottom:0; left:0; width:' + pct + '%; background:' + (it.error ? '#e05555' : ACCENT) + '; transition:width .15s;' })));
+    });
+    const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(520px,95%); display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
+      h('div', { style: 'padding:15px 17px; border-bottom:1px solid #2e2b27; display:flex; align-items:center; gap:10px;' },
+        h('span', { html: '<svg viewBox="0 0 24 24" fill="none" style="width:18px;height:18px;color:#c98a3e;"><path d="M12 4v11M7 10l5 5 5-5M5 19h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' }),
+        h('div', { class: 'z-uptitle', style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, allDone ? 'Upload complete' : 'Uploading — prefilling in parts')),
+      h('div', { style: 'padding:15px 17px;' }, rows.length ? rows : [h('div', { style: 'color:#7c736a; font-size:0.82rem;' }, 'Preparing…')]),
+      h('div', { style: 'padding:11px 17px 15px; display:flex; justify-content:flex-end;' },
+        h('button', { class: 'z-upcancel', onClick: cancelUpload, style: 'font-size:0.78rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:8px; padding:6px 14px; cursor:pointer; font-family:inherit;' }, 'Cancel')));
+    return h('div', { class: 'z-modal-ov', style: 'position:fixed; inset:0; z-index:460; background:rgba(0,0,0,0.62); display:flex; align-items:center; justify-content:center; padding:40px;' }, modal);
+  }
+
+  // ── files pane ───────────────────────────────────────────────────────────
+  function buildFilesPane() {
+    const conv = activeConv();
+    const rawFiles = (conv && conv.files) || [];
+    const list = h('div', { class: 'zscroll', ref: (el) => { filesListEl = el; }, style: 'flex:1; min-height:0; overflow-y:auto; padding:6px;' });
+    if (!rawFiles.length) list.appendChild(h('div', { style: 'padding:1.6rem 1rem; text-align:center; font-size:0.78rem; color:#6a6258; line-height:1.55;', html: 'No files yet.<br>Drag a file into the conversation to upload.' }));
+    rawFiles.forEach((f) => {
+      const cols = fileColors[f.kind] || fileColors.text;
+      list.appendChild(h('div', { class: 'z-file-row', onClick: () => openFile(f), style: 'display:flex; align-items:center; gap:10px; padding:8px 9px; border-radius:7px; cursor:pointer; background:' + (S.lastUploadedId === f.id ? 'rgba(201,138,62,0.18)' : 'transparent') + '; box-shadow:inset 3px 0 0 ' + (S.fileView && S.fileView.id === f.id ? '#2c3d52' : 'transparent') + '; transition:background .45s;' },
+        h('span', { style: 'flex-shrink:0; width:30px; height:30px; border-radius:6px; background:' + cols[1] + '; color:' + cols[0] + '; font-size:9px; font-weight:700; display:flex; align-items:center; justify-content:center; font-family:ui-monospace,monospace;' }, f.ext),
+        h('div', { style: 'flex:1; min-width:0;' },
+          h('div', { style: 'font-size:0.82rem; color:#ece8e4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, f.name),
+          h('div', { style: 'font-size:0.69rem; color:#7c736a; font-family:ui-monospace,monospace;' }, f.size + ' · ' + f.added))));
+    });
+    return h('div', { class: 'z-files', style: 'position:absolute; top:0; right:0; bottom:0; width:300px; z-index:37; display:flex; flex-direction:column; background:#1f1c1a; border-left:1px solid #38342f; box-shadow:-10px 0 30px rgba(0,0,0,0.45);' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:13px 14px; border-bottom:1px solid #2e2b27;' },
+        h('div', { style: 'display:flex; align-items:baseline; gap:8px;' },
+          h('span', { style: 'font-size:0.85rem; font-weight:650; color:#ece8e4;' }, 'Files'),
+          h('span', { style: 'font-size:0.7rem; color:#7c736a;' }, '' + rawFiles.length)),
+        h('button', { onClick: () => setState({ filesOpen: false }), title: 'Close', style: closeBtnStyle() }, '×')),
+      list);
+  }
+
+  // The projection popover lives directly on <body>, outside the render tree,
+  // so hovering a dot never triggers a full re-render (which would destroy the
+  // hovered dot and make the popover flicker). Shown/hidden imperatively.
+  let projPopEl = null;
+  function hideProjPopover() { if (projPopEl) { projPopEl.remove(); projPopEl = null; } }
+  function showProjPopover(sp, anchor) {
+    hideProjPopover();
+    const r = anchor.getBoundingClientRect();
+    // Inherit the hovered bar's actual color so the popover accent matches it
+    // (bars are colored by order, not span id).
+    projPopEl = buildProjPopover(sp, Math.round(r.top), Math.round(r.right + 12), anchor.style.background);
+    document.body.appendChild(projPopEl);
+  }
+
+  // ── overlays: proj popover, file viewer, substrate ──────────────────────
+  function buildProjPopover(sp, top, left, accent) {
+    const headColor = accent || projDisplay(sp).color;
+    const buckets = (sp.buckets || []).filter((b) => (b.tokens || 0) > 0);
+    const mat = sp.materialized_tokens || buckets.reduce((a, b) => a + (b.tokens || 0), 0) || 1;
+    const sub = Math.max(sp.substrate_tokens || 0, mat);
+    const colorFor = (i) => PROJ_PALETTE[i % PROJ_PALETTE.length];
+    const gen = Math.max(0, (sp.end_token || 0) - (sp.start_token || 0));
+    const secs = sp.seconds || 0;
+    const tps = sp.tokens_per_second || (secs > 0 ? gen / secs : 0);
+
+    // Stacked bar map: one segment per category, width ∝ tokens. System (first
+    // bucket) leftmost, then section groups, then turns — the order the engine
+    // emits them.
+    const bar = h('div', { style: 'display:flex; height:13px; border-radius:4px; overflow:hidden; background:#161412; border:1px solid #2e2b27;' },
+      buckets.length
+        ? buckets.map((b, i) => h('div', { title: b.label + ' · ' + fmtTok(b.tokens), style: 'height:100%; width:' + ((b.tokens / mat) * 100) + '%; background:' + colorFor(i) + ';' }))
+        : [h('div', { style: 'width:100%; height:100%;' })]);
+    // Legend: every category that contributed > 0 tokens.
+    const legend = h('div', { style: 'display:flex; flex-wrap:wrap; gap:5px 12px; margin-top:9px;' },
+      buckets.map((b, i) => h('div', { style: 'display:flex; align-items:center; gap:6px; font-size:0.7rem; color:#b8b2ac;' },
+        h('span', { style: 'width:8px; height:8px; border-radius:2px; background:' + colorFor(i) + '; flex-shrink:0;' }),
+        h('span', {}, b.label),
+        h('span', { style: 'color:#6a6258; font-family:ui-monospace,monospace;' }, fmtTok(b.tokens)))));
+
+    return h('div', { style: 'position:fixed; top:' + top + 'px; left:' + left + 'px; z-index:300; width:300px; background:#26231f; border:1px solid #4a443e; border-radius:11px; box-shadow:0 10px 34px rgba(0,0,0,0.55); padding:13px 14px; pointer-events:none;' },
+      h('div', { style: 'display:flex; align-items:center; gap:7px; margin-bottom:10px;' },
+        h('span', { style: 'width:9px; height:9px; border-radius:50%; background:' + headColor + ';' }),
+        h('span', { style: 'font-size:0.8rem; font-weight:650; color:#ece8e4;' }, 'Projection'),
+        h('span', { style: 'margin-left:auto; font-size:0.68rem; color:#7c736a; font-family:ui-monospace,monospace;' }, sp.step || '')),
+      bar,
+      legend,
+      h('div', { style: 'display:flex; justify-content:space-between; align-items:baseline; margin-top:12px;' },
+        h('span', { style: 'font-size:0.72rem; color:#9a9490;' }, 'materialized context'),
+        h('span', { style: 'font-size:0.7rem; color:#b8b2ac; font-family:ui-monospace,monospace;' }, fmtTok(mat) + ' / ' + fmtTok(sub) + ' tokens')),
+      h('div', { style: 'font-size:0.64rem; color:#5a5652; font-family:ui-monospace,monospace; margin-top:6px;' },
+        gen + ' tokens in ' + secs.toFixed(1) + 's (' + Math.round(tps) + ' t/s)'));
+  }
+
+  function buildFileViewer() {
+    const fv = S.fileView;
+    const cols = fileColors[fv.kind] || fileColors.text;
+    const isImg = fv.kind === 'img';
+    const body = isImg
+      ? h('div', { style: 'display:flex; align-items:center; justify-content:center; min-height:280px; padding:40px;', html: '<div style="text-align:center; color:#5a5652;"><svg viewBox="0 0 24 24" fill="none" style="width:40px;height:40px;margin-bottom:10px;"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.4"/><circle cx="8.5" cy="9.5" r="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M5 18l5-5 4 3 2-2 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg><div style="font-size:0.82rem;">Image preview unavailable in this demo</div></div>' })
+      : h('pre', { style: 'margin:0; padding:15px 17px; font-family:ui-monospace,monospace; font-size:12.5px; line-height:1.6; color:#cdbfae; white-space:pre;' }, fv.content || '');
+    const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(820px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; gap:11px; padding:14px 16px; border-bottom:1px solid #2e2b27;' },
+        h('span', { style: 'flex-shrink:0; width:32px; height:32px; border-radius:7px; background:' + cols[1] + '; color:' + cols[0] + '; font-size:9.5px; font-weight:700; display:flex; align-items:center; justify-content:center; font-family:ui-monospace,monospace;' }, fv.ext),
+        h('div', { style: 'flex:1; min-width:0;' },
+          h('div', { style: 'font-size:0.92rem; font-weight:650; color:#ece8e4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, fv.name),
+          h('div', { style: 'font-size:0.71rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:2px;' }, fv.size + ' · ' + fv.added)),
+        h('button', { onClick: () => deleteFile(fv), title: 'Delete file', style: 'flex-shrink:0; display:flex; align-items:center; gap:5px; font-size:0.74rem; color:#b8867f; background:rgba(200,80,80,0.07); border:1px solid rgba(200,80,80,0.2); border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M2.5 3.5h9M5 3.5V2.3h4v1.2M5.6 6v4M8.4 6v4M3.4 3.5l.5 8h6.2l.5-8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Delete</span>' }),
+        h('button', { onClick: () => downloadFile(fv), title: 'Download', style: 'flex-shrink:0; display:flex; align-items:center; gap:5px; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M7 1.5v7M4 6l3 3 3-3M2.5 11.5h9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Download</span>' }),
+        h('button', { onClick: copyFileView, style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy'),
+        h('button', { onClick: () => setState({ fileView: null }), style: closeBtnStyle() }, '×')),
+      h('div', { class: 'zscroll', style: 'flex:1; min-height:0; overflow:auto; background:#161412;' }, body));
+    return h('div', { class: 'z-modal-ov', onClick: () => setState({ fileView: null }), style: modalOvStyle(420) }, modal);
+  }
+  function downloadFile(fv) {
+    const blob = new Blob([fv.content || ''], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = fv.name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function copyFileView(e) { try { navigator.clipboard.writeText((S.fileView && S.fileView.content) || ''); } catch (_) {} flash(e.currentTarget, 'Copied', 'Copy'); }
+
+  // The full materialized context as plain text, reconstructed by CONCATENATING
+  // each piece's authored bytes in materialized order — glue markers, section
+  // content, turn framing, decoded tail. No trimming and no inserted separators:
+  // the dialect markers and section content already carry their own newlines, so
+  // splicing anything in (or stripping anything off) would corrupt the spacing.
+  // Backs the projection panel's "Copy all".
+  function substrateAllText(node) {
+    const sel = (node && node.selection) || { system: [], turns: [] };
+    const G = S.substrateGlue, C = S.substrateContent || {};
+    const um = S.substrateUserMsg, dm = S.substrateMsg;
+    let out = '';
+    const add = (s) => { if (s != null) out += s; };
+    (sel.system || []).forEach((item) => {
+      if (item.kind === 'glue') add(item.content);
+      else if (item.kind === 'collection') item.sections.forEach((s) => { if (s.selected) add(C[s.name]); });
+      else add(C[item.name]);
+    });
+    // Memory-tier turns (non-dialogue layers) sit between the system prompt and
+    // the dialogue conversation; each is framed as full ChatML (user half, then
+    // assistant half), bodies read from the substrate (turnContent).
+    const TC = S.substrateTurnContent || {};
+    (sel.turns || []).filter((t) => t.layer && t.layer !== 'dialogue').forEach((t) => {
+      const tc = TC[t.group + '::' + t.index] || {};
+      add(G && G.user_start); add(tc.user);
+      add(G && G.user_end); add(G && G.assistant_start); add(tc.assistant);
+      add(G && G.assistant_end);
+    });
+    // The conversation, from the REAL messages: prior exchanges, the active user
+    // prompt, then the response decoded up to THIS dot's `end_token` (token
+    // fraction). Each message is framed by its own role markers; the trailing
+    // assistant is left open while still decoding.
+    const hist = S.substrateHistory || [];
+    const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
+    const maxEnd = Math.max(1, ...ends);
+    const here = node && node.end_token != null ? node.end_token : maxEnd;
+    const complete = here >= maxEnd;
+    const msg = (role, content, open) => {
+      const isUser = role === 'user';
+      add(isUser ? (G && G.user_start) : (G && G.assistant_start));
+      add(content);
+      if (!open) add(isUser ? (G && G.user_end) : (G && G.assistant_end));
+    };
+    hist.forEach((m) => msg(m.role, m.content));
+    if (um) msg('user', um.content);
+    if (dm && dm.role === 'assistant' && (dm.content || '').length) {
+      const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
+      msg('assistant', dm.content.slice(0, cut), !complete);
+    }
+    return out;
+  }
+
+  function buildSubstrate() {
+    const node = S.substrateNode;
+    const sel = (node && node.selection) || { system: [], turns: [] };
+    const body = h('div', { class: 'zscroll', ref: (el) => { substrateEl = el; }, style: 'flex:1; min-height:0; overflow-y:auto; padding:13px 15px; background:#161412;' });
+
+    const toggle = (mapKey, key) => {
+      const m = Object.assign({}, S[mapKey]); m[key] = !m[key]; setState({ [mapKey]: m });
+    };
+    const chev = (open) => h('span', { class: 'zsub-chev' + (open ? ' open' : ''), style: 'flex-shrink:0; color:#a89b8a; font-size:10px; width:10px; text-align:center;' }, '▸');
+
+    // One section row: chevron + dot + name + token count, dimmed when
+    // provenance skipped it. Clicking expands it to show the authored content
+    // (fetched on demand — never stored in the projection event). Content is
+    // still loading until the fetch resolves → show a spinner, not stale text.
+    const sectionRow = (s, gkey) => {
+      const key = gkey + '::' + (s.name || '');
+      const open = !!S.substrateExpanded[key];
+      const row = h('div', { class: 'zsub-row', onClick: () => toggle('substrateExpanded', key), style: 'cursor:pointer; display:flex; align-items:center; gap:8px; padding:5px 11px 5px 11px; font-size:12px; ' + (s.selected ? 'color:#d8d2cc;' : 'color:#6a6258; opacity:0.6;') },
+        chev(open),
+        h('span', { style: 'width:6px; height:6px; border-radius:2px; flex-shrink:0; background:' + (s.selected ? '#6cb39a' : '#403b35') + ';' }),
+        h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace;' }, s.name || '(unnamed)'),
+        s.selected ? null : h('span', { style: 'font-size:9.5px; color:#5a5652; letter-spacing:0.04em; flex-shrink:0;' }, 'SKIPPED'),
+        h('span', { style: 'font-size:10.5px; color:#5a5652; font-family:ui-monospace,monospace; flex-shrink:0;' }, fmtTok(s.tokens) + ' tok'));
+      const wrap = h('div', {}, row);
+      if (open) {
+        if (S.substrateContent == null) {
+          wrap.appendChild(h('div', { style: 'display:flex; align-items:center; gap:10px; padding:11px 13px 12px 33px; font-size:11px; color:#8a8178; background:#141210; border-top:1px solid #221f1c;' },
+            h('span', { class: 'zspin' }), 'loading content…'));
+        } else {
+          const txt = S.substrateContent[s.name] != null ? S.substrateContent[s.name] : '(no authored content for this section)';
+          wrap.appendChild(h('pre', { style: 'margin:0; padding:8px 13px 10px 33px; font-size:11px; line-height:1.5; color:#bdb6ad; background:#141210; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; border-top:1px solid #221f1c;' }, txt));
+        }
+      }
+      return wrap;
+    };
+
+    // A collapsible group card, collapsed by default. Clicking the header (which
+    // highlights on hover and rotates its chevron) toggles its rows.
+    const group = (title, sub, accent, gkey, rows) => {
+      const open = !!S.substrateGroupOpen[gkey];
+      const card = h('div', { style: 'border:1px solid #2e2b27; border-left:3px solid ' + accent + '; border-radius:8px; overflow:hidden; margin:7px 0; background:#1a1816;' },
+        h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateGroupOpen', gkey), style: 'cursor:pointer; display:flex; align-items:center; gap:9px; padding:9px 11px; background:#201d1b;' },
+          chev(open),
+          h('span', { style: 'font-family:ui-monospace,monospace; font-size:12px; color:#ece8e4; font-weight:650;' }, title),
+          h('span', { style: 'margin-left:auto; font-size:10.5px; color:#7c736a; font-family:ui-monospace,monospace;' }, sub),
+          h('span', { style: 'font-size:9.5px; color:#6a6258; letter-spacing:0.05em; flex-shrink:0;' }, open ? 'HIDE' : 'SHOW')));
+      if (open) rows.forEach((r) => card.appendChild(r));
+      return card;
+    };
+
+    // A glue row — structural template markers (system/tool block envelopes)
+    // and the per-turn dialect framing — shown verbatim in materialized order.
+    const G = S.substrateGlue;
+    const glueRow = (text) => h('div', { style: 'padding:3px 13px 3px 15px; font-size:10.5px; font-family:ui-monospace,monospace; color:#7d7468; letter-spacing:0.02em; white-space:pre-wrap; word-break:break-word;' },
+      h('span', { style: 'color:#9a8f80; margin-right:6px;' }, '⟐'), (text || '').replace(/\n+$/, ''));
+
+    // System prompt in materialized order: the engine's structural glue rows
+    // (always visible — incl. the markers that CLOSE the tool block and system
+    // block) interleaved with collapsible content sections and the contributing
+    // collection. This mirrors exactly what the projection emitted.
+    sel.system.forEach((item) => {
+      if (item.kind === 'glue') {
+        body.appendChild(glueRow(item.content));
+      } else if (item.kind === 'collection') {
+        const picked = item.sections.filter((s) => s.selected).length;
+        const gkey = 'col::' + item.name;
+        body.appendChild(group(item.name, picked + ' / ' + item.sections.length + ' selected', '#6f9ed8', gkey, item.sections.map((s) => sectionRow(s, gkey))));
+      } else {
+        body.appendChild(sectionRow({ name: item.name, tokens: item.tokens, selected: true }, 'sys'));
+      }
+    });
+
+    // Verbatim body text in a pre-wrap block (preserves every space/newline).
+    const bodyPre = (txt) => h('pre', { style: 'margin:0; padding:8px 13px 11px 13px; font-size:11px; line-height:1.5; color:#cdc6bd; background:#141210; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; border-top:1px solid #2e2b27;' }, txt);
+
+    // One ChatML message as a collapsible card — shared by BOTH the memory tiers
+    // and the dialogue so they look identical. Header: "<layer> · <role> message"
+    // + token estimate, role-accented left border, clean body. The role markers
+    // are flat glue rows OUTSIDE the card; the closer is omitted while
+    // `opts.open` (a still-decoding assistant).
+    const pushMsg = (role, content, opts) => {
+      opts = opts || {};
+      const isUser = role === 'user';
+      const accent = isUser ? '#9b8fdf' : '#6cb39a';
+      const exp = !!S.substrateExpanded[opts.key];
+      if (G) body.appendChild(glueRow(isUser ? G.user_start : G.assistant_start));
+      const tok = fmtTok(Math.max(1, Math.round((content || '').length / 4)));
+      const wrap = h('div', { style: 'border:1px solid #2e2b27; border-left:3px solid ' + accent + '; border-radius:6px; overflow:hidden; margin:3px 0; background:#1a1816;' },
+        h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateExpanded', opts.key), style: 'cursor:pointer; display:flex; align-items:center; gap:9px; padding:7px 11px; background:#201d1b;' },
+          chev(exp),
+          h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace; font-size:12px; color:#ece8e4; font-weight:600;' }, (opts.layer ? opts.layer + ' · ' : '') + role + ' message' + (opts.suffix || '')),
+          h('span', { style: 'margin-left:auto; font-size:10.5px; color:#7c736a; font-family:ui-monospace,monospace; flex-shrink:0;' }, tok + ' tokens')));
+      if (exp) wrap.appendChild(bodyPre(content || ''));
+      body.appendChild(wrap);
+      if (G && !opts.open) body.appendChild(glueRow(isUser ? G.user_end : G.assistant_end));
+    };
+
+    const targetLayer = S.substrateTargetLayer || 'dialogue';
+
+    // Lower-layer memory tiers (repo_map, code_reading, …) projected into the
+    // window — between the system prompt and the dialogue. Each turn renders as
+    // two messages (user + assistant), identical in style to the conversation,
+    // prefixed with the originating layer.
+    const otherTurns = (sel.turns || []).filter((t) => t.layer && t.layer !== targetLayer)
+      .slice().sort((a, b) => ((a.layer || '') + (a.group || '')).localeCompare((b.layer || '') + (b.group || '')) || (a.index || 0) - (b.index || 0));
+    otherTurns.forEach((t) => {
+      const tc = (S.substrateTurnContent || {})[t.group + '::' + t.index] || {};
+      const base = 'turn::' + t.group + '::' + t.index;
+      pushMsg('user', tc.user, { layer: t.layer, key: base + '::user' });
+      pushMsg('assistant', tc.assistant, { layer: t.layer, key: base + '::assistant' });
+    });
+
+    // The conversation, rendered from the REAL messages (the GUI holds them with
+    // correct roles + bodies; `sel.turns` has neither — it tags every sealed turn
+    // `assistant` and carries no text). Sequence: prior exchanges, the active user
+    // prompt, then the response decoded SO FAR. Each projection dot fired at its
+    // own `end_token`; truncate the trailing response to THIS dot's progress (by
+    // token fraction — the panel has text, not token offsets) so an earlier dot
+    // shows proportionally less, not the whole final answer.
+    const dm = S.substrateMsg, um = S.substrateUserMsg, hist = S.substrateHistory || [];
+    const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
+    const maxEnd = Math.max(1, ...ends);
+    const here = node && node.end_token != null ? node.end_token : maxEnd;
+    const complete = here >= maxEnd;
+    let decoded = '';
+    if (dm && dm.role === 'assistant' && (dm.content || '').length) {
+      const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
+      decoded = dm.content.slice(0, cut);
+    }
+
+    // Same card style + layer prefix as the memory tiers above, so the whole
+    // panel is uniform. The trailing assistant is open-ended while still decoding.
+    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i }));
+    if (um) pushMsg('user', um.content, { layer: targetLayer, key: 'conv::um' });
+    if (dm) pushMsg('assistant', decoded, { layer: targetLayer, suffix: complete ? '' : ' · decoded so far', open: !complete, key: 'conv::dm' });
+
+    const empty = !sel.system.length && !hist.length && !um && !dm;
+    const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(880px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:flex-start; gap:12px; padding:15px 17px; border-bottom:1px solid #2e2b27;' },
+        h('div', { style: 'flex:1; min-width:0;' },
+          h('div', { style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, 'Projection selection'),
+          h('div', { style: 'font-size:0.73rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:3px; word-break:break-word;' }, !node ? '' : ((node.step || '') + ' · materialized ' + fmtTok(node.materialized_tokens) + ' / ' + fmtTok(node.substrate_tokens) + ' tokens' + (node.tokens_per_second ? ' · ' + Math.round(node.tokens_per_second) + ' t/s' : '')))),
+        empty ? null : h('button', { onClick: (e) => copyText(substrateAllText(node), e.currentTarget, 'Copied', 'Copy all'), style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy all'),
+        h('button', { onClick: () => setState({ substrateOpen: false }), style: closeBtnStyle() }, '×')),
+      empty ? h('div', { style: 'flex:1; padding:30px; color:#7c736a; font-size:0.85rem; background:#161412;' }, 'No selection recorded for this projection.') : body);
+    return h('div', { class: 'z-modal-ov', onClick: () => setState({ substrateOpen: false }), style: modalOvStyle(400) }, modal);
+  }
+
+  // ── logs pane ────────────────────────────────────────────────────────────
+  function buildLogs() {
+    const listEl = h('div', { class: 'zscroll-log', ref: (el) => { logEl = el; }, style: "flex:1; min-height:0; overflow-y:auto; font-family:'Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace; font-size:11px; line-height:1.55; padding:0.3rem 0;" });
+    logs.forEach((l) => {
+      const cc = logColors(l.level);
+      listEl.appendChild(h('div', { style: 'display:grid; grid-template-columns:54px 42px 1fr; gap:0 0.4rem; padding:0.12rem 0.65rem; align-items:center; min-width:0;' },
+        h('span', { style: 'color:#4a4540; white-space:nowrap; overflow:hidden; user-select:none; font-size:10px;' }, l.ts),
+        h('span', { style: 'font-size:9px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; white-space:nowrap; padding:0.15em 0.4em; border-radius:3px; text-align:center; color:' + cc[0] + '; background:' + cc[1] + ';' }, l.level),
+        h('span', { style: 'min-width:0; word-break:break-word; white-space:pre-wrap;', html: '<span style="color:#56504a;">' + esc(l.target) + '</span><span style="color:#2a2724;"> › </span><span style="color:#c0bbb6;">' + esc(l.msg) + '</span>' })));
+    });
+    return h('div', { class: 'z-logs', style: 'flex-shrink:0; width:' + S.logW + 'px; height:100%; display:flex; flex-direction:column; background:#0f0e0d; overflow:hidden;' },
+      h('div', { style: 'flex-shrink:0; display:flex; align-items:center; justify-content:space-between; padding:0.9rem 0.75rem 0.75rem; border-bottom:1px solid #252220; background:#0f0e0d;' },
+        h('span', { style: 'font-size:0.78rem; font-weight:650; color:#5a5450; letter-spacing:0.06em; text-transform:uppercase;' }, 'Logs'),
+        h('div', { style: 'display:flex; align-items:center; gap:0.55rem;' },
+          (function () {
+            const st = (typeof window !== 'undefined' && window.__ZEND_LOG_WS__) || 'ok';
+            const col = st === 'ok' ? '#34d399' : st === 'wait' ? '#d4a020' : '#e05555';
+            const title = st === 'ok' ? 'connected' : st === 'wait' ? 'connecting…' : 'disconnected — reconnecting';
+            return h('span', { title, style: 'width:7px; height:7px; border-radius:50%; background:' + col + '; box-shadow:0 0 5px ' + col + '66;' });
+          })(),
+          h('button', { onClick: () => { logs = []; renderLogsOnly(); }, style: 'font-size:0.68rem; color:#5a5652; background:none; border:1px solid #252220; border-radius:4px; padding:0.12rem 0.45rem; cursor:pointer; font-family:inherit;' }, 'Clear'),
+          h('button', { onClick: () => setState({ logsOpen: false }), title: 'Hide logs', style: 'display:flex; align-items:center; gap:4px; font-size:0.68rem; color:#9a9490; background:none; border:1px solid #3a3530; border-radius:4px; padding:0.12rem 0.5rem; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 12 12" fill="none" style="width:9px;height:9px;"><path d="M4 2l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Hide</span>' }))),
+      listEl);
+  }
+  function renderLogsOnly() {
+    if (!S.logsOpen) return;
+    const old = document.querySelector('.z-logs');
+    if (!old || !old.parentNode) { render(); return; }
+    if (logEl) logStick = nearBottom(logEl);
+    old.parentNode.replaceChild(buildLogs(), old);  // buildLogs reassigns logEl via ref
+    if (logStick) scrollLog();
+  }
+
+  // ── small shared bits ────────────────────────────────────────────────────
+  function iconBtn(path, title, onClick, size) {
+    const s = size || 27;
+    return h('button', { title, onClick, style: 'width:' + s + 'px; height:' + s + 'px; border-radius:' + (s > 30 ? 8 : 6) + 'px; border:1px solid #334455; background:transparent; color:' + (s > 30 ? '#8ba0b6' : '#6a8098') + '; cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:' + Math.round(s * 0.45) + 'px;height:' + Math.round(s * 0.45) + 'px;"><path d="' + path + '" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
+  }
+  function closeBtnStyle() { return 'flex-shrink:0; width:28px; height:28px; display:flex; align-items:center; justify-content:center; font-size:15px; color:#7c736a; background:none; border:1px solid #38342f; border-radius:7px; cursor:pointer; padding:0;'; }
+  function modalOvStyle(z) { return 'position:fixed; inset:0; z-index:' + z + '; background:rgba(0,0,0,0.62); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; padding:40px;'; }
+  function starLogo(sz, hole, rx) {
+    rx = rx || 7.5;
+    return '<svg width="' + sz + '" height="' + sz + '" viewBox="0 0 32 32" style="flex-shrink:0;display:block;"><rect width="32" height="32" rx="' + rx + '" fill="' + hole + '"/><path d="M16 2.5 C 16.4,9.8 22.2,15.6 29.5,16 C 22.2,16.4 16.4,22.2 16,29.5 C 15.6,22.2 9.8,16.4 2.5,16 C 9.8,15.6 15.6,9.8 16,2.5 Z" fill="#c98a3e"/><circle cx="16" cy="16" r="3.2" fill="' + hole + '" opacity="0.55"/></svg>';
+  }
+  function flash(btn, on, off) { if (btn) { btn.textContent = on; setTimeout(() => { btn.textContent = off; }, 1400); } }
+  // Robust clipboard copy. navigator.clipboard.writeText rejects ASYNC (a bare
+  // try/catch won't trap it and the button would lie "Copied"), so we await it
+  // and fall back to a hidden-textarea execCommand. Flashes only on success.
+  function copyText(text, btn, on, off) {
+    const done = (ok) => { if (ok && btn) flash(btn, on || 'Copied', off || (btn.textContent || 'Copy')); };
+    const fallback = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        const ok = document.execCommand('copy'); document.body.removeChild(ta);
+        return ok;
+      } catch (_) { return false; }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(fallback()));
+    } else {
+      done(fallback());
+    }
+  }
+
+  // ── startup / model-loading overlay (GET /v1/status) ─────────────────────
+  function buildLoadingScreen(boot) {
+    const ld = (boot && boot.loading) || { current: 'Loading model', progress: 0, completed: [] };
+    const pct = Math.round((ld.progress || 0) * 100);
+    const completed = (ld.completed || []).map((step) => h('li', {}, step));
+    const card = h('div', { class: 'z-load-card' },
+      h('div', { class: 'z-load-eyebrow' }, 'Starting up'),
+      h('div', { class: 'z-load-row' },
+        h('div', { class: 'z-spin' }),
+        h('span', { class: 'z-load-cur' }, ld.current || 'Loading model')),
+      h('div', { class: 'z-load-track' }, h('div', { class: 'z-load-bar', style: 'width:' + pct + '%;' })),
+      completed.length ? h('ul', { class: 'z-load-list' }, completed) : null,
+      h('div', { class: 'z-load-detail' }, (boot && boot.detail) || ''));
+    return h('div', { style: 'position:fixed; inset:0; background:#1c1917; display:flex; align-items:center; justify-content:center; z-index:500;' }, card);
+  }
+
+  // ── global handlers ──────────────────────────────────────────────────────
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (S.themeMenuOpen) setState({ themeMenuOpen: false });
+    else if (S.openMenu) setState({ openMenu: null });
+    else if (S.fileView) setState({ fileView: null });
+    else if (S.substrateOpen) setState({ substrateOpen: false });
+    else if (S.filesOpen) setState({ filesOpen: false });
+  });
+  document.addEventListener('mousedown', (e) => {
+    const t = e.target;
+    if (t && t.closest && t.closest('textarea, input, select, [contenteditable], button, a, label, [data-act]')) return;
+    e.preventDefault();
+  });
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.copy-btn');
+    if (!btn) return;
+    const cb = btn.closest('.code-block'); const code = cb && cb.querySelector('code');
+    if (code) { try { navigator.clipboard.writeText(code.innerText); } catch (_) {} btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 1600); }
+  });
+  document.addEventListener('toggle', (e) => {
+    const det = e.target;
+    if (det && det.classList && det.classList.contains('think-block')) {
+      const turn = det.closest('[data-msg]');
+      if (turn) { const key = S.activeId + ':' + turn.getAttribute('data-msg'); S.thinkOpen = Object.assign({}, S.thinkOpen, { [key]: det.open }); }
+    }
+    // No reposition needed: the bar gutter is align-self:stretch, so when a
+    // think block expands/collapses the bars re-flow by CSS % automatically.
+  }, true);
+  window.addEventListener('resize', () => {
+    const narrow = window.innerWidth < NARROW_W;
+    const wide = window.innerWidth >= WIDE_W;
+    if (narrow !== S.narrow || wide !== S.wide) setState({ narrow, wide });   // re-renders: gutter visibility + right margin
   });
 
-  // Complete tool calls without opener (Qwen3 quirk): JSON}</tool_call>
-  while (remaining.includes('</tool_call>')) {
-    const closeIdx = remaining.indexOf('</tool_call>');
-    const before = remaining.slice(0, closeIdx);
-    const jsonStart = before.lastIndexOf('{');
-    if (jsonStart !== -1) {
-      const marker = `\x00TC:${segments.length}\x00`;
-      segments.push({ complete: true, json: before.slice(jsonStart) });
-      remaining = before.slice(0, jsonStart) + marker + remaining.slice(closeIdx + '</tool_call>'.length);
-    } else {
-      remaining = before + remaining.slice(closeIdx + '</tool_call>'.length);
-    }
-  }
+  // ── boot ─────────────────────────────────────────────────────────────────
+  // Poll GET /v1/status until the daemon is ready (showing the loading overlay
+  // while the model loads), then do the async-tolerant initial load: the mock
+  // seeds synchronously, the live adapter fetches GET /v1/conversations. Either
+  // way we pick an active conversation (prefer hydrated, else first) + hydrate.
+  logUnsub = API.subscribeLogs((line) => addLog(line));
 
-  // Incomplete opener at end (still streaming)
-  const openIdx = remaining.lastIndexOf('<tool_call>');
-  if (openIdx !== -1) {
-    if (streaming) {
-      const marker = `\x00TC:${segments.length}\x00`;
-      segments.push({ complete: false, json: remaining.slice(openIdx + '<tool_call>'.length) });
-      remaining = remaining.slice(0, openIdx) + marker;
-    } else {
-      remaining = remaining.slice(0, openIdx) + remaining.slice(openIdx + '<tool_call>'.length);
-    }
-  }
-
-  // Render: split on \x00TC:N\x00 markers, alternating text / tool-call
-  const parts = remaining.split(/\x00TC:(\d+)\x00/);
-  let html = '';
-  for (let i = 0; i < parts.length; i++) {
-    if (i % 2 === 0) {
-      if (parts[i]) html += marked.parse(preprocess(parts[i]));
-    } else {
-      html += renderToolCallCard(segments[parseInt(parts[i], 10)]);
-    }
-  }
-  return html;
-}
-
-function copyCode(btn) {
-  navigator.clipboard.writeText(btn.closest('.code-block').querySelector('code').innerText)
-    .then(() => { btn.textContent = 'Copied!'; setTimeout(()=>{ btn.textContent='Copy'; }, 1800); })
-    .catch(()=>{});
-}
-
-function appendUserTurn(text) {
-  const div = document.createElement('div');
-  div.className = 'turn user';
-  div.innerHTML = `<div class="bubble">${esc(text)}</div>`;
-  chatView.appendChild(div);
-}
-
-function appendAssistantTurn() {
-  const div = document.createElement('div');
-  div.className = 'turn assistant';
-  div.innerHTML = `<div class="asst-icon"><svg width="14" height="14" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M16 2.5 C 16.4,9.8 22.2,15.6 29.5,16 C 22.2,16.4 16.4,22.2 16,29.5 C 15.6,22.2 9.8,16.4 2.5,16 C 9.8,15.6 15.6,9.8 16,2.5 Z" fill="#c98a3e"/><circle cx="16" cy="16" r="3.2" fill="currentColor" opacity="0.6"/></svg></div><div class="bubble"></div>`;
-  chatView.appendChild(div);
-  const bubble = div.querySelector('.bubble');
-  const loadingEl = document.createElement('span');
-  loadingEl.className = 'loading-dots';
-  loadingEl.innerHTML = '<span></span><span></span><span></span>';
-  bubble.appendChild(loadingEl);
-  const cursor = document.createElement('span');
-  cursor.className = 'cursor';
-  return { bubble, cursor, loadingEl };
-}
-
-// ── Send ───────────────────────────────────────────────────────────────────────
-
-async function send(text) {
-  if (!text) return;
-  if (activeId === null) {
-    const id = Date.now();
-    conversations.unshift({ id, title: 'New conversation', history: [] });
-    activeId = id;
-  }
-  const conv = conversations.find(c => c.id === activeId);
-  if (!conv || conv.streaming) return;
-
-  const convId = conv.id;
-
-  const firstMessage = conv.history.length === 0;
-  if (firstMessage) {
-    conv.title = text.length > 44 ? text.slice(0, 42) + '…' : text;
-    emptyState.style.display = 'none';
-    chatView.classList.add('active');
-  }
-
-  promptEl.value = '';
-  promptEl.style.height = 'auto';
-  conv.streaming = true;
-  chatAutoScroll = true;
-  updateSendBtn();
-  conv.history.push({ role: 'user', content: text });
-  // After the push the conv is no longer a draft and should now
-  // appear in the sidebar (the empty-history filter would have
-  // hidden it before the push).
-  if (firstMessage) renderSidebar();
-  appendUserTurn(text);
-  if (activeId === convId) chatScrollToBottom();
-
-  const { bubble, cursor, loadingEl } = appendAssistantTurn();
-  conv.pending = bubble.closest('.turn');
-  if (activeId === convId) chatScrollToBottom();
-  let accumulated = '';
-  let firstToken  = true;
-  let failed      = false;
-  let streamClean = false;  // set true only when [DONE] received
-
-  try {
-    const res = await fetch('/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'zen-code', stream: true, messages: conv.history, conv_id: String(conv.id) }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    const reader  = res.body.getReader();
-    const decoder = new TextDecoder();
-    let   buf          = '';
-    let   sseEventType = '';
-
-    outer: while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (line.startsWith('event: ')) { sseEventType = line.slice(7).trim(); continue; }
-        if (line === '')               { sseEventType = ''; continue; }
-        if (!line.startsWith('data: ')) continue;
-        const payload = line.slice(6).trim();
-        if (payload === '[DONE]') { streamClean = true; break outer; }
-
-        if (sseEventType === 'status') {
-          let statusText = '';
-          try { statusText = JSON.parse(payload).text ?? ''; } catch {}
-          if (statusText) {
-            let txt = loadingEl.querySelector('.status-text');
-            if (!txt) {
-              txt = document.createElement('span');
-              txt.className = 'status-text';
-              loadingEl.appendChild(txt);
-            }
-            txt.textContent = statusText;
-          }
-          sseEventType = '';
-          continue;
-        }
-
-        let chunk;
-        try { chunk = JSON.parse(payload); } catch { continue; }
-        const delta = chunk?.choices?.[0]?.delta?.content;
-        if (!delta) continue;
-        if (firstToken) { firstToken = false; loadingEl.remove(); bubble.appendChild(cursor); }
-        accumulated += delta;
-        bubble.innerHTML = renderContent(accumulated, true);
-        bubble.appendChild(cursor);
-        if (activeId === convId) chatScrollToBottom();
+  function initConversations() {
+    Promise.resolve(API.seedConversations(now)).then((list) => {
+      S.conversations = list || [];
+      const hashId = readHashConv();
+      const hashConv = hashId && S.conversations.find((c) => String(c.id) === String(hashId));
+      const hydrated = S.conversations.find((c) => c.history && c.history.length);
+      const first = S.conversations[0];
+      S.activeId = hashConv ? hashConv.id : (hydrated ? hydrated.id : (first ? first.id : null));
+      if (S.activeId) {
+        const a = S.conversations.find((c) => c.id === S.activeId);
+        S.loaded[S.activeId] = !!(a && a.history && a.history.length);
       }
-    }
-  } catch (err) {
-    failed = true;
-    loadingEl.remove();
-    cursor.remove();
-    const isNetwork = err instanceof TypeError;
-    const msg = isNetwork
-      ? 'Connection lost — the server may have restarted.'
-      : `Server error: ${err.message}`;
-    bubble.innerHTML = `<span class="error-turn">⚠ ${esc(msg)}</span>`;
-  }
-
-  if (!failed) {
-    cursor.remove();
-    if (firstToken) loadingEl.remove();  // spinner stuck if no tokens arrived
-    if (!streamClean && !accumulated) {
-      // Stream ended without [DONE] and no content — server-side error.
-      bubble.innerHTML = `<span class="error-turn">⚠ Server error — check the Logs pane for details.</span>`;
-      failed = true;
-    } else if (accumulated) {
-      conv.history.push({ role: 'assistant', content: accumulated });
-    }
-  }
-  conv.pending   = null;
-  conv.streaming = false;
-  if (activeId === convId) {
-    updateSendBtn();
-    promptEl.focus();
-  }
-
-  // After a successful turn, the daemon's titler may have written a
-  // substrate-backed sidebar label by now (or it's about to). Pull the
-  // server's view and update this conv's title in place if it changed.
-  // The titler runs in parallel with decode so the label often lands
-  // before [DONE]; the few cases where it's still in flight get caught
-  // by a short retry.
-  if (!failed) {
-    refreshTitleForConv(conv);
-  }
-}
-
-async function refreshTitleForConv(conv) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      const res = await fetch('/v1/conversations');
-      if (res.ok) {
-        const body = await res.json();
-        const remote = (body.conversations || []).find(c => c.id === String(conv.id));
-        if (remote && remote.label && remote.label !== conv.title) {
-          conv.title = remote.label;
-          renderSidebar();
-          return;
-        }
-      }
-    } catch (_) { /* network blip — retry */ }
-    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
-  }
-}
-
-promptEl.focus();
-
-chatView.addEventListener('scroll', () => {
-  chatAutoScroll = chatView.scrollHeight - chatView.scrollTop - chatView.clientHeight < 60;
-});
-
-function chatScrollToBottom() {
-  if (chatAutoScroll) chatView.scrollTop = chatView.scrollHeight;
-}
-
-// ── Live log pane ──────────────────────────────────────────────────────────────
-
-const logEntries = document.getElementById('log-entries');
-const logDot     = document.getElementById('log-dot');
-const logClear   = document.getElementById('log-clear');
-const MAX_LOG    = 600;
-let logAutoScroll = true;
-let wsRetryMs     = 1000;
-
-// Parse a tracing-subscriber fmt line (no ANSI):
-//   2026-05-07T02:29:15.554713Z  INFO zend::foo: the message  field=val
-function parseLogLine(raw) {
-  const m = raw.match(/^(\S+)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(\S+?):\s*(.*)/);
-  if (!m) return { ts: '', level: 'INFO', target: '', msg: raw };
-  const ts = (m[1].match(/T(\d{2}:\d{2}:\d{2})/) || [])[1] ?? '';
-  return { ts, level: m[2], target: m[3], msg: m[4] };
-}
-
-function appendLog(raw) {
-  const { ts, level, target, msg } = parseLogLine(raw);
-
-  const el = document.createElement('div');
-  el.className = 'le';
-  el.innerHTML =
-    `<span class="le-ts">${ts}</span>` +
-    `<span class="le-level lv-${level}">${level}</span>` +
-    `<span class="le-body"><span class="le-target">${esc(target)}</span>` +
-    (target && msg ? '<span style="color:#2a2724"> › </span>' : '') +
-    `<span class="le-msg">${esc(msg)}</span></span>`;
-
-  logEntries.appendChild(el);
-
-  // Trim oldest entries
-  while (logEntries.children.length > MAX_LOG) {
-    logEntries.removeChild(logEntries.firstChild);
-  }
-
-  if (logAutoScroll) logEntries.scrollTop = logEntries.scrollHeight;
-}
-
-logEntries.addEventListener('scroll', () => {
-  const atBottom = logEntries.scrollHeight - logEntries.scrollTop - logEntries.clientHeight < 24;
-  logAutoScroll = atBottom;
-});
-
-logClear.addEventListener('click', () => {
-  logEntries.innerHTML = '';
-  logAutoScroll = true;
-});
-
-function connectLogWs() {
-  logDot.className = 'log-dot wait';
-  logDot.title = 'connecting…';
-
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws/logs`);
-
-  ws.onopen = () => {
-    logDot.className = 'log-dot ok';
-    logDot.title = 'connected';
-    wsRetryMs = 1000;
-  };
-
-  ws.onmessage = e => appendLog(e.data);
-
-  ws.onclose = () => {
-    logDot.className = 'log-dot err';
-    logDot.title = `reconnecting in ${wsRetryMs / 1000}s…`;
-    setTimeout(connectLogWs, wsRetryMs);
-    wsRetryMs = Math.min(wsRetryMs * 2, 16000);
-  };
-
-  ws.onerror = () => {
-    logDot.className = 'log-dot err';
-    logDot.title = 'error';
-  };
-}
-
-connectLogWs();
-
-// ── Resizable columns ──────────────────────────────────────────────────────────
-
-(function () {
-  const sidebar = document.getElementById('sidebar');
-  const logPane = document.getElementById('log-pane');
-
-  function makeResizer(handle, el, minW, maxW, invert) {
-    handle.addEventListener('mousedown', e => {
-      e.preventDefault();
-      handle.classList.add('dragging');
-      document.body.style.cursor    = 'col-resize';
-      document.body.style.userSelect = 'none';
-
-      const startX = e.clientX;
-      const startW = el.offsetWidth;
-
-      const onMove = mv => {
-        const dx = (mv.clientX - startX) * (invert ? -1 : 1);
-        el.style.width = Math.max(minW, Math.min(maxW, startW + dx)) + 'px';
-      };
-      const onUp = () => {
-        handle.classList.remove('dragging');
-        document.body.style.cursor    = '';
-        document.body.style.userSelect = '';
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup',   onUp);
-      };
-
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup',   onUp);
+      render();
+      focusPrompt();
+      if (S.activeId && !S.loaded[S.activeId]) hydrateIfNeeded(S.activeId);
+      window.__ZEND_READY__ = true;
+    }).catch((e) => {
+      if (window.console) console.error('seedConversations failed', e);
+      render();
+      window.__ZEND_READY__ = true;
     });
   }
 
-  makeResizer(document.getElementById('resizer-l'), sidebar, 120, 420, false);
-  makeResizer(document.getElementById('resizer-r'), logPane, 160, 560, true);
-}());
+  // Boot/reload state. `reloadPolling` is true while pollStatus owns the screen
+  // (initial load OR a detected daemon reload), so periodicSync stays out of the
+  // way. `lastStartedAt` tracks the daemon's start stamp to detect restarts.
+  let lastStartedAt = null;
+  let reloadPolling = false;
+  const LOADING_BOOT = (label) => ({ state: 'loading', detail: '', loading: { current: label, progress: 0, completed: [] } });
+
+  function pollStatus() {
+    Promise.resolve(API.getStatus()).then((st) => {
+      checkBuild(st);   // capture the build id on first sighting
+      if (st && st.state === 'ready') {
+        reloadPolling = false;
+        if (st.started_at_ms != null) lastStartedAt = st.started_at_ms;
+        S.boot = null;
+        initConversations();
+      } else {
+        S.boot = st || S.boot || LOADING_BOOT('Loading model');
+        render();
+        setTimeout(pollStatus, 1000);
+      }
+    }).catch(() => { S.boot = S.boot || LOADING_BOOT('Reconnecting'); render(); setTimeout(pollStatus, 1000); });
+  }
+
+  // Server-authoritative sidebar sync (live only): pick up the titler's label,
+  // archive changes from elsewhere, new/removed conversations. The mock has no
+  // server to sync against, so this is a no-op there.
+  function refreshConversationList() {
+    if (window.ZEND_BACKEND_ACTIVE !== 'live') return;
+    Promise.resolve(API.seedConversations(now)).then((list) => {
+      if (!Array.isArray(list)) return;
+      const serverIds = new Set(list.map((c) => String(c.id)));
+      let mutated = false;
+      // Drop entries the server no longer knows about — but keep the in-flight
+      // stream and a fresh local draft the user is still composing.
+      S.conversations = S.conversations.filter((c) => {
+        if (c.streaming || c.id === S.activeId) return true;
+        if (!serverIds.has(String(c.id))) { delete S.loaded[c.id]; mutated = true; return false; }
+        return true;
+      });
+      list.forEach((e) => {
+        const ex = S.conversations.find((c) => String(c.id) === String(e.id));
+        if (ex) {
+          if (e.title && e.title !== ex.title) { ex.title = e.title; mutated = true; }   // titler is authoritative
+          if (!!e.archived !== !!ex.archived) { ex.archived = !!e.archived; mutated = true; }
+          if (e.updated_ms) ex.updated_ms = e.updated_ms;
+        } else {
+          S.conversations = S.conversations.concat([Object.assign({}, e, { history: e.history || [] })]);
+          mutated = true;
+        }
+      });
+      if (mutated) render();
+    }).catch(() => {});
+  }
+
+  // Continuous status poll after ready: detect daemon restarts / model reloads
+  // and keep the sidebar in sync.
+  function periodicSync() {
+    if (reloadPolling) return;   // a reload poll already owns the loading screen
+    Promise.resolve(API.getStatus()).then((st) => {
+      if (checkBuild(st)) return;   // build changed -> reloading
+      if (!st || st.state !== 'ready') {
+        // Daemon is mid-reload (restart / model reload). Drop back to the
+        // loading overlay and hand off to pollStatus until it's ready again,
+        // then re-init — previously this just returned and left the stale UI up
+        // until the user pressed F5.
+        reloadPolling = true;
+        S.boot = st || LOADING_BOOT('Reloading model');
+        S.loaded = {};
+        render();
+        pollStatus();
+        return;
+      }
+      if (lastStartedAt !== null && st.started_at_ms && st.started_at_ms !== lastStartedAt) {
+        lastStartedAt = st.started_at_ms;
+        S.loaded = {};
+        initConversations();   // daemon restarted — reload from scratch
+      } else {
+        if (st.started_at_ms) lastStartedAt = st.started_at_ms;
+        refreshConversationList();
+      }
+    }).catch(() => {
+      // Unreachable — daemon almost certainly restarting. Show the loading
+      // overlay and poll until it returns.
+      reloadPolling = true;
+      S.boot = LOADING_BOOT('Reconnecting');
+      S.loaded = {};
+      render();
+      pollStatus();
+    });
+  }
+
+  render();      // loading overlay (S.boot starts in the loading state)
+  reloadPolling = true;   // the initial model-load poll owns the loading screen
+  pollStatus();
+  setInterval(periodicSync, 5000);
+})();
 </script>
 </body>
 </html>

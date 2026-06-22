@@ -735,6 +735,25 @@ impl Cache {
         }
     }
 
+    /// Truncate the chunked sequence to exactly `offset` cum-tokens, freeing any
+    /// writer-owned chunks/usage beyond it (Arc-shared prefix chunks are kept).
+    /// This makes an offset-`N` re-prefill idempotent — re-running a prefill at the
+    /// same offset must not stack stale tail chunks. Unlike `reset`, it keeps the
+    /// backing slot allocated. No-op when already ≤ `offset` tokens.
+    pub(crate) fn truncate_chunked_to_tokens(&mut self, offset: usize) {
+        self.current_seq_len = offset;
+        match &mut self.storage {
+            CacheStorage::Chunked(c) => {
+                let _ = c.backing.truncate_sequence_to_tokens(c.batch_idx, offset);
+            }
+            CacheStorage::Contiguous { all_data } => {
+                if offset == 0 {
+                    *all_data = None;
+                }
+            }
+        }
+    }
+
     /// Fork this cache, creating a new cache that shares data via copy-on-write.
     ///
     /// For chunked (paged) caches: complete blocks are shared via COW, partial
@@ -1279,6 +1298,14 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k.reset();
         self.v.reset();
+    }
+
+    /// Truncate both K and V to exactly `offset` cum-tokens, freeing any chunks
+    /// beyond it. Makes an offset-`N` (re)prefill idempotent (see
+    /// [`Cache::truncate_chunked_to_tokens`]).
+    pub fn truncate_to_offset(&mut self, offset: usize) {
+        self.k.truncate_chunked_to_tokens(offset);
+        self.v.truncate_chunked_to_tokens(offset);
     }
 
     /// Fork this KV cache, creating a new cache that shares data via copy-on-write.

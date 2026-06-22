@@ -14,11 +14,16 @@
 //! ```
 
 mod api;
+mod chatml;
 mod code_read;
 mod config;
+mod conv_file_store;
+mod conv_files;
 mod download;
 mod loading;
 mod log_broadcast;
+mod log_line;
+mod projection_event;
 mod refresh_ctx;
 mod repo_scan;
 mod session;
@@ -65,6 +70,11 @@ struct Cli {
     /// without the per-file prefill sweep.
     #[arg(long)]
     skip_code_read: bool,
+
+    /// Skip the startup repository scan. Brings the daemon up fast
+    /// (model + substrate + sections only) so you can test conversations
+    #[arg(long)]
+    skip_repo_scan: bool,
 
     /// Compact the substrate redo log once at startup (reclaims dead records
     /// from superseded turns / tombstoned timelines). Off by default;
@@ -140,11 +150,15 @@ async fn main() -> anyhow::Result<()> {
         workspace: workspace.clone(),
         port: cli.port,
         skip_code_read: cli.skip_code_read,
+        skip_repo_scan: cli.skip_repo_scan,
         compact_substrate: cli.compact_substrate,
     };
 
     if cli.skip_code_read {
         tracing::info!("--skip-code-read: startup code-reading ingest is disabled");
+    }
+    if cli.skip_repo_scan {
+        tracing::info!("--skip-repo-scan: startup repository scan is disabled");
     }
     if cli.compact_substrate {
         tracing::info!("--compact-substrate: will compact the redo log once at startup");

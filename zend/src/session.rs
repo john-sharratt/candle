@@ -15,12 +15,14 @@ use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_
 use candle_conversation::projection::{
     self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
 };
-use candle_conversation::{ConversationEngine, Sequence, TokenDecoder, TurnEvent};
+use candle_conversation::{ConversationEngine, GlueMarkers, Sequence, TokenDecoder, TurnEvent};
 
 use crate::code_read::CodeReadState;
 use crate::config::DaemonConfig;
+use crate::conv_file_store::ConvFileStore;
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
 use crate::log_broadcast::LogBus;
+use crate::projection_event::ProjectionEventOut;
 use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{ClusterState, RepoMap};
 use crate::tools::{
@@ -83,7 +85,15 @@ pub(crate) struct CodeReadConv {
 pub enum StreamItem {
     Status(String),
     Token(String),
+    /// A projection event emitted once per decode (at seal): the materialized
+    /// context's composition + decode throughput, driving the GUI timeline dots
+    /// and the projection popover (docs/zend_ui_redesign.md §2.3).
+    Projection(ProjectionEventOut),
 }
+
+/// Process-global monotonic id for projection events, so dot ids stay unique
+/// across conversations and requests.
+static PROJ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // ── Inference state ───────────────────────────────────────────────────────────
 
@@ -160,6 +170,7 @@ impl InferenceState {
         tokenizer_path: PathBuf,
         workspace: PathBuf,
         skip_code_read: bool,
+        skip_repo_scan: bool,
         compact_substrate: bool,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -482,6 +493,7 @@ impl InferenceState {
             &workspace,
             conv_config.clone(),
             &progress,
+            skip_repo_scan,
         )?;
 
         // Wrap the engine in its session Mutex now: code_read's per-file
@@ -670,8 +682,8 @@ fn run_inference_stream(
     sampling: Option<candle_conversation::SamplingConfig>,
     force_hires: Option<String>,
     assistant_prefill: Option<String>,
-) -> Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send + 'static>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<String>>(64);
+) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
     tokio::task::spawn_blocking(move || {
         let msg_preview: String = user_message.chars().take(60).collect();
@@ -773,6 +785,9 @@ fn run_inference_stream(
 
         for iteration in 0..=MAX_TOOL_ITERATIONS {
             tracing::debug!(conv_id = %conv_id, iteration, "submitting turn");
+            // Collect this turn's projection events (reprojections + decode-end)
+            // so they survive a browser reload (served back on hydrate).
+            let mut turn_events: Vec<ProjectionEventOut> = Vec::new();
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: sampling.clone(),
@@ -813,7 +828,10 @@ fn run_inference_stream(
                             if text.len() > emitted_len && text.is_char_boundary(emitted_len) {
                                 let new_part = &text[emitted_len..];
                                 if !new_part.contains('\u{FFFD}') {
-                                    if tx.blocking_send(Ok(new_part.to_string())).is_err() {
+                                    if tx
+                                        .blocking_send(Ok(StreamItem::Token(new_part.to_string())))
+                                        .is_err()
+                                    {
                                         // Client closed the connection.  Break
                                         // immediately so `handle` is dropped on
                                         // return, which closes event_rx and causes
@@ -843,7 +861,7 @@ fn run_inference_stream(
                         tracing::error!(conv_id = %conv_id, iteration, "scheduler error: {msg}");
                         // Send as text so the client shows the message rather
                         // than dropping the connection.
-                        let _ = tx.blocking_send(Ok(format!("\n\n⚠ {msg}")));
+                        let _ = tx.blocking_send(Ok(StreamItem::Token(format!("\n\n⚠ {msg}"))));
                         turn_error = Some(anyhow::anyhow!("{msg}"));
                         // Do not return — drain the iterator so the channel
                         // closes cleanly before we decide what to do with the
@@ -851,6 +869,14 @@ fn run_inference_stream(
                     }
                     TurnEvent::HealthWarning(msg) => {
                         tracing::warn!(conv_id = %conv_id, "decode health: {msg}");
+                    }
+                    // A mid-decode reprojection — stream it straight to the GUI
+                    // timeline as it happens (a dot per reprojection).
+                    TurnEvent::Projection(event) => {
+                        let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let out = ProjectionEventOut::answer(seq, event);
+                        turn_events.push(out.clone());
+                        let _ = tx.blocking_send(Ok(StreamItem::Projection(out)));
                     }
                     _ => {}
                 }
@@ -874,9 +900,9 @@ fn run_inference_stream(
                             iteration,
                             "turn ended without Done or Error — evicting conversation",
                         );
-                        let _ = tx.blocking_send(Ok(
+                        let _ = tx.blocking_send(Ok(StreamItem::Token(
                             "\n\n⚠ Generation ended unexpectedly. Your next message will start fresh.".to_string()
-                        ));
+                        )));
                     }
                     // Evict the conversation so the next request forks fresh
                     // rather than hitting the in-flight guard.  Dropping `handle`
@@ -891,7 +917,7 @@ fn run_inference_stream(
             if resp.text.len() > emitted_len && resp.text.is_char_boundary(emitted_len) {
                 let tail = &resp.text[emitted_len..];
                 if !tail.is_empty() {
-                    let _ = tx.blocking_send(Ok(tail.to_string()));
+                    let _ = tx.blocking_send(Ok(StreamItem::Token(tail.to_string())));
                 }
             }
 
@@ -905,6 +931,28 @@ fn run_inference_stream(
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
+            }
+
+            // One projection event per decode: the scored reprojection now
+            // reflects what provenance materialized for this turn (finish_turn
+            // refreshed the BDP scores). Stream it so the GUI drops a timeline
+            // dot the moment the turn seals — no separate fetch needed.
+            if let Some(event) = cs.conv.projection_event(&resp.stats) {
+                let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let out = ProjectionEventOut::answer(seq, event);
+                turn_events.push(out.clone());
+                let _ = tx.blocking_send(Ok(StreamItem::Projection(out)));
+            }
+
+            // Persist this turn's events to the substrate redo log so the
+            // timeline survives a browser reload AND a daemon restart. Keyed to
+            // the just-sealed turn; served back on hydrate via the substrate.
+            if !turn_events.is_empty() {
+                let events: Vec<candle_conversation::ProjectionEvent> =
+                    turn_events.into_iter().map(|o| o.event).collect();
+                if let Err(e) = cs.conv.persist_projection_events(&events) {
+                    tracing::warn!(conv_id = %conv_id, "persist projection events: {e}");
+                }
             }
 
             // Group-commit the substrate redo log: the just-sealed turn is
@@ -1084,6 +1132,9 @@ pub struct ZendSession {
     /// here so dropping the session also drops the watch.  None until
     /// the inference state is ready.
     watcher: Mutex<Option<RecommendedWatcher>>,
+    /// Conversation-files store (uploads). Persistent under the workspace,
+    /// independent of the inference engine — available before the model loads.
+    file_store: ConvFileStore,
 }
 
 /// Snapshot returned by `GET /v1/status`. `loading` is `None` once the
@@ -1116,6 +1167,11 @@ pub struct ConvEntry {
     /// sidebar hides archived entries by default; the "show archived"
     /// checkbox toggles them back in via `?include_archived=true`.
     pub archived: bool,
+    /// Last-activity timestamp (ms since epoch) used by the sidebar to sort
+    /// newest-first. Derived from the `conv_id`, which encodes its creation
+    /// time (the client mints `Date.now()`-style ids); `0` when the id is not
+    /// numeric.
+    pub updated_ms: u64,
 }
 
 impl ZendSession {
@@ -1128,6 +1184,7 @@ impl ZendSession {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let file_store = ConvFileStore::open(&config.workspace);
         Self {
             inference: Arc::new(RwLock::new(None)),
             watcher: Mutex::new(None),
@@ -1138,7 +1195,13 @@ impl ZendSession {
             status_tx,
             load_progress: Arc::new(LoadProgress::new()),
             started_at_ms,
+            file_store,
         }
+    }
+
+    /// The conversation-files store (uploads). Available before the model loads.
+    pub fn files(&self) -> &ConvFileStore {
+        &self.file_store
     }
 
     /// Snapshot for `GET /v1/status`. `loading=None` once every startup
@@ -1201,11 +1264,15 @@ impl ZendSession {
             .into_iter()
             .filter(|(tl, _, _, _)| *tl != titler_timeline)
             .filter(|(_, _, _, archived)| include_archived || !*archived)
-            .map(|(tl, conv_id, label, archived)| ConvEntry {
-                id: conv_id,
-                label,
-                turn_count: turn_counts.get(&tl).copied().unwrap_or(0),
-                archived,
+            .map(|(tl, conv_id, label, archived)| {
+                let updated_ms = conv_id.parse::<u64>().unwrap_or(0);
+                ConvEntry {
+                    id: conv_id,
+                    label,
+                    turn_count: turn_counts.get(&tl).copied().unwrap_or(0),
+                    archived,
+                    updated_ms,
+                }
             })
             .collect();
         entries.sort_by(|a, b| b.id.cmp(&a.id));
@@ -1236,7 +1303,8 @@ impl ZendSession {
         let timeline = timeline_for(conv_id);
         let raw = {
             let base = state.base_conv.lock().unwrap();
-            base.recovered_history(timeline)
+            // Conversation view: hide the summariser's ghost summary turns.
+            base.recovered_history(timeline, false)
         };
         let decoded = raw
             .into_iter()
@@ -1252,6 +1320,68 @@ impl ZendSession {
         Some(decoded)
     }
 
+    /// Projection-event buckets banked for a conversation this daemon session,
+    /// one per assistant turn (in order). Backs the timeline-dot replay on a
+    /// browser reload. Empty when the conversation isn't resident (e.g. it was
+    /// recovered from disk but hasn't been chatted with since startup).
+    pub fn conversation_projections(&self, conv_id: &str) -> Vec<Vec<ProjectionEventOut>> {
+        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
+            return Vec::new();
+        };
+        let timeline = timeline_for(conv_id);
+        let raw = {
+            let base = state.base_conv.lock().unwrap();
+            base.recovered_projection_events(timeline)
+        };
+        // Re-attach the display id/region/step the wire shape needs (these are
+        // GUI concerns, not persisted); one bucket per assistant turn, in order.
+        raw.into_iter()
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|event| {
+                        let seq = PROJ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ProjectionEventOut::answer(seq, event)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Windowed-substrate view for one conversation — backs
+    /// `(section name, authored content)` for every system-prompt section in the
+    /// schema. Backs the projection panel's expandable section text — resolved
+    /// on demand from the schema, never stored in the projection event. The
+    /// schema is workspace-wide, so `conv_id` is not needed.
+    pub fn section_content(&self) -> Option<Vec<(String, String)>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        Some(base.section_contents())
+    }
+
+    /// The target (dialogue) layer's name, for the panel's conversation prefix.
+    pub fn target_layer_name(&self) -> Option<String> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        Some(base.target_layer_name())
+    }
+
+    /// The `(user, assistant)` halves of a projected turn (`group` × `index`),
+    /// read from the substrate. Backs the projection panel's memory-tier bodies.
+    pub fn resolve_turn_text(&self, group: &str, index: u32) -> Option<(String, String)> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        base.resolve_turn_text(group, index)
+    }
+
+    /// The dialect's framing markers — the glue wrapped around the system prompt
+    /// and each turn. The projection panel renders these between sections/turns.
+    pub fn glue_markers(&self) -> Option<GlueMarkers> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        Some(base.glue_markers())
+    }
+
     pub fn start_loading(self: &Arc<Self>) {
         let slot = Arc::clone(&self.inference);
         let proj_builder = self.projection_builder.clone();
@@ -1260,6 +1390,7 @@ impl ZendSession {
         let load_progress = Arc::clone(&self.load_progress);
         let workspace = self.config.workspace.clone();
         let skip_code_read = self.config.skip_code_read;
+        let skip_repo_scan = self.config.skip_repo_scan;
         let compact_substrate = self.config.compact_substrate;
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
         // plain OS thread and drops its temporary download runtime before the
@@ -1336,6 +1467,7 @@ impl ZendSession {
                     tok_path,
                     workspace,
                     skip_code_read,
+                    skip_repo_scan,
                     compact_substrate,
                     load_progress_for_blocking,
                 ) {
@@ -1379,14 +1511,20 @@ impl ZendSession {
                             // with tens of thousands of files; doing it
                             // twice per burst is wasted work.
                             let map = crate::repo_scan::walk_workspace(&state.workspace);
-                            match state.refresh_repo_map(Some(map.clone())) {
-                                Ok(true) => {
-                                    tracing::info!("repo map refreshed after fs event burst")
+                            if skip_repo_scan {
+                                tracing::debug!(
+                                    "--skip-repo-scan: watcher repo-map refresh suppressed"
+                                );
+                            } else {
+                                match state.refresh_repo_map(Some(map.clone())) {
+                                    Ok(true) => {
+                                        tracing::info!("repo map refreshed after fs event burst")
+                                    }
+                                    Ok(false) => tracing::debug!(
+                                        "fs event burst saw no cluster hash change — repo map skipped"
+                                    ),
+                                    Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
                                 }
-                                Ok(false) => tracing::debug!(
-                                    "fs event burst saw no cluster hash change — repo map skipped"
-                                ),
-                                Err(e) => tracing::warn!("repo map refresh failed: {e:#}"),
                             }
                             // Honour --skip-code-read for the watcher too: with code
                             // reading disabled the per-file content state is empty,
@@ -1569,7 +1707,7 @@ impl ZendSession {
                     assistant_prefill,
                 );
                 while let Some(item) = ts.next().await {
-                    if tx.send(item.map(StreamItem::Token)).await.is_err() {
+                    if tx.send(item).await.is_err() {
                         break;
                     }
                 }

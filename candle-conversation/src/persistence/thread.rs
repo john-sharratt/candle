@@ -50,13 +50,16 @@ use std::collections::HashMap;
 /// How often the loop wakes up on its own when no triggers arrive.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(5);
 
-/// Clone-able fire-and-forget trigger for the persistence thread. Held
-/// by anything that wants to wake the loop early (e.g. the scheduler
-/// signalling "turn just sealed"). Cheap to clone — wraps a
-/// `crossbeam::channel::Sender<()>`.
+/// Clone-able trigger for the persistence thread. Held by anything that
+/// wants to wake the loop early (e.g. the scheduler signalling "turn just
+/// sealed"). Cheap to clone — wraps two `crossbeam::channel` senders: a
+/// fire-and-forget wake and a blocking "drain hot→warm now" flush.
 #[derive(Clone)]
 pub struct PersistenceTrigger {
     tx: Sender<()>,
+    /// Carries a one-shot ack sender into the loop: the next pass runs the
+    /// hot→warm migration and replies on the ack once pending_warm is drained.
+    flush_tx: Sender<Sender<()>>,
 }
 
 impl PersistenceTrigger {
@@ -66,14 +69,33 @@ impl PersistenceTrigger {
         let _ = self.tx.try_send(());
     }
 
-    /// Test-only no-op trigger. Holds a sender whose receiver is
-    /// dropped immediately, so [`Self::fire`] silently fails. For
-    /// tests that construct a `Scheduler` without spawning a real
+    /// Block until the persistence thread completes a pass that drains the
+    /// pending hot→warm migration, giving substrate offload **complete
+    /// priority**. After this returns `true`, just-sealed turns hold a warm
+    /// (RAM) copy and so become eligible for hot-tier eviction — the VRAM can
+    /// actually move to the substrate. Used by the scheduler under VRAM
+    /// pressure, before it evicts hot KV.
+    ///
+    /// Returns `false` if the request couldn't be queued (a flush is already
+    /// in flight) or the pass didn't ack within `timeout` (the timeout is a
+    /// safety cap against a wedged thread, not the expected path).
+    pub fn flush_blocking(&self, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = channel::bounded::<()>(1);
+        if self.flush_tx.try_send(ack_tx).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Test-only no-op trigger. Holds senders whose receivers are dropped
+    /// immediately, so [`Self::fire`]/[`Self::flush_blocking`] silently fail.
+    /// For tests that construct a `Scheduler` without spawning a real
     /// persistence thread.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn noop() -> Self {
         let (tx, _rx) = channel::bounded(1);
-        Self { tx }
+        let (flush_tx, _flush_rx) = channel::bounded(1);
+        Self { tx, flush_tx }
     }
 }
 
@@ -88,6 +110,7 @@ impl PersistenceTrigger {
 pub struct PersistenceThread {
     handle: Mutex<Option<JoinHandle<()>>>,
     trigger_tx: Sender<()>,
+    flush_tx: Sender<Sender<()>>,
     shutdown_tx: Sender<()>,
 }
 
@@ -110,6 +133,7 @@ impl PersistenceThread {
         compression_policy: Option<CompressionPolicy>,
     ) -> Self {
         let (trigger_tx, trigger_rx) = channel::bounded::<()>(1);
+        let (flush_tx, flush_rx) = channel::bounded::<Sender<()>>(1);
         let (shutdown_tx, shutdown_rx) = channel::bounded::<()>(1);
 
         // All persist-thread CUDA work runs on the device's primary
@@ -138,6 +162,7 @@ impl PersistenceThread {
                     copy_stream,
                     compression_policy,
                     trigger_rx,
+                    flush_rx,
                     shutdown_rx,
                 );
             })
@@ -146,6 +171,7 @@ impl PersistenceThread {
         Self {
             handle: Mutex::new(Some(handle)),
             trigger_tx,
+            flush_tx,
             shutdown_tx,
         }
     }
@@ -162,6 +188,7 @@ impl PersistenceThread {
     pub fn trigger_handle(&self) -> PersistenceTrigger {
         PersistenceTrigger {
             tx: self.trigger_tx.clone(),
+            flush_tx: self.flush_tx.clone(),
         }
     }
 
@@ -191,6 +218,7 @@ fn run_loop(
     copy_stream: Arc<CudaStream>,
     compression_policy: Option<CompressionPolicy>,
     trigger_rx: Receiver<()>,
+    flush_rx: Receiver<Sender<()>>,
     shutdown_rx: Receiver<()>,
 ) {
     // Bind this thread to the device's CUDA context BEFORE any pinned
@@ -215,8 +243,12 @@ fn run_loop(
         // fires first. The `default` arm fires after `DEFAULT_TICK` if
         // nothing else has woken the thread.
         let mut shutting_down = false;
+        // One-shot ack for a blocking flush request (scheduler under VRAM
+        // pressure): reply once this pass has drained the hot→warm migration.
+        let mut flush_ack: Option<Sender<()>> = None;
         crossbeam::channel::select! {
             recv(trigger_rx) -> _ => {}
+            recv(flush_rx) -> ack => { flush_ack = ack.ok(); }
             recv(shutdown_rx) -> _ => { shutting_down = true; }
             default(DEFAULT_TICK) => {}
         }
@@ -229,6 +261,12 @@ fn run_loop(
             compression_policy.as_ref(),
             &mut pinned_scratch,
         );
+
+        // run_pass migrates all pending hot→warm before returning, so by here
+        // the just-sealed turns hold a warm copy — signal the waiting flush.
+        if let Some(ack) = flush_ack {
+            let _ = ack.send(());
+        }
 
         if shutting_down {
             // Final group-commit before exiting — any work staged but

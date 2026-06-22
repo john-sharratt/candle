@@ -844,7 +844,9 @@ unsafe fn accumulate_depth_avx512(
             if qual_hd >= 0 && (hd as i64) <= qual_hd {
                 agg.insert_topk(ag);
                 qual_hd = agg.topk_qual_hd();
-                qual_vec = _mm512_set1_epi64(qual_hd.max(0));
+                // No `qual_vec` refresh here: the scalar tail gates on `qual_hd`
+                // directly, and the SIMD `qual_vec` broadcast is re-derived from
+                // `agg.topk_qual_hd()` at the top of the next probe (above).
             }
             ci += 1;
         }

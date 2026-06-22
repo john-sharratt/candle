@@ -13,8 +13,8 @@ use futures::StreamExt;
 
 use crate::session::{StreamItem, ZendSession};
 use crate::types::{
-    AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChunkChoice,
-    CompletionChoice, Delta,
+    AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
+    ChunkChoice, CompletionChoice, Delta, Role,
 };
 
 /// `POST /v1/chat/completions`
@@ -44,14 +44,21 @@ pub async fn completions(
         if last_preview.len() == 80 { "…" } else { "" },
     );
 
+    let effort = req.effort;
+    let think = req.think;
     let max_tokens = req.max_tokens.map(|n| n as usize);
     let conv_id = req.conv_id.unwrap_or_else(|| "default".to_string());
     let force_hires = req.force_high_resolution;
     let assistant_prefill = req.assistant_prefill;
+    // Composer "thinking effort" dial: Off (`effort: 0` / `think: false`)
+    // suppresses the reasoning channel via the `/no_think` dialect prefix
+    // (docs/zend_ui_redesign.md decision 10). Stripped again on hydrate by
+    // `crate::chatml::split_turn`.
+    let messages = apply_no_think(req.messages, effort, think);
     if req.stream {
         stream_sse(
             session,
-            req.messages,
+            messages,
             max_tokens,
             conv_id,
             force_hires,
@@ -64,7 +71,7 @@ pub async fn completions(
     } else {
         collect_completion(
             session,
-            req.messages,
+            messages,
             max_tokens,
             conv_id,
             force_hires,
@@ -75,6 +82,25 @@ pub async fn completions(
         )
         .await
     }
+}
+
+/// Prepend the `/no_think` dialect prefix to the most recent user turn when the
+/// composer requests no-thinking (`think == Some(false)` or `effort == Some(0)`).
+/// Idempotent — never double-prefixes.
+fn apply_no_think(
+    mut messages: Vec<ChatMessage>,
+    effort: Option<u8>,
+    think: Option<bool>,
+) -> Vec<ChatMessage> {
+    let suppress = think == Some(false) || effort == Some(0);
+    if suppress {
+        if let Some(m) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
+            if !m.content.starts_with("/no_think") {
+                m.content = format!("/no_think\n{}", m.content);
+            }
+        }
+    }
+    messages
 }
 
 // ── Streaming path ────────────────────────────────────────────────────────────
@@ -114,6 +140,11 @@ async fn stream_sse(
             Ok(StreamItem::Status(msg)) => {
                 let data = serde_json::json!({ "text": msg }).to_string();
                 Ok(Event::default().event("status").data(data))
+            }
+
+            Ok(StreamItem::Projection(event)) => {
+                let data = serde_json::to_string(&event).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(Event::default().event("projection").data(data))
             }
 
             Ok(StreamItem::Token(text)) => {
@@ -201,6 +232,7 @@ async fn collect_completion(
                 full.push_str(&chunk);
             }
             Ok(StreamItem::Status(_)) => {} // status events are display-only
+            Ok(StreamItem::Projection(_)) => {} // timeline-only; not in the collected body
             Err(_) => {}
         }
     }
@@ -236,4 +268,55 @@ fn unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod no_think_tests {
+    use super::*;
+
+    fn user(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn think_false_prepends_no_think() {
+        let out = apply_no_think(vec![user("trace the redo log")], None, Some(false));
+        assert_eq!(out[0].content, "/no_think\ntrace the redo log");
+    }
+
+    #[test]
+    fn effort_zero_prepends_no_think() {
+        let out = apply_no_think(vec![user("hello")], Some(0), None);
+        assert_eq!(out[0].content, "/no_think\nhello");
+    }
+
+    #[test]
+    fn default_dials_leave_message_untouched() {
+        let out = apply_no_think(vec![user("hello")], Some(2), None);
+        assert_eq!(out[0].content, "hello");
+    }
+
+    #[test]
+    fn only_the_last_user_turn_is_prefixed() {
+        let msgs = vec![
+            user("first"),
+            ChatMessage {
+                role: Role::Assistant,
+                content: "reply".into(),
+            },
+            user("second"),
+        ];
+        let out = apply_no_think(msgs, Some(0), None);
+        assert_eq!(out[0].content, "first");
+        assert_eq!(out[2].content, "/no_think\nsecond");
+    }
+
+    #[test]
+    fn idempotent_when_already_prefixed() {
+        let out = apply_no_think(vec![user("/no_think\nhi")], Some(0), None);
+        assert_eq!(out[0].content, "/no_think\nhi");
+    }
 }

@@ -101,6 +101,23 @@ pub fn collect_live_records(
             let r = read_record_at(log, loc.offset, loc.record_size)?;
             out.push((r.header, r.payload));
         }
+        // Per-turn projection-event timeline — re-emitted from the resident
+        // bytes (not read back from disk like signatures), so the GUI dots
+        // survive a compaction pass.
+        if let Some(payload) = &entry.projection_events {
+            out.push((
+                RecordHeader {
+                    record_type: RecordType::ProjectionEvents,
+                    format: 0,
+                    payload_len: payload.len() as u64,
+                    crc: 0,
+                    stream_id: stream_id.0,
+                    chunk_index: 0,
+                    token_count: 0,
+                },
+                payload.clone(),
+            ));
+        }
         if let Some(through) = entry.committed_through {
             out.push((
                 RecordHeader {
@@ -275,6 +292,7 @@ pub fn dead_record_ratio(
                     | RecordType::ConvState
                     | RecordType::TreeMetadata
                     | RecordType::DebugId
+                    | RecordType::ProjectionEvents
             )
         })
         .count()
@@ -285,6 +303,10 @@ pub fn dead_record_ratio(
         + substrate
             .all_streams()
             .filter(|(_, s)| s.committed_through.is_some())
+            .count()
+        + substrate
+            .all_streams()
+            .filter(|(_, s)| s.projection_events.is_some())
             .count()
         + substrate.live_conv_meta().len()
         + substrate.live_tree_metadata_payloads().len()
@@ -520,6 +542,48 @@ mod tests {
                     .unwrap_or(false)
             }),
             "alive timeline's Label must survive compaction",
+        );
+    }
+
+    #[test]
+    fn projection_events_record_survives_compaction() {
+        use crate::persistence::streams::{StreamDecl, TurnDecl};
+
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 42,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 2,
+            block_start: 0,
+            block_end: 0,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            scores: super::super::streams::PerDepthScores::default(),
+            user_chunk_count: 0,
+            user_token_count: 0,
+            user_sig_count: 0,
+            user_text: String::new(),
+            assistant_text: String::new(),
+        });
+        let sid = 4242u64; // header stream id ties the two records to one stream
+        let proj_payload = br#"[{"start_token":0,"end_token":120,"buckets":[]}]"#.to_vec();
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));
+        blob.extend_from_slice(&record(RecordType::ProjectionEvents, sid, 0, &proj_payload));
+
+        let mut mem = MemLog::with_records(&blob);
+        let (manifest, substrate, _) =
+            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
+
+        assert!(
+            live.iter().any(|(h, p)| h.record_type == RecordType::ProjectionEvents
+                && p == &proj_payload),
+            "ProjectionEvents record must survive compaction with its payload intact",
         );
     }
 }

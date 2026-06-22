@@ -27,3 +27,11 @@ INSTANTIATE_KERNELS(
     QK2_K_K128, QI2_K_K128, block_c_q2_K, VDR_Q2_K_K128,
     float, float
 )
+
+// q8a128 TC path — INT8-MMA grouped matmul for Q2_K (2-bit affine weights, per-16
+// {d,m} via split 2-MMA + all-ones MMA for the per-16 min term, F32 output).
+INSTANTIATE_KERNEL_GROUPED_INT8(
+    q2_k_int8_f32,
+    QK2_K_K128, QI2_K_K128, block_c_q2_K, VDR_Q2_K_K128,
+    float
+)

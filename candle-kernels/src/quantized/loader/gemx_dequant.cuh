@@ -142,6 +142,87 @@ struct block_type_traits<block_c_q5_K> {
     static constexpr bool has_min = true;
 };
 
+// INT8 path: distinct weight scales per 32-K MMA sub. Most formats quantize per-32
+// (==1, single post-MMA fold). K-quants whose scales are per-16 set this to 2,
+// triggering the split 2-MMA fold (C_lo·scale_lo + C_hi·scale_hi) that applies each
+// 16-group's scale exactly. Those formats feed CENTERED signed int8 weights (no min
+// term) so no per-16 activation sum is needed.
+template <typename BlockType>
+struct int8_scales_per_sub_trait {
+    static constexpr int value = 1;
+};
+template <>
+struct int8_scales_per_sub_trait<block_c_q6_K> {
+    static constexpr int value = 2;
+};
+// block_c_q6_KO: requantized to per-32 affine (scale,min) → default value=1 → per-32 affine
+// fold (else branch), like Q4_KO/Q8_KO. No per-16 split.
+template <>
+struct int8_scales_per_sub_trait<block_c_q3_K> {
+    static constexpr int value = 2;
+};
+
+// INT8 path: affine per-16 K-quants (Q2_K). value = d·q + m with per-16 {d,m}. The
+// split 2-MMA applies each 16-group's d to its half (C_lo, C_hi); the per-16 min
+// term m·Σx needs per-16 activation sums, obtained in-kernel via an all-ones MMA
+// over the same half-fragments (no q8a128 format change). Weights stay UNSIGNED
+// (q in 0..3). Formats here implement sub_dm (lo {d,m}) and sub_dm_hi (hi {d,m}).
+template <typename BlockType>
+struct int8_affine_per16_trait {
+    static constexpr bool value = false;
+};
+template <>
+struct int8_affine_per16_trait<block_c_q2_K> {
+    static constexpr bool value = true;
+};
+
+// INT8 path: per-32 affine formats that benefit from issuing the k32 MMA as TWO k16
+// MMAs (clo+chi == the k32 result exactly). The extra in-flight tensor-core work hides
+// the cp.async weight-load latency that the single k32 MMA leaves exposed. Q5_K's int8
+// path is otherwise latency-bound (ncu: long_scoreboard ~16, idle pipes) despite the
+// same traffic/occupancy as the per-16-split Q6_K. Fold is the standard per-32 affine.
+// The 2-k16-MMA split was a latency-hiding device for Q5 — but k16 int8 MMAs run at
+// FP16 tensor rate (the int8 2× only comes from k32 packing 2× the K per issue), and
+// the split doubles the int32 accumulators. Q5 is per-32 (one scale/sub) and
+// clo+chi == the k32 result exactly, so it routes into the per-32 k32 branch instead:
+// full int8 tensor throughput + fewer accumulator registers. No format uses the split.
+template <typename BlockType>
+struct int8_split_per32_trait {
+    static constexpr bool value = false;
+};
+
+// De-interleaved scale storage: when true, the per-32 {scale,-min} dm values do NOT
+// live in the weight block — they sit in a separate scale region at the tail of the
+// weight tensor (one 16B dm block per quant block, same block index). The fold reads
+// them straight from global by index instead of from the staged smem block (sub_dm).
+// This keeps the cp.async weight stream pure quants (the MMA skips the float sectors).
+template <typename BlockType>
+struct is_scale_separate {
+    static constexpr bool value = false;
+};
+template <>
+struct is_scale_separate<block_c_q5_KO> {
+    static constexpr bool value = true;
+};
+template <>
+struct is_scale_separate<block_c_q4_KO> {
+    static constexpr bool value = true;
+};
+template <>
+struct is_scale_separate<block_c_q6_KO> {
+    static constexpr bool value = true;
+};
+template <>
+struct is_scale_separate<block_c_q8_KO> {
+    static constexpr bool value = true;
+};
+// k1024 chunk blocks carry their scales inline (blk.dm) — the int8 fold reads them from
+// the chunk, the only "scale-separate" (non-staged) path now used.
+template <> struct is_scale_separate<block_c_q4_KO_k1024> { static constexpr bool value = true; };
+template <> struct is_scale_separate<block_c_q5_KO_k1024> { static constexpr bool value = true; };
+template <> struct is_scale_separate<block_c_q6_KO_k1024> { static constexpr bool value = true; };
+template <> struct is_scale_separate<block_c_q8_KO_k1024> { static constexpr bool value = true; };
+
 // =============================================================================
 // K/64 SCALE HELPERS (embedded scales)
 // =============================================================================

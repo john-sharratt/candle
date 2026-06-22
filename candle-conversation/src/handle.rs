@@ -81,6 +81,13 @@ pub enum TurnEvent {
     /// Generation complete. Contains the full response.
     Done(TurnResponse),
 
+    /// A projection event: emitted once at each mid-decode reprojection, when
+    /// the scheduler rebuilds the view against fresh provenance scores. Carries
+    /// the materialized-context composition that reprojection selected plus the
+    /// decode throughput of the span that just completed — the GUI drops a
+    /// timeline dot per event (docs/zend_ui_redesign.md §2.3).
+    Projection(crate::projection::ProjectionEvent),
+
     /// Something went wrong.
     Error(ConversationError),
 

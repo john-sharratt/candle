@@ -33,6 +33,28 @@ extern "C" {
         hidden_dim: usize,
     );
 
+    /// Fused router: softmax + top-k select + (optional) renormalize, one thread per token.
+    ///
+    /// Replaces the `softmax → sort → narrow(top-k) → renorm → flatten` op chain with one
+    /// launch. Top-k of softmax == top-k of logits (monotonic) and renorm cancels the global
+    /// softmax denominator, so the kernel makes a single pass over the experts.
+    ///
+    /// - `dtype`: MoeScatterDType value (logits dtype: 0=f32, 1=f16, 2=bf16)
+    /// - `logits`: device pointer to `[num_tokens, n_experts]`
+    /// - `out_idx`: device pointer to u32 `[num_tokens, k]` top-k expert indices (descending)
+    /// - `out_weights`: device pointer to f32 `[num_tokens, k]` routing weights (descending)
+    /// - `norm_topk`: 1 = renormalized top-k softmax, 0 = plain full-softmax weights
+    pub fn run_moe_route(
+        dtype: i32,
+        logits: *const c_void,
+        out_idx: *mut u32,
+        out_weights: *mut f32,
+        num_tokens: i32,
+        n_experts: i32,
+        k: i32,
+        norm_topk: i32,
+    );
+
     /// Deterministic scatter: sequential per-token reduce, no atomicAdd.
     /// perm[i] maps token-major index i to the expert-major row in down_out,
     /// so no CPU-side reorder of down_out is needed before calling.

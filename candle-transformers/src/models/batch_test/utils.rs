@@ -1,3 +1,4 @@
+use candle::quantized::Int8Mode;
 use candle::{DType, Device, Result, Tensor};
 use std::time::Duration;
 use tokenizers::Tokenizer;
@@ -7,7 +8,6 @@ use crate::models::batched_inference::{
 };
 use crate::models::dialect::Dialect;
 use crate::models::expert_lre::PipelineStats;
-use crate::models::kv_cache_utils::{KvCaches, SequenceContext};
 use crate::models::profile::ProfileSnapshot;
 use crate::models::profile::{pipeline_record, pipeline_snapshot_and_reset, profile_now};
 
@@ -72,6 +72,10 @@ pub struct TestParams {
     pub device: Device,
     pub begin_document_token: Option<u32>,
     pub timeout_secs: u64, // Test timeout in seconds (default: 120)
+    /// Inference `Int8Mode` for this run, shown in the comparison table's `int8` column so a saved
+    /// table records which numeric mode produced it. Defaults to `Off`; set via
+    /// [`Self::with_int8mode`].
+    pub int8mode: Int8Mode,
 }
 
 impl TestParams {
@@ -113,7 +117,14 @@ impl TestParams {
             device,
             begin_document_token,
             timeout_secs: 120,
+            int8mode: Int8Mode::Off,
         })
+    }
+
+    /// Set the inference [`Int8Mode`] shown in the comparison table's `int8` column.
+    pub fn with_int8mode(mut self, mode: Int8Mode) -> Self {
+        self.int8mode = mode;
+        self
     }
 
     /// Create test parameters with default (ChatML) dialect
@@ -411,17 +422,6 @@ fn format_diff(expected: &str, actual: &str) -> String {
     output
 }
 
-/// Callbacks for non-batched (sequential) inference mode.
-/// Each sequence has its own KvCaches and is processed independently.
-pub struct SequentialCallbacks<C, F, S> {
-    /// Create a single KvCaches instance for one sequence
-    pub create_cache: C,
-    /// Forward pass for a single sequence
-    pub forward: F,
-    /// Sample the next token from logits
-    pub sample: S,
-}
-
 impl TestParams {
     /// Generic test harness for forward pass performance testing.
     ///
@@ -432,16 +432,12 @@ impl TestParams {
     /// * `configs` - List of test configurations to run
     /// * `sequential` - Callbacks for non-batched mode (individual caches per sequence)
     /// * `model` - The model implementing ManagedBatchedModel for batched mode
-    pub fn run<C, F, S, M>(
+    pub fn run<M>(
         mut self,
         configs: Vec<TestConfig>,
         load_model: impl Fn() -> Result<M>,
-        mut sequential: SequentialCallbacks<C, F, S>,
     ) -> Result<()>
     where
-        C: FnMut(&TestConfig, &M) -> Result<KvCaches>,
-        F: FnMut(SequenceContext<'_>, &M) -> Result<Tensor>,
-        S: FnMut(&Tensor) -> Result<u32>,
         M: ManagedBatchedModel,
     {
         println!("✓ TestParams created successfully");
@@ -517,23 +513,20 @@ impl TestParams {
                 &self.device,
             );
 
-            let result = if config.use_batched {
-                match self.run_batched_config(&config, &model) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Arena bytes and table were already captured by the ArenaErrGuard
-                        // inside run_batched_config (while the session was still alive).
-                        // Just take the OOM snapshot — it will use those pre-registered values.
-                        let _ = candle::gpu_memory::snapshot(
-                            &format!("OOM_{:?}×{}", config.mode, config.num_contexts),
-                            &self.device,
-                        );
-                        let _ = candle::gpu_memory::print_report(&self.device);
-                        return Err(e);
-                    }
+            // The harness is batched-only — the sequential/`forward_with_context` path is retired.
+            let result = match self.run_batched_config(&config, &model) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Arena bytes and table were already captured by the ArenaErrGuard
+                    // inside run_batched_config (while the session was still alive).
+                    // Just take the OOM snapshot — it will use those pre-registered values.
+                    let _ = candle::gpu_memory::snapshot(
+                        &format!("OOM_{:?}×{}", config.mode, config.num_contexts),
+                        &self.device,
+                    );
+                    let _ = candle::gpu_memory::print_report(&self.device);
+                    return Err(e);
                 }
-            } else {
-                self.run_sequential_config(&model, &config, &mut sequential)?
             };
 
             // Collect expert pipeline stats for this config
@@ -565,139 +558,6 @@ impl TestParams {
 
         // Validate and print results
         self.validate_and_print_results(&mut results)
-    }
-
-    /// Run a configuration in sequential (non-batched) mode
-    fn run_sequential_config<C, F, S, M>(
-        &self,
-        model: &M,
-        config: &TestConfig,
-        callbacks: &mut SequentialCallbacks<C, F, S>,
-    ) -> Result<TestResults>
-    where
-        C: FnMut(&TestConfig, &M) -> Result<KvCaches>,
-        F: FnMut(SequenceContext<'_>, &M) -> Result<Tensor>,
-        S: FnMut(&Tensor) -> Result<u32>,
-        M: ManagedBatchedModel,
-    {
-        // Create individual caches for each sequence
-        let mut caches: Vec<KvCaches> = (0..config.num_contexts)
-            .map(|_| (callbacks.create_cache)(config, model))
-            .collect::<Result<Vec<_>>>()?;
-
-        let effective_mode = config.test_mode.unwrap_or(self.test_mode);
-
-        // Initialize test runs with system prompts
-        let mut runs = Vec::with_capacity(config.num_contexts);
-        for (n, cache) in caches.iter_mut().enumerate() {
-            let system_tokens = self.system_prompt_tokens(n);
-            let system_tensor = self.tokens_to_tensor(&system_tokens)?;
-
-            let logits = (callbacks.forward)(
-                SequenceContext {
-                    kv_caches: cache,
-                    offset: 0,
-                    input_ids: &system_tensor,
-                    input_len: system_tokens.len(),
-                    write_offset_shift: 0,
-                },
-                model,
-            )?;
-
-            runs.push(self.create_test_run(n, logits, effective_mode));
-        }
-
-        // Prompt phase — per-session user prompts (may vary in length for
-        // NameGreeting mode where {INSERT_NAME} is embedded in the user turn).
-        let prompt_start = std::time::Instant::now();
-        let t_prompt_total = profile_now();
-        let mut prompt_tokens = 0usize;
-        let mut user_prompt_lens: Vec<usize> = Vec::with_capacity(config.num_contexts);
-        for (n, (cache, run)) in caches.iter_mut().zip(runs.iter_mut()).enumerate() {
-            let user_prompt = self.user_prompt_tokens(n);
-            let user_tensor = self.tokens_to_tensor(&user_prompt)?;
-            user_prompt_lens.push(user_prompt.len());
-            let start = cache.current_seq_len();
-            for _ in 0..config.num_repeats.max(1) {
-                if cache.current_seq_len() != start {
-                    cache.truncate(start)?;
-                }
-                run.logits = (callbacks.forward)(
-                    SequenceContext {
-                        kv_caches: cache,
-                        offset: start,
-                        input_ids: &user_tensor,
-                        input_len: user_prompt.len(),
-                        write_offset_shift: 0,
-                    },
-                    model,
-                )?;
-            }
-            prompt_tokens += user_prompt.len() * config.num_repeats.max(1);
-        }
-        self.device.synchronize()?;
-        pipeline_record("bench:bulk_total", t_prompt_total);
-        let prompt_duration = prompt_start.elapsed();
-        let prompt_tokens_per_sec = (prompt_tokens as f64) / prompt_duration.as_secs_f64();
-
-        // Snapshot bulk profile at prompt→generate boundary
-        let bulk_profile = model.snapshot_profiles();
-
-        // Generate phase
-        let mut remaining_steps = self.generate_token_count;
-
-        // Warmup step
-        if remaining_steps > 0 {
-            self.decode_step_sequential(model, &mut caches, &mut runs, callbacks)?;
-            self.device.synchronize()?;
-            remaining_steps -= 1;
-        }
-
-        self.device.synchronize()?;
-        let generate_start = std::time::Instant::now();
-        let t_decode_total = profile_now();
-        for _ in 0..remaining_steps {
-            self.decode_step_sequential(model, &mut caches, &mut runs, callbacks)?;
-        }
-        self.device.synchronize()?;
-        pipeline_record("bench:decode_total", t_decode_total);
-        let generate_duration = generate_start.elapsed();
-        let generate_tokens = remaining_steps * config.num_contexts;
-        let generate_tokens_per_sec = if generate_tokens == 0 {
-            0.0
-        } else {
-            (generate_tokens as f64) / generate_duration.as_secs_f64()
-        };
-
-        // Calculate peak tokens: sum of all tokens across all sessions
-        let peak_tokens: usize = (0..config.num_contexts)
-            .map(|n| {
-                self.system_prompt_tokens(n).len() + user_prompt_lens[n] + self.generate_token_count
-            })
-            .sum();
-
-        // Explicitly drop caches and sync to release GPU memory before returning
-        drop(caches);
-        self.device.synchronize()?;
-
-        // Snapshot single (generate) profile
-        let single_profile = model.snapshot_profiles();
-
-        Ok(TestResults {
-            config: config.clone(),
-            sessions: runs,
-            prompt_tokens_per_sec,
-            generate_tokens_per_sec,
-            all_valid: true,
-            quantized_token_percent: None, // Sequential mode doesn't use quantized KV
-            compression_ratio: None,       // Sequential mode doesn't quantize
-            peak_tokens,
-            expert_stats: None,
-            bulk_profile,
-            single_profile,
-            pipeline_profile: pipeline_snapshot_and_reset(),
-            effective_test_mode: effective_mode,
-        })
     }
 
     /// Run a configuration in batched mode using BatchedInferenceSession
@@ -1102,54 +962,6 @@ impl TestParams {
             generate_total_ms: 0.0,
             total_time_ms: 0.0,
         }
-    }
-
-    /// Decode step for sequential mode
-    fn decode_step_sequential<C, F, S, M>(
-        &self,
-        model: &M,
-        caches: &mut [KvCaches],
-        runs: &mut [TestRun],
-        callbacks: &mut SequentialCallbacks<C, F, S>,
-    ) -> Result<()>
-    where
-        C: FnMut(&TestConfig, &M) -> Result<KvCaches>,
-        F: FnMut(SequenceContext<'_>, &M) -> Result<Tensor>,
-        S: FnMut(&Tensor) -> Result<u32>,
-        M: ManagedBatchedModel,
-    {
-        // Sample tokens
-        let sampled_tokens: Vec<u32> = runs
-            .iter()
-            .map(|run| (callbacks.sample)(&run.logits))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Update outputs
-        for (run, &tok) in runs.iter_mut().zip(sampled_tokens.iter()) {
-            run.output.push(tok);
-        }
-
-        // Forward each sequence
-        for ((cache, &token), run) in caches
-            .iter_mut()
-            .zip(sampled_tokens.iter())
-            .zip(runs.iter_mut())
-        {
-            let offset = cache.current_seq_len();
-            let input_tensor = Tensor::new(&[token], &self.device)?.unsqueeze(0)?;
-            run.logits = (callbacks.forward)(
-                SequenceContext {
-                    kv_caches: cache,
-                    offset,
-                    input_ids: &input_tensor,
-                    input_len: 1,
-                    write_offset_shift: 0,
-                },
-                model,
-            )?;
-        }
-
-        Ok(())
     }
 
     /// Decode step for batched mode
@@ -1677,9 +1489,9 @@ impl TestParams {
         }
 
         println!("\n\n=== Performance Comparison ===");
-        println!("┌──────────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┐");
-        println!("│ KvMode   │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│");
-        println!("├──────────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┤");
+        println!("┌──────────┬──────┬─────────┬──────────┬───────┬────────────┬──────────────┬─────────────┬───────────────┬───────────┬──────────┬────────────┐");
+        println!("│ KvMode   │ int8 │ Batched │ Contexts │ Valid │ t/s (bulk) │ t/s (single) │ perf (bulk) │ perf (single) │ %Quantized│ Compress │ Peak Tokens│");
+        println!("├──────────┼──────┼─────────┼──────────┼───────┼────────────┼──────────────┼─────────────┼───────────────┼───────────┼──────────┼────────────┤");
 
         // Baseline is the first config
         let baseline = &results[0];
@@ -1688,6 +1500,12 @@ impl TestParams {
 
         for (i, result) in results.iter().enumerate() {
             let mode_str = format!("{:?}", result.config.mode);
+            // int8 weight mode for this run (one mode per load, same for every row).
+            let int8_str = match self.int8mode {
+                Int8Mode::Off => "off",
+                Int8Mode::Performance => "perf",
+                Int8Mode::Precision => "prec",
+            };
             let batched_str = if result.config.use_batched {
                 "  yes  "
             } else {
@@ -1731,8 +1549,9 @@ impl TestParams {
             };
 
             println!(
-                "│ {:>8} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │",
+                "│ {:>8} │ {:>4} │ {} │ {:>8} │ {} │ {:>10.1} │ {:>12.1} │ {:>11} │ {:>13} │ {} │ {:>8} │ {:>10} │",
                 mode_str,
+                int8_str,
                 batched_str,
                 contexts,
                 valid_str,
@@ -1746,7 +1565,7 @@ impl TestParams {
             );
         }
 
-        println!("└──────────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┘");
+        println!("└──────────┴──────┴─────────┴──────────┴───────┴────────────┴──────────────┴─────────────┴───────────────┴───────────┴──────────┴────────────┘");
     }
 
     /// Print a transposed expert pipeline stats table.

@@ -417,10 +417,15 @@ fn paged_prefill_batched_impl(
 
         // Use the cache's dtype — for quantized backings this returns F16 (the dequant
         // output dtype), and for float backings it returns the arena's actual dtype.
-        // This matches the decode path (batched_layer.rs dispatch_dtype) and correctly
-        // handles pre-reconcile state where arenas are float even if the target is quant.
-        let k_compute = first.k_cache().dtype();
-        let v_compute = first.v_cache().dtype();
+        // The paged attention kernels run in F16/BF16 only, so collapse F32/F64 reference-mode
+        // float arenas to BF16 — matching the decode path (decode_utils compute_dtype) and the
+        // chunked-backing dtype selection above. Q/K/V are cast to this dtype before launch.
+        let collapse_compute = |d: DType| match d {
+            DType::F32 | DType::F64 => DType::BF16,
+            other => other,
+        };
+        let k_compute = collapse_compute(first.k_cache().dtype());
+        let v_compute = collapse_compute(first.v_cache().dtype());
         if k_compute != v_compute {
             candle::bail!(
                 "K and V caches require different compute dtypes: K={:?} V={:?}",
@@ -1544,6 +1549,46 @@ pub fn paged_decode_attn(
         rope_cs: rope_cs.clone(),
         rope_interleaved,
         num_active_slots,
+        emit_q8: false,
+    };
+    q.apply_op1(op)
+}
+
+/// B2 decode: like [`paged_decode_attn`] but the combine kernel emits the attention context
+/// directly as q8a1024 blocks (head_dim 128 only). Returns a flat `[q8_bytes]` U8 tensor; the
+/// caller wraps it as a `Q8a128Operand` (`rows = num_active_slots`, `cols = n_q_head·head_dim`)
+/// and feeds `o_proj` via the int8 path — no FP store + standalone quantize.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "cuda")]
+pub fn paged_decode_attn_q8(
+    q: &Tensor,
+    headers_ptr: u64,
+    arena_dtype: DType,
+    n_q_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    softmax_scale: f32,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    rope_cs: &Tensor,
+    rope_interleaved: bool,
+) -> Result<Tensor> {
+    let num_active_slots = q.dim(0)?;
+    let k_new = k_new.contiguous()?;
+    let v_new = v_new.contiguous()?;
+    let op = PagedDecode {
+        headers_ptr,
+        arena_dtype,
+        n_q_head,
+        n_kv_head,
+        head_dim,
+        softmax_scale,
+        k_new,
+        v_new,
+        rope_cs: rope_cs.clone(),
+        rope_interleaved,
+        num_active_slots,
+        emit_q8: true,
     };
     q.apply_op1(op)
 }
@@ -1561,10 +1606,21 @@ struct PagedDecode {
     rope_cs: Tensor,
     rope_interleaved: bool,
     num_active_slots: usize,
+    /// B2: when true the combine kernel emits the attention context as q8a1024 blocks (head_dim
+    /// 128 only) instead of an FP tensor, so `o_proj` consumes it via the int8 path with no
+    /// standalone quantize. The op then returns a flat `[q8_bytes]` U8 tensor of the operand bytes.
+    emit_q8: bool,
 }
 
 #[cfg(feature = "cuda")]
 impl PagedDecode {
+    /// q8a1024 byte size of the emitted context: `[num_active_slots × (n_q_head·head_dim)]`.
+    fn q8_byte_size(&self) -> usize {
+        let cols = self.n_q_head * self.head_dim;
+        let total_tiles = self.num_active_slots * (cols / 128);
+        total_tiles.div_ceil(8) * 1152
+    }
+
     fn cuda_fwd_typed<
         Q: candle::cuda_backend::CudaDType + DeviceRepr + 'static,
         KV: candle::cuda_backend::CudaDType + DeviceRepr,
@@ -1657,6 +1713,94 @@ impl PagedDecode {
         let out_shape = Shape::from_dims(&[self.num_active_slots, self.n_q_head, self.head_dim]);
         Ok((dst_cs, out_shape))
     }
+
+    /// B2 q8a1024-emitting variant: allocates the q8a1024 byte buffer and passes it as the
+    /// kernel's `q8_out`, returning a flat `[q8_bytes]` U8 storage (no FP context store).
+    fn cuda_fwd_typed_q8<
+        Q: candle::cuda_backend::CudaDType + DeviceRepr + 'static,
+        KV: candle::cuda_backend::CudaDType + DeviceRepr,
+    >(
+        &self,
+        q: &candle::CudaStorage,
+        q_l: &Layout,
+        ffi_fn: unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const u8,
+            *mut core::ffi::c_void,
+            i32,
+            i32,
+            i32,
+            i32,
+            f32,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const f32,
+            i32,
+            *mut core::ffi::c_void,
+        ),
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let dev = q.device().clone();
+        let stream = dev.cuda_stream();
+
+        let q8_bytes = self.q8_byte_size();
+        let dst = unsafe { dev.alloc::<u8>(q8_bytes)? };
+
+        {
+            let q_slice = q.as_cuda_slice::<Q>()?.slice(q_l.start_offset()..);
+            let (q_ptr, _q_g) = q_slice.device_ptr(&stream);
+
+            let headers_ptr = self.headers_ptr as *const u8;
+
+            let (k_s, k_l) = self.k_new.storage_and_layout();
+            let k_slice = match &*k_s {
+                candle::Storage::Cuda(c) => c.as_cuda_slice::<KV>()?,
+                _ => candle::bail!("paged-decode-v2: k_new must be CUDA"),
+            }
+            .slice(k_l.start_offset()..);
+            let (k_ptr, _k_g) = k_slice.device_ptr(&stream);
+
+            let (v_s, v_l) = self.v_new.storage_and_layout();
+            let v_slice = match &*v_s {
+                candle::Storage::Cuda(c) => c.as_cuda_slice::<KV>()?,
+                _ => candle::bail!("paged-decode-v2: v_new must be CUDA"),
+            }
+            .slice(v_l.start_offset()..);
+            let (v_ptr, _v_g) = v_slice.device_ptr(&stream);
+
+            let (rcs_s, rcs_l) = self.rope_cs.storage_and_layout();
+            let rcs_slice = match &*rcs_s {
+                candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
+                _ => candle::bail!("paged-decode-v2: rope_cs must be CUDA"),
+            }
+            .slice(rcs_l.start_offset()..);
+            let (rcs_ptr, _rcs_g) = rcs_slice.device_ptr(&stream);
+
+            let (dst_ptr, _dst_g) = dst.device_ptr(&stream);
+
+            candle::set_kernel_breadcrumb("run_paged_decode_q8", file!(), line!());
+            let raw_stream = stream.cu_stream() as *mut core::ffi::c_void;
+            unsafe {
+                ffi_fn(
+                    q_ptr as *const core::ffi::c_void,
+                    headers_ptr as *const u8,
+                    dst_ptr as *mut core::ffi::c_void,
+                    self.num_active_slots as i32,
+                    self.n_q_head as i32,
+                    self.n_kv_head as i32,
+                    self.head_dim as i32,
+                    self.softmax_scale,
+                    k_ptr as *const core::ffi::c_void,
+                    v_ptr as *const core::ffi::c_void,
+                    rcs_ptr as *const f32,
+                    self.rope_interleaved as i32,
+                    raw_stream,
+                );
+            }
+        } // all guards dropped here, dst no longer borrowed
+
+        let dst_cs = candle::CudaStorage::wrap_cuda_slice(dst, dev);
+        Ok((dst_cs, Shape::from_dims(&[q8_bytes])))
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1674,8 +1818,6 @@ impl candle::CustomOp1 for PagedDecode {
         q: &candle::CudaStorage,
         q_l: &Layout,
     ) -> Result<(candle::CudaStorage, Shape)> {
-        use candle_kernels::paged_decode::{run_paged_decode_bf16, run_paged_decode_fp16};
-
         match self.head_dim {
             64 | 96 | 128 | 256 => {}
             hd => candle::bail!(
@@ -1683,6 +1825,27 @@ impl candle::CustomOp1 for PagedDecode {
             ),
         }
 
+        // B2: emit the attention context as q8a1024 (head_dim 128 only) so o_proj runs int8.
+        if self.emit_q8 {
+            use candle_kernels::paged_decode::{
+                run_paged_decode_bf16_q8, run_paged_decode_fp16_q8,
+            };
+            if self.head_dim != 128 {
+                candle::bail!(
+                    "paged-decode q8: q8a1024 emit requires head_dim 128, got {}",
+                    self.head_dim
+                );
+            }
+            return match self.arena_dtype {
+                DType::F16 => self.cuda_fwd_typed_q8::<f16, f16>(q, q_l, run_paged_decode_fp16_q8),
+                DType::BF16 | DType::F8E4M3 => {
+                    self.cuda_fwd_typed_q8::<bf16, bf16>(q, q_l, run_paged_decode_bf16_q8)
+                }
+                dt => candle::bail!("paged-decode q8: unsupported arena dtype {:?}", dt),
+            };
+        }
+
+        use candle_kernels::paged_decode::{run_paged_decode_bf16, run_paged_decode_fp16};
         match self.arena_dtype {
             DType::F16 => self.cuda_fwd_typed::<f16, f16, f16>(q, q_l, run_paged_decode_fp16),
             DType::BF16 | DType::F8E4M3 => {

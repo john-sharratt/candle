@@ -592,7 +592,43 @@ __device__ inline void extract_scales_impl(
 template <typename compute_t, typename scale_t>
 struct gemx_dequant_traits<block_c_q5_K, compute_t, scale_t> {
     static constexpr int K128_BYTES = 112;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 5-bit = 4-bit nibble (qs) + 1 high bit (qh), affine, per-32 scale (dm0..3 each
+    // cover 32 K, aligning with the k32 MMA sub). Same unpack as Q5_1 (mask + prmt
+    // 0x3120 nibbles; high bit spread into byte bit 4). Fold applies d·C + m·Σx with
+    // the explicit affine {scale, neg_min}.
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        constexpr int QS_OFF[16] =
+            {8, 12, 16, 20, 24, 28, 32, 36, 56, 60, 64, 68, 72, 76, 80, 84};
+        constexpr int QH_BASE[4] = {4, 40, 52, 88};
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int sh = (q3 & 1) * 4;
+        const int m0 = sub * 4 + (q3 >> 1);
+        const int m1 = m0 + 2;
+        const int v0 = *reinterpret_cast<const int*>(rb + QS_OFF[m0]);
+        const int v1 = *reinterpret_cast<const int*>(rb + QS_OFF[m1]);
+        const uint32_t nib0 = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t nib1 = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t qh0 = *(rb + QH_BASE[m0 >> 2] + (m0 & 3));
+        const uint32_t qh1 = *(rb + QH_BASE[m1 >> 2] + (m1 & 3));
+        const uint32_t hb0 = (qh0 >> sh) & 0xF;
+        const uint32_t hb1 = (qh1 >> sh) & 0xF;
+        b_frag[0] = nib0 | (((hb0 * 0x00204081u) & 0x01010101u) << 4);
+        b_frag[1] = nib1 | (((hb1 * 0x00204081u) & 0x01010101u) << 4);
+    }
+    // Per-sub affine {scale (low), neg_min (high)} from dm0..dm3 at data[0,11,12,23].
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int DM_OFF[4] = {0, 44, 48, 92};
+        return *reinterpret_cast<const half2*>(row_block + DM_OFF[sub]);
+    }
+
     using Frags = GemxFragmentTypes<compute_t>;
     using FragB = typename Frags::FragB;
     
@@ -1094,6 +1130,77 @@ struct gemx_dequant_traits<block_c_q5_K, compute_t, scale_t> {
             r1 = __hfma2(sc23_2, __hsub2(*reinterpret_cast<half2*>(&w1), *reinterpret_cast<const half2*>(&SUB)), nm23_2);
             frag_b[6] = *reinterpret_cast<uint32_t*>(&r0);
             frag_b[7] = *reinterpret_cast<uint32_t*>(&r1);
+        }
+    }
+};
+
+// Q5_KO: byte-permuted twin of Q5_K — qs contiguous (field m at m*4), qh ints
+// contiguous (64-79), the four (scale,-min) pairs grouped (80-95). Inherits Q5_K and
+// overrides only the two int8 accessors with the regularized offsets; identical
+// nibble + 5th-bit-spread math. Int8-only (FP accessors inherited, not built).
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q5_KO, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q5_K, compute_t, scale_t> {
+    using base = gemx_dequant_traits<block_c_q5_K, compute_t, scale_t>;
+
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        // De-interleaved Q5_KO block is 80 B (quant only) — NOT base::K128_BYTES (112,
+        // the interleaved Q5_K size). Scales live in the separate region (sub_dm unused).
+        const uint8_t* rb = warp_rows + row * smem_row_stride<block_c_q5_KO_k128>::value;
+        const int sh = (q3 & 1) * 4;
+        // qs ints interleaved [I0,I2,I1,I3] per sub so the lane's two qs ints are
+        // adjacent → one int2 (LDS.64) instead of two int loads (−1 LDS/sub: helps
+        // push Q5 back under the MIO-throttle cliff). q3<2 → {I0,I2}; q3>=2 → {I1,I3}.
+        const int2 qv = *reinterpret_cast<const int2*>(rb + sub * 16 + (q3 >> 1) * 8);
+        const uint32_t nib0 = __byte_perm((qv.x >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        const uint32_t nib1 = __byte_perm((qv.y >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        // qh0/qh1 are bytes (q3>>1) and (q3>>1)+2 of the SAME qh int (qh[sub] at
+        // 64+sub*4, since m0>>2 == m1>>2 == sub). Load that int once (broadcast across
+        // the k-group) and extract the two bytes from registers — replacing two slow
+        // sub-word byte loads with one aligned int load: the Q5 qh bottleneck.
+        const uint32_t qhw = *reinterpret_cast<const uint32_t*>(rb + 64 + sub * 4);
+        const uint32_t qh0 = (qhw >> ((q3 >> 1) * 8)) & 0xFFu;
+        const uint32_t qh1 = (qhw >> (((q3 >> 1) + 2) * 8)) & 0xFFu;
+        const uint32_t hb0 = (qh0 >> sh) & 0xF;
+        const uint32_t hb1 = (qh1 >> sh) & 0xF;
+        b_frag[0] = nib0 | (((hb0 * 0x00204081u) & 0x01010101u) << 4);
+        b_frag[1] = nib1 | (((hb1 * 0x00204081u) & 0x01010101u) << 4);
+    }
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int sub) {
+        constexpr int DM_OFF[4] = {80, 84, 88, 92};
+        return *reinterpret_cast<const half2*>(row_block + DM_OFF[sub]);
+    }
+};
+
+// Q5_KO K/1024 chunk — WAVEFRONT-OPTIMAL dequant, LANE-MAJOR. The 640 B quant region splits
+// into a 512 B ql stream (lane's 4 subs at lane*16+sub*4, like Q4) and a 128 B 5th-bit stream
+// (lane's 4 subs' bytes at 512+lane*4+sub; low nibble = the four 5th-bits of b_frag[0], high =
+// those of b_frag[1]). ONE int4 LDS at lane*16 pulls all 4 subs' ql, ONE uint32 LDS at
+// 512+lane*4 pulls all 4 subs' hi-bytes — both conflict-free (lane*16 / lane*4 → distinct
+// banks per quarter-warp phase). The 5th bits spread to bit 4 via the 0x00204081/0x01010101
+// magic (Q5_K math). Values 0..31; per-32 (scale,min) fold. dm at 640.
+template <typename compute_t, typename scale_t>
+struct gemx_dequant_traits<block_c_q5_KO_k1024, compute_t, scale_t>
+    : gemx_dequant_traits<block_c_q5_KO, compute_t, scale_t> {
+    __device__ __forceinline__ static void dequant_all_subs_int8(
+        const uint8_t* __restrict__ chunk, int lane, uint32_t (&b_frags)[4][2])
+    {
+        const int4 vv = *reinterpret_cast<const int4*>(chunk + lane * 16);
+        const uint32_t s4[4] = {(uint32_t)vv.x, (uint32_t)vv.y, (uint32_t)vv.z, (uint32_t)vv.w};
+        const uint32_t hi4 = *reinterpret_cast<const uint32_t*>(chunk + 512 + lane * 4);
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const uint32_t nib0 = s4[sub] & 0x0F0F0F0Fu;
+            const uint32_t nib1 = (s4[sub] >> 4) & 0x0F0F0F0Fu;
+            const uint32_t hbb = (hi4 >> (sub * 8)) & 0xFFu;
+            const uint32_t hb0 = hbb & 0xFu;
+            const uint32_t hb1 = (hbb >> 4) & 0xFu;
+            b_frags[sub][0] = nib0 | (((hb0 * 0x00204081u) & 0x01010101u) << 4);
+            b_frags[sub][1] = nib1 | (((hb1 * 0x00204081u) & 0x01010101u) << 4);
         }
     }
 };

@@ -1083,7 +1083,14 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
         GgmlDType::QAWQ | GgmlDType::QAWQ_G64 => 0.001,
 
         // Candle-specific types not in GGML matmul benchmarks
-        GgmlDType::Q4_KS | GgmlDType::Q8_KS | GgmlDType::Q2_0 | GgmlDType::Q3_0 => {
+        GgmlDType::Q4_KS
+        | GgmlDType::Q8_KS
+        | GgmlDType::Q2_0
+        | GgmlDType::Q3_0
+        | GgmlDType::Q4_KO
+        | GgmlDType::Q5_KO
+        | GgmlDType::Q6_KO
+        | GgmlDType::Q8_KO => {
             panic!("matmul error not defined for this type")
         }
 
@@ -1399,6 +1406,122 @@ fn quantized_matmul_q4k() -> Result<()> {
     assert_eq!(dst, [1.125, 1.435, -0.201, 1.589]);
 
     ggml_matmul_error_test::<BlockQ4_K>()?;
+
+    Ok(())
+}
+
+/// CPU codec for the byte-permuted Q4_KO block: `from_float` → `to_float` must
+/// recover every element within one affine 4-bit quant step of its 32-element
+/// sub-block. Exercises the contiguous-qs / tail-scales layout and the shared
+/// {n0,n4,n2,n6,n1,n5,n3,n7} nibble order on the CPU side.
+#[test]
+fn q4_ko_cpu_roundtrip() -> Result<()> {
+    use k_quants::BlockQ4_KO;
+    let nblocks = 4usize;
+    let n = 128 * nblocks;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20_240_613);
+    let xs: Vec<f32> = (0..n).map(|_| rng.random_range(-3.0f32..3.0)).collect();
+
+    let mut blocks = vec![BlockQ4_KO::zeros(); nblocks];
+    BlockQ4_KO::from_float(&xs, &mut blocks);
+    let mut ys = vec![0f32; n];
+    BlockQ4_KO::to_float(&blocks, &mut ys);
+
+    // Affine 4-bit per 32-element sub-block: each value lands within one quant step.
+    for b in 0..nblocks {
+        for sub in 0..4 {
+            let lo = b * 128 + sub * 32;
+            let (mut mn, mut mx) = (f32::MAX, f32::MIN);
+            for &x in &xs[lo..lo + 32] {
+                mn = mn.min(x);
+                mx = mx.max(x);
+            }
+            let step = (mx - mn) / 15.0;
+            for i in lo..lo + 32 {
+                let err = (xs[i] - ys[i]).abs();
+                assert!(
+                    err <= step + 1e-3,
+                    "elem {i}: |{} - {}| = {err} exceeds one quant step {step}",
+                    xs[i],
+                    ys[i]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// CPU codecs for Q5_KO (per-32 affine, 5-bit + 5th-bit), Q6_KO (per-16 symmetric,
+/// 6-bit crumbs), Q8_KO (per-128, 8-bit). Each `from_float`→`to_float` recovers every
+/// element within one quant step of its scale group.
+#[test]
+fn q5q6q8_ko_cpu_roundtrip() -> Result<()> {
+    use k_quants::{BlockQ5_KO, BlockQ6_KO, BlockQ8_KO};
+    let nblocks = 4usize;
+    let n = 128 * nblocks;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20_240_614);
+    let xs: Vec<f32> = (0..n).map(|_| rng.random_range(-3.0f32..3.0)).collect();
+
+    // Helper: assert each element of `ys` is within `step(group)` of `xs`, where the
+    // group covers `gsize` elements and the step is computed from the group's spread.
+    let check = |ys: &[f32], gsize: usize, step_of: &dyn Fn(&[f32]) -> f32, tag: &str| {
+        for b in 0..nblocks {
+            for g in 0..(128 / gsize) {
+                let lo = b * 128 + g * gsize;
+                let step = step_of(&xs[lo..lo + gsize]);
+                for i in lo..lo + gsize {
+                    let err = (xs[i] - ys[i]).abs();
+                    assert!(
+                        err <= step + 1e-3,
+                        "{tag} elem {i}: |{} - {}| = {err} exceeds step {step}",
+                        xs[i],
+                        ys[i]
+                    );
+                }
+            }
+        }
+    };
+
+    // Q5_KO: per-32 affine, q5 in [0,31] → step = (max-min)/31.
+    let mut b5 = vec![BlockQ5_KO::zeros(); nblocks];
+    BlockQ5_KO::from_float(&xs, &mut b5);
+    let mut y5 = vec![0f32; n];
+    BlockQ5_KO::to_float(&b5, &mut y5);
+    check(
+        &y5,
+        32,
+        &|g| {
+            let (mn, mx) = g
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            (mx - mn) / 31.0
+        },
+        "Q5_KO",
+    );
+
+    // Q6_KO: per-16 symmetric, q6-32 in [-32,31] → step = amax/32.
+    let mut b6 = vec![BlockQ6_KO::zeros(); nblocks];
+    BlockQ6_KO::from_float(&xs, &mut b6);
+    let mut y6 = vec![0f32; n];
+    BlockQ6_KO::to_float(&b6, &mut y6);
+    check(
+        &y6,
+        16,
+        &|g| g.iter().fold(0f32, |a, &v| a.max(v.abs())) / 32.0,
+        "Q6_KO",
+    );
+
+    // Q8_KO: per-128, 8-bit → step = amax/127.
+    let mut b8 = vec![BlockQ8_KO::zeros(); nblocks];
+    BlockQ8_KO::from_float(&xs, &mut b8);
+    let mut y8 = vec![0f32; n];
+    BlockQ8_KO::to_float(&b8, &mut y8);
+    check(
+        &y8,
+        128,
+        &|g| g.iter().fold(0f32, |a, &v| a.max(v.abs())) / 127.0,
+        "Q8_KO",
+    );
 
     Ok(())
 }

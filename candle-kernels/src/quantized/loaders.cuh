@@ -109,8 +109,12 @@ template <> struct block_compact<block_c_q8_K> { using type = block_c_q8_K; };
 template <> struct block_compact<block_c_q2_K> { using type = block_c_q2_K; };
 template <> struct block_compact<block_c_q3_K> { using type = block_c_q3_K; };
 template <> struct block_compact<block_c_q4_K> { using type = block_c_q4_K; };
+template <> struct block_compact<block_c_q4_KO> { using type = block_c_q4_KO_k1024; };
 template <> struct block_compact<block_c_q5_K> { using type = block_c_q5_K; };
+template <> struct block_compact<block_c_q5_KO> { using type = block_c_q5_KO_k1024; };
 template <> struct block_compact<block_c_q6_K> { using type = block_c_q6_K; };
+template <> struct block_compact<block_c_q6_KO> { using type = block_c_q6_KO_k1024; };
+template <> struct block_compact<block_c_q8_KO> { using type = block_c_q8_KO_k1024; };
 
 // AWQ mappings
 template <> struct block_compact<block_q_awq> { using type = block_c_q_awq; };

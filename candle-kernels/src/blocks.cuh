@@ -176,6 +176,53 @@ typedef struct {
 #define QI8_1_KTILE 16
 #define VDR_Q8_1_KTILE 1
 
+// Q8A128: q8 ACTIVATION block — 128-wide, contiguous int8 + ONE per-128 {scale,sum}
+// header up front. The activation-ordered twin of block_c_q8_1_k128 (the interleaved
+// weight form), but qs is contiguous and 16-byte aligned for a single wide cp.async and
+// the standard A-fragment load. The 16-byte header holds the tile's single {scale, sum} at
+// ds[0] (per-128); ds[1..3] are alignment pad, exactly aligning qs (144 = 16 + 128, both
+// 16-aligned). ds[0].x = scale (amax/127, = s_a), ds[0].y = sum (Σx, the raw float sum
+// feeding the asymmetric-weight min term).
+#define QK8A128 128
+typedef struct __align__(16) {
+    half2  ds[4];           // ds[0] = the tile's {scale, sum} (per-128); ds[1..3] = align pad
+    int8_t qs[QK8A128];     // contiguous, 16-byte aligned
+} block_q8a128;
+static_assert(sizeof(block_q8a128) == 144, "block_q8a128 must be 144 bytes");
+
+// Q8A1024 — flat-grouped, position-independent packing of the q8a128 activation
+// data. The activation tensor is a flat sequence of 128-element tiles in
+// token-major order (flat_tile = token*tiles_per_row + k_tile). Eight consecutive
+// tiles share one self-contained 1152-byte block (9 cache lines):
+//
+//   [ 1024 B : 8 × int8 qs[128] ]   slot s at +s*128    (8 lines, each 32-aligned)
+//   [  128 B : 8 × half2 ds[4]  ]   slot s at +1024+s*16 (1 line; only ds[0] live, +12 B pad)
+//
+//   block = flat_tile >> 3 ;  slot = flat_tile & 7
+//
+// De-interleaving the int8 quants from the scales makes every qs tile a clean
+// 128-byte run → 100% cp.async sector efficiency (vs 49% for the old 144-byte
+// AoS block whose 16-byte ds header knocked qs off the 32-byte sector grid).
+// The packing depends ONLY on flat_tile, so it is position-independent: the
+// per-tensor (rows,cols) split is irrelevant and the n-only unified dispatch
+// produces byte-identical output to the typed path. Numerics are the per-128
+// {amax/127, Σx} (fp16) → bit-exact across the two dispatch paths.
+#define Q8A1024_BLK_BYTES 1152
+#define Q8A1024_META_OFF  1024
+
+// byte offset of tile `flat_tile`'s int8 qs[128] within the q8a1024 buffer.
+__host__ __device__ __forceinline__ int64_t q8a1024_qs_off(int64_t flat_tile) {
+    return (flat_tile >> 3) * Q8A1024_BLK_BYTES + (flat_tile & 7) * 128;
+}
+// byte offset of tile `flat_tile`'s ds slot (ds[0] = the per-128 {scale, sum}) within the buffer.
+__host__ __device__ __forceinline__ int64_t q8a1024_ds_off(int64_t flat_tile) {
+    return (flat_tile >> 3) * Q8A1024_BLK_BYTES + Q8A1024_META_OFF + (flat_tile & 7) * 16;
+}
+// number of 1152-byte blocks needed to hold `total_tiles` 128-element tiles.
+__host__ __device__ __forceinline__ int64_t q8a1024_num_blocks(int64_t total_tiles) {
+    return (total_tiles + 7) >> 3;
+}
+
 // Q4_KS: 4-bit with attention-sink sub-block scaling (20 bytes)
 // Sub-block A: elements 0-3 (attention sinks), fine scale sa
 // Sub-block B: elements 4-31, fine scale sb

@@ -548,8 +548,8 @@ impl Tensor {
         self.is_variable || self.op.is_some()
     }
 
-    // TODO: Also make an inplace version or a pre-allocated? This could be tricky
-    // if this can create cycles in the compute graph.
+    // These binary ops allocate a fresh output; there is no in-place / pre-allocated
+    // variant, since reusing an operand's storage could create cycles in the compute graph.
     binary_op!(add, Add);
     binary_op!(mul, Mul);
     binary_op!(sub, Sub);
@@ -2179,7 +2179,8 @@ impl Tensor {
         let (l_shape, r_shape) = lhs.shape().broadcast_shape_matmul(rhs.shape())?;
         let l_broadcast = l_shape != *lhs.shape();
         let r_broadcast = r_shape != *rhs.shape();
-        // TODO: Avoid concretising the broadcasted matrixes via contiguous.
+        // Broadcast operands are concretised via `contiguous` here; a strided matmul
+        // path would avoid the copy.
         match (l_broadcast, r_broadcast) {
             (true, true) => lhs
                 .broadcast_as(&l_shape)?
@@ -2357,7 +2358,8 @@ impl Tensor {
         if dim == 0 {
             self.slice_scatter0(src, start)
         } else {
-            // TODO: Maybe we want to add a more efficient implementation at some point.
+            // Non-zero `dim`: reuse the dim-0 path by transposing `dim` to the front,
+            // scattering, then transposing back.
             self.transpose(0, dim)?
                 .slice_scatter0(&src.transpose(0, dim)?, start)?
                 .transpose(0, dim)
@@ -3011,8 +3013,8 @@ impl Tensor {
                 (Storage::Cuda(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Metal(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Cuda(storage), Device::Cuda(cuda)) => {
-                    // TODO: Avoid passing through the cpu storage here, especially if the gpu ids
-                    // are the same.
+                    // CUDA→CUDA copy currently round-trips through CPU storage even when the
+                    // source and destination GPU ids match.
                     let cpu_storage = storage.to_cpu_storage()?;
                     Storage::Cuda(cuda.storage_from_cpu_storage(&cpu_storage)?)
                 }
@@ -3121,8 +3123,13 @@ impl Tensor {
             *self = self.contiguous()?;
         }
 
-        // Try in-place conversion first (only works on CUDA with sufficient buffer)
-        let converted_in_place = {
+        // Try in-place conversion first (only works on CUDA with sufficient buffer).
+        // Skip it when the storage is shared (e.g. this tensor is a `narrow` view that
+        // aliases a sibling view of the same buffer, as the fused gate/up MLP produces):
+        // an in-place cast mutates the shared buffer and corrupts the other views.
+        let converted_in_place = if Arc::strong_count(&self.storage) > 1 {
+            false
+        } else {
             let mut storage = self.storage_mut();
             storage.to_dtype_mut(self.layout(), dtype)?
         };

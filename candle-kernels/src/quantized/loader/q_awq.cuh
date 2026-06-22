@@ -311,7 +311,32 @@ struct gemx_dequant_traits<block_c_q_awq, compute_t, scale_t> {
     
     // K/128 block byte size
     static constexpr int K128_BYTES = 80;
-    
+
+    // -------------------------------------------------------------------------
+    // INT8 TENSOR-CORE PATH
+    // -------------------------------------------------------------------------
+    // 4-bit unsigned asymmetric (w = scale·q + neg_sz, neg_sz = -scale·zero). LOP3
+    // nibble order (mask + prmt 0x3120 → natural {0,1,2,3}); qs[f] is one int per
+    // field at byte f*4. One scale/zero per 128-element block (same for all 4 subs).
+    __device__ __forceinline__ static void dequant_to_b_frag_int8(
+        const uint8_t* __restrict__ warp_rows, int sub, int lane, uint32_t (&b_frag)[2])
+    {
+        const int row = lane >> 2;
+        const int q3 = lane & 3;
+        const uint8_t* rb = warp_rows + row * K128_BYTES;
+        const int sh = (q3 & 1) * 4;
+        const int v0 = *reinterpret_cast<const int*>(rb + (sub * 4 + (q3 >> 1)) * 4);
+        const int v1 = *reinterpret_cast<const int*>(rb + (sub * 4 + 2 + (q3 >> 1)) * 4);
+        b_frag[0] = __byte_perm((v0 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+        b_frag[1] = __byte_perm((v1 >> sh) & 0x0F0F0F0F, 0, 0x3120);
+    }
+    // Affine {scale, neg_sz = -scale·zero}; scale@byte64, zero@byte66 (per block).
+    __device__ __forceinline__ static half2 sub_dm(const uint8_t* __restrict__ row_block, int) {
+        const float scale = __half2float(*reinterpret_cast<const half*>(row_block + 64));
+        const float zero = __half2float(*reinterpret_cast<const half*>(row_block + 66));
+        return __halves2half2(__float2half(scale), __float2half(-scale * zero));
+    }
+
     // =========================================================================
     // RUNTIME DEQUANT FOR MMA m16n8k16
     // =========================================================================

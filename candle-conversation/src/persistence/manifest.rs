@@ -209,6 +209,7 @@ impl Manifest {
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
+            | RecordType::ProjectionEvents
             | RecordType::Unknown => {}
         }
         Ok(())

@@ -152,7 +152,17 @@ impl Scheduler {
             // op-profile dumps were removed once measurement ruled the expert
             // path out — dma_loads stays 0; the prefill cost is the attention
             // kernel, seen in the per-forward `code-read prefill` breakdown.)
-            self.wave_stats.flush_if_due();
+            if self.wave_stats.due() {
+                // Our eviction gate's own view of VRAM: the pool budget we
+                // defend (vram_budget_available) and pool_used — queried only
+                // on the wave we emit, not every iteration.
+                let kv_vram = self
+                    .session
+                    .vram_budget_available()
+                    .zip(self.session.vram_pool_stats())
+                    .map(|(budget, (used, _reserved))| (budget, used));
+                self.wave_stats.flush(kv_vram);
+            }
         }
 
         tracing::info!("scheduler shut down");

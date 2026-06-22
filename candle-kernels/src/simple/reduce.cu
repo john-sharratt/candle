@@ -4,6 +4,7 @@
 #include "rope_utils.cuh"
 #include "softmax_utils.cuh"
 #include "reduce_utils.cuh"
+#include "../blocks.cuh"
 #include <cmath>
 #include <stdint.h>
 #include <type_traits>
@@ -504,6 +505,145 @@ __device__ void rmsnorm(const T * x, T * dst, const T * alpha, const int ncols, 
 }
 
 // =============================================================================
+// FUSED RMSNORM → q8a128 (producer epilogue B1/B3/B5)
+// =============================================================================
+// One block per row. PASS 1 caches the row in shared memory and block-reduces
+// Σx² → scale = rsqrt(Σx²/ncols + eps) (same formula as `rmsnorm`). PASS 2 lays
+// the block out as one warp per 128-tile (lane owns 4 contiguous elements) and
+// writes the q8a128 activation block directly — the per-128 amax/Σx butterfly +
+// char4 store + lane-0 ds, identical to `quantize_q8a128_kernel`, but on the
+// normalized values. Each normalized value is round-tripped through the store
+// dtype T so the result tracks `rmsnorm`→`quantize_q8a128` within float margin.
+// Output is the flat-grouped q8a1024 buffer (see blocks.cuh). Requires
+// ncols % 128 == 0 and alpha != nullptr (the RMSNorm weight).
+
+// Vectorized 4-wide load (mirrors quantize_q8a128's q8a128_load4): one 16/8-byte vector load → 4
+// floats, for the PASS-2 alpha read. PASS-1 uses the VecTraits path (load_and_square_sum).
+template <typename T>
+__device__ __forceinline__ void rms_load4(const T* p, float& a, float& b, float& c, float& d);
+template <>
+__device__ __forceinline__ void rms_load4<float>(const float* p, float& a, float& b, float& c, float& d) {
+    const float4 v = *reinterpret_cast<const float4*>(p);
+    a = v.x; b = v.y; c = v.z; d = v.w;
+}
+template <>
+__device__ __forceinline__ void rms_load4<__half>(const __half* p, float& a, float& b, float& c, float& d) {
+    const __half2* h = reinterpret_cast<const __half2*>(p);
+    const float2 lo = __half22float2(h[0]);
+    const float2 hi = __half22float2(h[1]);
+    a = lo.x; b = lo.y; c = hi.x; d = hi.y;
+}
+template <>
+__device__ __forceinline__ void rms_load4<__nv_bfloat16>(const __nv_bfloat16* p, float& a, float& b, float& c, float& d) {
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(p);
+    const float2 lo = __bfloat1622float2(h[0]);
+    const float2 hi = __bfloat1622float2(h[1]);
+    a = lo.x; b = lo.y; c = hi.x; d = hi.y;
+}
+
+template <typename T, int BLOCK_SIZE>
+__device__ void rmsnorm_q8a128_impl(
+    const T* __restrict__ x, block_q8a128* __restrict__ out,
+    const T* __restrict__ alpha, const int ncols, const float eps, float* x_cache)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const T* x_row = x + (int64_t)row * ncols;
+    const float inv_ncols = 1.0f / ncols;
+
+    // PASS 1: cache the row as f32 and accumulate Σx² (vectorized 16-byte loads, same path as the
+    // FP `rmsnorm_cached`). ncols % 128 == 0 so the vector loop covers the whole row.
+    constexpr int VEC_SIZE = VecTraits<T>::VEC_SIZE;
+    using VecType = typename VecTraits<T>::VecType;
+    const int ncols_vec = (ncols / VEC_SIZE) * VEC_SIZE;
+    float sum_sq = 0.0f;
+    #pragma unroll 2
+    for (int col = tid * VEC_SIZE; col < ncols_vec; col += BLOCK_SIZE * VEC_SIZE) {
+        VecType v = *reinterpret_cast<const VecType*>(&x_row[col]);
+        sum_sq += load_and_square_sum(v);
+        if constexpr (VEC_SIZE == 4) {
+            const float4 vf = *reinterpret_cast<const float4*>(&v);
+            x_cache[col] = vf.x;
+            x_cache[col + 1] = vf.y;
+            x_cache[col + 2] = vf.z;
+            x_cache[col + 3] = vf.w;
+        } else if constexpr (VEC_SIZE == 2 && std::is_same_v<T, __half>) {
+            const float2 vf = __half22float2(*reinterpret_cast<const __half2*>(&v));
+            x_cache[col] = vf.x;
+            x_cache[col + 1] = vf.y;
+        } else if constexpr (VEC_SIZE == 2 && std::is_same_v<T, __nv_bfloat16>) {
+            const float2 vf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
+            x_cache[col] = vf.x;
+            x_cache[col + 1] = vf.y;
+        } else {
+            x_cache[col] = to_float_val(v);
+        }
+    }
+    // Tail (only if ncols is not a VEC_SIZE multiple — never for the q8a128 contract, kept safe).
+    for (int col = ncols_vec + tid; col < ncols; col += BLOCK_SIZE) {
+        float xi = to_float_val(x_row[col]);
+        x_cache[col] = xi;
+        sum_sq = __fmaf_rn(xi, xi, sum_sq);
+    }
+    __syncthreads();
+    sum_sq = block_reduce_sum<BLOCK_SIZE>(sum_sq);
+    const float scale = rsqrtf(sum_sq * inv_ncols + eps);
+    __syncthreads(); // x_cache must be fully visible to every warp before PASS 2
+
+    // PASS 2: one warp per 128-tile; lane owns 4 contiguous normalized elements.
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_warps = BLOCK_SIZE >> 5;
+    const int tiles_per_row = ncols >> 7; // ncols / 128
+    uint8_t* obytes = reinterpret_cast<uint8_t*>(out);
+    for (int t = warp; t < tiles_per_row; t += n_warps) {
+        const int col0 = t * 128 + lane * 4;
+        // normalize, fold alpha (vector-loaded), round through T (mirrors the FP store rmsnorm does).
+        float a0, a1, a2, a3;
+        rms_load4<T>(alpha + col0, a0, a1, a2, a3);
+        const float n0 = to_float_val(from_float_val<T>(scale * x_cache[col0 + 0] * a0));
+        const float n1 = to_float_val(from_float_val<T>(scale * x_cache[col0 + 1] * a1));
+        const float n2 = to_float_val(from_float_val<T>(scale * x_cache[col0 + 2] * a2));
+        const float n3 = to_float_val(from_float_val<T>(scale * x_cache[col0 + 3] * a3));
+
+        float amax = fmaxf(fmaxf(fabsf(n0), fabsf(n1)), fmaxf(fabsf(n2), fabsf(n3)));
+        float s = n0 + n1 + n2 + n3;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
+            s += __shfl_xor_sync(0xffffffff, s, off, 32);
+        }
+        const float id = (amax != 0.f) ? 127.f / amax : 0.f;
+        const int64_t flat = (int64_t)row * tiles_per_row + t;
+        *reinterpret_cast<char4*>(obytes + q8a1024_qs_off(flat) + lane * 4) = make_char4(
+            (int8_t)__float2int_rn(n0 * id),
+            (int8_t)__float2int_rn(n1 * id),
+            (int8_t)__float2int_rn(n2 * id),
+            (int8_t)__float2int_rn(n3 * id));
+        if (lane == 0) {
+            half2* ds = reinterpret_cast<half2*>(obytes + q8a1024_ds_off(flat));
+            ds[0] = make_half2(__float2half_rn(amax / 127.f), __float2half_rn(s));
+        }
+    }
+}
+
+template <typename T>
+__device__ void rmsnorm_q8a128(
+    const T* x, block_q8a128* out, const T* alpha,
+    const int ncols, const int block_size, const float eps)
+{
+    extern __shared__ float shared_cache[];
+    switch (block_size) {
+        case 32:   rmsnorm_q8a128_impl<T, 32>(x, out, alpha, ncols, eps, shared_cache); break;
+        case 64:   rmsnorm_q8a128_impl<T, 64>(x, out, alpha, ncols, eps, shared_cache); break;
+        case 128:  rmsnorm_q8a128_impl<T, 128>(x, out, alpha, ncols, eps, shared_cache); break;
+        case 256:  rmsnorm_q8a128_impl<T, 256>(x, out, alpha, ncols, eps, shared_cache); break;
+        case 512:  rmsnorm_q8a128_impl<T, 512>(x, out, alpha, ncols, eps, shared_cache); break;
+        default:   rmsnorm_q8a128_impl<T, 1024>(x, out, alpha, ncols, eps, shared_cache); break;
+    }
+}
+
+// =============================================================================
 // SOFTMAX - OPTIMIZED VERSION
 // =============================================================================
 // Key optimizations over ggml baseline:
@@ -877,6 +1017,14 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     rmsnorm<TYPENAME>(src, dst, alpha, n_cols, block_size, eps);               \
   }                                                                            \
 
+#define RMSNORM_Q8A128_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *src, void *out, const TYPENAME *alpha,                   \
+      const int n_cols, const int block_size, const float eps) {              \
+    rmsnorm_q8a128<TYPENAME>(                                                  \
+        src, reinterpret_cast<block_q8a128*>(out), alpha, n_cols, block_size, eps); \
+  }                                                                            \
+
 #define LAYERNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
       const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
@@ -921,6 +1069,7 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
+RMSNORM_Q8A128_OP(__nv_bfloat16, rmsnorm_q8a128_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
 ROPE_OP(__nv_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
 SUM_OP(__nv_bfloat16, sum_bf16)
@@ -942,6 +1091,7 @@ extern "C" __global__ void fast_sum_f8_e4m3(
 
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
+RMSNORM_Q8A128_OP(__half, rmsnorm_q8a128_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
@@ -953,6 +1103,7 @@ SUM_OP(uint32_t, sum_u32)
 SOFTMAX_OP(float, float, softmax_f32)
 SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
+RMSNORM_Q8A128_OP(float, rmsnorm_q8a128_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 LAYERNORM_OP(float, layernorm_f32)
 LAYERNORM_OP(double, layernorm_f64)

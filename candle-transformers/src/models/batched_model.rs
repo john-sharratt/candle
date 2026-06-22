@@ -456,20 +456,19 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         );
 
         let t_proj = profile_now();
-        // Apply final normalization
+        // B5: gather the positions that actually need logits BEFORE normalizing (RMSNorm is
+        // per-position, so select-then-norm == norm-then-select), then fuse the final RMSNorm into
+        // q8a128 and feed `output_proj` directly via `forward_dynamic` — no FP store + standalone
+        // quantize on the int8 path. Off mode (every non-int8 model) takes the plain FP path.
         let x_tensor = x.to_tensor();
-        let x = self.model.final_norm().forward(&x_tensor)?;
-
-        // Project to vocabulary
-        let logits = if self.all_logits {
-            // All positions (perplexity evaluation mode)
-            self.model.output_proj().forward(&x)?
+        let pre_norm = if self.all_logits {
+            // All positions (perplexity evaluation mode).
+            x_tensor.clone()
         } else if is_prefill {
-            // Flat-packed prefill: x is [1, total, hidden]; the last token of
-            // sequence i sits at the flat index (Σ_{j<=i} q_lens[j]) - 1. Gather
-            // those rows → [n_seqs, hidden] before the vocab projection.
-            let hidden = x.dim(2)?;
-            let x_flat = x.reshape((seq_len, hidden))?;
+            // Flat-packed prefill: x is [1, total, hidden]; the last token of sequence i sits at
+            // the flat index (Σ_{j<=i} q_lens[j]) - 1. Gather those rows → [n_seqs, hidden].
+            let hidden = x_tensor.dim(2)?;
+            let x_flat = x_tensor.reshape((seq_len, hidden))?;
             let mut last_idx = Vec::with_capacity(q_lens.len());
             let mut acc = 0u32;
             for &l in &q_lens {
@@ -477,12 +476,27 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 last_idx.push(acc - 1);
             }
             let idx = Tensor::from_vec(last_idx, q_lens.len(), x_flat.device())?;
-            let last_hidden = x_flat.index_select(&idx, 0)?.contiguous()?;
-            self.model.output_proj().forward(&last_hidden)?
+            x_flat.index_select(&idx, 0)?.contiguous()?
         } else {
             // Decode: [b_sz, 1, hidden] → the single (last) token per sequence.
-            let last_hidden = x.i((.., seq_len - 1, ..))?.contiguous()?;
-            self.model.output_proj().forward(&last_hidden)?
+            x_tensor.i((.., seq_len - 1, ..))?.contiguous()?
+        };
+
+        let logits = {
+            #[cfg(feature = "cuda")]
+            {
+                let proj = self.model.output_proj();
+                let acts = self
+                    .model
+                    .final_norm()
+                    .forward_dynamic(&pre_norm, proj.int8mode())?;
+                proj.forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let normed = self.model.final_norm().forward(&pre_norm)?;
+                self.model.output_proj().forward(&normed)?
+            }
         };
 
         profile_sync(embedded.device());

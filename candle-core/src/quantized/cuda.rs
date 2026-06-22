@@ -1,4 +1,4 @@
-use super::{GgmlDType, QStorage};
+use super::{GgmlDType, Int8Mode, QStorage};
 use crate::backend::{BackendDevice, BackendStorage};
 
 use crate::quantized::k_quants::GgmlType;
@@ -10,24 +10,43 @@ use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut};
 
 // Import the FFI dispatcher functions
 use candle_kernels::simple::quantized::{
-    run_arena_compact_copy, run_arena_compact_patch, run_dequantize_block,
-    run_dequantize_mul_mat_vec, run_mul_mat, run_mul_mat_vec_q8_1, run_quantize_block,
-    run_quantize_palette4_convert, run_quantize_q8_1, run_quantize_transposed_batched,
-    run_quantize_transposed_batched_typed, run_reduce_head_stats_format,
-    run_sample_quant_errors_kv_paged, run_sample_quant_errors_paged,
+    run_arena_compact_copy, run_arena_compact_patch, run_dequantize_block, run_dequantize_ko,
+    run_dequantize_mul_mat_vec, run_dequantize_q8a128, run_mul_mat, run_mul_mat_vec_q8_1,
+    run_quantize_block, run_quantize_ko, run_quantize_palette4_convert, run_quantize_q8_1,
+    run_quantize_q8a128, run_quantize_transposed_batched, run_quantize_transposed_batched_typed,
+    run_reduce_head_stats_format, run_sample_quant_errors_kv_paged, run_sample_quant_errors_paged,
     run_select_kv_format_palette4_paged, run_select_winners_kv_paged,
     run_summarize_winners_side_paged, DequantOutDType, QType,
 };
 
+// Fused RMSNorm → q8a128 producer epilogue (B1/B3/B5).
+use candle_kernels::simple::reduce::run_rmsnorm_q8a128_op;
+
+// Fused SwiGLU → q8a128 producer epilogue (B4).
+use candle_kernels::simple::fused_silu_mul::run_silu_mul_q8a128_op;
+
 // Import the new quantized matmul dispatcher
 // K/128 blocks have embedded scales, no external scale extraction needed.
 use candle_kernels::quantized::{
-    dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_quantized_matmul, VxSegment,
-    YType,
+    dispatch_info, flush_l2_cache, run_grouped_quantized_matmul, run_qkv_segmented_matmul,
+    run_quantized_matmul, VxSegment, YType,
 };
 
 // Import GEMX repacking dispatcher
 use candle_kernels::quantized::{get_repacked_size_bytes, is_gemx_supported, run_repack_gemx};
+
+use super::int8_matmul_mode::q8a128_dense_use_mode2;
+
+/// Process-cached SM count for the int8 dense tiling (occupancy) heuristic. SM count is a fixed
+/// device property; querying the driver attribute on every matmul would add an FFI call to the hot
+/// path, so memoize it once. Single-GPU assumption (this fork targets one accelerator) — a tiling
+/// heuristic does not need per-device precision, and `0` (query failure) degrades safely (mode-2
+/// outside the trap).
+fn cached_sm_count(device: &CudaDevice) -> usize {
+    use std::sync::OnceLock;
+    static SM_COUNT: OnceLock<usize> = OnceLock::new();
+    *SM_COUNT.get_or_init(|| device.multiprocessor_count().unwrap_or(0))
+}
 
 // ============================================================================
 // Host-Mapped / Pinned Memory Primitives
@@ -249,6 +268,10 @@ fn dtype_to_qtype(dtype: GgmlDType) -> Result<QType> {
         GgmlDType::Q1_A => QType::Q1_A,
         GgmlDType::Q0_X => QType::Q0_X,
         GgmlDType::Q0_M2 => QType::Q0_M2,
+        GgmlDType::Q4_KO => QType::Q4_KO,
+        GgmlDType::Q5_KO => QType::Q5_KO,
+        GgmlDType::Q6_KO => QType::Q6_KO,
+        GgmlDType::Q8_KO => QType::Q8_KO,
         GgmlDType::Q0_M4 => QType::Q0_M4,
         _ => crate::bail!("unsupported dtype for quantized op: {dtype:?}"),
     })
@@ -2524,6 +2547,170 @@ fn mul_mat_via_q8_1(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Float dense quantized matmul shared by `QCudaStorage::matmul_gemx` and the `Float`
+/// arm of [`dense_qmatmul`]: quantized weight `[nrows(N) x ncols(K)]` (qtype, `weight_len`
+/// bytes at `weight_ptr`) times float activations `rhs` -> same-dtype output `[.. x N]`.
+/// An unsupported activation dtype is converted to BF16 and the output converted back.
+#[allow(clippy::too_many_arguments)]
+fn dense_qmatmul_float(
+    weight_ptr: u64,
+    qtype: i32,
+    weight_len: usize,
+    nrows: usize,
+    ncols: usize,
+    rhs: &CudaStorage,
+    rhs_l: &crate::Layout,
+    device: &CudaDevice,
+) -> Result<(CudaStorage, crate::Shape)> {
+    use crate::cuda_backend::CudaStorageSlice;
+    use half::bf16;
+
+    let (batch_size, k) = match rhs_l.shape().dims() {
+        [b, m, k] => (b * m, *k),
+        [b, k] => (*b, *k),
+        _ => crate::bail!(
+            "unexpected rhs shape in quantized_matmul {:?}",
+            rhs_l.shape()
+        ),
+    };
+    if ncols != k {
+        crate::bail!(
+            "mismatch on matmul dim N={nrows} K={ncols} vs rhs {:?}",
+            rhs_l.shape()
+        )
+    }
+
+    let input_dtype = rhs.dtype();
+    let needs_conversion = !matches!(
+        input_dtype,
+        crate::DType::F16 | crate::DType::BF16 | crate::DType::F32
+    );
+    let rhs_converted: Option<CudaStorage> = if needs_conversion {
+        Some(rhs.to_dtype(rhs_l, crate::DType::BF16)?)
+    } else {
+        None
+    };
+    let rhs_storage = rhs_converted.as_ref().unwrap_or(rhs);
+    let rhs_layout_owned;
+    let rhs_layout = if rhs_converted.is_some() {
+        rhs_layout_owned = crate::Layout::contiguous(rhs_l.shape());
+        &rhs_layout_owned
+    } else {
+        rhs_l
+    };
+
+    let ytype = match &rhs_storage.slice {
+        CudaStorageSlice::F16(_) => YType::F16,
+        CudaStorageSlice::BF16(_) => YType::BF16,
+        CudaStorageSlice::F32(_) => YType::F32,
+        _ => unreachable!("should have been converted to BF16"),
+    };
+
+    enum OutputSlice {
+        F16(CudaSlice<f16>),
+        BF16(CudaSlice<bf16>),
+        F32(CudaSlice<f32>),
+    }
+    let dst_slice = match ytype {
+        YType::F16 => OutputSlice::F16(unsafe { device.alloc::<f16>(nrows * batch_size)? }),
+        YType::BF16 => OutputSlice::BF16(unsafe { device.alloc::<bf16>(nrows * batch_size)? }),
+        YType::F32 => OutputSlice::F32(unsafe { device.alloc::<f32>(nrows * batch_size)? }),
+        YType::Q8A128 => {
+            crate::bail!("YType::Q8A128 is the int8 matmul INPUT format, not an FP output dtype")
+        }
+    };
+
+    {
+        let stream = device.cuda_stream();
+        let segment = VxSegment {
+            weights: weight_ptr as *const std::ffi::c_void,
+            batch_count: batch_size as i32,
+        };
+        macro_rules! run_matmul {
+            ($y_ptr:expr, $dst_ptr:expr) => {
+                unsafe {
+                    run_quantized_matmul(
+                        &segment as *const VxSegment,
+                        1,
+                        $y_ptr as *const std::ffi::c_void,
+                        $dst_ptr as *mut std::ffi::c_void,
+                        ncols as i32,
+                        nrows as i32,
+                        k as i32,
+                        nrows as i32,
+                        qtype,
+                        ytype as i32,
+                        weight_len,
+                        0, // force_mode2: FP path ignores it
+                    );
+                }
+            };
+        }
+        match (&rhs_storage.slice, &dst_slice) {
+            (CudaStorageSlice::F16(y_data), OutputSlice::F16(dst)) => {
+                let y_view = match rhs_layout.contiguous_offsets() {
+                    Some((o1, o2)) => y_data.slice(o1..o2),
+                    None => {
+                        return Err(crate::Error::RequiresContiguous {
+                            op: "quantized_matmul",
+                        }
+                        .bt())?
+                    }
+                };
+                let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
+                let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                run_matmul!(y_ptr, dst_ptr);
+            }
+            (CudaStorageSlice::BF16(y_data), OutputSlice::BF16(dst)) => {
+                let y_view = match rhs_layout.contiguous_offsets() {
+                    Some((o1, o2)) => y_data.slice(o1..o2),
+                    None => {
+                        return Err(crate::Error::RequiresContiguous {
+                            op: "quantized_matmul",
+                        }
+                        .bt())?
+                    }
+                };
+                let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
+                let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                run_matmul!(y_ptr, dst_ptr);
+            }
+            (CudaStorageSlice::F32(y_data), OutputSlice::F32(dst)) => {
+                let y_view = match rhs_layout.contiguous_offsets() {
+                    Some((o1, o2)) => y_data.slice(o1..o2),
+                    None => {
+                        return Err(crate::Error::RequiresContiguous {
+                            op: "quantized_matmul",
+                        }
+                        .bt())?
+                    }
+                };
+                let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
+                let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
+                run_matmul!(y_ptr, dst_ptr);
+            }
+            _ => unreachable!("ytype and rhs_storage slice should match"),
+        }
+    }
+
+    let out_storage = match dst_slice {
+        OutputSlice::F16(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
+        OutputSlice::BF16(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
+        OutputSlice::F32(dst) => CudaStorage::wrap_cuda_slice(dst, device.clone()),
+    };
+    let mut out_shape = rhs_l.shape().dims().to_vec();
+    out_shape.pop();
+    out_shape.push(nrows);
+    let out_shape: crate::Shape = out_shape.into();
+    if needs_conversion {
+        let out_layout = crate::Layout::contiguous(&out_shape);
+        let converted_out = out_storage.to_dtype(&out_layout, input_dtype)?;
+        Ok((converted_out, out_shape))
+    } else {
+        Ok((out_storage, out_shape))
+    }
+}
+
 impl QCudaStorage {
     pub fn zeros(device: &CudaDevice, el_count: usize, dtype: GgmlDType) -> Result<Self> {
         let size_in_bytes = ceil_div(el_count, dtype.block_size()) * dtype.type_size();
@@ -2575,15 +2762,11 @@ impl QCudaStorage {
             }
         }
 
-        // Wrap the pinned host buffer as a CudaSlice via device H2D copy.
-        // Note: we still need a CudaSlice for the QCudaStorage API.
-        // We allocate VRAM and copy â€” but the data also lives in pinned host
-        // memory for future zero-copy patterns.
-        //
-        // TODO(perf): When cudarc supports wrapping an external device pointer
-        // (from cuMemHostGetDevicePointer) into a CudaSlice without ownership,
-        // we can eliminate this VRAM copy entirely. For now, the HostMappedAlloc
-        // guard keeps the pinned buffer alive as a correctness guarantee.
+        // Wrap the pinned host buffer as a CudaSlice via a device H2D copy: the
+        // QCudaStorage API needs an owned CudaSlice, and cudarc has no way to wrap an
+        // external device pointer (from cuMemHostGetDevicePointer) into a CudaSlice
+        // without ownership, so the mapped-host zero-copy path is not expressible here.
+        // The HostMappedAlloc guard keeps the pinned buffer alive alongside the VRAM copy.
         let pinned_slice = unsafe { std::slice::from_raw_parts(host_ptr, size_in_bytes) };
         let mut inner = unsafe { device.alloc::<u8>(padded_size_in_bytes)? };
         device.memcpy_htod(pinned_slice, &mut inner.slice_mut(..size_in_bytes))?;
@@ -2705,6 +2888,10 @@ impl QCudaStorage {
             GgmlDType::Q0_X => deq::<crate::quantized::BlockQ0X>(&buffer, block_len, &mut out),
             GgmlDType::Q0_M2 => deq::<crate::quantized::BlockQ0M2>(&buffer, block_len, &mut out),
             GgmlDType::Q0_M4 => deq::<crate::quantized::BlockQ0M4>(&buffer, block_len, &mut out),
+            GgmlDType::Q4_KO => deq::<crate::quantized::BlockQ4_KO>(&buffer, block_len, &mut out),
+            GgmlDType::Q5_KO => deq::<crate::quantized::BlockQ5_KO>(&buffer, block_len, &mut out),
+            GgmlDType::Q6_KO => deq::<crate::quantized::BlockQ6_KO>(&buffer, block_len, &mut out),
+            GgmlDType::Q8_KO => deq::<crate::quantized::BlockQ8_KO>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -3241,187 +3428,20 @@ impl QCudaStorage {
         rhs: &CudaStorage,
         rhs_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        use crate::cuda_backend::CudaStorageSlice;
-        use half::bf16;
-
         let (nrows, ncols) = self_shape.dims2()?;
-        let (batch_size, k) = match rhs_l.shape().dims() {
-            [b, m, k] => (b * m, *k),
-            [b, k] => (*b, *k),
-            _ => crate::bail!(
-                "unexpected rhs shape in quantized_matmul {:?}",
-                rhs_l.shape()
-            ),
-        };
-        if ncols != k {
-            crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
-        }
-
-        let input_dtype = rhs.dtype();
-
-        // Check if we need to convert input to BF16
-        // F32 is now supported for Q4_K via dedicated kernel
-        let needs_conversion = !matches!(
-            input_dtype,
-            crate::DType::F16 | crate::DType::BF16 | crate::DType::F32
-        );
-
-        // If input is not a supported type, convert to BF16
-        let rhs_converted: Option<CudaStorage> = if needs_conversion {
-            Some(rhs.to_dtype(rhs_l, crate::DType::BF16)?)
-        } else {
-            None
-        };
-
-        // Get the actual storage and layout to use
-        let rhs_storage = rhs_converted.as_ref().unwrap_or(rhs);
-        let rhs_layout_owned;
-        let rhs_layout = if rhs_converted.is_some() {
-            // Converted storage is contiguous
-            rhs_layout_owned = crate::Layout::contiguous(rhs_l.shape());
-            &rhs_layout_owned
-        } else {
-            rhs_l
-        };
-
-        // Convert GgmlDType to qtype
         let qtype = dtype_to_qtype(self.dtype)? as i32;
-
-        // Determine Y type
-        let ytype = match &rhs_storage.slice {
-            CudaStorageSlice::F16(_) => YType::F16,
-            CudaStorageSlice::BF16(_) => YType::BF16,
-            CudaStorageSlice::F32(_) => YType::F32,
-            _ => unreachable!("should have been converted to BF16"),
-        };
-
-        // NOTE: GEMX tensor core kernels are integrated into run_quantized_matmul
-        // The dispatcher automatically uses tensor cores for batch >= 16 on SM80+ with F16
-
-        // Allocate output based on ytype - enum to hold different slice types
-        enum OutputSlice {
-            F16(CudaSlice<f16>),
-            BF16(CudaSlice<bf16>),
-            F32(CudaSlice<f32>),
-        }
-
-        let dst_slice = match ytype {
-            YType::F16 => {
-                OutputSlice::F16(unsafe { self.device.alloc::<f16>(nrows * batch_size)? })
-            }
-            YType::BF16 => {
-                OutputSlice::BF16(unsafe { self.device.alloc::<bf16>(nrows * batch_size)? })
-            }
-            YType::F32 => {
-                OutputSlice::F32(unsafe { self.device.alloc::<f32>(nrows * batch_size)? })
-            }
-        };
-
-        // Run kernel in a block so all guards drop before we wrap the output
-        {
-            let stream = self.device.cuda_stream();
-
-            // Get data pointer (quantized weights with embedded scales in K/128 format)
-            let (data_ptr, _data_guard) = self.data.inner.device_ptr(&stream);
-
-            // Build single segment descriptor (non-MoE: one segment, all batches)
-            let segment = VxSegment {
-                weights: data_ptr as *const std::ffi::c_void,
-                batch_count: batch_size as i32,
-            };
-
-            // Helper macro to run the matmul with the correct Y/output pointers
-            // This avoids code duplication across all the y_type match arms
-            // NOTE: K/128 blocks have embedded scales, no external scales needed
-            macro_rules! run_matmul {
-                ($y_ptr:expr, $dst_ptr:expr) => {
-                    unsafe {
-                        run_quantized_matmul(
-                            &segment as *const VxSegment,
-                            1, // num_segments = 1 (non-MoE)
-                            $y_ptr as *const std::ffi::c_void,
-                            $dst_ptr as *mut std::ffi::c_void,
-                            ncols as i32,
-                            nrows as i32,
-                            k as i32,
-                            nrows as i32,
-                            qtype,
-                            ytype as i32,
-                            self.data.len,
-                        );
-                    }
-                };
-            }
-
-            // Get Y pointer based on type
-            match (&rhs_storage.slice, &dst_slice) {
-                (CudaStorageSlice::F16(y_data), OutputSlice::F16(dst)) => {
-                    let y_view = match rhs_layout.contiguous_offsets() {
-                        Some((o1, o2)) => y_data.slice(o1..o2),
-                        None => {
-                            return Err(crate::Error::RequiresContiguous {
-                                op: "quantized_matmul",
-                            }
-                            .bt())?
-                        }
-                    };
-                    let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
-                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
-                    run_matmul!(y_ptr, dst_ptr);
-                }
-                (CudaStorageSlice::BF16(y_data), OutputSlice::BF16(dst)) => {
-                    let y_view = match rhs_layout.contiguous_offsets() {
-                        Some((o1, o2)) => y_data.slice(o1..o2),
-                        None => {
-                            return Err(crate::Error::RequiresContiguous {
-                                op: "quantized_matmul",
-                            }
-                            .bt())?
-                        }
-                    };
-                    let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
-                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
-                    run_matmul!(y_ptr, dst_ptr);
-                }
-                (CudaStorageSlice::F32(y_data), OutputSlice::F32(dst)) => {
-                    let y_view = match rhs_layout.contiguous_offsets() {
-                        Some((o1, o2)) => y_data.slice(o1..o2),
-                        None => {
-                            return Err(crate::Error::RequiresContiguous {
-                                op: "quantized_matmul",
-                            }
-                            .bt())?
-                        }
-                    };
-                    let (y_ptr, _y_guard) = y_view.device_ptr(&stream);
-                    let (dst_ptr, _dst_guard) = dst.device_ptr(&stream);
-                    run_matmul!(y_ptr, dst_ptr);
-                }
-                _ => unreachable!("ytype and rhs_storage slice should match"),
-            }
-        } // All guards dropped here, kernel is synchronized
-
-        // Wrap output - guards have been dropped so we can move the slice
-        let out_storage = match dst_slice {
-            OutputSlice::F16(dst) => CudaStorage::wrap_cuda_slice(dst, self.device.clone()),
-            OutputSlice::BF16(dst) => CudaStorage::wrap_cuda_slice(dst, self.device.clone()),
-            OutputSlice::F32(dst) => CudaStorage::wrap_cuda_slice(dst, self.device.clone()),
-        };
-
-        // Build output shape
-        let mut out_shape = rhs_l.shape().dims().to_vec();
-        out_shape.pop();
-        out_shape.push(nrows);
-        let out_shape: crate::Shape = out_shape.into();
-
-        // Convert output back to input dtype if we converted the input
-        if needs_conversion {
-            let out_layout = crate::Layout::contiguous(&out_shape);
-            let converted_out = out_storage.to_dtype(&out_layout, input_dtype)?;
-            Ok((converted_out, out_shape))
-        } else {
-            Ok((out_storage, out_shape))
-        }
+        let stream = self.device.cuda_stream();
+        let (weight_ptr, _weight_guard) = self.data.inner.device_ptr(&stream);
+        dense_qmatmul_float(
+            weight_ptr,
+            qtype,
+            self.data.len,
+            nrows,
+            ncols,
+            rhs,
+            rhs_l,
+            &self.device,
+        )
     }
 
     fn dequantize_matmul_vec(
@@ -3570,6 +3590,52 @@ impl QCudaStorage {
         })
     }
 
+    /// Re-quantize this (compact) weight `[nrows × ncols]` into the lane-major KO format
+    /// `ko_dtype` for the q8a128 int8 matmul: dequantize to f32, then per-128 affine KO
+    /// quantize. Both stages run on the GPU and the dequantized f32 is fed straight into
+    /// `run_quantize_ko` without ever leaving VRAM. The int8-mode counterpart of
+    /// [`Self::repack_gemx`] used by `QMatMul::repack_for_optimization`.
+    pub fn repack_ko(&self, shape: &Shape, ko_dtype: GgmlDType) -> Result<Self> {
+        let (nrows, ncols) = shape.dims2()?;
+        // The KO chunk layout packs 8 rows × 128 K per chunk; unaligned dims would under-size the
+        // output buffer below while the kernel writes the full N×K → OOB device write. Match the
+        // CPU twin's invariants (ko_quant::quantize_ko).
+        if nrows % 8 != 0 || ncols % 128 != 0 {
+            crate::bail!(
+                "repack_ko: shape [{nrows}, {ncols}] must have nrows % 8 == 0 and ncols % 128 == 0"
+            );
+        }
+        let qtype = dtype_to_qtype(ko_dtype)? as i32;
+        let bytes =
+            (nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(ko_dtype);
+        // dequantize stays on-device; quantize reads that f32 buffer directly (no D2H/H2D).
+        let f32_storage = self.dequantize(nrows * ncols)?;
+        let f32_slice = f32_storage.as_cuda_slice::<f32>()?;
+        let mut out = unsafe { self.device.alloc::<u8>(bytes)? };
+        {
+            let stream = self.device.cuda_stream();
+            let (wp, _gw) = f32_slice.device_ptr(&stream);
+            let (op, _go) = out.device_ptr_mut(&stream);
+            unsafe {
+                run_quantize_ko(
+                    wp as *const f32,
+                    op as *mut std::ffi::c_void,
+                    nrows as i32,
+                    ncols as i32,
+                    qtype,
+                );
+            }
+        }
+        Ok(Self {
+            data: PaddedCudaSlice {
+                inner: out,
+                len: bytes,
+            },
+            dtype: ko_dtype,
+            device: self.device.clone(),
+        })
+    }
+
     /// Get the size in bytes after GEMX repacking, without actually repacking.
     pub fn repacked_size(&self, shape: &Shape) -> Result<usize> {
         let (nrows, ncols) = shape.dims2()?;
@@ -3707,7 +3773,26 @@ pub fn repack_to_host(
     nrows: usize,
     ncols: usize,
     dtype: GgmlDType,
+    target_dtype: GgmlDType,
 ) -> Result<Vec<u8>> {
+    // KO target: dequantize the compact source (`dtype`) and re-quantize to the KO twin
+    // (`target_dtype`) ONCE. The host bytes are cached in the expert pinned pool exactly like the
+    // gemx repack, so a miss DMA-reloads them with no per-miss re-quant. The int8 KO matmul reads
+    // these; the staging pipeline is format-agnostic (gemx K/128 or KO — both just tensors).
+    if target_dtype.is_ko() {
+        let src = load_repacked(device, ggml_bytes, dtype)?;
+        let src_cuda = match &src {
+            QStorage::Cuda(s) => s,
+            _ => crate::bail!("repack_to_host(KO): expected CUDA storage"),
+        };
+        let shape: Shape = vec![nrows, ncols].into();
+        let ko = src_cuda.repack_ko(&shape, target_dtype)?;
+        let host = device
+            .memcpy_dtov(&ko.data.inner.slice(..ko.data.len))
+            .map_err(crate::Error::wrap)?;
+        return Ok(host);
+    }
+
     let qtype = dtype_to_qtype(dtype)? as i32;
 
     let supported = unsafe { is_gemx_supported(qtype) };
@@ -3761,6 +3846,13 @@ pub fn repack_to_host(
 /// Get the repacked byte size for a weight matrix of the given dimensions
 /// and quantization type, without actually repacking.
 pub fn repacked_size_bytes(nrows: usize, ncols: usize, dtype: GgmlDType) -> Result<usize> {
+    // KO target: per-128 chunk bytes (the format the expert pinned pool caches for int8 experts).
+    if dtype.is_ko() {
+        if nrows % 8 != 0 || ncols % 128 != 0 {
+            crate::bail!("repacked_size_bytes(KO): nrows={nrows} %8, ncols={ncols} %128 required");
+        }
+        return Ok((nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(dtype));
+    }
     let qtype = dtype_to_qtype(dtype)? as i32;
     let size = unsafe { get_repacked_size_bytes(nrows as i32, ncols as i32, qtype) };
     if size < 0 {
@@ -3793,7 +3885,7 @@ pub fn repacked_size_bytes(nrows: usize, ncols: usize, dtype: GgmlDType) -> Resu
 ///
 /// # Returns
 /// A `Tensor` with shape `[total_batch, N]` on the same CUDA device.
-pub fn grouped_matmul_gemx(
+fn grouped_matmul_gemx_impl(
     weight_ptrs: &[u64],
     weight_dtype: GgmlDType,
     nrows: usize,
@@ -3879,6 +3971,9 @@ pub fn grouped_matmul_gemx(
         YType::F16 => OutputSlice::F16(unsafe { device.alloc::<f16>(nrows * total_batch)? }),
         YType::BF16 => OutputSlice::BF16(unsafe { device.alloc::<bf16>(nrows * total_batch)? }),
         YType::F32 => OutputSlice::F32(unsafe { device.alloc::<f32>(nrows * total_batch)? }),
+        YType::Q8A128 => crate::bail!(
+            "YType::Q8A128 is the int8 grouped matmul INPUT format, not an FP output dtype"
+        ),
     };
 
     // Grouped dispatch: split each expert's [offset..offset+cnt) batch range into
@@ -3997,6 +4092,958 @@ pub fn grouped_matmul_gemx(
     ))
 }
 
+/// Single-launch grouped MoE expert matmul over FP activations (F16/BF16/F32):
+/// FP16 tensor-core MMA with Q4_K weights dequantized on the fly. The INT8-MMA path
+/// is `grouped_matmul_gemx_q8a128` (q8a128 activations). See docs/q8_matmul_pipeline.md.
+pub fn grouped_matmul_gemx(
+    weight_ptrs: &[u64],
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    ncols: usize,
+    activations: &CudaStorage,
+    act_layout: &crate::Layout,
+    expert_offsets: &[i32],
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    grouped_matmul_gemx_impl(
+        weight_ptrs,
+        weight_dtype,
+        nrows,
+        ncols,
+        activations,
+        act_layout,
+        expert_offsets,
+        device,
+    )
+}
+
+/// The minimum token count M at which the q8a1024 int8 matmul flips from mode-1 to
+/// mode-2. Measured crossover: below this, the per-token weight re-read of mode-2's
+/// Bm=32 tile costs more than it saves; at/above it, weight reuse wins (the prefill
+/// regime). M is the absolute number of token rows fed to the quantizer.
+/// q8a128-quantized int8 operand for the tensor-core qmatmul: the packed blocks (stored in
+/// the q8a1024 flat-grouped super-block layout — see blocks.cuh), the logical shape
+/// `[rows × cols]` = `[M × K]`, and `lead` — the original activation's leading dims
+/// (`prod(lead) == rows`) so the matmul can rebuild the output rank (`[lead.., N]`) to match the
+/// float path on 3D+ activations. The mode-1/mode-2 flip is NOT stored here: the q8a1024 layout
+/// is mode-independent, so the dispatcher chooses the kernel tiling from the token count. Named
+/// "operand" (not "acts") because either matmul side could be supplied this way.
+/// Backing bytes for a [`Q8a128Operand`]: either an owned `CudaSlice` (the quantizer / fused
+/// RMSNorm / SwiGLU producers `alloc` their own buffer) or a `U8` [`Tensor`] of q8a1024 bytes.
+/// The latter lets a producer that returns through `apply_op1` (e.g. the B2 decode op, whose
+/// output is a tensor) feed the int8 matmul WITHOUT a device copy — the operand just borrows the
+/// tensor's bytes. Both expose a device pointer via [`Q8a128Operand::with_device_ptr`].
+pub enum Q8a128Data {
+    Owned(CudaSlice<u8>),
+    Tensor(crate::Tensor),
+}
+
+pub struct Q8a128Operand {
+    pub data: Q8a128Data,
+    pub rows: usize,      // M (flattened token count)
+    pub cols: usize,      // K
+    pub lead: Vec<usize>, // output leading dims; prod == rows (defaults to [rows])
+}
+
+impl Q8a128Operand {
+    /// Wrap owned q8a128 blocks of flattened logical shape `[rows × cols]`. `lead` defaults to
+    /// `[rows]` (a 2D `[M, N]` output); use [`Self::with_lead`] to preserve higher activation
+    /// ranks. The matmul mode (mode-1 vs mode-2 weight-reuse) is NOT stored here — it is a
+    /// kernel/tiling property the dispatcher derives from the token count, not an attribute of
+    /// the (mode-independent) activation bytes.
+    pub fn new(data: CudaSlice<u8>, rows: usize, cols: usize) -> Self {
+        Self {
+            data: Q8a128Data::Owned(data),
+            rows,
+            cols,
+            lead: vec![rows],
+        }
+    }
+
+    /// Wrap a contiguous `U8` [`Tensor`] of q8a1024 bytes as an operand, no copy. For producers
+    /// that emit through `apply_op1` (the B2 decode context), whose result is a tensor.
+    pub fn from_tensor(data: crate::Tensor, rows: usize, cols: usize) -> Self {
+        Self {
+            data: Q8a128Data::Tensor(data),
+            rows,
+            cols,
+            lead: vec![rows],
+        }
+    }
+
+    /// Set the output leading dims (the activation's dims minus K); `prod(lead)` must equal
+    /// `rows`. Lets the int8 matmul reproduce the activation's rank, e.g. `[B, M, K]→[B, M, N]`.
+    pub fn with_lead(mut self, lead: Vec<usize>) -> Self {
+        debug_assert_eq!(
+            lead.iter().product::<usize>(),
+            self.rows,
+            "lead must multiply to rows"
+        );
+        self.lead = lead;
+        self
+    }
+
+    /// Borrow the owned backing slice; bails on the tensor-backed variant. For callers/tests that
+    /// need the raw `CudaSlice` directly (e.g. `dequantize_q8a128`).
+    pub fn data_slice(&self) -> Result<&CudaSlice<u8>> {
+        match &self.data {
+            Q8a128Data::Owned(s) => Ok(s),
+            Q8a128Data::Tensor(_) => {
+                crate::bail!("Q8a128Operand::data_slice: operand is tensor-backed, not owned")
+            }
+        }
+    }
+
+    /// Consume into the owned backing slice; bails on the tensor-backed variant.
+    pub fn into_owned_data(self) -> Result<CudaSlice<u8>> {
+        match self.data {
+            Q8a128Data::Owned(s) => Ok(s),
+            Q8a128Data::Tensor(_) => {
+                crate::bail!("Q8a128Operand::into_owned_data: operand is tensor-backed, not owned")
+            }
+        }
+    }
+
+    /// Run `f` with the raw device pointer to the q8a128 bytes, keeping the backing's
+    /// storage/stream guards alive for the duration so the pointer stays valid. Unifies the
+    /// owned-slice and tensor-backed variants for the kernel dispatch.
+    pub fn with_device_ptr<R>(
+        &self,
+        device: &CudaDevice,
+        f: impl FnOnce(u64) -> Result<R>,
+    ) -> Result<R> {
+        let stream = device.cuda_stream();
+        match &self.data {
+            Q8a128Data::Owned(s) => {
+                let (ptr, _g) = s.device_ptr(&stream);
+                f(ptr)
+            }
+            Q8a128Data::Tensor(t) => {
+                let (storage, layout) = t.storage_and_layout();
+                let cuda = match &*storage {
+                    crate::Storage::Cuda(c) => c,
+                    _ => crate::bail!("Q8a128Operand: tensor backing must be a CUDA tensor"),
+                };
+                let slice = cuda.as_cuda_slice::<u8>()?.slice(layout.start_offset()..);
+                let (ptr, _g) = slice.device_ptr(&stream);
+                f(ptr)
+            }
+        }
+    }
+}
+
+/// A qmatmul activation/LHS that is either a plain float tensor (F16/BF16/F32 — the
+/// dequant-weight float path) or pre-quantized q8a1024 int8 blocks (the int8 tensor-core
+/// path). Threading one type through the matmul hides whether it runs in float or int8
+/// mode: the int8 arm runs the q8a128 tensor-core path (mode-1/mode-2 chosen by the occupancy
+/// formula `q8a128_dense_use_mode2` at dispatch), the float arm derives it from the tensor's dtype.
+pub enum DynamicTensor<'a> {
+    Float(&'a crate::Tensor),
+    Int8(&'a Q8a128Operand),
+}
+
+/// Owned activation operand produced by [`to_dynamic`]: a float tensor ([`Int8Mode::Off`]) or
+/// pre-quantized q8a128 blocks (any int8 mode). `DynamicTensor` borrows, so this owns the
+/// chosen representation and hands out a borrow via [`DynamicActs::as_dynamic`] for the matmul.
+pub enum DynamicActs {
+    Float(crate::Tensor),
+    Int8(Q8a128Operand),
+}
+
+impl DynamicActs {
+    /// Borrow as the matmul-facing [`DynamicTensor`].
+    pub fn as_dynamic(&self) -> DynamicTensor<'_> {
+        match self {
+            DynamicActs::Float(t) => DynamicTensor::Float(t),
+            DynamicActs::Int8(op) => DynamicTensor::Int8(op),
+        }
+    }
+}
+
+/// Convert activations `[M × K]` (or `[B × M × K]`) to the matmul operand selected by `mode`,
+/// the single knob that drives the whole inference's numeric mode: any int8 mode → quantize to
+/// q8a128 (the int8 tensor-core path, paired with KO weights), [`Int8Mode::Off`] → keep the float
+/// tensor (the dequant-weight float path). The q8a128 activation is identical for
+/// [`Int8Mode::Performance`] and [`Int8Mode::Precision`] — only the weight twin differs — so this
+/// branches solely on [`Int8Mode::is_int8`]. Paired with `QMatMul::repack_for_optimization` on the
+/// weight side; the matmul's KO⇔int8 guard keeps the two consistent.
+pub fn to_dynamic(xs: &crate::Tensor, mode: Int8Mode, device: &CudaDevice) -> Result<DynamicActs> {
+    use crate::cuda_backend::CudaStorageSlice;
+    if !mode.is_int8() {
+        return Ok(DynamicActs::Float(xs.clone()));
+    }
+    let (rows, cols) = match xs.dims() {
+        &[m, k] => (m, k),
+        &[b, m, k] => (b * m, k),
+        s => crate::bail!("to_dynamic(int8): expected 2D/3D activations, got {s:?}"),
+    };
+    let dtype_code: i32 = match xs.dtype() {
+        crate::DType::F16 => 0,
+        crate::DType::BF16 => 1,
+        crate::DType::F32 => 2,
+        d => crate::bail!("to_dynamic(int8): unsupported activation dtype {d:?}"),
+    };
+    let (storage, layout) = xs.storage_and_layout();
+    let (o1, o2) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::RequiresContiguous { op: "to_dynamic" }.bt())?;
+    let cuda = match &*storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("to_dynamic(int8): activations must be a CUDA tensor"),
+    };
+    let stream = device.cuda_stream();
+    let op = match &cuda.slice {
+        CudaStorageSlice::F16(s) => {
+            let v = s.slice(o1..o2);
+            let (ptr, _g) = v.device_ptr(&stream);
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+        }
+        CudaStorageSlice::BF16(s) => {
+            let v = s.slice(o1..o2);
+            let (ptr, _g) = v.device_ptr(&stream);
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+        }
+        CudaStorageSlice::F32(s) => {
+            let v = s.slice(o1..o2);
+            let (ptr, _g) = v.device_ptr(&stream);
+            quantize_acts_q8a128(ptr, dtype_code, rows, cols, device)?
+        }
+        _ => crate::bail!("to_dynamic(int8): activation slice dtype must be F16/BF16/F32"),
+    };
+    // Preserve the activation's leading dims (everything but K) so the int8 matmul rebuilds
+    // the output rank ([B,M,K]→[B,M,N]) exactly like the float path.
+    let lead: Vec<usize> = xs.dims()[..xs.rank() - 1].to_vec();
+    Ok(DynamicActs::Int8(op.with_lead(lead)))
+}
+
+/// Quantize activations `[rows, cols]` (dtype 0=F16,1=BF16,2=F32 at `act_ptr`) →
+/// q8a1024 flat-grouped blocks (8 × 128-tiles per 1152-byte super-block; qs
+/// de-interleaved from the per-32 ds — see blocks.cuh). The matmul mode is not chosen here; it is
+/// derived later by the occupancy formula `q8a128_dense_use_mode2` at dispatch.
+pub fn quantize_acts_q8a128(
+    act_ptr: u64,
+    dtype: i32,
+    rows: usize,
+    cols: usize,
+    device: &CudaDevice,
+) -> Result<Q8a128Operand> {
+    // q8a1024 flat-grouped: 8 × 128-tiles per 1152-byte super-block (see blocks.cuh).
+    let total_tiles = rows * (cols / 128);
+    let bytes = total_tiles.div_ceil(8) * 1152;
+    let mut out = unsafe { device.alloc::<u8>(bytes)? };
+    {
+        let stream = device.cuda_stream();
+        let (op, _g) = out.device_ptr_mut(&stream);
+        unsafe {
+            run_quantize_q8a128(
+                act_ptr as *const std::ffi::c_void,
+                op as *mut std::ffi::c_void,
+                rows as i32,
+                cols as i32,
+                dtype,
+            );
+        }
+    }
+    Ok(Q8a128Operand::new(out, rows, cols))
+}
+
+/// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the
+/// q8a128 activation operand directly, in ONE kernel — the producer epilogue for B1/B3/B5. This
+/// replaces the unfused `rms_norm` (FP store) + [`quantize_acts_q8a128`] (re-read) pair, removing
+/// the standalone quantize launch + FP round-trip that dominates M=1 decode. The result tracks
+/// that two-call path within float margin (the quant grid is per-128; the normalized values are
+/// rounded through the input dtype before quantization, mirroring the FP store). `K` must be a
+/// multiple of 128 and ≤ 8192 (the row is cached in shared memory). Leading dims are preserved on
+/// the operand so the int8 matmul rebuilds the output rank like the float path.
+pub fn rms_norm_q8a128(
+    xs: &crate::Tensor,
+    alpha: &crate::Tensor,
+    eps: f32,
+    device: &CudaDevice,
+) -> Result<Q8a128Operand> {
+    use crate::cuda_backend::CudaStorageSlice;
+    let (rows, cols) = match xs.dims() {
+        &[m, k] => (m, k),
+        &[b, m, k] => (b * m, k),
+        s => crate::bail!("rms_norm_q8a128: expected 2D/3D activations, got {s:?}"),
+    };
+    if cols % 128 != 0 {
+        crate::bail!("rms_norm_q8a128: K={cols} must be a multiple of 128");
+    }
+    if cols > 8192 {
+        crate::bail!("rms_norm_q8a128: K={cols} exceeds the cached-row limit (8192)");
+    }
+    if alpha.dims() != [cols] {
+        crate::bail!(
+            "rms_norm_q8a128: alpha must be [{cols}], got {:?}",
+            alpha.dims()
+        );
+    }
+    if xs.dtype() != alpha.dtype() {
+        crate::bail!(
+            "rms_norm_q8a128: xs/alpha dtype mismatch {:?} vs {:?}",
+            xs.dtype(),
+            alpha.dtype()
+        );
+    }
+    // FloatDType code for the reduce dispatcher: 0=f32, 2=f16, 3=bf16.
+    let dtype_code: i32 = match xs.dtype() {
+        crate::DType::F32 => 0,
+        crate::DType::F16 => 2,
+        crate::DType::BF16 => 3,
+        d => crate::bail!("rms_norm_q8a128: unsupported dtype {d:?}"),
+    };
+
+    let total_tiles = rows * (cols / 128);
+    let bytes = total_tiles.div_ceil(8) * 1152;
+    let mut out = unsafe { device.alloc::<u8>(bytes)? };
+
+    let (xs_storage, xs_layout) = xs.storage_and_layout();
+    let (xo1, xo2) = xs_layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "rms_norm_q8a128(xs)",
+        }
+        .bt()
+    })?;
+    let xs_cuda = match &*xs_storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("rms_norm_q8a128: xs must be a CUDA tensor"),
+    };
+    let (a_storage, a_layout) = alpha.storage_and_layout();
+    let (ao1, ao2) = a_layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "rms_norm_q8a128(alpha)",
+        }
+        .bt()
+    })?;
+    let a_cuda = match &*a_storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("rms_norm_q8a128: alpha must be a CUDA tensor"),
+    };
+
+    let stream = device.cuda_stream();
+    {
+        let (out_ptr, _go) = out.device_ptr_mut(&stream);
+        // The src/alpha slices and their device-ptr guards must outlive the launch, so the kernel
+        // call happens inside the match arm where all are still alive.
+        macro_rules! launch {
+            ($xsl:expr, $asl:expr) => {{
+                let xv = $xsl.slice(xo1..xo2);
+                let av = $asl.slice(ao1..ao2);
+                let (sp, _gx) = xv.device_ptr(&stream);
+                let (ap, _ga) = av.device_ptr(&stream);
+                unsafe {
+                    run_rmsnorm_q8a128_op(
+                        dtype_code,
+                        sp as *const std::ffi::c_void,
+                        out_ptr as *mut std::ffi::c_void,
+                        ap as *const std::ffi::c_void,
+                        rows as i32,
+                        cols as i32,
+                        eps,
+                    );
+                }
+            }};
+        }
+        match (&xs_cuda.slice, &a_cuda.slice) {
+            (CudaStorageSlice::F16(x), CudaStorageSlice::F16(a)) => launch!(x, a),
+            (CudaStorageSlice::BF16(x), CudaStorageSlice::BF16(a)) => launch!(x, a),
+            (CudaStorageSlice::F32(x), CudaStorageSlice::F32(a)) => launch!(x, a),
+            _ => crate::bail!("rms_norm_q8a128: xs/alpha must be F16/BF16/F32 and match"),
+        }
+    }
+
+    let lead: Vec<usize> = xs.dims()[..xs.rank() - 1].to_vec();
+    Ok(Q8a128Operand::new(out, rows, cols).with_lead(lead))
+}
+
+/// Fused SwiGLU → q8a128: compute `silu(gate) · up` element-wise and emit the q8a128 activation
+/// operand directly, in ONE kernel — the producer epilogue for B4 (feeds the down projection).
+/// Replaces the unfused `silu_mul` (FP store) + [`quantize_acts_q8a128`] (re-read). `gate`/`up`
+/// must share shape `[.. × K]` and dtype; `K` (and the total element count) must be a multiple of
+/// 128. Tracks the two-call path within float margin (silu uses the same fast-exp path, the
+/// result is rounded through the input dtype before quantization). Leading dims are preserved.
+pub fn silu_mul_q8a128(
+    gate: &crate::Tensor,
+    up: &crate::Tensor,
+    device: &CudaDevice,
+) -> Result<Q8a128Operand> {
+    use crate::cuda_backend::CudaStorageSlice;
+    if gate.dims() != up.dims() {
+        crate::bail!(
+            "silu_mul_q8a128: gate/up shape mismatch {:?} vs {:?}",
+            gate.dims(),
+            up.dims()
+        );
+    }
+    if gate.dtype() != up.dtype() {
+        crate::bail!(
+            "silu_mul_q8a128: gate/up dtype mismatch {:?} vs {:?}",
+            gate.dtype(),
+            up.dtype()
+        );
+    }
+    let (rows, cols) = match gate.dims() {
+        &[m, k] => (m, k),
+        &[b, m, k] => (b * m, k),
+        s => crate::bail!("silu_mul_q8a128: expected 2D/3D activations, got {s:?}"),
+    };
+    if (rows * cols) % 128 != 0 {
+        crate::bail!(
+            "silu_mul_q8a128: rows*cols ({}) must be a multiple of 128",
+            rows * cols
+        );
+    }
+    // FusedSiluMul dtype code: 0=f32, 1=f16, 2=bf16.
+    let dtype_code: i32 = match gate.dtype() {
+        crate::DType::F32 => 0,
+        crate::DType::F16 => 1,
+        crate::DType::BF16 => 2,
+        d => crate::bail!("silu_mul_q8a128: unsupported dtype {d:?}"),
+    };
+
+    let total_tiles = rows * (cols / 128);
+    let bytes = total_tiles.div_ceil(8) * 1152;
+    let mut out = unsafe { device.alloc::<u8>(bytes)? };
+
+    let (g_storage, g_layout) = gate.storage_and_layout();
+    let (go1, go2) = g_layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "silu_mul_q8a128(gate)",
+        }
+        .bt()
+    })?;
+    let g_cuda = match &*g_storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("silu_mul_q8a128: gate must be a CUDA tensor"),
+    };
+    let (u_storage, u_layout) = up.storage_and_layout();
+    let (uo1, uo2) = u_layout.contiguous_offsets().ok_or_else(|| {
+        crate::Error::RequiresContiguous {
+            op: "silu_mul_q8a128(up)",
+        }
+        .bt()
+    })?;
+    let u_cuda = match &*u_storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("silu_mul_q8a128: up must be a CUDA tensor"),
+    };
+
+    let stream = device.cuda_stream();
+    {
+        let (out_ptr, _go) = out.device_ptr_mut(&stream);
+        macro_rules! launch {
+            ($gsl:expr, $usl:expr) => {{
+                let gv = $gsl.slice(go1..go2);
+                let uv = $usl.slice(uo1..uo2);
+                let (gp, _gg) = gv.device_ptr(&stream);
+                let (upp, _gu) = uv.device_ptr(&stream);
+                unsafe {
+                    run_silu_mul_q8a128_op(
+                        dtype_code,
+                        gp as *const std::ffi::c_void,
+                        upp as *const std::ffi::c_void,
+                        out_ptr as *mut std::ffi::c_void,
+                        rows as i32,
+                        cols as i32,
+                    );
+                }
+            }};
+        }
+        match (&g_cuda.slice, &u_cuda.slice) {
+            (CudaStorageSlice::F16(g), CudaStorageSlice::F16(u)) => launch!(g, u),
+            (CudaStorageSlice::BF16(g), CudaStorageSlice::BF16(u)) => launch!(g, u),
+            (CudaStorageSlice::F32(g), CudaStorageSlice::F32(u)) => launch!(g, u),
+            _ => crate::bail!("silu_mul_q8a128: gate/up must be F16/BF16/F32 and match"),
+        }
+    }
+
+    let lead: Vec<usize> = gate.dims()[..gate.rank() - 1].to_vec();
+    Ok(Q8a128Operand::new(out, rows, cols).with_lead(lead))
+}
+
+/// Quantize F32 weights `[nrows × ncols]` (row-major) → a GPU buffer in the lane-major KO
+/// layout the int8 KO matmul reads (`Q4_KO`/`Q5_KO`/`Q6_KO`/`Q8_KO`). The de-interleave runs
+/// on the GPU (`run_quantize_ko`), byte-identical to the CPU `ko_quant::quantize_ko` — the
+/// symmetric weight counterpart to `quantize_acts_q8a128`. `nrows` is N (output rows), `ncols`
+/// is K; `nrows` must be a multiple of 8, `ncols` a multiple of 128.
+pub fn quantize_ko_weights(
+    data: &[f32],
+    nrows: usize,
+    ncols: usize,
+    dtype: GgmlDType,
+    device: &CudaDevice,
+) -> Result<CudaSlice<u8>> {
+    if nrows % 8 != 0 || ncols % 128 != 0 || data.len() != nrows * ncols {
+        crate::bail!(
+            "quantize_ko_weights: bad shape nrows={nrows} ncols={ncols} len={}",
+            data.len()
+        );
+    }
+    let qtype = dtype_to_qtype(dtype)? as i32;
+    let bytes = (nrows / 8) * (ncols / 128) * crate::quantized::ko_quant::ko_chunk_bytes(dtype);
+    let w_dev = device.memcpy_stod(data)?;
+    let mut out = unsafe { device.alloc::<u8>(bytes)? };
+    {
+        let stream = device.cuda_stream();
+        let (wp, _g0) = w_dev.device_ptr(&stream);
+        let (op, _g1) = out.device_ptr_mut(&stream);
+        unsafe {
+            run_quantize_ko(
+                wp as *const f32,
+                op as *mut std::ffi::c_void,
+                nrows as i32,
+                ncols as i32,
+                qtype,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Dequantize a lane-major KO chunk buffer → f32 `[nrows × ncols]` (row-major) on the GPU
+/// (`run_dequantize_ko`). Inverse of [`quantize_ko_weights`]; matches `ko_quant::dequant_ko`.
+pub fn dequant_ko_weights(
+    chunk: &CudaSlice<u8>,
+    nrows: usize,
+    ncols: usize,
+    dtype: GgmlDType,
+    device: &CudaDevice,
+) -> Result<CudaSlice<f32>> {
+    let qtype = dtype_to_qtype(dtype)? as i32;
+    let mut out = unsafe { device.alloc::<f32>(nrows * ncols)? };
+    {
+        let stream = device.cuda_stream();
+        let (cp, _g0) = chunk.device_ptr(&stream);
+        let (op, _g1) = out.device_ptr_mut(&stream);
+        unsafe {
+            run_dequantize_ko(
+                cp as *const std::ffi::c_void,
+                op as *mut f32,
+                nrows as i32,
+                ncols as i32,
+                qtype,
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Dequantize q8a1024 flat-grouped blocks → f32 `[rows, cols]`.
+pub fn dequantize_q8a128(
+    blocks: &CudaSlice<u8>,
+    rows: usize,
+    cols: usize,
+    device: &CudaDevice,
+) -> Result<CudaSlice<f32>> {
+    let mut out = unsafe { device.alloc::<f32>(rows * cols)? };
+    {
+        let stream = device.cuda_stream();
+        let (bp, _g1) = blocks.device_ptr(&stream);
+        let (op, _g2) = out.device_ptr_mut(&stream);
+        unsafe {
+            run_dequantize_q8a128(
+                bp as *const std::ffi::c_void,
+                op as *mut std::ffi::c_void,
+                rows as i32,
+                cols as i32,
+                2, // F32 output
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// INT8 grouped matmul on PRE-QUANTIZED q8a128 activations
+/// (`block_q8a128[total_batch][K/128]`). The caller quantizes once (amortized
+/// across gate/up). Tensor-core only (the q8a128 input has no FP fallback);
+/// output is F32. Routes through the unified `run_grouped_quantized_matmul`
+/// with ytype = Q8A128. The grouped/MoE path has no mode-2 kernel, so it always
+/// runs mode-1 (Q8A128V) regardless of M. Internal building block for the `Int8`
+/// arm of [`grouped_qmatmul`].
+fn grouped_matmul_gemx_q8a128(
+    act_ptr: u64,
+    weight_ptrs: &[u64],
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    ncols: usize,
+    total_batch: usize,
+    expert_offsets: &[i32],
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    let num_experts = weight_ptrs.len();
+    if num_experts == 0 {
+        crate::bail!("grouped_matmul_gemx_q8a128: no experts provided");
+    }
+    if nrows % 32 != 0 {
+        crate::bail!("grouped_matmul_gemx_q8a128: nrows={nrows} must be a multiple of 32");
+    }
+    if ncols % 128 != 0 {
+        crate::bail!("grouped_matmul_gemx_q8a128: ncols={ncols} must be a multiple of 128");
+    }
+    let qtype = dtype_to_qtype(weight_dtype)? as i32;
+
+    // Tile tables: ≤32-token tiles per expert — the mode-2 (Bm=32, N_SUB=2) weight-reuse
+    // width. The grouped int8 kernel loads each expert weight ONCE per tile and sweeps the
+    // m16n8k32 core across up to two 16-row token sub-tiles, halving weight reads at the MoE
+    // sweet spot (16–32 tokens/expert). A tile holding ≤16 tokens runs a single sub-tile and
+    // writes nothing for the empty one — identical weight traffic to a 16-wide tile — so 32
+    // is the unconditional width: Qwen3's expert matrices are far past the reuse crossover,
+    // and the partial-sub-tile path is the same one dense prefill already exercises at 128K.
+    let mut tile_expert: Vec<i32> = Vec::new();
+    let mut tile_b_start: Vec<i32> = Vec::new();
+    let mut tile_b_cnt: Vec<i32> = Vec::new();
+    for e in 0..num_experts {
+        let mut s = expert_offsets[e];
+        let end = expert_offsets[e + 1];
+        while s < end {
+            let cnt = (end - s).min(32);
+            tile_expert.push(e as i32);
+            tile_b_start.push(s);
+            tile_b_cnt.push(cnt);
+            s += cnt;
+        }
+    }
+    let num_tiles = tile_expert.len();
+
+    let mut dst = unsafe { device.alloc::<f32>(nrows * total_batch)? };
+
+    {
+        let stream = device.cuda_stream();
+        let off_te = num_experts * 8;
+        let off_tbs = off_te + num_tiles * 4;
+        let off_tbc = off_tbs + num_tiles * 4;
+        let total_bytes = off_tbc + num_tiles * 4;
+        let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+        for &w in weight_ptrs {
+            packed.extend_from_slice(&w.to_le_bytes());
+        }
+        for &x in &tile_expert {
+            packed.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &tile_b_start {
+            packed.extend_from_slice(&x.to_le_bytes());
+        }
+        for &x in &tile_b_cnt {
+            packed.extend_from_slice(&x.to_le_bytes());
+        }
+        let tables_dev = device.memcpy_stod(&packed)?;
+        let (base, _tg) = tables_dev.device_ptr(&stream);
+        let wptr_ptr = base;
+        let te_ptr = base + off_te as u64;
+        let tbs_ptr = base + off_tbs as u64;
+        let tbc_ptr = base + off_tbc as u64;
+        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
+        unsafe {
+            run_grouped_quantized_matmul(
+                wptr_ptr as *const std::ffi::c_void,
+                te_ptr as *const std::ffi::c_void,
+                tbs_ptr as *const std::ffi::c_void,
+                tbc_ptr as *const std::ffi::c_void,
+                act_ptr as *const std::ffi::c_void,
+                dst_ptr as *mut std::ffi::c_void,
+                ncols as i32, // ncols_x = K
+                nrows as i32, // nrows_x = N
+                ncols as i32, // y_stride (unused by int8 kernel; ABI)
+                nrows as i32, // dst_stride = N
+                num_tiles as i32,
+                qtype,
+                YType::Q8A128 as i32, // the grouped dispatcher picks mode-1/mode-2 per-expert
+            );
+        }
+    }
+
+    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
+    let out_shape: Shape = vec![total_batch, nrows].into();
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(out_storage),
+        out_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// Grouped (MoE) quantized matmul over a [`DynamicTensor`] activation, dispatched by
+/// numeric mode: `Int8` runs the q8a128 tensor-core grouped path (mode-1 only — the grouped
+/// kernel has no mode-2, so an operand carrying `Q8A128X` from M≥64 still runs mode-1; the
+/// operand's `ytype` is ignored here), `Float` runs the dequant-weight float grouped path.
+/// M and K come from the activation (operand shape / tensor shape); `nrows` is N per
+/// expert, `expert_offsets` partitions the M token rows across `weight_ptrs`.
+/// KO weights and int8 (q8a128) activations are EXCLUSIVELY paired: the int8 tensor-core
+/// kernels read only KO weights, and KO weights are only consumed through the int8 path.
+/// So `DynamicTensor::Int8` must pair with a KO weight and `DynamicTensor::Float` with a
+/// non-KO weight — any cross combination (int8 × non-KO, or float × KO) has no kernel and
+/// is rejected here rather than silently producing garbage.
+fn ensure_qmatmul_pairing(input: &DynamicTensor, weight_dtype: GgmlDType) -> Result<()> {
+    let is_int8 = matches!(input, DynamicTensor::Int8(_));
+    if weight_dtype.is_ko() != is_int8 {
+        crate::bail!(
+            "qmatmul: KO weights and int8 q8a128 activations are exclusively paired — got \
+             weight {weight_dtype:?} (KO={}) with {} activations. Pair Int8 activations with \
+             KO weights, and Float activations with non-KO weights.",
+            weight_dtype.is_ko(),
+            if is_int8 { "Int8" } else { "Float" },
+        );
+    }
+    Ok(())
+}
+
+pub fn grouped_qmatmul(
+    input: DynamicTensor,
+    weight_ptrs: &[u64],
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    expert_offsets: &[i32],
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    ensure_qmatmul_pairing(&input, weight_dtype)?;
+    match input {
+        DynamicTensor::Int8(op) => op.with_device_ptr(device, |act_ptr| {
+            grouped_matmul_gemx_q8a128(
+                act_ptr,
+                weight_ptrs,
+                weight_dtype,
+                nrows,
+                op.cols,
+                op.rows,
+                expert_offsets,
+                device,
+            )
+        }),
+        DynamicTensor::Float(t) => {
+            let (storage, layout) = t.storage_and_layout();
+            let cuda = match &*storage {
+                crate::Storage::Cuda(c) => c,
+                _ => crate::bail!("grouped_qmatmul: Float input must be a CUDA tensor"),
+            };
+            let ncols = *layout.shape().dims().last().unwrap();
+            grouped_matmul_gemx_impl(
+                weight_ptrs,
+                weight_dtype,
+                nrows,
+                ncols,
+                cuda,
+                layout,
+                expert_offsets,
+                device,
+            )
+        }
+    }
+}
+
+/// Dense (non-MoE) quantized matmul over a [`DynamicTensor`] activation: a single weight
+/// `[nrows(N) × ncols(K)]` (KO format for the `Int8` arm, FP GEMX K/128-repack for the
+/// `Float` arm) × the activation `[.. × K]` → `[.., N]` (leading dims preserved on both arms).
+/// `Int8` runs the q8a128 tensor-core path (mode-1/mode-2 chosen by `q8a128_dense_use_mode2` at
+/// dispatch), output F32; `Float` runs the dequant-weight float path
+/// ([`dense_qmatmul_float`]), output matching the activation dtype. The caller stays
+/// agnostic to which numeric mode runs. `weight_len` is the quantized-weight byte length
+/// used by the float path; the int8 path ignores it. See docs/q8_matmul_pipeline.md.
+/// KO format code for the segmented qkv kernel's `fmt` field (0=Q4_KO … 3=Q8_KO).
+fn ko_fmt_code(dtype: GgmlDType) -> Result<i32> {
+    Ok(match dtype {
+        GgmlDType::Q4_KO => 0,
+        GgmlDType::Q5_KO => 1,
+        GgmlDType::Q6_KO => 2,
+        GgmlDType::Q8_KO => 3,
+        other => {
+            crate::bail!("qkv_segmented_matmul: unsupported segment dtype {other:?} (KO only)")
+        }
+    })
+}
+
+/// Fused qkv int8 dense matmul: a SINGLE launch multiplies the shared q8a128 activation `op`
+/// (`[lead.., K]`) by up to three KO weights of possibly-different formats, writing the
+/// **concatenated** `[lead.., ΣN]` F32 output. Per thread-block the global N-tile resolves to one
+/// segment (boundaries align to the 32-row tile → no divergence) and runs that segment's format on
+/// the shared activation. Float-identical to running the segments as separate `q8a128_dense_matmul`
+/// calls, but one launch with full GPU occupancy (the tiny k/v GEMVs no longer starve).
+///
+/// `segments`: `(weight device ptr, KO dtype, N)` for each of q, k, v — N must be a multiple of 32.
+pub(crate) fn qkv_segmented_matmul(
+    op: &Q8a128Operand,
+    segments: &[(u64, GgmlDType, usize)],
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    if op.cols % 128 != 0 {
+        crate::bail!(
+            "qkv_segmented_matmul: K={} must be a multiple of 128",
+            op.cols
+        );
+    }
+    if segments.is_empty() {
+        crate::bail!("qkv_segmented_matmul: no segments");
+    }
+    let k = op.cols;
+    let m = op.rows;
+
+    // Build the device-side segment table (24-byte qkv_seg_t each): weights(8) fmt(4)
+    // n_tile_start(4) n_size(4) dst_col_off(4).
+    let mut bytes: Vec<u8> = Vec::with_capacity(segments.len() * 24);
+    let mut tile_start: i32 = 0;
+    let mut col_off: i32 = 0;
+    let mut n_total: usize = 0;
+    for &(wptr, dtype, n) in segments {
+        if n % 32 != 0 {
+            crate::bail!("qkv_segmented_matmul: segment N={n} must be a multiple of 32");
+        }
+        let fmt = ko_fmt_code(dtype)?;
+        bytes.extend_from_slice(&wptr.to_le_bytes());
+        bytes.extend_from_slice(&fmt.to_le_bytes());
+        bytes.extend_from_slice(&tile_start.to_le_bytes());
+        bytes.extend_from_slice(&(n as i32).to_le_bytes());
+        bytes.extend_from_slice(&col_off.to_le_bytes());
+        tile_start += ((n + 31) / 32) as i32;
+        col_off += n as i32;
+        n_total += n;
+    }
+    let total_n_tiles = tile_start;
+
+    let mode2 = q8a128_dense_use_mode2(m, n_total, k, cached_sm_count(device)) as i32;
+    let mut dst = unsafe { device.alloc::<f32>(m * n_total)? };
+    op.with_device_ptr(device, |act_ptr| {
+        let stream = device.cuda_stream();
+        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
+        // `bytes` is the HOST segment table (≤3 × 24B); the launcher copies it into by-value kernel
+        // params, so there is no per-call device upload.
+        unsafe {
+            run_qkv_segmented_matmul(
+                bytes.as_ptr() as *const std::ffi::c_void,
+                segments.len() as i32,
+                act_ptr as *const std::ffi::c_void,
+                dst_ptr as *mut std::ffi::c_void,
+                k as i32,
+                total_n_tiles,
+                m as i32,
+                n_total as i32,
+                mode2,
+            );
+        }
+        Ok(())
+    })?;
+
+    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
+    let mut out_dims = op.lead.clone();
+    out_dims.push(n_total);
+    let out_shape: Shape = out_dims.into();
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(out_storage),
+        out_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// The q8a128 int8 dense launch with an **explicit** tiling mode (`mode2`: false = mode-1 `Bm=16`,
+/// true = mode-2 `Bm=32` weight-reuse). Production reaches this from [`dense_qmatmul`] with the mode
+/// chosen by [`q8a128_dense_use_mode2`]; the crossover benchmark calls it directly to time each mode
+/// at a fixed `(M, N, K)`. Result is the F32 `[lead.., N]` output (rank rebuilt from `op.lead`).
+pub(crate) fn q8a128_dense_matmul(
+    op: &Q8a128Operand,
+    weight_ptr: u64,
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    weight_len: usize,
+    mode2: bool,
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    if nrows % 32 != 0 {
+        crate::bail!("q8a128_dense_matmul: nrows={nrows} must be a multiple of 32");
+    }
+    if op.cols % 128 != 0 {
+        crate::bail!(
+            "q8a128_dense_matmul: K={} must be a multiple of 128",
+            op.cols
+        );
+    }
+    let qtype = dtype_to_qtype(weight_dtype)? as i32;
+    let (ncols, total_batch) = (op.cols, op.rows);
+    let mut dst = unsafe { device.alloc::<f32>(nrows * total_batch)? };
+    op.with_device_ptr(device, |act_ptr| {
+        let stream = device.cuda_stream();
+        let (dst_ptr, _gd) = dst.device_ptr_mut(&stream);
+        let segment = VxSegment {
+            weights: weight_ptr as *const std::ffi::c_void,
+            batch_count: total_batch as i32,
+        };
+        unsafe {
+            run_quantized_matmul(
+                &segment as *const VxSegment,
+                1, // num_segments = 1 (non-MoE)
+                act_ptr as *const std::ffi::c_void,
+                dst_ptr as *mut std::ffi::c_void,
+                ncols as i32,       // ncols_x = K
+                nrows as i32,       // nrows_x = N
+                total_batch as i32, // nrows_y = M
+                nrows as i32,       // nrows_dst = N
+                qtype,
+                YType::Q8A128 as i32, // int8 activation; tiling forced via `mode2`
+                weight_len,           // weight_bytes (FP path only; int8 ignores)
+                mode2 as i32,         // 0 = mode-1, 1 = mode-2 (weight-reuse)
+            );
+        }
+        Ok(())
+    })?;
+    let out_storage = CudaStorage::wrap_cuda_slice(dst, device.clone());
+    // Rebuild the output rank from the operand's leading dims ([lead.., N]) so the int8 arm matches
+    // the float arm on 3D+ activations (data is row-major [M, N]).
+    let mut out_dims = op.lead.clone();
+    out_dims.push(nrows);
+    let out_shape: Shape = out_dims.into();
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Cuda(out_storage),
+        out_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+pub fn dense_qmatmul(
+    input: DynamicTensor,
+    weight_ptr: u64,
+    weight_dtype: GgmlDType,
+    nrows: usize,
+    weight_len: usize,
+    device: &CudaDevice,
+) -> Result<crate::Tensor> {
+    ensure_qmatmul_pairing(&input, weight_dtype)?;
+    let qtype = dtype_to_qtype(weight_dtype)? as i32;
+    match input {
+        DynamicTensor::Int8(op) => {
+            // Tiling choice (mode-1 Bm=16 vs mode-2 Bm=32, N_SUB=2): an occupancy decision driven by
+            // M and N (block count vs SM count) plus the [17,32] trap — not weight bytes. The bench
+            // reaches the same launch with a forced mode via `q8a128_dense_matmul`.
+            let mode2 = q8a128_dense_use_mode2(op.rows, nrows, op.cols, cached_sm_count(device));
+            q8a128_dense_matmul(
+                op,
+                weight_ptr,
+                weight_dtype,
+                nrows,
+                weight_len,
+                mode2,
+                device,
+            )
+        }
+        DynamicTensor::Float(t) => {
+            let (storage, layout) = t.storage_and_layout();
+            let cuda = match &*storage {
+                crate::Storage::Cuda(c) => c,
+                _ => crate::bail!("dense_qmatmul: Float input must be a CUDA tensor"),
+            };
+            let ncols = *layout.shape().dims().last().unwrap();
+            let (out_storage, out_shape) = dense_qmatmul_float(
+                weight_ptr, qtype, weight_len, nrows, ncols, cuda, layout, device,
+            )?;
+            Ok(crate::tensor::from_storage(
+                crate::Storage::Cuda(out_storage),
+                out_shape,
+                crate::op::BackpropOp::none(),
+                false,
+            ))
+        }
+    }
+}
+
 // =============================================================================
 // FUSED MoE GATHER / WEIGHTED-SCATTER-ADD
 // =============================================================================
@@ -4082,6 +5129,133 @@ pub fn fused_moe_gather(
         crate::op::BackpropOp::none(),
         false,
     ))
+}
+
+/// Fused MoE router: softmax + top-k select + (optional) renormalize over `logits`
+/// `[num_tokens, n_experts]` in **one** kernel launch, replacing the
+/// `softmax → sort(desc) → narrow(k) → renorm → flatten` op chain (≈6 launches over a tiny
+/// tensor). Returns `(weights, indices)`, each `[num_tokens, k]`: f32 routing weights and u32
+/// expert ids in descending-logit order. With `norm_topk` the selected top-k softmax weights are
+/// renormalized (which cancels the global softmax denominator exactly, so the kernel never
+/// computes the 128-wide softmax); without it they are the plain full-softmax values.
+pub fn moe_route(
+    logits: &crate::Tensor,
+    k: usize,
+    norm_topk: bool,
+) -> Result<(crate::Tensor, crate::Tensor)> {
+    use crate::cuda_backend::CudaStorageSlice;
+
+    let (num_tokens, n_experts) = logits.dims2()?;
+    if k == 0 || k > 16 {
+        crate::bail!("moe_route: k={k} must be in 1..=16 (kernel top-k register bound)");
+    }
+    if k > n_experts {
+        crate::bail!("moe_route: k={k} exceeds n_experts={n_experts}");
+    }
+    if n_experts > 256 {
+        crate::bail!("moe_route: n_experts={n_experts} exceeds 256 (warp slot bound)");
+    }
+    let device = match logits.device() {
+        crate::Device::Cuda(d) => d.clone(),
+        _ => crate::bail!("moe_route: expected a CUDA tensor"),
+    };
+    let dtype = logits.dtype();
+    let moe_dtype = dtype_to_moe_scatter_dtype(dtype)?;
+
+    let (storage, layout) = logits.storage_and_layout();
+    let (o1, o2) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::RequiresContiguous { op: "moe_route" }.bt())?;
+    let cuda = match &*storage {
+        crate::Storage::Cuda(c) => c,
+        _ => crate::bail!("moe_route: expected CUDA storage"),
+    };
+
+    let stream = device.cuda_stream();
+    let out_idx: CudaSlice<u32> = unsafe { device.alloc::<u32>(num_tokens * k)? };
+    let out_w: CudaSlice<f32> = unsafe { device.alloc::<f32>(num_tokens * k)? };
+
+    macro_rules! launch {
+        ($s:expr) => {{
+            let v = $s.slice(o1..o2);
+            let (lp, _lg) = v.device_ptr(&stream);
+            let (ip, _ig) = out_idx.device_ptr(&stream);
+            let (wp, _wg) = out_w.device_ptr(&stream);
+            unsafe {
+                candle_kernels::simple::moe_scatter::run_moe_route(
+                    moe_dtype,
+                    lp as *const std::ffi::c_void,
+                    ip as *mut u32,
+                    wp as *mut f32,
+                    num_tokens as i32,
+                    n_experts as i32,
+                    k as i32,
+                    norm_topk as i32,
+                );
+            }
+        }};
+    }
+    match &cuda.slice {
+        CudaStorageSlice::F32(s) => launch!(s),
+        CudaStorageSlice::F16(s) => launch!(s),
+        CudaStorageSlice::BF16(s) => launch!(s),
+        _ => crate::bail!("moe_route: unsupported logits dtype {dtype:?}"),
+    }
+
+    let shape: Shape = vec![num_tokens, k].into();
+    let weights = crate::tensor::from_storage(
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out_w, device.clone())),
+        shape.clone(),
+        crate::op::BackpropOp::none(),
+        false,
+    );
+    let indices = crate::tensor::from_storage(
+        crate::Storage::Cuda(CudaStorage::wrap_cuda_slice(out_idx, device.clone())),
+        shape,
+        crate::op::BackpropOp::none(),
+        false,
+    );
+    Ok((weights, indices))
+}
+
+/// B3: gather pre-quantized q8a1024 activations by token id into a stacked q8a1024 operand the
+/// experts consume directly. The q8a1024 layout is token-contiguous (`hidden % 1024 == 0`), so
+/// this is a byte-row copy of each token's `hidden/1024 · 1152` bytes — no gather-then-quantize.
+/// Mirrors [`fused_moe_gather`] for the int8 path; pairs with [`rms_norm_q8a128`]-fused ln2.
+pub fn fused_moe_gather_q8a128(
+    xs_q8: &Q8a128Operand,
+    ids_dev: &CudaSlice<u32>,
+    total_rows: usize,
+    device: &CudaDevice,
+) -> Result<Q8a128Operand> {
+    let hidden = xs_q8.cols;
+    if hidden % 1024 != 0 {
+        crate::bail!(
+            "fused_moe_gather_q8a128: hidden={hidden} must be a multiple of 1024 (token-contiguous \
+             q8a1024)"
+        );
+    }
+    let row_bytes = (hidden / 1024) * 1152;
+    let mut out = unsafe { device.alloc::<u8>(total_rows * row_bytes)? };
+    {
+        let stream = device.cuda_stream();
+        let (out_ptr, _og) = out.device_ptr_mut(&stream);
+        let (ids_ptr, _ig) = ids_dev.device_ptr(&stream);
+        xs_q8.with_device_ptr(device, |src_ptr| {
+            unsafe {
+                candle_kernels::simple::moe_scatter::run_moe_gather(
+                    3, // u8 (q8a1024 byte-row)
+                    out_ptr as *mut std::ffi::c_void,
+                    src_ptr as *const std::ffi::c_void,
+                    ids_ptr as *const u32,
+                    total_rows,
+                    row_bytes,
+                );
+            }
+            Ok(())
+        })?;
+    }
+    Ok(Q8a128Operand::new(out, total_rows, hidden))
 }
 
 /// Deterministic MoE scatter: sequential per-token reduce, no atomicAdd.

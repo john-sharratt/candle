@@ -41,4 +41,18 @@ extern "C" {
         up: *const c_void,
         out: *mut c_void,
     );
+
+    /// Fused SwiGLU → q8a128: `out = quantize(silu(gate) * up)` in one kernel (producer
+    /// epilogue B4). `out` is the flat-grouped q8a1024 buffer. Requires `(rows*cols) % 128 == 0`;
+    /// `gate`/`up` are contiguous `[rows × cols]`.
+    ///
+    /// - `dtype`: gate/up dtype (0=f32, 1=f16, 2=bf16)
+    pub fn run_silu_mul_q8a128_op(
+        dtype: i32,
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        cols: i32,
+    );
 }

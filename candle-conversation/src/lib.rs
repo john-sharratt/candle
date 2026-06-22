@@ -70,10 +70,11 @@ pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
-pub use conversation::Sequence;
+pub use conversation::{GlueMarkers, Sequence};
 pub use engine::{ConversationEngine, SubstrateReloadStatus};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
+pub use projection::{BucketKind, ProjectionBucket, ProjectionEvent};
 pub use provenance::{
     ProbeSignatures, ProvenanceFile, SigEntry, TokenSignature, TurnChunkRank, TurnSignatures,
 };
