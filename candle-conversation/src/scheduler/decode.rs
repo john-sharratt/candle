@@ -52,6 +52,14 @@ impl Scheduler {
         // Extract raw usize IDs for the forward_batched call into candle-transformers.
         let seq_ids_raw: Vec<usize> = seq_ids.iter().map(|id| id.0).collect();
 
+        // Attended-KV length each decode step sweeps, summed over the batch
+        // (captured before the forward advances the offsets). On the wave line
+        // this is the per-step context the decode attends over.
+        let kv_len: usize = seq_ids_raw
+            .iter()
+            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
+            .sum();
+
         // Forward pass: all active sequences, 1 token each.
         let t_fwd = std::time::Instant::now();
         let logits_vec = match self
@@ -68,7 +76,7 @@ impl Scheduler {
         super::record_phase(t_fwd, "decode_forward");
         // Decode batch = N sequences × 1 token each.
         self.wave_stats
-            .record(false, seq_ids.len(), seq_ids.len(), fwd_ms);
+            .record(false, seq_ids.len(), seq_ids.len(), kv_len, fwd_ms);
 
         // Advance offsets (1 token per sequence) and mirror the
         // input token into the slot's diagnostic log — this is the

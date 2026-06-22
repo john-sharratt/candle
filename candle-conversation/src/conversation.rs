@@ -10,7 +10,8 @@ use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::persistence::content_hash::{hash_tokens, ContentChain};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    Builder, Conversation, ProjectionTarget, SectionId, SystemPromptItem, TimelineId, TurnIndex,
+    from_projection, Builder, Conversation, ProjectionEvent, ProjectionTarget, SectionId,
+    SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
@@ -153,6 +154,20 @@ pub struct Sequence {
     /// Persistent BDP scanner — its score map lives for the lifetime of
     /// the conversation, refreshed each time `run_bdp_scan` is called.
     pub(crate) bdp_scanner: crate::provenance::BdpScanner,
+}
+
+/// The dialect's framing markers (`<|im_start|>system`, `<|im_end|>`, …) — the
+/// glue the projection assembler wraps around the system prompt and each turn.
+/// Returned by [`Sequence::glue_markers`] so the projection panel can render the
+/// framing verbatim.
+#[derive(Debug, Clone)]
+pub struct GlueMarkers {
+    pub system_start: String,
+    pub system_end: String,
+    pub user_start: String,
+    pub user_end: String,
+    pub assistant_start: String,
+    pub assistant_end: String,
 }
 
 impl Sequence {
@@ -966,6 +981,9 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            // Decode path: the assistant half is produced by the model, so the
+            // seal stores its decoded text — nothing to pre-supply here.
+            String::new(),
             post_decode_tokens,
             max_tokens,
             sampling,
@@ -995,6 +1013,7 @@ impl Sequence {
     ///   paths); `> 0` to follow with a decode loop.
     /// - `reprojection` — `Some` enables continuous mid-decode
     ///   re-projection; `None` runs a single-shot prefill+decode.
+    #[allow(clippy::too_many_arguments)]
     fn submit_prefill_unit(
         &self,
         sequence_id: SequenceId,
@@ -1002,6 +1021,7 @@ impl Sequence {
         prefill_text: String,
         prefill_tokens: TokenBuffer,
         user_text: String,
+        prefill_assistant_text: String,
         post_decode_tokens: TokenBuffer,
         max_decode_tokens: usize,
         sampling: SamplingConfig,
@@ -1023,6 +1043,7 @@ impl Sequence {
                 prefill_tokens,
                 prefill_text,
                 user_text,
+                prefill_assistant_text,
                 post_decode_tokens,
                 max_decode_tokens,
                 sampling,
@@ -1126,6 +1147,9 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            // Prefill path: the assistant half is supplied (not decoded), so
+            // hand it through to be stored verbatim as the turn's assistant_text.
+            assistant_text.to_string(),
             post_decode_tokens,
             0,
             self.config.sampling.clone(),
@@ -1192,6 +1216,91 @@ impl Sequence {
         drop(handle);
 
         self.finalize_turn_post_done(user_tt, assistant_tt, response.seal.as_ref())
+    }
+
+    /// Recompute the materialized projection for this conversation and pair it
+    /// with the just-finished decode's throughput into a [`ProjectionEvent`].
+    ///
+    /// Call this immediately after [`finish_turn`](Self::finish_turn): the BDP
+    /// scan run there leaves fresh per-turn scores on the scanner, so the
+    /// scored reprojection here reflects what provenance selects for this
+    /// conversation at the decoding head. Returns `None` for layers that don't
+    /// reproject (`disable_reprojection` — utility/reference ingestion), where
+    /// a projection event carries no meaning.
+    ///
+    /// The composition (system / section groups / turns), per-category token
+    /// counts, substrate total, and decode throughput are all real; the only
+    /// approximation is the probe — the recompute scores against the
+    /// just-finished turn rather than replaying each live decode-step Q vector.
+    pub fn projection_event(&self, stats: &crate::stats::TurnStats) -> Option<ProjectionEvent> {
+        if self.config.disable_reprojection {
+            return None;
+        }
+        let scores = self.bdp_scanner.to_projection_scores();
+        let resolver = self.substrate.read_for_scored(self.target, &scores);
+        let projection = self.projection.project(self.target, &resolver);
+        let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
+        Some(from_projection(
+            &projection.segments,
+            self.projection.schema(),
+            &resolver,
+            substrate_total,
+            0,
+            stats.tokens_generated as u32,
+            stats.decode_ms / 1000.0,
+        ))
+    }
+
+    /// `(section name, authored content)` for every system-prompt section in the
+    /// schema (bare sections + every collection member). Backs the projection
+    /// panel's expandable section text — fetched on demand, never stored in the
+    /// projection event.
+    pub fn section_contents(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for layer in &self.projection.schema().layers {
+            for item in &layer.system_prompt.items {
+                match item {
+                    crate::projection::SystemPromptItem::Section(s) => {
+                        out.push((s.name.clone(), s.content.clone()));
+                    }
+                    crate::projection::SystemPromptItem::Collection(c) => {
+                        for s in &c.sections {
+                            out.push((s.name.clone(), s.content.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The dialect's framing markers — the "glue" the assembler wraps around the
+    /// system prompt and each turn (`BoundaryMarkers` tokenises exactly these).
+    /// Surfaced verbatim so the projection panel can show the glue between
+    /// sections/turns without re-tokenising or re-projecting.
+    pub fn glue_markers(&self) -> GlueMarkers {
+        let d = &self.config.dialect;
+        GlueMarkers {
+            system_start: d.system_start.to_string(),
+            system_end: d.system_end.to_string(),
+            user_start: d.user_start.to_string(),
+            user_end: d.user_end.to_string(),
+            assistant_start: d.assistant_start.to_string(),
+            assistant_end: d.assistant_end.to_string(),
+        }
+    }
+
+    /// The YAML name of this conversation's target layer (e.g. `dialogue`) — the
+    /// memory tier the dialogue exchange itself lives in. The panel prefixes the
+    /// conversation messages with it, derived from the schema rather than guessed.
+    pub fn target_layer_name(&self) -> String {
+        self.projection
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == self.target.layer)
+            .map(|l| l.name.clone())
+            .unwrap_or_default()
     }
 
     /// Shared post-prefill turn-completion path.
@@ -1515,10 +1624,26 @@ impl Sequence {
     /// the assistant's reply (the decoded body).  Both strings come
     /// straight off `TurnPart::user_text` and `assistant_text` — no
     /// re-tokenising, no marker scanning, no decoding.
-    pub fn recovered_history(&self, timeline: TimelineId) -> Vec<(Role, String)> {
+    /// Recovered turn history for `timeline`. When `include_ghost_summaries` is
+    /// false, the ghost summary turns the summariser appends to the timeline
+    /// (`SummaryOfTurns` / `SummaryOfSummaries` tree nodes) are skipped — they
+    /// exist for provenance/projection, not for the conversation view. Pass
+    /// `true` for substrate-level views that legitimately surface them.
+    pub fn recovered_history(
+        &self,
+        timeline: TimelineId,
+        include_ghost_summaries: bool,
+    ) -> Vec<(Role, String)> {
         let read = self.substrate.read();
         let mut out: Vec<(Role, String)> = Vec::new();
         for idx in read.turn_indices(timeline) {
+            if !include_ghost_summaries
+                && read
+                    .tree_meta_of(timeline, idx)
+                    .is_some_and(|m| m.kind.is_summary())
+            {
+                continue;
+            }
             let user_text = read.user_text_of(timeline, idx);
             let assistant_text = read.assistant_text_of(timeline, idx);
             if !user_text.is_empty() {
@@ -1529,6 +1654,78 @@ impl Sequence {
             }
         }
         out
+    }
+
+    /// The two verbatim halves — `(user_text, assistant_text)` — of projected
+    /// turn `index` in the group named `group_name`, read from the substrate.
+    /// Returned UNFRAMED (no dialect markers): the caller places the glue around
+    /// and between them. Both halves are stored verbatim (decoded for dialogue
+    /// turns, supplied for prefill ingests like repo_map/code_reading; see
+    /// `insert_turn` → the seal). `None` if the group/turn isn't found or is
+    /// entirely empty.
+    pub fn resolve_turn_text(&self, group_name: &str, index: u32) -> Option<(String, String)> {
+        let gid = self
+            .projection
+            .schema()
+            .layers
+            .iter()
+            .flat_map(|l| l.groups.iter())
+            .find(|g| g.name == group_name)
+            .map(|g| g.id)?;
+        let read = self.substrate.read();
+        let timeline = read.active_timelines_for_group(gid).next()?;
+        let idx = TurnIndex(index);
+        let user = read.user_text_of(timeline, idx);
+        let assistant = read.assistant_text_of(timeline, idx);
+        if user.is_empty() && assistant.is_empty() {
+            return None;
+        }
+        Some((user, assistant))
+    }
+
+    /// Persist this conversation's projection-event timeline for the most
+    /// recently sealed turn. Called by the caller after `finish_turn` with the
+    /// events streamed during (and at the end of) that turn's decode; survives
+    /// a daemon restart via the `ProjectionEvents` redo-log record.
+    pub fn persist_projection_events(&self, events: &[ProjectionEvent]) -> crate::Result<()> {
+        let timeline = self.target.timeline;
+        let count = self.substrate.read().turn_count(timeline);
+        if count == 0 {
+            return Ok(());
+        }
+        let stream_id =
+            crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
+        let payload = crate::projection::encode_events(events);
+        self.substrate
+            .persist_projection_events(stream_id, &payload)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Recovered projection-event timelines for a conversation, one `Vec` per
+    /// turn in turn order (empty for turns that have none). Mirrors
+    /// [`recovered_history`](Self::recovered_history); backs the GUI timeline
+    /// replay after reload.
+    pub fn recovered_projection_events(&self, timeline: TimelineId) -> Vec<Vec<ProjectionEvent>> {
+        let read = self.substrate.read();
+        let indices: Vec<TurnIndex> = read.turn_indices(timeline).collect();
+        indices
+            .into_iter()
+            // One bucket per assistant bubble — filter to turns with a non-empty
+            // assistant reply, and skip ghost summary turns, so this lines up
+            // index-for-index with the assistant entries the conversation view
+            // (`recovered_history(.., false)`) produces.
+            .filter(|&idx| {
+                !read
+                    .tree_meta_of(timeline, idx)
+                    .is_some_and(|m| m.kind.is_summary())
+                    && !read.assistant_text_of(timeline, idx).is_empty()
+            })
+            .map(|idx| {
+                read.projection_events_blob(timeline, idx)
+                    .map(crate::projection::decode_events)
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Every timeline with at least one recovered turn, paired with the

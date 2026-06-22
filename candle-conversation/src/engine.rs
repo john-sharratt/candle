@@ -780,6 +780,7 @@ impl ConversationEngine {
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),
                 user_text: String::new(),
+                prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens,
                 sampling: SamplingConfig::argmax(),

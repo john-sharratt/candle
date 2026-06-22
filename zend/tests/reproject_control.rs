@@ -157,6 +157,7 @@ mod control {
             workspace,
             port: 0,
             skip_code_read: true,
+            skip_repo_scan: true,
             ..Default::default()
         };
         let session = Arc::new(ZendSession::new(config, Arc::clone(&log)));

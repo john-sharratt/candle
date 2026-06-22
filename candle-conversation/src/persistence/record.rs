@@ -115,6 +115,11 @@ pub enum RecordType {
     /// view; the compactor physically drops the matching records
     /// on the next compaction pass.
     Tombstone = 14,
+    /// Per-turn projection-event timeline — the materialized-context
+    /// composition + decode throughput the GUI draws as timeline dots.
+    /// JSON payload: a `Vec<ProjectionEvent>` for one turn, keyed by the
+    /// turn's `stream_id`. Last-writer-wins on replay.
+    ProjectionEvents = 15,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]

@@ -99,6 +99,7 @@ mod conversation {
                     eprint!("{tok}");
                     response.push_str(&tok);
                 }
+                StreamItem::Projection(_) => {}
             }
         }
 

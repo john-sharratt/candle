@@ -1172,6 +1172,18 @@ impl BatchedInferenceSession {
         Ok(total_freed)
     }
 
+    /// Release fully-empty KV arenas across all backings **without** the
+    /// chunk-moving defrag — cheap VRAM relief for the scheduler's pressure
+    /// path (the costly speculative defrag is left to the allocation-time OOM
+    /// retry). Returns arenas freed.
+    pub fn release_empty_arenas(&self) -> Result<usize> {
+        let mut total_freed = 0;
+        for backing in &self.backings {
+            total_freed += backing.release_empty_arenas()?;
+        }
+        Ok(total_freed)
+    }
+
     /// Device VRAM `(free, total)` in bytes, or `None` on non-CUDA devices /
     /// query failure. Drives the scheduler's VRAM-pressure admission gate.
     pub fn vram_free_total(&self) -> Option<(usize, usize)> {
@@ -1179,6 +1191,47 @@ impl BatchedInferenceSession {
         {
             if let Device::Cuda(d) = &self.device {
                 return d.mem_get_info().ok();
+            }
+        }
+        None
+    }
+
+    /// Pool-aware KV-VRAM budget headroom in bytes (`init_free - pool_used -
+    /// reserve`), or `None` on non-CUDA / query failure. Unlike
+    /// [`Self::vram_free_total`] (the volatile driver `cuMemGetInfo` free, which
+    /// our stream-ordered pool's reserved-but-free memory hides from and which
+    /// WDDM pollutes with other processes' resident memory), this counts only
+    /// *our* live footprint — so KV freed back into the pool registers as
+    /// headroom. This is the number the per-arena budget gate already uses.
+    pub fn vram_budget_available(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        return candle_nn::kv_cache::vram_budget_available(&self.device);
+        #[cfg(not(feature = "cuda"))]
+        return None;
+    }
+
+    /// True when a forced compaction could free at least one whole arena from
+    /// any KV backing. When false, the cache is packed to within a single arena
+    /// of free space and compaction would reclaim nothing — the scheduler uses
+    /// this to skip a futile compaction pass under VRAM pressure.
+    pub fn can_reclaim_arena(&self) -> bool {
+        self.backings.iter().any(|b| b.can_reclaim_arena())
+    }
+
+    /// Our CUDA memory pool's `(used, reserved)` bytes — what our allocations
+    /// actually occupy (model weights + KV + activations) vs the high-water
+    /// bytes the pool has reserved from the OS. `reserved - used` is held but
+    /// reusable; `reserved` is why the driver's `free` reads near zero. The
+    /// real diagnostic for "what's using VRAM". `None` on non-CUDA / failure.
+    pub fn vram_pool_stats(&self) -> Option<(usize, usize)> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(d) = &self.device {
+                if let (Ok(used), Ok(reserved)) =
+                    (d.pool_used_bytes(), d.pool_reserved_bytes())
+                {
+                    return Some((used, reserved));
+                }
             }
         }
         None

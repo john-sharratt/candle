@@ -3496,6 +3496,79 @@ layers:
     }
 
     #[test]
+    fn template_closing_after_collection_still_emits() {
+        // Regression: `tools_close` is declared AFTER the `tools` collection
+        // (with `depends_on: tools`). The emission pass drains the
+        // collection-results map as each collection emits, so the close marker
+        // must be gated on a set captured up front — otherwise it reads the
+        // drained map, sees `None`, and the tool block is never closed in the
+        // materialized context (an unclosed `<tools>` block reaches the model).
+        use super::super::project::ProjectionSegment;
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    system_prompt:
+      items:
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: tools
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 1 }
+          sections:
+            - id: t1
+              content: "tool one"
+        - kind: template
+          id: tools_close
+          dialect: tool_block_close
+          depends_on: tools
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let mut b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+        b.tokenize_templates::<std::convert::Infallible, _>(|s| {
+            Ok(s.bytes().map(u32::from).collect())
+        })
+        .unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let convo = b.id_for_group("convo").unwrap();
+        let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+
+        // Score t1 so the tools collection materialises (non-empty) — the
+        // precondition for both `tools_open` and `tools_close` to emit.
+        let resolver = MockResolver::new().with_section_score(t1, 0.9);
+        let proj = b.project(
+            ProjectionTarget {
+                layer: dialogue,
+                group: convo,
+                timeline: TimelineId::for_test(1),
+            },
+            &resolver,
+        );
+
+        let glue: Vec<&str> = proj
+            .segments
+            .iter()
+            .filter_map(|seg| match seg {
+                ProjectionSegment::Generated { identity, .. } => Some(identity.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            glue.contains(&"tools_open"),
+            "tools_open should emit, got {glue:?}",
+        );
+        assert!(
+            glue.contains(&"tools_close"),
+            "tools_close (declared after the collection) must still emit, got {glue:?}",
+        );
+    }
+
+    #[test]
     fn template_depends_on_unknown_collection_errors() {
         let yaml = r#"
 layers:

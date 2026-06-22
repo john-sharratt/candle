@@ -190,6 +190,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         workspace,
         conv_config.clone(),
         &progress,
+        false,
     )
     .expect("repo map ingest");
     eprintln!(

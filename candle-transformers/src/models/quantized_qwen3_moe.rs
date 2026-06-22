@@ -1170,9 +1170,14 @@ impl ModelWeights {
         device: &Device,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Self> {
-        // Auto-enable int8 (Precision) on GPUs that can run the int8 m16n8k32 MMA; otherwise the
-        // FP16 reference path. Explicit-mode callers use `from_gguf_by_path_with_int8` instead.
-        let int8mode = Int8Mode::auto(device);
+        // VRAM-aware auto: int8 Precision on int8-MMA-capable GPUs when the
+        // weights leave headroom, else Performance (smaller footprint); FP16 Off
+        // on CPU. Sized by the GGUF length. Explicit-mode callers use
+        // `from_gguf_by_path_with_int8` instead.
+        let model_bytes = std::fs::metadata(file_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let int8mode = Int8Mode::auto_sized(device, model_bytes);
         Self::from_gguf_by_path_with_int8(file_path, device, progress, int8mode)
     }
 

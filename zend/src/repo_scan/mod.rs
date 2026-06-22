@@ -211,6 +211,7 @@ pub fn ingest_repo_map(
     workspace: &Path,
     config: SequenceConfig,
     progress: &LoadProgress,
+    skip: bool,
 ) -> anyhow::Result<(Sequence, RepoMap, ClusterState)> {
     let layer = proj_builder
         .id_for_layer("repo_map")
@@ -230,7 +231,12 @@ pub fn ingest_repo_map(
         )
         .map_err(|e| anyhow::anyhow!("repo_map conv create: {e}"))?;
 
-    let (map, state) = {
+    // `--skip-repo-scan`: the `repo_map` layer conversation is still minted (the
+    // projection schema requires it) but left empty — no walk, no cluster ingest.
+    let (map, state) = if skip {
+        tracing::info!("--skip-repo-scan: bypassing repo-map walk + cluster ingest");
+        (RepoMap::default(), ClusterState::default())
+    } else {
         let mut sink = SequenceTurnSink::new(&mut sequence);
         ingest_repo_map_into_sink(&mut sink, workspace, progress)?
     };

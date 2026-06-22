@@ -762,6 +762,17 @@ fn emit_system_prompt_items<R: ContentResolver>(
             collection_results.insert(coll.id, selected);
         }
     }
+    // Collections that materialised ≥1 section, captured up front. The second
+    // pass DRAINS `collection_results` (`remove`) as each collection emits, so a
+    // `depends_on` template that appears AFTER its collection — e.g. a
+    // `tool_block_close` closing the tool block — must consult this set, not the
+    // drained map. Reading the drained map would see `None` and silently drop the
+    // closing marker, leaving the block unclosed in the materialized context.
+    let non_empty_collections: std::collections::HashSet<CollectionId> = collection_results
+        .iter()
+        .filter(|(_, segs)| !segs.is_empty())
+        .map(|(cid, _)| *cid)
+        .collect();
     // Second pass: walk items in declaration order, applying the
     // `depends_on` predicate to Sections and using the cached
     // collection results for Collections.
@@ -770,10 +781,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
             SystemPromptItem::Section(s) => {
                 let should_emit = match s.depends_on {
                     None => true,
-                    Some(cid) => collection_results
-                        .get(&cid)
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false),
+                    Some(cid) => non_empty_collections.contains(&cid),
                 };
                 if should_emit {
                     push_section_segment(&mut out, s);

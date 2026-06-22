@@ -27,6 +27,28 @@
 /// treated as noise and removed (just the tag, not the content around it).
 /// This handles models that accidentally append `</think>` to their response.
 pub fn strip_think_blocks(text: &str) -> String {
+    let collapsed = collapse_whitespace(&strip_to_raw(text));
+    collapsed.trim().to_string()
+}
+
+/// Strip `<think>…</think>` blocks while preserving the surviving text's line
+/// structure and indentation.
+///
+/// Unlike [`strip_think_blocks`], this does **not** collapse internal
+/// whitespace — newlines, blank lines, and leading indentation are kept so a
+/// stored assistant reply renders back with its original markdown paragraphs,
+/// lists, and code blocks intact. Only leading/trailing whitespace is trimmed.
+/// This is the right choice for the persisted reply the GUI re-displays on
+/// reload; the whitespace-collapsing [`strip_think_blocks`] is for the compact
+/// one-line summaries the summariser stores.
+pub fn strip_think_blocks_keep_layout(text: &str) -> String {
+    strip_to_raw(text).trim().to_string()
+}
+
+/// Remove every `<think>…</think>` block (and stray unmatched `</think>` tags),
+/// inserting a single space at each removal seam. Returns the raw result with
+/// no whitespace normalization — the caller decides whether to collapse.
+fn strip_to_raw(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -48,7 +70,7 @@ pub fn strip_think_blocks(text: &str) -> String {
                 let after_close = after_open + close_start + "</think>".len();
                 rest = &rest[after_close..];
                 // Insert a space at the join point so surrounding words don't
-                // run together; collapse_whitespace() squashes any runs.
+                // run together.
                 out.push(' ');
             }
             None => {
@@ -58,8 +80,7 @@ pub fn strip_think_blocks(text: &str) -> String {
         }
     }
 
-    let collapsed = collapse_whitespace(&out);
-    collapsed.trim().to_string()
+    out
 }
 
 /// Remove all stray `</think>` close tags (those with no matching open tag)
@@ -128,7 +149,36 @@ fn collapse_whitespace(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_think_blocks;
+    use super::{strip_think_blocks, strip_think_blocks_keep_layout};
+
+    // ── Layout-preserving variant ──────────────────────────────────────────
+
+    #[test]
+    fn keep_layout_preserves_paragraphs_and_lists() {
+        let s = "First paragraph.\n\nSecond paragraph.\n\n- a\n- b";
+        assert_eq!(strip_think_blocks_keep_layout(s), s);
+    }
+
+    #[test]
+    fn keep_layout_preserves_code_block_indentation() {
+        let s = "Here:\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```";
+        assert_eq!(strip_think_blocks_keep_layout(s), s);
+    }
+
+    #[test]
+    fn keep_layout_strips_leading_think_block_and_trims() {
+        let s = "<think>\nreasoning\nmore\n</think>\n\nThe answer:\n\n- one\n- two";
+        assert_eq!(
+            strip_think_blocks_keep_layout(s),
+            "The answer:\n\n- one\n- two"
+        );
+    }
+
+    #[test]
+    fn keep_layout_drops_inline_think_but_keeps_following_lines() {
+        let s = "<think>x</think>Line one\nLine two";
+        assert_eq!(strip_think_blocks_keep_layout(s), "Line one\nLine two");
+    }
 
     // ── Basic ──────────────────────────────────────────────────────────────
 

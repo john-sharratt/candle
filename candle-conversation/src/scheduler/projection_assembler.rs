@@ -108,6 +108,87 @@ impl BoundaryMarkers {
     }
 }
 
+/// One step of the assembled materialized prefix, in logical order.
+///
+/// This is the SINGLE source of truth for how a projection's segments + dialect
+/// glue lay out. Both the apply path (which injects K/V per piece) and the
+/// substrate debug view (which renders them) iterate the same
+/// [`assemble_pieces`] output, so they can never silently diverge.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AssembledPiece {
+    /// A run of "glue" tokens — `Generated` template runs merged with the
+    /// inter-turn boundary markers (`user_start` before a turn, `assistant_end`
+    /// after it) — that the engine gap-fills as one island.
+    Glue(Vec<u32>),
+    /// A sealed system-prompt section; its K/V comes from the substrate.
+    Section(SectionId),
+    /// A sealed past turn; its K/V comes from the substrate.
+    Turn {
+        group: GroupId,
+        index: TurnIndex,
+        role: crate::Role,
+    },
+    /// The in-flight user message, deferred to prefill after the gap-fill.
+    DeferredUser(Arc<Vec<u32>>),
+}
+
+/// Lay out a projection's segments into the ordered [`AssembledPiece`]s the
+/// engine materializes — the glue *decision*, factored out of the K/V injection
+/// so it can be reused (the substrate debug view) and unit-tested in isolation.
+///
+/// Exactly mirrors what the apply walk produced inline: consecutive `Generated`
+/// runs accumulate into one glue island; a `Sealed::Turn` is wrapped with
+/// `user_start` (flushed into the glue island immediately before it) and
+/// `assistant_end` (carried into the island after it, so it merges with the next
+/// turn's `user_start`); `NewUserMessage` is deferred past the gap-fill.
+pub(crate) fn assemble_pieces(
+    segments: &[ProjectionSegment],
+    markers: &BoundaryMarkers,
+) -> Vec<AssembledPiece> {
+    let mut pieces: Vec<AssembledPiece> = Vec::new();
+    let mut run: Vec<u32> = Vec::new();
+    fn flush(run: &mut Vec<u32>, pieces: &mut Vec<AssembledPiece>) {
+        if !run.is_empty() {
+            pieces.push(AssembledPiece::Glue(std::mem::take(run)));
+        }
+    }
+    let mut i = 0;
+    while i < segments.len() {
+        if matches!(&segments[i], ProjectionSegment::Generated { .. }) {
+            while let Some(ProjectionSegment::Generated { tokens, .. }) = segments.get(i) {
+                run.extend(tokens.iter().copied());
+                i += 1;
+            }
+            flush(&mut run, &mut pieces);
+            continue;
+        }
+        match &segments[i] {
+            ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                flush(&mut run, &mut pieces);
+                pieces.push(AssembledPiece::Section(rs.id));
+            }
+            ProjectionSegment::Sealed(SealedKind::Turn(rt, role)) => {
+                run.extend(markers.user_start.iter().copied());
+                flush(&mut run, &mut pieces);
+                pieces.push(AssembledPiece::Turn {
+                    group: rt.group(),
+                    index: rt.index(),
+                    role: *role,
+                });
+                run.extend(markers.assistant_end.iter().copied());
+            }
+            ProjectionSegment::NewUserMessage { tokens } => {
+                flush(&mut run, &mut pieces);
+                pieces.push(AssembledPiece::DeferredUser(tokens.clone()));
+            }
+            ProjectionSegment::Generated { .. } => unreachable!("handled in the run loop above"),
+        }
+        i += 1;
+    }
+    flush(&mut run, &mut pieces);
+    pieces
+}
+
 /// Borrowed scheduler state the assembler needs in order to run.
 ///
 /// `model` and `device` are required so cache-miss runs can drive a
@@ -203,52 +284,29 @@ pub(super) fn apply_segments_build(
     //    every glue island's K/V at once — each attends only logically-earlier
     //    columns via `col_actual_pos`. The NewUserMessage is deferred to after
     //    the gap-fill so it prefills against the full `[sealed | glue]` prefix.
+    // The glue/order decision is owned by `assemble_pieces` (the single source
+    // of truth, shared with the substrate debug view). Here we only drive the
+    // per-piece K/V injection + logical-column accounting from its output: a
+    // glue island is collected as one run; a sealed section/turn is injected
+    // (the boundary markers around a turn are already folded into the adjacent
+    // glue islands by `assemble_pieces`); the user message is deferred.
     let mut walker = SegmentWalker::new();
-
-    let mut i = 0;
-    while i < new_segments.len() {
-        if matches!(&new_segments[i], ProjectionSegment::Generated { .. }) {
-            while i < new_segments.len() {
-                let ProjectionSegment::Generated { tokens, .. } = &new_segments[i] else {
-                    break;
-                };
-                walker.run_tokens.extend(tokens.iter().copied());
-                i += 1;
+    for piece in assemble_pieces(new_segments, ctx.boundary_markers) {
+        match piece {
+            AssembledPiece::Glue(tokens) => {
+                walker.run_tokens.extend(tokens);
+                walker.collect_run();
             }
-            walker.collect_run();
-            continue;
+            AssembledPiece::Section(id) => {
+                inject_sealed_section(ctx, &mut walker, id)?;
+            }
+            AssembledPiece::Turn { group, index, role } => {
+                inject_sealed_turn(ctx, &mut walker, group, index, role)?;
+            }
+            AssembledPiece::DeferredUser(tokens) => {
+                walker.deferred_user = Some(tokens);
+            }
         }
-
-        match &new_segments[i] {
-            ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                walker.collect_run();
-                inject_sealed_section(ctx, &mut walker, rs.id)?;
-            }
-            ProjectionSegment::Sealed(SealedKind::Turn(rt, part)) => {
-                // Wrap the turn in its boundary markers: `user_start` joins the
-                // glue run that closes immediately before the turn injects (so
-                // it lands at a logical position just before the turn), and
-                // `assistant_end` opens the next run, accumulating until the
-                // following non-Generated segment. Both are collected into the
-                // single gap-fill new region rather than prefilled per-island.
-                walker
-                    .run_tokens
-                    .extend(ctx.boundary_markers.user_start.iter().copied());
-                walker.collect_run();
-                inject_sealed_turn(ctx, &mut walker, rt.group(), rt.index(), *part)?;
-                walker
-                    .run_tokens
-                    .extend(ctx.boundary_markers.assistant_end.iter().copied());
-            }
-            ProjectionSegment::NewUserMessage { tokens } => {
-                // The in-flight user message is the logical tail; defer it past
-                // the gap-fill so it prefills against the full [sealed | glue].
-                walker.collect_run();
-                walker.deferred_user = Some(tokens.clone());
-            }
-            ProjectionSegment::Generated { .. } => unreachable!("handled in run loop above"),
-        }
-        i += 1;
     }
     walker.collect_run();
 
@@ -858,6 +916,72 @@ mod tests {
     fn slot_state_default_is_empty() {
         let s = SlotState::default();
         assert!(s.pending_user_part.is_none());
+    }
+
+    fn test_markers() -> BoundaryMarkers {
+        BoundaryMarkers {
+            user_start: Arc::new(vec![100]),
+            assistant_end: Arc::new(vec![200]),
+            user_end: Arc::new(vec![101]),
+            assistant_start: Arc::new(vec![201]),
+        }
+    }
+
+    #[test]
+    fn assemble_pieces_wraps_turns_merges_glue_and_defers_user() {
+        let m = test_markers();
+        let segments = vec![
+            generated_seg("a", 0, &[1, 2]),
+            section_seg(7),
+            turn_seg(1, 2, 3),
+            turn_seg(1, 2, 4),
+            generated_seg("b", 0, &[3]),
+            ProjectionSegment::NewUserMessage {
+                tokens: Arc::new(vec![9, 9]),
+            },
+        ];
+        let pieces = assemble_pieces(&segments, &m);
+        assert_eq!(
+            pieces,
+            vec![
+                // leading Generated run
+                AssembledPiece::Glue(vec![1, 2]),
+                AssembledPiece::Section(SectionId::new(7)),
+                // user_start flushed just before the first turn
+                AssembledPiece::Glue(vec![100]),
+                AssembledPiece::Turn { group: GroupId::for_test(2), index: TurnIndex(3), role: crate::Role::Assistant },
+                // turn 1's assistant_end MERGES with turn 2's user_start in one island
+                AssembledPiece::Glue(vec![200, 100]),
+                AssembledPiece::Turn { group: GroupId::for_test(2), index: TurnIndex(4), role: crate::Role::Assistant },
+                // turn 2's assistant_end merges with the trailing Generated run
+                AssembledPiece::Glue(vec![200, 3]),
+                // in-flight user message deferred past the gap-fill
+                AssembledPiece::DeferredUser(Arc::new(vec![9, 9])),
+            ]
+        );
+    }
+
+    #[test]
+    fn assemble_pieces_consecutive_generated_form_one_island() {
+        let m = test_markers();
+        let segments = vec![
+            generated_seg("a", 0, &[1]),
+            generated_seg("b", 1, &[2, 3]),
+            section_seg(5),
+        ];
+        let pieces = assemble_pieces(&segments, &m);
+        assert_eq!(
+            pieces,
+            vec![
+                AssembledPiece::Glue(vec![1, 2, 3]),
+                AssembledPiece::Section(SectionId::new(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn assemble_pieces_empty_is_empty() {
+        assert!(assemble_pieces(&[], &test_markers()).is_empty());
     }
 
     #[test]

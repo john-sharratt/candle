@@ -746,6 +746,21 @@ impl ArenaPool {
         (arenas.saturating_sub(needed)) as f32 / arenas as f32
     }
 
+    /// Whole arenas this pool could free via perfect defragmentation:
+    /// `total_arenas - ceil(total_live / arena_chunks)`. Zero means the pool is
+    /// packed to within a single arena of free space, so a compaction pass
+    /// would reclaim nothing — the signal to skip a futile (expensive) compact.
+    fn reclaimable_arenas(&self) -> usize {
+        let arenas = self.total_arenas.load(Ordering::Relaxed);
+        let live = self.total_live();
+        let needed = if live == 0 {
+            0
+        } else {
+            live.div_ceil(self.arena_chunks)
+        };
+        arenas.saturating_sub(needed)
+    }
+
     /// CUDA-only: list every live gid in a specific arena. Used by the
     /// defrag/eviction path to remap chunks before tombstoning the
     /// drained arena.
@@ -1045,6 +1060,17 @@ impl ChunkGidPool {
         any
     }
 
+    /// True when a forced compaction could free at least one whole arena across
+    /// any registered pool. When false, every pool is packed to within a single
+    /// arena of free space — compaction would reclaim nothing, so callers under
+    /// VRAM pressure should skip the (expensive) pass rather than spin on it.
+    pub fn can_reclaim_arena(&self) -> bool {
+        self.inner
+            .pools
+            .values()
+            .any(|pool| pool.reclaimable_arenas() >= 1)
+    }
+
     /// Force-release an arena's bookkeeping after an external drain
     /// of its gids. Used by the compaction path that manually frees
     /// chunks then expects the pool slot to disappear.
@@ -1321,5 +1347,26 @@ mod tests {
         // 2 lives, 2 arenas, capacity per arena `arena_chunks`. live ÷
         // arena_chunks rounded up = 1 arena needed; 1 of 2 reclaimable.
         assert!(pool.defragmentable_ratio_for(&key) > 0.0);
+    }
+
+    #[test]
+    fn can_reclaim_arena_only_when_a_whole_arena_is_recoverable() {
+        let pool = ChunkGidPool::new();
+        let key = float_key();
+        // One arena holding a live chunk: less than a whole arena of free space,
+        // so a forced compaction can release nothing.
+        pool.register_arena(key.clone());
+        let _a0 = pool.allocate_from_arena(key.clone(), 0).unwrap();
+        assert!(
+            !pool.can_reclaim_arena(),
+            "1 arena with a live chunk: nothing whole to reclaim"
+        );
+        // Add a second, empty arena: a whole arena's worth of free space is now
+        // recoverable (needed = ceil(1 live / arena_chunks) = 1, of 2 arenas).
+        pool.register_arena(key.clone());
+        assert!(
+            pool.can_reclaim_arena(),
+            "2 arenas, 1 live chunk: one whole arena is reclaimable"
+        );
     }
 }

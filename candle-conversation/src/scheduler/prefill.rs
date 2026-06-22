@@ -1,6 +1,32 @@
 use super::*;
 use crate::token_buffer::TokenBuffer;
 
+/// Pool-budget headroom we keep free by offloading hot KV. Sized **above** the
+/// transient per-forward allocation peak (MoE expert gather + attention /
+/// activation workspaces) so a forward never stalls hunting for space against
+/// a near-exhausted pool. Measured: forwards were still fast at ~1.3 GB budget
+/// but stalled once budget fell under ~0.5 GB (driver free hitting 0), so we
+/// relieve as the budget *dips toward* 1 GB rather than after it bottoms out.
+const VRAM_BUDGET_BAND: usize = 1024 * 1024 * 1024;
+/// Pool reuse headroom (reserved-but-free pool bytes) below which the
+/// stream-ordered pool can no longer absorb a new allocation without growing
+/// our OS footprint — only then does a low driver `free` count as pressure
+/// (mirrors `vram_has_room`'s `os_needed`). A fresh arena is small, so unlike
+/// the budget band this stays tight; it is the OS-safety floor, not the
+/// keep-forwards-fast headroom.
+const VRAM_REUSE_BAND: usize = 512 * 1024 * 1024;
+/// Bytes of hot KV to shed per pressure episode. The eviction overshoots the
+/// trigger by this much, so the pool budget oscillates in
+/// `[VRAM_BUDGET_BAND, VRAM_BUDGET_BAND + VRAM_EVICT_BAND]` and we don't
+/// re-trip on the very next wave.
+const VRAM_EVICT_BAND: u64 = 1024 * 1024 * 1024;
+/// Safety cap on the synchronous substrate-offload flush under pressure. The
+/// pass migrates hot→warm *before* its cold-disk writes, so the warm copies
+/// the eviction needs exist well before this fires — a timeout only clips the
+/// tail of the cold-write wait (turns are already evictable) and guards against
+/// a wedged persistence thread; it is not the expected path.
+const VRAM_OFFLOAD_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Scheduler {
     /// Promote up to `MAX_ACTIVE_PREFILLS - active_prefills.len()` newly
     /// submitted PrefillWorks from the FIFO queue into the in-flight
@@ -18,8 +44,51 @@ impl Scheduler {
             // progress — a single oversized turn is then bounded by the per-arena
             // VRAM budget gate (which compacts/fails fast rather than spilling).
             if !self.active_prefills.is_empty() && self.vram_under_pressure() {
-                let _ = self.session.compact_forced();
-                if self.vram_under_pressure() {
+                // Under VRAM pressure we offload hot KV to the substrate rather
+                // than piling on more concurrent prefills. Three steps:
+                //
+                //  1. Give substrate offload *complete priority*: synchronously
+                //     drain the pending hot→warm migration so just-sealed turns
+                //     gain a warm (RAM) copy — only warm-backed turns can be
+                //     evicted hot→warm.
+                //  2. Evict the least-recently-used hot turns across the
+                //     resident conversations (drop the hot copy, keep warm),
+                //     returning their VRAM chunks to the pool free-list.
+                //  3. Release the arenas the eviction emptied back to the pool,
+                //     which is what actually lowers `pool_used` and restores
+                //     budget. (The expensive chunk-moving defrag stays on the
+                //     allocation-time OOM retry, never on this every-wave path.)
+                //
+                // If pressure persists, throttle admission (break) — we keep ≥1
+                // prefill in flight (the `!is_empty` guard) so we still progress.
+                let t = std::time::Instant::now();
+                let flushed = self
+                    .persist_trigger
+                    .flush_blocking(VRAM_OFFLOAD_FLUSH_TIMEOUT);
+                let evicted = self.evict_cold_tail(VRAM_EVICT_BAND);
+                let released = self.session.release_empty_arenas().unwrap_or(0);
+                let still = self.vram_under_pressure();
+                if let Some((free, total)) = self.session.vram_free_total() {
+                    let (pool_used, pool_reserved) =
+                        self.session.vram_pool_stats().unwrap_or((0, 0));
+                    tracing::info!(
+                        target: "candle_conversation::scheduler::timing",
+                        offload_ms = t.elapsed().as_millis() as u64,
+                        warm_flushed = flushed,
+                        turns_evicted = evicted.count,
+                        evicted_mib = evicted.bytes / (1 << 20),
+                        arenas_released = released,
+                        // Our footprint vs the OS-reserved high-water: this, not
+                        // `vram_free`, says what's actually consuming the card.
+                        pool_used_mib = (pool_used / (1 << 20)) as u64,
+                        pool_reserved_mib = (pool_reserved / (1 << 20)) as u64,
+                        vram_free_mib = (free / (1 << 20)) as u64,
+                        vram_total_mib = (total / (1 << 20)) as u64,
+                        relieved = !still,
+                        "promote: offloaded hot KV to substrate under VRAM pressure"
+                    );
+                }
+                if still {
                     break;
                 }
             }
@@ -52,19 +121,73 @@ impl Scheduler {
         }
     }
 
-    /// True when device VRAM free space has dropped below the admission
-    /// reserve (10% of total, floor 1 GiB) — the signal to stop admitting
-    /// additional concurrent prefills. Sits just above the per-arena VRAM
-    /// budget gate's reserve so admission throttles slightly before a hard
-    /// arena OOM. `false` on non-CUDA devices / when the query is unavailable.
+    /// True when VRAM is under pressure — the signal to offload hot KV to the
+    /// substrate (and, failing that, to stop admitting more concurrent
+    /// prefills).
+    ///
+    /// Two complementary gates, pressure if **either** trips:
+    /// - **Pool budget low** — [`vram_budget_available`] (`init_free -
+    ///   pool_used - reserve`) drops below [`VRAM_BUDGET_BAND`]. Pool-aware, so
+    ///   it doesn't false-fire when KV is freed back into our stream-ordered
+    ///   pool (which the driver `free` can't see), robust to WDDM's polluted
+    ///   driver free, and the gate hot-tier eviction can actually relieve
+    ///   (dropping a hot copy lowers `pool_used`). The band sits above the
+    ///   per-forward transient peak so we relieve *before* forwards stall.
+    /// - **Driver free below the reserve floor *and* the pool can't absorb the
+    ///   next allocation by reuse** — `free < max(10% total, 1 GiB)` while the
+    ///   pool's reserved-but-free headroom (`pool_reserved - pool_used`) is
+    ///   under [`VRAM_REUSE_BAND`]. The reuse-headroom qualifier mirrors
+    ///   [`vram_has_room`]'s `os_needed` gate: a low driver free while the pool
+    ///   still holds freed blocks to reuse is *not* pressure (reusing them
+    ///   costs zero new OS memory, so `free` never moves) — without this
+    ///   qualifier the floor false-fires on WDDM, where the pool's own
+    ///   reservation pins driver free low, and needlessly throttles admission
+    ///   while gigabytes of pool budget remain.
+    ///
+    /// `false` on non-CUDA / when the queries are unavailable.
+    ///
+    /// [`vram_budget_available`]: super::super::BatchedInferenceSession::vram_budget_available
+    /// [`vram_has_room`]: candle_nn::kv_cache
     pub(super) fn vram_under_pressure(&self) -> bool {
-        match self.session.vram_free_total() {
-            Some((free, total)) => {
-                let reserve = (total / 10).max(1usize << 30);
-                free < reserve
+        let pool_low = self
+            .session
+            .vram_budget_available()
+            .is_some_and(|avail| avail < VRAM_BUDGET_BAND);
+        let driver_below_floor =
+            match (self.session.vram_free_total(), self.session.vram_pool_stats()) {
+                (Some((free, total)), Some((used, reserved))) => {
+                    let reuse_headroom = reserved.saturating_sub(used);
+                    free < (total / 10).max(1usize << 30)
+                        && reuse_headroom < VRAM_REUSE_BAND
+                }
+                _ => false,
+            };
+        pool_low || driver_below_floor
+    }
+
+    /// Shed least-recently-used hot turn KV to the warm (RAM) tier across the
+    /// resident conversations, freeing up to `target_bytes` of pool VRAM.
+    /// Oldest-first and reversible (a reselected turn reloads from RAM). Only
+    /// turns that already hold a warm copy are evictable, so callers should
+    /// first [`PersistenceTrigger::flush_blocking`] to make the just-sealed
+    /// turns qualify. The `target_bytes` budget caps total bytes freed, so a
+    /// conversation reached via several slots is naturally not over-evicted
+    /// (and `evict_hot_to_free` is per-conversation scoped — it can never touch
+    /// a parallel conversation's selected working set).
+    fn evict_cold_tail(&mut self, target_bytes: u64) -> crate::substrate::EvictionReport {
+        let mut report = crate::substrate::EvictionReport { count: 0, bytes: 0 };
+        let mut remaining = target_bytes;
+        let convs: Vec<Conversation> = self.slot_conversations.values().cloned().collect();
+        for conv in convs {
+            if remaining == 0 {
+                break;
             }
-            None => false,
+            let r = conv.write().evict_hot_to_free(&[], &[], remaining);
+            remaining = remaining.saturating_sub(r.bytes);
+            report.count += r.count;
+            report.bytes += r.bytes;
         }
+        report
     }
 
     /// Number of in-flight prefills that still have tokens left to process
@@ -98,28 +221,27 @@ impl Scheduler {
             return;
         }
 
-        let chunk_len = active
-            .iter()
-            .map(|&i| {
-                let s = &self.active_section_ingests[i];
-                s.tokens.len() - s.offset
-            })
-            .min()
-            .unwrap()
-            .min(self.max_prefill_pass_tokens);
-
+        // Ragged batch: each section advances by its OWN min(remaining, cap).
+        // The varlen forward packs the heterogeneous lengths flat, so one
+        // near-finished section no longer collapses the whole wave to the batch
+        // minimum — the bug that dragged a 93-wide tool-catalog ingest down to
+        // ~1 token/seq/forward. Mirrors `run_one_prefill_pass`.
+        let cap = self.max_prefill_pass_tokens;
         let mut seq_ids: Vec<usize> = Vec::with_capacity(active.len());
         let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
         let mut group_idxs: Vec<usize> = Vec::with_capacity(active.len());
+        let mut advances: Vec<usize> = Vec::with_capacity(active.len());
         for &i in &active {
             let s = &mut self.active_section_ingests[i];
             let off = s.offset;
-            let tokens = &s.tokens[off..off + chunk_len];
+            let advance = (s.tokens.len() - off).min(cap);
+            let tokens = &s.tokens[off..off + advance];
             match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
                     seq_ids.push(s.sequence_id.0);
                     inputs.push(t);
                     group_idxs.push(i);
+                    advances.push(advance);
                 }
                 Err(e) => {
                     s.error = Some(ConversationError::Model(e));
@@ -130,14 +252,22 @@ impl Scheduler {
             return;
         }
 
+        let total_tokens: usize = advances.iter().sum();
         tracing::debug!(
             target: "sched",
-            "section_ingest batch={} chunk_len={} seq_ids={:?}",
+            "section_ingest batch={} tokens={} seq_ids={:?}",
             seq_ids.len(),
-            chunk_len,
+            total_tokens,
             seq_ids
         );
 
+        // Attended-KV length swept, summed over the batch, before the forward
+        // advances the sequences.
+        let kv_len: usize = seq_ids
+            .iter()
+            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
+            .sum();
+        let t_fwd = Instant::now();
         let logits_vec = match self
             .model
             .forward_batched(&mut self.session, &seq_ids, &inputs)
@@ -152,20 +282,29 @@ impl Scheduler {
                 return;
             }
         };
+        // Section ingest batch = n_seqs sequences, Σ advances tokens (ragged).
+        let fwd_ms = t_fwd.elapsed().as_millis() as u64;
+        self.wave_stats
+            .record_section(seq_ids.len(), total_tokens, kv_len, fwd_ms);
 
         // Logits are produced but not used — section ingests have no decode.
-        // We only need to advance the session offset and record slot tokens.
-        for (_logits, &i) in logits_vec.into_iter().zip(group_idxs.iter()) {
+        // We only need to advance each section by ITS OWN advance and record
+        // its slot tokens.
+        for ((_logits, &i), &advance) in logits_vec
+            .into_iter()
+            .zip(group_idxs.iter())
+            .zip(advances.iter())
+        {
             let s = &mut self.active_section_ingests[i];
-            if let Err(e) = self.session.advance_sequence(s.sequence_id.0, chunk_len) {
+            if let Err(e) = self.session.advance_sequence(s.sequence_id.0, advance) {
                 s.error = Some(ConversationError::Model(e));
                 continue;
             }
             let seq_id = s.sequence_id;
             let off = s.offset;
-            let chunk_tokens = s.tokens[off..off + chunk_len].to_vec();
+            let chunk_tokens = s.tokens[off..off + advance].to_vec();
             super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &chunk_tokens);
-            s.offset += chunk_len;
+            s.offset += advance;
         }
     }
 
@@ -281,6 +420,14 @@ impl Scheduler {
             .iter()
             .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
             .collect();
+        // Total attended-KV length this prefill sweeps (prefix/context summed
+        // over the batch), captured before the forward advances the sequences.
+        // Surfaced on the wave line so a growing prefix (the prefill-slowing
+        // growth area) is visible vs. a flat paged-glue prefix.
+        let kv_len: usize = seq_ids
+            .iter()
+            .map(|&sid| self.session.sequence_offset(sid).unwrap_or(0))
+            .sum();
         let t_fwd = Instant::now();
         let logits_vec = match self
             .model
@@ -297,7 +444,8 @@ impl Scheduler {
         };
         // Prefill batch = n_seqs sequences, Σ advances tokens (ragged).
         let fwd_ms = t_fwd.elapsed().as_millis() as u64;
-        self.wave_stats.record(true, n_seqs, total_tokens, fwd_ms);
+        self.wave_stats
+            .record(true, n_seqs, total_tokens, kv_len, fwd_ms);
         #[cfg(feature = "profile")]
         {
             let snap = candle_transformers::models::profile::pipeline_snapshot_and_reset();
@@ -530,6 +678,7 @@ impl Scheduler {
                         post_decode_tokens: work.post_decode_tokens,
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
+                        prefill_assistant_text: work.prefill_assistant_text,
                         finished: true,
                         decode_start: Instant::now(),
                         prefill_ms,
@@ -579,6 +728,7 @@ impl Scheduler {
                 post_decode_tokens: work.post_decode_tokens,
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
+                prefill_assistant_text: work.prefill_assistant_text,
                 finished: false,
                 decode_start: Instant::now(),
                 prefill_ms,

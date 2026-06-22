@@ -997,6 +997,23 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist signatures: {e}")))
     }
 
+    /// Persist a turn's projection-event timeline to the redo log — the
+    /// `ProjectionEvents` record. `payload` is the
+    /// [`crate::projection::encode_events`] JSON. Also mirrors the bytes into
+    /// the in-RAM substrate so the current session reads them back without a
+    /// restart.
+    pub fn persist_projection_events(
+        &self,
+        stream_id: StreamId,
+        payload: &[u8],
+    ) -> candle::Result<()> {
+        self.write()
+            .set_projection_events_blob(stream_id, payload.to_vec());
+        let mut p = self.persistence.lock().unwrap();
+        p.append_projection_events(stream_id, payload)
+            .map_err(|e| candle::Error::Msg(format!("persist projection events: {e}")))
+    }
+
     /// Declare a section stream — appends a `StreamDecl::PromptSection`
     /// record carrying the content address and debug name.  The
     /// derived stream id matches `section_stream_id(address)`.  Called

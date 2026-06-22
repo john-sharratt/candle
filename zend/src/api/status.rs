@@ -30,6 +30,7 @@ pub async fn status(State(session): State<Arc<ZendSession>>) -> Json<StatusBody>
         started_at_ms: snap.started_at_ms,
         detail: snap.detail,
         loading,
+        build: super::build_id(),
     })
 }
 
@@ -52,6 +53,9 @@ pub struct StatusBody {
     pub started_at_ms: u64,
     pub detail: String,
     pub loading: Option<LoadingBody>,
+    /// Hash of the embedded web build. The frontend captures this on load and
+    /// force-reloads when it changes (daemon rebuilt with new UI assets).
+    pub build: &'static str,
 }
 
 /// Structured loading-state view sent inside `StatusBody.loading`.

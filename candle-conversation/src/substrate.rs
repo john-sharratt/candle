@@ -126,6 +126,15 @@ pub struct Substrate {
     /// for the session.
     sections: AHashMap<SectionId, SectionEntryData>,
 
+    /// Running per-timeline sum of turn token counts — the O(1) corpus-size
+    /// counter behind `total_token_count`. Maintained on turn append/extend
+    /// (turns are append-only, so this only grows until `reset`), keeping the
+    /// "materialized / N tokens" denominator off the O(corpus) hot path.
+    timeline_token_totals: HashMap<TimelineId, usize>,
+    /// Running global sum of ingested section token counts (the shared
+    /// workspace corpus). Maintained on section install (overwrite-aware).
+    section_token_total: usize,
+
     /// Hot-tier LRU list, most-recently-used at the front.
     /// `front()` = MRU, `back()` = next eviction victim. Membership
     /// mirrors `residence[idx].hot.is_some()` for every index in the
@@ -980,6 +989,11 @@ pub struct StreamRuntime {
     pub tokens: Option<RecordLoc>,
     /// Latest `Signatures` record for the stream.
     pub signatures: Option<RecordLoc>,
+    /// Latest `ProjectionEvents` record payload (opaque JSON bytes — the
+    /// projection layer decodes). Eager bytes rather than a `RecordLoc`: the
+    /// per-turn timeline is tiny, so we keep it resident and re-emit it on
+    /// compaction like the other synthesised per-entity records.
+    pub projection_events: Option<Vec<u8>>,
     /// Highest chunk index the stream is durably committed through.
     pub committed_through: Option<u64>,
 }
@@ -2355,6 +2369,12 @@ impl Substrate {
                     self.apply_tombstone(&payload);
                 }
             }
+            RecordType::ProjectionEvents => {
+                // Opaque JSON bytes — the projection layer decodes them on read.
+                // Last-writer-wins per turn stream id.
+                self.streams.entry(stream_id).or_default().projection_events =
+                    Some(entry.record.payload.clone());
+            }
             // Singletons go to the manifest, not the substrate.
             RecordType::ModelSpec
             | RecordType::Template
@@ -2460,6 +2480,7 @@ impl Substrate {
                 },
             },
         );
+        *self.timeline_token_totals.entry(timeline).or_default() += token_count;
         // Every persisted turn carries a parallel `TreeNodeMeta`.  New
         // turns default to a `Normal` content sub-leaf and are pushed
         // onto the summariser's pending queue so the async thread can
@@ -2506,6 +2527,7 @@ impl Substrate {
         let residence = self.alloc_residence(turn_stream_id(timeline.raw(), idx.0), compression);
         let block_start = write.block_start;
         let block_end = write.block_end;
+        let token_count = write.token_count;
         {
             let tl = self.timelines.get_mut(&timeline).unwrap();
             tl.turns.insert(
@@ -2515,7 +2537,7 @@ impl Substrate {
                     content: TurnPart {
                         user_text: write.user_text,
                         assistant_text: write.assistant_text,
-                        token_count: write.token_count,
+                        token_count,
                         token_ids: write.token_ids,
                         sig_entries: Vec::new(),
                         residence,
@@ -2527,6 +2549,7 @@ impl Substrate {
                 tl.pending_summary_queue.push_back(idx);
             }
         }
+        *self.timeline_token_totals.entry(timeline).or_default() += token_count;
         if !sealed_cpu.is_empty() {
             self.install_hot(residence, sealed_cpu);
         }
@@ -2598,6 +2621,7 @@ impl Substrate {
                 .entry(idx)
                 .or_insert_with(TreeNodeMeta::default);
         }
+        *self.timeline_token_totals.entry(timeline).or_default() += token_count;
         if let Some(cold_seqs) = cold {
             if !cold_seqs.is_empty() {
                 // Sum cold record bytes into residence.byte_size so
@@ -2737,10 +2761,13 @@ impl Substrate {
         additional_tokens: usize,
         new_block_end: u64,
     ) {
-        if let Some(entry) = self.turn_mut(timeline, index) {
-            entry.content.token_count = entry.content.token_count.saturating_add(additional_tokens);
-            entry.block_range.1 = new_block_end;
-        }
+        let Some(entry) = self.turn_mut(timeline, index) else {
+            return;
+        };
+        entry.content.token_count = entry.content.token_count.saturating_add(additional_tokens);
+        entry.block_range.1 = new_block_end;
+        // `entry`'s borrow ends here, so the counter bump can re-borrow self.
+        *self.timeline_token_totals.entry(timeline).or_default() += additional_tokens;
     }
 
     pub fn block_range_of(&self, timeline: TimelineId, index: TurnIndex) -> (u64, u64) {
@@ -2803,6 +2830,22 @@ impl Substrate {
         self.timelines
             .get(&timeline)
             .map_or(0, |t| t.turns.len() as u32)
+    }
+
+    /// Corpus size for a conversation — `timeline`'s turn tokens plus the
+    /// shared section (workspace) tokens. This is the denominator the GUI shows
+    /// as "materialized M / N tokens": the size of the unbounded store this
+    /// projection draws from, against which its materialized subset is compared.
+    ///
+    /// O(1) — served from the maintained running counters, not an O(corpus)
+    /// re-sum (which would be called on every reprojection during decode and
+    /// scale with depth, defeating the engine's O(1) premise).
+    pub fn total_token_count(&self, timeline: TimelineId) -> usize {
+        self.timeline_token_totals
+            .get(&timeline)
+            .copied()
+            .unwrap_or(0)
+            + self.section_token_total
     }
 
     pub fn turn_indices(&self, timeline: TimelineId) -> impl Iterator<Item = TurnIndex> + '_ {
@@ -2986,6 +3029,22 @@ impl Substrate {
         self.timelines.clear();
         self.timelines_by_group.clear();
         self.sections.clear();
+        self.timeline_token_totals.clear();
+        self.section_token_total = 0;
+    }
+
+    /// Store a turn's projection-event record payload (opaque JSON bytes) on its
+    /// stream runtime, keyed by the turn's `stream_id`. Called at write time
+    /// and on redo-log replay.
+    pub fn set_projection_events_blob(&mut self, stream_id: StreamId, payload: Vec<u8>) {
+        self.streams.entry(stream_id).or_default().projection_events = Some(payload);
+    }
+
+    /// The stored projection-event record payload for a turn, if any.
+    pub fn projection_events_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
+        self.streams
+            .get(&turn_stream_id(timeline.raw(), index.0))
+            .and_then(|s| s.projection_events.as_deref())
     }
 
     // ── Section accessors ────────────────────────────────────────────────────
@@ -3024,7 +3083,8 @@ impl Substrate {
             tokens,
             residence,
         };
-        self.sections.insert(section, entry);
+        let prev = self.sections.insert(section, entry).map_or(0, |e| e.token_count);
+        self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_cpu.is_empty() {
             self.install_section_hot(residence, sealed_cpu);
         }
@@ -3061,7 +3121,8 @@ impl Substrate {
             tokens,
             residence,
         };
-        self.sections.insert(section, entry);
+        let prev = self.sections.insert(section, entry).map_or(0, |e| e.token_count);
+        self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_hot.is_empty() {
             self.install_section_hot(residence, sealed_hot);
         }
@@ -3842,6 +3903,80 @@ mod tests {
         sub.reset();
         assert_eq!(sub.turn_count(timeline), 0);
         assert!(sub.turn_sealed_of(timeline, TurnIndex(0)).is_none());
+    }
+
+    /// `total_token_count(timeline)` is this conversation's turn tokens plus the
+    /// shared section tokens, served from the O(1) maintained counters.
+    #[test]
+    fn total_token_count_sums_turns_and_sections() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        for tc in [30usize, 12] {
+            sub.append_complete(
+                timeline,
+                TurnPartWrite {
+                    token_count: tc,
+                    sealed_gpu: Some(Arc::new(vec![])),
+                    ..Default::default()
+                },
+                identity_migrate,
+            )
+            .unwrap();
+        }
+        // A 10-token ingested section adds to the total.
+        sub.set_section_full(
+            SectionId::new(7),
+            StreamId::default(),
+            10,
+            vec![],
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32, 2, 3]),
+        )
+        .unwrap();
+        assert_eq!(sub.total_token_count(timeline), 30 + 12 + 10);
+    }
+
+    /// The maintained counter handles section re-ingest (overwrite, not add)
+    /// and turn extension without drifting.
+    #[test]
+    fn total_token_count_handles_overwrite_and_extend() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        sub.append_complete(
+            timeline,
+            TurnPartWrite {
+                token_count: 20,
+                sealed_gpu: Some(Arc::new(vec![])),
+                ..Default::default()
+            },
+            identity_migrate,
+        )
+        .unwrap();
+        sub.set_section_full(
+            SectionId::new(9),
+            StreamId::default(),
+            100,
+            vec![],
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32]),
+        )
+        .unwrap();
+        assert_eq!(sub.total_token_count(timeline), 120);
+        // Re-ingest the SAME section smaller — replaces its 100 with 60.
+        sub.set_section_full(
+            SectionId::new(9),
+            StreamId::default(),
+            60,
+            vec![],
+            Arc::new(vec![minimal_sealed_layer()]),
+            identity_migrate,
+            Arc::new(vec![1u32]),
+        )
+        .unwrap();
+        assert_eq!(sub.total_token_count(timeline), 80);
+        // Extend the turn by 5 tokens.
+        sub.extend_turn(timeline, TurnIndex(0), 5, 2);
+        assert_eq!(sub.total_token_count(timeline), 85);
     }
 
     /// Two successive appends produce independent entries.

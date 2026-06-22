@@ -252,6 +252,7 @@ impl SummarizationTask {
                 prefill_tokens,
                 prefill_text: window_text,
                 user_text: String::new(),
+                prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens: config.summarization_max_tokens as usize,
                 sampling: summarization_sampling,
@@ -332,6 +333,9 @@ impl CognitiveTask for SummarizationTask {
                         let _ = tx.send(evt);
                     }
                 }
+                // Projection events are timeline telemetry for the live UI;
+                // the summariser has no use for them.
+                Ok(TurnEvent::Projection(_)) => {}
                 Ok(TurnEvent::Done(response)) => {
                     self.free_sequence();
                     let summary_text = crate::think_strip::strip_think_blocks(&response.text);

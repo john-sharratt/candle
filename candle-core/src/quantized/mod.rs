@@ -541,6 +541,29 @@ impl Int8Mode {
             _ => Self::Off,
         }
     }
+
+    /// VRAM-aware [`Int8Mode::auto`]: on an int8-MMA-capable CUDA device, picks
+    /// [`Int8Mode::Precision`] (near-lossless, but the *larger* stepped-up weight
+    /// twin) only when the weights leave comfortable headroom — the model is at
+    /// most ~70% of free VRAM, so the KV cache, activations, and (MoE) hot
+    /// experts still fit — and otherwise drops to [`Int8Mode::Performance`] (the
+    /// smaller same-width twin) so a tight model still fits. `Off` (FP16) on CPU
+    /// / non-int8 devices, or [`Int8Mode::Performance`] if VRAM can't be queried.
+    ///
+    /// `model_bytes` is the on-disk quantized weight size (e.g. the GGUF length).
+    pub fn auto_sized(device: &crate::Device, model_bytes: usize) -> Self {
+        match device {
+            #[cfg(feature = "cuda")]
+            crate::Device::Cuda(d) if d.supports_int8_mma() => match device.mem_get_info() {
+                // model / free <= 7/10  ⇒  fits with headroom  ⇒  Precision.
+                Ok((free, _)) if model_bytes.saturating_mul(10) <= free.saturating_mul(7) => {
+                    Self::Precision
+                }
+                _ => Self::Performance,
+            },
+            _ => Self::Off,
+        }
+    }
 }
 
 #[repr(u32)]
