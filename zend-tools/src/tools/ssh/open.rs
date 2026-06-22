@@ -1,4 +1,4 @@
-//! ssh_session_open tool.
+//! ssh_open tool.
 
 use std::net::TcpStream;
 
@@ -32,7 +32,7 @@ pub struct OpenResponse {
 pub struct SshSessionOpen;
 
 impl Tool for SshSessionOpen {
-    const NAME: &'static str = "ssh_session_open";
+    const NAME: &'static str = "ssh_open";
     const DESCRIPTION: &'static str =
         "Open a persistent SSH shell session on a remote host using a stored credential. Use \
          to start a working session before issuing commands, when the user names an SSH host \

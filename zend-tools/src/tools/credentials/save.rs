@@ -45,7 +45,7 @@ impl Tool for CredentialSave {
          http_bearer, http_basic, http_header, totp_secret, sql_password, remote_fs_password, \
          tls_client_cert, signing_key. Triggered by \"save this key\", \"remember this \
          password\", \"store my credentials for\", \"add a credential called\", \"set up auth \
-         for\". Returns the credential ID and name. Use credential_list to find existing \
+         for\". Returns the credential ID and name. Use cred_list to find existing \
          credentials; credential_delete to revoke. Note: secrets passed here enter conversation \
          history.";
 

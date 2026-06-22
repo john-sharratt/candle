@@ -129,7 +129,7 @@ mod wave {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit(messages, Some(max_tokens), conv_id.to_string())
+            .submit(messages, Some(max_tokens), conv_id.to_string(), None, None)
             .await;
         let mut n = 0usize;
         let mut text = String::new();

@@ -36,6 +36,18 @@ pub struct ChatCompletionRequest {
     /// When absent, all requests share a single default conversation.
     #[serde(default)]
     pub conv_id: Option<String>,
+    /// Capture aid (zend-only): name of a section collection (e.g. `"tools"`)
+    /// to force to full resolution for this conversation — projection and
+    /// reprojection stop filtering it, so all its sections stay materialised.
+    /// Used to build tool-invocation training data; absent in normal use.
+    #[serde(default)]
+    pub force_high_resolution: Option<String>,
+    /// Capture aid (zend-only): text to prefill as the start of the assistant's
+    /// response (e.g. `"<tool_call>"`), forcing the decode to continue from it.
+    /// Used to capture clean tool-call exemplars regardless of whether the model
+    /// would otherwise refuse, narrate, or fabricate a result; absent in normal use.
+    #[serde(default)]
+    pub assistant_prefill: Option<String>,
 }
 
 // ── Streaming response (SSE) ──────────────────────────────────────────────────

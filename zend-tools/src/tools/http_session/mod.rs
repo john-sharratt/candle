@@ -15,7 +15,7 @@
 //!
 //! # Binary response bodies
 //!
-//! `http_session_request` returns `body` (UTF-8 string) for text content types
+//! `http_request` returns `body` (UTF-8 string) for text content types
 //! and `body_b64` (base64) for binary.  At most one is present per response.
 //! HTTP uses base64 (not hex) — that's the established convention for
 //! HTTP-over-JSON tooling, and response bodies are usually structured rather than
@@ -23,7 +23,7 @@
 //!
 //! # Confirmation policy
 //!
-//! `http_session_request` confirms for mutating methods (POST, PUT, PATCH, DELETE).
+//! `http_request` confirms for mutating methods (POST, PUT, PATCH, DELETE).
 //! GET, HEAD, and OPTIONS do not confirm (read-only by HTTP spec).
 //! Open, list, and close do not confirm.
 //!

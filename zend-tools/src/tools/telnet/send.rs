@@ -1,4 +1,4 @@
-//! telnet_session_send tool.
+//! telnet_send tool.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ pub struct SendResponse {
 pub struct TelnetSessionSend;
 
 impl Tool for TelnetSessionSend {
-    const NAME: &'static str = "telnet_session_send";
+    const NAME: &'static str = "telnet_send";
     const DESCRIPTION: &'static str =
         "Send text to an open Telnet session and read until an expect regex matches (the device \
          prompt, by default). Use for: running commands on network gear, querying device status, \

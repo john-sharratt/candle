@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "note": "Per-tool train + holdout user prompts for gen_tool_cases. Each prompt is authored to trigger exactly one tool when the full catalog is present. Stateful session tools reference a plausible session id so they fire single-turn; the call is captured but never executed.",
+  "cases": [
+    { "tool": "datetime", "train": "What time is it in Tokyo right now?", "holdout": "What's today's date and what day of the week is it?" },
+    { "tool": "calculator", "train": "Evaluate (48273 * 9184 + 65521) / 37 to four decimal places.", "holdout": "What is sqrt(152399) * 12.5 - 8473 / 17, to six decimal places?" },
+    { "tool": "unit_convert", "train": "Convert 2.5 cubic feet to litres.", "holdout": "How many kilometres is 26.2 miles?" },
+    { "tool": "random", "train": "Roll two six-sided dice for me.", "holdout": "Pick one option at random from red, green, and blue." },
+    { "tool": "web_search", "train": "Search the web for the latest on the James Webb Space Telescope.", "holdout": "Look up recent news about quantum error correction." },
+    { "tool": "web_fetch", "train": "Fetch and summarise the page at https://example.com/article.", "holdout": "Read the content of https://docs.rust-lang.org/book/ch01-00-getting-started.html" },
+    { "tool": "weather", "train": "What's the weather like in Seattle today?", "holdout": "Will it rain tomorrow in London?" },
+
+    { "tool": "write", "train": "Create a file called notes.txt containing the text 'hello world'.", "holdout": "Save a Python script to fib.py that prints the first 10 Fibonacci numbers." },
+    { "tool": "file_read", "train": "Show me the contents of notes.txt.", "holdout": "Read the file config.json." },
+    { "tool": "file_edit", "train": "In config.yaml, change the port value from 8080 to 9090.", "holdout": "Update main.py: replace the line 'DEBUG = True' with 'DEBUG = False'." },
+    { "tool": "file_list", "train": "List the files in the workspace.", "holdout": "What files do I have under the src/ prefix?" },
+    { "tool": "file_delete", "train": "Delete the file temp.log.", "holdout": "Remove the file called draft.txt." },
+    { "tool": "file_present", "train": "Show me the file report.pdf in the chat.", "holdout": "Surface output.csv to me in the interface." },
+
+    { "tool": "notes_write", "train": "Save a note under the key 'project_status' saying the build is green.", "holdout": "Make a note called 'todo' with the text 'refactor the parser'." },
+    { "tool": "notes_read", "train": "Read my note with the key 'project_status'.", "holdout": "Retrieve the note stored under 'meeting_minutes'." },
+    { "tool": "notes_search", "train": "Search my notes for anything mentioning 'deadline'.", "holdout": "Find my notes tagged with 'security'." },
+    { "tool": "notes_list", "train": "List all my notes.", "holdout": "Browse my notes with the key prefix 'project_'." },
+
+    { "tool": "credential_save", "train": "Save an API token credential named 'github_pat' with the value ghp_example123.", "holdout": "Store my SSH password for the prod server under the name 'prod_login'." },
+    { "tool": "cred_list", "train": "What credentials do I have saved?", "holdout": "List my saved SSH keys." },
+    { "tool": "credential_delete", "train": "Delete the credential named 'old_api_key'.", "holdout": "Revoke the stored credential called 'prod_login'." },
+
+    { "tool": "ssh_open", "train": "SSH into prod.example.com using my 'prod_login' credential.", "holdout": "Open an SSH connection to 10.0.0.5 as user deploy." },
+    { "tool": "ssh_session_exec", "train": "On SSH session ssh_1, run the command `uptime`.", "holdout": "Execute `df -h` on my SSH session ssh_1." },
+    { "tool": "ssh_session_exec_async", "train": "Start a long-running `tar -czf backup.tgz /data` on SSH session ssh_1 without blocking.", "holdout": "Kick off `apt upgrade -y` asynchronously on SSH session ssh_1." },
+    { "tool": "ssh_session_poll", "train": "Check the output of async process proc_7 on SSH session ssh_1.", "holdout": "Poll async job proc_3 on SSH session ssh_1 for new output." },
+    { "tool": "ssh_session_list", "train": "List my open SSH sessions.", "holdout": "Which SSH connections do I currently have open?" },
+    { "tool": "ssh_session_close", "train": "Close SSH session ssh_1.", "holdout": "End my SSH session ssh_2." },
+
+    { "tool": "telnet_session_open", "train": "Open a Telnet session to 192.168.1.1 on port 23.", "holdout": "Connect via Telnet to the switch at console.lab.local." },
+    { "tool": "telnet_send", "train": "On Telnet session tel_1, send `show running-config`.", "holdout": "Run `show version` on Telnet session tel_1." },
+    { "tool": "telnet_session_list", "train": "List my open Telnet sessions.", "holdout": "What Telnet connections are open right now?" },
+    { "tool": "telnet_session_close", "train": "Close Telnet session tel_1.", "holdout": "End my Telnet session tel_2." },
+
+    { "tool": "http_session_open", "train": "Open an HTTP session with base URL https://api.example.com using my bearer token.", "holdout": "Set up an HTTP client for https://service.local with a default header X-Env: prod." },
+    { "tool": "http_request", "train": "On HTTP session http_1, POST the JSON {\"name\":\"test\"} to /users.", "holdout": "GET /status from HTTP session http_1." },
+    { "tool": "http_session_list", "train": "List my open HTTP sessions.", "holdout": "Which API connections do I have open?" },
+    { "tool": "http_session_close", "train": "Close HTTP session http_1.", "holdout": "Disconnect HTTP session http_2." },
+
+    { "tool": "tcp_session_open", "train": "Open a raw TCP connection to 10.0.0.9 on port 9000.", "holdout": "Connect over TCP to mail.example.com on port 25." },
+    { "tool": "tcp_session_send", "train": "Send the text 'PING' to TCP session tcp_1.", "holdout": "Write the hex bytes 16 03 01 to TCP session tcp_1." },
+    { "tool": "tcp_session_recv", "train": "Read 64 bytes from TCP session tcp_1.", "holdout": "Drain TCP session tcp_1 for 3 seconds and show what arrives." },
+    { "tool": "tcp_session_list", "train": "List my open TCP connections.", "holdout": "What raw TCP sockets are open?" },
+    { "tool": "tcp_session_close", "train": "Close TCP session tcp_1.", "holdout": "Drop my TCP connection tcp_2." },
+
+    { "tool": "udp_session_open", "train": "Open a UDP socket connected to 10.0.0.20 on port 5353.", "holdout": "Bind a UDP socket with default peer ntp.example.com:123." },
+    { "tool": "udp_session_send", "train": "Send the text 'hello' as a UDP datagram on session udp_1.", "holdout": "Transmit the hex bytes ff ee dd over UDP session udp_1." },
+    { "tool": "udp_session_recv", "train": "Read one incoming UDP datagram on session udp_1.", "holdout": "Wait for a packet on UDP session udp_1 and show the sender." },
+    { "tool": "udp_session_list", "train": "List my open UDP sockets.", "holdout": "What UDP sessions are bound right now?" },
+    { "tool": "udp_session_close", "train": "Close UDP session udp_1.", "holdout": "Release my UDP socket udp_2." },
+
+    { "tool": "tls_session_open", "train": "Open a TLS connection to imap.example.com on port 993.", "holdout": "Establish a TLS session to smtp.mail.local on port 465." },
+    { "tool": "tls_session_send", "train": "Send 'A1 LOGIN user pass' over TLS session tls_1.", "holdout": "Transmit the command 'EHLO client' on TLS session tls_1." },
+    { "tool": "tls_session_recv", "train": "Read the decrypted response from TLS session tls_1.", "holdout": "Receive data from TLS session tls_1." },
+    { "tool": "tls_session_list", "train": "List my open TLS connections.", "holdout": "What TLS sessions are currently open?" },
+    { "tool": "tls_session_close", "train": "Close TLS session tls_1.", "holdout": "Shut down TLS session tls_2." },
+
+    { "tool": "sql_session_open", "train": "Open a SQLite session on an in-memory database.", "holdout": "Connect to the SQLite database at /data/app.db." },
+    { "tool": "sql_session_query", "train": "On SQL session sql_1, run SELECT * FROM users LIMIT 5.", "holdout": "Execute INSERT INTO logs(msg) VALUES('boot') on SQL session sql_1." },
+    { "tool": "sql_session_list", "train": "List my open database sessions.", "holdout": "What SQL connections do I have open?" },
+    { "tool": "sql_session_close", "train": "Close SQL session sql_1.", "holdout": "End my database session sql_2." },
+
+    { "tool": "remote_fs_session_open", "train": "Open an SFTP session to sftp://deploy@host.example.com:22/srv using my ssh key.", "holdout": "Connect over SFTP to sftp://user@10.0.0.7/home/user." },
+    { "tool": "remote_fs_session_list_dir", "train": "On SFTP session fs_1, list the directory /var/log.", "holdout": "Show the contents of /etc on SFTP session fs_1." },
+    { "tool": "remote_fs_session_stat", "train": "Get the metadata for /srv/app.conf on SFTP session fs_1.", "holdout": "Stat the file /home/user/data.bin over SFTP session fs_1." },
+    { "tool": "remote_fs_session_get", "train": "Download /var/log/syslog from SFTP session fs_1 into my workspace.", "holdout": "Fetch /srv/config.yaml from SFTP session fs_1." },
+    { "tool": "remote_fs_session_put", "train": "Upload my local file report.txt to /srv/report.txt on SFTP session fs_1.", "holdout": "Push deploy.sh to /home/deploy/deploy.sh over SFTP session fs_1." },
+    { "tool": "remote_fs_session_delete", "train": "Delete /tmp/old.log on the remote host via SFTP session fs_1.", "holdout": "Remove /srv/stale.tmp over SFTP session fs_1." },
+    { "tool": "remote_fs_session_mkdir", "train": "Create the directory /srv/releases on SFTP session fs_1.", "holdout": "Make a new remote directory /home/user/backups via SFTP session fs_1." },
+    { "tool": "remote_fs_session_rename", "train": "Rename /srv/app.old to /srv/app.bak on SFTP session fs_1.", "holdout": "Move /tmp/a.txt to /tmp/b.txt over SFTP session fs_1." },
+    { "tool": "remote_fs_session_list", "train": "List my open SFTP sessions.", "holdout": "What remote filesystem connections are open?" },
+    { "tool": "remote_fs_session_close", "train": "Close SFTP session fs_1.", "holdout": "End my remote filesystem session fs_2." },
+
+    { "tool": "dns_lookup", "train": "What is the IP address of example.com?", "holdout": "Resolve the hostname api.github.com." },
+    { "tool": "ping_icmp", "train": "Ping 8.8.8.8 and show the latency.", "holdout": "Is the host db.internal reachable?" },
+    { "tool": "trace_route", "train": "Trace the route to cloudflare.com.", "holdout": "Map the network path to 1.1.1.1." },
+    { "tool": "port_scan", "train": "Check whether ports 22, 80, and 443 are open on 10.0.0.5.", "holdout": "Scan ports 3306 and 5432 on db.example.com." },
+    { "tool": "ip_scan", "train": "Sweep the subnet 192.168.1.0/24 for live hosts.", "holdout": "Discover hosts on 10.0.0.0/24." },
+    { "tool": "host_info", "train": "Profile the host example.com — resolve it and do a reverse lookup.", "holdout": "Identify the host at 93.184.216.34." },
+
+    { "tool": "hash_scan", "train": "Identify which hash algorithm produced 5d41402abc4b2a76b9719d911017c592.", "holdout": "What algorithm made this digest: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824?" },
+    { "tool": "hash_compute", "train": "Compute the SHA-256 hash of the text 'hello world'.", "holdout": "Give me the blake3 digest of 'the quick brown fox'." },
+    { "tool": "totp", "train": "Generate the current 2FA code from my 'github_totp' credential.", "holdout": "Give me the current authenticator code for 'vpn_totp' right now.", "prefill": "<tool_call>{\"name\": \"totp\",", "prefill_note": "The model reliably routes 'authenticator code for <name>' to the credential-listing family (get_credentials/cred_list) instead of totp — an adjacent-family selection ambiguity that tool descriptions and prompt wording could not override (verified across runs). For a clean exemplar we pin the tool name (through the trailing comma, so the emitted JSON stays well-formed — without it the model sometimes drops the separator) and let the model fill the arguments; the selection error itself is documented, not aliased away. This is the only case needing a non-default prefill." },
+
+    { "tool": "aead_encrypt", "train": "Encrypt the plaintext 'secret message' with AES-256-GCM using key 0000000000000000000000000000000000000000000000000000000000000000.", "holdout": "Encrypt 'token' with ChaCha20-Poly1305 using key 1111111111111111111111111111111111111111111111111111111111111111." },
+    { "tool": "aead_decrypt", "train": "Decrypt this AES-256-GCM ciphertext 9a1c with key 0000000000000000000000000000000000000000000000000000000000000000 and nonce 000000000000000000000000.", "holdout": "Decrypt this ChaCha20-Poly1305 ciphertext ab12 using the key 1111111111111111111111111111111111111111111111111111111111111111 and nonce 111111111111111111111111." },
+    { "tool": "hmac_compute", "train": "Compute the HMAC-SHA256 of the message 'data' with key 'k3y'.", "holdout": "Give me the HMAC-SHA512 tag for 'payload' using key 'secret'." },
+    { "tool": "signature_verify", "train": "Verify this ed25519 signature ab12 over the message 'hello' with public key cd34.", "holdout": "Check whether this p256 signature ef56 is valid for the message 'manifest' under public key 7890." },
+    { "tool": "signature_sign", "train": "Sign the message 'release-v2' with my ed25519 signing key credential 'release_key'.", "holdout": "Produce a p256 signature over 'manifest' using my stored signing key 'ci_key'." },
+    { "tool": "kdf_derive", "train": "Derive a key from the password 'hunter2' using argon2id.", "holdout": "Stretch the password 'correcthorsebatterystaple' with scrypt." },
+    { "tool": "hkdf_extract", "train": "Run HKDF-Extract with SHA-256 on input key material aabbcc and salt 001122.", "holdout": "HKDF-Extract a PRK from IKM ddeeff using SHA-512." },
+    { "tool": "hkdf_expand_label", "train": "Do an HKDF-Expand-Label for the TLS 1.3 'c hs traffic' secret from PRK aabbcc.", "holdout": "Expand the TLS 1.3 label 'key' from pseudorandom key ddeeff." },
+
+    { "tool": "hash_state_init", "train": "Start a streaming SHA-256 hash.", "holdout": "Begin an incremental blake3 hash computation." },
+    { "tool": "hash_state_update", "train": "Feed the chunk 'part one ' into streaming hash state hs_1.", "holdout": "Absorb the next block of data 'more bytes' into hash state hs_1." },
+    { "tool": "hash_state_finalize", "train": "Finalize streaming hash state hs_1 and give me the digest.", "holdout": "Emit the final digest for hash state hs_2." },
+
+    { "tool": "bytes_transcode", "train": "Convert the hex string 48656c6c6f to base64.", "holdout": "Re-encode this base64 value to hex: aGVsbG8=." },
+    { "tool": "bytes_pack", "train": "Pack the values 1, 2, and 300 as little-endian uint16 using the format '<HHH'.", "holdout": "Pack the u32 70000 and the f32 3.14 big-endian with the format '>If'." },
+    { "tool": "bytes_unpack", "train": "Unpack the bytes 01000200 as two little-endian uint16 with the format '<HH'.", "holdout": "Decode the buffer 0001e240 as a big-endian u32 using the format '>I'." },
+    { "tool": "bytes_xor", "train": "XOR the byte sequences ff00 and 0ff0.", "holdout": "Compute the bitwise XOR of the bytes 61626364 with the key 10101010." },
+
+    { "tool": "code_run", "train": "Run this Python: print(sum(range(100))).", "holdout": "Execute the bash command `echo $((6*7))`." },
+    { "tool": "code_session_open", "train": "Open a persistent Python code session.", "holdout": "Start a Node.js execution session." },
+    { "tool": "code_session_exec", "train": "In code session code_1, run `x = 5`.", "holdout": "Execute `print(x * 2)` in code session code_1." },
+    { "tool": "code_list", "train": "List my open code execution sessions.", "holdout": "What sandboxes are currently running?" },
+    { "tool": "code_session_close", "train": "Close code session code_1.", "holdout": "Terminate code session code_2." },
+
+    { "tool": "sub_run", "train": "Have a subagent research three approaches to caching and report back.", "holdout": "Delegate the task of summarising these logs to a nested agent." }
+  ]
+}

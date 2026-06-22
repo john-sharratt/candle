@@ -461,6 +461,20 @@ impl SubstratePersistence {
         Ok(())
     }
 
+    /// Append a [`RecordType::ToolSummary`] record caching the collection
+    /// summary keyed by `catalog_hash`. A workspace singleton: this supersedes
+    /// any prior tool summary (the walker keeps the latest, the compactor
+    /// reclaims the rest). Callers gate the write on a changed `catalog_hash`.
+    pub fn write_tool_summary(&mut self, catalog_hash: u128, summary: &str) -> Result<()> {
+        let payload = record::ToolSummaryPayload {
+            catalog_hash,
+            summary: summary.to_string(),
+        };
+        let bytes = payload.encode();
+        self.append_record(RecordType::ToolSummary, 0, 0, 0, 0, &bytes)?;
+        Ok(())
+    }
+
     /// Append a `DebugId` record for `timeline_id`.  Last-writer-wins
     /// on replay.  Callers check idempotency against substrate state.
     pub fn write_debug_id(&mut self, timeline_id: u64, debug_id: &str) -> Result<()> {
@@ -1296,6 +1310,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_summary_survives_reopen_supersedes_and_compacts() {
+        let dir = tmp_dir("tool_summary");
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.write_tool_summary(0xAAAA, "summary-A").unwrap();
+            sp.write_tool_summary(0xBBBB, "summary-B").unwrap(); // supersedes A
+            sp.commit().unwrap();
+        }
+        // Reload: the latest summary wins.
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(substrate.tool_summary_hash(), Some(0xBBBB));
+            assert_eq!(substrate.tool_summary_text(), Some("summary-B"));
+        }
+        // The superseded copy is dead — compaction reclaims it (collect_live_records
+        // emits only `manifest.tool_summary`), keeping only the latest.
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            sp.compact(&mut substrate, None).unwrap();
+            assert_eq!(substrate.tool_summary_hash(), Some(0xBBBB));
+        }
+        {
+            let mut substrate = Substrate::new();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(substrate.tool_summary_hash(), Some(0xBBBB));
+            assert_eq!(substrate.tool_summary_text(), Some("summary-B"));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn streams_and_turns_recover_across_reopen() {
         let dir = tmp_dir("recover");
         let turn = StreamDecl::Turn(TurnDecl {
@@ -1311,9 +1359,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: streams::PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -1384,9 +1432,9 @@ mod tests {
             anchored_prefix: vec![sec.stream_id()],
             view: Vec::new(),
             scores: streams::PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         });

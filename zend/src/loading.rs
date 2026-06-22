@@ -233,7 +233,10 @@ mod tests {
         p.set_step(LoadStep::Sections);
         let snap = p.snapshot().unwrap();
         assert_eq!(snap.current, LoadStep::Sections);
-        assert_eq!(snap.completed, vec![LoadStep::Model, LoadStep::Substrate]);
+        assert_eq!(
+            snap.completed,
+            vec![LoadStep::Model, LoadStep::Substrate, LoadStep::Compacting]
+        );
     }
 
     #[test]

@@ -243,6 +243,20 @@ impl SamplingConfig {
         }
     }
 
+    /// Decode config for the summary compressor. Greedy (temperature 0, so the
+    /// compression stays deterministic and faithful) but with a repetition
+    /// penalty — plain argmax with no penalty collapses into degenerate loops
+    /// and word-salad on this task (e.g. `"valid, valid, firm, firm, …"` or a
+    /// paragraph that repeats one clause to the token cap). A multiplicative
+    /// `repeat_penalty` breaks those loops while leaving legitimate repetition
+    /// (a repo map listing `candle-core, candle-nn, …`) intact — unlike
+    /// cumulative frequency/presence penalties, which suppress such lists. The
+    /// brevity itself comes from the per-layer `summary` prompts, not the
+    /// penalty. Tuned via the `regen_summaries` example.
+    pub fn compression() -> Self {
+        Self::argmax().with_repeat_penalty(1.3)
+    }
+
     /// Top-K sampling with temperature.
     pub fn top_k(k: i32, temperature: f32) -> Self {
         Self {

@@ -15,7 +15,7 @@ use crate::persistence::SubstratePersistence;
 use crate::provenance::SigEntry;
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
-    TurnPartWrite,
+    TurnContentBounds, TurnPartWrite,
 };
 use crate::summary_tree::SelectionDiagnostics;
 use crate::token_buffer::TokenBuffer;
@@ -223,6 +223,7 @@ impl Conversation {
         // `assistant_text` without re-tokenising or scanning.
         let user_text = write.user_text.clone();
         let assistant_text = write.assistant_text.clone();
+        let content_bounds = write.content_bounds;
         let idx = {
             let mut view = self.inner.write().unwrap();
             view.append_complete(timeline, write, migrate_to_cpu)?
@@ -249,9 +250,9 @@ impl Conversation {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: content_bounds.user_start,
+            user_content_end: content_bounds.user_end,
+            assistant_content_start: content_bounds.asst_start,
             user_text,
             assistant_text,
         });
@@ -305,9 +306,9 @@ impl Conversation {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -467,6 +468,12 @@ impl Conversation {
                 std::mem::take(&mut decl.assistant_text),
                 TokenBuffer::from(recovered.token_ids),
                 token_count,
+                TurnContentBounds::clamped(
+                    decl.user_content_start as usize,
+                    decl.user_content_end as usize,
+                    decl.assistant_content_start as usize,
+                    token_count,
+                ),
                 cold_refs,
                 decl.block_start,
                 decl.block_end,
@@ -476,17 +483,24 @@ impl Conversation {
             }
             restored += 1;
         }
-        // Reload re-summarises nothing. The summary tree is persisted
-        // (`TreeMetadata` records, replayed during the open pass) and reloaded
-        // as-is — it is authoritative, not rebuilt. A clean restart must
-        // therefore generate ZERO summary probes. We deliberately do NOT
-        // re-enqueue "uncovered" Normal turns or re-seed the dirty set: turns
-        // left un-summarised at shutdown simply stay raw (the projection covers
-        // recent turns by recency regardless), and dirty nodes keep their
-        // existing (valid) summary. Only genuinely new turns sealed after
-        // restart enqueue — live, and only on summarisable timelines. (The
-        // earlier "re-enqueue the orphan tail" sweep flooded the summariser at
-        // startup and was the root of the restart hangs.)
+        // Arm low-priority reconciliation per timeline. The summary forest is
+        // immutable and its canonical ternary shape is a pure function of the
+        // leaves (`docs/immutable_summary_forest.md`), so the reload doesn't
+        // re-summarise anything — it just asks the summariser to rebuild any
+        // internal node that's missing (a crash between sealing leaves and their
+        // parent) or non-canonical (binary nodes from the superseded AVL, which
+        // `mark_for_reconcile` purges). For a clean forest `reconcile_next`
+        // returns `None` on the first pass and the hint clears immediately, so a
+        // healthy restart does zero probe work. Reconcile is strictly
+        // lower-priority than live turns, so it never floods startup the way the
+        // old "re-enqueue the orphan tail" sweep did.
+        {
+            let timelines: Vec<TimelineId> = self.read().all_timeline_ids().collect();
+            let mut view = self.write();
+            for tl in timelines {
+                view.mark_for_reconcile(tl);
+            }
+        }
         if let Some(p) = progress {
             p(total, total);
         }
@@ -845,13 +859,6 @@ impl Conversation {
         self.read().pending_summary_len(timeline)
     }
 
-    /// Number of summary nodes currently marked dirty (children
-    /// changed since last regeneration).  `0` means the dirty sweep
-    /// has caught up.
-    pub fn dirty_summary_len(&self, timeline: TimelineId) -> usize {
-        self.read().dirty_summary_len(timeline)
-    }
-
     /// Most recent score-density [`SelectionDiagnostics`] for
     /// `timeline`, or `None` if no projection has run yet (or the
     /// projection used the rule-based path).  Pure test-harness
@@ -871,6 +878,26 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         p.write_tree_metadata(payload)
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
+    }
+
+    /// Persist a cached tool-catalog summary to the redo log, keyed by
+    /// `catalog_hash`. Supersedes any prior summary (last-writer-wins; the
+    /// compactor reclaims the old copy). The in-RAM substrate's cached summary
+    /// is updated too, so a same-process re-read sees the new hash without a
+    /// reload. Callers gate this on a changed hash — see
+    /// [`crate::substrate::Substrate::tool_summary_hash`].
+    pub fn write_tool_summary(&self, catalog_hash: u128, summary: &str) -> candle::Result<()> {
+        {
+            let mut p = self.persistence.lock().unwrap();
+            p.write_tool_summary(catalog_hash, summary)
+                .map_err(|e| candle::Error::Msg(format!("write_tool_summary: {e}")))?;
+        }
+        self.write()
+            .apply_tool_summary(crate::persistence::record::ToolSummaryPayload {
+                catalog_hash,
+                summary: summary.to_string(),
+            });
+        Ok(())
     }
 
     /// Persist a sealed turn's per-layer KV grid + token ids to the redo log

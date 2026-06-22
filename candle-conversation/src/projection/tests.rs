@@ -8,8 +8,9 @@
 use std::collections::HashMap;
 
 use super::builder::Builder;
-use super::ids::{GroupId, SectionId, TimelineId, TurnIndex};
+use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex};
 use super::project::ProjectionTarget;
+use super::schema::SummaryMode;
 use crate::substrate::ContentResolver;
 
 // —— Mock resolver —————————————————————————————————————————————————————————————
@@ -26,6 +27,8 @@ struct MockResolver {
     turn_counts: HashMap<u32, u32>,
     /// section_id → score
     section_scores: HashMap<u32, f32>,
+    /// section_id → token count (0 = "not sealed" for sections not present)
+    section_tokens: HashMap<u32, usize>,
     default_score: f32,
     default_tokens: usize,
 }
@@ -71,6 +74,13 @@ impl MockResolver {
         self.section_scores.insert(section.raw(), score);
         self
     }
+
+    /// Mark a section as sealed with `tokens` tokens — projection's tool-summary
+    /// gate emits the summary only when its `section_token_count` is `> 0`.
+    fn with_section_tokens(mut self, section: SectionId, tokens: usize) -> Self {
+        self.section_tokens.insert(section.raw(), tokens);
+        self
+    }
 }
 
 impl ContentResolver for MockResolver {
@@ -111,6 +121,12 @@ impl ContentResolver for MockResolver {
         // Sections without explicit scores will lose to those with scores.
         *self.section_scores.get(&section.raw()).unwrap_or(&0.0)
     }
+
+    fn section_token_count(&self, section: SectionId) -> usize {
+        // 0 unless explicitly marked sealed — mirrors a section not present in
+        // the substrate. The tool-summary gate keys off `> 0`.
+        *self.section_tokens.get(&section.raw()).unwrap_or(&0)
+    }
 }
 
 // —— Helpers ———————————————————————————————————————————————————————————————————
@@ -144,6 +160,15 @@ layers:
         - id: stub
           content: "stub"
     window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 40
@@ -155,6 +180,15 @@ layers:
 
   - name: dialogue
     window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 100
@@ -370,6 +404,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: group_a1
@@ -415,6 +458,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -461,6 +513,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     score_threshold: 0.8
     budget:
@@ -474,6 +535,15 @@ layers:
         - id: stub
           content: "stub"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 50
@@ -521,6 +591,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -565,6 +644,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -605,6 +693,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -647,6 +744,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: conv
@@ -707,6 +813,15 @@ layers:
         - id: s1
           content: "X"
     window: 4500
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -755,6 +870,15 @@ layers:
         - id: s1
           content: "X"
     window: 900
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -797,6 +921,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -837,6 +970,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: low_grp
@@ -849,6 +991,15 @@ layers:
         - id: stub
           content: "stub"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: target_grp
@@ -898,6 +1049,15 @@ layers:
         - id: stub
           content: "stub"
     window: 95000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     score_threshold: 0.1
     budget:
@@ -915,6 +1075,15 @@ layers:
         - id: stub
           content: "stub"
     window: 95000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: top_k_mean
     score_formula_k: 3
     budget:
@@ -929,6 +1098,15 @@ layers:
 
   - name: dialogue
     window: 95000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 100
@@ -1085,6 +1263,15 @@ layers:
         - id: big
           content: "Very large section content that would dwarf any turn budget."
     window: 800
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1145,6 +1332,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: dup
@@ -1155,6 +1351,15 @@ layers:
         - id: stub
           content: "stub"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: dup
@@ -1180,6 +1385,15 @@ layers:
         - id: s1
           content: "B"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1202,6 +1416,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1224,6 +1447,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1247,6 +1479,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1272,6 +1513,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp1
@@ -1298,6 +1548,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1321,6 +1580,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1343,6 +1611,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1368,6 +1645,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1395,6 +1681,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: sum
     groups:
       - id: grp_low
@@ -1407,6 +1702,15 @@ layers:
         - id: stub
           content: "stub"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: upper_grp
@@ -1456,6 +1760,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: count
     groups:
       - id: small_grp
@@ -1468,6 +1781,15 @@ layers:
         - id: stub
           content: "stub"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: upper_grp
@@ -1519,6 +1841,15 @@ layers:
         - id: s1
           content: "X"
     window: 9500
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 50
@@ -1531,6 +1862,15 @@ layers:
         - id: stub
           content: "stub"
     window: 9500
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 50
@@ -1594,6 +1934,15 @@ layers:
         - id: s1
           content: "X"
     window: 9500
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: empty_grp
@@ -1636,6 +1985,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1672,6 +2030,15 @@ layers:
         - id: s1
           content: "X"
     window: 4500
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1716,6 +2083,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: priority_grp
@@ -1769,6 +2145,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: top_k_mean
     score_formula_k: 2
     score_threshold: 0.5
@@ -1825,6 +2210,15 @@ layers:
         - id: s1
           content: "X"
     window: 9500
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: capped_grp
@@ -1879,6 +2273,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: conv
@@ -1921,6 +2324,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: conv
@@ -1968,6 +2380,15 @@ layers:
         - id: s1
           content: "X"
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -1986,6 +2407,15 @@ fn missing_layer_system_prompt_is_parse_error() {
 layers:
   - name: layer
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -2001,6 +2431,15 @@ fn empty_layer_system_prompt_is_construction_error() {
 layers:
   - name: layer
     window: 9000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     system_prompt:
       sections: []
@@ -2028,6 +2467,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: data_grp
@@ -2038,6 +2486,15 @@ layers:
         - id: stub
           content: "stub"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: empty_target
@@ -2074,6 +2531,15 @@ const SUBST_YAML: &str = r#"
 layers:
   - name: dialogue
     window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
@@ -2112,6 +2578,15 @@ fn substitution_catches_template_typo() {
 layers:
   - name: dialogue
     window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
@@ -2137,6 +2612,15 @@ fn substitution_leaves_non_identifier_braces_alone() {
 layers:
   - name: dialogue
     window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
@@ -2163,6 +2647,15 @@ fn from_yaml_rejects_any_placeholder() {
 layers:
   - name: dialogue
     window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
@@ -2223,6 +2716,40 @@ fn zend_projection_yaml_parses() {
     assert_eq!(last.name, "dialogue", "dialogue must be the topmost layer");
 
     assert!(b.id_for_group("primary_conversation").is_some());
+
+    // The structural layers declare the validated structural-pipeline mode for
+    // their summary-of-summaries level; dialogue stays single-pass.
+    let mode_of = |layer: &str| {
+        let id = b.id_for_layer(layer).unwrap();
+        b.schema()
+            .layers
+            .iter()
+            .find(|l| l.id == id)
+            .unwrap()
+            .summary
+            .summaries
+            .as_ref()
+            .expect("layer has a summaries level")
+            .mode
+    };
+    // Only repo_map (directory trees) uses the deterministic structural roll-up;
+    // the other layers' summaries are code definitions/artifacts, not paths.
+    assert_eq!(mode_of("repo_map"), SummaryMode::Structural);
+    for single in [
+        "code_reading",
+        "static_analysis",
+        "dependency_analysis",
+        "dialogue",
+        "bug_analysis",
+        "architectural_analysis",
+        "dream_log",
+    ] {
+        assert_eq!(
+            mode_of(single),
+            SummaryMode::SinglePass,
+            "{single} should stay single-pass"
+        );
+    }
 }
 
 #[test]
@@ -2235,6 +2762,15 @@ layers:
         - id: s1
           content: "X"
     window: 49000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     groups:
       - id: grp
@@ -2317,6 +2853,15 @@ fn yaml_depth_weights_default_when_omitted() {
 layers:
   - name: layer
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       sections:
         - id: s
@@ -2336,6 +2881,15 @@ fn yaml_depth_weights_override() {
 layers:
   - name: layer
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     depth_weights:
       syntactic: 0.2
       semantic: 0.6
@@ -2362,6 +2916,15 @@ fn yaml_depth_weights_partial_override_uses_defaults() {
 layers:
   - name: layer
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     depth_weights:
       semantic: 5.0
     system_prompt:
@@ -2387,6 +2950,15 @@ fn yaml_negative_depth_weight_is_error() {
 layers:
   - name: layer
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     depth_weights:
       semantic: -0.5
     system_prompt:
@@ -2420,6 +2992,15 @@ fn session_resolver_picks_correct_metric_per_score_formula() {
 layers:
   - name: l
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       sections:
         - id: s
@@ -2492,6 +3073,15 @@ fn session_resolver_combines_depths_with_weights() {
 layers:
   - name: l
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       sections:
         - id: s
@@ -2567,6 +3157,15 @@ fn projection_uses_bdp_scores_to_pick_top_k() {
 layers:
   - name: l
     window: 10000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     system_prompt:
       sections:
@@ -2635,6 +3234,15 @@ fn projection_per_layer_depth_weights_alter_ranking() {
 layers:
   - name: l
     window: 10000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     depth_weights:
       syntactic: 10.0
@@ -2769,6 +3377,15 @@ fn yaml_all_zero_depth_weights_is_error() {
 layers:
   - name: layer
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     depth_weights:
       syntactic: 0.0
       semantic: 0.0
@@ -2800,6 +3417,15 @@ const SECTIONS_YAML_FLAT: &str = r#"
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget:
       priority: 100
@@ -2849,6 +3475,15 @@ const COLLECTION_YAML: &str = r#"
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
@@ -2860,6 +3495,16 @@ layers:
           id: tools_intro
           content: "tools_intro"
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: tools
           selection: { kind: top_k, k: 2 }
           sections:
@@ -2878,6 +3523,163 @@ layers:
       - id: convo
         selection: { kind: always_visible }
 "#;
+
+/// Like `COLLECTION_YAML` but the collection's `top_k` (5) exceeds its member
+/// count (2), so every projection selects *all* tools — the all-selected case.
+const ALL_TOOLS_FIT_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    budget: { priority: 100 }
+    system_prompt:
+      items:
+        - kind: section
+          id: tools_intro
+          content: "tools_intro"
+        - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose categories.
+              user_prompt: Propose categories.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign by number.
+              user_prompt: Assign by number.
+          name: tools
+          selection: { kind: top_k, k: 5 }
+          sections:
+            - id: tool_a
+              content: "A"
+            - id: tool_b
+              content: "B"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+/// Partial selection (top-2 of 4) + a sealed summary → the summary section is
+/// emitted, just before the selected tool members.
+#[test]
+fn collection_partial_selection_emits_summary_before_members() {
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(dialogue, tools, summary)
+        .unwrap();
+    let tools_intro = b.id_for_section_in(dialogue, "tools_intro").unwrap();
+    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
+    let tool_d = b.id_for_section_in(dialogue, "tool_d").unwrap();
+
+    let resolver = MockResolver::new()
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_d, 0.8)
+        .with_section_tokens(summary, 100); // sealed
+
+    let p = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    let sp = ids
+        .iter()
+        .position(|&i| i == summary)
+        .unwrap_or_else(|| panic!("summary not emitted on partial selection: {ids:?}"));
+    let intro_pos = ids.iter().position(|&i| i == tools_intro).unwrap();
+    let tp = ids.iter().position(|&i| i == tool_b).unwrap();
+    // After the static intro, before the tools.
+    assert!(
+        intro_pos < sp && sp < tp,
+        "want intro < summary < tools: {ids:?}"
+    );
+    assert!(ids.contains(&tool_d));
+}
+
+/// When the collection selects all its members (top-k ≥ member count), nothing
+/// was dropped, so the summary is omitted even though it is sealed.
+#[test]
+fn collection_all_selected_omits_summary() {
+    let mut b = Builder::from_yaml(ALL_TOOLS_FIT_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(dialogue, tools, summary)
+        .unwrap();
+    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
+    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
+
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.9)
+        .with_section_score(tool_b, 0.8)
+        .with_section_tokens(summary, 100); // sealed, but all selected
+
+    let p = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    assert!(
+        !ids.contains(&summary),
+        "summary must be omitted when all tools are selected: {ids:?}"
+    );
+    assert!(ids.contains(&tool_a) && ids.contains(&tool_b));
+}
+
+/// Partial selection but the summary section was never sealed
+/// (`section_token_count == 0`) → it is not emitted (no phantom segment).
+#[test]
+fn collection_partial_but_unsealed_summary_omitted() {
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(dialogue, tools, summary)
+        .unwrap();
+    let tool_b = b.id_for_section_in(dialogue, "tool_b").unwrap();
+    let tool_d = b.id_for_section_in(dialogue, "tool_d").unwrap();
+
+    // Partial, but no `with_section_tokens` → summary is unsealed.
+    let resolver = MockResolver::new()
+        .with_section_score(tool_b, 0.9)
+        .with_section_score(tool_d, 0.8);
+
+    let p = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    let ids: Vec<SectionId> = p.sealed_sections().map(|s| s.id).collect();
+    assert!(
+        !ids.contains(&summary),
+        "an unsealed summary must not be emitted: {ids:?}"
+    );
+}
 
 #[test]
 fn collection_top_k_keeps_highest_scored_in_declaration_order() {
@@ -2956,11 +3758,30 @@ const COLLECTION_YAML_THRESHOLD: &str = r#"
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
       items:
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: tools
           selection: { kind: top_k, k: 5 }
           score_threshold: 0.4
@@ -3007,11 +3828,30 @@ fn collection_single_picks_max_only() {
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
       items:
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: choices
           selection: { kind: single }
           sections:
@@ -3053,11 +3893,30 @@ fn collection_always_visible_emits_every_section() {
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
       items:
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: all
           sections:
             - id: a
@@ -3094,11 +3953,30 @@ fn yaml_section_priority_field_parses() {
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
       items:
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: pick
           selection: { kind: top_k, k: 1 }
           sections:
@@ -3136,6 +4014,15 @@ fn collection_with_no_qualifying_sections_yields_empty_subset() {
 layers:
   - name: dialogue
     window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     score_formula: max
     budget: { priority: 100 }
     system_prompt:
@@ -3144,6 +4031,16 @@ layers:
           id: framing
           content: "framing"
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: tools
           selection: { kind: top_k, k: 2 }
           score_threshold: 0.5
@@ -3216,6 +4113,53 @@ fn add_collection_appends_and_returns_id() {
         )
         .unwrap();
     assert_eq!(b.id_for_collection_in(dialogue, "tools"), Some(cid));
+}
+
+#[test]
+fn runtime_section_ids_stay_disjoint_from_compression_prompts() {
+    // Regression: a layer's compression-prompt sections (and collection
+    // summaries) live in `layer.summary` / the collection summary, NOT in
+    // `system_prompt.items`, and for a trailing layer get the highest section
+    // ids. Runtime allocation (`add_section_to_collection`, the daemon's tool
+    // catalog) must skip past them — otherwise a tool section reuses a
+    // compression-prompt id and `ensure_summary_section` injects the tool's
+    // content as the compression prompt, collapsing the compression decode into
+    // a degenerate loop (the live-daemon bug this guards).
+    let mut b = Builder::from_yaml(COLLECTION_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let cid = b.id_for_collection_in(dialogue, "tools").unwrap();
+
+    // The hidden (compression-prompt + collection-summary) section ids — those
+    // in `all_section_ids` but not visible in `system_prompt.items`.
+    let hidden: Vec<u32> = {
+        let layer = b.schema().layers.iter().find(|l| l.id == dialogue).unwrap();
+        let visible: std::collections::HashSet<u32> = layer
+            .system_prompt
+            .all_sections()
+            .map(|s| s.id.raw())
+            .collect();
+        layer
+            .all_section_ids()
+            .into_iter()
+            .filter(|id| !visible.contains(id))
+            .collect()
+    };
+    assert!(
+        !hidden.is_empty(),
+        "layer must own hidden compression-prompt / collection-summary sections"
+    );
+
+    for t in 0..6 {
+        let id = b
+            .add_section_to_collection(dialogue, cid, format!("rt_{t}"), "x", 50.0)
+            .unwrap();
+        assert!(
+            !hidden.contains(&id.raw()),
+            "runtime section id {} reuses a hidden compression-prompt id {:?}",
+            id.raw(),
+            hidden,
+        );
+    }
 }
 
 #[test]
@@ -3334,6 +4278,15 @@ mod dialect_templates {
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template
@@ -3388,6 +4341,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template
@@ -3421,6 +4383,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template
@@ -3457,6 +4428,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template
@@ -3464,6 +4444,16 @@ layers:
           dialect: tool_block_open
           depends_on: tools
         - kind: collection
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose a few functional categories for the sections.
+              user_prompt: Propose categories for the content above.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign each section to a category by number.
+              user_prompt: Assign each section above to a category number.
           name: tools
           selection: { kind: top_k, k: 1 }
           sections:
@@ -3501,6 +4491,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template
@@ -3528,6 +4527,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: section

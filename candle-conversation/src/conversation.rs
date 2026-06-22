@@ -15,11 +15,12 @@ use crate::projection::{
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
 use crate::sequence_handle::{BlockCount, SequenceId};
+use crate::substrate::TurnContentBounds;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
-use candle_nn::kv_cache::SealedSequence;
+use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 
 /// Slice a per-layer sealing down to the chunk range `[from..to)`.
@@ -50,6 +51,87 @@ pub(crate) fn slice_per_layer_sealed(
             }
         })
         .collect()
+}
+
+/// Window a turn's per-layer sealed K/V down to the token range
+/// `[start_tok, end_tok)` as a zero-copy view over the *same* physical
+/// chunks.
+///
+/// A turn is sealed once as a single contiguous unit, with the chat
+/// template's role markers baked into the K/V grid:
+/// `[user_start][no_think][user_msg][user_end][assistant_start][response]`.
+/// The compressor injects *content-only* halves of a turn — the user
+/// message body or the assistant response body — without those markers,
+/// so each half is derived here by windowing the sealed grid to the
+/// content's token span.
+///
+/// Each returned `SealedSequence` references the same `ChunkGid`s the
+/// turn already owns, windowing the partially-covered boundary chunks by
+/// `offset` / `token_count` so no K/V bytes are copied.  The kernel
+/// honours `offset` (it packs into the high 16 bits of `ChunkMeta`), so
+/// a window can be injected at any tail position and read correctly.
+///
+/// Walking each layer's chunks with a running token start `acc` and the
+/// chunk's own `c = token_count`, the chunk's slot span is `[acc, acc + c)`.
+/// Intersecting it with `[start_tok, end_tok)`:
+/// - empty intersection → the chunk is skipped.
+/// - the intersection equals the whole chunk → the chunk is cloned as-is.
+/// - otherwise the chunk straddles a window edge → a clone is taken with
+///   `offset += (overlap_start - acc)` and `token_count = overlap_len`.
+///   The clone shares the same `ChunkGid`s as the source chunk.
+///
+/// The result's `token_count == end_tok - start_tok` (clamped to the
+/// sequence's own length).  `start_tok >= end_tok` yields an empty window.
+pub(crate) fn window_sealed_tokens(
+    sealed: &[SealedSequence],
+    start_tok: usize,
+    end_tok: usize,
+) -> Vec<SealedSequence> {
+    let mut layers: Vec<SealedSequence> = Vec::with_capacity(sealed.len());
+
+    for seq in sealed {
+        let total = seq.token_count;
+        let win_start = start_tok.min(total);
+        let win_end = end_tok.min(total).max(win_start);
+        let mut chunks: Vec<SealedChunk> = Vec::new();
+
+        let mut acc = 0usize;
+        for chunk in &seq.chunks {
+            let c = chunk.token_count as usize;
+            let chunk_start = acc;
+            let chunk_end = acc + c;
+            acc = chunk_end;
+
+            // Intersect the chunk's slot span with the window.
+            let overlap_start = chunk_start.max(win_start);
+            let overlap_end = chunk_end.min(win_end);
+            if overlap_start >= overlap_end {
+                // No overlap — chunk lies wholly outside the window.
+                continue;
+            }
+            let overlap_len = (overlap_end - overlap_start) as u16;
+            if overlap_start == chunk_start && overlap_len as usize == c {
+                // Whole chunk inside the window — clone as-is.
+                chunks.push(chunk.clone());
+            } else {
+                // Partial chunk: window it, sharing the same physical
+                // chunk via the cloned `ChunkGid`s.
+                let mut w = chunk.clone();
+                w.offset = chunk.offset + (overlap_start - chunk_start) as u16;
+                w.token_count = overlap_len;
+                chunks.push(w);
+            }
+        }
+
+        layers.push(SealedSequence {
+            chunks,
+            token_count: win_end - win_start,
+            chunk_size: seq.chunk_size,
+            location: seq.location,
+        });
+    }
+
+    layers
 }
 
 use crossbeam::channel::Sender;
@@ -918,18 +1000,24 @@ impl Sequence {
         // context changes.  The intra-turn `user_end` and
         // `assistant_start` markers stay baked — their hidden state is
         // dominated by the turn's own (invariant) content.
-        let formatted = format!(
-            "{}{}{}{}",
-            no_think_prefix,
-            user_message,
-            self.config.dialect.user_end,
-            self.config.dialect.active_assistant_start(
-                self.config.suppress_thinking,
-                self.config.thinking_capable
-                    && (!self.config.suppress_thinking || self.config.inject_no_think_block)
-                    && self.config.dialect.supports_no_think(),
-            ),
+        let assistant_start_marker = self.config.dialect.active_assistant_start(
+            self.config.suppress_thinking,
+            self.config.thinking_capable
+                && (!self.config.suppress_thinking || self.config.inject_no_think_block)
+                && self.config.dialect.supports_no_think(),
         );
+        // Optional assistant prefill: text seeded as the start of the response so
+        // the decode is forced to continue from it (e.g. `<tool_call>` commits to
+        // the tool-call grammar). It is pinned into the prefill grid and sealed
+        // as assistant content (see `assistant_content_start` below); the model
+        // decodes the continuation. Empty when unset — the path is then identical
+        // to an ordinary turn.
+        let assistant_prefill = options.assistant_prefill.as_deref().unwrap_or("");
+        let assistant_head = format!(
+            "{}{}{}{}",
+            no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
+        );
+        let formatted = format!("{assistant_head}{assistant_prefill}");
         let prefill_tokens = self.tokenize(&formatted)?;
 
         // No post-decode tail in the Phase 5 layout.  The model's
@@ -960,12 +1048,41 @@ impl Sequence {
         );
 
         let reprojection = self.build_reprojection_policy();
+        // Content boundaries inside the sealed grid.  The prefill grid is
+        // `[no_think_prefix][user_msg][user_end][assistant_start]` — the
+        // leading `user_start` is a live `Generated` segment, not part of
+        // the prefill — and the assistant body is decoded after it.  So the
+        // user message body spans `[len(no_think_prefix), len(no_think +
+        // user_msg))` and the assistant content begins where decode starts,
+        // at the full prefill length.  Tokenise the prefixes against the
+        // SAME strings the prefill is built from so the indices land on the
+        // real grid.
+        let user_content_start = self.tokenize(no_think_prefix)?.len();
+        let user_content_end = self
+            .tokenize(&format!("{no_think_prefix}{user_message}"))?
+            .len();
+        // Assistant content begins at the `assistant_start` boundary — before any
+        // prefilled prefix — so the prefix's K/V seals as part of the assistant
+        // turn. With no prefill this is exactly `prefill_tokens.len()` (the head
+        // IS the whole prefill), preserving the ordinary-turn layout byte-for-byte.
+        let assistant_content_start = if assistant_prefill.is_empty() {
+            prefill_tokens.len()
+        } else {
+            self.tokenize(&assistant_head)?.len()
+        };
+        let content_bounds = TurnContentBounds::clamped(
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            prefill_tokens.len(),
+        );
         let handle = self.submit_prefill_unit(
             self.id,
             Some(self.projection_inputs()),
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            content_bounds,
             post_decode_tokens,
             max_tokens,
             sampling,
@@ -1002,6 +1119,7 @@ impl Sequence {
         prefill_text: String,
         prefill_tokens: TokenBuffer,
         user_text: String,
+        content_bounds: TurnContentBounds,
         post_decode_tokens: TokenBuffer,
         max_decode_tokens: usize,
         sampling: SamplingConfig,
@@ -1023,6 +1141,7 @@ impl Sequence {
                 prefill_tokens,
                 prefill_text,
                 user_text,
+                content_bounds,
                 post_decode_tokens,
                 max_decode_tokens,
                 sampling,
@@ -1085,7 +1204,7 @@ impl Sequence {
         // by the model; we append the full `assistant_end` (EOS +
         // structural tail) ourselves so the seal captures a
         // structurally-complete turn.
-        // Same Phase 5 shape as `submit_turn`: `user_start` and
+        // Same sealed shape as `submit_turn`: `user_start` and
         // `assistant_end` are stripped from the persisted bytes; the
         // projection's live `Generated` segments re-emit them around
         // the sealed turn on every future projection.  The trailing
@@ -1107,6 +1226,38 @@ impl Sequence {
         let prefill_tokens = self.tokenize(&formatted)?;
         let post_decode_tokens = TokenBuffer::new();
 
+        // Content boundaries inside the sealed grid.  The prefill grid is
+        // `[no_think_prefix][user_msg][user_end][assistant_start][assistant_text]`
+        // (no leading `user_start` — that's a live `Generated` segment).
+        // The user message body spans `[len(no_think_prefix), len(no_think +
+        // user_msg))`; the assistant content begins after the
+        // `[user_end][assistant_start]` markers.  Tokenise each prefix
+        // against the SAME strings the prefill is built from so the indices
+        // land on the real grid; clamp/monotonise so a tokenizer that
+        // merges across a join can never invert the windows.
+        let assistant_start_marker = self.config.dialect.active_assistant_start(
+            self.config.suppress_thinking,
+            self.config.thinking_capable
+                && (!self.config.suppress_thinking || self.config.inject_no_think_block)
+                && self.config.dialect.supports_no_think(),
+        );
+        let user_content_start = self.tokenize(no_think_prefix)?.len();
+        let user_content_end = self
+            .tokenize(&format!("{no_think_prefix}{user_message}"))?
+            .len();
+        let assistant_content_start = self
+            .tokenize(&format!(
+                "{}{}{}{}",
+                no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
+            ))?
+            .len();
+        let content_bounds = TurnContentBounds::clamped(
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            prefill_tokens.len(),
+        );
+
         // Build the TokenizedText for both halves now — assistant
         // text is supplied directly, not decoded, so we can fill it
         // in without waiting on event_rx for token chunks.
@@ -1126,6 +1277,7 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            content_bounds,
             post_decode_tokens,
             0,
             self.config.sampling.clone(),
@@ -1311,6 +1463,16 @@ impl Sequence {
         self.fork_onto(timeline)
     }
 
+    /// Swap the projection schema this sequence projects + reprojects with.
+    ///
+    /// The new builder must share the current one's section ids (e.g. a clone
+    /// with one collection's selection overridden) — its sealed-section KV is
+    /// reused as-is. Takes effect on the next submitted turn (the prefill
+    /// projection and the reprojection policy both read this on submit).
+    pub fn set_projection(&mut self, projection: Arc<Builder>) {
+        self.projection = projection;
+    }
+
     /// Shared body of [`Self::fork`] / [`Self::fork_resuming`]: allocate a
     /// fresh scheduler slot bound to the workspace substrate and `timeline`.
     fn fork_onto(&self, fork_timeline: TimelineId) -> crate::Result<Sequence> {
@@ -1404,6 +1566,34 @@ impl Sequence {
         self.tree.clear_turns();
 
         Ok(())
+    }
+
+    /// Abandon an in-flight turn whose stream ended without a `Done` (e.g. the
+    /// scheduler shut down mid-decode, or a scheduler error). Clears the local
+    /// in-flight state so the next [`Self::submit_turn`]/[`Self::reset`] is not
+    /// permanently rejected by the `turn_in_flight` guard. Best-effort on the
+    /// scheduler side — a gone scheduler is ignored, since the only caller is
+    /// already tearing the turn down.
+    pub fn abort_turn(&mut self) {
+        // Best-effort scheduler-side view cleanup; ignore a gone scheduler.
+        let (response_tx, response_rx) = crossbeam::channel::bounded(1);
+        if self
+            .scheduler_tx
+            .send(SchedulerRequest::ResetSequence {
+                sequence_id: self.id,
+                response_tx,
+            })
+            .is_ok()
+        {
+            let _ = response_rx.recv();
+        }
+
+        // Clear local turn state unconditionally so the sequence is reusable.
+        self.turn_in_flight = false;
+        self.pending_user = None;
+        self.bdp_scanner.clear();
+        self.current_blocks = BlockCount(0);
+        self.tree.clear_turns();
     }
 
     /// Extract raw K/V/Q float data from the KV cache for a set of layer
@@ -1943,5 +2133,128 @@ impl Drop for Sequence {
                 sequence_id: self.id,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod window_sealed_tokens_tests {
+    use super::window_sealed_tokens;
+    use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
+
+    /// Build a one-layer sealed turn with the given per-chunk token
+    /// counts.  Each chunk gets a distinct detached gid (1000 + idx) so
+    /// the boundary-sharing assertion can compare raw ids.
+    fn one_layer(counts: &[u16]) -> Vec<SealedSequence> {
+        let chunks: Vec<SealedChunk> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| SealedChunk::for_test(1000 + i as i64, c))
+            .collect();
+        let token_count = counts.iter().map(|&c| c as usize).sum();
+        vec![SealedSequence {
+            chunks,
+            token_count,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        }]
+    }
+
+    #[test]
+    fn window_spanning_both_boundaries_windows_first_and_last_chunk() {
+        // Four chunks [32, 32, 32, 20] = 116 tokens. Window [20, 90) starts
+        // mid-chunk-0 (offset 20) and ends mid-chunk-2 (offset 90 -> the
+        // chunk spanning [64,96) is cut at local index 26).
+        let sealed = one_layer(&[32, 32, 32, 20]);
+        let first_gid = sealed[0].chunks[0].gids.as_slice()[0].raw();
+        let last_gid = sealed[0].chunks[2].gids.as_slice()[0].raw();
+
+        let win = window_sealed_tokens(&sealed, 20, 90);
+
+        // Chunk-0 partial (20..32 -> 12 tokens), chunk-1 whole (32),
+        // chunk-2 partial (64..90 -> 26 tokens). Chunk-3 wholly outside.
+        assert_eq!(win[0].chunks.len(), 3);
+
+        // First chunk: windowed at the window start — offset advanced to 20,
+        // token_count = 32 - 20 = 12.
+        let first = &win[0].chunks[0];
+        assert_eq!(first.offset, 20);
+        assert_eq!(first.token_count, 12);
+
+        // Middle chunk: wholly inside — cloned as-is.
+        assert_eq!(win[0].chunks[1].offset, 0);
+        assert_eq!(win[0].chunks[1].token_count, 32);
+
+        // Last chunk: windowed at the window end — offset unchanged (its
+        // span begins inside the window), token_count = 90 - 64 = 26.
+        let last = &win[0].chunks[2];
+        assert_eq!(last.offset, 0);
+        assert_eq!(last.token_count, 26);
+
+        // Sequence-level token count equals the window width, and the
+        // summed chunk token counts reconstruct it.
+        assert_eq!(win[0].token_count, 70);
+        let sum: usize = win[0].chunks.iter().map(|c| c.token_count as usize).sum();
+        assert_eq!(sum, 90 - 20);
+
+        // The boundary chunks are physically SHARED: the windowed clones
+        // carry the same raw gid as their source chunk.
+        assert_eq!(first.gids.as_slice()[0].raw(), first_gid);
+        assert_eq!(last.gids.as_slice()[0].raw(), last_gid);
+    }
+
+    #[test]
+    fn empty_window_yields_no_chunks() {
+        let sealed = one_layer(&[32, 10]);
+        // start >= end -> empty window.
+        let win = window_sealed_tokens(&sealed, 20, 20);
+        assert_eq!(win[0].chunks.len(), 0);
+        assert_eq!(win[0].token_count, 0);
+    }
+
+    #[test]
+    fn window_beyond_total_clamps_to_sequence_length() {
+        let sealed = one_layer(&[32, 10]);
+        let win = window_sealed_tokens(&sealed, 0, 1000);
+        assert_eq!(win[0].chunks.len(), 2);
+        assert_eq!(win[0].token_count, 42);
+        assert_eq!(win[0].chunks[0].token_count, 32);
+        assert_eq!(win[0].chunks[1].token_count, 10);
+    }
+
+    #[test]
+    fn chunk_aligned_window_does_not_window_chunks() {
+        // Aligned window [32, 64): keeps only the second of three chunks.
+        let sealed = one_layer(&[32, 32, 32]);
+        let win = window_sealed_tokens(&sealed, 32, 64);
+        assert_eq!(win[0].chunks.len(), 1);
+        assert_eq!(win[0].chunks[0].token_count, 32);
+        assert_eq!(win[0].chunks[0].offset, 0);
+        assert_eq!(win[0].token_count, 32);
+    }
+
+    #[test]
+    fn windowing_the_user_and_assistant_content_halves() {
+        // A turn laid out as [markers | user_msg | markers | response]
+        // across chunks [32, 32, 20]. Content bounds: user [4, 50),
+        // assistant content starts at 56. The two halves carry only the
+        // content span, never the leading/trailing template markers.
+        let sealed = one_layer(&[32, 32, 20]);
+        let user = window_sealed_tokens(&sealed, 4, 50);
+        let asst = window_sealed_tokens(&sealed, 56, 84);
+
+        assert_eq!(user[0].token_count, 46);
+        // user-half: chunk-0 windowed (4..32 -> 28), chunk-1 windowed (32..50 -> 18).
+        assert_eq!(user[0].chunks.len(), 2);
+        assert_eq!(user[0].chunks[0].offset, 4);
+        assert_eq!(user[0].chunks[0].token_count, 28);
+        assert_eq!(user[0].chunks[1].offset, 0);
+        assert_eq!(user[0].chunks[1].token_count, 18);
+
+        assert_eq!(asst[0].token_count, 28);
+        // assistant-half: chunk-1 windowed (56..64 -> 8), chunk-2 whole (20).
+        assert_eq!(asst[0].chunks.len(), 2);
+        assert_eq!(asst[0].chunks[0].offset, 24);
+        assert_eq!(asst[0].chunks[0].token_count, 8);
+        assert_eq!(asst[0].chunks[1].token_count, 20);
     }
 }

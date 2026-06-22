@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use candle_conversation::projection::{
-    Builder, GroupId, LayerId, Projection, ProjectionTarget, SectionId,
+    Builder, GroupId, LayerId, Projection, ProjectionTarget, Reserved, SectionId,
 };
 use candle_conversation::provenance::{
     BdpScanner, ProvenanceFile, RawFileHeader, RawProvenanceFile, RawSigEntry, SigEntry, TokenHit,
@@ -452,6 +452,17 @@ impl Harness {
                 .unwrap_or_else(|e| panic!("add_section_to_collection({tool}): {e}"));
             tool_section_ids.insert(tool.to_string(), sid);
         }
+
+        // Associate the reserved tool-summary section with the collection, exactly
+        // as `zend::tools::install_tool_catalog` does — so projection emits it just
+        // before the selected tools when top-k drops at least one member.
+        builder
+            .set_collection_summary_section(
+                dialogue_layer,
+                tools_coll,
+                SectionId::reserved(Reserved::ToolSummary),
+            )
+            .expect("set_collection_summary_section");
 
         // The projection.yaml carries `kind: template` items (ChatML dialect
         // markers) that `project()` emits as `Generated` segments — and it

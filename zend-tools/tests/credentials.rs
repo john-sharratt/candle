@@ -53,7 +53,7 @@ fn credential_list_type_filter() {
         &ctx,
     );
     let resp = harness::expect_success(harness::invoke_with_ctx(
-        "credential_list",
+        "cred_list",
         json!({"type": "api_key"}),
         &ctx,
     ));
@@ -104,8 +104,7 @@ fn credential_save_list_delete() {
     assert!(!id.is_empty());
     assert_eq!(saved["created"], true);
 
-    let list_resp =
-        harness::expect_success(harness::invoke_with_ctx("credential_list", json!({}), &ctx));
+    let list_resp = harness::expect_success(harness::invoke_with_ctx("cred_list", json!({}), &ctx));
     let creds = list_resp["credentials"].as_array().unwrap();
     assert_eq!(creds.len(), 1);
     assert_eq!(creds[0]["name"], "my-api-key");
@@ -117,8 +116,7 @@ fn credential_save_list_delete() {
     ));
     assert_eq!(del["deleted"], true);
 
-    let list2 =
-        harness::expect_success(harness::invoke_with_ctx("credential_list", json!({}), &ctx));
+    let list2 = harness::expect_success(harness::invoke_with_ctx("cred_list", json!({}), &ctx));
     assert_eq!(list2["credentials"].as_array().unwrap().len(), 0);
 }
 
@@ -214,7 +212,7 @@ fn credential_list_by_type() {
     );
 
     let resp = harness::expect_success(harness::invoke_with_ctx(
-        "credential_list",
+        "cred_list",
         json!({"type": "api_key"}),
         &ctx,
     ));

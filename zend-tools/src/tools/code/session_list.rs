@@ -1,4 +1,4 @@
-//! code_session_list tool.
+//! code_list tool.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ pub struct SessionListResp {
 pub struct CodeSessionList;
 
 impl Tool for CodeSessionList {
-    const NAME: &'static str = "code_session_list";
+    const NAME: &'static str = "code_list";
     const DESCRIPTION: &'static str =
         "List open code execution sandbox sessions for the current conversation. Use for: \
          checking which sandboxes are currently running, finding a session_id before \

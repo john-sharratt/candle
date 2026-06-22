@@ -1,6 +1,8 @@
 //! Tests for the dialogue layer's `tools` collection:
 //! per-tool BDP discrimination and projection top-3 selection.
 
+use candle_conversation::projection::{Reserved, SectionId};
+
 use crate::corpus::{load_fixtures, TOOLS};
 use crate::harness::Harness;
 
@@ -65,6 +67,49 @@ fn projection_top3_includes_probe_tool() {
     assert!(
         failures.is_empty(),
         "probe tool not selected by projection:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// With 8 tools and a top-k smaller than 8, every projection drops at least one
+/// tool — so the catalog summary section must be emitted, and emitted *before*
+/// any tool section (it is a compact overview of everything, including what was
+/// dropped).
+#[test]
+fn partial_selection_emits_summary_before_tools() {
+    let (manifest, pf) = load_fixtures();
+    let h = Harness::build();
+    let target = h.target();
+    let summary_id = SectionId::reserved(Reserved::ToolSummary);
+    let tool_ids: std::collections::HashSet<SectionId> =
+        h.tool_section_ids.values().copied().collect();
+
+    let mut failures: Vec<String> = Vec::new();
+    for (probe_tool, resolver) in &h.scan_all_pos1(&pf, &manifest) {
+        let projection = h.builder.project(target, resolver);
+        let ids: Vec<SectionId> = projection.sealed_sections().map(|rs| rs.id).collect();
+
+        // Sanity: the selection is a proper subset of the 8 tools.
+        let n_tools = ids.iter().filter(|i| tool_ids.contains(i)).count();
+        assert!(
+            n_tools < TOOLS.len(),
+            "{probe_tool}: expected partial selection, got all {n_tools}",
+        );
+
+        let summary_pos = ids.iter().position(|&i| i == summary_id);
+        let first_tool_pos = ids.iter().position(|i| tool_ids.contains(i));
+        match (summary_pos, first_tool_pos) {
+            (Some(sp), Some(tp)) if sp < tp => {}
+            (Some(sp), Some(tp)) => {
+                failures.push(format!("{probe_tool}: summary at {sp}, first tool at {tp}"))
+            }
+            (None, _) => failures.push(format!("{probe_tool}: summary section not emitted")),
+            (_, None) => failures.push(format!("{probe_tool}: no tools emitted")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "summary-before-tools failed:\n  {}",
         failures.join("\n  ")
     );
 }

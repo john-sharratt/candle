@@ -22,6 +22,7 @@
 //!   │   (builder.rs)       │ MaxLessThanMin                              │
 //!   │                      │ NegativeScoreThreshold                      │
 //!   │                      │ EmptyLayerSystemPrompt                      │
+//!   │                      │ InvalidSummary                              │
 //!   ├──────────────────────┼─────────────────────────────────────────────┤
 //!   │ Projection-time      │ (none — pure given valid inputs)            │
 //!   └──────────────────────┴─────────────────────────────────────────────┘
@@ -85,6 +86,22 @@ pub enum ConstructionError {
     #[error("layer {layer:?} must declare at least one system_prompt section")]
     EmptyLayerSystemPrompt { layer: String },
 
+    /// A `summary:` block (on a layer or a section group) had a non-positive
+    /// `max_tokens`, or an empty `system_prompt` / `user_prompt`. Every layer
+    /// and every collection must declare a usable summary so its content is
+    /// always compressible.
+    #[error(
+        "summary for {owner:?} must have max_tokens >= 1 and non-empty \
+         system_prompt + user_prompt"
+    )]
+    InvalidSummary { owner: String },
+
+    /// A summary level's `mode:` was not `single_pass` or `structural`.
+    #[error(
+        "summary for {owner:?} has unknown mode {mode:?} (expected `single_pass` or `structural`)"
+    )]
+    InvalidSummaryMode { owner: String, mode: String },
+
     /// A `{name}` placeholder remained in the YAML template after
     /// substitution — either the caller forgot to supply that variable, or
     /// the template has a typo (`{wokrspace}` vs `{workspace}`).
@@ -130,6 +147,11 @@ pub enum ConstructionError {
     /// was given a collection id that no layer in the schema owns.
     #[error("unknown collection {0:?}")]
     UnknownCollection(String),
+
+    /// Runtime mutator (e.g. [`super::Builder::set_collection_single_section`])
+    /// was given a section name the collection does not contain.
+    #[error("unknown section {0:?} in collection")]
+    UnknownSection(String),
 
     /// A `kind: template` item referenced a `dialect:` name that
     /// [`candle_transformers::models::dialect::DialectTemplate::from_yaml_name`]

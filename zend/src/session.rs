@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use futures::{Stream, StreamExt};
@@ -9,7 +12,9 @@ use notify::RecommendedWatcher;
 
 use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
-use candle_conversation::projection::{self, Builder, Reserved, SystemPromptItem, TimelineId};
+use candle_conversation::projection::{
+    self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
+};
 use candle_conversation::{ConversationEngine, Sequence, TokenDecoder, TurnEvent};
 
 use crate::code_read::CodeReadState;
@@ -25,6 +30,22 @@ use crate::tools::{
 use crate::types::{ChatMessage, Role};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
+
+/// Bound on the titler queue. A backlog beyond this many un-started titles
+/// means the worker can't keep up; further jobs are dropped (labels are
+/// best-effort), which is preferable to unbounded growth under a burst.
+const TITLER_QUEUE_DEPTH: usize = 256;
+
+/// Work item for the titler worker thread.
+enum TitleJob {
+    /// Generate a sidebar title for `timeline` from `message` and write it.
+    Title {
+        timeline: TimelineId,
+        message: String,
+    },
+    /// Stop draining and exit (sent during shutdown to wake an idle worker).
+    Shutdown,
+}
 
 // ── Repo-map handle ──────────────────────────────────────────────────────────
 
@@ -80,14 +101,21 @@ struct InferenceState {
     conversations: Mutex<HashMap<String, Arc<Mutex<ConvState>>>>,
     /// System-prompt already prefilled; all new conversations fork from this.
     base_conv: Mutex<Sequence>,
-    /// Dedicated tiny-system-prompt conversation that turns the user's
-    /// first message into a short sidebar title. Shared across all main
-    /// conversations; serialised by the mutex but each call is fast
-    /// (~30 ms — prefill is bounded by `head_tail_truncate`).
-    titler: Mutex<Sequence>,
+    /// Queue feeding the dedicated titler worker thread. The request path
+    /// enqueues a [`TitleJob`] (non-blocking, dropped if the worker is backed
+    /// up) instead of spawning a thread per submit, so title generation runs
+    /// in the background — concurrently with main decode, never serialised
+    /// against the request path — and drains cleanly on shutdown.
+    titler_tx: SyncSender<TitleJob>,
+    /// Handle to the titler worker thread, joined during [`ZendSession::shutdown`]
+    /// so any in-flight title turn unwinds before the process exits.
+    titler_worker: Mutex<Option<JoinHandle<()>>>,
     /// The titler's timeline id — excluded from `list_conversations` so
     /// it doesn't show up in the user-facing sidebar.
     titler_timeline: TimelineId,
+    /// Set once shutdown begins. The titler worker checks it between jobs and
+    /// stops draining; the request path stops enqueuing new title jobs.
+    shutting_down: AtomicBool,
     /// `repo_map` layer's owning conversation.  Holds one
     /// prefilled turn pair per directory cluster; [`ClusterState`]
     /// is the per-cluster file-name hash record the refresh path
@@ -306,7 +334,7 @@ impl InferenceState {
         // refresh paths to mint fresh repo_map / code_reading
         // timelines when the watcher fires.
         let proj_builder_refresh = proj_builder.clone();
-        let base_conv = engine
+        let mut base_conv = engine
             .new_conversation_with_projection_progress(
                 &formatted_prompt,
                 proj_builder,
@@ -331,6 +359,94 @@ impl InferenceState {
             n_tool_sections = tool_sections.len(),
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
+
+        // Tool-catalog summary execution path. Hash the freshly-injected catalog
+        // (ordered tool names + parameter schemas) and compare to the summary
+        // cached in the redo log. On a match the catalog is unchanged and we
+        // reuse it (no model work); on a mismatch — or first run — regenerate the
+        // categorize→assign summary and persist it, which supersedes the stale
+        // copy (the compactor reclaims it). Gated on change, so a normal restart
+        // pays only the hash compare.
+        {
+            let catalog_hash = crate::tool_summary::catalog_hash(&tool_sections);
+            let conv = engine.conversation();
+            let cached = conv.read().tool_summary_hash();
+
+            // Resolve the summary text: reuse the cached one on a hash match, else
+            // regenerate (model) and persist the new text + hash.
+            let summary_text: Option<String> = if cached == Some(catalog_hash) {
+                tracing::info!(catalog_hash, "tool summary cache hit (catalog unchanged)");
+                conv.read().tool_summary_text().map(str::to_string)
+            } else {
+                let tools_gs = proj_builder_refresh
+                    .schema()
+                    .layers
+                    .iter()
+                    .find(|l| l.id == dialogue_layer)
+                    .and_then(|l| l.system_prompt.collection_named("tools"))
+                    .map(|c| c.summary.clone());
+                match tools_gs {
+                    None => {
+                        tracing::warn!("tool summary: dialogue layer has no 'tools' collection");
+                        None
+                    }
+                    Some(gs) => {
+                        tracing::info!(
+                            catalog_hash,
+                            ?cached,
+                            "tool catalog changed — regenerating summary",
+                        );
+                        match crate::tool_summary::generate_tool_summary(
+                            &engine,
+                            &tool_sections,
+                            &gs,
+                            &conv_config,
+                        ) {
+                            Ok(summary) => {
+                                match conv.write_tool_summary(catalog_hash, &summary) {
+                                    Ok(()) => {
+                                        // Force the record durable now — the summary
+                                        // is expensive to regenerate, so don't risk
+                                        // losing it to an early shutdown.
+                                        if let Err(e) = engine.checkpoint_persistence() {
+                                            tracing::warn!("tool summary checkpoint failed: {e}");
+                                        }
+                                        tracing::info!(
+                                            chars = summary.len(),
+                                            "tool summary regenerated + persisted",
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!("tool summary persist failed: {e}"),
+                                }
+                                Some(summary)
+                            }
+                            Err(e) => {
+                                tracing::warn!("tool summary generation failed: {e:#}");
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Seal the summary as a section, re-prefilled with the same prefix the
+            // tool sections see (the non-template sections before the `tools`
+            // collection), so its KV is position-correct for "just before the
+            // tools". First run ingests + persists (content-addressed); a restart
+            // restores it from disk under the reserved id.
+            if let Some(text) = summary_text {
+                let prelude = pre_tools_section_ids(&proj_builder_refresh);
+                let sid = SectionId::reserved(Reserved::ToolSummary);
+                match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
+                    Ok(()) => tracing::info!(
+                        section = sid.raw(),
+                        prelude = prelude.len(),
+                        "tool summary section sealed (re-prefilled before tools)",
+                    ),
+                    Err(e) => tracing::warn!("tool summary section seal failed: {e}"),
+                }
+            }
+        }
 
         // Dedicated titler conversation. Lives on the `Reserved::Titler`
         // id range (at the top of the u32 space) so its layer/group/section
@@ -392,13 +508,20 @@ impl InferenceState {
             )?
         };
 
-        Ok(Arc::new(Self {
+        // The titler runs on a single dedicated worker thread fed by this
+        // queue. The worker owns the titler `Sequence` exclusively (no shared
+        // mutex, so title generation never serialises against the request
+        // path), and is joined on shutdown so its in-flight turn unwinds.
+        let (titler_tx, titler_rx) = sync_channel(TITLER_QUEUE_DEPTH);
+        let state = Arc::new(Self {
             decoder,
             engine,
             conversations: Mutex::new(HashMap::new()),
             base_conv: Mutex::new(base_conv),
-            titler: Mutex::new(titler),
+            titler_tx,
+            titler_worker: Mutex::new(None),
             titler_timeline,
+            shutting_down: AtomicBool::new(false),
             repo_map_conv: Mutex::new(RepoMapConv {
                 sequence: repo_map_sequence,
                 state: repo_map_state,
@@ -411,7 +534,12 @@ impl InferenceState {
             workspace,
             tokenizer,
             tool_host: ToolHost::new(),
-        }))
+        });
+        let worker_state = Arc::clone(&state);
+        let worker =
+            std::thread::spawn(move || titler_worker_loop(worker_state, titler, titler_rx));
+        *state.titler_worker.lock().unwrap() = Some(worker);
+        Ok(state)
     }
 
     /// Build a [`RefreshContext`] bound to this state's engine,
@@ -511,12 +639,37 @@ impl InferenceState {
 /// turns.  `<tool_call>` markup appears at the tail of those responses
 /// so the user sees the natural-language prefix streamed live and the
 /// tool markup appear at the end before the follow-up response begins.
+/// Clone the live projection builder with a high-resolution capture override.
+///
+/// `spec` selects what to force:
+/// - `"tools"` — force the whole `tools` collection to AllVisible (all sections);
+/// - `"tools/datetime"` — emit ONLY the `datetime` section of `tools`.
+///
+/// The clone shares all section ids with the base, so a forked sequence's
+/// already-sealed section KV is reused unchanged.
+fn build_hires_projection(state: &InferenceState, spec: &str) -> anyhow::Result<Arc<Builder>> {
+    let mut b = state.refresh_builder.clone();
+    let dialogue = b
+        .id_for_layer("dialogue")
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'dialogue' layer"))?;
+    if let Some((collection, section)) = spec.split_once('/') {
+        b.set_collection_single_section(dialogue, collection, section)
+            .map_err(|e| anyhow::anyhow!("force-hires '{spec}': {e}"))?;
+    } else {
+        b.set_collection_selection(dialogue, spec, SelectionRule::AlwaysVisible)
+            .map_err(|e| anyhow::anyhow!("force-hires '{spec}': {e}"))?;
+    }
+    Ok(Arc::new(b))
+}
+
 fn run_inference_stream(
     state: Arc<InferenceState>,
     conv_id: String,
     user_message: String,
     max_tokens: Option<usize>,
     sampling: Option<candle_conversation::SamplingConfig>,
+    force_hires: Option<String>,
+    assistant_prefill: Option<String>,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send + 'static>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<String>>(64);
 
@@ -570,25 +723,51 @@ fn run_inference_stream(
             tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
         }
 
-        // Fire the titler in parallel with the main decode, now that
-        // the timeline is registered and the conv_id is in-RAM (so the
-        // titler's `set_conversation_label` write composes correctly
-        // with the conv_id field of the same Label record).
+        // Hand the titler off to its worker, now that the timeline is
+        // registered and the conv_id is in-RAM (so the titler's
+        // `set_conversation_label` write composes correctly with the conv_id
+        // field of the same Label record). The decode runs in the background,
+        // batched alongside the main decode. Enqueue is non-blocking: a full
+        // queue or in-progress shutdown drops the job (labels are best-effort).
         let already_labelled = state
             .engine
             .lock()
             .unwrap()
             .conversation_label_of(timeline)
             .is_some();
-        if !already_labelled && !user_message.is_empty() {
-            let state_for_titler = Arc::clone(&state);
-            let user_msg_for_titler = user_message.clone();
-            std::thread::spawn(move || {
-                generate_and_set_title(state_for_titler, timeline, user_msg_for_titler);
-            });
+        if !already_labelled
+            && !user_message.is_empty()
+            && !state.shutting_down.load(Ordering::Relaxed)
+        {
+            let job = TitleJob::Title {
+                timeline,
+                message: user_message.clone(),
+            };
+            if let Err(e) = state.titler_tx.try_send(job) {
+                tracing::debug!("titler queue full or closed — skipping label: {e}");
+            }
         }
 
         let mut cs = conv_arc.lock().unwrap();
+
+        // Capture aid: force a section collection (e.g. `tools`) to full
+        // resolution for this conversation by swapping its projection to a
+        // clone with that collection set to AllVisible. Both the prefill
+        // projection and the reprojection read the swapped builder, so neither
+        // filters the collection's sections.
+        if let Some(ref coll) = force_hires {
+            match build_hires_projection(&state, coll) {
+                Ok(b) => {
+                    cs.conv.set_projection(b);
+                    tracing::info!(conv_id = %conv_id, collection = %coll,
+                        "force-high-resolution: collection forced to AllVisible");
+                }
+                Err(e) => {
+                    tracing::warn!(conv_id = %conv_id, "force-high-resolution failed: {e}")
+                }
+            }
+        }
+
         let original_user_message = user_message.clone();
         let mut current_message = user_message;
 
@@ -597,6 +776,13 @@ fn run_inference_stream(
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: sampling.clone(),
+                // Seed the response only on the first turn — forcing every chained
+                // tool iteration would prevent the model ever giving a final answer.
+                assistant_prefill: if iteration == 0 {
+                    assistant_prefill.clone()
+                } else {
+                    None
+                },
                 ..Default::default()
             };
             let handle = match cs.conv.submit_turn_with_options(&current_message, options) {
@@ -710,7 +896,12 @@ fn run_inference_stream(
             }
 
             let calls = extract_tool_calls(&resp.text);
-            let is_final = calls.is_empty() || iteration == MAX_TOOL_ITERATIONS;
+            // Force-high-resolution is a capture mode: seal the first turn (the
+            // tool invocation) into the substrate as the dataset baseline, but
+            // do NOT execute the tools — capture-only, so `code_run` / network
+            // tools have no real side effects.
+            let is_final =
+                calls.is_empty() || iteration == MAX_TOOL_ITERATIONS || force_hires.is_some();
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
@@ -752,71 +943,107 @@ fn run_inference_stream(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
-/// Run the titler conversation against `user_message` and write the result
-/// as the main conversation's sidebar label. Runs on a detached thread so
-/// the user-facing SSE stream isn't blocked. Errors are logged and dropped
-/// — the worst case is a missing sidebar label, never a failed response.
-fn generate_and_set_title(state: Arc<InferenceState>, timeline: TimelineId, user_message: String) {
+/// The titler worker thread. Owns the titler [`Sequence`] exclusively and
+/// drains title jobs one at a time off `rx`. Each title-gen overlaps the main
+/// decode (the scheduler batches both sequences), but the worker never blocks
+/// the request path and never piles up a thread per submit. Between jobs it
+/// checks the shutdown flag, so once shutdown begins it stops draining queued
+/// jobs immediately; on exit it abandons any in-flight turn so the sequence is
+/// left clean.
+fn titler_worker_loop(state: Arc<InferenceState>, mut titler: Sequence, rx: Receiver<TitleJob>) {
+    while let Ok(job) = rx.recv() {
+        if state.shutting_down.load(Ordering::Relaxed) {
+            break;
+        }
+        match job {
+            TitleJob::Shutdown => break,
+            TitleJob::Title { timeline, message } => {
+                generate_one_title(&state, &mut titler, timeline, &message);
+            }
+        }
+    }
+    // If shutdown interrupted a decode, the turn is still in flight — clear it
+    // so the sequence (and its substrate timeline) unwinds cleanly.
+    if titler.is_in_flight() {
+        titler.abort_turn();
+    }
+}
+
+/// Run the titler conversation against `user_message` and write the result as
+/// the main conversation's sidebar label. Errors are logged and dropped — the
+/// worst case is a missing sidebar label, never a failed response. Any turn
+/// that doesn't reach `Done` (scheduler error, or shutdown mid-decode) is
+/// aborted rather than left in flight, so the next title-gen can `reset`.
+fn generate_one_title(
+    state: &Arc<InferenceState>,
+    titler: &mut Sequence,
+    timeline: TimelineId,
+    user_message: &str,
+) {
     use candle_conversation::{TurnEvent, TurnOptions};
 
     let truncated = head_tail_truncate(
-        &user_message,
+        user_message,
         &state.tokenizer,
         TITLER_HEAD_TOKENS,
         TITLER_TAIL_TOKENS,
     );
 
-    let title = {
-        let mut titler = state.titler.lock().unwrap();
-        // Clear the titler's in-memory turn tree so each title-gen
-        // starts from just the system prompt (no accumulated history).
-        if let Err(e) = titler.reset() {
-            tracing::warn!("titler reset failed: {e}");
-            return;
-        }
-        let opts = TurnOptions {
-            max_tokens: Some(TITLER_MAX_TOKENS),
-            ..Default::default()
-        };
-        let handle = match titler.submit_turn_with_options(&truncated, opts) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!("titler submit failed: {e}");
-                return;
-            }
-        };
-        let mut done = None;
-        for event in handle.stream() {
-            match event {
-                TurnEvent::Done(r) => {
-                    done = Some(r);
-                    break;
-                }
-                TurnEvent::Error(e) => {
-                    tracing::warn!("titler scheduler error: {e}");
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let Some(resp) = done else {
-            tracing::warn!("titler ended without a response");
-            return;
-        };
-        let title_text = clean_title(&resp.text);
-        if let Err(e) = titler.finish_turn(handle, &resp) {
-            tracing::warn!("titler finish_turn failed: {e}");
-        }
-        title_text
+    // Clear the titler's in-memory turn tree so each title-gen starts from
+    // just the system prompt (no accumulated history).
+    if let Err(e) = titler.reset() {
+        tracing::warn!("titler reset failed: {e}");
+        return;
+    }
+    let opts = TurnOptions {
+        max_tokens: Some(TITLER_MAX_TOKENS),
+        ..Default::default()
     };
+    let handle = match titler.submit_turn_with_options(&truncated, opts) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("titler submit failed: {e}");
+            return;
+        }
+    };
+    let mut done = None;
+    for event in handle.stream() {
+        match event {
+            TurnEvent::Done(r) => {
+                done = Some(r);
+                break;
+            }
+            TurnEvent::Error(e) => {
+                tracing::warn!("titler scheduler error: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(resp) = done else {
+        // No response: scheduler error or shutdown mid-decode. Abandon the
+        // turn so it doesn't wedge the sequence (the cause of the shutdown
+        // "already has a turn in flight" reset loop).
+        tracing::warn!("titler ended without a response");
+        drop(handle);
+        titler.abort_turn();
+        return;
+    };
+    let title = clean_title(&resp.text);
+    if let Err(e) = titler.finish_turn(handle, &resp) {
+        tracing::warn!("titler finish_turn failed: {e}");
+    }
 
     if title.is_empty() {
         tracing::warn!("titler produced an empty title — skipping label write");
         return;
     }
+    // Don't touch the engine once shutdown has begun — it's being torn down.
+    if state.shutting_down.load(Ordering::Relaxed) {
+        return;
+    }
 
-    // Write the label via the engine's substrate-shared handle — no
-    // need for a Sequence (and therefore no lock on the user's ConvState).
+    // Write the label via the engine's substrate-shared handle.
     let result = state
         .engine
         .lock()
@@ -1211,14 +1438,29 @@ impl ZendSession {
             tracing::info!("shutdown: model never loaded — nothing to persist");
             return;
         };
+        // Signal the titler worker to stop draining and wake it if it's idle.
+        // This must happen before the scheduler stops so the worker skips any
+        // queued jobs (rather than failing each one against a dead scheduler).
+        state.shutting_down.store(true, Ordering::Relaxed);
+        let _ = state.titler_tx.try_send(TitleJob::Shutdown);
         let _ = tokio::task::spawn_blocking(move || {
-            let engine = state.engine.lock().unwrap();
-            match engine.checkpoint_persistence() {
-                Ok(()) => tracing::info!("shutdown: substrate checkpointed"),
-                Err(e) => tracing::error!("shutdown: checkpoint failed: {e}"),
-            }
-            if let Err(e) = engine.shutdown() {
-                tracing::error!("shutdown: scheduler stop failed: {e}");
+            {
+                let engine = state.engine.lock().unwrap();
+                match engine.checkpoint_persistence() {
+                    Ok(()) => tracing::info!("shutdown: substrate checkpointed"),
+                    Err(e) => tracing::error!("shutdown: checkpoint failed: {e}"),
+                }
+                if let Err(e) = engine.shutdown() {
+                    tracing::error!("shutdown: scheduler stop failed: {e}");
+                }
+            } // release the engine lock before joining the worker
+
+            // Join the titler worker so any in-flight title turn unwinds
+            // (via `abort_turn`) before the process exits.
+            if let Some(worker) = state.titler_worker.lock().unwrap().take() {
+                if worker.join().is_err() {
+                    tracing::warn!("shutdown: titler worker panicked");
+                }
             }
         })
         .await;
@@ -1230,13 +1472,24 @@ impl ZendSession {
         messages: Vec<ChatMessage>,
         max_tokens: Option<usize>,
         conv_id: String,
+        force_hires: Option<String>,
+        assistant_prefill: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
-        self.submit_with_sampling(messages, max_tokens, conv_id, None)
-            .await
+        self.submit_with_sampling(
+            messages,
+            max_tokens,
+            conv_id,
+            None,
+            force_hires,
+            assistant_prefill,
+        )
+        .await
     }
 
     /// Same as [`Self::submit`] but accepts an explicit
-    /// [`candle_conversation::SamplingConfig`] override.
+    /// [`candle_conversation::SamplingConfig`] override and an optional
+    /// `force_hires` collection name (zend capture: force that collection to
+    /// full resolution for this conversation — see [`ChatCompletionRequest`]).
     ///
     /// Used by tests that want deterministic generation (e.g.
     /// `SamplingConfig::argmax()` for greedy decoding) so the
@@ -1247,6 +1500,8 @@ impl ZendSession {
         max_tokens: Option<usize>,
         conv_id: String,
         sampling: Option<candle_conversation::SamplingConfig>,
+        force_hires: Option<String>,
+        assistant_prefill: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         let last_user = messages
             .iter()
@@ -1310,6 +1565,8 @@ impl ZendSession {
                     last_user.clone(),
                     max_tokens,
                     sampling,
+                    force_hires,
+                    assistant_prefill,
                 );
                 while let Some(item) = ts.next().await {
                     if tx.send(item.map(StreamItem::Token)).await.is_err() {
@@ -1421,4 +1678,30 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         }
     }
     out
+}
+
+/// The non-template content sections that precede the `tools` collection in the
+/// dialogue layer. This is the prefix the tool sections are sealed against (the
+/// summariser excludes collection members + templates from the prefix chain), so
+/// sealing the tool-summary section with the *same* prefix puts its KV exactly
+/// where "just before the tools" is.
+fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
+    let Some(layer) = builder
+        .schema()
+        .layers
+        .iter()
+        .find(|l| l.name == "dialogue")
+    else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for item in &layer.system_prompt.items {
+        match item {
+            SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
+            // The dialogue layer's only collection is `tools`; stop at it.
+            SystemPromptItem::Collection(_) => break,
+            SystemPromptItem::Section(_) => {}
+        }
+    }
+    ids
 }

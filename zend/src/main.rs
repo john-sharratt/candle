@@ -22,6 +22,7 @@ mod log_broadcast;
 mod refresh_ctx;
 mod repo_scan;
 mod session;
+mod tool_summary;
 mod tools;
 mod turn_sink;
 mod types;

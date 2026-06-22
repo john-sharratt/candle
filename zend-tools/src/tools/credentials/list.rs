@@ -1,4 +1,4 @@
-//! credential_list tool.
+//! cred_list tool.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ pub struct ListResponse {
 pub struct CredentialList;
 
 impl Tool for CredentialList {
-    const NAME: &'static str = "credential_list";
+    const NAME: &'static str = "cred_list";
     const DESCRIPTION: &'static str =
         "List all credentials available to the current user, returning metadata only — names, \
          types, usernames, default hosts, creation dates — never the secret material itself. \

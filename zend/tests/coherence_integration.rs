@@ -115,7 +115,14 @@ mod coherence {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit_with_sampling(messages, max_tokens, conv_id.to_string(), sampling)
+            .submit_with_sampling(
+                messages,
+                max_tokens,
+                conv_id.to_string(),
+                sampling,
+                None,
+                None,
+            )
             .await;
 
         let mut response = String::new();

@@ -12,7 +12,7 @@ fn file_write_unicode() {
     let ctx = ctx();
     let content = "こんにちは 🌍 — Unicode test";
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "uni.txt", "content": content}),
         &ctx,
     );
@@ -37,20 +37,16 @@ fn file_edit_not_found() {
 fn file_list_prefix() {
     let ctx = ctx();
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "alpha/a.txt", "content": "1"}),
         &ctx,
     );
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "alpha/b.txt", "content": "2"}),
         &ctx,
     );
-    harness::invoke_with_ctx(
-        "file_write",
-        json!({"path": "beta/c.txt", "content": "3"}),
-        &ctx,
-    );
+    harness::invoke_with_ctx("write", json!({"path": "beta/c.txt", "content": "3"}), &ctx);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
         json!({"prefix": "alpha/"}),
@@ -66,11 +62,7 @@ fn file_list_prefix() {
 #[test]
 fn file_delete_idempotent() {
     let ctx = ctx();
-    harness::invoke_with_ctx(
-        "file_write",
-        json!({"path": "idem.txt", "content": "x"}),
-        &ctx,
-    );
+    harness::invoke_with_ctx("write", json!({"path": "idem.txt", "content": "x"}), &ctx);
     harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
         json!({"path": "idem.txt"}),
@@ -84,13 +76,13 @@ fn file_delete_idempotent() {
 fn file_write_overwrite_created_false() {
     let ctx = ctx();
     let r1 = harness::expect_success(harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "ow.txt", "content": "v1"}),
         &ctx,
     ));
     assert_eq!(r1["created"], true);
     let r2 = harness::expect_success(harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "ow.txt", "content": "v2"}),
         &ctx,
     ));
@@ -107,7 +99,7 @@ fn file_write_overwrite_created_false() {
 fn file_edit_round_trip() {
     let ctx = ctx();
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "rt.txt", "content": "hello world"}),
         &ctx,
     );
@@ -128,7 +120,7 @@ fn file_edit_round_trip() {
 fn file_write_read_roundtrip() {
     let ctx = ctx();
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "hello.txt", "content": "hello world"}),
         &ctx,
     );
@@ -145,13 +137,13 @@ fn file_write_read_roundtrip() {
 fn file_write_creates_vs_overwrites() {
     let ctx = ctx();
     let r1 = harness::expect_success(harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "a.txt", "content": "v1"}),
         &ctx,
     ));
     assert_eq!(r1["created"], true);
     let r2 = harness::expect_success(harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "a.txt", "content": "v2"}),
         &ctx,
     ));
@@ -168,7 +160,7 @@ fn file_read_not_found() {
 fn file_edit_success() {
     let ctx = ctx();
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "edit.txt", "content": "foo bar baz"}),
         &ctx,
     );
@@ -194,7 +186,7 @@ fn file_edit_success() {
 fn file_edit_ambiguous() {
     let ctx = ctx();
     harness::invoke_with_ctx(
-        "file_write",
+        "write",
         json!({"path": "dup.txt", "content": "aa bb aa"}),
         &ctx,
     );
@@ -213,16 +205,8 @@ fn file_edit_ambiguous() {
 #[test]
 fn file_list() {
     let ctx = ctx();
-    harness::invoke_with_ctx(
-        "file_write",
-        json!({"path": "a/b.txt", "content": "1"}),
-        &ctx,
-    );
-    harness::invoke_with_ctx(
-        "file_write",
-        json!({"path": "a/c.txt", "content": "2"}),
-        &ctx,
-    );
+    harness::invoke_with_ctx("write", json!({"path": "a/b.txt", "content": "1"}), &ctx);
+    harness::invoke_with_ctx("write", json!({"path": "a/c.txt", "content": "2"}), &ctx);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_list",
         json!({"prefix": "a/"}),
@@ -235,11 +219,7 @@ fn file_list() {
 #[test]
 fn file_delete() {
     let ctx = ctx();
-    harness::invoke_with_ctx(
-        "file_write",
-        json!({"path": "del.txt", "content": "bye"}),
-        &ctx,
-    );
+    harness::invoke_with_ctx("write", json!({"path": "del.txt", "content": "bye"}), &ctx);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_delete",
         json!({"path": "del.txt"}),
@@ -253,11 +233,7 @@ fn file_delete() {
 #[test]
 fn file_present_found_and_missing() {
     let ctx = ctx();
-    harness::invoke_with_ctx(
-        "file_write",
-        json!({"path": "p.txt", "content": "hi"}),
-        &ctx,
-    );
+    harness::invoke_with_ctx("write", json!({"path": "p.txt", "content": "hi"}), &ctx);
     let resp = harness::expect_success(harness::invoke_with_ctx(
         "file_present",
         json!({

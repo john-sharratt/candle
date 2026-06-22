@@ -40,7 +40,7 @@ mod persistence {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit(messages, Some(64), conv_id.to_string())
+            .submit(messages, Some(64), conv_id.to_string(), None, None)
             .await;
         let mut response = String::new();
         while let Some(result) = stream.next().await {

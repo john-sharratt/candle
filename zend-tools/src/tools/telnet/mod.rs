@@ -7,7 +7,7 @@
 //!
 //! # Send semantics
 //!
-//! `telnet_session_send` writes the `send` string to the stream and then reads
+//! `telnet_send` writes the `send` string to the stream and then reads
 //! until the optional `expect` regex matches or `timeout_sec` elapses.  The
 //! response includes the full received text, a `matched` flag, and a
 //! `received_truncated` flag (cap: 32 KiB).
@@ -23,7 +23,7 @@
 //!
 //! # Confirmation policy
 //!
-//! `telnet_session_send` confirms every call.  Open, list, and close do not.
+//! `telnet_send` confirms every call.  Open, list, and close do not.
 
 use crate::ToolError;
 use thiserror::Error;

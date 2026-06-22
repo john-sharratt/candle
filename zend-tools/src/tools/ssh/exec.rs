@@ -37,7 +37,7 @@ impl Tool for SshSessionExec {
     const DESCRIPTION: &'static str =
         "Run a command on a remote server through an open SSH session. \
          Returns stdout, stderr, exit code, working directory, and duration. \
-         Use ssh_session_open first. Every command requires confirmation.";
+         Use ssh_open first. Every command requires confirmation.";
 
     type Request = ExecRequest;
     type Response = ExecResponse;

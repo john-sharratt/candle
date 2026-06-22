@@ -24,10 +24,10 @@ pub const FILE_MAGIC: u32 = 0x474f_4c53;
 
 /// On-disk file-format version.
 ///
-/// Bumped to `2` for the per-half turn split — `TurnDecl` gained
-/// `user_chunk_count` / `user_token_count` / `user_sig_count`
-/// partition fields and reload semantics changed to write to the
-/// assistant half of the in-memory `TurnEntryData`.  Old (v1) logs
+/// Bumped to `2` for the per-half turn split — `TurnDecl` gained the
+/// `user_content_start` / `user_content_end` / `assistant_content_start`
+/// content boundaries and reload semantics changed to window the turn's
+/// content halves out of the in-memory `TurnEntryData`.  Old (v1) logs
 /// are rejected on open, forcing a clean rebuild rather than silently
 /// loading pre-split records into the new substrate shape.
 pub const FILE_FORMAT_VERSION: u32 = 2;

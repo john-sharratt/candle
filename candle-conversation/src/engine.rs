@@ -11,7 +11,7 @@ use crate::projection::{
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
-use crate::substrate::{ConvCompression, Substrate};
+use crate::substrate::{ConvCompression, Substrate, TurnContentBounds};
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
@@ -435,12 +435,6 @@ impl ConversationEngine {
         self.conversation.pending_summary_len(timeline)
     }
 
-    /// Backpressure metric — summary nodes currently dirty for
-    /// `timeline`.  Zero when the dirty sweep is caught up.
-    pub fn dirty_summary_len(&self, timeline: TimelineId) -> usize {
-        self.conversation.dirty_summary_len(timeline)
-    }
-
     /// Test-harness diagnostic — the most recent score-density
     /// [`SelectionDiagnostics`] for `timeline`, or `None` if no
     /// projection has run yet (or projection used the rule-based
@@ -678,12 +672,13 @@ impl ConversationEngine {
         };
         self.conversation
             .set_timeline_compression(timeline, compression);
-        // Utility/reference layers (repo_map, code_reading) are append-only and
-        // must not be summarised — summarising them is pointless work that
-        // storms the summariser during repo ingest/scan. `disable_reprojection`
-        // is exactly the utility-layer marker; reuse it as the summarise gate.
-        self.conversation
-            .set_timeline_summarize(timeline, !config.disable_reprojection);
+        // Every layer summarises into its AVL summary tree; provenance scans then
+        // expand the compressed nodes on retrieval. This is independent of
+        // `disable_reprojection` — that flag only gates the per-turn reprojection
+        // and the O(n²) BDP scan for append-only utility layers. The AVL
+        // summariser runs on its own thread (wave-driven compression) and never
+        // blocks ingest, so even high-turn-count utility layers can summarise.
+        self.conversation.set_timeline_summarize(timeline, true);
         let target = ProjectionTarget {
             layer,
             group,
@@ -780,6 +775,7 @@ impl ConversationEngine {
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),
                 user_text: String::new(),
+                content_bounds: TurnContentBounds::default(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens,
                 sampling: SamplingConfig::argmax(),

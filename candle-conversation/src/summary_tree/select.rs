@@ -370,11 +370,11 @@ fn lca_of_normals(
     None
 }
 
-/// Build a child → parent map by walking the tree from the root.
+/// Build a child → parent map by walking the forest from every peak.
 fn build_parent_map(tree: &SummaryTree) -> AHashMap<NodeId, NodeId> {
     let mut map: AHashMap<NodeId, NodeId> = AHashMap::default();
-    if let Some(root) = tree.root() {
-        walk_parents(tree, root, &mut map);
+    for peak in tree.peaks() {
+        walk_parents(tree, peak, &mut map);
     }
     map
 }
@@ -511,15 +511,13 @@ mod tests {
                 normals.push(NodeId(next_normal_id));
                 next_normal_id += 1;
             }
-            // Insert the SoT leaf with its normals.  But the
-            // `insert_leaf_rightmost` API expects the normals to
-            // already be present in the tree (or it'll skip
-            // registering them).  Insert them as Normal nodes first.
+            // Register the leaf's Normal children first, then append the SoT
+            // leaf (which runs the ternary carry as needed).
             for n in &normals {
                 tree.insert_node(Node::normal(*n, tokens_per_normal));
             }
             let leaf = Node::summary_of_turns(NodeId(leaf_id), normals.clone(), tokens_per_summary);
-            tree.insert_leaf_rightmost(leaf);
+            tree.append_leaf(leaf);
             all_normals.extend(normals);
         }
         (tree, all_normals)
@@ -593,40 +591,42 @@ mod tests {
 
     #[test]
     fn redundancy_eliminates_ancestor_when_all_children_selected() {
-        // Build a tree, hand-curate `selected` with both children of
-        // an internal node, then call eliminate_redundant directly.
-        let (tree, _) = build_uniform_tree(2, 1, 10, 20);
+        // Three SoT leaves carry into one ternary SoS internal; selecting all
+        // three children makes the ancestor redundant.
+        let (tree, _) = build_uniform_tree(3, 1, 10, 20);
         let mut sel: AHashSet<NodeId> = AHashSet::default();
         sel.insert(NodeId(1));
         sel.insert(NodeId(2));
+        sel.insert(NodeId(3));
         // The auto-generated SoS internal has id 2^31.
         let internal = NodeId(1u32 << 31);
         sel.insert(internal);
-        // 20 (leaf 1) + 20 (leaf 2) + 20 (internal, DEFAULT_INTERNAL_TOKENS).
-        let mut used = 60;
+        // 3 × 20 (leaves) + 20 (internal, DEFAULT_INTERNAL_TOKENS).
+        let mut used = 80;
         eliminate_redundant(&tree, &mut sel, &mut used);
         assert!(!sel.contains(&internal));
         assert!(sel.contains(&NodeId(1)));
         assert!(sel.contains(&NodeId(2)));
+        assert!(sel.contains(&NodeId(3)));
         // The dropped internal returns its 20 tokens to the budget.
-        assert_eq!(used, 40);
+        assert_eq!(used, 60);
     }
 
     #[test]
     fn redundancy_keeps_ancestor_when_one_child_uncovered() {
-        // SoS with two SoT leaves; only one leaf selected.  Ancestor
-        // must stay if it's selected (it's the only way to cover the
-        // other side).
-        let (tree, _) = build_uniform_tree(2, 1, 10, 20);
+        // Ternary SoS over three SoT leaves; only two selected. The ancestor
+        // must stay — it's the only way to cover the third leaf.
+        let (tree, _) = build_uniform_tree(3, 1, 10, 20);
         let mut sel: AHashSet<NodeId> = AHashSet::default();
         sel.insert(NodeId(1));
+        sel.insert(NodeId(2));
         let internal = NodeId(1u32 << 31);
         sel.insert(internal);
-        let mut used = 40;
+        let mut used = 60;
         eliminate_redundant(&tree, &mut sel, &mut used);
         assert!(
             sel.contains(&internal),
-            "SoS must stay when right child uncovered"
+            "SoS must stay when a child is uncovered"
         );
         assert!(sel.contains(&NodeId(1)));
     }
@@ -636,7 +636,7 @@ mod tests {
         // `covered(node, sel)` from §8.4 means: every leaf descendant
         // of `node` is in `sel` (or `node` itself is).  It does NOT
         // walk upward.  This is the redundancy-elimination semantics.
-        let (tree, _) = build_uniform_tree(2, 2, 10, 20);
+        let (tree, _) = build_uniform_tree(3, 2, 10, 20);
         let internal = NodeId(1u32 << 31);
 
         // SoS in sel → trivially covered.
@@ -649,11 +649,12 @@ mod tests {
         // asks).
         assert!(!covered(&tree, NodeId(1), &sel_internal));
 
-        // Both SoT leaves in sel → SoS is covered (its 2 binary children
-        // are both in sel).
+        // All three SoT leaves in sel → SoS is covered (its ternary children
+        // are all in sel).
         let mut sel_leaves = AHashSet::default();
         sel_leaves.insert(NodeId(1));
         sel_leaves.insert(NodeId(2));
+        sel_leaves.insert(NodeId(3));
         assert!(covered(&tree, internal, &sel_leaves));
         // ...and each leaf is covered (in sel).
         assert!(covered(&tree, NodeId(1), &sel_leaves));
@@ -711,12 +712,15 @@ mod tests {
 
     #[test]
     fn lca_of_normals_across_leaves_finds_common_ancestor() {
-        let (tree, normals) = build_uniform_tree(4, 1, 10, 20);
+        let (tree, normals) = build_uniform_tree(3, 1, 10, 20);
         let parents = build_parent_map(&tree);
         let map = build_normal_to_leaf_map(&tree);
-        // Normals 0 and 3 span all 4 leaves → LCA = root.
-        let lca = lca_of_normals(&tree, &[normals[0], normals[3]], &parents, &map);
-        assert_eq!(lca, tree.root());
+        // Three leaves carry into a single ternary SoS peak; normals 0 and 2
+        // span all three leaves → LCA = that sole peak.
+        let lca = lca_of_normals(&tree, &[normals[0], normals[2]], &parents, &map);
+        let peaks = tree.peaks();
+        assert_eq!(peaks.len(), 1);
+        assert_eq!(lca, Some(peaks[0]));
     }
 
     #[test]

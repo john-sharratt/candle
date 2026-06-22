@@ -53,12 +53,13 @@ use candle_nn::kv_cache::{QuantFormat, SealedSequence};
 use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::sync::Arc;
 
+use crate::conversation::window_sealed_tokens;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, RecordType, TombstonePayload, TreeMetadataPayload,
+    DebugIdPayload, RecordType, TombstonePayload, ToolSummaryPayload, TreeMetadataPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -68,7 +69,7 @@ use crate::projection::{
 };
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
-    TurnKind,
+    TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
 use crate::SigEntry;
@@ -178,6 +179,10 @@ pub struct Substrate {
     /// `StreamDecl::Turn`) — registration just observes them as
     /// already tombstoned, which is the correct behaviour.
     tombstoned_timelines: HashSet<TimelineId>,
+    /// Latest cached tool-catalog summary (the `ToolSummary` singleton),
+    /// last-writer-wins. The startup hook reads `catalog_hash` to decide whether
+    /// the catalog changed and the summary must be regenerated.
+    tool_summary: Option<ToolSummaryPayload>,
 }
 
 // ── Tier residence ────────────────────────────────────────────────────────────
@@ -640,6 +645,58 @@ pub struct SectionEntryData {
 /// submit time — no role markers, no `/no_think` prefix.  They're
 /// stored verbatim so the sidebar reload path renders without any
 /// re-tokenising or boundary scanning.
+/// The three content boundaries that frame a turn's user-message body
+/// and assistant-response body inside the sealed K/V grid.
+///
+/// A turn is sealed with the chat template's role markers baked into the
+/// grid:
+/// `[user_start][no_think][user_msg][user_end][assistant_start][response]`.
+/// The compressor injects *content-only* halves — the user message body
+/// or the assistant response body — with no surrounding markers, so it
+/// needs to know where each body begins and ends in token-index terms:
+///
+/// - `user_start` — token index where the user *message* begins, after
+///   the leading `[user_start][no_think]` markers.
+/// - `user_end` — token index where the user message ends, before the
+///   `[user_end]` marker.
+/// - `asst_start` — token index where the assistant *response* begins,
+///   after the `[user_end][assistant_start]` markers.
+///
+/// The assistant content runs from `asst_start` to the turn's total token
+/// count.  The boundaries are kept monotonic and clamped to the turn's
+/// length at every seal site:
+/// `user_start <= user_end <= asst_start <= total`.
+///
+/// [`turn_user_sealed_half`](Substrate::turn_user_sealed_half) windows the
+/// sealed grid to `[user_start, user_end)` for the injected user half via
+/// [`window_sealed_tokens`](crate::conversation::window_sealed_tokens), and
+/// [`turn_assistant_token_ids`](Substrate::turn_assistant_token_ids) slices
+/// `[asst_start, total)` for the text-prefilled assistant half — so neither
+/// half carries a leading or trailing template marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnContentBounds {
+    pub user_start: u32,
+    pub user_end: u32,
+    pub asst_start: u32,
+}
+
+impl TurnContentBounds {
+    /// Build clamped, monotonic bounds for a turn of `total` tokens.
+    /// Each boundary is clamped to `total` and forced non-decreasing so a
+    /// tokenizer that merges across a join (producing a prefix length
+    /// longer than the body it sits in) can never invert the windows.
+    pub fn clamped(user_start: usize, user_end: usize, asst_start: usize, total: usize) -> Self {
+        let us = user_start.min(total);
+        let ue = user_end.min(total).max(us);
+        let as_ = asst_start.min(total).max(ue);
+        TurnContentBounds {
+            user_start: us as u32,
+            user_end: ue as u32,
+            asst_start: as_ as u32,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnPart {
     /// The user's message text, exactly as `submit_turn` received it
@@ -667,6 +724,12 @@ pub struct TurnPart {
     /// same bytes so cross-process replay (`recover_turn`)
     /// reconstructs the slot K/V exactly.
     pub token_ids: TokenBuffer,
+    /// Content boundaries that frame the user-message body and the
+    /// assistant-response body inside the sealed grid — see
+    /// [`TurnContentBounds`].  The compressor windows the sealed K/V to
+    /// these boundaries so it injects content-only halves with no template
+    /// markers.  All-zero where the boundaries are genuinely unknown.
+    pub content_bounds: TurnContentBounds,
     pub sig_entries: Vec<SigEntry>,
     /// Slot in [`Substrate::residence`] holding this turn's
     /// hot/warm/cold KV state.
@@ -691,6 +754,8 @@ pub struct TurnPartWrite {
     pub assistant_text: String,
     pub token_ids: TokenBuffer,
     pub token_count: usize,
+    /// Content boundaries — see [`TurnPart::content_bounds`].
+    pub content_bounds: TurnContentBounds,
     pub block_start: u64,
     pub block_end: u64,
     pub sealed_gpu: Option<Arc<Vec<SealedSequence>>>,
@@ -872,19 +937,14 @@ pub struct TimelineEntry {
     /// in index order — naturally matches the append-monotonic semantic
     /// the old `tails: Vec<TurnIndex>` field used to encode separately.
     pub turns: BTreeMap<TurnIndex, TurnEntryData>,
-    /// Per-turn tree metadata for the infinite-conversation summary
-    /// tree (`docs/infinite_conversations.md` §5).  Parallel to
-    /// `turns`: every recorded turn carries exactly one
-    /// [`TreeNodeMeta`] entry (defaults to a `Normal` content
-    /// sub-leaf with no children).  Promoted to a
-    /// `SummaryOfTurns` / `SummaryOfSummaries` by the async
-    /// summariser thread after the §6 probe runs.
+    /// Per-turn tree metadata for the immutable summary forest
+    /// (`docs/immutable_summary_forest.md`).  Parallel to `turns`: every
+    /// recorded turn carries exactly one [`TreeNodeMeta`] entry (defaults to a
+    /// `Normal` content sub-leaf with no children).  Promoted to a
+    /// `SummaryOfTurns` / `SummaryOfSummaries` by the async summariser thread
+    /// after the §6 probe runs.  The peak set (window entry points) is derived
+    /// from this map — see [`Substrate::peaks_of`].
     pub tree_meta: BTreeMap<TurnIndex, TreeNodeMeta>,
-    /// Root of the per-timeline summary tree.  `None` until the first
-    /// `SummaryOfTurns` leaf is sealed.  Persisted as part of the
-    /// timeline's `TreeMetadata` records on the redo log and
-    /// reconstructed on cold-load.
-    pub tree_root: Option<TurnIndex>,
     /// Optional substrate-side resume key.  Set via
     /// [`Substrate::set_debug_id`] and reverse-indexed by
     /// [`Substrate::timeline_by_debug_id`].  Used by the
@@ -903,10 +963,13 @@ pub struct TimelineEntry {
     /// ingest/scan. When `false`, turns are never pushed onto
     /// `pending_summary_queue`, so the summariser never touches this timeline.
     pub summarize: bool,
-    /// Summary nodes whose stored Q-fingerprint is stale because their
-    /// children changed (most commonly after an AVL rotation).  The
-    /// summariser sweep regenerates one per pass (§7.3).
-    pub dirty_summary_set: std::collections::BTreeSet<TurnIndex>,
+    /// Set on cold-load (and after the old-AVL migration) to ask the summariser
+    /// to reconcile this timeline's persisted forest against the canonical
+    /// ternary shape — building any missing/mismatched internal nodes on the
+    /// low-priority queue.  Cleared once [`Substrate::reconcile_next`] reports
+    /// the forest whole.  Live appends keep the forest whole, so this stays
+    /// `false` during normal operation.
+    pub needs_reconcile: bool,
     /// Most recent score-density [`SelectionDiagnostics`] for this
     /// timeline, written by the scheduler at projection time and read
     /// by the test harness via
@@ -920,29 +983,23 @@ pub struct TimelineEntry {
 
 /// Tree-bookkeeping metadata stored alongside every substrate turn.
 ///
-/// Every persisted turn carries one of these — defaults are a `Normal`
-/// content sub-leaf with no children and a clean dirty flag.  Summary
-/// nodes (produced by the §6 probe) overwrite the defaults with the
-/// real kind / children / height when the summariser thread seals
-/// them.
+/// Every persisted turn carries one of these — defaults are a `Normal` content
+/// sub-leaf with no children.  Summary nodes (produced by the §6 probe)
+/// overwrite the defaults with the real kind / children / level when the
+/// summariser thread seals them.  Nodes are immutable once promoted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeNodeMeta {
     /// Three-kind tag from `summary_tree::TurnKind`, mirrored here so
     /// the substrate is the single source of truth and the redo-log
     /// codec can round-trip without depending on the algorithm module.
     pub kind: TurnKind,
-    /// For `SummaryOfTurns`: the Normal-turn children in
-    /// chronological order.  For `SummaryOfSummaries`: exactly the
-    /// `[left, right]` summary children.  For `Normal`: empty.
+    /// For `SummaryOfTurns`: the Normal-turn children in chronological order.
+    /// For `SummaryOfSummaries`: exactly `MERGE_FANOUT` same-level summary
+    /// children.  For `Normal`: empty.
     pub children: Vec<TurnIndex>,
-    /// AVL height for binary summary nodes.  Always `0` for `Normal`.
-    /// `SummaryOfTurns` defaults to `1`; `SummaryOfSummaries` carries
-    /// `max(child_height) + 1` per the standard AVL invariant.
+    /// Forest level.  Always `0` for `Normal`.  `SummaryOfTurns` is `1`;
+    /// `SummaryOfSummaries` carries `child_level + 1`.
     pub tree_height: u8,
-    /// `true` when this summary's children have changed since the
-    /// stored content (and its Q-fingerprint) was generated.  The
-    /// summariser sweep clears this when it regenerates.
-    pub dirty: bool,
 }
 
 impl Default for TreeNodeMeta {
@@ -951,7 +1008,6 @@ impl Default for TreeNodeMeta {
             kind: TurnKind::Normal,
             children: Vec::new(),
             tree_height: 0,
-            dirty: false,
         }
     }
 }
@@ -960,6 +1016,25 @@ impl TreeNodeMeta {
     /// Sensible default for a Normal content turn.
     pub fn normal() -> Self {
         Self::default()
+    }
+}
+
+/// Smallest Normal-turn index covered by `idx` within a timeline's `tree_meta`.
+/// Defines the chronological order of peaks (and of any subtree): a node sorts
+/// by the oldest content beneath it.
+fn leftmost_normal_in(tree_meta: &BTreeMap<TurnIndex, TreeNodeMeta>, idx: TurnIndex) -> u32 {
+    match tree_meta.get(&idx) {
+        None => idx.0,
+        Some(meta) => match meta.kind {
+            TurnKind::Normal => idx.0,
+            TurnKind::SummaryOfTurns => meta.children.iter().map(|c| c.0).min().unwrap_or(idx.0),
+            TurnKind::SummaryOfSummaries => meta
+                .children
+                .iter()
+                .map(|c| leftmost_normal_in(tree_meta, *c))
+                .min()
+                .unwrap_or(idx.0),
+        },
     }
 }
 
@@ -995,11 +1070,10 @@ impl TimelineEntry {
             archived: false,
             turns: BTreeMap::new(),
             tree_meta: BTreeMap::new(),
-            tree_root: None,
             debug_id: None,
             pending_summary_queue: std::collections::VecDeque::new(),
             summarize: true,
-            dirty_summary_set: std::collections::BTreeSet::new(),
+            needs_reconcile: false,
             last_selection: None,
         }
     }
@@ -1840,56 +1914,149 @@ impl Substrate {
             .and_then(|tl| tl.tree_meta.get(&idx))
     }
 
-    /// Overwrite a turn's [`TreeNodeMeta`].  The summariser thread
-    /// calls this once it has decided how a turn slots into the
-    /// summary tree (Normal sub-leaf vs SummaryOfTurns leaf vs
-    /// SummaryOfSummaries internal).  Clearing `dirty` is the caller's
-    /// responsibility; this method writes the value verbatim.
+    /// Overwrite a turn's [`TreeNodeMeta`].  The summariser thread calls this
+    /// once, to promote a turn into the forest (Normal sub-leaf → SummaryOfTurns
+    /// leaf, or to record a fresh SummaryOfSummaries internal).  Nodes are
+    /// immutable: an existing summary node is never rewritten.
     pub fn set_tree_meta(&mut self, timeline: TimelineId, idx: TurnIndex, meta: TreeNodeMeta) {
         if let Some(tl) = self.timelines.get_mut(&timeline) {
             tl.tree_meta.insert(idx, meta);
         }
     }
 
-    /// Mark a summary node dirty (children changed; stored Q-fingerprint
-    /// no longer reflects the subtree).  Adds the node to the dirty set
-    /// so the summariser sweep picks it up.  No-op for Normal turns.
-    pub fn mark_summary_dirty(&mut self, timeline: TimelineId, idx: TurnIndex) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
-            if let Some(meta) = tl.tree_meta.get_mut(&idx) {
-                if meta.kind.is_summary() {
-                    meta.dirty = true;
-                    tl.dirty_summary_set.insert(idx);
+    /// The peak set — orphan summary nodes (no parent), in chronological order
+    /// (oldest/leftmost-covering first), each paired with its level.  These are
+    /// the window's coarse entry points (`docs/immutable_summary_forest.md`).
+    pub fn peaks_of(&self, timeline: TimelineId) -> Vec<(TurnIndex, u8)> {
+        let Some(tl) = self.timelines.get(&timeline) else {
+            return Vec::new();
+        };
+        let mut claimed: std::collections::BTreeSet<TurnIndex> = std::collections::BTreeSet::new();
+        for meta in tl.tree_meta.values() {
+            if meta.kind == TurnKind::SummaryOfSummaries {
+                for c in &meta.children {
+                    claimed.insert(*c);
                 }
             }
         }
+        let mut peaks: Vec<(TurnIndex, u8)> = tl
+            .tree_meta
+            .iter()
+            .filter(|(idx, meta)| meta.kind.is_summary() && !claimed.contains(*idx))
+            .map(|(idx, meta)| (*idx, meta.tree_height))
+            .collect();
+        peaks.sort_by_key(|(idx, _)| leftmost_normal_in(&tl.tree_meta, *idx));
+        peaks
     }
 
-    /// Clear the dirty bit + remove from the dirty set.  Called by the
-    /// summariser after a regeneration probe completes successfully.
-    pub fn clear_summary_dirty(&mut self, timeline: TimelineId, idx: TurnIndex) {
-        if let Some(tl) = self.timelines.get_mut(&timeline) {
-            if let Some(meta) = tl.tree_meta.get_mut(&idx) {
-                meta.dirty = false;
+    /// Cheap guard: does this timeline have any summary nodes yet?
+    pub fn has_summary_nodes(&self, timeline: TimelineId) -> bool {
+        self.timelines
+            .get(&timeline)
+            .map(|tl| tl.tree_meta.values().any(|m| m.kind.is_summary()))
+            .unwrap_or(false)
+    }
+
+    /// The next internal node to (re)build during reconciliation, expressed as
+    /// the [`MERGE_FANOUT`] child indices it must cover — the lowest buildable
+    /// node (all children already present) whose canonical `SummaryOfSummaries`
+    /// is missing from the persisted forest.  `None` once the forest matches the
+    /// canonical ternary shape for its leaves.
+    ///
+    /// Derived from the persisted state each call (the "dirty" bit is gone —
+    /// staleness is computed, never stored).  See
+    /// `docs/immutable_summary_forest.md`.
+    pub fn reconcile_next(&self, timeline: TimelineId) -> Option<Vec<TurnIndex>> {
+        let tl = self.timelines.get(&timeline)?;
+        let tm = &tl.tree_meta;
+        // SoT leaves in chronological order (by their single Normal child).
+        let mut leaves: Vec<(u32, TurnIndex)> = tm
+            .iter()
+            .filter(|(_, m)| m.kind == TurnKind::SummaryOfTurns)
+            .map(|(idx, m)| (m.children.first().map(|c| c.0).unwrap_or(idx.0), *idx))
+            .collect();
+        leaves.sort_by_key(|(normal, _)| *normal);
+        // Persisted SoS indexed by exact children signature (canonical nodes
+        // have `MERGE_FANOUT` children; old binary nodes never match).
+        let mut sos_by_children: std::collections::HashMap<Vec<TurnIndex>, TurnIndex> =
+            std::collections::HashMap::new();
+        for (idx, m) in tm {
+            if m.kind == TurnKind::SummaryOfSummaries {
+                sos_by_children.insert(m.children.clone(), *idx);
             }
-            tl.dirty_summary_set.remove(&idx);
         }
+        // Replay the ternary carry with persisted nodes; the first carry whose
+        // canonical SoS is absent is the lowest buildable rebuild.
+        let mut peaks: Vec<(TurnIndex, u8)> = Vec::new();
+        for (_, leaf_idx) in &leaves {
+            peaks.push((*leaf_idx, 1));
+            loop {
+                let n = peaks.len();
+                if n < MERGE_FANOUT {
+                    break;
+                }
+                let lvl = peaks[n - 1].1;
+                if !peaks[n - MERGE_FANOUT..].iter().all(|(_, l)| *l == lvl) {
+                    break;
+                }
+                let children: Vec<TurnIndex> =
+                    peaks[n - MERGE_FANOUT..].iter().map(|(i, _)| *i).collect();
+                match sos_by_children.get(&children) {
+                    Some(&sos_idx) => {
+                        peaks.truncate(n - MERGE_FANOUT);
+                        peaks.push((sos_idx, lvl + 1));
+                    }
+                    None => return Some(children),
+                }
+            }
+        }
+        None
     }
 
-    /// Current tree root of a timeline.
-    pub fn tree_root_of(&self, timeline: TimelineId) -> Option<TurnIndex> {
-        self.timelines.get(&timeline).and_then(|tl| tl.tree_root)
+    /// Whether the summariser should run a reconcile pass for this timeline.
+    pub fn needs_reconcile(&self, timeline: TimelineId) -> bool {
+        self.timelines
+            .get(&timeline)
+            .map(|tl| tl.needs_reconcile)
+            .unwrap_or(false)
     }
 
-    /// Set the tree root for a timeline.  Used by the summariser
-    /// thread after every insertion that surfaces a new root.
-    pub fn set_tree_root(&mut self, timeline: TimelineId, root: Option<TurnIndex>) {
+    /// Set/clear the reconcile hint.
+    pub fn set_needs_reconcile(&mut self, timeline: TimelineId, v: bool) {
         if let Some(tl) = self.timelines.get_mut(&timeline) {
-            tl.tree_root = root;
+            tl.needs_reconcile = v;
         }
     }
 
-    // ── Pending + dirty queue accessors (§6 backpressure metrics) ──────────
+    /// Prepare a freshly-loaded timeline for reconciliation: drop any
+    /// non-canonical `SummaryOfSummaries` meta (e.g. binary nodes written by the
+    /// superseded AVL code) so the ternary canonical nodes can be rebuilt, and
+    /// arm the reconcile hint when the forest isn't already whole.
+    pub fn mark_for_reconcile(&mut self, timeline: TimelineId) {
+        let Some(tl) = self.timelines.get_mut(&timeline) else {
+            return;
+        };
+        let noncanonical: Vec<TurnIndex> = tl
+            .tree_meta
+            .iter()
+            .filter(|(_, m)| {
+                m.kind == TurnKind::SummaryOfSummaries && m.children.len() != MERGE_FANOUT
+            })
+            .map(|(idx, _)| *idx)
+            .collect();
+        for idx in noncanonical {
+            tl.tree_meta.remove(&idx);
+        }
+        // Arm reconcile when any leaf exists; `reconcile_next` returns `None`
+        // immediately when the forest is already whole, so this is cheap.
+        let has_leaf = tl
+            .tree_meta
+            .values()
+            .any(|m| m.kind == TurnKind::SummaryOfTurns);
+        tl.needs_reconcile = has_leaf;
+    }
+
+    // ── Pending + reconcile accessors (§6 backpressure metrics) ────────────
 
     /// FIFO pop: next pending turn for the summariser to absorb, or
     /// `None` if the queue is empty.
@@ -1911,29 +2078,11 @@ impl Substrate {
         }
     }
 
-    /// Pop the oldest dirty summary node.  Returns `None` when no
-    /// summary is currently dirty.  The summariser sweep regenerates
-    /// at most one node per pass (§7.3).
-    pub fn pop_oldest_dirty(&mut self, timeline: TimelineId) -> Option<TurnIndex> {
-        let tl = self.timelines.get_mut(&timeline)?;
-        let id = *tl.dirty_summary_set.iter().next()?;
-        tl.dirty_summary_set.remove(&id);
-        Some(id)
-    }
-
     /// `pending_summary_queue.len()` — backpressure metric (§9).
     pub fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.timelines
             .get(&timeline)
             .map(|tl| tl.pending_summary_queue.len())
-            .unwrap_or(0)
-    }
-
-    /// `dirty_summary_set.len()` — backpressure metric (§9).
-    pub fn dirty_summary_len(&self, timeline: TimelineId) -> usize {
-        self.timelines
-            .get(&timeline)
-            .map(|tl| tl.dirty_summary_set.len())
             .unwrap_or(0)
     }
 
@@ -2048,9 +2197,8 @@ impl Substrate {
             tl.archived = false;
             tl.debug_id = None;
             tl.tree_meta.clear();
-            tl.tree_root = None;
             tl.pending_summary_queue.clear();
-            tl.dirty_summary_set.clear();
+            tl.needs_reconcile = false;
         }
     }
 
@@ -2084,19 +2232,12 @@ impl Substrate {
                     TurnKind::SummaryOfTurns => 1,
                     TurnKind::SummaryOfSummaries => 2,
                 };
-                let root_now = if tl.tree_root == Some(*idx) {
-                    Some(idx.0)
-                } else {
-                    None
-                };
                 out.push(TreeMetadataPayload {
                     timeline_id: tid.raw(),
                     turn_index: idx.0,
                     kind,
                     tree_height: meta.tree_height,
-                    dirty: meta.dirty,
                     children: meta.children.iter().map(|c| c.0).collect(),
-                    root_now,
                 });
             }
         }
@@ -2212,8 +2353,9 @@ impl Substrate {
         }
     }
 
-    /// Apply a decoded `TreeMetadataPayload`.  Sets per-turn tree
-    /// meta + (if `root_now` is set) the timeline's tree root.
+    /// Apply a decoded `TreeMetadataPayload` — sets the turn's per-node forest
+    /// meta (kind / children / level).  The peak set is derived, so there is no
+    /// root marker to apply.
     pub fn apply_tree_metadata_payload(&mut self, payload: &TreeMetadataPayload) {
         let Some(timeline) = TimelineId::from_raw(payload.timeline_id) else {
             return;
@@ -2228,12 +2370,8 @@ impl Substrate {
             kind,
             children: payload.children.iter().map(|c| TurnIndex(*c)).collect(),
             tree_height: payload.tree_height,
-            dirty: payload.dirty,
         };
         self.set_tree_meta(timeline, TurnIndex(payload.turn_index), meta);
-        if let Some(root) = payload.root_now {
-            self.set_tree_root(timeline, Some(TurnIndex(root)));
-        }
     }
 
     /// Apply a decoded `DebugIdPayload`.
@@ -2355,7 +2493,13 @@ impl Substrate {
                     self.apply_tombstone(&payload);
                 }
             }
-            // Singletons go to the manifest, not the substrate.
+            RecordType::ToolSummary => {
+                if let Ok(payload) = ToolSummaryPayload::decode(&entry.record.payload) {
+                    self.apply_tool_summary(payload);
+                }
+            }
+            // Model/template/tokenizer singletons go to the manifest, not the
+            // substrate (their content is read on demand from the log).
             RecordType::ModelSpec
             | RecordType::Template
             | RecordType::Tokenizer
@@ -2364,10 +2508,28 @@ impl Substrate {
         }
     }
 
-    /// Build an in-memory [`summary_tree::SummaryTree`] from the
-    /// timeline's persisted `tree_meta`.  Used by the projection's
-    /// score-density selector (§8) and the cold-load missing-child
-    /// regeneration sweep.
+    /// Apply a decoded [`ToolSummaryPayload`], last-writer-wins: the walker
+    /// replays records in append order, so the final `ToolSummary` is the live
+    /// one and overwrites any earlier cached summary.
+    pub fn apply_tool_summary(&mut self, payload: ToolSummaryPayload) {
+        self.tool_summary = Some(payload);
+    }
+
+    /// The catalog hash of the currently-cached tool summary, if any. The
+    /// startup hook compares this to the freshly-injected catalog's hash to
+    /// decide whether the summary must be regenerated.
+    pub fn tool_summary_hash(&self) -> Option<u128> {
+        self.tool_summary.as_ref().map(|p| p.catalog_hash)
+    }
+
+    /// The currently-cached tool-summary text, if any.
+    pub fn tool_summary_text(&self) -> Option<&str> {
+        self.tool_summary.as_ref().map(|p| p.summary.as_str())
+    }
+
+    /// Build an in-memory [`summary_tree::SummaryTree`] (forest) from the
+    /// timeline's persisted `tree_meta`.  Used by the projection's score-density
+    /// selector (§8); the peak set is derived from node parentage.
     ///
     /// The returned tree's [`NodeId`](NodeId)
     /// values are `TurnIndex.0` directly — there's a 1-to-1 mapping
@@ -2390,7 +2552,6 @@ impl Substrate {
                 kind: meta.kind,
                 children: node_children,
                 tree_height: meta.tree_height,
-                dirty: meta.dirty,
                 tokens: token_count,
             };
             tree.insert_node(node);
@@ -2400,7 +2561,8 @@ impl Substrate {
                 TurnKind::SummaryOfSummaries => {}
             }
         }
-        tree.set_root(tl.tree_root.map(|r| NodeId(r.0)));
+        // The peak set (forest roots) is derived from the node parentage — no
+        // single root to install.
         tree
     }
 
@@ -2455,6 +2617,7 @@ impl Substrate {
                     assistant_text: String::new(),
                     token_count,
                     token_ids: TokenBuffer::default(),
+                    content_bounds: TurnContentBounds::default(),
                     sig_entries: Vec::new(),
                     residence,
                 },
@@ -2517,6 +2680,7 @@ impl Substrate {
                         assistant_text: write.assistant_text,
                         token_count: write.token_count,
                         token_ids: write.token_ids,
+                        content_bounds: write.content_bounds,
                         sig_entries: Vec::new(),
                         residence,
                     },
@@ -2554,6 +2718,7 @@ impl Substrate {
         assistant_text: String,
         token_ids: TokenBuffer,
         token_count: usize,
+        content_bounds: TurnContentBounds,
         cold: Option<Vec<StoredSequence>>,
         block_start: u64,
         block_end: u64,
@@ -2576,6 +2741,7 @@ impl Substrate {
                         assistant_text,
                         token_count,
                         token_ids,
+                        content_bounds,
                         sig_entries: Vec::new(),
                         residence,
                     },
@@ -2791,6 +2957,46 @@ impl Substrate {
         let residence = self.turn(timeline, index)?.content.residence;
         let hot = self.residence[residence.0].hot.as_ref()?;
         Some(Arc::new(hot.clone()))
+    }
+
+    /// Sealed K/V for the turn's *user-message body* `[user_start, user_end)`
+    /// (see [`TurnContentBounds`]), derived on demand as a zero-copy window
+    /// view over the turn's existing chunks via [`window_sealed_tokens`].
+    /// Content-only — no leading or trailing chat-template role marker — so
+    /// the compression assembler can inject it into the user-input region as
+    /// role-matched sealed K/V (no re-prefill) when laying down a
+    /// `SealedKind::TurnHalf` segment.
+    ///
+    /// Only the user half is injected; the assistant half is text-prefilled
+    /// instead (its assistant-role K/V would be incoherent in the
+    /// compression's user-input frame — see [`Self::turn_assistant_token_ids`]).
+    pub fn turn_user_sealed_half(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<Arc<Vec<SealedSequence>>> {
+        let full = self.turn_sealed_of(timeline, index)?;
+        let bounds = self.turn(timeline, index)?.content.content_bounds;
+        let half =
+            window_sealed_tokens(&full, bounds.user_start as usize, bounds.user_end as usize);
+        Some(Arc::new(half))
+    }
+
+    /// Token ids of the turn's *assistant-response body* `[asst_start, total)`.
+    /// The compression path prefills the assistant half as text rather than
+    /// injecting it (its assistant-role K/V are incoherent in the
+    /// compression's user-input frame); the user half is injected instead
+    /// (see [`Self::turn_user_sealed_half`]).
+    pub fn turn_assistant_token_ids(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Option<Vec<u32>> {
+        let toks = self.token_ids_of(timeline, index);
+        let bounds = self.turn(timeline, index)?.content.content_bounds;
+        let total = toks.len();
+        let start = (bounds.asst_start as usize).min(total);
+        Some(toks[start..total].to_vec())
     }
 
     /// Turn token count — pinned bytes the seal recorded.
@@ -3406,11 +3612,10 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
-        // No tree yet → fall through to the rule-based path.
-        let root = self.substrate.tree_root_of(timeline)?;
-        // Reachability guard: if the recorded root isn't actually
-        // present, treat as "no tree" rather than crash.
-        self.substrate.tree_meta_of(timeline, root)?;
+        // No summary nodes yet → fall through to the rule-based path.
+        if !self.substrate.has_summary_nodes(timeline) {
+            return None;
+        }
         let tree = self.substrate.build_summary_tree_in_memory(timeline);
         if tree.is_empty() {
             return None;
@@ -3630,7 +3835,6 @@ mod tests {
         assert_eq!(meta.kind, TurnKind::Normal);
         assert!(meta.children.is_empty());
         assert_eq!(meta.tree_height, 0);
-        assert!(!meta.dirty);
     }
 
     #[test]
@@ -3652,7 +3856,6 @@ mod tests {
             kind: TurnKind::SummaryOfTurns,
             children: vec![TurnIndex(99)],
             tree_height: 1,
-            dirty: false,
         };
         sub.set_tree_meta(timeline, idx, meta.clone());
         assert_eq!(sub.tree_meta_of(timeline, idx), Some(&meta));
@@ -3660,34 +3863,42 @@ mod tests {
         assert_eq!(leaves, vec![idx]);
     }
 
+    /// Three SoT leaves carry into one ternary SoS; the SoS is the sole peak.
     #[test]
-    fn mark_summary_dirty_indexes_into_dirty_set() {
+    fn peaks_of_derives_ternary_forest() {
         let (_, _, timeline, mut sub) = make_timeline();
-        let idx = sub.append_with_blocks(timeline, 10, 0, 1);
-        // Marking a Normal turn is a no-op.
-        sub.mark_summary_dirty(timeline, idx);
-        assert_eq!(sub.dirty_summary_len(timeline), 0);
-        // Convert to summary then mark dirty.
+        let mut leaves = Vec::new();
+        for n in 0..3u32 {
+            let idx = sub.append_with_blocks(timeline, 10, n as u64, n as u64 + 1);
+            sub.set_tree_meta(
+                timeline,
+                idx,
+                TreeNodeMeta {
+                    kind: TurnKind::SummaryOfTurns,
+                    children: vec![idx],
+                    tree_height: 1,
+                },
+            );
+            leaves.push(idx);
+        }
+        // Before the SoS exists, all three leaves are peaks; reconcile wants to
+        // build the SoS over them.
+        assert_eq!(sub.peaks_of(timeline).len(), 3);
+        let next = sub.reconcile_next(timeline).expect("an SoS to build");
+        assert_eq!(next, leaves);
+        // Record the SoS; now it is the single peak and the forest is whole.
+        let sos = sub.append_with_blocks(timeline, 10, 3, 4);
         sub.set_tree_meta(
             timeline,
-            idx,
+            sos,
             TreeNodeMeta {
-                kind: TurnKind::SummaryOfTurns,
-                ..Default::default()
+                kind: TurnKind::SummaryOfSummaries,
+                children: leaves.clone(),
+                tree_height: 2,
             },
         );
-        sub.mark_summary_dirty(timeline, idx);
-        assert_eq!(sub.dirty_summary_len(timeline), 1);
-        assert_eq!(sub.pop_oldest_dirty(timeline), Some(idx));
-        assert_eq!(sub.dirty_summary_len(timeline), 0);
-        // After pop the meta's `dirty` flag is still true — the caller
-        // (the summariser) clears it explicitly via `clear_summary_dirty`
-        // once the regeneration probe lands.  This decoupling lets the
-        // sweep batch the regeneration without losing the dirty bit on
-        // a crash mid-sweep.
-        assert!(sub.tree_meta_of(timeline, idx).unwrap().dirty);
-        sub.clear_summary_dirty(timeline, idx);
-        assert!(!sub.tree_meta_of(timeline, idx).unwrap().dirty);
+        assert_eq!(sub.peaks_of(timeline), vec![(sos, 2)]);
+        assert_eq!(sub.reconcile_next(timeline), None);
     }
 
     #[test]
@@ -3703,15 +3914,41 @@ mod tests {
         assert_eq!(sub.lookup_by_debug_id("two-topics-100"), Some(timeline));
     }
 
+    /// `mark_for_reconcile` purges non-canonical (old binary) SoS meta and arms
+    /// the reconcile hint so the ternary nodes get rebuilt.
     #[test]
-    fn tree_root_set_and_get() {
+    fn mark_for_reconcile_purges_noncanonical_sos() {
         let (_, _, timeline, mut sub) = make_timeline();
-        assert_eq!(sub.tree_root_of(timeline), None);
-        let idx = sub.append_with_blocks(timeline, 10, 0, 1);
-        sub.set_tree_root(timeline, Some(idx));
-        assert_eq!(sub.tree_root_of(timeline), Some(idx));
-        sub.set_tree_root(timeline, None);
-        assert_eq!(sub.tree_root_of(timeline), None);
+        let leaf_a = sub.append_with_blocks(timeline, 10, 0, 1);
+        let leaf_b = sub.append_with_blocks(timeline, 10, 1, 2);
+        for leaf in [leaf_a, leaf_b] {
+            sub.set_tree_meta(
+                timeline,
+                leaf,
+                TreeNodeMeta {
+                    kind: TurnKind::SummaryOfTurns,
+                    children: vec![leaf],
+                    tree_height: 1,
+                },
+            );
+        }
+        // A legacy binary SoS (2 children) — not canonical for MERGE_FANOUT=3.
+        let bin = sub.append_with_blocks(timeline, 10, 2, 3);
+        sub.set_tree_meta(
+            timeline,
+            bin,
+            TreeNodeMeta {
+                kind: TurnKind::SummaryOfSummaries,
+                children: vec![leaf_a, leaf_b],
+                tree_height: 2,
+            },
+        );
+        assert!(sub.tree_meta_of(timeline, bin).is_some());
+        sub.mark_for_reconcile(timeline);
+        // Binary SoS purged; reconcile armed; the two leaves survive.
+        assert!(sub.tree_meta_of(timeline, bin).is_none());
+        assert!(sub.needs_reconcile(timeline));
+        assert_eq!(sub.peaks_of(timeline).len(), 2);
     }
 
     /// Identity migration: returns the input unchanged (simulates CPU == GPU in tests).
@@ -4105,7 +4342,6 @@ mod tests {
                 kind: TurnKind::SummaryOfTurns,
                 children: vec![TurnIndex(7)],
                 tree_height: 1,
-                dirty: false,
             },
         );
 
@@ -4116,6 +4352,7 @@ mod tests {
             String::new(),
             TokenBuffer::default(),
             20,
+            TurnContentBounds::default(),
             None,
             0,
             0,
@@ -4136,6 +4373,7 @@ mod tests {
             String::new(),
             TokenBuffer::default(),
             10,
+            TurnContentBounds::default(),
             None,
             0,
             0,
@@ -4169,6 +4407,7 @@ mod tests {
             String::new(),
             TokenBuffer::default(),
             32,
+            TurnContentBounds::default(),
             Some(cold_payload),
             0,
             1,
@@ -4192,6 +4431,7 @@ mod tests {
             String::new(),
             TokenBuffer::default(),
             0,
+            TurnContentBounds::default(),
             None,
             0,
             0,

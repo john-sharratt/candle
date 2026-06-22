@@ -7,7 +7,7 @@ Raw TCP sessions for legacy network equipment that lacks SSH.
 | File | Tool | Description |
 |------|------|-------------|
 | `open.rs` | `telnet_session_open` | Connect; optional prompt pattern |
-| `send.rs` | `telnet_session_send` | Write and optionally wait for a regex match |
+| `send.rs` | `telnet_send` | Write and optionally wait for a regex match |
 | `list.rs` | `telnet_session_list` | List open sessions |
 | `close.rs` | `telnet_session_close` | Drop the connection |
 | `mod.rs` | — | `TelnetError` enum |
@@ -20,7 +20,7 @@ SSH, use `ssh_session_*` instead.
 
 ## Send semantics
 
-`telnet_session_send` parameters:
+`telnet_send` parameters:
 - `send` — text to write to the stream (e.g. `"show interfaces\r\n"`)
 - `expect` — optional regex; the tool reads until the pattern matches
 - `timeout_sec` — how long to wait for the expect match (default varies)
@@ -42,4 +42,4 @@ Response fields:
 
 ## Confirmation
 
-`telnet_session_send` confirms every call.  Open, list, and close do not.
+`telnet_send` confirms every call.  Open, list, and close do not.

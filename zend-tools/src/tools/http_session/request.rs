@@ -1,4 +1,4 @@
-//! http_session_request tool.
+//! http_request tool.
 
 use std::collections::HashMap;
 
@@ -42,7 +42,7 @@ pub struct ReqResponse {
 pub struct HttpSessionRequest;
 
 impl Tool for HttpSessionRequest {
-    const NAME: &'static str = "http_session_request";
+    const NAME: &'static str = "http_request";
     const DESCRIPTION: &'static str =
         "Issue an HTTP request through an existing session — GET, POST, PUT, PATCH, DELETE, \
          HEAD, or OPTIONS — with optional headers, query parameters, and body. Use for: REST \

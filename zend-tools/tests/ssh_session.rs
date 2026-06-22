@@ -20,7 +20,7 @@ fn ssh_session_close_missing() {
 #[test]
 fn ssh_session_open_credential_not_found() {
     let resp = harness::invoke(
-        "ssh_session_open",
+        "ssh_open",
         json!({"credential_name": "bogus_cred", "host": "localhost"}),
     );
     harness::expect_error(&resp, "credential_not_found");

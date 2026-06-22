@@ -65,8 +65,10 @@ mod tests {
                 .to_dtype(DType::BF16)
                 .unwrap();
 
-            // Write at offset 0
+            // Write at offset 0, then record the valid length (write_contiguous
+            // moves bytes; set_len records how many tokens each chunk holds).
             backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, len);
 
             // Read back
             let (k_read, v_read) = backing.read_contiguous(0, 0, len).unwrap();
@@ -85,6 +87,7 @@ mod tests {
             let k = Tensor::ones((1, 4, 64, 32), DType::BF16, &Device::Cpu).unwrap();
             let v = Tensor::ones((1, 4, 64, 32), DType::BF16, &Device::Cpu).unwrap();
             backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, 64);
 
             // Read only 32 tokens (1 chunk)
             let (k_read, v_read) = backing.read_contiguous(0, 0, 32).unwrap();
@@ -102,6 +105,7 @@ mod tests {
             let k = Tensor::ones((1, 4, 64, 32), DType::BF16, &Device::Cpu).unwrap();
             let v = Tensor::ones((1, 4, 64, 32), DType::BF16, &Device::Cpu).unwrap();
             backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, 64);
 
             // Read 16 tokens starting at offset 16
             let (k_read, v_read) = backing.read_contiguous(0, 16, 16).unwrap();
@@ -118,6 +122,101 @@ mod tests {
             // Try to read without writing (no chunks allocated)
             let result = backing.read_contiguous(0, 0, 32);
             assert!(result.is_err());
+        }
+
+        /// `read_contiguous` must honor per-chunk `offset`/`usage` window
+        /// geometry, not assume a flat `pos / CHUNK_SIZE` packed grid. A
+        /// windowed slot whose first chunk begins at a non-zero offset (the
+        /// assistant-half boundary case) must return the windowed logical
+        /// tokens — not the physical slot-0 tokens the old code returned.
+        #[test]
+        fn test_read_contiguous_honors_window_offset() {
+            use crate::kv_cache::chunked::{SealedChunk, SealedSequence};
+
+            // Window `seq` to the token range `[start, end)`, sharing physical
+            // chunks. The chunk containing `start` becomes an offset>0 partial.
+            fn window_range(seq: &SealedSequence, start: usize, end: usize) -> SealedSequence {
+                let mut chunks: Vec<SealedChunk> = Vec::new();
+                let mut acc = 0usize;
+                for chunk in &seq.chunks {
+                    let c = chunk.token_count as usize;
+                    let (cs, ce) = (acc, acc + c);
+                    acc = ce;
+                    let os = cs.max(start);
+                    let oe = ce.min(end);
+                    if os >= oe {
+                        continue;
+                    }
+                    let olen = (oe - os) as u16;
+                    if os == cs && olen as usize == c {
+                        chunks.push(chunk.clone());
+                    } else {
+                        let mut w = chunk.clone();
+                        w.offset = chunk.offset + (os - cs) as u16;
+                        w.token_count = olen;
+                        chunks.push(w);
+                    }
+                }
+                SealedSequence {
+                    chunks,
+                    token_count: end - start,
+                    chunk_size: seq.chunk_size,
+                    location: seq.location,
+                }
+            }
+
+            let backing = create_test_backing(); // n_kv_head=4, head_dim=32, CHUNK_SIZE=32
+            let (n_kv_head, head_dim, total) = (4usize, 32usize, 64usize);
+            let slot = backing.alloc_sequence().unwrap();
+
+            // Token t carries the constant value t across all heads/dims, so the
+            // read-back identifies exactly which logical token landed where
+            // (integers < 256 are exact in BF16).
+            let tvals = Tensor::arange(0.0f32, total as f32, &Device::Cpu)
+                .unwrap()
+                .reshape((1, 1, total, 1))
+                .unwrap();
+            let k = tvals
+                .broadcast_as((1, n_kv_head, total, head_dim))
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let v = k.clone();
+            backing.write_contiguous(slot, 0, &k, &v).unwrap();
+            backing.set_len(slot, total);
+            let sealed = backing.record_turn(slot).unwrap();
+
+            // Window [18, 64): the first chunk gets offset=18 (14 valid tokens),
+            // the second is full (32) — the offset>0 boundary layout.
+            let (start, end) = (18usize, 64usize);
+            let win = window_range(&sealed, start, end);
+            assert!(win.chunks[0].offset > 0, "expected offset>0 first window chunk");
+
+            let dst = backing.alloc_sequence().unwrap();
+            backing.inject_sealed_at_tail(dst, &win).unwrap();
+
+            let (k_read, _) = backing.read_contiguous(dst, 0, end - start).unwrap();
+            assert_eq!(k_read.dims(), &[1, n_kv_head, end - start, head_dim]);
+
+            // Logical token i of the window must be original token (start + i).
+            let got: Vec<f32> = k_read
+                .narrow(1, 0, 1)
+                .unwrap()
+                .narrow(3, 0, 1)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let expected: Vec<f32> = (start..end).map(|t| t as f32).collect();
+            assert_eq!(
+                got, expected,
+                "read_contiguous returned the wrong tokens for an offset>0 window",
+            );
         }
     }
 
@@ -298,6 +397,7 @@ mod tests {
 
             // Write
             backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, 32);
 
             // Read back
             let (k_read, _v_read) = backing.read_contiguous(0, 0, 32).unwrap();

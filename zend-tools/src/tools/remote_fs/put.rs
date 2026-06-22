@@ -32,7 +32,7 @@ impl Tool for RemoteFsSessionPut {
     const NAME: &'static str = "remote_fs_session_put";
     const DESCRIPTION: &'static str =
         "Upload a file from the session VFS to the remote SFTP filesystem. \
-         The file must exist in the VFS (use file_write first).";
+         The file must exist in the VFS (use write first).";
     type Request = PutRequest;
     type Response = PutResponse;
     type Error = RemoteFsError;

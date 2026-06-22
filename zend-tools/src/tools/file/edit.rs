@@ -33,7 +33,7 @@ impl Tool for FileEdit {
          old_str must appear exactly once — if it appears multiple times the call returns \
          ambiguous and asks for more surrounding context. Triggered by \"change X to Y in the \
          file\", \"update this line\", \"modify the part where it says\", \"fix the value of\". \
-         Returns path and new byte count. For full rewrites use file_write.";
+         Returns path and new byte count. For full rewrites use write.";
 
     type Request = EditRequest;
     type Response = EditResponse;

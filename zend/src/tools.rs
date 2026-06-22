@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, SectionId};
+use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, Reserved, SectionId};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -108,6 +108,17 @@ pub fn install_tool_catalog(
             .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e))?;
         out.push((tool.name.to_string(), id, json_line));
     }
+    // Associate the reserved tool-summary section with the collection. The
+    // section is sealed at runtime (the daemon's startup hook); projection emits
+    // it just before the selected tools whenever top-k dropped at least one, and
+    // only once it is actually sealed. See `crate::tool_summary`.
+    builder
+        .set_collection_summary_section(
+            dialogue_layer,
+            collection_id,
+            SectionId::reserved(Reserved::ToolSummary),
+        )
+        .map_err(|e| anyhow::anyhow!("set tool-summary section: {e}"))?;
     Ok(out)
 }
 
@@ -133,26 +144,66 @@ fn render_tool_json_line(tool: &registry::RegisteredTool) -> String {
 
 // ── Tool-call extraction ─────────────────────────────────────────────────────
 
+/// Top-level balanced `{...}` object spans in `text`, as `(start, end)`
+/// half-open byte ranges. String literals are respected (braces inside JSON
+/// strings don't perturb the depth count), and only outermost objects are
+/// returned (a nested object is part of its parent's span). Operates on bytes;
+/// the brace/quote/escape sentinels are ASCII, so multi-byte UTF-8 is safe.
+fn balanced_object_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    spans.push((start, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
 /// Scan a model response for tool-call blocks.
 ///
 /// The canonical Hermes format is `<tool_call>{json}</tool_call>`, but
-/// Qwen3-A3B (especially in `/no_think` mode) sometimes elides the
-/// opening `<tool_call>` tag and emits just `{json}</tool_call>` —
-/// the closer is reliable, the opener is not.  Verified by inspection
-/// of raw token IDs in the sampling trace: the model genuinely
-/// doesn't emit the opener; it's not a tokenizer/decoder bug.  Both
-/// shapes are accepted here so we don't lose tool calls to that quirk.
+/// Qwen3-A3B (especially in `/no_think` mode) is unreliable about the tags:
+/// sometimes it elides the opening `<tool_call>` and emits `{json}</tool_call>`,
+/// and sometimes it emits a bare `{json}` with no tags at all. Verified by
+/// inspection of raw token IDs in the sampling trace — the model genuinely
+/// drops the tags; it's not a tokenizer/decoder bug. All three shapes are
+/// accepted so we don't lose tool calls to that quirk.
 ///
 /// Strategy:
-/// 1. Find every `</tool_call>` close-tag occurrence.
-/// 2. From each close, scan backwards for the *matching* JSON object.
-///    If a `<tool_call>` opener is present between the prior call's
-///    close (or document start) and the close-tag, use the span
-///    starting at the opener; otherwise look for the closest preceding
-///    balanced-brace `{...}` object that doesn't cross another
-///    close-tag.
-/// 3. Parse the JSON inside as `{name, arguments}` — malformed blocks
-///    are silently skipped, same as before.
+/// 1. Strict `<tool_call>{json}</tool_call>` matches.
+/// 2. Lenient `{json}</tool_call>` matches (elided opener) not already covered.
+/// 3. Bare `{json}` objects (no tags) not already covered — but only when the
+///    object names a real tool (or alias) via the registry, so prose JSON and
+///    fabricated tool *responses* (`{"error": ...}`) aren't mistaken for calls.
+/// Malformed blocks are silently skipped.
 pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     use regex::Regex;
     use std::sync::OnceLock;
@@ -173,15 +224,18 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
 
     let mut out = Vec::new();
     let mut consumed_ends: Vec<usize> = Vec::new();
+    // JSON-object byte spans already claimed by a tagged match, so the bare
+    // pass (3) doesn't re-detect the same object.
+    let mut consumed_spans: Vec<(usize, usize)> = Vec::new();
 
     // Pass 1: strict <tool_call>...</tool_call> matches.
     for cap in strict_re.captures_iter(response_text) {
         let full_end = cap.get(0).map(|m| m.end()).unwrap_or(0);
-        let json_text = match cap.get(1) {
-            Some(m) => m.as_str(),
+        let json = match cap.get(1) {
+            Some(m) => m,
             None => continue,
         };
-        if let Ok(raw) = serde_json::from_str::<RawCall>(json_text) {
+        if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
                 out.push(ToolCall {
                     name: raw.name,
@@ -190,6 +244,7 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
             }
         }
         consumed_ends.push(full_end);
+        consumed_spans.push((json.start(), json.end()));
     }
 
     // Pass 2: lenient `{json}</tool_call>` matches — only consider
@@ -207,12 +262,38 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         // regex would already have caught it; we wouldn't be here.
         // But guard against the JSON body itself containing `<` —
         // the `[^<]*?` in the regex already enforces that.
-        let json_text = match cap.get(1) {
-            Some(m) => m.as_str(),
+        let json = match cap.get(1) {
+            Some(m) => m,
             None => continue,
         };
-        if let Ok(raw) = serde_json::from_str::<RawCall>(json_text) {
+        if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
+                out.push(ToolCall {
+                    name: raw.name,
+                    arguments: raw.arguments.unwrap_or(Value::Null),
+                });
+            }
+        }
+        consumed_spans.push((json.start(), json.end()));
+    }
+
+    // Pass 3: bare `{json}` objects with no wrapper tags at all. Lower
+    // precision than the tagged passes, so it's gated three ways: the object
+    // must (a) not overlap a tagged match, (b) carry an `arguments` field — so a
+    // tool *definition* echo (`{"name","description","parameters"}`) isn't taken
+    // for a call — and (c) name a real tool/alias in the registry. This recovers
+    // the calls Qwen3 emits as raw JSON while ignoring prose JSON, tool
+    // definitions, and fabricated tool responses.
+    for (start, end) in balanced_object_spans(response_text) {
+        let overlaps = consumed_spans.iter().any(|&(s, e)| start < e && s < end);
+        if overlaps {
+            continue;
+        }
+        if let Ok(raw) = serde_json::from_str::<RawCall>(&response_text[start..end]) {
+            if !raw.name.is_empty()
+                && raw.arguments.is_some()
+                && registry::find(&raw.name).is_some()
+            {
                 out.push(ToolCall {
                     name: raw.name,
                     arguments: raw.arguments.unwrap_or(Value::Null),
@@ -421,6 +502,60 @@ some text
         let text = "just some narrative</tool_call>";
         let calls = extract_tool_calls(text);
         assert!(calls.is_empty(), "got phantom call: {calls:?}");
+    }
+
+    #[test]
+    fn extract_tool_calls_recovers_bare_json_no_tags() {
+        // Qwen3 sometimes emits the call as raw JSON with no tags at all.
+        let text = r#"{"name": "web_search", "arguments": {"query": "q", "max_results": 5}}"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "bare JSON call not recovered: {calls:?}");
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments["max_results"], 5);
+    }
+
+    #[test]
+    fn extract_tool_calls_bare_json_with_preamble_and_nested_args() {
+        // Preamble prose before a bare, multi-line call with nested arguments.
+        let text = "I'll run that for you.\n{\n  \"name\": \"calculator\",\n  \"arguments\": {\"expression\": \"(1+2)*3\"}\n}\n";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].name, "calculator");
+        assert_eq!(calls[0].arguments["expression"], "(1+2)*3");
+    }
+
+    #[test]
+    fn extract_tool_calls_bare_json_resolves_alias() {
+        // A bare call under a known alias is recovered (the registry gate
+        // resolves it); the canonical name is settled later by `run_tool`.
+        let text = r#"{"name": "file_create", "arguments": {"path": "a.txt", "content": "hi"}}"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "aliased bare call not recovered: {calls:?}");
+        assert_eq!(calls[0].name, "file_create");
+        assert!(registry::find(&calls[0].name).is_some());
+    }
+
+    #[test]
+    fn extract_tool_calls_bare_json_ignores_non_tool_and_fabricated_response() {
+        // Prose JSON that doesn't name a real tool, and a fabricated tool
+        // *response*, must not be mistaken for calls.
+        let unknown = r#"{"name": "definitely_not_a_tool", "arguments": {}}"#;
+        assert!(extract_tool_calls(unknown).is_empty());
+        let fabricated = r#"{"error": "No active HTTP sessions found."}"#;
+        assert!(extract_tool_calls(fabricated).is_empty());
+        // A tool *definition* echo (no `arguments`, has `parameters`) is not a call.
+        let definition = r#"{"name": "ping_icmp", "description": "ping a host", "parameters": {}}"#;
+        assert!(extract_tool_calls(definition).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_bare_pass_does_not_double_count_tagged() {
+        // A fully-tagged call must yield exactly one ToolCall — the bare pass
+        // must skip the object already claimed by the strict match.
+        let text = r#"<tool_call>{"name": "datetime", "arguments": {}}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "tagged call double-counted: {calls:?}");
+        assert_eq!(calls[0].name, "datetime");
     }
 
     #[test]

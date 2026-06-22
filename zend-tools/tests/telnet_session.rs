@@ -36,7 +36,7 @@ fn telnet_session_close_returns_session_id() {
 #[test]
 fn telnet_session_send_not_found() {
     let resp = harness::invoke(
-        "telnet_session_send",
+        "telnet_send",
         json!({"session_id": "no_session", "send": "hello\r\n"}),
     );
     harness::expect_error(&resp, "session_not_found");

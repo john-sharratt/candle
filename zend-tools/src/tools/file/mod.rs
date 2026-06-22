@@ -20,11 +20,11 @@
 //! An explicit foreground gesture: the model calls this to draw the user's
 //! attention to specific files as deliverables.  Distinct from passive Files-panel
 //! visibility — `file_present` emits an SSE `file_present` frame; the panel is
-//! driven by `file_write` / `file_edit` / `file_delete` events separately.
+//! driven by `write` / `file_edit` / `file_delete` events separately.
 //!
 //! # Size cap
 //!
-//! 10 MiB total VFS content per session.  `file_write` returns `vfs_full` if the
+//! 10 MiB total VFS content per session.  `write` returns `vfs_full` if the
 //! cap would be exceeded.
 //!
 //! # Error codes

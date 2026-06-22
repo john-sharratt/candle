@@ -6,7 +6,7 @@ Persistent SSH shell sessions backed by `ssh2` (libssh2 bindings).
 
 | File | Tool | Description |
 |------|------|-------------|
-| `open.rs` | `ssh_session_open` | Connect, authenticate, open shell channel |
+| `open.rs` | `ssh_open` | Connect, authenticate, open shell channel |
 | `exec.rs` | `ssh_session_exec` | Run command synchronously; return full output |
 | `exec_async.rs` | `ssh_session_exec_async` | Start command; return `process_id` immediately |
 | `poll.rs` | `ssh_session_poll` | Read output chunks; optionally send signal |
@@ -60,7 +60,7 @@ returns `host_key_mismatch` rather than connecting.
 
 | Tool | Confirms |
 |------|----------|
-| `ssh_session_open` | Once (shows host + credential name) |
+| `ssh_open` | Once (shows host + credential name) |
 | `ssh_session_exec` | Every call (shows exact command) |
 | `ssh_session_exec_async` | Every call (shows command + timeout) |
 | `ssh_session_poll` | Only when `signal` is provided |

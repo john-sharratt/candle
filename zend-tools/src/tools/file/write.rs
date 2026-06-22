@@ -1,4 +1,4 @@
-//! file_write tool.
+//! write tool.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ pub struct WriteResponse {
 pub struct FileWrite;
 
 impl Tool for FileWrite {
-    const NAME: &'static str = "file_write";
+    const NAME: &'static str = "write";
     const DESCRIPTION: &'static str =
         "Create a new file or overwrite an existing one in the in-memory virtual filesystem \
          (VFS) for this session. Use for: drafting code, writing notes, saving intermediate \

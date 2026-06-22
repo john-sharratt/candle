@@ -67,8 +67,9 @@ use serde::Deserialize;
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
 use super::schema::{
-    Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema,
-    SelectionRule, SystemPromptItem, SystemPromptSchema,
+    Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, GroupSummaryStage,
+    LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SelectionRule,
+    SummaryMode, SystemPromptItem, SystemPromptSchema, TurnSummary,
 };
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
@@ -163,6 +164,65 @@ struct YamlSection {
     priority: Option<f32>,
 }
 
+/// One compression framing + instruction pair. Both fields mandatory.
+#[derive(Deserialize)]
+struct YamlCompressionPrompt {
+    /// System-prompt framing for the compression pass.
+    system_prompt: String,
+    /// Compression instruction, prefilled after the content.
+    user_prompt: String,
+}
+
+/// One tree-level of a layer's `summary:` — the question and answer halves plus
+/// a shared decode cap. All fields mandatory (no serde default).
+#[derive(Deserialize)]
+struct YamlTurnSummary {
+    /// Hard decode-token ceiling for each compressed half.
+    max_tokens: usize,
+    /// Compresses the user-message half of a turn (`Role::User`).
+    user: YamlCompressionPrompt,
+    /// Compresses the assistant-response half of a turn (`Role::Assistant`).
+    assistant: YamlCompressionPrompt,
+    /// `single_pass` (default) or `structural` — the validated structural
+    /// pipeline. Only meaningful on a `summaries` level.
+    #[serde(default)]
+    mode: String,
+}
+
+/// A layer's `summary:` block — required on every layer. `turns` (SummaryOfTurns)
+/// is mandatory; `summaries` (SummaryOfSummaries) is optional and falls back to
+/// `turns` when omitted.
+#[derive(Deserialize)]
+struct YamlLayerSummary {
+    turns: YamlTurnSummary,
+    #[serde(default)]
+    summaries: Option<YamlTurnSummary>,
+}
+
+/// A section group's `summary:` block — a two-stage categorize→assign workflow
+/// (a group is a catalog, summarised by grouping its sections rather than by a
+/// single compression pass). All fields mandatory.
+#[derive(Deserialize)]
+struct YamlGroupSummary {
+    /// Sections per stage-2 assignment chunk.
+    chunk: usize,
+    /// Stage 1 — the model proposes the categories.
+    categorize: YamlGroupSummaryStage,
+    /// Stage 2 — assign each section to one of the categories.
+    assign: YamlGroupSummaryStage,
+}
+
+/// One stage of a group summary: a system/user prompt pair + decode cap.
+#[derive(Deserialize)]
+struct YamlGroupSummaryStage {
+    /// System-prompt framing for the pass.
+    system_prompt: String,
+    /// Instruction, prefilled after the content.
+    user_prompt: String,
+    /// Hard decode-token ceiling for this stage.
+    max_tokens: usize,
+}
+
 /// One entry in a YAML `items:` list — tagged via the `kind` discriminator.
 ///
 /// ```yaml
@@ -218,6 +278,8 @@ enum YamlSystemPromptItem {
         score_threshold: f32,
         #[serde(default)]
         depth_weights: Option<YamlDepthWeights>,
+        /// Required — how this section group is compressed (config only for now).
+        summary: YamlGroupSummary,
         #[serde(default)]
         sections: Vec<YamlSection>,
     },
@@ -237,6 +299,9 @@ struct YamlLayer {
     /// Required system prompt — every layer must declare its framing.
     /// Validated to contain at least one section at construction time.
     system_prompt: YamlSystemPrompt,
+    /// Required — how this layer's turns are compressed across the summary tree
+    /// (`turns` + optional `summaries`, each with question/answer halves).
+    summary: YamlLayerSummary,
     groups: Vec<YamlGroup>,
     /// Optional weights for the three BDP signature depths.  Default is
     /// `(1.0, 1.0, 1.0)` — equal mean.
@@ -455,6 +520,7 @@ fn build(
                     selection,
                     score_threshold,
                     depth_weights: coll_depth_weights_yaml,
+                    summary,
                     sections,
                 } => {
                     let cid = *layer_collections
@@ -495,6 +561,12 @@ fn build(
                     } else {
                         None
                     };
+                    let coll_summary = build_group_summary(
+                        &label,
+                        summary,
+                        format!("__summary__{name}"),
+                        &mut section_alloc,
+                    )?;
                     items.push(SystemPromptItem::Collection(SectionCollection {
                         id: cid,
                         name: name.clone(),
@@ -502,6 +574,8 @@ fn build(
                         selection: coll_selection,
                         score_threshold: *score_threshold,
                         depth_weights: coll_dw_opt,
+                        summary: coll_summary,
+                        summary_section: None,
                     }));
                 }
             }
@@ -545,6 +619,8 @@ fn build(
 
         let depth_weights = parse_depth_weights(&yl.name, yl.depth_weights.as_ref())?;
 
+        let layer_summary = build_layer_summary(&yl.name, &yl.summary, &mut section_alloc)?;
+
         layers.push(LayerSchema {
             id: lid,
             name: yl.name.clone(),
@@ -553,6 +629,7 @@ fn build(
             window: yl.window,
             budget: layer_budget,
             system_prompt: SystemPromptSchema { items },
+            summary: layer_summary,
             groups,
             depth_weights,
         });
@@ -563,6 +640,136 @@ fn build(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a [`CompressionPrompt`] from a YAML framing/instruction pair. Allocates
+/// a `SectionId` for its system-prompt framing — that section is never emitted in
+/// a normal projection (it is reached only by id during compression), so it is
+/// deliberately NOT registered in `NameMaps` or `system_prompt.items`. Validates
+/// both prompts are non-empty.
+fn build_compression_prompt(
+    owner_label: &str,
+    yc: &YamlCompressionPrompt,
+    section_name: String,
+    section_alloc: &mut SectionIdAlloc,
+) -> Result<CompressionPrompt, ConstructionError> {
+    if yc.system_prompt.trim().is_empty() || yc.user_prompt.trim().is_empty() {
+        return Err(ConstructionError::InvalidSummary {
+            owner: owner_label.to_string(),
+        });
+    }
+    let sid = section_alloc.next();
+    Ok(CompressionPrompt {
+        system_prompt: SectionSchema {
+            id: sid,
+            name: section_name,
+            content: yc.system_prompt.clone(),
+            priority: 50.0,
+            depends_on: None,
+            is_template: false,
+            template_tokens: None,
+        },
+        user_prompt: yc.user_prompt.clone(),
+    })
+}
+
+/// Build one tree-level [`TurnSummary`] (question + answer halves + decode cap).
+/// Validates `max_tokens >= 1`; each half allocates its own framing section.
+fn build_turn_summary(
+    owner_label: &str,
+    yt: &YamlTurnSummary,
+    q_name: String,
+    a_name: String,
+    section_alloc: &mut SectionIdAlloc,
+) -> Result<TurnSummary, ConstructionError> {
+    if yt.max_tokens == 0 {
+        return Err(ConstructionError::InvalidSummary {
+            owner: owner_label.to_string(),
+        });
+    }
+    let mode = match yt.mode.as_str() {
+        "" | "single_pass" => SummaryMode::SinglePass,
+        "structural" => SummaryMode::Structural,
+        other => {
+            return Err(ConstructionError::InvalidSummaryMode {
+                owner: owner_label.to_string(),
+                mode: other.to_string(),
+            })
+        }
+    };
+    Ok(TurnSummary {
+        user: build_compression_prompt(owner_label, &yt.user, q_name, section_alloc)?,
+        assistant: build_compression_prompt(owner_label, &yt.assistant, a_name, section_alloc)?,
+        max_tokens: yt.max_tokens,
+        mode,
+    })
+}
+
+/// Build a layer's [`LayerSummary`] — the mandatory `turns` level plus the
+/// optional `summaries` level.
+fn build_layer_summary(
+    owner_label: &str,
+    yl: &YamlLayerSummary,
+    section_alloc: &mut SectionIdAlloc,
+) -> Result<LayerSummary, ConstructionError> {
+    let turns = build_turn_summary(
+        owner_label,
+        &yl.turns,
+        "__summary_turns_user__".to_string(),
+        "__summary_turns_assistant__".to_string(),
+        section_alloc,
+    )?;
+    let summaries = match &yl.summaries {
+        Some(ys) => Some(build_turn_summary(
+            &format!("{owner_label} (summaries)"),
+            ys,
+            "__summary_sums_user__".to_string(),
+            "__summary_sums_assistant__".to_string(),
+            section_alloc,
+        )?),
+        None => None,
+    };
+    Ok(LayerSummary { turns, summaries })
+}
+
+/// Build a section group's [`GroupSummary`] — a single compression prompt and
+/// decode cap. Validates `max_tokens >= 1` and non-empty prompts.
+fn build_group_summary(
+    owner_label: &str,
+    yg: &YamlGroupSummary,
+    section_base: String,
+    section_alloc: &mut SectionIdAlloc,
+) -> Result<GroupSummary, ConstructionError> {
+    if yg.chunk == 0 || yg.categorize.max_tokens == 0 || yg.assign.max_tokens == 0 {
+        return Err(ConstructionError::InvalidSummary {
+            owner: owner_label.to_string(),
+        });
+    }
+    let build_stage = |stage: &YamlGroupSummaryStage,
+                       suffix: &str,
+                       alloc: &mut SectionIdAlloc|
+     -> Result<GroupSummaryStage, ConstructionError> {
+        let prompt = build_compression_prompt(
+            owner_label,
+            &YamlCompressionPrompt {
+                system_prompt: stage.system_prompt.clone(),
+                user_prompt: stage.user_prompt.clone(),
+            },
+            format!("{section_base}_{suffix}"),
+            alloc,
+        )?;
+        Ok(GroupSummaryStage {
+            prompt,
+            max_tokens: stage.max_tokens,
+        })
+    };
+    let categorize = build_stage(&yg.categorize, "categorize", section_alloc)?;
+    let assign = build_stage(&yg.assign, "assign", section_alloc)?;
+    Ok(GroupSummary {
+        categorize,
+        assign,
+        chunk: yg.chunk,
+    })
+}
 
 fn validate_priority(name: &str, v: f32) -> Result<(), ConstructionError> {
     if v <= 0.0 {

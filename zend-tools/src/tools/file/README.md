@@ -8,7 +8,7 @@ written here ever touches disk — the VFS is a `HashMap<String, String>` in the
 
 | File | Tool | Description |
 |------|------|-------------|
-| `write.rs` | `file_write` | Create or overwrite a file; enforces 10 MiB cap |
+| `write.rs` | `write` | Create or overwrite a file; enforces 10 MiB cap |
 | `read.rs` | `file_read` | Return full content + line count |
 | `edit.rs` | `file_edit` | Unique-substring replacement |
 | `list.rs` | `file_list` | List all files, optionally filtered by path prefix |
@@ -38,14 +38,14 @@ multi-site edits from an insufficiently specific search string.
 ## `file_present` vs Files panel
 
 The Files panel is driven by `vfs_update` SSE events emitted after each
-`file_write` / `file_edit` / `file_delete`.  `file_present` is a separate,
+`write` / `file_edit` / `file_delete`.  `file_present` is a separate,
 explicit foreground gesture that emits a `file_present` SSE event — use it
 to draw the user's attention to specific files as deliverables.
 
 ## VFS size cap
 
 10 MiB total across all files in the session.  The cap is checked on every
-`file_write`; if the new total would exceed 10 MiB the write is rejected with
+`write`; if the new total would exceed 10 MiB the write is rejected with
 `vfs_full`.
 
 ## Error codes

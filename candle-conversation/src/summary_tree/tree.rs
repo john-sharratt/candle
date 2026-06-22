@@ -1,62 +1,63 @@
-//! The `SummaryTree` — three-kind tagged tree with an AVL-balanced binary
-//! summary spine.  Pure data structure: no substrate, no scheduler.
+//! The `SummaryTree` — a three-kind tagged **append-only immutable forest**
+//! (a ternary Merkle Mountain Range). Pure data structure: no substrate, no
+//! scheduler. See `docs/immutable_summary_forest.md`.
 //!
 //! # Shape
 //!
 //! ```text
-//!         SummaryOfSummaries          ← internal binary nodes (AVL)
-//!            ╱           ╲
-//!   SummaryOfSummaries  SummaryOfTurns
-//!         ╱  ╲                │
-//!         …  SummaryOfTurns   ●  ●  ●          ← Normal sub-leaves
-//!                  │
-//!                  ●  ●  ●
+//!   peaks:   SoS(level h)        SoS(h')   SoT … (orphans = window entry points)
+//!            ╱   │   ╲
+//!         SoS  SoS  SoS          ← exactly MERGE_FANOUT children, all level h-1
+//!          │    │    │
+//!         SoT  SoT  SoT          ← one Normal child each (level 1)
+//!          │    │    │
+//!          ●    ●    ●           ← Normal content sub-leaves
 //! ```
-//!
-//! The AVL invariant `|h(left) − h(right)| ≤ 1` applies to the
-//! `SummaryOfSummaries → SummaryOfTurns` binary portion only.  Normal
-//! turns are content under each `SummaryOfTurns` leaf — they do not
-//! contribute to `tree_height` and do not participate in rotations.
 //!
 //! # Insertion
 //!
-//! New `SummaryOfTurns` leaves are appended on the right edge (newest
-//! turn → rightmost binary leaf), then standard AVL rotations restore
-//! the height invariant.  Normal turns are absorbed into the rightmost
-//! "open cluster" `SummaryOfTurns` leaf without touching the binary
-//! structure.
+//! New `SummaryOfTurns` leaves are appended on the right (newest turn →
+//! rightmost peak). After each append the **carry rule** fires: while the
+//! last `MERGE_FANOUT` peaks share a level, they are merged into one parent
+//! one level up. Nodes are never mutated once created — a node leaves the
+//! peak set only when a later merge gives it a parent. There is no balancing,
+//! no rotation, and no `dirty` state: the structure is a pure function of the
+//! leaf sequence.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 
-/// Default token cost for a synthesised `SummaryOfSummaries` internal
-/// node — matches the design's "~20 tokens per summary turn" sizing.
-/// The §6 probe overwrites this with the actual content size once the
-/// regenerated summary turn lands.
+/// Fan-out of an internal `SummaryOfSummaries` node: a merge combines exactly
+/// this many same-level peaks into one parent. Ternary (3) halves the
+/// internal-node count versus binary while keeping the peak window tight.
+pub const MERGE_FANOUT: usize = 3;
+
+/// Default token cost for a synthesised `SummaryOfSummaries` internal node.
+/// The §6 probe overwrites this with the actual content size once the sealed
+/// summary turn lands.
 pub const DEFAULT_INTERNAL_TOKENS: u32 = 20;
 
-/// Tag distinguishing the three node kinds in the summary tree.
+/// Tag distinguishing the three node kinds in the summary forest.
 ///
-/// Every persisted turn carries one of these tags so the cold-load path
-/// can reconstruct the tree structure from a flat list of turn records.
+/// Every persisted turn carries one of these tags so the cold-load path can
+/// reconstruct the forest from a flat list of turn records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TurnKind {
-    /// Ordinary user / assistant content.  Lives as a content sub-leaf
-    /// under a [`SummaryOfTurns`](TurnKind::SummaryOfTurns) parent in
-    /// the tree, but not part of the binary AVL structure.
+    /// Ordinary user / assistant content. Lives as a content sub-leaf under a
+    /// [`SummaryOfTurns`](TurnKind::SummaryOfTurns) parent; not part of the
+    /// forest spine.
     Normal,
-    /// Binary-tree leaf: a single summary turn covering a contiguous
-    /// run of Normal-turn children.  Produced by the §6 probe over its
-    /// Normal children.
+    /// Forest leaf: a single summary turn over exactly one `Normal` turn.
+    /// Level 1. Produced by the §6 probe over its Normal child.
     SummaryOfTurns,
-    /// Internal binary-tree node: a summary covering exactly two child
-    /// summary nodes (either `SummaryOfTurns` or another
-    /// `SummaryOfSummaries`).  Produced by the §6 probe.
+    /// Internal forest node: a summary covering exactly [`MERGE_FANOUT`] child
+    /// summary nodes (each `SummaryOfTurns` or another `SummaryOfSummaries`),
+    /// all of the same level. Produced by the §6 probe.
     SummaryOfSummaries,
 }
 
 impl TurnKind {
-    /// True when this kind participates in the binary AVL structure
-    /// (i.e. summary nodes — not Normal sub-leaves).
+    /// True when this kind participates in the forest spine (summary nodes —
+    /// not Normal sub-leaves).
     pub fn is_summary(self) -> bool {
         matches!(
             self,
@@ -65,9 +66,8 @@ impl TurnKind {
     }
 }
 
-/// Abstract node identifier.  In Tier-1 algorithm tests this is a plain
-/// `u32`; the production integration (Phase 1) replaces this with the
-/// substrate's `TurnKey`.
+/// Abstract node identifier. In algorithm tests this is a plain `u32`; the
+/// production integration maps it to the substrate's `TurnIndex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
 
@@ -77,33 +77,22 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// One tree node.  Uniform shape across all three kinds so the
-/// score-density selection (`select_dense`) can walk the tree without
-/// branching on kind.  The AVL operations validate that
-/// `SummaryOfSummaries` has exactly 2 children and treat
-/// `SummaryOfTurns` as the binary-tree leaf.
+/// One forest node. Uniform shape across all three kinds so the score-density
+/// selection (`select_dense`) can walk the forest without branching on kind.
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: NodeId,
     pub kind: TurnKind,
-    /// For `SummaryOfSummaries`: exactly two child IDs in `[left, right]`
-    /// order — the binary AVL structure.
-    /// For `SummaryOfTurns`: the IDs of all Normal-turn sub-leaves under
-    /// this binary leaf, in chronological order.
+    /// For `SummaryOfSummaries`: exactly [`MERGE_FANOUT`] child summary IDs in
+    /// chronological order.
+    /// For `SummaryOfTurns`: the IDs of all Normal-turn sub-leaves under this
+    /// leaf, in chronological order (one in production).
     /// For `Normal`: empty.
     pub children: Vec<NodeId>,
-    /// AVL height for binary summary nodes.  Defined as
-    /// `max(height(children)) + 1` over the binary structure
-    /// (`SummaryOfSummaries` ↔ `SummaryOfTurns`).  A `SummaryOfTurns`
-    /// always has `tree_height = 1`.  `Normal` turns are not part of
-    /// the AVL and always carry `tree_height = 0`.
+    /// Forest level. `SummaryOfTurns` is always 1; a `SummaryOfSummaries` over
+    /// level-`h` children is level `h + 1`. `Normal` turns are not part of the
+    /// spine and carry level 0.
     pub tree_height: u8,
-    /// Marks a summary whose children have changed since its content
-    /// was last regenerated by a §6 probe.  Dirty nodes are still
-    /// scoreable (their stored Q-fingerprint is slightly stale but
-    /// still encodes related content); the async summariser sweep
-    /// (§7.3) regenerates them lazily.
-    pub dirty: bool,
     /// Token cost of this node's content for budget accounting.
     pub tokens: u32,
 }
@@ -116,74 +105,82 @@ impl Node {
             kind: TurnKind::Normal,
             children: Vec::new(),
             tree_height: 0,
-            dirty: false,
             tokens,
         }
     }
 
-    /// Build a fresh `SummaryOfTurns` binary leaf.  The caller supplies
-    /// the Normal-turn children in chronological order.
+    /// Build a fresh `SummaryOfTurns` leaf. The caller supplies the Normal-turn
+    /// children in chronological order.
     pub fn summary_of_turns(id: NodeId, normals: Vec<NodeId>, tokens: u32) -> Self {
         Self {
             id,
             kind: TurnKind::SummaryOfTurns,
             children: normals,
             tree_height: 1,
-            dirty: false,
             tokens,
         }
     }
 
-    /// Build a fresh `SummaryOfSummaries` internal binary node.
-    /// `children` must be `[left, right]` in that order.  `tree_height`
-    /// is set by the caller (AVL bookkeeping).
+    /// Build a fresh `SummaryOfSummaries` internal node over `children` (exactly
+    /// [`MERGE_FANOUT`] same-level summary nodes). `tree_height` is one above the
+    /// children's level.
     pub fn summary_of_summaries(
         id: NodeId,
-        left: NodeId,
-        right: NodeId,
+        children: Vec<NodeId>,
         tree_height: u8,
         tokens: u32,
     ) -> Self {
         Self {
             id,
             kind: TurnKind::SummaryOfSummaries,
-            children: vec![left, right],
+            children,
             tree_height,
-            dirty: false,
             tokens,
         }
     }
 
-    /// True iff this node has children (any kind of children — Normal
-    /// sub-leaves under a `SummaryOfTurns` count).
+    /// True iff this node has children.
     pub fn has_children(&self) -> bool {
         !self.children.is_empty()
     }
 }
 
-/// The summary tree itself.  Owns every node; the AVL ops mutate
-/// `children`, `tree_height`, and (transitively, on rotation) the
-/// `root`.
+/// Whether appending fired a carry: given the current peak **levels** in
+/// chronological order, return `Some(start)` of the trailing run of
+/// [`MERGE_FANOUT`] equal-level peaks to merge, else `None`. Shared by the pure
+/// [`SummaryTree::append_leaf`] and the substrate-driven summariser so the
+/// carry rule lives in exactly one place.
+pub fn carry_triple(levels: &[u8]) -> Option<usize> {
+    let n = levels.len();
+    if n < MERGE_FANOUT {
+        return None;
+    }
+    let start = n - MERGE_FANOUT;
+    let lvl = levels[start];
+    if levels[start..].iter().all(|&l| l == lvl) {
+        Some(start)
+    } else {
+        None
+    }
+}
+
+/// The summary forest. Owns every node; appends are the only mutation and they
+/// never rewrite an existing node.
 ///
-/// Storage: `AHashMap<NodeId, Node>` plus a single `root: Option<NodeId>`.
-/// The map gives O(1) lookup; iteration order is unspecified — the
-/// algorithms that need ordered traversal use the children pointers.
+/// Storage: `AHashMap<NodeId, Node>`. The peak set (orphan summary nodes) is
+/// derived on demand — a node is a peak iff no `SummaryOfSummaries` lists it as
+/// a child.
 #[derive(Debug, Clone, Default)]
 pub struct SummaryTree {
     nodes: AHashMap<NodeId, Node>,
-    root: Option<NodeId>,
-    /// All Normal-turn children in chronological order (left-to-right
-    /// across the binary leaves).  Maintained on every insertion so the
-    /// recency-decay scorer (§8.2) can walk the right edge in O(1).
+    /// All Normal-turn children in chronological order.
     chrono_normals: Vec<NodeId>,
-    /// All `SummaryOfTurns` binary leaves in chronological order.
-    /// Maintained so the right-edge anchor (§8.2 last-3-leaves rule)
-    /// can be evaluated in O(1).
+    /// All `SummaryOfTurns` leaves in chronological order.
     chrono_leaves: Vec<NodeId>,
 }
 
 impl SummaryTree {
-    /// Empty tree.
+    /// Empty forest.
     pub fn new() -> Self {
         Self::default()
     }
@@ -197,11 +194,6 @@ impl SummaryTree {
         self.nodes.is_empty()
     }
 
-    /// Root of the tree (None when empty).
-    pub fn root(&self) -> Option<NodeId> {
-        self.root
-    }
-
     /// Lookup a node by id.
     pub fn get(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(&id)
@@ -212,7 +204,7 @@ impl SummaryTree {
         self.nodes.keys().copied()
     }
 
-    /// All `SummaryOfTurns` binary leaves in chronological order.
+    /// All `SummaryOfTurns` leaves in chronological order.
     pub fn chrono_leaves(&self) -> &[NodeId] {
         &self.chrono_leaves
     }
@@ -222,397 +214,147 @@ impl SummaryTree {
         &self.chrono_normals
     }
 
-    /// Height of the binary spine (`tree_height` of root, or 0 if
-    /// empty).  Used by AVL invariant checks.
-    pub fn height(&self) -> u8 {
-        self.root
-            .and_then(|r| self.nodes.get(&r).map(|n| n.tree_height))
-            .unwrap_or(0)
+    /// The peak set — orphan summary nodes (no parent) in chronological order
+    /// (oldest/leftmost-covering first). This is the window's set of coarse
+    /// entry points.
+    pub fn peaks(&self) -> Vec<NodeId> {
+        let mut claimed: AHashSet<NodeId> = AHashSet::new();
+        for node in self.nodes.values() {
+            if node.kind == TurnKind::SummaryOfSummaries {
+                for c in &node.children {
+                    claimed.insert(*c);
+                }
+            }
+        }
+        let mut peaks: Vec<NodeId> = self
+            .nodes
+            .values()
+            .filter(|n| n.kind.is_summary() && !claimed.contains(&n.id))
+            .map(|n| n.id)
+            .collect();
+        peaks.sort_by_key(|id| self.leftmost_normal(*id));
+        peaks
     }
 
-    /// Insert a freshly-built `Node` into the storage map.  Does not
-    /// affect `root` or `chrono_*`.  For test scaffolding, the
-    /// internal AVL ops, and the substrate-side tree reconstruction
-    /// path (which rebuilds the tree from persisted `TreeNodeMeta`
-    /// records without going through `insert_leaf_rightmost`).
+    /// Levels of the peaks, aligned with [`Self::peaks`].
+    pub fn peak_levels(&self) -> Vec<u8> {
+        self.peaks()
+            .iter()
+            .map(|id| self.nodes.get(id).map(|n| n.tree_height).unwrap_or(0))
+            .collect()
+    }
+
+    /// Smallest Normal-turn index covered by `id` — defines chronological order
+    /// of peaks (and of any subtree).
+    fn leftmost_normal(&self, id: NodeId) -> u32 {
+        let node = match self.nodes.get(&id) {
+            Some(n) => n,
+            None => return id.0,
+        };
+        match node.kind {
+            TurnKind::Normal => id.0,
+            TurnKind::SummaryOfTurns => node.children.iter().map(|c| c.0).min().unwrap_or(id.0),
+            TurnKind::SummaryOfSummaries => node
+                .children
+                .iter()
+                .map(|c| self.leftmost_normal(*c))
+                .min()
+                .unwrap_or(id.0),
+        }
+    }
+
+    /// Tallest peak level, or 0 when empty.
+    pub fn height(&self) -> u8 {
+        self.peak_levels().into_iter().max().unwrap_or(0)
+    }
+
+    /// Insert a freshly-built `Node` into the storage map. Does not touch
+    /// `chrono_*`. Used by test scaffolding and the substrate-side rebuild path
+    /// (which feeds persisted nodes back in without re-running the merge).
     pub fn insert_node(&mut self, node: Node) {
         self.nodes.insert(node.id, node);
     }
 
-    /// Explicitly set the tree root.  Used by the substrate-side
-    /// rebuild path (cold-load) — the live AVL ops manage the root
-    /// pointer themselves.
-    pub fn set_root(&mut self, root: Option<NodeId>) {
-        self.root = root;
-    }
-
-    /// Append a Normal sub-leaf to the chronological order.  Used by
-    /// substrate-side rebuild after `insert_node` has registered the
-    /// node itself.
+    /// Append a Normal sub-leaf to the chronological order. Used by
+    /// substrate-side rebuild after `insert_node` has registered the node.
     pub fn push_chrono_normal(&mut self, id: NodeId) {
         self.chrono_normals.push(id);
     }
 
-    /// Append a `SummaryOfTurns` binary leaf to the chronological
-    /// order.  Used by substrate-side rebuild.
+    /// Append a `SummaryOfTurns` leaf to the chronological order. Used by
+    /// substrate-side rebuild.
     pub fn push_chrono_leaf(&mut self, id: NodeId) {
         self.chrono_leaves.push(id);
     }
 
-    /// Replace a node's children + height in place.  For AVL rotations.
-    fn set_summary_children(&mut self, id: NodeId, left: NodeId, right: NodeId) {
-        if let Some(node) = self.nodes.get_mut(&id) {
-            assert_eq!(
-                node.kind,
-                TurnKind::SummaryOfSummaries,
-                "set_summary_children called on non-SoS node"
-            );
-            node.children.clear();
-            node.children.push(left);
-            node.children.push(right);
-        }
-    }
-
-    /// Recompute `tree_height` of a single SoS node from its current
-    /// children.  Assumes children already have correct heights.
-    fn refresh_height(&mut self, id: NodeId) {
-        let (lh, rh) = {
-            let node = match self.nodes.get(&id) {
-                Some(n) if n.kind == TurnKind::SummaryOfSummaries => n,
-                _ => return,
-            };
-            let l = node.children[0];
-            let r = node.children[1];
-            let lh = self.nodes.get(&l).map(|n| n.tree_height).unwrap_or(0);
-            let rh = self.nodes.get(&r).map(|n| n.tree_height).unwrap_or(0);
-            (lh, rh)
-        };
-        if let Some(node) = self.nodes.get_mut(&id) {
-            node.tree_height = lh.max(rh) + 1;
-        }
-    }
-
-    /// Mark a summary node's `dirty` flag.
-    pub fn mark_dirty(&mut self, id: NodeId) {
-        if let Some(node) = self.nodes.get_mut(&id) {
-            if node.kind.is_summary() {
-                node.dirty = true;
-            }
-        }
-    }
-
-    /// True iff every summary node in the tree satisfies the AVL
-    /// invariant `|h(left) − h(right)| ≤ 1`.  Used by the property
-    /// checker (§10.6 `check_avl_invariants`).
-    pub fn is_balanced(&self) -> bool {
-        for node in self.nodes.values() {
-            if node.kind != TurnKind::SummaryOfSummaries {
-                continue;
-            }
-            let l = node.children[0];
-            let r = node.children[1];
-            let lh = self.nodes.get(&l).map(|n| n.tree_height).unwrap_or(0) as i16;
-            let rh = self.nodes.get(&r).map(|n| n.tree_height).unwrap_or(0) as i16;
-            if (lh - rh).abs() > 1 {
-                return false;
-            }
-            // The stored tree_height must match the structural one.
-            if node.tree_height != (lh.max(rh) as u8 + 1) {
-                return false;
-            }
-        }
-        true
-    }
-
-    // ── Open-cluster operations ─────────────────────────────────────────
-
-    /// Append a Normal-turn sub-leaf to the rightmost (open) cluster.
-    ///
-    /// The Normal turn becomes a child of the current rightmost
-    /// `SummaryOfTurns` leaf.  Does **not** touch the binary AVL spine
-    /// (Normal turns are content sub-leaves, not binary leaves).
+    /// Append a Normal-turn sub-leaf to the rightmost (open) `SummaryOfTurns`
+    /// leaf. Does not touch the forest spine.
     ///
     /// # Panics
-    /// Panics if the tree has no `SummaryOfTurns` leaf yet — call
-    /// `freeze_and_insert_leaf` (or its open-cluster equivalent) first
-    /// to seed the tree.
+    /// Panics if the forest has no `SummaryOfTurns` leaf yet.
     pub fn append_normal_to_open_cluster(&mut self, normal: Node) {
         assert_eq!(
             normal.kind,
             TurnKind::Normal,
             "append_normal_to_open_cluster called with non-Normal node"
         );
-        let open_leaf = *self
-            .chrono_leaves
-            .last()
-            .expect("tree must contain at least one SummaryOfTurns leaf before appending Normals");
+        let open_leaf = *self.chrono_leaves.last().expect(
+            "forest must contain at least one SummaryOfTurns leaf before appending Normals",
+        );
         let normal_id = normal.id;
         let normal_tokens = normal.tokens;
         self.nodes.insert(normal_id, normal);
         self.chrono_normals.push(normal_id);
         if let Some(leaf) = self.nodes.get_mut(&open_leaf) {
             leaf.children.push(normal_id);
-            // Open cluster's summary is now stale by definition (its
-            // children set has expanded).  The §7.3 sweep regenerates
-            // it.  However, while the cluster is still open we don't
-            // mark dirty — the design treats the open cluster as
-            // "rewritten in place" each turn, not as dirty.
-            //
-            // Bump token count to reflect the absorbed Normal so that
-            // budget accounting sees the leaf as bigger.
             leaf.tokens = leaf.tokens.saturating_add(normal_tokens);
         }
     }
 
-    /// Insert a fresh `SummaryOfTurns` binary leaf into the AVL.  Used
-    /// when the §6 probe ruled boundary and the current open cluster is
-    /// frozen, with the new leaf opening to the right.
-    ///
-    /// Returns the IDs of all summary ancestors whose children changed
-    /// during the insertion / rotations.  The caller marks them dirty
-    /// (the dirty propagation is policy-level — pure data-structure
-    /// code returns the set and lets the caller decide).
-    pub fn insert_leaf_rightmost(&mut self, leaf: Node) -> Vec<NodeId> {
+    /// Append a fresh `SummaryOfTurns` leaf on the right, then run the ternary
+    /// carry: while the last [`MERGE_FANOUT`] peaks share a level, merge them
+    /// into a fresh internal node one level up. Internal node IDs are
+    /// auto-allocated (test/pure use; the summariser supplies real substrate
+    /// turn indices instead). Returns the internal nodes created by this append,
+    /// oldest-merge first.
+    pub fn append_leaf(&mut self, leaf: Node) -> Vec<NodeId> {
         assert_eq!(
             leaf.kind,
             TurnKind::SummaryOfTurns,
-            "insert_leaf_rightmost requires a SummaryOfTurns node"
+            "append_leaf requires a SummaryOfTurns node"
         );
-
         let leaf_id = leaf.id;
-        // Track Normal children of the new leaf in chrono order.
         let normal_ids: Vec<NodeId> = leaf.children.clone();
         self.nodes.insert(leaf_id, leaf);
         for nid in &normal_ids {
-            // Normals belonging to a freshly-frozen leaf should
-            // already exist in chrono_normals (they were appended via
-            // append_normal_to_open_cluster).  But the test
-            // scaffolding may build a leaf with no pre-existing
-            // normals; in that case we register them here.
-            if !self.nodes.contains_key(nid) {
-                // Caller responsibility — but be defensive.
-                continue;
-            }
-            if !self.chrono_normals.iter().any(|n| n == nid) {
+            if self.nodes.contains_key(nid) && !self.chrono_normals.iter().any(|n| n == nid) {
                 self.chrono_normals.push(*nid);
             }
         }
         self.chrono_leaves.push(leaf_id);
 
-        if self.root.is_none() {
-            self.root = Some(leaf_id);
-            return Vec::new();
+        let mut created = Vec::new();
+        loop {
+            let peaks = self.peaks();
+            let levels: Vec<u8> = peaks.iter().map(|id| self.nodes[id].tree_height).collect();
+            let Some(start) = carry_triple(&levels) else {
+                break;
+            };
+            let children: Vec<NodeId> = peaks[start..].to_vec();
+            let level = levels[start] + 1;
+            let parent_id = self.fresh_internal_id();
+            self.nodes.insert(
+                parent_id,
+                Node::summary_of_summaries(parent_id, children, level, DEFAULT_INTERNAL_TOKENS),
+            );
+            created.push(parent_id);
         }
-
-        // AVL insertion: attach the new leaf to the rightmost slot of
-        // the current binary spine, walk back up, refresh heights, and
-        // rotate as needed.  `dirty_set` accumulates every SoS ancestor
-        // whose children changed during the rotations.
-        let mut dirty_set: Vec<NodeId> = Vec::new();
-        let new_root = self.avl_insert_rightmost(self.root.unwrap(), leaf_id, &mut dirty_set);
-        self.root = Some(new_root);
-        dirty_set
+        created
     }
 
-    /// Recursive AVL insert into the right spine of `subtree`.  Returns
-    /// the new root of `subtree` after any rotation.  Appends to
-    /// `dirty_set` every SoS node whose children pointer was rewritten
-    /// during this insertion.
-    fn avl_insert_rightmost(
-        &mut self,
-        subtree: NodeId,
-        new_leaf: NodeId,
-        dirty_set: &mut Vec<NodeId>,
-    ) -> NodeId {
-        let node = self
-            .nodes
-            .get(&subtree)
-            .expect("avl_insert_rightmost: subtree node missing");
-        match node.kind {
-            TurnKind::SummaryOfTurns => {
-                // Reached a binary leaf; lift it + new_leaf into a fresh
-                // SummaryOfSummaries parent.  Default token cost
-                // (`DEFAULT_INTERNAL_TOKENS`) matches the design's
-                // assumed summary turn size — the actual content is
-                // produced later by the §6 probe, which overwrites the
-                // tokens field when the regenerated summary turn lands.
-                let parent_id = self.fresh_internal_id();
-                let parent = Node::summary_of_summaries(
-                    parent_id,
-                    subtree,
-                    new_leaf,
-                    2,
-                    DEFAULT_INTERNAL_TOKENS,
-                );
-                self.nodes.insert(parent_id, parent);
-                dirty_set.push(parent_id); // freshly created
-                parent_id
-            }
-            TurnKind::SummaryOfSummaries => {
-                let right_child = node.children[1];
-                let new_right = self.avl_insert_rightmost(right_child, new_leaf, dirty_set);
-                let left_child = self.nodes.get(&subtree).unwrap().children[0];
-                if new_right != right_child {
-                    self.set_summary_children(subtree, left_child, new_right);
-                    if !dirty_set.contains(&subtree) {
-                        dirty_set.push(subtree);
-                    }
-                }
-                self.refresh_height(subtree);
-                self.rebalance(subtree, dirty_set)
-            }
-            TurnKind::Normal => {
-                panic!("avl_insert_rightmost reached a Normal node; tree shape invariant violated");
-            }
-        }
-    }
-
-    /// Apply at most one AVL rotation at `node` if its balance factor
-    /// is outside `[-1, +1]`.  Returns the new root of the (sub-)tree
-    /// after rotation (may be unchanged).  Appends rotated nodes to
-    /// `dirty_set`.
-    fn rebalance(&mut self, node_id: NodeId, dirty_set: &mut Vec<NodeId>) -> NodeId {
-        let (left, right, lh, rh) = {
-            let node = self.nodes.get(&node_id).expect("rebalance: node missing");
-            if node.kind != TurnKind::SummaryOfSummaries {
-                return node_id;
-            }
-            let l = node.children[0];
-            let r = node.children[1];
-            let lh = self.nodes.get(&l).map(|n| n.tree_height).unwrap_or(0) as i16;
-            let rh = self.nodes.get(&r).map(|n| n.tree_height).unwrap_or(0) as i16;
-            (l, r, lh, rh)
-        };
-        let balance = lh - rh;
-        if balance < -1 {
-            // Right-heavy.  Determine RR vs RL by the right child's
-            // own balance.
-            let rl_h = self.child_left_height(right);
-            let rr_h = self.child_right_height(right);
-            if rl_h > rr_h {
-                // RL case: right-rotate the right child first.
-                let new_right = self.rotate_right(right, dirty_set);
-                self.set_summary_children(node_id, left, new_right);
-                if !dirty_set.contains(&node_id) {
-                    dirty_set.push(node_id);
-                }
-                self.refresh_height(node_id);
-            }
-            // RR (single left rotation).
-            self.rotate_left(node_id, dirty_set)
-        } else if balance > 1 {
-            // Left-heavy.  LL vs LR.
-            let ll_h = self.child_left_height(left);
-            let lr_h = self.child_right_height(left);
-            if lr_h > ll_h {
-                let new_left = self.rotate_left(left, dirty_set);
-                self.set_summary_children(node_id, new_left, right);
-                if !dirty_set.contains(&node_id) {
-                    dirty_set.push(node_id);
-                }
-                self.refresh_height(node_id);
-            }
-            self.rotate_right(node_id, dirty_set)
-        } else {
-            node_id
-        }
-    }
-
-    fn child_left_height(&self, id: NodeId) -> i16 {
-        let node = match self.nodes.get(&id) {
-            Some(n) if n.kind == TurnKind::SummaryOfSummaries => n,
-            Some(_) => return 0,
-            None => return 0,
-        };
-        let l = node.children[0];
-        self.nodes
-            .get(&l)
-            .map(|n| n.tree_height as i16)
-            .unwrap_or(0)
-    }
-
-    fn child_right_height(&self, id: NodeId) -> i16 {
-        let node = match self.nodes.get(&id) {
-            Some(n) if n.kind == TurnKind::SummaryOfSummaries => n,
-            Some(_) => return 0,
-            None => return 0,
-        };
-        let r = node.children[1];
-        self.nodes
-            .get(&r)
-            .map(|n| n.tree_height as i16)
-            .unwrap_or(0)
-    }
-
-    /// Left rotation at `a`:
-    ///
-    /// ```text
-    ///     a                b
-    ///    ╱╲              ╱  ╲
-    ///   x  b      →      a    z
-    ///      ╱╲           ╱╲
-    ///     y  z         x  y
-    /// ```
-    fn rotate_left(&mut self, a: NodeId, dirty_set: &mut Vec<NodeId>) -> NodeId {
-        let (x, b) = {
-            let node = self.nodes.get(&a).expect("rotate_left: a missing");
-            (node.children[0], node.children[1])
-        };
-        let (y, z) = {
-            let bn = self.nodes.get(&b).expect("rotate_left: b missing");
-            assert_eq!(bn.kind, TurnKind::SummaryOfSummaries);
-            (bn.children[0], bn.children[1])
-        };
-        self.set_summary_children(a, x, y);
-        self.set_summary_children(b, a, z);
-        self.refresh_height(a);
-        self.refresh_height(b);
-        if !dirty_set.contains(&a) {
-            dirty_set.push(a);
-        }
-        if !dirty_set.contains(&b) {
-            dirty_set.push(b);
-        }
-        // Maintain root pointer if `a` was the root.
-        if self.root == Some(a) {
-            self.root = Some(b);
-        }
-        b
-    }
-
-    /// Right rotation at `a` (mirror of `rotate_left`).
-    fn rotate_right(&mut self, a: NodeId, dirty_set: &mut Vec<NodeId>) -> NodeId {
-        let (b, z) = {
-            let node = self.nodes.get(&a).expect("rotate_right: a missing");
-            (node.children[0], node.children[1])
-        };
-        let (x, y) = {
-            let bn = self.nodes.get(&b).expect("rotate_right: b missing");
-            assert_eq!(bn.kind, TurnKind::SummaryOfSummaries);
-            (bn.children[0], bn.children[1])
-        };
-        self.set_summary_children(a, y, z);
-        self.set_summary_children(b, x, a);
-        self.refresh_height(a);
-        self.refresh_height(b);
-        if !dirty_set.contains(&a) {
-            dirty_set.push(a);
-        }
-        if !dirty_set.contains(&b) {
-            dirty_set.push(b);
-        }
-        if self.root == Some(a) {
-            self.root = Some(b);
-        }
-        b
-    }
-
-    /// Allocate a fresh NodeId for a synthesised internal node.  The
-    /// Tier-1 algorithm code reserves IDs in a high range (≥ 2^31) so
-    /// they cannot collide with caller-supplied leaf IDs (which are
-    /// typically dense small u32s from sequence counters or substrate
-    /// `TurnKey`s).  Production integration replaces this with a
-    /// substrate-allocated id.
+    /// Allocate a fresh NodeId for a synthesised internal node (auto-allocator
+    /// for pure/test use). Reserves IDs ≥ 2^31 so they cannot collide with
+    /// caller-supplied leaf IDs.
     fn fresh_internal_id(&mut self) -> NodeId {
         let mut candidate = 1u32 << 31;
         while self.nodes.contains_key(&NodeId(candidate)) {
@@ -621,17 +363,12 @@ impl SummaryTree {
         NodeId(candidate)
     }
 
-    // ── Post-order traversal helper (used by select_dense's redundancy
-    //    elimination pass; lives here so it can be shared without
-    //    exposing the AHashMap) ────────────────────────────────────────
-
-    /// Walk the tree in post-order — Normal sub-leaves first, then
-    /// `SummaryOfTurns` binary leaves, then `SummaryOfSummaries`
-    /// internals (recursively).  Returns the resulting traversal order.
+    /// Walk the forest in post-order across all peaks (chronological): Normal
+    /// sub-leaves first, then `SummaryOfTurns`, then `SummaryOfSummaries`.
     pub fn post_order(&self) -> Vec<NodeId> {
         let mut out = Vec::with_capacity(self.nodes.len());
-        if let Some(root) = self.root {
-            self.post_order_walk(root, &mut out);
+        for peak in self.peaks() {
+            self.post_order_walk(peak, &mut out);
         }
         out
     }
@@ -652,9 +389,9 @@ impl SummaryTree {
                 out.push(id);
             }
             TurnKind::SummaryOfSummaries => {
-                // Children[0] = left, [1] = right.
-                self.post_order_walk(node.children[0], out);
-                self.post_order_walk(node.children[1], out);
+                for child in &node.children {
+                    self.post_order_walk(*child, out);
+                }
                 out.push(id);
             }
         }
@@ -665,7 +402,9 @@ impl SummaryTree {
 mod tests {
     use super::*;
 
-    /// Build a leaf with no Normal children (Tier-1 test convenience).
+    // A SoT leaf with no Normal sub-children — the carry/peak structure only
+    // depends on the summary spine, and leaving normals out keeps leaf ids
+    // (which the SoS children lists reference) easy to assert against.
     fn leaf(id: u32, tokens: u32) -> Node {
         Node::summary_of_turns(NodeId(id), Vec::new(), tokens)
     }
@@ -674,364 +413,203 @@ mod tests {
         Node::normal(NodeId(id), tokens)
     }
 
-    // ── Empty + first-leaf cases ────────────────────────────────────
+    /// Sorted multiset of peak levels — the structural fingerprint of the
+    /// forest after `N` appends. The carry rule makes this exactly the base-3
+    /// digit expansion of `N` (digit `d` at level `h+1` ⇒ `d` peaks of level
+    /// `h+1`).
+    fn peak_level_histogram(t: &SummaryTree) -> Vec<u8> {
+        let mut levels = t.peak_levels();
+        levels.sort_unstable();
+        levels
+    }
+
+    /// Expected peak levels for `n` leaves, derived from base-3 digits.
+    fn expected_levels(n: u32) -> Vec<u8> {
+        let mut levels = Vec::new();
+        let mut n = n;
+        let mut level = 1u8; // leaves are level 1
+        while n > 0 {
+            let digit = n % 3;
+            for _ in 0..digit {
+                levels.push(level);
+            }
+            n /= 3;
+            level += 1;
+        }
+        levels.sort_unstable();
+        levels
+    }
 
     #[test]
-    fn empty_tree_has_no_root() {
+    fn empty_forest() {
         let t = SummaryTree::new();
         assert!(t.is_empty());
-        assert_eq!(t.root(), None);
+        assert!(t.peaks().is_empty());
         assert_eq!(t.height(), 0);
-        assert!(t.is_balanced());
     }
 
     #[test]
-    fn first_leaf_becomes_root() {
+    fn first_leaf_is_lone_peak() {
         let mut t = SummaryTree::new();
-        let dirty = t.insert_leaf_rightmost(leaf(1, 20));
-        assert_eq!(t.root(), Some(NodeId(1)));
+        let created = t.append_leaf(leaf(1, 20));
+        assert!(created.is_empty(), "first leaf creates no internal");
+        assert_eq!(t.peaks(), vec![NodeId(1)]);
         assert_eq!(t.height(), 1);
-        assert!(t.is_balanced());
-        // No rotations happen on root insert, so dirty_set is empty.
-        assert!(dirty.is_empty(), "first insert should not dirty anything");
-    }
-
-    // ── Pure binary inserts (RR / RL cases reachable via right-edge
-    //    insertion; LL / LR not reachable via right-edge-only inserts,
-    //    so the test suite covers them by direct calls to the rotation
-    //    helpers below.) ────────────────────────────────────────────────
-
-    #[test]
-    fn second_leaf_creates_sos_parent() {
-        let mut t = SummaryTree::new();
-        t.insert_leaf_rightmost(leaf(1, 20));
-        let dirty = t.insert_leaf_rightmost(leaf(2, 20));
-        assert_eq!(t.height(), 2);
-        assert!(t.is_balanced());
-        let root = t.root().unwrap();
-        let root_node = t.get(root).unwrap();
-        assert_eq!(root_node.kind, TurnKind::SummaryOfSummaries);
-        assert_eq!(root_node.children, vec![NodeId(1), NodeId(2)]);
-        assert!(
-            dirty.contains(&root),
-            "the freshly-created internal node must be in the dirty set"
-        );
     }
 
     #[test]
-    fn three_leaves_rotate_left_at_root_when_needed() {
+    fn three_leaves_carry_into_one_sos() {
         let mut t = SummaryTree::new();
-        t.insert_leaf_rightmost(leaf(1, 20));
-        t.insert_leaf_rightmost(leaf(2, 20));
-        // After 3 inserts the tree could look like:
-        //     SoS(SoS(L1, L2), L3) → unbalanced (heights 2 and 1)
-        // OR: SoS(L1, SoS(L2, L3)) → unbalanced (heights 1 and 2).
-        // Our right-edge insertion + AVL must produce the latter, or
-        // rotate from the former.  Either way, |lh − rh| ≤ 1 must hold.
-        t.insert_leaf_rightmost(leaf(3, 20));
-        assert!(t.is_balanced(), "tree must be balanced after 3 inserts");
-        assert!(t.height() <= 3);
+        t.append_leaf(leaf(1, 20));
+        t.append_leaf(leaf(2, 20));
+        let created = t.append_leaf(leaf(3, 20));
+        // Third leaf triggers a single carry: one level-2 SoS over [1,2,3].
+        assert_eq!(created.len(), 1);
+        let sos = created[0];
+        let node = t.get(sos).unwrap();
+        assert_eq!(node.kind, TurnKind::SummaryOfSummaries);
+        assert_eq!(node.tree_height, 2);
+        assert_eq!(node.children, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(t.peaks(), vec![sos]);
     }
 
     #[test]
-    fn many_leaves_stay_balanced() {
+    fn nine_leaves_collapse_to_single_level3_peak() {
         let mut t = SummaryTree::new();
-        for i in 1..=64u32 {
-            t.insert_leaf_rightmost(leaf(i, 20));
-            assert!(
-                t.is_balanced(),
-                "tree out of balance after inserting leaf {}",
-                i
+        for i in 1..=9u32 {
+            t.append_leaf(leaf(i, 20));
+        }
+        // 9 = 3^2 → a single level-3 peak over three level-2 nodes.
+        let peaks = t.peaks();
+        assert_eq!(peaks.len(), 1);
+        let root = t.get(peaks[0]).unwrap();
+        assert_eq!(root.tree_height, 3);
+        assert_eq!(root.children.len(), MERGE_FANOUT);
+        for c in &root.children {
+            let child = t.get(*c).unwrap();
+            assert_eq!(child.tree_height, 2);
+            assert_eq!(child.children.len(), MERGE_FANOUT);
+        }
+    }
+
+    #[test]
+    fn peak_levels_track_base3_digits() {
+        let mut t = SummaryTree::new();
+        for n in 1..=40u32 {
+            t.append_leaf(leaf(n, 20));
+            assert_eq!(
+                peak_level_histogram(&t),
+                expected_levels(n),
+                "peak levels diverged from base-3 digits at n={n}"
             );
         }
-        // log2(64) = 6, so AVL height ≤ ~1.44 * 6 + 1 ≈ 10.
-        assert!(t.height() <= 10);
-        assert_eq!(t.chrono_leaves().len(), 64);
     }
 
     #[test]
-    fn dirty_set_covers_every_modified_ancestor() {
-        // After a long chain of right-edge inserts, every rotation
-        // must include both the pivot and the surfaced node.  We
-        // detect a rotation by spotting a rebalance event (height drop
-        // at root) and verify the dirty set covers the surfaced nodes.
+    fn every_sos_has_fanout_equal_level_children() {
         let mut t = SummaryTree::new();
-        let mut last_root = None;
-        for i in 1..=8u32 {
-            let dirty = t.insert_leaf_rightmost(leaf(i, 20));
-            // Every dirty id must exist as a SoS node in the tree.
-            for d in &dirty {
-                let n = t.get(*d).expect("dirty id must be a live node");
-                assert_eq!(n.kind, TurnKind::SummaryOfSummaries);
+        for n in 1..=40u32 {
+            t.append_leaf(leaf(n, 20));
+        }
+        for node in t.all_ids().filter_map(|id| t.get(id)) {
+            if node.kind != TurnKind::SummaryOfSummaries {
+                continue;
             }
-            // The current root must always be in dirty (either because
-            // it was rewritten on the way down, or because a rotation
-            // surfaced a new root).  Exception: the very first leaf
-            // insertion doesn't even create a SoS.
-            if i >= 2 {
-                let root = t.root().unwrap();
-                if Some(root) != last_root {
-                    // Root identity changed — rotation surfaced a new
-                    // root, so it must be in dirty.
-                    assert!(
-                        dirty.contains(&root),
-                        "after root surfacing at insert {}, dirty must contain new root {}",
-                        i,
-                        root
-                    );
+            assert_eq!(node.children.len(), MERGE_FANOUT);
+            let levels: Vec<u8> = node
+                .children
+                .iter()
+                .map(|c| t.get(*c).unwrap().tree_height)
+                .collect();
+            assert!(
+                levels.iter().all(|&l| l == levels[0]),
+                "SoS children must share a level"
+            );
+            assert_eq!(node.tree_height, levels[0] + 1);
+        }
+    }
+
+    #[test]
+    fn nodes_are_immutable_across_appends() {
+        // Snapshot every node after each append; nodes that already existed
+        // must never change their children or level.
+        let mut t = SummaryTree::new();
+        let mut snap: std::collections::HashMap<NodeId, (Vec<NodeId>, u8)> =
+            std::collections::HashMap::new();
+        for n in 1..=27u32 {
+            t.append_leaf(leaf(n, 20));
+            for id in t.all_ids() {
+                let node = t.get(id).unwrap();
+                let now = (node.children.clone(), node.tree_height);
+                if let Some(prev) = snap.get(&id) {
+                    assert_eq!(prev, &now, "node {id} mutated after creation");
+                } else {
+                    snap.insert(id, now);
                 }
-                last_root = Some(root);
             }
         }
     }
 
-    // ── Normal sub-leaves ─────────────────────────────────────────────
+    #[test]
+    fn peaks_form_contiguous_cover() {
+        let mut t = SummaryTree::new();
+        for n in 1..=20u32 {
+            t.append_leaf(leaf(n, 20));
+        }
+        // Each peak's covered leaves, concatenated left→right, must be exactly
+        // leaves 1..=20 with no gaps or overlaps.
+        let mut covered: Vec<u32> = Vec::new();
+        for peak in t.peaks() {
+            collect_leaves(&t, peak, &mut covered);
+        }
+        assert_eq!(covered, (1..=20).collect::<Vec<_>>());
+    }
+
+    fn collect_leaves(t: &SummaryTree, id: NodeId, out: &mut Vec<u32>) {
+        let node = t.get(id).unwrap();
+        match node.kind {
+            TurnKind::SummaryOfTurns => out.push(id.0),
+            TurnKind::SummaryOfSummaries => {
+                for c in &node.children {
+                    collect_leaves(t, *c, out);
+                }
+            }
+            TurnKind::Normal => {}
+        }
+    }
+
+    #[test]
+    fn carry_triple_detects_trailing_run() {
+        assert_eq!(carry_triple(&[]), None);
+        assert_eq!(carry_triple(&[1, 1]), None);
+        assert_eq!(carry_triple(&[2, 1, 1, 1]), Some(1));
+        assert_eq!(carry_triple(&[1, 1, 2]), None);
+        assert_eq!(carry_triple(&[2, 2, 2]), Some(0));
+    }
 
     #[test]
     fn append_normal_attaches_under_open_cluster() {
         let mut t = SummaryTree::new();
-        t.insert_leaf_rightmost(leaf(1, 20));
-        t.insert_leaf_rightmost(leaf(2, 20));
+        t.append_leaf(leaf(1, 20));
         t.append_normal_to_open_cluster(make_normal(100, 10));
         t.append_normal_to_open_cluster(make_normal(101, 10));
-        // The open cluster is the rightmost leaf (id 2).
-        let open = t.get(NodeId(2)).unwrap();
+        let open = t.get(NodeId(1)).unwrap();
         assert_eq!(open.children, vec![NodeId(100), NodeId(101)]);
-        // Normals are tracked in chrono order.
-        assert_eq!(t.chrono_normals(), &[NodeId(100), NodeId(101)]);
     }
 
     #[test]
-    #[should_panic(expected = "tree must contain at least one")]
-    fn append_normal_panics_without_seed_leaf() {
+    fn post_order_visits_children_before_peaks() {
         let mut t = SummaryTree::new();
-        t.append_normal_to_open_cluster(make_normal(100, 10));
-    }
-
-    // ── Post-order traversal correctness ─────────────────────────────
-
-    #[test]
-    fn post_order_visits_normals_then_leaves_then_internals() {
-        let mut t = SummaryTree::new();
-        t.insert_leaf_rightmost(leaf(1, 20));
-        t.append_normal_to_open_cluster(make_normal(101, 5));
-        t.append_normal_to_open_cluster(make_normal(102, 5));
-        t.insert_leaf_rightmost(leaf(2, 20));
-        t.append_normal_to_open_cluster(make_normal(201, 5));
-
+        for n in 1..=3u32 {
+            t.append_leaf(leaf(n, 20));
+        }
         let order = t.post_order();
-        // Find positions of leaf, its normals, and root.
+        // SoT leaves come before the SoS peak; the peak is last.
+        let peak = t.peaks()[0];
+        assert_eq!(*order.last().unwrap(), peak);
         let pos = |id: u32| order.iter().position(|n| *n == NodeId(id)).unwrap();
-        assert!(pos(101) < pos(1));
-        assert!(pos(102) < pos(1));
-        assert!(pos(201) < pos(2));
-        // Root must be last.
-        assert_eq!(*order.last().unwrap(), t.root().unwrap());
-    }
-
-    // ── Direct rotation tests (LL / LR cases — reachable by hand-
-    //    constructing an imbalanced tree and asking rebalance() to fix
-    //    it; right-edge insertion alone never produces these). ─────
-
-    #[test]
-    fn left_rotation_works_at_root() {
-        // Build:    a(h=3)
-        //          ╱ ╲
-        //         x   b(h=2)
-        //             ╱ ╲
-        //            y   z
-        // Expected after left-rotate(a):
-        //              b(h=3)
-        //              ╱ ╲
-        //          a(h=2)  z
-        //          ╱ ╲
-        //         x   y
-        let mut t = SummaryTree::new();
-        t.insert_node(leaf(10, 20)); // x
-        t.insert_node(leaf(11, 20)); // y
-        t.insert_node(leaf(12, 20)); // z
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(20),
-            NodeId(11),
-            NodeId(12),
-            2,
-            0,
-        )); // b
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(21),
-            NodeId(10),
-            NodeId(20),
-            3,
-            0,
-        )); // a
-        t.root = Some(NodeId(21));
-
-        let mut dirty = Vec::new();
-        let new_root = t.rotate_left(NodeId(21), &mut dirty);
-        assert_eq!(new_root, NodeId(20));
-        let b = t.get(NodeId(20)).unwrap();
-        assert_eq!(b.children, vec![NodeId(21), NodeId(12)]);
-        let a = t.get(NodeId(21)).unwrap();
-        assert_eq!(a.children, vec![NodeId(10), NodeId(11)]);
-        assert!(t.is_balanced());
-        assert_eq!(t.root(), Some(NodeId(20)));
-        assert!(dirty.contains(&NodeId(21)) && dirty.contains(&NodeId(20)));
-    }
-
-    #[test]
-    fn right_rotation_works_at_root() {
-        // Mirror: build left-heavy and right-rotate.
-        //          a(h=3)
-        //          ╱ ╲
-        //       b(h=2) z
-        //        ╱ ╲
-        //       x   y
-        // Expect:    b(h=3)
-        //            ╱ ╲
-        //           x   a(h=2)
-        //               ╱ ╲
-        //              y   z
-        let mut t = SummaryTree::new();
-        t.insert_node(leaf(10, 20)); // x
-        t.insert_node(leaf(11, 20)); // y
-        t.insert_node(leaf(12, 20)); // z
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(20),
-            NodeId(10),
-            NodeId(11),
-            2,
-            0,
-        )); // b
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(21),
-            NodeId(20),
-            NodeId(12),
-            3,
-            0,
-        )); // a
-        t.root = Some(NodeId(21));
-
-        let mut dirty = Vec::new();
-        let new_root = t.rotate_right(NodeId(21), &mut dirty);
-        assert_eq!(new_root, NodeId(20));
-        let b = t.get(NodeId(20)).unwrap();
-        assert_eq!(b.children, vec![NodeId(10), NodeId(21)]);
-        let a = t.get(NodeId(21)).unwrap();
-        assert_eq!(a.children, vec![NodeId(11), NodeId(12)]);
-        assert!(t.is_balanced());
-        assert_eq!(t.root(), Some(NodeId(20)));
-    }
-
-    #[test]
-    fn ll_case_double_rotation() {
-        // LL is what you'd get if a left-edge insertion existed.  We
-        // simulate it by building the imbalanced tree directly and
-        // calling rebalance.
-        //         a(lh=3, rh=1)
-        //         ╱ ╲
-        //       b   z
-        //      ╱╲
-        //     c  y
-        //    ╱╲
-        //   p  q
-        let mut t = SummaryTree::new();
-        for (id, tk) in [(1, 20), (2, 20), (3, 20), (4, 20), (5, 20)] {
-            t.insert_node(leaf(id, tk));
-        }
-        // c = SoS(1, 2)
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(10),
-            NodeId(1),
-            NodeId(2),
-            2,
-            0,
-        ));
-        // b = SoS(c, 3)
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(11),
-            NodeId(10),
-            NodeId(3),
-            3,
-            0,
-        ));
-        // a = SoS(b, 4)
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(12),
-            NodeId(11),
-            NodeId(4),
-            4,
-            0,
-        ));
-        t.root = Some(NodeId(12));
-        // Balance factor at a = 3 - 1 = 2 → LL.
-        let mut dirty = Vec::new();
-        let new_root = t.rebalance(NodeId(12), &mut dirty);
-        assert_eq!(new_root, NodeId(11)); // b surfaces
-        assert!(t.is_balanced());
-        assert_eq!(t.root(), Some(NodeId(11)));
-    }
-
-    #[test]
-    fn rl_case_double_rotation() {
-        // RL: insert into the left subtree of the right child of an
-        // already-tall node.  Build a tree where rebalance must do
-        // right-then-left.
-        //         a(lh=1, rh=3)
-        //         ╱ ╲
-        //        x   b
-        //            ╱ ╲
-        //           c   z
-        //          ╱╲
-        //         p  q
-        let mut t = SummaryTree::new();
-        for id in [1, 2, 3, 4, 5] {
-            t.insert_node(leaf(id, 20));
-        }
-        // c = SoS(1, 2)
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(10),
-            NodeId(1),
-            NodeId(2),
-            2,
-            0,
-        ));
-        // b = SoS(c, 3)
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(11),
-            NodeId(10),
-            NodeId(3),
-            3,
-            0,
-        ));
-        // a = SoS(4, b)
-        t.insert_node(Node::summary_of_summaries(
-            NodeId(12),
-            NodeId(4),
-            NodeId(11),
-            4,
-            0,
-        ));
-        t.root = Some(NodeId(12));
-        let mut dirty = Vec::new();
-        let new_root = t.rebalance(NodeId(12), &mut dirty);
-        // After RL: the result must be balanced and rooted at c (10).
-        assert_eq!(new_root, NodeId(10));
-        assert!(t.is_balanced());
-    }
-
-    // ── Mark-dirty ───────────────────────────────────────────────────
-
-    #[test]
-    fn mark_dirty_only_affects_summary_nodes() {
-        let mut t = SummaryTree::new();
-        t.insert_leaf_rightmost(leaf(1, 20));
-        t.append_normal_to_open_cluster(make_normal(100, 5));
-        t.mark_dirty(NodeId(1));
-        t.mark_dirty(NodeId(100));
-        assert!(t.get(NodeId(1)).unwrap().dirty);
-        assert!(
-            !t.get(NodeId(100)).unwrap().dirty,
-            "Normal must never be dirty"
-        );
+        assert!(pos(1) < pos(peak.0));
+        assert!(pos(2) < pos(peak.0));
+        assert!(pos(3) < pos(peak.0));
     }
 }

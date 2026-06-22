@@ -1,29 +1,20 @@
-//! The async summariser thread (`docs/infinite_conversations.md` §7).
+//! The async summariser thread (`docs/immutable_summary_forest.md`).
 //!
-//! Spawned alongside the persistence thread at engine start.  Mirrors
-//! its trigger/tick/shutdown idiom.  Owns the per-timeline AVL
-//! structure: drains pending Normal turns, runs §6 probes to seal
-//! summary turns, atomic-writes tree metadata + redo-log records, and
-//! processes the dirty-node sweep one node per pass.
+//! Spawned alongside the persistence thread at engine start.  Mirrors its
+//! trigger/tick/shutdown idiom.  Builds the per-timeline **append-only
+//! immutable forest** (a ternary Merkle Mountain Range): drains pending Normal
+//! turns into `SummaryOfTurns` leaves, runs the ternary carry to seal
+//! `SummaryOfSummaries` internals, and persists each node's `TreeMetadata`.
+//! Nodes are never rewritten, so there is no `dirty` bit and no regeneration.
 //!
 //! ```text
-//!   ┌─────────────────────────────────────────────────────────────┐
-//!   │  loop {                                                       │
-//!   │      select! {                                                │
-//!   │          tick (250ms) ─► run_pass()                          │
-//!   │          trigger      ─► run_pass()                          │
-//!   │          shutdown     ─► drain + exit                        │
-//!   │      }                                                        │
-//!   │  }                                                            │
-//!   │                                                                │
-//!   │  run_pass(timeline):                                          │
-//!   │    1. drain pending: each Normal → §6 probe → new SoT leaf   │
-//!   │       → AVL insert → rotation handling (allocate internal    │
-//!   │       SoS via §6 probes as needed).                          │
-//!   │    2. dirty sweep: pop one dirty SoS → §6 regeneration       │
-//!   │       probe → replace turn → clear dirty.                    │
-//!   │    3. emit TreeMetadata records for everything that changed. │
-//!   └─────────────────────────────────────────────────────────────┘
+//!   run_pass(timeline):
+//!     1. drain pending (high priority): each Normal → §6 probe → new SoT leaf
+//!        → carry: while the last MERGE_FANOUT peaks share a level, §6 probe a
+//!        SoS over them.
+//!     2. reconcile (low priority, only when nothing pending): build at most
+//!        one missing internal node toward the canonical shape — backfills a
+//!        forest loaded from disk or migrated from the superseded AVL.
 //! ```
 //!
 //! Failures:
@@ -44,7 +35,7 @@ use crate::projection::{Conversation, TimelineId, TurnIndex};
 use crate::scheduler::SchedulerRequest;
 use crate::substrate::TreeNodeMeta;
 use crate::summary_tree::probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
-use crate::summary_tree::tree::{Node, NodeId, SummaryTree};
+use crate::summary_tree::tree::carry_triple;
 use crate::summary_tree::TurnKind;
 
 /// How often the summariser wakes up on its own when no triggers
@@ -202,7 +193,22 @@ pub fn run_pass(
     runner: &dyn ProbeRunner,
     max_concurrent: usize,
 ) -> Result<(), ProbeError> {
-    let timeline_ids: Vec<TimelineId> = conversation.read().all_timeline_ids().collect();
+    // Engine-internal (reserved) conversations — the titler especially —
+    // accumulate substrate turns as they work but have no user-facing
+    // projection/summary to compress against, so any probe soft-fails. Exclude
+    // them from the sweep outright; otherwise every pass re-enqueues a doomed
+    // compression and floods the log.
+    let timeline_ids: Vec<TimelineId> = {
+        let guard = conversation.read();
+        let all: Vec<TimelineId> = guard.all_timeline_ids().collect();
+        all.into_iter()
+            .filter(|t| {
+                !guard
+                    .timeline_target(*t)
+                    .is_some_and(|(layer, _)| layer.is_reserved())
+            })
+            .collect()
+    };
     for timeline in &timeline_ids {
         let pending = conversation.read().pending_summary_len(*timeline);
         if pending > 0 {
@@ -233,7 +239,25 @@ pub fn run_pass(
                 }
             }
         }
-        sweep_one_dirty(conversation, timeline);
+        // Low-priority reconcile: only when nothing is pending, build at most one
+        // missing internal node toward the canonical ternary shape. New turns
+        // (high priority) keep the live frontier whole; this backfills a forest
+        // loaded from disk (or migrated from the old AVL) without blocking them.
+        if conversation.read().pending_summary_len(timeline) == 0 {
+            if let Err(e) = reconcile_pass(conversation, runner, timeline) {
+                match e {
+                    ProbeError::Hard(_) => return Err(e),
+                    ProbeError::Soft(msg) => {
+                        tracing::warn!(
+                            target: "candle_conversation::summariser",
+                            timeline = %timeline,
+                            "reconcile soft-failed, skipping timeline this pass: {msg}"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -299,6 +323,7 @@ fn absorb_pending_turns(
                 timeline,
                 kind: TurnKind::SummaryOfTurns,
                 children: vec![normal_idx],
+                height: 1,
             })
             .collect();
         let results = runner.run_batch(requests);
@@ -321,13 +346,8 @@ fn absorb_pending_turns(
         for (&normal_idx, result) in batch.iter().zip(results) {
             match result {
                 Ok(sealed) => {
-                    seal_leaf_and_avl_insert(
-                        conversation,
-                        runner,
-                        timeline,
-                        sealed,
-                        vec![normal_idx],
-                    )?;
+                    seal_leaf(conversation, timeline, sealed, vec![normal_idx])?;
+                    carry_merge(conversation, runner, timeline)?;
                 }
                 Err(ProbeError::Soft(msg)) => {
                     tracing::warn!(
@@ -352,509 +372,128 @@ fn absorb_pending_turns(
     }
 }
 
-/// Attach `TreeNodeMeta(kind=SoT)` to `sealed.sealed_turn`, then
-/// AVL-insert it as the rightmost binary leaf for `timeline`.  Emits
-/// `TreeMetadata` redo-log records for every node that changed.
-fn seal_leaf_and_avl_insert(
+/// Promote a freshly-sealed summary turn into a `SummaryOfTurns` leaf and
+/// persist its `TreeMetadata`. Leaves are immutable — written exactly once.
+fn seal_leaf(
     conversation: &Conversation,
-    runner: &dyn ProbeRunner,
     timeline: TimelineId,
     sealed: ProbeResponse,
     normal_children: Vec<TurnIndex>,
 ) -> Result<(), ProbeError> {
-    // Step 1 — write the leaf's meta and the children's meta (still
-    // Normal, but the dirty bit is unaffected; defaults are correct).
     let leaf_idx = sealed.sealed_turn;
-    {
-        let mut view = conversation.write();
-        view.set_tree_meta(
-            timeline,
-            leaf_idx,
-            TreeNodeMeta {
-                kind: TurnKind::SummaryOfTurns,
-                children: normal_children.clone(),
-                tree_height: 1,
-                dirty: false,
-            },
-        );
-    }
-    // Step 2 — rebuild the in-memory tree and AVL-insert the new
-    // leaf, using a probe-backed internal allocator for any new SoS
-    // ancestors.
-    let avl_result = perform_avl_insert_rightmost(conversation, runner, timeline, leaf_idx)?;
+    conversation.write().set_tree_meta(
+        timeline,
+        leaf_idx,
+        TreeNodeMeta {
+            kind: TurnKind::SummaryOfTurns,
+            children: normal_children,
+            tree_height: 1,
+        },
+    );
+    persist_tree_meta(conversation, timeline, leaf_idx);
+    Ok(())
+}
 
-    // Step 3 — persist everything that changed.  TreeMetadata record
-    // per touched node; root marker on the eventual root.
-    let touched = avl_result.touched_nodes;
-    let new_root = avl_result.new_root;
-    for idx in &touched {
-        let meta = match conversation.read().tree_meta_of(timeline, *idx).cloned() {
-            Some(m) => m,
-            None => continue,
+/// Run the ternary carry off the substrate's current peaks: while the last
+/// `MERGE_FANOUT` peaks share a level, seal a `SummaryOfSummaries` over them.
+/// Peaks are recomputed each iteration so a cascading carry (e.g. at a power
+/// of three) resolves fully. Existing nodes are never mutated.
+fn carry_merge(
+    conversation: &Conversation,
+    runner: &dyn ProbeRunner,
+    timeline: TimelineId,
+) -> Result<(), ProbeError> {
+    loop {
+        let peaks = conversation.read().peaks_of(timeline);
+        let levels: Vec<u8> = peaks.iter().map(|(_, l)| *l).collect();
+        let Some(start) = carry_triple(&levels) else {
+            break;
         };
-        let payload = TreeMetadataPayload {
-            timeline_id: timeline.raw(),
-            turn_index: idx.0,
-            kind: match meta.kind {
-                TurnKind::Normal => 0,
-                TurnKind::SummaryOfTurns => 1,
-                TurnKind::SummaryOfSummaries => 2,
-            },
-            tree_height: meta.tree_height,
-            dirty: meta.dirty,
-            children: meta.children.iter().map(|c| c.0).collect(),
-            root_now: if Some(*idx) == new_root {
-                new_root.map(|r| r.0)
-            } else {
-                None
-            },
-        };
-        if let Err(e) = conversation.write_tree_metadata(payload) {
-            tracing::warn!(
-                target: "candle_conversation::summariser",
-                "write_tree_metadata failed for {idx}: {e}"
-            );
-        }
+        let children: Vec<TurnIndex> = peaks[start..].iter().map(|(idx, _)| *idx).collect();
+        let level = levels[start] + 1;
+        build_sos(conversation, runner, timeline, children, level)?;
     }
     Ok(())
 }
 
-/// Result of one AVL insertion: which substrate turn indices had
-/// their tree metadata mutated, and what the (possibly new) root is.
-struct AvlInsertOutcome {
-    touched_nodes: Vec<TurnIndex>,
-    new_root: Option<TurnIndex>,
-}
-
-/// AVL-insert `new_leaf` on the right edge of the timeline's current
-/// summary tree.  Allocates new `SummaryOfSummaries` internals via
-/// `runner` probes.  Writes the resulting tree state back into the
-/// substrate (children + height per touched node, root pointer).
-fn perform_avl_insert_rightmost(
+/// Seal one `SummaryOfSummaries` over `children` (a `MERGE_FANOUT`-run of
+/// same-level peaks) via a §6 probe, write its immutable `TreeNodeMeta`, and
+/// persist it. Returns the new node's turn index.
+fn build_sos(
     conversation: &Conversation,
     runner: &dyn ProbeRunner,
     timeline: TimelineId,
-    new_leaf: TurnIndex,
-) -> Result<AvlInsertOutcome, ProbeError> {
-    // Build the in-memory tree from the substrate's persisted state.
-    let mut tree: SummaryTree = conversation.read().build_summary_tree_in_memory(timeline);
-    // Inject the new leaf into the in-memory tree.  The substrate
-    // already holds its meta (set by `seal_leaf_and_avl_insert`).
-    let leaf_meta = conversation
-        .read()
-        .tree_meta_of(timeline, new_leaf)
-        .cloned();
-    let leaf_meta = match leaf_meta {
-        Some(m) => m,
-        None => {
-            return Err(ProbeError::Soft(format!(
-                "new leaf {new_leaf} missing tree meta after seal"
-            )))
-        }
-    };
-    let leaf_tokens = conversation.read().turn_token_count_of(timeline, new_leaf) as u32;
-    let leaf_node = Node {
-        id: NodeId(new_leaf.0),
-        kind: leaf_meta.kind,
-        children: leaf_meta.children.iter().map(|c| NodeId(c.0)).collect(),
-        tree_height: leaf_meta.tree_height,
-        dirty: leaf_meta.dirty,
-        tokens: leaf_tokens,
-    };
-
-    let mut touched: Vec<TurnIndex> = vec![new_leaf];
-
-    // Empty-or-rootless tree → new leaf becomes root.  The "rootless
-    // but non-empty" case arises during seal_leaf_and_avl_insert when
-    // the caller has already written the new leaf's TreeNodeMeta to
-    // the substrate (so `build_summary_tree_in_memory` will include
-    // that node) but the tree's root pointer is still `None`.  Both
-    // states resolve identically: install the leaf as root.
-    if tree.root().is_none() {
-        tree.insert_node(leaf_node);
-        if tree
-            .chrono_leaves()
-            .iter()
-            .all(|n| *n != NodeId(new_leaf.0))
-        {
-            tree.push_chrono_leaf(NodeId(new_leaf.0));
-        }
-        tree.set_root(Some(NodeId(new_leaf.0)));
-        commit_tree_to_substrate(conversation, timeline, &tree, &mut touched);
-        return Ok(AvlInsertOutcome {
-            touched_nodes: touched,
-            new_root: Some(new_leaf),
-        });
-    }
-
-    // Non-empty: AVL-insert the new leaf, supplying a probe-backed
-    // allocator for new internals.  Each allocation produces a real
-    // substrate turn via a SummaryOfSummaries probe over the two
-    // sub-children.
-    //
-    // We implement the AVL descent locally here (mirroring
-    // SummaryTree::avl_insert_rightmost) because the trait-style
-    // allocator would need to call back into the substrate (which we
-    // already have through `conversation`).  Keeps the closure
-    // simple.
-    // Closure that runs a SoS probe over two children, writes the
-    // resulting TreeNodeMeta into the substrate, and returns the new
-    // TurnIndex.  Does NOT touch the `touched` vec — the recursive
-    // walker handles that bookkeeping after each call.
-    let mut alloc_internal =
-        |left_child: TurnIndex, right_child: TurnIndex| -> Result<TurnIndex, ProbeError> {
-            let probe = ProbeRequest {
-                timeline,
-                kind: TurnKind::SummaryOfSummaries,
-                children: vec![left_child, right_child],
-            };
-            let resp = runner.run(probe)?;
-            let internal_idx = resp.sealed_turn;
-            let lh = conversation
-                .read()
-                .tree_meta_of(timeline, left_child)
-                .map(|m| m.tree_height)
-                .unwrap_or(0);
-            let rh = conversation
-                .read()
-                .tree_meta_of(timeline, right_child)
-                .map(|m| m.tree_height)
-                .unwrap_or(0);
-            let height = lh.max(rh) + 1;
-            conversation.write().set_tree_meta(
-                timeline,
-                internal_idx,
-                TreeNodeMeta {
-                    kind: TurnKind::SummaryOfSummaries,
-                    children: vec![left_child, right_child],
-                    tree_height: height,
-                    dirty: false,
-                },
-            );
-            Ok(internal_idx)
-        };
-
-    // Insert.  This walks the rightmost spine and lifts the rightmost
-    // current leaf + new_leaf into a fresh SoS parent (allocated via
-    // the closure).  Any AVL rebalancing along the way also creates
-    // new SoS internals.
-    let current_root = tree
-        .root()
-        .ok_or_else(|| ProbeError::Soft("tree.root() unexpectedly None".into()))?;
-    tree.insert_node(leaf_node);
-    tree.push_chrono_leaf(NodeId(new_leaf.0));
-    let new_root_node = recursive_avl_insert(
-        &mut tree,
-        current_root,
-        NodeId(new_leaf.0),
-        &mut alloc_internal,
-        &mut touched,
+    children: Vec<TurnIndex>,
+    level: u8,
+) -> Result<TurnIndex, ProbeError> {
+    let probe = ProbeRequest {
         timeline,
-        conversation,
-    )?;
-    tree.set_root(Some(new_root_node));
-
-    // Mark any node whose children pointer changed as dirty.  The
-    // descent updated their tree_height inline; flag them now.
-    let new_root_idx = TurnIndex(new_root_node.0);
-    commit_tree_to_substrate(conversation, timeline, &tree, &mut touched);
-    Ok(AvlInsertOutcome {
-        touched_nodes: touched,
-        new_root: Some(new_root_idx),
-    })
-}
-
-/// Recursive AVL insert with an external allocator for new internal
-/// nodes.  Mirrors [`SummaryTree::avl_insert_rightmost`]
-/// but takes a `FnMut` so internal-node identities come from real
-/// substrate turns rather than the default `fresh_internal_id`
-/// auto-allocator.
-fn recursive_avl_insert<F>(
-    tree: &mut SummaryTree,
-    subtree: NodeId,
-    new_leaf: NodeId,
-    alloc: &mut F,
-    touched: &mut Vec<TurnIndex>,
-    _timeline: TimelineId,
-    _conv: &Conversation,
-) -> Result<NodeId, ProbeError>
-where
-    F: FnMut(TurnIndex, TurnIndex) -> Result<TurnIndex, ProbeError>,
-{
-    let subtree_kind = tree
-        .get(subtree)
-        .map(|n| n.kind)
-        .ok_or_else(|| ProbeError::Soft(format!("avl: subtree {subtree} missing")))?;
-    match subtree_kind {
-        TurnKind::SummaryOfTurns => {
-            // Reached a binary leaf — allocate a fresh SoS parent over
-            // (subtree, new_leaf) via the probe-backed allocator.
-            let parent_idx = alloc(TurnIndex(subtree.0), TurnIndex(new_leaf.0))?;
-            touched.push(parent_idx);
-            let parent_id = NodeId(parent_idx.0);
-            // Manually install the node into the tree (the substrate
-            // already has its meta).
-            let lh = tree.get(subtree).map(|n| n.tree_height).unwrap_or(0);
-            let rh = tree.get(new_leaf).map(|n| n.tree_height).unwrap_or(0);
-            let height = lh.max(rh) + 1;
-            tree.insert_node(Node::summary_of_summaries(
-                parent_id, subtree, new_leaf, height, 20,
-            ));
-            Ok(parent_id)
-        }
-        TurnKind::SummaryOfSummaries => {
-            let right_child = tree.get(subtree).unwrap().children[1];
-            let left_child = tree.get(subtree).unwrap().children[0];
-            let new_right = recursive_avl_insert(
-                tree,
-                right_child,
-                new_leaf,
-                alloc,
-                touched,
-                _timeline,
-                _conv,
-            )?;
-            // Replace right child pointer via insert_node.
-            if new_right != right_child {
-                let lh = tree.get(left_child).map(|n| n.tree_height).unwrap_or(0);
-                let rh = tree.get(new_right).map(|n| n.tree_height).unwrap_or(0);
-                let height = lh.max(rh) + 1;
-                tree.insert_node(Node::summary_of_summaries(
-                    subtree, left_child, new_right, height, 20,
-                ));
-                touched.push(TurnIndex(subtree.0));
-            }
-            // Rebalance: detect imbalance and apply the standard
-            // four-case rotation.  We allocate a fresh internal for
-            // any node whose children pointer changes, mirroring
-            // `SummaryTree::rebalance`.
-            rebalance_at(tree, subtree, alloc, touched)
-        }
-        TurnKind::Normal => Err(ProbeError::Soft(format!(
-            "avl: descended into Normal turn {subtree}; tree shape invariant violated"
-        ))),
-    }
-}
-
-fn rebalance_at<F>(
-    tree: &mut SummaryTree,
-    node_id: NodeId,
-    alloc: &mut F,
-    touched: &mut Vec<TurnIndex>,
-) -> Result<NodeId, ProbeError>
-where
-    F: FnMut(TurnIndex, TurnIndex) -> Result<TurnIndex, ProbeError>,
-{
-    use TurnKind;
-    let node = tree
-        .get(node_id)
-        .ok_or_else(|| ProbeError::Soft(format!("rebalance: missing {node_id}")))?;
-    if node.kind != TurnKind::SummaryOfSummaries {
-        return Ok(node_id);
-    }
-    let left = node.children[0];
-    let right = node.children[1];
-    let lh = tree.get(left).map(|n| n.tree_height as i16).unwrap_or(0);
-    let rh = tree.get(right).map(|n| n.tree_height as i16).unwrap_or(0);
-    let balance = lh - rh;
-    if balance.abs() <= 1 {
-        return Ok(node_id);
-    }
-    // Right-heavy: RR or RL.
-    if balance < -1 {
-        // RL: right child is left-heavy → rotate its subtree right
-        // first.  We allocate a fresh internal for the rotation.
-        let r_node = tree.get(right).unwrap();
-        let rl_h = tree
-            .get(r_node.children[0])
-            .map(|n| n.tree_height as i16)
-            .unwrap_or(0);
-        let rr_h = tree
-            .get(r_node.children[1])
-            .map(|n| n.tree_height as i16)
-            .unwrap_or(0);
-        let new_right = if rl_h > rr_h {
-            rotate_right_via_alloc(tree, right, alloc, touched)?
-        } else {
-            right
-        };
-        if new_right != right {
-            // Reattach to node_id (re-allocate parent? No — we just
-            // overwrite this node's children list.  This node stays
-            // the same TurnIndex, but its content (kind=SoS,
-            // children=[left, new_right]) is now stale → mark dirty
-            // and re-write its tree_meta on commit.
-            let lh2 = tree.get(left).map(|n| n.tree_height).unwrap_or(0);
-            let rh2 = tree.get(new_right).map(|n| n.tree_height).unwrap_or(0);
-            let h = lh2.max(rh2) + 1;
-            tree.insert_node(Node::summary_of_summaries(node_id, left, new_right, h, 20));
-            touched.push(TurnIndex(node_id.0));
-        }
-        rotate_left_via_alloc(tree, node_id, alloc, touched)
-    } else {
-        // Left-heavy: LL or LR.  Mirror of above.
-        let l_node = tree.get(left).unwrap();
-        let ll_h = tree
-            .get(l_node.children[0])
-            .map(|n| n.tree_height as i16)
-            .unwrap_or(0);
-        let lr_h = tree
-            .get(l_node.children[1])
-            .map(|n| n.tree_height as i16)
-            .unwrap_or(0);
-        let new_left = if lr_h > ll_h {
-            rotate_left_via_alloc(tree, left, alloc, touched)?
-        } else {
-            left
-        };
-        if new_left != left {
-            let lh2 = tree.get(new_left).map(|n| n.tree_height).unwrap_or(0);
-            let rh2 = tree.get(right).map(|n| n.tree_height).unwrap_or(0);
-            let h = lh2.max(rh2) + 1;
-            tree.insert_node(Node::summary_of_summaries(node_id, new_left, right, h, 20));
-            touched.push(TurnIndex(node_id.0));
-        }
-        rotate_right_via_alloc(tree, node_id, alloc, touched)
-    }
-}
-
-/// Left rotation at `a` — same shape as
-/// [`SummaryTree::rotate_left`], except we mutate
-/// the existing nodes' children/height in place rather than allocating.
-/// The rotation re-purposes existing TurnIndices (which already exist
-/// as substrate turns); their tree_meta gets rewritten to reflect new
-/// children.  The new dirty bit is set by the commit step.
-fn rotate_left_via_alloc<F>(
-    tree: &mut SummaryTree,
-    a: NodeId,
-    _alloc: &mut F,
-    touched: &mut Vec<TurnIndex>,
-) -> Result<NodeId, ProbeError>
-where
-    F: FnMut(TurnIndex, TurnIndex) -> Result<TurnIndex, ProbeError>,
-{
-    let (x, b) = {
-        let node = tree
-            .get(a)
-            .ok_or_else(|| ProbeError::Soft(format!("rotate_left: a={a} missing")))?;
-        (node.children[0], node.children[1])
+        kind: TurnKind::SummaryOfSummaries,
+        children: children.clone(),
+        height: level,
     };
-    let (y, z) = {
-        let bn = tree
-            .get(b)
-            .ok_or_else(|| ProbeError::Soft(format!("rotate_left: b={b} missing")))?;
-        (bn.children[0], bn.children[1])
-    };
-    // a takes (x, y); b takes (a, z).  Heights refresh from children.
-    let xh = tree.get(x).map(|n| n.tree_height).unwrap_or(0);
-    let yh = tree.get(y).map(|n| n.tree_height).unwrap_or(0);
-    let ah = xh.max(yh) + 1;
-    tree.insert_node(Node::summary_of_summaries(a, x, y, ah, 20));
-    let zh = tree.get(z).map(|n| n.tree_height).unwrap_or(0);
-    let bh = ah.max(zh) + 1;
-    tree.insert_node(Node::summary_of_summaries(b, a, z, bh, 20));
-    touched.push(TurnIndex(a.0));
-    touched.push(TurnIndex(b.0));
-    Ok(b)
+    let idx = runner.run(probe)?.sealed_turn;
+    conversation.write().set_tree_meta(
+        timeline,
+        idx,
+        TreeNodeMeta {
+            kind: TurnKind::SummaryOfSummaries,
+            children,
+            tree_height: level,
+        },
+    );
+    persist_tree_meta(conversation, timeline, idx);
+    Ok(idx)
 }
 
-fn rotate_right_via_alloc<F>(
-    tree: &mut SummaryTree,
-    a: NodeId,
-    _alloc: &mut F,
-    touched: &mut Vec<TurnIndex>,
-) -> Result<NodeId, ProbeError>
-where
-    F: FnMut(TurnIndex, TurnIndex) -> Result<TurnIndex, ProbeError>,
-{
-    let (b, z) = {
-        let node = tree
-            .get(a)
-            .ok_or_else(|| ProbeError::Soft(format!("rotate_right: a={a} missing")))?;
-        (node.children[0], node.children[1])
-    };
-    let (x, y) = {
-        let bn = tree
-            .get(b)
-            .ok_or_else(|| ProbeError::Soft(format!("rotate_right: b={b} missing")))?;
-        (bn.children[0], bn.children[1])
-    };
-    let yh = tree.get(y).map(|n| n.tree_height).unwrap_or(0);
-    let zh = tree.get(z).map(|n| n.tree_height).unwrap_or(0);
-    let ah = yh.max(zh) + 1;
-    tree.insert_node(Node::summary_of_summaries(a, y, z, ah, 20));
-    let xh = tree.get(x).map(|n| n.tree_height).unwrap_or(0);
-    let bh = xh.max(ah) + 1;
-    tree.insert_node(Node::summary_of_summaries(b, x, a, bh, 20));
-    touched.push(TurnIndex(a.0));
-    touched.push(TurnIndex(b.0));
-    Ok(b)
-}
-
-/// Copy every node in `tree` whose id appears in `touched` back into
-/// the substrate's `tree_meta` map.  Updates `tree_root` from
-/// `tree.root()`.  Marks summary nodes whose children changed dirty
-/// IF their `dirty` flag was already true in-memory.
-fn commit_tree_to_substrate(
+/// Build at most one missing internal node toward the canonical ternary shape,
+/// clearing the reconcile hint once the forest is whole. One node per pass keeps
+/// reconciliation low-priority. See `docs/immutable_summary_forest.md`.
+fn reconcile_pass(
     conversation: &Conversation,
+    runner: &dyn ProbeRunner,
     timeline: TimelineId,
-    tree: &SummaryTree,
-    touched: &mut Vec<TurnIndex>,
-) {
-    use TurnKind;
-    let mut view = conversation.write();
-    touched.sort_by_key(|t| t.0);
-    touched.dedup();
-    for idx in touched.iter() {
-        let node = match tree.get(NodeId(idx.0)) {
-            Some(n) => n,
-            None => continue,
-        };
-        let prev_dirty = view
-            .tree_meta_of(timeline, *idx)
-            .map(|m| m.dirty)
-            .unwrap_or(false);
-        let new_meta = TreeNodeMeta {
-            kind: node.kind,
-            children: node.children.iter().map(|c| TurnIndex(c.0)).collect(),
-            tree_height: node.tree_height,
-            // A rotation may have rewritten children — mark dirty so
-            // the next sweep regenerates the summary content.  But
-            // don't unset dirty if it was already set.
-            dirty: prev_dirty
-                || (node.kind == TurnKind::SummaryOfSummaries && {
-                    // Compare against previously-recorded children to
-                    // tell if this rotation changed them.
-                    let old_children = view
-                        .tree_meta_of(timeline, *idx)
-                        .map(|m| m.children.clone())
-                        .unwrap_or_default();
-                    let new_children: Vec<TurnIndex> =
-                        node.children.iter().map(|c| TurnIndex(c.0)).collect();
-                    old_children != new_children
-                }),
-        };
-        view.set_tree_meta(timeline, *idx, new_meta);
+) -> Result<(), ProbeError> {
+    if !conversation.read().needs_reconcile(timeline) {
+        return Ok(());
     }
-    view.set_tree_root(timeline, tree.root().map(|r| TurnIndex(r.0)));
+    let Some(children) = conversation.read().reconcile_next(timeline) else {
+        conversation.write().set_needs_reconcile(timeline, false);
+        return Ok(());
+    };
+    let level = conversation
+        .read()
+        .tree_meta_of(timeline, children[0])
+        .map(|m| m.tree_height)
+        .unwrap_or(1)
+        + 1;
+    build_sos(conversation, runner, timeline, children, level)?;
+    Ok(())
 }
 
-/// Clear the oldest dirty node's dirty bit. At most one per pass.
-///
-/// A `SummaryOfSummaries` node is marked dirty when an AVL rotation rewrites
-/// its children, so its summary content is now a summary of a shifted span.
-/// Clearing the bit — rather than regenerating the content — is deliberate:
-/// re-probing would mint a fresh summary turn with no way to re-link it into
-/// the tree, leaving an orphan that the model-backed probe path drops onto the
-/// pending queue as a `Normal` turn and re-summarises, cascading into an
-/// unbounded loop of summary-of-summary turns. The SoS node keeps its
-/// (slightly stale but valid) summary of the shifted span, which is correct
-/// for retrieval, and no orphan turns are created.
-fn sweep_one_dirty(conversation: &Conversation, timeline: TimelineId) {
-    if let Some(dirty_idx) = conversation.write().pop_oldest_dirty(timeline) {
-        conversation
-            .write()
-            .clear_summary_dirty(timeline, dirty_idx);
+/// Persist one node's `TreeMetadata` redo-log record from its current
+/// (immutable) substrate meta.
+fn persist_tree_meta(conversation: &Conversation, timeline: TimelineId, idx: TurnIndex) {
+    let meta = match conversation.read().tree_meta_of(timeline, idx).cloned() {
+        Some(m) => m,
+        None => return,
+    };
+    let payload = TreeMetadataPayload {
+        timeline_id: timeline.raw(),
+        turn_index: idx.0,
+        kind: match meta.kind {
+            TurnKind::Normal => 0,
+            TurnKind::SummaryOfTurns => 1,
+            TurnKind::SummaryOfSummaries => 2,
+        },
+        tree_height: meta.tree_height,
+        children: meta.children.iter().map(|c| c.0).collect(),
+    };
+    if let Err(e) = conversation.write_tree_metadata(payload) {
+        tracing::warn!(
+            target: "candle_conversation::summariser",
+            "write_tree_metadata failed for {idx}: {e}"
+        );
     }
 }
 
@@ -884,6 +523,7 @@ impl ProbeRunner for ChannelProbeRunner {
             timeline: request.timeline,
             kind: request.kind,
             children: request.children.clone(),
+            height: request.height,
             response_tx,
         };
         if let Err(e) = self.request_tx.send(scheduler_request) {
@@ -910,6 +550,7 @@ impl ProbeRunner for ChannelProbeRunner {
                 timeline: request.timeline,
                 kind: request.kind,
                 children: request.children.clone(),
+                height: request.height,
                 response_tx,
             };
             match self.request_tx.send(scheduler_request) {
@@ -993,6 +634,7 @@ impl ProbeRunner for MockProbeRunner {
 mod tests {
     use super::*;
     use crate::projection::{Conversation, TimelineId, TurnIndex};
+    use crate::summary_tree::tree::MERGE_FANOUT;
     use TurnKind;
 
     fn ephemeral_workspace() -> tempfile::TempDir {
@@ -1024,6 +666,7 @@ mod tests {
                 timeline,
                 kind: TurnKind::SummaryOfTurns,
                 children: vec![normal],
+                height: 1,
             })
             .unwrap();
         assert_eq!(resp.sealed_turn.0, 1);
@@ -1145,36 +788,38 @@ mod tests {
         assert_eq!(leaf_meta.kind, TurnKind::SummaryOfTurns);
         assert_eq!(leaf_meta.children, vec![TurnIndex(0)]);
         assert_eq!(leaf_meta.tree_height, 1);
-        // Root is the leaf.
-        assert_eq!(conv.read().tree_root_of(timeline), Some(TurnIndex(1)));
+        // The lone leaf is the single peak.
+        assert_eq!(conv.read().peaks_of(timeline), vec![(TurnIndex(1), 1)]);
     }
 
     #[test]
-    fn absorb_two_pending_creates_sos_parent_via_probe_allocator() {
+    fn absorb_three_pending_carries_into_ternary_sos() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        let _n0 = conv.write().append_with_blocks(timeline, 10, 0, 1);
-        let _n1 = conv.write().append_with_blocks(timeline, 10, 1, 2);
+        for i in 0..3u64 {
+            conv.write().append_with_blocks(timeline, 10, i, i + 1);
+        }
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
-        // Index 0 = Normal, 1 = first SoT, 2 = Normal, 3 = second SoT,
-        // 4 = SoS parent (allocated by the alloc closure).
-        // Order is determined by `append_with_blocks` ordering inside
-        // the MockProbeRunner.
-        // The root should be a SummaryOfSummaries.
-        let root = conv.read().tree_root_of(timeline).expect("root exists");
+        // Three Normal turns → three SoT leaves → one ternary SoS peak over them.
+        let peaks = conv.read().peaks_of(timeline);
+        assert_eq!(peaks.len(), 1, "the SoS should be the sole peak");
+        let (root, level) = peaks[0];
+        assert_eq!(level, 2);
         let root_meta = conv
             .read()
             .tree_meta_of(timeline, root)
             .cloned()
             .expect("root meta");
         assert_eq!(root_meta.kind, TurnKind::SummaryOfSummaries);
-        assert_eq!(root_meta.children.len(), 2);
+        assert_eq!(root_meta.children.len(), MERGE_FANOUT);
         assert_eq!(root_meta.tree_height, 2);
+        // Forest is whole — nothing to reconcile.
+        assert_eq!(conv.read().reconcile_next(timeline), None);
     }
 
     #[test]
-    fn many_pending_keeps_tree_balanced() {
+    fn many_pending_build_canonical_ternary_forest() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
         for i in 0..16u64 {
@@ -1182,15 +827,24 @@ mod tests {
         }
         let runner = MockProbeRunner::new(conv.clone());
         absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
-        // Build the in-memory tree from the substrate state and
-        // verify it's balanced.
+        // 16 = 121 base 3 → peak levels {3, 2, 2, 1}; tallest peak level 3.
+        let mut levels: Vec<u8> = conv
+            .read()
+            .peaks_of(timeline)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        levels.sort_unstable();
+        assert_eq!(levels, vec![1, 2, 2, 3]);
+        // Every SoS is canonical (exactly MERGE_FANOUT children) and the forest
+        // is whole.
         let tree = conv.read().build_summary_tree_in_memory(timeline);
-        assert!(
-            tree.is_balanced(),
-            "tree must be balanced after absorbing 16 pending turns"
-        );
-        // 16 Normal turns → 16 SoT leaves → log2(16) + 1 internals.
-        // Height ≤ log2(16) + 1 = 5.
-        assert!(tree.height() <= 5);
+        for id in tree.all_ids() {
+            let node = tree.get(id).unwrap();
+            if node.kind == TurnKind::SummaryOfSummaries {
+                assert_eq!(node.children.len(), MERGE_FANOUT);
+            }
+        }
+        assert_eq!(conv.read().reconcile_next(timeline), None);
     }
 }

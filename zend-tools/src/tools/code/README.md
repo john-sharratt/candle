@@ -9,7 +9,7 @@ Run Python or Node.js code in a subprocess interpreter.
 | `run.rs` | `code_run` | One-shot execution; subprocess spawned and killed per call |
 | `session_open.rs` | `code_session_open` | Open a persistent REPL subprocess |
 | `session_exec.rs` | `code_session_exec` | Execute a snippet in the running REPL |
-| `session_list.rs` | `code_session_list` | List open code sessions |
+| `session_list.rs` | `code_list` | List open code sessions |
 | `session_close.rs` | `code_session_close` | Kill the interpreter subprocess |
 | `mod.rs` | — | `CodeError`; `PYTHON_REPL`; `NODE_REPL`; `now()` |
 

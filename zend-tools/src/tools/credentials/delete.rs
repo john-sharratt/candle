@@ -29,7 +29,7 @@ impl Tool for CredentialDelete {
          needed, or when cleaning up after a workflow. Triggered by \"delete the credential \
          for\", \"remove that key\", \"forget that password\", \"rotate this credential\", \
          \"revoke\". Active sessions using the deleted credential continue running until closed; \
-         only new opens fail. Returns the name and a deleted flag. Use credential_list to \
+         only new opens fail. Returns the name and a deleted flag. Use cred_list to \
          find the exact name before deleting.";
 
     type Request = DeleteRequest;

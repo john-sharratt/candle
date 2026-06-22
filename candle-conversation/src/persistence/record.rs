@@ -115,6 +115,12 @@ pub enum RecordType {
     /// view; the compactor physically drops the matching records
     /// on the next compaction pass.
     Tombstone = 14,
+    /// Cached summary of a section collection (today: the tool catalog),
+    /// keyed by a hash of the ordered collection content. A workspace
+    /// singleton — last-writer-wins on replay, and the compactor keeps only
+    /// the latest, dropping every superseded copy. JSON payload
+    /// [`ToolSummaryPayload`]. Regenerated only when the catalog hash changes.
+    ToolSummary = 15,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -658,10 +664,9 @@ impl<'a> ByteReader<'a> {
 /// per `(timeline, turn_index)`.  Last-writer-wins on reload: a later
 /// record for the same key supersedes the earlier one.
 ///
-/// Stored as JSON because it's small (a handful of integer fields plus
-/// a children list whose length is bounded by the AVL invariants) and
-/// because the redo-log already has a JSON-header culture; binary
-/// would buy nothing here.
+/// Stored as JSON because it's small (a handful of integer fields plus a
+/// children list bounded by `MERGE_FANOUT`) and because the redo-log already
+/// has a JSON-header culture; binary would buy nothing here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeMetadataPayload {
     /// `TimelineId.raw()` — opaque u64 key.
@@ -671,21 +676,13 @@ pub struct TreeMetadataPayload {
     /// Discriminant matching `summary_tree::TurnKind`:
     ///   0 = Normal, 1 = SummaryOfTurns, 2 = SummaryOfSummaries.
     pub kind: u8,
-    /// AVL height for binary summary nodes; 0 for Normal sub-leaves.
+    /// Forest level: `SummaryOfTurns` = 1, a `SummaryOfSummaries` over level-`h`
+    /// children = `h + 1`; 0 for Normal sub-leaves.
     pub tree_height: u8,
-    /// `true` iff the summary's stored Q-fingerprint is stale (a
-    /// rotation moved children around since the last regeneration).
-    pub dirty: bool,
-    /// For `SummaryOfTurns`: Normal-child indices in chronological
-    /// order.  For `SummaryOfSummaries`: exactly `[left, right]`.  For
-    /// `Normal`: empty.
+    /// For `SummaryOfTurns`: Normal-child indices in chronological order.  For
+    /// `SummaryOfSummaries`: exactly `MERGE_FANOUT` same-level child indices.
+    /// For `Normal`: empty.
     pub children: Vec<u32>,
-    /// Optional tree-root marker — when `Some`, the writer is also
-    /// declaring that the timeline's tree root is now this turn
-    /// (i.e. the rotation surfaced a new root).  Reload tracks the
-    /// most-recently-written `Some(_)` per timeline as the final root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_now: Option<u32>,
 }
 
 impl TreeMetadataPayload {
@@ -740,6 +737,30 @@ impl TombstonePayload {
     }
 }
 
+/// JSON payload for a [`RecordType::ToolSummary`] record. A workspace
+/// singleton (last-writer-wins): `catalog_hash` is a 128-bit hash of the
+/// ordered collection content the summary was generated from, and `summary`
+/// is the generated text. On startup the caller hashes the freshly-injected
+/// catalog and compares to the latest record's `catalog_hash`; an equal hash
+/// is a cache hit (no regeneration), a different one triggers a regenerate +
+/// rewrite, and the compactor reclaims the superseded copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSummaryPayload {
+    pub catalog_hash: u128,
+    pub summary: String,
+}
+
+impl ToolSummaryPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("ToolSummaryPayload serialise infallible")
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        serde_json::from_slice(buf)
+            .map_err(|e| PersistenceError::Corrupt(format!("ToolSummary JSON parse: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,9 +778,7 @@ mod tests {
             turn_index: 17,
             kind: 1, // SummaryOfTurns
             tree_height: 1,
-            dirty: false,
-            children: vec![10, 11, 12, 13, 14],
-            root_now: None,
+            children: vec![10],
         };
         let bytes = p.encode();
         let back = TreeMetadataPayload::decode(&bytes).unwrap();
@@ -783,19 +802,47 @@ mod tests {
     }
 
     #[test]
-    fn tree_metadata_root_now_round_trips() {
+    fn tree_metadata_sos_round_trips() {
         let p = TreeMetadataPayload {
             timeline_id: 7,
             turn_index: 99,
             kind: 2, // SummaryOfSummaries
             tree_height: 4,
-            dirty: true,
-            children: vec![50, 75],
-            root_now: Some(99),
+            children: vec![50, 75, 88],
         };
         let bytes = p.encode();
         let back = TreeMetadataPayload::decode(&bytes).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn tool_summary_payload_round_trips_and_bytes() {
+        let p = ToolSummaryPayload {
+            catalog_hash: 1u128 << 64, // 18446744073709551616 — exercises the high word
+            summary: "## A\n  x, y".to_string(),
+        };
+        // Exact wire bytes: serde_json emits the struct fields in order, the
+        // u128 as a decimal number and the string with its newline escaped.
+        let bytes = p.encode();
+        let expected = "{\"catalog_hash\":18446744073709551616,\"summary\":\"## A\\n  x, y\"}";
+        assert_eq!(bytes, expected.as_bytes());
+        let back = ToolSummaryPayload::decode(&bytes).unwrap();
+        assert_eq!(p, back);
+
+        // Through a real record frame.
+        let header = RecordHeader {
+            record_type: RecordType::ToolSummary,
+            format: 0,
+            payload_len: bytes.len() as u64,
+            crc: crc32(&bytes),
+            stream_id: 0,
+            chunk_index: 0,
+            token_count: 0,
+        };
+        let frame = encode_record(&header, &bytes);
+        let (hdr2, payload2, _total) = decode_record(&frame).unwrap();
+        assert_eq!(hdr2.record_type, RecordType::ToolSummary);
+        assert_eq!(ToolSummaryPayload::decode(payload2).unwrap(), p);
     }
 
     #[test]

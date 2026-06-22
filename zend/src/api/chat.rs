@@ -46,12 +46,16 @@ pub async fn completions(
 
     let max_tokens = req.max_tokens.map(|n| n as usize);
     let conv_id = req.conv_id.unwrap_or_else(|| "default".to_string());
+    let force_hires = req.force_high_resolution;
+    let assistant_prefill = req.assistant_prefill;
     if req.stream {
         stream_sse(
             session,
             req.messages,
             max_tokens,
             conv_id,
+            force_hires,
+            assistant_prefill,
             model,
             id,
             created,
@@ -63,6 +67,8 @@ pub async fn completions(
             req.messages,
             max_tokens,
             conv_id,
+            force_hires,
+            assistant_prefill,
             model,
             id,
             created,
@@ -78,11 +84,21 @@ async fn stream_sse(
     messages: Vec<crate::types::ChatMessage>,
     max_tokens: Option<usize>,
     conv_id: String,
+    force_hires: Option<String>,
+    assistant_prefill: Option<String>,
     model: String,
     id: String,
     created: u64,
 ) -> Response {
-    let token_stream = session.submit(messages, max_tokens, conv_id).await;
+    let token_stream = session
+        .submit(
+            messages,
+            max_tokens,
+            conv_id,
+            force_hires,
+            assistant_prefill,
+        )
+        .await;
 
     let id_c = id.clone();
     let model_c = model.clone();
@@ -161,11 +177,21 @@ async fn collect_completion(
     messages: Vec<crate::types::ChatMessage>,
     max_tokens: Option<usize>,
     conv_id: String,
+    force_hires: Option<String>,
+    assistant_prefill: Option<String>,
     model: String,
     id: String,
     created: u64,
 ) -> Response {
-    let mut token_stream = session.submit(messages, max_tokens, conv_id).await;
+    let mut token_stream = session
+        .submit(
+            messages,
+            max_tokens,
+            conv_id,
+            force_hires,
+            assistant_prefill,
+        )
+        .await;
     let mut full = String::new();
     let mut tokens = 0usize;
     while let Some(result) = token_stream.next().await {

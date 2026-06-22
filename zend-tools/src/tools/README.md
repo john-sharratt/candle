@@ -39,7 +39,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 
 | Tool | File | Notes |
 |------|------|-------|
-| `file_write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
+| `write` | `file/write.rs` | Create or overwrite; 10 MiB VFS cap |
 | `file_read` | `file/read.rs` | Full content + line count |
 | `file_edit` | `file/edit.rs` | Unique-substring replacement |
 | `file_list` | `file/list.rs` | Path prefix filter; sorted |
@@ -60,14 +60,14 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | Tool | File | Notes |
 |------|------|-------|
 | `credential_save` | `credentials/save.rs` | Type allowlist; PEM validation for ssh_key |
-| `credential_list` | `credentials/list.rs` | Metadata only; never returns secrets |
+| `cred_list` | `credentials/list.rs` | Metadata only; never returns secrets |
 | `credential_delete` | `credentials/delete.rs` | By name; active sessions unaffected |
 
 ### SSH sessions (6 tools) — web chat only
 
 | Tool | File | Notes |
 |------|------|-------|
-| `ssh_session_open` | `ssh/open.rs` | TOFU host key; confirms |
+| `ssh_open` | `ssh/open.rs` | TOFU host key; confirms |
 | `ssh_session_exec` | `ssh/exec.rs` | Sentinel/nonce; 32 KiB cap; confirms |
 | `ssh_session_exec_async` | `ssh/exec_async.rs` | Returns process_id; confirms |
 | `ssh_session_poll` | `ssh/poll.rs` | Read chunks; optional signal |
@@ -79,7 +79,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | Tool | File | Notes |
 |------|------|-------|
 | `telnet_session_open` | `telnet/open.rs` | Raw TCP; optional prompt pattern |
-| `telnet_session_send` | `telnet/send.rs` | `send` + optional `expect` regex; confirms |
+| `telnet_send` | `telnet/send.rs` | `send` + optional `expect` regex; confirms |
 | `telnet_session_list` | `telnet/list.rs` | |
 | `telnet_session_close` | `telnet/close.rs` | |
 
@@ -88,7 +88,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | Tool | File | Notes |
 |------|------|-------|
 | `http_session_open` | `http_session/open.rs` | reqwest client + cookie jar |
-| `http_session_request` | `http_session/request.rs` | GET no-confirm; POST/PUT/etc confirm; body/body_b64 |
+| `http_request` | `http_session/request.rs` | GET no-confirm; POST/PUT/etc confirm; body/body_b64 |
 | `http_session_list` | `http_session/list.rs` | |
 | `http_session_close` | `http_session/close.rs` | |
 
@@ -163,7 +163,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 |------|------|-------|
 | `hash_compute` | `hash/compute.rs` | SHA256/512, SHA1, MD5, SHA3, BLAKE3 |
 | `hash_scan` | `hash/scan.rs` | Identify algorithm from digest + pre-image |
-| `totp_generate` | `totp.rs` | RFC 6238 TOTP via `totp-rs` |
+| `totp` | `totp.rs` | RFC 6238 TOTP via `totp-rs` |
 
 ### Cryptographic primitives (8 tools) — web chat only
 
@@ -202,11 +202,11 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | `code_run` | `code/run.rs` | One-shot; Python or Node subprocess |
 | `code_session_open` | `code/session_open.rs` | Persistent REPL; Python or Node |
 | `code_session_exec` | `code/session_exec.rs` | Execute in running REPL |
-| `code_session_list` | `code/session_list.rs` | |
+| `code_list` | `code/session_list.rs` | |
 | `code_session_close` | `code/session_close.rs` | Kills subprocess |
 
 ### Subagent (1 tool) — web chat only
 
 | Tool | File | Notes |
 |------|------|-------|
-| `subagent_run` | `subagent.rs` | Nested agent loop via `SubagentRunner` trait |
+| `sub_run` | `subagent.rs` | Nested agent loop via `SubagentRunner` trait |

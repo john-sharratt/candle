@@ -240,6 +240,15 @@ pub(super) fn apply_segments_build(
                     .run_tokens
                     .extend(ctx.boundary_markers.assistant_end.iter().copied());
             }
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
+                // A turn-half injects only the user-message K/V window with
+                // NO per-turn boundary-marker wrapping: the compression pass
+                // supplies its own framing glue (`user_start` + system prompt,
+                // then `user_end` + `assistant_start`) so the user halves of
+                // every child concatenate into one coherent block.
+                walker.collect_run();
+                inject_sealed_turn_half(ctx, &mut walker, rt.group(), rt.index())?;
+            }
             ProjectionSegment::NewUserMessage { tokens } => {
                 // The in-flight user message is the logical tail; defer it past
                 // the gap-fill so it prefills against the full [sealed | glue].
@@ -525,6 +534,55 @@ fn inject_sealed_turn(
         .set_block_range(timeline, index, start_block as u64, end_block as u64);
 
     log_injected_tokens(ctx, &toks);
+    walker.sealed_turns += 1;
+    walker.sealed_tokens += sealed[0].token_count;
+    walker.record_sealed(sealed[0].token_count);
+    Ok(())
+}
+
+/// Inject the user half of a turn onto the slot as a zero-copy sealed
+/// window.  Mirrors [`inject_sealed_turn`] but resolves the half via
+/// [`Substrate::turn_user_sealed_half`] and does not update any
+/// turn/section block range (a half is a transient compression input, not
+/// a projected turn).  Used only by the summary-tree compression passes.
+fn inject_sealed_turn_half(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    group: GroupId,
+    index: TurnIndex,
+) -> Result<(), ConversationError> {
+    let parent_id = ctx.parent_id;
+
+    let timeline: Option<TimelineId> = match ctx.slot_target {
+        Some(tgt) if group == tgt.group => Some(tgt.timeline),
+        _ => ctx.conversation.read().timelines_for_group(group).next(),
+    };
+    let Some(timeline) = timeline else {
+        walker.skipped_turns += 1;
+        tracing::warn!(
+            target: "candle_conversation::scheduler::reproject",
+            slot = parent_id.0,
+            group = group.raw(),
+            index = index.0,
+            "compress: no timeline for group; dropping turn-half"
+        );
+        return Ok(());
+    };
+
+    let sealed = match ctx
+        .conversation
+        .read()
+        .turn_user_sealed_half(timeline, index)
+    {
+        Some(s) if !s.is_empty() && s[0].token_count > 0 => s,
+        _ => {
+            // Empty half (e.g. a turn with no user content) — nothing to
+            // inject. Not an error: the other pass carries that content.
+            return Ok(());
+        }
+    };
+    inject_arc_sealed(ctx.session, parent_id, ctx.chunk_size, &sealed)?;
+
     walker.sealed_turns += 1;
     walker.sealed_tokens += sealed[0].token_count;
     walker.record_sealed(sealed[0].token_count);

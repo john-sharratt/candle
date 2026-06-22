@@ -114,16 +114,16 @@ pub struct TurnDecl {
     pub view: Vec<u32>,
     #[serde(default)]
     pub scores: PerDepthScores,
-    /// Per-half partition counts.  Reserved for a future per-half
-    /// K/V split; under the current seal path they're always zero.
-    /// Kept on the record so the on-disk shape doesn't shift again
-    /// when that work lands.
+    /// Content boundaries that frame the user-message body and the
+    /// assistant-response body inside the sealed grid — see
+    /// `substrate::TurnContentBounds`.  Persisted so the compressor can
+    /// window content-only turn halves after a substrate reload.
     #[serde(default)]
-    pub user_chunk_count: u32,
+    pub user_content_start: u32,
     #[serde(default)]
-    pub user_token_count: u32,
+    pub user_content_end: u32,
     #[serde(default)]
-    pub user_sig_count: u32,
+    pub assistant_content_start: u32,
     /// The user message text for this turn — exactly what
     /// `submit_turn` received, with no role-marker envelope and no
     /// `/no_think` prefix.  Stored directly so reload re-populates
@@ -219,9 +219,9 @@ mod tests {
             anchored_prefix: vec![StreamId(7), StreamId(8), StreamId(123)],
             view: vec![0, 2, 5],
             scores: PerDepthScores(lanes),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -246,9 +246,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn stream_decl_ignores_unknown_field() {
         // A Turn with an extra `future_field`. serde drops unknown keys.
-        // All mandatory fields (including the partition counts) must
+        // All mandatory fields (including the content boundaries) must
         // still be present — only the unknown `future_field` is the
         // forward-compat surface this test exercises.
         let payload = br#"{
@@ -269,9 +269,9 @@ mod tests {
             "timeline_id":1,
             "turn_index":0,
             "role":1,
-            "user_chunk_count":0,
-            "user_token_count":0,
-            "user_sig_count":0,
+            "user_content_start":0,
+            "user_content_end":0,
+            "assistant_content_start":0,
             "future_field":"opaque"
         }"#;
         let decoded = StreamDecl::decode(payload).unwrap();

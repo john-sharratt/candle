@@ -1,4 +1,4 @@
-//! `totp_generate` tool.
+//! `totp` tool.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -46,15 +46,17 @@ pub struct Response {
 pub struct TotpGenerate;
 
 impl Tool for TotpGenerate {
-    const NAME: &'static str = "totp_generate";
+    const NAME: &'static str = "totp";
     const DESCRIPTION: &'static str =
         "Generate a current TOTP (Time-based One-Time Password / authenticator app) code \
          from a stored totp_secret credential. Use for: producing a 2FA or MFA code before \
          logging in to a service, automating authentication flows that require a rotating OTP, \
-         getting the current 6-digit authenticator code. Triggered by \"generate a 2FA code\", \
-         \"get the TOTP code for\", \"what's the authenticator code for\", \"generate OTP for\". \
-         Returns the current code, seconds remaining until it expires, and the credential name. \
-         Requires credential of type totp_secret saved via credential_save.";
+         getting the current 6-digit authenticator code for a named secret. Triggered by \
+         \"generate a 2FA code\", \"get the TOTP code for\", \"what's the authenticator code for \
+         my <name> secret\", \"generate OTP for\". Pass the credential's name in `credential_name` \
+         — this tool reads the stored totp_secret itself, so do NOT fetch or look up the \
+         credential first; call this directly. Returns the current code, seconds remaining until \
+         it expires, and the credential name.";
 
     type Request = Request;
     type Response = Response;

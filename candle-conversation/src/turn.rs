@@ -59,6 +59,14 @@ pub struct TurnOptions {
     /// Stencil constraint override for this turn.
     /// If set, overrides any conversation-level stencil.
     pub turn_stencil: Option<Vec<i32>>,
+
+    /// Text to prefill as the start of the assistant's response, decoded from
+    /// rather than sampled. The model is forced to continue from this prefix —
+    /// e.g. seeding `<tool_call>` commits the decode to the tool-call grammar so
+    /// it cannot refuse, narrate, or fabricate a result. The prefix is pinned
+    /// into the turn's K/V and sealed as part of the assistant content; the
+    /// model decodes the continuation. `None` = ordinary free decode.
+    pub assistant_prefill: Option<String>,
 }
 
 impl TurnOptions {
@@ -99,6 +107,13 @@ impl TurnOptions {
     /// Builder: set stencil constraint for this turn.
     pub fn stencil(mut self, tokens: Vec<i32>) -> Self {
         self.turn_stencil = Some(tokens);
+        self
+    }
+
+    /// Builder: seed the assistant response with `prefix`, forcing the decode to
+    /// continue from it (see [`Self::assistant_prefill`]).
+    pub fn assistant_prefill(mut self, prefix: impl Into<String>) -> Self {
+        self.assistant_prefill = Some(prefix.into());
         self
     }
 }

@@ -132,7 +132,7 @@ mod control {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit(messages, Some(max_tokens), CONV_ID.to_string())
+            .submit(messages, Some(max_tokens), CONV_ID.to_string(), None, None)
             .await;
         let mut n = 0usize;
         let mut text = String::new();

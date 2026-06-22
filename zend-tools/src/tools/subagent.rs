@@ -1,4 +1,4 @@
-//! `subagent_run` tool — delegates to the injected SubagentRunner.
+//! `sub_run` tool — delegates to the injected SubagentRunner.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ pub struct Response {
 pub struct SubagentRun;
 
 impl Tool for SubagentRun {
-    const NAME: &'static str = "subagent_run";
+    const NAME: &'static str = "sub_run";
     const DESCRIPTION: &'static str =
         "Spawn a nested agent loop with its own context, message history, and tool subset. \
          Use for: decomposing complex multi-step tasks, parallelising subtasks with different \

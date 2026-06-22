@@ -31,11 +31,15 @@ use candle_conversation::persistence::checkpoint;
 use candle_conversation::persistence::compaction;
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
 use candle_conversation::persistence::manifest::Manifest;
-use candle_conversation::persistence::record::{ChunkPayload, Record, RecordType};
+use candle_conversation::persistence::record::{
+    ChunkPayload, Record, RecordType, ToolSummaryPayload,
+};
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId};
 use candle_conversation::persistence::walker;
+use candle_conversation::projection::{TimelineId, TurnIndex};
 use candle_conversation::substrate::Substrate;
+use candle_conversation::summary_tree::TurnKind;
 use candle_nn::kv_cache::KvFormat;
 use tokenizers::Tokenizer;
 
@@ -87,8 +91,22 @@ enum Cmd {
     },
     /// The live `ModelSpec` / `Template` payloads.
     Meta,
+    /// The cached tool-catalog summary (the `ToolSummary` singleton): its
+    /// catalog hash and the full generated text.
+    ToolSummary,
     /// Latest checkpoint and the manifest it recovers.
     Checkpoint,
+    /// Per-timeline summary forest reconstructed from `TreeMetadata` records:
+    /// kind / level / children for every summary node, with peaks flagged.
+    Tree {
+        /// Restrict to one timeline (raw u64 id, as printed in the header).
+        #[arg(long)]
+        timeline: Option<u64>,
+        /// Decode each summary node's text (and, for a SoT leaf, the source
+        /// turn it compresses) so faithfulness can be eyeballed.
+        #[arg(long)]
+        text: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -112,9 +130,175 @@ fn main() -> Result<()> {
             tokens(&mut log, &log_path, parse_stream_id(&stream_id)?, ids)?
         }
         Cmd::Meta => meta(&mut log, &log_path)?,
+        Cmd::ToolSummary => tool_summary(&mut log)?,
         Cmd::Checkpoint => checkpoint_view(&mut log)?,
+        Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
     }
     Ok(())
+}
+
+/// Render the per-timeline summary tree reconstructed from `TreeMetadata`
+/// records. With `with_text`, decode each summary node (and a SoT's source
+/// turn) using the tokenizer sidecar so faithfulness is visible.
+fn tree(
+    log: &mut LogFile,
+    log_path: &std::path::Path,
+    only_timeline: Option<u64>,
+    with_text: bool,
+) -> Result<()> {
+    let substrate = build_substrate(log)?;
+    let tok = if with_text {
+        load_log_tokenizer(log_path)?
+    } else {
+        None
+    };
+
+    // A raw walker pass populates `streams` + the tree metadata (via
+    // `set_tree_meta`), but NOT the per-timeline turn registry (that needs
+    // `register_timeline`, whose layer/group map isn't in the log). So enumerate
+    // turns from the turn streams, query the tree meta off the substrate, and
+    // grab each turn's Tokens-record location for on-demand decode.
+    struct NodeInfo {
+        idx: u32,
+        kind: TurnKind,
+        children: Vec<u32>,
+        height: u8,
+    }
+    let mut by_tl: std::collections::BTreeMap<u64, Vec<NodeInfo>> =
+        std::collections::BTreeMap::new();
+    // Peak set (orphan summary nodes = window entry points) per timeline.
+    let mut peaks: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
+    let mut tokens_loc: std::collections::HashMap<(u64, u32), (u64, u64)> =
+        std::collections::HashMap::new();
+
+    for (_sid, entry) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &entry.decl else {
+            continue;
+        };
+        let Some(tl) = TimelineId::from_raw(t.timeline_id) else {
+            continue;
+        };
+        let (kind, children, height) = match substrate.tree_meta_of(tl, TurnIndex(t.turn_index)) {
+            Some(m) => (
+                m.kind,
+                m.children.iter().map(|c| c.0).collect(),
+                m.tree_height,
+            ),
+            None => (TurnKind::Normal, Vec::new(), 0),
+        };
+        by_tl.entry(t.timeline_id).or_default().push(NodeInfo {
+            idx: t.turn_index,
+            kind,
+            children,
+            height,
+        });
+        peaks.entry(t.timeline_id).or_insert_with(|| {
+            substrate
+                .peaks_of(tl)
+                .into_iter()
+                .map(|(idx, _)| idx.0)
+                .collect()
+        });
+        if let Some(l) = entry.tokens {
+            tokens_loc.insert((t.timeline_id, t.turn_index), (l.offset, l.record_size));
+        }
+    }
+    drop(substrate);
+
+    if by_tl.is_empty() {
+        println!("(no turn streams in substrate)");
+        return Ok(());
+    }
+
+    for (tl_raw, mut nodes) in by_tl {
+        if let Some(want) = only_timeline {
+            if tl_raw != want {
+                continue;
+            }
+        }
+        nodes.sort_by_key(|n| n.idx);
+        let n_normal = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, TurnKind::Normal))
+            .count();
+        let n_sot = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, TurnKind::SummaryOfTurns))
+            .count();
+        let n_sos = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, TurnKind::SummaryOfSummaries))
+            .count();
+        let tl_peaks = peaks.get(&tl_raw).cloned().unwrap_or_default();
+        println!(
+            "\n══ timeline {tl_raw} ── {} turns: {n_normal} normal, {n_sot} SoT, {n_sos} SoS  peaks={}",
+            nodes.len(),
+            tl_peaks.len(),
+        );
+
+        for n in &nodes {
+            if matches!(n.kind, TurnKind::Normal) {
+                continue;
+            }
+            let kind = match n.kind {
+                TurnKind::SummaryOfTurns => "SoT",
+                TurnKind::SummaryOfSummaries => "SoS",
+                TurnKind::Normal => "?",
+            };
+            let mark = if tl_peaks.contains(&n.idx) {
+                "  [PEAK]"
+            } else {
+                ""
+            };
+            println!(
+                "  #{:<4} {kind}  h={}  children={:?}{mark}",
+                n.idx, n.height, n.children
+            );
+            if let Some(t) = &tok {
+                if let Some(text) = decode_turn(log, &tokens_loc, tl_raw, n.idx, t)? {
+                    println!("        summary: {}", trunc(&text, 320));
+                }
+                if matches!(n.kind, TurnKind::SummaryOfTurns) {
+                    for &c in &n.children {
+                        if let Some(ctext) = decode_turn(log, &tokens_loc, tl_raw, c, t)? {
+                            println!("        source #{c}: {}", trunc(&ctext, 320));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode a turn's text from its Tokens record (looked up by `(timeline, idx)`).
+fn decode_turn(
+    log: &mut LogFile,
+    tokens_loc: &std::collections::HashMap<(u64, u32), (u64, u64)>,
+    timeline: u64,
+    idx: u32,
+    tok: &Tokenizer,
+) -> Result<Option<String>> {
+    let Some(&(off, size)) = tokens_loc.get(&(timeline, idx)) else {
+        return Ok(None);
+    };
+    let rec = read_record_at(log, off, size)?;
+    let ids = decode_token_ids(&rec.payload)?;
+    let text = tok
+        .decode(&ids, true)
+        .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+    Ok(Some(text))
+}
+
+/// Trim + truncate to `max` chars with an ellipsis.
+fn trunc(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
 }
 
 // ── Views ───────────────────────────────────────────────────────────────────
@@ -124,8 +308,9 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     let sb = log.superblock();
     let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
 
-    // Record-type histogram.
-    let mut counts = [0usize; 9];
+    // Record-type histogram. Sized past every known discriminant (Tombstone=14,
+    // Unknown=15) so a newer record type can't index out of bounds.
+    let mut counts = [0usize; 16];
     let mut payload_bytes = 0u64;
     for e in &entries {
         counts[type_index(e.record.header.record_type)] += 1;
@@ -479,7 +664,7 @@ fn checkpoint_view(log: &mut LogFile) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const ALL_TYPES: [RecordType; 9] = [
+const ALL_TYPES: [RecordType; 16] = [
     RecordType::ModelSpec,
     RecordType::Template,
     RecordType::StreamDecl,
@@ -489,10 +674,37 @@ const ALL_TYPES: [RecordType; 9] = [
     RecordType::Commit,
     RecordType::Checkpoint,
     RecordType::Tokenizer,
+    RecordType::Label,
+    RecordType::ConvState,
+    RecordType::TreeMetadata,
+    RecordType::DebugId,
+    RecordType::Tombstone,
+    RecordType::ToolSummary,
+    RecordType::Unknown,
 ];
 
 fn type_index(rt: RecordType) -> usize {
     rt as usize - 1
+}
+
+/// Decode and print the cached tool-catalog summary (the `ToolSummary`
+/// singleton): its catalog hash and the full generated text.
+fn tool_summary(log: &mut LogFile) -> Result<()> {
+    let manifest = build_manifest(log)?;
+    match manifest.tool_summary {
+        None => {
+            println!("tool summary  (none — not generated yet; restart the daemon to create it)");
+        }
+        Some(loc) => {
+            let rec = read_record_at(log, loc.offset, loc.record_size)?;
+            let payload = ToolSummaryPayload::decode(&rec.payload)
+                .map_err(|e| anyhow::anyhow!("decode ToolSummary: {e}"))?;
+            println!("catalog hash  {:032x}", payload.catalog_hash);
+            println!("text          {} bytes\n", payload.summary.len());
+            println!("{}", payload.summary);
+        }
+    }
+    Ok(())
 }
 
 fn build_manifest(log: &mut LogFile) -> Result<Manifest> {

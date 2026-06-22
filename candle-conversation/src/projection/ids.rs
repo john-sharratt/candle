@@ -58,14 +58,24 @@ pub enum Reserved {
     /// own layer/group/section so its turns never enter a user
     /// conversation's projection.
     Titler,
+    /// The cached tool-catalog summary section. Sealed at runtime (its content
+    /// is model-generated, not in the schema) and pinned under this reserved
+    /// [`SectionId`] so it can be injected just before the `tools` collection.
+    ToolSummary,
 }
 
 impl Reserved {
+    /// Number of reserved kinds — the width of the band at the very top of the
+    /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
+    /// when adding a `Reserved` variant.
+    pub const COUNT: u32 = 2;
+
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
     const fn slot(self) -> u32 {
         match self {
             Reserved::Titler => 0,
+            Reserved::ToolSummary => 1,
         }
     }
 
@@ -105,6 +115,14 @@ impl LayerId {
     /// Raw integer for diagnostics or external persistence.
     pub fn raw(self) -> u32 {
         self.0.get()
+    }
+
+    /// True if this id is in the reserved engine-internal band at the top of
+    /// the u32 space (e.g. [`Reserved::Titler`]), rather than the `1..n` range
+    /// YAML allocates for user layers. Engine-internal conversations have no
+    /// user-facing projection/summary and are excluded from compression.
+    pub fn is_reserved(self) -> bool {
+        self.0.get() > u32::MAX - Reserved::COUNT
     }
 
     /// Rebuild a `LayerId` from a persisted [`Self::raw`] value — the resume

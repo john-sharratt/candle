@@ -38,7 +38,7 @@ impl Tool for HttpSessionOpen {
          or service to interact with, or when setting up a workflow hitting the same endpoint \
          multiple times. Triggered by \"connect to the API\", \"set up a session for\", \"use \
          this base URL\", \"open an HTTP client for\", \"I want to call the X API\". Returns \
-         session_id and base_url. Subsequent requests use http_session_request. For one-shot \
+         session_id and base_url. Subsequent requests use http_request. For one-shot \
          retrieval of a public page use web_fetch — no session needed.";
 
     type Request = OpenRequest;

@@ -13,17 +13,19 @@ impl Scheduler {
         self.active_decodes.values().filter(|s| !s.finished).count()
     }
 
-    /// Active *foreground* decode sequences — excludes summary probes.
+    /// Active *foreground* decode sequences — excludes compression passes.
     ///
-    /// Summary decodes ride the decode batch opportunistically, but must not
-    /// feed the prefill/decode flip heuristic: if they counted, a lingering
-    /// summary would keep the loop in decode-first mode and starve prefills
-    /// that would add more throughput. They still decode (via `decode_width`'s
-    /// guard) — they just don't bias the phase ordering.
+    /// Count the active foreground dialogue decodes that feed the
+    /// prefill/decode flip heuristic. Compression half-passes ride
+    /// `active_decodes` and the decode wave like any decode, but are excluded
+    /// here so they never hold the loop in decode-first mode at the expense of
+    /// dialogue prefills (they are off the critical path).
     fn foreground_decode_width(&self) -> usize {
         self.active_decodes
             .iter()
-            .filter(|(id, s)| !s.finished && !self.summary_completions.contains_key(id))
+            .filter(|(_, s)| {
+                !s.finished && !matches!(s.seal_action, super::SealAction::CompressionPass { .. })
+            })
             .count()
     }
 

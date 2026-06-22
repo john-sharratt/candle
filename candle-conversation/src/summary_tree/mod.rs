@@ -31,6 +31,7 @@ pub mod fixture;
 pub mod probe;
 mod recency;
 mod select;
+mod structural;
 pub mod summariser;
 mod tree;
 
@@ -38,8 +39,9 @@ pub use diagnostics::{SelectionDiagnostics, SelectionOrigin};
 pub use fixture::{
     ExpectedInvariants, FixtureError, FixtureManifest, PlantSpec, ProbeSpec, SubstrateFixture,
 };
-pub use probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner, SUMMARISER_SYSTEM_PROMPT};
+pub use probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
 pub use recency::{recency_score, RecencyConfig};
 pub use select::{select_dense, Selection};
+pub use structural::{leaf_skeleton, structural_rollup, StructuralRollup};
 pub use summariser::{ChannelProbeRunner, MockProbeRunner, SummariserThread, SummariserTrigger};
-pub use tree::{Node, NodeId, SummaryTree, TurnKind};
+pub use tree::{carry_triple, Node, NodeId, SummaryTree, TurnKind, MERGE_FANOUT};

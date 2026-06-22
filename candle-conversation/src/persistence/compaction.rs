@@ -48,6 +48,13 @@ pub fn collect_live_records(
         let r = read_record_at(log, loc.offset, loc.record_size)?;
         out.push((r.header, r.payload));
     }
+    // Only the latest `ToolSummary` is live; every superseded copy is dropped
+    // (the same last-writer-wins reclaim as the model/template/tokenizer
+    // singletons — this is what "tombstones" an out-of-date tool summary).
+    if let Some(loc) = manifest.tool_summary {
+        let r = read_record_at(log, loc.offset, loc.record_size)?;
+        out.push((r.header, r.payload));
+    }
 
     // Tombstoned timelines drop out of the compacted log entirely
     // — their records are physically gone, not merely hidden.  This
@@ -432,9 +439,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: super::super::streams::PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         };

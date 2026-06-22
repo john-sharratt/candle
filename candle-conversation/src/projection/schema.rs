@@ -170,6 +170,17 @@ pub struct SectionCollection {
     /// collection calibrated for pragmatic-only while turn scoring uses
     /// semantic-heavy weights).
     pub depth_weights: Option<DepthWeights>,
+    /// How this section group is compressed. Parsed, stored, and validated; no
+    /// compression path reads a group summary yet (only layer summaries drive
+    /// the live compression).
+    pub summary: GroupSummary,
+    /// The runtime-sealed summary section ([`Reserved::ToolSummary`](super::Reserved::ToolSummary)),
+    /// set once the catalog summary is generated. When `Some` and the collection's
+    /// selection is a *proper subset* of its members (top-k dropped at least one),
+    /// projection emits this section's sealed K/V just before the selected members —
+    /// a compact overview of everything, including what wasn't selected. Omitted when
+    /// all members are selected (nothing was dropped) or the section isn't sealed yet.
+    pub summary_section: Option<SectionId>,
 }
 
 impl Default for SectionCollection {
@@ -181,6 +192,8 @@ impl Default for SectionCollection {
             selection: SelectionRule::AlwaysVisible,
             score_threshold: 0.0,
             depth_weights: None,
+            summary: GroupSummary::default(),
+            summary_section: None,
         }
     }
 }
@@ -230,6 +243,176 @@ pub struct SectionSchema {
     /// prefilled run.  `None` for `is_template == false` sections —
     /// their K/V comes from the substrate-pinned sealed path.
     pub template_tokens: Option<std::sync::Arc<Vec<u32>>>,
+}
+
+/// A single compression framing + instruction pair — the unit the compression
+/// path consumes.
+///
+/// The `system_prompt` is sealed once as a section (its [`SectionId`] is
+/// allocated from the schema's section pool but never added to
+/// `system_prompt.items`, so it only ever materialises via the compression seal,
+/// never in a normal projection) and injected zero-copy at the head of a
+/// compression pass. The `user_prompt` is prefilled as text after the content —
+/// the "user turn" of the compression frame.
+#[derive(Debug, Clone)]
+pub struct CompressionPrompt {
+    pub system_prompt: SectionSchema,
+    pub user_prompt: String,
+}
+
+impl CompressionPrompt {
+    /// A placeholder with an empty prompt and a stand-in section id, used by the
+    /// `Default` impls below. Real schemas overwrite both via the YAML/builder
+    /// path, which allocates a unique [`SectionId`] per prompt.
+    fn placeholder(name: &str) -> Self {
+        Self {
+            system_prompt: SectionSchema {
+                id: SectionId::new(1),
+                name: name.to_string(),
+                content: String::new(),
+                priority: 50.0,
+                depends_on: None,
+                is_template: false,
+                template_tokens: None,
+            },
+            user_prompt: String::new(),
+        }
+    }
+}
+
+/// How a compression level runs.
+///
+/// The leaf level (a layer's `turns`) is always [`SinglePass`](SummaryMode::SinglePass).
+/// A `summaries` (summary-of-summaries) level may instead be
+/// [`Structural`](SummaryMode::Structural) — a pipeline for structural content
+/// (repo_map, code_reading): the prompts run as a stage-1 abstraction, then a
+/// deterministic stage validates every emitted name against the child summaries
+/// and drops anything invented (see `zend/examples/pipeline_sos.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SummaryMode {
+    /// One compression pass per half. The only mode for leaf turns; the default
+    /// for `summaries` too.
+    #[default]
+    SinglePass,
+    /// Stage-1 model abstraction + deterministic stage-2 name-validation against
+    /// the child summaries. For structural roll-ups, where the names are known
+    /// from the children and the model only decides the grouping/abstraction.
+    Structural,
+}
+
+/// How one tree-level of a layer's turns is compressed.
+///
+/// A turn has two bodies — the user-message half (`Role::User`,
+/// `[user_start, user_end)`) and the assistant-response half (`Role::Assistant`,
+/// `[asst_start, total)`) — and they compress differently, so each gets its own
+/// [`CompressionPrompt`]. The decode cap is shared across both halves of this
+/// level. `mode` selects single-pass vs the validated structural pipeline.
+#[derive(Debug, Clone)]
+pub struct TurnSummary {
+    /// Compresses the user-message half of a turn (`Role::User`).
+    pub user: CompressionPrompt,
+    /// Compresses the assistant-response half of a turn (`Role::Assistant`).
+    pub assistant: CompressionPrompt,
+    /// Hard decode-token ceiling for each compressed half.
+    pub max_tokens: usize,
+    /// Single-pass (default) or the validated structural pipeline. Always
+    /// `SinglePass` for leaf turns; a `summaries` level may set `Structural`.
+    pub mode: SummaryMode,
+}
+
+impl Default for TurnSummary {
+    fn default() -> Self {
+        Self {
+            user: CompressionPrompt::placeholder("__summary_user__"),
+            assistant: CompressionPrompt::placeholder("__summary_assistant__"),
+            max_tokens: 0,
+            mode: SummaryMode::SinglePass,
+        }
+    }
+}
+
+/// How a layer's turns are compressed across the summary tree.
+///
+/// `turns` drives `SummaryOfTurns` nodes (compressing raw turns); `summaries`
+/// drives `SummaryOfSummaries` nodes (compressing already-compressed children).
+/// When `summaries` is `None`, those nodes reuse `turns`.
+#[derive(Debug, Clone, Default)]
+pub struct LayerSummary {
+    pub turns: TurnSummary,
+    pub summaries: Option<TurnSummary>,
+}
+
+impl LayerSummary {
+    /// The [`TurnSummary`] driving compression for a node: `summaries` for a
+    /// `SummaryOfSummaries` node (falling back to `turns`), else `turns`.
+    pub fn for_kind(&self, is_summary_of_summaries: bool) -> &TurnSummary {
+        if is_summary_of_summaries {
+            self.summaries.as_ref().unwrap_or(&self.turns)
+        } else {
+            &self.turns
+        }
+    }
+
+    /// Push every compression-prompt [`SectionId`] (raw) this layer summary owns
+    /// into `out` — the `turns` halves and, if present, the `summaries` halves.
+    fn push_section_ids(&self, out: &mut Vec<u32>) {
+        self.turns.push_section_ids(out);
+        if let Some(s) = &self.summaries {
+            s.push_section_ids(out);
+        }
+    }
+}
+
+impl TurnSummary {
+    fn push_section_ids(&self, out: &mut Vec<u32>) {
+        out.push(self.user.system_prompt.id.raw());
+        out.push(self.assistant.system_prompt.id.raw());
+    }
+}
+
+/// How a section group (collection) is compressed.
+///
+/// A group is a catalog of sections, so it is summarised by a two-stage
+/// **categorize → assign** workflow rather than a single compression pass (a
+/// model cannot faithfully reproduce dozens of section names in one shot — see
+/// `zend/examples/compress_tools.rs`): stage 1 the model proposes the category
+/// labels; stage 2 it assigns each section to one by number, over chunks. The
+/// numbers map back to the real section names in code, with a deterministic
+/// name-token fallback, so no name can be invented. Parsed, stored, and
+/// validated; the execution path that reads it is a follow-up.
+#[derive(Debug, Clone)]
+pub struct GroupSummary {
+    /// Stage 1 — the model proposes the categories.
+    pub categorize: GroupSummaryStage,
+    /// Stage 2 — assign each section to one of the fixed categories, over chunks
+    /// of [`Self::chunk`] sections.
+    pub assign: GroupSummaryStage,
+    /// Sections per stage-2 assignment chunk.
+    pub chunk: usize,
+}
+
+/// One stage of a group's categorize→assign workflow: a compression prompt plus
+/// its decode-token ceiling.
+#[derive(Debug, Clone)]
+pub struct GroupSummaryStage {
+    pub prompt: CompressionPrompt,
+    pub max_tokens: usize,
+}
+
+impl Default for GroupSummary {
+    fn default() -> Self {
+        Self {
+            categorize: GroupSummaryStage {
+                prompt: CompressionPrompt::placeholder("__categorize__"),
+                max_tokens: 0,
+            },
+            assign: GroupSummaryStage {
+                prompt: CompressionPrompt::placeholder("__assign__"),
+                max_tokens: 0,
+            },
+            chunk: 0,
+        }
+    }
 }
 
 /// Per-layer weighting for the three Binary Directional Provenance depths.
@@ -319,12 +502,46 @@ pub struct LayerSchema {
     /// — every layer must declare at least one section so the layer is
     /// always usable as a projection target.
     pub system_prompt: SystemPromptSchema,
+    /// How this layer's turns are compressed across the summary tree — the
+    /// `turns`/`summaries` tree-levels, each splitting the question and answer
+    /// halves into their own framing + instruction, with a per-level decode cap.
+    pub summary: LayerSummary,
     /// Groups in declaration order. At projection time they are sorted by
     /// derived group score for emission.
     pub groups: Vec<GroupSchema>,
     /// Weights for combining per-depth BDP scores into a single per-turn
     /// score.  Default is equal weighting across all three depths.
     pub depth_weights: DepthWeights,
+}
+
+impl LayerSchema {
+    /// Every `SectionId` (as raw `u32`) this layer allocates: the system-prompt
+    /// sections and collection member sections (via
+    /// [`SystemPromptSchema::all_sections`]), every collection's compression
+    /// summary, and the layer's own `turns`/`summaries` × `question`/`answer`
+    /// compression prompts.
+    ///
+    /// Runtime section-id allocation ([`super::Builder::add_section_to_collection`])
+    /// must stay disjoint from all of these. The compression-prompt sections
+    /// never appear in `system_prompt.items`, so a max over only the *visible*
+    /// sections would alias them — a runtime-added section would reuse a
+    /// compression-prompt id, and `ensure_summary_section` would then inject that
+    /// section's content (e.g. a tool's JSON) as the compression prompt.
+    pub fn all_section_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .system_prompt
+            .all_sections()
+            .map(|s| s.id.raw())
+            .collect();
+        for item in &self.system_prompt.items {
+            if let SystemPromptItem::Collection(c) = item {
+                ids.push(c.summary.categorize.prompt.system_prompt.id.raw());
+                ids.push(c.summary.assign.prompt.system_prompt.id.raw());
+            }
+        }
+        self.summary.push_section_ids(&mut ids);
+        ids
+    }
 }
 
 /// Schema for one group within a layer.

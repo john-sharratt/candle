@@ -27,16 +27,15 @@ pub use walk::walk_workspace;
 /// Strip auto-summarization from a [`SequenceConfig`] before using
 /// it to mint a utility-layer conversation (repo_map, code_reading).
 ///
-/// The default tree config triggers summarization every 8 turns.
-/// For the dialogue layer that's correct — long conversations need
-/// rolling summaries to stay tractable.  For repo_map and
-/// code_reading it's a fatal stall: each cluster's `insert_turn`
-/// blocks inside `finalize_turn_post_done` waiting for the
-/// summarizer task to complete, and the summarizer holds the
-/// engine in a state that prevents the next cluster from making
-/// progress.  These layers carry hundreds of small turns whose
-/// content is structured (cluster listings, scope reads), not
-/// dialogue — they should never be summarized.
+/// The legacy per-turn tree summarization (`summarize_every`) runs synchronously
+/// inside `finalize_turn_post_done` — `drain_cognitive_tasks` spin-polls each
+/// task to completion before `insert_turn` returns. For repo_map / code_reading,
+/// which carry hundreds of small structured turns (cluster listings, scope
+/// reads), that would stall every cluster behind the summarizer, so it stays off
+/// here. The async AVL summariser is separate and unaffected: it runs on its own
+/// thread (wave-driven compression) and summarises every layer — including these
+/// — without blocking ingest, and provenance scans expand the compressed nodes
+/// on retrieval.
 pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     config.tree.summarize_every = 0;
     config.tree.segment_summarize_every = 0;

@@ -1,7 +1,7 @@
-//! Credential management tools: `credential_save`, `credential_list`, `credential_delete`.
+//! Credential management tools: `credential_save`, `cred_list`, `credential_delete`.
 //!
 //! Credentials are named auth material stored in [`crate::state::CredentialStore`] for
-//! use by session-open tools (`ssh_session_open`, `http_session_open`, etc.).  Tools
+//! use by session-open tools (`ssh_open`, `http_session_open`, etc.).  Tools
 //! reference credentials by the friendly `name`, not by UUID.
 //!
 //! # Supported credential types
@@ -35,7 +35,7 @@
 //! # Confirmation policy
 //!
 //! `credential_save` confirms before saving (shows type + name).
-//! `credential_list` and `credential_delete` do not confirm.
+//! `cred_list` and `credential_delete` do not confirm.
 
 use thiserror::Error;
 

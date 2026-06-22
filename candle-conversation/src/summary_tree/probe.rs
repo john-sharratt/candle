@@ -1,20 +1,20 @@
 //! The §6 summary probe — slot recipe + runner abstraction.
 //!
 //! A "summary probe" is the §6 forward-continuation that produces a
-//! summary turn over a set of children:
+//! compressed turn over a set of children:
 //!
 //! ```text
 //!     ┌─────────────────────────────────────────────────────────┐
-//!     │  "summariser" system prompt + the children's text        │
+//!     │  "compressor" system prompt + the children turns' text   │
 //!     ├─────────────────────────────────────────────────────────┤
-//!     │  Prefill:  "Summarise the above turns."                  │
-//!     │  Decode:   plain prose summary                           │
+//!     │  Prefill:  "Compress the conversation above…"            │
+//!     │  Decode:   a faithful, much shorter rewrite of the turns │
 //!     └─────────────────────────────────────────────────────────┘
 //!                              │
 //!                              ▼
 //!     A new substrate turn is sealed with `kind = SummaryOfTurns`
-//!     (or `SummaryOfSummaries`), carrying the decoded prose summary's
-//!     K/V (so a later projection can inject it).
+//!     (or `SummaryOfSummaries`), carrying the decoded compressed
+//!     turn's K/V (so a later projection can inject it).
 //! ```
 //!
 //! The probe execution itself happens on the GPU via the scheduler.
@@ -38,22 +38,27 @@
 use crate::projection::{TimelineId, TurnIndex};
 use crate::summary_tree::TurnKind;
 
-/// One probe request — "summarise these children into a new turn of
-/// this `kind`".  The summariser thread emits one of these per
-/// pending-turn absorption and one per dirty-set sweep regeneration.
+/// One probe request — "compress these turns into a new turn of this
+/// `kind`".  The summariser thread emits one of these per pending-turn
+/// absorption and one per dirty-set sweep regeneration.
 #[derive(Debug, Clone)]
 pub struct ProbeRequest {
     pub timeline: TimelineId,
-    /// What the produced summary turn's tree role will be.  The
+    /// What the produced compressed turn's tree role will be.  The
     /// runner doesn't strictly need this — the summariser sets the
     /// `TreeNodeMeta` after sealing — but it's useful for tracing and
     /// for runners that choose different system prompts per kind.
     pub kind: TurnKind,
-    /// Children to summarise, in chronological order.  For
-    /// `SummaryOfTurns`: the run of Normal turns.  For
-    /// `SummaryOfSummaries`: exactly two summary turns (`[left,
-    /// right]`).
+    /// The structural tree children this node records, in chronological
+    /// order, *and* the turns the compressor reads to produce its text. For
+    /// `SummaryOfTurns`: the single Normal turn. For `SummaryOfSummaries`:
+    /// a run of `MERGE_FANOUT` same-level summary turns. Written into the node's
+    /// `TreeNodeMeta`; the compression pass injects each child's two halves.
     pub children: Vec<TurnIndex>,
+    /// The node's tree height (`SummaryOfTurns` leaves = 1; a
+    /// `SummaryOfSummaries` = its children's level + 1). Drives the structural
+    /// roll-up's height-based directory-depth pruning.
+    pub height: u8,
 }
 
 /// One probe response — the substrate-level `TurnIndex` of the
@@ -111,15 +116,11 @@ pub trait ProbeRunner: Send + Sync + 'static {
     }
 }
 
-/// Standard "summariser" system prompt text — the §6.1 recipe's
-/// `①` block, prefixed to every probe's prefill.
-///
-/// Plain prose output: the probe decodes the summary like any normal
-/// assistant turn and seals it. Kept short so the prefill is cheap.
-pub const SUMMARISER_SYSTEM_PROMPT: &str =
-    "You are a summariser. Read the conversation turns above and write a concise prose \
-     summary of what was discussed, asked, and decided. Write two to four plain sentences. \
-     Do not add headings, lists, commentary, or quotation — just the summary itself.";
+// The compressor system prompt, the per-half instruction, and the token/word
+// budget are no longer hardcoded here — each projection layer (and section
+// group) declares its own `summary` block (system prompt + user prompt +
+// max_tokens) in the template; the scheduler reads the target layer's summary
+// when it runs a compression pass.
 
 #[cfg(test)]
 mod tests {
@@ -133,14 +134,5 @@ mod tests {
         let hard = ProbeError::Hard("gpu oom".into());
         assert!(hard.to_string().contains("hard"));
         assert!(hard.to_string().contains("gpu oom"));
-    }
-
-    #[test]
-    fn summariser_prompt_is_prose() {
-        // Prose, not structured output: no JSON / schema framing.
-        assert!(!SUMMARISER_SYSTEM_PROMPT.contains("JSON"));
-        assert!(!SUMMARISER_SYSTEM_PROMPT.contains("coherent"));
-        assert!(!SUMMARISER_SYSTEM_PROMPT.contains("split_at"));
-        assert!(SUMMARISER_SYSTEM_PROMPT.contains("summar"));
     }
 }

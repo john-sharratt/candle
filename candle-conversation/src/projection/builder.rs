@@ -43,8 +43,9 @@ use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
 use super::project::FIXED_FORMULA;
 use super::project::{run, run_with_sink, Projection, ProjectionMode, ProjectionTarget};
 use super::schema::{
-    Budget, DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection,
-    SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema,
+    Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, LayerSchema, LayerSummary,
+    Schema, ScoreFormula, SectionCollection, SectionSchema, SelectionRule, SummaryMode,
+    SystemPromptItem, SystemPromptSchema, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
 use crate::provenance::DEFAULT_SPAN_ALPHA;
@@ -444,6 +445,60 @@ impl Builder {
             .copied()
     }
 
+    /// Override a collection's selection rule after construction.
+    ///
+    /// Used to force a collection (e.g. `tools`) to [`SelectionRule::AlwaysVisible`]
+    /// for a high-resolution capture conversation, so projection and reprojection
+    /// stop filtering its members. The schema is otherwise identical (same section
+    /// ids), so the override can be applied to a clone shared with already-sealed
+    /// sequences.
+    pub fn set_collection_selection(
+        &mut self,
+        layer: LayerId,
+        name: &str,
+        selection: SelectionRule,
+    ) -> Result<(), ConstructionError> {
+        validate_selection(name, &selection)?;
+        let layer_idx = self.layer_idx(layer)?;
+        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
+            if let SystemPromptItem::Collection(coll) = item {
+                if coll.name == name {
+                    coll.selection = selection;
+                    return Ok(());
+                }
+            }
+        }
+        Err(ConstructionError::UnknownCollection(name.to_string()))
+    }
+
+    /// Restrict a collection to a single named member and force it
+    /// [`SelectionRule::AlwaysVisible`] — projection + reprojection emit exactly
+    /// that one section and drop the rest. Used to test whether the model
+    /// invokes a tool when only its own definition is in context (vs the full
+    /// catalog). The dropped sections keep their sealed KV in the substrate;
+    /// they are simply not projected for this conversation.
+    pub fn set_collection_single_section(
+        &mut self,
+        layer: LayerId,
+        collection: &str,
+        section: &str,
+    ) -> Result<(), ConstructionError> {
+        let layer_idx = self.layer_idx(layer)?;
+        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
+            if let SystemPromptItem::Collection(coll) = item {
+                if coll.name == collection {
+                    coll.sections.retain(|s| s.name == section);
+                    if coll.sections.is_empty() {
+                        return Err(ConstructionError::UnknownSection(section.to_string()));
+                    }
+                    coll.selection = SelectionRule::AlwaysVisible;
+                    return Ok(());
+                }
+            }
+        }
+        Err(ConstructionError::UnknownCollection(collection.to_string()))
+    }
+
     /// The span α used by [`super::project::FIXED_FORMULA`].
     ///
     /// The BDP scanner in the reprojection path must use the same alpha so
@@ -555,6 +610,10 @@ impl Builder {
                 selection,
                 score_threshold,
                 depth_weights: None,
+                // Runtime-added collections carry a placeholder summary; no
+                // compression path reads a group summary.
+                summary: GroupSummary::default(),
+                summary_section: None,
             }));
         self.name_maps
             .collection_names
@@ -628,6 +687,33 @@ impl Builder {
         Ok(new_id)
     }
 
+    /// Associate a runtime-sealed summary section with a collection. Once set,
+    /// projection emits that section's K/V just before the collection's selected
+    /// members whenever the selection is a proper subset (top-k / threshold
+    /// dropped at least one member) and the section is sealed. See
+    /// [`SectionCollection::summary_section`].
+    pub fn set_collection_summary_section(
+        &mut self,
+        layer: LayerId,
+        collection: CollectionId,
+        section: SectionId,
+    ) -> Result<(), ConstructionError> {
+        let layer_idx = self.layer_idx(layer)?;
+        let coll = self.schema.layers[layer_idx]
+            .system_prompt
+            .items
+            .iter_mut()
+            .find_map(|it| match it {
+                SystemPromptItem::Collection(c) if c.id == collection => Some(c),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ConstructionError::UnknownCollection(format!("CollectionId({collection:?})"))
+            })?;
+        coll.summary_section = Some(section);
+        Ok(())
+    }
+
     /// Look up a layer's index in `self.schema.layers` by id, returning
     /// an error if unknown.
     fn layer_idx(&self, layer: LayerId) -> Result<usize, ConstructionError> {
@@ -665,12 +751,15 @@ impl Builder {
     /// + 1.  Sections are globally unique even though names are per-
     /// layer scoped.
     fn next_section_id_raw(&self) -> u32 {
+        // Must cover EVERY allocated section id, including the compression-prompt
+        // sections that live in `layer.summary` / collection summaries rather
+        // than `system_prompt.items` — otherwise a runtime-added section aliases
+        // a compression-prompt id and corrupts the compression frame.
         let max_id = self
             .schema
             .layers
             .iter()
-            .flat_map(|l| l.system_prompt.all_sections())
-            .map(|s| s.id.raw())
+            .flat_map(|l| l.all_section_ids())
             .max()
             .unwrap_or(0);
         max_id + 1
@@ -802,6 +891,18 @@ impl Builder {
         group_id: GroupId,
         section_id: SectionId,
     ) -> Self {
+        // Distinct ids for the question/answer summary framing sections (never
+        // emitted; sealed lazily only if this conversation is summarised). Offset
+        // from the frame, special-cased so a reserved frame (top of the u32
+        // range) keeps both ids in the reserved band.
+        let (summary_q_id, summary_a_id) = if section_id.raw() == u32::MAX {
+            (SectionId::new(u32::MAX - 1), SectionId::new(u32::MAX - 2))
+        } else {
+            (
+                SectionId::new(section_id.raw() + 1),
+                SectionId::new(section_id.raw() + 2),
+            )
+        };
         let schema = Schema {
             layers: vec![LayerSchema {
                 id: layer_id,
@@ -824,6 +925,58 @@ impl Builder {
                         is_template: false,
                         template_tokens: None,
                     })],
+                },
+                // Template-less fallback summary so a plain-prompt conversation
+                // is still summarisable (the production path supplies its own
+                // tailored summary via the YAML template). Generic faithful
+                // compression — not a product prompt. Only `turns` is provided;
+                // SummaryOfSummaries nodes reuse it.
+                summary: LayerSummary {
+                    turns: TurnSummary {
+                        user: CompressionPrompt {
+                            system_prompt: SectionSchema {
+                                id: summary_q_id,
+                                name: "__summary_turns_user__".to_string(),
+                                content: "You are a faithful compressor. Compress the user's \
+                                          message below into a much shorter version that preserves \
+                                          what was asked — the specific request, names, numbers, \
+                                          and constraints — in the original voice. No commentary, \
+                                          headings, or lists."
+                                    .to_string(),
+                                priority: 50.0,
+                                depends_on: None,
+                                is_template: false,
+                                template_tokens: None,
+                            },
+                            user_prompt: "Compress the user message above into a faithful, much \
+                                          shorter version that preserves the specific request, \
+                                          names, numbers, and constraints, in the original voice."
+                                .to_string(),
+                        },
+                        assistant: CompressionPrompt {
+                            system_prompt: SectionSchema {
+                                id: summary_a_id,
+                                name: "__summary_turns_assistant__".to_string(),
+                                content: "You are a faithful compressor. Compress the assistant's \
+                                          reply below into a much shorter version that preserves \
+                                          the specific facts, numbers, decisions, and advice, in \
+                                          the original voice. No commentary, headings, or lists."
+                                    .to_string(),
+                                priority: 50.0,
+                                depends_on: None,
+                                is_template: false,
+                                template_tokens: None,
+                            },
+                            user_prompt:
+                                "Compress the assistant reply above into a faithful, much \
+                                          shorter version that preserves the specific facts, \
+                                          numbers, decisions, and advice, in the original voice."
+                                    .to_string(),
+                        },
+                        max_tokens: 384,
+                        mode: SummaryMode::SinglePass,
+                    },
+                    summaries: None,
                 },
                 groups: vec![GroupSchema {
                     id: group_id,

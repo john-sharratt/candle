@@ -1,0 +1,1862 @@
+[
+  {
+    "tool": "datetime",
+    "split": "train",
+    "conv_id": "toolcase_datetime_train",
+    "prompt": "What time is it in Tokyo right now?",
+    "response": "<tool_call>{\"name\": \"datetime\", \"arguments\": {\"timezone\": \"Asia/Tokyo\"}}</tool_call>",
+    "invoked_tool": "datetime",
+    "resolved_tool": "datetime",
+    "correct": true
+  },
+  {
+    "tool": "datetime",
+    "split": "holdout",
+    "conv_id": "toolcase_datetime_holdout",
+    "prompt": "What's today's date and what day of the week is it?",
+    "response": "<tool_call>{\"name\": \"datetime\", \"arguments\": {\"timezone\": \"UTC\"}}</tool_call>",
+    "invoked_tool": "datetime",
+    "resolved_tool": "datetime",
+    "correct": true
+  },
+  {
+    "tool": "calculator",
+    "split": "train",
+    "conv_id": "toolcase_calculator_train",
+    "prompt": "Evaluate (48273 * 9184 + 65521) / 37 to four decimal places.",
+    "response": "<tool_call>{\"name\": \"calculator\", \"arguments\": {\"expression\": \"(48273 * 9184 + 65521) / 37\"}}</tool_call>",
+    "invoked_tool": "calculator",
+    "resolved_tool": "calculator",
+    "correct": true
+  },
+  {
+    "tool": "calculator",
+    "split": "holdout",
+    "conv_id": "toolcase_calculator_holdout",
+    "prompt": "What is sqrt(152399) * 12.5 - 8473 / 17, to six decimal places?",
+    "response": "<tool_call>{\"name\":\"calculator\",\"arguments\":{\"expression\":\"sqrt(152399) * 12.5 - 8473 / 17\"}}</tool_call>",
+    "invoked_tool": "calculator",
+    "resolved_tool": "calculator",
+    "correct": true
+  },
+  {
+    "tool": "unit_convert",
+    "split": "train",
+    "conv_id": "toolcase_unit_convert_train",
+    "prompt": "Convert 2.5 cubic feet to litres.",
+    "response": "<tool_call>{\"name\": \"unit_convert\", \"arguments\": {\"from\": \"cubic foot\", \"to\": \"litre\", \"value\": 2.5}}</tool_call>",
+    "invoked_tool": "unit_convert",
+    "resolved_tool": "unit_convert",
+    "correct": true
+  },
+  {
+    "tool": "unit_convert",
+    "split": "holdout",
+    "conv_id": "toolcase_unit_convert_holdout",
+    "prompt": "How many kilometres is 26.2 miles?",
+    "response": "<tool_call>{\"name\": \"unit_convert\", \"arguments\": {\"from\": \"mile\", \"to\": \"kilometre\", \"value\": 26.2}}</tool_call>",
+    "invoked_tool": "unit_convert",
+    "resolved_tool": "unit_convert",
+    "correct": true
+  },
+  {
+    "tool": "random",
+    "split": "train",
+    "conv_id": "toolcase_random_train",
+    "prompt": "Roll two six-sided dice for me.",
+    "response": "<tool_call>{\"name\": \"random\", \"arguments\": {\"kind\": \"dice\", \"sides\": 6, \"count\": 2}}</tool_call>",
+    "invoked_tool": "random",
+    "resolved_tool": "random",
+    "correct": true
+  },
+  {
+    "tool": "random",
+    "split": "holdout",
+    "conv_id": "toolcase_random_holdout",
+    "prompt": "Pick one option at random from red, green, and blue.",
+    "response": "<tool_call>{\"name\": \"random\", \"arguments\": {\"kind\": \"choice\", \"choices\": [\"red\", \"green\", \"blue\"]}}</tool_call>",
+    "invoked_tool": "random",
+    "resolved_tool": "random",
+    "correct": true
+  },
+  {
+    "tool": "web_search",
+    "split": "train",
+    "conv_id": "toolcase_web_search_train",
+    "prompt": "Search the web for the latest on the James Webb Space Telescope.",
+    "response": "<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"latest news James Webb Space Telescope 2024\"}}</tool_call>",
+    "invoked_tool": "web_search",
+    "resolved_tool": "web_search",
+    "correct": true
+  },
+  {
+    "tool": "web_search",
+    "split": "holdout",
+    "conv_id": "toolcase_web_search_holdout",
+    "prompt": "Look up recent news about quantum error correction.",
+    "response": "<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"recent news about quantum error correction\", \"max_results\": 10}}</tool_call>",
+    "invoked_tool": "web_search",
+    "resolved_tool": "web_search",
+    "correct": true
+  },
+  {
+    "tool": "web_fetch",
+    "split": "train",
+    "conv_id": "toolcase_web_fetch_train",
+    "prompt": "Fetch and summarise the page at https://example.com/article.",
+    "response": "<tool_call>{\"name\": \"web_fetch\", \"arguments\": {\"url\": \"https://example.com/article\"}}</tool_call>",
+    "invoked_tool": "web_fetch",
+    "resolved_tool": "web_fetch",
+    "correct": true
+  },
+  {
+    "tool": "web_fetch",
+    "split": "holdout",
+    "conv_id": "toolcase_web_fetch_holdout",
+    "prompt": "Read the content of https://docs.rust-lang.org/book/ch01-00-getting-started.html",
+    "response": "<tool_call>{\"name\": \"web_fetch\", \"arguments\": {\"url\": \"https://docs.rust-lang.org/book/ch01-00-getting-started.html\"}}</tool_call>",
+    "invoked_tool": "web_fetch",
+    "resolved_tool": "web_fetch",
+    "correct": true
+  },
+  {
+    "tool": "weather",
+    "split": "train",
+    "conv_id": "toolcase_weather_train",
+    "prompt": "What's the weather like in Seattle today?",
+    "response": "<tool_call>{\"name\": \"weather\", \"arguments\": {\"location\": \"Seattle\"}}</tool_call>",
+    "invoked_tool": "weather",
+    "resolved_tool": "weather",
+    "correct": true
+  },
+  {
+    "tool": "weather",
+    "split": "holdout",
+    "conv_id": "toolcase_weather_holdout",
+    "prompt": "Will it rain tomorrow in London?",
+    "response": "<tool_call>{\"name\": \"weather\", \"arguments\": {\"location\": \"London\", \"days\": 1}}</tool_call>",
+    "invoked_tool": "weather",
+    "resolved_tool": "weather",
+    "correct": true
+  },
+  {
+    "tool": "write",
+    "split": "train",
+    "conv_id": "toolcase_write_train",
+    "prompt": "Create a file called notes.txt containing the text 'hello world'.",
+    "response": "<tool_call>{\"name\": \"file_write\", \"arguments\": {\"path\": \"notes.txt\", \"content\": \"hello world\"}}</tool_call>",
+    "invoked_tool": "file_write",
+    "resolved_tool": "write",
+    "correct": true
+  },
+  {
+    "tool": "write",
+    "split": "holdout",
+    "conv_id": "toolcase_write_holdout",
+    "prompt": "Save a Python script to fib.py that prints the first 10 Fibonacci numbers.",
+    "response": "<tool_call>{\"name\": \"file_write\", \"arguments\": {\"path\": \"fib.py\", \"content\": \"def fibonacci(n):\\n    a, b = 0, 1\\n    for _ in range(n):\\n        yield a\\n        a, b = b, a + b\\n\\ndef main():\\n    print(list(fibonacci(10)))\\n\\nif __name__ == \\\"__main__\\\":\\n    main()\\n\"}}\n</tool_call>",
+    "invoked_tool": "file_write",
+    "resolved_tool": "write",
+    "correct": true
+  },
+  {
+    "tool": "file_read",
+    "split": "train",
+    "conv_id": "toolcase_file_read_train",
+    "prompt": "Show me the contents of notes.txt.",
+    "response": "<tool_call>{\"name\": \"file_read\", \"arguments\": {\"path\": \"notes.txt\"}}</tool_call>",
+    "invoked_tool": "file_read",
+    "resolved_tool": "file_read",
+    "correct": true
+  },
+  {
+    "tool": "file_read",
+    "split": "holdout",
+    "conv_id": "toolcase_file_read_holdout",
+    "prompt": "Read the file config.json.",
+    "response": "<tool_call>{\"name\": \"file_read\", \"arguments\": {\"path\": \"config.json\"}}</tool_call>",
+    "invoked_tool": "file_read",
+    "resolved_tool": "file_read",
+    "correct": true
+  },
+  {
+    "tool": "file_edit",
+    "split": "train",
+    "conv_id": "toolcase_file_edit_train",
+    "prompt": "In config.yaml, change the port value from 8080 to 9090.",
+    "response": "<tool_call>{\"name\": \"modify\", \"arguments\": {\"path\": \"config.yaml\", \"old_str\": \"port: 8080\", \"new_str\": \"port: 9090\"}}</tool_call>",
+    "invoked_tool": "modify",
+    "resolved_tool": "file_edit",
+    "correct": true
+  },
+  {
+    "tool": "file_edit",
+    "split": "holdout",
+    "conv_id": "toolcase_file_edit_holdout",
+    "prompt": "Update main.py: replace the line 'DEBUG = True' with 'DEBUG = False'.",
+    "response": "<tool_call>{\"name\": \"modify\", \"arguments\": {\"path\": \"main.py\", \"old_str\": \"DEBUG = True\", \"new_str\": \"DEBUG = False\"}}</tool_call>",
+    "invoked_tool": "modify",
+    "resolved_tool": "file_edit",
+    "correct": true
+  },
+  {
+    "tool": "file_list",
+    "split": "train",
+    "conv_id": "toolcase_file_list_train",
+    "prompt": "List the files in the workspace.",
+    "response": "<tool_call>{\"name\": \"file_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "file_list",
+    "resolved_tool": "file_list",
+    "correct": true
+  },
+  {
+    "tool": "file_list",
+    "split": "holdout",
+    "conv_id": "toolcase_file_list_holdout",
+    "prompt": "What files do I have under the src/ prefix?",
+    "response": "<tool_call>{\"name\": \"file_list\", \"arguments\": {\"prefix\": \"src/\"}}</tool_call>",
+    "invoked_tool": "file_list",
+    "resolved_tool": "file_list",
+    "correct": true
+  },
+  {
+    "tool": "file_delete",
+    "split": "train",
+    "conv_id": "toolcase_file_delete_train",
+    "prompt": "Delete the file temp.log.",
+    "response": "<tool_call>{\"name\": \"file_delete\", \"arguments\": {\"path\": \"temp.log\"}}</tool_call>",
+    "invoked_tool": "file_delete",
+    "resolved_tool": "file_delete",
+    "correct": true
+  },
+  {
+    "tool": "file_delete",
+    "split": "holdout",
+    "conv_id": "toolcase_file_delete_holdout",
+    "prompt": "Remove the file called draft.txt.",
+    "response": "<tool_call>{\"name\": \"file_delete\", \"arguments\": {\"path\": \"draft.txt\"}}</tool_call>",
+    "invoked_tool": "file_delete",
+    "resolved_tool": "file_delete",
+    "correct": true
+  },
+  {
+    "tool": "file_present",
+    "split": "train",
+    "conv_id": "toolcase_file_present_train",
+    "prompt": "Show me the file report.pdf in the chat.",
+    "response": "<tool_call>{\"name\": \"file_present\", \"arguments\": {\"paths\": [\"report.pdf\"]}}</tool_call>",
+    "invoked_tool": "file_present",
+    "resolved_tool": "file_present",
+    "correct": true
+  },
+  {
+    "tool": "file_present",
+    "split": "holdout",
+    "conv_id": "toolcase_file_present_holdout",
+    "prompt": "Surface output.csv to me in the interface.",
+    "response": "<tool_call>{\"name\": \"file_present\", \"arguments\": {\"paths\": [\"output.csv\"]}}</tool_call>",
+    "invoked_tool": "file_present",
+    "resolved_tool": "file_present",
+    "correct": true
+  },
+  {
+    "tool": "notes_write",
+    "split": "train",
+    "conv_id": "toolcase_notes_write_train",
+    "prompt": "Save a note under the key 'project_status' saying the build is green.",
+    "response": "<tool_call>{\"name\": \"notes_write\", \"arguments\": {\"key\": \"project_status\", \"content\": \"Build is green.\", \"tags\": [\"status\", \"build\"]}}</tool_call>",
+    "invoked_tool": "notes_write",
+    "resolved_tool": "notes_write",
+    "correct": true
+  },
+  {
+    "tool": "notes_write",
+    "split": "holdout",
+    "conv_id": "toolcase_notes_write_holdout",
+    "prompt": "Make a note called 'todo' with the text 'refactor the parser'.",
+    "response": "<tool_call>{\"name\":\"notes_write\",\"arguments\":{\"key\":\"todo\",\"content\":\"refactor the parser\"}}</tool_call>",
+    "invoked_tool": "notes_write",
+    "resolved_tool": "notes_write",
+    "correct": true
+  },
+  {
+    "tool": "notes_read",
+    "split": "train",
+    "conv_id": "toolcase_notes_read_train",
+    "prompt": "Read my note with the key 'project_status'.",
+    "response": "<tool_call>{\"name\": \"notes_read\", \"arguments\": {\"key\": \"project_status\"}}</tool_call>",
+    "invoked_tool": "notes_read",
+    "resolved_tool": "notes_read",
+    "correct": true
+  },
+  {
+    "tool": "notes_read",
+    "split": "holdout",
+    "conv_id": "toolcase_notes_read_holdout",
+    "prompt": "Retrieve the note stored under 'meeting_minutes'.",
+    "response": "<tool_call>{\"name\": \"notes_read\", \"arguments\": {\"key\": \"meeting_minutes\"}}</tool_call>",
+    "invoked_tool": "notes_read",
+    "resolved_tool": "notes_read",
+    "correct": true
+  },
+  {
+    "tool": "notes_search",
+    "split": "train",
+    "conv_id": "toolcase_notes_search_train",
+    "prompt": "Search my notes for anything mentioning 'deadline'.",
+    "response": "<tool_call>{\"name\": \"notes_search\", \"arguments\": {\"query\": \"deadline\"}}</tool_call>",
+    "invoked_tool": "notes_search",
+    "resolved_tool": "notes_search",
+    "correct": true
+  },
+  {
+    "tool": "notes_search",
+    "split": "holdout",
+    "conv_id": "toolcase_notes_search_holdout",
+    "prompt": "Find my notes tagged with 'security'.",
+    "response": "<tool_call>{\"name\": \"notes_search\", \"arguments\": {\"tags\": [\"security\"]}}</tool_call>",
+    "invoked_tool": "notes_search",
+    "resolved_tool": "notes_search",
+    "correct": true
+  },
+  {
+    "tool": "notes_list",
+    "split": "train",
+    "conv_id": "toolcase_notes_list_train",
+    "prompt": "List all my notes.",
+    "response": "<tool_call>{\"name\": \"notes_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "notes_list",
+    "resolved_tool": "notes_list",
+    "correct": true
+  },
+  {
+    "tool": "notes_list",
+    "split": "holdout",
+    "conv_id": "toolcase_notes_list_holdout",
+    "prompt": "Browse my notes with the key prefix 'project_'.",
+    "response": "<tool_call>{\"name\": \"notes_list\", \"arguments\": {\"prefix\": \"project_\"}}</tool_call>",
+    "invoked_tool": "notes_list",
+    "resolved_tool": "notes_list",
+    "correct": true
+  },
+  {
+    "tool": "credential_save",
+    "split": "train",
+    "conv_id": "toolcase_credential_save_train",
+    "prompt": "Save an API token credential named 'github_pat' with the value ghp_example123.",
+    "response": "<tool_call>{\"name\":\"credential_save\",\"arguments\":{\"name\":\"github_pat\",\"secret\":\"ghp_example123\",\"type\":\"http_bearer\"}}</tool_call>",
+    "invoked_tool": "credential_save",
+    "resolved_tool": "credential_save",
+    "correct": true
+  },
+  {
+    "tool": "credential_save",
+    "split": "holdout",
+    "conv_id": "toolcase_credential_save_holdout",
+    "prompt": "Store my SSH password for the prod server under the name 'prod_login'.",
+    "response": "<tool_call>{\"name\":\"credential_save\",\"arguments\":{\"name\":\"prod_login\",\"secret\":\"your_actual_ssh_password_here\",\"type\":\"ssh_password\"}}</tool_call>",
+    "invoked_tool": "credential_save",
+    "resolved_tool": "credential_save",
+    "correct": true
+  },
+  {
+    "tool": "cred_list",
+    "split": "train",
+    "conv_id": "toolcase_cred_list_train",
+    "prompt": "What credentials do I have saved?",
+    "response": "<tool_call>{\"name\": \"credlist\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "credlist",
+    "resolved_tool": "cred_list",
+    "correct": true
+  },
+  {
+    "tool": "cred_list",
+    "split": "holdout",
+    "conv_id": "toolcase_cred_list_holdout",
+    "prompt": "List my saved SSH keys.",
+    "response": "<tool_call>{\"name\": \"cred\", \"arguments\": {\"type\": \"ssh_key\"}}</tool_call>",
+    "invoked_tool": "cred",
+    "resolved_tool": "cred_list",
+    "correct": true
+  },
+  {
+    "tool": "credential_delete",
+    "split": "train",
+    "conv_id": "toolcase_credential_delete_train",
+    "prompt": "Delete the credential named 'old_api_key'.",
+    "response": "<tool_call>{\"name\": \"credential_delete\", \"arguments\": {\"name\": \"old_api_key\"}}</tool_call>",
+    "invoked_tool": "credential_delete",
+    "resolved_tool": "credential_delete",
+    "correct": true
+  },
+  {
+    "tool": "credential_delete",
+    "split": "holdout",
+    "conv_id": "toolcase_credential_delete_holdout",
+    "prompt": "Revoke the stored credential called 'prod_login'.",
+    "response": "<tool_call>{\"name\": \"credential_delete\", \"arguments\": {\"name\": \"prod_login\"}}</tool_call>",
+    "invoked_tool": "credential_delete",
+    "resolved_tool": "credential_delete",
+    "correct": true
+  },
+  {
+    "tool": "ssh_open",
+    "split": "train",
+    "conv_id": "toolcase_ssh_open_train",
+    "prompt": "SSH into prod.example.com using my 'prod_login' credential.",
+    "response": "<tool_call>{\"name\":\"ssh\",\"arguments\":{\"credential_name\":\"prod_login\"}}</tool_call>",
+    "invoked_tool": "ssh",
+    "resolved_tool": "ssh_open",
+    "correct": true
+  },
+  {
+    "tool": "ssh_open",
+    "split": "holdout",
+    "conv_id": "toolcase_ssh_open_holdout",
+    "prompt": "Open an SSH connection to 10.0.0.5 as user deploy.",
+    "response": "<tool_call>{\"name\": \"ssh\", \"arguments\": {\"credential_name\": \"deploy\", \"host\": \"10.0.0.5\"}}</tool_call>",
+    "invoked_tool": "ssh",
+    "resolved_tool": "ssh_open",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_exec",
+    "split": "train",
+    "conv_id": "toolcase_ssh_session_exec_train",
+    "prompt": "On SSH session ssh_1, run the command `uptime`.",
+    "response": "<tool_call>{\"name\":\"ssh_session_exec\",\"arguments\":{\"command\":\"uptime\",\"session_id\":\"ssh_1\"}}</tool_call>",
+    "invoked_tool": "ssh_session_exec",
+    "resolved_tool": "ssh_session_exec",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_exec",
+    "split": "holdout",
+    "conv_id": "toolcase_ssh_session_exec_holdout",
+    "prompt": "Execute `df -h` on my SSH session ssh_1.",
+    "response": "<tool_call>{\"name\":\"ssh_session_exec\",\"arguments\":{\"command\":\"df -h\",\"session_id\":\"ssh_1\"}}</tool_call>",
+    "invoked_tool": "ssh_session_exec",
+    "resolved_tool": "ssh_session_exec",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_exec_async",
+    "split": "train",
+    "conv_id": "toolcase_ssh_session_exec_async_train",
+    "prompt": "Start a long-running `tar -czf backup.tgz /data` on SSH session ssh_1 without blocking.",
+    "response": "<tool_call>{\"name\":\"ssh_session_exec_async\",\"arguments\":{\"command\":\"tar -czf backup.tgz /data\",\"session_id\":\"ssh_1\"}}</tool_call>",
+    "invoked_tool": "ssh_session_exec_async",
+    "resolved_tool": "ssh_session_exec_async",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_exec_async",
+    "split": "holdout",
+    "conv_id": "toolcase_ssh_session_exec_async_holdout",
+    "prompt": "Kick off `apt upgrade -y` asynchronously on SSH session ssh_1.",
+    "response": "<tool_call>{\"name\":\"ssh_session_exec_async\",\"arguments\":{\"command\":\"sudo apt update && sudo apt upgrade -y\",\"cwd\":null,\"env\":null,\"session_id\":\"ssh_1\"}}",
+    "invoked_tool": "ssh_session_exec_async",
+    "resolved_tool": "ssh_session_exec_async",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_poll",
+    "split": "train",
+    "conv_id": "toolcase_ssh_session_poll_train",
+    "prompt": "Check the output of async process proc_7 on SSH session ssh_1.",
+    "response": "<tool_call>{\"name\": \"ssh_session_poll\", \"arguments\": {\"process_id\": \"proc_7\", \"process_id\": \"proc_7\"}}</tool_call>",
+    "invoked_tool": "ssh_session_poll",
+    "resolved_tool": "ssh_session_poll",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_poll",
+    "split": "holdout",
+    "conv_id": "toolcase_ssh_session_poll_holdout",
+    "prompt": "Poll async job proc_3 on SSH session ssh_1 for new output.",
+    "response": "<tool_call>{\"name\": \"ssh_session_poll\", \"arguments\": {\"process_id\": \"proc_3\", \"session_id\": \"ssh_1\"}}</tool_call>",
+    "invoked_tool": "ssh_session_poll",
+    "resolved_tool": "ssh_session_poll",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_list",
+    "split": "train",
+    "conv_id": "toolcase_ssh_session_list_train",
+    "prompt": "List my open SSH sessions.",
+    "response": "<tool_call>{\"name\": \"ssh_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "ssh_session_list",
+    "resolved_tool": "ssh_session_list",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_ssh_session_list_holdout",
+    "prompt": "Which SSH connections do I currently have open?",
+    "response": "<tool_call>{\"name\": \"ssh_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "ssh_session_list",
+    "resolved_tool": "ssh_session_list",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_close",
+    "split": "train",
+    "conv_id": "toolcase_ssh_session_close_train",
+    "prompt": "Close SSH session ssh_1.",
+    "response": "<tool_call>{\"name\": \"ssh_session_close\", \"arguments\": {\"session_id\": \"ssh_1\"}}</tool_call>",
+    "invoked_tool": "ssh_session_close",
+    "resolved_tool": "ssh_session_close",
+    "correct": true
+  },
+  {
+    "tool": "ssh_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_ssh_session_close_holdout",
+    "prompt": "End my SSH session ssh_2.",
+    "response": "<tool_call>{\"name\": \"ssh_session_close\", \"arguments\": {\"session_id\": \"ssh_2\"}}</tool_call>",
+    "invoked_tool": "ssh_session_close",
+    "resolved_tool": "ssh_session_close",
+    "correct": true
+  },
+  {
+    "tool": "telnet_session_open",
+    "split": "train",
+    "conv_id": "toolcase_telnet_session_open_train",
+    "prompt": "Open a Telnet session to 192.168.1.1 on port 23.",
+    "response": "<tool_call>{\"name\": \"telnet_session_open\", \"arguments\": {\"host\": \"192.168.1.1\", \"port\": 23}}</tool_call>",
+    "invoked_tool": "telnet_session_open",
+    "resolved_tool": "telnet_session_open",
+    "correct": true
+  },
+  {
+    "tool": "telnet_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_telnet_session_open_holdout",
+    "prompt": "Connect via Telnet to the switch at console.lab.local.",
+    "response": "<tool_call>{\"name\": \"telnet_session_open\", \"arguments\": {\"host\": \"console.lab.local\", \"port\": 23, \"timeout\": 60}}</tool_call>",
+    "invoked_tool": "telnet_session_open",
+    "resolved_tool": "telnet_session_open",
+    "correct": true
+  },
+  {
+    "tool": "telnet_send",
+    "split": "train",
+    "conv_id": "toolcase_telnet_send_train",
+    "prompt": "On Telnet session tel_1, send `show running-config`.",
+    "response": "<tool_call>{\"name\": \"telnet\", \"arguments\": {\"session_id\": \"tel_1\", \"send\": \"show running-config\", \"expect\": \".*[#>]}$\"}}</tool_call>",
+    "invoked_tool": "telnet",
+    "resolved_tool": "telnet_send",
+    "correct": true
+  },
+  {
+    "tool": "telnet_send",
+    "split": "holdout",
+    "conv_id": "toolcase_telnet_send_holdout",
+    "prompt": "Run `show version` on Telnet session tel_1.",
+    "response": "<tool_call>{\"name\": \"telnet\", \"arguments\": {\"session_id\": \"tel_1\", \"send\": \"show version\\n\", \"expect\": null}}</tool_call>",
+    "invoked_tool": "telnet",
+    "resolved_tool": "telnet_send",
+    "correct": true
+  },
+  {
+    "tool": "telnet_session_list",
+    "split": "train",
+    "conv_id": "toolcase_telnet_session_list_train",
+    "prompt": "List my open Telnet sessions.",
+    "response": "<tool_call>{\"name\": \"telnet_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "telnet_session_list",
+    "resolved_tool": "telnet_session_list",
+    "correct": true
+  },
+  {
+    "tool": "telnet_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_telnet_session_list_holdout",
+    "prompt": "What Telnet connections are open right now?",
+    "response": "<tool_call>{\"name\": \"telnet_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "telnet_session_list",
+    "resolved_tool": "telnet_session_list",
+    "correct": true
+  },
+  {
+    "tool": "telnet_session_close",
+    "split": "train",
+    "conv_id": "toolcase_telnet_session_close_train",
+    "prompt": "Close Telnet session tel_1.",
+    "response": "<tool_call>{\"name\": \"telnet_session_close\", \"arguments\": {\"session_id\": \"tel_1\"}}</tool_call>",
+    "invoked_tool": "telnet_session_close",
+    "resolved_tool": "telnet_session_close",
+    "correct": true
+  },
+  {
+    "tool": "telnet_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_telnet_session_close_holdout",
+    "prompt": "End my Telnet session tel_2.",
+    "response": "<tool_call>{\"name\": \"telnet_session_close\", \"arguments\": {\"session_id\": \"tel_2\"}}</tool_call>",
+    "invoked_tool": "telnet_session_close",
+    "resolved_tool": "telnet_session_close",
+    "correct": true
+  },
+  {
+    "tool": "http_session_open",
+    "split": "train",
+    "conv_id": "toolcase_http_session_open_train",
+    "prompt": "Open an HTTP session with base URL https://api.example.com using my bearer token.",
+    "response": "<tool_call>{\"name\":\"http_session_open\",\"arguments\":{\"base\":\"https://api.example.com\",\"credential_name\":\"my_bearer_token\"}}</tool_call>",
+    "invoked_tool": "http_session_open",
+    "resolved_tool": "http_session_open",
+    "correct": true
+  },
+  {
+    "tool": "http_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_http_session_open_holdout",
+    "prompt": "Set up an HTTP client for https://service.local with a default header X-Env: prod.",
+    "response": "<tool_call>{\"name\":\"http_session_open\",\"arguments\":{\"base\":\"https://service.local\",\"headers\":{\"X-Env\":\"prod\"}}}</tool_call>",
+    "invoked_tool": "http_session_open",
+    "resolved_tool": "http_session_open",
+    "correct": true
+  },
+  {
+    "tool": "http_request",
+    "split": "train",
+    "conv_id": "toolcase_http_request_train",
+    "prompt": "On HTTP session http_1, POST the JSON {\"name\":\"test\"} to /users.",
+    "response": "<tool_call>{\"name\": \"http_request\", \"arguments\": {\"method\": \"POST\", \"path\": \"/users\", \"body_json\": {\"name\": \"test\"}, \"session_id\": \"http_1\"}}</tool_call>",
+    "invoked_tool": "http_request",
+    "resolved_tool": "http_request",
+    "correct": true
+  },
+  {
+    "tool": "http_request",
+    "split": "holdout",
+    "conv_id": "toolcase_http_request_holdout",
+    "prompt": "GET /status from HTTP session http_1.",
+    "response": "<tool_call>{\"name\": \"http_request\", \"arguments\": {\"path\": \"/status\", \"session_id\": \"http_1\"}}</tool_call>",
+    "invoked_tool": "http_request",
+    "resolved_tool": "http_request",
+    "correct": true
+  },
+  {
+    "tool": "http_session_list",
+    "split": "train",
+    "conv_id": "toolcase_http_session_list_train",
+    "prompt": "List my open HTTP sessions.",
+    "response": "<tool_call>{\"name\": \"http_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "http_session_list",
+    "resolved_tool": "http_session_list",
+    "correct": true
+  },
+  {
+    "tool": "http_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_http_session_list_holdout",
+    "prompt": "Which API connections do I have open?",
+    "response": "<tool_call>{\"name\": \"http_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "http_session_list",
+    "resolved_tool": "http_session_list",
+    "correct": true
+  },
+  {
+    "tool": "http_session_close",
+    "split": "train",
+    "conv_id": "toolcase_http_session_close_train",
+    "prompt": "Close HTTP session http_1.",
+    "response": "<tool_call>{\"name\": \"http_session_close\", \"arguments\": {\"session_id\": \"http_1\"}}</tool_call>",
+    "invoked_tool": "http_session_close",
+    "resolved_tool": "http_session_close",
+    "correct": true
+  },
+  {
+    "tool": "http_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_http_session_close_holdout",
+    "prompt": "Disconnect HTTP session http_2.",
+    "response": "<tool_call>{\"name\": \"http_session_close\", \"arguments\": {\"session_id\": \"http_2\"}}</tool_call>",
+    "invoked_tool": "http_session_close",
+    "resolved_tool": "http_session_close",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_open",
+    "split": "train",
+    "conv_id": "toolcase_tcp_session_open_train",
+    "prompt": "Open a raw TCP connection to 10.0.0.9 on port 9000.",
+    "response": "<tool_call>{\"name\": \"tcp_session_open\", \"arguments\": {\"host\": \"10.0.0.9\", \"port\": 9000, \"timeout_ms\": 5000}}</tool_call>",
+    "invoked_tool": "tcp_session_open",
+    "resolved_tool": "tcp_session_open",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_tcp_session_open_holdout",
+    "prompt": "Connect over TCP to mail.example.com on port 25.",
+    "response": "<tool_call>{\"name\":\"tcp_session_open\",\"arguments\":{\"host\":\"mail.example.com\",\"port\":25,\"timeout_ms\":10000}}</tool_call>",
+    "invoked_tool": "tcp_session_open",
+    "resolved_tool": "tcp_session_open",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_send",
+    "split": "train",
+    "conv_id": "toolcase_tcp_session_send_train",
+    "prompt": "Send the text 'PING' to TCP session tcp_1.",
+    "response": "<tool_call>{\"name\": \"tcp_session_send\", \"arguments\": {\"session_id\": \"tcp_1\", \"data\": \"PING\"}}</tool_call>",
+    "invoked_tool": "tcp_session_send",
+    "resolved_tool": "tcp_session_send",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_send",
+    "split": "holdout",
+    "conv_id": "toolcase_tcp_session_send_holdout",
+    "prompt": "Write the hex bytes 16 03 01 to TCP session tcp_1.",
+    "response": "<tool_call>{\"name\": \"tcp_session_send\", \"arguments\": {\"session_id\": \"tcp_1\", \"data_hex\": \"16 03 01\"}}</tool_call>",
+    "invoked_tool": "tcp_session_send",
+    "resolved_tool": "tcp_session_send",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_recv",
+    "split": "train",
+    "conv_id": "toolcase_tcp_session_recv_train",
+    "prompt": "Read 64 bytes from TCP session tcp_1.",
+    "response": "<tool_call>{\"name\": \"tcp_session_recv\", \"arguments\": {\"session_id\": \"tcp_1\", \"recv_amt\": 64}}</tool_call>",
+    "invoked_tool": "tcp_session_recv",
+    "resolved_tool": "tcp_session_recv",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_recv",
+    "split": "holdout",
+    "conv_id": "toolcase_tcp_session_recv_holdout",
+    "prompt": "Drain TCP session tcp_1 for 3 seconds and show what arrives.",
+    "response": "<tool_call>{\"name\": \"tcp_session_recv\", \"arguments\": {\"session_id\": \"tcp_1\", \"recv_wait\": 3.0}}</tool_call>",
+    "invoked_tool": "tcp_session_recv",
+    "resolved_tool": "tcp_session_recv",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_list",
+    "split": "train",
+    "conv_id": "toolcase_tcp_session_list_train",
+    "prompt": "List my open TCP connections.",
+    "response": "<tool_call>{\"name\": \"tcp_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "tcp_session_list",
+    "resolved_tool": "tcp_session_list",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_tcp_session_list_holdout",
+    "prompt": "What raw TCP sockets are open?",
+    "response": "<tool_call>{\"name\": \"tcp_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "tcp_session_list",
+    "resolved_tool": "tcp_session_list",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_close",
+    "split": "train",
+    "conv_id": "toolcase_tcp_session_close_train",
+    "prompt": "Close TCP session tcp_1.",
+    "response": "<tool_call>{\"name\": \"tcp_session_close\", \"arguments\": {\"session_id\": \"tcp_1\"}}</tool_call>",
+    "invoked_tool": "tcp_session_close",
+    "resolved_tool": "tcp_session_close",
+    "correct": true
+  },
+  {
+    "tool": "tcp_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_tcp_session_close_holdout",
+    "prompt": "Drop my TCP connection tcp_2.",
+    "response": "<tool_call>{\"name\": \"tcp_session_close\", \"arguments\": {\"session_id\": \"tcp_2\"}}</tool_call>",
+    "invoked_tool": "tcp_session_close",
+    "resolved_tool": "tcp_session_close",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_open",
+    "split": "train",
+    "conv_id": "toolcase_udp_session_open_train",
+    "prompt": "Open a UDP socket connected to 10.0.0.20 on port 5353.",
+    "response": "<tool_call>{\"name\":\"udp_session_open\",\"arguments\":{\"default_peer\":\"10.0.0.20:5353\"}}</tool_call>",
+    "invoked_tool": "udp_session_open",
+    "resolved_tool": "udp_session_open",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_udp_session_open_holdout",
+    "prompt": "Bind a UDP socket with default peer ntp.example.com:123.",
+    "response": "<tool_call>{\"name\":\"udp_session_open\",\"arguments\":{\"bind_addr\":null,\"default_peer\":\"ntp.example.com:123\"}}</tool_call>",
+    "invoked_tool": "udp_session_open",
+    "resolved_tool": "udp_session_open",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_send",
+    "split": "train",
+    "conv_id": "toolcase_udp_session_send_train",
+    "prompt": "Send the text 'hello' as a UDP datagram on session udp_1.",
+    "response": "<tool_call>{\"name\": \"udp_session_send\", \"arguments\": {\"data\": \"hello\", \"session_id\": \"udp_1\"}}</tool_call>",
+    "invoked_tool": "udp_session_send",
+    "resolved_tool": "udp_session_send",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_send",
+    "split": "holdout",
+    "conv_id": "toolcase_udp_session_send_holdout",
+    "prompt": "Transmit the hex bytes ff ee dd over UDP session udp_1.",
+    "response": "<tool_call>{\"name\": \"udp_session_send\", \"arguments\": {\"data_hex\": \"ffee dd\", \"session_id\": \"udp_1\"}}</tool_call>",
+    "invoked_tool": "udp_session_send",
+    "resolved_tool": "udp_session_send",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_recv",
+    "split": "train",
+    "conv_id": "toolcase_udp_session_recv_train",
+    "prompt": "Read one incoming UDP datagram on session udp_1.",
+    "response": "<tool_call>{\"name\": \"udp_session_recv\", \"arguments\": {\"session_id\": \"udp_1\"}}</tool_call>",
+    "invoked_tool": "udp_session_recv",
+    "resolved_tool": "udp_session_recv",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_recv",
+    "split": "holdout",
+    "conv_id": "toolcase_udp_session_recv_holdout",
+    "prompt": "Wait for a packet on UDP session udp_1 and show the sender.",
+    "response": "<tool_call>{\"name\": \"udp_session_recv\", \"arguments\": {\"session_id\": \"udp_1\"}}</tool_call>",
+    "invoked_tool": "udp_session_recv",
+    "resolved_tool": "udp_session_recv",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_list",
+    "split": "train",
+    "conv_id": "toolcase_udp_session_list_train",
+    "prompt": "List my open UDP sockets.",
+    "response": "<tool_call>{\"name\": \"udp_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "udp_session_list",
+    "resolved_tool": "udp_session_list",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_udp_session_list_holdout",
+    "prompt": "What UDP sessions are bound right now?",
+    "response": "<tool_call>{\"name\": \"udp_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "udp_session_list",
+    "resolved_tool": "udp_session_list",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_close",
+    "split": "train",
+    "conv_id": "toolcase_udp_session_close_train",
+    "prompt": "Close UDP session udp_1.",
+    "response": "<tool_call>{\"name\": \"udp_session_close\", \"arguments\": {\"session_id\": \"udp_1\"}}</tool_call>",
+    "invoked_tool": "udp_session_close",
+    "resolved_tool": "udp_session_close",
+    "correct": true
+  },
+  {
+    "tool": "udp_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_udp_session_close_holdout",
+    "prompt": "Release my UDP socket udp_2.",
+    "response": "<tool_call>{\"name\": \"udp_session_close\", \"arguments\": {\"session_id\": \"udp_2\"}}</tool_call>",
+    "invoked_tool": "udp_session_close",
+    "resolved_tool": "udp_session_close",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_open",
+    "split": "train",
+    "conv_id": "toolcase_tls_session_open_train",
+    "prompt": "Open a TLS connection to imap.example.com on port 993.",
+    "response": "<tool_call>{\"name\": \"tls_session_open\", \"arguments\": {\"host\": \"imap.example.com\", \"port\": 993, \"timeout_ms\": 10000}}</tool_call>",
+    "invoked_tool": "tls_session_open",
+    "resolved_tool": "tls_session_open",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_tls_session_open_holdout",
+    "prompt": "Establish a TLS session to smtp.mail.local on port 465.",
+    "response": "<tool_call>{\"name\": \"tls_session_open\", \"arguments\": {\"host\": \"smtp.mail.local\", \"port\": 465, \"accept_invalid_certs\": null, \"timeout_ms\": 10000}}</tool_call>",
+    "invoked_tool": "tls_session_open",
+    "resolved_tool": "tls_session_open",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_send",
+    "split": "train",
+    "conv_id": "toolcase_tls_session_send_train",
+    "prompt": "Send 'A1 LOGIN user pass' over TLS session tls_1.",
+    "response": "<tool_call>{\"name\": \"tls_session_send\", \"arguments\": {\"data\": \"A1 LOGIN user pass\", \"session_id\": \"tls_1\"}}</tool_call>",
+    "invoked_tool": "tls_session_send",
+    "resolved_tool": "tls_session_send",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_send",
+    "split": "holdout",
+    "conv_id": "toolcase_tls_session_send_holdout",
+    "prompt": "Transmit the command 'EHLO client' on TLS session tls_1.",
+    "response": "<tool_call>{\"name\": \"tls_session_send\", \"arguments\": {\"data\": \"EHLO client\", \"session_id\": \"tls_1\"}}</tool_call>",
+    "invoked_tool": "tls_session_send",
+    "resolved_tool": "tls_session_send",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_recv",
+    "split": "train",
+    "conv_id": "toolcase_tls_session_recv_train",
+    "prompt": "Read the decrypted response from TLS session tls_1.",
+    "response": "<tool_call>{\"name\": \"tls_session_recv\", \"arguments\": {\"session_id\": \"tls_1\"}}</tool_call>",
+    "invoked_tool": "tls_session_recv",
+    "resolved_tool": "tls_session_recv",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_recv",
+    "split": "holdout",
+    "conv_id": "toolcase_tls_session_recv_holdout",
+    "prompt": "Receive data from TLS session tls_1.",
+    "response": "<tool_call>{\"name\": \"tls_session_recv\", \"arguments\": {\"session_id\": \"tls_1\"}}</tool_call>",
+    "invoked_tool": "tls_session_recv",
+    "resolved_tool": "tls_session_recv",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_list",
+    "split": "train",
+    "conv_id": "toolcase_tls_session_list_train",
+    "prompt": "List my open TLS connections.",
+    "response": "<tool_call>{\"name\": \"tls_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "tls_session_list",
+    "resolved_tool": "tls_session_list",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_tls_session_list_holdout",
+    "prompt": "What TLS sessions are currently open?",
+    "response": "<tool_call>{\"name\": \"tls_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "tls_session_list",
+    "resolved_tool": "tls_session_list",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_close",
+    "split": "train",
+    "conv_id": "toolcase_tls_session_close_train",
+    "prompt": "Close TLS session tls_1.",
+    "response": "<tool_call>{\"name\": \"tls_session_close\", \"arguments\": {\"session_id\": \"tls_1\"}}</tool_call>",
+    "invoked_tool": "tls_session_close",
+    "resolved_tool": "tls_session_close",
+    "correct": true
+  },
+  {
+    "tool": "tls_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_tls_session_close_holdout",
+    "prompt": "Shut down TLS session tls_2.",
+    "response": "<tool_call>{\"name\": \"tls_session_close\", \"arguments\": {\"session_id\": \"tls_2\"}}</tool_call>",
+    "invoked_tool": "tls_session_close",
+    "resolved_tool": "tls_session_close",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_open",
+    "split": "train",
+    "conv_id": "toolcase_sql_session_open_train",
+    "prompt": "Open a SQLite session on an in-memory database.",
+    "response": "<tool_call>{\"name\": \"sql_session_open\", \"arguments\": {\"database\": \":memory:\"}}</tool_call>",
+    "invoked_tool": "sql_session_open",
+    "resolved_tool": "sql_session_open",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_sql_session_open_holdout",
+    "prompt": "Connect to the SQLite database at /data/app.db.",
+    "response": "<tool_call>{\"name\": \"sql_session_open\", \"arguments\": {\"credential_name\": \"app_db\", \"database\": \"/data/app.db\"}}</tool_call>",
+    "invoked_tool": "sql_session_open",
+    "resolved_tool": "sql_session_open",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_query",
+    "split": "train",
+    "conv_id": "toolcase_sql_session_query_train",
+    "prompt": "On SQL session sql_1, run SELECT * FROM users LIMIT 5.",
+    "response": "<tool_call>{\"name\": \"sql_session_query\", \"arguments\": {\"session_id\": \"sql_1\", \"query\": \"SELECT * FROM users LIMIT 5\"}}</tool_call>",
+    "invoked_tool": "sql_session_query",
+    "resolved_tool": "sql_session_query",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_query",
+    "split": "holdout",
+    "conv_id": "toolcase_sql_session_query_holdout",
+    "prompt": "Execute INSERT INTO logs(msg) VALUES('boot') on SQL session sql_1.",
+    "response": "<tool_call>{\"name\": \"sql_session_query\", \"arguments\": {\"query\": \"INSERT INTO logs(msg) VALUES('boot')\", \"session_id\": \"sql_1\"}}</tool_call>",
+    "invoked_tool": "sql_session_query",
+    "resolved_tool": "sql_session_query",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_list",
+    "split": "train",
+    "conv_id": "toolcase_sql_session_list_train",
+    "prompt": "List my open database sessions.",
+    "response": "<tool_call>{\"name\": \"sql_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "sql_session_list",
+    "resolved_tool": "sql_session_list",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_sql_session_list_holdout",
+    "prompt": "What SQL connections do I have open?",
+    "response": "<tool_call>{\"name\": \"sql_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "sql_session_list",
+    "resolved_tool": "sql_session_list",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_close",
+    "split": "train",
+    "conv_id": "toolcase_sql_session_close_train",
+    "prompt": "Close SQL session sql_1.",
+    "response": "<tool_call>{\"name\": \"sql_session_close\", \"arguments\": {\"session_id\": \"sql_1\"}}</tool_call>",
+    "invoked_tool": "sql_session_close",
+    "resolved_tool": "sql_session_close",
+    "correct": true
+  },
+  {
+    "tool": "sql_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_sql_session_close_holdout",
+    "prompt": "End my database session sql_2.",
+    "response": "<tool_call>{\"name\": \"sql_session_close\", \"arguments\": {\"session_id\": \"sql_2\"}}</tool_call>",
+    "invoked_tool": "sql_session_close",
+    "resolved_tool": "sql_session_close",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_open",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_open_train",
+    "prompt": "Open an SFTP session to sftp://deploy@host.example.com:22/srv using my ssh key.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_open\", \"arguments\": {\"uri\": \"sftp://deploy@host.example.com:22/srv\"}}",
+    "invoked_tool": "remote_fs_session_open",
+    "resolved_tool": "remote_fs_session_open",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_open_holdout",
+    "prompt": "Connect over SFTP to sftp://user@10.0.0.7/home/user.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_open\", \"arguments\": {\"uri\": \"sftp://user@10.0.0.7:22\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_open",
+    "resolved_tool": "remote_fs_session_open",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_list_dir",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_list_dir_train",
+    "prompt": "On SFTP session fs_1, list the directory /var/log.",
+    "response": "<tool_call>{\"name\":\"remote_fs_session_list_dir\",\"arguments\":{\"path\":\"/var/log\",\"session_id\":\"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_list_dir",
+    "resolved_tool": "remote_fs_session_list_dir",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_list_dir",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_list_dir_holdout",
+    "prompt": "Show the contents of /etc on SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_list_dir\", \"arguments\": {\"path\": \"/etc\", \"session_id\": \"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_list_dir",
+    "resolved_tool": "remote_fs_session_list_dir",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_stat",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_stat_train",
+    "prompt": "Get the metadata for /srv/app.conf on SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_stat\", \"arguments\": {\"path\": \"/srv/app.conf\", \"session_id\": \"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_stat",
+    "resolved_tool": "remote_fs_session_stat",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_stat",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_stat_holdout",
+    "prompt": "Stat the file /home/user/data.bin over SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_stat\", \"arguments\": {\"path\": \"/home/user/data.bin\", \"session_id\": \"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_stat",
+    "resolved_tool": "remote_fs_session_stat",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_get",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_get_train",
+    "prompt": "Download /var/log/syslog from SFTP session fs_1 into my workspace.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_get\", \"arguments\": {\"session_id\": \"fs_1\", \"remote_path\": \"/var/log/syslog\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_get",
+    "resolved_tool": "remote_fs_session_get",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_get",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_get_holdout",
+    "prompt": "Fetch /srv/config.yaml from SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_get\", \"arguments\": {\"session_id\": \"fs_1\", \"remote_path\": \"/srv/config.yaml\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_get",
+    "resolved_tool": "remote_fs_session_get",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_put",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_put_train",
+    "prompt": "Upload my local file report.txt to /srv/report.txt on SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_put\", \"arguments\": {\"local_vfs_path\": \"report.txt\", \"remote_path\": \"/srv/report.txt\", \"session_id\": \"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_put",
+    "resolved_tool": "remote_fs_session_put",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_put",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_put_holdout",
+    "prompt": "Push deploy.sh to /home/deploy/deploy.sh over SFTP session fs_1.",
+    "response": "<tool_call>{\"name\":\"remote_fs_session_put\",\"arguments\":{\"local_vfs_path\":\"/home/ubuntu/candle/deploy.sh\",\"remote_path\":\"/home/deploy/deploy.sh\",\"session_id\":\"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_put",
+    "resolved_tool": "remote_fs_session_put",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_delete",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_delete_train",
+    "prompt": "Delete /tmp/old.log on the remote host via SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_delete\", \"arguments\": {\"path\": \"/tmp/old.log\", \"session_id\": \"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_delete",
+    "resolved_tool": "remote_fs_session_delete",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_delete",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_delete_holdout",
+    "prompt": "Remove /srv/stale.tmp over SFTP session fs_1.",
+    "response": "<tool_call>{\"name\":\"remote_fs_session_delete\",\"arguments\":{\"path\":\"/srv/stale.tmp\",\"session_id\":\"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_delete",
+    "resolved_tool": "remote_fs_session_delete",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_mkdir",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_mkdir_train",
+    "prompt": "Create the directory /srv/releases on SFTP session fs_1.",
+    "response": "<tool_call>{\"name\":\"remote_fs_session_mkdir\",\"arguments\":{\"path\":\"/srv/releases\",\"session_id\":\"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_mkdir",
+    "resolved_tool": "remote_fs_session_mkdir",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_mkdir",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_mkdir_holdout",
+    "prompt": "Make a new remote directory /home/user/backups via SFTP session fs_1.",
+    "response": "<tool_call>{\"name\":\"remote_fs_session_mkdir\",\"arguments\":{\"path\":\"/home/user/backups\",\"session_id\":\"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_mkdir",
+    "resolved_tool": "remote_fs_session_mkdir",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_rename",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_rename_train",
+    "prompt": "Rename /srv/app.old to /srv/app.bak on SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_rename\", \"arguments\": {\"from\": \"/srv/app.old\", \"session_id\": \"fs_1\", \"to\": \"/srv/app.bak\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_rename",
+    "resolved_tool": "remote_fs_session_rename",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_rename",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_rename_holdout",
+    "prompt": "Move /tmp/a.txt to /tmp/b.txt over SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_rename\", \"arguments\": {\"from\": \"/tmp/a.txt\", \"session_id\": \"fs_1\", \"to\": \"/tmp/b.txt\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_rename",
+    "resolved_tool": "remote_fs_session_rename",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_list",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_list_train",
+    "prompt": "List my open SFTP sessions.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "remote_fs_session_list",
+    "resolved_tool": "remote_fs_session_list",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_list",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_list_holdout",
+    "prompt": "What remote filesystem connections are open?",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_list\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "remote_fs_session_list",
+    "resolved_tool": "remote_fs_session_list",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_close",
+    "split": "train",
+    "conv_id": "toolcase_remote_fs_session_close_train",
+    "prompt": "Close SFTP session fs_1.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_close\", \"arguments\": {\"session_id\": \"fs_1\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_close",
+    "resolved_tool": "remote_fs_session_close",
+    "correct": true
+  },
+  {
+    "tool": "remote_fs_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_remote_fs_session_close_holdout",
+    "prompt": "End my remote filesystem session fs_2.",
+    "response": "<tool_call>{\"name\": \"remote_fs_session_close\", \"arguments\": {\"session_id\": \"fs_2\"}}</tool_call>",
+    "invoked_tool": "remote_fs_session_close",
+    "resolved_tool": "remote_fs_session_close",
+    "correct": true
+  },
+  {
+    "tool": "dns_lookup",
+    "split": "train",
+    "conv_id": "toolcase_dns_lookup_train",
+    "prompt": "What is the IP address of example.com?",
+    "response": "<tool_call>{\"name\": \"dns_lookup\", \"arguments\": {\"host\": \"example.com\"}}</tool_call>",
+    "invoked_tool": "dns_lookup",
+    "resolved_tool": "dns_lookup",
+    "correct": true
+  },
+  {
+    "tool": "dns_lookup",
+    "split": "holdout",
+    "conv_id": "toolcase_dns_lookup_holdout",
+    "prompt": "Resolve the hostname api.github.com.",
+    "response": "<tool_call>{\"name\": \"dns_lookup\", \"arguments\": {\"host\": \"api.github.com\"}}</tool_call>",
+    "invoked_tool": "dns_lookup",
+    "resolved_tool": "dns_lookup",
+    "correct": true
+  },
+  {
+    "tool": "ping_icmp",
+    "split": "train",
+    "conv_id": "toolcase_ping_icmp_train",
+    "prompt": "Ping 8.8.8.8 and show the latency.",
+    "response": "<tool_call>{\"name\": \"ping_icmp\", \"arguments\": {\"host\": \"8.8.8.8\", \"count\": 4}}</tool_call>",
+    "invoked_tool": "ping_icmp",
+    "resolved_tool": "ping_icmp",
+    "correct": true
+  },
+  {
+    "tool": "ping_icmp",
+    "split": "holdout",
+    "conv_id": "toolcase_ping_icmp_holdout",
+    "prompt": "Is the host db.internal reachable?",
+    "response": "<tool_call>{\"name\": \"ping_icmp\", \"arguments\": {\"host\": \"db.internal\"}}</tool_call>",
+    "invoked_tool": "ping_icmp",
+    "resolved_tool": "ping_icmp",
+    "correct": true
+  },
+  {
+    "tool": "trace_route",
+    "split": "train",
+    "conv_id": "toolcase_trace_route_train",
+    "prompt": "Trace the route to cloudflare.com.",
+    "response": "<tool_call>{\"name\": \"trace_route\", \"arguments\": {\"host\": \"cloudflare.com\"}}</tool_call>",
+    "invoked_tool": "trace_route",
+    "resolved_tool": "trace_route",
+    "correct": true
+  },
+  {
+    "tool": "trace_route",
+    "split": "holdout",
+    "conv_id": "toolcase_trace_route_holdout",
+    "prompt": "Map the network path to 1.1.1.1.",
+    "response": "<tool_call>{\"name\": \"trace_route\", \"arguments\": {\"host\": \"1.1.1.1\"}}</tool_call>",
+    "invoked_tool": "trace_route",
+    "resolved_tool": "trace_route",
+    "correct": true
+  },
+  {
+    "tool": "port_scan",
+    "split": "train",
+    "conv_id": "toolcase_port_scan_train",
+    "prompt": "Check whether ports 22, 80, and 443 are open on 10.0.0.5.",
+    "response": "<tool_call>{\"name\": \"port_scan\", \"arguments\": {\"host\": \"10.0.0.5\", \"ports\": [22, 80, 443], \"timeout_ms\": 3000}}</tool_call>",
+    "invoked_tool": "port_scan",
+    "resolved_tool": "port_scan",
+    "correct": true
+  },
+  {
+    "tool": "port_scan",
+    "split": "holdout",
+    "conv_id": "toolcase_port_scan_holdout",
+    "prompt": "Scan ports 3306 and 5432 on db.example.com.",
+    "response": "<tool_call>{\"name\": \"port_scan\", \"arguments\": {\"host\": \"db.example.com\", \"ports\": [3306, 5432], \"timeout_ms\": 1000}}</tool_call>",
+    "invoked_tool": "port_scan",
+    "resolved_tool": "port_scan",
+    "correct": true
+  },
+  {
+    "tool": "ip_scan",
+    "split": "train",
+    "conv_id": "toolcase_ip_scan_train",
+    "prompt": "Sweep the subnet 192.168.1.0/24 for live hosts.",
+    "response": "<tool_call>{\"name\": \"ip_scan\", \"arguments\": {\"subnet\": \"192.168.1.0/24\"}}</tool_call>",
+    "invoked_tool": "ip_scan",
+    "resolved_tool": "ip_scan",
+    "correct": true
+  },
+  {
+    "tool": "ip_scan",
+    "split": "holdout",
+    "conv_id": "toolcase_ip_scan_holdout",
+    "prompt": "Discover hosts on 10.0.0.0/24.",
+    "response": "<tool_call>{\"name\": \"ip_scan\", \"arguments\": {\"subnet\": \"10.0.0.0/24\"}}</tool_call>",
+    "invoked_tool": "ip_scan",
+    "resolved_tool": "ip_scan",
+    "correct": true
+  },
+  {
+    "tool": "host_info",
+    "split": "train",
+    "conv_id": "toolcase_host_info_train",
+    "prompt": "Profile the host example.com — resolve it and do a reverse lookup.",
+    "response": "<tool_call>{\"name\": \"host_info\", \"arguments\": {\"host\": \"example.com\"}}</tool_call>",
+    "invoked_tool": "host_info",
+    "resolved_tool": "host_info",
+    "correct": true
+  },
+  {
+    "tool": "host_info",
+    "split": "holdout",
+    "conv_id": "toolcase_host_info_holdout",
+    "prompt": "Identify the host at 93.184.216.34.",
+    "response": "<tool_call>{\"name\": \"host_info\", \"arguments\": {\"host\": \"93.184.216.34\"}}</tool_call>",
+    "invoked_tool": "host_info",
+    "resolved_tool": "host_info",
+    "correct": true
+  },
+  {
+    "tool": "hash_scan",
+    "split": "train",
+    "conv_id": "toolcase_hash_scan_train",
+    "prompt": "Identify which hash algorithm produced 5d41402abc4b2a76b9719d911017c592.",
+    "response": "<tool_call>{\"name\": \"hash_scan\", \"arguments\": {\"data\": \"\", \"known_hash\": \"5d41402abc4b2a76b9719d911017c592\"}}</tool_call>",
+    "invoked_tool": "hash_scan",
+    "resolved_tool": "hash_scan",
+    "correct": true
+  },
+  {
+    "tool": "hash_scan",
+    "split": "holdout",
+    "conv_id": "toolcase_hash_scan_holdout",
+    "prompt": "What algorithm made this digest: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824?",
+    "response": "<tool_call>{\"name\":\"hash_scan\",\"arguments\":{\"data\":\"hello world\",\"known_hash\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"}}</tool_call>",
+    "invoked_tool": "hash_scan",
+    "resolved_tool": "hash_scan",
+    "correct": true
+  },
+  {
+    "tool": "hash_compute",
+    "split": "train",
+    "conv_id": "toolcase_hash_compute_train",
+    "prompt": "Compute the SHA-256 hash of the text 'hello world'.",
+    "response": "<tool_call>{\"name\": \"hash_compute\", \"arguments\": {\"algorithm\": \"sha256\", \"data\": \"hello world\"}}</tool_call>",
+    "invoked_tool": "hash_compute",
+    "resolved_tool": "hash_compute",
+    "correct": true
+  },
+  {
+    "tool": "hash_compute",
+    "split": "holdout",
+    "conv_id": "toolcase_hash_compute_holdout",
+    "prompt": "Give me the blake3 digest of 'the quick brown fox'.",
+    "response": "<tool_call>{\"name\": \"hash_compute\", \"arguments\": {\"algorithm\": \"blake3\", \"data\": \"the quick brown fox\"}}</tool_call>",
+    "invoked_tool": "hash_compute",
+    "resolved_tool": "hash_compute",
+    "correct": true
+  },
+  {
+    "tool": "totp",
+    "split": "train",
+    "conv_id": "toolcase_totp_train",
+    "prompt": "Generate the current 2FA code from my 'github_totp' credential.",
+    "response": "<tool_call>{\"name\": \"totp\", \"arguments\": {\"credential_name\": \"github_totp\"}}</tool_call>",
+    "invoked_tool": "totp",
+    "resolved_tool": "totp",
+    "correct": true
+  },
+  {
+    "tool": "totp",
+    "split": "holdout",
+    "conv_id": "toolcase_totp_holdout",
+    "prompt": "Give me the current authenticator code for 'vpn_totp' right now.",
+    "response": "<tool_call>{\"name\": \"totp\", \"arguments\": {\"credential_name\": \"vpn_totp\"}}</tool_call>",
+    "invoked_tool": "totp",
+    "resolved_tool": "totp",
+    "correct": true
+  },
+  {
+    "tool": "aead_encrypt",
+    "split": "train",
+    "conv_id": "toolcase_aead_encrypt_train",
+    "prompt": "Encrypt the plaintext 'secret message' with AES-256-GCM using key 0000000000000000000000000000000000000000000000000000000000000000.",
+    "response": "<tool_call>{\"name\":\"aead_encrypt\",\"arguments\":{\"algorithm\":\"aes-256-gcm\",\"data\":\"secret message\",\"key_hex\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"aad\":null,\"nonce_hex\":null}}}</tool_call>",
+    "invoked_tool": "aead_encrypt",
+    "resolved_tool": "aead_encrypt",
+    "correct": true
+  },
+  {
+    "tool": "aead_encrypt",
+    "split": "holdout",
+    "conv_id": "toolcase_aead_encrypt_holdout",
+    "prompt": "Encrypt 'token' with ChaCha20-Poly1305 using key 1111111111111111111111111111111111111111111111111111111111111111.",
+    "response": "<tool_call>{\"name\":\"aead_encrypt\",\"arguments\":{\"algorithm\":\"ChaCha20-Poly1305\",\"data\":\"token\",\"key_hex\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}}</tool_call>",
+    "invoked_tool": "aead_encrypt",
+    "resolved_tool": "aead_encrypt",
+    "correct": true
+  },
+  {
+    "tool": "aead_decrypt",
+    "split": "train",
+    "conv_id": "toolcase_aead_decrypt_train",
+    "prompt": "Decrypt this AES-256-GCM ciphertext 9a1c with key 0000000000000000000000000000000000000000000000000000000000000000 and nonce 000000000000000000000000.",
+    "response": "<tool_call>{\"name\":\"aead_decrypt\",\"arguments\":{\"algorithm\":\"aes-256-gcm\",\"ciphertext_hex\":\"9a1c\",\"key_hex\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"nonce_hex\":\"000000000000000000000000\"}}</tool_call>",
+    "invoked_tool": "aead_decrypt",
+    "resolved_tool": "aead_decrypt",
+    "correct": true
+  },
+  {
+    "tool": "aead_decrypt",
+    "split": "holdout",
+    "conv_id": "toolcase_aead_decrypt_holdout",
+    "prompt": "Decrypt this ChaCha20-Poly1305 ciphertext ab12 using the key 1111111111111111111111111111111111111111111111111111111111111111 and nonce 111111111111111111111111.",
+    "response": "<tool_call>{\"name\":\"aead_decrypt\",\"arguments\":{\"algorithm\":\"chacha20-poly1305\",\"ciphertext_hex\":\"ab12\",\"key_hex\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"nonce_hex\":\"111111111111111111111111\"}}</tool_call>",
+    "invoked_tool": "aead_decrypt",
+    "resolved_tool": "aead_decrypt",
+    "correct": true
+  },
+  {
+    "tool": "hmac_compute",
+    "split": "train",
+    "conv_id": "toolcase_hmac_compute_train",
+    "prompt": "Compute the HMAC-SHA256 of the message 'data' with key 'k3y'.",
+    "response": "<tool_call>{\"name\": \"hmac_compute\", \"arguments\": {\"algorithm\": \"sha256\", \"data\": \"data\", \"key\": \"k3y\"}}</tool_call>",
+    "invoked_tool": "hmac_compute",
+    "resolved_tool": "hmac_compute",
+    "correct": true
+  },
+  {
+    "tool": "hmac_compute",
+    "split": "holdout",
+    "conv_id": "toolcase_hmac_compute_holdout",
+    "prompt": "Give me the HMAC-SHA512 tag for 'payload' using key 'secret'.",
+    "response": "<tool_call>{\"name\": \"hmac_compute\", \"arguments\": {\"algorithm\": \"sha512\", \"data\": \"payload\", \"key\": \"secret\", \"encoding\": \"hex\"}}</tool_call>",
+    "invoked_tool": "hmac_compute",
+    "resolved_tool": "hmac_compute",
+    "correct": true
+  },
+  {
+    "tool": "signature_verify",
+    "split": "train",
+    "conv_id": "toolcase_signature_verify_train",
+    "prompt": "Verify this ed25519 signature ab12 over the message 'hello' with public key cd34.",
+    "response": "<tool_call>{\"name\": \"signature_verify\", \"arguments\": {\"algorithm\": \"ed25519\", \"data\": \"hello\", \"data_encoding\": null, \"public_key\": \"cd34\", \"signature_hex\": \"ab12\"}}</tool_call>",
+    "invoked_tool": "signature_verify",
+    "resolved_tool": "signature_verify",
+    "correct": true
+  },
+  {
+    "tool": "signature_verify",
+    "split": "holdout",
+    "conv_id": "toolcase_signature_verify_holdout",
+    "prompt": "Check whether this p256 signature ef56 is valid for the message 'manifest' under public key 7890.",
+    "response": "<tool_call>{\"name\": \"signature_verify\", \"arguments\": {\"algorithm\": \"p256_sha256\", \"data\": \"manifest\", \"data_encoding\": null, \"public_key\": \"7890\", \"signature_hex\": \"ef56\"}}</tool_call>",
+    "invoked_tool": "signature_verify",
+    "resolved_tool": "signature_verify",
+    "correct": true
+  },
+  {
+    "tool": "signature_sign",
+    "split": "train",
+    "conv_id": "toolcase_signature_sign_train",
+    "prompt": "Sign the message 'release-v2' with my ed25519 signing key credential 'release_key'.",
+    "response": "<tool_call>{\"name\": \"signature_sign\", \"arguments\": {\"algorithm\": \"ed25519\", \"credential_name\": \"release_key\", \"data\": \"release-v2\"}}</tool_call>",
+    "invoked_tool": "signature_sign",
+    "resolved_tool": "signature_sign",
+    "correct": true
+  },
+  {
+    "tool": "signature_sign",
+    "split": "holdout",
+    "conv_id": "toolcase_signature_sign_holdout",
+    "prompt": "Produce a p256 signature over 'manifest' using my stored signing key 'ci_key'.",
+    "response": "<tool_call>{\"name\": \"signature_sign\", \"arguments\": {\"algorithm\": \"p256_sha256\", \"credential_name\": \"ci_key\", \"data\": \"manifest\"}}</tool_call>",
+    "invoked_tool": "signature_sign",
+    "resolved_tool": "signature_sign",
+    "correct": true
+  },
+  {
+    "tool": "kdf_derive",
+    "split": "train",
+    "conv_id": "toolcase_kdf_derive_train",
+    "prompt": "Derive a key from the password 'hunter2' using argon2id.",
+    "response": "<tool_call>{\"name\": \"kdf_derive\", \"arguments\": {\"algorithm\": \"argon2id\", \"password\": \"hunter2\", \"salt\": \"random_salt_12345678901234567890123456789012\", \"length\": 32, \"memory_kib\": 65536, \"iterations\": 3}}</tool_call>",
+    "invoked_tool": "kdf_derive",
+    "resolved_tool": "kdf_derive",
+    "correct": true
+  },
+  {
+    "tool": "kdf_derive",
+    "split": "holdout",
+    "conv_id": "toolcase_kdf_derive_holdout",
+    "prompt": "Stretch the password 'correcthorsebatterystaple' with scrypt.",
+    "response": "<tool_call>{\"name\":\"kdf_derive\",\"arguments\":{\"algorithm\":\"scrypt\",\"password\":\"correcthorsebatterystaple\",\"salt\":\"random_salt_1234567890\",\"length\":32,\"memory_kib\":65536,\"iterations\":1024}}</tool_call>",
+    "invoked_tool": "kdf_derive",
+    "resolved_tool": "kdf_derive",
+    "correct": true
+  },
+  {
+    "tool": "hkdf_extract",
+    "split": "train",
+    "conv_id": "toolcase_hkdf_extract_train",
+    "prompt": "Run HKDF-Extract with SHA-256 on input key material aabbcc and salt 001122.",
+    "response": "<tool_call>{\"name\": \"hkdf_extract\", \"arguments\": {\"algorithm\": \"sha256\", \"ikm\": \"aabbcc\", \"salt\": \"001122\"}}</tool_call>",
+    "invoked_tool": "hkdf_extract",
+    "resolved_tool": "hkdf_extract",
+    "correct": true
+  },
+  {
+    "tool": "hkdf_extract",
+    "split": "holdout",
+    "conv_id": "toolcase_hkdf_extract_holdout",
+    "prompt": "HKDF-Extract a PRK from IKM ddeeff using SHA-512.",
+    "response": "<tool_call>{\"name\": \"hkdf_extract\", \"arguments\": {\"algorithm\": \"sha512\", \"ikm\": \"ddeeff\", \"salt\": null, \"encoding\": \"hex\"}}</tool_call>",
+    "invoked_tool": "hkdf_extract",
+    "resolved_tool": "hkdf_extract",
+    "correct": true
+  },
+  {
+    "tool": "hkdf_expand_label",
+    "split": "train",
+    "conv_id": "toolcase_hkdf_expand_label_train",
+    "prompt": "Do an HKDF-Expand-Label for the TLS 1.3 'c hs traffic' secret from PRK aabbcc.",
+    "response": "<tool_call>{\"name\": \"hkdf_expand_label\", \"arguments\": {\"algorithm\": \"sha256\", \"label\": \"c hs traffic\", \"length\": 32, \"prk_hex\": \"aabbcc\"}}</tool_call>",
+    "invoked_tool": "hkdf_expand_label",
+    "resolved_tool": "hkdf_expand_label",
+    "correct": true
+  },
+  {
+    "tool": "hkdf_expand_label",
+    "split": "holdout",
+    "conv_id": "toolcase_hkdf_expand_label_holdout",
+    "prompt": "Expand the TLS 1.3 label 'key' from pseudorandom key ddeeff.",
+    "response": "<tool_call>{\"name\": \"hkdf_expand_label\", \"arguments\": {\"algorithm\": \"sha256\", \"label\": \"key\", \"length\": 32, \"prk_hex\": \"ddeeff\"}}</tool_call>",
+    "invoked_tool": "hkdf_expand_label",
+    "resolved_tool": "hkdf_expand_label",
+    "correct": true
+  },
+  {
+    "tool": "hash_state_init",
+    "split": "train",
+    "conv_id": "toolcase_hash_state_init_train",
+    "prompt": "Start a streaming SHA-256 hash.",
+    "response": "<tool_call>{\"name\":\"hash_state_init\",\"arguments\":{\"algorithm\":\"sha256\"}}</tool_call>",
+    "invoked_tool": "hash_state_init",
+    "resolved_tool": "hash_state_init",
+    "correct": true
+  },
+  {
+    "tool": "hash_state_init",
+    "split": "holdout",
+    "conv_id": "toolcase_hash_state_init_holdout",
+    "prompt": "Begin an incremental blake3 hash computation.",
+    "response": "<tool_call>{\"name\":\"hash_state_init\",\"arguments\":{\"algorithm\":\"blake3\"}}</tool_call>",
+    "invoked_tool": "hash_state_init",
+    "resolved_tool": "hash_state_init",
+    "correct": true
+  },
+  {
+    "tool": "hash_state_update",
+    "split": "train",
+    "conv_id": "toolcase_hash_state_update_train",
+    "prompt": "Feed the chunk 'part one ' into streaming hash state hs_1.",
+    "response": "<tool_call>{\"name\":\"hash_state_update\",\"arguments\":{\"data\":\"part one \",\"id\":\"hs_1\"}}</tool_call>",
+    "invoked_tool": "hash_state_update",
+    "resolved_tool": "hash_state_update",
+    "correct": true
+  },
+  {
+    "tool": "hash_state_update",
+    "split": "holdout",
+    "conv_id": "toolcase_hash_state_update_holdout",
+    "prompt": "Absorb the next block of data 'more bytes' into hash state hs_1.",
+    "response": "<tool_call>{\"name\":\"hash_state_update\",\"arguments\":{\"data\":\"more bytes\",\"id\":\"hs_1\"}}</tool_call>",
+    "invoked_tool": "hash_state_update",
+    "resolved_tool": "hash_state_update",
+    "correct": true
+  },
+  {
+    "tool": "hash_state_finalize",
+    "split": "train",
+    "conv_id": "toolcase_hash_state_finalize_train",
+    "prompt": "Finalize streaming hash state hs_1 and give me the digest.",
+    "response": "<tool_call>{\"name\":\"hash_state_finalize\",\"arguments\":{\"id\":\"hs_1\"}}</tool_call>",
+    "invoked_tool": "hash_state_finalize",
+    "resolved_tool": "hash_state_finalize",
+    "correct": true
+  },
+  {
+    "tool": "hash_state_finalize",
+    "split": "holdout",
+    "conv_id": "toolcase_hash_state_finalize_holdout",
+    "prompt": "Emit the final digest for hash state hs_2.",
+    "response": "<tool_call>{\"name\":\"hash_state_finalize\",\"arguments\":{\"id\":\"hs_2\"}}</tool_call>",
+    "invoked_tool": "hash_state_finalize",
+    "resolved_tool": "hash_state_finalize",
+    "correct": true
+  },
+  {
+    "tool": "bytes_transcode",
+    "split": "train",
+    "conv_id": "toolcase_bytes_transcode_train",
+    "prompt": "Convert the hex string 48656c6c6f to base64.",
+    "response": "<tool_call>{\"name\": \"bytes_transcode\", \"arguments\": {\"data\": \"48656c6c6f\", \"from\": \"hex\", \"to\": \"base64\"}}</tool_call>",
+    "invoked_tool": "bytes_transcode",
+    "resolved_tool": "bytes_transcode",
+    "correct": true
+  },
+  {
+    "tool": "bytes_transcode",
+    "split": "holdout",
+    "conv_id": "toolcase_bytes_transcode_holdout",
+    "prompt": "Re-encode this base64 value to hex: aGVsbG8=.",
+    "response": "<tool_call>{\"name\": \"bytes_transcode\", \"arguments\": {\"data\": \"aGVsbG8=\", \"from\": \"base64\", \"to\": \"hex\"}}</tool_call>",
+    "invoked_tool": "bytes_transcode",
+    "resolved_tool": "bytes_transcode",
+    "correct": true
+  },
+  {
+    "tool": "bytes_pack",
+    "split": "train",
+    "conv_id": "toolcase_bytes_pack_train",
+    "prompt": "Pack the values 1, 2, and 300 as little-endian uint16 using the format '<HHH'.",
+    "response": "<tool_call>{\"name\": \"bytes_pack\", \"arguments\": {\"format\": \"<HHH\", \"values\": [1, 2, 300]}}</tool_call>",
+    "invoked_tool": "bytes_pack",
+    "resolved_tool": "bytes_pack",
+    "correct": true
+  },
+  {
+    "tool": "bytes_pack",
+    "split": "holdout",
+    "conv_id": "toolcase_bytes_pack_holdout",
+    "prompt": "Pack the u32 70000 and the f32 3.14 big-endian with the format '>If'.",
+    "response": "<tool_call>{\"name\": \"bytes_pack\", \"arguments\": {\"format\": \">If\", \"values\": [70000, 3.14]}}</tool_call>",
+    "invoked_tool": "bytes_pack",
+    "resolved_tool": "bytes_pack",
+    "correct": true
+  },
+  {
+    "tool": "bytes_unpack",
+    "split": "train",
+    "conv_id": "toolcase_bytes_unpack_train",
+    "prompt": "Unpack the bytes 01000200 as two little-endian uint16 with the format '<HH'.",
+    "response": "<tool_call>{\"name\":\"bytes_unpack\",\"arguments\":{\"data\":\"01000200\",\"format\":\"<HH\"}}</tool_call>",
+    "invoked_tool": "bytes_unpack",
+    "resolved_tool": "bytes_unpack",
+    "correct": true
+  },
+  {
+    "tool": "bytes_unpack",
+    "split": "holdout",
+    "conv_id": "toolcase_bytes_unpack_holdout",
+    "prompt": "Decode the buffer 0001e240 as a big-endian u32 using the format '>I'.",
+    "response": "<tool_call>{\"name\":\"bytes_unpack\",\"arguments\":{\"data\":\"0001e240\",\"format\":\">I\"}}</tool_call>",
+    "invoked_tool": "bytes_unpack",
+    "resolved_tool": "bytes_unpack",
+    "correct": true
+  },
+  {
+    "tool": "bytes_xor",
+    "split": "train",
+    "conv_id": "toolcase_bytes_xor_train",
+    "prompt": "XOR the byte sequences ff00 and 0ff0.",
+    "response": "<tool_call>{\"name\":\"bytes_xor\",\"arguments\":{\"a\":\"ff00\",\"b\":\"0ff0\"}}</tool_call>",
+    "invoked_tool": "bytes_xor",
+    "resolved_tool": "bytes_xor",
+    "correct": true
+  },
+  {
+    "tool": "bytes_xor",
+    "split": "holdout",
+    "conv_id": "toolcase_bytes_xor_holdout",
+    "prompt": "Compute the bitwise XOR of the bytes 61626364 with the key 10101010.",
+    "response": "<tool_call>{\"name\": \"bytes_xor\", \"arguments\": {\"a\": \"61626364\", \"b\": \"10101010\", \"a_encoding\": \"hex\", \"b_encoding\": \"hex\"}}</tool_call>",
+    "invoked_tool": "bytes_xor",
+    "resolved_tool": "bytes_xor",
+    "correct": true
+  },
+  {
+    "tool": "code_run",
+    "split": "train",
+    "conv_id": "toolcase_code_run_train",
+    "prompt": "Run this Python: print(sum(range(100))).",
+    "response": "<tool_call>{\"name\":\"code_run\",\"arguments\":{\"code\":\"print(sum(range(100)))\\n\",\"language\":\"python\"}}</tool_call>",
+    "invoked_tool": "code_run",
+    "resolved_tool": "code_run",
+    "correct": true
+  },
+  {
+    "tool": "code_run",
+    "split": "holdout",
+    "conv_id": "toolcase_code_run_holdout",
+    "prompt": "Execute the bash command `echo $((6*7))`.",
+    "response": "<tool_call>{\"name\":\"code_run\",\"arguments\":{\"code\":\"echo $((6*7))\",\"language\":\"sh\"}}</tool_call>",
+    "invoked_tool": "code_run",
+    "resolved_tool": "code_run",
+    "correct": true
+  },
+  {
+    "tool": "code_session_open",
+    "split": "train",
+    "conv_id": "toolcase_code_session_open_train",
+    "prompt": "Open a persistent Python code session.",
+    "response": "<tool_call>{\"name\": \"code_session_open\", \"arguments\": {\"language\": \"python3\"}}</tool_call>",
+    "invoked_tool": "code_session_open",
+    "resolved_tool": "code_session_open",
+    "correct": true
+  },
+  {
+    "tool": "code_session_open",
+    "split": "holdout",
+    "conv_id": "toolcase_code_session_open_holdout",
+    "prompt": "Start a Node.js execution session.",
+    "response": "<tool_call>{\"name\":\"code_session_open\",\"arguments\":{\"language\":\"node\"}}</tool_call>",
+    "invoked_tool": "code_session_open",
+    "resolved_tool": "code_session_open",
+    "correct": true
+  },
+  {
+    "tool": "code_session_exec",
+    "split": "train",
+    "conv_id": "toolcase_code_session_exec_train",
+    "prompt": "In code session code_1, run `x = 5`.",
+    "response": "<tool_call>{\"name\":\"code_session_exec\",\"arguments\":{\"code\":\"x = 5\",\"session_id\":\"code_1\"}}</tool_call>",
+    "invoked_tool": "code_session_exec",
+    "resolved_tool": "code_session_exec",
+    "correct": true
+  },
+  {
+    "tool": "code_session_exec",
+    "split": "holdout",
+    "conv_id": "toolcase_code_session_exec_holdout",
+    "prompt": "Execute `print(x * 2)` in code session code_1.",
+    "response": "<tool_call>{\"name\":\"code_session_exec\",\"arguments\":{\"code\":\"x = 5\\nprint(x * 2)\",\"session_id\":\"code_1\"}}</tool_call>",
+    "invoked_tool": "code_session_exec",
+    "resolved_tool": "code_session_exec",
+    "correct": true
+  },
+  {
+    "tool": "code_list",
+    "split": "train",
+    "conv_id": "toolcase_code_list_train",
+    "prompt": "List my open code execution sessions.",
+    "response": "<tool_call>{\"name\": \"code\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "code",
+    "resolved_tool": "code_list",
+    "correct": true
+  },
+  {
+    "tool": "code_list",
+    "split": "holdout",
+    "conv_id": "toolcase_code_list_holdout",
+    "prompt": "What sandboxes are currently running?",
+    "response": "<tool_call>{\"name\": \"code\", \"arguments\": {}}</tool_call>",
+    "invoked_tool": "code",
+    "resolved_tool": "code_list",
+    "correct": true
+  },
+  {
+    "tool": "code_session_close",
+    "split": "train",
+    "conv_id": "toolcase_code_session_close_train",
+    "prompt": "Close code session code_1.",
+    "response": "<tool_call>{\"name\": \"code_session_close\", \"arguments\": {\"session_id\": \"code_1\"}}</tool_call>",
+    "invoked_tool": "code_session_close",
+    "resolved_tool": "code_session_close",
+    "correct": true
+  },
+  {
+    "tool": "code_session_close",
+    "split": "holdout",
+    "conv_id": "toolcase_code_session_close_holdout",
+    "prompt": "Terminate code session code_2.",
+    "response": "<tool_call>{\"name\": \"code_session_close\", \"arguments\": {\"session_id\": \"code_2\"}}</tool_call>",
+    "invoked_tool": "code_session_close",
+    "resolved_tool": "code_session_close",
+    "correct": true
+  },
+  {
+    "tool": "sub_run",
+    "split": "train",
+    "conv_id": "toolcase_sub_run_train",
+    "prompt": "Have a subagent research three approaches to caching and report back.",
+    "response": "<tool_call>{\"name\": \"sub_run\", \"arguments\": {\"instruction\": \"Research three distinct approaches to implementing caching in software systems, focusing on design patterns, trade-offs, and real-world implementations. Include at least one cache invalidation strategy, one content-addressable approach (e.g., hash-based keying), and one system-level solution like Redis or memcached with TTLs. Summarize each with: name, core idea, pros, cons, and example use cases.\", \"tools\": [\"search\", \"read_file\"], \"model\": \"gpt-4o-mini\"}}",
+    "invoked_tool": "sub_run",
+    "resolved_tool": "sub_run",
+    "correct": true
+  },
+  {
+    "tool": "sub_run",
+    "split": "holdout",
+    "conv_id": "toolcase_sub_run_holdout",
+    "prompt": "Delegate the task of summarising these logs to a nested agent.",
+    "response": "<tool_call>{\"name\": \"sub_run\", \"arguments\": {\"instruction\": \"Summarize the provided log content into a concise, technical summary focusing on key events, errors, and system state changes. Use precise terminology from the codebase (e.g., 'event loop', 'event queue', 'worker pool', 'task cancellation'). Avoid vague terms like 'something went wrong' or 'the system failed'. If no meaningful events are present, return: 'No significant activity detected.'\", \"tools\": [\"read_file\"]}}",
+    "invoked_tool": "sub_run",
+    "resolved_tool": "sub_run",
+    "correct": true
+  }
+]

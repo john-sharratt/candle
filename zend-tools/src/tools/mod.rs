@@ -29,11 +29,11 @@
 //! | `remote_fs` | `remote_fs_session_*` (10 tools) | SFTP via ssh2 |
 //! | `sql_session` | `sql_session_{open,query,list,close}` | rusqlite |
 //! | `ssh` | `ssh_session_{open,exec,exec_async,poll,list,close}` | ssh2 |
-//! | `subagent` | `subagent_run` | Calls `SubagentRunner` trait impl injected by daemon |
+//! | `subagent` | `sub_run` | Calls `SubagentRunner` trait impl injected by daemon |
 //! | `tcp_session` | `tcp_session_{open,send,recv,list,close}` | Raw TCP; hex wire format |
 //! | `telnet` | `telnet_session_{open,send,list,close}` | Raw TCP; prompt-regex |
 //! | `tls_session` | `tls_session_{open,send,recv,list,close}` | native-tls |
-//! | `totp` | `totp_generate` | totp-rs; RFC 6238 |
+//! | `totp` | `totp` | totp-rs; RFC 6238 |
 //! | `udp_session` | `udp_session_{open,send,recv,list,close}` | UDP socket; hex wire format |
 //! | `unit_convert` | `unit_convert` | Static unit table; temperature special-cased |
 //! | `weather` | `weather` | Open-Meteo (no API key) |

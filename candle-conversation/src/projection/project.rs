@@ -242,6 +242,17 @@ pub enum ProjectionSegment {
 pub enum SealedKind {
     Section(ResolvedSection),
     Turn(ResolvedTurn, crate::Role),
+    /// The *user half* of a turn — its user-message body, derived on
+    /// demand as a zero-copy window view over the turn's existing chunks.
+    /// Distinct from [`SealedKind::Turn`], which always injects the whole
+    /// turn: a `TurnHalf` injects only the user content (no per-turn
+    /// boundary-marker wrapping), so the compression path can assemble
+    /// many turns' user-halves into one coherent block.  The assistant
+    /// half is text-prefilled rather than injected — its assistant-role
+    /// K/V are incoherent in the compression's user-input frame — so only
+    /// the user half is ever injected.  Used solely by the summary-tree
+    /// compression passes.
+    TurnHalf(ResolvedTurn),
 }
 
 /// Diagnostic identity for a [`ProjectionSegment::Generated`] run.
@@ -781,6 +792,19 @@ fn emit_system_prompt_items<R: ContentResolver>(
             }
             SystemPromptItem::Collection(coll) => {
                 if let Some(selected) = collection_results.remove(&coll.id) {
+                    // Emit the catalog summary just before the members when the
+                    // selection is a *proper subset* (top-k / threshold dropped at
+                    // least one member) and the summary section is actually sealed.
+                    // When all members survive, nothing was dropped, so the summary
+                    // adds nothing and is omitted.
+                    if let Some(sum_id) = coll.summary_section {
+                        let partial = selected.len() < coll.sections.len();
+                        if partial && resolver.section_token_count(sum_id) > 0 {
+                            out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                                ResolvedSection { id: sum_id },
+                            )));
+                        }
+                    }
                     out.extend(selected);
                 }
             }

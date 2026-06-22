@@ -189,6 +189,7 @@ mod tests {
                 .unwrap();
 
             backing.write_contiguous(0, 0, &k, &v).unwrap();
+            backing.set_len(0, 8);
 
             // Read data before migration
             let (k_before, _v_before) = backing.read_contiguous(0, 0, 8).unwrap();

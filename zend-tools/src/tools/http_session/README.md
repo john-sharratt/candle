@@ -7,7 +7,7 @@ Stateful HTTP client sessions with a persistent cookie jar and optional auth hea
 | File | Tool | Description |
 |------|------|-------------|
 | `open.rs` | `http_session_open` | Create reqwest client with credential and base URL |
-| `request.rs` | `http_session_request` | Send a request; handle binary bodies |
+| `request.rs` | `http_request` | Send a request; handle binary bodies |
 | `list.rs` | `http_session_list` | List open sessions |
 | `close.rs` | `http_session_close` | Drop the client |
 | `mod.rs` | — | `HttpSessionError` enum |
@@ -17,8 +17,8 @@ Stateful HTTP client sessions with a persistent cookie jar and optional auth hea
 | Situation | Right tool |
 |-----------|-----------|
 | One-off page fetch, no auth needed | `web_fetch` |
-| REST API with Bearer/Basic auth | `http_session_open` + `http_session_request` |
-| Multi-request flow needing cookie state | `http_session_open` + `http_session_request` |
+| REST API with Bearer/Basic auth | `http_session_open` + `http_request` |
+| Multi-request flow needing cookie state | `http_session_open` + `http_request` |
 | Custom headers (API key) across requests | `http_session_open` with `http_header` credential |
 
 ## Authentication
@@ -33,7 +33,7 @@ Credentials are set at open time and applied to every request:
 
 ## Response body encoding
 
-`http_session_request` returns at most one body field per response:
+`http_request` returns at most one body field per response:
 - `body` — present when the response has a text content-type (text/*, application/json, etc.)
   and the bytes are valid UTF-8
 - `body_b64` — present for binary content types or non-UTF-8 bytes

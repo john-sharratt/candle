@@ -106,6 +106,9 @@ pub struct Manifest {
     /// Latest `Tokenizer` record.
     #[serde(default)]
     pub tokenizer: Option<RecordLoc>,
+    /// Latest `ToolSummary` record (workspace singleton).
+    #[serde(default)]
+    pub tool_summary: Option<RecordLoc>,
     /// Offset of the most recent `Checkpoint` record seen.
     #[serde(default)]
     pub last_checkpoint_offset: Option<u64>,
@@ -189,6 +192,7 @@ impl Manifest {
             RecordType::ModelSpec => self.model_spec = Some(loc),
             RecordType::Template => self.template = Some(loc),
             RecordType::Tokenizer => self.tokenizer = Some(loc),
+            RecordType::ToolSummary => self.tool_summary = Some(loc),
             RecordType::Checkpoint => {
                 self.last_checkpoint_offset = Some(entry.offset);
             }

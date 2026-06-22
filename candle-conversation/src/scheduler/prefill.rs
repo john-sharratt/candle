@@ -387,6 +387,54 @@ impl Scheduler {
                 error,
                 prefill_start,
             } = p;
+            // A compression-turn re-prefill carries no decode and reports to the
+            // summariser, not a caller. Seal it directly off the wave (snapshot
+            // the role-coherent K/V + record the turn) instead of running
+            // `finalise_prefill`.
+            if let SealAction::CompressionTurn { job_id } = &work.seal_action {
+                let job_id = *job_id;
+                let slot = work.sequence_id;
+                match error {
+                    Some(e) => {
+                        if let Some(p) = self.pending_compression_seals.remove(&job_id) {
+                            let _ = p
+                                .response_tx
+                                .send(Err(format!("SubmitSummaryProbe: reproject prefill: {e}")));
+                        }
+                        self.free_summary_slot(slot);
+                    }
+                    None => self.complete_compression_turn(slot, job_id),
+                }
+                continue;
+            }
+            // The assistant half's content prefill finished on the wave. Run the
+            // synchronous tail (assistant_start + sample first + register the
+            // `CompressionPass` decode); tear the whole node down on failure.
+            if let SealAction::CompressionSetup {
+                job_id,
+                half,
+                max_tokens,
+            } = &work.seal_action
+            {
+                let job_id = *job_id;
+                let half = *half;
+                let max_tokens = *max_tokens;
+                let slot = work.sequence_id;
+                match error {
+                    Some(e) => self.abort_compression_job(
+                        job_id,
+                        format!("SubmitSummaryProbe: assistant content prefill: {e}"),
+                    ),
+                    None => {
+                        if let Err(e) =
+                            self.finish_compression_pass_setup(slot, half, max_tokens, job_id)
+                        {
+                            self.abort_compression_job(job_id, e);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(e) = error {
                 let _ = work.event_tx.send(TurnEvent::Error(e));
                 continue;
@@ -530,6 +578,7 @@ impl Scheduler {
                         post_decode_tokens: work.post_decode_tokens,
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
+                        content_bounds: work.content_bounds,
                         finished: true,
                         decode_start: Instant::now(),
                         prefill_ms,
@@ -579,6 +628,7 @@ impl Scheduler {
                 post_decode_tokens: work.post_decode_tokens,
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
+                content_bounds: work.content_bounds,
                 finished: false,
                 decode_start: Instant::now(),
                 prefill_ms,

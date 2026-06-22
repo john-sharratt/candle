@@ -35,12 +35,26 @@
 
 #![cfg(feature = "cuda")]
 
-use candle::quantized::pinned_staging::PinnedStager;
+use candle::cuda_backend::cudarc::driver::CudaStream;
+use candle::quantized::pinned_staging::{PinnedBuf, PinnedStager};
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::{ChunkedKvBacking, KvCache, CHUNK_SIZE};
-use candle_transformers::models::prefill_utils::{
-    compute_rope_cs, paged_decode_attn, paged_prefill_batched,
+use candle_nn::kv_cache::{
+    quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvCache, KvFormat, SealedChunk,
+    SealedSequence, CHUNK_SIZE,
 };
+use candle_transformers::models::prefill_utils::{
+    compute_rope_cs, paged_decode_attn, paged_glue_attn, paged_prefill_batched,
+};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+// These tests share one GPU and the process-global quantized arena table, so
+// they must not run concurrently. Each test acquires this guard first; poison
+// from a panicking sibling is recovered (the next test rebuilds its own state).
+static GPU_SERIAL: Mutex<()> = Mutex::new(());
+
+fn gpu_serial() -> MutexGuard<'static, ()> {
+    GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Test-config knobs
@@ -48,8 +62,8 @@ use candle_transformers::models::prefill_utils::{
 
 const N_KV_HEAD: usize = 4;
 const N_HEAD: usize = 4; // No GQA — keeps the test simple
-const HEAD_DIM: usize = 64;
-const MAX_BLOCKS: usize = 64; // Headroom for the larger layouts
+const HEAD_DIM: usize = 128;
+const MAX_BLOCKS: usize = 256; // Headroom for the larger layouts + quant candidate arenas
 const EXTRA_PREFILL_TOKENS: usize = 8;
 
 /// fp16 attention has ~1e-3 numeric error per dot; the partial-chunk
@@ -147,6 +161,7 @@ const TEST_CASES: &[(&str, &[usize])] = &[
 
 #[test]
 fn kernel_layout_decode_matches_full_vs_partial() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -177,6 +192,7 @@ fn kernel_layout_decode_matches_full_vs_partial() -> Result<()> {
 
 #[test]
 fn kernel_layout_prefill_matches_full_vs_partial() -> Result<()> {
+    let _serial = gpu_serial();
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
         _ => {
@@ -219,6 +235,7 @@ fn kernel_layout_prefill_matches_full_vs_partial() -> Result<()> {
 ///      the write-region extension the prefill path applies.
 #[test]
 fn prefill_position_map_hoist_is_byte_exact() -> Result<()> {
+    let _serial = gpu_serial();
     use candle_transformers::models::slot_state::{SlotStateHost, TokenSliceHost};
     let device = match Device::cuda_if_available(0) {
         Ok(d) if d.is_cuda() => d,
@@ -710,11 +727,20 @@ fn decode_one_slot(
     slot.extend_for_write_region(1, CHUNK_SIZE);
 
     // Two-section layout: out-of-line KvHead records first, then 16-byte slice
-    // headers whose kvheads_ptr points into the records tensor.
-    let rec_bytes = TokenSliceHost::record_size(N_KV_HEAD, HEAD_DIM);
-    let mut records_buf = Vec::with_capacity(slot.slices.len() * rec_bytes);
+    // headers whose kvheads_ptr points at the slice's record. Float/transient
+    // slices (meta.is_none()) serialize a scratch record here; quantized slices
+    // (meta.is_some()) carry a device-resident meta-pool record and point
+    // kvheads_ptr straight at its `device_addr()` — exactly as the production
+    // `sync_decode_gpu_chunks` path does.
+    let mut records_buf: Vec<u8> = Vec::new();
+    let mut rec_offset: Vec<Option<usize>> = Vec::with_capacity(slot.slices.len());
     for s in &slot.slices {
-        s.serialize_record(&mut records_buf);
+        if s.meta.is_some() {
+            rec_offset.push(None);
+        } else {
+            rec_offset.push(Some(records_buf.len()));
+            s.serialize_record(&mut records_buf);
+        }
     }
     let records_tensor = if records_buf.is_empty() {
         Tensor::zeros(1, DType::U8, device)?
@@ -724,8 +750,11 @@ fn decode_one_slot(
     let records_base = tensor_u8_device_ptr(&records_tensor)?;
 
     let mut slice_buf = Vec::with_capacity(slot.slices.len() * TokenSliceHost::SLICE_HEADER_SIZE);
-    for (i, s) in slot.slices.iter().enumerate() {
-        let kvheads_ptr = records_base + (i * rec_bytes) as u64;
+    for (s, off) in slot.slices.iter().zip(&rec_offset) {
+        let kvheads_ptr = match s.meta.as_ref() {
+            Some(m) => m.device_addr(),
+            None => records_base + off.expect("non-meta slice has a record offset") as u64,
+        };
         s.serialize_slice_header(&mut slice_buf, kvheads_ptr);
     }
     let slices_tensor = if slice_buf.is_empty() {
@@ -854,4 +883,943 @@ fn max_abs_diff_f32(a: &Tensor, b: &Tensor) -> Result<f32> {
     let m = d.max(0)?;
     let m = m.to_dtype(DType::F32)?.to_scalar::<f32>()?;
     Ok(m)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Offset>0 window coverage
+//
+// Every case in TEST_CASES builds its partial chunks by prefilling a
+// segment fresh into a scratch slot at state.offset=0, so they only ever
+// exercise offset==0 windows (pure end trims). The compression
+// assistant-half is the only production path that injects an offset>0
+// window: a chunk that physically holds tokens [a, a+N) but is read through
+// the sub-window [a+off, a+N), sharing the physical chunk with the turn's
+// user-half. These cases pin that read path — a suffix injected as an
+// offset>0 window of a full prefill must produce the same attention as the
+// identical suffix prefilled fresh at offset 0.
+// ──────────────────────────────────────────────────────────────────────
+
+/// `(name, total, window_start)`. `window_start % CHUNK_SIZE != 0` forces
+/// the first windowed chunk to carry a non-zero `offset`.
+const OFFSET_WINDOW_CASES: &[(&str, usize, usize)] = &[
+    ("offset_window_single_chunk", 32, 10),
+    ("offset_window_boundary_18", 64, 18),
+    ("offset_window_multi_chunk", 70, 10),
+    ("offset_window_deep", 200, 50),
+];
+
+#[test]
+fn kernel_layout_offset_window_matches_fresh() -> Result<()> {
+    let _serial = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let mut failures: Vec<String> = Vec::new();
+    // Each case twice: rope=false isolates chunk-read addressing; rope=true
+    // additionally exercises the per-token RoPE position `slice_rope +
+    // (within - off)` that the offset>0 read must compute.
+    for &(name, total, window_start) in OFFSET_WINDOW_CASES {
+        for with_rope in [false, true] {
+            let label = if with_rope { "rope" } else { "flat" };
+            match run_offset_window_case(name, total, window_start, with_rope, &device, &stager) {
+                Ok(diff) => eprintln!("offset-window {name:28} [{label}] diff = {diff:.6e}"),
+                Err(e) => {
+                    eprintln!("offset-window {name:28} [{label}] FAILED: {e}");
+                    failures.push(format!("{name} [{label}]: {e}"));
+                }
+            }
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!(
+            "offset>0 window divergence in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// Window `seq` to `[start_tok, token_count)`, sharing the physical chunks.
+/// The chunk containing `start_tok` becomes an offset>0 partial; earlier
+/// chunks drop out. Mirrors `conversation::window_sealed_tokens` for the
+/// suffix case.
+fn window_suffix(seq: &SealedSequence, start_tok: usize) -> SealedSequence {
+    let win_start = start_tok.min(seq.token_count);
+    let mut chunks: Vec<SealedChunk> = Vec::new();
+    let mut acc = 0usize;
+    for chunk in &seq.chunks {
+        let c = chunk.token_count as usize;
+        let chunk_start = acc;
+        let chunk_end = acc + c;
+        acc = chunk_end;
+        if win_start >= chunk_end {
+            continue;
+        }
+        let overlap_start = chunk_start.max(win_start);
+        let overlap_len = (chunk_end - overlap_start) as u16;
+        if overlap_start == chunk_start {
+            chunks.push(chunk.clone());
+        } else {
+            let mut w = chunk.clone();
+            w.offset = chunk.offset + (overlap_start - chunk_start) as u16;
+            w.token_count = overlap_len;
+            chunks.push(w);
+        }
+    }
+    SealedSequence {
+        chunks,
+        token_count: seq.token_count - win_start,
+        chunk_size: seq.chunk_size,
+        location: seq.location,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_offset_window_case(
+    case_name: &str,
+    total: usize,
+    window_start: usize,
+    with_rope: bool,
+    device: &Device,
+    stager: &PinnedStager,
+) -> Result<f32> {
+    let (q_master, k_master, v_master) = make_qkv(total, device, hash_str(case_name))?;
+    // rope=false (inv_freq=0) isolates chunk-read addressing; rope=true uses a
+    // real geometric inv_freq so the per-token RoPE position the offset>0 read
+    // computes (`slice_rope + (within - off)`) is exercised too.
+    let inv_freq = if with_rope {
+        let f: Vec<f32> = (0..HEAD_DIM / 2)
+            .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
+            .collect();
+        Tensor::from_vec(f, HEAD_DIM / 2, device)?
+    } else {
+        Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?
+    };
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let win_len = total - window_start;
+
+    // Reference slot C: fresh offset-0 prefill of master[window_start..total].
+    let q_suf = q_master.narrow(2, window_start, win_len)?.contiguous()?;
+    let k_suf = k_master.narrow(2, window_start, win_len)?.contiguous()?;
+    let v_suf = v_master.narrow(2, window_start, win_len)?.contiguous()?;
+    let (backing_c, cache_c) = build_control_slot(
+        win_len, &q_suf, &k_suf, &v_suf, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+
+    // Test slot B: full prefill into scratch, seal, window [window_start,
+    // total] (offset>0 first chunk), inject into slot 0.
+    let backing_b = fresh_backing(device)?;
+    let mut cache_b = bind_kv_cache(&backing_b, 0)?;
+    let mut scratch = bind_kv_cache(&backing_b, 1)?;
+    let q_all = q_master.narrow(2, 0, total)?.contiguous()?;
+    let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
+    let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
+    let _ = run_prefill(
+        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+    let real_chunks = total.div_ceil(CHUNK_SIZE);
+    backing_b.truncate_sequence_to_blocks(1, real_chunks)?;
+    let sealed = backing_b.record_turn(1)?;
+    let windowed = window_suffix(&sealed, window_start);
+    // The first windowed chunk must carry a non-zero offset, else the case
+    // isn't testing what it claims.
+    assert!(
+        windowed.chunks.first().map(|c| c.offset).unwrap_or(0) > 0,
+        "[{case_name}] window_start={window_start} produced an offset-0 first chunk",
+    );
+    backing_b.inject_sealed_at_tail(0, &windowed)?;
+    cache_b.set_current_seq_len(win_len)?;
+
+    // Same fresh decode Q on both slots.
+    let (q_dec, k_new, v_new) = make_qkv(1, device, hash_str(case_name) ^ 0xD3C0DE)?;
+    let q_dec_2d = q_dec.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let k_new_2d = k_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let v_new_2d = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+
+    let out_c = decode_one_slot(
+        &backing_c, &cache_c, &q_dec_2d, &k_new_2d, &v_new_2d, &rope_cs, stager, device,
+    )?;
+    let out_b = decode_one_slot(
+        &backing_b, &cache_b, &q_dec_2d, &k_new_2d, &v_new_2d, &rope_cs, stager, device,
+    )?;
+
+    let diff = max_abs_diff_f32(&out_c.to_dtype(DType::F32)?, &out_b.to_dtype(DType::F32)?)?;
+    if diff >= DIFF_TOLERANCE {
+        candle::bail!(
+            "offset>0 window diverged (total={total}, window_start={window_start}): \
+             max abs diff = {diff:.6e} (expected < {:.0e})",
+            DIFF_TOLERANCE,
+        );
+    }
+    Ok(diff)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Quantized offset>0 window coverage
+//
+// The fp16 cases above proved the decode kernel reads offset>0 windows at
+// exact byte fidelity. The production compression path reads QUANTIZED
+// sealed K/V, and quantization is per-32-token block. An offset>0 window
+// reads slots [offset, 32) of a quantized block whose packing+scale cover
+// the whole block — a path nothing else exercises. These cases compare a
+// quantized offset>0 window against the fp16 window of the same tokens
+// (rope and layout identical; only quantization differs), using the
+// offset-0 full read as the quant-noise baseline. A correct dequant makes
+// the offset>0 quant error track the offset-0 baseline; a broken one reads
+// the wrong slots/scale and the error explodes.
+// ──────────────────────────────────────────────────────────────────────
+
+/// `(name, total, window_start, level)`. `total % CHUNK_SIZE == 0` keeps
+/// the quantize on whole blocks; `window_start % CHUNK_SIZE != 0` forces an
+/// offset>0 first window chunk. `level` is the CompressionPolicy level.
+const OFFSET_WINDOW_QUANT_CASES: &[(&str, usize, usize, u8)] = &[
+    ("q_c0_single_off10", 32, 10, 0),
+    ("q_c3_single_off10", 32, 10, 3),
+    ("q_c0_boundary_off18", 64, 18, 0),
+    ("q_c3_boundary_off18", 64, 18, 3),
+    ("q_c3_multi_off40", 96, 40, 3),
+    ("q_c3_deep_off50", 128, 50, 3),
+];
+
+fn cuda_stream(device: &Device) -> Arc<CudaStream> {
+    match device {
+        Device::Cuda(d) => d.cuda_stream(),
+        _ => unreachable!("test gated on a CUDA device"),
+    }
+}
+
+#[test]
+fn kernel_layout_quantized_offset_window_matches_fp16() -> Result<()> {
+    let _serial = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let mut failures: Vec<String> = Vec::new();
+    for &(name, total, window_start, level) in OFFSET_WINDOW_QUANT_CASES {
+        match run_offset_window_quant_case(name, total, window_start, level, &device, &stager) {
+            Ok((base, win)) => {
+                eprintln!("quant-offset {name:24} baseline(off0)={base:.4e}  window(off>0)={win:.4e}")
+            }
+            Err(e) => {
+                eprintln!("quant-offset {name:24} FAILED: {e}");
+                failures.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!(
+            "quantized offset>0 window divergence in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// Decode one sealed sequence on a fresh slot of `backing`: bind, inject,
+/// set the logical length, single decode step. Returns the attention out.
+#[allow(clippy::too_many_arguments)]
+fn inject_and_decode(
+    backing: &ChunkedKvBacking,
+    slot: usize,
+    sealed: &SealedSequence,
+    q: &Tensor,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    rope_cs: &Tensor,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut cache = bind_kv_cache(backing, slot)?;
+    backing.inject_sealed_at_tail(slot, sealed)?;
+    // Production primes a fresh writer chunk after injecting Arc-shared
+    // sealed windows so the decode's write never lands in a shared chunk.
+    backing.push_empty_writer_chunk(slot)?;
+    cache.set_current_seq_len(sealed.token_count)?;
+    let out = decode_one_slot(backing, &cache, q, k_new, v_new, rope_cs, stager, device)?;
+    // Force any async kernel fault to surface here so the caller's stage
+    // markers attribute the crash to the right decode.
+    device.synchronize()?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_offset_window_quant_case(
+    case_name: &str,
+    total: usize,
+    window_start: usize,
+    level: u8,
+    device: &Device,
+    stager: &PinnedStager,
+) -> Result<(f32, f32)> {
+    let (q_master, k_master, v_master) = make_qkv(total, device, hash_str(case_name))?;
+    // rope cancels in the quant-vs-fp16 comparison (both apply the same
+    // position math to the same logical tokens); keep it off to isolate the
+    // dequant of the windowed sub-block.
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+
+    // Backing with the warm-protected adaptive candidate arenas for `level`,
+    // mirroring the substrate engine's startup wiring.
+    let policy = CompressionPolicy::new(level);
+    let backing = ChunkedKvBacking::new_with_format_adaptive(
+        4,
+        N_KV_HEAD,
+        HEAD_DIM,
+        KvFormat::Float(DType::F16),
+        KvFormat::Float(DType::F16),
+        device,
+        MAX_BLOCKS,
+        Some(policy.clone()),
+    )?;
+
+    // Prefill the full master into a scratch slot and seal it (fp16).
+    let mut scratch = bind_kv_cache(&backing, 0)?;
+    let q_all = q_master.narrow(2, 0, total)?.contiguous()?;
+    let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
+    let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
+    let _ = run_prefill(
+        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+    let real_chunks = total.div_ceil(CHUNK_SIZE);
+    backing.truncate_sequence_to_blocks(0, real_chunks)?;
+    let src = backing.record_turn(0)?;
+
+    // Quantize the sealed turn — the fp16 `src` survives alongside `warm`.
+    let copy_stream = cuda_stream(device);
+    let mut pinned: Option<PinnedBuf> = None;
+    let warm = quantize_sealed_in_place(
+        &backing,
+        &[&src],
+        &policy,
+        device,
+        &copy_stream,
+        &mut pinned,
+    )?;
+    copy_stream
+        .synchronize()
+        .map_err(|e| candle::Error::Msg(format!("quant sync: {e}")))?;
+    let warm = warm.into_iter().next().expect("one sealed in → one out");
+
+    let src_win = window_suffix(&src, window_start);
+    let warm_win = window_suffix(&warm, window_start);
+    assert!(
+        warm_win.chunks.first().map(|c| c.offset).unwrap_or(0) > 0,
+        "[{case_name}] window produced offset-0 first chunk",
+    );
+
+    let (q_dec, k_new, v_new) = make_qkv(1, device, hash_str(case_name) ^ 0xD3C0DE)?;
+    let q2 = q_dec.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let kn = k_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let vn = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+
+    // Four decodes on fresh slots: fp16/quant × full/window.
+    let out_fp16_full =
+        inject_and_decode(&backing, 1, &src, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let out_q_full =
+        inject_and_decode(&backing, 2, &warm, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let out_fp16_win =
+        inject_and_decode(&backing, 3, &src_win, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let out_q_win =
+        inject_and_decode(&backing, 4, &warm_win, &q2, &kn, &vn, &rope_cs, stager, device)?;
+
+    let baseline = max_abs_diff_f32(
+        &out_q_full.to_dtype(DType::F32)?,
+        &out_fp16_full.to_dtype(DType::F32)?,
+    )?;
+    let window = max_abs_diff_f32(
+        &out_q_win.to_dtype(DType::F32)?,
+        &out_fp16_win.to_dtype(DType::F32)?,
+    )?;
+
+    // A correct offset>0 dequant makes the window's quant error track the
+    // offset-0 baseline. A broken one reads the wrong slots/scale and the
+    // window error explodes far past it.
+    let allow = baseline * 4.0 + 5e-3;
+    if window > allow {
+        candle::bail!(
+            "quantized offset>0 window error {window:.4e} >> offset-0 baseline {baseline:.4e} \
+             (allow {allow:.4e}); total={total} window_start={window_start} level={level}",
+        );
+    }
+    Ok((baseline, window))
+}
+
+// Build a backing whose sealed turn exists in both fp16 (`src`) and quantized
+// (`warm`) form, for tests that compare the two reads of the same window.
+fn build_quant_pair(
+    total: usize,
+    level: u8,
+    device: &Device,
+    stager: &PinnedStager,
+) -> Result<(ChunkedKvBacking, SealedSequence, SealedSequence, Tensor)> {
+    let (q_master, k_master, v_master) = make_qkv(total, device, 0xA11CE)?;
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let policy = CompressionPolicy::new(level);
+    let backing = ChunkedKvBacking::new_with_format_adaptive(
+        4,
+        N_KV_HEAD,
+        HEAD_DIM,
+        KvFormat::Float(DType::F16),
+        KvFormat::Float(DType::F16),
+        device,
+        MAX_BLOCKS,
+        Some(policy.clone()),
+    )?;
+    let mut scratch = bind_kv_cache(&backing, 0)?;
+    let q_all = q_master.narrow(2, 0, total)?.contiguous()?;
+    let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
+    let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
+    let _ = run_prefill(
+        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+    backing.truncate_sequence_to_blocks(0, total.div_ceil(CHUNK_SIZE))?;
+    let src = backing.record_turn(0)?;
+    let copy_stream = cuda_stream(device);
+    let mut pinned: Option<PinnedBuf> = None;
+    let warm = quantize_sealed_in_place(&backing, &[&src], &policy, device, &copy_stream, &mut pinned)?;
+    copy_stream
+        .synchronize()
+        .map_err(|e| candle::Error::Msg(format!("quant sync: {e}")))?;
+    Ok((backing, src, warm.into_iter().next().unwrap(), rope_cs))
+}
+
+
+// ──────────────────────────────────────────────────────────────────────
+// Glue (gap-fill) offset>0 window coverage
+//
+// Compression assembles its context via the paged-glue (gap-fill) kernel,
+// which fills the glue tokens' K/V by attending to the sealed prefix —
+// reading the injected offset>0 assistant-half window. The glue kernel uses
+// a SEPARATE rope source (`col_actual_pos`) than decode, so its offset>0
+// read is independently untested. These cases inject an offset>0 window as
+// the prefix, run a glue forward over fresh glue tokens, and compare against
+// the same glue over a fresh offset-0 prefill of the identical suffix. A
+// correct glue read of the offset>0 prefix makes the two match exactly.
+// ──────────────────────────────────────────────────────────────────────
+
+const OFFSET_WINDOW_GLUE_CASES: &[(&str, usize, usize)] = &[
+    ("glue_off10_single", 32, 10),
+    ("glue_off18_boundary", 64, 18),
+    ("glue_off40_multi", 96, 40),
+    ("glue_off50_deep", 128, 50),
+];
+
+const GLUE_TOKENS: usize = 8;
+
+#[test]
+fn kernel_layout_glue_offset_window_matches_fresh() -> Result<()> {
+    let _serial = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let mut failures: Vec<String> = Vec::new();
+    for &(name, total, window_start) in OFFSET_WINDOW_GLUE_CASES {
+        match run_offset_window_glue_case(name, total, window_start, &device, &stager) {
+            Ok(diff) => eprintln!("glue-offset {name:24} diff = {diff:.6e}"),
+            Err(e) => {
+                eprintln!("glue-offset {name:24} FAILED: {e}");
+                failures.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!(
+            "glue offset>0 window divergence in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_offset_window_glue_case(
+    case_name: &str,
+    total: usize,
+    window_start: usize,
+    device: &Device,
+    stager: &PinnedStager,
+) -> Result<f32> {
+    let (q_master, k_master, v_master) = make_qkv(total, device, hash_str(case_name))?;
+    // Real geometric inv_freq so the glue's RoPE position — sourced from
+    // `col_actual_pos`, the one path decode does not share — is exercised on
+    // the offset>0 prefix read, not just the chunk addressing.
+    let f: Vec<f32> = (0..HEAD_DIM / 2)
+        .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
+        .collect();
+    let inv_freq = Tensor::from_vec(f, HEAD_DIM / 2, device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let win_len = total - window_start;
+
+    // Reference slot C: fresh offset-0 prefill of master[window_start..total].
+    let q_suf = q_master.narrow(2, window_start, win_len)?.contiguous()?;
+    let k_suf = k_master.narrow(2, window_start, win_len)?.contiguous()?;
+    let v_suf = v_master.narrow(2, window_start, win_len)?.contiguous()?;
+    let (backing_c, mut cache_c) = build_control_slot(
+        win_len, &q_suf, &k_suf, &v_suf, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+
+    // Test slot B: full prefill into scratch, seal, window [window_start,
+    // total] (offset>0 first chunk), inject, prime writer.
+    let backing_b = fresh_backing(device)?;
+    let mut cache_b = bind_kv_cache(&backing_b, 0)?;
+    let mut scratch = bind_kv_cache(&backing_b, 1)?;
+    let q_all = q_master.narrow(2, 0, total)?.contiguous()?;
+    let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
+    let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
+    let _ = run_prefill(
+        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+    backing_b.truncate_sequence_to_blocks(1, total.div_ceil(CHUNK_SIZE))?;
+    let sealed = backing_b.record_turn(1)?;
+    let windowed = window_suffix(&sealed, window_start);
+    assert!(
+        windowed.chunks.first().map(|c| c.offset).unwrap_or(0) > 0,
+        "[{case_name}] window produced offset-0 first chunk",
+    );
+    backing_b.inject_sealed_at_tail(0, &windowed)?;
+    backing_b.push_empty_writer_chunk(0)?;
+    cache_b.set_current_seq_len(win_len)?;
+
+    // Same glue tokens + col_actual_pos on both slots: prefix logical
+    // positions [0, win_len) then glue [win_len, win_len+GLUE_TOKENS).
+    let (qg, kg, vg) = make_qkv(GLUE_TOKENS, device, hash_str(case_name) ^ 0x6C0E_u64)?;
+    let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
+    let col: Vec<u32> = (0..(win_len + GLUE_TOKENS) as u32).collect();
+    let col_t = Tensor::from_vec(col, win_len + GLUE_TOKENS, device)?;
+
+    let gen_c = stager.begin_generation();
+    let out_c = paged_glue_attn(
+        &mut [&mut cache_c],
+        &[win_len],
+        &qgf,
+        &kgf,
+        &vgf,
+        1,
+        &[GLUE_TOKENS],
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        None,
+        &col_t,
+        &rope_cs,
+        false,
+        &gen_c,
+    )?;
+    let gen_b = stager.begin_generation();
+    let out_b = paged_glue_attn(
+        &mut [&mut cache_b],
+        &[win_len],
+        &qgf,
+        &kgf,
+        &vgf,
+        1,
+        &[GLUE_TOKENS],
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        None,
+        &col_t,
+        &rope_cs,
+        false,
+        &gen_b,
+    )?;
+    let _ = (&backing_b, &backing_c);
+
+    let diff = max_abs_diff_f32(&out_b.to_dtype(DType::F32)?, &out_c.to_dtype(DType::F32)?)?;
+    if diff >= DIFF_TOLERANCE {
+        candle::bail!(
+            "glue offset>0 window diverged (total={total}, window_start={window_start}): \
+             max abs diff = {diff:.6e} (expected < {:.0e})",
+            DIFF_TOLERANCE,
+        );
+    }
+    Ok(diff)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Quantized glue offset>0 window — the exact kernel combo compression uses:
+// a gap-fill forward whose sealed prefix is a QUANTIZED offset>0 window,
+// streamed dequant-once. Compares quant-glue vs fp16-glue for the same
+// window, with the offset-0 full read as the quant-noise baseline.
+// ──────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn glue_over(
+    backing: &ChunkedKvBacking,
+    slot: usize,
+    sealed: &SealedSequence,
+    qgf: &Tensor,
+    kgf: &Tensor,
+    vgf: &Tensor,
+    rope_cs: &Tensor,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut cache = bind_kv_cache(backing, slot)?;
+    backing.inject_sealed_at_tail(slot, sealed)?;
+    backing.push_empty_writer_chunk(slot)?;
+    let win_len = sealed.token_count;
+    cache.set_current_seq_len(win_len)?;
+    let col: Vec<u32> = (0..(win_len + GLUE_TOKENS) as u32).collect();
+    let col_t = Tensor::from_vec(col, win_len + GLUE_TOKENS, device)?;
+    let gen = stager.begin_generation();
+    let out = paged_glue_attn(
+        &mut [&mut cache], &[win_len], qgf, kgf, vgf, 1, &[GLUE_TOKENS],
+        N_HEAD, N_KV_HEAD, HEAD_DIM, None, &col_t, rope_cs, false, &gen,
+    )?;
+    device.synchronize()?;
+    Ok(out)
+}
+
+#[test]
+fn kernel_layout_quantized_glue_offset_window() -> Result<()> {
+    let _serial = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => return Ok(()),
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let mut failures: Vec<String> = Vec::new();
+    for &(name, total, ws) in &[("qglue_off18", 64usize, 18usize), ("qglue_off40", 96, 40), ("qglue_off50", 128, 50)] {
+        let r = (|| -> Result<(f32, f32)> {
+            let (backing, src, warm, rope_cs) = build_quant_pair(total, 3, &device, &stager)?;
+            let (qg, kg, vg) = make_qkv(GLUE_TOKENS, &device, 0x6C0E)?;
+            let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
+            let src_win = window_suffix(&src, ws);
+            let warm_win = window_suffix(&warm, ws);
+            let o_fp16_full = glue_over(&backing, 1, &src, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
+            let o_q_full = glue_over(&backing, 2, &warm, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
+            let o_fp16_win = glue_over(&backing, 3, &src_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
+            let o_q_win = glue_over(&backing, 4, &warm_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
+            let base = max_abs_diff_f32(&o_q_full.to_dtype(DType::F32)?, &o_fp16_full.to_dtype(DType::F32)?)?;
+            let win = max_abs_diff_f32(&o_q_win.to_dtype(DType::F32)?, &o_fp16_win.to_dtype(DType::F32)?)?;
+            Ok((base, win))
+        })();
+        match r {
+            Ok((base, win)) => {
+                eprintln!("qglue {name:16} baseline(off0)={base:.4e}  window(off>0)={win:.4e}");
+                if win > base * 4.0 + 5e-3 {
+                    failures.push(format!("{name}: window {win:.4e} >> baseline {base:.4e}"));
+                }
+            }
+            Err(e) => {
+                eprintln!("qglue {name:16} FAILED: {e}");
+                failures.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!("quantized glue offset>0 divergence:\n  - {}", failures.join("\n  - "));
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Multi-segment composite: two windows that SHARE the boundary chunk
+//
+// This is the closest analog to the real compression assembly: a turn's
+// user-half [0, split) and assistant-half [split, total) are derived as two
+// windows of the same sealed sequence. They share the physical boundary
+// chunk (the one straddling `split`) via the same ChunkGid — the first half
+// reads its [0, split%32) slots (offset 0), the second its [split%32, 32)
+// slots (offset>0). Injecting BOTH back-to-back into one slot and decoding
+// must match a fresh prefill of the whole logical sequence. A host
+// composition bug (rope_base accumulation across the shared chunk, or
+// position_map ordering for the second window) shows up as divergence here
+// where the single-window tests pass.
+// ──────────────────────────────────────────────────────────────────────
+
+/// `(name, total, split)` — `split % CHUNK_SIZE != 0` makes the boundary
+/// chunk shared between the two windows with a non-zero second-window offset.
+const MULTISEG_CASES: &[(&str, usize, usize)] = &[
+    ("multiseg_split18", 64, 18),
+    ("multiseg_split33", 70, 33),
+    ("multiseg_split40", 96, 40),
+    ("multiseg_split50", 128, 50),
+];
+
+/// Window `seq` to the token range `[start, end)`, sharing physical chunks.
+fn window_range(seq: &SealedSequence, start_tok: usize, end_tok: usize) -> SealedSequence {
+    let ws = start_tok.min(seq.token_count);
+    let we = end_tok.min(seq.token_count).max(ws);
+    let mut chunks: Vec<SealedChunk> = Vec::new();
+    let mut acc = 0usize;
+    for chunk in &seq.chunks {
+        let c = chunk.token_count as usize;
+        let (cs, ce) = (acc, acc + c);
+        acc = ce;
+        let os = cs.max(ws);
+        let oe = ce.min(we);
+        if os >= oe {
+            continue;
+        }
+        let olen = (oe - os) as u16;
+        if os == cs && olen as usize == c {
+            chunks.push(chunk.clone());
+        } else {
+            let mut w = chunk.clone();
+            w.offset = chunk.offset + (os - cs) as u16;
+            w.token_count = olen;
+            chunks.push(w);
+        }
+    }
+    SealedSequence {
+        chunks,
+        token_count: we - ws,
+        chunk_size: seq.chunk_size,
+        location: seq.location,
+    }
+}
+
+#[test]
+fn kernel_layout_multiseg_shared_boundary_matches_fresh() -> Result<()> {
+    let _serial = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => return Ok(()),
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let mut failures: Vec<String> = Vec::new();
+    for &(name, total, split) in MULTISEG_CASES {
+        match run_multiseg_case(name, total, split, &device, &stager) {
+            Ok(diff) => eprintln!("multiseg {name:20} diff = {diff:.6e}"),
+            Err(e) => {
+                eprintln!("multiseg {name:20} FAILED: {e}");
+                failures.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!("multiseg divergence:\n  - {}", failures.join("\n  - "));
+    }
+    Ok(())
+}
+
+fn run_multiseg_case(
+    name: &str,
+    total: usize,
+    split: usize,
+    device: &Device,
+    stager: &PinnedStager,
+) -> Result<f32> {
+    let (qm, km, vm) = make_qkv(total, device, hash_str(name))?;
+    let f: Vec<f32> = (0..HEAD_DIM / 2)
+        .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / HEAD_DIM as f32))
+        .collect();
+    let inv_freq = Tensor::from_vec(f, HEAD_DIM / 2, device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+
+    let q_all = qm.narrow(2, 0, total)?.contiguous()?;
+    let k_all = km.narrow(2, 0, total)?.contiguous()?;
+    let v_all = vm.narrow(2, 0, total)?.contiguous()?;
+
+    // Reference slot: one fresh prefill of the whole logical sequence.
+    let (backing_ref, cache_ref) = build_control_slot(
+        total, &q_all, &k_all, &v_all, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+
+    // Test slot: prefill+seal once, derive two windows sharing the boundary
+    // chunk, inject both back-to-back.
+    let backing = fresh_backing(device)?;
+    let mut cache = bind_kv_cache(&backing, 0)?;
+    let mut scratch = bind_kv_cache(&backing, 1)?;
+    let _ = run_prefill(
+        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+    backing.truncate_sequence_to_blocks(1, total.div_ceil(CHUNK_SIZE))?;
+    let sealed = backing.record_turn(1)?;
+    let seg_a = window_range(&sealed, 0, split);
+    let seg_b = window_range(&sealed, split, total);
+    assert!(
+        seg_b.chunks.first().map(|c| c.offset).unwrap_or(0) > 0,
+        "[{name}] second window has offset-0 first chunk (split aligned?)",
+    );
+    // The boundary chunk's gid must appear in BOTH windows (shared).
+    let gid_id = |c: &SealedChunk| {
+        let g = &c.gids.as_slice()[0];
+        (g.arena_idx(), g.chunk_idx())
+    };
+    let a_last = seg_a.chunks.last().map(gid_id);
+    let b_first = seg_b.chunks.first().map(gid_id);
+    assert_eq!(a_last, b_first, "[{name}] boundary chunk not shared across windows");
+    backing.inject_sealed_at_tail(0, &seg_a)?;
+    backing.inject_sealed_at_tail(0, &seg_b)?;
+    backing.push_empty_writer_chunk(0)?;
+    cache.set_current_seq_len(total)?;
+
+    let (q_dec, k_new, v_new) = make_qkv(1, device, hash_str(name) ^ 0xD3C0DE)?;
+    let q2 = q_dec.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let kn = k_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let vn = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+
+    let out_ref = decode_one_slot(
+        &backing_ref, &cache_ref, &q2, &kn, &vn, &rope_cs, stager, device,
+    )?;
+    let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope_cs, stager, device)?;
+
+    let diff = max_abs_diff_f32(&out_test.to_dtype(DType::F32)?, &out_ref.to_dtype(DType::F32)?)?;
+    if diff >= DIFF_TOLERANCE {
+        candle::bail!(
+            "multiseg shared-boundary diverged (total={total}, split={split}): \
+             max abs diff = {diff:.6e} (expected < {:.0e})",
+            DIFF_TOLERANCE,
+        );
+    }
+    Ok(diff)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Interspersed-glue composite: glue logically BEFORE an injected segment
+// but physically appended after it (the gap-fill writes all glue at the
+// tail). Mirrors compression's `[section | user_start-glue | half | …]`,
+// where the glue's true position precedes the half it physically follows.
+// The post-glue decode must position every token by its TRUE logical
+// position; if it falls back to cumulative-physical rope, the half and the
+// glue land at the wrong positions and this diverges from a fresh prefill.
+// ──────────────────────────────────────────────────────────────────────
+
+const GLUE_INTERSPERSED_CASES: &[(&str, usize, usize, usize)] = &[
+    // (name, len_a, glue_len, len_b)
+    ("inter_a16_g8_b24", 16, 8, 24),
+    ("inter_a32_g8_b30", 32, 8, 30),
+    ("inter_a40_g16_b40", 40, 16, 40),
+];
+
+#[test]
+fn kernel_layout_glue_interspersed_matches_fresh() -> Result<()> {
+    let _serial = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => return Ok(()),
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let mut failures: Vec<String> = Vec::new();
+    for &(name, la, g, lb) in GLUE_INTERSPERSED_CASES {
+        match run_glue_interspersed_case(name, la, g, lb, &device, &stager) {
+            Ok(diff) => eprintln!("inter-glue {name:20} diff = {diff:.6e}"),
+            Err(e) => {
+                eprintln!("inter-glue {name:20} FAILED: {e}");
+                failures.push(format!("{name}: {e}"));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!("interspersed-glue divergence:\n  - {}", failures.join("\n  - "));
+    }
+    Ok(())
+}
+
+fn run_glue_interspersed_case(
+    name: &str,
+    la: usize,
+    g: usize,
+    lb: usize,
+    device: &Device,
+    stager: &PinnedStager,
+) -> Result<f32> {
+    let total = la + g + lb;
+    let (qm, km, vm) = make_qkv(total, device, hash_str(name))?;
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, device)?; // isolate ordering, not rope
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, device)?;
+    let rope_offsets_b1 = Tensor::zeros(1, DType::U32, device)?;
+    let q_all = qm.narrow(2, 0, total)?.contiguous()?;
+    let k_all = km.narrow(2, 0, total)?.contiguous()?;
+    let v_all = vm.narrow(2, 0, total)?.contiguous()?;
+
+    // Reference slot: fresh prefill of the whole logical sequence [A|glue|B],
+    // then one decode step.
+    let (backing_ref, cache_ref) = build_control_slot(
+        total, &q_all, &k_all, &v_all, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+
+    // Test slot: inject A=[0,la) and B=[la+g, total) (both sealed), then a glue
+    // forward writes the glue [la, la+g) — logically between A and B, physically
+    // after both. col_actual_pos carries each token's TRUE logical position.
+    let backing = fresh_backing(device)?;
+    let mut cache = bind_kv_cache(&backing, 0)?;
+    let mut scratch = bind_kv_cache(&backing, 1)?;
+    let _ = run_prefill(
+        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+    )?;
+    backing.truncate_sequence_to_blocks(1, total.div_ceil(CHUNK_SIZE))?;
+    let sealed = backing.record_turn(1)?;
+    let seg_a = window_range(&sealed, 0, la);
+    let seg_b = window_range(&sealed, la + g, total);
+    backing.inject_sealed_at_tail(0, &seg_a)?;
+    backing.inject_sealed_at_tail(0, &seg_b)?;
+    cache.set_current_seq_len(la + lb)?;
+
+    // Glue tokens = master[la, la+g); col_actual_pos = A logical, B logical,
+    // glue logical (prefix in inject/physical order, then glue).
+    let qg = qm.narrow(2, la, g)?.contiguous()?;
+    let kg = km.narrow(2, la, g)?.contiguous()?;
+    let vg = vm.narrow(2, la, g)?.contiguous()?;
+    let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
+    let mut col: Vec<u32> = Vec::with_capacity(total);
+    col.extend(0..la as u32); // A logical
+    col.extend((la + g) as u32..total as u32); // B logical
+    col.extend(la as u32..(la + g) as u32); // glue logical
+    let col_t = Tensor::from_vec(col, total, device)?;
+    let gen = stager.begin_generation();
+    let _ = paged_glue_attn(
+        &mut [&mut cache],
+        &[la + lb],
+        &qgf,
+        &kgf,
+        &vgf,
+        1,
+        &[g],
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        None,
+        &col_t,
+        &rope_cs,
+        false,
+        &gen,
+    )?;
+    device.synchronize()?;
+    cache.set_current_seq_len(total)?;
+
+    let (q_dec, k_new, v_new) = make_qkv(1, device, hash_str(name) ^ 0xD3C0DE)?;
+    let q2 = q_dec.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let kn = k_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let vn = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
+    let out_ref = decode_one_slot(
+        &backing_ref, &cache_ref, &q2, &kn, &vn, &rope_cs, stager, device,
+    )?;
+    let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let diff = max_abs_diff_f32(&out_test.to_dtype(DType::F32)?, &out_ref.to_dtype(DType::F32)?)?;
+    if diff >= DIFF_TOLERANCE {
+        candle::bail!(
+            "interspersed-glue diverged (la={la}, g={g}, lb={lb}): \
+             max abs diff = {diff:.6e} (expected < {:.0e})",
+            DIFF_TOLERANCE,
+        );
+    }
+    Ok(diff)
 }

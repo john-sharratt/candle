@@ -43,7 +43,7 @@
 //!
 //! # Confirmation policy
 //!
-//! `ssh_session_open` confirms once (shows host + credential name).
+//! `ssh_open` confirms once (shows host + credential name).
 //! `ssh_session_exec` and `ssh_session_exec_async` confirm every call (shows exact command).
 //! List, poll (read-only), and close do not confirm.
 

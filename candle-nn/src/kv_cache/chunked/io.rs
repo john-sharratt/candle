@@ -35,6 +35,45 @@ impl ChunkedKvBacking {
         let chunk_size = CHUNK_SIZE;
         let device = &self.inner.device;
 
+        // Map each requested logical token to its physical `(chunk_idx, in_blk)`,
+        // honoring per-chunk window geometry. A logical sequence is NOT a flat
+        // `pos / CHUNK_SIZE` grid: injected/windowed chunks carry a non-zero
+        // `offset` (valid data starts mid-chunk) and a `usage` below CHUNK_SIZE,
+        // so cumulative token counts — not chunk_size multiples — define the
+        // block boundaries and the in-chunk slot.
+        let positions: Vec<(usize, usize)> = {
+            let seq = state.sequences[batch_idx].as_ref().ok_or_else(|| {
+                candle::Error::Msg(format!("missing sequence allocation for batch {batch_idx}"))
+            })?;
+            let want_end = offset + len;
+            let mut positions = Vec::with_capacity(len);
+            let mut cum = 0usize;
+            for blk in 0..seq.block_count() {
+                let cw = seq
+                    .chunk_at(blk)
+                    .expect("block_count guarantees this chunk exists");
+                let chunk_start = cum;
+                cum += cw.usage as usize;
+                let ov_start = chunk_start.max(offset);
+                let ov_end = cum.min(want_end);
+                if ov_start >= ov_end {
+                    continue;
+                }
+                let base = cw.offset as usize;
+                for pos in ov_start..ov_end {
+                    positions.push((blk, base + (pos - chunk_start)));
+                }
+            }
+            if positions.len() != len {
+                candle::bail!(
+                    "read_contiguous: logical range [{offset}, {want_end}) not fully populated \
+                     for batch {batch_idx} (covered {} of {len} tokens)",
+                    positions.len(),
+                );
+            }
+            positions
+        };
+
         // Gather K/V for each token in range using closure-based arena access
         self.inner.storage.read(|arena_state| {
             let arenas = arena_state.arenas();
@@ -42,9 +81,7 @@ impl ChunkedKvBacking {
             let mut v_slices = Vec::with_capacity(len);
 
             for tok in 0..len {
-                let pos = offset + tok;
-                let blk = pos / chunk_size;
-                let in_blk = pos % chunk_size;
+                let (blk, in_blk) = positions[tok];
 
                 let cw = state.sequences[batch_idx]
                     .as_ref()

@@ -12,7 +12,7 @@ fn http_session_list_empty() {
 #[test]
 fn http_session_request_no_session() {
     let resp = harness::invoke(
-        "http_session_request",
+        "http_request",
         json!({"session_id": "sess_bogus", "path": "https://example.com"}),
     );
     harness::expect_error(&resp, "session_not_found");
