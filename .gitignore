@@ -69,3 +69,6 @@ candle-kernels/build_tool/
 # capture here by default. The committed test fixture is the trimmed copy under
 # candle-transformers/tests/fixtures/ (LFS-tracked via .gitattributes).
 /prefill_fixture.bin
+
+# BDP tool-selection debug dump (large; written by the tool-selection probes).
+/tool_select_debug.json

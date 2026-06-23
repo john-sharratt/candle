@@ -1376,4 +1376,10 @@ pub struct SequenceConfig {
 
     /// V counterpart to [`Self::kv_force_k_format`]. **Default: `None`.**
     pub kv_force_v_format: Option<QuantFormat>,
+
+    /// When `true`, skip the hot→warm quantize pass for this conversation's
+    /// turns entirely — persist K/V in the native R16/F16 form (lossless). Used
+    /// to capture full-resolution tool-call exemplars for the provenance work.
+    /// Overrides the level/force fields above. **Default: `false`.**
+    pub kv_lossless: bool,
 }

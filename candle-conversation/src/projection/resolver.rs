@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::{DepthWeights, ScoreFormula};
-use crate::persistence::record::TreeMetadataPayload;
+use crate::persistence::record::{ToolSummaryPayload, TreeMetadataPayload};
 use crate::persistence::streams::{
     ContentAddress, PerDepthScores, SectionDecl, StreamDecl, StreamId, TurnDecl,
 };
@@ -886,17 +886,13 @@ impl Conversation {
     /// is updated too, so a same-process re-read sees the new hash without a
     /// reload. Callers gate this on a changed hash — see
     /// [`crate::substrate::Substrate::tool_summary_hash`].
-    pub fn write_tool_summary(&self, catalog_hash: u128, summary: &str) -> candle::Result<()> {
+    pub fn write_tool_summary(&self, payload: ToolSummaryPayload) -> candle::Result<()> {
         {
             let mut p = self.persistence.lock().unwrap();
-            p.write_tool_summary(catalog_hash, summary)
+            p.write_tool_summary(&payload)
                 .map_err(|e| candle::Error::Msg(format!("write_tool_summary: {e}")))?;
         }
-        self.write()
-            .apply_tool_summary(crate::persistence::record::ToolSummaryPayload {
-                catalog_hash,
-                summary: summary.to_string(),
-            });
+        self.write().apply_tool_summary(payload);
         Ok(())
     }
 

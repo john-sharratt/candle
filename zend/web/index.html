@@ -57,6 +57,19 @@
   .zmd .tool-call-arg-key { color: #9a9490; white-space: nowrap; }
   .zmd .tool-call-arg-sep { color: #5a5652; }
   .zmd .tool-call-arg-val { color: #b8d4a4; word-break: break-word; }
+  .zmd details.tool-call-card > summary.tool-call-header { cursor: pointer; list-style: none; user-select: none; }
+  .zmd details.tool-call-card > summary.tool-call-header::-webkit-details-marker { display: none; }
+  .zmd details.tool-call-card:not([open]) > summary.tool-call-header { border-bottom: none; }
+  .zmd .tool-call-chevron { width: 9px; height: 9px; color: #5a5652; margin-left: auto; transition: transform .18s; flex-shrink: 0; }
+  .zmd details.tool-call-card[open] > summary .tool-call-chevron { transform: rotate(90deg); }
+  .zmd .tool-call-badge { font-size: .68rem; font-weight: 600; padding: .05rem .4rem; border-radius: 4px; letter-spacing: .02em; }
+  .zmd .tool-call-badge.ok { color: #8fce9b; background: rgba(110,179,154,.12); }
+  .zmd .tool-call-badge.err { color: #d99a8f; background: rgba(200,90,80,.13); }
+  .zmd .tool-call-badge.pend { color: #8a8074; background: rgba(120,114,108,.12); }
+  .zmd .tool-call-out { padding: .35rem .75rem .55rem; border-top: 1px solid #2e2b27; }
+  .zmd .tool-call-out-label { font-size: .68rem; color: #9a9490; margin-bottom: .25rem; text-transform: uppercase; letter-spacing: .04em; }
+  .zmd .tool-call-out-body { margin: 0; padding: .4rem .55rem; background: #1a1816; border: 1px solid #2e2b27; border-radius: 5px; color: #c7bdb0; font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 18rem; overflow: auto; }
+  .zmd .tool-call-out.err .tool-call-out-body { color: #e0b0a6; border-color: #4a322c; }
   .zmd .think-block { margin: .1rem 0 .9rem; }
   .zmd .think-summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; font-size: .8rem; color: #7c736a; user-select: none; padding: .2rem 0; transition: color .13s; }
   .zmd .think-summary:hover { color: #9a9490; }
@@ -164,6 +177,7 @@
     logsOpen: false,
     effortLevel: 2,
     verbosityLevel: 2,
+    toolsLevel: 2,
     openMenu: null,
     theme: (function () { try { return localStorage.getItem('zend.theme') || 'dark'; } catch (_) { return 'dark'; } })(),
     themeMenuOpen: false,
@@ -362,18 +376,43 @@
     }
     return html;
   }
-  function toolCard(json, complete) {
+  // A user turn that is purely a tool result, e.g. `<tool_response>{…}</tool_response>`.
+  function isToolResponse(content) {
+    const t = (content || '').trim();
+    return t.indexOf('<tool_response>') !== -1 && t.indexOf('</tool_response>') !== -1;
+  }
+  // Pull the inner payload out of a `<tool_response>…</tool_response>` turn and
+  // classify it (an `error`/`detail` key ⇒ the call failed).
+  function toolResponseInfo(content) {
+    const m = /<tool_response>([\s\S]*?)<\/tool_response>/.exec(content || '');
+    const raw = (m ? m[1] : (content || '')).trim();
+    let obj = null; try { obj = JSON.parse(raw); } catch (_) {}
+    const isError = !!(obj && (obj.error || obj.detail));
+    return { raw, isError };
+  }
+  // An expandable tool-call block: header (name + result badge), then the call
+  // parameters and — when the matching `<tool_response>` is paired in — the tool
+  // output. Defaults open while still streaming or when there's a result to read.
+  function toolCard(json, complete, output) {
     if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
     let parsed;
-    try { parsed = JSON.parse(json.trim()); } catch (e) {
-      return '<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">tool call</span></div></div>';
-    }
-    const name = parsed.name || '(unknown)';
-    const args = parsed.arguments || parsed.params || {};
+    try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
+    const name = (parsed && parsed.name) || 'tool call';
+    const args = (parsed && (parsed.arguments || parsed.parameters || parsed.params)) || {};
     const argsHtml = Object.entries(args).map(([k, v]) =>
       '<div class="tool-call-arg"><span class="tool-call-arg-key">' + esc(k) + '</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">' + esc(typeof v === 'string' ? v : JSON.stringify(v)) + '</span></div>'
     ).join('');
-    return '<div class="tool-call-card"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span></div>' + (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + '</div>';
+    const resp = output != null ? toolResponseInfo(output) : null;
+    const badge = resp
+      ? '<span class="tool-call-badge ' + (resp.isError ? 'err' : 'ok') + '">' + (resp.isError ? 'error' : 'result') + '</span>'
+      : '<span class="tool-call-badge pend">no result</span>';
+    const outHtml = resp
+      ? '<div class="tool-call-out' + (resp.isError ? ' err' : '') + '"><div class="tool-call-out-label">' + (resp.isError ? 'Error' : 'Output') + '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
+      : '';
+    return '<details class="tool-call-card">' +
+      '<summary class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">' + esc(name) + '</span>' + badge +
+      '<svg class="tool-call-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></summary>' +
+      (argsHtml ? '<div class="tool-call-args">' + argsHtml + '</div>' : '') + outHtml + '</details>';
   }
   function renderThink(seg, open) {
     const words = (seg.body || '').trim().split(/\s+/).filter(Boolean).length;
@@ -390,7 +429,7 @@
       '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
       '</summary><div class="think-body">' + body + '</div></details>';
   }
-  function renderContent(text, streaming, open) {
+  function renderContent(text, streaming, open, toolOutputs) {
     const segs = [];
     let rem = text;
     rem = rem.replace(/<think>([\s\S]*?)<\/think>/g, (m, body) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: true, body }); return mk; });
@@ -402,25 +441,35 @@
     }
     openIdx = rem.lastIndexOf('<tool_call>');
     if (openIdx !== -1) {
-      if (streaming) { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'tool', complete: false, json: rem.slice(openIdx + 11) }); rem = rem.slice(0, openIdx) + mk; }
-      else rem = rem.slice(0, openIdx);
+      const mk = ' SEG:' + segs.length + ' ';
+      // Streaming: a still-arriving call → pending card. Completed: the model
+      // emitted the call but hit end-of-turn before the closing </tool_call>
+      // (its JSON is usually valid) → render it as a finished card anyway, so
+      // an unterminated tool-call turn isn't dropped to a blank bubble.
+      segs.push({ kind: 'tool', complete: !streaming, json: rem.slice(openIdx + 11) });
+      rem = rem.slice(0, openIdx) + mk;
     }
     const parts = rem.split(/ SEG:(\d+) /);
     let html = '';
+    let toolIdx = 0;
     for (let i = 0; i < parts.length; i++) {
       if (i % 2 === 0) { if (parts[i]) html += renderMd(parts[i]); }
-      else { const s = segs[parseInt(parts[i], 10)]; html += s.kind === 'think' ? renderThink(s, open) : toolCard(s.json, s.complete); }
+      else {
+        const s = segs[parseInt(parts[i], 10)];
+        if (s.kind === 'think') { html += renderThink(s, open); }
+        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null); toolIdx++; }
+      }
     }
     return html;
   }
-  function nodeHtml(msg, open) {
+  function nodeHtml(msg, open, toolOutputs) {
     if (msg.streaming && !msg.content) {
       // Bouncing dots while waiting; the italic word only appears if the daemon
       // emits a status event (e.g. "retrieving context").
       const status = msg.status ? '<span class="zstatus">' + esc(msg.status) + '</span>' : '';
       return '<span class="zdots"><i></i><i></i><i></i>' + status + '</span>';
     }
-    let html = renderContent(msg.content, !!msg.streaming, open);
+    let html = renderContent(msg.content, !!msg.streaming, open, toolOutputs);
     if (msg.streaming) html += '<span class="zcursor"></span>';
     return html;
   }
@@ -460,6 +509,14 @@
     const conv = S.conversations.find((c) => c.id === id);
     if (!conv || S.loaded[id]) return;
     S.loaded[id] = true;
+    hydrateConv(id);
+  }
+  // Fetch the persisted conversation and replace local history with it — the
+  // authoritative per-turn split plus the full projection timeline. Used on
+  // first open (via hydrateIfNeeded) AND after a stream completes: the live
+  // view accumulates a whole tool loop into one streaming bubble, so this
+  // reconciles it to the real turns without the user having to reload.
+  function hydrateConv(id) {
     API.getConversation(id).then((full) => {
       const patch = { history: full.history || [] };
       if (full.title != null) patch.title = full.title;
@@ -571,7 +628,7 @@
   function startStream(convId, userText) {
     if (stream) stream.cancel();
     const conv = S.conversations.find((c) => c.id === convId);
-    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel };
+    const opts = { think: S.effortLevel !== 0, effort: S.effortLevel, verbosity: S.verbosityLevel, tools: ['none', 'restricted', 'comprehensive'][S.toolsLevel] };
     stream = API.streamChatCompletion(conv, userText, opts, {
       onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
       onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; }); },
@@ -581,6 +638,11 @@
         patchStream(convId, (m) => { m.streaming = false; });
         S.conversations = S.conversations.map((c) => c.id === convId ? Object.assign({}, c, { streaming: false }) : c);
         render();
+        // Reconcile the live single-bubble stream to the persisted per-turn
+        // structure (real turns + full projection timeline). The daemon commits
+        // every turn's events before sending Done, so the fetch sees them.
+        S.loaded[convId] = true;
+        hydrateConv(convId);
         addLog(API.mkLog('INFO', 'zend::http', 'POST /v1/chat/completions conv_id=' + convId + ' 200 stream=done'));
       },
     });
@@ -857,13 +919,28 @@
     // When wide, keep content left of the top-right Logs/Files pills (~112px).
     const rightPad = S.wide ? '8rem' : '2rem';
     const scroller = h('div', { class: 'zscroll zscroll-wide z-chatscroll', ref: (el) => { chatEl = el; }, onScroll: (e) => { const st = e.currentTarget.scrollTop; if (st < lastScrollTop - 1) stick = false; else if (nearBottom(e.currentTarget)) stick = true; lastScrollTop = st; }, style: 'display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:2rem ' + rightPad + ' 0.5rem ' + leftPad + '; position:relative;' });
+    // Pair each tool result with the call it answers: a user turn that is a bare
+    // <tool_response> is the OUTPUT of the most recent assistant turn's tool
+    // call, not a chat bubble of its own — fold it into that call's card (in
+    // call order) and hide the raw bubble.
+    const toolOut = {};
+    const skipMsg = {};
+    conv.history.forEach((m, i) => {
+      if (m.role === 'user' && isToolResponse(m.content)) {
+        for (let j = i - 1; j >= 0; j--) {
+          if (conv.history[j].role === 'assistant') { (toolOut[j] = toolOut[j] || []).push(m.content); break; }
+        }
+        skipMsg[i] = true;
+      }
+    });
     conv.history.forEach((m, idx) => {
+      if (skipMsg[idx]) return;
       if (m.role === 'user') {
         scroller.appendChild(h('div', { style: 'display:flex; flex-direction:row-reverse; gap:0.85rem; margin-bottom:2rem; padding-left:3rem;' },
           h('div', { style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content)));
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
-        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtml(m, open) });
+        const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtml(m, open, toolOut[idx]) });
         // Wrap the content blocks into per-projection segments, each carrying an
         // in-flow colored bar — pinned to the text at both ends, reflows with it.
         if (!S.narrow) applyProjSegments(zmd, m);
@@ -985,7 +1062,9 @@
           h('span', { class: 'z-dial-label', style: 'font-size:0.72rem; color:#6a625a;' }, 'think'),
           buildDial('effort'),
           h('span', { class: 'z-dial-label', style: 'font-size:0.72rem; color:#6a625a;' }, 'answer'),
-          buildDial('verbosity')),
+          buildDial('verbosity'),
+          h('span', { class: 'z-dial-label', style: 'font-size:0.72rem; color:#6a625a;' }, 'tools'),
+          buildDial('tools')),
         h('div', { style: 'display:flex; align-items:center; gap:0.65rem;' },
           h('span', { class: 'z-sendhint', style: 'font-size:0.72rem; color:#5a5652; white-space:nowrap;' }, sendHint),
           sendBtn)));
@@ -993,22 +1072,35 @@
     return wrap;
   }
 
+  const HAMMER_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;">' +
+    '<path d="m15 12-8.5 8.5a2.12 2.12 0 1 1-3-3L12 9"/>' +
+    '<path d="M17.64 15 22 10.64"/>' +
+    '<path d="m20.91 11.7-1.25-1.25c-.6-.6-.93-1.4-.93-2.25v-.86L16.01 4.6a5.56 5.56 0 0 0-3.94-1.64H9l.92.82A6.18 6.18 0 0 1 12 8.4v1.56l2 2h.86c.85 0 1.65.33 2.25.93l1.25 1.25"/></svg>';
   const DIALS = {
     effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', ticksGrow: true },
     verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', ticksGrow: false },
+    tools: { label: 'Tools', names: ['None', 'Restricted', 'Comprehensive'], subs: ['no tools', 'safe tools only', 'every tool'], key: 'toolsLevel', ticksGrow: false, icon: HAMMER_SVG, zeroable: true },
   };
   function buildDial(which) {
     const d = DIALS[which];
     const lvl = S[d.key];
     const open = S.openMenu === which;
     const ticks = [];
-    for (let i = 0; i < 5; i++) {
+    // `zeroable` dials (e.g. Tools) show one fewer bar than levels and light
+    // `lvl` of them, so level 0 lights none; ordinary dials show one bar per
+    // level and light through the current one (level 0 still lights the first).
+    const nBars = d.zeroable ? d.names.length - 1 : d.names.length;
+    for (let i = 0; i < nBars; i++) {
+      const lit = d.zeroable ? i < lvl : i <= lvl;
       const ht = d.ticksGrow ? (4 + i * 1.8) : 10;
-      ticks.push(h('span', { style: 'width:2.5px; height:' + ht + 'px; border-radius:1px; background:' + (i <= lvl ? ACCENT : '#3a352f') + ';' }));
+      ticks.push(h('span', { style: 'width:2.5px; height:' + ht + 'px; border-radius:1px; background:' + (lit ? ACCENT : '#3a352f') + ';' }));
     }
+    const kids = [];
+    if (d.icon) kids.push(h('span', { html: d.icon, style: 'display:inline-flex; align-items:center; color:#a89a86;' }));
+    kids.push(h('span', { style: 'display:inline-flex; align-items:' + (d.ticksGrow ? 'flex-end' : 'center') + '; gap:1.5px; height:11px;' }, ticks));
+    kids.push(d.names[lvl]);
     const btn = h('button', { onClick: () => setState({ openMenu: open ? null : which }), title: d.label, style: 'display:inline-flex; align-items:center; gap:0.42rem; height:27px; padding:0 0.62rem; border-radius:8px; border:1px solid #38342f; background:#1c1a18; color:#cfc8c0; cursor:pointer; font:inherit; font-size:0.74rem; font-weight:500;' },
-      h('span', { style: 'display:inline-flex; align-items:' + (d.ticksGrow ? 'flex-end' : 'center') + '; gap:1.5px; height:11px;' }, ticks),
-      d.names[lvl]);
+      ...kids);
     const wrap = h('span', { style: 'position:relative; z-index:50;' }, btn);
     if (open) {
       wrap.appendChild(h('div', { style: 'position:absolute; bottom:calc(100% + 7px); left:0; min-width:200px; background:#26231f; border:1px solid #4a443e; border-radius:10px; box-shadow:0 -10px 30px rgba(0,0,0,0.55); padding:5px;' },

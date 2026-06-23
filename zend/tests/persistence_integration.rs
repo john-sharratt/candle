@@ -40,7 +40,15 @@ mod persistence {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit(messages, Some(64), conv_id.to_string(), None, None)
+            .submit(
+                messages,
+                Some(64),
+                conv_id.to_string(),
+                None,
+                None,
+                false,
+                zend::types::ToolMode::Comprehensive,
+            )
             .await;
         let mut response = String::new();
         while let Some(result) = stream.next().await {

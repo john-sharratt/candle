@@ -14,11 +14,23 @@
 //! ```
 
 use candle_conversation::models::Model;
+use candle_conversation::persistence::record::{ToolSummaryEntry, ToolSummaryPayload};
 use candle_conversation::projection::Builder;
 use zend::tool_summary::catalog_hash;
 use zend::tools::install_tool_catalog;
 
 const ZEND_YAML: &str = include_str!("../src/prompts/projection.yaml");
+
+/// Build a single-entry payload (comprehensive slot) for the cache demo.
+fn comp_payload(catalog_hash: u128, summary: &str) -> ToolSummaryPayload {
+    ToolSummaryPayload {
+        comprehensive: Some(ToolSummaryEntry {
+            catalog_hash,
+            summary: summary.to_string(),
+        }),
+        restricted: None,
+    }
+}
 
 /// Install the real catalog into a throwaway projection and return its hash.
 /// The hash is over the tools' content (name + JSON), independent of the dialect
@@ -78,10 +90,10 @@ fn main() -> anyhow::Result<()> {
         let engine = load_engine(&device, ws.path())?;
         hash1 = catalog_hash_for(&engine)?;
         let conv = engine.conversation();
-        let before = conv.read().tool_summary_hash();
+        let before = conv.read().tool_summary_hash(false);
         println!("load 1: catalog hash = {hash1:032x}, cached = {before:?}");
         assert_eq!(before, None, "fresh workspace must have no cached summary");
-        conv.write_tool_summary(hash1, "FAKE SUMMARY v1")?;
+        conv.write_tool_summary(comp_payload(hash1, "FAKE SUMMARY v1"))?;
         engine.checkpoint_persistence()?;
         println!("load 1: persisted summary for hash {hash1:032x}");
     }
@@ -91,11 +103,11 @@ fn main() -> anyhow::Result<()> {
     {
         let engine = load_engine(&device, ws.path())?;
         let hash2 = catalog_hash_for(&engine)?;
-        let cached = engine.conversation().read().tool_summary_hash();
+        let cached = engine.conversation().read().tool_summary_hash(false);
         let text = engine
             .conversation()
             .read()
-            .tool_summary_text()
+            .tool_summary_text(false)
             .map(str::to_string);
         println!("load 2: recomputed hash = {hash2:032x}, cached = {cached:?}, text = {text:?}");
         assert_eq!(hash2, hash1, "catalog hash must be stable across restarts");
@@ -105,17 +117,20 @@ fn main() -> anyhow::Result<()> {
 
         // ── Supersede: a different hash overwrites; last-writer-wins.
         let conv = engine.conversation();
-        conv.write_tool_summary(hash1 ^ 0xFFFF, "FAKE SUMMARY v2")?;
+        conv.write_tool_summary(comp_payload(hash1 ^ 0xFFFF, "FAKE SUMMARY v2"))?;
         engine.checkpoint_persistence()?;
-        assert_eq!(conv.read().tool_summary_hash(), Some(hash1 ^ 0xFFFF));
-        assert_eq!(conv.read().tool_summary_text(), Some("FAKE SUMMARY v2"));
+        assert_eq!(conv.read().tool_summary_hash(false), Some(hash1 ^ 0xFFFF));
+        assert_eq!(
+            conv.read().tool_summary_text(false),
+            Some("FAKE SUMMARY v2")
+        );
         println!("supersede: new hash + text won (last-writer-wins) ✓");
     }
 
     // ── Load 3: the superseded value is what survives the reload.
     {
         let engine = load_engine(&device, ws.path())?;
-        let cached = engine.conversation().read().tool_summary_hash();
+        let cached = engine.conversation().read().tool_summary_hash(false);
         assert_eq!(
             cached,
             Some(hash1 ^ 0xFFFF),

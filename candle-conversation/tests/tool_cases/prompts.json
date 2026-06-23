@@ -109,7 +109,7 @@
     { "tool": "code_run", "train": "Run this Python: print(sum(range(100))).", "holdout": "Execute the bash command `echo $((6*7))`." },
     { "tool": "code_session_open", "train": "Open a persistent Python code session.", "holdout": "Start a Node.js execution session." },
     { "tool": "code_session_exec", "train": "In code session code_1, run `x = 5`.", "holdout": "Execute `print(x * 2)` in code session code_1." },
-    { "tool": "code_list", "train": "List my open code execution sessions.", "holdout": "What sandboxes are currently running?" },
+    { "tool": "code_session_list", "train": "List my open code execution sessions.", "holdout": "What sandboxes are currently running?" },
     { "tool": "code_session_close", "train": "Close code session code_1.", "holdout": "Terminate code session code_2." },
 
     { "tool": "sub_run", "train": "Have a subagent research three approaches to caching and report back.", "holdout": "Delegate the task of summarising these logs to a nested agent." }

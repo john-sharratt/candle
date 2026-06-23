@@ -20,7 +20,9 @@ use std::collections::HashSet;
 
 use candle_conversation::persistence::content_hash::hash_bytes;
 use candle_conversation::projection::{GroupSummary, SectionId};
-use candle_conversation::{ConversationEngine, SamplingConfig, SequenceConfig};
+use candle_conversation::{
+    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TurnHandle,
+};
 
 /// Run one throwaway `(system, user)` exchange and return the reply text. The
 /// scratch conversation's timeline is tombstoned immediately — these
@@ -36,6 +38,10 @@ fn run_scratch(
         .new_conversation(system, cfg.clone())
         .map_err(|e| anyhow::anyhow!("tool-summary scratch conversation: {e}"))?;
     let timeline = conv.timeline_id();
+    // Exempt this throwaway timeline from the summariser before its turn seals:
+    // it is tombstoned below, so a wave-driven compression pass on it would burn
+    // a decode mid-startup and race the tombstone. Must precede `send_turn`.
+    engine.set_timeline_summarize(timeline, false);
     let result = conv.send_turn(user);
     drop(conv);
     if let Err(e) = engine.tombstone_timeline(timeline) {
@@ -44,6 +50,47 @@ fn run_scratch(
     Ok(result
         .map_err(|e| anyhow::anyhow!("tool-summary scratch send: {e}"))?
         .text)
+}
+
+/// Submit `users` as concurrent turns — one per fork of `base` — so their
+/// decodes batch in the scheduler instead of running one-at-a-time. Each fork
+/// shares `base`'s already-prefilled system-prompt KV (no re-prefill) and is
+/// tombstoned once its reply lands. Returns the reply text per input, in order.
+///
+/// The forks are scaffolding: summarisation is disabled before the turn seals
+/// (so the wave-driven summariser never spends a decode on them), and
+/// `finish_turn` is skipped — the scheduler auto-finalises the view and the slot
+/// frees on drop, so there is no point paying the per-turn finalize + next-user
+/// header prefill that `send_turn` would.
+fn run_forked_batch(
+    engine: &ConversationEngine,
+    base: &Sequence,
+    users: &[String],
+) -> anyhow::Result<Vec<String>> {
+    // Submit every fork first (non-blocking) so they are all in flight before we
+    // block on any reply — that is what lets the scheduler co-batch their decodes.
+    let mut pending: Vec<(Sequence, TurnHandle)> = Vec::with_capacity(users.len());
+    for user in users {
+        let mut fork = base
+            .fork()
+            .map_err(|e| anyhow::anyhow!("tool-summary fork: {e}"))?;
+        engine.set_timeline_summarize(fork.timeline_id(), false);
+        let handle = fork
+            .submit_turn(user)
+            .map_err(|e| anyhow::anyhow!("tool-summary fork submit: {e}"))?;
+        pending.push((fork, handle));
+    }
+    let mut out = Vec::with_capacity(users.len());
+    for (fork, handle) in pending {
+        let resp = handle
+            .wait()
+            .map_err(|e| anyhow::anyhow!("tool-summary fork wait: {e}"))?;
+        out.push(resp.text);
+        let timeline = fork.timeline_id();
+        drop(fork);
+        let _ = engine.tombstone_timeline(timeline);
+    }
+    Ok(out)
 }
 
 /// One installed tool: `(name, section_id, json_line)` — the triple
@@ -110,6 +157,12 @@ pub fn generate_tool_summary(
     }
 
     // ── Stage 2: assign each tool to a fixed category, by number, in chunks.
+    //
+    // Every chunk runs the *same* assign system prompt, so prefill it once into a
+    // base conversation and fork per chunk: the forks share that system-prompt KV
+    // (no re-prefill) and their decodes batch in the scheduler rather than running
+    // one-at-a-time. The categorize→assign→missing stages stay ordered (genuine
+    // data dependencies); only the independent chunks within a stage fan out.
     let cat_list: String = categories
         .iter()
         .enumerate()
@@ -118,39 +171,61 @@ pub fn generate_tool_summary(
         .join("; ");
     let asn_sys = &gs.assign.prompt.system_prompt.content;
     let chunk = gs.chunk.max(1);
-    let mut assigns: Vec<(usize, usize)> = Vec::new();
-    for start in (0..names.len()).step_by(chunk) {
-        let end = (start + chunk).min(names.len());
-        let mut sub = String::new();
-        for (i, name) in names.iter().enumerate().take(end).skip(start) {
-            sub.push_str(&format!("{}. {}\n", i + 1, name));
+
+    // Per-chunk `(first_tool_number - 1, last_tool_number, user_prompt)`.
+    let chunks: Vec<(usize, usize, String)> = (0..names.len())
+        .step_by(chunk)
+        .map(|start| {
+            let end = (start + chunk).min(names.len());
+            let mut sub = String::new();
+            for (i, name) in names.iter().enumerate().take(end).skip(start) {
+                sub.push_str(&format!("{}. {}\n", i + 1, name));
+            }
+            let user = format!(
+                "FIXED categories (use ONLY these numbers, never invent any):\n{cat_list}\n\n\
+                 Tools:\n{sub}\n{}\nExample: [{}=1][{}=4].",
+                gs.assign.prompt.user_prompt,
+                start + 1,
+                start + 2
+            );
+            (start, end, user)
+        })
+        .collect();
+
+    // Base holds the prefilled assign system prompt; every fork shares it.
+    let base = engine
+        .new_conversation(asn_sys, cfg.clone())
+        .map_err(|e| anyhow::anyhow!("tool-summary assign base conversation: {e}"))?;
+    let base_timeline = base.timeline_id();
+    engine.set_timeline_summarize(base_timeline, false);
+
+    // Best-of-3 per chunk, batched: each round forks every still-incomplete chunk
+    // at once so their decodes ride one wave. Keep the longest parse seen.
+    let mut got: Vec<Vec<(usize, usize)>> = vec![Vec::new(); chunks.len()];
+    for _ in 0..3 {
+        let todo: Vec<usize> = (0..chunks.len())
+            .filter(|&i| got[i].len() < chunks[i].1 - chunks[i].0)
+            .collect();
+        if todo.is_empty() {
+            break;
         }
-        let user = format!(
-            "FIXED categories (use ONLY these numbers, never invent any):\n{cat_list}\n\n\
-             Tools:\n{sub}\n{}\nExample: [{}=1][{}=4].",
-            gs.assign.prompt.user_prompt,
-            start + 1,
-            start + 2
-        );
-        let want = end - start;
-        let mut got: Vec<(usize, usize)> = Vec::new();
-        for _ in 0..3 {
-            let text = run_scratch(engine, asn_sys, &user, &cfg)?;
-            let part: Vec<(usize, usize)> = parse_numeric_assignments(&text)
+        let users: Vec<String> = todo.iter().map(|&i| chunks[i].2.clone()).collect();
+        let texts = run_forked_batch(engine, &base, &users)?;
+        for (k, &i) in todo.iter().enumerate() {
+            let (start, end, _) = chunks[i];
+            let part: Vec<(usize, usize)> = parse_numeric_assignments(&texts[k])
                 .into_iter()
                 .filter(|(n, _)| *n > start && *n <= end)
                 .collect();
-            if part.len() > got.len() {
-                got = part;
-            }
-            if got.len() >= want {
-                break;
+            if part.len() > got[i].len() {
+                got[i] = part;
             }
         }
-        assigns.extend(got);
     }
+    let mut assigns: Vec<(usize, usize)> = got.into_iter().flatten().collect();
 
-    // Final pass over any tool no chunk resolved.
+    // Final pass over any tool no chunk resolved — one fork per retry (still
+    // sharing the base prefill), accumulating until every gap is closed.
     let mut have: HashSet<usize> = assigns
         .iter()
         .filter(|(n, k)| *n >= 1 && *n <= names.len() && *k >= 1 && *k <= categories.len())
@@ -169,7 +244,9 @@ pub fn generate_tool_summary(
             categories.len()
         );
         for _ in 0..3 {
-            let text = run_scratch(engine, asn_sys, &user, &cfg)?;
+            let text = run_forked_batch(engine, &base, std::slice::from_ref(&user))?
+                .pop()
+                .unwrap_or_default();
             for (n, k) in parse_numeric_assignments(&text) {
                 if missing.contains(&n) && !have.contains(&n) {
                     have.insert(n);
@@ -181,6 +258,9 @@ pub fn generate_tool_summary(
             }
         }
     }
+
+    // Base no longer needed — its forks carried the work.
+    let _ = engine.tombstone_timeline(base_timeline);
 
     // Deterministic fallback: place any still-unassigned tool with the category
     // whose tools share the most underscore-separated name tokens with it.

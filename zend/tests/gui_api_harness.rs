@@ -73,10 +73,18 @@ async fn serves_gui_shell_and_seam_scripts() {
     assert!(ct.contains("text/html"), "content-type was {ct}");
     let body = r.text().await.unwrap();
     assert!(body.contains("id=\"app\""), "shell missing #app root");
-    assert!(body.contains("zend-api.js"), "shell missing seam script tag");
+    assert!(
+        body.contains("zend-api.js"),
+        "shell missing seam script tag"
+    );
 
     // the seam scripts the GUI loads must all be served
-    for path in ["zend-api.js", "zend-api.mock.js", "zend-api.live.js", "favicon.svg"] {
+    for path in [
+        "zend-api.js",
+        "zend-api.mock.js",
+        "zend-api.live.js",
+        "favicon.svg",
+    ] {
         let r = client.get(format!("{base}/{path}")).send().await.unwrap();
         assert_eq!(r.status(), 200, "asset {path} not served");
     }
@@ -89,13 +97,19 @@ async fn model_independent_api_contract() {
     let client = reqwest::Client::new();
 
     // status answers with a `state` field even before any model load
-    let r = client.get(format!("{base}/v1/status")).send().await.unwrap();
+    let r = client
+        .get(format!("{base}/v1/status"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let v: serde_json::Value = r.json().await.unwrap();
     assert!(v.get("state").is_some(), "status missing state: {v}");
     // build id for the hot-reload check (frontend force-reloads when it changes)
     assert!(
-        v.get("build").and_then(|b| b.as_str()).is_some_and(|s| !s.is_empty()),
+        v.get("build")
+            .and_then(|b| b.as_str())
+            .is_some_and(|s| !s.is_empty()),
         "status missing build id: {v}"
     );
 
@@ -107,10 +121,17 @@ async fn model_independent_api_contract() {
         .unwrap();
     assert_eq!(r.status(), 200);
     let v: serde_json::Value = r.json().await.unwrap();
-    assert!(v["conversations"].is_array(), "conversations not an array: {v}");
+    assert!(
+        v["conversations"].is_array(),
+        "conversations not an array: {v}"
+    );
 
     // unknown path -> 404 (fallback)
-    let r = client.get(format!("{base}/no-such-asset")).send().await.unwrap();
+    let r = client
+        .get(format!("{base}/no-such-asset"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 404);
 
     // archive is a model-gated write -> 503 when no engine is loaded
@@ -218,7 +239,10 @@ async fn ws_logs_streams_structured_json() {
             tracing::info!(target: "zend::harness", "structured frame check");
         });
     }
-    assert!(!hz.log.recent().is_empty(), "log bus did not capture the line");
+    assert!(
+        !hz.log.recent().is_empty(),
+        "log bus did not capture the line"
+    );
 
     let url = format!("ws://{}/ws/logs", hz.addr);
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url.as_str())

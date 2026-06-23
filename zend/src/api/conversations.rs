@@ -108,7 +108,7 @@ pub async fn get(
     // extra round-trip. Computed on demand; never persisted in the event.
     let glue = session.glue_markers().map(Glue::from);
     let section_content = session
-        .section_content()
+        .section_content(&id)
         .unwrap_or_default()
         .into_iter()
         .map(|(name, content)| SectionContent { name, content })

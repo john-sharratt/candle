@@ -202,7 +202,7 @@ cross-references. See `docs/tool-system.md § Tool Description Format`.
 | `code_run` | `code/run.rs` | One-shot; Python or Node subprocess |
 | `code_session_open` | `code/session_open.rs` | Persistent REPL; Python or Node |
 | `code_session_exec` | `code/session_exec.rs` | Execute in running REPL |
-| `code_list` | `code/session_list.rs` | |
+| `code_session_list` | `code/session_list.rs` | |
 | `code_session_close` | `code/session_close.rs` | Kills subprocess |
 
 ### Subagent (1 tool) — web chat only

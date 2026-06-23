@@ -153,15 +153,16 @@ impl Scheduler {
             .session
             .vram_budget_available()
             .is_some_and(|avail| avail < VRAM_BUDGET_BAND);
-        let driver_below_floor =
-            match (self.session.vram_free_total(), self.session.vram_pool_stats()) {
-                (Some((free, total)), Some((used, reserved))) => {
-                    let reuse_headroom = reserved.saturating_sub(used);
-                    free < (total / 10).max(1usize << 30)
-                        && reuse_headroom < VRAM_REUSE_BAND
-                }
-                _ => false,
-            };
+        let driver_below_floor = match (
+            self.session.vram_free_total(),
+            self.session.vram_pool_stats(),
+        ) {
+            (Some((free, total)), Some((used, reserved))) => {
+                let reuse_headroom = reserved.saturating_sub(used);
+                free < (total / 10).max(1usize << 30) && reuse_headroom < VRAM_REUSE_BAND
+            }
+            _ => false,
+        };
         pool_low || driver_below_floor
     }
 

@@ -499,6 +499,33 @@ impl Builder {
         Err(ConstructionError::UnknownCollection(collection.to_string()))
     }
 
+    /// Retain only the collection members whose name is in `keep`, dropping the
+    /// rest, and keep the collection's existing selection rule. Unlike
+    /// [`Self::set_collection_single_section`] this allows the collection to end
+    /// up **empty** (when `keep` is empty) — that is how "None" tools mode drops
+    /// the whole catalog: the `<tools>`/`</tools>` wrapper sections `depends_on`
+    /// the collection, so they stop emitting once it materialises nothing.
+    /// "Restricted" mode passes the safe-tool names, leaving the top-k rule to
+    /// surface the most relevant safe tools. The dropped members keep their
+    /// sealed K/V in the substrate; they are simply not projected.
+    pub fn retain_collection_sections(
+        &mut self,
+        layer: LayerId,
+        collection: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), ConstructionError> {
+        let layer_idx = self.layer_idx(layer)?;
+        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
+            if let SystemPromptItem::Collection(coll) = item {
+                if coll.name == collection {
+                    coll.sections.retain(|s| keep.contains(&s.name));
+                    return Ok(());
+                }
+            }
+        }
+        Err(ConstructionError::UnknownCollection(collection.to_string()))
+    }
+
     /// The span α used by [`super::project::FIXED_FORMULA`].
     ///
     /// The BDP scanner in the reprojection path must use the same alpha so

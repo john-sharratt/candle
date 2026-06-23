@@ -1,4 +1,4 @@
-//! code_list tool.
+//! code_session_list tool.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,14 +18,16 @@ pub struct SessionListResp {
 pub struct CodeSessionList;
 
 impl Tool for CodeSessionList {
-    const NAME: &'static str = "code_list";
+    const NAME: &'static str = "code_session_list";
     const DESCRIPTION: &'static str =
-        "List open code execution sandbox sessions for the current conversation. Use for: \
-         checking which sandboxes are currently running, finding a session_id before \
-         issuing code_session_exec, seeing which languages are active, identifying stale \
-         sessions to clean up. Triggered by \"what code sessions do I have\", \"list active \
-         sandboxes\", \"show running execution environments\". Returns session_id, language, \
-         opened_at, last_activity, and alive flag for each session.";
+        "List open code execution sandbox SESSIONS for the current conversation. This does \
+         NOT list files or directories — it lists live interpreter/REPL sessions (use \
+         file_list for filesystem contents). Use for: checking which sandboxes are currently \
+         running, finding a session_id before issuing code_session_exec, seeing which \
+         languages are active, identifying stale sessions to clean up. Triggered by \"what \
+         code sessions do I have\", \"list active sandboxes\", \"show running execution \
+         environments\". Returns session_id, language, opened_at, last_activity, and alive \
+         flag for each session.";
     type Request = SessionListReq;
     type Response = SessionListResp;
     type Error = CodeError;

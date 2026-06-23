@@ -93,6 +93,7 @@
         effort: opts ? opts.effort : undefined,
         verbosity: opts ? opts.verbosity : undefined,
         think: opts ? opts.think : undefined,
+        tools: opts ? opts.tools : undefined,
       };
       fetch('/v1/chat/completions', {
         method: 'POST',

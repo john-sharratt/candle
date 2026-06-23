@@ -48,6 +48,11 @@ pub struct ChatCompletionRequest {
     /// would otherwise refuse, narrate, or fabricate a result; absent in normal use.
     #[serde(default)]
     pub assistant_prefill: Option<String>,
+    /// Capture aid (zend-only): when true, this conversation's turns are sealed
+    /// **without** KV quantization — K/V persist in native R16/F16 (lossless), so
+    /// the provenance work has full-resolution keys. Absent/false in normal use.
+    #[serde(default)]
+    pub lossless_kv: bool,
     /// Composer "thinking effort" dial (0..=4). `0` (and `think: false`) route to
     /// the `/no_think` dialect prefix; `1..=4` select the reasoning-depth
     /// directive section. Absent → server default. Consumed by the projection
@@ -62,6 +67,29 @@ pub struct ChatCompletionRequest {
     /// unless `effort == 0`.
     #[allow(dead_code)]
     pub think: Option<bool>,
+    /// Composer "tools" dial. Selects which tool sections the projection
+    /// materialises for this conversation: `None` omits every tool section,
+    /// `Restricted` omits the high-risk tools (and uses the restricted tool
+    /// summary), `Comprehensive` keeps the full catalog. Absent → server
+    /// default (`Comprehensive`).
+    #[serde(default)]
+    pub tools: Option<ToolMode>,
+}
+
+/// Which slice of the tool catalog a conversation projects. Maps to the GUI
+/// "tools" dial. Drives both projection (which tool sections materialise) and
+/// which tool summary is injected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolMode {
+    /// No tools: every tool section and the tool summary are omitted.
+    None,
+    /// Safe tools only: high-risk tool sections are omitted; the restricted
+    /// summary is injected.
+    Restricted,
+    /// Every tool; the comprehensive summary is injected.
+    #[default]
+    Comprehensive,
 }
 
 #[cfg(test)]
@@ -80,10 +108,9 @@ mod request_tests {
 
     #[test]
     fn parses_with_composer_dials() {
-        let req: ChatCompletionRequest = serde_json::from_str(
-            r#"{"messages":[],"effort":0,"verbosity":4,"think":false}"#,
-        )
-        .unwrap();
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"messages":[],"effort":0,"verbosity":4,"think":false}"#)
+                .unwrap();
         assert_eq!(req.effort, Some(0));
         assert_eq!(req.verbosity, Some(4));
         assert_eq!(req.think, Some(false));

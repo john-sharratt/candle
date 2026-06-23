@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use candle_conversation::projection::{self, SystemPromptItem};
 use zend::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool, run_tool_calls,
-    ToolCall, ToolResult, MAX_TOOL_ITERATIONS,
+    ToolCall, ToolResult,
 };
 use zend_tools::{registry, ToolContext};
 
@@ -380,12 +380,4 @@ fn format_tool_responses_escapes_nested_json_correctly() {
     assert!(formatted.starts_with("<tool_response>"));
     assert!(formatted.contains("</tool_response>"));
     assert!(formatted.contains("\"nested\""));
-}
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-#[test]
-fn max_tool_iterations_is_reasonable() {
-    const _: () = assert!(MAX_TOOL_ITERATIONS >= 2);
-    const _: () = assert!(MAX_TOOL_ITERATIONS <= 32);
 }

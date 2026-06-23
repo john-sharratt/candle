@@ -467,15 +467,12 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Append a [`RecordType::ToolSummary`] record caching the collection
-    /// summary keyed by `catalog_hash`. A workspace singleton: this supersedes
-    /// any prior tool summary (the walker keeps the latest, the compactor
-    /// reclaims the rest). Callers gate the write on a changed `catalog_hash`.
-    pub fn write_tool_summary(&mut self, catalog_hash: u128, summary: &str) -> Result<()> {
-        let payload = record::ToolSummaryPayload {
-            catalog_hash,
-            summary: summary.to_string(),
-        };
+    /// Append a [`RecordType::ToolSummary`] record caching both tool-mode
+    /// summaries (comprehensive + restricted) in one payload. A workspace
+    /// singleton: this supersedes any prior tool summary (the walker keeps the
+    /// latest, the compactor reclaims the rest). Callers gate the write on a
+    /// changed catalog hash for either entry.
+    pub fn write_tool_summary(&mut self, payload: &record::ToolSummaryPayload) -> Result<()> {
         let bytes = payload.encode();
         self.append_record(RecordType::ToolSummary, 0, 0, 0, 0, &bytes)?;
         Ok(())
@@ -1320,16 +1317,30 @@ mod tests {
         let dir = tmp_dir("tool_summary");
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            sp.write_tool_summary(0xAAAA, "summary-A").unwrap();
-            sp.write_tool_summary(0xBBBB, "summary-B").unwrap(); // supersedes A
+            let entry = |h: u128, s: &str| record::ToolSummaryEntry {
+                catalog_hash: h,
+                summary: s.to_string(),
+            };
+            sp.write_tool_summary(&record::ToolSummaryPayload {
+                comprehensive: Some(entry(0xAAAA, "comp-A")),
+                restricted: Some(entry(0x1111, "restr-A")),
+            })
+            .unwrap();
+            sp.write_tool_summary(&record::ToolSummaryPayload {
+                comprehensive: Some(entry(0xBBBB, "comp-B")),
+                restricted: Some(entry(0x2222, "restr-B")),
+            })
+            .unwrap(); // supersedes A
             sp.commit().unwrap();
         }
-        // Reload: the latest summary wins.
+        // Reload: the latest record wins; both mode entries are readable.
         {
             let mut substrate = Substrate::new();
             let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            assert_eq!(substrate.tool_summary_hash(), Some(0xBBBB));
-            assert_eq!(substrate.tool_summary_text(), Some("summary-B"));
+            assert_eq!(substrate.tool_summary_hash(false), Some(0xBBBB));
+            assert_eq!(substrate.tool_summary_text(false), Some("comp-B"));
+            assert_eq!(substrate.tool_summary_hash(true), Some(0x2222));
+            assert_eq!(substrate.tool_summary_text(true), Some("restr-B"));
         }
         // The superseded copy is dead — compaction reclaims it (collect_live_records
         // emits only `manifest.tool_summary`), keeping only the latest.
@@ -1338,13 +1349,13 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             sp.compact(&mut substrate, None).unwrap();
-            assert_eq!(substrate.tool_summary_hash(), Some(0xBBBB));
+            assert_eq!(substrate.tool_summary_hash(false), Some(0xBBBB));
         }
         {
             let mut substrate = Substrate::new();
             let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            assert_eq!(substrate.tool_summary_hash(), Some(0xBBBB));
-            assert_eq!(substrate.tool_summary_text(), Some("summary-B"));
+            assert_eq!(substrate.tool_summary_hash(false), Some(0xBBBB));
+            assert_eq!(substrate.tool_summary_text(true), Some("restr-B"));
         }
         std::fs::remove_dir_all(&dir).ok();
     }

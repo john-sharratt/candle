@@ -259,6 +259,9 @@ async fn main() -> anyhow::Result<()> {
                         "conv_id": &conv_id,
                         "force_high_resolution": format!("tools/{tool}"),
                         "assistant_prefill": &prefill,
+                        // Seal these capture turns without KV quantization so the
+                        // provenance work gets full-resolution (native R16/F16) keys.
+                        "lossless_kv": true,
                         "max_tokens": 128,
                     });
                     match client.post(&url).json(&body).send().await {

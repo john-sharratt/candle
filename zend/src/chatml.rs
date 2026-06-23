@@ -8,9 +8,9 @@
 //! adapter stays thin (docs/zend_ui_redesign.md decision 9).
 //!
 //! Within a `user` segment the `/no_think` dialect prefix is stripped (it is the
-//! no-thinking switch — decision 10 — and is not human content). A segment that
-//! is only a `<tool_response>…</tool_response>` wrapper is dropped (tool-loop
-//! scaffolding, not human/model content).
+//! no-thinking switch — decision 10 — and is not human content). A
+//! `<tool_response>…</tool_response>` segment is kept: the GUI pairs each with the
+//! preceding tool call and renders it as that call's output.
 
 use crate::types::Role;
 
@@ -47,10 +47,6 @@ fn push_segment(role: Role, lines: &[&str], out: &mut Vec<(Role, String)>) {
     let text = lines.join("\n");
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return;
-    }
-    // Drop bare tool-loop scaffolding.
-    if trimmed.starts_with("<tool_response>") && trimmed.ends_with("</tool_response>") {
         return;
     }
     let cleaned = if role == Role::User {
@@ -109,10 +105,16 @@ mod tests {
     }
 
     #[test]
-    fn drops_bare_tool_response_segment() {
+    fn keeps_tool_response_segment() {
+        // Tool results are real turns — the GUI pairs them with the preceding
+        // tool call and renders them as that call's output, so they must survive
+        // the split (they used to be dropped as "scaffolding").
         assert_eq!(
-            split_turn(Role::Assistant, "<tool_response>{\"ok\":true}</tool_response>"),
-            Vec::<(Role, String)>::new()
+            split_turn(Role::User, "<tool_response>{\"ok\":true}</tool_response>"),
+            vec![(
+                Role::User,
+                "<tool_response>{\"ok\":true}</tool_response>".to_string()
+            )]
         );
     }
 

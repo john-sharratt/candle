@@ -83,7 +83,15 @@ mod conversation {
             content: "What is 2 + 2?  Reply with just the number.".to_string(),
         }];
         let mut stream = session
-            .submit(messages, Some(64), "test-conv".to_string(), None, None)
+            .submit(
+                messages,
+                Some(64),
+                "test-conv".to_string(),
+                None,
+                None,
+                false,
+                zend::types::ToolMode::Comprehensive,
+            )
             .await;
 
         let mut status_msgs: Vec<String> = Vec::new();

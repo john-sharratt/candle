@@ -130,6 +130,10 @@ pub(crate) enum AssembledPiece {
     },
     /// The in-flight user message, deferred to prefill after the gap-fill.
     DeferredUser(Arc<Vec<u32>>),
+    /// A sealed turn's user-message half only (compression turn-half injection),
+    /// with NO per-turn boundary-marker wrapping — the compression pass supplies
+    /// its own framing glue.
+    TurnHalf { group: GroupId, index: TurnIndex },
 }
 
 /// Lay out a projection's segments into the ordered [`AssembledPiece`]s the
@@ -176,6 +180,15 @@ pub(crate) fn assemble_pieces(
                     role: *role,
                 });
                 run.extend(markers.assistant_end.iter().copied());
+            }
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
+                // The compression pass supplies its own framing glue, so the
+                // user-half injects with no per-turn boundary-marker wrapping.
+                flush(&mut run, &mut pieces);
+                pieces.push(AssembledPiece::TurnHalf {
+                    group: rt.group(),
+                    index: rt.index(),
+                });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
                 flush(&mut run, &mut pieces);
@@ -305,6 +318,9 @@ pub(super) fn apply_segments_build(
             }
             AssembledPiece::DeferredUser(tokens) => {
                 walker.deferred_user = Some(tokens);
+            }
+            AssembledPiece::TurnHalf { group, index } => {
+                inject_sealed_turn_half(ctx, &mut walker, group, index)?;
             }
         }
     }
@@ -998,10 +1014,18 @@ mod tests {
                 AssembledPiece::Section(SectionId::new(7)),
                 // user_start flushed just before the first turn
                 AssembledPiece::Glue(vec![100]),
-                AssembledPiece::Turn { group: GroupId::for_test(2), index: TurnIndex(3), role: crate::Role::Assistant },
+                AssembledPiece::Turn {
+                    group: GroupId::for_test(2),
+                    index: TurnIndex(3),
+                    role: crate::Role::Assistant
+                },
                 // turn 1's assistant_end MERGES with turn 2's user_start in one island
                 AssembledPiece::Glue(vec![200, 100]),
-                AssembledPiece::Turn { group: GroupId::for_test(2), index: TurnIndex(4), role: crate::Role::Assistant },
+                AssembledPiece::Turn {
+                    group: GroupId::for_test(2),
+                    index: TurnIndex(4),
+                    role: crate::Role::Assistant
+                },
                 // turn 2's assistant_end merges with the trailing Generated run
                 AssembledPiece::Glue(vec![200, 3]),
                 // in-flight user message deferred past the gap-fill

@@ -562,9 +562,9 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: super::super::streams::PerDepthScores::default(),
-            user_chunk_count: 0,
-            user_token_count: 0,
-            user_sig_count: 0,
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -581,8 +581,8 @@ mod tests {
         let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
 
         assert!(
-            live.iter().any(|(h, p)| h.record_type == RecordType::ProjectionEvents
-                && p == &proj_payload),
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::ProjectionEvents && p == &proj_payload),
             "ProjectionEvents record must survive compaction with its payload intact",
         );
     }

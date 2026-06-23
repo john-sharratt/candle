@@ -181,7 +181,11 @@ fn code_session_list_shows_open_sessions() {
     ));
     let sid = open["session_id"].as_str().unwrap().to_string();
 
-    let list = harness::expect_success(harness::invoke_with_ctx("code_list", json!({}), &ctx));
+    let list = harness::expect_success(harness::invoke_with_ctx(
+        "code_session_list",
+        json!({}),
+        &ctx,
+    ));
     let sessions = list["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["language"], "python");
@@ -234,6 +238,6 @@ fn code_run_unknown_language() {
 
 #[test]
 fn code_session_list_empty_initial() {
-    let resp = harness::expect_success(harness::invoke("code_list", json!({})));
+    let resp = harness::expect_success(harness::invoke("code_session_list", json!({})));
     assert_eq!(resp["sessions"].as_array().unwrap().len(), 0);
 }

@@ -80,7 +80,8 @@ mod tests {
 
     #[test]
     fn parses_a_standard_info_line() {
-        let l = parse("2026-06-21T11:55:00.123456Z  INFO zend::substrate: recovered 5 conversations");
+        let l =
+            parse("2026-06-21T11:55:00.123456Z  INFO zend::substrate: recovered 5 conversations");
         assert_eq!(
             l,
             LogLine {

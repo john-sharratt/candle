@@ -59,7 +59,8 @@ use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
 use crate::persistence::record::{
-    DebugIdPayload, RecordType, TombstonePayload, ToolSummaryPayload, TreeMetadataPayload,
+    DebugIdPayload, RecordType, TombstonePayload, ToolSummaryEntry, ToolSummaryPayload,
+    TreeMetadataPayload,
 };
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
@@ -241,6 +242,11 @@ pub struct ResidenceIndex(pub usize);
 /// live dialogue, or to pin dialogue turns to a fixed near-lossless format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConvCompression {
+    /// Skip the hot→warm quantize pass entirely for this conversation's turns,
+    /// persisting their K/V in the native R16/F16 form (no adaptive
+    /// compression). Used to capture lossless tool-call exemplars for the
+    /// provenance work. Overrides every other field here when set.
+    pub lossless: bool,
     /// Adaptive compression level override. `Some` replaces the engine-wide
     /// turn level; `None` keeps it (used when only the forced formats below
     /// are set).
@@ -2519,7 +2525,6 @@ impl Substrate {
                     Some(entry.record.payload.clone());
             }
             // Singletons go to the manifest, not the substrate.
-
             RecordType::ModelSpec
             | RecordType::Template
             | RecordType::Tokenizer
@@ -2535,16 +2540,29 @@ impl Substrate {
         self.tool_summary = Some(payload);
     }
 
-    /// The catalog hash of the currently-cached tool summary, if any. The
-    /// startup hook compares this to the freshly-injected catalog's hash to
-    /// decide whether the summary must be regenerated.
-    pub fn tool_summary_hash(&self) -> Option<u128> {
-        self.tool_summary.as_ref().map(|p| p.catalog_hash)
+    /// The catalog hash of the currently-cached tool summary for the requested
+    /// mode (`restricted = true` for the safe-subset summary, `false` for the
+    /// full-catalog one), if any. The startup hook compares this to the
+    /// freshly-injected catalog's hash to decide whether to regenerate.
+    pub fn tool_summary_hash(&self, restricted: bool) -> Option<u128> {
+        self.tool_summary_entry(restricted).map(|e| e.catalog_hash)
     }
 
-    /// The currently-cached tool-summary text, if any.
-    pub fn tool_summary_text(&self) -> Option<&str> {
-        self.tool_summary.as_ref().map(|p| p.summary.as_str())
+    /// The currently-cached tool-summary text for the requested mode, if any.
+    pub fn tool_summary_text(&self, restricted: bool) -> Option<&str> {
+        self.tool_summary_entry(restricted)
+            .map(|e| e.summary.as_str())
+    }
+
+    /// The cached summary entry for the requested mode.
+    fn tool_summary_entry(&self, restricted: bool) -> Option<&ToolSummaryEntry> {
+        self.tool_summary.as_ref().and_then(|p| {
+            if restricted {
+                p.restricted.as_ref()
+            } else {
+                p.comprehensive.as_ref()
+            }
+        })
     }
 
     /// Build an in-memory [`summary_tree::SummaryTree`] (forest) from the
@@ -3026,6 +3044,19 @@ impl Substrate {
         Some(toks[start..total].to_vec())
     }
 
+    /// Token ids of the turn's *user-input body* `[user_start, user_end)`. The
+    /// compression path text-prefills this alongside the assistant half so each
+    /// half-summary is grounded in the full exchange rather than confabulating
+    /// from one half in isolation (see [`Self::turn_assistant_token_ids`]).
+    pub fn turn_user_token_ids(&self, timeline: TimelineId, index: TurnIndex) -> Option<Vec<u32>> {
+        let toks = self.token_ids_of(timeline, index);
+        let bounds = self.turn(timeline, index)?.content.content_bounds;
+        let total = toks.len();
+        let start = (bounds.user_start as usize).min(total);
+        let end = (bounds.user_end as usize).min(total).max(start);
+        Some(toks[start..end].to_vec())
+    }
+
     /// Turn token count — pinned bytes the seal recorded.
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
         self.turn(timeline, index)
@@ -3289,7 +3320,10 @@ impl Substrate {
             tokens,
             residence,
         };
-        let prev = self.sections.insert(section, entry).map_or(0, |e| e.token_count);
+        let prev = self
+            .sections
+            .insert(section, entry)
+            .map_or(0, |e| e.token_count);
         self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_cpu.is_empty() {
             self.install_section_hot(residence, sealed_cpu);
@@ -3327,7 +3361,10 @@ impl Substrate {
             tokens,
             residence,
         };
-        let prev = self.sections.insert(section, entry).map_or(0, |e| e.token_count);
+        let prev = self
+            .sections
+            .insert(section, entry)
+            .map_or(0, |e| e.token_count);
         self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_hot.is_empty() {
             self.install_section_hot(residence, sealed_hot);

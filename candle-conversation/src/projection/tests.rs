@@ -4498,6 +4498,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template
@@ -4506,6 +4515,16 @@ layers:
           depends_on: tools
         - kind: collection
           name: tools
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose categories.
+              user_prompt: Propose categories.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign by number.
+              user_prompt: Assign by number.
           selection: { kind: top_k, k: 1 }
           sections:
             - id: t1

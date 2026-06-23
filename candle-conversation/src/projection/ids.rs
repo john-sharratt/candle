@@ -58,17 +58,23 @@ pub enum Reserved {
     /// own layer/group/section so its turns never enter a user
     /// conversation's projection.
     Titler,
-    /// The cached tool-catalog summary section. Sealed at runtime (its content
-    /// is model-generated, not in the schema) and pinned under this reserved
+    /// The cached tool-catalog summary section for "Comprehensive" tools mode —
+    /// an overview of the full catalog. Sealed at runtime (its content is
+    /// model-generated, not in the schema) and pinned under this reserved
     /// [`SectionId`] so it can be injected just before the `tools` collection.
     ToolSummary,
+    /// The cached tool-catalog summary section for "Restricted" tools mode — an
+    /// overview built from the safe (non-high-risk) tool subset only. The
+    /// Restricted-mode projection points the `tools` collection at this section
+    /// instead of [`Reserved::ToolSummary`]; "None" mode emits neither.
+    ToolSummaryRestricted,
 }
 
 impl Reserved {
     /// Number of reserved kinds — the width of the band at the very top of the
     /// u32 space that is disjoint from the `1..n` ids YAML allocates. Bump this
     /// when adding a `Reserved` variant.
-    pub const COUNT: u32 = 2;
+    pub const COUNT: u32 = 3;
 
     /// Per-kind offset from the top of the u32 range. Slot 0 = `u32::MAX`,
     /// slot 1 = `u32::MAX - 1`, etc.
@@ -76,6 +82,7 @@ impl Reserved {
         match self {
             Reserved::Titler => 0,
             Reserved::ToolSummary => 1,
+            Reserved::ToolSummaryRestricted => 2,
         }
     }
 

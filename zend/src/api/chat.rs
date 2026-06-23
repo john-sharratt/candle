@@ -50,6 +50,10 @@ pub async fn completions(
     let conv_id = req.conv_id.unwrap_or_else(|| "default".to_string());
     let force_hires = req.force_high_resolution;
     let assistant_prefill = req.assistant_prefill;
+    let lossless_kv = req.lossless_kv;
+    // Composer "tools" dial — which slice of the catalog this conversation
+    // projects. Absent → Comprehensive (full catalog).
+    let tools_mode = req.tools.unwrap_or_default();
     // Composer "thinking effort" dial: Off (`effort: 0` / `think: false`)
     // suppresses the reasoning channel via the `/no_think` dialect prefix
     // (docs/zend_ui_redesign.md decision 10). Stripped again on hydrate by
@@ -63,6 +67,8 @@ pub async fn completions(
             conv_id,
             force_hires,
             assistant_prefill,
+            lossless_kv,
+            tools_mode,
             model,
             id,
             created,
@@ -76,6 +82,8 @@ pub async fn completions(
             conv_id,
             force_hires,
             assistant_prefill,
+            lossless_kv,
+            tools_mode,
             model,
             id,
             created,
@@ -112,6 +120,8 @@ async fn stream_sse(
     conv_id: String,
     force_hires: Option<String>,
     assistant_prefill: Option<String>,
+    lossless_kv: bool,
+    tools_mode: crate::types::ToolMode,
     model: String,
     id: String,
     created: u64,
@@ -123,6 +133,8 @@ async fn stream_sse(
             conv_id,
             force_hires,
             assistant_prefill,
+            lossless_kv,
+            tools_mode,
         )
         .await;
 
@@ -210,6 +222,8 @@ async fn collect_completion(
     conv_id: String,
     force_hires: Option<String>,
     assistant_prefill: Option<String>,
+    lossless_kv: bool,
+    tools_mode: crate::types::ToolMode,
     model: String,
     id: String,
     created: u64,
@@ -221,6 +235,8 @@ async fn collect_completion(
             conv_id,
             force_hires,
             assistant_prefill,
+            lossless_kv,
+            tools_mode,
         )
         .await;
     let mut full = String::new();

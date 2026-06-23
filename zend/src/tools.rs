@@ -22,6 +22,7 @@
 //! output presented to the client — the user sees only the assistant's
 //! final natural-language answer.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, Reserved, SectionId};
@@ -30,13 +31,17 @@ use serde_json::Value;
 
 use zend_tools::{registry, ToolContext};
 
-/// Maximum number of chained tool turns inside a single user request.
-///
-/// Prevents runaway loops where the model keeps emitting tool calls
-/// indefinitely.  Once exceeded, the orchestrator returns whatever
-/// content the most recent turn produced and the user sees a partial
-/// answer.
-pub const MAX_TOOL_ITERATIONS: usize = 8;
+/// The names of every tool that is **not** high-risk — the subset projected in
+/// "Restricted" tools mode. Derived from the registry's `.risky()` policy (see
+/// [`zend_tools::registry`]); "None" mode projects no tools, "Comprehensive"
+/// projects all of them.
+pub fn safe_tool_names() -> HashSet<String> {
+    registry::all_tools()
+        .iter()
+        .filter(|t| !t.high_risk)
+        .map(|t| t.name.to_string())
+        .collect()
+}
 
 /// One Hermes tool-call block parsed from a model response.
 #[derive(Debug, Clone, PartialEq, Eq)]

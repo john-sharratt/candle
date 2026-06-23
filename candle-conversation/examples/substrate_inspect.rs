@@ -16,7 +16,10 @@
 //!   chunks  <stream-id>   KV chunk records for a stream (format, sizes, bytes)
 //!   tokens  <stream-id>   decode a stream's Tokens record to token ids
 //!   meta                  the live ModelSpec / Template payloads
+//!   tool-summary          the cached tool-catalog summary (hash + text)
 //!   checkpoint            latest checkpoint + what it recovers to
+//!   projections [stream]  per-decode projection composition (the GUI panel data)
+//!   tree                  per-timeline summary forest from TreeMetadata records
 //! ```
 //!
 //! `<stream-id>` accepts decimal or `0x`-prefixed hex (as printed by
@@ -37,7 +40,9 @@ use candle_conversation::persistence::record::{
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId};
 use candle_conversation::persistence::walker;
-use candle_conversation::projection::{TimelineId, TurnIndex};
+use candle_conversation::projection::{
+    decode_events, ProjectionEvent, SystemItem, TimelineId, TurnIndex,
+};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::summary_tree::TurnKind;
 use candle_nn::kv_cache::KvFormat;
@@ -96,6 +101,14 @@ enum Cmd {
     ToolSummary,
     /// Latest checkpoint and the manifest it recovers.
     Checkpoint,
+    /// Per-decode projection composition — the same data the GUI's projection
+    /// panel draws: for each decoded turn, the throughput plus what provenance
+    /// materialized (token buckets) and which system-prompt sections it selected
+    /// vs skipped and which conversation turns it pulled in.
+    Projections {
+        /// One turn stream (decimal or `0x`-hex). Omit to dump every decoded turn.
+        stream_id: Option<String>,
+    },
     /// Per-timeline summary forest reconstructed from `TreeMetadata` records:
     /// kind / level / children for every summary node, with peaks flagged.
     Tree {
@@ -129,12 +142,134 @@ fn main() -> Result<()> {
         Cmd::Tokens { stream_id, ids } => {
             tokens(&mut log, &log_path, parse_stream_id(&stream_id)?, ids)?
         }
+        Cmd::Projections { stream_id } => {
+            let only = stream_id.as_deref().map(parse_stream_id).transpose()?;
+            projections(&mut log, only)?
+        }
         Cmd::Meta => meta(&mut log, &log_path)?,
         Cmd::ToolSummary => tool_summary(&mut log)?,
         Cmd::Checkpoint => checkpoint_view(&mut log)?,
         Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
     }
     Ok(())
+}
+
+/// Render the per-decode projection composition for one or all decoded turns —
+/// the same materialized-context account the GUI's projection panel shows. For
+/// each turn we print every `ProjectionEvent` (one per reprojection span): the
+/// decode throughput, the token buckets, the system-prompt sections provenance
+/// selected vs skipped, and the conversation turns it pulled into the window.
+fn projections(log: &mut LogFile, only: Option<StreamId>) -> Result<()> {
+    let substrate = build_substrate(log)?;
+    let first_seen = first_seen_offsets(log)?;
+    let mut turns: Vec<(StreamId, u64, u32)> = substrate
+        .all_streams()
+        .filter_map(|(id, e)| match &e.decl {
+            Some(StreamDecl::Turn(t)) => Some((id, t.timeline_id, t.turn_index)),
+            _ => None,
+        })
+        .filter(|(id, _, _)| only.map_or(true, |o| *id == o))
+        .collect();
+    turns.sort_by_key(|(id, _, _)| first_seen.get(id).copied().unwrap_or(u64::MAX));
+
+    if turns.is_empty() {
+        println!(
+            "(no turn streams{})",
+            if only.is_some() {
+                " matching that id"
+            } else {
+                ""
+            }
+        );
+        return Ok(());
+    }
+
+    let mut any = false;
+    for (id, timeline, idx) in turns {
+        let Some(tl) = TimelineId::from_raw(timeline) else {
+            continue;
+        };
+        let Some(blob) = substrate.projection_events_blob(tl, TurnIndex(idx)) else {
+            continue;
+        };
+        let events = decode_events(blob);
+        if events.is_empty() {
+            continue;
+        }
+        any = true;
+        println!(
+            "\n══ turn {timeline}#{idx}  (stream {})  — {} projection event(s)",
+            stream_hex(id.0),
+            events.len()
+        );
+        for (i, ev) in events.iter().enumerate() {
+            print_projection_event(i, ev);
+        }
+    }
+    if !any {
+        println!(
+            "(no projection events recorded — these are written per decoded dialogue turn; \
+             section / utility ingests don't emit them)"
+        );
+    }
+    Ok(())
+}
+
+/// One `ProjectionEvent` — a single reprojection span within a turn: throughput,
+/// token buckets, and the per-section selected/skipped breakdown.
+fn print_projection_event(i: usize, ev: &ProjectionEvent) {
+    println!(
+        "  span #{i}: {} gen tok [{}..{}] in {:.2}s = {:.1} tok/s   materialized {} / substrate {} tokens",
+        ev.end_token.saturating_sub(ev.start_token),
+        ev.start_token,
+        ev.end_token,
+        ev.seconds,
+        ev.tokens_per_second,
+        ev.materialized_tokens,
+        ev.substrate_tokens,
+    );
+    if !ev.buckets.is_empty() {
+        let parts: Vec<String> = ev
+            .buckets
+            .iter()
+            .map(|b| format!("{}={}", b.label, b.tokens))
+            .collect();
+        println!("      buckets: {}", parts.join("  "));
+    }
+    for item in &ev.selection.system {
+        match item {
+            SystemItem::Glue { name, tokens, .. } => {
+                println!("      [glue]    {name} ({tokens} tok)")
+            }
+            SystemItem::Section { name, tokens } => {
+                println!("      [section] {name} ({tokens} tok)")
+            }
+            SystemItem::Collection { name, sections } => {
+                let sel = sections.iter().filter(|s| s.selected).count();
+                println!(
+                    "      [collect] {name}: {sel}/{} sections selected",
+                    sections.len()
+                );
+                for s in sections {
+                    println!(
+                        "          {} {} ({} tok)",
+                        if s.selected { "[x]" } else { "[ ]" },
+                        s.name,
+                        s.tokens
+                    );
+                }
+            }
+        }
+    }
+    if !ev.selection.turns.is_empty() {
+        println!("      turns selected:");
+        for t in &ev.selection.turns {
+            println!(
+                "          {}/{} #{} {} ({} tok)",
+                t.layer, t.group, t.index, t.role, t.tokens
+            );
+        }
+    }
 }
 
 /// Render the per-timeline summary tree reconstructed from `TreeMetadata`
@@ -308,9 +443,11 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     let sb = log.superblock();
     let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
 
-    // Record-type histogram. Sized past every known discriminant (Tombstone=14,
-    // Unknown=15) so a newer record type can't index out of bounds.
-    let mut counts = [0usize; 16];
+    // Record-type histogram. `type_index` maps each discriminant to
+    // `rt as usize - 1`, so `Unknown` (the highest discriminant) maps to the
+    // largest index; sizing off it keeps the array in step as record types are
+    // added without re-counting by hand.
+    let mut counts = [0usize; RecordType::Unknown as usize];
     let mut payload_bytes = 0u64;
     for e in &entries {
         counts[type_index(e.record.header.record_type)] += 1;
@@ -664,7 +801,7 @@ fn checkpoint_view(log: &mut LogFile) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const ALL_TYPES: [RecordType; 16] = [
+const ALL_TYPES: [RecordType; 17] = [
     RecordType::ModelSpec,
     RecordType::Template,
     RecordType::StreamDecl,
@@ -679,6 +816,7 @@ const ALL_TYPES: [RecordType; 16] = [
     RecordType::TreeMetadata,
     RecordType::DebugId,
     RecordType::Tombstone,
+    RecordType::ProjectionEvents,
     RecordType::ToolSummary,
     RecordType::Unknown,
 ];
@@ -699,9 +837,20 @@ fn tool_summary(log: &mut LogFile) -> Result<()> {
             let rec = read_record_at(log, loc.offset, loc.record_size)?;
             let payload = ToolSummaryPayload::decode(&rec.payload)
                 .map_err(|e| anyhow::anyhow!("decode ToolSummary: {e}"))?;
-            println!("catalog hash  {:032x}", payload.catalog_hash);
-            println!("text          {} bytes\n", payload.summary.len());
-            println!("{}", payload.summary);
+            for (label, entry) in [
+                ("comprehensive", &payload.comprehensive),
+                ("restricted", &payload.restricted),
+            ] {
+                println!("──── {label} ────");
+                match entry {
+                    None => println!("(none — not generated)\n"),
+                    Some(e) => {
+                        println!("catalog hash  {:032x}", e.catalog_hash);
+                        println!("text          {} bytes\n", e.summary.len());
+                        println!("{}\n", e.summary);
+                    }
+                }
+            }
         }
     }
     Ok(())

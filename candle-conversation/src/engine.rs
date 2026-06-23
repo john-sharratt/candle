@@ -474,6 +474,29 @@ impl ConversationEngine {
         self.conversation.label_of(timeline)
     }
 
+    /// Set (or clear) the per-conversation KV-compression override for
+    /// `timeline` at runtime — used by the daemon to flag a forked capture
+    /// conversation as lossless (native R16/F16, no quantize) before its first
+    /// turn migrates hot→warm. See [`crate::substrate::ConvCompression`].
+    pub fn set_timeline_compression(
+        &self,
+        timeline: TimelineId,
+        compression: Option<ConvCompression>,
+    ) {
+        self.conversation
+            .set_timeline_compression(timeline, compression);
+    }
+
+    /// Enable or disable AVL summarisation for `timeline`. Conversations default
+    /// to `true`; scratch/scaffolding timelines (e.g. the tool-summary
+    /// categorize/assign passes) set `false` before their first turn seals so
+    /// the wave-driven summariser never spends a compression decode on work that
+    /// is about to be tombstoned. See [`crate::summary_tree`].
+    pub fn set_timeline_summarize(&self, timeline: TimelineId, summarize: bool) {
+        self.conversation
+            .set_timeline_summarize(timeline, summarize);
+    }
+
     /// Merge a `(key, value)` into `timeline`'s free-form `custom`
     /// metadata bag and persist it. Used by utility ingests to tag each
     /// conversation with a content hash + descriptive fields for the
@@ -660,8 +683,10 @@ impl ConversationEngine {
         let compression = if config.kv_compression_level.is_some()
             || config.kv_force_k_format.is_some()
             || config.kv_force_v_format.is_some()
+            || config.kv_lossless
         {
             Some(ConvCompression {
+                lossless: config.kv_lossless,
                 level: config.kv_compression_level,
                 disable_k_override: config.kv_disable_k_override,
                 force_k: config.kv_force_k_format,

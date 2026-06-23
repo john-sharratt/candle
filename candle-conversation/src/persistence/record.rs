@@ -742,17 +742,27 @@ impl TombstonePayload {
     }
 }
 
-/// JSON payload for a [`RecordType::ToolSummary`] record. A workspace
-/// singleton (last-writer-wins): `catalog_hash` is a 128-bit hash of the
-/// ordered collection content the summary was generated from, and `summary`
-/// is the generated text. On startup the caller hashes the freshly-injected
-/// catalog and compares to the latest record's `catalog_hash`; an equal hash
-/// is a cache hit (no regeneration), a different one triggers a regenerate +
-/// rewrite, and the compactor reclaims the superseded copy.
+/// One cached tool-catalog summary: `catalog_hash` is a 128-bit hash of the
+/// ordered collection content the summary was generated from, and `summary` is
+/// the generated text. The caller hashes the freshly-injected catalog and
+/// compares to `catalog_hash`; an equal hash is a cache hit (no regeneration).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolSummaryPayload {
+pub struct ToolSummaryEntry {
     pub catalog_hash: u128,
     pub summary: String,
+}
+
+/// JSON payload for a [`RecordType::ToolSummary`] record. A workspace singleton
+/// (last-writer-wins) holding both tool-mode summaries in one record so the
+/// existing single-slot manifest/compaction logic is unchanged: `comprehensive`
+/// is the overview of the full catalog, `restricted` the overview of the safe
+/// (non-high-risk) subset. Either may be `None` when its generation was absent
+/// or failed. A mismatch on either entry's `catalog_hash` triggers a regenerate
+/// + rewrite of the whole record; the compactor reclaims the superseded copy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSummaryPayload {
+    pub comprehensive: Option<ToolSummaryEntry>,
+    pub restricted: Option<ToolSummaryEntry>,
 }
 
 impl ToolSummaryPayload {
@@ -823,13 +833,16 @@ mod tests {
     #[test]
     fn tool_summary_payload_round_trips_and_bytes() {
         let p = ToolSummaryPayload {
-            catalog_hash: 1u128 << 64, // 18446744073709551616 — exercises the high word
-            summary: "## A\n  x, y".to_string(),
+            comprehensive: Some(ToolSummaryEntry {
+                catalog_hash: 1u128 << 64, // 18446744073709551616 — exercises the high word
+                summary: "## A\n  x, y".to_string(),
+            }),
+            restricted: None,
         };
         // Exact wire bytes: serde_json emits the struct fields in order, the
         // u128 as a decimal number and the string with its newline escaped.
         let bytes = p.encode();
-        let expected = "{\"catalog_hash\":18446744073709551616,\"summary\":\"## A\\n  x, y\"}";
+        let expected = "{\"comprehensive\":{\"catalog_hash\":18446744073709551616,\"summary\":\"## A\\n  x, y\"},\"restricted\":null}";
         assert_eq!(bytes, expected.as_bytes());
         let back = ToolSummaryPayload::decode(&bytes).unwrap();
         assert_eq!(p, back);

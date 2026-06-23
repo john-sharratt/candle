@@ -122,6 +122,8 @@ mod coherence {
                 sampling,
                 None,
                 None,
+                false,
+                zend::types::ToolMode::Comprehensive,
             )
             .await;
 

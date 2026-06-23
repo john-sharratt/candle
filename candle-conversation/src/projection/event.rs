@@ -237,7 +237,9 @@ pub fn from_projection(
         .filter_map(|seg| match seg {
             ProjectionSegment::Sealed(SealedKind::Section(s)) => {
                 let tokens = resolver.section_token_count(s.id) as u32;
-                let (label, kind) = match collection_name_of(schema, s.id) {
+                let (label, kind) = match collection_name_of(schema, s.id)
+                    .or_else(|| collection_of_summary(schema, s.id))
+                {
                     Some(name) => (name.to_string(), BucketKind::Section),
                     None => ("system".to_string(), BucketKind::System),
                 };
@@ -263,6 +265,8 @@ pub fn from_projection(
                 label: "current message".to_string(),
                 tokens: tokens.len() as u32,
             }),
+            // Compression-internal turn-half — not part of the displayed timeline.
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(_)) => None,
             // Structural framing — not materialized content.
             ProjectionSegment::Generated { .. } => None,
         })
@@ -323,6 +327,8 @@ fn build_selection(
                     tokens: tokens.len() as u32,
                 });
             }
+            // Compression-internal turn-half — not a displayed dialogue turn.
+            ProjectionSegment::Sealed(SealedKind::TurnHalf(_)) => {}
             ProjectionSegment::Generated { tokens, identity } => {
                 emitted_glue.insert(identity.name.as_str(), tokens.len() as u32);
             }
@@ -354,23 +360,36 @@ fn build_selection(
                     });
                 }
                 SystemPromptItem::Section(_) => {}
-                SystemPromptItem::Collection(c)
-                    if c.sections.iter().any(|s| selected.contains(&s.id)) =>
-                {
-                    system.push(SystemItem::Collection {
-                        name: c.name.clone(),
-                        sections: c
-                            .sections
-                            .iter()
-                            .map(|s| SelectedSection {
-                                name: s.name.clone(),
-                                tokens: resolver.section_token_count(s.id) as u32,
-                                selected: selected.contains(&s.id),
-                            })
-                            .collect(),
-                    });
+                SystemPromptItem::Collection(c) => {
+                    // The collection's runtime summary section materializes just
+                    // before the members on partial selection. It is a reserved
+                    // section (not a schema item), so emit it explicitly here when
+                    // it fired — otherwise it is silently folded into `system` and
+                    // invisible in the panel. Named `"<collection> summary"`; the
+                    // daemon serves its text under the same key.
+                    if let Some(sum) = c.summary_section {
+                        if selected.contains(&sum) {
+                            system.push(SystemItem::Section {
+                                name: format!("{} summary", c.name),
+                                tokens: resolver.section_token_count(sum) as u32,
+                            });
+                        }
+                    }
+                    if c.sections.iter().any(|s| selected.contains(&s.id)) {
+                        system.push(SystemItem::Collection {
+                            name: c.name.clone(),
+                            sections: c
+                                .sections
+                                .iter()
+                                .map(|s| SelectedSection {
+                                    name: s.name.clone(),
+                                    tokens: resolver.section_token_count(s.id) as u32,
+                                    selected: selected.contains(&s.id),
+                                })
+                                .collect(),
+                        });
+                    }
                 }
-                SystemPromptItem::Collection(_) => {}
             }
         }
     }
@@ -407,6 +426,21 @@ fn collection_name_of(schema: &Schema, id: SectionId) -> Option<&str> {
     schema.layers.iter().find_map(|l| {
         l.system_prompt.items.iter().find_map(|item| match item {
             SystemPromptItem::Collection(c) if c.sections.iter().any(|s| s.id == id) => {
+                Some(c.name.as_str())
+            }
+            _ => None,
+        })
+    })
+}
+
+/// The name of the collection whose *runtime summary section* is `id`. Unlike
+/// [`collection_name_of`] (which matches declared members), this matches the
+/// reserved summary section a collection injects before its members on partial
+/// selection — that section is not a schema item, so it is classified here.
+fn collection_of_summary(schema: &Schema, id: SectionId) -> Option<&str> {
+    schema.layers.iter().find_map(|l| {
+        l.system_prompt.items.iter().find_map(|item| match item {
+            SystemPromptItem::Collection(c) if c.summary_section == Some(id) => {
                 Some(c.name.as_str())
             }
             _ => None,
@@ -518,13 +552,22 @@ mod tests {
     fn encode_decode_events_round_trips() {
         let events = vec![
             aggregate(
-                &[seg(BucketKind::System, "system", 320), seg(BucketKind::Section, "code_read", 800)],
+                &[
+                    seg(BucketKind::System, "system", 320),
+                    seg(BucketKind::Section, "code_read", 800),
+                ],
                 42_000,
                 0,
                 120,
                 3.0,
             ),
-            aggregate(&[seg(BucketKind::Turns, "conversation", 540)], 42_000, 120, 512, 8.0),
+            aggregate(
+                &[seg(BucketKind::Turns, "conversation", 540)],
+                42_000,
+                120,
+                512,
+                8.0,
+            ),
         ];
         assert_eq!(super::decode_events(&super::encode_events(&events)), events);
     }
@@ -544,6 +587,15 @@ layers:
     score_formula: max
     budget:
       priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: section
@@ -551,6 +603,16 @@ layers:
           content: "You are Zen-Code."
         - kind: collection
           name: code_read
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: Propose categories.
+              user_prompt: Propose categories.
+            assign:
+              max_tokens: 128
+              system_prompt: Assign by number.
+              user_prompt: Assign by number.
           selection: { kind: top_k, k: 3 }
           sections:
             - id: file_a
@@ -577,10 +639,7 @@ layers:
             0
         }
         fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-            *self
-                .turn_tokens
-                .get(&(group.raw(), index.0))
-                .unwrap_or(&0)
+            *self.turn_tokens.get(&(group.raw(), index.0)).unwrap_or(&0)
         }
         fn turn_score(
             &self,
@@ -625,7 +684,8 @@ layers:
                 crate::Role::Assistant,
             ))
         };
-        let section = |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
+        let section =
+            |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
 
         let segments = vec![
             section(frame),
@@ -741,6 +801,15 @@ layers:
 layers:
   - name: dialogue
     window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
     system_prompt:
       items:
         - kind: template

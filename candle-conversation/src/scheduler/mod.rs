@@ -931,7 +931,14 @@ impl WaveStats {
     /// (seqs × per-seq chunk for prefill, seqs × 1 for decode). `kv_len` is the
     /// total attended-KV length the forward swept (Σ per-seq prefix/context
     /// length, captured before the forward advanced the sequences).
-    fn record(&mut self, prefill: bool, n_seqs: usize, n_tokens: usize, kv_len: usize, fwd_ms: u64) {
+    fn record(
+        &mut self,
+        prefill: bool,
+        n_seqs: usize,
+        n_tokens: usize,
+        kv_len: usize,
+        fwd_ms: u64,
+    ) {
         let ch = if prefill {
             &mut self.prefill
         } else {
@@ -1012,7 +1019,11 @@ impl WaveStats {
         if d.fwds > 0 {
             parts.push(format!(
                 "decode fwds={} seqs avg={:.1} max={} kv/fwd avg={:.0} fwd avg={:.0}ms",
-                d.fwds, avg(d.seq_sum, d.fwds), d.seq_max, avg(d.kv_sum, d.fwds), avg(d.ms_sum, d.fwds),
+                d.fwds,
+                avg(d.seq_sum, d.fwds),
+                d.seq_max,
+                avg(d.kv_sum, d.fwds),
+                avg(d.ms_sum, d.fwds),
             ));
         }
         let s = &self.section;
@@ -1105,19 +1116,6 @@ pub(crate) struct Scheduler {
     /// the span `[anchor.token, now]` and re-anchors. Drives the t/s on each
     /// `TurnEvent::Projection`. Pruned in `cleanup_finished`.
     reproj_anchor: HashMap<SequenceId, (u32, Instant)>,
-    /// Slots that are summary probes in flight. Presence here marks a decode
-    /// as a summary (vs. a dialogue turn): `cleanup_finished` routes it to the
-    /// summary seal + fires this channel with the new `TurnIndex` instead of
-    /// streaming `TurnEvent`s. The summariser thread blocks on the matching
-    /// receiver. Lets a summary decode batch with foreground decodes in the
-    /// wave loop instead of monopolising the scheduler thread.
-    summary_completions: HashMap<SequenceId, Sender<Result<TurnIndex, String>>>,
-    /// Keeps each in-flight summary slot's token-event receiver alive. The
-    /// decode loop treats a failed `event_tx.send` as "caller hung up, stop"
-    /// — so a dropped receiver would terminate the summary after one token.
-    /// We never read these; the receiver is dropped in `free_summary_slot`
-    /// once the decode completes.
-    summary_event_rx: HashMap<SequenceId, Receiver<TurnEvent>>,
     /// Persistent sampling state per sequence ID (survives across turns).
     /// DRY penalty needs the recent-token window to span turn boundaries.
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
@@ -1415,8 +1413,6 @@ impl Scheduler {
             device,
             active_decodes: HashMap::new(),
             reproj_anchor: HashMap::new(),
-            summary_completions: HashMap::new(),
-            summary_event_rx: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
@@ -2499,6 +2495,58 @@ impl Scheduler {
             },
         });
 
+        // Rolling anchor: the most recent sealed *summary* turn before these
+        // children — the running thread of the conversation so far, itself
+        // bounded (it is a prior summary, not raw history, so this stays O(1)).
+        // Prepended as context so each half-summary is grounded in what came
+        // before instead of confabulating a request/answer from a bare turn.
+        //
+        // BOTH halves of the prior leaf are carried — its question summary AND
+        // its answer summary, separated. A stitched leaf is stored as
+        // `[question][user_end][assistant_start][answer]`; reading only the
+        // assistant half would amputate the running *question* thread, so the
+        // original ask would survive exactly one turn and then vanish.
+        let anchor_sep = self
+            .tokenizer
+            .encode("\n\n", false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
+        let prior_summary: Vec<u32> = {
+            let first_child = children.iter().map(|t| t.0).min().unwrap_or(0);
+            let view = conv.read();
+            view.turn_indices(target.timeline)
+                .filter(|idx| {
+                    idx.0 < first_child
+                        && view
+                            .tree_meta_of(target.timeline, *idx)
+                            .is_some_and(|m| m.kind.is_summary())
+                })
+                .max_by_key(|idx| idx.0)
+                .map(|idx| {
+                    let mut q = view
+                        .turn_user_token_ids(target.timeline, idx)
+                        .unwrap_or_default();
+                    let a = view
+                        .turn_assistant_token_ids(target.timeline, idx)
+                        .unwrap_or_default();
+                    if !q.is_empty() && !a.is_empty() {
+                        q.extend_from_slice(&anchor_sep);
+                    }
+                    q.extend(a);
+                    q
+                })
+                .unwrap_or_default()
+        };
+        if !prior_summary.is_empty() {
+            prefix.push(ProjectionSegment::Generated {
+                tokens: Arc::new(prior_summary),
+                identity: GeneratedIdentity {
+                    name: "compress_prior".to_string(),
+                    position: 1,
+                },
+            });
+        }
+
         // Close glue: the compression instruction followed by `user_end`.
         let close: Vec<u32> = {
             let mut t = self
@@ -2534,11 +2582,42 @@ impl Scheduler {
                         },
                     )));
                 }
+                // Ground with the assistant half (text) so the user-request
+                // summary sees the response it produced — a bare tool-result
+                // turn is otherwise context-free and confabulates.
+                let asst_ctx: Vec<u32> = {
+                    let view = conv.read();
+                    let mut acc: Vec<u32> = Vec::new();
+                    for &c in children {
+                        let half = view
+                            .turn_assistant_token_ids(target.timeline, c)
+                            .unwrap_or_default();
+                        if half.is_empty() {
+                            continue;
+                        }
+                        // Separate consecutive children's halves (same `\n\n` as
+                        // the rolling anchor); single-child leaves are unchanged.
+                        if !acc.is_empty() {
+                            acc.extend_from_slice(&anchor_sep);
+                        }
+                        acc.extend(half);
+                    }
+                    acc
+                };
+                if !asst_ctx.is_empty() {
+                    segments.push(ProjectionSegment::Generated {
+                        tokens: Arc::new(asst_ctx),
+                        identity: GeneratedIdentity {
+                            name: "compress_asst_ctx".to_string(),
+                            position: 2,
+                        },
+                    });
+                }
                 segments.push(ProjectionSegment::Generated {
                     tokens: Arc::new(close),
                     identity: GeneratedIdentity {
                         name: "compress_close".to_string(),
-                        position: 1,
+                        position: 3,
                     },
                 });
                 if let Err(e) =
@@ -2565,12 +2644,41 @@ impl Scheduler {
                     return Err(e);
                 }
                 let mut wave_tokens: Vec<u32> = Vec::new();
-                for &child in children {
-                    let half_toks = conv
-                        .read()
-                        .turn_assistant_token_ids(target.timeline, child)
-                        .unwrap_or_default();
-                    wave_tokens.extend_from_slice(&half_toks);
+                {
+                    let view = conv.read();
+                    // Ground with the user half (text) first so the response
+                    // summary sees the request it answers, then the assistant
+                    // half it actually summarizes. Consecutive children's halves
+                    // within each block are separated (same `\n\n` as the rolling
+                    // anchor); a single-child leaf is unchanged.
+                    let mut first = true;
+                    for &child in children {
+                        let half = view
+                            .turn_user_token_ids(target.timeline, child)
+                            .unwrap_or_default();
+                        if half.is_empty() {
+                            continue;
+                        }
+                        if !first {
+                            wave_tokens.extend_from_slice(&anchor_sep);
+                        }
+                        first = false;
+                        wave_tokens.extend(half);
+                    }
+                    let mut first = true;
+                    for &child in children {
+                        let half = view
+                            .turn_assistant_token_ids(target.timeline, child)
+                            .unwrap_or_default();
+                        if half.is_empty() {
+                            continue;
+                        }
+                        if !first {
+                            wave_tokens.extend_from_slice(&anchor_sep);
+                        }
+                        first = false;
+                        wave_tokens.extend(half);
+                    }
                 }
                 wave_tokens.extend_from_slice(&close);
 
@@ -2584,6 +2692,7 @@ impl Scheduler {
                     prefill_text: String::new(),
                     user_text: String::new(),
                     content_bounds: TurnContentBounds::default(),
+                    prefill_assistant_text: String::new(),
                     event_tx,
                     max_decode_tokens: 0,
                     sampling: SamplingConfig::compression(),
@@ -2927,6 +3036,7 @@ impl Scheduler {
             prefill_text: String::new(),
             user_text: String::new(),
             content_bounds: TurnContentBounds::default(),
+            prefill_assistant_text: String::new(),
             event_tx,
             max_decode_tokens: 0,
             sampling: SamplingConfig::compression(),
@@ -5801,7 +5911,11 @@ impl Scheduler {
                 start_token: from_token,
                 end_token: repro_gen,
                 seconds,
-                tokens_per_second: if seconds > 0.0 { span as f64 / seconds } else { 0.0 },
+                tokens_per_second: if seconds > 0.0 {
+                    span as f64 / seconds
+                } else {
+                    0.0
+                },
                 ..composition
             };
             let _ = decode_state.event_tx.send(TurnEvent::Projection(event));
@@ -5889,7 +6003,8 @@ impl Scheduler {
         }
         // Migrate the projection-span anchor onto the new view id so the next
         // reproject / final seal measures its span from this reprojection.
-        self.reproj_anchor.insert(new_view_id, (repro_gen, repro_now));
+        self.reproj_anchor
+            .insert(new_view_id, (repro_gen, repro_now));
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real

@@ -476,6 +476,7 @@ impl ModelBuilder {
             kv_disable_k_override: false,
             kv_force_k_format: None,
             kv_force_v_format: None,
+            kv_lossless: false,
         }
     }
 

@@ -936,6 +936,13 @@ layers:
 
         - kind: section
           id: tools_overview
+          # Gated on the tools collection: the "how to call a tool" prose only
+          # makes sense when at least one tool is projected. With None tools mode
+          # the collection materialises nothing, so this section (like the
+          # `<tools>` markers) is suppressed — the conversation never sees a tools
+          # preamble with no tools behind it. Sealed unconditionally; emitted only
+          # when the collection has members.
+          depends_on: tools
           content: |+
             You have access to the tools listed below. Every listed tool is available and
             working right now. Never say a tool is unavailable, that you can't access

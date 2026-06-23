@@ -219,7 +219,7 @@ pub use builder::Builder;
 pub use error::ConstructionError;
 pub use event::{
     aggregate, decode_events, encode_events, from_projection, BucketKind, ProjectionBucket,
-    ProjectionEvent,
+    ProjectionEvent, ProjectionSelection, SelectedSection, SelectedTurn, SystemItem,
 };
 pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,

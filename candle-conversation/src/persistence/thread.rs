@@ -294,6 +294,8 @@ fn effective_turn_policy(
     cc: Option<ConvCompression>,
 ) -> Option<CompressionPolicy> {
     match (base, cc) {
+        // Lossless capture: skip the quantize pass so turns keep native R16/F16.
+        (_, Some(c)) if c.lossless => None,
         (Some(b), Some(c)) => {
             let mut p = b.clone();
             if let Some(level) = c.level {

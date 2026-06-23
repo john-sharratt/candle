@@ -1883,8 +1883,7 @@ impl Sequence {
         if count == 0 {
             return Ok(());
         }
-        let stream_id =
-            crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
+        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
         let payload = crate::projection::encode_events(events);
         self.substrate
             .persist_projection_events(stream_id, &payload)

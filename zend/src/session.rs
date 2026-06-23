@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +11,7 @@ use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
 
 use candle_conversation::models::{Dialect, Model};
+use candle_conversation::persistence::record::{ToolSummaryEntry, ToolSummaryPayload};
 use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
@@ -27,9 +28,8 @@ use crate::refresh_ctx::RefreshContext;
 use crate::repo_scan::{ClusterState, RepoMap};
 use crate::tools::{
     extract_tool_calls, format_tool_responses, install_tool_catalog, run_tool_calls, ToolHost,
-    MAX_TOOL_ITERATIONS,
 };
-use crate::types::{ChatMessage, Role};
+use crate::types::{ChatMessage, Role, ToolMode};
 
 const PROJECTION_SCHEMA_TEMPLATE: &str = include_str!("prompts/projection.yaml");
 
@@ -99,6 +99,11 @@ static PROJ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 struct ConvState {
     conv: Sequence,
+    /// The tools mode last applied to this conversation's projection (set each
+    /// turn in `run_inference_stream`). The projection panel uses it to display
+    /// the tool summary that was actually injected — the restricted (safe-subset)
+    /// summary in Restricted mode, the full one in Comprehensive, none in None.
+    tool_mode: ToolMode,
 }
 
 struct InferenceState {
@@ -146,6 +151,10 @@ struct InferenceState {
     /// ingestion ran under.
     refresh_builder: Builder,
     refresh_config: candle_conversation::SequenceConfig,
+    /// Per-tools-mode projection builders, built once at startup (Restricted
+    /// drops the high-risk tools; None drops the whole catalog). Each turn hands
+    /// out the matching one as a cheap `Arc` clone via [`ModeBuilders::get`].
+    mode_builders: ModeBuilders,
     /// Tokenizer shared with the engine — used by `head_tail_truncate`
     /// to bound the titler's prefill at first 50 + last 50 tokens.
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -371,90 +380,121 @@ impl InferenceState {
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
 
-        // Tool-catalog summary execution path. Hash the freshly-injected catalog
-        // (ordered tool names + parameter schemas) and compare to the summary
-        // cached in the redo log. On a match the catalog is unchanged and we
-        // reuse it (no model work); on a mismatch — or first run — regenerate the
-        // categorize→assign summary and persist it, which supersedes the stale
-        // copy (the compactor reclaims it). Gated on change, so a normal restart
-        // pays only the hash compare.
+        // Tool-catalog summaries: one for "Comprehensive" tools mode (the full
+        // catalog) and one for "Restricted" mode (the safe / non-high-risk
+        // subset). Each is hashed against the catalog content it summarises and
+        // both are cached together in one redo-log record; a restart with an
+        // unchanged catalog pays only the hash compares. Regeneration is gated
+        // per mode, so a changed catalog regenerates both.
         {
-            let catalog_hash = crate::tool_summary::catalog_hash(&tool_sections);
             let conv = engine.conversation();
-            let cached = conv.read().tool_summary_hash();
+            let tools_gs = proj_builder_refresh
+                .schema()
+                .layers
+                .iter()
+                .find(|l| l.id == dialogue_layer)
+                .and_then(|l| l.system_prompt.collection_named("tools"))
+                .map(|c| c.summary.clone());
+            let prelude = pre_tools_section_ids(&proj_builder_refresh);
 
-            // Resolve the summary text: reuse the cached one on a hash match, else
-            // regenerate (model) and persist the new text + hash.
-            let summary_text: Option<String> = if cached == Some(catalog_hash) {
-                tracing::info!(catalog_hash, "tool summary cache hit (catalog unchanged)");
-                conv.read().tool_summary_text().map(str::to_string)
-            } else {
-                let tools_gs = proj_builder_refresh
-                    .schema()
-                    .layers
-                    .iter()
-                    .find(|l| l.id == dialogue_layer)
-                    .and_then(|l| l.system_prompt.collection_named("tools"))
-                    .map(|c| c.summary.clone());
-                match tools_gs {
-                    None => {
-                        tracing::warn!("tool summary: dialogue layer has no 'tools' collection");
-                        None
+            // Resolve one mode's summary over `sections`: reuse the cached text
+            // on a hash match, else regenerate. Returns the record entry (built
+            // from cached or fresh text), the text to seal, and whether it was
+            // regenerated (drives the persist).
+            let resolve = |sections: &[crate::tool_summary::InstalledTool], restricted: bool| {
+                let hash = crate::tool_summary::catalog_hash(sections);
+                if conv.read().tool_summary_hash(restricted) == Some(hash) {
+                    tracing::info!(
+                        restricted,
+                        hash,
+                        "tool summary cache hit (catalog unchanged)"
+                    );
+                    let text = conv
+                        .read()
+                        .tool_summary_text(restricted)
+                        .map(str::to_string);
+                    let entry = text.clone().map(|summary| ToolSummaryEntry {
+                        catalog_hash: hash,
+                        summary,
+                    });
+                    return (entry, text, false);
+                }
+                let Some(gs) = tools_gs.as_ref() else {
+                    tracing::warn!("tool summary: dialogue layer has no 'tools' collection");
+                    return (None, None, false);
+                };
+                tracing::info!(
+                    restricted,
+                    hash,
+                    "tool catalog changed — regenerating summary"
+                );
+                match crate::tool_summary::generate_tool_summary(
+                    &engine,
+                    sections,
+                    gs,
+                    &conv_config,
+                ) {
+                    Ok(summary) => {
+                        let entry = ToolSummaryEntry {
+                            catalog_hash: hash,
+                            summary: summary.clone(),
+                        };
+                        (Some(entry), Some(summary), true)
                     }
-                    Some(gs) => {
-                        tracing::info!(
-                            catalog_hash,
-                            ?cached,
-                            "tool catalog changed — regenerating summary",
-                        );
-                        match crate::tool_summary::generate_tool_summary(
-                            &engine,
-                            &tool_sections,
-                            &gs,
-                            &conv_config,
-                        ) {
-                            Ok(summary) => {
-                                match conv.write_tool_summary(catalog_hash, &summary) {
-                                    Ok(()) => {
-                                        // Force the record durable now — the summary
-                                        // is expensive to regenerate, so don't risk
-                                        // losing it to an early shutdown.
-                                        if let Err(e) = engine.checkpoint_persistence() {
-                                            tracing::warn!("tool summary checkpoint failed: {e}");
-                                        }
-                                        tracing::info!(
-                                            chars = summary.len(),
-                                            "tool summary regenerated + persisted",
-                                        );
-                                    }
-                                    Err(e) => tracing::warn!("tool summary persist failed: {e}"),
-                                }
-                                Some(summary)
-                            }
-                            Err(e) => {
-                                tracing::warn!("tool summary generation failed: {e:#}");
-                                None
-                            }
-                        }
+                    Err(e) => {
+                        tracing::warn!(restricted, "tool summary generation failed: {e:#}");
+                        (None, None, false)
                     }
                 }
             };
 
-            // Seal the summary as a section, re-prefilled with the same prefix the
-            // tool sections see (the non-template sections before the `tools`
-            // collection), so its KV is position-correct for "just before the
-            // tools". First run ingests + persists (content-addressed); a restart
-            // restores it from disk under the reserved id.
-            if let Some(text) = summary_text {
-                let prelude = pre_tools_section_ids(&proj_builder_refresh);
-                let sid = SectionId::reserved(Reserved::ToolSummary);
-                match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
-                    Ok(()) => tracing::info!(
-                        section = sid.raw(),
-                        prelude = prelude.len(),
-                        "tool summary section sealed (re-prefilled before tools)",
-                    ),
-                    Err(e) => tracing::warn!("tool summary section seal failed: {e}"),
+            let safe_names = crate::tools::safe_tool_names();
+            let safe_sections: Vec<crate::tool_summary::InstalledTool> = tool_sections
+                .iter()
+                .filter(|(name, _, _)| safe_names.contains(name))
+                .cloned()
+                .collect();
+            let (comp_entry, comp_text, comp_changed) = resolve(&tool_sections, false);
+            let (restr_entry, restr_text, restr_changed) = resolve(&safe_sections, true);
+
+            // Persist both entries in one record when either regenerated. The
+            // unchanged mode keeps its cached entry so it is not lost.
+            if comp_changed || restr_changed {
+                let payload = ToolSummaryPayload {
+                    comprehensive: comp_entry,
+                    restricted: restr_entry,
+                };
+                match conv.write_tool_summary(payload) {
+                    Ok(()) => {
+                        // Force durable now — summaries are expensive to regenerate.
+                        if let Err(e) = engine.checkpoint_persistence() {
+                            tracing::warn!("tool summary checkpoint failed: {e}");
+                        }
+                        tracing::info!("tool summaries persisted (comprehensive + restricted)");
+                    }
+                    Err(e) => tracing::warn!("tool summary persist failed: {e}"),
+                }
+            }
+
+            // Seal each mode's summary under its reserved section id, re-prefilled
+            // with the same pre-tools prefix so its KV is position-correct for
+            // "just before the tools". The Restricted projection points the tools
+            // collection at `ToolSummaryRestricted`, Comprehensive at `ToolSummary`;
+            // None emits neither.
+            for (text, reserved, label) in [
+                (comp_text, Reserved::ToolSummary, "comprehensive"),
+                (restr_text, Reserved::ToolSummaryRestricted, "restricted"),
+            ] {
+                if let Some(text) = text {
+                    let sid = SectionId::reserved(reserved);
+                    match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
+                        Ok(()) => tracing::info!(
+                            section = sid.raw(),
+                            label,
+                            "tool summary section sealed (re-prefilled before tools)",
+                        ),
+                        Err(e) => tracing::warn!(label, "tool summary section seal failed: {e}"),
+                    }
                 }
             }
         }
@@ -525,6 +565,11 @@ impl InferenceState {
         // mutex, so title generation never serialises against the request
         // path), and is joined on shutdown so its in-flight turn unwinds.
         let (titler_tx, titler_rx) = sync_channel(TITLER_QUEUE_DEPTH);
+        // Build the three per-tools-mode projection builders once, up front, so
+        // each turn only pays a cheap `Arc` clone instead of re-cloning the
+        // ~93-section schema (see `ModeBuilders`).
+        let mode_builders =
+            ModeBuilders::build(&proj_builder_refresh, &crate::tools::safe_tool_names());
         let state = Arc::new(Self {
             decoder,
             engine,
@@ -543,6 +588,7 @@ impl InferenceState {
             }),
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
+            mode_builders,
             workspace,
             tokenizer,
             tool_host: ToolHost::new(),
@@ -651,6 +697,91 @@ impl InferenceState {
 /// turns.  `<tool_call>` markup appears at the tail of those responses
 /// so the user sees the natural-language prefix streamed live and the
 /// tool markup appear at the end before the follow-up response begins.
+/// Build the projection for one tools mode by cloning `base` and filtering the
+/// `tools` collection: `Comprehensive` is the base unchanged (full catalog + the
+/// comprehensive summary); `Restricted` retains only the safe (non-high-risk)
+/// tool sections and points the collection summary at
+/// [`Reserved::ToolSummaryRestricted`]; `None` retains no members, so the
+/// `depends_on: tools` wrapper sections self-suppress and the conversation sees
+/// no tools at all. Called once per mode at startup by [`ModeBuilders::build`];
+/// the results are cached and handed out as cheap `Arc` clones each turn, since
+/// both projection and reprojection just read the swapped builder.
+fn build_mode_builder(
+    base: &Builder,
+    safe_tool_names: &HashSet<String>,
+    mode: ToolMode,
+) -> anyhow::Result<Arc<Builder>> {
+    let mut b = base.clone();
+    let dialogue = b
+        .id_for_layer("dialogue")
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'dialogue' layer"))?;
+    match mode {
+        ToolMode::Comprehensive => {}
+        ToolMode::Restricted => {
+            let coll = b
+                .id_for_collection_in(dialogue, "tools")
+                .ok_or_else(|| anyhow::anyhow!("dialogue layer missing 'tools' collection"))?;
+            b.retain_collection_sections(dialogue, "tools", safe_tool_names)
+                .map_err(|e| anyhow::anyhow!("restricted tools projection: {e}"))?;
+            b.set_collection_summary_section(
+                dialogue,
+                coll,
+                SectionId::reserved(Reserved::ToolSummaryRestricted),
+            )
+            .map_err(|e| anyhow::anyhow!("restricted tool summary: {e}"))?;
+        }
+        ToolMode::None => {
+            b.retain_collection_sections(dialogue, "tools", &HashSet::new())
+                .map_err(|e| anyhow::anyhow!("none tools projection: {e}"))?;
+        }
+    }
+    Ok(Arc::new(b))
+}
+
+/// The three per-tools-mode projection builders, built once at startup so each
+/// turn hands out a cheap `Arc` clone instead of re-cloning the ~93-section
+/// schema. A mode whose build fails falls back to the comprehensive builder so
+/// the daemon still starts.
+struct ModeBuilders {
+    none: Arc<Builder>,
+    restricted: Arc<Builder>,
+    comprehensive: Arc<Builder>,
+}
+
+impl ModeBuilders {
+    fn build(base: &Builder, safe_tool_names: &HashSet<String>) -> Self {
+        let comprehensive = Arc::new(base.clone());
+        let restricted = match build_mode_builder(base, safe_tool_names, ToolMode::Restricted) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("restricted tools projection build failed, using full catalog: {e}");
+                Arc::clone(&comprehensive)
+            }
+        };
+        let none = match build_mode_builder(base, safe_tool_names, ToolMode::None) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("none tools projection build failed, using full catalog: {e}");
+                Arc::clone(&comprehensive)
+            }
+        };
+        Self {
+            none,
+            restricted,
+            comprehensive,
+        }
+    }
+
+    /// The prebuilt projection for `mode` (a cheap `Arc` clone).
+    fn get(&self, mode: ToolMode) -> Arc<Builder> {
+        match mode {
+            ToolMode::None => Arc::clone(&self.none),
+            ToolMode::Restricted => Arc::clone(&self.restricted),
+            ToolMode::Comprehensive => Arc::clone(&self.comprehensive),
+        }
+    }
+}
+
 /// Clone the live projection builder with a high-resolution capture override.
 ///
 /// `spec` selects what to force:
@@ -682,6 +813,8 @@ fn run_inference_stream(
     sampling: Option<candle_conversation::SamplingConfig>,
     force_hires: Option<String>,
     assistant_prefill: Option<String>,
+    lossless_kv: bool,
+    tools_mode: ToolMode,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
@@ -715,7 +848,10 @@ fn run_inference_stream(
                         return;
                     }
                 };
-                let arc = Arc::new(Mutex::new(ConvState { conv }));
+                let arc = Arc::new(Mutex::new(ConvState {
+                    conv,
+                    tool_mode: ToolMode::default(),
+                }));
                 map.insert(conv_id.clone(), Arc::clone(&arc));
                 arc
             }
@@ -733,6 +869,23 @@ fn run_inference_stream(
             .set_conversation_conv_id(timeline, &conv_id)
         {
             tracing::warn!(conv_id = %conv_id, "persist conv_id failed: {e}");
+        }
+
+        // Lossless capture: seal this conversation's turns WITHOUT KV
+        // quantization — K/V persist in native R16/F16 so the provenance work
+        // gets full-resolution keys. Set before the first turn's residence is
+        // allocated so the hot→warm migration inherits it.
+        if lossless_kv {
+            state.engine.lock().unwrap().set_timeline_compression(
+                timeline,
+                Some(candle_conversation::substrate::ConvCompression {
+                    lossless: true,
+                    level: None,
+                    disable_k_override: false,
+                    force_k: None,
+                    force_v: None,
+                }),
+            );
         }
 
         // Hand the titler off to its worker, now that the timeline is
@@ -762,15 +915,24 @@ fn run_inference_stream(
 
         let mut cs = conv_arc.lock().unwrap();
 
-        // Capture aid: force a section collection (e.g. `tools`) to full
-        // resolution for this conversation by swapping its projection to a
-        // clone with that collection set to AllVisible. Both the prefill
-        // projection and the reprojection read the swapped builder, so neither
-        // filters the collection's sections.
+        // Per-conversation projection swap. Both the prefill projection and the
+        // reprojection read the swapped builder, so neither re-introduces a
+        // filtered section mid-conversation.
+        //
+        // `force_hires` is the zend capture aid (force one collection to
+        // AllVisible) and wins when present; otherwise apply the composer's
+        // tools mode — Comprehensive restores the full catalog (so switching a
+        // conversation back from Restricted/None works), Restricted drops the
+        // high-risk tools, None drops the whole catalog.
+        // `cs.tool_mode` records the mode actually applied, so the projection
+        // panel shows the matching tool summary.
         if let Some(ref coll) = force_hires {
             match build_hires_projection(&state, coll) {
                 Ok(b) => {
                     cs.conv.set_projection(b);
+                    // The capture override forces the full catalog (AllVisible),
+                    // so the panel should show the comprehensive summary.
+                    cs.tool_mode = ToolMode::Comprehensive;
                     tracing::info!(conv_id = %conv_id, collection = %coll,
                         "force-high-resolution: collection forced to AllVisible");
                 }
@@ -778,12 +940,24 @@ fn run_inference_stream(
                     tracing::warn!(conv_id = %conv_id, "force-high-resolution failed: {e}")
                 }
             }
+        } else {
+            // Cheap `Arc` clone of the prebuilt mode projection (no per-turn
+            // schema clone). Applied every turn so a mid-conversation dial change
+            // takes effect, and both projection and reprojection use it.
+            cs.conv.set_projection(state.mode_builders.get(tools_mode));
+            cs.tool_mode = tools_mode;
+            tracing::info!(conv_id = %conv_id, ?tools_mode, "tools mode applied");
         }
 
         let original_user_message = user_message.clone();
         let mut current_message = user_message;
 
-        for iteration in 0..=MAX_TOOL_ITERATIONS {
+        // The tool loop runs until the model stops emitting tool calls (i.e.
+        // produces a final answer) — there is no fixed iteration cap. A wedged
+        // model that never stops calling tools is bounded only by the client
+        // disconnecting (handled below) or the conversation being evicted, not
+        // by cutting the workflow short at an arbitrary count.
+        for iteration in 0.. {
             tracing::debug!(conv_id = %conv_id, iteration, "submitting turn");
             // Collect this turn's projection events (reprojections + decode-end)
             // so they survive a browser reload (served back on hydrate).
@@ -926,8 +1100,7 @@ fn run_inference_stream(
             // tool invocation) into the substrate as the dataset baseline, but
             // do NOT execute the tools — capture-only, so `code_run` / network
             // tools have no real side effects.
-            let is_final =
-                calls.is_empty() || iteration == MAX_TOOL_ITERATIONS || force_hires.is_some();
+            let is_final = calls.is_empty() || force_hires.is_some();
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
@@ -971,13 +1144,6 @@ fn run_inference_stream(
                 n_calls = calls.len(),
                 "dispatching tool calls",
             );
-            if iteration == MAX_TOOL_ITERATIONS - 1 {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    "tool iteration cap ({MAX_TOOL_ITERATIONS}) reached — \
-                     forcing final response on next turn",
-                );
-            }
             let results = run_tool_calls(&state.tool_host.ctx, calls);
             current_message = format_tool_responses(&results);
         }
@@ -1348,15 +1514,48 @@ impl ZendSession {
             .collect()
     }
 
-    /// Windowed-substrate view for one conversation — backs
     /// `(section name, authored content)` for every system-prompt section in the
-    /// schema. Backs the projection panel's expandable section text — resolved
-    /// on demand from the schema, never stored in the projection event. The
-    /// schema is workspace-wide, so `conv_id` is not needed.
-    pub fn section_content(&self) -> Option<Vec<(String, String)>> {
+    /// schema, plus the runtime tool summary matching this conversation's tools
+    /// mode. Backs the projection panel's expandable section text — resolved on
+    /// demand, never stored in the projection event. The schema is workspace-wide;
+    /// `conv_id` selects which tool summary (restricted vs comprehensive) to serve.
+    pub fn section_content(&self, conv_id: &str) -> Option<Vec<(String, String)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let base = state.base_conv.lock().unwrap();
-        Some(base.section_contents())
+        let mut out = {
+            let base = state.base_conv.lock().unwrap();
+            base.section_contents()
+        };
+        // The `tools` collection's summary section is generated at runtime (not a
+        // schema section), so its text isn't in `section_contents`. Serve the
+        // summary matching this conversation's tools mode — the restricted
+        // (safe-subset) summary in Restricted, the full one in Comprehensive, and
+        // none in None (no tools are projected) — under the key the projection
+        // event uses (`<collection> summary`) so the panel expands the right list.
+        // Copy the Arc out and release the conversations-map lock before locking
+        // the per-conversation state: the inference loop holds a conversation's
+        // lock for its entire decode, so locking it while still holding the map
+        // mutex would stall every other conversation's turn submission.
+        let cs = state.conversations.lock().unwrap().get(conv_id).cloned();
+        let mode = cs
+            .map(|cs| cs.lock().unwrap().tool_mode)
+            .unwrap_or_default();
+        let restricted = match mode {
+            ToolMode::None => return Some(out),
+            ToolMode::Restricted => true,
+            ToolMode::Comprehensive => false,
+        };
+        if let Some(text) = state
+            .engine
+            .lock()
+            .unwrap()
+            .conversation()
+            .read()
+            .tool_summary_text(restricted)
+            .map(str::to_string)
+        {
+            out.push(("tools summary".to_string(), text));
+        }
+        Some(out)
     }
 
     /// The target (dialogue) layer's name, for the panel's conversation prefix.
@@ -1612,6 +1811,8 @@ impl ZendSession {
         conv_id: String,
         force_hires: Option<String>,
         assistant_prefill: Option<String>,
+        lossless_kv: bool,
+        tools_mode: ToolMode,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         self.submit_with_sampling(
             messages,
@@ -1620,6 +1821,8 @@ impl ZendSession {
             None,
             force_hires,
             assistant_prefill,
+            lossless_kv,
+            tools_mode,
         )
         .await
     }
@@ -1640,6 +1843,8 @@ impl ZendSession {
         sampling: Option<candle_conversation::SamplingConfig>,
         force_hires: Option<String>,
         assistant_prefill: Option<String>,
+        lossless_kv: bool,
+        tools_mode: ToolMode,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         let last_user = messages
             .iter()
@@ -1705,6 +1910,8 @@ impl ZendSession {
                     sampling,
                     force_hires,
                     assistant_prefill,
+                    lossless_kv,
+                    tools_mode,
                 );
                 while let Some(item) = ts.next().await {
                     if tx.send(item).await.is_err() {
