@@ -91,6 +91,7 @@ mod conversation {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                candle_conversation::SelectionState::default(),
             )
             .await;
 

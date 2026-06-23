@@ -4655,4 +4655,279 @@ layers:
         let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
         assert!(b.id_for_layer("dialogue").is_some());
     }
+
+    // —— Section tree (optional toggles + N-way selectors) ————————————————————————
+
+    const TREE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: no_think
+              content: "/no_think"
+              default: present
+            - kind: section
+              id: role
+              content: "You are an assistant."
+            - kind: selector
+              id: length
+              default: standard
+              options:
+                - id: terse
+                  content: "Be terse."
+                - id: standard
+                  content: "Be balanced."
+                - id: verbose
+                  content: "Be verbose."
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+    fn tree_target(b: &Builder) -> ProjectionTarget {
+        ProjectionTarget {
+            layer: b.id_for_layer("dialogue").unwrap(),
+            group: b.id_for_group("convo").unwrap(),
+            timeline: TimelineId::for_test(1),
+        }
+    }
+
+    fn dialogue_tree(b: &Builder) -> &crate::projection::SectionTree {
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        b.layer(dialogue)
+            .unwrap()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|it| match it {
+                crate::projection::SystemPromptItem::SectionTree(t) => Some(t),
+                _ => None,
+            })
+            .expect("dialogue layer has a section_tree")
+    }
+
+    /// The sealed variant id of `node`'s `option` for the given dim selection.
+    fn opt_var(b: &Builder, node: &str, option: &str, selection: &[u8]) -> SectionId {
+        let tree = dialogue_tree(b);
+        let n = tree.nodes.iter().find(|n| n.name == node).unwrap();
+        let o = n.options.iter().find(|o| o.id == option).unwrap();
+        o.variant_for(tree.pack(selection, n.ancestor_dims))
+            .expect("variant sealed for this branch")
+            .id
+    }
+
+    #[test]
+    fn section_tree_default_emits_default_selection() {
+        use crate::projection::{ProjectionMode, ResolvedSelection, SelectionState};
+        let b = Builder::from_yaml(TREE_YAML).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        // Declared names resolve to the default-selection variant.
+        let no_think = b.id_for_section_in(dialogue, "no_think").unwrap();
+        let role = b.id_for_section_in(dialogue, "role").unwrap();
+        let length = b.id_for_section_in(dialogue, "length").unwrap();
+        let resolver = MockResolver::new();
+
+        // Empty state → defaults: no_think present, role, length=standard.
+        let proj = b.project_with_selection(
+            tree_target(&b),
+            &resolver,
+            ProjectionMode::Decode,
+            &SelectionState::default(),
+        );
+        let ids: Vec<SectionId> = proj.sealed_sections().map(|s| s.id).collect();
+        assert_eq!(ids, vec![no_think, role, length]);
+        // Both selectors report the option they emitted, by id.
+        assert_eq!(
+            proj.selections,
+            vec![
+                ResolvedSelection {
+                    selector: "no_think".to_string(),
+                    option: "present".to_string(),
+                },
+                ResolvedSelection {
+                    selector: "length".to_string(),
+                    option: "standard".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn section_tree_optional_absent_drops_node_and_reprefixes() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let b = Builder::from_yaml(TREE_YAML).unwrap();
+        let resolver = MockResolver::new();
+
+        let mut sel = SelectionState::new();
+        sel.select("no_think", "absent");
+        let proj =
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
+
+        // no_think absent ⇒ it emits nothing; role + length still emit, but as
+        // their ABSENT-branch variants (sealed without no_think above them).
+        let ids: Vec<SectionId> = proj.sealed_sections().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                opt_var(&b, "role", "content", &[1, 1]),
+                opt_var(&b, "length", "standard", &[1, 1]),
+            ]
+        );
+        // Distinct from the present-branch (default) variants.
+        assert_ne!(
+            opt_var(&b, "role", "content", &[1, 1]),
+            opt_var(&b, "role", "content", &[0, 1]),
+        );
+    }
+
+    #[test]
+    fn section_tree_selector_override_emits_chosen_option() {
+        use crate::projection::{ProjectionMode, ResolvedSelection, SelectionState};
+        let b = Builder::from_yaml(TREE_YAML).unwrap();
+        let resolver = MockResolver::new();
+
+        let mut sel = SelectionState::new();
+        sel.select("length", "verbose");
+        let proj =
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
+
+        let ids: Vec<SectionId> = proj.sealed_sections().map(|s| s.id).collect();
+        // no_think present (default), role, length=verbose (overridden).
+        assert_eq!(ids[2], opt_var(&b, "length", "verbose", &[0, 2]));
+        assert_ne!(ids[2], opt_var(&b, "length", "standard", &[0, 1]));
+        assert!(proj.selections.contains(&ResolvedSelection {
+            selector: "length".to_string(),
+            option: "verbose".to_string(),
+        }));
+    }
+
+    #[test]
+    fn section_tree_seals_full_cross_product_with_correct_prefixes() {
+        let b = Builder::from_yaml(TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+        let no_think = tree.nodes.iter().find(|n| n.name == "no_think").unwrap();
+        let role = tree.nodes.iter().find(|n| n.name == "role").unwrap();
+        let length = tree.nodes.iter().find(|n| n.name == "length").unwrap();
+
+        // Two dims: no_think (radix 2), length (radix 3); defaults present/standard.
+        assert_eq!(tree.dims.len(), 2);
+        assert_eq!(tree.default_selection, vec![0, 1]);
+
+        // no_think: `present` has 1 variant (root), `absent` is empty (0).
+        let present = no_think.options.iter().find(|o| o.id == "present").unwrap();
+        let absent = no_think.options.iter().find(|o| o.id == "absent").unwrap();
+        assert_eq!(present.variants.len(), 1);
+        assert!(present.variants[0].in_tree_prefix.is_empty());
+        assert!(absent.variants.is_empty());
+
+        // role (mandatory): one variant per no_think branch (2).
+        let role_opt = &role.options[0];
+        assert_eq!(role_opt.variants.len(), 2);
+        assert_eq!(
+            role_opt.variant_for(0).unwrap().in_tree_prefix,
+            vec![present.variants[0].id] // present branch attends to no_think
+        );
+        assert!(role_opt.variant_for(1).unwrap().in_tree_prefix.is_empty()); // absent branch
+
+        // length: each of 3 options × 2 no_think branches = 6 variants.
+        assert_eq!(
+            length
+                .options
+                .iter()
+                .map(|o| o.variants.len())
+                .sum::<usize>(),
+            6
+        );
+        let std = length.options.iter().find(|o| o.id == "standard").unwrap();
+        // length.standard on the present branch attends to [no_think, role].
+        assert_eq!(
+            std.variant_for(0).unwrap().in_tree_prefix,
+            vec![present.variants[0].id, role_opt.variant_for(0).unwrap().id]
+        );
+    }
+
+    #[test]
+    fn section_tree_invalid_optional_default_rejected() {
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: x
+              content: "x"
+              default: maybe
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let err = Builder::from_yaml(yaml).unwrap_err();
+        assert!(
+            matches!(err, ConstructionError::InvalidToggleDefault { ref value, .. } if value == "maybe"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn section_tree_unknown_selector_default_rejected() {
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: selector
+              id: length
+              default: nope
+              options:
+                - id: terse
+                  content: "a"
+                - id: standard
+                  content: "b"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let err = Builder::from_yaml(yaml).unwrap_err();
+        assert!(
+            matches!(err, ConstructionError::UnknownTreeOption { ref option, .. } if option == "nope"),
+            "got {err:?}",
+        );
+    }
 }

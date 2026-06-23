@@ -390,6 +390,25 @@ fn build_selection(
                         });
                     }
                 }
+                SystemPromptItem::SectionTree(t) => {
+                    // A node emitted exactly one option's branch variant; show
+                    // the node (and chosen option, for selectors) with its tokens.
+                    for n in &t.nodes {
+                        for o in &n.options {
+                            if let Some(v) = o.variants.iter().find(|v| selected.contains(&v.id)) {
+                                let name = if n.options.len() > 1 {
+                                    format!("{}:{}", n.name, o.id)
+                                } else {
+                                    n.name.clone()
+                                };
+                                system.push(SystemItem::Section {
+                                    name,
+                                    tokens: resolver.section_token_count(v.id) as u32,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }

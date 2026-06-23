@@ -71,6 +71,12 @@ fn build_projection(
                     prelude_ids.push(s.id);
                 }
             }
+            SystemPromptItem::SectionTree(t) => {
+                for n in &t.nodes {
+                    prelude_text.push_str(&n.options[n.chosen(&t.default_selection)].content);
+                }
+                prelude_ids.extend(t.default_present_ids.iter().copied());
+            }
             SystemPromptItem::Collection(_) => break,
         }
     }

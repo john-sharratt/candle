@@ -87,6 +87,7 @@ mod tool_scenarios {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                candle_conversation::SelectionState::default(),
             )
             .await;
 
@@ -101,6 +102,12 @@ mod tool_scenarios {
                 StreamItem::Token(tok) => {
                     eprint!("{tok}");
                     response.push_str(&tok);
+                }
+                StreamItem::Projection(projection_event_out) => {
+                    eprintln!(
+                        "\n[PROJECTION EVENT] {}",
+                        projection_event_out.projection_event
+                    );
                 }
             }
         }

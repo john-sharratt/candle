@@ -13,6 +13,9 @@
 //!   summary               file + superblock overview, record histogram, live/dead
 //!   headers               every record in append order (offset/type/ids/sizes)
 //!   streams               per-stream manifest (turns + prompt sections)
+//!   sections              prompt sections grouped by name, with per-branch
+//!                         content address + KV fingerprint (verifies a
+//!                         section-tree's branch variants were sealed distinctly)
 //!   chunks  <stream-id>   KV chunk records for a stream (format, sizes, bytes)
 //!   tokens  <stream-id>   decode a stream's Tokens record to token ids
 //!   meta                  the live ModelSpec / Template payloads
@@ -30,20 +33,23 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use std::collections::BTreeMap;
+
 use candle_conversation::persistence::checkpoint;
 use candle_conversation::persistence::compaction;
+use candle_conversation::persistence::content_hash::ContentHash;
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
 use candle_conversation::persistence::manifest::Manifest;
 use candle_conversation::persistence::record::{
     ChunkPayload, Record, RecordType, ToolSummaryPayload,
 };
 use candle_conversation::persistence::resume::decode_token_ids;
-use candle_conversation::persistence::streams::{StreamDecl, StreamId};
+use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId};
 use candle_conversation::persistence::walker;
 use candle_conversation::projection::{
     decode_events, ProjectionEvent, SystemItem, TimelineId, TurnIndex,
 };
-use candle_conversation::substrate::Substrate;
+use candle_conversation::substrate::{StreamRuntime, Substrate};
 use candle_conversation::summary_tree::TurnKind;
 use candle_nn::kv_cache::KvFormat;
 use tokenizers::Tokenizer;
@@ -77,6 +83,11 @@ enum Cmd {
     Headers,
     /// Per-stream manifest view (turns and prompt sections).
     Streams,
+    /// Prompt sections grouped by name, each variant with its content address
+    /// (prefix + section hash) and a KV fingerprint. A section-tree's branch
+    /// variants share a name and `section_hash` but differ in `prefix_hash` and
+    /// KV — this view proves that directly from the persisted bytes.
+    Sections,
     /// KV chunk records for one stream.
     Chunks {
         /// Stream id, decimal or `0x`-hex.
@@ -136,6 +147,7 @@ fn main() -> Result<()> {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::Headers => headers(&mut log)?,
         Cmd::Streams => streams(&mut log)?,
+        Cmd::Sections => sections(&mut log, &log_path)?,
         Cmd::Chunks { stream_id, preview } => {
             chunks(&mut log, parse_stream_id(&stream_id)?, preview)?
         }
@@ -550,8 +562,7 @@ fn headers(log: &mut LogFile) -> Result<()> {
 
 fn streams(log: &mut LogFile) -> Result<()> {
     let substrate = build_substrate(log)?;
-    let mut streams: Vec<(StreamId, &candle_conversation::substrate::StreamRuntime)> =
-        substrate.all_streams().collect();
+    let mut streams: Vec<(StreamId, &StreamRuntime)> = substrate.all_streams().collect();
     if streams.is_empty() {
         println!("(no streams)");
         return Ok(());
@@ -680,6 +691,196 @@ fn print_fmt_distribution(label: &str, dist: &std::collections::HashMap<u8, usiz
             0.0
         };
         println!("  {name:<22} {count:>9}  ({pct:>5.1}%)");
+    }
+}
+
+/// Prompt sections grouped by name, each variant with its content address and a
+/// KV fingerprint over its persisted chunks.
+///
+/// A section-tree's branch variants share a name and `section_hash` (identical
+/// tokens) but were sealed under different prefixes, so they differ in
+/// `prefix_hash` — and therefore in their actual K/V.  This view proves that
+/// straight from the persisted bytes: it reads every variant's chunk records and
+/// hashes the quantized `kv_bytes`, then flags whether the branches' content
+/// matches while their prefix + KV diverge.
+fn sections(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
+    let substrate = build_substrate(log)?;
+    // Decode a short content preview per group so each branched node is
+    // identifiable (`frame`, `thinking_effort.deep`, …) — the persisted
+    // debug_name is only `section_<id>`.
+    let tok = load_log_tokenizer(log_path)?;
+
+    // Collect every prompt-section stream with its content address. Section
+    // NAMES are per-layer (titler, repo_map, dialogue all declare a `frame`), so
+    // the robust key for "branch variants of one node" is the SECTION HASH: same
+    // tokens sealed under different prefixes. Group by that.
+    struct Sec {
+        id: StreamId,
+        name: String,
+        addr: ContentAddress,
+    }
+    let mut all: Vec<Sec> = Vec::new();
+    for (id, entry) in substrate.all_streams() {
+        if let Some(StreamDecl::PromptSection(s)) = &entry.decl {
+            all.push(Sec {
+                id,
+                name: s.debug_name.clone(),
+                addr: s.address,
+            });
+        }
+    }
+    if all.is_empty() {
+        println!("(no prompt-section streams)");
+        return Ok(());
+    }
+
+    let mut by_content: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
+    for (i, s) in all.iter().enumerate() {
+        by_content
+            .entry((s.addr.section_hash.hi, s.addr.section_hash.lo))
+            .or_default()
+            .push(i);
+    }
+    let branched = by_content.values().filter(|v| v.len() > 1).count();
+    println!(
+        "{} prompt-section streams, {} distinct contents, {} branched \
+         (same content sealed under multiple prefixes)\n",
+        all.len(),
+        by_content.len(),
+        branched,
+    );
+
+    // Detail every branched section — these are the section-tree nodes.
+    for idxs in by_content.values() {
+        if idxs.len() < 2 {
+            continue;
+        }
+        let preview = stream_preview(log, &substrate, all[idxs[0]].id, &tok);
+        println!(
+            "content {}  ({} branch variants)   {preview}",
+            hash_hex(all[idxs[0]].addr.section_hash),
+            idxs.len(),
+        );
+        let mut kv_hashes = Vec::new();
+        let mut prefixes = Vec::new();
+        for &i in idxs {
+            let s = &all[i];
+            let entry = substrate.stream_of(s.id).expect("listed stream is present");
+            let (kv_hash, chunks, kv_bytes) = fingerprint_stream(log, entry)?;
+            kv_hashes.push(kv_hash);
+            prefixes.push(s.addr.prefix_hash);
+            println!(
+                "   {:<14} {}  prefix={}  chunks={chunks:>3}  kv={kv_bytes:>8}B  kvhash=0x{kv_hash:016x}",
+                format!("\"{}\"", s.name),
+                stream_hex(s.id.0),
+                hash_hex(s.addr.prefix_hash),
+            );
+        }
+        let distinct_prefix = all_distinct(&prefixes);
+        let distinct_kv = all_distinct(&kv_hashes);
+        let verdict = if distinct_prefix && distinct_kv {
+            "✓ branches sealed independently (distinct prefix ⇒ distinct K/V)"
+        } else {
+            "✗ unexpected — branches may have collapsed"
+        };
+        println!(
+            "   → distinct prefix: {}   distinct KV: {}   {verdict}\n",
+            yn(distinct_prefix),
+            yn(distinct_kv),
+        );
+    }
+    if branched == 0 {
+        println!("(no branched sections — every prompt section has a single prefix)");
+    }
+    Ok(())
+}
+
+/// Decode a stream's first non-blank content line (truncated) from its `Tokens`
+/// record, for an at-a-glance "which section is this".  Falls back to a token
+/// count when no tokenizer sidecar is present.
+fn stream_preview(
+    log: &mut LogFile,
+    substrate: &Substrate,
+    sid: StreamId,
+    tok: &Option<Tokenizer>,
+) -> String {
+    let Some(loc) = substrate.stream_of(sid).and_then(|s| s.tokens) else {
+        return String::new();
+    };
+    let ids = match read_record_at(log, loc.offset, loc.record_size) {
+        Ok(rec) => match decode_token_ids(&rec.payload) {
+            Ok(ids) => ids,
+            Err(_) => return String::new(),
+        },
+        Err(_) => return String::new(),
+    };
+    let Some(t) = tok else {
+        return format!("({} tokens)", ids.len());
+    };
+    let text = t.decode(&ids, false).unwrap_or_default();
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let truncated: String = line.chars().take(64).collect();
+    if line.chars().count() > 64 {
+        format!("\"{truncated}…\"")
+    } else {
+        format!("\"{truncated}\"")
+    }
+}
+
+/// FNV-1a over a stream's persisted chunk records — the quantized `kv_bytes`
+/// plus palettes + scales, walked in chunk-index order.  Returns `(hash,
+/// chunk_count, kv_byte_total)`.
+fn fingerprint_stream(log: &mut LogFile, entry: &StreamRuntime) -> Result<(u64, usize, usize)> {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64 offset basis
+    let mut chunk_count = 0usize;
+    let mut kv_total = 0usize;
+    for loc in entry.chunks.values() {
+        let rec = read_record_at(log, loc.offset, loc.record_size)?;
+        let p = ChunkPayload::decode(&rec.payload)?;
+        fnv_mix(&mut h, &p.kv_bytes);
+        fnv_mix(&mut h, &p.k_pal);
+        fnv_mix(&mut h, &p.v_pal);
+        for s in &p.k_scale {
+            fnv_mix(&mut h, &s.to_le_bytes());
+        }
+        for s in &p.v_scale {
+            fnv_mix(&mut h, &s.to_le_bytes());
+        }
+        chunk_count += 1;
+        kv_total += p.kv_bytes.len();
+    }
+    Ok((h, chunk_count, kv_total))
+}
+
+fn fnv_mix(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// 128-bit content hash as full `hi:lo` hex.
+fn hash_hex(h: ContentHash) -> String {
+    format!("{:016x}{:016x}", h.hi, h.lo)
+}
+
+fn all_distinct<T: Eq + std::hash::Hash + Clone>(xs: &[T]) -> bool {
+    xs.iter()
+        .cloned()
+        .collect::<std::collections::HashSet<T>>()
+        .len()
+        == xs.len()
+}
+
+fn yn(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "NO"
     }
 }
 

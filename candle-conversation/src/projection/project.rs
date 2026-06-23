@@ -281,6 +281,111 @@ pub struct GeneratedIdentity {
 #[derive(Debug, Clone, Default)]
 pub struct Projection {
     pub segments: Vec<ProjectionSegment>,
+    /// Section-tree selectors as resolved for this projection — which option each
+    /// selector emitted, addressed by their string ids.  Empty when the target
+    /// layer has no [`super::SectionTree`].
+    pub selections: Vec<ResolvedSelection>,
+}
+
+/// The section-tree selector id the engine reads to drive per-turn thinking
+/// suppression.  The dialogue schema authors an `optional` node with this id;
+/// [`OptionalState::Present`] suppresses reasoning for the turn, [`Absent`]
+/// enables it.  The contract lives here (not as scattered `"no_think"` literals)
+/// so the schema author, the dial mapping, and the suppression read can't drift.
+///
+/// [`Absent`]: OptionalState::Absent
+pub const NO_THINK_SELECTOR: &str = "no_think";
+
+/// The two states of an `optional` section-tree node: whether its content is
+/// projected (`Present`) or omitted (`Absent`).
+///
+/// Unlike a selector's *option* ids (which are authored in YAML and so are
+/// inherently dynamic strings), these two ids are a fixed convention the
+/// `optional` lowering synthesizes — a closed set the engine owns.  This enum is
+/// the typed form; [`Self::as_id`] / [`Self::from_id`] are the only place the
+/// `"present"` / `"absent"` strings are defined, so a typo can't silently slip
+/// past the compiler and fall through to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalState {
+    Present,
+    Absent,
+}
+
+impl OptionalState {
+    /// The synthesized option id this state serializes to in a [`SelectionState`].
+    pub const fn as_id(self) -> &'static str {
+        match self {
+            OptionalState::Present => "present",
+            OptionalState::Absent => "absent",
+        }
+    }
+
+    /// Parse an `optional` node's option id back to its typed state; `None` for
+    /// any id that isn't one of the two synthesized optional ids.
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "present" => Some(OptionalState::Present),
+            "absent" => Some(OptionalState::Absent),
+            _ => None,
+        }
+    }
+}
+
+/// Runtime override of section-tree selectors for one projection.
+///
+/// Maps a selector id (a dimension node's declared name) to the chosen option
+/// id.  Any selector absent from the map falls back to its authored default, so
+/// an empty state reproduces the schema defaults exactly.
+///
+/// Selector and option ids are `String`s by necessity — they are authored in
+/// the projection YAML, so the override map is data-driven and can't be a closed
+/// Rust type.  For the engine's own closed conventions (the `optional`
+/// present/absent state), use the typed [`Self::optional`] / [`Self::set_optional`]
+/// accessors rather than bare string literals.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionState {
+    chosen: HashMap<String, String>,
+}
+
+impl SelectionState {
+    /// An empty selection — every selector falls back to its authored default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Select a selector's option by id.  Returns `&mut self` for chaining.
+    pub fn select(&mut self, selector: impl Into<String>, option: impl Into<String>) -> &mut Self {
+        self.chosen.insert(selector.into(), option.into());
+        self
+    }
+
+    /// Set an `optional` selector to a typed [`OptionalState`].  Returns
+    /// `&mut self` for chaining.  Prefer this over `select(id, "present")` so the
+    /// present/absent ids stay in one place.
+    pub fn set_optional(&mut self, selector: impl Into<String>, state: OptionalState) -> &mut Self {
+        self.select(selector, state.as_id())
+    }
+
+    /// The chosen option id for a selector, if one was set.
+    pub fn get(&self, selector: &str) -> Option<&str> {
+        self.chosen.get(selector).map(String::as_str)
+    }
+
+    /// The typed state of an `optional` selector.  `None` when the selector is
+    /// unset (the caller falls back to its schema/config default) or resolves to
+    /// an id that isn't one of the optional present/absent ids.
+    pub fn optional(&self, selector: &str) -> Option<OptionalState> {
+        self.get(selector).and_then(OptionalState::from_id)
+    }
+}
+
+/// One section-tree selector as resolved for a projection — the selector id and
+/// the option it emitted.  Carried on [`Projection::selections`] so callers
+/// (GUI, runtime) know exactly which option fired and can address it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSelection {
+    pub selector: String,
+    pub option: String,
 }
 
 impl Projection {
@@ -356,8 +461,9 @@ pub fn run<R: ContentResolver>(
     target: ProjectionTarget,
     resolver: &R,
     mode: ProjectionMode,
+    selection: &SelectionState,
 ) -> Projection {
-    run_with_sink(schema, target, resolver, mode, &mut |_| {})
+    run_with_sink(schema, target, resolver, mode, selection, &mut |_| {})
 }
 
 /// Variant of [`run`] that delivers score-density [`SelectionDiagnostics`]
@@ -377,6 +483,7 @@ pub fn run_with_sink<R: ContentResolver>(
     target: ProjectionTarget,
     resolver: &R,
     mode: ProjectionMode,
+    selection: &SelectionState,
     sink: &mut dyn FnMut(SelectionDiagnostics),
 ) -> Projection {
     // ── Step 1: Mask ─────────────────────────────────────────────────────────
@@ -556,16 +663,18 @@ pub fn run_with_sink<R: ContentResolver>(
     // system prompt mix always-emit framing (role, grounding,
     // dialect markers) with dynamic catalogs (tool definitions,
     // retrieval candidates) at well-defined positions.
+    let mut resolved_selections: Vec<ResolvedSelection> = Vec::new();
     let system_prompt_segments: Vec<ProjectionSegment> = schema
         .layers
         .iter()
         .find(|l| l.id == target.layer)
-        .map(|l| emit_system_prompt_items(l, resolver, mode))
+        .map(|l| emit_system_prompt_items(l, resolver, mode, selection, &mut resolved_selections))
         .unwrap_or_default();
 
     if group_states.is_empty() {
         return Projection {
             segments: system_prompt_segments,
+            selections: resolved_selections,
         };
     }
 
@@ -746,7 +855,10 @@ pub fn run_with_sink<R: ContentResolver>(
             .into_iter()
             .map(|t| ProjectionSegment::Sealed(SealedKind::Turn(t, crate::Role::Assistant))),
     );
-    Projection { segments }
+    Projection {
+        segments,
+        selections: resolved_selections,
+    }
 }
 
 /// Walk a layer's `system_prompt.items` in declaration order, emitting
@@ -759,6 +871,8 @@ fn emit_system_prompt_items<R: ContentResolver>(
     layer: &LayerSchema,
     resolver: &R,
     mode: ProjectionMode,
+    selection_state: &SelectionState,
+    resolved_selections: &mut Vec<ResolvedSelection>,
 ) -> Vec<ProjectionSegment> {
     let scoring = mode.collection_scoring();
     let mut out: Vec<ProjectionSegment> = Vec::new();
@@ -814,6 +928,32 @@ fn emit_system_prompt_items<R: ContentResolver>(
                         }
                     }
                     out.extend(selected);
+                }
+            }
+            SystemPromptItem::SectionTree(tree) => {
+                // Resolve the active selection (runtime overrides over authored
+                // defaults), then emit each node's chosen option's PRE-SEALED
+                // variant for that branch — the one whose substrate K/V was
+                // prefilled with exactly this branch's prefix, so the nodes
+                // attend to each other correctly with no re-prefill. Each
+                // selector's resolved option is recorded so the caller knows what
+                // fired, addressed by id.
+                let selection = tree.selection(|id| selection_state.get(id));
+                for node in &tree.nodes {
+                    let opt_idx = node.chosen(&selection);
+                    let option = &node.options[opt_idx];
+                    if let Some(sel_id) = node.selector_id() {
+                        resolved_selections.push(ResolvedSelection {
+                            selector: sel_id.to_string(),
+                            option: option.id.clone(),
+                        });
+                    }
+                    // Empty options (e.g. a binary node's `absent`) emit nothing.
+                    if let Some(v) = option.variant_for(tree.pack(&selection, node.ancestor_dims)) {
+                        out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                            ResolvedSection { id: v.id },
+                        )));
+                    }
                 }
             }
         }

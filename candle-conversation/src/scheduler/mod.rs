@@ -26,7 +26,7 @@ use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
     Builder, CompressionPrompt, Conversation, GeneratedIdentity, GroupId, ProjectionMode,
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind, SectionId,
-    SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey,
+    SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey,
 };
 use crate::provenance::{
     extract_mh_signatures_from_r16_dump, merge_turn_signatures_xor, BdpScanner, SigEntry,
@@ -37,7 +37,6 @@ use crate::substrate::{ResidenceIndex, TurnContentBounds, TurnPartWrite};
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, SelectionDiagnostics, SummariserTrigger, TurnKind,
 };
-use crate::think_strip::{strip_think_blocks, strip_think_blocks_keep_layout};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::{ProvenanceFile, SubstrateReloadStatus, TurnStats};
@@ -447,6 +446,9 @@ fn record_phase(start: Instant, phase: &'static str) {
 pub(crate) struct ReprojectionPolicy {
     pub(crate) target: ProjectionTarget,
     pub(crate) projection: Arc<Builder>,
+    /// Section-tree selection (the composer dials), so decode reprojection emits
+    /// the same selector options as the initial prefill.
+    pub(crate) selection: SelectionState,
     pub(crate) substrate: Conversation,
     pub(crate) provenance: Arc<ProvenanceFile>,
     pub(crate) provenance_layer_indices: ProvenanceLayerIndices,
@@ -487,6 +489,8 @@ pub(crate) struct ReprojectionPolicy {
 #[derive(Clone)]
 pub(crate) struct ProjectionInputs {
     pub projection: Arc<Builder>,
+    /// Section-tree selection for this turn's projection (the composer dials).
+    pub selection: SelectionState,
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -578,7 +582,10 @@ struct DecodeState {
     post_decode_tokens: TokenBuffer,
     /// Full prefill token sequence pinned into the slot at this
     /// turn's submit:
-    /// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block]`.
+    /// `[user_msg][user_end][assistant_start]` — a *suppressed* turn bakes an
+    /// empty `<think></think>` right after `assistant_start`, and the
+    /// `insert_turn` path additionally prepends `/no_think`.  A *thinking*
+    /// turn's `<think>` is NOT here: the model emits it into `generated_tokens`.
     /// Concatenated with `generated_tokens` and `post_decode_tokens`
     /// at seal time to form `TurnContent::token_ids` — the
     /// cross-process replay sequence persisted to the redo log.
@@ -1636,6 +1643,7 @@ impl Scheduler {
                         target,
                         &view,
                         ProjectionMode::Prefill,
+                        &inputs.selection,
                         &mut |diag| {
                             diag_to_write = Some((target.timeline, diag));
                         },
@@ -3333,8 +3341,8 @@ impl Scheduler {
         prefill_token_count: usize,
     ) {
         let skip = !self.show_special_tokens;
+        // Persist verbatim (see the main finish path) — no think-stripping here.
         let text = self.tokenizer.decode(&[token], skip).unwrap_or_default();
-        let text = strip_think_blocks(&text);
         let total_ms = turn_start.elapsed().as_secs_f64() * 1000.0;
         let _ = event_tx.send(TurnEvent::Done(TurnResponse {
             text,
@@ -3619,14 +3627,17 @@ impl Scheduler {
                 };
 
                 let skip = !self.show_special_tokens;
+                // Persist the reply VERBATIM — including its `<think>…</think>`
+                // reasoning — so the stored text matches the sealed token_ids and
+                // a substrate reload renders identically to the live stream. The
+                // `<think>` block is part of the response; consumers that don't
+                // want it strip at the point of use (the summariser strips its own
+                // output), and the KV already carries the reasoning tokens either
+                // way. Stripping here would silently drop reasoning on F5/reload.
                 let text = self
                     .tokenizer
                     .decode(&state.generated_tokens, skip)
                     .unwrap_or_default();
-                // Keep the reply's line structure (paragraphs, lists, code
-                // indentation) so it re-renders correctly on substrate reload;
-                // only the <think> reasoning is removed.
-                let text = strip_think_blocks_keep_layout(&text);
                 // Snapshot stats before any view finalize, since the view
                 // slot is dropped during finalize and its sequence stats
                 // become unavailable.
@@ -5533,10 +5544,12 @@ impl Scheduler {
             // Prefill mode: the section corpus is prefill-Q of tool
             // descriptions, so reprojection scores it with the calibrated
             // prefill profile (Max / semantic, no threshold gate).
-            let projection =
-                policy
-                    .projection
-                    .project_with_mode(policy.target, &view, ProjectionMode::Prefill);
+            let projection = policy.projection.project_with_mode(
+                policy.target,
+                &view,
+                ProjectionMode::Prefill,
+                &policy.selection,
+            );
             // Walk segments once, populating both the elevate side-lists
             // and the segment list `apply_projection` will diff against
             // the slot's previous projection.

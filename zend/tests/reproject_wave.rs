@@ -137,6 +137,7 @@ mod wave {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                candle_conversation::SelectionState::default(),
             )
             .await;
         let mut n = 0usize;
@@ -148,6 +149,7 @@ mod wave {
                     text.push_str(&t);
                     n += 1;
                 }
+                StreamItem::Projection(projection_event_out) => {}
             }
         }
         (n, text)

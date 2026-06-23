@@ -646,7 +646,7 @@ pub struct SectionEntryData {
 /// One turn's pinned content in the substrate.  The turn's K/V
 /// chunks are a single contiguous block addressing the persisted
 /// token sequence
-/// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`
+/// `[user_msg][user_end][assistant_start][response]`
 /// — the inter-turn `user_start` head and `assistant_end` tail are
 /// **not** persisted: the projection assembler re-emits them as
 /// live `Generated` runs at every cross-turn boundary so their K
@@ -655,11 +655,58 @@ pub struct SectionEntryData {
 /// because its semantic context (the turn's own user message and
 /// decoded response) is invariant across projections.
 ///
+/// A thinking turn's reasoning is part of `[response]`: the model
+/// opens its own `<think>…</think>` as the first decoded tokens.  A
+/// suppressed turn instead carries an empty `<think></think>` baked
+/// right after `assistant_start`, so its `[response]` is the answer
+/// alone; prefilled (inserted) turns additionally prepend a
+/// `/no_think` and are always suppressed.
+///
 /// The text fields (`user_text` / `assistant_text`) carry the
 /// human-readable strings exactly as the caller had them at
-/// submit time — no role markers, no `/no_think` prefix.  They're
-/// stored verbatim so the sidebar reload path renders without any
-/// re-tokenising or boundary scanning.
+/// submit time — no role markers, no `/no_think` prefix.
+/// `assistant_text` is the verbatim decoded reply, **including** any
+/// `<think>…</think>` reasoning, so the sidebar reload path renders
+/// exactly what streamed without re-tokenising or boundary scanning.
+#[derive(Debug, Clone)]
+pub struct TurnPart {
+    /// The user's message text, exactly as `submit_turn` received it
+    /// — no role-marker envelope, no `/no_think` prefix, no
+    /// boundary tokens.  Stored verbatim so the sidebar can render
+    /// it without re-tokenising or pattern-matching at read time.
+    pub user_text: String,
+    /// The assistant's reply text — the decoded body of the model's
+    /// response with special tokens skipped.  Same "what the caller
+    /// already has" rule as `user_text`.
+    pub assistant_text: String,
+    /// Total token count this turn pins onto the slot — sum of the
+    /// K/V chunk's `token_count` fields.  Holds the invariant
+    /// `token_count == token_ids.len()` — every persisted token id
+    /// has a corresponding slot position in the K/V chunk grid.  The
+    /// decode-loop trailing-terminator (EOS or max-tokens edge token,
+    /// sampled but never forwarded) is trimmed at seal time to
+    /// preserve this; a `debug_assert_eq!` at the seal site guards
+    /// against any future regression.
+    pub token_count: usize,
+    /// Combined turn token ids in slot order:
+    /// `[user_msg][user_end][assistant_start][response]`.
+    /// Stored as one buffer because the K/V chunk grid pins this
+    /// exact sequence; the persisted `Tokens` record carries the
+    /// same bytes so cross-process replay (`recover_turn`)
+    /// reconstructs the slot K/V exactly.
+    pub token_ids: TokenBuffer,
+    /// Content boundaries that frame the user-message body and the
+    /// assistant-response body inside the sealed grid — see
+    /// [`TurnContentBounds`].  The compressor windows the sealed K/V to
+    /// these boundaries so it injects content-only halves with no template
+    /// markers.  All-zero where the boundaries are genuinely unknown.
+    pub content_bounds: TurnContentBounds,
+    pub sig_entries: Vec<SigEntry>,
+    /// Slot in [`Substrate::residence`] holding this turn's
+    /// hot/warm/cold KV state.
+    pub residence: ResidenceIndex,
+}
+
 /// The three content boundaries that frame a turn's user-message body
 /// and assistant-response body inside the sealed K/V grid.
 ///
@@ -710,45 +757,6 @@ impl TurnContentBounds {
             asst_start: as_ as u32,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct TurnPart {
-    /// The user's message text, exactly as `submit_turn` received it
-    /// — no role-marker envelope, no `/no_think` prefix, no
-    /// boundary tokens.  Stored verbatim so the sidebar can render
-    /// it without re-tokenising or pattern-matching at read time.
-    pub user_text: String,
-    /// The assistant's reply text — the decoded body of the model's
-    /// response with special tokens skipped.  Same "what the caller
-    /// already has" rule as `user_text`.
-    pub assistant_text: String,
-    /// Total token count this turn pins onto the slot — sum of the
-    /// K/V chunk's `token_count` fields.  Holds the invariant
-    /// `token_count == token_ids.len()` — every persisted token id
-    /// has a corresponding slot position in the K/V chunk grid.  The
-    /// decode-loop trailing-terminator (EOS or max-tokens edge token,
-    /// sampled but never forwarded) is trimmed at seal time to
-    /// preserve this; a `debug_assert_eq!` at the seal site guards
-    /// against any future regression.
-    pub token_count: usize,
-    /// Combined turn token ids in slot order:
-    /// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`.
-    /// Stored as one buffer because the K/V chunk grid pins this
-    /// exact sequence; the persisted `Tokens` record carries the
-    /// same bytes so cross-process replay (`recover_turn`)
-    /// reconstructs the slot K/V exactly.
-    pub token_ids: TokenBuffer,
-    /// Content boundaries that frame the user-message body and the
-    /// assistant-response body inside the sealed grid — see
-    /// [`TurnContentBounds`].  The compressor windows the sealed K/V to
-    /// these boundaries so it injects content-only halves with no template
-    /// markers.  All-zero where the boundaries are genuinely unknown.
-    pub content_bounds: TurnContentBounds,
-    pub sig_entries: Vec<SigEntry>,
-    /// Slot in [`Substrate::residence`] holding this turn's
-    /// hot/warm/cold KV state.
-    pub residence: ResidenceIndex,
 }
 
 #[derive(Debug, Clone)]

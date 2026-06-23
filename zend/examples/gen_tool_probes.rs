@@ -157,6 +157,11 @@ fn pre_collection_prelude(builder: &Builder) -> String {
     for item in &layer.system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => out.push_str(&s.content),
+            SystemPromptItem::SectionTree(t) => {
+                for n in &t.nodes {
+                    out.push_str(&n.options[n.chosen(&t.default_selection)].content);
+                }
+            }
             SystemPromptItem::Collection(_) => break,
         }
     }

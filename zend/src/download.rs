@@ -14,9 +14,14 @@ use tokio::io::AsyncWriteExt;
 
 // ── Model coordinates ─────────────────────────────────────────────────────────
 
-const MODEL_REPO: &str = "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF";
-const MODEL_FILE: &str = "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
-const TOK_REPO: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+// Original (April 2025) Qwen3-30B-A3B — the HYBRID model whose chat template
+// carries `<think>` + `enable_thinking`, so it honours the `/think` ↔ `/no_think`
+// switch the composer effort dial drives. The 2507 Instruct/Thinking refreshes
+// each dropped one half of that toggle, so neither can do both. Keep these in
+// sync with the library spec in `candle-conversation/src/models/qwen3_moe.rs`.
+const MODEL_REPO: &str = "unsloth/Qwen3-30B-A3B-GGUF";
+const MODEL_FILE: &str = "Qwen3-30B-A3B-Q4_K_M.gguf";
+const TOK_REPO: &str = "Qwen/Qwen3-30B-A3B";
 const TOK_FILE: &str = "tokenizer.json";
 const MODEL_BYTES: u64 = 17_100_000_000; // ~17 GB; fallback when Content-Length absent
 

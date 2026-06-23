@@ -35,6 +35,15 @@ fn main() -> anyhow::Result<()> {
                         println!("{:?}\t{}\tcoll\t{}", s.id, layer.name, s.name);
                     }
                 }
+                SystemPromptItem::SectionTree(t) => {
+                    for n in &t.nodes {
+                        for o in &n.options {
+                            for v in &o.variants {
+                                println!("{:?}\t{}\ttree\t{}:{}", v.id, layer.name, n.name, o.id);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -226,13 +226,15 @@ pub use ids::{
     TurnIndex, TurnKey,
 };
 pub use project::{
-    GeneratedIdentity, Projection, ProjectionMode, ProjectionSegment, ProjectionTarget,
-    ResolvedSection, ResolvedTurn, SealedKind,
+    GeneratedIdentity, OptionalState, Projection, ProjectionMode, ProjectionSegment,
+    ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn, SealedKind, SelectionState,
+    NO_THINK_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub use resolver::{Conversation, TargetedRead};
 pub use schema::{
     Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, GroupSummaryStage,
-    LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection, SectionSchema,
-    SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema, TurnSummary,
+    LayerSchema, LayerSummary, Schema, ScoreFormula, SectionCollection, SectionSchema, SectionTree,
+    SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode,
+    TreeOption, TreeVariant, TurnSummary,
 };

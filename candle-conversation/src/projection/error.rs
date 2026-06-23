@@ -169,4 +169,16 @@ pub enum ConstructionError {
          supplied to the parser — use Builder::from_yaml_with_vars_and_dialect"
     )]
     DialectRequired { item: String },
+
+    /// A `kind: section_tree` optional node's `default:` was neither `present`
+    /// nor `absent`.
+    #[error(
+        "section_tree node {item:?} has invalid default {value:?} (expected `present` or `absent`)"
+    )]
+    InvalidToggleDefault { item: String, value: String },
+
+    /// A `kind: selector` node's `default:` named an option id that none of its
+    /// `options` declares.
+    #[error("section_tree selector {item:?} default names unknown option {option:?}")]
+    UnknownTreeOption { item: String, option: String },
 }

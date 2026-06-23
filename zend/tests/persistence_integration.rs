@@ -48,6 +48,7 @@ mod persistence {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                candle_conversation::SelectionState::default(),
             )
             .await;
         let mut response = String::new();

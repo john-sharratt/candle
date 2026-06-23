@@ -11,6 +11,8 @@ use axum::{
 };
 use futures::StreamExt;
 
+use candle_conversation::{OptionalState, SelectionState, NO_THINK_SELECTOR};
+
 use crate::session::{StreamItem, ZendSession};
 use crate::types::{
     AssistantMessage, ChatCompletion, ChatCompletionChunk, ChatCompletionRequest, ChatMessage,
@@ -31,7 +33,7 @@ pub async fn completions(
         .messages
         .iter()
         .rev()
-        .find(|m| m.role == crate::types::Role::User)
+        .find(|m| m.role == Role::User)
         .map(|m| m.content.chars().take(80).collect())
         .unwrap_or_default();
 
@@ -44,8 +46,6 @@ pub async fn completions(
         if last_preview.len() == 80 { "…" } else { "" },
     );
 
-    let effort = req.effort;
-    let think = req.think;
     let max_tokens = req.max_tokens.map(|n| n as usize);
     let conv_id = req.conv_id.unwrap_or_else(|| "default".to_string());
     let force_hires = req.force_high_resolution;
@@ -54,11 +54,12 @@ pub async fn completions(
     // Composer "tools" dial — which slice of the catalog this conversation
     // projects. Absent → Comprehensive (full catalog).
     let tools_mode = req.tools.unwrap_or_default();
-    // Composer "thinking effort" dial: Off (`effort: 0` / `think: false`)
-    // suppresses the reasoning channel via the `/no_think` dialect prefix
-    // (docs/zend_ui_redesign.md decision 10). Stripped again on hydrate by
-    // `crate::chatml::split_turn`.
-    let messages = apply_no_think(req.messages, effort, think);
+    // The composer dials drive the dialogue layer's section-tree selectors — the
+    // projection emits the matching thinking-effort / response-length directive
+    // sections (and the `/no_think` node) on this and every subsequent turn until
+    // the dials change.
+    let selection = dial_selection(req.effort, req.verbosity, req.think);
+    let messages = req.messages;
     if req.stream {
         stream_sse(
             session,
@@ -72,6 +73,7 @@ pub async fn completions(
             model,
             id,
             created,
+            selection,
         )
         .await
     } else {
@@ -87,35 +89,55 @@ pub async fn completions(
             model,
             id,
             created,
+            selection,
         )
         .await
     }
 }
 
-/// Prepend the `/no_think` dialect prefix to the most recent user turn when the
-/// composer requests no-thinking (`think == Some(false)` or `effort == Some(0)`).
-/// Idempotent — never double-prefixes.
-fn apply_no_think(
-    mut messages: Vec<ChatMessage>,
+/// Map the composer dials to the dialogue section-tree selection.  Only the
+/// dials the request actually carries are set; any omitted selector falls back
+/// to the schema's authored default (so a new conversation defaults naturally).
+///
+/// - `effort` 0..4  → `thinking_effort` = off / quick / balanced / deep / exhaustive
+/// - `verbosity` 0..4 → `response_length` = terse / concise / standard / detailed / comprehensive
+/// - `no_think` = present (suppress) when `effort == 0` or `think == false`, else absent
+fn dial_selection(
     effort: Option<u8>,
+    verbosity: Option<u8>,
     think: Option<bool>,
-) -> Vec<ChatMessage> {
-    let suppress = think == Some(false) || effort == Some(0);
-    if suppress {
-        if let Some(m) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
-            if !m.content.starts_with("/no_think") {
-                m.content = format!("/no_think\n{}", m.content);
-            }
-        }
+) -> SelectionState {
+    const EFFORT: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
+    const LENGTH: [&str; 5] = ["terse", "concise", "standard", "detailed", "comprehensive"];
+    let mut sel = SelectionState::new();
+    if let Some(e) = effort {
+        sel.select(
+            "thinking_effort",
+            *EFFORT.get(e as usize).unwrap_or(&"exhaustive"),
+        );
     }
-    messages
+    if let Some(v) = verbosity {
+        sel.select(
+            "response_length",
+            *LENGTH.get(v as usize).unwrap_or(&"comprehensive"),
+        );
+    }
+    if effort.is_some() || think.is_some() {
+        let state = if think == Some(false) || effort == Some(0) {
+            OptionalState::Present
+        } else {
+            OptionalState::Absent
+        };
+        sel.set_optional(NO_THINK_SELECTOR, state);
+    }
+    sel
 }
 
 // ── Streaming path ────────────────────────────────────────────────────────────
 
 async fn stream_sse(
     session: Arc<ZendSession>,
-    messages: Vec<crate::types::ChatMessage>,
+    messages: Vec<ChatMessage>,
     max_tokens: Option<usize>,
     conv_id: String,
     force_hires: Option<String>,
@@ -125,6 +147,7 @@ async fn stream_sse(
     model: String,
     id: String,
     created: u64,
+    selection: SelectionState,
 ) -> Response {
     let token_stream = session
         .submit(
@@ -135,6 +158,7 @@ async fn stream_sse(
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            selection,
         )
         .await;
 
@@ -217,7 +241,7 @@ async fn stream_sse(
 
 async fn collect_completion(
     session: Arc<ZendSession>,
-    messages: Vec<crate::types::ChatMessage>,
+    messages: Vec<ChatMessage>,
     max_tokens: Option<usize>,
     conv_id: String,
     force_hires: Option<String>,
@@ -227,6 +251,7 @@ async fn collect_completion(
     model: String,
     id: String,
     created: u64,
+    selection: SelectionState,
 ) -> Response {
     let mut token_stream = session
         .submit(
@@ -237,6 +262,7 @@ async fn collect_completion(
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            selection,
         )
         .await;
     let mut full = String::new();
@@ -287,52 +313,40 @@ fn unix_ms() -> u128 {
 }
 
 #[cfg(test)]
-mod no_think_tests {
+mod dial_tests {
     use super::*;
 
-    fn user(content: &str) -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            content: content.to_string(),
-        }
+    #[test]
+    fn effort_zero_suppresses_thinking() {
+        let sel = dial_selection(Some(0), Some(2), None);
+        assert_eq!(sel.get("thinking_effort"), Some("off"));
+        assert_eq!(sel.get("response_length"), Some("standard"));
+        assert_eq!(
+            sel.optional(NO_THINK_SELECTOR),
+            Some(OptionalState::Present)
+        );
     }
 
     #[test]
-    fn think_false_prepends_no_think() {
-        let out = apply_no_think(vec![user("trace the redo log")], None, Some(false));
-        assert_eq!(out[0].content, "/no_think\ntrace the redo log");
+    fn mid_dials_map_to_balanced_standard_thinking_on() {
+        let sel = dial_selection(Some(2), Some(2), Some(true));
+        assert_eq!(sel.get("thinking_effort"), Some("balanced"));
+        assert_eq!(sel.get("response_length"), Some("standard"));
+        assert_eq!(sel.optional(NO_THINK_SELECTOR), Some(OptionalState::Absent));
     }
 
     #[test]
-    fn effort_zero_prepends_no_think() {
-        let out = apply_no_think(vec![user("hello")], Some(0), None);
-        assert_eq!(out[0].content, "/no_think\nhello");
+    fn extremes_map_to_exhaustive_comprehensive() {
+        let sel = dial_selection(Some(4), Some(4), Some(true));
+        assert_eq!(sel.get("thinking_effort"), Some("exhaustive"));
+        assert_eq!(sel.get("response_length"), Some("comprehensive"));
     }
 
     #[test]
-    fn default_dials_leave_message_untouched() {
-        let out = apply_no_think(vec![user("hello")], Some(2), None);
-        assert_eq!(out[0].content, "hello");
-    }
-
-    #[test]
-    fn only_the_last_user_turn_is_prefixed() {
-        let msgs = vec![
-            user("first"),
-            ChatMessage {
-                role: Role::Assistant,
-                content: "reply".into(),
-            },
-            user("second"),
-        ];
-        let out = apply_no_think(msgs, Some(0), None);
-        assert_eq!(out[0].content, "first");
-        assert_eq!(out[2].content, "/no_think\nsecond");
-    }
-
-    #[test]
-    fn idempotent_when_already_prefixed() {
-        let out = apply_no_think(vec![user("/no_think\nhi")], Some(0), None);
-        assert_eq!(out[0].content, "/no_think\nhi");
+    fn absent_dials_leave_schema_defaults() {
+        let sel = dial_selection(None, None, None);
+        assert_eq!(sel.get("thinking_effort"), None);
+        assert_eq!(sel.get("response_length"), None);
+        assert_eq!(sel.optional(NO_THINK_SELECTOR), None);
     }
 }

@@ -270,7 +270,10 @@ impl InferenceState {
             // layers (repo_map, code_reading) override to C6 per-conversation
             // (see `repo_scan::utility_config` / `code_read`'s sequence config).
             .compression_level(5)
-            .thinking(false);
+            // Thinking is ENABLED at the model level; per-turn suppression is
+            // driven by the section-tree `no_think` selector (the composer
+            // effort dial), not this static flag.
+            .thinking(true);
         let conv_config = builder.conversation_config();
 
         // Per-layer progress callback — the library reports
@@ -815,6 +818,7 @@ fn run_inference_stream(
     assistant_prefill: Option<String>,
     lossless_kv: bool,
     tools_mode: ToolMode,
+    selection: candle_conversation::SelectionState,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
@@ -972,6 +976,7 @@ fn run_inference_stream(
                 } else {
                     None
                 },
+                selection: selection.clone(),
                 ..Default::default()
             };
             let handle = match cs.conv.submit_turn_with_options(&current_message, options) {
@@ -1209,8 +1214,16 @@ fn generate_one_title(
         tracing::warn!("titler reset failed: {e}");
         return;
     }
+    // The titler generates a short label — never reason. Suppress thinking
+    // explicitly (the model thinks by default).
+    let mut titler_sel = candle_conversation::SelectionState::new();
+    titler_sel.set_optional(
+        candle_conversation::NO_THINK_SELECTOR,
+        candle_conversation::OptionalState::Present,
+    );
     let opts = TurnOptions {
         max_tokens: Some(TITLER_MAX_TOKENS),
+        selection: titler_sel,
         ..Default::default()
     };
     let handle = match titler.submit_turn_with_options(&truncated, opts) {
@@ -1623,26 +1636,23 @@ impl ZendSession {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::warn!("local tokio runtime for download failed: {e:#}");
+                        tracing::error!(
+                            "local tokio runtime for download failed: {e:#}; exiting"
+                        );
                         status_tx.send(format!("Runtime build failed: {e}")).ok();
-                        load_progress.mark_ready();
-                        ready_tx.send(true).ok();
-                        return;
+                        std::process::exit(1);
                     }
                 };
                 let (model_path, tok_path) =
                     match download_runtime.block_on(crate::download::ensure_model(&status_tx)) {
                         Ok(p) => p,
                         Err(e) => {
-                            tracing::warn!("model download failed: {e:#}");
+                            // A missing model is fatal — the daemon cannot serve
+                            // anything without it. Fail hard rather than limping
+                            // into a fake-ready state that errors on first submit.
+                            tracing::error!("model download failed: {e:#}; exiting");
                             status_tx.send(format!("Download failed: {e}")).ok();
-                            // Surface the error to anyone waiting on ready
-                            // by flipping into the ready state with the
-                            // error detail still visible — the chat will
-                            // fail loudly when the user actually submits.
-                            load_progress.mark_ready();
-                            ready_tx.send(true).ok();
-                            return;
+                            std::process::exit(1);
                         }
                     };
                 // Drop the runtime; the model load below is sync.
@@ -1754,8 +1764,9 @@ impl ZendSession {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("inference engine failed to load: {e:#}");
+                        tracing::error!("inference engine failed to load: {e:#}; exiting");
                         status_tx.send(format!("Load failed: {e}")).ok();
+                        std::process::exit(1);
                     }
                 }
                 load_progress.mark_ready();
@@ -1813,6 +1824,7 @@ impl ZendSession {
         assistant_prefill: Option<String>,
         lossless_kv: bool,
         tools_mode: ToolMode,
+        selection: candle_conversation::SelectionState,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         self.submit_with_sampling(
             messages,
@@ -1823,6 +1835,7 @@ impl ZendSession {
             assistant_prefill,
             lossless_kv,
             tools_mode,
+            selection,
         )
         .await
     }
@@ -1845,6 +1858,7 @@ impl ZendSession {
         assistant_prefill: Option<String>,
         lossless_kv: bool,
         tools_mode: ToolMode,
+        selection: candle_conversation::SelectionState,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
         let last_user = messages
             .iter()
@@ -1912,6 +1926,7 @@ impl ZendSession {
                     assistant_prefill,
                     lossless_kv,
                     tools_mode,
+                    selection,
                 );
                 while let Some(item) = ts.next().await {
                     if tx.send(item).await.is_err() {
@@ -2019,6 +2034,12 @@ fn pre_collection_prelude(builder: &Builder) -> String {
     for item in &layer.system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => out.push_str(&s.content),
+            SystemPromptItem::SectionTree(t) => {
+                // Default selection: each node's default option content, in order.
+                for n in &t.nodes {
+                    out.push_str(&n.options[n.chosen(&t.default_selection)].content);
+                }
+            }
             SystemPromptItem::Collection(_) => break,
         }
     }
@@ -2043,6 +2064,11 @@ fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
     for item in &layer.system_prompt.items {
         match item {
             SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
+            // Section-tree variants are sealed (not live templates), and
+            // `pre_collection_prelude` bakes their default content into the
+            // prefix — so the tool summary must seal against the same default
+            // variant ids to land at the right position.
+            SystemPromptItem::SectionTree(t) => ids.extend(t.default_present_ids.iter().copied()),
             // The dialogue layer's only collection is `tools`; stop at it.
             SystemPromptItem::Collection(_) => break,
             SystemPromptItem::Section(_) => {}

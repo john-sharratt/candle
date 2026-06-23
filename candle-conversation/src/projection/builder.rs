@@ -41,7 +41,9 @@
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, Reserved, SectionId};
 use super::project::FIXED_FORMULA;
-use super::project::{run, run_with_sink, Projection, ProjectionMode, ProjectionTarget};
+use super::project::{
+    run, run_with_sink, Projection, ProjectionMode, ProjectionTarget, SelectionState,
+};
 use super::schema::{
     Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, LayerSchema, LayerSummary,
     Schema, ScoreFormula, SectionCollection, SectionSchema, SelectionRule, SummaryMode,
@@ -83,7 +85,7 @@ fn validate(schema: &Schema) -> Result<(), ConstructionError> {
         // top-level section — otherwise the layer can't render any
         // system prompt at all.
         if layer.system_prompt.items.is_empty()
-            || layer.system_prompt.all_sections().next().is_none()
+            || layer.system_prompt.all_section_ids().next().is_none()
         {
             return Err(ConstructionError::EmptyLayerSystemPrompt {
                 layer: layer.name.clone(),
@@ -350,6 +352,9 @@ impl Builder {
                             }
                         }
                     }
+                    // Tree nodes are always sealed content (never templates),
+                    // so there is nothing to pre-tokenise here.
+                    SystemPromptItem::SectionTree(_) => {}
                 }
             }
         }
@@ -763,12 +768,17 @@ impl Builder {
                 SystemPromptItem::Section(s) if s.name == name => {
                     return Err(ConstructionError::DuplicateSectionName(name.to_string()));
                 }
+                SystemPromptItem::Section(_) => {}
                 SystemPromptItem::Collection(c) => {
                     if c.sections.iter().any(|s| s.name == name) {
                         return Err(ConstructionError::DuplicateSectionName(name.to_string()));
                     }
                 }
-                _ => {}
+                SystemPromptItem::SectionTree(t) => {
+                    if t.nodes.iter().any(|n| n.name == name) {
+                        return Err(ConstructionError::DuplicateSectionName(name.to_string()));
+                    }
+                }
             }
         }
         Ok(())
@@ -824,7 +834,26 @@ impl Builder {
         target: ProjectionTarget,
         resolver: &R,
     ) -> Projection {
-        run(&self.schema, target, resolver, ProjectionMode::Decode)
+        run(
+            &self.schema,
+            target,
+            resolver,
+            ProjectionMode::Decode,
+            &SelectionState::default(),
+        )
+    }
+
+    /// Projection with an explicit section-tree [`SelectionState`] — the entry
+    /// the runtime uses to choose selector options (e.g. the thinking-effort /
+    /// response-length dials).  An empty state reproduces the authored defaults.
+    pub fn project_with_selection<R: ContentResolver>(
+        &self,
+        target: ProjectionTarget,
+        resolver: &R,
+        mode: ProjectionMode,
+        selection: &SelectionState,
+    ) -> Projection {
+        run(&self.schema, target, resolver, mode, selection)
     }
 
     /// Run the projection pipeline for an explicit [`ProjectionMode`].
@@ -837,8 +866,9 @@ impl Builder {
         target: ProjectionTarget,
         resolver: &R,
         mode: ProjectionMode,
+        selection: &SelectionState,
     ) -> Projection {
-        run(&self.schema, target, resolver, mode)
+        run(&self.schema, target, resolver, mode, selection)
     }
 
     /// Variant of [`Self::project_with_mode`] that delivers score-density
@@ -853,9 +883,10 @@ impl Builder {
         target: ProjectionTarget,
         resolver: &R,
         mode: ProjectionMode,
+        selection: &SelectionState,
         sink: &mut dyn FnMut(SelectionDiagnostics),
     ) -> Projection {
-        run_with_sink(&self.schema, target, resolver, mode, sink)
+        run_with_sink(&self.schema, target, resolver, mode, selection, sink)
     }
 
     /// Token-window budget configured for `layer`.  Used by the

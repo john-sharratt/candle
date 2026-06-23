@@ -133,9 +133,8 @@ fn infinite_conversation_cruise() {
         if i % 50 == 0 {
             let diag = engine.last_selection_diagnostics(timeline_id);
             eprintln!(
-                "cruise: depth={i} pending={} dirty={} selected={}",
+                "cruise: depth={i} pending={} selected={}",
                 engine.pending_summary_len(timeline_id),
-                engine.dirty_summary_len(timeline_id),
                 diag.map(|d| d.selected_nodes.len()).unwrap_or(0)
             );
         }
@@ -151,9 +150,8 @@ fn infinite_conversation_cruise() {
     let recalled = response.text.contains("17-42-9");
     let diag = engine.last_selection_diagnostics(timeline_id);
     eprintln!(
-        "cruise CSV: depth={GROWTH} recalled={recalled} pending={} dirty={} selected_count={}",
+        "cruise CSV: depth={GROWTH} recalled={recalled} pending={} selected_count={}",
         engine.pending_summary_len(timeline_id),
-        engine.dirty_summary_len(timeline_id),
         diag.map(|d| d.selected_nodes.len()).unwrap_or(0),
     );
     probe_conv.close().expect("close probe");
@@ -187,9 +185,8 @@ fn infinite_conversation_stress() {
         let _ = conv.send_turn(&user_msg).expect("send_turn");
         if i % 200 == 0 {
             eprintln!(
-                "stress: depth={i} pending={} dirty={}",
-                engine.pending_summary_len(timeline_id),
-                engine.dirty_summary_len(timeline_id)
+                "stress: depth={i} pending={}",
+                engine.pending_summary_len(timeline_id)
             );
         }
     }

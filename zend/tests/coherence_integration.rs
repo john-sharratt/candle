@@ -124,6 +124,7 @@ mod coherence {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                candle_conversation::SelectionState::default(),
             )
             .await;
 
@@ -140,6 +141,12 @@ mod coherence {
                     token_events += 1;
                     eprint!("{tok}");
                     response.push_str(&tok);
+                }
+                StreamItem::Projection(projection_event_out) => {
+                    eprintln!(
+                        "\n[PROJECTION EVENT] {}",
+                        projection_event_out.projection_event
+                    );
                 }
             }
         }

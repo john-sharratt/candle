@@ -985,7 +985,12 @@ fn main() -> anyhow::Result<()> {
         // Cross-check against the real Decode projection.
         let scored = ScoredSubstrate::new(&substrate, &p.proj_scores);
         let projection_selected: Vec<String> = proj
-            .project_with_mode(target, &scored, ProjectionMode::Decode)
+            .project_with_mode(
+                target,
+                &scored,
+                ProjectionMode::Decode,
+                &candle_conversation::SelectionState::default(),
+            )
             .sealed_sections()
             .filter_map(|rs| sid_to_name.get(&rs.id).map(|s| s.to_string()))
             .collect();

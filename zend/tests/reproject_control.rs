@@ -140,6 +140,7 @@ mod control {
                 None,
                 false,
                 zend::types::ToolMode::Comprehensive,
+                candle_conversation::SelectionState::default(),
             )
             .await;
         let mut n = 0usize;
