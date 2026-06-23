@@ -804,8 +804,8 @@ mod tests {
     #[test]
     fn projection_events_persist_and_recover() {
         use crate::projection::{
-            decode_events, encode_events, BucketKind, ProjectionBucket, ProjectionEvent, TimelineId,
-            TurnIndex,
+            decode_events, encode_events, BucketKind, ProjectionBucket, ProjectionEvent,
+            TimelineId, TurnIndex,
         };
         let dir = tmp_dir("proj_events");
         let decl = turn_decl(7, 0, 2);
@@ -821,8 +821,16 @@ mod tests {
                 materialized_tokens: 1120,
                 substrate_tokens: 42_000,
                 buckets: vec![
-                    ProjectionBucket { label: "system".into(), kind: BucketKind::System, tokens: 320 },
-                    ProjectionBucket { label: "code_read".into(), kind: BucketKind::Section, tokens: 800 },
+                    ProjectionBucket {
+                        label: "system".into(),
+                        kind: BucketKind::System,
+                        tokens: 320,
+                    },
+                    ProjectionBucket {
+                        label: "code_read".into(),
+                        kind: BucketKind::Section,
+                        tokens: 800,
+                    },
                 ],
                 selection: Default::default(),
             },
@@ -853,8 +861,7 @@ mod tests {
         // Reopen — a simulated daemon restart — and recover the timeline.
         {
             let mut substrate = Substrate::new();
-            let _sp =
-                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
             let blob = substrate
                 .projection_events_blob(tl, TurnIndex(decl.turn_index))

@@ -88,7 +88,30 @@ impl SystemPromptSchema {
         self.items.iter().flat_map(|it| match it {
             SystemPromptItem::Section(s) => std::slice::from_ref(s).iter(),
             SystemPromptItem::Collection(c) => c.sections.iter(),
+            // Tree nodes are not `SectionSchema`s (they carry per-branch
+            // variants); address them via [`Self::all_section_ids`] instead.
+            SystemPromptItem::SectionTree(_) => [].iter(),
         })
+    }
+
+    /// Every substrate [`super::SectionId`] this system prompt owns — bare
+    /// sections, collection members, **and** every section-tree variant.  Used
+    /// for id-space accounting (max id, emptiness) where tree variants must be
+    /// counted even though they aren't `SectionSchema`s.
+    pub fn all_section_ids(&self) -> impl Iterator<Item = SectionId> + '_ {
+        self.items
+            .iter()
+            .flat_map(|it| -> Box<dyn Iterator<Item = SectionId>> {
+                match it {
+                    SystemPromptItem::Section(s) => Box::new(std::iter::once(s.id)),
+                    SystemPromptItem::Collection(c) => Box::new(c.sections.iter().map(|s| s.id)),
+                    SystemPromptItem::SectionTree(t) => Box::new(t.nodes.iter().flat_map(|n| {
+                        n.options
+                            .iter()
+                            .flat_map(|o| o.variants.iter().map(|v| v.id))
+                    })),
+                }
+            })
     }
 
     /// Find a [`SectionCollection`] by name, walking only top-level
@@ -132,6 +155,156 @@ pub enum SystemPromptItem {
     /// A named bucket of sections with its own selection rule.  Only
     /// the surviving subset emits, but in declaration order.
     Collection(SectionCollection),
+    /// An ordered, individually-toggleable tree of sealed sections.  See
+    /// [`SectionTree`].
+    SectionTree(SectionTree),
+}
+
+/// An ordered tree of system-prompt sections where some nodes are SELECTORS —
+/// each emits one of N mutually-exclusive options.  The binary `optional` node
+/// is the 2-option special case (`present` content vs an empty `absent`); a
+/// `mandatory` node is the 1-option case.
+///
+/// Because a sealed section's K/V is conditioned on everything injected before
+/// it, every selector multiplies the possible prefixes for the nodes below it.
+/// The tree resolves this by **pre-sealing the full cross-product**: each option
+/// carries one [`TreeVariant`] per assignment of the selector dimensions
+/// declared above its node, each sealed with that branch's exact prefix.
+/// Projection resolves the active selection (one option per selector id) and
+/// emits, for each node, the chosen option's variant for that branch — so
+/// changing a selector picks a pre-prefilled variant instead of re-prefilling
+/// the nodes beneath it.
+///
+/// Lives as one [`SystemPromptItem::SectionTree`] at its declared position in
+/// the layer's system-prompt stream.
+#[derive(Debug, Clone, Default)]
+pub struct SectionTree {
+    /// Root-first declaration order.
+    pub nodes: Vec<TreeNode>,
+    /// The selector dimensions, in declaration order — one per node with >1
+    /// option.  A node's variant key is a mixed-radix pack of the dims declared
+    /// before it (see [`Self::pack`]).
+    pub dims: Vec<TreeDim>,
+    /// Default option index per dim — the selection used when the runtime
+    /// supplies no override.
+    pub default_selection: Vec<u8>,
+    /// The default selection's emitted (non-empty) variant ids, in tree order.
+    /// Sections declared **after** the tree (and priming) attend to this branch.
+    pub default_present_ids: Vec<SectionId>,
+}
+
+impl SectionTree {
+    /// Resolve the active selection — option index per dim.  `resolve(selector_id)`
+    /// returns the chosen option id, or `None` for the authored default; an
+    /// unknown option id also falls back to the default.
+    pub fn selection<'a>(&self, mut resolve: impl FnMut(&str) -> Option<&'a str>) -> Vec<u8> {
+        self.dims
+            .iter()
+            .map(|d| {
+                let node = &self.nodes[d.node_index];
+                match resolve(&d.selector_id) {
+                    Some(opt) => node
+                        .options
+                        .iter()
+                        .position(|o| o.id == opt)
+                        .map(|i| i as u8)
+                        .unwrap_or(d.default_option),
+                    None => d.default_option,
+                }
+            })
+            .collect()
+    }
+
+    /// Pack the sub-assignment over the first `dim_count` dims into a mixed-radix
+    /// key — the [`TreeVariant::ancestors`] key for a node with that many
+    /// ancestor dims.
+    pub fn pack(&self, selection: &[u8], dim_count: usize) -> u32 {
+        let mut key = 0u32;
+        let mut mult = 1u32;
+        for d in 0..dim_count {
+            key += selection[d] as u32 * mult;
+            mult *= self.dims[d].option_count as u32;
+        }
+        key
+    }
+}
+
+/// One selector dimension of a [`SectionTree`] — a node with more than one
+/// option.
+#[derive(Debug, Clone)]
+pub struct TreeDim {
+    /// The selector id — the stable string the runtime sets (e.g.
+    /// `thinking_effort`, or a binary node's own name).
+    pub selector_id: String,
+    /// Which node owns this dimension.
+    pub node_index: usize,
+    /// Number of options (the radix).
+    pub option_count: u8,
+    /// Default option index when the runtime supplies no selection.
+    pub default_option: u8,
+}
+
+/// One node in a [`SectionTree`] — a section that emits one of its options.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    /// Declared id (its YAML `id:`).
+    pub name: String,
+    /// The options this node can emit.  `len() == 1` ⇒ mandatory (always that
+    /// content).  `len() > 1` ⇒ a selector dimension (see [`Self::dim`]).
+    pub options: Vec<TreeOption>,
+    /// Index into [`SectionTree::dims`] when this node is a selector, else `None`.
+    pub dim: Option<usize>,
+    /// How many selector dims are declared **before** this node — the width of
+    /// its ancestor assignment (the `dim_count` for [`SectionTree::pack`]).
+    pub ancestor_dims: usize,
+}
+
+impl TreeNode {
+    /// The selector id this node exposes (its name when it is a dimension), or
+    /// `None` for a mandatory node.
+    pub fn selector_id(&self) -> Option<&str> {
+        (self.options.len() > 1).then_some(self.name.as_str())
+    }
+
+    /// The option index this node emits under `selection`.
+    pub fn chosen(&self, selection: &[u8]) -> usize {
+        self.dim.map_or(0, |d| selection[d] as usize)
+    }
+}
+
+/// One mutually-exclusive option of a [`TreeNode`].
+#[derive(Debug, Clone)]
+pub struct TreeOption {
+    /// Option id (e.g. `present`/`absent` for a binary node, `off`..`exhaustive`
+    /// for a selector).
+    pub id: String,
+    /// Authored/resolved content.  May be empty (e.g. a binary node's `absent`),
+    /// in which case the option emits nothing and seals no variants.
+    pub content: String,
+    /// One sealed variant per ancestor-dim assignment (packed key).  Empty when
+    /// `content` is empty.
+    pub variants: Vec<TreeVariant>,
+}
+
+impl TreeOption {
+    /// The sealed variant for a packed ancestor assignment, if this option was
+    /// sealed (non-empty content).
+    pub fn variant_for(&self, ancestors: u32) -> Option<&TreeVariant> {
+        self.variants.iter().find(|v| v.ancestors == ancestors)
+    }
+}
+
+/// One pre-sealed branch of a [`TreeOption`] — its substrate [`SectionId`] plus
+/// the in-tree prefix it was sealed against.
+#[derive(Debug, Clone)]
+pub struct TreeVariant {
+    /// Packed mixed-radix ancestor assignment this variant is sealed for.
+    pub ancestors: u32,
+    /// This variant's substrate section id — its prefix-conditioned K/V.
+    pub id: SectionId,
+    /// The present-ancestor variant ids forming this branch's in-tree prefix, in
+    /// order.  Ingest prepends the pre-tree content prefix before sealing.
+    pub in_tree_prefix: Vec<SectionId>,
 }
 
 /// A named bucket of system-prompt sections with its own selection rule.

@@ -1,4 +1,5 @@
 use crate::config::SamplingConfig;
+use crate::projection::SelectionState;
 use crate::token_buffer::TokenBuffer;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,12 @@ pub struct TurnOptions {
     /// Stencil constraint override for this turn.
     /// If set, overrides any conversation-level stencil.
     pub turn_stencil: Option<Vec<i32>>,
+
+    /// Section-tree selector choices for this turn (e.g. the composer
+    /// thinking-effort / response-length dials).  Becomes the conversation's
+    /// current selection, used by every projection until the next turn changes
+    /// it.  Empty = the schema's authored defaults.
+    pub selection: SelectionState,
 }
 
 impl TurnOptions {

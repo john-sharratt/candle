@@ -66,9 +66,11 @@ use serde::Deserialize;
 
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
+use super::project::OptionalState;
 use super::schema::{
     Budget, DepthWeights, GroupSchema, LayerSchema, Schema, SectionCollection, SectionSchema,
-    SelectionRule, SystemPromptItem, SystemPromptSchema,
+    SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode,
+    TreeOption, TreeVariant,
 };
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
@@ -221,6 +223,74 @@ enum YamlSystemPromptItem {
         #[serde(default)]
         sections: Vec<YamlSection>,
     },
+    /// An ordered, individually-toggleable tree of sealed sections.  Each node
+    /// is a `section` (mandatory), an `optional` (binary toggle), or a
+    /// `selector` (pick one of N options).  See [`super::SectionTree`].
+    ///
+    /// ```yaml
+    /// - kind: section_tree
+    ///   nodes:
+    ///     - kind: optional
+    ///       id: no_think
+    ///       dialect: no_think_prefix
+    ///       default: present
+    ///     - kind: section
+    ///       id: frame
+    ///       content: "You are ..."
+    ///     - kind: selector
+    ///       id: thinking_effort
+    ///       default: balanced
+    ///       options:
+    ///         - id: off       content: "Answer directly."
+    ///         - id: balanced  content: "Reason at a natural pace."
+    /// ```
+    SectionTree { nodes: Vec<YamlTreeNode> },
+}
+
+/// One node in a `kind: section_tree` item — tagged by `kind`.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum YamlTreeNode {
+    /// Mandatory single-content node — always emits its content.
+    Section {
+        id: String,
+        #[serde(default)]
+        content: String,
+        /// Dialect template source (e.g. `no_think_prefix`); resolved to a
+        /// string and sealed as content.
+        #[serde(default)]
+        dialect: Option<String>,
+    },
+    /// Binary toggle — `present` (the content) vs `absent` (empty).  Its `id`
+    /// is the selector id the runtime flips.
+    Optional {
+        id: String,
+        #[serde(default)]
+        content: String,
+        #[serde(default)]
+        dialect: Option<String>,
+        /// Authored default presence: `present` (default) or `absent`.
+        #[serde(default)]
+        default: Option<String>,
+    },
+    /// N-way selector — emits the one option whose id the runtime selects (by
+    /// the node `id`).  Exactly one option emits.
+    Selector {
+        id: String,
+        /// The option id used when the runtime supplies no selection.
+        default: String,
+        options: Vec<YamlTreeOption>,
+    },
+}
+
+/// One option of a `kind: selector` tree node.
+#[derive(Deserialize)]
+struct YamlTreeOption {
+    id: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    dialect: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -504,6 +574,17 @@ fn build(
                         depth_weights: coll_dw_opt,
                     }));
                 }
+                YamlSystemPromptItem::SectionTree { nodes } => {
+                    items.push(build_section_tree(
+                        &yl.name,
+                        lid,
+                        nodes,
+                        dialect,
+                        &mut section_alloc,
+                        &mut maps,
+                        &mut layer_section_names,
+                    )?);
+                }
             }
         }
 
@@ -563,6 +644,255 @@ fn build(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Mixed-radix pack of `selection[0..radices.len()]` — the variant key for a
+/// node whose ancestor dims have the given option counts.
+fn pack_assignment(selection: &[u8], radices: &[u8]) -> u32 {
+    let mut key = 0u32;
+    let mut mult = 1u32;
+    for (i, &r) in radices.iter().enumerate() {
+        key += selection[i] as u32 * mult;
+        mult *= r as u32;
+    }
+    key
+}
+
+/// Build one `kind: section_tree` item — the full cross-product fan-out.
+///
+/// Each node carries a list of options; nodes with >1 option are SELECTOR
+/// dimensions.  A breadth-first walk maintains the live branch set —
+/// `(option-assignment-of-dims-so-far, in-tree prefix of emitted variant ids)`.
+/// At each node it seals one [`TreeVariant`] per (non-empty option × current
+/// branch); then a mandatory node appends its single option's variant to every
+/// branch, while a selector multiplies the branch set by its option count (each
+/// non-empty option's variant joining that sub-branch's prefix).  The node's
+/// declared name maps to its default-selection variant id.
+fn build_section_tree(
+    layer_name: &str,
+    lid: LayerId,
+    nodes: &[YamlTreeNode],
+    dialect: Option<&Dialect>,
+    section_alloc: &mut SectionIdAlloc,
+    maps: &mut NameMaps,
+    layer_section_names: &mut std::collections::HashSet<String>,
+) -> Result<SystemPromptItem, ConstructionError> {
+    // Resolve a node/option's content from an explicit `content:` or a dialect
+    // template; either way the section is SEALED (never a live template).
+    let resolve_content = |item: &str,
+                           content: &str,
+                           dlct_name: &Option<String>|
+     -> Result<String, ConstructionError> {
+        match dlct_name {
+            Some(dname) => {
+                let dlct = dialect.ok_or_else(|| ConstructionError::DialectRequired {
+                    item: item.to_string(),
+                })?;
+                let template = DialectTemplate::from_yaml_name(dname).ok_or_else(|| {
+                    ConstructionError::UnknownDialectTemplate {
+                        item: item.to_string(),
+                        name: dname.clone(),
+                    }
+                })?;
+                Ok(dlct.template(template).to_string())
+            }
+            None => Ok(content.to_string()),
+        }
+    };
+
+    // ── Pass 1: resolve each node's (id, options, default option index) ──────
+    struct Spec {
+        name: String,
+        options: Vec<(String, String)>, // (option id, content)
+        default_option: u8,
+    }
+    let mut specs: Vec<Spec> = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let (id, options, default_option) = match n {
+            YamlTreeNode::Section {
+                id,
+                content,
+                dialect: d,
+            } => {
+                let item = format!("{layer_name}/{id}");
+                (
+                    id.clone(),
+                    vec![("content".to_string(), resolve_content(&item, content, d)?)],
+                    0u8,
+                )
+            }
+            YamlTreeNode::Optional {
+                id,
+                content,
+                dialect: d,
+                default,
+            } => {
+                let item = format!("{layer_name}/{id}");
+                // `present` is option 0, `absent` option 1 — an unspecified
+                // `default:` falls back to present.
+                let default_option = match default.as_deref() {
+                    None => 0u8,
+                    Some(s) => match OptionalState::from_id(s) {
+                        Some(OptionalState::Present) => 0u8,
+                        Some(OptionalState::Absent) => 1u8,
+                        None => {
+                            return Err(ConstructionError::InvalidToggleDefault {
+                                item,
+                                value: s.to_string(),
+                            })
+                        }
+                    },
+                };
+                (
+                    id.clone(),
+                    vec![
+                        (
+                            OptionalState::Present.as_id().to_string(),
+                            resolve_content(&item, content, d)?,
+                        ),
+                        (OptionalState::Absent.as_id().to_string(), String::new()),
+                    ],
+                    default_option,
+                )
+            }
+            YamlTreeNode::Selector {
+                id,
+                default,
+                options,
+            } => {
+                let item = format!("{layer_name}/{id}");
+                let mut opts = Vec::with_capacity(options.len());
+                for o in options {
+                    opts.push((
+                        o.id.clone(),
+                        resolve_content(&format!("{item}/{}", o.id), &o.content, &o.dialect)?,
+                    ));
+                }
+                let default_option =
+                    opts.iter()
+                        .position(|(oid, _)| oid == default)
+                        .ok_or_else(|| ConstructionError::UnknownTreeOption {
+                            item,
+                            option: default.clone(),
+                        })? as u8;
+                (id.clone(), opts, default_option)
+            }
+        };
+        if !layer_section_names.insert(id.clone()) {
+            return Err(ConstructionError::DuplicateSectionName(id));
+        }
+        specs.push(Spec {
+            name: id,
+            options,
+            default_option,
+        });
+    }
+
+    // ── Pass 2: cross-product fan-out ────────────────────────────────────────
+    // A branch = (option assignment over the dims seen so far, in-tree prefix).
+    let mut branches: Vec<(Vec<u8>, Vec<SectionId>)> = vec![(Vec::new(), Vec::new())];
+    let mut radices: Vec<u8> = Vec::new(); // option_count of each dim, in order
+    let mut dims: Vec<TreeDim> = Vec::new();
+    let mut default_selection: Vec<u8> = Vec::new();
+    let mut tree_nodes: Vec<TreeNode> = Vec::with_capacity(specs.len());
+
+    for spec in &specs {
+        let ancestor_dims = radices.len();
+        let is_dim = spec.options.len() > 1;
+
+        // Seal one variant per (non-empty option × current branch).
+        let mut options: Vec<TreeOption> = Vec::with_capacity(spec.options.len());
+        for (oid, content) in &spec.options {
+            let mut variants = Vec::new();
+            if !content.is_empty() {
+                for (asm, prefix) in &branches {
+                    variants.push(TreeVariant {
+                        ancestors: pack_assignment(asm, &radices),
+                        id: section_alloc.next(),
+                        in_tree_prefix: prefix.clone(),
+                    });
+                }
+            }
+            options.push(TreeOption {
+                id: oid.clone(),
+                content: content.clone(),
+                variants,
+            });
+        }
+
+        // The declared name resolves to the default selection's variant.
+        let default_opt = &options[spec.default_option as usize];
+        if let Some(v) = default_opt.variant_for(pack_assignment(&default_selection, &radices)) {
+            maps.section_names.insert((lid, spec.name.clone()), v.id);
+        }
+
+        // Advance the live branch set + dims.
+        if is_dim {
+            let dim_index = dims.len();
+            dims.push(TreeDim {
+                selector_id: spec.name.clone(),
+                node_index: tree_nodes.len(),
+                option_count: spec.options.len() as u8,
+                default_option: spec.default_option,
+            });
+            let mut next = Vec::with_capacity(branches.len() * spec.options.len());
+            for (asm, prefix) in &branches {
+                let key = pack_assignment(asm, &radices);
+                for (opt_i, option) in options.iter().enumerate() {
+                    let mut sub_asm = asm.clone();
+                    sub_asm.push(opt_i as u8);
+                    let mut sub_prefix = prefix.clone();
+                    if let Some(v) = option.variant_for(key) {
+                        sub_prefix.push(v.id); // non-empty option joins the prefix
+                    }
+                    next.push((sub_asm, sub_prefix));
+                }
+            }
+            branches = next;
+            radices.push(spec.options.len() as u8);
+            default_selection.push(spec.default_option);
+            tree_nodes.push(TreeNode {
+                name: spec.name.clone(),
+                options,
+                dim: Some(dim_index),
+                ancestor_dims,
+            });
+        } else {
+            // Mandatory: append its single option's variant to every branch.
+            for (asm, prefix) in branches.iter_mut() {
+                let key = pack_assignment(asm, &radices);
+                if let Some(v) = options[0].variant_for(key) {
+                    prefix.push(v.id);
+                }
+            }
+            tree_nodes.push(TreeNode {
+                name: spec.name.clone(),
+                options,
+                dim: None,
+                ancestor_dims,
+            });
+        }
+    }
+
+    let mut tree = SectionTree {
+        nodes: tree_nodes,
+        dims,
+        default_selection,
+        default_present_ids: Vec::new(),
+    };
+    // The default selection's emitted variant ids — what sections after the tree
+    // (and priming) attend to.
+    tree.default_present_ids = tree
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            let opt = &n.options[n.chosen(&tree.default_selection)];
+            opt.variant_for(tree.pack(&tree.default_selection, n.ancestor_dims))
+                .map(|v| v.id)
+        })
+        .collect();
+
+    Ok(SystemPromptItem::SectionTree(tree))
+}
 
 fn validate_priority(name: &str, v: f32) -> Result<(), ConstructionError> {
     if v <= 0.0 {

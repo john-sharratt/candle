@@ -79,7 +79,12 @@ mod tool_scenarios {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit(messages, Some(512), conv_id.to_string())
+            .submit(
+                messages,
+                Some(512),
+                conv_id.to_string(),
+                candle_conversation::SelectionState::default(),
+            )
             .await;
 
         let mut response = String::new();
@@ -93,6 +98,12 @@ mod tool_scenarios {
                 StreamItem::Token(tok) => {
                     eprint!("{tok}");
                     response.push_str(&tok);
+                }
+                StreamItem::Projection(projection_event_out) => {
+                    eprintln!(
+                        "\n[PROJECTION EVENT] {}",
+                        projection_event_out.projection_event
+                    );
                 }
             }
         }

@@ -371,6 +371,25 @@ fn build_selection(
                     });
                 }
                 SystemPromptItem::Collection(_) => {}
+                SystemPromptItem::SectionTree(t) => {
+                    // A node emitted exactly one option's branch variant; show
+                    // the node (and chosen option, for selectors) with its tokens.
+                    for n in &t.nodes {
+                        for o in &n.options {
+                            if let Some(v) = o.variants.iter().find(|v| selected.contains(&v.id)) {
+                                let name = if n.options.len() > 1 {
+                                    format!("{}:{}", n.name, o.id)
+                                } else {
+                                    n.name.clone()
+                                };
+                                system.push(SystemItem::Section {
+                                    name,
+                                    tokens: resolver.section_token_count(v.id) as u32,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -518,13 +537,22 @@ mod tests {
     fn encode_decode_events_round_trips() {
         let events = vec![
             aggregate(
-                &[seg(BucketKind::System, "system", 320), seg(BucketKind::Section, "code_read", 800)],
+                &[
+                    seg(BucketKind::System, "system", 320),
+                    seg(BucketKind::Section, "code_read", 800),
+                ],
                 42_000,
                 0,
                 120,
                 3.0,
             ),
-            aggregate(&[seg(BucketKind::Turns, "conversation", 540)], 42_000, 120, 512, 8.0),
+            aggregate(
+                &[seg(BucketKind::Turns, "conversation", 540)],
+                42_000,
+                120,
+                512,
+                8.0,
+            ),
         ];
         assert_eq!(super::decode_events(&super::encode_events(&events)), events);
     }
@@ -577,10 +605,7 @@ layers:
             0
         }
         fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
-            *self
-                .turn_tokens
-                .get(&(group.raw(), index.0))
-                .unwrap_or(&0)
+            *self.turn_tokens.get(&(group.raw(), index.0)).unwrap_or(&0)
         }
         fn turn_score(
             &self,
@@ -625,7 +650,8 @@ layers:
                 crate::Role::Assistant,
             ))
         };
-        let section = |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
+        let section =
+            |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
 
         let segments = vec![
             section(frame),

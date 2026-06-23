@@ -21,14 +21,21 @@ pub(super) fn qwen3_30b_a3b_q4() -> ModelSpec {
         arch: ModelArch::Qwen3Moe,
         dialect: chat_format.dialect(),
         chat_format,
-        model_repo: "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF".into(),
-        model_filename: "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf".into(),
-        tokenizer_repo: "Qwen/Qwen3-30B-A3B-Instruct-2507".into(),
+        // Original (April 2025) Qwen3-30B-A3B — the HYBRID model: its chat
+        // template carries `<think>` + `enable_thinking`, so it honours the
+        // `/think` ↔ `/no_think` soft switch the composer effort dial drives.
+        // (The 2507 refresh split this into separate Instruct/Thinking models,
+        // neither of which can toggle — see the spec history.)
+        model_repo: "unsloth/Qwen3-30B-A3B-GGUF".into(),
+        model_filename: "Qwen3-30B-A3B-Q4_K_M.gguf".into(),
+        tokenizer_repo: "Qwen/Qwen3-30B-A3B".into(),
         default_system_prompt: PROMPT.into(),
         max_seq_len: 4096,
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
-        inject_no_think_block: false,
+        // Suppression injects an empty `<think></think>` (the strong switch),
+        // not just the `/no_think` text — so effort=Off reliably stops reasoning.
+        inject_no_think_block: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
     }
 }

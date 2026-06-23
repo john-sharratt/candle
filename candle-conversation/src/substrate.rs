@@ -635,7 +635,7 @@ pub struct SectionEntryData {
 /// One turn's pinned content in the substrate.  The turn's K/V
 /// chunks are a single contiguous block addressing the persisted
 /// token sequence
-/// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`
+/// `[user_msg][user_end][assistant_start][response]`
 /// — the inter-turn `user_start` head and `assistant_end` tail are
 /// **not** persisted: the projection assembler re-emits them as
 /// live `Generated` runs at every cross-turn boundary so their K
@@ -644,11 +644,19 @@ pub struct SectionEntryData {
 /// because its semantic context (the turn's own user message and
 /// decoded response) is invariant across projections.
 ///
+/// A thinking turn's reasoning is part of `[response]`: the model
+/// opens its own `<think>…</think>` as the first decoded tokens.  A
+/// suppressed turn instead carries an empty `<think></think>` baked
+/// right after `assistant_start`, so its `[response]` is the answer
+/// alone; prefilled (inserted) turns additionally prepend a
+/// `/no_think` and are always suppressed.
+///
 /// The text fields (`user_text` / `assistant_text`) carry the
 /// human-readable strings exactly as the caller had them at
-/// submit time — no role markers, no `/no_think` prefix.  They're
-/// stored verbatim so the sidebar reload path renders without any
-/// re-tokenising or boundary scanning.
+/// submit time — no role markers, no `/no_think` prefix.
+/// `assistant_text` is the verbatim decoded reply, **including** any
+/// `<think>…</think>` reasoning, so the sidebar reload path renders
+/// exactly what streamed without re-tokenising or boundary scanning.
 #[derive(Debug, Clone)]
 pub struct TurnPart {
     /// The user's message text, exactly as `submit_turn` received it
@@ -670,7 +678,7 @@ pub struct TurnPart {
     /// against any future regression.
     pub token_count: usize,
     /// Combined turn token ids in slot order:
-    /// `[no_think_prefix][user_msg][user_end][assistant_start][/think_block][response]`.
+    /// `[user_msg][user_end][assistant_start][response]`.
     /// Stored as one buffer because the K/V chunk grid pins this
     /// exact sequence; the persisted `Tokens` record carries the
     /// same bytes so cross-process replay (`recover_turn`)
@@ -3083,7 +3091,10 @@ impl Substrate {
             tokens,
             residence,
         };
-        let prev = self.sections.insert(section, entry).map_or(0, |e| e.token_count);
+        let prev = self
+            .sections
+            .insert(section, entry)
+            .map_or(0, |e| e.token_count);
         self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_cpu.is_empty() {
             self.install_section_hot(residence, sealed_cpu);
@@ -3121,7 +3132,10 @@ impl Substrate {
             tokens,
             residence,
         };
-        let prev = self.sections.insert(section, entry).map_or(0, |e| e.token_count);
+        let prev = self
+            .sections
+            .insert(section, entry)
+            .map_or(0, |e| e.token_count);
         self.section_token_total = self.section_token_total + token_count - prev;
         if !sealed_hot.is_empty() {
             self.install_section_hot(residence, sealed_hot);

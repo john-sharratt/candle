@@ -149,6 +149,18 @@
 
   // ── state ────────────────────────────────────────────────────────────────
   const now = Date.now();
+
+  // Composer-dial preference persistence (per-user, browser-local).
+  function dialPref(key, dflt) {
+    try {
+      const v = parseInt(localStorage.getItem(key), 10);
+      return Number.isInteger(v) && v >= 0 && v <= 4 ? v : dflt;
+    } catch (_) { return dflt; }
+  }
+  function saveDialPref(key, value) {
+    try { localStorage.setItem(key, String(value)); } catch (_) {}
+  }
+
   const S = {
     conversations: [],   // filled by the async seed at boot (mock is sync, live fetches)
     activeId: null,
@@ -162,8 +174,11 @@
     dragging: null,
     promptValue: '',
     logsOpen: false,
-    effortLevel: 2,
-    verbosityLevel: 2,
+    // Composer dials are a per-user browser preference (persisted in
+    // localStorage, like theme/show-archived), so a new conversation starts
+    // with the user's last-chosen settings rather than a hardcoded default.
+    effortLevel: dialPref('zend.effort', 2),
+    verbosityLevel: dialPref('zend.verbosity', 2),
     openMenu: null,
     theme: (function () { try { return localStorage.getItem('zend.theme') || 'dark'; } catch (_) { return 'dark'; } })(),
     themeMenuOpen: false,
@@ -994,8 +1009,8 @@
   }
 
   const DIALS = {
-    effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', ticksGrow: true },
-    verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', ticksGrow: false },
+    effort: { label: 'Thinking effort', names: ['Off', 'Quick', 'Balanced', 'Deep', 'Exhaustive'], subs: ['no thinking', 'a moment', 'default pace', 'careful reasoning', 'leave nothing out'], key: 'effortLevel', pref: 'zend.effort', ticksGrow: true },
+    verbosity: { label: 'Response length', names: ['Terse', 'Concise', 'Standard', 'Detailed', 'Comprehensive'], subs: ['a line or two', 'just essentials', 'balanced detail', 'full explanation', 'exhaustive depth'], key: 'verbosityLevel', pref: 'zend.verbosity', ticksGrow: false },
   };
   function buildDial(which) {
     const d = DIALS[which];
@@ -1013,7 +1028,7 @@
     if (open) {
       wrap.appendChild(h('div', { style: 'position:absolute; bottom:calc(100% + 7px); left:0; min-width:200px; background:#26231f; border:1px solid #4a443e; border-radius:10px; box-shadow:0 -10px 30px rgba(0,0,0,0.55); padding:5px;' },
         h('div', { style: 'font-size:0.62rem; text-transform:uppercase; letter-spacing:0.07em; color:#7c736a; padding:5px 8px 4px;' }, d.label),
-        d.names.map((name, i) => h('button', { onClick: () => setState({ ['' + d.key]: i, openMenu: null }), style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
+        d.names.map((name, i) => h('button', { onClick: () => { saveDialPref(d.pref, i); setState({ ['' + d.key]: i, openMenu: null }); }, style: 'display:flex; align-items:center; gap:9px; width:100%; padding:7px 9px; border:none; background:' + (i === lvl ? 'rgba(201,138,62,0.16)' : 'transparent') + '; color:' + (i === lvl ? ACCENT : '#cfc8c0') + '; border-radius:6px; cursor:pointer; font:inherit; font-size:0.78rem; text-align:left; white-space:nowrap;' },
           h('span', { style: 'width:7px; height:7px; border-radius:50%; background:' + (i === lvl ? ACCENT : '#3a352f') + ';' }),
           h('span', { style: 'flex:1;' }, name),
           h('span', { style: 'font-size:0.66rem; color:#7c736a;' }, d.subs[i])))));
@@ -1202,7 +1217,8 @@
     (sel.turns || []).filter((t) => t.layer && t.layer !== 'dialogue').forEach((t) => {
       const tc = TC[t.group + '::' + t.index] || {};
       add(G && G.user_start); add(tc.user);
-      add(G && G.user_end); add(G && G.assistant_start); add(tc.assistant);
+      // Prefilled memory turns always carry the empty (suppressed) think header.
+      add(G && G.user_end); add(G && G.assistant_start); add(G && G.no_think_block); add(tc.assistant);
       add(G && G.assistant_end);
     });
     // The conversation, from the REAL messages: prior exchanges, the active user
@@ -1214,9 +1230,13 @@
     const maxEnd = Math.max(1, ...ends);
     const here = node && node.end_token != null ? node.end_token : maxEnd;
     const complete = here >= maxEnd;
+    // Only a suppressed dialogue turn (effort Off) carries a forced think header;
+    // a thinking turn's `<think>` is a decoded token in the body, not glue.
+    const dialogueThink = (G && S.effortLevel === 0) ? G.no_think_block : '';
     const msg = (role, content, open) => {
       const isUser = role === 'user';
       add(isUser ? (G && G.user_start) : (G && G.assistant_start));
+      if (!isUser) add(dialogueThink);
       add(content);
       if (!open) add(isUser ? (G && G.user_end) : (G && G.assistant_end));
     };
@@ -1315,6 +1335,10 @@
       const accent = isUser ? '#9b8fdf' : '#6cb39a';
       const exp = !!S.substrateExpanded[opts.key];
       if (G) body.appendChild(glueRow(isUser ? G.user_start : G.assistant_start));
+      // The reasoning header baked after assistant_start — open <think> when the
+      // turn reasons, empty <think></think> when suppressed. Shown verbatim so
+      // the think framing is visible, not hidden inside the turn.
+      if (!isUser && opts.thinkBlock) body.appendChild(glueRow(opts.thinkBlock));
       const tok = fmtTok(Math.max(1, Math.round((content || '').length / 4)));
       const wrap = h('div', { style: 'border:1px solid #2e2b27; border-left:3px solid ' + accent + '; border-radius:6px; overflow:hidden; margin:3px 0; background:#1a1816;' },
         h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateExpanded', opts.key), style: 'cursor:pointer; display:flex; align-items:center; gap:9px; padding:7px 11px; background:#201d1b;' },
@@ -1327,6 +1351,10 @@
     };
 
     const targetLayer = S.substrateTargetLayer || 'dialogue';
+    // Only a SUPPRESSED dialogue turn (effort Off) carries a forced think header;
+    // a thinking turn emits its own `<think>` as a decoded token, so it appears
+    // in the body, not as glue. Memory tiers are always prefilled-suppressed.
+    const dialogueThink = (G && S.effortLevel === 0) ? G.no_think_block : '';
 
     // Lower-layer memory tiers (repo_map, code_reading, …) projected into the
     // window — between the system prompt and the dialogue. Each turn renders as
@@ -1338,7 +1366,7 @@
       const tc = (S.substrateTurnContent || {})[t.group + '::' + t.index] || {};
       const base = 'turn::' + t.group + '::' + t.index;
       pushMsg('user', tc.user, { layer: t.layer, key: base + '::user' });
-      pushMsg('assistant', tc.assistant, { layer: t.layer, key: base + '::assistant' });
+      pushMsg('assistant', tc.assistant, { layer: t.layer, key: base + '::assistant', thinkBlock: G && G.no_think_block });
     });
 
     // The conversation, rendered from the REAL messages (the GUI holds them with
@@ -1361,9 +1389,9 @@
 
     // Same card style + layer prefix as the memory tiers above, so the whole
     // panel is uniform. The trailing assistant is open-ended while still decoding.
-    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i }));
+    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i, thinkBlock: dialogueThink }));
     if (um) pushMsg('user', um.content, { layer: targetLayer, key: 'conv::um' });
-    if (dm) pushMsg('assistant', decoded, { layer: targetLayer, suffix: complete ? '' : ' · decoded so far', open: !complete, key: 'conv::dm' });
+    if (dm) pushMsg('assistant', decoded, { layer: targetLayer, suffix: complete ? '' : ' · decoded so far', open: !complete, key: 'conv::dm', thinkBlock: dialogueThink });
 
     const empty = !sel.system.length && !hist.length && !um && !dm;
     const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(880px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },

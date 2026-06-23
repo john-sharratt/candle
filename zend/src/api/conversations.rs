@@ -201,6 +201,10 @@ pub struct Glue {
     pub user_end: String,
     pub assistant_start: String,
     pub assistant_end: String,
+    /// Empty/closed reasoning header forced when a turn is suppressed — what the
+    /// effort dial's Off injects and what every prefilled memory-tier turn carries.
+    /// A thinking turn has none (its `<think>` is a decoded token in the body).
+    pub no_think_block: String,
 }
 
 impl From<candle_conversation::GlueMarkers> for Glue {
@@ -212,6 +216,7 @@ impl From<candle_conversation::GlueMarkers> for Glue {
             user_end: m.user_end,
             assistant_start: m.assistant_start,
             assistant_end: m.assistant_end,
+            no_think_block: m.no_think_block,
         }
     }
 }

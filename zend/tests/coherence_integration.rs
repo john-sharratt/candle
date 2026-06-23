@@ -115,7 +115,13 @@ mod coherence {
             content: prompt.to_string(),
         }];
         let mut stream = session
-            .submit_with_sampling(messages, max_tokens, conv_id.to_string(), sampling)
+            .submit_with_sampling(
+                messages,
+                max_tokens,
+                conv_id.to_string(),
+                sampling,
+                candle_conversation::SelectionState::default(),
+            )
             .await;
 
         let mut response = String::new();
@@ -131,6 +137,12 @@ mod coherence {
                     token_events += 1;
                     eprint!("{tok}");
                     response.push_str(&tok);
+                }
+                StreamItem::Projection(projection_event_out) => {
+                    eprintln!(
+                        "\n[PROJECTION EVENT] {}",
+                        projection_event_out.projection_event
+                    );
                 }
             }
         }

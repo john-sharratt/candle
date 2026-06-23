@@ -10,8 +10,9 @@ use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::persistence::content_hash::{hash_tokens, ContentChain};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection, Builder, Conversation, ProjectionEvent, ProjectionTarget, SectionId,
-    SystemPromptItem, TimelineId, TurnIndex,
+    from_projection, Builder, Conversation, OptionalState, ProjectionEvent, ProjectionMode,
+    ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
+    NO_THINK_SELECTOR,
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
@@ -105,6 +106,11 @@ pub struct Sequence {
     /// Per-conversation config.
     config: SequenceConfig,
 
+    /// Current section-tree selection (e.g. the composer dials).  Set from each
+    /// turn's [`TurnOptions::selection`] and used by every projection until the
+    /// next turn changes it.  Empty = the schema's authored defaults.
+    selection: SelectionState,
+
     /// True while a submitted turn is being processed by the scheduler.
     turn_in_flight: bool,
 
@@ -168,6 +174,13 @@ pub struct GlueMarkers {
     pub user_end: String,
     pub assistant_start: String,
     pub assistant_end: String,
+    /// The empty/closed reasoning header forced after `assistant_start` when a
+    /// turn is *suppressed* (`<think>\n\n</think>\n\n` for Qwen3) — what the
+    /// composer effort dial's Off setting injects, and what every prefilled
+    /// memory-tier turn carries. (A *thinking* turn has no forced header: the
+    /// model emits its own `<think>` as a decoded token, so it shows up in the
+    /// turn body, not here.) Surfaced so the panel renders the framing verbatim.
+    pub no_think_block: String,
 }
 
 impl Sequence {
@@ -216,6 +229,7 @@ impl Sequence {
             id: sequence_id,
             tokenizer,
             tree: ConversationTree::with_config(system_prompt, tree_config),
+            selection: SelectionState::default(),
             pending_user: None,
             turn_counter: initial_turn_counter,
             config,
@@ -304,6 +318,15 @@ impl Sequence {
                     .iter()
                     .filter(|s| !s.is_template)
                     .map(|s| s.content.len() as u64)
+                    .sum::<u64>(),
+                // Tree nodes are sealed content; the ingest loop seals every
+                // option's branch variants — count content × variant-count over
+                // every option of every node.
+                SystemPromptItem::SectionTree(t) => t
+                    .nodes
+                    .iter()
+                    .flat_map(|n| n.options.iter())
+                    .map(|o| o.content.len() as u64 * o.variants.len() as u64)
                     .sum::<u64>(),
             })
             .sum::<u64>();
@@ -395,6 +418,37 @@ impl Sequence {
                             continue;
                         }
                         linear_prefix.push(sec.id);
+                    }
+                }
+                SystemPromptItem::SectionTree(tree) => {
+                    // Seal EVERY option's branch variants up front — the full
+                    // cross-product prefill that makes selector switching free.
+                    // Each variant is sealed against `[outer content prefix |
+                    // that branch's in-tree ancestor variants]`.  Sealing in
+                    // (node order, option order, variant order) is
+                    // dependency-safe: a variant's in-tree prefix references only
+                    // earlier nodes' variants, which are already sealed.
+                    for node in &tree.nodes {
+                        for option in &node.options {
+                            for v in &option.variants {
+                                let mut prefix = linear_prefix.clone();
+                                prefix.extend_from_slice(&v.in_tree_prefix);
+                                conv.insert_section_with_prefix(
+                                    v.id,
+                                    option.content.as_str(),
+                                    &prefix,
+                                )?;
+                                done_bytes += option.content.len() as u64;
+                                report(done_bytes);
+                            }
+                        }
+                    }
+                    // Sections declared after the tree (and the priming
+                    // projection) attend to the default branch — the fan-out is
+                    // bounded to the tree itself.
+                    for id in &tree.default_present_ids {
+                        linear_prefix.push(*id);
+                        fixed_prefix.push(*id);
                     }
                 }
             }
@@ -908,19 +962,35 @@ impl Sequence {
             });
         }
 
+        // Adopt this turn's section-tree selection (the composer dials).  It
+        // becomes the conversation's current selection and drives every
+        // projection — initial prefill and decode reprojection — until the next
+        // turn changes it.
+        self.selection = options.selection.clone();
+
         // Pin the system prompt into the substrate (idempotent).
         // Subsequent SubmitTurn calls re-inject it onto the slot via
         // `apply_projection`; the upload cache amortises after the
         // first turn.
 
-        // Format: [/no_think] + user_message + user_end + assistant_start.
-        let no_think_prefix = if self.config.suppress_thinking {
-            self.config.dialect.no_think
-        } else {
-            ""
+        // Thinking suppression is PER-TURN, driven by the section-tree
+        // `no_think` selector (the composer effort dial): `present` suppresses
+        // this turn, `absent` enables thinking.  Falls back to the
+        // conversation's configured default when the turn carries no selection
+        // (e.g. the titler).  The `/no_think` *text*, when suppressing, is
+        // emitted by the projection's `no_think` section — so it shows in the
+        // glue / section-tree view rather than being baked invisibly into the
+        // user turn here.  Only the assistant-header think block is set below.
+        let suppress = match self.selection.optional(NO_THINK_SELECTOR) {
+            Some(OptionalState::Present) => true,
+            Some(OptionalState::Absent) => false,
+            None => self.config.suppress_thinking,
         };
         // The persisted turn shape is
-        //     [no_think_prefix] + user_message + user_end + assistant_start [+ think_block] + decoded_body
+        //     user_message + user_end + assistant_start [+ no_think_block] + decoded_body
+        // where `no_think_block` (`<think></think>`) is present only when this
+        // turn is suppressed; a thinking turn opens its own `<think>` as the
+        // first decoded token, so it lives in `decoded_body`.
         // — i.e. `user_start` is **not** in the prefill and `assistant_end`
         // is **not** appended after decode.  Both boundary markers are
         // emitted as live `Generated` segments by the projection engine
@@ -934,20 +1004,19 @@ impl Sequence {
         // `assistant_start` markers stay baked — their hidden state is
         // dominated by the turn's own (invariant) content.
         let formatted = format!(
-            "{}{}{}{}",
-            no_think_prefix,
+            "{}{}{}",
             user_message,
             self.config.dialect.user_end,
             self.config.dialect.active_assistant_start(
-                self.config.suppress_thinking,
+                suppress,
                 self.config.thinking_capable
-                    && (!self.config.suppress_thinking || self.config.inject_no_think_block)
+                    && (!suppress || self.config.inject_no_think_block)
                     && self.config.dialect.supports_no_think(),
             ),
         );
         let prefill_tokens = self.tokenize(&formatted)?;
 
-        // No post-decode tail in the Phase 5 layout.  The model's
+        // No post-decode tail in the turn layout.  The model's
         // `<|im_end|>` EOS doesn't get forwarded (sampling stops on
         // EOS without a follow-up forward pass), and the trailing
         // `\n` that used to come from `assistant_end` is now the live
@@ -1063,6 +1132,7 @@ impl Sequence {
     fn projection_inputs(&self) -> ProjectionInputs {
         ProjectionInputs {
             projection: Arc::clone(&self.projection),
+            selection: self.selection.clone(),
         }
     }
 
@@ -1095,18 +1165,22 @@ impl Sequence {
 
         // Format the full exchange (user + assistant_start prefix +
         // assistant_text) and tokenize as a single prefill payload.
-        let no_think_prefix = if self.config.suppress_thinking {
-            self.config.dialect.no_think
-        } else {
-            ""
-        };
-        // Format: {user_start}[/no_think]{user}{user_end}{assistant_start}{assistant_text}.
+        //
+        // Prefilled content turns (repo_map, code_reading, tool ingests, …)
+        // carry SUPPLIED content — they never run a decoded reasoning pass — so
+        // the assistant think block is ALWAYS suppressed here (an empty
+        // `<think></think>`, never an open `<think>` that would swallow the
+        // content), independent of the model's thinking mode.  That's why the
+        // `/no_think` prefix and `active_assistant_start`'s suppress flag are
+        // hard `true` below, not derived from a per-turn selection.
+        let no_think_prefix = self.config.dialect.no_think;
+        // Format: {user_start}/no_think{user}{user_end}{assistant_start}<think></think>{assistant_text}.
         // The assistant role-end comes through `post_decode_tokens`
         // — there is no decode in this path so the EOS isn't emitted
         // by the model; we append the full `assistant_end` (EOS +
         // structural tail) ourselves so the seal captures a
         // structurally-complete turn.
-        // Same Phase 5 shape as `submit_turn`: `user_start` and
+        // Same boundary shape as `submit_turn`: `user_start` and
         // `assistant_end` are stripped from the persisted bytes; the
         // projection's live `Generated` segments re-emit them around
         // the sealed turn on every future projection.  The trailing
@@ -1118,9 +1192,9 @@ impl Sequence {
             user_message,
             self.config.dialect.user_end,
             self.config.dialect.active_assistant_start(
-                self.config.suppress_thinking,
+                true,
                 self.config.thinking_capable
-                    && (!self.config.suppress_thinking || self.config.inject_no_think_block)
+                    && self.config.inject_no_think_block
                     && self.config.dialect.supports_no_think(),
             ),
             assistant_text,
@@ -1238,7 +1312,12 @@ impl Sequence {
         }
         let scores = self.bdp_scanner.to_projection_scores();
         let resolver = self.substrate.read_for_scored(self.target, &scores);
-        let projection = self.projection.project(self.target, &resolver);
+        let projection = self.projection.project_with_selection(
+            self.target,
+            &resolver,
+            ProjectionMode::Decode,
+            &self.selection,
+        );
         let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
         Some(from_projection(
             &projection.segments,
@@ -1268,6 +1347,20 @@ impl Sequence {
                             out.push((s.name.clone(), s.content.clone()));
                         }
                     }
+                    crate::projection::SystemPromptItem::SectionTree(t) => {
+                        // One entry per (node, option): name `node` or `node:option`
+                        // for selector options, so the panel can resolve each.
+                        for n in &t.nodes {
+                            for o in &n.options {
+                                let name = if n.options.len() > 1 {
+                                    format!("{}:{}", n.name, o.id)
+                                } else {
+                                    n.name.clone()
+                                };
+                                out.push((name, o.content.clone()));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1287,6 +1380,7 @@ impl Sequence {
             user_end: d.user_end.to_string(),
             assistant_start: d.assistant_start.to_string(),
             assistant_end: d.assistant_end.to_string(),
+            no_think_block: d.no_think_block.to_string(),
         }
     }
 
@@ -1447,6 +1541,7 @@ impl Sequence {
             id: new_seq_id,
             tokenizer: Arc::clone(&self.tokenizer),
             tree: self.tree.clone(),
+            selection: self.selection.clone(),
             pending_user: None,
             turn_counter: self.turn_counter,
             config: self.config.clone(),
@@ -1693,8 +1788,7 @@ impl Sequence {
         if count == 0 {
             return Ok(());
         }
-        let stream_id =
-            crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
+        let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), count - 1);
         let payload = crate::projection::encode_events(events);
         self.substrate
             .persist_projection_events(stream_id, &payload)
@@ -1893,6 +1987,7 @@ impl Sequence {
         Some(ReprojectionPolicy {
             target: self.target,
             projection: Arc::clone(&self.projection),
+            selection: self.selection.clone(),
             substrate: self.substrate.clone(),
             provenance: Arc::clone(&self.provenance),
             provenance_layer_indices: self.model_core.provenance_layer_indices,

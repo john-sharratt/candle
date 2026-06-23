@@ -574,8 +574,8 @@ mod tests {
         let live = collect_live_records(&mut mem, &manifest, &substrate).unwrap();
 
         assert!(
-            live.iter().any(|(h, p)| h.record_type == RecordType::ProjectionEvents
-                && p == &proj_payload),
+            live.iter()
+                .any(|(h, p)| h.record_type == RecordType::ProjectionEvents && p == &proj_payload),
             "ProjectionEvents record must survive compaction with its payload intact",
         );
     }

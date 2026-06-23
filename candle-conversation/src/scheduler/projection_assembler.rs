@@ -949,10 +949,18 @@ mod tests {
                 AssembledPiece::Section(SectionId::new(7)),
                 // user_start flushed just before the first turn
                 AssembledPiece::Glue(vec![100]),
-                AssembledPiece::Turn { group: GroupId::for_test(2), index: TurnIndex(3), role: crate::Role::Assistant },
+                AssembledPiece::Turn {
+                    group: GroupId::for_test(2),
+                    index: TurnIndex(3),
+                    role: crate::Role::Assistant
+                },
                 // turn 1's assistant_end MERGES with turn 2's user_start in one island
                 AssembledPiece::Glue(vec![200, 100]),
-                AssembledPiece::Turn { group: GroupId::for_test(2), index: TurnIndex(4), role: crate::Role::Assistant },
+                AssembledPiece::Turn {
+                    group: GroupId::for_test(2),
+                    index: TurnIndex(4),
+                    role: crate::Role::Assistant
+                },
                 // turn 2's assistant_end merges with the trailing Generated run
                 AssembledPiece::Glue(vec![200, 3]),
                 // in-flight user message deferred past the gap-fill
