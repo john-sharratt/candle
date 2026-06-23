@@ -142,9 +142,10 @@ async fn model_independent_api_contract() {
         .unwrap();
     assert_eq!(r.status(), 503);
 
-    // windowed-substrate is model-gated -> 503 without an engine
+    // conversation history (and its windowed-substrate panel data, now folded
+    // into this endpoint) is model-gated -> 503 without an engine
     let r = client
-        .get(format!("{base}/v1/conversations/whatever/substrate"))
+        .get(format!("{base}/v1/conversations/whatever"))
         .send()
         .await
         .unwrap();
