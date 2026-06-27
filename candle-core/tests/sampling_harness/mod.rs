@@ -35,12 +35,12 @@ pub fn cpu_apply_penalties(
     eos_ramp_len: i32,
     eos_boost_max_multiplier: f32,
     current_len: i32,
-    eot_boost: f32,
-    eot_token_id: i32,
-    eot_ramp_start: i32,
-    eot_ramp_len: i32,
-    eot_boost_max_multiplier: f32,
-    thinking_len: i32,
+    segment_close_boost: f32,
+    segment_close_token_id: i32,
+    segment_close_ramp_start: i32,
+    segment_close_ramp_len: i32,
+    segment_close_max_multiplier: f32,
+    segment_len: i32,
     cross_turn_penalty: f32,
     cross_turn_counts: &[i32],
     token_counts: &[i32],
@@ -52,11 +52,11 @@ pub fn cpu_apply_penalties(
 ) -> f32 {
     let mut v = logit;
 
-    // Protected tokens: EOS and EOT (</think>) must never be penalised.
+    // Protected tokens: EOS and the segment-close token must never be penalised.
     // Penalties would suppress the model's ability to stop generating.
     let is_eos = token_id as i32 == eos_token_id;
-    let is_eot = token_id as i32 == eot_token_id;
-    let is_protected = is_eos || is_eot;
+    let is_segment_close = token_id as i32 == segment_close_token_id;
+    let is_protected = is_eos || is_segment_close;
     let saved_logit = v;
 
     // Repeat penalty via recent token bitset
@@ -96,7 +96,7 @@ pub fn cpu_apply_penalties(
         }
     }
 
-    // Restore logit for protected tokens (EOS, EOT) — undo all penalties above
+    // Restore logit for protected tokens (EOS, segment-close) — undo all penalties above
     if is_protected {
         v = saved_logit;
     }
@@ -113,16 +113,23 @@ pub fn cpu_apply_penalties(
         v += effective_boost;
     }
 
-    // EOT boost (end-of-thinking ramp) — same formula as EOS but uses thinking_len
-    if token_id as i32 == eot_token_id && eot_boost != 0.0 && thinking_len > 0 {
-        let effective_eot = if eot_ramp_len > 0 && eot_boost_max_multiplier > 0.0 {
-            let ramp_span = (eot_ramp_len - eot_ramp_start).max(1) as f32;
-            let t = ((thinking_len - eot_ramp_start).max(0) as f32 / ramp_span).min(1.0);
-            eot_boost * t * eot_boost_max_multiplier
+    // Per-segment close boost — same formula as EOS but uses segment_len, and
+    // targets BOTH the segment-close token AND EOS (inside a steered segment EOS
+    // is intercepted into a segment close, so it's a second per-segment close lever).
+    if (token_id as i32 == segment_close_token_id || token_id as i32 == eos_token_id)
+        && segment_close_boost != 0.0
+        && segment_len > 0
+    {
+        let effective_segment_close = if segment_close_ramp_len > 0
+            && segment_close_max_multiplier > 0.0
+        {
+            let ramp_span = (segment_close_ramp_len - segment_close_ramp_start).max(1) as f32;
+            let t = ((segment_len - segment_close_ramp_start).max(0) as f32 / ramp_span).min(1.0);
+            segment_close_boost * t * segment_close_max_multiplier
         } else {
-            eot_boost
+            segment_close_boost
         };
-        v += effective_eot;
+        v += effective_segment_close;
     }
 
     // Banned tokens
@@ -238,12 +245,15 @@ pub fn cpu_sample_argmax(
     eos_ramp_len: i32,
     eos_boost_max_multiplier: f32,
     current_len: i32,
-    eot_boost: f32,
-    eot_token_id: i32,
-    eot_ramp_start: i32,
-    eot_ramp_len: i32,
-    eot_boost_max_multiplier: f32,
-    thinking_len: i32,
+    segment_close_boost: f32,
+    segment_close_token_id: i32,
+    segment_close_ramp_start: i32,
+    segment_close_ramp_len: i32,
+    segment_close_max_multiplier: f32,
+    segment_len: i32,
+    segment_temp_boost: f32,
+    segment_suppress_tokens: &[i32],
+    segment_suppress_penalty: f32,
     cross_turn_penalty: f32,
     cross_turn_counts: &[i32],
     token_counts: &[i32],
@@ -255,6 +265,67 @@ pub fn cpu_sample_argmax(
     max_recent_len: usize,
     stencil: &[i32],
 ) -> u32 {
+    // In-segment steering mirrors the kernel:
+    //   - while inside a segment, restrict the repeat/DRY recent window to the
+    //     last `effective_len = min(segment_len, recent_len)` tokens (the
+    //     in-segment span), and cap dry_range to that window;
+    //   - DRY is gated off entirely outside a segment (segment_len == 0);
+    //   - temperature is nudged by `segment_temp_boost` while in-segment.
+    // The scoped recent window is materialised as a fresh per-batch buffer whose
+    // `batch_idx` row holds the in-segment suffix, left-aligned, so the existing
+    // index-by-batch helpers see exactly the scoped tokens.
+    let in_segment = segment_len > 0;
+    // Temperature boost applies whenever in-segment, independent of recent tokens.
+    let temperature = if in_segment {
+        temperature + segment_temp_boost
+    } else {
+        temperature
+    };
+    // Token suppression: subtract the penalty from each suppress token while
+    // in-segment. Gated to the segment exactly like the kernel.
+    let suppress_penalty = if in_segment {
+        segment_suppress_penalty
+    } else {
+        0.0
+    };
+    let suppress_logit = |token_id: usize, mut v: f32| -> f32 {
+        if suppress_penalty != 0.0 && segment_suppress_tokens.contains(&(token_id as i32)) {
+            v -= suppress_penalty;
+        }
+        v
+    };
+    let (recent_tokens, recent_lens, dry_range, dry_multiplier) =
+        if in_segment && !recent_tokens.is_empty() && !recent_lens.is_empty() {
+            // In-segment: scope repeat/DRY to the last `effective_len` recent tokens.
+            let rlen = recent_lens[batch_idx] as usize;
+            let effective_len = (segment_len as usize).min(rlen);
+            let offset = rlen - effective_len;
+            let base = batch_idx * max_recent_len;
+            let mut scoped = recent_tokens.to_vec();
+            for j in 0..effective_len {
+                scoped[base + j] = recent_tokens[base + offset + j];
+            }
+            let mut scoped_lens = recent_lens.to_vec();
+            scoped_lens[batch_idx] = effective_len as i32;
+            let scoped_dry_range = if dry_range > 0 {
+                dry_range.min(effective_len as i32)
+            } else {
+                effective_len as i32
+            };
+            (scoped, scoped_lens, scoped_dry_range, dry_multiplier)
+        } else {
+            // Outside a segment: DRY is gated off; repeat keeps its full window.
+            let gated_dry = if in_segment { dry_multiplier } else { 0.0 };
+            (
+                recent_tokens.to_vec(),
+                recent_lens.to_vec(),
+                dry_range,
+                gated_dry,
+            )
+        };
+    let recent_tokens: &[i32] = &recent_tokens;
+    let recent_lens: &[i32] = &recent_lens;
+
     // Stencil path
     if !stencil.is_empty() {
         let mut best_val = f32::NEG_INFINITY;
@@ -281,12 +352,12 @@ pub fn cpu_sample_argmax(
                 eos_ramp_len,
                 eos_boost_max_multiplier,
                 current_len,
-                eot_boost,
-                eot_token_id,
-                eot_ramp_start,
-                eot_ramp_len,
-                eot_boost_max_multiplier,
-                thinking_len,
+                segment_close_boost,
+                segment_close_token_id,
+                segment_close_ramp_start,
+                segment_close_ramp_len,
+                segment_close_max_multiplier,
+                segment_len,
                 cross_turn_penalty,
                 cross_turn_counts,
                 token_counts,
@@ -296,6 +367,8 @@ pub fn cpu_sample_argmax(
                 banned_tokens,
                 banned_per_seq,
             );
+
+            v = suppress_logit(tid, v);
 
             if v > best_val {
                 best_val = v;
@@ -342,12 +415,12 @@ pub fn cpu_sample_argmax(
             eos_ramp_len,
             eos_boost_max_multiplier,
             current_len,
-            eot_boost,
-            eot_token_id,
-            eot_ramp_start,
-            eot_ramp_len,
-            eot_boost_max_multiplier,
-            thinking_len,
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+            segment_len,
             cross_turn_penalty,
             cross_turn_counts,
             token_counts,
@@ -364,6 +437,9 @@ pub fn cpu_sample_argmax(
                 v -= penalty;
             }
         }
+
+        // Apply token suppression (in-segment ceiling lever).
+        v = suppress_logit(i, v);
 
         penalized.push(v);
     }
@@ -444,12 +520,18 @@ pub struct SamplingParams {
 
     pub current_lens: Vec<i32>,
 
-    pub eot_boost: f32,
-    pub eot_token_id: i32,
-    pub eot_ramp_start: i32,
-    pub eot_ramp_len: i32,
-    pub eot_boost_max_multiplier: f32,
-    pub thinking_lens: Vec<i32>,
+    pub segment_close_boost: f32,
+    pub segment_close_token_id: i32,
+    pub segment_close_ramp_start: i32,
+    pub segment_close_ramp_len: i32,
+    pub segment_close_max_multiplier: f32,
+    pub segment_lens: Vec<i32>,
+    pub segment_temp_boost: f32,
+
+    /// Shared token IDs suppressed while inside a segment.
+    pub segment_suppress_tokens: Vec<i32>,
+    /// Per-sequence suppression penalty subtracted from each suppress token.
+    pub segment_suppress_penalties: Vec<f32>,
 
     pub token_counts: Vec<i32>,
     pub banned_tokens: Vec<i32>,
@@ -492,12 +574,15 @@ impl Default for SamplingParams {
             cross_turn_penalty: 0.0,
             cross_turn_counts: vec![],
             current_lens: vec![],
-            eot_boost: 0.0,
-            eot_token_id: -1,
-            eot_ramp_start: 0,
-            eot_ramp_len: 0,
-            eot_boost_max_multiplier: 0.0,
-            thinking_lens: vec![],
+            segment_close_boost: 0.0,
+            segment_close_token_id: -1,
+            segment_close_ramp_start: 0,
+            segment_close_ramp_len: 0,
+            segment_close_max_multiplier: 0.0,
+            segment_lens: vec![],
+            segment_temp_boost: 0.0,
+            segment_suppress_tokens: vec![],
+            segment_suppress_penalties: vec![],
             token_counts: vec![],
             banned_tokens: vec![],
             num_banned_tokens: 0,
@@ -542,11 +627,16 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
     let token_counts_gpu = upload(stream, &p.token_counts);
     let cross_turn_gpu = upload(stream, &p.cross_turn_counts);
     let current_lens_gpu = upload(stream, &p.current_lens);
-    let thinking_lens_gpu = upload(stream, &p.thinking_lens);
+    let segment_lens_gpu = upload(stream, &p.segment_lens);
+    let suppress_tokens_gpu = upload(stream, &p.segment_suppress_tokens);
+    let suppress_penalties_gpu = upload(stream, &p.segment_suppress_penalties);
     let banned_gpu = upload(stream, &p.banned_tokens);
     let recent_gpu = upload(stream, &p.recent_tokens);
     let recent_lens_gpu = upload(stream, &p.recent_lens);
     let stencil_gpu = upload(stream, &p.stencil);
+
+    let suppress_active = !p.segment_suppress_tokens.is_empty()
+        && p.segment_suppress_penalties.iter().any(|&v| v != 0.0);
 
     let mut output_gpu: CudaSlice<u32> = alloc_zeroed(stream, p.batch_size as usize);
 
@@ -562,6 +652,34 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
         let (logits_ptr, _g1) = logits_gpu.device_ptr(stream);
         let (output_ptr, _g2) = output_gpu.device_ptr_mut(stream);
         let (rng_ptr, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+
+        let suppress_tok_ptr = if suppress_active {
+            suppress_tokens_gpu
+                .as_ref()
+                .map(|s| {
+                    let (p, _) = s.device_ptr(stream);
+                    p as *const i32
+                })
+                .unwrap_or(std::ptr::null())
+        } else {
+            std::ptr::null()
+        };
+        let suppress_pen_ptr = if suppress_active {
+            suppress_penalties_gpu
+                .as_ref()
+                .map(|s| {
+                    let (p, _) = s.device_ptr(stream);
+                    p as *const f32
+                })
+                .unwrap_or(std::ptr::null())
+        } else {
+            std::ptr::null()
+        };
+        let suppress_count = if suppress_active {
+            p.segment_suppress_tokens.len() as i32
+        } else {
+            0
+        };
 
         let tc_ptr = token_counts_gpu
             .as_ref()
@@ -584,7 +702,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p as *const i32
             })
             .unwrap_or(std::ptr::null());
-        let think_lens_ptr = thinking_lens_gpu
+        let segment_lens_ptr = segment_lens_gpu
             .as_ref()
             .map(|s| {
                 let (p, _) = s.device_ptr(stream);
@@ -644,12 +762,16 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p.cross_turn_penalty,
                 cross_ptr,
                 cur_lens_ptr,
-                p.eot_boost,
-                p.eot_token_id,
-                p.eot_ramp_start,
-                p.eot_ramp_len,
-                p.eot_boost_max_multiplier,
-                think_lens_ptr,
+                p.segment_close_boost,
+                p.segment_close_token_id,
+                p.segment_close_ramp_start,
+                p.segment_close_ramp_len,
+                p.segment_close_max_multiplier,
+                segment_lens_ptr,
+                p.segment_temp_boost,
+                suppress_tok_ptr,
+                suppress_count,
+                suppress_pen_ptr,
                 tc_ptr,
                 ban_ptr,
                 p.num_banned_tokens,
@@ -702,15 +824,22 @@ pub fn run_cpu(p: &SamplingParams) -> Vec<u32> {
                 p.eos_ramp_len,
                 p.eos_boost_max_multiplier,
                 current_len,
-                p.eot_boost,
-                p.eot_token_id,
-                p.eot_ramp_start,
-                p.eot_ramp_len,
-                p.eot_boost_max_multiplier,
-                if batch_idx < p.thinking_lens.len() {
-                    p.thinking_lens[batch_idx]
+                p.segment_close_boost,
+                p.segment_close_token_id,
+                p.segment_close_ramp_start,
+                p.segment_close_ramp_len,
+                p.segment_close_max_multiplier,
+                if batch_idx < p.segment_lens.len() {
+                    p.segment_lens[batch_idx]
                 } else {
                     0
+                },
+                p.segment_temp_boost,
+                &p.segment_suppress_tokens,
+                if batch_idx < p.segment_suppress_penalties.len() {
+                    p.segment_suppress_penalties[batch_idx]
+                } else {
+                    0.0
                 },
                 p.cross_turn_penalty,
                 &p.cross_turn_counts,
@@ -804,11 +933,16 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
     let token_counts_gpu = upload(stream, &p.token_counts);
     let cross_turn_gpu = upload(stream, &p.cross_turn_counts);
     let current_lens_gpu = upload(stream, &p.current_lens);
-    let thinking_lens_gpu = upload(stream, &p.thinking_lens);
+    let segment_lens_gpu = upload(stream, &p.segment_lens);
+    let suppress_tokens_gpu = upload(stream, &p.segment_suppress_tokens);
+    let suppress_penalties_gpu = upload(stream, &p.segment_suppress_penalties);
     let banned_gpu = upload(stream, &p.banned_tokens);
     let recent_gpu = upload(stream, &p.recent_tokens);
     let recent_lens_gpu = upload(stream, &p.recent_lens);
     let stencil_gpu = upload(stream, &p.stencil);
+
+    let suppress_active = !p.segment_suppress_tokens.is_empty()
+        && p.segment_suppress_penalties.iter().any(|&v| v != 0.0);
 
     let mut output_gpu: CudaSlice<u32> = alloc_zeroed(stream, p.batch_size as usize);
 
@@ -824,6 +958,34 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
         let (logits_ptr, _g1) = logits_gpu.device_ptr(stream);
         let (output_ptr, _g2) = output_gpu.device_ptr_mut(stream);
         let (rng_ptr, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+
+        let suppress_tok_ptr = if suppress_active {
+            suppress_tokens_gpu
+                .as_ref()
+                .map(|s| {
+                    let (p, _) = s.device_ptr(stream);
+                    p as *const i32
+                })
+                .unwrap_or(std::ptr::null())
+        } else {
+            std::ptr::null()
+        };
+        let suppress_pen_ptr = if suppress_active {
+            suppress_penalties_gpu
+                .as_ref()
+                .map(|s| {
+                    let (p, _) = s.device_ptr(stream);
+                    p as *const f32
+                })
+                .unwrap_or(std::ptr::null())
+        } else {
+            std::ptr::null()
+        };
+        let suppress_count = if suppress_active {
+            p.segment_suppress_tokens.len() as i32
+        } else {
+            0
+        };
 
         let tc_ptr = token_counts_gpu
             .as_ref()
@@ -846,7 +1008,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p as *const i32
             })
             .unwrap_or(std::ptr::null());
-        let think_lens_ptr = thinking_lens_gpu
+        let segment_lens_ptr = segment_lens_gpu
             .as_ref()
             .map(|s| {
                 let (p, _) = s.device_ptr(stream);
@@ -906,12 +1068,16 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p.cross_turn_penalty,
                 cross_ptr,
                 cur_lens_ptr,
-                p.eot_boost,
-                p.eot_token_id,
-                p.eot_ramp_start,
-                p.eot_ramp_len,
-                p.eot_boost_max_multiplier,
-                think_lens_ptr,
+                p.segment_close_boost,
+                p.segment_close_token_id,
+                p.segment_close_ramp_start,
+                p.segment_close_ramp_len,
+                p.segment_close_max_multiplier,
+                segment_lens_ptr,
+                p.segment_temp_boost,
+                suppress_tok_ptr,
+                suppress_count,
+                suppress_pen_ptr,
                 tc_ptr,
                 ban_ptr,
                 p.num_banned_tokens,

@@ -192,7 +192,10 @@ mod tests {
             // the second is full (32) — the offset>0 boundary layout.
             let (start, end) = (18usize, 64usize);
             let win = window_range(&sealed, start, end);
-            assert!(win.chunks[0].offset > 0, "expected offset>0 first window chunk");
+            assert!(
+                win.chunks[0].offset > 0,
+                "expected offset>0 first window chunk"
+            );
 
             let dst = backing.alloc_sequence().unwrap();
             backing.inject_sealed_at_tail(dst, &win).unwrap();

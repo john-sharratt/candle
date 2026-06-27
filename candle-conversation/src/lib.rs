@@ -57,6 +57,7 @@ pub mod provenance;
 pub(crate) mod scheduler;
 mod sequence_handle;
 mod stats;
+pub mod stencil;
 pub mod store;
 pub mod substrate;
 pub mod summary_tree;
@@ -71,7 +72,7 @@ pub use config::{
     SchedulerConfig, SequenceConfig,
 };
 pub use conversation::{GlueMarkers, Sequence};
-pub use engine::{ConversationEngine, SubstrateReloadStatus};
+pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{

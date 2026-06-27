@@ -3681,6 +3681,203 @@ fn collection_partial_but_unsealed_summary_omitted() {
     );
 }
 
+/// With a structural open marker (`<tools>`), the catalog summary emits OUTSIDE
+/// it — after the preamble section, before the open template — not inside the
+/// markers next to the members.
+#[test]
+fn collection_summary_emits_outside_structural_markers() {
+    use super::project::{ProjectionSegment, SealedKind};
+    use candle_transformers::models::dialect::Dialect;
+
+    let yaml = r#"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section
+          id: tools_overview
+          depends_on: tools
+          content: "overview"
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: tools
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 1 }
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: x
+              user_prompt: x
+            assign:
+              max_tokens: 128
+              system_prompt: x
+              user_prompt: x
+          sections:
+            - id: tool_a
+              content: "A"
+            - id: tool_b
+              content: "B"
+            - id: tool_c
+              content: "C"
+        - kind: template
+          id: tools_close
+          dialect: tool_block_close
+          depends_on: tools
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let dlct = Dialect::chat_ml();
+    let mut b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+    b.tokenize_templates::<std::convert::Infallible, _>(|s| Ok(s.bytes().map(u32::from).collect()))
+        .unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(dialogue, tools, summary)
+        .unwrap();
+    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
+
+    // top_k=1 over 3 members → partial; summary sealed.
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.9)
+        .with_section_tokens(summary, 100);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let order: Vec<String> = proj
+        .segments
+        .iter()
+        .map(|seg| match seg {
+            ProjectionSegment::Generated { identity, .. } => identity.name.clone(),
+            ProjectionSegment::Sealed(SealedKind::Section(s)) if s.id == summary => {
+                "SUMMARY".to_string()
+            }
+            _ => "_".to_string(),
+        })
+        .collect();
+    let sp = order
+        .iter()
+        .position(|s| s == "SUMMARY")
+        .unwrap_or_else(|| panic!("summary not emitted: {order:?}"));
+    let op = order
+        .iter()
+        .position(|s| s == "tools_open")
+        .unwrap_or_else(|| panic!("tools_open not emitted: {order:?}"));
+    // Summary sits OUTSIDE the markers: before `<tools>` opens.
+    assert!(
+        sp < op,
+        "summary must emit before the <tools> open marker: {order:?}"
+    );
+}
+
+/// `depends_on_absent` is the inverse of `depends_on`: its section emits only
+/// when the collection materialised zero members (the no-tools variant), and is
+/// suppressed when the collection has members.
+#[test]
+fn depends_on_absent_emits_only_when_collection_empty() {
+    const YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: c
+          user_prompt: c
+        assistant:
+          system_prompt: c
+          user_prompt: c
+    system_prompt:
+      items:
+        - kind: section
+          id: with_tools
+          depends_on: tools
+          content: "WITH"
+        - kind: section
+          id: no_tools
+          depends_on_absent: tools
+          content: "NO"
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 2 }
+          score_threshold: 0.5
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: x
+              user_prompt: x
+            assign:
+              max_tokens: 128
+              system_prompt: x
+              user_prompt: x
+          sections:
+            - id: t1
+              content: "tool one"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let b = Builder::from_yaml(YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let with = b.id_for_section_in(dialogue, "with_tools").unwrap();
+    let no = b.id_for_section_in(dialogue, "no_tools").unwrap();
+    let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+
+    // Tools present (t1 above threshold) → `with_tools` emits, `no_tools` not.
+    let present = MockResolver::new().with_section_score(t1, 0.9);
+    let ids: Vec<SectionId> = b
+        .project(target, &present)
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        ids.contains(&with) && !ids.contains(&no),
+        "tools present → only the tool-aware grounding: {ids:?}"
+    );
+
+    // No tools (t1 below threshold → collection empty) → `no_tools` emits.
+    let empty = MockResolver::new();
+    let ids: Vec<SectionId> = b
+        .project(target, &empty)
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        ids.contains(&no) && !ids.contains(&with),
+        "no tools → only the no-tools grounding: {ids:?}"
+    );
+}
+
 #[test]
 fn collection_top_k_keeps_highest_scored_in_declaration_order() {
     let b = Builder::from_yaml(COLLECTION_YAML).unwrap();

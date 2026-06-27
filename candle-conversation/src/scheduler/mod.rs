@@ -24,15 +24,17 @@ use crate::persistence::resume::encode_signatures;
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
-    Builder, CompressionPrompt, Conversation, GeneratedIdentity, GroupId, ProjectionMode,
-    ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind, SectionId,
-    SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey,
+    Builder, CompressionPrompt, Conversation, GeneratedIdentity, GroupId, OptionalState,
+    ProjectionMode, ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind,
+    SectionId, SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey,
+    NO_THINK_SELECTOR,
 };
 use crate::provenance::{
     extract_mh_signatures_from_r16_dump, merge_turn_signatures_xor, BdpScanner, SigEntry,
     TokenSignature, TurnSignatures,
 };
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
+use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry};
 use crate::substrate::{ResidenceIndex, TurnContentBounds, TurnPartWrite};
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -195,6 +197,10 @@ pub(crate) enum SchedulerRequest {
         /// re-projecting the whole trunk every turn is both unnecessary
         /// and O(n²) — see `zend::code_read`.
         disable_reprojection: bool,
+        /// Tool-call stencils that may fire during this turn's decode, keyed by
+        /// their trigger token (e.g. `<tool_call>`).  An empty registry means no
+        /// constrained decoding — the turn free-decodes.
+        triggers: Arc<TriggerRegistry>,
     },
 
     /// Free a sequence slot.
@@ -582,10 +588,11 @@ struct DecodeState {
     post_decode_tokens: TokenBuffer,
     /// Full prefill token sequence pinned into the slot at this
     /// turn's submit:
-    /// `[user_msg][user_end][assistant_start]` — a *suppressed* turn bakes an
-    /// empty `<think></think>` right after `assistant_start`, and the
-    /// `insert_turn` path additionally prepends `/no_think`.  A *thinking*
-    /// turn's `<think>` is NOT here: the model emits it into `generated_tokens`.
+    /// `[user_msg][user_end][assistant_start]` — the assistant header is clean,
+    /// and the `insert_turn` path additionally prepends `/no_think`.  The think
+    /// block is NEVER baked here: a suppressed turn decodes its own empty
+    /// `<think></think>` and a thinking turn opens its own `<think>`, so either
+    /// way it lands in `generated_tokens`.
     /// Concatenated with `generated_tokens` and `post_decode_tokens`
     /// at seal time to form `TurnContent::token_ids` — the
     /// cross-process replay sequence persisted to the redo log.
@@ -606,6 +613,19 @@ struct DecodeState {
     /// verbatim as `TurnPart::assistant_text` at seal time. Empty for decode
     /// turns, where the seal uses the model's decoded text instead.
     prefill_assistant_text: String,
+    /// Tool-call stencils available this turn, keyed by trigger token.  Empty
+    /// registry = free decode.  Carried from the turn's `SubmitTurn`.
+    triggers: Arc<TriggerRegistry>,
+    /// The constrained-decoding walk currently in progress (a `<tool_call>` is
+    /// mid-emission).  `None` whenever the model is free-decoding — a genuine
+    /// present/absent, not a feature flag.
+    stencil: Option<StencilDriver>,
+    /// The decode action (`Branch`/`Free`/`Done`) the stencil yielded for the
+    /// upcoming decode step.  Set by `inject_stencil_prefills` once any preceding
+    /// static runs are injected; consumed by `batch_decode_step` (apply the mask,
+    /// then `accept` the sampled token and clear).  `None` ⇒ the driver needs
+    /// advancing again.
+    pending_mask: Option<StepMask>,
 }
 
 /// Per-turn view bookkeeping carried in the scheduler's `turn_views` map.
@@ -828,6 +848,9 @@ pub(super) struct PrefillWork {
     /// post-decode forward pass in `cleanup_finished` can run.  Empty
     /// for paths that don't append a closing tail.
     pub(super) post_decode_tokens: TokenBuffer,
+    /// Tool-call stencils carried through prefill and installed on the
+    /// [`DecodeState`] at decode start.  Empty registry = no constrained decode.
+    pub(super) triggers: Arc<TriggerRegistry>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -1553,6 +1576,7 @@ impl Scheduler {
                 event_tx,
                 reprojection,
                 disable_reprojection,
+                triggers,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -1742,6 +1766,28 @@ impl Scheduler {
                             position: pos,
                         },
                     });
+                    // When the composer dial suppresses thinking, follow the user
+                    // opener with a live `/no_think` run.  Qwen3 only honours the
+                    // soft-switch from the user turn (not the system prompt), and
+                    // emitting it as GLUE here — re-decided from the current dial
+                    // every projection, never sealed into a turn — keeps it out of
+                    // the substrate and prevents a past suppressed turn from leaking
+                    // a stale switch onto a later thinking-on turn.  The assembler
+                    // batches it into the same live-prefill run as `user_start`.
+                    let suppress = matches!(
+                        inputs.selection.optional(NO_THINK_SELECTOR),
+                        Some(OptionalState::Present)
+                    );
+                    if suppress && !self.boundary_markers.no_think.is_empty() {
+                        let pos = segments.len();
+                        segments.push(ProjectionSegment::Generated {
+                            tokens: self.boundary_markers.no_think.clone(),
+                            identity: GeneratedIdentity {
+                                name: "no_think_current".into(),
+                                position: pos,
+                            },
+                        });
+                    }
                     (sections, segments)
                 } else {
                     (Vec::new(), Vec::new())
@@ -1921,6 +1967,7 @@ impl Scheduler {
                     reprojection,
                     seal_action,
                     post_decode_tokens,
+                    triggers,
                 });
                 true
             }
@@ -2199,7 +2246,7 @@ impl Scheduler {
         height: u8,
         response_tx: Sender<Result<TurnIndex, String>>,
     ) -> Result<(), String> {
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::summariser",
             timeline = %timeline,
             children = ?children,
@@ -2502,6 +2549,21 @@ impl Scheduler {
                 position: 0,
             },
         });
+        // `/no_think` rides the user opener as live glue — the same single
+        // mechanism the dialogue's `no_think_current` uses — so the compressor
+        // never reasons (the summary budget is tiny). Unconditional: a summary
+        // pass always suppresses, independent of the user's effort dial. The only
+        // other copy is in the compressor system prompt; it is never in the
+        // instruction text.
+        if !self.boundary_markers.no_think.is_empty() {
+            prefix.push(ProjectionSegment::Generated {
+                tokens: self.boundary_markers.no_think.clone(),
+                identity: GeneratedIdentity {
+                    name: "compress_no_think".to_string(),
+                    position: 0,
+                },
+            });
+        }
 
         // Rolling anchor: the most recent sealed *summary* turn before these
         // children — the running thread of the conversation so far, itself
@@ -2712,6 +2774,7 @@ impl Scheduler {
                         max_tokens,
                     },
                     post_decode_tokens: TokenBuffer::default(),
+                    triggers: Arc::new(TriggerRegistry::new()),
                 });
             }
             Role::System => {
@@ -2828,6 +2891,9 @@ impl Scheduler {
                 prefill_tokens: TokenBuffer::default(),
                 user_text: String::new(),
                 content_bounds: TurnContentBounds::default(),
+                triggers: Arc::new(TriggerRegistry::new()),
+                stencil: None,
+                pending_mask: None,
             },
         );
         Ok(())
@@ -2952,6 +3018,26 @@ impl Scheduler {
 
     /// Frame a compressed exchange (a user-half + assistant-half, already as
     /// token ids) as one clean marker-framed turn and enqueue it for the seal.
+    /// Decode `tokens`, strip any `<think>…</think>` block, and re-encode the
+    /// cleaned summary text. Returns the original tokens unchanged when there is
+    /// no think tag (the common case pays only a decode + scan), so the
+    /// deterministic structural path — which never emits a think block — is a
+    /// no-op.
+    fn strip_think_from_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+        let Ok(text) = self.tokenizer.decode(tokens, true) else {
+            return tokens.to_vec();
+        };
+        let lower = text.to_ascii_lowercase();
+        if !lower.contains("<think>") && !lower.contains("</think>") {
+            return tokens.to_vec();
+        }
+        let stripped = crate::think_strip::strip_think_blocks(&text);
+        self.tokenizer
+            .encode(stripped.as_str(), false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_else(|_| tokens.to_vec())
+    }
+
     /// Shared by the model-decode path ([`Self::enqueue_compression_turn`]) and
     /// the deterministic structural path ([`Self::handle_summary_probe`]).
     fn seal_compression_turn(
@@ -2963,6 +3049,14 @@ impl Scheduler {
         assistant_tokens: Vec<u32>,
         response_tx: Sender<Result<TurnIndex, String>>,
     ) -> Result<(), String> {
+        // Despite the `/no_think` directive the model may still emit an (empty)
+        // `<think></think>` block before the summary. Summaries are stored as
+        // plain content, so strip the block from each half here — before the
+        // halves are stitched, re-prefilled, and recorded — so it never leaks
+        // into the substrate or the GUI's summary view.
+        let user_tokens = self.strip_think_from_tokens(&user_tokens);
+        let assistant_tokens = self.strip_think_from_tokens(&assistant_tokens);
+
         // Frame the compressed exchange as a clean, marker-framed turn — the
         // question body, then `[user_end][assistant_start]`, then the answer body.
         // No leading `no_think` / `user_start` head: those are live `Generated`
@@ -3052,6 +3146,7 @@ impl Scheduler {
             reprojection: None,
             seal_action: SealAction::CompressionTurn { job_id },
             post_decode_tokens: TokenBuffer::default(),
+            triggers: Arc::new(TriggerRegistry::new()),
         });
         Ok(())
     }
@@ -3156,7 +3251,7 @@ impl Scheduler {
                 tracing::warn!("summary persist signatures failed: {e}");
             }
         }
-        tracing::info!(
+        tracing::trace!(
             target: "candle_conversation::summariser",
             timeline = %timeline,
             index = idx.0,

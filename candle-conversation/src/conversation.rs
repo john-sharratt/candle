@@ -10,9 +10,8 @@ use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::persistence::content_hash::{hash_tokens, ContentChain};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection, Builder, Conversation, OptionalState, ProjectionEvent, ProjectionMode,
-    ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
-    NO_THINK_SELECTOR,
+    from_projection, Builder, Conversation, ProjectionEvent, ProjectionMode, ProjectionTarget,
+    SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
@@ -136,6 +135,7 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
+use crate::stencil::TriggerRegistry;
 use crossbeam::channel::Sender;
 use std::sync::Arc;
 
@@ -256,13 +256,11 @@ pub struct GlueMarkers {
     pub user_end: String,
     pub assistant_start: String,
     pub assistant_end: String,
-    /// The empty/closed reasoning header forced after `assistant_start` when a
-    /// turn is *suppressed* (`<think>\n\n</think>\n\n` for Qwen3) — what the
-    /// composer effort dial's Off setting injects, and what every prefilled
-    /// memory-tier turn carries. (A *thinking* turn has no forced header: the
-    /// model emits its own `<think>` as a decoded token, so it shows up in the
-    /// turn body, not here.) Surfaced so the panel renders the framing verbatim.
-    pub no_think_block: String,
+    /// The `/no_think` soft-switch, emitted as live glue right after `user_start`
+    /// on a suppressed (effort-off) turn — see the scheduler's `no_think_current`
+    /// segment. Empty for non-thinking dialects. The panel renders it so its view
+    /// matches the actual prefill.
+    pub no_think: String,
 }
 
 impl Sequence {
@@ -1055,24 +1053,8 @@ impl Sequence {
         // `apply_projection`; the upload cache amortises after the
         // first turn.
 
-        // Thinking suppression is PER-TURN, driven by the section-tree
-        // `no_think` selector (the composer effort dial): `present` suppresses
-        // this turn, `absent` enables thinking.  Falls back to the
-        // conversation's configured default when the turn carries no selection
-        // (e.g. the titler).  The `/no_think` *text*, when suppressing, is
-        // emitted by the projection's `no_think` section — so it shows in the
-        // glue / section-tree view rather than being baked invisibly into the
-        // user turn here.  Only the assistant-header think block is set below.
-        let suppress = match self.selection.optional(NO_THINK_SELECTOR) {
-            Some(OptionalState::Present) => true,
-            Some(OptionalState::Absent) => false,
-            None => self.config.suppress_thinking,
-        };
         // The persisted turn shape is
-        //     user_message + user_end + assistant_start [+ no_think_block] + decoded_body
-        // where `no_think_block` (`<think></think>`) is present only when this
-        // turn is suppressed; a thinking turn opens its own `<think>` as the
-        // first decoded token, so it lives in `decoded_body`.
+        //     user_message + user_end + assistant_start + decoded_body
         // — i.e. `user_start` is **not** in the prefill and `assistant_end`
         // is **not** appended after decode.  Both boundary markers are
         // emitted as live `Generated` segments by the projection engine
@@ -1085,12 +1067,16 @@ impl Sequence {
         // context changes.  The intra-turn `user_end` and
         // `assistant_start` markers stay baked — their hidden state is
         // dominated by the turn's own (invariant) content.
-        let assistant_start_marker = self.config.dialect.active_assistant_start(
-            suppress,
-            self.config.thinking_capable
-                && (!suppress || self.config.inject_no_think_block)
-                && self.config.dialect.supports_no_think(),
-        );
+        //
+        // Thinking suppression is PER-TURN, driven by the composer effort dial.
+        // Qwen3's `/no_think` soft-switch is only honoured from the user turn (not
+        // the system prompt), so when suppressed it is emitted as live GLUE right
+        // before this user message by the scheduler (`no_think_current`, gated on
+        // the same selector — see `reproject` + `BoundaryMarkers`), never baked
+        // into the turn.  The assistant header itself is never modified: a
+        // suppressed turn decodes its own empty `<think></think>`, a thinking turn
+        // opens its own `<think>`.
+        let assistant_start_marker = self.config.dialect.assistant_start;
         // Optional assistant prefill: text seeded as the start of the response so
         // the decode is forced to continue from it (e.g. `<tool_call>` commits to
         // the tool-call grammar). It is pinned into the prefill grid and sealed
@@ -1134,12 +1120,10 @@ impl Sequence {
 
         let reprojection = self.build_reprojection_policy();
         // Content boundaries inside the sealed grid.  The prefill grid is
-        // `[user_msg][user_end][assistant_start]` — the leading `user_start`
-        // marker is a live `Generated` segment (not part of the prefill), and
-        // the `/no_think` text, when suppressing, is a projection section rather
-        // than baked here — so the user message body spans `[0, len(user_msg))`
-        // and the assistant content begins where decode starts, at the full
-        // prefill length.
+        // `[user_msg][user_end][assistant_start]` — the leading `user_start` (and,
+        // when suppressing, `/no_think`) are live `Generated` glue segments emitted
+        // by the scheduler, NOT part of the prefill — so the user body spans
+        // `[0, len(user_msg))`.
         let user_content_start = 0;
         let user_content_end = self.tokenize(user_message)?.len();
         // Assistant content begins at the `assistant_start` boundary — before any
@@ -1171,6 +1155,7 @@ impl Sequence {
             max_tokens,
             sampling,
             reprojection,
+            options.triggers,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1210,6 +1195,7 @@ impl Sequence {
         max_decode_tokens: usize,
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<TurnHandle> {
         let disable_reprojection = self.config.disable_reprojection;
         // Append-only ingests skip the per-turn projection rebuild and also
@@ -1235,6 +1221,7 @@ impl Sequence {
                 event_tx,
                 reprojection,
                 disable_reprojection,
+                triggers,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -1284,13 +1271,12 @@ impl Sequence {
         //
         // Prefilled content turns (repo_map, code_reading, tool ingests, …)
         // carry SUPPLIED content — they never run a decoded reasoning pass — so
-        // the assistant think block is ALWAYS suppressed here (an empty
-        // `<think></think>`, never an open `<think>` that would swallow the
-        // content), independent of the model's thinking mode.  That's why the
-        // `/no_think` prefix and `active_assistant_start`'s suppress flag are
-        // hard `true` below, not derived from a per-turn selection.
+        // the `/no_think` prefix is hard-applied here (independent of any
+        // per-turn dial) to keep the model out of a reasoning frame over the
+        // supplied text.  The assistant header is left clean: no block is baked
+        // into it.
         let no_think_prefix = self.config.dialect.no_think;
-        // Format: {user_start}/no_think{user}{user_end}{assistant_start}<think></think>{assistant_text}.
+        // Format: {user_start}/no_think{user}{user_end}{assistant_start}{assistant_text}.
         // The assistant role-end comes through `post_decode_tokens`
         // — there is no decode in this path so the EOS isn't emitted
         // by the model; we append the full `assistant_end` (EOS +
@@ -1307,12 +1293,7 @@ impl Sequence {
             no_think_prefix,
             user_message,
             self.config.dialect.user_end,
-            self.config.dialect.active_assistant_start(
-                true,
-                self.config.thinking_capable
-                    && self.config.inject_no_think_block
-                    && self.config.dialect.supports_no_think(),
-            ),
+            self.config.dialect.assistant_start,
             assistant_text,
         );
         let prefill_tokens = self.tokenize(&formatted)?;
@@ -1327,12 +1308,7 @@ impl Sequence {
         // against the SAME strings the prefill is built from so the indices
         // land on the real grid; clamp/monotonise so a tokenizer that
         // merges across a join can never invert the windows.
-        let assistant_start_marker = self.config.dialect.active_assistant_start(
-            self.config.suppress_thinking,
-            self.config.thinking_capable
-                && (!self.config.suppress_thinking || self.config.inject_no_think_block)
-                && self.config.dialect.supports_no_think(),
-        );
+        let assistant_start_marker = self.config.dialect.assistant_start;
         let user_content_start = self.tokenize(no_think_prefix)?.len();
         let user_content_end = self
             .tokenize(&format!("{no_think_prefix}{user_message}"))?
@@ -1377,6 +1353,8 @@ impl Sequence {
             0,
             self.config.sampling.clone(),
             None,
+            // A no-decode insert never samples, so no stencil can fire.
+            Arc::new(TriggerRegistry::new()),
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -1516,6 +1494,14 @@ impl Sequence {
         out
     }
 
+    /// The conversation's default sampling config (with the model's resolved
+    /// thinking / reflection-marker token IDs).  Callers clone this to derive a
+    /// per-turn config — e.g. to set the dial's `segment_suppress_penalty` — and
+    /// pass it back via `TurnOptions::sampling`.
+    pub fn default_sampling(&self) -> SamplingConfig {
+        self.config.sampling.clone()
+    }
+
     /// The dialect's framing markers — the "glue" the assembler wraps around the
     /// system prompt and each turn (`BoundaryMarkers` tokenises exactly these).
     /// Surfaced verbatim so the projection panel can show the glue between
@@ -1529,7 +1515,7 @@ impl Sequence {
             user_end: d.user_end.to_string(),
             assistant_start: d.assistant_start.to_string(),
             assistant_end: d.assistant_end.to_string(),
-            no_think_block: d.no_think_block.to_string(),
+            no_think: d.no_think.to_string(),
         }
     }
 

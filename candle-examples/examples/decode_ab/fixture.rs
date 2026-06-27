@@ -228,13 +228,14 @@ impl Fixture {
                 sc.head_dim,
                 &arena_info,
                 writer_start,
+                true, // build the position map — extended for the write region below
             );
             st.extend_for_write_region(1, CHUNK_SIZE);
 
-            let slice_size = TokenSliceHost::serialized_size(sc.n_kv_head, sc.head_dim);
+            let slice_size = TokenSliceHost::record_size(sc.n_kv_head, sc.head_dim);
             let mut sbuf = Vec::with_capacity(st.slices.len() * slice_size);
             for s in &st.slices {
-                s.serialize_into(&mut sbuf);
+                s.serialize_record(&mut sbuf);
             }
             let stensor = if sbuf.is_empty() {
                 Tensor::zeros(1, DType::U8, device)?
@@ -511,6 +512,8 @@ fn run_prefill(
         sc.rope_interleaved,
         0,
         &generation,
+        // No shared position-map cache in this one-shot fixture prefill.
+        &std::cell::RefCell::new(None),
     )?;
     caches_arr[0].set_current_seq_len(offset + sc.ctx_len)?;
     Ok(())

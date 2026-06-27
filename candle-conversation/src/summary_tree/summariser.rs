@@ -212,7 +212,7 @@ pub fn run_pass(
     for timeline in &timeline_ids {
         let pending = conversation.read().pending_summary_len(*timeline);
         if pending > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::summariser",
                 timeline = %timeline,
                 pending,
@@ -297,7 +297,7 @@ fn absorb_pending_turns(
                 .map(|m| m.kind != TurnKind::Normal)
                 .unwrap_or(false);
             if already_in_tree {
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::summariser",
                     timeline = %timeline,
                     normal = %normal_idx,
@@ -310,7 +310,7 @@ fn absorb_pending_turns(
         if batch.is_empty() {
             return Ok(());
         }
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::summariser",
             timeline = %timeline,
             batch = batch.len(),

@@ -56,9 +56,9 @@ impl TurnHandle {
 /// Events sent from the scheduler to the caller during a turn.
 pub enum TurnEvent {
     /// The formatted text that was actually submitted for prefill.
-    /// Includes user turn markup and assistant start (with no_think_block
-    /// when thinking is suppressed). This is the exact string that was
-    /// tokenized and sent to the model.
+    /// Includes user turn markup and the (clean) assistant start — no think
+    /// block is baked in; under `/no_think` the model decodes its own empty
+    /// `<think></think>`. This is the exact string tokenized and sent to the model.
     Prefill(String),
 
     /// Prefill progress (for visibility into long prefills).

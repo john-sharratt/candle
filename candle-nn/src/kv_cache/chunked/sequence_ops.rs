@@ -1904,7 +1904,11 @@ impl ChunkedKvBacking {
     /// shrunk — `target_tokens` always covers them (it is ≥ the shared prefix
     /// length). No-op when the sequence already holds ≤ `target_tokens` tokens
     /// (growth is handled by `set_len`).
-    pub fn truncate_sequence_to_tokens(&self, batch_idx: usize, target_tokens: usize) -> Result<()> {
+    pub fn truncate_sequence_to_tokens(
+        &self,
+        batch_idx: usize,
+        target_tokens: usize,
+    ) -> Result<()> {
         let mut state = self
             .state
             .write()

@@ -233,7 +233,6 @@ impl ModelBuilder {
             max_seq_len: info.context_length.unwrap_or(8192),
             default_sampling: info.sampling.clone(),
             supports_thinking: info.has_thinking,
-            inject_no_think_block: true,
             non_thinking_sampling: info.non_thinking.clone(),
         };
 
@@ -447,9 +446,6 @@ impl ModelBuilder {
             dialect: self.spec.dialect.clone(),
             max_response_tokens: self.max_response_tokens,
             sampling,
-            suppress_thinking: self.should_suppress_thinking(),
-            thinking_capable: self.spec.supports_thinking,
-            inject_no_think_block: self.spec.inject_no_think_block,
             tree: ConversationTreeConfig::default(),
             // 0 = incremental KV accumulation: only new tokens are prefilled each
             // turn and the KV cache is preserved across turns.  The previous value

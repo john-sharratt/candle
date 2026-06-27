@@ -43,6 +43,10 @@ impl Scheduler {
                 self.cleanup_finished();
                 return;
             }
+            // Inject any pending tool-call static runs (Layer 3) before the
+            // decode forward, so a `Static` run costs one prefill rather than N
+            // decode steps.  No-op when no sequence has an active stencil.
+            self.inject_stencil_prefills();
             self.batch_decode_step();
             // Drain any continuous-re-projection swaps queued during the
             // batch.  Must run BEFORE cleanup_finished so a swap that

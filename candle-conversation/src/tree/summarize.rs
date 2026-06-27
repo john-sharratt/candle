@@ -29,6 +29,7 @@ use std::time::Duration;
 use crossbeam::channel::{Receiver, TryRecvError};
 
 use crate::sequence_handle::SequenceId;
+use crate::stencil::TriggerRegistry;
 use crate::token_buffer::TokenBuffer;
 
 use super::config::ConversationTreeConfig;
@@ -261,6 +262,8 @@ impl SummarizationTask {
                 event_tx,
                 reprojection: None,
                 disable_reprojection: false,
+                // Summarization decodes free text only — no tool stencils.
+                triggers: Arc::new(TriggerRegistry::new()),
             })
             .is_err()
         {

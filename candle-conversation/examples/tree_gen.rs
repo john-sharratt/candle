@@ -1119,6 +1119,7 @@ fn stream_response(
             TurnEvent::HealthWarning(msg) => {
                 println!("\n\x1b[33m{} decode health: {}\x1b[0m", indent, msg);
             }
+            TurnEvent::Projection(_) => {}
         }
     }
 

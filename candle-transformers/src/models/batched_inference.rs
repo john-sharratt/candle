@@ -1227,9 +1227,7 @@ impl BatchedInferenceSession {
         #[cfg(feature = "cuda")]
         {
             if let Device::Cuda(d) = &self.device {
-                if let (Ok(used), Ok(reserved)) =
-                    (d.pool_used_bytes(), d.pool_reserved_bytes())
-                {
+                if let (Ok(used), Ok(reserved)) = (d.pool_used_bytes(), d.pool_reserved_bytes()) {
                     return Some((used, reserved));
                 }
             }

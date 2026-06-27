@@ -43,12 +43,16 @@ extern "C" {
     /// - `cross_turn_penalty`: Additive penalty for tokens seen in previous turns (0.0 = disabled)
     /// - `cross_turn_counts`: Per-token prior-turn counts for cross-turn penalty (nullable)
     /// - `current_lens`: Current generated length per sequence for EOS ramp (nullable)
-    /// - `eot_boost`: EOT token boost for end-of-thinking (0.0 = disabled)
-    /// - `eot_token_id`: Token ID of `</think>` (-1 = disabled)
-    /// - `eot_ramp_start`: Thinking-token count where EOT ramp begins
-    /// - `eot_ramp_len`: Thinking-token count where EOT ramp reaches full
-    /// - `eot_boost_max_multiplier`: Multiplier at EOT ramp peak
-    /// - `thinking_lens`: Per-sequence thinking token counts (nullable)
+    /// - `segment_close_boost`: Boost on the segment-close token (0.0 = disabled)
+    /// - `segment_close_token_id`: Token ID of the segment-close token (-1 = disabled)
+    /// - `segment_close_ramp_start`: Per-segment token count where the segment-close ramp begins
+    /// - `segment_close_ramp_len`: Per-segment token count where the segment-close ramp reaches full
+    /// - `segment_close_max_multiplier`: Multiplier at the segment-close ramp peak
+    /// - `segment_lens`: Per-sequence in-segment token counts (nullable)
+    /// - `segment_temp_boost`: Added to `temperature` for sequences inside a segment
+    /// - `suppress_tokens`: Shared token IDs suppressed while in-segment (nullable)
+    /// - `suppress_count`: Number of suppress tokens (0 = disabled)
+    /// - `suppress_penalties`: Per-sequence penalty subtracted from each suppress token while in-segment (nullable)
     /// - `token_counts`: Per-token counts for frequency penalty (nullable)
     /// - `banned_tokens`: Banned token IDs (nullable)
     /// - `num_banned_tokens`: Total number of banned tokens
@@ -84,12 +88,16 @@ extern "C" {
         cross_turn_penalty: f32,
         cross_turn_counts: *const i32,
         current_lens: *const i32,
-        eot_boost: f32,
-        eot_token_id: i32,
-        eot_ramp_start: i32,
-        eot_ramp_len: i32,
-        eot_boost_max_multiplier: f32,
-        thinking_lens: *const i32,
+        segment_close_boost: f32,
+        segment_close_token_id: i32,
+        segment_close_ramp_start: i32,
+        segment_close_ramp_len: i32,
+        segment_close_max_multiplier: f32,
+        segment_lens: *const i32,
+        segment_temp_boost: f32,
+        suppress_tokens: *const i32,
+        suppress_count: i32,
+        suppress_penalties: *const f32,
         token_counts: *const i32,
         banned_tokens: *const i32,
         num_banned_tokens: i32,

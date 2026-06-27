@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use crate::config::SamplingConfig;
 use crate::projection::SelectionState;
+use crate::stencil::TriggerRegistry;
 use crate::token_buffer::TokenBuffer;
 use serde::{Deserialize, Serialize};
 
@@ -74,6 +77,10 @@ pub struct TurnOptions {
     /// current selection, used by every projection until the next turn changes
     /// it.  Empty = the schema's authored defaults.
     pub selection: SelectionState,
+
+    /// Tool-call stencils that may fire during this turn, keyed by trigger
+    /// token.  The default is an empty registry — no constrained decoding.
+    pub triggers: Arc<TriggerRegistry>,
 }
 
 impl TurnOptions {
@@ -121,6 +128,12 @@ impl TurnOptions {
     /// continue from it (see [`Self::assistant_prefill`]).
     pub fn assistant_prefill(mut self, prefix: impl Into<String>) -> Self {
         self.assistant_prefill = Some(prefix.into());
+        self
+    }
+
+    /// Builder: set the tool-call stencil registry for this turn.
+    pub fn triggers(mut self, triggers: Arc<TriggerRegistry>) -> Self {
+        self.triggers = triggers;
         self
     }
 }

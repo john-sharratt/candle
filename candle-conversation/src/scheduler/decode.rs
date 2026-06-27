@@ -1,6 +1,191 @@
 use super::*;
 
 impl Scheduler {
+    /// Emit the steering finish trace: a one-line summary of the path the
+    /// stencil walk took (so a malformed tool call is diagnosable — e.g.
+    /// `bailed=true`, or `free_tokens=0` where an argument value was expected).
+    /// `reason` distinguishes a clean completion from a failsafe drop.
+    fn log_stencil_finish(seq_id: usize, driver: &StencilDriver, reason: &str) {
+        let s = driver.stats();
+        tracing::debug!(
+            target: "candle_conversation::stencil",
+            seq_id,
+            tree = driver.tree().label(),
+            reason,
+            prefills = s.prefills,
+            prefill_tokens = s.prefill_tokens,
+            branch_tokens = s.branch_tokens,
+            free_tokens = s.free_tokens,
+            heals = s.heals,
+            bailed = s.bailed,
+            "stencil steering finished",
+        );
+    }
+
+    // ── Stencil static-run prefill (Layer 3) ───────────────────────────
+
+    /// Inject any pending `Static` runs for active stencil sequences via the
+    /// prefill path, then record the next decode action in `pending_mask`.  Runs
+    /// once before `batch_decode_step` each decode iteration.
+    ///
+    /// A static run `R` following the sequence's pending token `Y` (the last
+    /// generated, not-yet-forwarded token) is injected as `[Y] ++ R[..last]` in
+    /// one prefill forward; the whole run is appended to `generated_tokens`, and
+    /// `R.last()` rides the normal decode forward in `batch_decode_step` — that
+    /// forward is exactly what produces the after-run logits for the next
+    /// `Branch`/`Free` token.  So an N-token run costs one prefill instead of N
+    /// decode steps, with no double-write of any token's KV.
+    pub(super) fn inject_stencil_prefills(&mut self) {
+        let ids: Vec<SequenceId> = self
+            .active_decodes
+            .iter()
+            .filter(|(_, s)| !s.finished && s.stencil.is_some() && s.pending_mask.is_none())
+            .map(|(&id, _)| id)
+            .collect();
+        let max_recent = self.sampler.max_recent_len();
+
+        for id in ids {
+            let mut guard = 0usize;
+            loop {
+                guard += 1;
+                if guard > 100_000 {
+                    tracing::error!(seq_id = id.0, "stencil prefill runaway — bailing");
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        if let Some(d) = &s.stencil {
+                            Self::log_stencil_finish(id.0, d, "runaway");
+                        }
+                        s.stencil = None;
+                    }
+                    break;
+                }
+
+                // Advance the driver one step (brief mutable borrow).
+                let action = match self
+                    .active_decodes
+                    .get_mut(&id)
+                    .and_then(|s| s.stencil.as_mut())
+                {
+                    Some(driver) => driver.step(),
+                    None => break,
+                };
+
+                let StepMask::Prefill(run) = action else {
+                    // Branch / Free / Done — the action for the upcoming decode.
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        s.pending_mask = Some(action);
+                    }
+                    break;
+                };
+
+                // Prefill `[Y] ++ run[..last]`; `run.last()` rides the decode.
+                let Some(y) = self
+                    .active_decodes
+                    .get(&id)
+                    .and_then(|s| s.generated_tokens.last().copied())
+                else {
+                    tracing::warn!(
+                        seq_id = id.0,
+                        "stencil run with no pending token — dropping"
+                    );
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        if let Some(d) = &s.stencil {
+                            Self::log_stencil_finish(id.0, d, "no pending token");
+                        }
+                        s.stencil = None;
+                    }
+                    break;
+                };
+                // A close run ends with the assistant EOS (`}}\n</tool_call>` +
+                // `<|im_end|>`): a tool call is the whole assistant turn, so the
+                // EOS terminates it.  Detect it here so the turn is sealed instead
+                // of the model free-decoding a hallucinated answer past the call.
+                let ends_turn = run.last().is_some_and(|&t| self.eos_tokens.contains(&t));
+
+                let mut input = Vec::with_capacity(run.len());
+                input.push(y);
+                // `run.last()` is never forwarded here: for a normal run it rides
+                // the decode in `batch_decode_step`; for an EOS-terminated run it
+                // is the turn terminator, whose KV is never written (exactly as a
+                // model-sampled EOS).  Either way it is excluded from the prefill.
+                input.extend_from_slice(&run[..run.len() - 1]);
+
+                if let Err(e) = self.run_prefill_with_shift(id, &input, 0) {
+                    tracing::warn!(
+                        seq_id = id.0,
+                        "stencil prefill forward failed: {e} — dropping"
+                    );
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        if let Some(d) = &s.stencil {
+                            Self::log_stencil_finish(id.0, d, "prefill failed");
+                        }
+                        s.stencil = None;
+                    }
+                    break;
+                }
+
+                // Append the run to the emitted output and stream it; `run.last()`
+                // becomes `generated_tokens.last()`, which the decode forwards.
+                // The trailing EOS of a close run is pushed to the buffer (it is
+                // part of the sealed turn) but never streamed — matching the
+                // normal decode path, which buffers EOS but does not emit it.
+                let mut carries_eot = false;
+                if let Some(s) = self.active_decodes.get_mut(&id) {
+                    let last = run.len() - 1;
+                    for (k, &t) in run.iter().enumerate() {
+                        s.generated_tokens.push(t);
+                        if !(ends_turn && k == last) {
+                            let _ = s.event_tx.send(TurnEvent::Token(t));
+                        }
+                    }
+                    // A think-steer tree always drops the model's own `</think>`
+                    // (the close token is suppressed) and injects the closing tag
+                    // as a static run instead, so the commit-loop flip that clears
+                    // `inside_think_block` on a sampled `</think>` never fires for a
+                    // think turn.  This injected closing tag is where the block
+                    // actually ends, so clear the flag here when the prefilled run
+                    // carries it — otherwise health stays relaxed forever after the
+                    // first think block.
+                    let eot = s.sampling_config.segment_close_token_id;
+                    carries_eot = eot >= 0 && run.contains(&(eot as u32));
+                    if carries_eot {
+                        s.health.inside_think_block = false;
+                    }
+                }
+                // Record the run in the repeat-penalty window so the model's
+                // subsequent free decode sees the tool-call tokens as recent
+                // context.  `record_context_tokens` touches only `recent_tokens`
+                // — not `token_counts` or `current_len` — so it cannot skew
+                // frequency/presence penalties or the EOS-length failsafe.
+                if let Some(ss) = self.sampling_states.get_mut(&id) {
+                    ss.record_context_tokens(&run, max_recent);
+                    // The injected `</think>` is where a steered block actually ends;
+                    // clear the sampler's `in_segment` here too (its commit-loop twin
+                    // never sees the dropped close), so the EOT boost and the
+                    // in-thinking temperature/DRY gates switch off for the answer.
+                    if carries_eot {
+                        ss.in_segment = false;
+                    }
+                }
+
+                if ends_turn {
+                    // The stencil emitted the tool call's closing EOS — the
+                    // assistant turn is complete.  Mark it finished and stop
+                    // steering; `cleanup_finished` finalizes and seals exactly as
+                    // for a model-sampled EOS.
+                    if let Some(s) = self.active_decodes.get_mut(&id) {
+                        if let Some(d) = &s.stencil {
+                            Self::log_stencil_finish(id.0, d, "completed");
+                        }
+                        s.stencil = None;
+                        s.finished = true;
+                    }
+                    break;
+                }
+                // Loop: the next action is the node after this static run.
+            }
+        }
+    }
+
     // ── Decode ─────────────────────────────────────────────────────────
 
     /// Run one decode step for all active (non-finished) sequences.
@@ -102,10 +287,52 @@ impl Scheduler {
         self.extract_prov_after_step(&seq_ids);
 
         // Clone sampling configs before taking mutable references
-        let configs: Vec<SamplingConfig> = seq_ids
+        let mut configs: Vec<SamplingConfig> = seq_ids
             .iter()
             .map(|id| self.active_decodes[id].sampling_config.clone())
             .collect();
+
+        // Fold each active tool-call stencil's constraint for this token (set by
+        // `inject_stencil_prefills`, which already injected any preceding static
+        // runs) into this row's `stencil` allow-list: a branch is its frontier (a
+        // tiny gather + sample), a free-text span clears the stencil (free decode
+        // through the kernel), and `Done` ends the walk (free decode + drop).
+        //
+        // The sampler resolves these per row in `sample_batch`, so a mask set
+        // here constrains only this sequence — other rows in the wave are
+        // unaffected, and constrained rows never run the full-vocab kernel.
+        for (i, &id) in seq_ids.iter().enumerate() {
+            if let Some(state) = self.active_decodes.get_mut(&id) {
+                if state.stencil.is_none() {
+                    continue;
+                }
+                match state.pending_mask.take() {
+                    Some(StepMask::Branch(set)) => {
+                        configs[i].stencil = set.tokens().iter().map(|&t| t as i32).collect();
+                    }
+                    Some(StepMask::Free { .. }) => {
+                        // A free-text span decodes normally — nothing is banned.  A
+                        // think-steer span's `</think>` and EOS are both intercepted
+                        // by the session's `observe` (the suppressed close drops the
+                        // token and prefills a continuation; the final span injects
+                        // the closing tag), and tool-call value spans close on a byte
+                        // delimiter — so the sampler just runs free here.
+                        configs[i].stencil.clear();
+                    }
+                    Some(StepMask::Done) => {
+                        if let Some(d) = &state.stencil {
+                            Self::log_stencil_finish(id.0, d, "completed");
+                        }
+                        state.stencil = None;
+                        configs[i].stencil.clear();
+                    }
+                    // A `Prefill` is consumed by `inject_stencil_prefills`; `None`
+                    // means the driver wasn't advanced — free-decode this step.
+                    Some(StepMask::Prefill(_)) | None => configs[i].stencil.clear(),
+                }
+            }
+        }
+
         let config_refs: Vec<&SamplingConfig> = configs.iter().collect();
 
         // Temporarily remove persistent sampling states to avoid borrow
@@ -126,7 +353,7 @@ impl Scheduler {
 
         // Sample next token for all sequences in a single batched call
         let t_sample = std::time::Instant::now();
-        let next_tokens =
+        let mut next_tokens =
             match self.sample_batch_from_logits(&logits_vec, &mut sampling_states, &config_refs) {
                 Ok(tokens) => tokens,
                 Err(e) => {
@@ -147,15 +374,34 @@ impl Scheduler {
         let sample_ms = t_sample.elapsed().as_millis() as u64;
         super::record_phase(t_sample, "decode_sample");
 
-        // Pre-decode the sampled tokens into a readable string for the
-        // timing trace.  Only built when the debug level is actually
-        // active (gated by `tracing::enabled!`) so the tokenizer call
-        // doesn't fire on the hot path under default logging.  Multi-
-        // sequence batches join the per-sequence fragments with `|`.
-        let token_str: String = if tracing::enabled!(
-            target: "candle_conversation::scheduler::timing",
-            tracing::Level::DEBUG,
-        ) {
+        // Summary/compression turns decode in the background and, three half-
+        // passes deep, flood the default DEBUG view.  When *every* sequence in
+        // this batch is a compression turn, log the step at TRACE so a real
+        // foreground decode stays readable at DEBUG; mixed/normal batches stay
+        // DEBUG.
+        let all_compression = !seq_ids.is_empty()
+            && seq_ids.iter().all(|id| {
+                self.active_decodes.get(id).is_some_and(|s| {
+                    matches!(
+                        s.seal_action,
+                        SealAction::CompressionSetup { .. }
+                            | SealAction::CompressionPass { .. }
+                            | SealAction::CompressionTurn { .. }
+                    )
+                })
+            });
+
+        // Pre-decode the sampled tokens into a readable string for the timing
+        // trace.  Only built when the level it will be logged at is actually
+        // active (gated by `tracing::enabled!`) so the tokenizer call doesn't
+        // fire on the hot path under default logging.  Multi-sequence batches
+        // join the per-sequence fragments with `|`.
+        let want_token_str = if all_compression {
+            tracing::enabled!(target: "candle_conversation::scheduler::timing", tracing::Level::TRACE)
+        } else {
+            tracing::enabled!(target: "candle_conversation::scheduler::timing", tracing::Level::DEBUG)
+        };
+        let token_str: String = if want_token_str {
             let skip = !self.show_special_tokens;
             next_tokens
                 .iter()
@@ -170,14 +416,157 @@ impl Scheduler {
             String::new()
         };
 
-        tracing::debug!(
-            target: "candle_conversation::scheduler::timing",
-            batch = seq_ids.len(),
-            fwd_ms,
-            sample_ms,
-            token_str = %token_str,
-            "decode_step",
-        );
+        if all_compression {
+            tracing::trace!(
+                target: "candle_conversation::scheduler::timing",
+                batch = seq_ids.len(),
+                fwd_ms,
+                sample_ms,
+                token_str = %token_str,
+                "decode_step",
+            );
+        } else {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::timing",
+                batch = seq_ids.len(),
+                fwd_ms,
+                sample_ms,
+                token_str = %token_str,
+                "decode_step",
+            );
+        }
+
+        // Advance each sequence's tool-call stencil with the token just sampled:
+        // feed it into an active walk, or start a walk if it is a trigger token
+        // (e.g. `<tool_call>`).  An empty trigger registry never starts a walk.
+        // Only an *active* walk needs the token's decoded bytes (free-text
+        // terminators read them); starting a walk needs only the token id, so the
+        // tokenizer decode stays off the hot path when no tool call is running.
+        // `(row, consumed, token bytes)` for rows whose free-text span closed
+        // strictly inside the sampled token — healed after this loop.
+        let mut heals: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        // Rows whose suppressed `</think>` close was dropped (a deep/exhaustive
+        // think-steer retry): the sampled close is not committed, so it never
+        // lands in the output and `inside_think_block` stays set;
+        // `inject_stencil_prefills` drains the continuation static before the next
+        // wave (the session already advanced to it on `accept`).
+        let mut dropped = vec![false; seq_ids.len()];
+        for (i, &seq_id) in seq_ids.iter().enumerate() {
+            let token = next_tokens[i];
+            let active = self
+                .active_decodes
+                .get(&seq_id)
+                .is_some_and(|s| s.stencil.is_some());
+            let bytes = if active {
+                self.tokenizer
+                    .decode(&[token], false)
+                    .map(String::into_bytes)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if let Some(state) = self.active_decodes.get_mut(&seq_id) {
+                match state.stencil.as_mut() {
+                    Some(driver) => {
+                        match driver.accept(token, &bytes) {
+                            Healed::Exit { consumed } => heals.push((i, consumed, bytes)),
+                            // A suppressed close: drop the closing token (do not
+                            // commit it).  This is the model's own `</think>` OR an
+                            // intercepted EOS (a token-closed span now closes on
+                            // either) — both land here as `Healed::Drop` and are thus
+                            // skipped by the commit loop below, including the EOS-seal,
+                            // so neither is written to the sequence; the steering's
+                            // injected closing tag / continuation prefills in its place.
+                            Healed::Drop => dropped[i] = true,
+                            Healed::No => {}
+                        }
+                        if driver.is_done() {
+                            Self::log_stencil_finish(seq_id.0, driver, "completed");
+                            state.stencil = None;
+                        }
+                        // Clear the pending mask so `inject_stencil_prefills` re-drives
+                        // the driver into the continuation static this drop advanced to.
+                        if dropped[i] {
+                            state.pending_mask = None;
+                        }
+                    }
+                    None => {
+                        if let Some(driver) = state.triggers.driver_for(token) {
+                            // A trigger token (e.g. `<tool_call>`) opened a grammar:
+                            // steer the rest of this call to the catalog's shape.
+                            tracing::debug!(
+                                target: "candle_conversation::stencil",
+                                seq_id = seq_id.0,
+                                tree = driver.tree().label(),
+                                trigger = token,
+                                "stencil steering started (trigger token decoded)",
+                            );
+                            state.stencil = Some(driver);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Restore `in_segment` and restart the per-span thinking budget for any
+        // row whose close was suppressed.  When the model sampled `</think>`,
+        // `sample_batch` already flipped `in_segment` off — but the steering
+        // dropped that close and kept the block open, so the flag is stale.  Re-arm
+        // it so the EOT boost/force ramp and the in-thinking temperature/DRY gates
+        // stay live across the steered spans.  (The injected `</think>` clears it
+        // for real in `inject_stencil_prefills`.)
+        //
+        // A suppressed close also ends one span and opens the next, so the EOT
+        // ramp's clock (`segment_len`) restarts here.  This is the single
+        // chokepoint every suppressed close passes through — a model `</think>`,
+        // an intercepted EOS (both are `TokenClosedDrop`), or a force-injected
+        // close.  `</think>` already zeroed `segment_len` via `exit_segment`, but
+        // an EOS close did not (EOS isn't the eot token), so reset unconditionally:
+        // each span gets its own budget regardless of how it closed.
+        for (i, &was_dropped) in dropped.iter().enumerate() {
+            if was_dropped {
+                if let Some(ss) = self.sampling_states.get_mut(&seq_ids[i]) {
+                    if ss.segment_len > 0 {
+                        tracing::debug!(
+                            target: "candle_conversation::eot",
+                            seq = seq_ids[i].0,
+                            span_thinking_len = ss.segment_len,
+                            "steered span closed — restarting per-span thinking budget",
+                        );
+                    }
+                    ss.in_segment = true;
+                    ss.segment_len = 0;
+                }
+            }
+        }
+
+        // Heal merged exit tokens: the model closed a free-text value with a
+        // token that also carries the next node's delimiter (e.g. `",`).  Commit
+        // only the re-tokenized valid prefix (the value + closing char); the
+        // delimiter is dropped and re-emitted by the successor node.  Common case
+        // (the valid prefix is a single token) is a plain swap; a multi-token
+        // prefix forwards all-but-last and lets the last ride this step's decode.
+        for (i, consumed, bytes) in heals {
+            let seq_id = seq_ids[i];
+            let text = String::from_utf8_lossy(&bytes[..consumed]);
+            let healed: Vec<u32> = self
+                .tokenizer
+                .encode(text.as_ref(), false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default();
+            let Some((&last, prefix)) = healed.split_last() else {
+                continue; // nothing valid to commit (degenerate) — leave as-is
+            };
+            if !prefix.is_empty() && self.run_prefill_with_shift(seq_id, prefix, 0).is_ok() {
+                if let Some(state) = self.active_decodes.get_mut(&seq_id) {
+                    for &t in prefix {
+                        state.generated_tokens.push(t);
+                        let _ = state.event_tx.send(TurnEvent::Token(t));
+                    }
+                }
+            }
+            next_tokens[i] = last;
+        }
 
         // Process each sampled token
         for (i, &seq_id) in seq_ids.iter().enumerate() {
@@ -186,8 +575,11 @@ impl Scheduler {
             if let Some(state) = self.active_decodes.get_mut(&seq_id) {
                 // ── Decode health checks ──────────────────────────────────────────────
                 // Gated by a single runtime bool (false by default). When disabled,
-                // this is one never-taken branch — near-zero overhead.
-                if self.health_config.enabled {
+                // this is one never-taken branch — near-zero overhead.  A suppressed
+                // `</think>` (`dropped[i]`) is never emitted, so it carries no logits
+                // signal to judge — skip health for it (and so don't advance the step
+                // counter on a non-token).
+                if self.health_config.enabled && !dropped[i] {
                     let step = state.health.step;
                     state.health.step += 1;
 
@@ -310,12 +702,27 @@ impl Scheduler {
                     // This takes effect on the *next* step's logit checks, which is correct:
                     // the logits that produced <think> are evaluated before entering the block,
                     // and the logits that produced </think> are evaluated before exiting it.
-                    if state.sampling_config.think_start_token_id >= 0 {
-                        if next_token == state.sampling_config.think_start_token_id as u32 {
+                    //
+                    // A *suppressed* </think> (a deep/exhaustive steer retry, `dropped[i]`)
+                    // is not a real close — the steered block continues — so it explicitly
+                    // does NOT exit the block.  Stating that here keeps the invariant local
+                    // rather than riding on the dropped token's commit being skipped below.
+                    if state.sampling_config.segment_open_token_id >= 0 {
+                        if next_token == state.sampling_config.segment_open_token_id as u32 {
                             state.health.inside_think_block = true;
-                        } else if next_token == state.sampling_config.eot_token_id as u32 {
+                        } else if next_token == state.sampling_config.segment_close_token_id as u32
+                            && !dropped[i]
+                        {
                             state.health.inside_think_block = false;
                         }
+                    }
+
+                    // A suppressed </think> is dropped: it produces no output token, no
+                    // stream event, and no repetition signal.  The think-block state above
+                    // is the only per-token update a retry needs; everything below is for
+                    // genuinely emitted tokens.
+                    if dropped[i] {
+                        continue;
                     }
 
                     // CPU repetition check: push token then test the window.
@@ -475,6 +882,17 @@ impl Scheduler {
                     }
                 }
                 // ── End health checks ─────────────────────────────────────────────────
+
+                // A dropped token (a suppressed `</think>` OR an intercepted EOS of
+                // a token-closed think span) is never committed: it carries no KV,
+                // emits no stream event, and must not seal the turn.  The steering's
+                // injected closing tag / continuation prefills in its place.  The
+                // health block above already skips it, but that block is gated on
+                // `health_config.enabled`; this guard makes the skip unconditional so
+                // the EOS-seal below cannot fire on an intercepted EOS.
+                if dropped[i] {
+                    continue;
+                }
 
                 state.generated_tokens.push(next_token);
 

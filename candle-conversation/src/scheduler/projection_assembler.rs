@@ -81,6 +81,11 @@ pub(crate) struct BoundaryMarkers {
     /// exchange so the model *responds* rather than continuing the prompt.
     pub(crate) user_end: Arc<Vec<u32>>,
     pub(crate) assistant_start: Arc<Vec<u32>>,
+    /// The dialect's `/no_think` soft-switch (empty for non-thinking dialects).
+    /// Emitted as live glue right after `user_start` on a suppressed turn so the
+    /// switch sits in the user turn (where Qwen3 honours it) without being baked
+    /// into any sealed turn.
+    pub(crate) no_think: Arc<Vec<u32>>,
 }
 
 impl BoundaryMarkers {
@@ -99,11 +104,13 @@ impl BoundaryMarkers {
         let assistant_end = Arc::new(tokenize(dialect.assistant_end)?);
         let user_end = Arc::new(tokenize(dialect.user_end)?);
         let assistant_start = Arc::new(tokenize(dialect.assistant_start)?);
+        let no_think = Arc::new(tokenize(dialect.no_think)?);
         Ok(Self {
             user_start,
             assistant_end,
             user_end,
             assistant_start,
+            no_think,
         })
     }
 }
@@ -989,6 +996,7 @@ mod tests {
             assistant_end: Arc::new(vec![200]),
             user_end: Arc::new(vec![101]),
             assistant_start: Arc::new(vec![201]),
+            no_think: Arc::new(vec![]),
         }
     }
 

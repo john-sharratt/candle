@@ -11,6 +11,10 @@ use crate::projection::{
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
+use crate::stencil::{
+    compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
+    ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+};
 use crate::substrate::{ConvCompression, Substrate, TurnContentBounds};
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
@@ -22,6 +26,36 @@ use crossbeam::channel;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// The compiled thinking-block steering trees, one per non-`Off` effort dial,
+/// built once at engine init (parallel to the tool-call registry).  Each turn
+/// derives its trigger registry by replacing the `<think>` trigger with the
+/// dial's tree — atomic and idempotent via [`TriggerRegistry::with_trigger`].
+pub struct ThinkSteering {
+    /// `<think>` id — the trigger the dial's tree is bound to.
+    think_open: TokenId,
+    quick: Arc<StencilTree>,
+    balanced: Arc<StencilTree>,
+    deep: Arc<StencilTree>,
+    exhaustive: Arc<StencilTree>,
+}
+
+impl ThinkSteering {
+    /// Derive a per-turn registry from `base` (e.g. the tool-call catalog) for
+    /// `mode`: bind the `<think>` trigger to that dial's steering tree, or clear
+    /// it for [`ThinkMode::Off`] (the `/no_think` glue yields the empty block, so
+    /// no tree steers it).  The base is untouched; the result is a fresh registry.
+    pub fn registry_for(&self, base: &TriggerRegistry, mode: ThinkMode) -> Arc<TriggerRegistry> {
+        let tree = match mode {
+            ThinkMode::Off => return Arc::new(base.without_trigger(self.think_open)),
+            ThinkMode::Quick => &self.quick,
+            ThinkMode::Balanced => &self.balanced,
+            ThinkMode::Deep => &self.deep,
+            ThinkMode::Exhaustive => &self.exhaustive,
+        };
+        Arc::new(base.with_trigger(self.think_open, Arc::clone(tree)))
+    }
+}
 
 /// How many summary probes the summariser submits per batch, chosen by total
 /// VRAM at engine init. Their decodes batch in the scheduler's wave loop, so a
@@ -591,6 +625,101 @@ impl ConversationEngine {
         self.new_conversation_with_projection(system_prompt, builder, layer_id, group_id, config)
     }
 
+    /// Compile a tool catalog into a [`TriggerRegistry`] for constrained
+    /// tool-call decoding.  Pass the returned registry to a turn via
+    /// [`TurnOptions::triggers`](crate::TurnOptions::triggers); a turn without it
+    /// (or with an empty registry) free-decodes as usual.
+    ///
+    /// The model emits the `<tool_call>` trigger token freely; the stencil then
+    /// forces the catalog's exact shape — name ∈ catalog, required params in
+    /// order, enum values exact, structurally-valid JSON — for the rest of the
+    /// call.  Compile once and reuse the registry across turns.
+    ///
+    /// If the tokenizer has no single `<tool_call>` token (the marker tokenizes
+    /// to several pieces), an **empty** registry is returned — constrained
+    /// decoding is simply inactive and the model free-decodes tool calls as
+    /// before.  This never fails startup over a tokenizer mismatch.
+    pub fn compile_tool_stencil(&self, tools: &[ToolSpec]) -> crate::Result<Arc<TriggerRegistry>> {
+        let Some(trigger) = self.tokenizer.token_to_id("<tool_call>") else {
+            tracing::warn!(
+                "tokenizer has no single <tool_call> token — tool-call stencils are inactive \
+                 (the model will free-decode tool calls)"
+            );
+            return Ok(Arc::new(TriggerRegistry::new()));
+        };
+        // The model emits the `<tool_call>` trigger itself, so the tree resumes
+        // *after* that marker: its `open` is the envelope minus the marker.
+        //
+        // The close ends with the assistant-turn EOS (`<|im_end|>`): a tool call
+        // is the entire assistant turn, so once it is emitted the turn must end.
+        // Without this the stencil releases control after `</tool_call>` and the
+        // model free-decodes a hallucinated answer past the call. The decode
+        // loop detects the EOS in the injected close run and seals the turn.
+        let envelope = ToolCallEnvelope {
+            open: "\n{\"name\": \"".to_string(),
+            args_open: ", \"arguments\": {".to_string(),
+            close: "}}\n</tool_call><|im_end|>".to_string(),
+        };
+        let spec = compile_tool_call_tree(tools, &envelope).map_err(|e| {
+            ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
+        })?;
+        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
+        let vocab = HfVocab::new(
+            (*self.tokenizer).clone(),
+            eos,
+            self.config.vocab_size as u64,
+        );
+        let tree = compile(&spec, &vocab).map_err(|e| {
+            ConversationError::from(candle::Error::Msg(format!("tool stencil: {e}")))
+        })?;
+        let mut registry = TriggerRegistry::new();
+        registry.register(trigger, Arc::new(tree));
+        Ok(Arc::new(registry))
+    }
+
+    /// Compile the thinking-block steering trees (one per non-`Off` effort dial)
+    /// once, for reuse across turns via [`ThinkSteering::registry_for`].  Like the
+    /// tool stencil, this is inactive — `Ok(None)` — when the tokenizer lacks a
+    /// single `<think>`/`</think>` token, so the model free-decodes its reasoning.
+    pub fn compile_think_steering(&self) -> crate::Result<Option<Arc<ThinkSteering>>> {
+        let (Some(think_open), Some(think_close)) = (
+            self.tokenizer.token_to_id("<think>"),
+            self.tokenizer.token_to_id("</think>"),
+        ) else {
+            tracing::warn!(
+                "tokenizer has no single <think>/</think> token — think steering is inactive \
+                 (the model will free-decode its reasoning)"
+            );
+            return Ok(None);
+        };
+        let eos = self.config.eos_tokens.iter().next().copied().unwrap_or(0);
+        let env = ThinkSteerEnvelope {
+            think_open,
+            think_close,
+            eos,
+        };
+        let vocab = HfVocab::new(
+            (*self.tokenizer).clone(),
+            eos,
+            self.config.vocab_size as u64,
+        );
+        let compile_mode = |mode: ThinkMode| -> crate::Result<Arc<StencilTree>> {
+            let spec = compile_think_tree(mode, &env)
+                .expect("a non-Off mode always yields a steering spec");
+            let tree = compile(&spec, &vocab).map_err(|e| {
+                ConversationError::from(candle::Error::Msg(format!("think stencil: {e}")))
+            })?;
+            Ok(Arc::new(tree))
+        };
+        Ok(Some(Arc::new(ThinkSteering {
+            think_open,
+            quick: compile_mode(ThinkMode::Quick)?,
+            balanced: compile_mode(ThinkMode::Balanced)?,
+            deep: compile_mode(ThinkMode::Deep)?,
+            exhaustive: compile_mode(ThinkMode::Exhaustive)?,
+        })))
+    }
+
     pub fn new_conversation(
         &self,
         system_prompt: &str,
@@ -808,6 +937,8 @@ impl ConversationEngine {
                 event_tx,
                 reprojection: None,
                 disable_reprojection: false,
+                // Raw eval/summarisation path: no tools, no constrained decode.
+                triggers: Arc::new(TriggerRegistry::new()),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 

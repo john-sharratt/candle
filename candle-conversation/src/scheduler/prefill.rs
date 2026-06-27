@@ -651,16 +651,30 @@ impl Scheduler {
             }
         };
 
-        // Detect think-mode entry from injected <think> in the prefill.
+        // Detect think-mode entry: the model opens its OWN `<think>` as the first
+        // decoded token (we never prefill one). The `work.tokens` check covers a
+        // caller-supplied assistant prefill that itself opens a think block.
         let initial_inside_think_block = {
-            let tid = work.sampling.think_start_token_id;
+            let tid = work.sampling.segment_open_token_id;
             if tid >= 0 {
                 let tok = tid as u32;
                 let prefill_has_think = work.tokens.iter().rev().take(5).any(|&t| t == tok);
-                if prefill_has_think && !sampling_state.in_thinking {
-                    sampling_state.enter_thinking();
+                // The block opens either way: the common case is the model
+                // sampling its OWN `<think>` as the first token; the rarer case is
+                // a caller-supplied assistant prefill that already opens one.  In
+                // BOTH cases the sampler's `in_segment` must flip — it gates DRY,
+                // the reflection-marker suppression, the thinking temperature
+                // boost, and the `</think>` EOT ramp (all keyed off `segment_len`,
+                // which only advances while `in_segment`).  Flipping it only for
+                // the prefilled case left the sampler's flag stuck false for a
+                // model-opened block, silently disabling every one of those
+                // controls for its whole duration even though the health flag
+                // (`inside_think_block`) correctly tracked it.
+                let opens_think = prefill_has_think || first_token == tok;
+                if opens_think && !sampling_state.in_segment {
+                    sampling_state.enter_segment();
                 }
-                prefill_has_think || first_token == tok
+                opens_think
             } else {
                 false
             }
@@ -750,6 +764,9 @@ impl Scheduler {
                         },
                         reprojection: work.reprojection,
                         prov_sig_entries: Vec::new(),
+                        triggers: work.triggers,
+                        stencil: None,
+                        pending_mask: None,
                     },
                 );
             } else {
@@ -766,6 +783,23 @@ impl Scheduler {
         }
 
         let _ = work.event_tx.send(TurnEvent::Token(first_token));
+
+        // The first sampled token can itself be a stencil trigger — e.g. the
+        // model emits `<tool_call>` as its very first response token, the common
+        // case under /no_think (the think block is prefilled, so the model goes
+        // straight to the call). The decode-loop trigger check runs only on
+        // tokens sampled in `batch_decode_step`, never this one, so check it here
+        // too — otherwise steering silently never engages for those calls.
+        let stencil = work.triggers.driver_for(first_token);
+        if let Some(d) = &stencil {
+            tracing::debug!(
+                target: "candle_conversation::stencil",
+                seq_id = work.sequence_id.0,
+                tree = d.tree().label(),
+                trigger = first_token,
+                "stencil steering started (trigger on the first decoded token)",
+            );
+        }
 
         self.active_decodes.insert(
             work.sequence_id,
@@ -801,11 +835,13 @@ impl Scheduler {
                 },
                 reprojection: work.reprojection,
                 prov_sig_entries: Vec::new(),
+                triggers: work.triggers,
+                stencil,
+                pending_mask: None,
             },
         );
     }
 
-    #[allow(dead_code)]
     pub(super) fn run_prefill_with_shift(
         &mut self,
         sequence_id: SequenceId,

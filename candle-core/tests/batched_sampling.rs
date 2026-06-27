@@ -1005,6 +1005,12 @@ fn qwen3_recommended_full_combination() {
         // match_length=3 > allowed_length=2, so
         // penalty = 0.4 * 1.75^(3-2) = 0.4 * 1.75 = 0.70 applied to
         // loop_tok (the continuation token at position 10).
+        //
+        // DRY is segment-only: it is gated on (and scoped to) the active
+        // segment. segment_lens >= the full recent window so the whole
+        // n-gram pattern (positions 7-127) stays in scope and the DRY math
+        // above holds unchanged (effective_len == recent_len, offset == 0).
+        segment_lens: vec![max_recent as i32],
         dry_multiplier: 0.4,
         dry_base: 1.75,
         dry_allowed_length: 2,
@@ -1101,168 +1107,574 @@ fn qwen3_recommended_full_combination() {
 }
 
 // ============================================================================
-// Tests: EOT (End-of-Thinking) Boost
+// Tests: Segment-only DRY gating + scoping
 // ============================================================================
 
-/// When thinking_len is below eot_ramp_start, the EOT boost should be zero
-/// and the EOT token should NOT be selected.
+/// DRY is gated to (and scoped within) the active segment.
+///
+/// A single repeated n-gram whose continuation is `loop_tok` is placed in the
+/// recent window.  `loop_tok` has the top raw logit, so without a DRY penalty it
+/// is the argmax; the penalty is sized to drop it below `alt_tok`.  Three rows
+/// share the SAME logits and recent history and differ ONLY in `segment_lens`,
+/// proving the gate and the scope in one test:
+///
+///   row 0 — in-segment, whole n-gram in scope   → DRY fires   → winner = alt_tok
+///   row 1 — outside a segment (segment_lens == 0)→ DRY gated   → winner = loop_tok
+///   row 2 — in-segment, but the n-gram precedes  → DRY scoped  → winner = loop_tok
+///           the segment (effective_len too small)   out
+///
+/// Repeat/frequency/presence penalties are all disabled so the result isolates
+/// DRY.  Argmax (temperature 0) keeps it deterministic, and `assert_gpu_cpu_match`
+/// confirms the CPU reference applies the identical gate/scope.
 #[test]
-fn eot_boost_zero_below_ramp_start() {
+fn dry_penalty_is_segment_scoped() {
     let stream = test_stream();
-    let vocab = 64;
-    let eot_id: i32 = 5;
+    let vocab = 64usize;
+    let rlen = 20usize;
+    let max_recent = rlen;
 
-    // Token 10 has higher base logit than the EOT token
-    let mut logits = vec![0.0f32; vocab];
-    logits[10] = 5.0;
-    logits[eot_id as usize] = 4.0;
+    let a_tok = 30usize; // n-gram element A
+    let b_tok = 31usize; // n-gram element B
+    let loop_tok = 40usize; // DRY continuation target (top raw logit)
+    let alt_tok = 41usize; // runner-up; wins only once loop_tok is penalized
+
+    // loop_tok leads alt_tok by 2.0.  DRY penalty on loop_tok is
+    //   multiplier * base^(match_len - allowed_len) = 2.0 * 1.75^(2-1) = 3.5,
+    // comfortably larger than the 2.0 gap, so the penalty flips the argmax.
+    let mut logits = vec![-20.0f32; vocab];
+    logits[loop_tok] = 5.0;
+    logits[alt_tok] = 3.0;
+
+    // Recent history (oldest-first, newest at the end), shared by all rows.
+    // Unique fillers (>= 100) everywhere except the n-gram positions so no
+    // accidental suffix match can form.
+    //   pos 5,6,7  = A, B, loop_tok   (the earlier occurrence + continuation)
+    //   pos 18,19  = A, B             (the current suffix that matches 5,6)
+    // Suffix [A,B] at 18-19 matches [A,B] at 5-6 (match_len=2 > allowed=1),
+    // so the continuation at pos 7 (loop_tok) is penalized.
+    let mut recent_row: Vec<i32> = (0..rlen).map(|i| 100 + i as i32).collect();
+    recent_row[5] = a_tok as i32;
+    recent_row[6] = b_tok as i32;
+    recent_row[7] = loop_tok as i32;
+    recent_row[18] = a_tok as i32;
+    recent_row[19] = b_tok as i32;
+
+    let mut recent_tokens = Vec::with_capacity(3 * max_recent);
+    for _ in 0..3 {
+        recent_tokens.extend_from_slice(&recent_row);
+    }
 
     let p = SamplingParams {
-        logits_f32: logits,
-        batch_size: 1,
+        logits_f32: {
+            // Same logits for all three rows.
+            let mut all = Vec::with_capacity(3 * vocab);
+            for _ in 0..3 {
+                all.extend_from_slice(&logits);
+            }
+            all
+        },
+        batch_size: 3,
         vocab_size: vocab as i32,
-        temperature: 0.0,
-        eot_boost: 1.0,
-        eot_token_id: eot_id,
-        eot_ramp_start: 150,
-        eot_ramp_len: 200,
-        eot_boost_max_multiplier: 3.0,
-        thinking_lens: vec![50], // well below ramp_start=150 → boost = 0
+        temperature: 0.0, // argmax — deterministic
+
+        // Isolate DRY: no repeat/frequency/presence penalties.
+        repeat_penalty: 1.0,
+        recent_tokens,
+        recent_lens: vec![rlen as i32; 3],
+        max_recent_len: max_recent as i32,
+
+        // DRY: multiplier=2.0, base=1.75, allowed_length=1, full look-back.
+        dry_multiplier: 2.0,
+        dry_base: 1.75,
+        dry_allowed_length: 1,
+        dry_range: 0,
+
+        // The gate/scope signal:
+        //   row 0: full segment in scope (effective_len == rlen, offset == 0)
+        //   row 1: outside a segment → DRY disabled entirely
+        //   row 2: only the last 2 tokens are in-segment → the earlier n-gram
+        //          occurrence at pos 5-7 is scoped out, so no match is found
+        segment_lens: vec![rlen as i32, 0, 2],
+
         ..Default::default()
     };
 
-    assert_gpu_cpu_match(&stream, &p, "eot_boost_zero_below_ramp_start");
-    let r = run_gpu(&stream, &p);
-    assert_eq!(r[0], 10, "EOT should NOT win below ramp_start (boost=0)");
-}
+    // CPU reference must apply the identical gate/scope.
+    assert_gpu_cpu_match(&stream, &p, "dry_penalty_is_segment_scoped");
 
-/// At the midpoint of the ramp, the EOT boost should be partial.
-#[test]
-fn eot_boost_partial_at_midpoint() {
-    let stream = test_stream();
-    let vocab = 64;
-    let eot_id: i32 = 5;
-
-    // ramp_start=150, ramp_len=200 → ramp spans 150..200 (50-token window)
-    // At thinking_len=175: t = (175-150)/(200-150) = 25/50 = 0.5
-    // boost = 1.0 * 0.5 * 3.0 = 1.5
-    // EOT logit = 4.0 + 1.5 = 5.5 > 5.0
-    let mut logits = vec![0.0f32; vocab];
-    logits[10] = 5.0;
-    logits[eot_id as usize] = 4.0;
-
-    let p = SamplingParams {
-        logits_f32: logits,
-        batch_size: 1,
-        vocab_size: vocab as i32,
-        temperature: 0.0,
-        eot_boost: 1.0,
-        eot_token_id: eot_id,
-        eot_ramp_start: 150,
-        eot_ramp_len: 200,
-        eot_boost_max_multiplier: 3.0,
-        thinking_lens: vec![175], // midpoint → boost = 1.5
-        ..Default::default()
-    };
-
-    assert_gpu_cpu_match(&stream, &p, "eot_boost_partial_at_midpoint");
-    let r = run_gpu(&stream, &p);
+    let result = run_gpu(&stream, &p);
     assert_eq!(
-        r[0], eot_id as u32,
-        "EOT should win at ramp midpoint (4.0+1.5=5.5 > 5.0)"
+        result[0], alt_tok as u32,
+        "row 0 (in-segment, n-gram in scope): DRY should penalize loop_tok so \
+         alt_tok ({alt_tok}) wins, got {}",
+        result[0]
+    );
+    assert_eq!(
+        result[1], loop_tok as u32,
+        "row 1 (outside a segment): DRY must be gated off so loop_tok ({loop_tok}) \
+         stays the argmax, got {}",
+        result[1]
+    );
+    assert_eq!(
+        result[2], loop_tok as u32,
+        "row 2 (in-segment but n-gram precedes the segment): DRY is scoped out so \
+         loop_tok ({loop_tok}) stays the argmax, got {}",
+        result[2]
     );
 }
 
-/// At full ramp (thinking_len >= ramp_len), the EOT boost is at maximum.
+/// Token suppression is gated to (and only fires inside) the active segment,
+/// mirroring `dry_penalty_is_segment_scoped`.
+///
+/// All three rows share the SAME logits: a `suppressed_tok` leading a runner-up
+/// `alt_tok` by 2.0. A custom suppress list `[suppressed_tok]` and a penalty of
+/// 3.0 (> the 2.0 gap) are configured. The rows differ ONLY in the gate:
+///
+///   row 0 — in-segment (`segment_lens > 0`) + penalty set → suppression fires →
+///           winner flips to `alt_tok`
+///   row 1 — outside a segment (`segment_lens == 0`)        → no suppression →
+///           `suppressed_tok` still wins
+///   row 2 — in-segment but `segment_suppress_penalty == 0` → no suppression →
+///           `suppressed_tok` still wins
+///
+/// Argmax (temperature 0) keeps it deterministic and `assert_gpu_cpu_match`
+/// confirms the CPU reference applies the identical gate.
 #[test]
-fn eot_boost_full_at_ramp_len() {
+fn marker_suppression_is_segment_gated() {
     let stream = test_stream();
-    let vocab = 64;
-    let eot_id: i32 = 5;
+    let vocab = 64usize;
 
-    // At thinking_len=200: t = (200-150)/(200-150) = 1.0
-    // boost = 1.0 * 1.0 * 3.0 = 3.0
-    // EOT logit = 2.1 + 3.0 = 5.1 > 5.0
-    let mut logits = vec![0.0f32; vocab];
-    logits[10] = 5.0;
-    logits[eot_id as usize] = 2.1;
+    let suppressed_tok = 40usize; // suppressed token (top raw logit)
+    let alt_tok = 41usize; // runner-up; wins once the token is suppressed
+
+    // suppressed_tok leads alt_tok by 2.0; a 3.0 penalty flips the argmax.
+    let mut row = vec![-20.0f32; vocab];
+    row[suppressed_tok] = 5.0;
+    row[alt_tok] = 3.0;
+
+    let mut logits_f32 = Vec::with_capacity(3 * vocab);
+    for _ in 0..3 {
+        logits_f32.extend_from_slice(&row);
+    }
 
     let p = SamplingParams {
-        logits_f32: logits,
-        batch_size: 1,
+        logits_f32,
+        batch_size: 3,
         vocab_size: vocab as i32,
-        temperature: 0.0,
-        eot_boost: 1.0,
-        eot_token_id: eot_id,
-        eot_ramp_start: 150,
-        eot_ramp_len: 200,
-        eot_boost_max_multiplier: 3.0,
-        thinking_lens: vec![200], // at ramp_len → full boost
+        temperature: 0.0, // argmax — deterministic
+
+        // The shared suppress list + per-sequence penalty (the gate):
+        //   row 0: in-segment, penalty 3.0 → suppression fires
+        //   row 1: outside a segment → suppression gated off
+        //   row 2: in-segment but penalty 0.0 → suppression disabled
+        segment_suppress_tokens: vec![suppressed_tok as i32],
+        segment_suppress_penalties: vec![3.0, 3.0, 0.0],
+        segment_lens: vec![1, 0, 1],
+
         ..Default::default()
     };
 
-    assert_gpu_cpu_match(&stream, &p, "eot_boost_full_at_ramp_len");
-    let r = run_gpu(&stream, &p);
+    // CPU reference must apply the identical gate.
+    assert_gpu_cpu_match(&stream, &p, "marker_suppression_is_segment_gated");
+
+    let result = run_gpu(&stream, &p);
     assert_eq!(
-        r[0], eot_id as u32,
-        "EOT should win at full ramp (2.1+3.0=5.1 > 5.0)"
+        result[0], alt_tok as u32,
+        "row 0 (in-segment, penalty set): suppression should drop suppressed_tok so \
+         alt_tok ({alt_tok}) wins, got {}",
+        result[0]
+    );
+    assert_eq!(
+        result[1], suppressed_tok as u32,
+        "row 1 (outside a segment): suppression must be gated off so suppressed_tok \
+         ({suppressed_tok}) stays the argmax, got {}",
+        result[1]
+    );
+    assert_eq!(
+        result[2], suppressed_tok as u32,
+        "row 2 (in-segment but penalty 0.0): suppression disabled so suppressed_tok \
+         ({suppressed_tok}) stays the argmax, got {}",
+        result[2]
     );
 }
 
-/// When thinking_lens = 0 (not in thinking mode), EOT boost should be disabled
-/// even when eot_boost > 0 and eot_token_id is valid.
+/// DRY with the **production** qwen3 params (`0.8, 1.75, 2, 512`) backs the model
+/// off a repeated *sentence*.  The penalty grows exponentially with the matched
+/// length — `multiplier · base^(match_len − allowed_length)` — so a short echo is
+/// tolerated but a long verbatim run is crushed.
+///
+/// Two in-segment rows share the same logits (the loop continuation leads its
+/// alternative by 2.0) and the same DRY config, differing only in how much of the
+/// sentence has already been re-emitted:
+///   row 0 — a 7-token suffix matches an earlier occurrence → penalty
+///           `0.8·1.75^(7−2) ≈ 13.1` ≫ 2.0 gap → argmax flips OFF the repeat
+///   row 1 — only a 3-token suffix matches → penalty `0.8·1.75^(3−2) ≈ 1.4` < 2.0
+///           → the short echo is still allowed (loop continuation wins)
+///
+/// So DRY backs off precisely once the verbatim run gets long — the sentence-loop
+/// case — with the configured params.  Argmax (temp 0) keeps it deterministic;
+/// `assert_gpu_cpu_match` confirms the CPU reference applies the identical penalty.
 #[test]
-fn eot_boost_disabled_when_not_thinking() {
+fn dry_backs_off_a_repeated_sentence() {
+    let stream = test_stream();
+    let vocab = 130usize;
+    let rlen = 24usize;
+    let max_recent = rlen;
+
+    let alt_tok = 40usize; // non-repeating runner-up
+                           // The "sentence": s0..s7.  s0..s6 form the matched suffix; s7 is the
+                           // continuation DRY penalizes when the whole prefix has been re-emitted.
+    let s: [i32; 8] = [50, 51, 52, 53, 54, 55, 56, 57];
+
+    // Row 0 — LONG match: earlier full occurrence [s0..s7], then the 7-token
+    // suffix [s0..s6] at the end → match_len 7, continuation s7 (=57) penalized.
+    let mut recent0: Vec<i32> = Vec::with_capacity(rlen);
+    recent0.extend([100i32, 101, 102, 103]);
+    recent0.extend_from_slice(&s);
+    recent0.extend([104i32, 105, 106, 107, 108]);
+    recent0.extend_from_slice(&s[..7]);
+    assert_eq!(recent0.len(), rlen);
+
+    // Row 1 — SHORT match: earlier [s0..s3], then the 3-token suffix [s0..s2] at
+    // the end → match_len 3, continuation s3 (=53) penalized only ≈1.4.
+    let mut recent1: Vec<i32> = Vec::with_capacity(rlen);
+    recent1.extend(110i32..120);
+    recent1.extend_from_slice(&s[..4]);
+    recent1.extend(120i32..127);
+    recent1.extend_from_slice(&s[..3]);
+    assert_eq!(recent1.len(), rlen);
+
+    let mut recent_tokens = Vec::with_capacity(2 * max_recent);
+    recent_tokens.extend_from_slice(&recent0);
+    recent_tokens.extend_from_slice(&recent1);
+
+    // Each row's loop continuation leads alt_tok by 2.0.
+    let row_logits = |loop_tok: usize| {
+        let mut l = vec![-20.0f32; vocab];
+        l[loop_tok] = 5.0;
+        l[alt_tok] = 3.0;
+        l
+    };
+    let mut logits_f32 = Vec::with_capacity(2 * vocab);
+    logits_f32.extend(row_logits(57)); // row 0 continuation = s7
+    logits_f32.extend(row_logits(53)); // row 1 continuation = s3
+
+    let p = SamplingParams {
+        logits_f32,
+        batch_size: 2,
+        vocab_size: vocab as i32,
+        temperature: 0.0, // argmax — deterministic
+
+        repeat_penalty: 1.0, // isolate DRY
+        recent_tokens,
+        recent_lens: vec![rlen as i32; 2],
+        max_recent_len: max_recent as i32,
+
+        // Production qwen3 DRY params.
+        dry_multiplier: 0.8,
+        dry_base: 1.75,
+        dry_allowed_length: 2,
+        dry_range: 512,
+
+        segment_lens: vec![rlen as i32; 2], // both fully in-segment
+
+        ..Default::default()
+    };
+
+    assert_gpu_cpu_match(&stream, &p, "dry_backs_off_a_repeated_sentence");
+
+    let result = run_gpu(&stream, &p);
+    assert_eq!(
+        result[0], alt_tok as u32,
+        "row 0 (7-token verbatim repeat): DRY penalty ≈13.1 must crush the loop \
+         continuation (57) so alt_tok ({alt_tok}) wins, got {}",
+        result[0]
+    );
+    assert_eq!(
+        result[1], 53,
+        "row 1 (3-token echo): DRY penalty ≈1.4 < 2.0 gap, so the short repeat is \
+         still allowed and continuation 53 stays the argmax, got {}",
+        result[1]
+    );
+}
+
+/// The in-segment temperature boost makes the in-segment row's distribution
+/// hotter (higher entropy / a larger runner-up probability) than the identical
+/// logits sampled with no boost, without moving the argmax.
+///
+/// Temperature scaling cannot change the argmax, so this is asserted on the
+/// softmax distribution rather than the sampled token.  The harness only returns
+/// a sampled token, so the distribution check is computed directly here from the
+/// raw logits (no penalties are configured, so post-penalty == raw logits) using
+/// the same `temperature + segment_temp_boost` the kernel applies in-segment.
+#[test]
+fn segment_temp_boost_raises_entropy_in_segment() {
+    let vocab = 8usize;
+    let logits = [4.0f32, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0];
+
+    let base_temp = 0.7f32;
+    let boost = 0.05f32;
+
+    // Runner-up probability under a given temperature.
+    let runner_up_prob = |temp: f32| -> f32 {
+        let inv = 1.0 / temp;
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|&l| ((l - max) * inv).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let mut probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+        probs.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        probs[1]
+    };
+
+    let entropy = |temp: f32| -> f32 {
+        let inv = 1.0 / temp;
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|&l| ((l - max) * inv).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        exps.iter()
+            .map(|&e| {
+                let p = e / sum;
+                if p > 0.0 {
+                    -p * p.ln()
+                } else {
+                    0.0
+                }
+            })
+            .sum()
+    };
+
+    let in_segment = runner_up_prob(base_temp + boost);
+    let baseline = runner_up_prob(base_temp);
+    assert!(
+        in_segment > baseline,
+        "in-segment runner-up prob ({in_segment}) should exceed the no-boost \
+         runner-up prob ({baseline})"
+    );
+
+    let h_in_segment = entropy(base_temp + boost);
+    let h_baseline = entropy(base_temp);
+    assert!(
+        h_in_segment > h_baseline,
+        "in-segment entropy ({h_in_segment}) should exceed no-boost entropy ({h_baseline})"
+    );
+
+    let _ = vocab;
+}
+
+// ============================================================================
+// Tests: Segment-Close Boost
+// ============================================================================
+
+/// When segment_len is below segment_close_ramp_start, the segment-close boost
+/// should be zero and the segment-close token should NOT be selected.
+#[test]
+fn segment_close_boost_zero_below_ramp_start() {
     let stream = test_stream();
     let vocab = 64;
-    let eot_id: i32 = 5;
+    let segment_close_id: i32 = 5;
 
-    // With thinking_lens=0, the EOT boost should NOT apply regardless of config
+    // Token 10 has higher base logit than the segment-close token
     let mut logits = vec![0.0f32; vocab];
     logits[10] = 5.0;
-    logits[eot_id as usize] = 4.0;
+    logits[segment_close_id as usize] = 4.0;
 
     let p = SamplingParams {
         logits_f32: logits,
         batch_size: 1,
         vocab_size: vocab as i32,
         temperature: 0.0,
-        eot_boost: 1.0,
-        eot_token_id: eot_id,
-        eot_ramp_start: 0, // would give t=1.0 if thinking_len > 0
-        eot_ramp_len: 1,
-        eot_boost_max_multiplier: 100.0, // huge multiplier to ensure failure if applied
-        thinking_lens: vec![0],          // NOT in thinking mode
+        segment_close_boost: 1.0,
+        segment_close_token_id: segment_close_id,
+        segment_close_ramp_start: 150,
+        segment_close_ramp_len: 200,
+        segment_close_max_multiplier: 3.0,
+        segment_lens: vec![50], // well below ramp_start=150 → boost = 0
         ..Default::default()
     };
 
-    assert_gpu_cpu_match(&stream, &p, "eot_boost_disabled_when_not_thinking");
+    assert_gpu_cpu_match(&stream, &p, "segment_close_boost_zero_below_ramp_start");
     let r = run_gpu(&stream, &p);
     assert_eq!(
         r[0], 10,
-        "EOT should NOT win when thinking_lens=0 (not in thinking mode)"
+        "segment-close token should NOT win below ramp_start (boost=0)"
     );
 }
 
-/// EOT boost and EOS boost can operate independently on different tokens.
+/// At the midpoint of the ramp, the segment-close boost should be partial.
 #[test]
-fn eot_boost_independent_of_eos_boost() {
+fn segment_close_boost_partial_at_midpoint() {
+    let stream = test_stream();
+    let vocab = 64;
+    let segment_close_id: i32 = 5;
+
+    // ramp_start=150, ramp_len=200 → ramp spans 150..200 (50-token window)
+    // At segment_len=175: t = (175-150)/(200-150) = 25/50 = 0.5
+    // boost = 1.0 * 0.5 * 3.0 = 1.5
+    // segment-close logit = 4.0 + 1.5 = 5.5 > 5.0
+    let mut logits = vec![0.0f32; vocab];
+    logits[10] = 5.0;
+    logits[segment_close_id as usize] = 4.0;
+
+    let p = SamplingParams {
+        logits_f32: logits,
+        batch_size: 1,
+        vocab_size: vocab as i32,
+        temperature: 0.0,
+        segment_close_boost: 1.0,
+        segment_close_token_id: segment_close_id,
+        segment_close_ramp_start: 150,
+        segment_close_ramp_len: 200,
+        segment_close_max_multiplier: 3.0,
+        segment_lens: vec![175], // midpoint → boost = 1.5
+        ..Default::default()
+    };
+
+    assert_gpu_cpu_match(&stream, &p, "segment_close_boost_partial_at_midpoint");
+    let r = run_gpu(&stream, &p);
+    assert_eq!(
+        r[0], segment_close_id as u32,
+        "segment-close token should win at ramp midpoint (4.0+1.5=5.5 > 5.0)"
+    );
+}
+
+/// At full ramp (segment_len >= ramp_len), the segment-close boost is at maximum.
+#[test]
+fn segment_close_boost_full_at_ramp_len() {
+    let stream = test_stream();
+    let vocab = 64;
+    let segment_close_id: i32 = 5;
+
+    // At segment_len=200: t = (200-150)/(200-150) = 1.0
+    // boost = 1.0 * 1.0 * 3.0 = 3.0
+    // segment-close logit = 2.1 + 3.0 = 5.1 > 5.0
+    let mut logits = vec![0.0f32; vocab];
+    logits[10] = 5.0;
+    logits[segment_close_id as usize] = 2.1;
+
+    let p = SamplingParams {
+        logits_f32: logits,
+        batch_size: 1,
+        vocab_size: vocab as i32,
+        temperature: 0.0,
+        segment_close_boost: 1.0,
+        segment_close_token_id: segment_close_id,
+        segment_close_ramp_start: 150,
+        segment_close_ramp_len: 200,
+        segment_close_max_multiplier: 3.0,
+        segment_lens: vec![200], // at ramp_len → full boost
+        ..Default::default()
+    };
+
+    assert_gpu_cpu_match(&stream, &p, "segment_close_boost_full_at_ramp_len");
+    let r = run_gpu(&stream, &p);
+    assert_eq!(
+        r[0], segment_close_id as u32,
+        "segment-close token should win at full ramp (2.1+3.0=5.1 > 5.0)"
+    );
+}
+
+/// Inside a segment, EOS gets the SAME per-segment (segment_len) close boost as
+/// the segment-close token — even when `current_len` is far below the total-length
+/// EOS ramp.  Inside a steered segment the model's EOS is intercepted into a
+/// segment close, so it must help close EARLY segments (where `current_len` is
+/// still small), not merely act as a late turn-ender.
+#[test]
+fn eos_gets_per_segment_close_boost_in_segment() {
+    let stream = test_stream();
+    let vocab = 64;
+    let segment_close_id: i32 = 5;
+    let eos_id: i32 = 6;
+
+    // A normal token outscores EOS at base.
+    let mut logits = vec![0.0f32; vocab];
+    logits[10] = 5.0;
+    logits[eos_id as usize] = 4.0;
+
+    let p = SamplingParams {
+        logits_f32: logits,
+        batch_size: 1,
+        vocab_size: vocab as i32,
+        temperature: 0.0,
+        // Per-segment close ramp (keyed on segment_len) at full strength.
+        segment_close_boost: 1.0,
+        segment_close_token_id: segment_close_id,
+        eos_token_id: eos_id,
+        segment_close_ramp_start: 150,
+        segment_close_ramp_len: 200,
+        segment_close_max_multiplier: 3.0,
+        segment_lens: vec![200], // full per-segment ramp → +3.0 on BOTH segment-close and EOS
+        // Total-length EOS boost is DORMANT: current_len far below its ramp.
+        eos_boost: 1.0,
+        eos_ramp_start: 5000,
+        eos_ramp_len: 5200,
+        eos_boost_max_multiplier: 3.0,
+        current_lens: vec![50],
+        ..Default::default()
+    };
+
+    assert_gpu_cpu_match(&stream, &p, "eos_gets_per_segment_close_boost_in_segment");
+    let r = run_gpu(&stream, &p);
+    assert_eq!(
+        r[0], eos_id as u32,
+        "EOS should win via the per-segment close boost (4.0+3.0=7.0 > 5.0) despite \
+         current_len being below the total-length EOS ramp",
+    );
+}
+
+/// When segment_lens = 0 (outside a segment), the segment-close boost should be
+/// disabled even when segment_close_boost > 0 and segment_close_token_id is valid.
+#[test]
+fn segment_close_boost_disabled_outside_segment() {
+    let stream = test_stream();
+    let vocab = 64;
+    let segment_close_id: i32 = 5;
+
+    // With segment_lens=0, the segment-close boost should NOT apply regardless of config
+    let mut logits = vec![0.0f32; vocab];
+    logits[10] = 5.0;
+    logits[segment_close_id as usize] = 4.0;
+
+    let p = SamplingParams {
+        logits_f32: logits,
+        batch_size: 1,
+        vocab_size: vocab as i32,
+        temperature: 0.0,
+        segment_close_boost: 1.0,
+        segment_close_token_id: segment_close_id,
+        segment_close_ramp_start: 0, // would give t=1.0 if segment_len > 0
+        segment_close_ramp_len: 1,
+        segment_close_max_multiplier: 100.0, // huge multiplier to ensure failure if applied
+        segment_lens: vec![0],               // outside a segment
+        ..Default::default()
+    };
+
+    assert_gpu_cpu_match(&stream, &p, "segment_close_boost_disabled_outside_segment");
+    let r = run_gpu(&stream, &p);
+    assert_eq!(
+        r[0], 10,
+        "segment-close token should NOT win when segment_lens=0 (outside a segment)"
+    );
+}
+
+/// The segment-close boost and EOS boost can operate independently on different tokens.
+#[test]
+fn segment_close_boost_independent_of_eos_boost() {
     let stream = test_stream();
     let vocab = 64;
     let eos_id: i32 = 1;
-    let eot_id: i32 = 5;
+    let segment_close_id: i32 = 5;
 
     // Both boosts active but targeting different tokens
     // EOS boost: ramp at current_len=100, ramp_start=80, ramp_len=100
     //   t = (100-80)/(100-80) = 1.0, boost = 1.0 * 1.0 * 2.0 = 2.0
     //   EOS logit = 1.0 + 2.0 = 3.0
-    // EOT boost: ramp at thinking_len=175, ramp_start=150, ramp_len=200
+    // Segment-close boost: ramp at segment_len=175, ramp_start=150, ramp_len=200
     //   t = (175-150)/(200-150) = 0.5, boost = 1.0 * 0.5 * 3.0 = 1.5
-    //   EOT logit = 4.0 + 1.5 = 5.5
+    //   segment-close logit = 4.0 + 1.5 = 5.5
     let mut logits = vec![0.0f32; vocab];
     logits[10] = 5.0;
     logits[eos_id as usize] = 1.0;
-    logits[eot_id as usize] = 4.0;
+    logits[segment_close_id as usize] = 4.0;
 
     let p = SamplingParams {
         logits_f32: logits,
@@ -1276,21 +1688,21 @@ fn eot_boost_independent_of_eos_boost() {
         eos_ramp_len: 100,
         eos_boost_max_multiplier: 2.0,
         current_lens: vec![100],
-        // EOT boost config
-        eot_boost: 1.0,
-        eot_token_id: eot_id,
-        eot_ramp_start: 150,
-        eot_ramp_len: 200,
-        eot_boost_max_multiplier: 3.0,
-        thinking_lens: vec![175],
+        // Segment-close boost config
+        segment_close_boost: 1.0,
+        segment_close_token_id: segment_close_id,
+        segment_close_ramp_start: 150,
+        segment_close_ramp_len: 200,
+        segment_close_max_multiplier: 3.0,
+        segment_lens: vec![175],
         ..Default::default()
     };
 
-    assert_gpu_cpu_match(&stream, &p, "eot_boost_independent_of_eos_boost");
+    assert_gpu_cpu_match(&stream, &p, "segment_close_boost_independent_of_eos_boost");
     let r = run_gpu(&stream, &p);
-    // EOT (5.5) > token 10 (5.0) > EOS (3.0)
+    // segment-close (5.5) > token 10 (5.0) > EOS (3.0)
     assert_eq!(
-        r[0], eot_id as u32,
-        "EOT should win (5.5) over token 10 (5.0) and EOS (3.0)"
+        r[0], segment_close_id as u32,
+        "segment-close token should win (5.5) over token 10 (5.0) and EOS (3.0)"
     );
 }

@@ -399,6 +399,12 @@ pub struct SectionSchema {
     /// markers (e.g. `<tools>` / `</tools>`) that should only appear
     /// when the collection itself emits anything.
     pub depends_on: Option<CollectionId>,
+    /// Inverse of [`Self::depends_on`]: when `Some(cid)`, this section emits only
+    /// when the named collection materialised **zero** members. Lets a layer
+    /// carry two variants of a section — one gated `depends_on` a collection,
+    /// the other `depends_on_absent` the same collection — so exactly one shows
+    /// (e.g. a tools-aware vs a no-tools grounding paragraph).
+    pub depends_on_absent: Option<CollectionId>,
     /// Marks this section as resolved from a dialect template (a
     /// `kind: template` YAML item that referenced a `DialectTemplate`
     /// catalog entry, e.g. `system_start`).  The scheduler's
@@ -445,6 +451,7 @@ impl CompressionPrompt {
                 content: String::new(),
                 priority: 50.0,
                 depends_on: None,
+                depends_on_absent: None,
                 is_template: false,
                 template_tokens: None,
             },

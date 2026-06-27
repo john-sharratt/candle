@@ -881,9 +881,21 @@ fn emit_system_prompt_items<R: ContentResolver>(
     // items for emission. Cached by CollectionId.
     let mut collection_results: std::collections::HashMap<CollectionId, Vec<ProjectionSegment>> =
         std::collections::HashMap::new();
+    // Catalog summaries to emit just before each collection's opening structural
+    // marker (OUTSIDE it). A summary emits only when the selection is a proper
+    // non-empty subset — top-k/threshold dropped at least one member, so the
+    // summary names the full set — and the summary section is actually sealed.
+    let mut pending_summaries: std::collections::HashMap<CollectionId, SectionId> =
+        std::collections::HashMap::new();
     for item in &layer.system_prompt.items {
         if let SystemPromptItem::Collection(coll) = item {
             let selected = select_collection_sections(coll, layer, resolver, &scoring);
+            if let Some(sum_id) = coll.summary_section {
+                let partial = !selected.is_empty() && selected.len() < coll.sections.len();
+                if partial && resolver.section_token_count(sum_id) > 0 {
+                    pending_summaries.insert(coll.id, sum_id);
+                }
+            }
             collection_results.insert(coll.id, selected);
         }
     }
@@ -904,28 +916,43 @@ fn emit_system_prompt_items<R: ContentResolver>(
     for item in &layer.system_prompt.items {
         match item {
             SystemPromptItem::Section(s) => {
-                let should_emit = match s.depends_on {
-                    None => true,
-                    Some(cid) => non_empty_collections.contains(&cid),
+                let should_emit = match (s.depends_on, s.depends_on_absent) {
+                    // `depends_on`: emit only when the collection materialised ≥1.
+                    (Some(cid), _) => non_empty_collections.contains(&cid),
+                    // `depends_on_absent`: the inverse — emit only when it
+                    // materialised zero (the no-tools variant).
+                    (None, Some(cid)) => !non_empty_collections.contains(&cid),
+                    (None, None) => true,
                 };
                 if should_emit {
+                    // Emit the collection's catalog summary just before its opening
+                    // structural template (e.g. `<tools>`), so it sits OUTSIDE the
+                    // markers. Triggered by the first emitting *template* gated on
+                    // the collection (the open marker; a plain prose section like
+                    // `tools_overview` does not trigger it); drained so the closing
+                    // marker doesn't re-emit it.
+                    if s.is_template {
+                        if let Some(cid) = s.depends_on {
+                            if let Some(sum_id) = pending_summaries.remove(&cid) {
+                                out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                                    ResolvedSection { id: sum_id },
+                                )));
+                            }
+                        }
+                    }
                     push_section_segment(&mut out, s);
                 }
             }
             SystemPromptItem::Collection(coll) => {
                 if let Some(selected) = collection_results.remove(&coll.id) {
-                    // Emit the catalog summary just before the members when the
-                    // selection is a *proper subset* (top-k / threshold dropped at
-                    // least one member) and the summary section is actually sealed.
-                    // When all members survive, nothing was dropped, so the summary
-                    // adds nothing and is omitted.
-                    if let Some(sum_id) = coll.summary_section {
-                        let partial = selected.len() < coll.sections.len();
-                        if partial && resolver.section_token_count(sum_id) > 0 {
-                            out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                                ResolvedSection { id: sum_id },
-                            )));
-                        }
+                    // Fallback for a collection with no opening structural template
+                    // to hang the summary on: emit it just before the members, as
+                    // before. (When the collection IS wrapped — e.g. `<tools>` —
+                    // the open template already drained and emitted it outside.)
+                    if let Some(sum_id) = pending_summaries.remove(&coll.id) {
+                        out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                            ResolvedSection { id: sum_id },
+                        )));
                     }
                     out.extend(selected);
                 }

@@ -112,8 +112,8 @@ pub struct DecodeHealthState {
     /// suppressed in this state. All other triggers — `TokenRepetition`, `PhraseLoop`,
     /// `LogitNaN/Inf/Magnitude`, and `ArgmaxDominance` — still fire normally.
     ///
-    /// Set by the decode loop when `<think>` (think_start_token_id) is sampled;
-    /// cleared when `</think>` (eot_token_id) is sampled.
+    /// Set by the decode loop when `<think>` (segment_open_token_id) is sampled;
+    /// cleared when `</think>` (segment_close_token_id) is sampled.
     pub inside_think_block: bool,
 
     /// `true` when the sequence was created with a near-zero (≤ 0.01) sampling

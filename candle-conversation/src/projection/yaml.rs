@@ -256,6 +256,10 @@ enum YamlSystemPromptItem {
         /// members. Ingested unconditionally either way.
         #[serde(default)]
         depends_on: Option<String>,
+        /// Inverse gate: emit only when the named sibling Collection
+        /// materialised **zero** members (e.g. a no-tools variant).
+        #[serde(default)]
+        depends_on_absent: Option<String>,
     },
     /// References a [`DialectTemplate`] catalog entry by snake-case
     /// name.  Resolves to the dialect's string at build time and lands
@@ -475,6 +479,7 @@ fn build(
                 content: s.content.clone(),
                 priority,
                 depends_on: None,
+                depends_on_absent: None,
                 is_template: false,
                 template_tokens: None,
             }));
@@ -509,6 +514,7 @@ fn build(
                     content,
                     priority,
                     depends_on,
+                    depends_on_absent,
                 } => {
                     if !layer_section_names.insert(id.clone()) {
                         return Err(ConstructionError::DuplicateSectionName(id.clone()));
@@ -517,21 +523,28 @@ fn build(
                     maps.section_names.insert((lid, id.clone()), sid);
                     let pri = priority.unwrap_or(50.0);
                     validate_priority(&format!("{}/{}", yl.name, id), pri)?;
-                    let depends_on_cid = match depends_on {
-                        Some(name) => Some(*layer_collections.get(name).ok_or_else(|| {
-                            ConstructionError::UnknownCollection(format!(
-                                "{}: section '{}' depends_on unknown collection '{}'",
-                                yl.name, id, name,
-                            ))
-                        })?),
-                        None => None,
+                    let resolve_dep = |name: &Option<String>| -> Result<_, ConstructionError> {
+                        match name {
+                            Some(name) => {
+                                Ok(Some(*layer_collections.get(name).ok_or_else(|| {
+                                    ConstructionError::UnknownCollection(format!(
+                                        "{}: section '{}' depends_on unknown collection '{}'",
+                                        yl.name, id, name,
+                                    ))
+                                })?))
+                            }
+                            None => Ok(None),
+                        }
                     };
+                    let depends_on_cid = resolve_dep(depends_on)?;
+                    let depends_on_absent_cid = resolve_dep(depends_on_absent)?;
                     items.push(SystemPromptItem::Section(SectionSchema {
                         id: sid,
                         name: id.clone(),
                         content: content.clone(),
                         priority: pri,
                         depends_on: depends_on_cid,
+                        depends_on_absent: depends_on_absent_cid,
                         is_template: false,
                         template_tokens: None,
                     }));
@@ -581,6 +594,7 @@ fn build(
                         content: content.to_string(),
                         priority: 50.0,
                         depends_on: depends_on_cid,
+                        depends_on_absent: None,
                         is_template: true,
                         template_tokens: None,
                     }));
@@ -620,6 +634,7 @@ fn build(
                             content: s.content.clone(),
                             priority: pri,
                             depends_on: None,
+                            depends_on_absent: None,
                             is_template: false,
                             template_tokens: None,
                         });
@@ -746,6 +761,7 @@ fn build_compression_prompt(
             content: yc.system_prompt.clone(),
             priority: 50.0,
             depends_on: None,
+            depends_on_absent: None,
             is_template: false,
             template_tokens: None,
         },

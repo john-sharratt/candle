@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{GroupId, SectionId};
+use super::ids::{CollectionId, GroupId, SectionId};
 use super::project::{ProjectionSegment, SealedKind};
 use super::schema::{Schema, SystemPromptItem};
 use crate::substrate::ContentResolver;
@@ -341,11 +341,49 @@ fn build_selection(
     // with a selected member. Template glue interleaves with content exactly as
     // the prompt is assembled, so the closing markers appear in place.
     let mut system: Vec<SystemItem> = Vec::new();
+    // A collection's catalog summary shows just before its opening structural
+    // marker (OUTSIDE it), matching the projected order in
+    // `emit_system_prompt_items`. Captured up front, drained as it emits.
+    //
+    // The `selected.contains(&sum)` gate is *inherited* from the projection: a
+    // summary section only lands in `selected` if `project.rs` already emitted it
+    // (its own `partial && token_count > 0` gate), so the panel can't show a
+    // summary the prompt didn't — no need to re-derive that gate here.
+    let mut pending_summaries: std::collections::HashMap<CollectionId, (String, u32)> =
+        std::collections::HashMap::new();
+    for layer in &schema.layers {
+        for item in &layer.system_prompt.items {
+            if let SystemPromptItem::Collection(c) = item {
+                if let Some(sum) = c.summary_section {
+                    if selected.contains(&sum) {
+                        pending_summaries.insert(
+                            c.id,
+                            (
+                                format!("{} summary", c.name),
+                                resolver.section_token_count(sum) as u32,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
     for layer in &schema.layers {
         for item in &layer.system_prompt.items {
             match item {
                 SystemPromptItem::Section(s) if s.is_template => {
                     if let Some(&tokens) = emitted_glue.get(s.name.as_str()) {
+                        // Emit the collection's summary just before its opening
+                        // marker (e.g. `<tools>`), so it sits OUTSIDE the block —
+                        // mirroring the projection.
+                        if let Some(cid) = s.depends_on {
+                            if let Some((name, sum_tokens)) = pending_summaries.remove(&cid) {
+                                system.push(SystemItem::Section {
+                                    name,
+                                    tokens: sum_tokens,
+                                });
+                            }
+                        }
                         system.push(SystemItem::Glue {
                             name: s.name.clone(),
                             content: s.content.clone(),
@@ -361,19 +399,14 @@ fn build_selection(
                 }
                 SystemPromptItem::Section(_) => {}
                 SystemPromptItem::Collection(c) => {
-                    // The collection's runtime summary section materializes just
-                    // before the members on partial selection. It is a reserved
-                    // section (not a schema item), so emit it explicitly here when
-                    // it fired — otherwise it is silently folded into `system` and
-                    // invisible in the panel. Named `"<collection> summary"`; the
-                    // daemon serves its text under the same key.
-                    if let Some(sum) = c.summary_section {
-                        if selected.contains(&sum) {
-                            system.push(SystemItem::Section {
-                                name: format!("{} summary", c.name),
-                                tokens: resolver.section_token_count(sum) as u32,
-                            });
-                        }
+                    // The runtime summary section (a reserved section, not a schema
+                    // item) shows just before the collection's opening marker, so
+                    // it was already drained above. This is the fallback for a
+                    // collection with no opening marker — show it before members.
+                    // Named `"<collection> summary"`; the daemon serves its text
+                    // under the same key.
+                    if let Some((name, tokens)) = pending_summaries.remove(&c.id) {
+                        system.push(SystemItem::Section { name, tokens });
                     }
                     if c.sections.iter().any(|s| selected.contains(&s.id)) {
                         system.push(SystemItem::Collection {
@@ -489,7 +522,7 @@ fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::super::builder::Builder;
-    use super::super::ids::{GroupId, SectionId, TurnId, TurnIndex};
+    use super::super::ids::{GroupId, Reserved, SectionId, TurnId, TurnIndex};
     use super::super::project::{
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
@@ -908,5 +941,107 @@ layers:
             }
             other => panic!("expected system_close glue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_projection_summary_shows_outside_tools_markers() {
+        use candle_transformers::models::dialect::Dialect;
+        const YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: c
+          user_prompt: c
+        assistant:
+          system_prompt: c
+          user_prompt: c
+    system_prompt:
+      items:
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: tools
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 1 }
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: x
+              user_prompt: x
+            assign:
+              max_tokens: 128
+              system_prompt: x
+              user_prompt: x
+          sections:
+            - id: t1
+              content: "tool"
+        - kind: template
+          id: tools_close
+          dialect: tool_block_close
+          depends_on: tools
+    groups:
+      - id: conversation
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let mut b = Builder::from_yaml_with_vars_and_dialect(YAML, &[], Some(&dlct)).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+        let summary = SectionId::reserved(Reserved::ToolSummary);
+        b.set_collection_summary_section(dialogue, tools, summary)
+            .unwrap();
+        let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+        let schema = b.schema();
+
+        let mut res = TokResolver::default();
+        res.section_tokens.insert(summary.raw(), 40);
+        res.section_tokens.insert(t1.raw(), 8);
+
+        // The projected order: summary OUTSIDE, then <tools>, member, </tools>.
+        let segments = vec![
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: summary })),
+            ProjectionSegment::Generated {
+                tokens: Arc::new(vec![1]),
+                identity: GeneratedIdentity {
+                    name: "tools_open".to_string(),
+                    position: 0,
+                },
+            },
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: t1 })),
+            ProjectionSegment::Generated {
+                tokens: Arc::new(vec![2]),
+                identity: GeneratedIdentity {
+                    name: "tools_close".to_string(),
+                    position: 2,
+                },
+            },
+        ];
+        let sel = from_projection(&segments, schema, &res, 1000, 0, 10, 1.0).selection;
+
+        // The catalog summary must appear BEFORE the `tools_open` glue — i.e.
+        // outside the `<tools>` block — in the panel composition.
+        let sum_pos = sel
+            .system
+            .iter()
+            .position(
+                |it| matches!(it, SystemItem::Section { name, .. } if name == "tools summary"),
+            )
+            .unwrap_or_else(|| panic!("summary not in composition: {:?}", sel.system));
+        let open_pos = sel
+            .system
+            .iter()
+            .position(|it| matches!(it, SystemItem::Glue { name, .. } if name == "tools_open"))
+            .unwrap_or_else(|| panic!("tools_open glue not in composition: {:?}", sel.system));
+        assert!(
+            sum_pos < open_pos,
+            "summary must show before <tools>: {:?}",
+            sel.system
+        );
     }
 }

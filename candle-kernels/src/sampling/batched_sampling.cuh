@@ -158,15 +158,15 @@ struct PenaltyParams {
     float eos_boost_max_multiplier;
     int32_t current_len;   // Current generated sequence length for this batch item.
 
-    // EOT (End-of-Thinking) boost — same ramp formula as EOS,
-    // but targets the </think> token and uses thinking_len.
+    // Segment-close boost — same ramp formula as EOS,
+    // but targets the segment-close token and uses segment_len.
     // 0.0 = disabled.
-    float eot_boost;
-    int32_t eot_token_id;
-    int32_t eot_ramp_start;
-    int32_t eot_ramp_len;
-    float eot_boost_max_multiplier;
-    int32_t thinking_len;  // Tokens generated since <think> for this batch item.
+    float segment_close_boost;
+    int32_t segment_close_token_id;
+    int32_t segment_close_ramp_start;
+    int32_t segment_close_ramp_len;
+    float segment_close_max_multiplier;
+    int32_t segment_len;  // Tokens generated since the segment opened for this batch item.
     
     // Token counts for frequency/presence penalty
     // Layout: [batch_size, vocab_size] - each sequence has its own counts
@@ -190,6 +190,16 @@ struct PenaltyParams {
     // Set to null to disable (use full vocabulary)
     const int32_t* stencil;
     int32_t stencil_size;           // Number of allowed tokens (0 = disabled)
+
+    // Token suppression (the in-segment ceiling lever).
+    // While this sequence is inside a segment, `suppress_penalty` is
+    // subtracted from the logit of every token in `suppress_tokens`. Outside a
+    // segment `suppress_penalty` is set to 0 by the caller, so tokens outside
+    // the segment are untouched. The token list is shared across the batch.
+    // Layout: [suppress_count] - array of suppress token IDs.
+    const int32_t* suppress_tokens;
+    int32_t suppress_count;         // Number of suppress tokens (0 = disabled)
+    float suppress_penalty;         // Per-sequence penalty (0.0 = disabled)
 };
 
 // ============================================================================
@@ -637,17 +647,17 @@ __device__ __forceinline__ float apply_penalties_branchless(
     const PenaltyParams& params,
     const uint32_t* __restrict__ recent_bitset
 ) {
-    // Protected tokens: EOS and EOT (</think>) must never be penalised.
+    // Protected tokens: EOS and the segment-close token must never be penalised.
     // Penalties would suppress the model's ability to stop generating.
     // Save the logit so we can restore it for protected tokens after penalties.
     float saved_logit = logit;
     int eos_diff = token_id - params.eos_token_id;
     int eos_abs  = (eos_diff ^ (eos_diff >> 31)) - (eos_diff >> 31);
     int is_eos   = 1 - min(eos_abs, 1);
-    int eot_diff = token_id - params.eot_token_id;
-    int eot_abs  = (eot_diff ^ (eot_diff >> 31)) - (eot_diff >> 31);
-    int is_eot   = 1 - min(eot_abs, 1);
-    int is_protected = is_eos | is_eot;
+    int segment_close_diff = token_id - params.segment_close_token_id;
+    int segment_close_abs  = (segment_close_diff ^ (segment_close_diff >> 31)) - (segment_close_diff >> 31);
+    int is_segment_close   = 1 - min(segment_close_abs, 1);
+    int is_protected = is_eos | is_segment_close;
 
     // 1. Repeat Penalty (truly branchless, per-sequence via recent_bitset)
     // Defensive check: token_id should always be in [0, vocab_size) but guard anyway
@@ -691,7 +701,7 @@ __device__ __forceinline__ float apply_penalties_branchless(
         logit -= __int2float_rn(cross_present) * params.cross_turn_penalty;
     }
 
-    // Restore logit for protected tokens (EOS, EOT) — undo all penalties above
+    // Restore logit for protected tokens (EOS, segment-close) — undo all penalties above
     float pf = __int2float_rn(is_protected);
     logit = fmaf(pf, saved_logit - logit, logit);
     
@@ -711,17 +721,23 @@ __device__ __forceinline__ float apply_penalties_branchless(
         logit = fmaf(eos_f, params.eos_boost * multiplier, logit);
     }
 
-    // 4b. EOT Boost (truly branchless, same ramp formula, targets </think> token)
-    //     Reuses is_eot computed above for protection. Uses thinking_len instead of current_len.
+    // 4b. Per-segment close boost (truly branchless, same ramp formula). Ramps on
+    //     segment_len — which resets each segment — so it fires in EVERY segment,
+    //     early ones included.  Targets BOTH the segment-close token AND EOS: inside
+    //     a steered segment the model's EOS is intercepted into a segment close, so
+    //     EOS is a second per-segment close lever and must get the same per-segment
+    //     ramp, not just the total-length EOS boost above (which is dormant until
+    //     late in the turn).  Outside a segment (segment_len == 0) this contributes
+    //     nothing, so EOS there is governed solely by the total-length boost/failsafe.
     {
-        float eot_f = __int2float_rn(is_eot);
-        int ramp_span = max(params.eot_ramp_len - params.eot_ramp_start, 1);
-        float t = fminf(__fdividef(float(max(params.thinking_len - params.eot_ramp_start, 0)),
+        float segment_close_f = __int2float_rn(is_segment_close | is_eos);
+        int ramp_span = max(params.segment_close_ramp_len - params.segment_close_ramp_start, 1);
+        float t = fminf(__fdividef(float(max(params.segment_len - params.segment_close_ramp_start, 0)),
                                    float(ramp_span)), 1.0f);
-        int use_ramp = (params.eot_ramp_len > 0) & (int)(params.eot_boost_max_multiplier > 0.0f);
+        int use_ramp = (params.segment_close_ramp_len > 0) & (int)(params.segment_close_max_multiplier > 0.0f);
         float use_ramp_f = __int2float_rn(use_ramp);
-        float multiplier = fmaf(use_ramp_f, t * params.eot_boost_max_multiplier - 1.0f, 1.0f);
-        logit = fmaf(eot_f, params.eot_boost * multiplier, logit);
+        float multiplier = fmaf(use_ramp_f, t * params.segment_close_max_multiplier - 1.0f, 1.0f);
+        logit = fmaf(segment_close_f, params.segment_close_boost * multiplier, logit);
     }
     
     // 5. Banned Tokens (per-sequence or shared)
@@ -749,7 +765,21 @@ __device__ __forceinline__ float apply_penalties_branchless(
     // Note: Cannot use `banned_mult * logit - (1-banned_mult) * INFINITY` because
     // when banned_mult==1.0 (no ban), 0.0f * INFINITY = NaN in IEEE 754.
     logit = (banned_mult < 1.0f) ? -INFINITY : logit;
-    
+
+    // 6. Token suppression (in-segment ceiling lever).
+    // `suppress_penalty` is non-zero only while this sequence is inside a segment
+    // (the caller zeroes it otherwise), so tokens outside the segment are never
+    // touched.  Subtract it once from every token in the shared suppress list.
+    if (params.suppress_penalty != 0.0f && params.suppress_tokens != nullptr) {
+        float suppress_mult = 0.0f;
+        for (int i = 0; i < params.suppress_count; i++) {
+            int t = params.suppress_tokens[i];
+            int is_match = (t >= 0) & (t == token_id);
+            suppress_mult += __int2float_rn(is_match);
+        }
+        logit -= suppress_mult * params.suppress_penalty;
+    }
+
     return logit;
 }
 
@@ -2138,7 +2168,7 @@ __global__ void stencil_sampling_kernel(
     float presence_penalty,
     float eos_boost,
     int32_t eos_token_id,
-    int32_t eot_token_id,
+    int32_t segment_close_token_id,
     
     // Penalty GPU pointers
     const int32_t* __restrict__ token_counts,     // [batch_size, vocab_size] or null
@@ -2232,15 +2262,15 @@ __global__ void stencil_sampling_kernel(
         float logit = load_as_float(my_logits, token_id);
         
         if constexpr (USE_PENALTIES) {
-            // Protected tokens: EOS and EOT must never be penalised
+            // Protected tokens: EOS and the segment-close token must never be penalised
             float saved_logit = logit;
             int eos_d = token_id - eos_token_id;
             int eos_a = (eos_d ^ (eos_d >> 31)) - (eos_d >> 31);
             int is_eos = 1 - min(eos_a, 1);
-            int eot_d = token_id - eot_token_id;
-            int eot_a = (eot_d ^ (eot_d >> 31)) - (eot_d >> 31);
-            int is_eot = 1 - min(eot_a, 1);
-            int is_protected = is_eos | is_eot;
+            int segment_close_d = token_id - segment_close_token_id;
+            int segment_close_a = (segment_close_d ^ (segment_close_d >> 31)) - (segment_close_d >> 31);
+            int is_segment_close = 1 - min(segment_close_a, 1);
+            int is_protected = is_eos | is_segment_close;
 
             // Apply repeat penalty (branchless - same pattern as apply_penalties_branchless)
             if (recent_tokens != nullptr) {
@@ -2266,7 +2296,7 @@ __global__ void stencil_sampling_kernel(
                 logit -= __int2float_rn(present) * presence_penalty;
             }
 
-            // Restore logit for protected tokens (EOS, EOT) — undo all penalties
+            // Restore logit for protected tokens (EOS, segment-close) — undo all penalties
             float pf = __int2float_rn(is_protected);
             logit = fmaf(pf, saved_logit - logit, logit);
             
@@ -2484,7 +2514,7 @@ inline void dispatch_stencil_sampling(
     float presence_penalty,
     float eos_boost,
     int32_t eos_token_id,
-    int32_t eot_token_id,
+    int32_t segment_close_token_id,
     // Penalty GPU pointers
     const int32_t* token_counts,
     const int32_t* banned_tokens,
@@ -2518,7 +2548,7 @@ inline void dispatch_stencil_sampling(
             <<<grid, block, bitset_bytes, stream>>>(
                 logits, vocab_size,
                 stencil, stencil_size,
-                repeat_penalty, frequency_penalty, presence_penalty, eos_boost, eos_token_id, eot_token_id,
+                repeat_penalty, frequency_penalty, presence_penalty, eos_boost, eos_token_id, segment_close_token_id,
                 token_counts, banned_tokens, num_banned_tokens,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -2529,7 +2559,7 @@ inline void dispatch_stencil_sampling(
             <<<grid, block, bitset_bytes, stream>>>(
                 logits, vocab_size,
                 stencil, stencil_size,
-                repeat_penalty, frequency_penalty, presence_penalty, eos_boost, eos_token_id, eot_token_id,
+                repeat_penalty, frequency_penalty, presence_penalty, eos_boost, eos_token_id, segment_close_token_id,
                 token_counts, banned_tokens, num_banned_tokens,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -2582,17 +2612,24 @@ batched_penalty_sampling_kernel(
     const int32_t* __restrict__ cross_turn_counts,  // [batch_size, vocab_size] or null
     // Per-sequence current lengths (for dynamic EOS ramp)
     const int32_t* __restrict__ current_lens,       // [batch_size] or null
-    // EOT (end-of-thinking) boost
-    float eot_boost,
-    int32_t eot_token_id,
-    int32_t eot_ramp_start,
-    int32_t eot_ramp_len,
-    float eot_boost_max_multiplier,
-    const int32_t* __restrict__ thinking_lens,      // [batch_size] or null
-    
+    // Segment-close boost
+    float segment_close_boost,
+    int32_t segment_close_token_id,
+    int32_t segment_close_ramp_start,
+    int32_t segment_close_ramp_len,
+    float segment_close_max_multiplier,
+    const int32_t* __restrict__ segment_lens,      // [batch_size] or null
+    // Added to `temperature` for sequences inside a segment (segment_lens[seq] > 0).
+    float segment_temp_boost,
+    // Token suppression: subtract `suppress_penalties[seq]` from each
+    // `suppress_tokens` logit while sequence `seq` is inside a segment.
+    const int32_t* __restrict__ suppress_tokens,    // [suppress_count] (shared) or null
+    int32_t suppress_count,
+    const float* __restrict__ suppress_penalties,   // [batch_size] or null
+
     // Penalty GPU pointers (already on device from Tensors)
     const int32_t* __restrict__ token_counts,     // [batch_size, vocab_size] or null
-    const int32_t* __restrict__ banned_tokens,    // [batch_size, banned_per_seq] or [num_banned] or null  
+    const int32_t* __restrict__ banned_tokens,    // [batch_size, banned_per_seq] or [num_banned] or null
     int32_t num_banned_tokens,
     int32_t banned_tokens_per_seq,
     
@@ -2653,12 +2690,12 @@ batched_penalty_sampling_kernel(
     penalty_params_local.eos_ramp_len = eos_ramp_len;
     penalty_params_local.eos_boost_max_multiplier = eos_boost_max_multiplier;
     penalty_params_local.current_len = (current_lens != nullptr) ? current_lens[batch_idx] : 0;
-    penalty_params_local.eot_boost = eot_boost;
-    penalty_params_local.eot_token_id = eot_token_id;
-    penalty_params_local.eot_ramp_start = eot_ramp_start;
-    penalty_params_local.eot_ramp_len = eot_ramp_len;
-    penalty_params_local.eot_boost_max_multiplier = eot_boost_max_multiplier;
-    penalty_params_local.thinking_len = (thinking_lens != nullptr) ? thinking_lens[batch_idx] : 0;
+    penalty_params_local.segment_close_boost = segment_close_boost;
+    penalty_params_local.segment_close_token_id = segment_close_token_id;
+    penalty_params_local.segment_close_ramp_start = segment_close_ramp_start;
+    penalty_params_local.segment_close_ramp_len = segment_close_ramp_len;
+    penalty_params_local.segment_close_max_multiplier = segment_close_max_multiplier;
+    penalty_params_local.segment_len = (segment_lens != nullptr) ? segment_lens[batch_idx] : 0;
     penalty_params_local.cross_turn_penalty = cross_turn_penalty;
     penalty_params_local.cross_turn_counts = cross_turn_counts;
     penalty_params_local.token_counts = token_counts;
@@ -2666,29 +2703,79 @@ batched_penalty_sampling_kernel(
     penalty_params_local.banned_tokens = banned_tokens;
     penalty_params_local.num_banned_tokens = num_banned_tokens;
     penalty_params_local.banned_tokens_per_seq = banned_tokens_per_seq;
-    
+    penalty_params_local.suppress_tokens = suppress_tokens;
+    penalty_params_local.suppress_count = suppress_count;
+    // Per-sequence suppression strength; gated to segments just below.
+    penalty_params_local.suppress_penalty = 0.0f;
+
+    // =========================================================
+    // In-segment steering (per-sequence, since each block = one sequence).
+    // While this sequence is inside a segment (segment_lens[seq] > 0):
+    //   - sample a touch hotter (temperature += segment_temp_boost)
+    //   - enable the DRY n-gram penalty (gated off entirely outside the segment
+    //     so verbatim code/number copying is never corrupted).
+    // Outside a segment both revert to the batch-wide values.
+    // =========================================================
+    const bool in_segment = (segment_lens != nullptr) && (segment_lens[batch_idx] > 0);
+    if (in_segment) {
+        temperature += segment_temp_boost;
+        // Activate token suppression for this sequence: subtract the per-sequence
+        // penalty from every suppress-token logit (applied in
+        // apply_penalties_branchless). Outside a segment this stays 0.
+        if (suppress_penalties != nullptr) {
+            penalty_params_local.suppress_penalty = suppress_penalties[batch_idx];
+        }
+    } else {
+        // Disable DRY for the answer: zero the multiplier the precompute and
+        // cached-lookup paths key off.  Shared memory for the cache is still
+        // allocated (USE_DRY is a batch-wide template param), but no penalties
+        // are produced for this sequence.
+        dry_multiplier = 0.0f;
+        penalty_params_local.dry_multiplier = 0.0f;
+    }
+
     // =========================================================
     // STEP 1: Build recent token bitset (if penalties enabled)
     // =========================================================
     if constexpr (USE_PENALTIES) {
         if (recent_tokens != nullptr && recent_lens != nullptr) {
-            // Get this sequence's recent tokens
+            // Get this sequence's recent tokens (oldest-first; newest at the end).
             const int32_t* my_recent = recent_tokens + batch_idx * max_recent_len;
             int my_recent_len = recent_lens[batch_idx];
+
+            // In-segment scoping: while inside a segment, repeat/DRY must only
+            // see the tokens generated inside the current segment — never the
+            // prompt or prior turns that precede the segment-open token. The
+            // segment spans the last `segment_len` tokens, so restrict the recent
+            // window to that suffix. `recent_tokens` is newest-at-the-end, so the
+            // last `effective_len` entries are exactly the in-segment tokens.
+            // Outside a segment, keep the full window (existing behavior).
+            const int32_t* eff_recent = my_recent;
+            int eff_recent_len = my_recent_len;
+            int eff_dry_range = dry_range;
+            if (in_segment) {
+                int effective_len = min(segment_lens[batch_idx], my_recent_len);
+                int offset = my_recent_len - effective_len;
+                eff_recent = my_recent + offset;
+                eff_recent_len = effective_len;
+                // Cap the DRY look-back to the in-block window.
+                eff_dry_range = (dry_range > 0) ? min(dry_range, effective_len) : effective_len;
+            }
+
             build_recent_bitset<THREADS>(
-                recent_bitset, 
-                my_recent, 
-                my_recent_len,
+                recent_bitset,
+                eff_recent,
+                eff_recent_len,
                 bitset_words
             );
-            
+
             // Precompute DRY penalties (O(n²) once, then O(1) lookup per token)
             // Only when USE_DRY template param is enabled
             if constexpr (USE_DRY) {
-                if (dry_multiplier != 0.0f && my_recent_len >= 2) {
+                if (dry_multiplier != 0.0f && eff_recent_len >= 2) {
                     precompute_dry_penalties<THREADS>(
-                        my_recent, my_recent_len,
-                        dry_multiplier, dry_base, dry_allowed_length, dry_range,
+                        eff_recent, eff_recent_len,
+                        dry_multiplier, dry_base, dry_allowed_length, eff_dry_range,
                         smem.dry_cache.as_ptr()
                     );
                 } else {
@@ -3000,13 +3087,17 @@ inline void dispatch_batched_sampling(
     float cross_turn_penalty,
     const int32_t* cross_turn_counts,
     const int32_t* current_lens,
-    // EOT (end-of-thinking) boost
-    float eot_boost,
-    int32_t eot_token_id,
-    int32_t eot_ramp_start,
-    int32_t eot_ramp_len,
-    float eot_boost_max_multiplier,
-    const int32_t* thinking_lens,
+    // Segment-close boost
+    float segment_close_boost,
+    int32_t segment_close_token_id,
+    int32_t segment_close_ramp_start,
+    int32_t segment_close_ramp_len,
+    float segment_close_max_multiplier,
+    const int32_t* segment_lens,
+    float segment_temp_boost,
+    const int32_t* suppress_tokens,
+    int32_t suppress_count,
+    const float* suppress_penalties,
     // Penalty GPU pointers (already on device)
     const int32_t* token_counts,
     const int32_t* banned_tokens,
@@ -3050,7 +3141,9 @@ inline void dispatch_batched_sampling(
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
-                eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+                segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                segment_temp_boost,
+                suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -3064,7 +3157,9 @@ inline void dispatch_batched_sampling(
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
-                eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+                segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                segment_temp_boost,
+                suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -3078,7 +3173,9 @@ inline void dispatch_batched_sampling(
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
-                eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+                segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                segment_temp_boost,
+                suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -3092,7 +3189,9 @@ inline void dispatch_batched_sampling(
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
-                eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+                segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                segment_temp_boost,
+                suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -3107,7 +3206,9 @@ inline void dispatch_batched_sampling(
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
-                eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+                segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                segment_temp_boost,
+                suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -3122,7 +3223,9 @@ inline void dispatch_batched_sampling(
                 dry_multiplier, dry_base, dry_allowed_length, dry_range,
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
-                eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+                segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                segment_temp_boost,
+                suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
@@ -3153,13 +3256,17 @@ inline void launch_batched_sampling_typed(
     float cross_turn_penalty,
     const int32_t* cross_turn_counts,
     const int32_t* current_lens,
-    // EOT (end-of-thinking) boost
-    float eot_boost,
-    int32_t eot_token_id,
-    int32_t eot_ramp_start,
-    int32_t eot_ramp_len,
-    float eot_boost_max_multiplier,
-    const int32_t* thinking_lens,
+    // Segment-close boost
+    float segment_close_boost,
+    int32_t segment_close_token_id,
+    int32_t segment_close_ramp_start,
+    int32_t segment_close_ramp_len,
+    float segment_close_max_multiplier,
+    const int32_t* segment_lens,
+    float segment_temp_boost,
+    const int32_t* suppress_tokens,
+    int32_t suppress_count,
+    const float* suppress_penalties,
     // Penalty GPU pointers (already on device)
     const int32_t* token_counts,
     const int32_t* banned_tokens,
@@ -3190,9 +3297,12 @@ inline void launch_batched_sampling_typed(
                          (cross_turn_penalty != 0.0f) ||
                          (dry_multiplier != 0.0f) ||
                          (eos_boost != 0.0f) ||
-                         (eot_boost != 0.0f) ||
+                         (segment_close_boost != 0.0f) ||
                          (num_banned_tokens > 0) ||
-                         (banned_tokens_per_seq > 0);
+                         (banned_tokens_per_seq > 0) ||
+                         // Token suppression needs the penalty path.
+                         (suppress_tokens != nullptr && suppress_count > 0 &&
+                          suppress_penalties != nullptr);
     bool use_top_p = (top_p < 1.0f);
     
     // Use optimized stencil kernel when stencil is provided and reasonably small
@@ -3202,7 +3312,7 @@ inline void launch_batched_sampling_typed(
         dispatch_stencil_sampling<T>(
             logits, batch_size, vocab_size,
             stencil, stencil_size,
-            repeat_penalty, frequency_penalty, presence_penalty, eos_boost, eos_token_id, eot_token_id,
+            repeat_penalty, frequency_penalty, presence_penalty, eos_boost, eos_token_id, segment_close_token_id,
             token_counts, banned_tokens, num_banned_tokens,
             recent_tokens, recent_lens, max_recent_len,
             temperature, top_k, top_p,
@@ -3218,7 +3328,9 @@ inline void launch_batched_sampling_typed(
             dry_multiplier, dry_base, dry_allowed_length, dry_range,
             eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
             cross_turn_penalty, cross_turn_counts, current_lens,
-            eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier, thinking_lens,
+            segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+            segment_temp_boost,
+            suppress_tokens, suppress_count, suppress_penalties,
             token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
             recent_tokens, recent_lens, max_recent_len,
             temperature, top_k, top_p,

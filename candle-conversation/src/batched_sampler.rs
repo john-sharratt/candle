@@ -7,6 +7,7 @@
 //! State (token counts, recent history) is owned by the caller (DecodeState).
 
 use crate::config::SamplingConfig;
+use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::CudaStorageSlice;
 use candle::{DType, Device, IndexOp, Tensor};
@@ -34,15 +35,16 @@ pub struct SequenceSamplingState {
     /// Stored oldest-first; the scheduler copies the tail window to the GPU buffer.
     pub recent_tokens: Vec<i32>,
 
-    /// Number of tokens generated so far this turn (for dynamic EOS ramp).
+    /// Number of tokens generated so far this turn (for the dynamic EOS ramp).
     pub current_len: i32,
 
-    /// Whether this sequence is currently inside a `<think>` block.
-    pub in_thinking: bool,
+    /// Whether this sequence is currently inside a marked segment (a caller-defined
+    /// span between two token ids).
+    pub in_segment: bool,
 
-    /// Tokens generated since entering thinking mode (for EOT ramp).
-    /// Reset when the sequence exits thinking (`</think>` is emitted).
-    pub thinking_len: i32,
+    /// Tokens generated since the current segment opened (for the segment-close
+    /// ramp).  Reset to 0 when the segment opens or closes.
+    pub segment_len: i32,
 
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
@@ -56,8 +58,8 @@ impl SequenceSamplingState {
             cross_turn_counts: vec![0; vocab_size],
             recent_tokens: Vec::with_capacity(max_recent_len),
             current_len: 0,
-            in_thinking: false,
-            thinking_len: 0,
+            in_segment: false,
+            segment_len: 0,
             rng_offset: 0,
         }
     }
@@ -72,9 +74,9 @@ impl SequenceSamplingState {
         self.recent_tokens.push(token as i32);
         self.current_len += 1;
 
-        // Track thinking length if inside a <think> block
-        if self.in_thinking {
-            self.thinking_len += 1;
+        // Advance the segment length while inside a segment.
+        if self.in_segment {
+            self.segment_len += 1;
         }
 
         // Maintain fixed-size sliding window
@@ -111,8 +113,8 @@ impl SequenceSamplingState {
         self.cross_turn_counts.fill(0);
         self.recent_tokens.clear();
         self.current_len = 0;
-        self.in_thinking = false;
-        self.thinking_len = 0;
+        self.in_segment = false;
+        self.segment_len = 0;
         self.rng_offset = 0;
     }
 
@@ -144,30 +146,36 @@ impl SequenceSamplingState {
         self.rng_offset = self.rng_offset.wrapping_add(1);
     }
 
-    /// Enter thinking mode (called when `<think>` is emitted).
-    pub fn enter_thinking(&mut self) {
-        self.in_thinking = true;
-        self.thinking_len = 0;
+    /// Open a segment (the caller signals this when the segment-open token is
+    /// sampled), restarting the per-segment length.
+    pub fn enter_segment(&mut self) {
+        self.in_segment = true;
+        self.segment_len = 0;
     }
 
-    /// Exit thinking mode (called when `</think>` is emitted).
-    pub fn exit_thinking(&mut self) {
-        self.in_thinking = false;
-        self.thinking_len = 0;
+    /// Close the segment (the caller signals this when the segment-close token is
+    /// sampled).
+    pub fn exit_segment(&mut self) {
+        self.in_segment = false;
+        self.segment_len = 0;
     }
 
-    /// Update thinking state after a sampled token.
-    ///
-    /// Call this after each token is sampled to automatically detect
-    /// `<think>` / `</think>` transitions.
-    pub fn update_thinking_state(&mut self, token: u32, think_start_id: i32, eot_id: i32) {
-        if think_start_id < 0 || eot_id < 0 {
-            return; // Thinking not configured
+    /// Advance the segment state for a sampled token: open it on `segment_open_id`,
+    /// close it on `segment_close_id`.  The sampler is told *which* token ids
+    /// delimit the segment — it has no notion of what the segment means.
+    pub fn update_segment_state(
+        &mut self,
+        token: u32,
+        segment_open_id: i32,
+        segment_close_id: i32,
+    ) {
+        if segment_open_id < 0 || segment_close_id < 0 {
+            return; // Segment tracking not configured.
         }
-        if token as i32 == think_start_id {
-            self.enter_thinking();
-        } else if token as i32 == eot_id && self.in_thinking {
-            self.exit_thinking();
+        if token as i32 == segment_open_id {
+            self.enter_segment();
+        } else if token as i32 == segment_close_id && self.in_segment {
+            self.exit_segment();
         }
     }
 }
@@ -241,22 +249,125 @@ impl BatchedSampler {
         if batch_size == 0 {
             return Ok(Vec::new());
         }
+        let logits2d = self.flatten_to_2d(logits)?;
+        let mut results = vec![0u32; batch_size];
 
-        if matches!(self.device, Device::Cuda(_)) {
-            return self.sample_batch_cuda(logits, states, configs);
+        // Split rows by stencil constraint.  Constrained rows take cheap CPU paths
+        // — a forced token (allow-list of one) needs no logits, a small allow-list
+        // is a tiny gather + sample — so only UNCONSTRAINED rows go to the
+        // full-vocab device kernel.  When nothing is constrained (the common wave)
+        // every row is a kernel row.
+        let mut kernel_idx: Vec<usize> = Vec::new();
+        let mut kernel_states: Vec<&mut SequenceSamplingState> = Vec::new();
+        let mut kernel_configs: Vec<&SamplingConfig> = Vec::new();
+        for (i, slot) in states.iter_mut().enumerate() {
+            let state: &mut SequenceSamplingState = slot;
+            let config = configs[i];
+            match config.stencil.as_slice() {
+                // Forced: the single allowed token, decided without logits.
+                [forced] => {
+                    let token = *forced as u32;
+                    state.record_token(token, self.max_recent_len);
+                    state.advance_rng();
+                    results[i] = token;
+                }
+                // Small allow-list: a tiny gather + sample, CPU-side.
+                [_, _, ..] => results[i] = self.sample_allow_list(&logits2d, i, config, state)?,
+                // Unconstrained: defer to the device kernel below.
+                [] => {
+                    kernel_idx.push(i);
+                    kernel_states.push(state);
+                    kernel_configs.push(config);
+                }
+            }
         }
 
-        self.sample_batch_cpu(logits, states, configs)
+        if !kernel_idx.is_empty() {
+            // Gather just the kernel rows — unless they ARE the whole batch, in
+            // which case skip the copy and run the kernel over every row.
+            let kernel_logits = if kernel_idx.len() == batch_size {
+                logits2d.clone()
+            } else {
+                let idx = Tensor::from_vec(
+                    kernel_idx.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                    kernel_idx.len(),
+                    &self.device,
+                )?;
+                logits2d.index_select(&idx, 0)?
+            };
+            let tokens =
+                self.sample_full_vocab(&kernel_logits, &mut kernel_states, &kernel_configs)?;
+            for (k, &i) in kernel_idx.iter().enumerate() {
+                results[i] = tokens[k];
+            }
+        }
+
+        Ok(results)
     }
 
-    /// CPU fallback implementation using candle's built-in sampling.
+    /// Flatten logits of rank 1/2/3 to `[batch, vocab]` (taking the last
+    /// position for rank-3).
+    fn flatten_to_2d(&self, logits: &Tensor) -> candle::Result<Tensor> {
+        match logits.dims().len() {
+            1 => logits.unsqueeze(0),
+            2 => Ok(logits.clone()),
+            3 => {
+                let seq_len = logits.dim(1)?;
+                logits.i((.., seq_len - 1, ..))
+            }
+            n => Err(candle::Error::Msg(format!("unexpected logits rank: {n}"))),
+        }
+    }
+
+    /// Dispatch the unconstrained (full-vocab) rows to the device sampler.
+    fn sample_full_vocab(
+        &self,
+        logits: &Tensor,
+        states: &mut [&mut SequenceSamplingState],
+        configs: &[&SamplingConfig],
+    ) -> candle::Result<Vec<u32>> {
+        if matches!(self.device, Device::Cuda(_)) {
+            self.sample_batch_cuda(logits, states, configs)
+        } else {
+            self.sample_batch_cpu(logits, states, configs)
+        }
+    }
+
+    /// Sample one row constrained to its stencil allow-list: gather just the
+    /// allowed logits (a handful) and sample among them with the row's strategy.
+    /// `O(allow-list)`, never the full vocab, and CPU-side regardless of device.
+    fn sample_allow_list(
+        &self,
+        logits2d: &Tensor,
+        row: usize,
+        config: &SamplingConfig,
+        state: &mut SequenceSamplingState,
+    ) -> candle::Result<u32> {
+        use candle_transformers::generation::LogitsProcessor;
+        let allow: Vec<u32> = config.stencil.iter().map(|&t| t as u32).collect();
+        let idx = Tensor::from_vec(allow.clone(), allow.len(), logits2d.device())?;
+        // Gather the allowed logits (small download), then sample over just them.
+        let gathered = logits2d.i(row)?.index_select(&idx, 0)?;
+        let gathered = apply_banned_local(&gathered, &allow, config)?;
+        let seed = config.seed.wrapping_add(state.rng_offset);
+        let mut processor = LogitsProcessor::from_sampling(seed, config_to_sampling(config));
+        let local = processor.sample(&gathered)? as usize;
+        let token = allow[local];
+        state.record_token(token, self.max_recent_len);
+        state.advance_rng();
+        Ok(token)
+    }
+
+    /// CPU fallback implementation using candle's built-in sampling.  Receives
+    /// only unconstrained (full-vocab) rows; stencil rows are resolved by
+    /// `sample_batch` before this is called.
     fn sample_batch_cpu(
         &self,
         logits: &Tensor,
         states: &mut [&mut SequenceSamplingState],
         configs: &[&SamplingConfig],
     ) -> candle::Result<Vec<u32>> {
-        use candle_transformers::generation::{LogitsProcessor, Sampling};
+        use candle_transformers::generation::LogitsProcessor;
 
         let batch_size = states.len();
         let mut results = Vec::with_capacity(batch_size);
@@ -269,48 +380,54 @@ impl BatchedSampler {
                 logits.clone()
             };
 
-            // Convert SamplingConfig to Sampling enum for CPU path
-            let sampling = if config.temperature <= 0.0 {
-                Sampling::ArgMax
-            } else if config.top_k > 0 && config.top_p < 1.0 {
-                Sampling::TopKThenTopP {
-                    k: config.top_k as usize,
-                    p: config.top_p as f64,
-                    temperature: config.temperature as f64,
-                }
-            } else if config.top_k > 0 {
-                Sampling::TopK {
-                    k: config.top_k as usize,
-                    temperature: config.temperature as f64,
-                }
-            } else if config.top_p < 1.0 {
-                Sampling::TopP {
-                    p: config.top_p as f64,
-                    temperature: config.temperature as f64,
-                }
+            // Apply this row's banned tokens (a small deny-list, e.g. a few EOS
+            // ids) by setting just those values to `-inf`.  Cheap on CPU — only the
+            // banned values change (apply_banned copies the row to host F32 to do
+            // it); a no-op when the list is empty.
+            let seq_logits = apply_banned(&seq_logits, config)?;
+
+            // Token suppression: while inside a segment, subtract the per-turn
+            // penalty from each suppress-token logit. Mirrors the kernel's
+            // in-segment gate, so tokens outside the segment are never touched.
+            let seq_logits = if state.in_segment
+                && config.segment_suppress_penalty != 0.0
+                && !config.segment_suppress_tokens.is_empty()
+            {
+                apply_suppression(&seq_logits, config)?
             } else {
-                Sampling::All {
-                    temperature: config.temperature as f64,
-                }
+                seq_logits
             };
 
+            // In-segment steering: while this sequence is inside a segment,
+            // sample a touch hotter (temperature + segment_temp_boost).
+            // Mirrors the kernel's per-seq gate so tokens outside the segment
+            // stay at the base temperature.  DRY is GPU-only — the CPU
+            // LogitsProcessor has no DRY path, so there is nothing to gate here for it.
+            let sampling = if state.in_segment && config.segment_temp_boost != 0.0 {
+                let mut boosted = config.clone();
+                boosted.temperature += config.segment_temp_boost;
+                config_to_sampling(&boosted)
+            } else {
+                config_to_sampling(config)
+            };
             let seed = config.seed.wrapping_add(state.rng_offset);
             let mut processor = LogitsProcessor::from_sampling(seed, sampling);
             let mut token = processor.sample(&seq_logits)?;
 
-            // EOT overrides: force </think> when thinking budget is exhausted.
-            if config.eot_token_id >= 0 && state.in_thinking {
-                let should_force = (config.graceful_eot_after > 0
-                    && state.thinking_len >= config.graceful_eot_after
+            // Segment-close overrides: force the close token when the segment budget is exhausted.
+            if config.segment_close_token_id >= 0 && state.in_segment {
+                let should_force = (config.graceful_segment_close_after > 0
+                    && state.segment_len >= config.graceful_segment_close_after
                     && state
                         .recent_tokens
                         .last()
                         .map(|&t| config.sentence_end_token_ids.contains(&t))
                         .unwrap_or(false))
-                    || (config.force_eot_after > 0 && state.thinking_len >= config.force_eot_after);
+                    || (config.force_segment_close_after > 0
+                        && state.segment_len >= config.force_segment_close_after);
 
                 if should_force {
-                    token = config.eot_token_id as u32;
+                    token = config.segment_close_token_id as u32;
                 }
             }
 
@@ -319,6 +436,13 @@ impl BatchedSampler {
             if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
                 // Hard stop: unconditionally force EOS regardless of sentence position.
                 token = eos_token_id;
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row = i,
+                    current_len = state.current_len,
+                    forced_eos_after = config.forced_eos_after,
+                    "hard EOS forced (length cap)",
+                );
             } else if config.graceful_eos_after > 0
                 && state.current_len >= config.graceful_eos_after
                 && !config.sentence_end_token_ids.is_empty()
@@ -334,6 +458,13 @@ impl BatchedSampler {
                     .unwrap_or(false)
                 {
                     token = eos_token_id;
+                    tracing::debug!(
+                        target: "candle_conversation::eos",
+                        row = i,
+                        current_len = state.current_len,
+                        graceful_eos_after = config.graceful_eos_after,
+                        "soft EOS forced (sentence boundary)",
+                    );
                 }
             } else if config.graceful_eos_after > 0
                 && state.current_len >= config.graceful_eos_after
@@ -342,6 +473,13 @@ impl BatchedSampler {
                 // No sentence-end tokens resolved (e.g. model loaded without tokenizer
                 // resolution): fall back to hard stop at the graceful threshold.
                 token = eos_token_id;
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row = i,
+                    current_len = state.current_len,
+                    graceful_eos_after = config.graceful_eos_after,
+                    "hard EOS forced (no sentence-end tokens)",
+                );
             }
 
             // Record the token and advance RNG
@@ -403,8 +541,10 @@ impl BatchedSampler {
         }
         let vocab_size = logits_vocab_size;
 
-        // For simplicity in Phase 1, we'll use the first config for all sequences
-        // (batched configs will be supported in Phase 2)
+        // This path only ever receives unconstrained (full-vocab) rows —
+        // stencil-constrained rows are resolved by `sample_batch` before the
+        // kernel and never reach here.  Scalar params still come from the first
+        // config for the whole sub-batch (the kernel's shared-config behavior).
         let config = configs[0];
 
         // Get DRY params
@@ -431,9 +571,9 @@ impl BatchedSampler {
         let banned_tokens = &config.banned_tokens;
         let num_banned = banned_tokens.len() as i32;
 
-        // Build stencil buffer
-        let stencil = &config.stencil;
-        let stencil_size = stencil.len() as i32;
+        // No stencil here — constrained rows were resolved before the kernel.
+        let stencil: &[i32] = &[];
+        let stencil_size = 0i32;
 
         // Allocate output buffer
         let mut output_tokens = vec![0u32; batch_size];
@@ -452,25 +592,42 @@ impl BatchedSampler {
             (0, 0, 0.0)
         };
 
-        // Compute EOT (end-of-thinking) params
-        // Only active when eot_boost > 0, eot_token_id >= 0, and at least one sequence is in thinking mode
-        let thinking_lens: Vec<i32> = states
+        // Compute segment-close params
+        // Only active when segment_close_boost > 0, segment_close_token_id >= 0, and at least one sequence is inside a segment
+        let segment_lens: Vec<i32> = states
             .iter()
-            .map(|s| if s.in_thinking { s.thinking_len } else { 0 })
+            .map(|s| if s.in_segment { s.segment_len } else { 0 })
             .collect();
-        let eot_active = config.eot_boost != 0.0 && config.eot_token_id >= 0;
-        let (eot_boost, eot_token_id, eot_ramp_start, eot_ramp_len, eot_boost_max_multiplier) =
-            if eot_active {
-                (
-                    config.eot_boost,
-                    config.eot_token_id,
-                    config.eot_ramp_start,
-                    config.eot_ramp_len,
-                    config.eot_boost_max_multiplier,
-                )
-            } else {
-                (0.0, -1, 0, 0, 0.0)
-            };
+        // Token suppression (the in-segment ceiling lever).
+        // The token list is shared across the batch (config[0]); the penalty is
+        // per-sequence (large = HARD ban, moderate = SOFT, 0.0 = off). Activate
+        // only when the list is non-empty AND at least one sequence has a nonzero
+        // penalty — otherwise pass null/0 so the kernel skips it entirely.
+        let suppress_penalties: Vec<f32> =
+            configs.iter().map(|c| c.segment_suppress_penalty).collect();
+        let suppress_tokens: Vec<i32> = config.segment_suppress_tokens.clone();
+        let suppress_active =
+            !suppress_tokens.is_empty() && suppress_penalties.iter().any(|&p| p != 0.0);
+
+        let segment_close_active =
+            config.segment_close_boost != 0.0 && config.segment_close_token_id >= 0;
+        let (
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+        ) = if segment_close_active {
+            (
+                config.segment_close_boost,
+                config.segment_close_token_id,
+                config.segment_close_ramp_start,
+                config.segment_close_ramp_len,
+                config.segment_close_max_multiplier,
+            )
+        } else {
+            (0.0, -1, 0, 0, 0.0)
+        };
 
         // Invoke the CUDA kernel
         self.invoke_cuda_kernel(
@@ -496,12 +653,16 @@ impl BatchedSampler {
             config.cross_turn_penalty,
             &cross_turn_counts,
             &current_lens,
-            eot_boost,
-            eot_token_id,
-            eot_ramp_start,
-            eot_ramp_len,
-            eot_boost_max_multiplier,
-            &thinking_lens,
+            segment_close_boost,
+            segment_close_token_id,
+            segment_close_ramp_start,
+            segment_close_ramp_len,
+            segment_close_max_multiplier,
+            &segment_lens,
+            config.segment_temp_boost,
+            &suppress_tokens,
+            &suppress_penalties,
+            suppress_active,
             &token_counts,
             banned_tokens,
             num_banned,
@@ -520,19 +681,37 @@ impl BatchedSampler {
         for (i, state) in states.iter_mut().enumerate() {
             let mut token = output_tokens[i];
 
-            // EOT overrides: force </think> when thinking budget is exhausted.
-            if config.eot_token_id >= 0 && state.in_thinking {
-                let should_force = (config.graceful_eot_after > 0
-                    && state.thinking_len >= config.graceful_eot_after
+            // One-shot: the dynamic EOS boost ramp begins as `current_len` reaches
+            // `eos_ramp_start` (it increments by one, so this fires exactly once per
+            // turn).  After this point EOS pressure builds toward the graceful/hard
+            // caps below.
+            if config.eos_boost != 0.0 && state.current_len == config.eos_ramp_start {
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row = i,
+                    current_len = state.current_len,
+                    eos_ramp_start = config.eos_ramp_start,
+                    eos_ramp_len = config.eos_ramp_len,
+                    graceful_eos_after = config.graceful_eos_after,
+                    forced_eos_after = config.forced_eos_after,
+                    "EOS boost ramp entered",
+                );
+            }
+
+            // Segment-close overrides: force the close token when the segment budget is exhausted.
+            if config.segment_close_token_id >= 0 && state.in_segment {
+                let should_force = (config.graceful_segment_close_after > 0
+                    && state.segment_len >= config.graceful_segment_close_after
                     && state
                         .recent_tokens
                         .last()
                         .map(|&t| config.sentence_end_token_ids.contains(&t))
                         .unwrap_or(false))
-                    || (config.force_eot_after > 0 && state.thinking_len >= config.force_eot_after);
+                    || (config.force_segment_close_after > 0
+                        && state.segment_len >= config.force_segment_close_after);
 
                 if should_force {
-                    token = config.eot_token_id as u32;
+                    token = config.segment_close_token_id as u32;
                 }
             }
 
@@ -540,6 +719,13 @@ impl BatchedSampler {
             if config.forced_eos_after > 0 && state.current_len >= config.forced_eos_after {
                 // Hard stop: unconditionally force EOS regardless of sentence position.
                 token = eos_token_id;
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row = i,
+                    current_len = state.current_len,
+                    forced_eos_after = config.forced_eos_after,
+                    "hard EOS forced (length cap)",
+                );
             } else if config.graceful_eos_after > 0
                 && state.current_len >= config.graceful_eos_after
                 && !config.sentence_end_token_ids.is_empty()
@@ -555,6 +741,13 @@ impl BatchedSampler {
                     .unwrap_or(false)
                 {
                     token = eos_token_id;
+                    tracing::debug!(
+                        target: "candle_conversation::eos",
+                        row = i,
+                        current_len = state.current_len,
+                        graceful_eos_after = config.graceful_eos_after,
+                        "soft EOS forced (sentence boundary)",
+                    );
                 }
             } else if config.graceful_eos_after > 0
                 && state.current_len >= config.graceful_eos_after
@@ -562,13 +755,24 @@ impl BatchedSampler {
             {
                 // No sentence-end tokens resolved: fall back to hard stop.
                 token = eos_token_id;
+                tracing::debug!(
+                    target: "candle_conversation::eos",
+                    row = i,
+                    current_len = state.current_len,
+                    graceful_eos_after = config.graceful_eos_after,
+                    "hard EOS forced (no sentence-end tokens)",
+                );
             }
             output_tokens[i] = token;
 
             state.record_token(token, self.max_recent_len);
             state.rng_offset = rng_offsets[i];
-            // Auto-detect <think> / </think> transitions for EOT boost
-            state.update_thinking_state(token, config.think_start_token_id, config.eot_token_id);
+            // Detect segment open/close transitions for the segment-close boost.
+            state.update_segment_state(
+                token,
+                config.segment_open_token_id,
+                config.segment_close_token_id,
+            );
         }
 
         Ok(output_tokens)
@@ -733,12 +937,16 @@ impl BatchedSampler {
         cross_turn_penalty: f32,
         cross_turn_counts: &[i32],
         current_lens: &[i32],
-        eot_boost: f32,
-        eot_token_id: i32,
-        eot_ramp_start: i32,
-        eot_ramp_len: i32,
-        eot_boost_max_multiplier: f32,
-        thinking_lens: &[i32],
+        segment_close_boost: f32,
+        segment_close_token_id: i32,
+        segment_close_ramp_start: i32,
+        segment_close_ramp_len: i32,
+        segment_close_max_multiplier: f32,
+        segment_lens: &[i32],
+        segment_temp_boost: f32,
+        suppress_tokens: &[i32],
+        suppress_penalties: &[f32],
+        suppress_active: bool,
         token_counts: &[i32],
         banned_tokens: &[i32],
         num_banned: i32,
@@ -784,10 +992,9 @@ impl BatchedSampler {
             .memcpy_stod(current_lens)
             .map_err(|e| candle::Error::Msg(format!("failed to upload current_lens: {}", e)))?;
 
-        let thinking_lens_gpu: cudarc::driver::CudaSlice<i32> =
-            stream.memcpy_stod(thinking_lens).map_err(|e| {
-                candle::Error::Msg(format!("failed to upload thinking_lens: {}", e))
-            })?;
+        let segment_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
+            .memcpy_stod(segment_lens)
+            .map_err(|e| candle::Error::Msg(format!("failed to upload segment_lens: {}", e)))?;
 
         let banned_gpu: cudarc::driver::CudaSlice<i32> = if banned_tokens.is_empty() {
             stream
@@ -798,6 +1005,24 @@ impl BatchedSampler {
                 .memcpy_stod(banned_tokens)
                 .map_err(|e| candle::Error::Msg(format!("failed to upload banned: {}", e)))?
         };
+
+        // Token suppression buffers. Always upload non-empty slices
+        // (cudarc rejects zero-length copies); the kernel pointers are nulled out
+        // below when suppression is inactive so these uploads are never read.
+        let suppress_tokens_gpu: cudarc::driver::CudaSlice<i32> = if suppress_tokens.is_empty() {
+            stream.memcpy_stod(&[-1i32]).map_err(|e| {
+                candle::Error::Msg(format!("failed to upload suppress_tokens: {}", e))
+            })?
+        } else {
+            stream.memcpy_stod(suppress_tokens).map_err(|e| {
+                candle::Error::Msg(format!("failed to upload suppress_tokens: {}", e))
+            })?
+        };
+
+        let suppress_penalties_gpu: cudarc::driver::CudaSlice<f32> =
+            stream.memcpy_stod(suppress_penalties).map_err(|e| {
+                candle::Error::Msg(format!("failed to upload suppress_penalties: {}", e))
+            })?;
 
         let recent_gpu: cudarc::driver::CudaSlice<i32> = stream
             .memcpy_stod(recent_tokens)
@@ -831,7 +1056,9 @@ impl BatchedSampler {
             let (tc_ptr, _g1) = token_counts_gpu.device_ptr(&stream);
             let (cross_ptr, _g2) = cross_turn_gpu.device_ptr(&stream);
             let (cur_lens_ptr, _g3) = current_lens_gpu.device_ptr(&stream);
-            let (think_lens_ptr, _g3b) = thinking_lens_gpu.device_ptr(&stream);
+            let (segment_lens_ptr, _g3b) = segment_lens_gpu.device_ptr(&stream);
+            let (suppress_tok_ptr, _g3c) = suppress_tokens_gpu.device_ptr(&stream);
+            let (suppress_pen_ptr, _g3d) = suppress_penalties_gpu.device_ptr(&stream);
             let (ban_ptr, _g4) = banned_gpu.device_ptr(&stream);
             let (recent_ptr, _g5) = recent_gpu.device_ptr(&stream);
             let (recent_lens_ptr, _g6) = recent_lens_gpu.device_ptr(&stream);
@@ -868,12 +1095,28 @@ impl BatchedSampler {
                         std::ptr::null()
                     },
                     cur_lens_ptr as *const i32,
-                    eot_boost,
-                    eot_token_id,
-                    eot_ramp_start,
-                    eot_ramp_len,
-                    eot_boost_max_multiplier,
-                    think_lens_ptr as *const i32,
+                    segment_close_boost,
+                    segment_close_token_id,
+                    segment_close_ramp_start,
+                    segment_close_ramp_len,
+                    segment_close_max_multiplier,
+                    segment_lens_ptr as *const i32,
+                    segment_temp_boost,
+                    if suppress_active {
+                        suppress_tok_ptr as *const i32
+                    } else {
+                        std::ptr::null()
+                    },
+                    if suppress_active {
+                        suppress_tokens.len() as i32
+                    } else {
+                        0
+                    },
+                    if suppress_active {
+                        suppress_pen_ptr as *const f32
+                    } else {
+                        std::ptr::null()
+                    },
                     tc_ptr as *const i32,
                     ban_ptr as *const i32,
                     num_banned,
@@ -942,6 +1185,95 @@ impl BatchedSampler {
 
 // ────────────────────────────────────────────────────────────────────────────
 // Unit tests
+/// Set this row's banned (deny-list) logits to `-inf`.  Modifies only the few
+/// banned *values* (on an F32 host copy of the row), and is a no-op when the list
+/// is empty, so unconstrained rows keep their exact logits.  Preserves the input
+/// dtype.
+fn apply_banned(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tensor> {
+    if config.banned_tokens.is_empty() {
+        return Ok(logits.clone());
+    }
+    let dtype = logits.dtype();
+    let dims = logits.dims().to_vec();
+    let mut v: Vec<f32> = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    for &b in &config.banned_tokens {
+        ban(&mut v, b as u32);
+    }
+    Tensor::from_vec(v, dims, logits.device())?.to_dtype(dtype)
+}
+
+/// Subtract the suppression penalty from each `segment_suppress_tokens` logit.
+/// The CPU mirror of the kernel's in-segment ceiling lever; the caller has
+/// already confirmed the sequence is inside a segment and the penalty is
+/// nonzero, so this is applied unconditionally here.
+fn apply_suppression(logits: &Tensor, config: &SamplingConfig) -> candle::Result<Tensor> {
+    let dtype = logits.dtype();
+    let dims = logits.dims().to_vec();
+    let vocab = logits.elem_count();
+    let mut v: Vec<f32> = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    for &t in &config.segment_suppress_tokens {
+        if t >= 0 && (t as usize) < vocab {
+            v[t as usize] -= config.segment_suppress_penalty;
+        }
+    }
+    Tensor::from_vec(v, dims, logits.device())?.to_dtype(dtype)
+}
+
+/// Apply banned tokens within a gathered allow-list logit vector: any banned
+/// token that also appears in `allow` is set to `-inf` at its local position.
+/// A no-op when no banned token intersects the allow-list.
+fn apply_banned_local(
+    gathered: &Tensor,
+    allow: &[u32],
+    config: &SamplingConfig,
+) -> candle::Result<Tensor> {
+    if config.banned_tokens.is_empty() {
+        return Ok(gathered.clone());
+    }
+    let banned: std::collections::HashSet<u32> =
+        config.banned_tokens.iter().map(|&b| b as u32).collect();
+    if !allow.iter().any(|t| banned.contains(t)) {
+        return Ok(gathered.clone());
+    }
+    let dtype = gathered.dtype();
+    let dims = gathered.dims().to_vec();
+    let mut v: Vec<f32> = gathered.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    for (local, t) in allow.iter().enumerate() {
+        if banned.contains(t) {
+            v[local] = f32::NEG_INFINITY;
+        }
+    }
+    Tensor::from_vec(v, dims, gathered.device())?.to_dtype(dtype)
+}
+
+/// Map a [`SamplingConfig`] to candle's `Sampling` strategy.
+fn config_to_sampling(config: &SamplingConfig) -> candle_transformers::generation::Sampling {
+    use candle_transformers::generation::Sampling;
+    if config.temperature <= 0.0 {
+        Sampling::ArgMax
+    } else if config.top_k > 0 && config.top_p < 1.0 {
+        Sampling::TopKThenTopP {
+            k: config.top_k as usize,
+            p: config.top_p as f64,
+            temperature: config.temperature as f64,
+        }
+    } else if config.top_k > 0 {
+        Sampling::TopK {
+            k: config.top_k as usize,
+            temperature: config.temperature as f64,
+        }
+    } else if config.top_p < 1.0 {
+        Sampling::TopP {
+            p: config.top_p as f64,
+            temperature: config.temperature as f64,
+        }
+    } else {
+        Sampling::All {
+            temperature: config.temperature as f64,
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -1092,90 +1424,231 @@ mod tests {
         assert_eq!(*state.recent_tokens.last().unwrap(), EOS_TOKEN as i32);
     }
 
-    // ── update_thinking_state tests ────────────────────────────────────
+    // ── Per-row stencil / banned-token masking ─────────────────────────
 
-    #[test]
-    fn test_think_start_enters_thinking() {
-        let mut state = make_state();
-        let think_start = 10i32;
-        let eot = 11i32;
-
-        assert!(!state.in_thinking);
-        assert_eq!(state.thinking_len, 0);
-
-        state.update_thinking_state(think_start as u32, think_start, eot);
-        assert!(
-            state.in_thinking,
-            "should enter thinking on think_start token"
-        );
-        assert_eq!(state.thinking_len, 0, "thinking_len reset on enter");
+    /// Build a `[batch, VOCAB]` logits tensor from per-row spikes.
+    fn logits_from_rows(rows: &[&[(usize, f32)]]) -> Tensor {
+        let mut data = vec![0.0f32; rows.len() * VOCAB_SIZE];
+        for (r, spikes) in rows.iter().enumerate() {
+            for &(tok, val) in *spikes {
+                data[r * VOCAB_SIZE + tok] = val;
+            }
+        }
+        Tensor::from_vec(data, (rows.len(), VOCAB_SIZE), &Device::Cpu).expect("logits")
     }
 
     #[test]
-    fn test_eot_exits_thinking() {
+    fn single_token_stencil_forces_that_token() {
+        // Token 90 dominates, but the stencil allows only 33 — it must win.
+        let sampler = make_sampler();
+        let config = SamplingConfig::argmax().with_stencil(vec![33]);
         let mut state = make_state();
-        let think_start = 10i32;
-        let eot = 11i32;
+        let logits = logits_from_rows(&[&[(90, 100.0), (33, -10.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 33, "single-token stencil forces its token");
+    }
 
-        // Enter thinking
-        state.update_thinking_state(think_start as u32, think_start, eot);
-        assert!(state.in_thinking);
+    #[test]
+    fn stencil_picks_best_within_allow_list() {
+        // Global best (50) is outside the stencil; best *inside* {10,20} is 20.
+        let sampler = make_sampler();
+        let config = SamplingConfig::argmax().with_stencil(vec![10, 20]);
+        let mut state = make_state();
+        let logits = logits_from_rows(&[&[(50, 100.0), (20, 5.0), (10, 1.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 20);
+    }
 
-        // Generate some tokens while thinking
+    #[test]
+    fn banned_token_excluded() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.banned_tokens = vec![50];
+        let mut state = make_state();
+        let logits = logits_from_rows(&[&[(50, 100.0), (60, 50.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 60, "banned best token → next best");
+    }
+
+    #[test]
+    fn stencil_and_banned_combine() {
+        // Stencil {10,20,30}; 30 is best but banned → 20 wins.
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax().with_stencil(vec![10, 20, 30]);
+        config.banned_tokens = vec![30];
+        let mut state = make_state();
+        let logits = logits_from_rows(&[&[(30, 100.0), (20, 50.0), (10, 10.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 20);
+    }
+
+    #[test]
+    fn empty_stencil_is_unconstrained() {
+        let sampler = make_sampler();
+        let config = SamplingConfig::argmax(); // no stencil, no bans
+        let mut state = make_state();
+        let logits = logits_from_rows(&[&[(77, 100.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 77);
+    }
+
+    #[test]
+    fn per_row_stencils_are_independent() {
+        // Two stenciled rows with disjoint allow-lists; the shared global best
+        // (50) is outside both and must be masked in each.
+        let sampler = make_sampler();
+        let c0 = SamplingConfig::argmax().with_stencil(vec![10, 20]);
+        let c1 = SamplingConfig::argmax().with_stencil(vec![30, 40]);
+        let mut s0 = make_state();
+        let mut s1 = make_state();
+        let logits = logits_from_rows(&[
+            &[(50, 100.0), (20, 5.0), (10, 1.0)],
+            &[(50, 100.0), (30, 7.0), (40, 2.0)],
+        ]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut s0, &mut s1], &[&c0, &c1])
+            .expect("sample");
+        assert_eq!(tokens, vec![20, 30]);
+    }
+
+    #[test]
+    fn mixed_batch_stencils_only_its_own_row() {
+        // THE per-row property the global-config kernel lacks: row 0 is forced
+        // to token 10 while row 1 (free) keeps its global best 90 — the stencil
+        // must not leak across rows.
+        let sampler = make_sampler();
+        let stenciled = SamplingConfig::argmax().with_stencil(vec![10]);
+        let free = SamplingConfig::argmax();
+        let mut s0 = make_state();
+        let mut s1 = make_state();
+        let logits = logits_from_rows(&[&[(90, 100.0), (10, 1.0)], &[(90, 100.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut s0, &mut s1], &[&stenciled, &free])
+            .expect("sample");
+        assert_eq!(tokens, vec![10, 90], "stencil applies to row 0 only");
+    }
+
+    #[test]
+    fn allow_list_gather_stays_in_set_under_temperature() {
+        // Stochastic sampling (temperature > 0) over the gathered allow-list must
+        // never escape it, across many seeds.
+        let sampler = make_sampler();
+        let allowed = [13usize, 41, 88];
+        let logits = logits_from_rows(&[&[(13, 2.0), (41, 1.0), (88, 1.5), (90, 100.0)]]);
+        for seed in 0..200u64 {
+            let mut config = SamplingConfig::argmax().with_stencil(vec![13, 41, 88]);
+            config.temperature = 1.0;
+            config.top_p = 0.99;
+            config.seed = seed;
+            let mut state = make_state();
+            let tokens = sampler
+                .sample_batch(&logits, &mut [&mut state], &[&config])
+                .expect("sample");
+            assert!(
+                allowed.contains(&(tokens[0] as usize)),
+                "sampled {} escaped the allow-list at seed {seed}",
+                tokens[0]
+            );
+        }
+    }
+
+    // ── update_segment_state tests ────────────────────────────────────
+
+    #[test]
+    fn test_open_token_enters_segment() {
+        let mut state = make_state();
+        let seg_open = 10i32;
+        let seg_close = 11i32;
+
+        assert!(!state.in_segment);
+        assert_eq!(state.segment_len, 0);
+
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+        assert!(
+            state.in_segment,
+            "should enter the segment on the open token"
+        );
+        assert_eq!(state.segment_len, 0, "segment_len reset on enter");
+    }
+
+    #[test]
+    fn test_close_token_exits_segment() {
+        let mut state = make_state();
+        let seg_open = 10i32;
+        let seg_close = 11i32;
+
+        // Open the segment
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+        assert!(state.in_segment);
+
+        // Generate some tokens inside the segment
         state.record_token(42, MAX_RECENT);
         state.record_token(43, MAX_RECENT);
-        assert_eq!(state.thinking_len, 2);
+        assert_eq!(state.segment_len, 2);
 
-        // Exit thinking
-        state.update_thinking_state(eot as u32, think_start, eot);
-        assert!(!state.in_thinking, "should exit thinking on eot token");
-        assert_eq!(state.thinking_len, 0, "thinking_len reset on exit");
+        // Close the segment
+        state.update_segment_state(seg_close as u32, seg_open, seg_close);
+        assert!(
+            !state.in_segment,
+            "should exit the segment on the close token"
+        );
+        assert_eq!(state.segment_len, 0, "segment_len reset on exit");
     }
 
     #[test]
-    fn test_eot_without_thinking_is_noop() {
+    fn test_close_token_without_open_segment_is_noop() {
         let mut state = make_state();
-        let think_start = 10i32;
-        let eot = 11i32;
+        let seg_open = 10i32;
+        let seg_close = 11i32;
 
-        // EOT when not in thinking should be a no-op
-        state.update_thinking_state(eot as u32, think_start, eot);
-        assert!(!state.in_thinking, "should remain not-thinking");
+        // The close token outside a segment should be a no-op
+        state.update_segment_state(seg_close as u32, seg_open, seg_close);
+        assert!(!state.in_segment, "should remain outside a segment");
     }
 
     #[test]
-    fn test_thinking_disabled_when_ids_negative() {
+    fn test_segment_tracking_disabled_when_ids_negative() {
         let mut state = make_state();
 
         // -1 means not configured
-        state.update_thinking_state(10, -1, 11);
+        state.update_segment_state(10, -1, 11);
         assert!(
-            !state.in_thinking,
-            "should not enter thinking when think_start_id < 0"
+            !state.in_segment,
+            "should not enter a segment when segment_open_id < 0"
         );
 
-        state.update_thinking_state(10, 10, -1);
+        state.update_segment_state(10, 10, -1);
         assert!(
-            !state.in_thinking,
-            "should not enter thinking when eot_id < 0"
+            !state.in_segment,
+            "should not enter a segment when segment_close_id < 0"
         );
     }
 
     #[test]
-    fn test_thinking_len_tracks_tokens() {
+    fn test_segment_len_tracks_tokens() {
         let mut state = make_state();
-        let think_start = 10i32;
-        let eot = 11i32;
+        let seg_open = 10i32;
+        let seg_close = 11i32;
 
-        state.update_thinking_state(think_start as u32, think_start, eot);
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
 
         for i in 0..5 {
             state.record_token(40 + i, MAX_RECENT);
         }
-        assert_eq!(state.thinking_len, 5);
+        assert_eq!(state.segment_len, 5);
 
-        // Re-entering thinking resets the counter
-        state.update_thinking_state(think_start as u32, think_start, eot);
-        assert_eq!(state.thinking_len, 0);
+        // Re-opening the segment resets the counter
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+        assert_eq!(state.segment_len, 0);
     }
 }
