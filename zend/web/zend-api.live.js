@@ -229,6 +229,10 @@
       try { if (handlers.onProjection) handlers.onProjection(JSON.parse(data)); } catch (_) {}
       return;
     }
+    if (event === 'tool') {
+      try { if (handlers.onTool) handlers.onTool(JSON.parse(data)); } catch (_) {}
+      return;
+    }
     if (data === '[DONE]') { handlers.onDone(); return; }
     try {
       const chunk = JSON.parse(data);

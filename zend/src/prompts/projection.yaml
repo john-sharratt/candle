@@ -918,7 +918,7 @@ layers:
           nodes:
             - kind: optional
               id: no_think
-              dialect: no_think_prefix
+              dialect: no_think_prefix      # present (thinking OFF): the /no_think prefix
               default: absent
 
             - kind: section
@@ -930,8 +930,13 @@ layers:
                 analysis-report formatting, no section headers, no enumerated checklists unless
                 the developer explicitly asks for one.
 
-            - kind: section
+            - kind: optional
               id: reasoning_stance
+              # present (thinking ON): the reasoning-stance framing. The composer
+              # sets this toggle INVERSELY to `no_think`, so it appears only when
+              # the model will actually think — a /no_think turn never sees
+              # <think>-block guidance that would contradict it.
+              default: present
               content: |+
                 When you think in a <think> block, it is working scratch space — not a
                 message to the developer.  Go straight to the substance: do not restate or
@@ -988,12 +993,24 @@ layers:
             traced dependencies, reasoned about architecture, and evaluated trade-offs.
             Treat those as your own prior work and draw on them directly without recapping.
 
+        # Two grounding variants — exactly one emits, gated on whether any tools
+        # were projected this turn, so a no-tools turn is never told to "fetch it
+        # with a tool" it doesn't have.
         - kind: section
           id: grounding
+          depends_on: tools
           content: |+
             Only speak from what is actually present in the conversation.  If a file or
             detail hasn't appeared yet, fetch it with a tool when one fits; otherwise say so
             rather than guessing.  Never fill the gap with an invented value or result.
+
+        - kind: section
+          id: grounding_no_tools
+          depends_on_absent: tools
+          content: |+
+            Only speak from what is actually present in the conversation.  If a file or
+            detail hasn't appeared yet, say so plainly rather than guessing.  Never fill the
+            gap with an invented value or result.
 
         - kind: section
           id: tools_overview
@@ -1092,6 +1109,7 @@ layers:
         max_tokens: 192
         user:
           system_prompt: |
+            /no_think
             You shorten a developer's message to its essential request, in their
             own words — the specific ask plus any names, numbers, and constraints.
             If it is already short (even a one-line question), output it almost
@@ -1102,6 +1120,7 @@ layers:
             their own words:
         assistant:
           system_prompt: |
+            /no_think
             You compress an assistant's reply into a faithful, shorter version.
             Keep only what the reply actually states — its specific facts, numbers,
             decisions, and advice — in the original first/second-person voice, as
@@ -1123,6 +1142,7 @@ layers:
         max_tokens: 192
         user:
           system_prompt: |
+            /no_think
             The question sections below are already compressed. Output one shorter
             line naming what was asked across them, in the developer's own words.
             Add nothing that is not already there; drop only what repeats. Output
@@ -1132,6 +1152,7 @@ layers:
             voice, as one short line:
         assistant:
           system_prompt: |
+            /no_think
             The answer sections below are already compressed. Merge them into one
             faithful, shorter section in the original first/second-person voice,
             keeping the facts, numbers, and decisions that still matter and dropping

@@ -110,7 +110,20 @@ fn dial_selection(
     const EFFORT: [&str; 5] = ["off", "quick", "balanced", "deep", "exhaustive"];
     const LENGTH: [&str; 5] = ["terse", "concise", "standard", "detailed", "comprehensive"];
     let mut sel = SelectionState::new();
-    if let Some(e) = effort {
+    // A thinking-off turn — effort 0, or the `think` toggle explicitly off — is
+    // suppressed via the `/no_think` glue.  The steering MUST match: force
+    // `thinking_effort = off` so it resolves to `ThinkMode::Off` (no opener, no
+    // injected close).  Otherwise a non-zero effort dial drives a steered `<think>`
+    // block while `/no_think` simultaneously tells the model to suppress it, and the
+    // block gets closed twice (a steered injected `</think>` plus the model's own).
+    let off = think == Some(false) || effort == Some(0);
+    if off {
+        // Only meaningful when the turn actually carries a dial; a bare
+        // `think: false` with no effort still wants the block suppressed.
+        if effort.is_some() || think.is_some() {
+            sel.select("thinking_effort", "off");
+        }
+    } else if let Some(e) = effort {
         sel.select(
             "thinking_effort",
             *EFFORT.get(e as usize).unwrap_or(&"exhaustive"),
@@ -123,12 +136,27 @@ fn dial_selection(
         );
     }
     if effort.is_some() || think.is_some() {
-        let state = if think == Some(false) || effort == Some(0) {
-            OptionalState::Present
-        } else {
-            OptionalState::Absent
-        };
-        sel.set_optional(NO_THINK_SELECTOR, state);
+        // `no_think` present (the /no_think prefix) ⇔ thinking off. The
+        // `reasoning_stance` toggle (its `<think>`-block guidance) is the
+        // inverse — present only when the model will actually think — so a
+        // /no_think turn never sees instructions on how to use a block it won't
+        // open. Both ids match the section-tree nodes in `projection.yaml`.
+        sel.set_optional(
+            NO_THINK_SELECTOR,
+            if off {
+                OptionalState::Present
+            } else {
+                OptionalState::Absent
+            },
+        );
+        sel.set_optional(
+            "reasoning_stance",
+            if off {
+                OptionalState::Absent
+            } else {
+                OptionalState::Present
+            },
+        );
     }
     sel
 }
@@ -181,6 +209,11 @@ async fn stream_sse(
             Ok(StreamItem::Projection(event)) => {
                 let data = serde_json::to_string(&event).map_err(|e| anyhow::anyhow!(e))?;
                 Ok(Event::default().event("projection").data(data))
+            }
+
+            Ok(StreamItem::Tool(status)) => {
+                let data = serde_json::to_string(&status).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(Event::default().event("tool").data(data))
             }
 
             Ok(StreamItem::Token(text)) => {
@@ -275,6 +308,7 @@ async fn collect_completion(
             }
             Ok(StreamItem::Status(_)) => {} // status events are display-only
             Ok(StreamItem::Projection(_)) => {} // timeline-only; not in the collected body
+            Ok(StreamItem::Tool(_)) => {}   // tool lifecycle; display-only, not in the body
             Err(_) => {}
         }
     }
@@ -325,6 +359,36 @@ mod dial_tests {
             sel.optional(NO_THINK_SELECTOR),
             Some(OptionalState::Present)
         );
+        // Thinking off → the reasoning-stance toggle is the inverse (absent), so
+        // its <think>-block guidance is not shown.
+        assert_eq!(
+            sel.optional("reasoning_stance"),
+            Some(OptionalState::Absent)
+        );
+    }
+
+    #[test]
+    fn think_toggle_off_forces_effort_off_despite_nonzero_dial() {
+        // The bug: effort dial set (quick) but the `think` toggle off. Both the
+        // steering (thinking_effort) and the /no_think glue (no_think) must agree on
+        // "off" — otherwise the model gets a steered <think> block AND a /no_think
+        // suppression signal and closes the block twice.
+        let sel = dial_selection(Some(1), Some(2), Some(false));
+        assert_eq!(
+            sel.get("thinking_effort"),
+            Some("off"),
+            "think:false must override a non-zero effort dial to off",
+        );
+        assert_eq!(
+            sel.optional(NO_THINK_SELECTOR),
+            Some(OptionalState::Present)
+        );
+        assert_eq!(
+            sel.optional("reasoning_stance"),
+            Some(OptionalState::Absent)
+        );
+        // The response-length dial is unaffected.
+        assert_eq!(sel.get("response_length"), Some("standard"));
     }
 
     #[test]
@@ -333,6 +397,11 @@ mod dial_tests {
         assert_eq!(sel.get("thinking_effort"), Some("balanced"));
         assert_eq!(sel.get("response_length"), Some("standard"));
         assert_eq!(sel.optional(NO_THINK_SELECTOR), Some(OptionalState::Absent));
+        // Thinking on → reasoning-stance present.
+        assert_eq!(
+            sel.optional("reasoning_stance"),
+            Some(OptionalState::Present)
+        );
     }
 
     #[test]
@@ -348,5 +417,8 @@ mod dial_tests {
         assert_eq!(sel.get("thinking_effort"), None);
         assert_eq!(sel.get("response_length"), None);
         assert_eq!(sel.optional(NO_THINK_SELECTOR), None);
+        // Unset → both toggles fall to their schema defaults (no_think absent,
+        // reasoning_stance present — i.e. thinking on).
+        assert_eq!(sel.optional("reasoning_stance"), None);
     }
 }

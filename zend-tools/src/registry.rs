@@ -28,6 +28,8 @@
 //! | `unknown_tool` | No entry in [`all_tools`] for the given name |
 //! | `internal_error` | Response serialization failure |
 
+use std::sync::OnceLock;
+
 use serde_json::{json, Value};
 use validator::Validate;
 
@@ -56,6 +58,11 @@ pub struct RegisteredTool {
     /// "Comprehensive" keeps the full catalog. The full policy is the set of
     /// `.risky()` calls in [`register_all`].
     pub high_risk: bool,
+    /// The tool's category label, stamped per group in [`register_all`]. Drives
+    /// the deterministic, decode-free tool-catalog summary (tools grouped under
+    /// `## <category>` headers). Empty only for a registration built outside the
+    /// grouped table.
+    pub category: &'static str,
 }
 
 impl RegisteredTool {
@@ -69,6 +76,7 @@ impl RegisteredTool {
             run: tool_run::<T>,
             confirmation: tool_confirmation::<T>,
             high_risk: false,
+            category: "",
         }
     }
 
@@ -76,6 +84,13 @@ impl RegisteredTool {
     /// Const so it composes into the `static` registry table.
     pub const fn risky(mut self) -> Self {
         self.high_risk = true;
+        self
+    }
+
+    /// Stamp this registration's category label. Applied per group in
+    /// [`register_all`] so the catalog summary can be assembled deterministically.
+    pub const fn category(mut self, category: &'static str) -> Self {
+        self.category = category;
         self
     }
 }
@@ -786,125 +801,174 @@ use crate::tools::{
 };
 
 fn register_all() -> &'static [RegisteredTool] {
-    // High-risk (`.risky()`) = side effects or reaches outside the host:
-    // mutation, code execution, remote/network access, credentials, scanning.
-    // These are the tools omitted in "Restricted" mode. Safe tools (local
-    // read-only + pure compute) carry no marker.
-    static TOOLS: &[RegisteredTool] = &[
-        // Shared tools (7) — all safe (compute + web read)
-        DATETIME,
-        CALC,
-        UNIT_CONVERT,
-        RANDOM,
-        WEB_SEARCH,
-        WEB_FETCH,
-        WEATHER,
-        // File tools (6) — reads safe, mutations high-risk
-        FILE_WRITE.risky(),
-        FILE_READ,
-        FILE_EDIT.risky(),
-        FILE_LIST,
-        FILE_DELETE.risky(),
-        FILE_PRESENT,
-        // Notes tools (4) — reads safe, write high-risk
-        NOTES_WRITE.risky(),
-        NOTES_READ,
-        NOTES_SEARCH,
-        NOTES_LIST,
-        // Credential tools (3) — all high-risk (secrets)
-        CREDENTIAL_SAVE.risky(),
-        CREDENTIAL_LIST.risky(),
-        CREDENTIAL_DELETE.risky(),
-        // SSH tools (6) — all high-risk (remote exec)
-        SSH_SESSION_OPEN.risky(),
-        SSH_SESSION_EXEC.risky(),
-        SSH_SESSION_EXEC_ASYNC.risky(),
-        SSH_SESSION_POLL.risky(),
-        SSH_SESSION_LIST.risky(),
-        SSH_SESSION_CLOSE.risky(),
-        // Telnet tools (4) — all high-risk (remote access)
-        TELNET_SESSION_OPEN.risky(),
-        TELNET_SESSION_SEND.risky(),
-        TELNET_SESSION_LIST.risky(),
-        TELNET_SESSION_CLOSE.risky(),
-        // HTTP session tools (4) — all high-risk (network)
-        HTTP_SESSION_OPEN.risky(),
-        HTTP_SESSION_REQUEST.risky(),
-        HTTP_SESSION_LIST.risky(),
-        HTTP_SESSION_CLOSE.risky(),
-        // TCP tools (5) — all high-risk (raw sockets)
-        TCP_SESSION_OPEN.risky(),
-        TCP_SESSION_SEND.risky(),
-        TCP_SESSION_RECV.risky(),
-        TCP_SESSION_LIST.risky(),
-        TCP_SESSION_CLOSE.risky(),
-        // UDP tools (5) — all high-risk (raw sockets)
-        UDP_SESSION_OPEN.risky(),
-        UDP_SESSION_SEND.risky(),
-        UDP_SESSION_RECV.risky(),
-        UDP_SESSION_LIST.risky(),
-        UDP_SESSION_CLOSE.risky(),
-        // TLS tools (5) — all high-risk (raw sockets)
-        TLS_SESSION_OPEN.risky(),
-        TLS_SESSION_SEND.risky(),
-        TLS_SESSION_RECV.risky(),
-        TLS_SESSION_LIST.risky(),
-        TLS_SESSION_CLOSE.risky(),
-        // SQL tools (4) — all high-risk (database access)
-        SQL_SESSION_OPEN.risky(),
-        SQL_SESSION_QUERY.risky(),
-        SQL_SESSION_LIST.risky(),
-        SQL_SESSION_CLOSE.risky(),
-        // Remote FS tools (10) — all high-risk (remote files)
-        REMOTE_FS_SESSION_OPEN.risky(),
-        REMOTE_FS_SESSION_LIST_DIR.risky(),
-        REMOTE_FS_SESSION_STAT.risky(),
-        REMOTE_FS_SESSION_GET.risky(),
-        REMOTE_FS_SESSION_PUT.risky(),
-        REMOTE_FS_SESSION_DELETE.risky(),
-        REMOTE_FS_SESSION_MKDIR.risky(),
-        REMOTE_FS_SESSION_RENAME.risky(),
-        REMOTE_FS_SESSION_LIST.risky(),
-        REMOTE_FS_SESSION_CLOSE.risky(),
-        // Network diagnostics (6) — lookups safe, scanning high-risk
-        DNS_LOOKUP,
-        PING_ICMP,
-        TRACE_ROUTE.risky(),
-        PORT_SCAN.risky(),
-        IP_SCAN.risky(),
-        HOST_INFO,
-        // Security utilities (3) — all safe (compute)
-        HASH_SCAN,
-        HASH_COMPUTE,
-        TOTP,
-        // Crypto primitives (8) — all safe (pure compute, no external effect)
-        AEAD_ENCRYPT,
-        AEAD_DECRYPT,
-        HMAC_COMPUTE,
-        SIGNATURE_VERIFY,
-        SIGNATURE_SIGN,
-        KDF_DERIVE,
-        HKDF_EXTRACT,
-        HKDF_EXPAND_LABEL,
-        // Hash state tools (3) — all safe (compute)
-        HASH_STATE_INIT,
-        HASH_STATE_UPDATE,
-        HASH_STATE_FINALIZE,
-        // Byte tools (4) — all safe (compute)
-        BYTES_TRANSCODE,
-        BYTES_PACK,
-        BYTES_UNPACK,
-        BYTES_XOR,
-        // Code execution (5) — all high-risk (arbitrary code)
-        CODE_RUN.risky(),
-        CODE_SESSION_OPEN.risky(),
-        CODE_SESSION_EXEC.risky(),
-        CODE_SESSION_LIST.risky(),
-        CODE_SESSION_CLOSE.risky(),
-        // Subagent (1) — high-risk (delegated agency)
-        SUBAGENT.risky(),
+    // Tools grouped by category. The group label stamps every tool in it via
+    // `.category()` (this is what the decode-free catalog summary groups under
+    // `## <label>` headers). High-risk (`.risky()`) = side effects or reaches
+    // outside the host: mutation, code execution, remote/network access,
+    // credentials, scanning — these are omitted in "Restricted" mode. Safe tools
+    // (local read-only + pure compute) carry no risk marker. Registry order is
+    // the flattened group order.
+    static GROUPS: &[(&str, &[RegisteredTool])] = &[
+        ("Date & math", &[DATETIME, CALC, UNIT_CONVERT, RANDOM]),
+        ("Web & weather", &[WEB_SEARCH, WEB_FETCH, WEATHER]),
+        (
+            "Files",
+            &[
+                FILE_WRITE.risky(),
+                FILE_READ,
+                FILE_EDIT.risky(),
+                FILE_LIST,
+                FILE_DELETE.risky(),
+                FILE_PRESENT,
+            ],
+        ),
+        (
+            "Notes",
+            &[NOTES_WRITE.risky(), NOTES_READ, NOTES_SEARCH, NOTES_LIST],
+        ),
+        (
+            "Credentials",
+            &[
+                CREDENTIAL_SAVE.risky(),
+                CREDENTIAL_LIST.risky(),
+                CREDENTIAL_DELETE.risky(),
+            ],
+        ),
+        (
+            "SSH",
+            &[
+                SSH_SESSION_OPEN.risky(),
+                SSH_SESSION_EXEC.risky(),
+                SSH_SESSION_EXEC_ASYNC.risky(),
+                SSH_SESSION_POLL.risky(),
+                SSH_SESSION_LIST.risky(),
+                SSH_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "Telnet",
+            &[
+                TELNET_SESSION_OPEN.risky(),
+                TELNET_SESSION_SEND.risky(),
+                TELNET_SESSION_LIST.risky(),
+                TELNET_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "HTTP",
+            &[
+                HTTP_SESSION_OPEN.risky(),
+                HTTP_SESSION_REQUEST.risky(),
+                HTTP_SESSION_LIST.risky(),
+                HTTP_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "TCP sockets",
+            &[
+                TCP_SESSION_OPEN.risky(),
+                TCP_SESSION_SEND.risky(),
+                TCP_SESSION_RECV.risky(),
+                TCP_SESSION_LIST.risky(),
+                TCP_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "UDP sockets",
+            &[
+                UDP_SESSION_OPEN.risky(),
+                UDP_SESSION_SEND.risky(),
+                UDP_SESSION_RECV.risky(),
+                UDP_SESSION_LIST.risky(),
+                UDP_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "TLS sockets",
+            &[
+                TLS_SESSION_OPEN.risky(),
+                TLS_SESSION_SEND.risky(),
+                TLS_SESSION_RECV.risky(),
+                TLS_SESSION_LIST.risky(),
+                TLS_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "SQL",
+            &[
+                SQL_SESSION_OPEN.risky(),
+                SQL_SESSION_QUERY.risky(),
+                SQL_SESSION_LIST.risky(),
+                SQL_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "Remote filesystem",
+            &[
+                REMOTE_FS_SESSION_OPEN.risky(),
+                REMOTE_FS_SESSION_LIST_DIR.risky(),
+                REMOTE_FS_SESSION_STAT.risky(),
+                REMOTE_FS_SESSION_GET.risky(),
+                REMOTE_FS_SESSION_PUT.risky(),
+                REMOTE_FS_SESSION_DELETE.risky(),
+                REMOTE_FS_SESSION_MKDIR.risky(),
+                REMOTE_FS_SESSION_RENAME.risky(),
+                REMOTE_FS_SESSION_LIST.risky(),
+                REMOTE_FS_SESSION_CLOSE.risky(),
+            ],
+        ),
+        (
+            "Network diagnostics",
+            &[
+                DNS_LOOKUP,
+                PING_ICMP,
+                TRACE_ROUTE.risky(),
+                PORT_SCAN.risky(),
+                IP_SCAN.risky(),
+                HOST_INFO,
+            ],
+        ),
+        ("Hashing & OTP", &[HASH_SCAN, HASH_COMPUTE, TOTP]),
+        (
+            "Cryptography",
+            &[
+                AEAD_ENCRYPT,
+                AEAD_DECRYPT,
+                HMAC_COMPUTE,
+                SIGNATURE_VERIFY,
+                SIGNATURE_SIGN,
+                KDF_DERIVE,
+                HKDF_EXTRACT,
+                HKDF_EXPAND_LABEL,
+            ],
+        ),
+        (
+            "Streaming hash",
+            &[HASH_STATE_INIT, HASH_STATE_UPDATE, HASH_STATE_FINALIZE],
+        ),
+        (
+            "Byte manipulation",
+            &[BYTES_TRANSCODE, BYTES_PACK, BYTES_UNPACK, BYTES_XOR],
+        ),
+        (
+            "Code execution",
+            &[
+                CODE_RUN.risky(),
+                CODE_SESSION_OPEN.risky(),
+                CODE_SESSION_EXEC.risky(),
+                CODE_SESSION_LIST.risky(),
+                CODE_SESSION_CLOSE.risky(),
+            ],
+        ),
+        ("Subagents", &[SUBAGENT.risky()]),
     ];
-    TOOLS
+    static TOOLS: OnceLock<Vec<RegisteredTool>> = OnceLock::new();
+    TOOLS.get_or_init(|| {
+        GROUPS
+            .iter()
+            .flat_map(|&(cat, tools)| tools.iter().map(move |t| t.category(cat)))
+            .collect()
+    })
 }
 
 #[cfg(test)]

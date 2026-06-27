@@ -22,7 +22,7 @@
 //! output presented to the client — the user sees only the assistant's
 //! final natural-language answer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, Reserved, SectionId};
@@ -41,6 +41,47 @@ pub fn safe_tool_names() -> HashSet<String> {
         .filter(|t| !t.high_risk)
         .map(|t| t.name.to_string())
         .collect()
+}
+
+/// Build the tool-catalog summary **deterministically** from each tool's
+/// `category` metadata — no model decode. Tools are grouped under
+/// `## <category>` headers in registry (group) order; `restricted` drops every
+/// high-risk tool (the "Restricted" tools-mode subset). This is the text
+/// prefilled into the reserved tool-summary section and shown to the model just
+/// before the selected tools, so it always knows the full breadth of the
+/// catalog even when top-k surfaced only a few definitions.
+pub fn build_tool_summary(restricted: bool) -> String {
+    // Collect tool names per category, preserving first-seen (group) order.
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut by_cat: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+    for tool in registry::all_tools() {
+        if restricted && tool.high_risk {
+            continue;
+        }
+        let cat = if tool.category.is_empty() {
+            "Other"
+        } else {
+            tool.category
+        };
+        by_cat
+            .entry(cat)
+            .or_insert_with(|| {
+                order.push(cat);
+                Vec::new()
+            })
+            .push(tool.name);
+    }
+    // Pre-prose: frame the list so the model reads it as the full catalog, of
+    // which only the most relevant few are detailed in the `<tools>` block.
+    let mut out = String::from(
+        "These are the tools available to you, grouped by category. Only the most relevant \
+         few are detailed in the <tools> block below, but every tool listed here is available \
+         — call any of them by name when it fits the request.\n\n",
+    );
+    for cat in order {
+        out.push_str(&format!("## {cat}\n  {}\n", by_cat[cat].join(", ")));
+    }
+    out.trim_end().to_string()
 }
 
 /// One Hermes tool-call block parsed from a model response.
@@ -115,8 +156,9 @@ pub fn install_tool_catalog(
     }
     // Associate the reserved tool-summary section with the collection. The
     // section is sealed at runtime (the daemon's startup hook); projection emits
-    // it just before the selected tools whenever top-k dropped at least one, and
-    // only once it is actually sealed. See `crate::tool_summary`.
+    // it just before the `<tools>` block — OUTSIDE the markers — whenever top-k
+    // dropped at least one tool, and only once it is actually sealed. See
+    // `crate::tool_summary`.
     builder
         .set_collection_summary_section(
             dialogue_layer,
@@ -242,9 +284,10 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         };
         if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
+                let arguments = raw.args();
                 out.push(ToolCall {
                     name: raw.name,
-                    arguments: raw.arguments.unwrap_or(Value::Null),
+                    arguments,
                 });
             }
         }
@@ -273,9 +316,10 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         };
         if let Ok(raw) = serde_json::from_str::<RawCall>(json.as_str()) {
             if !raw.name.is_empty() {
+                let arguments = raw.args();
                 out.push(ToolCall {
                     name: raw.name,
-                    arguments: raw.arguments.unwrap_or(Value::Null),
+                    arguments,
                 });
             }
         }
@@ -283,12 +327,14 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
     }
 
     // Pass 3: bare `{json}` objects with no wrapper tags at all. Lower
-    // precision than the tagged passes, so it's gated three ways: the object
-    // must (a) not overlap a tagged match, (b) carry an `arguments` field — so a
-    // tool *definition* echo (`{"name","description","parameters"}`) isn't taken
-    // for a call — and (c) name a real tool/alias in the registry. This recovers
-    // the calls Qwen3 emits as raw JSON while ignoring prose JSON, tool
-    // definitions, and fabricated tool responses.
+    // precision than the tagged passes, so it's gated four ways: the object
+    // must (a) not overlap a tagged match, (b) carry call values under either
+    // `arguments` or `parameters` (Qwen3 uses the schema key for the call when it
+    // degrades), (c) have NO top-level `description` — so a tool *definition* echo
+    // (`{"name","description","parameters":<schema>}`) isn't taken for a call,
+    // since it also carries `parameters` — and (d) name a real tool/alias in the
+    // registry. This recovers the calls Qwen3 emits as raw JSON while ignoring
+    // prose JSON, tool definitions, and fabricated tool responses.
     for (start, end) in balanced_object_spans(response_text) {
         let overlaps = consumed_spans.iter().any(|&(s, e)| start < e && s < end);
         if overlaps {
@@ -296,12 +342,14 @@ pub fn extract_tool_calls(response_text: &str) -> Vec<ToolCall> {
         }
         if let Ok(raw) = serde_json::from_str::<RawCall>(&response_text[start..end]) {
             if !raw.name.is_empty()
-                && raw.arguments.is_some()
+                && raw.has_args()
+                && !raw.looks_like_definition()
                 && registry::find(&raw.name).is_some()
             {
+                let arguments = raw.args();
                 out.push(ToolCall {
                     name: raw.name,
-                    arguments: raw.arguments.unwrap_or(Value::Null),
+                    arguments,
                 });
             }
         }
@@ -319,6 +367,36 @@ struct RawCall {
     name: String,
     #[serde(default)]
     arguments: Option<Value>,
+    /// Qwen3-30B-A3B sometimes emits `"parameters"` — the tool *schema* key —
+    /// in place of `"arguments"` for the call values (seen when it drops the
+    /// `<tool_call>` wrapper too).  Accepted as a fallback so the args aren't lost.
+    #[serde(default)]
+    parameters: Option<Value>,
+    /// Present only on a tool *definition* (`{"name","description","parameters"}`),
+    /// never on a call.  Lets the bare pass reject a definition echo even though it
+    /// also carries a top-level `"parameters"`.
+    #[serde(default)]
+    description: Option<Value>,
+}
+
+impl RawCall {
+    /// The call arguments: `"arguments"` if present, else the `"parameters"`
+    /// fallback, else null.
+    fn args(&self) -> Value {
+        self.arguments
+            .clone()
+            .or_else(|| self.parameters.clone())
+            .unwrap_or(Value::Null)
+    }
+    /// Whether the object carries call values under either key.
+    fn has_args(&self) -> bool {
+        self.arguments.is_some() || self.parameters.is_some()
+    }
+    /// A tool *definition* echo carries a top-level `description`; a call never
+    /// does (a param *named* `description` lives inside `parameters`, not here).
+    fn looks_like_definition(&self) -> bool {
+        self.description.is_some()
+    }
 }
 
 // ── Tool dispatch ────────────────────────────────────────────────────────────
@@ -548,9 +626,50 @@ some text
         assert!(extract_tool_calls(unknown).is_empty());
         let fabricated = r#"{"error": "No active HTTP sessions found."}"#;
         assert!(extract_tool_calls(fabricated).is_empty());
-        // A tool *definition* echo (no `arguments`, has `parameters`) is not a call.
+        // A tool *definition* echo (top-level `description` + a `parameters`
+        // schema) is not a call — even though `parameters` is now accepted as the
+        // args key, the `description` gate rejects it.
         let definition = r#"{"name": "ping_icmp", "description": "ping a host", "parameters": {}}"#;
         assert!(extract_tool_calls(definition).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_calls_recovers_bare_parameters_keyed_call() {
+        // The exact Qwen3-A3B degradation from the substrate: no `<tool_call>`
+        // wrapper AND the schema key `parameters` in place of `arguments`. Recover
+        // it as a real call, carrying the values.
+        let text = r#"{"name":"datetime","parameters":{"timezone":"Australia/Sydney"}}"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "bare parameters-keyed call not recovered: {calls:?}",
+        );
+        assert_eq!(calls[0].name, "datetime");
+        assert_eq!(calls[0].arguments["timezone"], "Australia/Sydney");
+    }
+
+    #[test]
+    fn extract_tool_calls_parameters_key_still_rejects_definition() {
+        // A full definition echo carries `parameters` too, but its top-level
+        // `description` must keep it from being mistaken for a call now that
+        // `parameters` is an accepted args key.
+        let def = r#"{"name":"datetime","description":"current time in a timezone","parameters":{"type":"object","properties":{"timezone":{"type":"string"}}}}"#;
+        assert!(
+            extract_tool_calls(def).is_empty(),
+            "definition echo taken for a call",
+        );
+    }
+
+    #[test]
+    fn extract_tool_calls_tagged_call_keeps_parameters_values() {
+        // Even inside a `<tool_call>` wrapper Qwen3 sometimes uses `parameters`;
+        // the args must survive rather than dropping to null.
+        let text =
+            r#"<tool_call>{"name": "datetime", "parameters": {"timezone": "UTC"}}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "got: {calls:?}");
+        assert_eq!(calls[0].arguments["timezone"], "UTC");
     }
 
     #[test]
@@ -633,5 +752,34 @@ some text
         assert_eq!(parsed["name"], "datetime");
         assert!(parsed["description"].is_string());
         assert!(parsed["parameters"].is_object());
+    }
+
+    #[test]
+    fn build_tool_summary_groups_by_category() {
+        let comp = build_tool_summary(false);
+        // Headers come from the registry's category labels; tools list under them.
+        assert!(comp.contains("## Files"), "missing Files header:\n{comp}");
+        assert!(comp.contains("file_read"), "missing a Files tool:\n{comp}");
+        assert!(
+            comp.contains("## Code execution") && comp.contains("code_run"),
+            "missing Code execution group:\n{comp}"
+        );
+        // Every category header that appears is `## <label>`; no decode artefacts.
+        assert!(!comp.contains("<think>"), "summary must be decode-free");
+    }
+
+    #[test]
+    fn build_tool_summary_restricted_drops_high_risk() {
+        let restricted = build_tool_summary(true);
+        // `code_run` is high-risk → absent from the restricted summary; a safe
+        // tool like `file_read` remains.
+        assert!(
+            !restricted.contains("code_run"),
+            "high-risk tool leaked into restricted summary:\n{restricted}"
+        );
+        assert!(
+            restricted.contains("file_read"),
+            "safe tool missing from restricted summary:\n{restricted}"
+        );
     }
 }

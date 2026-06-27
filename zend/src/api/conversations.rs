@@ -193,6 +193,11 @@ pub struct TurnContent {
 }
 
 /// The dialect framing markers the assembler wraps around the prompt and turns.
+/// These are the role markers the backend frames turns with, plus `no_think` —
+/// the `/no_think` soft-switch the scheduler emits as live glue right after
+/// `user_start` on a suppressed turn. The reasoning *block* is deliberately NOT
+/// here: it's never glue (a suppressed turn decodes its own empty
+/// `<think></think>` into the body), only the `/no_think` directive is.
 #[derive(Serialize)]
 pub struct Glue {
     pub system_start: String,
@@ -201,10 +206,7 @@ pub struct Glue {
     pub user_end: String,
     pub assistant_start: String,
     pub assistant_end: String,
-    /// Empty/closed reasoning header forced when a turn is suppressed — what the
-    /// effort dial's Off injects and what every prefilled memory-tier turn carries.
-    /// A thinking turn has none (its `<think>` is a decoded token in the body).
-    pub no_think_block: String,
+    pub no_think: String,
 }
 
 impl From<candle_conversation::GlueMarkers> for Glue {
@@ -216,7 +218,7 @@ impl From<candle_conversation::GlueMarkers> for Glue {
             user_end: m.user_end,
             assistant_start: m.assistant_start,
             assistant_end: m.assistant_end,
-            no_think_block: m.no_think_block,
+            no_think: m.no_think,
         }
     }
 }

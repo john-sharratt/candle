@@ -104,10 +104,10 @@ mod tool_scenarios {
                     response.push_str(&tok);
                 }
                 StreamItem::Projection(projection_event_out) => {
-                    eprintln!(
-                        "\n[PROJECTION EVENT] {}",
-                        projection_event_out.projection_event
-                    );
+                    eprintln!("\n[PROJECTION EVENT] {:?}", projection_event_out.event);
+                }
+                StreamItem::Tool(status) => {
+                    eprintln!("\n[TOOL {}] {:?}", status.phase, status.tools);
                 }
             }
         }
