@@ -766,6 +766,7 @@ pub fn paged_glue_attn(
     _col_actual_pos: &Tensor,
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
+    _fwd_window: usize,
     _generation: &Generation,
 ) -> Result<Tensor> {
     candle::bail!("paged-glue requires the cuda feature")
@@ -1119,6 +1120,8 @@ type GlueFfi = unsafe extern "C" fn(
     *const u32,    // cu_kvlens
     *const u32,    // glue_write_slice
     *const u32,    // glue_write_in_blk
+    u32,           // fwd_window
+    *const u32,    // b_avail
     *mut c_void,   // stream
 );
 
@@ -1143,6 +1146,11 @@ struct PagedGlueChunks {
     glue_write_slice: Tensor,
     /// Flat `[Σ q_lens]` U32 — in-block offset per glue row.
     glue_write_in_blk: Tensor,
+    /// Forward B-head window (tokens); `0` == backward-only. Glue rows also attend
+    /// the first `min(fwd_window, b_avail[slot])` columns of the next section (B).
+    fwd_window: u32,
+    /// `[batch]` U32 — per-slot count of B columns resident after `kv_len`.
+    b_avail: Tensor,
     headers_ptr: u64,
     batch_size: usize,
     max_glue: usize,
@@ -1195,6 +1203,7 @@ impl PagedGlueChunks {
         let cukv_ptr = u32_ptr(&self.cu_kvlens)?;
         let gws_ptr = u32_ptr(&self.glue_write_slice)?;
         let gwi_ptr = u32_ptr(&self.glue_write_in_blk)?;
+        let ba_ptr = u32_ptr(&self.b_avail)?;
 
         // Typed Q/K/V (compute dtype).
         let q_slice = q.as_cuda_slice::<T>()?.slice(q_l.start_offset()..);
@@ -1250,6 +1259,8 @@ impl PagedGlueChunks {
                 cukv_ptr as *const u32,
                 gws_ptr as *const u32,
                 gwi_ptr as *const u32,
+                self.fwd_window,
+                ba_ptr as *const u32,
                 raw_stream,
             );
         }
@@ -1312,6 +1323,7 @@ pub fn paged_glue_attn(
     col_actual_pos: &Tensor,
     rope_cs: &Tensor,
     rope_interleaved: bool,
+    fwd_window: usize,
     generation: &Generation,
 ) -> Result<Tensor> {
     if head_dim != 128 {
@@ -1437,6 +1449,16 @@ pub fn paged_glue_attn(
     let glue_write_slice = Tensor::from_vec(wslice, total_q.max(1), device)?;
     let glue_write_in_blk = Tensor::from_vec(winblk, total_q.max(1), device)?;
     let cu_kvlens = Tensor::from_vec(cu_kv, b_sz + 1, device)?;
+
+    // Forward B-head window availability. On this assembly path the per-slot
+    // `position_map` and `col_actual_pos` cover exactly `[0, kv_len)` — section B
+    // is NOT yet staged downstream of the glue in the same slot — so no slot has B
+    // columns resident after `kv_len` and `b_avail` is all-zero. With `fwd_b =
+    // min(fwd_window, 0) == 0` the kernel runs backward-only (bit-identical). When
+    // the B-forward staging lands (extending `position_map` / `col_actual_pos` /
+    // `cu_kvlens` with B's leading columns at their assembled positions), this is
+    // where the real per-slot residency count is computed.
+    let b_avail = Tensor::zeros(b_sz, DType::U32, device)?;
     profile_sync(device);
     pipeline_record("glue:hdr_meta", t_hdr);
 
@@ -1453,6 +1475,8 @@ pub fn paged_glue_attn(
         cu_kvlens,
         glue_write_slice,
         glue_write_in_blk,
+        fwd_window: fwd_window as u32,
+        b_avail,
         headers_ptr: header_upload.headers_ptr,
         batch_size: b_sz,
         max_glue,

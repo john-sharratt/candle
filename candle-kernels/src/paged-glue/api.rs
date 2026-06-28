@@ -46,6 +46,13 @@ extern "C" {
         cu_kvlens: *const u32,
         glue_write_slice: *const u32,
         glue_write_in_blk: *const u32,
+        // `fwd_window`: forward B-head window (tokens); `0` == backward-only
+        // (bit-identical to the pre-window kernel).
+        fwd_window: u32,
+        // `b_avail`: per-slot count of section-B columns resident in the slot's
+        // `position_map` after `kv_len` (`[batch]`). `fwd_b = min(fwd_window,
+        // b_avail[slot])`; all-zero leaves the kernel backward-only.
+        b_avail: *const u32,
         stream: *mut c_void,
     );
 
@@ -72,6 +79,8 @@ extern "C" {
         cu_kvlens: *const u32,
         glue_write_slice: *const u32,
         glue_write_in_blk: *const u32,
+        fwd_window: u32,
+        b_avail: *const u32,
         stream: *mut c_void,
     );
 }

@@ -734,6 +734,10 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             &g.col_actual_pos,
             rope_cs,
             rope_interleaved,
+            // Backward-only: B is not yet staged downstream of the glue in the
+            // slot's position_map / col_actual_pos on this path, so the forward
+            // B-head window stays closed (see `paged_glue_attn`'s `b_avail`).
+            0,
             generation,
         )?,
         _ => paged_prefill_batched(

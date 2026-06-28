@@ -15,6 +15,17 @@
 // v0: one block per (slot, kv_head); a per-column manual dot (correctness
 // first); query tokens tiled by G_TILE so the smem flash-state fits. The INT8
 // m16n8k32 MMA + split-KV + combine are layered on after the bit-exact gate.
+//
+// FORWARD WINDOW (fwd_window / b_avail): glue rows attend the prefix (A) and
+// earlier glue causally AND, additionally, the first `fwd_b` columns of the next
+// section (B), so glue is generated as a bridge INTO B, not a blind continuation
+// of A. B columns are read-only here (never scattered — B is immutable) and must
+// already be resident in the slot's position_map at [kv_len, kv_len+fwd_b) with
+// assembled positions in col_actual_pos. The window is asymmetric BY DESIGN:
+// backward is unbounded (A is true, fixed context — free and consistent to read),
+// forward is capped (B's leading keys are stale, written against B's original,
+// now-deleted neighbourhood — read only as far as B's heads reach back, ~16-32
+// tokens). fwd_b==0 is bit-identical to the backward-only kernel.
 // =============================================================================
 
 #include "../paged-decode/int8_decode_kernel.cuh"
@@ -53,7 +64,9 @@ __global__ void paged_glue_kernel(
     const uint32_t* __restrict__ col_actual_pos,
     const uint32_t* __restrict__ cu_kvlens,
     const uint32_t* __restrict__ glue_write_slice,
-    const uint32_t* __restrict__ glue_write_in_blk
+    const uint32_t* __restrict__ glue_write_in_blk,
+    uint32_t fwd_window,                       // forward B-head window (tokens); 0 == backward-only
+    const uint32_t* __restrict__ b_avail       // per-slot count of B columns resident after kv_len
 ) {
     constexpr int N_PALETTE = 4;
     constexpr int SUB_HEAD_DIM = HEAD_DIM / N_PALETTE;
@@ -89,6 +102,22 @@ __global__ void paged_glue_kernel(
     const int kv_len = (int)kv_lens[slot_idx];
     const int prefix_len = kv_len - g_total;
     const int kv_base = (int)cu_kvlens[slot_idx];
+
+    // ── Forward B-head window ────────────────────────────────────────────
+    // Glue rows may also attend the first `fwd_b` columns of the NEXT section
+    // (B), so the glue is generated as a bridge INTO B rather than as a blind
+    // continuation of A. These B columns are assumed already resident in THIS
+    // slot's position_map at packed indices [kv_len, kv_len+fwd_b), with
+    // col_actual_pos carrying their assembled (downstream-of-glue) positions —
+    // so the existing dequant-once + per-column RoPE path handles them with no
+    // special case, and the glue→B relative phase is correct by construction.
+    // Clamped per-slot to what is actually present: the last section / a short B
+    // yields a smaller window; b_avail==0 yields none. fwd_b==0 makes this
+    // kernel BIT-IDENTICAL to the backward-only path (same column set, same mask).
+    // NOTE: if B is NOT in this slot's position_map, fwd_b must be 0 — the
+    // separate-slot layout needs a different staging path and is out of scope here.
+    const int fwd_b = min((int)fwd_window, (int)b_avail[slot_idx]);
+    const int stream_cols = kv_len + fwd_b;
 
     // This block handles ONE query-row tile of GLUE_G_TILE glue tokens. The tiles
     // run in parallel across gridDim.z so different tiles' prefix streams (the
@@ -212,10 +241,10 @@ __global__ void paged_glue_kernel(
         // column's true sequence position (causal mask + RoPE).
         int cur_slice = -1;             // per-warp: this warp's last-seen slice
         PalIter<VEC, HEAD_DIM> ki, vi;  // per-warp un-permute maps
-        for (int c0 = 0; c0 < kv_len; c0 += TILE_COLS) {
+        for (int c0 = 0; c0 < stream_cols; c0 += TILE_COLS) {   // was kv_len; +fwd_b covers B-head
             const int c = c0 + warp; // this warp's column
             int col_pos = 0;
-            if (c < kv_len) {
+            if (c < stream_cols) {                              // was kv_len
                 int slice_idx = 0, in_blk = 0;
                 resolve_pos(slot, c, slice_idx, in_blk);
                 const uint8_t* sl = get_slice<HEAD_DIM>(slices_ptr, slice_idx, n_kv_head);
@@ -271,7 +300,7 @@ __global__ void paged_glue_kernel(
             }
             __syncthreads(); // all warps' tile columns staged into k_col/v_col
 
-            const int tile_cols = min(TILE_COLS, kv_len - c0);
+            const int tile_cols = min(TILE_COLS, stream_cols - c0);  // was kv_len
 
             // Score the tile's columns against this warp's rows, accumulating the
             // online-softmax state in registers. `m_reg`/`l_reg` stay
@@ -284,8 +313,19 @@ __global__ void paged_glue_kernel(
                 const int t = g0 + row / hpg;
                 const int row_pos = (int)col_actual_pos[kv_base + prefix_len + t];
                 for (int cc = 0; cc < tile_cols; ++cc) {
-                    const int cpos = (int)col_actual_pos[kv_base + c0 + cc];
-                    if (cpos > row_pos) continue; // causal (actual position)
+                    const int cabs = c0 + cc;                       // packed column index
+                    const int cpos = (int)col_actual_pos[kv_base + cabs];
+                    // Columns [0, kv_len)        : prefix (A) + glue — causal by
+                    //                              actual position (backward look,
+                    //                              unbounded over A; glue stays
+                    //                              causal among itself).
+                    // Columns [kv_len, stream_cols): B-head forward window — always
+                    //                              visible to glue rows regardless of
+                    //                              position (this is the +fwd_b look).
+                    //                              Only B is opened forward; glue↔glue
+                    //                              causality is unchanged.
+                    const bool fwd_b_col = (cabs >= kv_len);
+                    if (!fwd_b_col && cpos > row_pos) continue; // causal (actual position)
                     float dot = 0.f;
                     #pragma unroll
                     for (int j = 0; j < VEC; ++j)
@@ -351,6 +391,8 @@ inline void launch_paged_glue_attn(
     const uint32_t* cu_kvlens,
     const uint32_t* glue_write_slice,
     const uint32_t* glue_write_in_blk,
+    uint32_t fwd_window,            // forward B-head window (tokens); 0 == backward-only
+    const uint32_t* b_avail,        // per-slot count of B columns resident after kv_len
     cudaStream_t stream
 ) {
     constexpr int WARPS_PER_BLOCK = 8;
@@ -375,7 +417,8 @@ inline void launch_paged_glue_attn(
         q, headers_ptr, out, batch, n_q_head, n_kv_head, softmax_scale,
         k_new, v_new, rope_cs, rope_interleaved != 0,
         cu_seqlens_q, q_lens, kv_lens, col_actual_pos, cu_kvlens,
-        glue_write_slice, glue_write_in_blk);
+        glue_write_slice, glue_write_in_blk,
+        fwd_window, b_avail);
     cudaError_t e2 = cudaGetLastError();
     if (e1 != cudaSuccess || e2 != cudaSuccess) {
         printf("[GLUE LAUNCH] smem_req=%zu dev_max=%d setattr=%s launch=%s\n",

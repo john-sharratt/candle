@@ -23,7 +23,7 @@ use candle_nn::kv_cache::{
 };
 use candle_transformers::models::prefill_utils::compute_rope_cs;
 use candle_transformers::models::slot_state::{
-    tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
+    pack_position_entry, tensor_u8_device_ptr, SlotStateHost, TokenSliceHost,
 };
 
 const N_KV_HEAD: usize = 2;
@@ -134,6 +134,91 @@ fn reference_attn(
                 let mut acc = 0f32;
                 for (col, &w) in scores.iter().enumerate() {
                     acc += w * kv_at(col, kvh, d, &vs, &vg);
+                }
+                out[(t * N_HEAD + h) * HEAD_DIM + d] = acc / denom;
+            }
+        }
+    }
+    Tensor::from_vec(out, (glue, N_HEAD, HEAD_DIM), device)
+}
+
+/// Forward-window golden: like [`reference_attn`] but each glue row ADDITIONALLY
+/// attends the first `fwd_b` columns of section B unconditionally (the forward
+/// look), on top of its causal `[A | glue]` columns. Identity RoPE. This is the
+/// ground truth the kernel must reproduce when B is resident in the slot's
+/// position_map at `[kv_len, kv_len+fwd_b)`.
+#[allow(clippy::too_many_arguments)]
+fn reference_attn_fwd(
+    q_glue: &Tensor,
+    k_seal: &Tensor,
+    v_seal: &Tensor,
+    k_glue: &Tensor,
+    v_glue: &Tensor,
+    k_b: &Tensor,
+    v_b: &Tensor,
+    sealed: usize,
+    glue: usize,
+    fwd_b: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let hpg = N_HEAD / N_KV_HEAD;
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let flat = |t: &Tensor| -> Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1() };
+    let qd = flat(q_glue)?; // [glue,N_HEAD,HD]
+    let ks = flat(k_seal)?; // [sealed,N_KV,HD]
+    let vs = flat(v_seal)?;
+    let kg = flat(k_glue)?; // [glue,N_KV,HD]
+    let vg = flat(v_glue)?;
+    let kb = flat(k_b)?; // [b_len,N_KV,HD]
+    let vb = flat(v_b)?;
+    // Causal column `col` of [A | glue]: A for col<sealed else glue.
+    let cg = |col: usize, kvh: usize, d: usize, src: &[f32], srcg: &[f32]| -> f32 {
+        if col < sealed {
+            src[(col * N_KV_HEAD + kvh) * HEAD_DIM + d]
+        } else {
+            srcg[((col - sealed) * N_KV_HEAD + kvh) * HEAD_DIM + d]
+        }
+    };
+    let bcol = |col: usize, kvh: usize, d: usize, src: &[f32]| -> f32 {
+        src[(col * N_KV_HEAD + kvh) * HEAD_DIM + d]
+    };
+    let mut out = vec![0f32; glue * N_HEAD * HEAD_DIM];
+    for t in 0..glue {
+        let pos = sealed + t; // causal columns are 0..=pos
+        for h in 0..N_HEAD {
+            let kvh = h / hpg;
+            // Scores: pos+1 causal columns, then fwd_b forward B columns.
+            let mut scores = vec![0f32; pos + 1 + fwd_b];
+            let mut m = f32::NEG_INFINITY;
+            for (col, sc) in scores.iter_mut().enumerate().take(pos + 1) {
+                let mut dot = 0f32;
+                for d in 0..HEAD_DIM {
+                    dot += qd[(t * N_HEAD + h) * HEAD_DIM + d] * cg(col, kvh, d, &ks, &kg);
+                }
+                *sc = dot * scale;
+                m = m.max(*sc);
+            }
+            for bc in 0..fwd_b {
+                let mut dot = 0f32;
+                for d in 0..HEAD_DIM {
+                    dot += qd[(t * N_HEAD + h) * HEAD_DIM + d] * bcol(bc, kvh, d, &kb);
+                }
+                let s = dot * scale;
+                scores[pos + 1 + bc] = s;
+                m = m.max(s);
+            }
+            let mut denom = 0f32;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - m).exp();
+                denom += *sc;
+            }
+            for d in 0..HEAD_DIM {
+                let mut acc = 0f32;
+                for (col, &w) in scores.iter().enumerate().take(pos + 1) {
+                    acc += w * cg(col, kvh, d, &vs, &vg);
+                }
+                for bc in 0..fwd_b {
+                    acc += scores[pos + 1 + bc] * bcol(bc, kvh, d, &vb);
                 }
                 out[(t * N_HEAD + h) * HEAD_DIM + d] = acc / denom;
             }
@@ -271,7 +356,66 @@ fn dev_ptr_f16(t: &Tensor) -> Result<u64> {
     Ok(p)
 }
 
+/// A resident "section B" (the forward window): B's K/V sealed in its own F16
+/// backing, with `TokenSliceHost` slices resolved against that backing. The
+/// backing/cache are held alive by the struct so the device arena pointers baked
+/// into the slices stay valid through the kernel launch.
+struct BSection {
+    _backing: ChunkedKvBacking,
+    _cache: KvCache,
+    /// B's sealed-chunk slices (arena pointers resolved against `_backing`).
+    slices: Vec<TokenSliceHost>,
+    /// Assembled (downstream-of-glue) sequence position of each B column
+    /// (`len == b_len`). Identity RoPE in the tests makes the value numerically
+    /// inert, but it mirrors the production `col_actual_pos` layout.
+    positions: Vec<u32>,
+    b_len: usize,
+}
+
+/// Build section B as sealed F16 chunks in a fresh backing — the same way the
+/// prefix is built — and resolve its slices, ready to be appended into another
+/// slot's `position_map` at `[kv_len, kv_len+b_len)`.
+fn build_b_section(
+    k_b: &Tensor,
+    v_b: &Tensor,
+    b_len: usize,
+    assembled_base: usize,
+    device: &Device,
+) -> Result<BSection> {
+    let backing = fresh_backing(device)?;
+    let mut cache = bind_cache(&backing, 0)?;
+    build_sealed_arena(&backing, &mut cache, k_b, v_b, b_len)?;
+    let arena_info = backing.resolve_arena_info()?;
+    let chunks = cache
+        .k_cache()
+        .chunked_live_chunks_as_sealed()
+        .unwrap_or_default();
+    let mut cum: u32 = 0;
+    let slices: Vec<TokenSliceHost> = chunks
+        .iter()
+        .map(|c| {
+            let rope_base = cum;
+            cum += c.token_count as u32;
+            TokenSliceHost::from_sealed_chunk(c, rope_base, N_KV_HEAD, HEAD_DIM, &arena_info)
+        })
+        .collect();
+    let positions = (assembled_base as u32..(assembled_base + b_len) as u32).collect();
+    Ok(BSection {
+        _backing: backing,
+        _cache: cache,
+        slices,
+        positions,
+        b_len,
+    })
+}
+
 /// Append `glue` tokens over the cache's prefix via the glue kernel.
+///
+/// `fwd_window` is the forward B-head window cap; `b_section`, when present, is
+/// staged into this slot's `position_map` at `[kv_len, kv_len+b_len)` so the glue
+/// rows attend `min(fwd_window, b_len)` B columns. `(0, None)` is the
+/// backward-only path (bit-identical to the pre-window kernel).
+#[allow(clippy::too_many_arguments)]
 fn run_glue(
     backing: &ChunkedKvBacking,
     cache: &mut KvCache,
@@ -282,6 +426,8 @@ fn run_glue(
     rope_cs: &Tensor,
     stager: &PinnedStager,
     device: &Device,
+    fwd_window: usize,
+    b_section: Option<&BSection>,
 ) -> Result<(Tensor, f64)> {
     let prefix_len = cache.current_seq_len();
     let kv_len = prefix_len + glue;
@@ -302,6 +448,26 @@ fn run_glue(
         true,
     );
     slot.extend_for_write_region(glue, CHUNK_SIZE);
+
+    // Stage section B (the forward window) into THIS slot's position_map at packed
+    // indices [kv_len, kv_len+b_len): append B's slices and map B's columns onto
+    // them. B is read-only — the glue scatter only writes `t < glue` — exactly the
+    // layout the kernel's forward window assumes.
+    let mut b_positions: Vec<u32> = Vec::new();
+    if let Some(bs) = b_section {
+        let b_slice_base = slot.slices.len();
+        for s in &bs.slices {
+            slot.slices.push(s.clone());
+        }
+        for (li, s) in bs.slices.iter().enumerate() {
+            let sidx = (b_slice_base + li) as u32;
+            let off = s.offset as u32;
+            for i in 0..s.len as u32 {
+                slot.position_map.push(pack_position_entry(sidx, off + i));
+            }
+        }
+        b_positions = bs.positions.clone();
+    }
 
     // Two-section layout, mirroring build_slot_headers: resident slices
     // (meta=Some, quantized prefix) point kvheads_ptr at their device meta-pool
@@ -360,16 +526,17 @@ fn run_glue(
     let glue_write_slice = Tensor::from_vec(wslice, glue, device)?;
     let glue_write_in_blk = Tensor::from_vec(winblk, glue, device)?;
 
-    // Varlen meta (single slot) + identity col_actual_pos.
+    // Varlen meta (single slot) + identity col_actual_pos for [0, kv_len), then
+    // B's assembled positions for the forward window at [kv_len, kv_len+b_len).
     let cu_seqlens_q = Tensor::from_vec(vec![0u32, glue as u32], 2, device)?;
     let q_lens = Tensor::from_vec(vec![glue as u32], 1, device)?;
     let kv_lens = Tensor::from_vec(vec![kv_len as u32], 1, device)?;
     let cu_kvlens = Tensor::from_vec(vec![0u32, kv_len as u32], 2, device)?;
-    let col_actual_pos = Tensor::from_vec(
-        (0..kv_len as u32).collect::<Vec<_>>(),
-        kv_len.max(1),
-        device,
-    )?;
+    let mut cap: Vec<u32> = (0..kv_len as u32).collect();
+    cap.extend_from_slice(&b_positions);
+    let col_actual_pos = Tensor::from_vec(cap.clone(), cap.len().max(1), device)?;
+    let b_avail_n = b_section.map(|bs| bs.b_len).unwrap_or(0);
+    let b_avail = Tensor::from_vec(vec![b_avail_n as u32], 1, device)?;
 
     // 24-byte SlotHeader.
     let mut hdr = Vec::with_capacity(24);
@@ -429,6 +596,8 @@ fn run_glue(
             dev_ptr_u32(&cu_kvlens)? as *const u32,
             dev_ptr_u32(&glue_write_slice)? as *const u32,
             dev_ptr_u32(&glue_write_in_blk)? as *const u32,
+            fwd_window as u32,
+            dev_ptr_u32(&b_avail)? as *const u32,
             stream_ptr,
         );
     }
@@ -493,6 +662,8 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
             &rope_cs,
             &stager,
             &device,
+            0,
+            None,
         )?;
 
         let diff = max_abs_diff(&out_a, &out_b)?;
@@ -505,6 +676,93 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
     if !failures.is_empty() {
         candle::bail!(
             "paged-glue diverged from normal prefill in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// Forward-window gate: with section B resident in the slot's position_map at
+/// `[kv_len, kv_len+b_len)`, glue rows must attend the first `min(fwd_window,
+/// b_len)` columns of B. Two properties are checked per case:
+///   1. the forward output matches the forward golden (glue→B cross-attention),
+///   2. it DIFFERS from the backward-only (`fwd_window==0`) output — proving the
+///      window actually opened B rather than being a silent no-op.
+/// `fwd_window` is also driven above and below `b_len` to exercise the per-slot
+/// `min(fwd_window, b_avail)` clamp.
+#[test]
+fn paged_glue_forward_window_f16() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+
+    // (sealed, glue, b_len, fwd_window): the last two cases drive fwd_window below
+    // and above b_len to exercise the clamp (effective fwd_b = min(fwd_window, b)).
+    let cases: &[(usize, usize, usize, usize)] =
+        &[(32, 8, 16, 16), (64, 12, 24, 8), (100, 20, 16, 32)];
+    let mut failures = Vec::new();
+
+    for &(sealed, glue, b_len, fwd_window) in cases {
+        let fwd_b = fwd_window.min(b_len);
+        let (_q_seal, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ sealed as u64, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ glue as u64, &device)?;
+        let (_q_b, k_b, v_b) = make_qkv(b_len, 0xB0B ^ b_len as u64, &device)?;
+
+        // Backward-only kernel (fwd_window == 0): no B in the stream.
+        let backing_bwd = fresh_backing(&device)?;
+        let mut cache_bwd = bind_cache(&backing_bwd, 0)?;
+        build_sealed_arena(&backing_bwd, &mut cache_bwd, &k_seal, &v_seal, sealed)?;
+        let (out_bwd, _) = run_glue(
+            &backing_bwd, &mut cache_bwd, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager,
+            &device, 0, None,
+        )?;
+
+        // Forward kernel: B resident, attend min(fwd_window, b_len) of it.
+        let bsec = build_b_section(&k_b, &v_b, b_len, sealed + glue, &device)?;
+        let backing_fwd = fresh_backing(&device)?;
+        let mut cache_fwd = bind_cache(&backing_fwd, 0)?;
+        build_sealed_arena(&backing_fwd, &mut cache_fwd, &k_seal, &v_seal, sealed)?;
+        let (out_fwd, _) = run_glue(
+            &backing_fwd, &mut cache_fwd, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager,
+            &device, fwd_window, Some(&bsec),
+        )?;
+
+        // Forward golden (glue→B open) — the kernel must reproduce it.
+        let out_ref = reference_attn_fwd(
+            &q_glue, &k_seal, &v_seal, &k_glue, &v_glue, &k_b, &v_b, sealed, glue, fwd_b, &device,
+        )?;
+
+        let diff_ref = max_abs_diff(&out_ref, &out_fwd)?;
+        let diff_open = max_abs_diff(&out_bwd, &out_fwd)?;
+        eprintln!(
+            "paged-glue fwd (sealed={sealed}, glue={glue}, b_len={b_len}, fwd_window={fwd_window} \
+             -> fwd_b={fwd_b}): diff_vs_ref={diff_ref:.6e}, diff_vs_backward={diff_open:.6e}"
+        );
+        if !(diff_ref < DIFF_TOLERANCE) {
+            failures.push(format!(
+                "(sealed={sealed}, glue={glue}, fwd_b={fwd_b}): forward output != golden, diff={diff_ref:.6e}"
+            ));
+        }
+        // With fwd_b > 0 and B resident, opening the window MUST change the output;
+        // a ~0 delta means B was not actually in the stream (the no-op case).
+        if !(diff_open > 1e-3) {
+            failures.push(format!(
+                "(sealed={sealed}, glue={glue}, fwd_b={fwd_b}): forward window did not change output (diff_vs_backward={diff_open:.6e}) — B not in the stream"
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        candle::bail!(
+            "paged-glue forward window failed in {} case(s):\n  - {}",
             failures.len(),
             failures.join("\n  - ")
         );
@@ -544,7 +802,8 @@ fn paged_glue_kernel_timing() -> Result<()> {
             &backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device,
         )?;
         let (_out, ms) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, 0,
+            None,
         )?;
         Ok(ms)
     };
@@ -610,7 +869,8 @@ fn paged_glue_matches_golden_quant() -> Result<()> {
             &backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device,
         )?;
         let (out, _ms) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, 0,
+            None,
         )?;
 
         let diff = max_abs_diff(&out_ref, &out)?;

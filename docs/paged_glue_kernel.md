@@ -103,7 +103,38 @@ the per-slot `SlotHeader`s via the shared `build_slot_headers`, the glue write
 targets, and `cu_kvlens`, then launches the kernel through the `PagedGlueChunks`
 op). Other head dims fall through to plain `paged_prefill_batched`.
 
-## 6. Reuse from paged-decode
+## 6. Forward B-head window
+
+By default glue rows attend **backward only** — the sealed prefix (A) plus
+earlier glue, masked causally by true position. The optional **forward window**
+additionally opens the first `fwd_b` columns of the *next* section (B), so glue
+is generated as a bridge **into** B rather than a blind continuation of A.
+
+- **Kernel** (`fwd_window` / `b_avail`): `fwd_b = min(fwd_window, b_avail[slot])`
+  extends the column stream to `[0, kv_len + fwd_b)`. Columns `[kv_len,
+  kv_len+fwd_b)` are B; the causal test is skipped for them (always visible),
+  while glue↔glue causality is unchanged. B is **read-only** — the scatter still
+  writes only `t < g_total`. `fwd_b == 0` is bit-identical to the backward-only
+  kernel (same column set, same mask).
+- **Asymmetric by design.** Backward is unbounded (A is true, fixed context —
+  free and consistent to read); forward is capped at B's leading keys, which are
+  stale (written against B's original, now-deleted neighbourhood) and only
+  meaningful as far as B's heads reach back (~16–32 tokens).
+- **Layout assumption.** B's leading columns must already be resident in the
+  slot's `position_map` at `[kv_len, kv_len+fwd_b)`, with `col_actual_pos`
+  carrying their assembled (downstream-of-glue) positions — then the existing
+  dequant-once + per-column RoPE path handles them with no special case. If B
+  lives in a separate slot/allocation it is **not** in this position_map and the
+  window must stay closed (`b_avail == 0`); staging it there is a separate path.
+- **Status.** Threaded end-to-end (kernel → FFI → `PagedGlueChunks` →
+  `paged_glue_attn`). The production reproject path passes `fwd_window == 0` (B is
+  not yet staged downstream of the glue in the slot's position_map), so the window
+  is **landed dark**; the kernel gate `paged_glue_forward_window_f16` proves
+  correctness by staging B into the slot's position_map and matching a glue→B-head
+  cross-attention golden, while requiring the output to differ from the
+  backward-only run.
+
+## 7. Reuse from paged-decode
 
 | Reused from paged-decode | Role in glue |
 |---|---|
@@ -117,7 +148,7 @@ New code is the tile-streamed dequant loop, the smem flash-state, the
 `G_TILE × hpg` row scoring, the per-glue-row writeback targets, and the
 launcher/FFI/host wiring (`PagedGlueChunks`, `paged_glue_attn`).
 
-## 7. Remaining levers (diminishing)
+## 8. Remaining levers (diminishing)
 
 - **Register-resident `O`.** The prefill already keeps its output accumulator in
   per-thread MMA-fragment registers (`smem table: "O accumulators | registers |
