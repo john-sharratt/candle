@@ -46,22 +46,33 @@ fn build_test_projection() -> projection::Builder {
     .expect("projection.yaml must parse")
 }
 
+/// Find the dialogue layer's `tools` collection — top-level OR embedded as a
+/// section-tree node (the catalog sits under the `no_think` selector, so it is
+/// a prefix-transparent tree-collection node rather than a top-level item).
+fn tools_collection(builder: &projection::Builder) -> Option<&projection::SectionCollection> {
+    let dialogue = builder.id_for_layer("dialogue")?;
+    for it in &builder.layer(dialogue).unwrap().system_prompt.items {
+        match it {
+            SystemPromptItem::Collection(c) if c.name == "tools" => return Some(c),
+            SystemPromptItem::SectionTree(t) => {
+                for n in &t.nodes {
+                    if let Some(tc) = &n.collection {
+                        if tc.collection.name == "tools" {
+                            return Some(&tc.collection);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Helper: count tool sections currently in the dialogue layer's
-/// `tools` collection.
+/// `tools` collection (the canonical default-branch members).
 fn n_tools_in_collection(builder: &projection::Builder) -> usize {
-    let dialogue = builder.id_for_layer("dialogue").expect("dialogue");
-    builder
-        .layer(dialogue)
-        .unwrap()
-        .system_prompt
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            SystemPromptItem::Collection(c) if c.name == "tools" => Some(c.sections.len()),
-            _ => None,
-        })
-        .next()
-        .unwrap_or(0)
+    tools_collection(builder).map_or(0, |c| c.sections.len())
 }
 
 // ── install_tool_catalog ─────────────────────────────────────────────────────
@@ -95,11 +106,7 @@ fn install_tool_catalog_uses_existing_yaml_collection_topk() {
     let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
     install_tool_catalog(&mut builder, dialogue).unwrap();
 
-    let layer = builder.layer(dialogue).unwrap();
-    let coll = layer
-        .system_prompt
-        .collection_named("tools")
-        .expect("tools collection must exist");
+    let coll = tools_collection(&builder).expect("tools collection must exist");
     match coll.selection {
         projection::SelectionRule::TopK { k } => {
             assert!(k >= 1, "top-k must keep at least one tool");

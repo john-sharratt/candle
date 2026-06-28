@@ -224,6 +224,7 @@ impl Conversation {
         let user_text = write.user_text.clone();
         let assistant_text = write.assistant_text.clone();
         let content_bounds = write.content_bounds;
+        let no_think = write.no_think;
         let idx = {
             let mut view = self.inner.write().unwrap();
             view.append_complete(timeline, write, migrate_to_cpu)?
@@ -253,6 +254,7 @@ impl Conversation {
             user_content_start: content_bounds.user_start,
             user_content_end: content_bounds.user_end,
             assistant_content_start: content_bounds.asst_start,
+            no_think,
             user_text,
             assistant_text,
         });
@@ -309,6 +311,7 @@ impl Conversation {
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
+            no_think: false,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -474,6 +477,7 @@ impl Conversation {
                     decl.assistant_content_start as usize,
                     token_count,
                 ),
+                decl.no_think,
                 cold_refs,
                 decl.block_start,
                 decl.block_end,

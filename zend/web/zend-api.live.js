@@ -58,7 +58,7 @@
       (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.index] = { user: t.user, assistant: t.assistant }; });
       return {
         id: String(id),
-        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, spans: m.spans || [] })),
+        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, spans: m.spans || [] })),
         glue: body.glue || null,
         sectionContent,
         turnContent,

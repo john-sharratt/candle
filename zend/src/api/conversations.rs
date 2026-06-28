@@ -77,10 +77,21 @@ pub async fn get(
     // so the client renders one bubble per role without any ChatML parsing.
     let mut messages: Vec<HistoryMessage> = history
         .into_iter()
-        .flat_map(|(role, content)| crate::chatml::split_turn(role, &content))
-        .map(|(role, content)| HistoryMessage {
+        .flat_map(|(role, content, no_think)| {
+            // The turn's `no_think` belongs on the USER bubble only — a bundled
+            // turn can split into both roles, so tag the assistant half `false`
+            // (the GUI renders the `/no_think` glue only on user bubbles anyway).
+            crate::chatml::split_turn(role, &content)
+                .into_iter()
+                .map(move |(r, c)| {
+                    let user_no_think = no_think && r == Role::User;
+                    (r, c, user_no_think)
+                })
+        })
+        .map(|(role, content, no_think)| HistoryMessage {
             role: role_str(role),
             content,
+            no_think,
             spans: Vec::new(),
         })
         .collect();
@@ -233,6 +244,13 @@ pub struct SectionContent {
 pub struct HistoryMessage {
     pub role: &'static str,
     pub content: String,
+    /// Whether this turn was generated with thinking suppressed (the `/no_think`
+    /// dial active at submit).  Set on USER bubbles; the GUI re-renders the
+    /// `/no_think` soft-switch (`Glue.no_think`) right after `user_start` on each
+    /// prior user bubble where this is true — mirroring what the engine's
+    /// assembler now injects into the real model input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_think: bool,
     /// Projection-event timeline for this bubble (assistant turns only).
     /// Omitted from the wire when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]

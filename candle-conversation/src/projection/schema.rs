@@ -109,6 +109,11 @@ impl SystemPromptSchema {
                         n.options
                             .iter()
                             .flat_map(|o| o.variants.iter().map(|v| v.id))
+                            .chain(
+                                n.collection
+                                    .iter()
+                                    .flat_map(|tc| tc.variants.iter().flatten().map(|v| v.id)),
+                            )
                     })),
                 }
             })
@@ -139,6 +144,13 @@ impl SystemPromptSchema {
     pub fn is_collection_member(&self, section_id: super::ids::SectionId) -> bool {
         self.items.iter().any(|it| match it {
             SystemPromptItem::Collection(c) => c.sections.iter().any(|s| s.id == section_id),
+            // Members of a collection embedded as a tree node are collection
+            // members too — every per-branch variant id is one.
+            SystemPromptItem::SectionTree(t) => t.nodes.iter().any(|n| {
+                n.collection
+                    .as_ref()
+                    .is_some_and(|tc| tc.variants.iter().flatten().any(|v| v.id == section_id))
+            }),
             _ => false,
         })
     }
@@ -218,14 +230,35 @@ impl SectionTree {
     /// Pack the sub-assignment over the first `dim_count` dims into a mixed-radix
     /// key — the [`TreeVariant::ancestors`] key for a node with that many
     /// ancestor dims.
+    ///
+    /// A gated dim ([`TreeDim::gate`]) that is currently OUT OF SCOPE (its
+    /// enclosing group is on the other branch) is masked to its `default_option`,
+    /// because the sealed variant for that branch was keyed with the default — the
+    /// out-of-scope dim never multiplied it.  Trees with no gated dims pack
+    /// byte-identically to the raw `selection`.
     pub fn pack(&self, selection: &[u8], dim_count: usize) -> u32 {
         let mut key = 0u32;
         let mut mult = 1u32;
         for d in 0..dim_count {
-            key += selection[d] as u32 * mult;
+            let val = if self.dim_active(selection, d) {
+                selection[d]
+            } else {
+                self.dims[d].default_option
+            };
+            key += val as u32 * mult;
             mult *= self.dims[d].option_count as u32;
         }
         key
+    }
+
+    /// Whether dim `d` is in scope for `selection` — i.e. every gate in its chain
+    /// (the enclosing `optional_group` toggles) holds its active value.  A gate
+    /// dim `g` is always declared before `d`, so the recursion is well-founded.
+    fn dim_active(&self, selection: &[u8], d: usize) -> bool {
+        match self.dims[d].gate {
+            None => true,
+            Some((g, v)) => selection[g] == v && self.dim_active(selection, g),
+        }
     }
 }
 
@@ -242,16 +275,44 @@ pub struct TreeDim {
     pub option_count: u8,
     /// Default option index when the runtime supplies no selection.
     pub default_option: u8,
+    /// `Some((g, v))` when this dim lives INSIDE an `optional_group` branch — it
+    /// is "active" only while gate-dim `g` (an enclosing group's toggle) holds
+    /// value `v` (the active side).  When the gate is off the dim is OUT OF SCOPE:
+    /// the other branch never multiplied by it, and was sealed at this dim's
+    /// `default_option`, so [`SectionTree::pack`] masks the runtime value back to
+    /// the default to land on that sealed variant.  `None` for top-level dims
+    /// (always active — the common case, masking is a no-op).
+    pub gate: Option<(usize, u8)>,
 }
 
-/// One node in a [`SectionTree`] — a section that emits one of its options.
+/// One node in a [`SectionTree`] — a section that emits one of its options, or
+/// a prefix-transparent embedded collection ([`Self::collection`]).
 #[derive(Debug, Clone)]
 pub struct TreeNode {
     /// Declared id (its YAML `id:`).
     pub name: String,
     /// The options this node can emit.  `len() == 1` ⇒ mandatory (always that
     /// content).  `len() > 1` ⇒ a selector dimension (see [`Self::dim`]).
+    /// Empty when this node is a collection node ([`Self::collection`]).
     pub options: Vec<TreeOption>,
+    /// `Some` when this node is an embedded collection: its members are scored
+    /// + top-k selected at projection, sealed ×(ancestor dims), and the node
+    /// adds NOTHING to the in-tree prefix of nodes below it.
+    pub collection: Option<TreeCollection>,
+    /// `Some(cid)` when this node is a PLACEHOLDER whose *projection* is replaced
+    /// by collection `cid`'s top-k selection.  The node still seals + emits its
+    /// own content into the K/V prefix (so nodes below it anchor on a stable
+    /// placeholder, e.g. a `noop` tool), but at projection it is swapped for the
+    /// provenance-selected real members.  The referenced collection sets
+    /// [`TreeCollection::deferred_projection`] so it does not also emit.
+    pub inject_collection: Option<CollectionId>,
+    /// `Some` when this node is a live-prefilled structural marker (a `dialect:`
+    /// section, e.g. `<tools>` / `</tools>`) rather than sealed content: it
+    /// allocates NO sealed variants, is PREFIX-TRANSPARENT (nodes below seal as if
+    /// it were not there), and at projection emits a [`ProjectionSegment::Generated`]
+    /// run — but only in the branches it lives in (gated, see [`TreeGlue`]).  Its
+    /// marker text stays in `options[0].content` (for tokenisation + the GUI label).
+    pub glue: Option<TreeGlue>,
     /// Index into [`SectionTree::dims`] when this node is a selector, else `None`.
     pub dim: Option<usize>,
     /// How many selector dims are declared **before** this node — the width of
@@ -259,9 +320,23 @@ pub struct TreeNode {
     pub ancestor_dims: usize,
 }
 
+/// A live-prefilled structural marker in a [`SectionTree`] ([`TreeNode::glue`]).
+#[derive(Debug, Clone)]
+pub struct TreeGlue {
+    /// The marker's pre-tokenised tokens (populated by
+    /// [`super::Builder::tokenize_templates`]); the projection emits these as a
+    /// [`ProjectionSegment::Generated`] run, re-derived each projection.
+    pub tokens: Option<std::sync::Arc<Vec<u32>>>,
+    /// The packed ancestor keys (over the node's `ancestor_dims`) of the branches
+    /// this glue lives in — it emits only when the active selection's key is one
+    /// of these (e.g. a `<tools>` marker inside the `tools_enabled` present branch
+    /// emits only when tools are on).
+    pub active_keys: Vec<u32>,
+}
+
 impl TreeNode {
     /// The selector id this node exposes (its name when it is a dimension), or
-    /// `None` for a mandatory node.
+    /// `None` for a mandatory or collection node.
     pub fn selector_id(&self) -> Option<&str> {
         (self.options.len() > 1).then_some(self.name.as_str())
     }
@@ -269,6 +344,48 @@ impl TreeNode {
     /// The option index this node emits under `selection`.
     pub fn chosen(&self, selection: &[u8]) -> usize {
         self.dim.map_or(0, |d| selection[d] as usize)
+    }
+}
+
+/// A collection embedded as a [`TreeNode`] — scored + top-k selected at
+/// projection exactly like a top-level [`SectionCollection`], but
+/// PREFIX-TRANSPARENT (it contributes nothing to the in-tree prefix of nodes
+/// below it) and sealed ×(ancestor dims): each member carries one sealed
+/// variant per ancestor-branch assignment, so the members fan out across every
+/// outer selector declared above this node while the cheap selectors *below*
+/// it never multiply the members.
+#[derive(Debug, Clone)]
+pub struct TreeCollection {
+    /// Scoring + selection config and the canonical member schemas (name,
+    /// content, priority, [`CollectionId`] for `depends_on` gating).  The
+    /// `SectionSchema::id`s here are the default-branch variant ids; the full
+    /// per-branch sealed ids live in [`Self::variants`].
+    pub collection: SectionCollection,
+    /// Per member (declaration order) → one sealed [`TreeVariant`] per ancestor
+    /// branch.  `variants[member_index]` mirrors the member's per-branch seals.
+    pub variants: Vec<Vec<TreeVariant>>,
+    /// The ancestor branches this node fans out over — `(packed ancestor key,
+    /// in-tree prefix)` per outer-selector assignment, captured at build time.
+    /// Runtime member addition (`add_section_to_collection`) allocates one
+    /// sealed variant per branch from these templates.
+    pub branches: Vec<(u32, Vec<SectionId>)>,
+    /// The packed ancestor key of the default branch — the canonical variant
+    /// (the one that backs scoring, `depends_on` gating, and name resolution).
+    pub default_branch: u32,
+    /// When `true`, this collection does NOT emit its selection at its own tree
+    /// position — a placeholder node ([`TreeNode::inject_collection`]) below it
+    /// emits the top-k members instead.  Sealing is unchanged; only projection
+    /// position moves.
+    pub deferred_projection: bool,
+}
+
+impl TreeCollection {
+    /// The active-branch sealed variant for member `member_index`.
+    pub fn member_variant(&self, member_index: usize, ancestors: u32) -> Option<&TreeVariant> {
+        self.variants
+            .get(member_index)?
+            .iter()
+            .find(|v| v.ancestors == ancestors)
     }
 }
 
@@ -354,6 +471,15 @@ pub struct SectionCollection {
     /// a compact overview of everything, including what wasn't selected. Omitted when
     /// all members are selected (nothing was dropped) or the section isn't sealed yet.
     pub summary_section: Option<SectionId>,
+    /// Glue emitted BETWEEN consecutive selected members at projection — a real
+    /// structural token (e.g. a newline) that is NOT baked into any member's
+    /// seal, so it is independent of which members provenance selects.  `member_glue`
+    /// is the raw text; [`Self::member_glue_tokens`] is its build-time tokenisation
+    /// (populated by [`super::Builder::tokenize_templates`]).  Empty ⇒ no glue.
+    pub member_glue: String,
+    /// Tokenised [`Self::member_glue`], live-prefilled between members like a
+    /// structural template.  `None` until tokenised (or when `member_glue` is empty).
+    pub member_glue_tokens: Option<std::sync::Arc<Vec<u32>>>,
 }
 
 impl Default for SectionCollection {
@@ -367,6 +493,8 @@ impl Default for SectionCollection {
             depth_weights: None,
             summary: GroupSummary::default(),
             summary_section: None,
+            member_glue: String::new(),
+            member_glue_tokens: None,
         }
     }
 }
@@ -715,10 +843,22 @@ impl LayerSchema {
             .all_section_ids()
             .map(|id| id.raw())
             .collect();
+        let push_summary = |c: &SectionCollection, ids: &mut Vec<u32>| {
+            ids.push(c.summary.categorize.prompt.system_prompt.id.raw());
+            ids.push(c.summary.assign.prompt.system_prompt.id.raw());
+        };
         for item in &self.system_prompt.items {
-            if let SystemPromptItem::Collection(c) = item {
-                ids.push(c.summary.categorize.prompt.system_prompt.id.raw());
-                ids.push(c.summary.assign.prompt.system_prompt.id.raw());
+            match item {
+                SystemPromptItem::Collection(c) => push_summary(c, &mut ids),
+                // Tree-embedded collections carry their own summary prompts.
+                SystemPromptItem::SectionTree(t) => {
+                    for n in &t.nodes {
+                        if let Some(tc) = &n.collection {
+                            push_summary(&tc.collection, &mut ids);
+                        }
+                    }
+                }
+                SystemPromptItem::Section(_) => {}
             }
         }
         self.summary.push_section_ids(&mut ids);

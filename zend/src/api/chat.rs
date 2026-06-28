@@ -19,6 +19,11 @@ use crate::types::{
     ChunkChoice, CompletionChoice, Delta, Role,
 };
 
+/// The `optional_group` selector that gates the whole tool block in the dialogue
+/// section-tree (its `id:` in `projection.yaml`). Set to `present`/`absent` from
+/// the tools dial so a no-tools turn omits the block entirely.
+const TOOLS_ENABLED_SELECTOR: &str = "tools_enabled";
+
 /// `POST /v1/chat/completions`
 pub async fn completions(
     State(session): State<Arc<ZendSession>>,
@@ -58,7 +63,19 @@ pub async fn completions(
     // projection emits the matching thinking-effort / response-length directive
     // sections (and the `/no_think` node) on this and every subsequent turn until
     // the dials change.
-    let selection = dial_selection(req.effort, req.verbosity, req.think);
+    let mut selection = dial_selection(req.effort, req.verbosity, req.think);
+    // Gate the WHOLE tool block (overview, `<tools>`, catalog + glue, `</tools>`)
+    // on the tools dial via the `tools_enabled` optional_group: `None` omits the
+    // entire block (markers included), the other modes show it. Which *members*
+    // appear under Restricted vs Comprehensive is still the mode_builders' job.
+    selection.set_optional(
+        TOOLS_ENABLED_SELECTOR,
+        if matches!(tools_mode, crate::types::ToolMode::None) {
+            OptionalState::Absent
+        } else {
+            OptionalState::Present
+        },
+    );
     let messages = req.messages;
     if req.stream {
         stream_sse(

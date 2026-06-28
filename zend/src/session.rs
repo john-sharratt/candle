@@ -14,7 +14,7 @@ use candle_conversation::models::{Dialect, Model};
 use candle_conversation::persistence::record::{ToolSummaryEntry, ToolSummaryPayload};
 use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
 use candle_conversation::projection::{
-    self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
+    self, Builder, Reserved, SelectionRule, SystemPromptItem, TimelineId,
 };
 use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::{
@@ -343,6 +343,20 @@ impl InferenceState {
             "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
         );
 
+        // Tool-catalog overview goes into the `tool_summary` tree section as a
+        // REAL link in the K/V chain (before `<tools>`), so the catalog below
+        // genuinely attends it.  The text is deterministic from the installed
+        // tools' categories, so we write it here — before the section prefill —
+        // rather than re-prefilling a detached reserved section afterwards.  Set
+        // on `proj_builder` before its clones below so every mode builder + the
+        // base conversation seal the same overview.
+        let tool_overview = crate::tools::build_tool_summary(false);
+        if !tool_overview.is_empty() {
+            proj_builder
+                .set_tree_section_content(dialogue_layer, "tool_summary", &tool_overview)
+                .map_err(|e| anyhow::anyhow!("set tool_summary content: {e}"))?;
+        }
+
         // The dialogue layer's `system_prompt.items` start with a static
         // prelude (mode/frame/history_stance/grounding/tools_intro) →
         // then the `tools` collection (90+ tool sections, top_k=3) →
@@ -467,7 +481,7 @@ impl InferenceState {
         // refresh paths to mint fresh repo_map / code_reading
         // timelines when the watcher fires.
         let proj_builder_refresh = proj_builder.clone();
-        let mut base_conv = engine
+        let base_conv = engine
             .new_conversation_with_projection_progress(
                 &formatted_prompt,
                 proj_builder,
@@ -493,40 +507,30 @@ impl InferenceState {
             "base conversation ready (prelude + tool catalog + outro pinned at init)",
         );
 
-        // Tool-catalog summaries: one for "Comprehensive" tools mode (the full
-        // catalog) and one for "Restricted" mode (the safe / non-high-risk
-        // subset). Each is hashed against the catalog content it summarises and
-        // both are cached together in one redo-log record; a restart with an
-        // unchanged catalog pays only the hash compares. Regeneration is gated
-        // per mode, so a changed catalog regenerates both.
+        // Tool-catalog summary CACHE record — its catalog hash + text, read by the
+        // projection panel and used as the regeneration gate.  The summary that
+        // actually reaches the model is the `tool_summary` tree section sealed
+        // above (set on the builder before prefill, in the K/V chain); this block
+        // only keeps the redo-log record in sync.  One record holds both modes;
+        // a restart with an unchanged catalog pays only the hash/text compares.
         {
             let conv = engine.conversation();
-            let prelude = pre_tools_section_ids(&proj_builder_refresh);
-
-            // Resolve one mode's summary deterministically from the tools'
-            // `category` metadata — no model decode (the previous categorize→
-            // assign generation cost two decode stages over ~90 tools at every
-            // startup with a changed catalog). The catalog hash now only decides
-            // whether to rewrite the cached substrate record (read by the
-            // projection panel); the freshly built text is always what gets
-            // prefilled. Returns the record entry, the text to seal, and whether
-            // the cached record needs rewriting.
-            let resolve = |sections: &[crate::tool_summary::InstalledTool], restricted: bool| {
+            let resolve = |sections: &[crate::tool_summary::InstalledTool],
+                           restricted: bool|
+             -> (Option<ToolSummaryEntry>, bool) {
                 let text = crate::tools::build_tool_summary(restricted);
                 if text.is_empty() {
-                    return (None, None, false);
+                    return (None, false);
                 }
                 let hash = crate::tool_summary::catalog_hash(sections);
-                // Rewrite the cached record whenever the built text differs from
-                // what's persisted (compares text, not the catalog hash — the hash
-                // is unchanged by switching generators, but the text isn't, so the
-                // panel must converge to the deterministic output).
                 let changed = conv.read().tool_summary_text(restricted) != Some(text.as_str());
-                let entry = ToolSummaryEntry {
-                    catalog_hash: hash,
-                    summary: text.clone(),
-                };
-                (Some(entry), Some(text), changed)
+                (
+                    Some(ToolSummaryEntry {
+                        catalog_hash: hash,
+                        summary: text,
+                    }),
+                    changed,
+                )
             };
 
             let safe_names = crate::tools::safe_tool_names();
@@ -535,8 +539,8 @@ impl InferenceState {
                 .filter(|(name, _, _)| safe_names.contains(name))
                 .cloned()
                 .collect();
-            let (comp_entry, comp_text, comp_changed) = resolve(&tool_sections, false);
-            let (restr_entry, restr_text, restr_changed) = resolve(&safe_sections, true);
+            let (comp_entry, comp_changed) = resolve(&tool_sections, false);
+            let (restr_entry, restr_changed) = resolve(&safe_sections, true);
 
             // Persist both entries in one record when either regenerated. The
             // unchanged mode keeps its cached entry so it is not lost.
@@ -554,28 +558,6 @@ impl InferenceState {
                         tracing::info!("tool summaries persisted (comprehensive + restricted)");
                     }
                     Err(e) => tracing::warn!("tool summary persist failed: {e}"),
-                }
-            }
-
-            // Seal each mode's summary under its reserved section id, re-prefilled
-            // with the same pre-tools prefix so its KV is position-correct for
-            // "just before the tools". The Restricted projection points the tools
-            // collection at `ToolSummaryRestricted`, Comprehensive at `ToolSummary`;
-            // None emits neither.
-            for (text, reserved, label) in [
-                (comp_text, Reserved::ToolSummary, "comprehensive"),
-                (restr_text, Reserved::ToolSummaryRestricted, "restricted"),
-            ] {
-                if let Some(text) = text {
-                    let sid = SectionId::reserved(reserved);
-                    match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
-                        Ok(()) => tracing::info!(
-                            section = sid.raw(),
-                            label,
-                            "tool summary section sealed (re-prefilled before tools)",
-                        ),
-                        Err(e) => tracing::warn!(label, "tool summary section seal failed: {e}"),
-                    }
                 }
             }
         }
@@ -781,12 +763,13 @@ impl InferenceState {
 /// so the user sees the natural-language prefix streamed live and the
 /// tool markup appear at the end before the follow-up response begins.
 /// Build the projection for one tools mode by cloning `base` and filtering the
-/// `tools` collection: `Comprehensive` is the base unchanged (full catalog + the
-/// comprehensive summary); `Restricted` retains only the safe (non-high-risk)
-/// tool sections and points the collection summary at
-/// [`Reserved::ToolSummaryRestricted`]; `None` retains no members, so the
-/// `depends_on: tools` wrapper sections self-suppress and the conversation sees
-/// no tools at all. Called once per mode at startup by [`ModeBuilders::build`];
+/// `tools` collection MEMBERS: `Comprehensive` is the base unchanged (full
+/// catalog); `Restricted` retains only the safe (non-high-risk) tool sections;
+/// `None` retains none.  These builders control only WHICH members project — the
+/// WHOLE tool block (markers, catalog, summary) is gated separately by the
+/// `tools_enabled` optional_group, which chat.rs sets `absent` for `None`.  The
+/// `tool_summary` overview is the comprehensive one for every mode (sealed once on
+/// the base builder).  Called once per mode at startup by [`ModeBuilders::build`];
 /// the results are cached and handed out as cheap `Arc` clones each turn, since
 /// both projection and reprojection just read the swapped builder.
 fn build_mode_builder(
@@ -801,17 +784,10 @@ fn build_mode_builder(
     match mode {
         ToolMode::Comprehensive => {}
         ToolMode::Restricted => {
-            let coll = b
-                .id_for_collection_in(dialogue, "tools")
-                .ok_or_else(|| anyhow::anyhow!("dialogue layer missing 'tools' collection"))?;
+            // Drop the high-risk tools; the `tool_summary` overview (sealed on the
+            // base builder, in the K/V chain) rides along unchanged.
             b.retain_collection_sections(dialogue, "tools", safe_tool_names)
                 .map_err(|e| anyhow::anyhow!("restricted tools projection: {e}"))?;
-            b.set_collection_summary_section(
-                dialogue,
-                coll,
-                SectionId::reserved(Reserved::ToolSummaryRestricted),
-            )
-            .map_err(|e| anyhow::anyhow!("restricted tool summary: {e}"))?;
         }
         ToolMode::None => {
             b.retain_collection_sections(dialogue, "tools", &HashSet::new())
@@ -1665,7 +1641,7 @@ impl ZendSession {
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
-    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String)>> {
+    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String, bool)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = timeline_for(conv_id);
         let raw = {
@@ -1675,13 +1651,13 @@ impl ZendSession {
         };
         let decoded = raw
             .into_iter()
-            .map(|(role, text)| {
+            .map(|(role, text, no_think)| {
                 let role = match role {
                     candle_conversation::Role::User => Role::User,
                     candle_conversation::Role::Assistant => Role::Assistant,
                     candle_conversation::Role::System => Role::System,
                 };
-                (role, text)
+                (role, text, no_think)
             })
             .collect();
         Some(decoded)
@@ -1740,18 +1716,19 @@ impl ZendSession {
         let mode = cs
             .map(|cs| cs.lock().unwrap().tool_mode)
             .unwrap_or_default();
-        let restricted = match mode {
-            ToolMode::None => return Some(out),
-            ToolMode::Restricted => true,
-            ToolMode::Comprehensive => false,
-        };
+        if matches!(mode, ToolMode::None) {
+            return Some(out); // no tools projected → no summary
+        }
+        // The sealed `tool_summary` tree section is the COMPREHENSIVE overview for
+        // every tools-on mode (sealed once on the base builder), so the panel shows
+        // that — matching the K/V the model actually attends, even under Restricted.
         if let Some(text) = state
             .engine
             .lock()
             .unwrap()
             .conversation()
             .read()
-            .tool_summary_text(restricted)
+            .tool_summary_text(false)
             .map(str::to_string)
         {
             out.push(("tools summary".to_string(), text));
@@ -2227,8 +2204,19 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         match item {
             SystemPromptItem::Section(s) => out.push_str(&s.content),
             SystemPromptItem::SectionTree(t) => {
-                // Default selection: each node's default option content, in order.
+                // Default selection: each node's default option content, in order,
+                // STOPPING at the embedded `tools` collection node (the prelude is
+                // the text that precedes the tools; a collection node has no
+                // options to render and everything below it is post-tools).
                 for n in &t.nodes {
+                    if n.collection.is_some() {
+                        return out;
+                    }
+                    // Glue markers (`<tools>` etc.) are live-prefilled at projection,
+                    // not part of the static system-prompt prelude — skip them here.
+                    if n.glue.is_some() {
+                        continue;
+                    }
                     out.push_str(&n.options[n.chosen(&t.default_selection)].content);
                 }
             }
@@ -2236,37 +2224,6 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         }
     }
     out
-}
-
-/// The non-template content sections that precede the `tools` collection in the
-/// dialogue layer. This is the prefix the tool sections are sealed against (the
-/// summariser excludes collection members + templates from the prefix chain), so
-/// sealing the tool-summary section with the *same* prefix puts its KV exactly
-/// where "just before the tools" is.
-fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
-    let Some(layer) = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == "dialogue")
-    else {
-        return Vec::new();
-    };
-    let mut ids = Vec::new();
-    for item in &layer.system_prompt.items {
-        match item {
-            SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
-            // Section-tree variants are sealed (not live templates), and
-            // `pre_collection_prelude` bakes their default content into the
-            // prefix — so the tool summary must seal against the same default
-            // variant ids to land at the right position.
-            SystemPromptItem::SectionTree(t) => ids.extend(t.default_present_ids.iter().copied()),
-            // The dialogue layer's only collection is `tools`; stop at it.
-            SystemPromptItem::Collection(_) => break,
-            SystemPromptItem::Section(_) => {}
-        }
-    }
-    ids
 }
 
 #[cfg(test)]

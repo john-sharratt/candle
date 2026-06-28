@@ -1378,7 +1378,8 @@
   // The full materialized context as plain text, reconstructed by CONCATENATING
   // each piece's authored bytes in materialized order — glue markers, section
   // content, turn framing, decoded tail. No trimming and no inserted separators:
-  // the dialect markers and section content already carry their own newlines, so
+  // every separator is itself a materialized piece (dialect markers, and the
+  // collection `member_glue` rows the engine emits BETWEEN selected members), so
   // splicing anything in (or stripping anything off) would corrupt the spacing.
   // Backs the projection panel's "Copy all".
   function substrateAllText(node) {
@@ -1415,8 +1416,10 @@
     // The think block is never glue: under `/no_think` the model decodes its own
     // empty `<think></think>` into the body, and a thinking turn opens its own
     // `<think>` — either way it's part of `content`, not the assistant header.
-    // `/no_think` is live glue the backend emits after `user_start` ONLY for the
-    // in-flight (current) user turn when the effort dial is off — mirror that here.
+    // `/no_think` is glue emitted after `user_start`. PRIOR turns use their own
+    // recorded `no_think` flag (the backend tags each user bubble); the in-flight
+    // user turn uses the live effort dial (its flag isn't sealed yet) — mirroring
+    // the engine: prior turns from the substrate, the current one from the dial.
     const noThink = !!(G && G.no_think && S.effortLevel === 0);
     const msg = (role, content, open, withNoThink) => {
       const isUser = role === 'user';
@@ -1425,7 +1428,7 @@
       add(content);
       if (!open) add(isUser ? (G && G.user_end) : (G && G.assistant_end));
     };
-    hist.forEach((m) => msg(m.role, m.content));
+    hist.forEach((m) => msg(m.role, m.content, false, !!m.no_think));
     if (um) msg('user', um.content, false, noThink);
     if (dm && dm.role === 'assistant' && (dm.content || '').length) {
       const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
@@ -1487,8 +1490,26 @@
     // A glue row — structural template markers (system/tool block envelopes)
     // and the per-turn dialect framing — shown verbatim in materialized order.
     const G = S.substrateGlue;
-    const glueRow = (text) => h('div', { style: 'padding:3px 13px 3px 15px; font-size:10.5px; font-family:ui-monospace,monospace; color:#7d7468; letter-spacing:0.02em; white-space:pre-wrap; word-break:break-word;' },
-      h('span', { style: 'color:#9a8f80; margin-right:6px;' }, '⟐'), (text || '').replace(/\n+$/, ''));
+    // Whitespace-only glue (e.g. the newline BETWEEN selected tools) would render
+    // as a blank row; name it instead so the panel reads "newline" rather than
+    // showing nothing. Visible markers stay verbatim (trailing newlines trimmed
+    // for layout).
+    const wsGlueLabel = (s) => {
+      if (/^\n+$/.test(s)) return s.length === 1 ? 'newline' : s.length + ' newlines';
+      if (/^\t+$/.test(s)) return s.length === 1 ? 'tab' : s.length + ' tabs';
+      if (/^ +$/.test(s)) return s.length === 1 ? 'space' : s.length + ' spaces';
+      return s.replace(/\t/g, '\\t').replace(/\n/g, '\\n'); // mixed whitespace → escapes
+    };
+    const glueRow = (text) => {
+      const raw = text || '';
+      const trimmed = raw.replace(/\n+$/, '');
+      const wsOnly = raw !== '' && trimmed.trim() === '';
+      const body = wsOnly
+        ? h('span', { style: 'opacity:0.6; font-style:italic;' }, wsGlueLabel(raw))
+        : trimmed;
+      return h('div', { style: 'padding:3px 13px 3px 15px; font-size:10.5px; font-family:ui-monospace,monospace; color:#7d7468; letter-spacing:0.02em; white-space:pre-wrap; word-break:break-word;' },
+        h('span', { style: 'color:#9a8f80; margin-right:6px;' }, '⟐'), body);
+    };
 
     // System prompt in materialized order: the engine's structural glue rows
     // (always visible — incl. the markers that CLOSE the tool block and system
@@ -1520,8 +1541,8 @@
       const accent = isUser ? '#9b8fdf' : '#6cb39a';
       const exp = !!S.substrateExpanded[opts.key];
       if (G) body.appendChild(glueRow(isUser ? G.user_start : G.assistant_start));
-      // `/no_think` glue: emitted after `user_start` only for the in-flight user
-      // turn under effort-off (mirrors the scheduler's `no_think_current`).
+      // `/no_think` glue after `user_start`: prior turns pass their recorded
+      // `no_think` flag, the in-flight turn passes the live effort dial.
       if (isUser && opts.noThink && G && G.no_think) body.appendChild(glueRow(G.no_think));
       const tok = fmtTok(Math.max(1, Math.round((content || '').length / 4)));
       const wrap = h('div', { style: 'border:1px solid #2e2b27; border-left:3px solid ' + accent + '; border-radius:6px; overflow:hidden; margin:3px 0; background:#1a1816;' },
@@ -1569,7 +1590,7 @@
 
     // Same card style + layer prefix as the memory tiers above, so the whole
     // panel is uniform. The trailing assistant is open-ended while still decoding.
-    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i }));
+    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i, noThink: !!m.no_think }));
     if (um) pushMsg('user', um.content, { layer: targetLayer, key: 'conv::um', noThink: !!(G && G.no_think && S.effortLevel === 0) });
     if (dm) pushMsg('assistant', decoded, { layer: targetLayer, suffix: complete ? '' : ' · decoded so far', open: !complete, key: 'conv::dm' });
 

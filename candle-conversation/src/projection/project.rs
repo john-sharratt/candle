@@ -99,7 +99,7 @@ use super::ids::{CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, 
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
-    SelectionRule, SystemPromptItem,
+    SelectionRule, SystemPromptItem, TreeCollection,
 };
 use super::selection::apply_selection;
 use crate::substrate::ContentResolver;
@@ -887,16 +887,36 @@ fn emit_system_prompt_items<R: ContentResolver>(
     // summary names the full set — and the summary section is actually sealed.
     let mut pending_summaries: std::collections::HashMap<CollectionId, SectionId> =
         std::collections::HashMap::new();
+    let mut record = |coll: &SectionCollection, selected: Vec<ProjectionSegment>| {
+        if let Some(sum_id) = coll.summary_section {
+            let partial = !selected.is_empty() && selected.len() < coll.sections.len();
+            if partial && resolver.section_token_count(sum_id) > 0 {
+                pending_summaries.insert(coll.id, sum_id);
+            }
+        }
+        collection_results.insert(coll.id, selected);
+    };
     for item in &layer.system_prompt.items {
-        if let SystemPromptItem::Collection(coll) = item {
-            let selected = select_collection_sections(coll, layer, resolver, &scoring);
-            if let Some(sum_id) = coll.summary_section {
-                let partial = !selected.is_empty() && selected.len() < coll.sections.len();
-                if partial && resolver.section_token_count(sum_id) > 0 {
-                    pending_summaries.insert(coll.id, sum_id);
+        match item {
+            SystemPromptItem::Collection(coll) => {
+                let selected = select_collection_sections(coll, layer, resolver, &scoring);
+                record(coll, selected);
+            }
+            // Collections embedded as section-tree nodes resolve here too, so
+            // their materialised set feeds `depends_on` gating like any other.
+            SystemPromptItem::SectionTree(tree) => {
+                let selection = tree.selection(|id| selection_state.get(id));
+                for node in &tree.nodes {
+                    if let Some(tc) = &node.collection {
+                        let active_key = tree.pack(&selection, node.ancestor_dims);
+                        let selected = select_tree_collection_segments(
+                            tc, active_key, layer, resolver, &scoring,
+                        );
+                        record(&tc.collection, selected);
+                    }
                 }
             }
-            collection_results.insert(coll.id, selected);
+            _ => {}
         }
     }
     // Collections that materialised ≥1 section, captured up front. The second
@@ -967,6 +987,57 @@ fn emit_system_prompt_items<R: ContentResolver>(
                 // fired, addressed by id.
                 let selection = tree.selection(|id| selection_state.get(id));
                 for node in &tree.nodes {
+                    // A live-prefilled structural marker (`<tools>` etc.): emit a
+                    // Generated run when the active branch is one it lives in (e.g.
+                    // tools on).  Prefix-transparent — never a Sealed segment.
+                    if let Some(g) = &node.glue {
+                        let key = tree.pack(&selection, node.ancestor_dims);
+                        if g.active_keys.contains(&key) {
+                            if let Some(tokens) = &g.tokens {
+                                out.push(ProjectionSegment::Generated {
+                                    tokens: tokens.clone(),
+                                    identity: GeneratedIdentity {
+                                        name: node.name.clone(),
+                                        position: out.len(),
+                                    },
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    // A prefix-transparent embedded collection emits its cached
+                    // active-branch selection — the same drain path as a
+                    // top-level collection (summary outside its markers).  When
+                    // `deferred_projection` is set its selection is emitted by a
+                    // placeholder node below (`inject_collection`), so it skips
+                    // its own emission and leaves the cached results in place.
+                    if let Some(tc) = &node.collection {
+                        if tc.deferred_projection {
+                            continue;
+                        }
+                        if let Some(selected) = collection_results.remove(&tc.collection.id) {
+                            if let Some(sum_id) = pending_summaries.remove(&tc.collection.id) {
+                                out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                                    ResolvedSection { id: sum_id },
+                                )));
+                            }
+                            out.extend(selected);
+                        }
+                        continue;
+                    }
+                    // A placeholder node: it sealed its own anchor content (so the
+                    // nodes below attend to a stable prefix), but at projection its
+                    // content is REPLACED by the injected collection's top-k — the
+                    // provenance-selected real members, glued by their own trailing
+                    // newlines.  The anchor's K/V is intentionally not emitted here.
+                    // (The catalog summary is its own sealed tree section above the
+                    // tool block, not drained here.)
+                    if let Some(cid) = node.inject_collection {
+                        if let Some(selected) = collection_results.remove(&cid) {
+                            out.extend(selected);
+                        }
+                        continue;
+                    }
                     let opt_idx = node.chosen(&selection);
                     let option = &node.options[opt_idx];
                     if let Some(sel_id) = node.selector_id() {
@@ -1026,15 +1097,21 @@ fn push_section_segment(out: &mut Vec<ProjectionSegment>, s: &SectionSchema) {
 /// Selection picks by salience (score, then priority); emission
 /// preserves authored structure (declaration order).  Sections below
 /// `score_threshold` are filtered out before selection.
-fn select_collection_sections<R: ContentResolver>(
+/// The selected member declaration indices (returned in declaration order) for
+/// `coll` under `scoring`.  Shared by top-level collections and collections
+/// embedded as section-tree nodes; scoring is always by the member's canonical
+/// [`SectionSchema::id`], so a tree-node collection's selection is stable across
+/// the outer-branch (no_think) — only the *sealed K/V* it emits differs.
+fn select_collection_indices<R: ContentResolver>(
     coll: &SectionCollection,
     layer: &LayerSchema,
     resolver: &R,
     scoring: &CollectionScoring,
-) -> Vec<ProjectionSegment> {
+) -> Vec<usize> {
     if coll.sections.is_empty() {
         return Vec::new();
     }
+    use std::cmp::Ordering::Equal;
     // Mode-resolved depth weights: a prefill override beats the collection's
     // own YAML weights, which in turn beat the layer fallback.
     let dw = scoring
@@ -1042,102 +1119,114 @@ fn select_collection_sections<R: ContentResolver>(
         .as_ref()
         .or(coll.depth_weights.as_ref())
         .unwrap_or(&layer.depth_weights);
+    let score_of = |s: &SectionSchema| resolver.section_score(s.id, scoring.formula, dw);
     match &coll.selection {
-        SelectionRule::AlwaysVisible => {
-            let mut out = Vec::with_capacity(coll.sections.len());
-            for s in &coll.sections {
-                push_section_segment(&mut out, s);
-            }
-            out
+        // No sensible "recent" semantics for sections → all, declaration order.
+        SelectionRule::AlwaysVisible | SelectionRule::Sequence { .. } => {
+            (0..coll.sections.len()).collect()
         }
         SelectionRule::TopK { k } => {
-            let all_scored: Vec<(usize, &SectionSchema, f32)> = coll
+            let mut scored: Vec<(usize, f32, f32)> = coll
                 .sections
                 .iter()
                 .enumerate()
-                .map(|(decl, s)| {
-                    let score = resolver.section_score(s.id, scoring.formula, dw);
-                    (decl, s, score)
-                })
+                .map(|(decl, s)| (decl, score_of(s), s.priority))
+                .filter(|(_, score, _)| !scoring.apply_threshold || *score >= coll.score_threshold)
                 .collect();
             if tracing::enabled!(tracing::Level::TRACE) {
-                let mut by_score = all_scored.clone();
-                by_score.sort_by(|(_, _, a), (_, _, b)| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                let mut by_score = scored.clone();
+                by_score.sort_by(|(_, a, _), (_, b, _)| b.partial_cmp(a).unwrap_or(Equal));
                 let scores_str = by_score
                     .iter()
-                    .map(|(_, s, sc)| format!("{}={:.1}", s.name, sc))
+                    .map(|(i, sc, _)| format!("{}={:.1}", coll.sections[*i].name, sc))
                     .collect::<Vec<_>>()
                     .join(", ");
-                tracing::trace!(
-                    collection = %coll.name,
-                    threshold = coll.score_threshold,
-                    scores = %scores_str,
-                    "projection scores"
-                );
+                tracing::trace!(collection = %coll.name, threshold = coll.score_threshold, scores = %scores_str, "projection scores");
             }
-            let mut scored: Vec<(usize, &SectionSchema, f32)> = all_scored
-                .into_iter()
-                .filter(|(_, _, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
-                .collect();
-            scored.sort_by(|(ai, a, asc), (bi, b, bsc)| {
+            // Score desc, then priority desc, then declaration order.
+            scored.sort_by(|(ai, asc, ap), (bi, bsc, bp)| {
                 bsc.partial_cmp(asc)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(
-                        b.priority
-                            .partial_cmp(&a.priority)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
+                    .unwrap_or(Equal)
+                    .then(bp.partial_cmp(ap).unwrap_or(Equal))
                     .then(ai.cmp(bi))
             });
             scored.truncate(*k);
-            scored.sort_by_key(|(i, _, _)| *i);
-            let n = scored.len();
-            tracing::trace!(
-                collection = %coll.name,
-                selected = format!("{}/{}", n, coll.sections.len()),
-                sections = ?scored.iter().map(|(_, s, _)| s.name.as_str()).collect::<Vec<_>>(),
-                "projection"
-            );
-            let mut out = Vec::with_capacity(n);
-            for (_, s, _) in &scored {
-                push_section_segment(&mut out, s);
-            }
-            out
+            let mut idx: Vec<usize> = scored.into_iter().map(|(i, _, _)| i).collect();
+            idx.sort_unstable(); // re-emit in declaration order
+            idx
         }
-        SelectionRule::Single => {
-            let best = coll
-                .sections
-                .iter()
-                .map(|s| {
-                    let score = resolver.section_score(s.id, scoring.formula, dw);
-                    (s, score)
-                })
-                .filter(|(_, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
-                .max_by(|(a, asc), (b, bsc)| {
-                    asc.partial_cmp(bsc)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(
-                            a.priority
-                                .partial_cmp(&b.priority)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                });
-            let mut out = Vec::new();
-            if let Some((s, _)) = best {
-                push_section_segment(&mut out, s);
-            }
-            out
-        }
-        SelectionRule::Sequence { .. } => {
-            // No sensible "recent" semantics for sections.  Fall back
-            // to AlwaysVisible.
-            let mut out = Vec::with_capacity(coll.sections.len());
-            for s in &coll.sections {
-                push_section_segment(&mut out, s);
-            }
-            out
+        SelectionRule::Single => coll
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(decl, s)| (decl, score_of(s), s.priority))
+            .filter(|(_, score, _)| !scoring.apply_threshold || *score >= coll.score_threshold)
+            .max_by(|(_, asc, ap), (_, bsc, bp)| {
+                asc.partial_cmp(bsc)
+                    .unwrap_or(Equal)
+                    .then(ap.partial_cmp(bp).unwrap_or(Equal))
+            })
+            .map(|(i, _, _)| vec![i])
+            .unwrap_or_default(),
+    }
+}
+
+/// Emit the collection's `member_glue` (a live-prefilled structural token, e.g. a
+/// newline) into `out` BEFORE the next member — but never before the first one.
+/// The glue is independent of which members provenance selected: it is not baked
+/// into any member's seal, so a dropped member never takes its separator with it.
+fn push_member_glue(out: &mut Vec<ProjectionSegment>, coll: &SectionCollection) {
+    if out.is_empty() {
+        return; // no glue leads the first member
+    }
+    let Some(tokens) = &coll.member_glue_tokens else {
+        return;
+    };
+    let position = out.len();
+    out.push(ProjectionSegment::Generated {
+        tokens: tokens.clone(),
+        identity: GeneratedIdentity {
+            name: format!("{}__member_glue", coll.name),
+            position,
+        },
+    });
+}
+
+/// Resolve a top-level collection to its emitted segments (canonical member ids).
+fn select_collection_sections<R: ContentResolver>(
+    coll: &SectionCollection,
+    layer: &LayerSchema,
+    resolver: &R,
+    scoring: &CollectionScoring,
+) -> Vec<ProjectionSegment> {
+    let selected = select_collection_indices(coll, layer, resolver, scoring);
+    let mut out = Vec::with_capacity(selected.len());
+    for i in selected {
+        push_member_glue(&mut out, coll);
+        push_section_segment(&mut out, &coll.sections[i]);
+    }
+    out
+}
+
+/// Resolve a section-tree collection node to its emitted segments — the same
+/// top-k selection (over canonical ids), but emitting each selected member's
+/// ACTIVE-branch sealed variant for `active_key`.
+fn select_tree_collection_segments<R: ContentResolver>(
+    tc: &TreeCollection,
+    active_key: u32,
+    layer: &LayerSchema,
+    resolver: &R,
+    scoring: &CollectionScoring,
+) -> Vec<ProjectionSegment> {
+    let selected = select_collection_indices(&tc.collection, layer, resolver, scoring);
+    let mut out = Vec::with_capacity(selected.len());
+    for i in selected {
+        if let Some(v) = tc.member_variant(i, active_key) {
+            push_member_glue(&mut out, &tc.collection);
+            out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                ResolvedSection { id: v.id },
+            )));
         }
     }
+    out
 }

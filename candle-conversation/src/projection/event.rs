@@ -427,6 +427,21 @@ fn build_selection(
                     // A node emitted exactly one option's branch variant; show
                     // the node (and chosen option, for selectors) with its tokens.
                     for n in &t.nodes {
+                        // A live-prefilled structural marker (`<tools>` etc.): if it
+                        // fired this projection (its Generated run is in
+                        // `emitted_glue`), surface it as a real glue row.
+                        if n.glue.is_some() {
+                            if let Some(&tokens) = emitted_glue.get(n.name.as_str()) {
+                                system.push(SystemItem::Glue {
+                                    name: n.name.clone(),
+                                    content: n.options.first().map_or(String::new(), |o| {
+                                        o.content.clone()
+                                    }),
+                                    tokens,
+                                });
+                            }
+                            continue;
+                        }
                         for o in &n.options {
                             if let Some(v) = o.variants.iter().find(|v| selected.contains(&v.id)) {
                                 let name = if n.options.len() > 1 {
@@ -438,6 +453,44 @@ fn build_selection(
                                     name,
                                     tokens: resolver.section_token_count(v.id) as u32,
                                 });
+                            }
+                        }
+                        // An embedded collection node: show each selected member
+                        // (its active-branch variant landed in `selected`),
+                        // interleaving the collection's `member_glue` as a real
+                        // structural glue row BETWEEN consecutive members —
+                        // mirroring the `Generated` glue token the projection emits
+                        // (and NOT baked into any member's seal), so the panel and
+                        // its copy-all reproduce the exact materialized bytes.
+                        if let Some(tc) = &n.collection {
+                            let glue = &tc.collection.member_glue;
+                            // Mirror the projection EXACTLY: it interleaves member
+                            // glue only when the tokens exist (`member_glue_tokens`),
+                            // so gate the panel row on the same condition (not just
+                            // the non-empty string) or the panel would show a 0-token
+                            // glue row the materialized prompt never contained.
+                            let glue_tokens = tc
+                                .collection
+                                .member_glue_tokens
+                                .as_ref()
+                                .map(|t| t.len() as u32);
+                            let mut emitted_member = false;
+                            for (s, member) in tc.collection.sections.iter().zip(tc.variants.iter())
+                            {
+                                if let Some(v) = member.iter().find(|v| selected.contains(&v.id)) {
+                                    if let (true, Some(toks)) = (emitted_member, glue_tokens) {
+                                        system.push(SystemItem::Glue {
+                                            name: format!("{}__member_glue", tc.collection.name),
+                                            content: glue.clone(),
+                                            tokens: toks,
+                                        });
+                                    }
+                                    emitted_member = true;
+                                    system.push(SystemItem::Section {
+                                        name: s.name.clone(),
+                                        tokens: resolver.section_token_count(v.id) as u32,
+                                    });
+                                }
                             }
                         }
                     }
@@ -780,6 +833,114 @@ layers:
         assert_eq!(ev.materialized_tokens, 64 + 800 + 200 + 4);
         assert_eq!(ev.substrate_tokens, 99_999);
         assert_eq!(ev.tokens_per_second, 40.0); // 480 / 12s
+    }
+
+    const TREE_GLUE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: collection
+              name: tools
+              selection: { kind: top_k, k: 3 }
+              member_glue: "\n"
+              summary:
+                chunk: 4
+                categorize:
+                  max_tokens: 256
+                  system_prompt: cat
+                  user_prompt: cat
+                assign:
+                  max_tokens: 128
+                  system_prompt: assign
+                  user_prompt: assign
+              sections:
+                - id: tool_a
+                  content: "a"
+                - id: tool_b
+                  content: "b"
+    groups:
+      - id: conversation
+        selection:
+          kind: conversation
+          recent: 4
+          historical_top_k: 8
+"#;
+
+    #[test]
+    fn from_projection_interleaves_member_glue_between_tree_collection_members() {
+        use super::super::schema::SystemPromptItem;
+        let mut b = Builder::from_yaml(TREE_GLUE_YAML).unwrap();
+        // Tokenise so the glue carries a real token count (mock: byte → token).
+        b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
+            .unwrap();
+        let schema = b.schema();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+
+        // The tools tree-collection node + its (single-branch) member variants.
+        let tc = schema
+            .layers
+            .iter()
+            .find(|l| l.id == dialogue)
+            .unwrap()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|it| match it {
+                SystemPromptItem::SectionTree(t) => {
+                    t.nodes.iter().find_map(|n| n.collection.as_ref())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let key = tc.default_branch;
+        let a = tc.member_variant(0, key).unwrap().id;
+        let bb = tc.member_variant(1, key).unwrap().id;
+
+        let mut res = TokResolver::default();
+        res.section_tokens.insert(a.raw(), 10);
+        res.section_tokens.insert(bb.raw(), 20);
+
+        let section =
+            |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
+        let segments = vec![section(a), section(bb)];
+        let ev = from_projection(&segments, schema, &res, 0, 0, 1, 1.0);
+
+        // The materialized system view is: member → REAL glue token → member,
+        // not two members run together — so the GUI panel and its copy-all
+        // reproduce the exact bytes (the glue is no longer baked into a seal).
+        let sys = &ev.selection.system;
+        assert_eq!(sys.len(), 3, "expected member, glue, member; got {sys:?}");
+        match &sys[0] {
+            SystemItem::Section { name, .. } => assert_eq!(name, "tool_a"),
+            o => panic!("expected tool_a section, got {o:?}"),
+        }
+        match &sys[1] {
+            SystemItem::Glue { content, tokens, .. } => {
+                assert_eq!(content, "\n", "glue content must be the literal newline");
+                assert_eq!(*tokens, 1, "glue must report its token count");
+            }
+            o => panic!("expected a glue row between members, got {o:?}"),
+        }
+        match &sys[2] {
+            SystemItem::Section { name, .. } => assert_eq!(name, "tool_b"),
+            o => panic!("expected tool_b section, got {o:?}"),
+        }
     }
 
     #[test]

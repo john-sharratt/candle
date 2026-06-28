@@ -464,6 +464,7 @@ mod tests {
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
+            no_think: false,
             user_text: String::new(),
             assistant_text: String::new(),
         };
@@ -565,6 +566,7 @@ mod tests {
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
+            no_think: false,
             user_text: String::new(),
             assistant_text: String::new(),
         });

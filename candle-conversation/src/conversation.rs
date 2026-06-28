@@ -405,8 +405,23 @@ impl Sequence {
                 SystemPromptItem::SectionTree(t) => t
                     .nodes
                     .iter()
-                    .flat_map(|n| n.options.iter())
-                    .map(|o| o.content.len() as u64 * o.variants.len() as u64)
+                    .map(|n| {
+                        let opt_bytes: u64 = n
+                            .options
+                            .iter()
+                            .map(|o| o.content.len() as u64 * o.variants.len() as u64)
+                            .sum();
+                        // A collection node seals each member ×branch.
+                        let coll_bytes: u64 = n.collection.as_ref().map_or(0, |tc| {
+                            tc.collection
+                                .sections
+                                .iter()
+                                .zip(tc.variants.iter())
+                                .map(|(s, vs)| s.content.len() as u64 * vs.len() as u64)
+                                .sum()
+                        });
+                        opt_bytes + coll_bytes
+                    })
                     .sum::<u64>(),
             })
             .sum::<u64>();
@@ -509,6 +524,61 @@ impl Sequence {
                     // dependency-safe: a variant's in-tree prefix references only
                     // earlier nodes' variants, which are already sealed.
                     for node in &tree.nodes {
+                        // A prefix-transparent embedded collection: seal each
+                        // member ONCE PER ancestor branch (the ×outer-selector
+                        // fan-out), batching all members of a branch under that
+                        // branch's prefix with the aggressive collection quantize
+                        // policy.  It never extends `linear_prefix` — nodes below
+                        // anchor on the next mandatory node, not these members.
+                        if let Some(tc) = &node.collection {
+                            let members = &tc.collection.sections;
+                            // The branch set is identical across members; read it
+                            // off member 0's per-branch variant list.
+                            if let Some(branch_list) = tc.variants.first() {
+                                for (bi, bvar) in branch_list.iter().enumerate() {
+                                    let mut prefix = linear_prefix.clone();
+                                    prefix.extend_from_slice(&bvar.in_tree_prefix);
+                                    let batch: Vec<(SectionId, &str)> = members
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(mi, sec)| {
+                                            (tc.variants[mi][bi].id, sec.content.as_str())
+                                        })
+                                        .collect();
+                                    if !batch.is_empty() {
+                                        let done_bytes_ref = &mut done_bytes;
+                                        let report_ref = &report;
+                                        conv.insert_section_collection_with_progress(
+                                            &batch,
+                                            &prefix,
+                                            true,
+                                            |_sid, content_len| {
+                                                *done_bytes_ref += content_len as u64;
+                                                report_ref(*done_bytes_ref);
+                                            },
+                                        )?;
+                                        // Offload-as-we-go: quantize + persist +
+                                        // evict THIS branch's members before the
+                                        // next branch prefills, so the native
+                                        // catalog never exceeds one branch.  Safe
+                                        // because members are prefix-transparent —
+                                        // nothing attends back over them in the
+                                        // build — and the per-turn elevate reloads
+                                        // the projection's top-k on demand.
+                                        let (tx, rx) = crossbeam::channel::bounded(1);
+                                        conv.scheduler_tx
+                                            .send(SchedulerRequest::OffloadCollectionMembers {
+                                                conversation: conv.substrate.clone(),
+                                                response_tx: tx,
+                                            })
+                                            .map_err(|_| ConversationError::SchedulerGone)?;
+                                        rx.recv()
+                                            .map_err(|_| ConversationError::SchedulerGone)??;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         for option in &node.options {
                             for v in &option.variants {
                                 let mut prefix = linear_prefix.clone();
@@ -1141,6 +1211,15 @@ impl Sequence {
             assistant_content_start,
             prefill_tokens.len(),
         );
+        // Record whether the composer's `/no_think` dial is active for this
+        // turn, so the projection re-injects the soft-switch into this turn's
+        // user opener when it is later re-rendered as history.
+        let no_think = matches!(
+            options
+                .selection
+                .optional(crate::projection::NO_THINK_SELECTOR),
+            Some(crate::projection::OptionalState::Present)
+        );
         let handle = self.submit_prefill_unit(
             self.id,
             Some(self.projection_inputs()),
@@ -1148,6 +1227,7 @@ impl Sequence {
             prefill_tokens,
             user_message.to_string(),
             content_bounds,
+            no_think,
             // Decode path: the assistant half is produced by the model, so the
             // seal stores its decoded text — nothing to pre-supply here.
             String::new(),
@@ -1190,6 +1270,7 @@ impl Sequence {
         prefill_tokens: TokenBuffer,
         user_text: String,
         content_bounds: TurnContentBounds,
+        no_think: bool,
         prefill_assistant_text: String,
         post_decode_tokens: TokenBuffer,
         max_decode_tokens: usize,
@@ -1214,6 +1295,7 @@ impl Sequence {
                 prefill_text,
                 user_text,
                 content_bounds,
+                no_think,
                 prefill_assistant_text,
                 post_decode_tokens,
                 max_decode_tokens,
@@ -1346,6 +1428,9 @@ impl Sequence {
             prefill_tokens,
             user_message.to_string(),
             content_bounds,
+            // Prefill content turns hard-apply `/no_think` (see the prefix above)
+            // — record it so the re-render is consistent with the sealed grid.
+            true,
             // Prefill path: the assistant half is supplied (not decoded), so
             // hand it through to be stored verbatim as the turn's assistant_text.
             assistant_text.to_string(),
@@ -1485,6 +1570,12 @@ impl Sequence {
                                     n.name.clone()
                                 };
                                 out.push((name, o.content.clone()));
+                            }
+                            // An embedded collection node lists its members.
+                            if let Some(tc) = &n.collection {
+                                for s in &tc.collection.sections {
+                                    out.push((s.name.clone(), s.content.clone()));
+                                }
                             }
                         }
                     }
@@ -1897,13 +1988,18 @@ impl Sequence {
     /// (`SummaryOfTurns` / `SummaryOfSummaries` tree nodes) are skipped — they
     /// exist for provenance/projection, not for the conversation view. Pass
     /// `true` for substrate-level views that legitimately surface them.
+    /// Recover the conversation as `(role, text, no_think)` bubbles — one per
+    /// non-empty half of each turn, in order.  `no_think` is the turn's recorded
+    /// thinking-suppressed flag, set on the USER bubble so the GUI can re-render
+    /// the `/no_think` soft-switch on prior turns exactly as the assembler does
+    /// for the model (see `turn_no_think`); the assistant bubble carries `false`.
     pub fn recovered_history(
         &self,
         timeline: TimelineId,
         include_ghost_summaries: bool,
-    ) -> Vec<(Role, String)> {
+    ) -> Vec<(Role, String, bool)> {
         let read = self.substrate.read();
-        let mut out: Vec<(Role, String)> = Vec::new();
+        let mut out: Vec<(Role, String, bool)> = Vec::new();
         for idx in read.turn_indices(timeline) {
             if !include_ghost_summaries
                 && read
@@ -1914,11 +2010,12 @@ impl Sequence {
             }
             let user_text = read.user_text_of(timeline, idx);
             let assistant_text = read.assistant_text_of(timeline, idx);
+            let no_think = read.turn_no_think(timeline, idx);
             if !user_text.is_empty() {
-                out.push((Role::User, user_text));
+                out.push((Role::User, user_text, no_think));
             }
             if !assistant_text.is_empty() {
-                out.push((Role::Assistant, assistant_text));
+                out.push((Role::Assistant, assistant_text, false));
             }
         }
         out

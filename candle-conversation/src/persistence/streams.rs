@@ -124,6 +124,13 @@ pub struct TurnDecl {
     pub user_content_end: u32,
     #[serde(default)]
     pub assistant_content_start: u32,
+    /// Whether this turn was generated with thinking suppressed (the
+    /// `/no_think` dial active at submit).  Persisted so a substrate reload
+    /// re-renders the turn's `/no_think` soft-switch faithfully — see
+    /// `substrate::TurnPart::no_think`.  `serde(default)` ⇒ old logs read
+    /// back `false` (thinking on), no format break.
+    #[serde(default)]
+    pub no_think: bool,
     /// The user message text for this turn — exactly what
     /// `submit_turn` received, with no role-marker envelope and no
     /// `/no_think` prefix.  Stored directly so reload re-populates
@@ -222,6 +229,7 @@ mod tests {
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
+            no_think: false,
             user_text: String::new(),
             assistant_text: String::new(),
         });
@@ -249,6 +257,7 @@ mod tests {
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
+            no_think: false,
             user_text: String::new(),
             assistant_text: String::new(),
         });

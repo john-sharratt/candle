@@ -162,6 +162,9 @@ pub(crate) enum SchedulerRequest {
         /// compressor can window content-only halves. See
         /// [`TurnContentBounds`].
         content_bounds: TurnContentBounds,
+        /// Thinking suppressed at submit (the `/no_think` dial) — recorded into
+        /// `TurnPart::no_think` at seal so prior turns re-render their switch.
+        no_think: bool,
         /// The assistant half supplied by a PREFILL turn (e.g. repo_map /
         /// code_reading ingest), stored verbatim as `TurnPart::assistant_text`
         /// at seal time. A prefill never decodes, so the seal's decoded `text`
@@ -315,6 +318,18 @@ pub(crate) enum SchedulerRequest {
         /// use at first-turn time (declaration order from the schema loop,
         /// including collection members).
         section_ids: Vec<SectionId>,
+        response_tx: Sender<Result<(), ConversationError>>,
+    },
+
+    /// Quantize + offload the collection-member sections sealed so far, freeing
+    /// their VRAM mid-build.  Sent by the section-ingest loop after each batch
+    /// of prefix-transparent members (e.g. one `no_think` branch of the tool
+    /// catalog) so the native catalog never piles up past one batch.  The
+    /// handler quantizes the pending members, then blocks on a persistence pass
+    /// so their cold copies land and `install_cold` frees the hot VRAM before
+    /// the next batch prefills.
+    OffloadCollectionMembers {
+        conversation: Conversation,
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
@@ -609,6 +624,11 @@ struct DecodeState {
     /// into `TurnPart::content_bounds` at seal time so the compressor can
     /// window content-only halves on demand. See [`TurnContentBounds`].
     content_bounds: TurnContentBounds,
+    /// Whether this turn was submitted with thinking SUPPRESSED (the composer
+    /// `/no_think` dial active).  Recorded into `TurnPart::no_think` at seal so
+    /// the projection re-injects the `/no_think` soft-switch into this turn's
+    /// user opener when it re-renders the turn as history.
+    no_think: bool,
     /// The prefilled assistant half (repo_map / code_reading ingest), stored
     /// verbatim as `TurnPart::assistant_text` at seal time. Empty for decode
     /// turns, where the seal uses the model's decoded text instead.
@@ -799,6 +819,8 @@ pub(crate) struct TurnContent {
     pub token_ids: TokenBuffer,
     /// Content boundaries — see [`DecodeState::content_bounds`].
     pub content_bounds: TurnContentBounds,
+    /// Thinking suppressed at submit — see [`DecodeState::no_think`].
+    pub no_think: bool,
 }
 
 /// A section whose hot bytes are in their native (prefill-output) form
@@ -829,6 +851,8 @@ pub(super) struct PrefillWork {
     pub(super) user_text: String,
     /// Content boundaries — see [`DecodeState::content_bounds`].
     pub(super) content_bounds: TurnContentBounds,
+    /// Thinking suppressed at submit — see [`DecodeState::no_think`].
+    pub(super) no_think: bool,
     /// Prefilled assistant half — see [`DecodeState::prefill_assistant_text`].
     pub(super) prefill_assistant_text: String,
     pub(super) event_tx: Sender<TurnEvent>,
@@ -1569,6 +1593,7 @@ impl Scheduler {
                 prefill_text,
                 user_text,
                 content_bounds,
+                no_think,
                 prefill_assistant_text,
                 post_decode_tokens,
                 max_decode_tokens,
@@ -1959,6 +1984,7 @@ impl Scheduler {
                     prefill_text,
                     user_text,
                     content_bounds,
+                    no_think,
                     prefill_assistant_text,
                     event_tx,
                     max_decode_tokens,
@@ -2178,6 +2204,37 @@ impl Scheduler {
                     }
                     r
                 };
+                let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::OffloadCollectionMembers {
+                conversation,
+                response_tx,
+            } => {
+                let result = (|| -> Result<(), ConversationError> {
+                    if let Some(turn_policy) = self.session.compression_policy() {
+                        let boundary_policy = Self::section_compression_policy_boundary();
+                        let member_policy = Self::section_compression_policy_member(&turn_policy);
+                        // Quantize just the prefix-transparent members + flag
+                        // them for offload; boundary sections stay pending for
+                        // the turn-seal boundary.
+                        self.quantize_pending_collection_members(
+                            &conversation,
+                            &boundary_policy,
+                            &member_policy,
+                        )?;
+                    }
+                    // Block on a full persistence pass so the members' cold
+                    // copies land and `install_cold` frees their VRAM before the
+                    // next batch prefills.  The wave-batched prefill within a
+                    // batch keeps its own concurrency; this seam only gates
+                    // between batches so the native catalog can't outrun the
+                    // offload under VRAM pressure.
+                    self.persist_trigger
+                        .flush_blocking(std::time::Duration::from_secs(30));
+                    Ok(())
+                })();
                 let _ = response_tx.send(result);
                 true
             }
@@ -2762,6 +2819,7 @@ impl Scheduler {
                     prefill_text: String::new(),
                     user_text: String::new(),
                     content_bounds: TurnContentBounds::default(),
+                    no_think: false,
                     prefill_assistant_text: String::new(),
                     event_tx,
                     max_decode_tokens: 0,
@@ -2891,6 +2949,7 @@ impl Scheduler {
                 prefill_tokens: TokenBuffer::default(),
                 user_text: String::new(),
                 content_bounds: TurnContentBounds::default(),
+                no_think: false,
                 triggers: Arc::new(TriggerRegistry::new()),
                 stencil: None,
                 pending_mask: None,
@@ -3138,6 +3197,7 @@ impl Scheduler {
             prefill_text: String::new(),
             user_text: String::new(),
             content_bounds: TurnContentBounds::default(),
+            no_think: false,
             prefill_assistant_text: String::new(),
             event_tx,
             max_decode_tokens: 0,
@@ -3199,6 +3259,9 @@ impl Scheduler {
             token_ids: TokenBuffer::from(pending.token_ids),
             token_count,
             content_bounds: pending.content_bounds,
+            // Compression/summary turns are never re-rendered with the dialogue
+            // `/no_think` switch.
+            no_think: false,
             block_start: 0,
             block_end: block_end as u64,
             sealed_gpu: Some(Arc::new(sealed_gpu)),
@@ -3906,6 +3969,7 @@ impl Scheduler {
                                 assistant_text,
                                 token_ids: TokenBuffer::from(full_tokens),
                                 content_bounds: state.content_bounds,
+                                no_think: state.no_think,
                             })
                         } else {
                             None
@@ -4314,6 +4378,52 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
+        let drained: Vec<PendingSectionQuantize> =
+            self.pending_section_quantize.drain(..).collect();
+        self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
+    }
+
+    /// Quantize + offload ONLY the collection-member sections currently
+    /// pending, leaving boundary sections pending for the turn-seal boundary.
+    ///
+    /// Collection members are prefix-transparent — nothing attends back over
+    /// them during the build (priming uses the collections-empty projection),
+    /// so it is safe to quantize them mid-build the moment their ingest wave
+    /// has sealed.  This is what lets a large catalog (e.g. the tool list,
+    /// sealed ×no_think) be shrunk and offloaded as the build runs instead of
+    /// piling up native until the end.  Each member's residence is flagged
+    /// `evict_when_cold` so the persistence thread frees its VRAM the instant
+    /// the redo-log write lands.
+    fn quantize_pending_collection_members(
+        &mut self,
+        conversation: &Conversation,
+        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
+        member_policy: &candle_nn::kv_cache::CompressionPolicy,
+    ) -> Result<(), ConversationError> {
+        let mut members: Vec<PendingSectionQuantize> = Vec::new();
+        let mut keep: Vec<PendingSectionQuantize> = Vec::new();
+        for p in self.pending_section_quantize.drain(..) {
+            if p.in_collection {
+                members.push(p);
+            } else {
+                keep.push(p);
+            }
+        }
+        self.pending_section_quantize = keep;
+        self.quantize_section_batch(conversation, members, boundary_policy, member_policy, true)
+    }
+
+    /// Quantize an already-drained pending list and atomically swap each
+    /// residence's hot to its quantized form.  `mark_evict` additionally flags
+    /// every section's residence for offload-on-persist (collection-member path).
+    fn quantize_section_batch(
+        &mut self,
+        conversation: &Conversation,
+        pending_list: Vec<PendingSectionQuantize>,
+        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
+        member_policy: &candle_nn::kv_cache::CompressionPolicy,
+        mark_evict: bool,
+    ) -> Result<(), ConversationError> {
         // Snapshot per-section native hot + residence + which policy
         // applies under a brief read lock; the heavy GPU work runs
         // unlocked.  Pending list is partitioned into (residence,
@@ -4321,8 +4431,8 @@ impl Scheduler {
         // in_collection so each policy gets its own batched launch.
         let pending: Vec<(SectionId, ResidenceIndex, Vec<SealedSequence>, bool)> = {
             let view = conversation.read();
-            self.pending_section_quantize
-                .drain(..)
+            pending_list
+                .into_iter()
                 .filter_map(|p| {
                     let residence = view.section_residence(p.section_id)?;
                     let sealed = view.section_sealed_of(p.section_id)?;
@@ -4440,6 +4550,11 @@ impl Scheduler {
                 }
                 view.replace_section_hot(residence, q_per_layer);
                 view.clear_section_pending_quantize(residence);
+                // Collection-member path: free this section's VRAM as soon as
+                // the persistence thread lands its cold copy.
+                if mark_evict {
+                    view.mark_section_evict_when_cold(residence);
+                }
             }
         }
         // Now that the substrate holds the final (quantized) form for
@@ -4608,6 +4723,7 @@ impl Scheduler {
                     assistant_text,
                     token_ids,
                     content_bounds,
+                    no_think,
                 } = turn_content.unwrap_or_default();
                 // Re-clamp the content boundaries to the sealed token count
                 // so `window_sealed_tokens` can never window past the turn's
@@ -4640,6 +4756,7 @@ impl Scheduler {
                     token_ids,
                     token_count: turn_token_count,
                     content_bounds,
+                    no_think,
                     block_start: block_from as u64,
                     block_end: block_to as u64,
                     sealed_gpu: Some(Arc::new(delta_gpu)),

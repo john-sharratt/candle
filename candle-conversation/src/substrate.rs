@@ -298,6 +298,13 @@ pub struct SequenceResidence {
     /// across tier transitions since the payload itself doesn't change.
     /// `0` for a freshly-allocated residence with no bytes anywhere.
     pub byte_size: u64,
+    /// When `true`, the persistence thread frees `hot` the moment a cold
+    /// copy lands (Phase 2.5 `install_cold`) — offloading VRAM as the build
+    /// runs.  Set only for **collection-member** sections (prefix-transparent:
+    /// nothing attends back over them during the build, and the per-turn
+    /// `elevate_to_hot` reloads the projection's top-k selection on demand).
+    /// Boundary/turn residences leave this `false` and stay hot.
+    pub evict_when_cold: bool,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -701,6 +708,13 @@ pub struct TurnPart {
     /// these boundaries so it injects content-only halves with no template
     /// markers.  All-zero where the boundaries are genuinely unknown.
     pub content_bounds: TurnContentBounds,
+    /// Whether this turn was generated with thinking SUPPRESSED (the composer
+    /// `/no_think` dial active at submit).  Recorded so the projection can
+    /// re-inject the `/no_think` soft-switch into this turn's user opener when
+    /// it is re-rendered as history — keeping the conversation self-consistent
+    /// (a suppressed turn always shows its `/no_think`, matching its empty
+    /// `<think></think>`), not just on the live turn.
+    pub no_think: bool,
     pub sig_entries: Vec<SigEntry>,
     /// Slot in [`Substrate::residence`] holding this turn's
     /// hot/warm/cold KV state.
@@ -779,6 +793,8 @@ pub struct TurnPartWrite {
     pub token_count: usize,
     /// Content boundaries — see [`TurnPart::content_bounds`].
     pub content_bounds: TurnContentBounds,
+    /// Thinking-suppressed at submit — see [`TurnPart::no_think`].
+    pub no_think: bool,
     pub block_start: u64,
     pub block_end: u64,
     pub sealed_gpu: Option<Arc<Vec<SealedSequence>>>,
@@ -1142,6 +1158,7 @@ impl Substrate {
             warm: None,
             cold: None,
             byte_size: 0,
+            evict_when_cold: false,
         });
         idx
     }
@@ -1323,7 +1340,25 @@ impl Substrate {
     /// the redo log. Cold has no LRU (it's already the cheapest tier).
     pub fn install_cold(&mut self, residence: ResidenceIndex, cold: Vec<StoredSequence>) {
         debug_assert!(!cold.is_empty(), "install_cold called with empty Vec");
-        self.residence[residence.0].cold = Some(cold);
+        let slot = &mut self.residence[residence.0];
+        slot.cold = Some(cold);
+        // Offload-as-we-go: a flagged collection-member section now has its
+        // (quantized) bytes safely on disk, so free the VRAM immediately.  The
+        // drop returns the arena chunks to the pool for the next prefill; the
+        // per-turn `elevate_to_hot` reloads this section if the projection's
+        // top-k re-selects it.  Runs under the persistence thread's substrate
+        // write lock (Phase 2.5), so the arena free is serialised with the
+        // scheduler's allocations.
+        if slot.evict_when_cold {
+            slot.hot = None;
+        }
+    }
+
+    /// Flag a section residence so the persistence thread frees its `hot` the
+    /// moment a cold copy lands — see [`SequenceResidence::evict_when_cold`].
+    /// Set by the scheduler's collection-member quantize drain.
+    pub fn mark_section_evict_when_cold(&mut self, residence: ResidenceIndex) {
+        self.residence[residence.0].evict_when_cold = true;
     }
 
     /// Snapshot indices of hot-resident slots that lack a warm copy —
@@ -2664,6 +2699,7 @@ impl Substrate {
                     token_count,
                     token_ids: TokenBuffer::default(),
                     content_bounds: TurnContentBounds::default(),
+                    no_think: false,
                     sig_entries: Vec::new(),
                     residence,
                 },
@@ -2729,6 +2765,7 @@ impl Substrate {
                         token_count,
                         token_ids: write.token_ids,
                         content_bounds: write.content_bounds,
+                        no_think: write.no_think,
                         sig_entries: Vec::new(),
                         residence,
                     },
@@ -2768,6 +2805,7 @@ impl Substrate {
         token_ids: TokenBuffer,
         token_count: usize,
         content_bounds: TurnContentBounds,
+        no_think: bool,
         cold: Option<Vec<StoredSequence>>,
         block_start: u64,
         block_end: u64,
@@ -2791,6 +2829,7 @@ impl Substrate {
                         token_count,
                         token_ids,
                         content_bounds,
+                        no_think,
                         sig_entries: Vec::new(),
                         residence,
                     },
@@ -3069,6 +3108,15 @@ impl Substrate {
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
         self.turn(timeline, index)
             .map_or(0, |e| e.content.token_count)
+    }
+
+    /// Whether this turn was generated with thinking suppressed (the
+    /// `/no_think` dial active at submit).  The projection re-injects the
+    /// `/no_think` soft-switch into this turn's user opener when it re-renders
+    /// the turn as history.  `false` for unknown turns.
+    pub fn turn_no_think(&self, timeline: TimelineId, index: TurnIndex) -> bool {
+        self.turn(timeline, index)
+            .is_some_and(|e| e.content.no_think)
     }
 
     pub fn turn_count(&self, timeline: TimelineId) -> u32 {
@@ -4491,6 +4539,62 @@ mod tests {
         assert!(sub.residence[b.0].hot.is_none(), "b evicted instead");
     }
 
+    /// `install_cold` frees a section's hot VRAM only when its residence is
+    /// flagged `evict_when_cold` (the prefix-transparent collection-member
+    /// offload path); a plain/boundary section keeps its hot copy resident.
+    #[test]
+    fn install_cold_frees_section_hot_only_when_evict_flagged() {
+        let mut sub = Substrate::new();
+        let install = |sub: &mut Substrate, id: u32| {
+            let sealed = Arc::new(vec![minimal_sealed_layer()]);
+            sub.set_section_full(
+                SectionId::new(id),
+                StreamId::default(),
+                32,
+                vec![],
+                sealed,
+                identity_migrate,
+                Arc::new(vec![]),
+            )
+            .unwrap();
+            sub.section_residence(SectionId::new(id)).unwrap()
+        };
+        let cold = || {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+
+        let member = install(&mut sub, 1);
+        let boundary = install(&mut sub, 2);
+        assert!(sub.residence[member.0].hot.is_some());
+        assert!(sub.residence[boundary.0].hot.is_some());
+
+        // Only the collection member is flagged for offload-on-persist.
+        sub.mark_section_evict_when_cold(member);
+
+        sub.install_cold(member, cold());
+        sub.install_cold(boundary, cold());
+
+        // Flagged member: cold copy lands AND hot VRAM is freed.
+        assert!(
+            sub.residence[member.0].hot.is_none(),
+            "flagged member: VRAM offloaded once cold lands"
+        );
+        assert!(sub.residence[member.0].cold.is_some());
+        // Boundary section: cold copy lands but it stays hot for the build.
+        assert!(
+            sub.residence[boundary.0].hot.is_some(),
+            "boundary section stays hot"
+        );
+        assert!(sub.residence[boundary.0].cold.is_some());
+    }
+
     /// A zero target evicts nothing — there's no incoming load to make room
     /// for, so the working set is left fully hot.
     #[test]
@@ -4533,6 +4637,7 @@ mod tests {
             TokenBuffer::default(),
             20,
             TurnContentBounds::default(),
+            false,
             None,
             0,
             0,
@@ -4554,6 +4659,7 @@ mod tests {
             TokenBuffer::default(),
             10,
             TurnContentBounds::default(),
+            false,
             None,
             0,
             0,
@@ -4588,6 +4694,7 @@ mod tests {
             TokenBuffer::default(),
             32,
             TurnContentBounds::default(),
+            false,
             Some(cold_payload),
             0,
             1,
@@ -4612,6 +4719,7 @@ mod tests {
             TokenBuffer::default(),
             0,
             TurnContentBounds::default(),
+            false,
             None,
             0,
             0,

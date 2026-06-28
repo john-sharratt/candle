@@ -578,11 +578,12 @@ fn streams(log: &mut LogFile) -> Result<()> {
         let sig = if entry.signatures.is_some() { "y" } else { "n" };
         let detail = match &entry.decl {
             Some(StreamDecl::Turn(t)) => format!(
-                "exchange  idx={} chunks={} tok={} sig={}  conv={}",
+                "exchange  idx={} chunks={} tok={} sig={}  no_think={}  conv={}",
                 t.turn_index,
                 entry.chunks.len(),
                 tok,
                 sig,
+                t.no_think,
                 t.timeline_id,
             ),
             Some(StreamDecl::PromptSection(s)) => format!(

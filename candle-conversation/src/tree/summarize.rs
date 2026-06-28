@@ -255,6 +255,7 @@ impl SummarizationTask {
                 prefill_text: window_text,
                 user_text: String::new(),
                 content_bounds: TurnContentBounds::default(),
+                no_think: false,
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens: config.summarization_max_tokens as usize,

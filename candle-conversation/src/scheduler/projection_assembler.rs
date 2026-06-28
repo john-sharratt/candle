@@ -155,6 +155,7 @@ pub(crate) enum AssembledPiece {
 pub(crate) fn assemble_pieces(
     segments: &[ProjectionSegment],
     markers: &BoundaryMarkers,
+    mut turn_no_think: impl FnMut(GroupId, TurnIndex) -> bool,
 ) -> Vec<AssembledPiece> {
     let mut pieces: Vec<AssembledPiece> = Vec::new();
     let mut run: Vec<u32> = Vec::new();
@@ -180,6 +181,15 @@ pub(crate) fn assemble_pieces(
             }
             ProjectionSegment::Sealed(SealedKind::Turn(rt, role)) => {
                 run.extend(markers.user_start.iter().copied());
+                // Re-render this turn's `/no_think` soft-switch if it was sealed
+                // with thinking suppressed — sits right after `user_start`, where
+                // Qwen3 honours it, matching the live-turn `no_think_current`
+                // glue.  Keeps a re-rendered suppressed turn self-consistent: a
+                // `/no_think` opener for its empty `<think></think>`, instead of
+                // an unexplained empty block the model learns to mimic.
+                if turn_no_think(rt.group(), rt.index()) {
+                    run.extend(markers.no_think.iter().copied());
+                }
                 flush(&mut run, &mut pieces);
                 pieces.push(AssembledPiece::Turn {
                     group: rt.group(),
@@ -311,7 +321,21 @@ pub(super) fn apply_segments_build(
     // (the boundary markers around a turn are already folded into the adjacent
     // glue islands by `assemble_pieces`); the user message is deferred.
     let mut walker = SegmentWalker::new();
-    for piece in assemble_pieces(new_segments, ctx.boundary_markers) {
+    // Look up a sealed turn's recorded `no_think` so the assembler can re-render
+    // its `/no_think` switch.  Resolves group→timeline the same way
+    // `inject_sealed_turn` does (slot target first, else any timeline for the
+    // group).  Immutable borrow ends before the mutable walk below.
+    let slot_target = ctx.slot_target;
+    let conversation = ctx.conversation;
+    let no_think_for = |group: GroupId, index: TurnIndex| -> bool {
+        let view = conversation.read();
+        let timeline = match slot_target {
+            Some(tgt) if group == tgt.group => Some(tgt.timeline),
+            _ => view.timelines_for_group(group).next(),
+        };
+        timeline.is_some_and(|tl| view.turn_no_think(tl, index))
+    };
+    for piece in assemble_pieces(new_segments, ctx.boundary_markers, no_think_for) {
         match piece {
             AssembledPiece::Glue(tokens) => {
                 walker.run_tokens.extend(tokens);
@@ -1013,7 +1037,7 @@ mod tests {
                 tokens: Arc::new(vec![9, 9]),
             },
         ];
-        let pieces = assemble_pieces(&segments, &m);
+        let pieces = assemble_pieces(&segments, &m, |_, _| false);
         assert_eq!(
             pieces,
             vec![
@@ -1043,6 +1067,22 @@ mod tests {
     }
 
     #[test]
+    fn assemble_pieces_reinjects_no_think_for_recorded_suppressed_turn() {
+        let mut m = test_markers();
+        m.no_think = Arc::new(vec![42]); // the `/no_think` soft-switch tokens
+        let segments = vec![turn_seg(1, 2, 3)];
+
+        // Recorded thinking-ON: only `user_start` [100] precedes the turn.
+        let on = assemble_pieces(&segments, &m, |_, _| false);
+        assert_eq!(on[0], AssembledPiece::Glue(vec![100]));
+
+        // Recorded thinking-SUPPRESSED: `user_start` [100] ++ `/no_think` [42],
+        // so the re-rendered prior turn shows its switch.
+        let off = assemble_pieces(&segments, &m, |_, _| true);
+        assert_eq!(off[0], AssembledPiece::Glue(vec![100, 42]));
+    }
+
+    #[test]
     fn assemble_pieces_consecutive_generated_form_one_island() {
         let m = test_markers();
         let segments = vec![
@@ -1050,7 +1090,7 @@ mod tests {
             generated_seg("b", 1, &[2, 3]),
             section_seg(5),
         ];
-        let pieces = assemble_pieces(&segments, &m);
+        let pieces = assemble_pieces(&segments, &m, |_, _| false);
         assert_eq!(
             pieces,
             vec![
@@ -1062,7 +1102,7 @@ mod tests {
 
     #[test]
     fn assemble_pieces_empty_is_empty() {
-        assert!(assemble_pieces(&[], &test_markers()).is_empty());
+        assert!(assemble_pieces(&[], &test_markers(), |_, _| false).is_empty());
     }
 
     #[test]

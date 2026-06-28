@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, Reserved, SectionId};
+use candle_conversation::projection::{Builder as ProjectionBuilder, LayerId, SectionId};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -154,18 +154,9 @@ pub fn install_tool_catalog(
             .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e))?;
         out.push((tool.name.to_string(), id, json_line));
     }
-    // Associate the reserved tool-summary section with the collection. The
-    // section is sealed at runtime (the daemon's startup hook); projection emits
-    // it just before the `<tools>` block — OUTSIDE the markers — whenever top-k
-    // dropped at least one tool, and only once it is actually sealed. See
-    // `crate::tool_summary`.
-    builder
-        .set_collection_summary_section(
-            dialogue_layer,
-            collection_id,
-            SectionId::reserved(Reserved::ToolSummary),
-        )
-        .map_err(|e| anyhow::anyhow!("set tool-summary section: {e}"))?;
+    // The tool-catalog overview is the `tool_summary` tree section (a real link
+    // in the K/V chain, sealed before `<tools>`), not a separately-injected
+    // reserved section — so no summary association is needed on the collection.
     Ok(out)
 }
 
@@ -186,7 +177,10 @@ fn render_tool_json_line(tool: &registry::RegisteredTool) -> String {
         "description": tool.description,
         "parameters": schema,
     });
-    serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string()) + "\n"
+    // No trailing newline: the separator between tools is real structural glue
+    // (`member_glue` on the `tools` collection), injected between selected members
+    // at projection so it is independent of which tools provenance surfaces.
+    serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
 }
 
 // ── Tool-call extraction ─────────────────────────────────────────────────────
