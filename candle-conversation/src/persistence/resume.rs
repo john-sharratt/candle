@@ -695,12 +695,7 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
         }
     }
 
@@ -834,6 +829,7 @@ mod tests {
                     },
                 ],
                 selection: Default::default(),
+                materialized: Default::default(),
             },
             ProjectionEvent {
                 start_token: 120,
@@ -848,6 +844,7 @@ mod tests {
                     tokens: 540,
                 }],
                 selection: Default::default(),
+                materialized: Default::default(),
             },
         ];
         let payload = encode_events(&events);

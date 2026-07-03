@@ -95,7 +95,9 @@
 
 use std::collections::HashMap;
 
-use super::ids::{CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex};
+use super::ids::{
+    CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
+};
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
     DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
@@ -103,7 +105,7 @@ use super::schema::{
 };
 use super::selection::apply_selection;
 use crate::substrate::ContentResolver;
-use crate::summary_tree::{NodeId, SelectionDiagnostics};
+use crate::summary_tree::{NodeId, SelectionDiagnostics, SelectionOrigin};
 
 /// Fixed scoring formula used for all turn scoring and section selection.
 /// Calibrated against real Qwen3-30B-A3B Q-vector data; span α=2.0 with
@@ -179,12 +181,18 @@ pub struct ResolvedSection {
 
 /// One emitted turn reference, fully self-describing via [`TurnId`].
 ///
-/// Convenience accessors for the legacy `(group, index)` pair are provided
-/// so call sites that don't care about conversation/layer info can stay
-/// terse.
+/// Carries the resolved [`TimelineId`] — the *conversation* this turn belongs to
+/// — stamped ONCE at projection where the target is unambiguous (see
+/// [`ContentResolver::turn_timeline`]).  Downstream consumers read [`Self::key`]
+/// directly instead of re-deriving the timeline from the group: a turn's
+/// identity is `(timeline, index)`, and re-resolving `group → timeline` per
+/// consumer is exactly what once let the reproject pick the wrong conversation's
+/// timeline and drop a slot's whole history.  `None` only for mock resolvers in
+/// tests (which never reach the apply path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedTurn {
     pub id: TurnId,
+    pub timeline: Option<TimelineId>,
 }
 
 impl ResolvedTurn {
@@ -196,6 +204,16 @@ impl ResolvedTurn {
     #[inline]
     pub fn index(&self) -> TurnIndex {
         self.id.index
+    }
+
+    /// The fully-resolved `(timeline, index)` identity — the only correct key for
+    /// substrate turn lookups.  `None` for mock-resolver turns in tests.
+    #[inline]
+    pub fn key(&self) -> Option<TurnKey> {
+        self.timeline.map(|timeline| TurnKey {
+            timeline,
+            index: self.id.index,
+        })
     }
 }
 
@@ -285,6 +303,14 @@ pub struct Projection {
     /// selector emitted, addressed by their string ids.  Empty when the target
     /// layer has no [`super::SectionTree`].
     pub selections: Vec<ResolvedSelection>,
+    /// Why each selected turn entered the slot, keyed by `(group, turn)`. The
+    /// score-density path tags each pick from the summary forest (hard anchor /
+    /// provenance / coverage / …); the rule-based path tags `Recent` (inside the
+    /// recency window) vs `Historical` (top-k by score). Read by
+    /// [`super::event::from_projection_with_origins`] so the persisted projection
+    /// record / GUI can show "why is this turn in my context?". Empty entries
+    /// (e.g. the live user message) carry no origin.
+    pub selection_origins: HashMap<(GroupId, TurnIndex), SelectionOrigin>,
 }
 
 /// The section-tree selector id the engine reads to drive per-turn thinking
@@ -517,6 +543,9 @@ pub fn run_with_sink<R: ContentResolver>(
     }
 
     let mut group_states: Vec<GroupState> = Vec::new();
+    // Why each selected turn entered the slot — collected as we select, surfaced
+    // on the returned `Projection` so the persisted record / GUI can show it.
+    let mut selection_origins: HashMap<(GroupId, TurnIndex), SelectionOrigin> = HashMap::new();
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
@@ -564,6 +593,7 @@ pub fn run_with_sink<R: ContentResolver>(
                     for (turn_idx, origin, score) in &picks {
                         let tokens = resolver.turn_token_count(group.id, *turn_idx) as u32;
                         diag.push(NodeId(turn_idx.0), *origin, *score, tokens);
+                        selection_origins.insert((group.id, *turn_idx), *origin);
                     }
                     diag.pending_count = resolver.pending_summary_len(target.timeline);
                     sink(diag);
@@ -603,6 +633,25 @@ pub fn run_with_sink<R: ContentResolver>(
                     })
                     .collect()
             };
+
+            // Rule-based path has no per-pick origin; derive it from the
+            // `Sequence` rule's own recency split so the panel can still answer
+            // "why?": a turn inside the last `recent` window is `Recent`
+            // (inviolate), an older selected turn is `Historical` (top-k by
+            // score). Mirrors `select_conversation`'s `split_at = len - recent`.
+            if !score_density_used {
+                if let SelectionRule::Sequence { recent, .. } = &group.selection {
+                    let split = count.saturating_sub(*recent as u32);
+                    for (idx, _) in &selected {
+                        let origin = if idx.0 >= split {
+                            SelectionOrigin::Recent
+                        } else {
+                            SelectionOrigin::Historical
+                        };
+                        selection_origins.insert((group.id, *idx), origin);
+                    }
+                }
+            }
 
             tracing::trace!(
                 group = %group.name,
@@ -675,6 +724,7 @@ pub fn run_with_sink<R: ContentResolver>(
         return Projection {
             segments: system_prompt_segments,
             selections: resolved_selections,
+            selection_origins,
         };
     }
 
@@ -836,6 +886,9 @@ pub fn run_with_sink<R: ContentResolver>(
                         group_id: gs.schema.id,
                         index: idx,
                     },
+                    // Stamp the conversation ONCE, here, where the target-aware
+                    // resolver knows it — so no downstream consumer re-derives it.
+                    timeline: resolver.turn_timeline(gs.schema.id, idx),
                 });
             }
         }
@@ -858,6 +911,7 @@ pub fn run_with_sink<R: ContentResolver>(
     Projection {
         segments,
         selections: resolved_selections,
+        selection_origins,
     }
 }
 

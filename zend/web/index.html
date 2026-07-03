@@ -1393,46 +1393,58 @@
       else if (item.kind === 'collection') item.sections.forEach((s) => { if (s.selected) add(C[s.name]); });
       else add(C[item.name]);
     });
-    // Memory-tier turns (non-dialogue layers) sit between the system prompt and
-    // the dialogue conversation; each is framed as full ChatML (user half, then
-    // assistant half), bodies read from the substrate (turnContent).
     const TC = S.substrateTurnContent || {};
-    (sel.turns || []).filter((t) => t.layer && t.layer !== 'dialogue').forEach((t) => {
-      const tc = TC[t.group + '::' + t.index] || {};
-      add(G && G.user_start); add(tc.user);
-      // The assistant header is clean — no think block is baked into the glue.
-      add(G && G.user_end); add(G && G.assistant_start); add(tc.assistant);
-      add(G && G.assistant_end);
-    });
-    // The conversation, from the REAL messages: prior exchanges, the active user
-    // prompt, then the response decoded up to THIS dot's `end_token` (token
-    // fraction). Each message is framed by its own role markers; the trailing
-    // assistant is left open while still decoding.
-    const hist = S.substrateHistory || [];
     const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
     const maxEnd = Math.max(1, ...ends);
     const here = node && node.end_token != null ? node.end_token : maxEnd;
     const complete = here >= maxEnd;
-    // The think block is never glue: under `/no_think` the model decodes its own
-    // empty `<think></think>` into the body, and a thinking turn opens its own
-    // `<think>` — either way it's part of `content`, not the assistant header.
-    // `/no_think` is glue emitted after `user_start`. PRIOR turns use their own
-    // recorded `no_think` flag (the backend tags each user bubble); the in-flight
-    // user turn uses the live effort dial (its flag isn't sealed yet) — mirroring
-    // the engine: prior turns from the substrate, the current one from the dial.
     const noThink = !!(G && G.no_think && S.effortLevel === 0);
-    const msg = (role, content, open, withNoThink) => {
+    const msg = (role, content, open, withNoThink, isSummary) => {
       const isUser = role === 'user';
-      add(isUser ? (G && G.user_start) : (G && G.assistant_start));
+      // Full framing (live turn / fallback): every turn opens `user_start` (a
+      // summary has no user half but is still `user_start`-framed) and closes
+      // `assistant_end`; intra markers are baked into the body.
+      add(isUser || isSummary ? (G && G.user_start) : (G && G.assistant_start));
       if (isUser && withNoThink) add(G.no_think);
       add(content);
-      if (!open) add(isUser ? (G && G.user_end) : (G && G.assistant_end));
+      if (!open) add(isSummary ? (G && G.assistant_end) : isUser ? (G && G.user_end) : (G && G.assistant_end));
     };
-    hist.forEach((m) => msg(m.role, m.content, false, !!m.no_think));
-    if (um) msg('user', um.content, false, noThink);
-    if (dm && dm.role === 'assistant' && (dm.content || '').length) {
-      const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
-      msg('assistant', dm.content.slice(0, cut), !complete);
+    // The WHOLE turn as one continuous string (full sealed token range, with the
+    // intra-turn boundary baked in) — never split-and-re-glued. Inter-turn glue
+    // comes from the spine. Falls back to the old halves only if `text` is absent.
+    const turnInner = (t) => {
+      const tc = TC[t.group + '::' + t.index] || {};
+      if (tc.text != null) { add(tc.text); return; }
+      if (t.kind && t.kind !== 'normal') { add(tc.assistant || tc.user || ''); return; }
+      add(tc.user); add(G && G.user_end); add(G && G.assistant_start); add(tc.assistant);
+    };
+    const materialized = (node && node.materialized) || [];
+    if (materialized.length) {
+      // Truth: the copied text is the engine's injected spine verbatim — real
+      // glue islands (which carry user_start / no_think / assistant_end) plus the
+      // sealed turn bodies, in materialized order.
+      materialized.forEach((p) => { if (p.kind === 'glue') add(p.text); else if (p.turn) turnInner(p.turn); });
+    } else {
+      // Pre-spine fallback: reconstruct the inter-turn glue around each
+      // continuous full-turn body.
+      const reglued = (t) => { add(G && G.user_start); turnInner(t); add(G && G.assistant_end); };
+      (sel.turns || []).filter((t) => t.layer && t.layer !== 'dialogue').forEach(reglued);
+      (sel.turns || []).filter((t) => (t.layer || 'dialogue') === 'dialogue' && t.index !== 4294967295).forEach(reglued);
+    }
+    // The live, in-flight turn as one continuous run: user_start (+ /no_think),
+    // the user message, the baked role boundary, the assistant decoded-so-far,
+    // and assistant_end once complete — matching the panel's single live card.
+    if (um || dm) {
+      add(G && G.user_start);
+      if (noThink) add(G && G.no_think);
+      add(um ? um.content : '');
+      add(G && G.user_end);
+      add(G && G.assistant_start);
+      if (dm && dm.role === 'assistant' && (dm.content || '').length) {
+        const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
+        add(dm.content.slice(0, cut));
+      }
+      if (complete) add(G && G.assistant_end);
     }
     return out;
   }
@@ -1512,47 +1524,167 @@
     };
 
     // System prompt in materialized order: the engine's structural glue rows
-    // (always visible — incl. the markers that CLOSE the tool block and system
-    // block) interleaved with collapsible content sections and the contributing
-    // collection. This mirrors exactly what the projection emitted.
+    // (incl. the markers that CLOSE the tool block and system block) interleaved
+    // with collapsible content sections and the contributing collection — exactly
+    // what the projection emitted. The whole thing is nested in ONE collapsible
+    // card, COLLAPSED by default, so the panel opens focused on the conversation;
+    // expand it to inspect the full system framing.
+    const systemRows = [];
+    let sysTokens = 0, sysSel = 0, sysTotal = 0;
     sel.system.forEach((item) => {
       if (item.kind === 'glue') {
-        body.appendChild(glueRow(item.content));
+        sysTokens += item.tokens || 0;
+        systemRows.push(glueRow(item.content));
       } else if (item.kind === 'collection') {
         const picked = item.sections.filter((s) => s.selected).length;
+        sysSel += picked; sysTotal += item.sections.length;
+        item.sections.forEach((s) => { sysTokens += s.tokens || 0; });
         const gkey = 'col::' + item.name;
-        body.appendChild(group(item.name, picked + ' / ' + item.sections.length + ' selected', '#6f9ed8', gkey, item.sections.map((s) => sectionRow(s, gkey))));
+        systemRows.push(group(item.name, picked + ' / ' + item.sections.length + ' selected', '#6f9ed8', gkey, item.sections.map((s) => sectionRow(s, gkey))));
       } else {
-        body.appendChild(sectionRow({ name: item.name, tokens: item.tokens, selected: true }, 'sys'));
+        sysTokens += item.tokens || 0; sysSel++; sysTotal++;
+        systemRows.push(sectionRow({ name: item.name, tokens: item.tokens, selected: true }, 'sys'));
       }
     });
+    if (systemRows.length) {
+      const secSub = sysTotal ? sysSel + '/' + sysTotal + ' sections' : 'framing';
+      const sysSub = secSub + (sysTokens ? ' · ' + fmtTok(sysTokens) + ' tok' : '');
+      body.appendChild(group('system prompt', sysSub, '#6f9ed8', 'system', systemRows));
+    }
 
     // Verbatim body text in a pre-wrap block (preserves every space/newline).
     const bodyPre = (txt) => h('pre', { style: 'margin:0; padding:8px 13px 11px 13px; font-size:11px; line-height:1.5; color:#cdc6bd; background:#141210; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; border-top:1px solid #2e2b27;' }, txt);
+
+    // Colorized turn body: a turn is one continuous string (user content, the
+    // baked role boundary `user_end`/`assistant_start`, then assistant content).
+    // Split on the dialect markers and tint each part — user purple, assistant
+    // green, the boundary markers gray — so the roles are legible at a glance.
+    const turnBody = (txt) => {
+      let t = txt || '';
+      const us = (G && G.user_start) || '', nt = (G && G.no_think) || '';
+      const ue = (G && G.user_end) || '', as = (G && G.assistant_start) || '';
+      // Peel a leading turn-opener glue (user_start, optional /no_think) so it
+      // colors gray as glue, not purple as user content.
+      let lead = '';
+      if (us && t.startsWith(us)) { lead = us; t = t.slice(us.length); if (nt && t.startsWith(nt)) { lead += nt; t = t.slice(nt.length); } }
+      let userPart = '', boundary = '', asstPart = t;
+      const i = ue ? t.indexOf(ue) : -1;
+      if (i !== -1) {
+        userPart = t.slice(0, i);
+        let bEnd = i + ue.length;
+        const k = as ? t.indexOf(as, i) : -1;
+        if (k !== -1) bEnd = k + as.length;
+        boundary = t.slice(i, bEnd);
+        asstPart = t.slice(bEnd);
+      }
+      const span = (s, color) => s ? h('span', { style: 'color:' + color + ';' }, s) : null;
+      return h('pre', { style: 'margin:0; padding:8px 13px 11px 13px; font-size:11px; line-height:1.5; background:#141210; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; border-top:1px solid #2e2b27;' },
+        span(lead, '#6a6258'), span(userPart, '#a99cd6'), span(boundary, '#6a6258'), span(asstPart, '#7fc6a4'));
+    };
+
+    // Render an expanded turn body from its segment-vector LAYOUT (the engine's
+    // complete K/V description): each segment colored by role — user purple,
+    // assistant green, thinking amber, glue gray — and ETHEREAL segments (glue /
+    // thinking with no K/V: the spine-materialized prefix/suffix, a dropped
+    // reasoning block) dimmed + italic so "recorded but not in this turn's K/V"
+    // is visible at a glance.
+    const segMarker = (m) => ({
+      system_start: G && G.system_start, user_start: G && G.user_start,
+      assistant_start: G && G.assistant_start, im_end: G && (G.user_end || G.assistant_end),
+      no_think: G && G.no_think,
+    }[m] || ('<' + m + '>'));
+    // The turn's segment vector, rendered the SAME way the system prompt is:
+    // boundary glue as flat `⟐` rows (so it reads identically to the system
+    // framing) interleaved with the content blocks — user (purple), thinking
+    // (amber), assistant (green). Ethereal segments (glue/thinking with no K/V:
+    // the spine-materialized opener/closer, a dropped reasoning block) dim +
+    // italicize so "recorded but not in this turn's K/V" reads at a glance.
+    const segmentBody = (layout) => {
+      const segs = (layout && layout.segments) || [];
+      const wrap = h('div', { style: 'background:#141210; border-top:1px solid #2e2b27; padding:5px 0 7px 0;' });
+      segs.forEach((s) => {
+        const ethereal = s.kv == null;
+        if (s.kind === 'glue') {
+          const r = glueRow(segMarker(s.marker));
+          // Ethereal glue (the turn's opener/closer, materialized by the spine)
+          // stays legible — italic marks it as "not in this turn's own grid"
+          // without washing the text out.
+          if (ethereal) { r.style.opacity = '0.78'; r.style.fontStyle = 'italic'; }
+          wrap.appendChild(r);
+          return;
+        }
+        const color = s.kind === 'user' ? '#a99cd6' : s.kind === 'thinking' ? '#c9a14a' : '#7fc6a4';
+        const text = s.text != null ? s.text : (s.kind === 'assistant' ? '∅' : '');
+        wrap.appendChild(h('pre', { style: 'margin:0; padding:4px 13px 5px 26px; font-size:11px; line-height:1.5; color:' + color + '; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace;' + (ethereal ? ' opacity:0.45; font-style:italic;' : '') }, text));
+      });
+      return wrap;
+    };
 
     // One ChatML message as a collapsible card — shared by BOTH the memory tiers
     // and the dialogue so they look identical. Header: "<layer> · <role> message"
     // + token estimate, role-accented left border, clean body. The role markers
     // are flat glue rows OUTSIDE the card; the closer is omitted while
     // `opts.open` (a still-decoding assistant).
+    // Per-card badges: FOREST KIND (a `SoT`/`SoS` summary node standing in for
+    // the turns beneath it) and WHY the projection picked it (provenance /
+    // coverage / recency / anchor, or recent / historical on the rule-based
+    // path). Both render inline on the card header so the materialized view
+    // shows, in place, when a slot holds a summary instead of the raw turn.
+    const tagBadge = (txt, fg, bg) => h('span', { style: 'font-size:8.5px; font-weight:700; letter-spacing:0.04em; padding:1px 6px; border-radius:4px; white-space:nowrap; flex-shrink:0; color:' + fg + '; background:' + bg + ';' }, txt);
+    const REASON_NAME = { hard_anchor: 'anchor', provenance_score: 'provenance', recency_decay: 'recency', coverage_fill: 'coverage', refill: 'refill', pending: 'pending', recent: 'recent', historical: 'historical' };
+    const kindBadge = (k) => k === 'summary_of_summaries' ? tagBadge('SUMMARY · SoS', '#e8893c', 'rgba(232,137,60,0.18)')
+      : k === 'summary_of_turns' ? tagBadge('SUMMARY · SoT', '#d8a23a', 'rgba(216,162,58,0.18)') : null;
+    const reasonBadge = (r) => r ? tagBadge('why: ' + (REASON_NAME[r] || r), '#a99cd6', 'rgba(169,156,214,0.15)') : null;
+
     const pushMsg = (role, content, opts) => {
       opts = opts || {};
       const isUser = role === 'user';
-      const accent = isUser ? '#9b8fdf' : '#6cb39a';
+      const isSummary = opts.kind && opts.kind !== 'normal';
+      const accent = isSummary ? '#d8a23a' : isUser ? '#9b8fdf' : '#6cb39a';
       const exp = !!S.substrateExpanded[opts.key];
-      if (G) body.appendChild(glueRow(isUser ? G.user_start : G.assistant_start));
-      // `/no_think` glue after `user_start`: prior turns pass their recorded
-      // `no_think` flag, the in-flight turn passes the live effort dial.
-      if (isUser && opts.noThink && G && G.no_think) body.appendChild(glueRow(G.no_think));
-      const tok = fmtTok(Math.max(1, Math.round((content || '').length / 4)));
+      // INTER-turn markers (user_start / no_think / assistant_end) are the real
+      // boundary glue the assembler injects; when `spineGlue` is set they come
+      // from the materialized spine (real Glue pieces) and are suppressed here.
+      // INTRA-turn markers (user_end before the assistant half, assistant_start
+      // opening it) are baked into the turn body and always shown in place. A
+      // summary has no user half, so it is `user_start … assistant_end`-framed.
+      // `noGlue`: the whole turn is one continuous card — inter-turn glue comes
+      // from the materialized spine, intra-turn markers are baked into the body —
+      // so the card emits NO glue rows itself.
+      const spine = !!opts.spineGlue;
+      const noGlue = !!opts.noGlue;
+      if (G && !noGlue) {
+        const openInter = isUser || isSummary; // user_start (inter) vs assistant_start (intra)
+        if (!(spine && openInter)) body.appendChild(glueRow(openInter ? G.user_start : G.assistant_start));
+      }
+      // `/no_think` glue after `user_start` (inter): prior turns pass their
+      // recorded flag, the in-flight turn passes the live effort dial.
+      if (isUser && opts.noThink && !spine && !noGlue && G && G.no_think) body.appendChild(glueRow(G.no_think));
+      const tok = opts.tokens != null ? fmtTok(opts.tokens) : fmtTok(Math.max(1, Math.round((content || '').length / 4)));
+      // A summary is its own thing; a full continuous turn is "turn"; otherwise a
+      // single user/assistant half (fallback). `opts.label` overrides.
+      const label = (opts.layer ? opts.layer + ' · ' : '') + (opts.label || (isSummary ? 'summary' : role + ' message')) + (opts.suffix || '');
       const wrap = h('div', { style: 'border:1px solid #2e2b27; border-left:3px solid ' + accent + '; border-radius:6px; overflow:hidden; margin:3px 0; background:#1a1816;' },
-        h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateExpanded', opts.key), style: 'cursor:pointer; display:flex; align-items:center; gap:9px; padding:7px 11px; background:#201d1b;' },
+        h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateExpanded', opts.key), style: 'cursor:pointer; display:flex; align-items:center; gap:8px; padding:7px 11px; background:#201d1b;' },
           chev(exp),
-          h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace; font-size:12px; color:#ece8e4; font-weight:600;' }, (opts.layer ? opts.layer + ' · ' : '') + role + ' message' + (opts.suffix || '')),
-          h('span', { style: 'margin-left:auto; font-size:10.5px; color:#7c736a; font-family:ui-monospace,monospace; flex-shrink:0;' }, tok + ' tokens')));
-      if (exp) wrap.appendChild(bodyPre(content || ''));
+          h('span', { style: 'min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace; font-size:12px; color:#ece8e4; font-weight:600;' }, label),
+          kindBadge(opts.kind),
+          reasonBadge(opts.reason),
+          h('span', { style: 'flex:1;' }),
+          h('span', { style: 'font-size:10.5px; color:#7c736a; font-family:ui-monospace,monospace; flex-shrink:0;' }, tok + ' tokens')));
+      if (exp) {
+        // Truth-first: when the turn carries its stored segment vector, render it
+        // verbatim (glue/user/thinking/assistant, real vs ethereal). Only when no
+        // vector is present (a turn sealed before the layout existed) do we fall
+        // back to colorized / plain body text.
+        const hasSegs = opts.layout && opts.layout.segments && opts.layout.segments.length;
+        wrap.appendChild(hasSegs ? segmentBody(opts.layout) : opts.colorize ? turnBody(content || '') : bodyPre(content || ''));
+      }
       body.appendChild(wrap);
-      if (G && !opts.open) body.appendChild(glueRow(isUser ? G.user_end : G.assistant_end));
+      if (G && !opts.open && !noGlue) {
+        const closeInter = isSummary || !isUser; // assistant_end (inter) vs user_end (intra)
+        if (!(spine && closeInter)) body.appendChild(glueRow(closeInter ? G.assistant_end : G.user_end));
+      }
     };
 
     const targetLayer = S.substrateTargetLayer || 'dialogue';
@@ -1563,38 +1695,86 @@
     // prefixed with the originating layer.
     const otherTurns = (sel.turns || []).filter((t) => t.layer && t.layer !== targetLayer)
       .slice().sort((a, b) => ((a.layer || '') + (a.group || '')).localeCompare((b.layer || '') + (b.group || '')) || (a.index || 0) - (b.index || 0));
-    otherTurns.forEach((t) => {
-      const tc = (S.substrateTurnContent || {})[t.group + '::' + t.index] || {};
-      const base = 'turn::' + t.group + '::' + t.index;
-      pushMsg('user', tc.user, { layer: t.layer, key: base + '::user' });
-      pushMsg('assistant', tc.assistant, { layer: t.layer, key: base + '::assistant' });
-    });
 
-    // The conversation, rendered from the REAL messages (the GUI holds them with
-    // correct roles + bodies; `sel.turns` has neither — it tags every sealed turn
-    // `assistant` and carries no text). Sequence: prior exchanges, the active user
-    // prompt, then the response decoded SO FAR. Each projection dot fired at its
-    // own `end_token`; truncate the trailing response to THIS dot's progress (by
-    // token fraction — the panel has text, not token offsets) so an earlier dot
-    // shows proportionally less, not the whole final answer.
-    const dm = S.substrateMsg, um = S.substrateUserMsg, hist = S.substrateHistory || [];
+    // The conversation is rendered from the engine's MATERIALIZED spine (the
+    // `assemble_pieces` output carried on the event): real boundary-glue islands
+    // interleaved with the sealed turns — memory tiers + dialogue, summaries in
+    // place. This is the literal injected order/glue, not a reconstruction.
+    const dm = S.substrateMsg, um = S.substrateUserMsg;
     const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
     const maxEnd = Math.max(1, ...ends);
     const here = node && node.end_token != null ? node.end_token : maxEnd;
     const complete = here >= maxEnd;
-    let decoded = '';
-    if (dm && dm.role === 'assistant' && (dm.content || '').length) {
-      const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
-      decoded = dm.content.slice(0, cut);
+
+    // The sealed dialogue turns the projection actually selected (the live,
+    // still-decoding turn is NOT one of them — it is rendered from `um`/`dm`
+    // below, and the current user message carries index u32::MAX).
+    const dialogueTurns = (sel.turns || []).filter((t) => (t.layer || targetLayer) === targetLayer && t.index !== 4294967295);
+    const TCd = S.substrateTurnContent || {};
+    // Render one materialized turn (memory tier or dialogue) as ONE card. Its body
+    // (on expand) is the turn's stored segment vector — user / assistant / thinking
+    // with boundary glue rendered INSIDE it (`segmentBody`) — falling back to
+    // colorized text when a turn has no vector. `noGlue`: the card emits no glue
+    // rows of its own; all glue lives inside the segment vector.
+    const renderTurn = (t) => {
+      const tc = TCd[t.group + '::' + t.index] || {};
+      const isSummary = t.kind && t.kind !== 'normal';
+      const full = tc.text != null ? tc.text
+        : (isSummary ? (tc.assistant || tc.user || '') : ((tc.user || '') + (tc.assistant || '')));
+      pushMsg('assistant', full, { layer: t.layer || targetLayer, key: 'conv::' + t.group + '::' + t.index, kind: t.kind, reason: t.reason, noGlue: true, colorize: true, layout: tc.layout, label: isSummary ? 'summary' : 'turn', tokens: t.tokens });
+    };
+    const materialized = (node && node.materialized) || [];
+    if (materialized.length) {
+      // Walk the injected spine for turn ORDER; each turn renders its own glue in
+      // place. EXCEPT the decoded turn (#N) — the LAST dialogue turn — which is
+      // this projection's OUTPUT, not attended context: the event is built AFTER
+      // finish_turn, so the reprojection pulls the just-sealed turn back into the
+      // spine by recency, making the panel look like the model read its own answer.
+      // Skip it here and draw it below as the decoded-turn card, so the spine
+      // shows only what was actually attended (#0…#N-1).
+      let skipTurn = -1;
+      if (um || dm) {
+        for (let i = materialized.length - 1; i >= 0; i--) {
+          const p = materialized[i];
+          if (p.kind === 'turn' && p.turn && (p.turn.layer || targetLayer) === targetLayer) { skipTurn = i; break; }
+        }
+      }
+      materialized.forEach((p, i) => {
+        if (i === skipTurn) return;
+        if (p.kind === 'turn' && p.turn) renderTurn(p.turn);
+      });
+    } else {
+      // Fallback for event records predating the materialized spine.
+      otherTurns.forEach(renderTurn);
+      // Drop the decoded turn (the last dialogue turn) — drawn below as output.
+      const ctxTurns = (um || dm) ? dialogueTurns.slice(0, -1) : dialogueTurns;
+      ctxTurns.forEach((t) => renderTurn({ ...t, layer: targetLayer }));
+    }
+    // The turn THIS event decoded — user prompt (the attended query) + the assistant
+    // text that was actually IN SCOPE when provenance last selected, clipped there.
+    // A mid-decode reprojection carries that point directly in `here`. The post-seal
+    // "answer" event is stamped t=full, but its selection was computed from the
+    // decode as of the LAST mid-decode re-scan — so for it we clip at that point
+    // (or at nothing for a short turn that never re-scanned mid-decode), giving the
+    // SAME clipped "decoding" view every other projection shows, never the whole
+    // finished turn. Drawn below the attended context (it is this decode's output).
+    if (um || dm) {
+      // `ends`/`maxEnd` (computed above) already hold every span's end_token + max.
+      let clipTok = here;
+      if (complete) {
+        const mids = ends.filter((e) => e < maxEnd);
+        clipTok = mids.length ? Math.max(...mids) : 0; // last mid-decode re-scan, else none
+      }
+      const clen = (dm && dm.content) ? dm.content.length : 0;
+      const clipCut = Math.max(0, Math.min(clen, Math.round(clen * clipTok / maxEnd)));
+      const scoped = (dm && dm.role === 'assistant') ? dm.content.slice(0, clipCut) : '';
+      const liveNoThink = !!(G && G.no_think && S.effortLevel === 0);
+      const lead = G ? (G.user_start + (liveNoThink && G.no_think ? G.no_think : '')) : '';
+      const liveText = lead + (um ? um.content : '') + (G ? (G.user_end + G.assistant_start) : '') + scoped;
+      pushMsg('assistant', liveText, { layer: targetLayer, key: 'conv::live', noGlue: true, colorize: true, label: 'turn', suffix: ' · decoding', open: true });
     }
 
-    // Same card style + layer prefix as the memory tiers above, so the whole
-    // panel is uniform. The trailing assistant is open-ended while still decoding.
-    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i, noThink: !!m.no_think }));
-    if (um) pushMsg('user', um.content, { layer: targetLayer, key: 'conv::um', noThink: !!(G && G.no_think && S.effortLevel === 0) });
-    if (dm) pushMsg('assistant', decoded, { layer: targetLayer, suffix: complete ? '' : ' · decoded so far', open: !complete, key: 'conv::dm' });
-
-    const empty = !sel.system.length && !hist.length && !um && !dm;
+    const empty = !sel.system.length && !(sel.turns || []).length && !um && !dm;
     const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(880px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:flex-start; gap:12px; padding:15px 17px; border-bottom:1px solid #2e2b27;' },
         h('div', { style: 'flex:1; min-width:0;' },

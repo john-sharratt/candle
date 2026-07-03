@@ -181,19 +181,12 @@ pub const CODE_READ_PARALLELISM: usize = 16;
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
 /// (no reprojection), inheriting the utility C6 compression level.
 ///
-/// **K override stays on.** Ideally code_reading would also drop the
-/// engine-wide K→Q4_KS override so K is fully adaptively quantized, but the
-/// decode kernel's K-side still fails recall on non-identity pal_map +
-/// non-unit outer scales (see `CompressionPolicy::override_k_quant` /
-/// `ModelBuilder::engine`). Dropping it would corrupt code_reading recall
-/// the moment dialogue attends back over it. So K stays Q4_KS (identity)
-/// and only V gets the harder C6 selection. `kv_disable_k_override = false`
-/// is the engine default; set explicitly here to document the deliberate
-/// choice — flip it to `true` once the decode K-path is fixed.
+/// V is adaptively quantized at C6; K inherits the engine-wide uniform-K pin
+/// (Q8_KS, identity pal_map + unit scales) so the provenance recall path reads
+/// `code_reading` keys consistently when dialogue attends back over them (see
+/// `ModelBuilder::engine` / `CompressionPolicy::override_k_quant`).
 fn code_read_config(config: SequenceConfig) -> SequenceConfig {
-    let mut cfg = utility_config(config);
-    cfg.kv_disable_k_override = false;
-    cfg
+    utility_config(config)
 }
 
 /// Resolve the worker count for the parallel ingest.  Reads

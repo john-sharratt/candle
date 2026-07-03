@@ -34,9 +34,6 @@ use crate::models::slot_state::{SlotStateHost, TokenSliceHost};
 struct SlotHeaderUpload {
     /// Raw GPU address of `SlotHeader[b]` (24 bytes each).
     headers_ptr: u64,
-    /// Per-slot host slot state, write region extended; `position_map[off+t]`
-    /// locates glue token `t`'s writer slice/in-block offset.
-    slots: Vec<SlotStateHost>,
     /// Keeps the stager uploads (headers, slices, records) alive for the
     /// duration of the kernel launch. The position_map upload is layer-invariant
     /// and held separately in the per-forward [`SharedPm`] cache.
@@ -270,7 +267,6 @@ fn build_slot_headers(
 
     Ok(SlotHeaderUpload {
         headers_ptr,
-        slots,
         _guards: (headers_gpu, slices_gpu, records_gpu),
     })
 }
@@ -1116,12 +1112,9 @@ type GlueFfi = unsafe extern "C" fn(
     *const u32,    // cu_seqlens_q
     *const u32,    // q_lens
     *const u32,    // kv_lens
-    *const u32,    // col_actual_pos
-    *const u32,    // cu_kvlens
     *const u32,    // glue_write_slice
     *const u32,    // glue_write_in_blk
-    u32,           // fwd_window
-    *const u32,    // b_avail
+    *const u32,    // fwd_ahead
     *mut c_void,   // stream
 );
 
@@ -1138,19 +1131,12 @@ struct PagedGlueChunks {
     kv_lens: Tensor,
     k_new: Tensor,
     v_new: Tensor,
-    /// Flat `[Σ kv_lens]` U32 — true sequence position of every column.
-    col_actual_pos: Tensor,
-    /// `[batch+1]` U32 — exclusive prefix sum of `kv_lens` (col_actual_pos offsets).
-    cu_kvlens: Tensor,
-    /// Flat `[Σ q_lens]` U32 — writer-chunk slice index per glue row.
+    /// Flat `[Σ q_lens]` U32 — gap chunk slice index per glue row (scatter target).
     glue_write_slice: Tensor,
     /// Flat `[Σ q_lens]` U32 — in-block offset per glue row.
     glue_write_in_blk: Tensor,
-    /// Forward B-head window (tokens); `0` == backward-only. Glue rows also attend
-    /// the first `min(fwd_window, b_avail[slot])` columns of the next section (B).
-    fwd_window: u32,
-    /// `[batch]` U32 — per-slot count of B columns resident after `kv_len`.
-    b_avail: Tensor,
+    /// Flat `[Σ q_lens]` U32 — forward bridge window per glue row (`0` == causal).
+    fwd_ahead: Tensor,
     headers_ptr: u64,
     batch_size: usize,
     max_glue: usize,
@@ -1199,11 +1185,9 @@ impl PagedGlueChunks {
         let cu_ptr = u32_ptr(&self.cu_seqlens_q)?;
         let ql_ptr = u32_ptr(&self.q_lens)?;
         let kv_ptr = u32_ptr(&self.kv_lens)?;
-        let cap_ptr = u32_ptr(&self.col_actual_pos)?;
-        let cukv_ptr = u32_ptr(&self.cu_kvlens)?;
         let gws_ptr = u32_ptr(&self.glue_write_slice)?;
         let gwi_ptr = u32_ptr(&self.glue_write_in_blk)?;
-        let ba_ptr = u32_ptr(&self.b_avail)?;
+        let fa_ptr = u32_ptr(&self.fwd_ahead)?;
 
         // Typed Q/K/V (compute dtype).
         let q_slice = q.as_cuda_slice::<T>()?.slice(q_l.start_offset()..);
@@ -1255,12 +1239,9 @@ impl PagedGlueChunks {
                 cu_ptr as *const u32,
                 ql_ptr as *const u32,
                 kv_ptr as *const u32,
-                cap_ptr as *const u32,
-                cukv_ptr as *const u32,
                 gws_ptr as *const u32,
                 gwi_ptr as *const u32,
-                self.fwd_window,
-                ba_ptr as *const u32,
+                fa_ptr as *const u32,
                 raw_stream,
             );
         }
@@ -1300,12 +1281,14 @@ impl candle::CustomOp1 for PagedGlueChunks {
     }
 }
 
-/// Reprojection glue forward over chunked KV: each slot's `q_lens[i]` glue
-/// queries attend its existing sealed prefix (`offsets[i]` columns) + earlier
-/// glue, writing their own K/V to the writer chunks. `col_actual_pos` carries
-/// every column's TRUE sequence position (flat, `cu_kvlens` order) so the glue
-/// islands mask + RoPE by logical position rather than packed position. HD128
-/// only — other head dims must stay on the plain prefill path.
+/// Reprojection glue forward over chunked KV. Each slot's `q_lens[i]` glue
+/// queries are reserved IN PLACE as gap chunks at their logical positions; this
+/// forward scatters each query's K/V into its gap (`glue_write_slice/in_blk`)
+/// and computes its attention over the whole slot. Every column's sequence
+/// position comes from its chunk `rope_base` (`slice_rope`) — the same
+/// convention decode reads — so there is no `col_actual_pos`. Each glue token
+/// attends backward over everything and forward up to `fwd_ahead[t]` tokens (its
+/// bridge window). HD128 only — other head dims stay on the plain prefill path.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_glue_attn(
@@ -1320,10 +1303,11 @@ pub fn paged_glue_attn(
     n_kv_head: usize,
     head_dim: usize,
     prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
-    col_actual_pos: &Tensor,
+    glue_write_slice: &Tensor,
+    glue_write_in_blk: &Tensor,
+    fwd_ahead: &Tensor,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-    fwd_window: usize,
     generation: &Generation,
 ) -> Result<Tensor> {
     if head_dim != 128 {
@@ -1331,6 +1315,7 @@ pub fn paged_glue_attn(
     }
     let total_q: usize = q_lens.iter().sum();
     let max_glue = q_lens.iter().copied().max().unwrap_or(0);
+    let _ = offsets; // slot geometry is read from the cache, not the caller offset
 
     // Glue fires over an already-sealed prefix, so the caches must be chunked.
     let use_chunks = caches
@@ -1341,10 +1326,10 @@ pub fn paged_glue_attn(
         candle::bail!("paged-glue requires chunked caches");
     }
 
-    // Allocate the writer region for each slot's glue tokens (exactly q_lens[i]).
-    for (i, &add) in q_lens.iter().enumerate() {
-        KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
-    }
+    // The gaps are already reserved chunks (the slot length counts them) — no
+    // capacity allocation here. `kv_len` is the slot's actual length, read from
+    // the cache so it is independent of how the caller accounts the offset.
+    let kv_lens_host: Vec<usize> = caches.iter().map(|c| c.current_seq_len()).collect();
 
     let (compute_dtype, _max_blocks) = {
         let first = caches
@@ -1387,8 +1372,9 @@ pub fn paged_glue_attn(
     };
 
     let device = q.device();
-    let (cu_seqlens_q, q_lens_dev, kv_lens) = if let Some((cu, ql, kv, _hp)) = prefill_meta {
-        (cu.clone(), ql.clone(), kv.clone())
+    let _ = total_q;
+    let (cu_seqlens_q, q_lens_dev) = if let Some((cu, ql, _kv, _hp)) = prefill_meta {
+        (cu.clone(), ql.clone())
     } else {
         let mut cu = Vec::with_capacity(b_sz + 1);
         cu.push(0u32);
@@ -1403,62 +1389,24 @@ pub fn paged_glue_attn(
             b_sz,
             device,
         )?;
-        let kv_lens = Tensor::from_vec(
-            offsets
-                .iter()
-                .zip(q_lens.iter())
-                .map(|(&o, &l)| (o + l) as u32)
-                .collect::<Vec<_>>(),
-            b_sz,
-            device,
-        )?;
-        (cu_seqlens_q, q_lens_dev, kv_lens)
+        (cu_seqlens_q, q_lens_dev)
     };
+    // `kv_len` is the slot's actual length (the reserved gaps ARE the glue tokens,
+    // already counted) — independent of how the caller accounts the offset.
+    let kv_lens = Tensor::from_vec(
+        kv_lens_host.iter().map(|&l| l as u32).collect::<Vec<_>>(),
+        b_sz,
+        device,
+    )?;
 
     let t_hdr = profile_now();
-    // Glue derives each row's writer slot from the host `position_map` below, so
-    // it must be built every call — a fresh (always-miss) cache forces that and
-    // never reuses, unlike the per-forward sharing on the plain prefill path.
+    // The gaps are real chunks already (no trailing write region), so the slot
+    // headers cover exactly `[0, kv_len)`; pass zero glue so build_slot_headers
+    // does not extend a write region. Built fresh every call (always-miss).
+    let zero_q = vec![0usize; b_sz];
     let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
     let header_upload =
-        build_slot_headers(caches, q_lens, n_kv_head, head_dim, generation, &glue_pm)?;
-
-    // Glue write targets (flat, cu_seqlens_q order) + cu_kvlens (col_actual_pos
-    // offsets). Each glue row's writer slot is its slot's position_map entry at
-    // the write region: `(slice << 16) | in_blk`.
-    let mut wslice: Vec<u32> = Vec::with_capacity(total_q.max(1));
-    let mut winblk: Vec<u32> = Vec::with_capacity(total_q.max(1));
-    let mut cu_kv: Vec<u32> = Vec::with_capacity(b_sz + 1);
-    cu_kv.push(0);
-    let mut kv_acc = 0u32;
-    for (i, slot) in header_upload.slots.iter().enumerate() {
-        let off = offsets[i];
-        let add = q_lens[i];
-        for t in 0..add {
-            let e = slot.position_map[off + t];
-            wslice.push(e >> 16);
-            winblk.push(e & 0xffff);
-        }
-        kv_acc += (off + add) as u32;
-        cu_kv.push(kv_acc);
-    }
-    if wslice.is_empty() {
-        wslice.push(0);
-        winblk.push(0);
-    }
-    let glue_write_slice = Tensor::from_vec(wslice, total_q.max(1), device)?;
-    let glue_write_in_blk = Tensor::from_vec(winblk, total_q.max(1), device)?;
-    let cu_kvlens = Tensor::from_vec(cu_kv, b_sz + 1, device)?;
-
-    // Forward B-head window availability. On this assembly path the per-slot
-    // `position_map` and `col_actual_pos` cover exactly `[0, kv_len)` — section B
-    // is NOT yet staged downstream of the glue in the same slot — so no slot has B
-    // columns resident after `kv_len` and `b_avail` is all-zero. With `fwd_b =
-    // min(fwd_window, 0) == 0` the kernel runs backward-only (bit-identical). When
-    // the B-forward staging lands (extending `position_map` / `col_actual_pos` /
-    // `cu_kvlens` with B's leading columns at their assembled positions), this is
-    // where the real per-slot residency count is computed.
-    let b_avail = Tensor::zeros(b_sz, DType::U32, device)?;
+        build_slot_headers(caches, &zero_q, n_kv_head, head_dim, generation, &glue_pm)?;
     profile_sync(device);
     pipeline_record("glue:hdr_meta", t_hdr);
 
@@ -1471,12 +1419,10 @@ pub fn paged_glue_attn(
         kv_lens,
         k_new: k_packed.to_dtype(compute_dtype)?,
         v_new: v_packed.to_dtype(compute_dtype)?,
-        col_actual_pos: col_actual_pos.clone(),
-        cu_kvlens,
-        glue_write_slice,
-        glue_write_in_blk,
-        fwd_window: fwd_window as u32,
-        b_avail,
+        // Per-token gap scatter target + forward bridge window, from the caller.
+        glue_write_slice: glue_write_slice.clone(),
+        glue_write_in_blk: glue_write_in_blk.clone(),
+        fwd_ahead: fwd_ahead.clone(),
         headers_ptr: header_upload.headers_ptr,
         batch_size: b_sz,
         max_glue,
@@ -1492,11 +1438,14 @@ pub fn paged_glue_attn(
     profile_sync(device);
     pipeline_record("glue:kernel", t_kernel);
 
-    // Advance each slot to [sealed | glue]. `header_upload` stays alive until the
-    // function returns, keeping the stager-resident headers valid for the launch.
-    for ((cache, &off), &add) in caches.iter_mut().zip(offsets.iter()).zip(q_lens.iter()) {
-        cache.set_current_seq_len(off + add)?;
-    }
+    // NO advance here: the glue tokens are reserved IN PLACE as gap chunks whose
+    // `usage` is already counted in each slot's length (`reserve_glue_gap`). This
+    // forward only SCATTERS their K/V into those gaps — it does not append a
+    // trailing region. Advancing by `add` again (the old trailing-glue design)
+    // would double-count the slot length and, because `writer_start` points past
+    // the last chunk, `set_len`'s `writer_start.min(n-1)` fallback would inflate
+    // the final gap chunk's usage — desyncing the slot and overflowing the next
+    // prefill's write region. `header_upload` stays alive until return.
     if !needs_reconcile {
         KvCache::prime_chunked_decode_slots_batch(caches)?;
     }

@@ -41,18 +41,17 @@ extern "C" {
         rope_interleaved: i32,
         cu_seqlens_q: *const u32,
         q_lens: *const u32,
+        // `kv_lens[b]`: the slot's total column count (the reserved gaps ARE the
+        // glue queries, already counted). Each column's sequence position is read
+        // from its chunk `rope_base` (`slice_rope`) — no `col_actual_pos`.
         kv_lens: *const u32,
-        col_actual_pos: *const u32,
-        cu_kvlens: *const u32,
+        // Per glue row (`[Σ q_lens]`): the gap chunk slice index + in-block offset
+        // its K/V scatters into; its position is `slice_rope(gap) + in_blk`.
         glue_write_slice: *const u32,
         glue_write_in_blk: *const u32,
-        // `fwd_window`: forward B-head window (tokens); `0` == backward-only
-        // (bit-identical to the pre-window kernel).
-        fwd_window: u32,
-        // `b_avail`: per-slot count of section-B columns resident in the slot's
-        // `position_map` after `kv_len` (`[batch]`). `fwd_b = min(fwd_window,
-        // b_avail[slot])`; all-zero leaves the kernel backward-only.
-        b_avail: *const u32,
+        // Per glue row (`[Σ q_lens]`): forward bridge window in tokens. Row `t`
+        // attends column `c` iff `cpos <= row_pos + fwd_ahead[t]`. `0` == causal.
+        fwd_ahead: *const u32,
         stream: *mut c_void,
     );
 
@@ -75,12 +74,9 @@ extern "C" {
         cu_seqlens_q: *const u32,
         q_lens: *const u32,
         kv_lens: *const u32,
-        col_actual_pos: *const u32,
-        cu_kvlens: *const u32,
         glue_write_slice: *const u32,
         glue_write_in_blk: *const u32,
-        fwd_window: u32,
-        b_avail: *const u32,
+        fwd_ahead: *const u32,
         stream: *mut c_void,
     );
 }

@@ -461,12 +461,7 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: super::super::streams::PerDepthScores::default(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
         };
         let dead_decl = StreamDecl::Turn(turn_decl(dead_tl));
         let alive_decl = StreamDecl::Turn(turn_decl(alive_tl));
@@ -563,12 +558,7 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: super::super::streams::PerDepthScores::default(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
         });
         let sid = 4242u64; // header stream id ties the two records to one stream
         let proj_payload = br#"[{"start_token":0,"end_token":120,"buckets":[]}]"#.to_vec();

@@ -198,7 +198,6 @@ impl SummarizationTask {
         use crate::config::SamplingConfig;
         use crate::error::ConversationError;
         use crate::scheduler::SchedulerRequest;
-        use crate::substrate::TurnContentBounds;
 
         // Tokenize the system prompt and window text together — the
         // summarisation slot is its own short-lived workspace; we
@@ -254,7 +253,9 @@ impl SummarizationTask {
                 prefill_tokens,
                 prefill_text: window_text,
                 user_text: String::new(),
-                content_bounds: TurnContentBounds::default(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
                 no_think: false,
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),

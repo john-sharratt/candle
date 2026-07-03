@@ -435,57 +435,64 @@ struct SequenceState {
     caches: KvCaches,
 }
 
-/// Assemble a [`GlueMeta`] from the wave's per-slot column positions for a
-/// gap-fill forward. `col_per_seq[i]` must have length `seq_offsets[i] +
-/// input_lens[i]` (sealed prefix ++ glue) — the kernel reads it as the flat
-/// `col_actual_pos` over every slot's `[0, kv_len)`. Returns `None` (falls back
-/// to plain prefill) only when no slot actually carries glue.
+/// Assemble a [`GlueMeta`] from the wave's per-slot glue descriptors for a
+/// gap-fill forward. Each `pending[i]`'s three vectors have length
+/// `input_lens[i]` (the slot's glue-token count); they are concatenated in the
+/// forward's flat `q` order. There is no `col_actual_pos`: the kernel derives
+/// every column's position from its chunk `rope_base` (`slice_rope`), the same
+/// convention decode reads. Returns `None` (falls back to plain prefill) only
+/// when no slot actually carries glue.
 #[cfg(feature = "cuda")]
 fn build_glue_meta(
-    col_per_seq: Vec<Vec<u32>>,
-    seq_offsets: &[usize],
+    pending: Vec<PendingGlue>,
     input_lens: &[usize],
     device: &Device,
 ) -> Result<Option<GlueMeta>> {
-    if col_per_seq.len() != seq_offsets.len() || col_per_seq.len() != input_lens.len() {
+    if pending.len() != input_lens.len() {
         candle::bail!(
-            "build_glue_meta: {} col vecs vs {} offsets / {} input_lens",
-            col_per_seq.len(),
-            seq_offsets.len(),
+            "build_glue_meta: {} glue descriptors vs {} input_lens",
+            pending.len(),
             input_lens.len()
         );
     }
-    let mut flat: Vec<u32> = Vec::with_capacity(col_per_seq.iter().map(|c| c.len()).sum());
-    for (i, cols) in col_per_seq.iter().enumerate() {
-        let expected = seq_offsets[i] + input_lens[i];
-        if cols.len() != expected {
+    let total: usize = input_lens.iter().sum();
+    let mut write_slice: Vec<u32> = Vec::with_capacity(total);
+    let mut write_in_blk: Vec<u32> = Vec::with_capacity(total);
+    let mut fwd_ahead: Vec<u32> = Vec::with_capacity(total);
+    for (i, p) in pending.iter().enumerate() {
+        if p.write_slice.len() != input_lens[i]
+            || p.write_in_blk.len() != input_lens[i]
+            || p.fwd_ahead.len() != input_lens[i]
+        {
             candle::bail!(
-                "build_glue_meta: slot {i} col_actual_pos len {} != kv_len {} (offset {} + glue {})",
-                cols.len(),
-                expected,
-                seq_offsets[i],
+                "build_glue_meta: slot {i} glue len ({}/{}/{}) != input_len {}",
+                p.write_slice.len(),
+                p.write_in_blk.len(),
+                p.fwd_ahead.len(),
                 input_lens[i]
             );
         }
-        flat.extend_from_slice(cols);
+        write_slice.extend_from_slice(&p.write_slice);
+        write_in_blk.extend_from_slice(&p.write_in_blk);
+        fwd_ahead.extend_from_slice(&p.fwd_ahead);
     }
-    if flat.is_empty() {
+    if write_slice.is_empty() {
         return Ok(None);
     }
-    let n = flat.len();
-    let col_actual_pos = Tensor::from_vec(flat, n, device)?;
-    // Confirms the gap-fill forward took the paged-glue route (HD128) rather than
-    // plain prefill, with the glue shape — one line per reproject. Logged under
-    // the scheduler's reproject target so it rides alongside the reproject
-    // summary in the normal log view.
+    let n = write_slice.len();
+    // Confirms the gap-fill forward took the paged-glue route (HD128) — one line
+    // per reproject, under the scheduler's reproject log target.
     tracing::info!(
         target: "candle_conversation::scheduler::reproject",
-        slots = col_per_seq.len(),
-        total_glue = input_lens.iter().sum::<usize>(),
-        max_prefix = seq_offsets.iter().copied().max().unwrap_or(0),
+        slots = pending.len(),
+        total_glue = total,
         "paged-glue route active"
     );
-    Ok(Some(GlueMeta { col_actual_pos }))
+    Ok(Some(GlueMeta {
+        glue_write_slice: Tensor::from_vec(write_slice, n, device)?,
+        glue_write_in_blk: Tensor::from_vec(write_in_blk, n, device)?,
+        fwd_ahead: Tensor::from_vec(fwd_ahead, n, device)?,
+    }))
 }
 
 /// Batched inference session that manages KV cache state for multiple sequences.
@@ -507,12 +514,27 @@ pub struct BatchedInferenceSession {
     num_layers: usize,
     /// Device the session is on.
     device: Device,
-    /// Pending reprojection-glue column positions, set by the wave immediately
-    /// before its gap-fill `forward_batched`. One entry per sequence (in the
-    /// forward's `seq_indices` order); each is that slot's flat `col_actual_pos`
-    /// (sealed prefix ++ glue, TRUE sequence positions). Taken + cleared inside
-    /// `forward_batched`, which routes HD128 glue to the paged-glue kernel.
-    pending_glue: Option<Vec<Vec<u32>>>,
+    /// Pending reprojection-glue descriptors, set by the wave immediately before
+    /// its gap-fill `forward_batched`. One entry per sequence (in the forward's
+    /// `seq_indices` order). Taken + cleared inside `forward_batched`, which
+    /// routes HD128 glue to the paged-glue kernel.
+    pending_glue: Option<Vec<PendingGlue>>,
+}
+
+/// Per-slot reprojection-glue descriptor staged on the session for one gap-fill
+/// `forward_batched`. The glue tokens are reserved IN PLACE as gap chunks during
+/// assembly, so there is no `col_actual_pos`: every column's sequence position
+/// comes from its chunk's `rope_base` (`slice_rope`), the same convention decode
+/// reads. This carries only what the kernel can't derive from the slot itself —
+/// where each glue token scatters, and how far it bridges forward.
+#[derive(Clone, Debug)]
+pub struct PendingGlue {
+    /// Per glue token: the gap chunk's block index its K/V scatters into.
+    pub write_slice: Vec<u32>,
+    /// Per glue token: the in-block offset within its gap chunk.
+    pub write_in_blk: Vec<u32>,
+    /// Per glue token: forward bridge window in tokens (`0` == backward-only).
+    pub fwd_ahead: Vec<u32>,
 }
 
 impl BatchedInferenceSession {
@@ -582,16 +604,15 @@ impl BatchedInferenceSession {
         }
     }
 
-    /// Stage reprojection-glue column positions for the next `forward_batched`.
-    /// `col_actual_pos_per_seq[i]` is sequence `i`'s flat `col_actual_pos`
-    /// (sealed prefix ++ glue), aligned with the `seq_indices` of the imminent
-    /// gap-fill forward. Consumed (and cleared) by that single forward.
-    pub fn set_pending_glue(&mut self, col_actual_pos_per_seq: Vec<Vec<u32>>) {
-        self.pending_glue = Some(col_actual_pos_per_seq);
+    /// Stage per-slot reprojection-glue descriptors for the next
+    /// `forward_batched`. `pending[i]` aligns with the `seq_indices` of the
+    /// imminent gap-fill forward. Consumed (and cleared) by that single forward.
+    pub fn set_pending_glue(&mut self, pending: Vec<PendingGlue>) {
+        self.pending_glue = Some(pending);
     }
 
-    /// Take + clear the staged glue column positions (one forward's worth).
-    pub fn take_pending_glue(&mut self) -> Option<Vec<Vec<u32>>> {
+    /// Take + clear the staged glue descriptors (one forward's worth).
+    pub fn take_pending_glue(&mut self) -> Option<Vec<PendingGlue>> {
         self.pending_glue.take()
     }
 
@@ -981,6 +1002,41 @@ impl BatchedInferenceSession {
             backing.push_empty_writer_chunk(seq_idx)?;
         }
         Ok(())
+    }
+
+    /// Reserve an in-place glue gap of `n_tokens` slots at the slot tail across
+    /// every layer, advance the session offset, and return the gap's block index
+    /// (identical across layers). The glue forward later fills the gap by
+    /// explicit `(slice, in_blk)` write target; until then its K/V is
+    /// uninitialised but never read (the kernel scatters before it streams).
+    ///
+    /// This is the interleaved-glue primitive: because the gap is a real chunk
+    /// with `usage = n_tokens` sitting at its logical position, the
+    /// cumulative-usage `rope_base` of every later chunk equals its true
+    /// sequence position — so decode and glue share one positional convention
+    /// (`slice_rope`) with no `col_actual_pos` side channel.
+    /// Reserve a full-by-construction glue gap across every layer's backing.
+    /// Returns `(gap_block_index, in_blk_base)` — the block index (identical
+    /// across layers) and the first valid slot of the gap's tail window, into
+    /// which the glue forward scatters the island's K/V.
+    pub fn reserve_glue_gap(&mut self, seq_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
+        let mut gap: Option<(usize, u32)> = None;
+        for backing in &self.backings {
+            let (idx, in_blk_base) = backing.reserve_glue_gap_chunk(seq_idx, n_tokens)?;
+            match gap {
+                None => gap = Some((idx, in_blk_base)),
+                Some((g, _)) if g != idx => candle::bail!(
+                    "reserve_glue_gap: layer gap index diverged ({g} != {idx}) for slot {seq_idx}"
+                ),
+                _ => {}
+            }
+        }
+        if let Some(Some(state)) = self.sequences.get_mut(seq_idx) {
+            state.offset += n_tokens as usize;
+        } else {
+            candle::bail!("reserve_glue_gap: sequence {seq_idx} not allocated");
+        }
+        gap.ok_or_else(|| candle::Error::Msg("reserve_glue_gap: no layers".into()))
     }
 
     /// Truncate every backing's view of `seq_idx` to `block_count`
@@ -2672,11 +2728,11 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         } else {
             let mut meta =
                 BatchedPrefillMeta::new_ragged(&seq_offsets, &input_lens, self.device())?;
-            // A reprojection-glue forward stages its per-slot column positions on
+            // A reprojection-glue forward stages its per-slot glue descriptors on
             // the session; attach them so the layer routes HD128 to the paged-glue
             // kernel. Consumed once — ordinary prefills leave `glue` None.
-            if let Some(glue_cols) = session.take_pending_glue() {
-                meta.glue = build_glue_meta(glue_cols, &seq_offsets, &input_lens, self.device())?;
+            if let Some(pending) = session.take_pending_glue() {
+                meta.glue = build_glue_meta(pending, &input_lens, self.device())?;
             }
             (None, DecodeHeaders::Prefill(meta))
         };

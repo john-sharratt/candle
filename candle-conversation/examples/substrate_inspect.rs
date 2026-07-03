@@ -44,7 +44,7 @@ use candle_conversation::persistence::record::{
     ChunkPayload, Record, RecordType, ToolSummaryPayload,
 };
 use candle_conversation::persistence::resume::decode_token_ids;
-use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId};
+use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::walker;
 use candle_conversation::projection::{
     decode_events, ProjectionEvent, SystemItem, TimelineId, TurnIndex,
@@ -131,6 +131,21 @@ enum Cmd {
         #[arg(long)]
         text: bool,
     },
+    /// Per-turn structural audit — the "is the user half actually in the K/V?"
+    /// view.  For every turn it cross-references the persisted token_ids length
+    /// against the summed chunk `token_count` (the real sealed-KV token count),
+    /// the block span, and the content bounds (`user_content_start/end`,
+    /// `assistant_content_start`).  Flags any turn whose sealed K/V is shorter
+    /// than its token_ids — i.e. the user-message tokens never made it into the
+    /// arena, so reprojection re-injects an assistant-only turn.
+    TurnAudit {
+        /// Restrict to one timeline (raw u64 id, as printed by `streams`).
+        #[arg(long)]
+        timeline: Option<u64>,
+        /// Also decode the user/assistant body slices via the content bounds.
+        #[arg(long)]
+        text: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -162,6 +177,7 @@ fn main() -> Result<()> {
         Cmd::ToolSummary => tool_summary(&mut log)?,
         Cmd::Checkpoint => checkpoint_view(&mut log)?,
         Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
+        Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, &log_path, timeline, text)?,
     }
     Ok(())
 }
@@ -274,11 +290,22 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
         }
     }
     if !ev.selection.turns.is_empty() {
-        println!("      turns selected:");
+        println!("      turns selected:  (src = raw turn vs SUMMARY node; why = selection origin)");
         for t in &ev.selection.turns {
+            // The decisive column: was this slot filled with a real turn, or a
+            // summary node standing in for the turns beneath it?
+            let src = match t.kind {
+                TurnKind::Normal => "turn",
+                TurnKind::SummaryOfTurns => "SUMMARY(SoT)",
+                TurnKind::SummaryOfSummaries => "SUMMARY(SoS)",
+            };
+            let why = t
+                .reason
+                .map(|r| format!("{r:?}"))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "          {}/{} #{} {} ({} tok)",
-                t.layer, t.group, t.index, t.role, t.tokens
+                "          {}/{} #{} {} {:<12} ({} tok)  why={}",
+                t.layer, t.group, t.index, t.role, src, t.tokens, why
             );
         }
     }
@@ -413,6 +440,154 @@ fn tree(
                         }
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-turn structural audit (see [`Cmd::TurnAudit`]).  The decisive column is
+/// `kv_tok` (summed chunk `token_count` = the real sealed-KV length) vs `n_tok`
+/// (the persisted token_ids length).  When `kv_tok < n_tok` the arena is missing
+/// the leading tokens; when `kv_tok ≈ n_tok − assistant_content_start` those
+/// missing tokens are exactly the USER half — the turn was sealed assistant-only,
+/// so reprojection re-injects a turn the model reads as having no user message.
+fn turn_audit(
+    log: &mut LogFile,
+    log_path: &std::path::Path,
+    only_timeline: Option<u64>,
+    with_text: bool,
+) -> Result<()> {
+    let substrate = build_substrate(log)?;
+    let first_seen = first_seen_offsets(log)?;
+    let tok = load_log_tokenizer(log_path)?;
+
+    struct TurnRec {
+        id: StreamId,
+        decl: TurnDecl,
+        chunk_locs: Vec<(u64, u64)>, // (record offset, record size), chunk-index order
+        tokens_loc: Option<(u64, u64)>,
+    }
+    let mut turns: Vec<TurnRec> = Vec::new();
+    for (id, entry) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &entry.decl else {
+            continue;
+        };
+        if only_timeline.is_some_and(|o| t.timeline_id != o) {
+            continue;
+        }
+        turns.push(TurnRec {
+            id,
+            decl: t.clone(),
+            chunk_locs: entry
+                .chunks
+                .values()
+                .map(|l| (l.offset, l.record_size))
+                .collect(),
+            tokens_loc: entry.tokens.map(|l| (l.offset, l.record_size)),
+        });
+    }
+    drop(substrate);
+    turns.sort_by_key(|t| first_seen.get(&t.id).copied().unwrap_or(u64::MAX));
+
+    if turns.is_empty() {
+        println!("(no turn streams matching that filter)");
+        return Ok(());
+    }
+
+    let role_name = |r: u8| match r {
+        0 => "sys",
+        1 => "user",
+        2 => "asst",
+        _ => "?",
+    };
+    println!(
+        "{:<22} {:>4} {:>6} {:>6} {:>5} {:>5} {:>14} {:>10}   flags",
+        "timeline#idx", "role", "n_tok", "kv_tok", "chnk", "blks", "uc[start..end)", "asst@"
+    );
+    for t in &turns {
+        let d = &t.decl;
+        let layout = candle_conversation::turn_layout::TurnLayout::new(d.segments.clone());
+        let n_tok = match t.tokens_loc {
+            Some((off, sz)) => decode_token_ids(&read_record_at(log, off, sz)?.payload)?.len(),
+            None => 0,
+        } as u64;
+        let mut kv_tok = 0u64;
+        for &(off, sz) in &t.chunk_locs {
+            kv_tok += read_record_at(log, off, sz)?.header.token_count;
+        }
+        let blks = d.block_end.saturating_sub(d.block_start);
+        // Chunks are stored per (block × layer); `kv_tok` sums all layers, so the
+        // real KV length is per-layer.  `n_layers = chunks / blks`.
+        let n_chunks = t.chunk_locs.len() as u64;
+        let n_layers = if blks > 0 { n_chunks / blks } else { 0 };
+        let kv_per_layer = if n_layers > 0 {
+            kv_tok / n_layers
+        } else {
+            kv_tok
+        };
+        let asst = layout.assistant_content_start() as u64;
+        let assistant_body = n_tok.saturating_sub(asst);
+
+        let mut flags: Vec<String> = Vec::new();
+        if kv_per_layer + 1 < n_tok {
+            flags.push(format!("KV<token_ids by {}", n_tok - kv_per_layer));
+        }
+        // The smoking-gun check: per-layer sealed KV equals the assistant body
+        // length, i.e. the user half ([0..assistant_content_start)) was NOT sealed.
+        if asst > 0 && kv_per_layer + 1 < n_tok && kv_per_layer.abs_diff(assistant_body) <= 1 {
+            flags.push("** ASSISTANT-ONLY: user half not sealed **".to_string());
+        }
+        if asst == 0 {
+            flags.push("user-region-empty(asst@0)".to_string());
+        }
+        if n_layers > 0 && n_chunks % blks != 0 {
+            flags.push(format!("chunks {n_chunks} not /blks {blks}"));
+        }
+        if flags.is_empty() {
+            flags.push("ok".to_string());
+        }
+
+        println!(
+            "{:<22} {:>4} {:>6} {:>7} {:>5} {:>5} {:>4} {:>13} {:>6}   {}",
+            format!("{}#{}", d.timeline_id, d.turn_index),
+            role_name(d.role),
+            n_tok,
+            kv_per_layer,
+            t.chunk_locs.len(),
+            blks,
+            n_layers,
+            format!(
+                "[{}..{})",
+                layout.user_content_start(),
+                layout.user_content_end()
+            ),
+            asst,
+            flags.join("; "),
+        );
+        if with_text {
+            println!(
+                "    view (selected context turns): {:?}   anchored_prefix={}",
+                d.view,
+                d.anchored_prefix.len()
+            );
+            let user_text = layout.user_text();
+            let assistant_text = layout.assistant_text().unwrap_or_default();
+            let utxt = trunc(user_text, 200);
+            let atxt = trunc(&assistant_text, 500);
+            println!("    user_text({:>3}): {utxt}", user_text.chars().count());
+            println!(
+                "    asst_text({:>3}): {atxt}",
+                assistant_text.chars().count()
+            );
+            // Decode the leading `kv_tok` tokens to show what the SEALED K/V
+            // actually starts with (does it open with the user message or the
+            // assistant body?).
+            if let (Some(t0), Some((off, sz))) = (tok.as_ref(), t.tokens_loc) {
+                let ids = decode_token_ids(&read_record_at(log, off, sz)?.payload)?;
+                let head: Vec<u32> = ids.iter().take(24).copied().collect();
+                let head_txt = t0.decode(&head, false).unwrap_or_default();
+                println!("    token_ids head: {}", trunc(&head_txt, 110));
             }
         }
     }
@@ -577,15 +752,20 @@ fn streams(log: &mut LogFile) -> Result<()> {
         let tok = if entry.tokens.is_some() { "y" } else { "n" };
         let sig = if entry.signatures.is_some() { "y" } else { "n" };
         let detail = match &entry.decl {
-            Some(StreamDecl::Turn(t)) => format!(
-                "exchange  idx={} chunks={} tok={} sig={}  no_think={}  conv={}",
-                t.turn_index,
-                entry.chunks.len(),
-                tok,
-                sig,
-                t.no_think,
-                t.timeline_id,
-            ),
+            Some(StreamDecl::Turn(t)) => {
+                let no_think =
+                    candle_conversation::turn_layout::TurnLayout::new(t.segments.clone())
+                        .no_think();
+                format!(
+                    "exchange  idx={} chunks={} tok={} sig={}  no_think={}  conv={}",
+                    t.turn_index,
+                    entry.chunks.len(),
+                    tok,
+                    sig,
+                    no_think,
+                    t.timeline_id,
+                )
+            }
             Some(StreamDecl::PromptSection(s)) => format!(
                 "section \"{}\"  chunks={} tok={} sig={}",
                 s.debug_name,

@@ -1,4 +1,4 @@
-﻿//! Tests for allocation methods in ChunkedKvBacking.
+//! Tests for allocation methods in ChunkedKvBacking.
 
 use candle::{DType, Device, Tensor};
 
@@ -569,6 +569,145 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ==================== reserve_glue_gap_chunk Tests ====================
+    //
+    // The in-place glue gap is the load-bearing primitive of the interleaved-
+    // glue design: each gap is a real chunk with a real `usage` at its logical
+    // position, so the cumulative-usage `rope_base` of every later chunk equals
+    // its true sequence position — the single convention decode + glue read via
+    // `slice_rope`. These tests pin that convention at the lowest layer.
+    mod glue_gap_tests {
+        use super::*;
+        use crate::kv_cache::chunked::CHUNK_SIZE;
+
+        /// Sum of `usage` over chunks `[0, blk)` — exactly the `rope_base` the
+        /// decode kernel derives for block `blk` (`types.rs` `rebuild_decode`).
+        fn rope_base_of(backing: &ChunkedKvBacking, batch_idx: usize, blk: usize) -> u32 {
+            let state = backing.state.read().expect("lock");
+            let seq = state.sequences[batch_idx].as_ref().expect("slot");
+            seq.chunks_slice()[..blk].iter().map(|c| c.usage).sum()
+        }
+
+        fn read_chunk(backing: &ChunkedKvBacking, batch_idx: usize, blk: usize) -> (u32, u16) {
+            let state = backing.state.read().expect("lock");
+            let seq = state.sequences[batch_idx].as_ref().expect("slot");
+            let c = &seq.chunks_slice()[blk];
+            (c.usage, c.offset)
+        }
+
+        fn writer_start(backing: &ChunkedKvBacking, batch_idx: usize) -> usize {
+            let state = backing.state.read().expect("lock");
+            state.sequences[batch_idx]
+                .as_ref()
+                .expect("slot")
+                .writer_start_idx()
+        }
+
+        fn block_count(backing: &ChunkedKvBacking, batch_idx: usize) -> usize {
+            let state = backing.state.read().expect("lock");
+            state.sequences[batch_idx]
+                .as_ref()
+                .expect("slot")
+                .block_count()
+        }
+
+        #[test]
+        fn reserves_full_chunk_with_tail_window() {
+            // Full-by-construction: a 5-token gap is allocated `usage=5`,
+            // `offset = CHUNK_SIZE - 5 = 27`, so `offset + usage == CHUNK_SIZE`.
+            // The chunk reads as FULL to every writer-region scan (so no prefill
+            // can extend into it), while `usage` stays 5 for the cumulative
+            // `rope_base` convention. Valid window is the tail `[27, 32)`.
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            let (gap, in_blk_base) = backing.reserve_glue_gap_chunk(0, 5).unwrap();
+            assert_eq!(gap, 0, "first gap is block 0");
+            assert_eq!(
+                in_blk_base,
+                CHUNK_SIZE as u32 - 5,
+                "scatter base == offset == 27 (tail window [27, 32))"
+            );
+            assert_eq!(
+                read_chunk(&backing, 0, 0),
+                (5, CHUNK_SIZE as u16 - 5),
+                "usage=5, offset=27 (full: offset+usage==CHUNK_SIZE)"
+            );
+            assert_eq!(block_count(&backing, 0), 1);
+        }
+
+        #[test]
+        fn gap_sits_below_writer_boundary() {
+            // The gap must NOT be the active writer: `writer_start` is advanced
+            // past it so decode/prefill never auto-select it (only the glue
+            // forward fills it, by explicit target).
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            let (gap, _) = backing.reserve_glue_gap_chunk(0, 4).unwrap();
+            assert_eq!(
+                writer_start(&backing, 0),
+                gap + 1,
+                "writer_start advanced past the gap"
+            );
+        }
+
+        #[test]
+        fn cumulative_usage_equals_logical_position() {
+            // THE convention: reserve three gaps of different sizes; each later
+            // chunk's rope_base (Σ preceding usage) is its logical start.
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            backing.reserve_glue_gap_chunk(0, 3).unwrap(); // logical [0,3)
+            backing.reserve_glue_gap_chunk(0, 7).unwrap(); // logical [3,10)
+            backing.reserve_glue_gap_chunk(0, 2).unwrap(); // logical [10,12)
+            assert_eq!(rope_base_of(&backing, 0, 0), 0, "gap0 base");
+            assert_eq!(rope_base_of(&backing, 0, 1), 3, "gap1 base = Σ(3)");
+            assert_eq!(rope_base_of(&backing, 0, 2), 10, "gap2 base = Σ(3,7)");
+            assert_eq!(rope_base_of(&backing, 0, 3), 12, "end = Σ(3,7,2)");
+        }
+
+        #[test]
+        fn gaps_get_unique_gids() {
+            // Each gap is writer-owned with its own GIDs — never Arc-shared, so
+            // the glue's explicit write can't corrupt another holder and truncate
+            // frees them by refcount.
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            backing.reserve_glue_gap_chunk(0, 4).unwrap();
+            backing.reserve_glue_gap_chunk(0, 4).unwrap();
+            let snap = k_gid_snapshot(&backing);
+            assert_ne!(snap[0][0], snap[0][1], "the two gaps hold distinct GIDs");
+            assert_ne!(snap[0][0], -1, "gap0 allocated");
+            assert_ne!(snap[0][1], -1, "gap1 allocated");
+        }
+
+        #[test]
+        fn rejects_zero_and_oversize() {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            assert!(
+                backing.reserve_glue_gap_chunk(0, 0).is_err(),
+                "0-token gap rejected"
+            );
+            assert!(
+                backing
+                    .reserve_glue_gap_chunk(0, CHUNK_SIZE as u32 + 1)
+                    .is_err(),
+                "gap larger than CHUNK_SIZE rejected (one island = one chunk)"
+            );
+            assert!(
+                backing.reserve_glue_gap_chunk(0, CHUNK_SIZE as u32).is_ok(),
+                "exactly CHUNK_SIZE is allowed"
+            );
+        }
+
+        #[test]
+        fn out_of_range_batch_idx_errors() {
+            let backing = create_test_backing();
+            backing.alloc_sequence().unwrap();
+            assert!(backing.reserve_glue_gap_chunk(999, 4).is_err());
         }
     }
 }

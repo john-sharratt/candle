@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::content_hash::{section_stream_id, turn_stream_id, ContentHash};
 use super::{PersistenceError, Result};
+use crate::turn_layout::TurnSegment;
 
 /// Per-`(timeline, turn)` count of cognitive-depth scores carried in
 /// a turn declaration: 3 depths (syntactic / semantic / pragmatic) ×
@@ -114,34 +115,13 @@ pub struct TurnDecl {
     pub view: Vec<u32>,
     #[serde(default)]
     pub scores: PerDepthScores,
-    /// Content boundaries that frame the user-message body and the
-    /// assistant-response body inside the sealed grid — see
-    /// `substrate::TurnContentBounds`.  Persisted so the compressor can
-    /// window content-only turn halves after a substrate reload.
+    /// The turn's segment-vector layout — the complete description of its K/V
+    /// (user / thinking / assistant text and each real segment's span) plus its
+    /// `/no_think` glue.  Persisted so a substrate reload reconstructs
+    /// `TurnPart::layout` exactly: the per-half text without re-tokenising and
+    /// the content boundaries the compressor windows on.
     #[serde(default)]
-    pub user_content_start: u32,
-    #[serde(default)]
-    pub user_content_end: u32,
-    #[serde(default)]
-    pub assistant_content_start: u32,
-    /// Whether this turn was generated with thinking suppressed (the
-    /// `/no_think` dial active at submit).  Persisted so a substrate reload
-    /// re-renders the turn's `/no_think` soft-switch faithfully — see
-    /// `substrate::TurnPart::no_think`.  `serde(default)` ⇒ old logs read
-    /// back `false` (thinking on), no format break.
-    #[serde(default)]
-    pub no_think: bool,
-    /// The user message text for this turn — exactly what
-    /// `submit_turn` received, with no role-marker envelope and no
-    /// `/no_think` prefix.  Stored directly so reload re-populates
-    /// `TurnPart::user_text` without re-tokenising or scanning for
-    /// boundary markers.
-    #[serde(default)]
-    pub user_text: String,
-    /// The assistant's decoded reply text for this turn — same
-    /// "store what the caller already has" rule as `user_text`.
-    #[serde(default)]
-    pub assistant_text: String,
+    pub segments: Vec<TurnSegment>,
 }
 
 /// The payload of a `StreamDecl` record — declares a stream and
@@ -226,12 +206,16 @@ mod tests {
             anchored_prefix: vec![StreamId(7), StreamId(8), StreamId(123)],
             view: vec![0, 2, 5],
             scores: PerDepthScores(lanes),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: vec![
+                TurnSegment::User {
+                    text: "hi".into(),
+                    kv: crate::turn_layout::KvSpan::new(0, 2),
+                },
+                TurnSegment::Assistant {
+                    text: Some("ok".into()),
+                    kv: crate::turn_layout::KvSpan::new(2, 3),
+                },
+            ],
         });
         let bytes = decl.encode();
         let decoded = StreamDecl::decode(&bytes).unwrap();
@@ -254,12 +238,7 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: PerDepthScores::default(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
         });
         assert_eq!(StreamDecl::decode(&decl.encode()).unwrap(), decl);
     }
@@ -269,18 +248,15 @@ mod tests {
     /// keys) rather than fail.
     #[test]
     fn stream_decl_ignores_unknown_field() {
-        // A Turn with an extra `future_field`. serde drops unknown keys.
-        // All mandatory fields (including the content boundaries) must
-        // still be present — only the unknown `future_field` is the
-        // forward-compat surface this test exercises.
+        // A Turn with an extra `future_field`, plus a few superseded keys an
+        // older writer may still emit. serde drops every unknown key (the new
+        // `segments` field defaults to empty), which is the forward/backward
+        // compat surface this test exercises.
         let payload = br#"{
             "kind":"turn",
             "timeline_id":1,
             "turn_index":0,
             "role":1,
-            "user_content_start":0,
-            "user_content_end":0,
-            "assistant_content_start":0,
             "future_field":"opaque"
         }"#;
         let decoded = StreamDecl::decode(payload).unwrap();

@@ -993,7 +993,6 @@ fn pad_suspended(suspended: &mut [Vec<(Vec<u8>, Vec<SectionId>)>], value: u8) {
     }
 }
 
-
 /// Pre-allocate one collection's [`CollectionId`] and register its name so
 /// `depends_on` forward references resolve.  Errors on a duplicate name.
 fn register_collection_id(
@@ -1664,7 +1663,10 @@ fn build_section_tree<'a>(
                     .expect("GroupElse without a matching GroupStart");
                 suspended.push(std::mem::take(&mut branches)); // extended present
                 branches = absent;
-                group_ctx.last_mut().expect("GroupElse without GroupStart").1 = 1; // absent side
+                group_ctx
+                    .last_mut()
+                    .expect("GroupElse without GroupStart")
+                    .1 = 1; // absent side
             }
             TreeSpec::GroupEnd => {
                 // Fold the OTHER branch (the absent sub-branches when there was no

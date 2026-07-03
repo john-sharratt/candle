@@ -1,20 +1,23 @@
 //! Per-slot projection assembler — full rebuild of the slot's prefix
 //! K/V on every call.
 //!
-//! Snapshots the slot's writer tail, truncates to zero, then walks
-//! `Vec<ProjectionSegment>` in declaration order:
+//! Snapshots the slot's writer tail, truncates to zero, then walks the
+//! [`assemble_pieces`] output in logical order, building the slot's chunk list
+//! IN PLACE:
 //!
-//! - `Sealed(Section|Turn)` — resolve the substrate entry's per-layer
-//!   sealed K/V, Arc-clone it onto the slot.
-//! - `Generated { tokens, .. }` — accumulate into the current run; do
-//!   not advance the slot yet. Adjacent `Generated` segments batch into
-//!   a single run so one forward pass amortises the launch cost across
-//!   all the structural/boundary tokens.
-//! - On a non-Generated segment (or end of list), flush the current run:
-//!   a synchronous forward pass over `run_tokens` writes their K/V onto
-//!   the slot.
+//! - `Section` / `Turn` — resolve the substrate entry's per-layer sealed K/V and
+//!   Arc-clone it onto the slot.
+//! - `Glue` (a boundary-marker island) — reserve a real, writer-owned **gap
+//!   chunk** at this logical position (zeros, [`reserve_glue_island`]), recording
+//!   each token's scatter target + forward bridge window. The gaps' K/V is filled
+//!   afterwards by a single batched gap-fill forward ([`fire_gap_fill_batch`]).
 //!
-//! Re-attach the writer tail at the end.
+//! Because sealed injects and gap chunks land in logical order, every chunk's
+//! cumulative-usage `rope_base` equals its true sequence position — the single
+//! positional convention the glue and decode kernels both read via `slice_rope`,
+//! with no `col_actual_pos` side channel. A convention assert (`slot offset ==
+//! walker logical_pos`) guards it. The in-flight user message is deferred to
+//! prefill after the gaps are filled; the writer tail is re-attached at the end.
 //!
 //! The prefix is re-derived from scratch every projection — there is no
 //! cross-projection memoisation, so the assembled K/V always reflects the
@@ -26,17 +29,19 @@ use std::sync::Arc;
 use candle::{Device, Tensor};
 use candle_nn::kv_cache::{SealedSequence, WriterTail};
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel,
+    BatchedInferenceSession, ManagedBatchedModel, PendingGlue,
 };
 
 use crate::conversation::slice_per_layer_sealed;
 use crate::error::ConversationError;
+use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::{
-    Conversation, GroupId, ProjectionSegment, ProjectionTarget, SealedKind, SectionId, TimelineId,
-    TurnIndex,
+    ContentResolver, Conversation, GroupId, MaterializedPiece, ProjectionSegment, ProjectionTarget,
+    Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex,
 };
 use crate::scheduler::profile;
 use crate::sequence_handle::SequenceId;
+use crate::summary_tree::SelectionOrigin;
 
 /// Per-slot state owned by the projection assembler.
 ///
@@ -129,18 +134,26 @@ pub(crate) enum AssembledPiece {
     Glue(Vec<u32>),
     /// A sealed system-prompt section; its K/V comes from the substrate.
     Section(SectionId),
-    /// A sealed past turn; its K/V comes from the substrate.
+    /// A sealed past turn; its K/V comes from the substrate.  `timeline` is the
+    /// turn's conversation, stamped at projection (see [`ResolvedTurn::key`]) and
+    /// carried here so the inject path never re-derives it from `group`.  `group`
+    /// is retained only for diagnostics.
     Turn {
         group: GroupId,
         index: TurnIndex,
         role: crate::Role,
+        timeline: Option<TimelineId>,
     },
     /// The in-flight user message, deferred to prefill after the gap-fill.
     DeferredUser(Arc<Vec<u32>>),
     /// A sealed turn's user-message half only (compression turn-half injection),
     /// with NO per-turn boundary-marker wrapping — the compression pass supplies
     /// its own framing glue.
-    TurnHalf { group: GroupId, index: TurnIndex },
+    TurnHalf {
+        group: GroupId,
+        index: TurnIndex,
+        timeline: Option<TimelineId>,
+    },
 }
 
 /// Lay out a projection's segments into the ordered [`AssembledPiece`]s the
@@ -155,7 +168,7 @@ pub(crate) enum AssembledPiece {
 pub(crate) fn assemble_pieces(
     segments: &[ProjectionSegment],
     markers: &BoundaryMarkers,
-    mut turn_no_think: impl FnMut(GroupId, TurnIndex) -> bool,
+    mut turn_no_think: impl FnMut(Option<TimelineId>, TurnIndex) -> bool,
 ) -> Vec<AssembledPiece> {
     let mut pieces: Vec<AssembledPiece> = Vec::new();
     let mut run: Vec<u32> = Vec::new();
@@ -187,7 +200,7 @@ pub(crate) fn assemble_pieces(
                 // glue.  Keeps a re-rendered suppressed turn self-consistent: a
                 // `/no_think` opener for its empty `<think></think>`, instead of
                 // an unexplained empty block the model learns to mimic.
-                if turn_no_think(rt.group(), rt.index()) {
+                if turn_no_think(rt.timeline, rt.index()) {
                     run.extend(markers.no_think.iter().copied());
                 }
                 flush(&mut run, &mut pieces);
@@ -195,6 +208,7 @@ pub(crate) fn assemble_pieces(
                     group: rt.group(),
                     index: rt.index(),
                     role: *role,
+                    timeline: rt.timeline,
                 });
                 run.extend(markers.assistant_end.iter().copied());
             }
@@ -205,6 +219,7 @@ pub(crate) fn assemble_pieces(
                 pieces.push(AssembledPiece::TurnHalf {
                     group: rt.group(),
                     index: rt.index(),
+                    timeline: rt.timeline,
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -217,6 +232,80 @@ pub(crate) fn assemble_pieces(
     }
     flush(&mut run, &mut pieces);
     pieces
+}
+
+/// Lay out the **conversation region** of a projection into the ordered
+/// [`MaterializedPiece`]s the projection panel renders — real boundary-glue
+/// islands interleaved with the sealed turns, built from the SAME
+/// [`assemble_pieces`] decision the engine injects from, so the panel's glue can
+/// never drift from what the projection really does.
+///
+/// The system prompt is excluded (it is covered by
+/// [`ProjectionSelection::system`]); the live, still-decoding user message and
+/// the compression turn-halves are excluded too (the panel renders the live turn
+/// from its own `um`/`dm`). Glue islands are decoded to text via `decode`; each
+/// turn is classified (layer / group / role / token count / forest kind / why)
+/// via `resolver` + `origins`.
+pub(crate) fn materialize_conversation(
+    segments: &[ProjectionSegment],
+    markers: &BoundaryMarkers,
+    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
+    resolver: &dyn ContentResolver,
+    schema: &Schema,
+    mut decode: impl FnMut(&[u32]) -> String,
+) -> Vec<MaterializedPiece> {
+    // Conversation region = from the first sealed turn / turn-half / deferred
+    // user onward; everything before is the system prompt.
+    let start = segments
+        .iter()
+        .position(|s| {
+            matches!(
+                s,
+                ProjectionSegment::Sealed(SealedKind::Turn(..))
+                    | ProjectionSegment::Sealed(SealedKind::TurnHalf(..))
+                    | ProjectionSegment::NewUserMessage { .. }
+            )
+        })
+        .unwrap_or(segments.len());
+    // `/no_think` per turn comes from the same suppression bit the assembler
+    // reads, so the re-rendered soft-switch matches the engine exactly.
+    let no_think =
+        |tl: Option<TimelineId>, idx: TurnIndex| tl.is_some_and(|t| resolver.turn_no_think(t, idx));
+    assemble_pieces(&segments[start..], markers, no_think)
+        .into_iter()
+        .filter_map(|piece| match piece {
+            AssembledPiece::Glue(tokens) => {
+                let text = decode(&tokens);
+                (!text.is_empty()).then_some(MaterializedPiece::Glue { text })
+            }
+            AssembledPiece::Turn {
+                group,
+                index,
+                role,
+                timeline,
+            } => Some(MaterializedPiece::Turn {
+                turn: SelectedTurn {
+                    layer: layer_name_of_group(schema, group).unwrap_or("").to_string(),
+                    group: group_name_of(schema, group)
+                        .unwrap_or("conversation")
+                        .to_string(),
+                    index: index.0,
+                    role: role_str(role).to_string(),
+                    tokens: resolver.turn_token_count(group, index) as u32,
+                    kind: resolver.turn_kind(group, index),
+                    reason: origins.get(&(group, index)).copied(),
+                    timeline: timeline.map(|tl| tl.raw()),
+                },
+            }),
+            // The live user message is a separate prefill unit (not part of
+            // `project()`'s segments), so it never reaches this spine — the panel
+            // renders the in-flight turn from `um`/`dm`. The compression turn-half
+            // and any stray section are not part of the displayed dialogue spine.
+            AssembledPiece::DeferredUser(_)
+            | AssembledPiece::TurnHalf { .. }
+            | AssembledPiece::Section(_) => None,
+        })
+        .collect()
 }
 
 /// Borrowed scheduler state the assembler needs in order to run.
@@ -250,15 +339,22 @@ pub(super) struct ApplyContext<'a> {
 /// fire one batched multi-slot forward, then finish each slot independently.
 pub(super) struct GapFillPlan {
     pub parent_id: SequenceId,
-    /// The new region: every glue island's tokens, in logical order.
+    /// The glue tokens, in logical order — the Q stream of the gap-fill forward.
+    /// Each is reserved **in place** as a real gap chunk at its logical position,
+    /// so the glue and decode kernels both derive its sequence position from the
+    /// chunk's own `rope_base` (`slice_rope`) — no `col_actual_pos` side channel.
     pub glue_tokens: Vec<u32>,
-    /// Flat (kv_len) TRUE sequence position of each column (sealed prefix ++
-    /// glue). Computed by the wave; staged on the session by
-    /// [`fire_gap_fill_batch`] and consumed by the paged-glue kernel's
-    /// actual-position mask + RoPE.
-    pub col_actual_pos: Vec<u32>,
+    /// Per glue token: the writer-chunk block index its K/V scatters into (the
+    /// reserved gap). Aligned with `glue_tokens`.
+    pub glue_write_slice: Vec<u32>,
+    /// Per glue token: the in-block offset within its gap chunk.
+    pub glue_write_in_blk: Vec<u32>,
+    /// Per glue token: how far it may attend FORWARD past its own position (the
+    /// bridge window). `0` == backward-only (causal). Per-token so future code
+    /// varies it by glue-island type with no kernel change.
+    pub fwd_ahead: Vec<u32>,
     /// The in-flight user message, prefilled in `apply_segments_finish` after
-    /// the gap-fill so it lands against the full `[sealed | glue]` prefix.
+    /// the gap-fill so it lands against the full interleaved prefix.
     pub deferred_user: Option<Arc<Vec<u32>>>,
     /// The writer tail snapshotted before truncation, re-attached on finish.
     pub tail_per_layer: Vec<WriterTail>,
@@ -308,59 +404,69 @@ pub(super) fn apply_segments_build(
         entry.clear();
     }
 
-    // 4. Walk segments: inject sealed as the contiguous prefix and collect all
-    //    glue (boundary markers + Generated) as the new region, tracking every
-    //    column's TRUE logical position. A single gap-fill forward then computes
-    //    every glue island's K/V at once — each attends only logically-earlier
-    //    columns via `col_actual_pos`. The NewUserMessage is deferred to after
-    //    the gap-fill so it prefills against the full `[sealed | glue]` prefix.
+    // 4. Walk segments in logical order, building the slot's chunk list IN
+    //    PLACE: a sealed section/turn is Arc-injected; a glue island reserves a
+    //    real, writer-owned GAP chunk at its position (zeros, filled later). The
+    //    chunks therefore land in logical order, so every chunk's cumulative-
+    //    usage `rope_base` equals its true sequence position — the single
+    //    positional convention the glue and decode kernels both read via
+    //    `slice_rope`, with no `col_actual_pos` side channel. A single batched
+    //    gap-fill forward then scatters every island's K/V into its gap. The
+    //    NewUserMessage is deferred to prefill after the gaps are filled.
     // The glue/order decision is owned by `assemble_pieces` (the single source
-    // of truth, shared with the substrate debug view). Here we only drive the
-    // per-piece K/V injection + logical-column accounting from its output: a
-    // glue island is collected as one run; a sealed section/turn is injected
-    // (the boundary markers around a turn are already folded into the adjacent
-    // glue islands by `assemble_pieces`); the user message is deferred.
+    // of truth, shared with the substrate debug view).
     let mut walker = SegmentWalker::new();
     // Look up a sealed turn's recorded `no_think` so the assembler can re-render
-    // its `/no_think` switch.  Resolves group→timeline the same way
-    // `inject_sealed_turn` does (slot target first, else any timeline for the
-    // group).  Immutable borrow ends before the mutable walk below.
-    let slot_target = ctx.slot_target;
+    // its `/no_think` switch.  The turn carries its own timeline (stamped at
+    // projection), so this reads it directly — no group→timeline resolution.
+    // Immutable borrow ends before the mutable walk below.
     let conversation = ctx.conversation;
-    let no_think_for = |group: GroupId, index: TurnIndex| -> bool {
-        let view = conversation.read();
-        let timeline = match slot_target {
-            Some(tgt) if group == tgt.group => Some(tgt.timeline),
-            _ => view.timelines_for_group(group).next(),
-        };
-        timeline.is_some_and(|tl| view.turn_no_think(tl, index))
+    let no_think_for = |timeline: Option<TimelineId>, index: TurnIndex| -> bool {
+        timeline.is_some_and(|tl| conversation.read().turn_no_think(tl, index))
     };
     for piece in assemble_pieces(new_segments, ctx.boundary_markers, no_think_for) {
         match piece {
             AssembledPiece::Glue(tokens) => {
-                walker.run_tokens.extend(tokens);
-                walker.collect_run();
+                reserve_glue_island(ctx, &mut walker, &tokens)?;
             }
             AssembledPiece::Section(id) => {
                 inject_sealed_section(ctx, &mut walker, id)?;
             }
-            AssembledPiece::Turn { group, index, role } => {
-                inject_sealed_turn(ctx, &mut walker, group, index, role)?;
+            AssembledPiece::Turn {
+                group,
+                index,
+                role,
+                timeline,
+            } => {
+                inject_sealed_turn(ctx, &mut walker, timeline, group, index, role)?;
             }
             AssembledPiece::DeferredUser(tokens) => {
                 walker.deferred_user = Some(tokens);
             }
-            AssembledPiece::TurnHalf { group, index } => {
-                inject_sealed_turn_half(ctx, &mut walker, group, index)?;
+            AssembledPiece::TurnHalf {
+                group,
+                index,
+                timeline,
+            } => {
+                inject_sealed_turn_half(ctx, &mut walker, timeline, group, index)?;
             }
         }
     }
-    walker.collect_run();
 
-    // Reserve the glue's writer chunk now (before the batched forward) so the
-    // gap-fill writes don't alias the Arc-shared sealed partial tail.
-    if !walker.glue_tokens.is_empty() {
-        push_empty_if_sealed(ctx, walker.last_was_sealed)?;
+    // Convention assert: the slot's chunks were built in logical order (gaps
+    // reserved in place), so the slot offset (Σ chunk usage) must equal the
+    // walker's running logical position. If they ever diverge, a chunk's
+    // `rope_base` no longer equals its sequence position and the kernels would
+    // silently mis-RoPE — fail loudly here instead.
+    let slot_offset = ctx.session.sequence_offset(parent_id.0).ok_or_else(|| {
+        ConversationError::Channel(format!("apply_segments: slot {} not in session", parent_id))
+    })?;
+    if slot_offset as u32 != walker.logical_pos {
+        return Err(ConversationError::Channel(format!(
+            "glue convention violated: slot {} offset {} != logical_pos {} \
+             (chunk rope_base would diverge from sequence position)",
+            parent_id, slot_offset, walker.logical_pos
+        )));
     }
 
     // Assembly summary: how much selected history actually reached the slot.
@@ -383,14 +489,12 @@ pub(super) fn apply_segments_build(
         "apply_segments: assembled slot prefix"
     );
 
-    let mut col_actual_pos = Vec::with_capacity(walker.col_prefix.len() + walker.col_new.len());
-    col_actual_pos.extend_from_slice(&walker.col_prefix);
-    col_actual_pos.extend_from_slice(&walker.col_new);
-
     Ok(GapFillPlan {
         parent_id,
         glue_tokens: std::mem::take(&mut walker.glue_tokens),
-        col_actual_pos,
+        glue_write_slice: std::mem::take(&mut walker.glue_write_slice),
+        glue_write_in_blk: std::mem::take(&mut walker.glue_write_in_blk),
+        fwd_ahead: std::mem::take(&mut walker.fwd_ahead),
         deferred_user: walker.deferred_user.take(),
         tail_per_layer,
         n_glue_tokens: walker.n_glue_tokens,
@@ -401,16 +505,17 @@ pub(super) fn apply_segments_build(
 /// new region (every glue island) plus each column's TRUE logical position, so
 /// the walk emits one batched gap-fill forward instead of N per-island prefills.
 struct SegmentWalker {
-    /// Glue tokens for the *current* run, drained by `collect_run`.
-    run_tokens: Vec<u32>,
-    /// All glue tokens across every island, in logical order — the new region.
+    /// All glue tokens across every island, in logical order — the gap-fill Q.
     glue_tokens: Vec<u32>,
-    /// Logical position of each sealed (prefix) column, in inject order — must
-    /// match the position_map order the gap-fill reads the prefix in.
-    col_prefix: Vec<u32>,
-    /// Logical position of each glue (new-region) column, in collect order.
-    col_new: Vec<u32>,
+    /// Per glue token: the reserved gap chunk's block index (its scatter target).
+    glue_write_slice: Vec<u32>,
+    /// Per glue token: the in-block offset within its gap chunk.
+    glue_write_in_blk: Vec<u32>,
+    /// Per glue token: forward bridge window (tokens past its own position).
+    fwd_ahead: Vec<u32>,
     /// Running TRUE sequence position as the walk advances through sealed+glue.
+    /// Equal to `Σ chunk usage` by construction (gaps are reserved in place), so
+    /// it cross-checks the slot offset in the convention assert.
     logical_pos: u32,
     /// True if the most recent slot mutation was a Sealed inject (Arc-shared,
     /// partial trailing chunk possible) — so the gap-fill pushes a fresh writer
@@ -435,10 +540,10 @@ struct SegmentWalker {
 impl SegmentWalker {
     fn new() -> Self {
         Self {
-            run_tokens: Vec::new(),
             glue_tokens: Vec::new(),
-            col_prefix: Vec::new(),
-            col_new: Vec::new(),
+            glue_write_slice: Vec::new(),
+            glue_write_in_blk: Vec::new(),
+            fwd_ahead: Vec::new(),
             logical_pos: 0,
             last_was_sealed: false,
             deferred_user: None,
@@ -451,32 +556,67 @@ impl SegmentWalker {
         }
     }
 
-    /// Close the current glue run: append its tokens to the new region and stamp
-    /// each with its logical position. No forward pass — the gap-fill runs once,
-    /// after the whole walk.
-    fn collect_run(&mut self) {
-        if self.run_tokens.is_empty() {
-            return;
-        }
-        let n = self.run_tokens.len();
-        for k in 0..n {
-            self.col_new.push(self.logical_pos + k as u32);
-        }
-        self.glue_tokens.append(&mut self.run_tokens);
-        self.logical_pos += n as u32;
-        self.n_glue_tokens += n;
-    }
-
-    /// Record `count` sealed (prefix) columns at the current logical position
-    /// and advance. Called by the sealed-inject helpers after a successful
-    /// inject so the prefix's `col_actual_pos` matches the position_map order.
+    /// Record `count` sealed (prefix) columns and advance the logical position.
+    /// Called by the sealed-inject helpers after a successful inject. The
+    /// position itself is carried by the injected chunks' `rope_base`; the walker
+    /// only tracks the running total for the convention assert.
     fn record_sealed(&mut self, count: usize) {
-        for k in 0..count {
-            self.col_prefix.push(self.logical_pos + k as u32);
-        }
         self.logical_pos += count as u32;
         self.last_was_sealed = true;
     }
+}
+
+// ── Glue-island gap reservation ──────────────────────────────────────────────
+
+/// Reserve a glue island IN PLACE: append real, writer-owned gap chunk(s) of the
+/// island's length at its logical position and record, per token, the
+/// `(block, in_blk)` scatter target plus its forward bridge window. The gap's
+/// K/V is filled by the batched gap-fill forward; until then it is unread (the
+/// kernel scatters before it streams). An island longer than one chunk is split
+/// across consecutive gap chunks — the per-token targets stay contiguous, so the
+/// `slice_rope` position of token `t` is exactly its logical position.
+fn reserve_glue_island(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    tokens: &[u32],
+) -> Result<(), ConversationError> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let parent = ctx.parent_id.0;
+    let chunk = ctx.chunk_size.max(1);
+    let mut placed = 0;
+    while placed < n {
+        let take = (n - placed).min(chunk);
+        // The gap is full-by-construction: it returns the base of its valid tail
+        // window, and we scatter the island's K/V into `[base, base + take)`.
+        // Using the reservation's own base (not a recomputed one) means the write
+        // window can never drift from the chunk's `slice_offset`; the column
+        // position stays `slice_rope + (in_blk - offset)` = `rope_base + i`, so
+        // logical order is preserved.
+        let (gap_blk, in_blk_base) = ctx
+            .session
+            .reserve_glue_gap(parent, take as u32)
+            .map_err(ConversationError::Model)?;
+        for i in 0..take as u32 {
+            walker.glue_write_slice.push(gap_blk as u32);
+            walker.glue_write_in_blk.push(in_blk_base + i);
+            // Backward-only for now; future code sets this per glue-island type
+            // (e.g. a `user_start` bridging into its turn) with no kernel change.
+            walker.fwd_ahead.push(0);
+        }
+        placed += take;
+    }
+    walker.glue_tokens.extend_from_slice(tokens);
+    walker.logical_pos += n as u32;
+    // A gap is a complete region like a sealed inject: the next live prefill
+    // (the deferred user message) must push a fresh writer chunk after it rather
+    // than extend into it.
+    walker.last_was_sealed = true;
+    walker.n_glue_tokens += n;
+    log_injected_tokens(ctx, tokens);
+    Ok(())
 }
 
 // ── Sealed-segment injection ─────────────────────────────────────────────────
@@ -528,16 +668,16 @@ fn inject_sealed_section(
 fn inject_sealed_turn(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
+    timeline: Option<TimelineId>,
     group: GroupId,
     index: TurnIndex,
     _part: crate::Role,
 ) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
 
-    let timeline: Option<TimelineId> = match ctx.slot_target {
-        Some(tgt) if group == tgt.group => Some(tgt.timeline),
-        _ => ctx.conversation.read().timelines_for_group(group).next(),
-    };
+    // The turn carries its own conversation (stamped at projection); this path
+    // never re-derives it from `group`.  A `None` here is a degenerate (mock /
+    // genuinely untracked) turn, surfaced loudly rather than silently dropped.
     let Some(timeline) = timeline else {
         walker.skipped_turns += 1;
         tracing::warn!(
@@ -545,7 +685,7 @@ fn inject_sealed_turn(
             slot = parent_id.0,
             group = group.raw(),
             index = index.0,
-            "apply_projection: no timeline for group; dropping selected turn"
+            "apply_projection: turn carries no timeline; dropping selected turn"
         );
         return Ok(());
     };
@@ -554,12 +694,13 @@ fn inject_sealed_turn(
         Some(s) => s,
         None => {
             walker.skipped_turns += 1;
-            // Distinguish the two failure modes:
-            //   entry_exists = false → the turn does not exist under the
-            //     timeline we resolved → timeline mismatch (the assembler used
-            //     `slot_target.timeline`; the elevate-set builder used
-            //     `timelines_for_group(group).next()` — if the group has >1
-            //     timeline these disagree).
+            // Distinguish the two failure modes (timeline resolution is now
+            // unified through `Substrate::resolve_turn_timeline`, so a stale
+            // group→timeline DISAGREEMENT between the selection and apply paths is
+            // no longer one of them):
+            //   entry_exists = false → the turn genuinely isn't tracked under the
+            //     resolved timeline → a selection/registration gap (the projection
+            //     picked a turn the substrate doesn't hold here).
             //   entry_exists = true  → the turn exists here but its residence
             //     hot is None → elevate promoted a different (timeline, index)
             //     so this one was never lifted into VRAM.
@@ -644,15 +785,13 @@ fn inject_sealed_turn(
 fn inject_sealed_turn_half(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
+    timeline: Option<TimelineId>,
     group: GroupId,
     index: TurnIndex,
 ) -> Result<(), ConversationError> {
     let parent_id = ctx.parent_id;
 
-    let timeline: Option<TimelineId> = match ctx.slot_target {
-        Some(tgt) if group == tgt.group => Some(tgt.timeline),
-        _ => ctx.conversation.read().timelines_for_group(group).next(),
-    };
+    // Carried from projection — see `inject_sealed_turn`.
     let Some(timeline) = timeline else {
         walker.skipped_turns += 1;
         tracing::warn!(
@@ -660,7 +799,7 @@ fn inject_sealed_turn_half(
             slot = parent_id.0,
             group = group.raw(),
             index = index.0,
-            "compress: no timeline for group; dropping turn-half"
+            "compress: turn-half carries no timeline; dropping turn-half"
         );
         return Ok(());
     };
@@ -824,12 +963,13 @@ fn drive_prefill_and_capture(
 }
 
 /// Fire ONE batched gap-fill forward over `plans` (the cross-conversation wave),
-/// then commit each slot's glue. Plans with no glue are skipped. Every slot's
-/// glue is the new region of a ragged prefill (per-slot kv_lens via cu_seqlens);
-/// a single flat `col_actual_pos` covers every slot's sealed prefix ++ glue, so
-/// each glue token attends only logically-earlier columns within its own slot.
-/// The resulting `[sealed | glue]` slot decodes correctly because attention is
-/// order-invariant over keys and K is stored un-rotated (re-RoPE'd at read).
+/// then fill each slot's gaps. Plans with no glue are skipped. The gaps were
+/// reserved IN PLACE during the walk, so this forward only scatters each glue
+/// token's K/V into its gap (by explicit `(slice, in_blk)` target) and computes
+/// its attention; the slot length already counts the gaps, so there is no commit
+/// step. Every column's sequence position comes from its chunk's `rope_base`
+/// (`slice_rope`) — the same convention the decode reads — so the interleaved
+/// slot decodes correctly with no `col_actual_pos` side channel.
 pub(super) fn fire_gap_fill_batch(
     session: &mut BatchedInferenceSession,
     model: &(dyn ManagedBatchedModel + Send),
@@ -846,20 +986,25 @@ pub(super) fn fire_gap_fill_batch(
     }
     let mut ids: Vec<usize> = Vec::with_capacity(active.len());
     let mut inputs: Vec<Tensor> = Vec::with_capacity(active.len());
-    let mut glue_cols: Vec<Vec<u32>> = Vec::with_capacity(active.len());
+    let mut pending: Vec<PendingGlue> = Vec::with_capacity(active.len());
     for p in &active {
         ids.push(p.parent_id.0);
         let input = Tensor::new(p.glue_tokens.as_slice(), device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
         inputs.push(input);
-        glue_cols.push(p.col_actual_pos.clone());
+        pending.push(PendingGlue {
+            write_slice: p.glue_write_slice.clone(),
+            write_in_blk: p.glue_write_in_blk.clone(),
+            fwd_ahead: p.fwd_ahead.clone(),
+        });
     }
-    // Stage each slot's TRUE column positions (sealed prefix ++ glue), aligned
-    // with `ids`. The forward routes the HD128 glue to the paged-glue kernel,
-    // which streams the quantized prefix once (dequant-once) and masks every
-    // glue island by logical position via `col_actual_pos`.
-    session.set_pending_glue(glue_cols);
+    // Stage each slot's per-token gap scatter target + forward bridge window,
+    // aligned with `ids`. The forward routes the HD128 glue to the paged-glue
+    // kernel, which streams the quantized slot once (dequant-once), positions
+    // every column by its chunk `rope_base`, and masks each glue token by
+    // `cpos > row_pos + fwd_ahead[t]`.
+    session.set_pending_glue(pending);
     // Clear the per-op pipeline profile so the snapshot below covers only this
     // gap-fill forward (attn_core / mlp_ffn / qkv / out_proj, summed over layers).
     #[cfg(feature = "profile")]
@@ -869,6 +1014,27 @@ pub(super) fn fire_gap_fill_batch(
         model
             .forward_batched(session, &ids, &inputs)
             .map_err(ConversationError::Model)?;
+    }
+    // The gap-fill must ONLY scatter K/V into the pre-reserved gaps — it must not
+    // advance the slot. If a trailing-append advance ever creeps back in, the
+    // session offset (used by the next prefill) and the backing's actual length
+    // (sum of chunk usages) desync, and the final gap chunk's usage is inflated;
+    // the symptom is an out-of-bounds panic deep in a later prefill's write-region
+    // extension. Assert the invariant `session.offset == backing length` here, at
+    // the source, so the failure is named instead of a cryptic index panic.
+    for &id in &ids {
+        let session_off = session.sequence_offset(id).unwrap_or(0);
+        let backing_len = session
+            .sequence_caches(id)
+            .map(|c| c.current_seq_len())
+            .unwrap_or(session_off);
+        if backing_len != session_off {
+            return Err(ConversationError::Channel(format!(
+                "gap-fill desynced slot {id}: session offset {session_off} != backing length \
+                 {backing_len}. The glue forward advanced the slot instead of only scattering \
+                 into pre-reserved gaps."
+            )));
+        }
     }
     #[cfg(feature = "profile")]
     {
@@ -886,12 +1052,8 @@ pub(super) fn fire_gap_fill_batch(
             parts.join("  ")
         );
     }
-    // Commit each slot's glue (consecutive writer tail).
-    for p in &active {
-        session
-            .advance_sequence(p.parent_id.0, p.glue_tokens.len())
-            .map_err(ConversationError::Model)?;
-    }
+    // No commit step: the gaps were reserved in place during the walk (the slot
+    // offset already counts them), so this forward only filled their K/V.
     Ok(())
 }
 
@@ -905,23 +1067,24 @@ pub(super) fn apply_segments_finish(
 ) -> Result<(), ConversationError> {
     let GapFillPlan {
         parent_id,
-        glue_tokens,
-        col_actual_pos: _,
+        glue_tokens: _,
+        glue_write_slice: _,
+        glue_write_in_blk: _,
+        fwd_ahead: _,
         deferred_user,
         tail_per_layer,
         n_glue_tokens,
     } = plan;
+    // The glue tokens were already logged into the slot_tokens debug view at
+    // their interleaved positions during the walk (`reserve_glue_island`).
 
-    if !glue_tokens.is_empty() {
-        log_injected_tokens(ctx, &glue_tokens);
-    }
-
-    // The in-flight user message prefills last, against [sealed | glue]. After
-    // the gap-fill the slot ends in glue writer chunks (last_was_sealed=false);
-    // with no glue it ends in the sealed inject (last_was_sealed=true).
+    // The in-flight user message prefills last, after the now-filled gaps. The
+    // slot always ends in a complete region (a reserved gap chunk, or a sealed
+    // inject when there is no glue), so the user message must push a fresh writer
+    // chunk rather than extend it — `last_was_sealed = true` unconditionally.
     if let Some(tokens) = deferred_user {
         let mut walker = SegmentWalker::new();
-        walker.last_was_sealed = glue_tokens.is_empty();
+        walker.last_was_sealed = true;
         handle_new_user_message(state, ctx, &mut walker, &tokens)?;
     }
 
@@ -977,7 +1140,7 @@ fn log_injected_tokens(ctx: &mut ApplyContext<'_>, tokens: &[u32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TurnId};
+    use crate::projection::{GroupId, LayerId, ResolvedSection, ResolvedTurn, TimelineId, TurnId};
 
     fn section_seg(id: u32) -> ProjectionSegment {
         ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection {
@@ -993,6 +1156,7 @@ mod tests {
                     group_id: GroupId::for_test(group),
                     index: TurnIndex(index),
                 },
+                timeline: Some(TimelineId::for_test(group as u64)),
             },
             crate::Role::Assistant,
         ))
@@ -1049,14 +1213,16 @@ mod tests {
                 AssembledPiece::Turn {
                     group: GroupId::for_test(2),
                     index: TurnIndex(3),
-                    role: crate::Role::Assistant
+                    role: crate::Role::Assistant,
+                    timeline: Some(TimelineId::for_test(2)),
                 },
                 // turn 1's assistant_end MERGES with turn 2's user_start in one island
                 AssembledPiece::Glue(vec![200, 100]),
                 AssembledPiece::Turn {
                     group: GroupId::for_test(2),
                     index: TurnIndex(4),
-                    role: crate::Role::Assistant
+                    role: crate::Role::Assistant,
+                    timeline: Some(TimelineId::for_test(2)),
                 },
                 // turn 2's assistant_end merges with the trailing Generated run
                 AssembledPiece::Glue(vec![200, 3]),

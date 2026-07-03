@@ -22,12 +22,15 @@
 //! [`from_projection`] adapter that classifies real [`ProjectionSegment`]s
 //! against the live [`Schema`] + [`ContentResolver`].
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use super::ids::{CollectionId, GroupId, SectionId};
+use super::ids::{CollectionId, GroupId, SectionId, TurnIndex};
 use super::project::{ProjectionSegment, SealedKind};
 use super::schema::{Schema, SystemPromptItem};
 use crate::substrate::ContentResolver;
+use crate::summary_tree::{SelectionOrigin, TurnKind};
 
 /// Which category a materialized segment falls into. Drives the GUI bar-map
 /// color and ordering (system leftmost, then section groups, then turns).
@@ -107,6 +110,51 @@ pub struct SelectedTurn {
     pub index: u32,
     pub role: String,
     pub tokens: u32,
+    /// Forest kind: `normal` for a raw conversation turn, or
+    /// `summary_of_turns` / `summary_of_summaries` when a summary node stood in
+    /// for the turns beneath it. This is the "did my context get a summary
+    /// instead of the real turn?" signal — otherwise invisible once a node is
+    /// materialized as a turn segment.
+    #[serde(default = "default_turn_kind")]
+    pub kind: TurnKind,
+    /// Why this turn won its slot, when known: score-density origin (hard anchor /
+    /// provenance / coverage / …) from the summary-forest path, or `recent` /
+    /// `historical` from the rule-based path. `None` for the live user message.
+    #[serde(default)]
+    pub reason: Option<SelectionOrigin>,
+    /// The resolved source timeline (raw id) this turn belongs to — stamped from
+    /// [`ResolvedTurn::timeline`], which the projection fixed unambiguously at
+    /// selection time. A turn's identity is `(timeline, index)`; consumers resolve
+    /// its body by this key directly, NEVER by re-deriving `group → timeline`
+    /// (the shared substrate holds many conversations under one group, so that
+    /// re-derivation is non-deterministic). `None` only for the live user message.
+    #[serde(default)]
+    pub timeline: Option<u64>,
+}
+
+/// Serde default for [`SelectedTurn::kind`] on records written before the field
+/// existed — a missing tag means a plain conversation turn.
+fn default_turn_kind() -> TurnKind {
+    TurnKind::Normal
+}
+
+/// One piece of the materialized conversation, in injection order, exactly as
+/// the assembler's `assemble_pieces` produced it — the single source of truth
+/// for the inter-turn boundary glue. The panel renders the dialogue region from
+/// this so the glue it shows is literally what the engine injected, not a
+/// client-side reconstruction. The system prompt is covered separately by
+/// [`ProjectionSelection::system`]; this is the conversation region only (and
+/// excludes the live, still-decoding user turn).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaterializedPiece {
+    /// A glue island the assembler gap-fills verbatim — the inter-turn boundary
+    /// markers (`user_start`, the `/no_think` soft-switch, `assistant_end`),
+    /// merged into one island and decoded to text.
+    Glue { text: String },
+    /// A sealed turn (memory tier or dialogue), carrying its forest kind + why so
+    /// the card can show summary-vs-raw in place.
+    Turn { turn: SelectedTurn },
 }
 
 /// The exact materialized-context selection for a projection — what provenance
@@ -157,6 +205,14 @@ pub struct ProjectionEvent {
     /// backs the projection bubble's substrate view.
     #[serde(default)]
     pub selection: ProjectionSelection,
+    /// The conversation in materialized injection order, exactly as the assembler
+    /// laid it out (`assemble_pieces`): real boundary-glue islands interleaved
+    /// with the sealed turns. The panel renders the dialogue region from this so
+    /// its glue is what the engine truly injected. Empty on records written
+    /// before this field, or when the boundary markers weren't available to the
+    /// builder (the panel then falls back to reconstructing the framing).
+    #[serde(default)]
+    pub materialized: Vec<MaterializedPiece>,
 }
 
 /// One classified segment before aggregation — `(kind, label, tokens)`.
@@ -214,6 +270,7 @@ pub fn aggregate(
         substrate_tokens,
         buckets,
         selection: ProjectionSelection::default(),
+        materialized: Vec::new(),
     }
 }
 
@@ -225,6 +282,34 @@ pub fn aggregate(
 /// envelopes) are framing, not content, and are skipped.
 pub fn from_projection(
     segments: &[ProjectionSegment],
+    schema: &Schema,
+    resolver: &dyn ContentResolver,
+    substrate_tokens: u32,
+    start_token: u32,
+    end_token: u32,
+    seconds: f64,
+) -> ProjectionEvent {
+    from_projection_with_origins(
+        segments,
+        &HashMap::new(),
+        schema,
+        resolver,
+        substrate_tokens,
+        start_token,
+        end_token,
+        seconds,
+    )
+}
+
+/// As [`from_projection`], but also stamps each selected turn with *why* it was
+/// chosen — the `(group, turn) → SelectionOrigin` map carried on
+/// [`super::Projection::selection_origins`]. Production callers pass it so the
+/// persisted record / GUI can show provenance vs recency vs coverage; tests and
+/// the no-origin wrapper above pass an empty map (every `reason` is then `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn from_projection_with_origins(
+    segments: &[ProjectionSegment],
+    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
     schema: &Schema,
     resolver: &dyn ContentResolver,
     substrate_tokens: u32,
@@ -279,7 +364,7 @@ pub fn from_projection(
         end_token,
         seconds,
     );
-    event.selection = build_selection(segments, schema, resolver);
+    event.selection = build_selection(segments, origins, schema, resolver);
     event
 }
 
@@ -290,6 +375,7 @@ pub fn from_projection(
 /// conversation segments plus the current message.
 fn build_selection(
     segments: &[ProjectionSegment],
+    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
     schema: &Schema,
     resolver: &dyn ContentResolver,
 ) -> ProjectionSelection {
@@ -316,6 +402,9 @@ fn build_selection(
                     index: t.index().0,
                     role: role_str(*role).to_string(),
                     tokens: resolver.turn_token_count(t.group(), t.index()) as u32,
+                    kind: resolver.turn_kind(t.group(), t.index()),
+                    reason: origins.get(&(t.group(), t.index())).copied(),
+                    timeline: t.timeline.map(|tl| tl.raw()),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -325,6 +414,11 @@ fn build_selection(
                     index: u32::MAX,
                     role: "user".to_string(),
                     tokens: tokens.len() as u32,
+                    // The live message is the probe, not a selected memory — it
+                    // is always a raw turn and has no selection origin.
+                    kind: TurnKind::Normal,
+                    reason: None,
+                    timeline: None,
                 });
             }
             // Compression-internal turn-half — not a displayed dialogue turn.
@@ -434,9 +528,10 @@ fn build_selection(
                             if let Some(&tokens) = emitted_glue.get(n.name.as_str()) {
                                 system.push(SystemItem::Glue {
                                     name: n.name.clone(),
-                                    content: n.options.first().map_or(String::new(), |o| {
-                                        o.content.clone()
-                                    }),
+                                    content: n
+                                        .options
+                                        .first()
+                                        .map_or(String::new(), |o| o.content.clone()),
                                     tokens,
                                 });
                             }
@@ -503,7 +598,7 @@ fn build_selection(
 }
 
 /// Role → wire string for [`SelectedTurn`].
-fn role_str(role: crate::Role) -> &'static str {
+pub(crate) fn role_str(role: crate::Role) -> &'static str {
     match role {
         crate::Role::User => "user",
         crate::Role::Assistant => "assistant",
@@ -554,7 +649,7 @@ fn collection_of_summary(schema: &Schema, id: SectionId) -> Option<&str> {
 }
 
 /// The YAML name of a group by its globally-unique id.
-fn group_name_of(schema: &Schema, id: GroupId) -> Option<&str> {
+pub(crate) fn group_name_of(schema: &Schema, id: GroupId) -> Option<&str> {
     schema
         .layers
         .iter()
@@ -564,7 +659,7 @@ fn group_name_of(schema: &Schema, id: GroupId) -> Option<&str> {
 }
 
 /// The YAML name of the layer that owns the group with this id.
-fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> {
+pub(crate) fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> {
     schema
         .layers
         .iter()
@@ -785,6 +880,7 @@ layers:
                         group_id: conv,
                         index: TurnIndex(idx),
                     },
+                    timeline: None,
                 },
                 crate::Role::Assistant,
             ))
@@ -931,7 +1027,9 @@ layers:
             o => panic!("expected tool_a section, got {o:?}"),
         }
         match &sys[1] {
-            SystemItem::Glue { content, tokens, .. } => {
+            SystemItem::Glue {
+                content, tokens, ..
+            } => {
                 assert_eq!(content, "\n", "glue content must be the literal newline");
                 assert_eq!(*tokens, 1, "glue must report its token count");
             }
@@ -970,6 +1068,7 @@ layers:
                         group_id: conv,
                         index: TurnIndex(0),
                     },
+                    timeline: None,
                 },
                 crate::Role::User,
             )),

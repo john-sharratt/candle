@@ -548,7 +548,9 @@ impl Scheduler {
                         if let Some(p) = self.pending_compression_seals.remove(&job_id) {
                             let _ = p
                                 .response_tx
-                                .send(Err(format!("SubmitSummaryProbe: reproject prefill: {e}")));
+                                .send(Err(crate::summary_tree::ProbeError::Soft(format!(
+                                    "SubmitSummaryProbe: reproject prefill: {e}"
+                                ))));
                         }
                         self.free_summary_slot(slot);
                     }
@@ -741,7 +743,9 @@ impl Scheduler {
                         post_decode_tokens: work.post_decode_tokens,
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
-                        content_bounds: work.content_bounds,
+                        user_content_start: work.user_content_start,
+                        user_content_end: work.user_content_end,
+                        assistant_content_start: work.assistant_content_start,
                         no_think: work.no_think,
                         prefill_assistant_text: work.prefill_assistant_text,
                         finished: true,
@@ -813,7 +817,9 @@ impl Scheduler {
                 post_decode_tokens: work.post_decode_tokens,
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
-                content_bounds: work.content_bounds,
+                user_content_start: work.user_content_start,
+                user_content_end: work.user_content_end,
+                assistant_content_start: work.assistant_content_start,
                 no_think: work.no_think,
                 prefill_assistant_text: work.prefill_assistant_text,
                 finished: false,

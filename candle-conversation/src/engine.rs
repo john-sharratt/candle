@@ -15,7 +15,7 @@ use crate::stencil::{
     compile, compile_think_tree, compile_tool_call_tree, HfVocab, StencilTree, ThinkMode,
     ThinkSteerEnvelope, TokenId, ToolCallEnvelope, ToolSpec, TriggerRegistry,
 };
-use crate::substrate::{ConvCompression, Substrate, TurnContentBounds};
+use crate::substrate::{ConvCompression, Substrate};
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
 use crate::token_buffer::TokenBuffer;
 
@@ -929,7 +929,9 @@ impl ConversationEngine {
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),
                 user_text: String::new(),
-                content_bounds: TurnContentBounds::default(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
                 no_think: false,
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),

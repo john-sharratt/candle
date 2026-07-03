@@ -254,6 +254,29 @@
       const end = start + gen;
       conv._projTok = end;
       const tps = 36 + Math.random() * 18;
+      // The selected turns (memory tiers, then dialogue with two summary nodes in
+      // place of older spans). One entry per turn; bodies come from turnContent.
+      const convTurns = [
+        { layer: 'repo_map', group: 'files', index: 0, role: 'assistant', tokens: rnd(180, 360), kind: 'normal', reason: 'recent' },
+        { layer: 'repo_map', group: 'files', index: 1, role: 'assistant', tokens: rnd(180, 360), kind: 'normal', reason: 'recent' },
+        { layer: 'code_reading', group: 'scopes', index: 0, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'provenance_score' },
+        { layer: 'code_reading', group: 'scopes', index: 1, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'provenance_score' },
+        { layer: 'code_reading', group: 'scopes', index: 2, role: 'assistant', tokens: rnd(300, 600), kind: 'normal', reason: 'coverage_fill' },
+        { layer: 'dialogue', group: 'primary_conversation', index: 3, role: 'assistant', tokens: rnd(120, 240), kind: 'summary_of_summaries', reason: 'coverage_fill' },
+        { layer: 'dialogue', group: 'primary_conversation', index: 5, role: 'assistant', tokens: rnd(90, 160), kind: 'summary_of_turns', reason: 'provenance_score' },
+        { layer: 'dialogue', group: 'primary_conversation', index: 6, role: 'assistant', tokens: rnd(300, 900), kind: 'normal', reason: 'recent' },
+      ];
+      // The materialized spine: real boundary-glue islands (user_start, and
+      // assistant_end + user_start between turns) interleaved with the turns —
+      // exactly as `assemble_pieces` lays them out, so the panel renders the
+      // engine's literal injected order/glue, not a reconstruction.
+      const US = '<|im_start|>user\n', AE = '<|im_end|>\n';
+      const matz = [];
+      convTurns.forEach((t, i) => {
+        matz.push({ kind: 'glue', text: (i === 0 ? '' : AE) + US });
+        matz.push({ kind: 'turn', turn: t });
+      });
+      matz.push({ kind: 'glue', text: AE });
       return {
         id: (this._spanSeq += 1),
         region: region || 'answer',
@@ -285,18 +308,13 @@
             { kind: 'glue', name: 'tools_close', content: '</tools>\n', tokens: 3 },
             { kind: 'glue', name: 'system_close', content: '<|im_end|>\n', tokens: 2 },
           ],
-          turns: [
-            // Lower-layer memory tiers projected into the window (no bodies in GUI).
-            { layer: 'repo_map', group: 'files', index: 0, role: 'assistant', tokens: rnd(180, 360) },
-            { layer: 'repo_map', group: 'files', index: 1, role: 'assistant', tokens: rnd(180, 360) },
-            { layer: 'code_reading', group: 'scopes', index: 0, role: 'assistant', tokens: rnd(300, 600) },
-            { layer: 'code_reading', group: 'scopes', index: 1, role: 'assistant', tokens: rnd(300, 600) },
-            { layer: 'code_reading', group: 'scopes', index: 2, role: 'assistant', tokens: rnd(300, 600) },
-            // Dialogue turns (rendered from the GUI message history, not these).
-            { layer: 'dialogue', group: 'primary_conversation', index: 0, role: 'user', tokens: rnd(40, 120) },
-            { layer: 'dialogue', group: 'primary_conversation', index: 0, role: 'assistant', tokens: rnd(300, 900) },
-          ],
+          // Each turn carries `kind` (raw `normal` turn vs `summary_of_turns` /
+          // `summary_of_summaries` forest node) and `reason` (why it won its slot).
+          turns: convTurns,
         },
+        // The conversation in materialized injection order (real boundary glue +
+        // sealed turns) — the panel renders the dialogue region from this.
+        materialized: matz,
       };
     },
     seedProjections(conv) {
@@ -441,7 +459,34 @@
         'scopes::0': { user: 'Scope: substrate/src/lib.rs :: Substrate::recover', assistant: J(['pub fn recover(path: &Path) -> Result<Self> {', '    let mut s = Substrate::open(path)?;', '    for frame in s.log.iter()? { s.apply(frame?)?; }', '    Ok(s)', '}']) },
         'scopes::1': { user: 'Scope: substrate/src/redo.rs :: FrameIter::next', assistant: J(['fn next(&mut self) -> Option<Result<Frame>> {', '    let len = self.read_len().ok()??;', '    if self.remaining() < len { return None; }', '    Some(self.read_frame(len))', '}']) },
         'scopes::2': { user: 'Scope: substrate/src/tensor.rs :: Tensor::matmul', assistant: J(['pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {', '    self.backend.matmul(self, rhs)', '}']) },
+        // Dialogue bodies: summary nodes (3, 5) carry the summary text they
+        // injected in place of the turns they cover; the recent raw turn (6) has
+        // both halves. The panel renders these as the materialized KV.
+        'primary_conversation::3': { user: '', assistant: J(['[summary of turns 0–3] The user asked for a codebase tour; the assistant walked the crate layout (core/nn/transformers/kernels) and the KV-cache subsystem.']) },
+        'primary_conversation::5': { user: '', assistant: J(['[summary of turn 4] The user asked how the redo log replays on boot; the assistant traced Substrate::recover iterating frames.']) },
+        'primary_conversation::6': { user: 'so what triggers a reprojection mid-decode?', assistant: J(['A reprojection fires when the BDP scan’s top-k selection changes during decode — the scheduler rebuilds the slot from the substrate with the newly-selected turns.']) },
       };
+      // A turn is stored as ONE continuous block; synthesize `text` (the whole
+      // turn, with the baked intra-turn boundary) so the panel renders one card
+      // per turn instead of two re-glued halves.
+      Object.keys(turnContent).forEach((k) => {
+        const t = turnContent[k];
+        if (t.text == null) t.text = (t.user ? t.user + '<|im_end|>\n<|im_start|>assistant\n' : '') + (t.assistant || '');
+        // Segment-vector layout: user_start/im_end suffix are ethereal (spine-
+        // materialized); the intra markers + bodies are real.
+        if (t.layout == null) {
+          const u = t.user || '', a = t.assistant || '';
+          const ul = Math.max(1, Math.round(u.length / 4)), al = Math.max(1, Math.round(a.length / 4));
+          t.layout = { segments: [
+            { kind: 'glue', marker: 'user_start', kv: null },
+            { kind: 'user', text: u, kv: { offset: 0, len: ul } },
+            { kind: 'glue', marker: 'im_end', kv: { offset: ul, len: 2 } },
+            { kind: 'glue', marker: 'assistant_start', kv: { offset: ul + 2, len: 3 } },
+            { kind: 'assistant', text: a, kv: { offset: ul + 5, len: al } },
+            { kind: 'glue', marker: 'im_end', kv: null },
+          ] };
+        }
+      });
       return { sectionContent: content, glue, turnContent, targetLayer: 'dialogue' };
     },
 

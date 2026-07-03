@@ -10,17 +10,18 @@ use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::persistence::content_hash::{hash_tokens, ContentChain};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection, Builder, Conversation, ProjectionEvent, ProjectionMode, ProjectionTarget,
-    SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
+    from_projection_with_origins, Builder, Conversation, ProjectionEvent, ProjectionMode,
+    ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
 };
 use crate::provenance::ProvenanceFile;
+use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
 use crate::sequence_handle::{BlockCount, SequenceId};
-use crate::substrate::TurnContentBounds;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
+use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 
@@ -1205,12 +1206,15 @@ impl Sequence {
         } else {
             self.tokenize(&assistant_head)?.len()
         };
-        let content_bounds = TurnContentBounds::clamped(
-            user_content_start,
-            user_content_end,
-            assistant_content_start,
-            prefill_tokens.len(),
-        );
+        // Clamp to the prefill length and force monotonic so a tokenizer that
+        // merges across a join can never invert the windows at seal time.
+        let total = prefill_tokens.len();
+        let user_content_start = (user_content_start.min(total)) as u32;
+        let user_content_end =
+            (user_content_end.min(total).max(user_content_start as usize)) as u32;
+        let assistant_content_start = (assistant_content_start
+            .min(total)
+            .max(user_content_end as usize)) as u32;
         // Record whether the composer's `/no_think` dial is active for this
         // turn, so the projection re-injects the soft-switch into this turn's
         // user opener when it is later re-rendered as history.
@@ -1226,7 +1230,9 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
-            content_bounds,
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
             no_think,
             // Decode path: the assistant half is produced by the model, so the
             // seal stores its decoded text — nothing to pre-supply here.
@@ -1269,7 +1275,9 @@ impl Sequence {
         prefill_text: String,
         prefill_tokens: TokenBuffer,
         user_text: String,
-        content_bounds: TurnContentBounds,
+        user_content_start: u32,
+        user_content_end: u32,
+        assistant_content_start: u32,
         no_think: bool,
         prefill_assistant_text: String,
         post_decode_tokens: TokenBuffer,
@@ -1294,7 +1302,9 @@ impl Sequence {
                 prefill_tokens,
                 prefill_text,
                 user_text,
-                content_bounds,
+                user_content_start,
+                user_content_end,
+                assistant_content_start,
                 no_think,
                 prefill_assistant_text,
                 post_decode_tokens,
@@ -1401,12 +1411,13 @@ impl Sequence {
                 no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
             ))?
             .len();
-        let content_bounds = TurnContentBounds::clamped(
-            user_content_start,
-            user_content_end,
-            assistant_content_start,
-            prefill_tokens.len(),
-        );
+        let total = prefill_tokens.len();
+        let user_content_start = (user_content_start.min(total)) as u32;
+        let user_content_end =
+            (user_content_end.min(total).max(user_content_start as usize)) as u32;
+        let assistant_content_start = (assistant_content_start
+            .min(total)
+            .max(user_content_end as usize)) as u32;
 
         // Build the TokenizedText for both halves now — assistant
         // text is supplied directly, not decoded, so we can fill it
@@ -1427,7 +1438,9 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
-            content_bounds,
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
             // Prefill content turns hard-apply `/no_think` (see the prefix above)
             // — record it so the re-render is consistent with the sealed grid.
             true,
@@ -1531,15 +1544,35 @@ impl Sequence {
             &self.selection,
         );
         let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
-        Some(from_projection(
+        let mut ev = from_projection_with_origins(
             &projection.segments,
+            &projection.selection_origins,
             self.projection.schema(),
             &resolver,
             substrate_total,
             0,
             stats.tokens_generated as u32,
             stats.decode_ms / 1000.0,
-        ))
+        );
+        // Materialized dialogue glue, from the SAME `assemble_pieces` decision the
+        // engine injects from, so the persisted panel shows the real boundary
+        // markers. Best-effort: if the markers can't be tokenised, leave it empty
+        // and the panel reconstructs the framing.
+        if let Ok(markers) = BoundaryMarkers::from_dialect(&self.config.dialect, |s| {
+            self.tokenizer
+                .encode(s, false)
+                .map(|e| e.get_ids().to_vec())
+        }) {
+            ev.materialized = materialize_conversation(
+                &projection.segments,
+                &markers,
+                &projection.selection_origins,
+                &resolver,
+                self.projection.schema(),
+                |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+            );
+        }
+        Some(ev)
     }
 
     /// `(section name, authored content)` for every system-prompt section in the
@@ -2021,24 +2054,19 @@ impl Sequence {
         out
     }
 
-    /// The two verbatim halves — `(user_text, assistant_text)` — of projected
-    /// turn `index` in the group named `group_name`, read from the substrate.
-    /// Returned UNFRAMED (no dialect markers): the caller places the glue around
-    /// and between them. Both halves are stored verbatim (decoded for dialogue
-    /// turns, supplied for prefill ingests like repo_map/code_reading; see
-    /// `insert_turn` → the seal). `None` if the group/turn isn't found or is
-    /// entirely empty.
-    pub fn resolve_turn_text(&self, group_name: &str, index: u32) -> Option<(String, String)> {
-        let gid = self
-            .projection
-            .schema()
-            .layers
-            .iter()
-            .flat_map(|l| l.groups.iter())
-            .find(|g| g.name == group_name)
-            .map(|g| g.id)?;
+    /// The two verbatim halves — `(user_text, assistant_text)` — of turn `index`
+    /// in `timeline`, read from the substrate. Returned UNFRAMED (no dialect
+    /// markers): the caller places the glue around and between them. Both halves
+    /// are stored verbatim (decoded for dialogue turns, supplied for prefill
+    /// ingests like repo_map/code_reading; see `insert_turn` → the seal).
+    ///
+    /// `timeline` is the turn's resolved identity, stamped by the projection at
+    /// selection time (`SelectedTurn::timeline`) — it is NEVER re-derived from a
+    /// group here, because the shared substrate registers many conversations under
+    /// one group and that re-derivation is non-deterministic. `None` if the turn
+    /// isn't found or is entirely empty.
+    pub fn resolve_turn_text(&self, timeline: TimelineId, index: u32) -> Option<(String, String)> {
         let read = self.substrate.read();
-        let timeline = read.active_timelines_for_group(gid).next()?;
         let idx = TurnIndex(index);
         let user = read.user_text_of(timeline, idx);
         let assistant = read.assistant_text_of(timeline, idx);
@@ -2046,6 +2074,32 @@ impl Sequence {
             return None;
         }
         Some((user, assistant))
+    }
+
+    /// The ENTIRE turn `index` in `timeline` as one continuous string: the full
+    /// sealed token range — user content, the baked intra-turn boundary
+    /// (`user_end` / `assistant_start`), and assistant content — decoded verbatim,
+    /// exactly as it sits in the KV. `timeline` is the turn's resolved identity
+    /// (`SelectedTurn::timeline`); see [`Self::resolve_turn_text`]. `None` if the
+    /// turn isn't found or has no tokens.
+    pub fn resolve_turn_full_text(&self, timeline: TimelineId, index: u32) -> Option<String> {
+        let read = self.substrate.read();
+        let ids = read.token_ids_of(timeline, TurnIndex(index));
+        if ids.is_empty() {
+            return None;
+        }
+        self.tokenizer.decode(&ids, false).ok()
+    }
+
+    /// The segment-vector [`TurnLayout`] for turn `index` in `timeline` — the
+    /// complete, validated description of its K/V (user / thinking / assistant /
+    /// boundary glue). Built at seal time and stored on the turn, so this is a
+    /// direct fetch. `timeline` is the turn's resolved identity
+    /// (`SelectedTurn::timeline`); see [`Self::resolve_turn_text`]. `None` if the
+    /// turn isn't found.
+    pub fn turn_layout(&self, timeline: TimelineId, index: u32) -> Option<TurnLayout> {
+        let read = self.substrate.read();
+        read.turn_layout(timeline, TurnIndex(index))
     }
 
     /// Persist this conversation's projection-event timeline for the most

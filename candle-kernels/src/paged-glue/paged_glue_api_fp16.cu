@@ -30,12 +30,9 @@ extern "C" void run_paged_glue_fp16(
     const uint32_t* cu_seqlens_q,
     const uint32_t* q_lens,
     const uint32_t* kv_lens,
-    const uint32_t* col_actual_pos,
-    const uint32_t* cu_kvlens,
     const uint32_t* glue_write_slice,
     const uint32_t* glue_write_in_blk,
-    uint32_t fwd_window,
-    const uint32_t* b_avail,
+    const uint32_t* fwd_ahead,
     void* stream_ptr
 ) {
     cudaStream_t stream = (cudaStream_t)stream_ptr;
@@ -44,8 +41,8 @@ extern "C" void run_paged_glue_fp16(
             (const __half*)q_ptr, headers_ptr, (__half*)o_ptr, \
             batch, max_glue, n_q_head, n_kv_head, softmax_scale, \
             (const __half*)k_new, (const __half*)v_new, rope_cs, rope_interleaved, \
-            cu_seqlens_q, q_lens, kv_lens, col_actual_pos, cu_kvlens, \
-            glue_write_slice, glue_write_in_blk, fwd_window, b_avail, stream)
+            cu_seqlens_q, q_lens, kv_lens, \
+            glue_write_slice, glue_write_in_blk, fwd_ahead, stream)
     switch (head_dim) {
         case 128: LAUNCH_GLUE(128); break;
         default: break;

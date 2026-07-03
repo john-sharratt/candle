@@ -188,7 +188,8 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // (`mode`, `system_open`/`system_close`, `tools_open`/`tools_close`
     // are `kind: template` items now and don't appear in the section
     // name map — see `projection.yaml`.)
-    for name in ["frame", "history_stance", "grounding", "tools_overview"] {
+    // (`grounding` / `grounding_no_tools` are commented out in projection.yaml.)
+    for name in ["frame", "history_stance", "tools_overview"] {
         assert!(
             builder.id_for_section_in(dialogue, name).is_some(),
             "static section {name:?} must still resolve",

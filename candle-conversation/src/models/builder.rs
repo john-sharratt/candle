@@ -548,12 +548,13 @@ impl ModelBuilder {
 
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.batched_config.compression_level = Some(self.kv_compression_level);
-        // Until decode's K-side honors non-identity pal_map with non-unit
-        // outer scales, force K storage to uniform Q4_KS with identity
-        // pal_map and unit scales for every conversation consumer. V keeps
-        // full selection adaptivity. Drop the override once the decode
-        // kernel's K-path is fixed.
-        ret.batched_config.override_k_quant = Some(QuantFormat::Q4_KS);
+        // K is pinned to a UNIFORM format with identity pal_map + unit outer
+        // scales. The provenance recall path's K-signature reader assumes that
+        // layout; adaptive (non-identity pal_map / non-unit scale) K measurably
+        // degrades recall when dialogue attends back over it. Q8_KS keeps the
+        // recall-safe uniform layout while giving K full 8-bit fidelity (vs the
+        // harder 4-bit Q4_KS). V stays fully adaptive.
+        ret.batched_config.override_k_quant = Some(QuantFormat::Q8_KS);
         ret.batched_config.override_v_quant = None;
         ret.vocab_size = vocab_size;
         ret.max_concurrent_conversations = self.max_concurrent;

@@ -125,24 +125,46 @@ pub async fn get(
         .map(|(name, content)| SectionContent { name, content })
         .collect();
 
-    // Memory-tier turn bodies (every projected layer except the dialogue, whose
-    // bodies the GUI already holds): read from the substrate so the panel can
-    // expand them, exactly like section content. Deduped across spans.
+    // Bodies for EVERY projected turn — memory tiers AND the dialogue, including
+    // summary nodes — read from the substrate so the projection panel renders the
+    // materialized KV exactly as selected (summaries shown in place of the turns
+    // they replaced), not the raw message history. Deduped across spans. The live
+    // user message (`u32::MAX`) has no sealed body and is skipped.
     let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     let mut turn_content: Vec<TurnContent> = Vec::new();
     for span_list in &buckets {
         for ev in span_list {
             for t in &ev.event.selection.turns {
-                if t.layer == "dialogue" || t.index == u32::MAX {
+                if t.index == u32::MAX {
                     continue;
                 }
                 if seen.insert((t.group.clone(), t.index)) {
-                    if let Some((user, assistant)) = session.resolve_turn_text(&t.group, t.index) {
+                    // Resolve the body by the turn's STAMPED timeline identity
+                    // (`SelectedTurn::timeline`), never by group: the shared
+                    // substrate registers many conversations under one group, so a
+                    // group→timeline lookup is non-deterministic. A turn with no
+                    // stamped timeline (only the live user message) is skipped.
+                    let Some(timeline) = t
+                        .timeline
+                        .and_then(candle_conversation::projection::TimelineId::from_raw)
+                    else {
+                        continue;
+                    };
+                    // The whole turn, continuous (what the panel renders). Fall
+                    // back to the split halves only to populate the legacy fields.
+                    let text = session.resolve_turn_full_text(timeline, t.index);
+                    let (user, assistant) = session
+                        .resolve_turn_text(timeline, t.index)
+                        .unwrap_or_default();
+                    let layout = session.turn_layout(timeline, t.index);
+                    if let Some(text) = text {
                         turn_content.push(TurnContent {
                             group: t.group.clone(),
                             index: t.index,
+                            text,
                             user,
                             assistant,
+                            layout,
                         });
                     }
                 }
@@ -193,14 +215,24 @@ pub struct HistoryBody {
     pub target_layer: String,
 }
 
-/// One projected turn's two halves, read from the substrate on demand. Returned
-/// unframed; the GUI places the dialect glue around and between them.
+/// One projected turn's body, read from the substrate on demand. `text` is the
+/// ENTIRE turn as one continuous string — the full sealed token range decoded
+/// verbatim (user content, the baked intra-turn boundary, and assistant content)
+/// — which the panel renders as a single card; the turn is stored continuously,
+/// so this is the truth, not two re-glued halves. `user`/`assistant` are the
+/// legacy split halves, retained only for the pre-materialized fallback.
 #[derive(Serialize)]
 pub struct TurnContent {
     pub group: String,
     pub index: u32,
+    pub text: String,
     pub user: String,
     pub assistant: String,
+    /// The turn's segment-vector layout (real/ethereal glue, user, thinking,
+    /// assistant) — the complete K/V description, surfaced so the panel renders
+    /// the exact segments instead of re-splitting the text on markers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<candle_conversation::turn_layout::TurnLayout>,
 }
 
 /// The dialect framing markers the assembler wraps around the prompt and turns.

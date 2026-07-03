@@ -121,13 +121,19 @@ impl<'a> BatchedAttentionParams<'a> {
 
 /// Reprojection-glue metadata. Present only when the multi-token forward is a
 /// gap-fill (glue) pass: it routes the layer's attention to the paged-glue
-/// kernel instead of plain prefill. `col_actual_pos` is the flat `[Σ kv_lens]`
-/// U32 of every column's TRUE sequence position (sealed prefix ++ glue), in
-/// `cu_seqlens_q` slot order — the kernel masks + RoPEs by logical position so
-/// scattered glue islands attend only logically-earlier columns.
+/// kernel instead of plain prefill. The glue tokens are reserved IN PLACE as gap
+/// chunks, so there is no `col_actual_pos` — every column's position comes from
+/// its chunk `rope_base` (`slice_rope`), the convention decode also reads. These
+/// flat `[Σ q_lens]` U32 tensors carry only what the kernel can't derive from
+/// the slot: per glue token, where it scatters and how far it bridges forward.
 #[derive(Clone)]
 pub struct GlueMeta {
-    pub col_actual_pos: Tensor,
+    /// Gap chunk block index each glue token's K/V scatters into.
+    pub glue_write_slice: Tensor,
+    /// In-block offset within the gap chunk.
+    pub glue_write_in_blk: Tensor,
+    /// Forward bridge window in tokens (`0` == backward-only).
+    pub fwd_ahead: Tensor,
 }
 
 /// Precomputed metadata for paged prefill attention.
@@ -715,8 +721,9 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     let rope_zeros = Tensor::zeros(n_seqs, DType::U32, q.device())?;
     // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
     // forward (HD128, chunked) routes to the paged-glue kernel — it streams the
-    // quantized prefix once and reuses it across all glue rows (dequant-once),
-    // masking by TRUE sequence position via `col_actual_pos`. Everything else
+    // quantized slot once and reuses it across all glue rows (dequant-once),
+    // positioning every column by its chunk `rope_base` (`slice_rope`) and
+    // masking each glue token by `cpos > row_pos + fwd_ahead[t]`. Everything else
     // (ordinary prefill, non-128 head dims) stays on the plain prefill kernel.
     let out_packed = match glue_meta {
         Some(g) if is_cuda_paged && head_dim == 128 => paged_glue_attn(
@@ -731,13 +738,11 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             n_kv_head,
             head_dim,
             prefill_meta,
-            &g.col_actual_pos,
+            &g.glue_write_slice,
+            &g.glue_write_in_blk,
+            &g.fwd_ahead,
             rope_cs,
             rope_interleaved,
-            // Backward-only: B is not yet staged downstream of the glue in the
-            // slot's position_map / col_actual_pos on this path, so the forward
-            // B-head window stays closed (see `paged_glue_attn`'s `b_avail`).
-            0,
             generation,
         )?,
         _ => paged_prefill_batched(

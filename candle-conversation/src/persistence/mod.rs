@@ -1376,12 +1376,7 @@ mod tests {
             anchored_prefix: Vec::new(),
             view: Vec::new(),
             scores: streams::PerDepthScores::default(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
         });
         let turn_id;
         {
@@ -1450,12 +1445,7 @@ mod tests {
             anchored_prefix: vec![sec.stream_id()],
             view: Vec::new(),
             scores: streams::PerDepthScores::default(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            no_think: false,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
         });
         child.declare_stream(&child_turn).unwrap();
         child.commit().unwrap();

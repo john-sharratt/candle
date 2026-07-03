@@ -372,11 +372,10 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
-            // Normal (dialogue) conversation turns compress at C5 — the same as
-            // the library default, but zend sets it explicitly. The utility
-            // layers (repo_map, code_reading) override to C6 per-conversation
-            // (see `repo_scan::utility_config` / `code_read`'s sequence config).
-            .compression_level(5)
+            // Near-lossless KV: dialogue turns compress at C1 (high-fidelity V
+            // for recall). The utility layers (repo_map, code_reading) match this
+            // at C1 too (see `repo_scan::utility_config` / `code_read`'s config).
+            .compression_level(1)
             // Thinking is ENABLED at the model level; per-turn suppression is
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
@@ -1303,6 +1302,7 @@ fn run_inference_stream(
             // the tools — `run_tool_calls` blocks until every tool returns — then
             // the "done" notice clears the spinner and carries each result so the
             // cards resolve immediately, before the post-stream hydrate.
+            let n_calls = calls.len();
             let results = run_tool_calls(&state.tool_host.ctx, calls);
             let _ = tx.blocking_send(Ok(StreamItem::Tool(ToolStatusOut {
                 phase: "done",
@@ -1310,6 +1310,24 @@ fn run_inference_stream(
                 results: results.iter().map(|r| r.response.clone()).collect(),
             })));
             current_message = format_tool_responses(&results);
+            // A tool round that produces no response text must NOT spawn a
+            // follow-up turn. `format_tool_responses` wraps every real result in
+            // `<tool_response>…</tool_response>`, so an empty `current_message`
+            // means no tool actually ran (the model emitted a tool call that was
+            // filtered/failed). Submitting it would seal a phantom turn whose grid
+            // is nothing but boundary glue (no user content), which the model then
+            // "answers" with a generic greeting — derailing the conversation. The
+            // answer already streamed for this turn stands; end the loop here.
+            if current_message.trim().is_empty() {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    iteration,
+                    n_calls,
+                    "tool round yielded no response text; ending turn loop instead \
+                     of submitting an empty follow-up turn",
+                );
+                break;
+            }
         }
 
         // Title generation has already been fired in parallel from
@@ -1743,12 +1761,45 @@ impl ZendSession {
         Some(base.target_layer_name())
     }
 
-    /// The `(user, assistant)` halves of a projected turn (`group` × `index`),
+    /// The `(user, assistant)` halves of a projected turn `index` in `timeline`,
     /// read from the substrate. Backs the projection panel's memory-tier bodies.
-    pub fn resolve_turn_text(&self, group: &str, index: u32) -> Option<(String, String)> {
+    /// `timeline` is the turn's resolved identity from `SelectedTurn::timeline` —
+    /// never a group→timeline guess (the shared substrate holds many
+    /// conversations under one group).
+    pub fn resolve_turn_text(
+        &self,
+        timeline: candle_conversation::projection::TimelineId,
+        index: u32,
+    ) -> Option<(String, String)> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let base = state.base_conv.lock().unwrap();
-        base.resolve_turn_text(group, index)
+        base.resolve_turn_text(timeline, index)
+    }
+
+    /// The entire turn `index` in `timeline` as one continuous string (the full
+    /// sealed token range, decoded verbatim). Backs the projection panel's turn
+    /// cards — emit the whole turn rather than the split user/assistant halves.
+    pub fn resolve_turn_full_text(
+        &self,
+        timeline: candle_conversation::projection::TimelineId,
+        index: u32,
+    ) -> Option<String> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        base.resolve_turn_full_text(timeline, index)
+    }
+
+    /// The turn's segment-vector `TurnLayout` — the complete K/V description
+    /// (glue / user / thinking / assistant, real vs ethereal). Backs the panel's
+    /// exact-segment rendering. `timeline` is the turn's resolved identity.
+    pub fn turn_layout(
+        &self,
+        timeline: candle_conversation::projection::TimelineId,
+        index: u32,
+    ) -> Option<candle_conversation::turn_layout::TurnLayout> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        base.turn_layout(timeline, index)
     }
 
     /// The dialect's framing markers — the glue wrapped around the system prompt

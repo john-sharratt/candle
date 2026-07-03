@@ -1031,25 +1031,26 @@ layers:
                   id: tools_close
                   dialect: tool_block_close
 
-                # Grounding lives INSIDE the tool toggle so it differs by branch
-                # with NO new dimension: the present (tools-on) branch tells the
-                # model to fetch missing context with a tool; the `absent` branch
-                # below says so plainly.  Each is sealed only in its own branch, so
-                # the directives downstream anchor on whichever grounding fired
-                # (K/V-continuous) — grounding totals the same 4 variants either way.
-                - kind: section
-                  id: grounding
-                  content: |+
-                    Only speak from what is actually present in the conversation.  If a file or
-                    detail hasn't appeared yet, fetch it with a tool when one fits; otherwise say so
-                    rather than guessing.  Never fill the gap with an invented value or result.
-              absent:
-                - kind: section
-                  id: grounding_no_tools
-                  content: |+
-                    Only speak from what is actually present in the conversation.  If a file or
-                    detail hasn't appeared yet, say so rather than guessing.  Never fill the gap
-                    with an invented value or result.
+                # Grounding (tools-on `grounding` + tools-off `grounding_no_tools`)
+                # is commented out to test whether the "only speak from what's
+                # present / say so rather than guessing" directive is what drives
+                # the model's "I can't see the history" disclaimer.  With both
+                # branches cleared the absent side is empty (`absent: []`) and the
+                # present side ends at `tools_close`; the downstream directives
+                # still anchor on `noop_tool` (present) / `frame` (absent) as before.
+                # - kind: section
+                #   id: grounding
+                #   content: |+
+                #     Only speak from what is actually present in the conversation.  If a file or
+                #     detail hasn't appeared yet, fetch it with a tool when one fits; otherwise say so
+                #     rather than guessing.  Never fill the gap with an invented value or result.
+              absent: []
+                # - kind: section
+                #   id: grounding_no_tools
+                #   content: |+
+                #     Only speak from what is actually present in the conversation.  If a file or
+                #     detail hasn't appeared yet, say so rather than guessing.  Never fill the gap
+                #     with an invented value or result.
 
             - kind: section
               id: history_stance

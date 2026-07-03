@@ -362,8 +362,7 @@ impl Builder {
                     // both here.
                     SystemPromptItem::SectionTree(tree) => {
                         for node in tree.nodes.iter_mut() {
-                            let need_glue =
-                                node.glue.as_ref().is_some_and(|g| g.tokens.is_none());
+                            let need_glue = node.glue.as_ref().is_some_and(|g| g.tokens.is_none());
                             if need_glue {
                                 let content = node.options[0].content.clone();
                                 let toks = std::sync::Arc::new(tokenize(&content)?);
@@ -861,11 +860,7 @@ impl Builder {
     ) -> Result<(), ConstructionError> {
         let layer_idx = self.layer_idx(layer)?;
         let content = content.into();
-        for item in self.schema.layers[layer_idx]
-            .system_prompt
-            .items
-            .iter_mut()
-        {
+        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
             if let SystemPromptItem::SectionTree(t) = item {
                 for node in t.nodes.iter_mut() {
                     // A glue node also has `collection: None` + one option, but its

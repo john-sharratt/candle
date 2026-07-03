@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use super::builder::Builder;
-use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex};
+use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::SummaryMode;
 use crate::substrate::ContentResolver;
@@ -31,6 +31,10 @@ struct MockResolver {
     section_tokens: HashMap<u32, usize>,
     default_score: f32,
     default_tokens: usize,
+    /// Conversation stamped onto every emitted turn (mirrors the real
+    /// target-aware resolver, which returns `target.timeline` for the target
+    /// group). `None` ⇒ the trait default (untracked).
+    timeline: Option<TimelineId>,
 }
 
 impl MockResolver {
@@ -70,6 +74,11 @@ impl MockResolver {
         self
     }
 
+    fn with_timeline(mut self, timeline: TimelineId) -> Self {
+        self.timeline = Some(timeline);
+        self
+    }
+
     fn with_section_score(mut self, section: SectionId, score: f32) -> Self {
         self.section_scores.insert(section.raw(), score);
         self
@@ -93,6 +102,10 @@ impl ContentResolver for MockResolver {
             .tokens
             .get(&(group.raw(), index.0))
             .unwrap_or(&self.default_tokens)
+    }
+
+    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
+        self.timeline
     }
 
     fn turn_score(
@@ -335,6 +348,45 @@ fn turns_appear_after_append() {
         &resolver,
     );
     assert_eq!(proj.sealed_turns().count(), 3);
+}
+
+/// By design, a projected turn carries its resolved conversation: the timeline is
+/// stamped ONCE at projection (from the target-aware resolver) onto every emitted
+/// turn, so no downstream consumer re-derives `group → timeline` — which is what
+/// once let the reproject pick the wrong conversation and drop a slot's history.
+#[test]
+fn projected_turn_carries_its_resolved_timeline() {
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+
+    let tl = TimelineId::for_test(42);
+    let mut resolver = MockResolver::new().with_timeline(tl);
+    resolver.append(conv);
+    resolver.append(conv);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: tl,
+        },
+        &resolver,
+    );
+
+    let turns: Vec<_> = proj.sealed_turns().collect();
+    assert_eq!(turns.len(), 2);
+    for t in turns {
+        // The conversation is carried on the turn — not re-derived downstream.
+        assert_eq!(t.timeline, Some(tl));
+        assert_eq!(
+            t.key(),
+            Some(TurnKey {
+                timeline: tl,
+                index: t.index()
+            })
+        );
+    }
 }
 
 // —— Masking ———————————————————————————————————————————————————————————————————
@@ -2797,8 +2849,8 @@ fn zend_projection_yaml_parses() {
 /// runtime-seal path against silently emitting nothing.
 #[test]
 fn real_yaml_injects_topk_runtime_tools_under_no_think_present() {
-    use candle_transformers::models::dialect::Dialect;
     use crate::projection::{ProjectionMode, SelectionState, SystemPromptItem};
+    use candle_transformers::models::dialect::Dialect;
 
     let yaml = include_str!("../../../zend/src/prompts/projection.yaml");
     let dlct = Dialect::chat_ml();
@@ -5527,7 +5579,9 @@ layers:
 
         // Wiring: the tools collection is marked deferred, and the noop node points
         // at it.
-        let cid = b.id_for_collection_in(b.id_for_layer("dialogue").unwrap(), "tools").unwrap();
+        let cid = b
+            .id_for_collection_in(b.id_for_layer("dialogue").unwrap(), "tools")
+            .unwrap();
         let tree = dialogue_tree(&b);
         let tools = tree.nodes.iter().find(|n| n.name == "tools").unwrap();
         assert!(
@@ -5555,10 +5609,7 @@ layers:
         let proj =
             b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
 
-        let ids: Vec<SectionId> = proj
-            .sealed_sections()
-            .map(|s| s.id)
-            .collect();
+        let ids: Vec<SectionId> = proj.sealed_sections().map(|s| s.id).collect();
         // The placeholder's own anchor is NOT emitted; the two real tools take its
         // place, and the directive below still emits.
         assert!(
@@ -5583,10 +5634,18 @@ layers:
         };
         let a = seg_pos(tool_a);
         let bseg = seg_pos(tool_b);
-        assert_eq!(bseg, a + 2, "exactly one segment sits between the two tools");
+        assert_eq!(
+            bseg,
+            a + 2,
+            "exactly one segment sits between the two tools"
+        );
         match &proj.segments[a + 1] {
             ProjectionSegment::Generated { tokens, .. } => {
-                assert_eq!(tokens.as_ref(), &vec![10u32], "glue must be the newline token");
+                assert_eq!(
+                    tokens.as_ref(),
+                    &vec![10u32],
+                    "glue must be the newline token"
+                );
             }
             other => panic!("expected a Generated glue token between tools, got {other:?}"),
         }
@@ -5703,7 +5762,11 @@ layers:
         // Members seal ONLY under the present branch — ×no_think (2), not ×4.
         let member_ids: std::collections::HashSet<SectionId> =
             tc.variants.iter().flatten().map(|v| v.id).collect();
-        assert_eq!(member_ids.len(), 2 * 2, "2 members × 2 no_think (present only)");
+        assert_eq!(
+            member_ids.len(),
+            2 * 2,
+            "2 members × 2 no_think (present only)"
+        );
 
         let present = proj("present", "present");
         let absent = proj("present", "absent");
@@ -5794,7 +5857,11 @@ layers:
         let tree = dialogue_tree(&b);
 
         // `inner` is gated by `grp` being present (option 0).
-        let grp_idx = tree.dims.iter().position(|d| d.selector_id == "grp").unwrap();
+        let grp_idx = tree
+            .dims
+            .iter()
+            .position(|d| d.selector_id == "grp")
+            .unwrap();
         let inner_dim = tree.dims.iter().find(|d| d.selector_id == "inner").unwrap();
         assert_eq!(inner_dim.gate, Some((grp_idx, 0)));
 
@@ -5802,9 +5869,18 @@ layers:
         // — NOT four: the absent side does not multiply by `inner`.
         let after = tree.nodes.iter().find(|n| n.name == "after").unwrap();
         assert_eq!(after.options[0].variants.len(), 3);
-        let after_a = after.options[0].variant_for(tree.pack(&[0, 0], 2)).unwrap().id;
-        let after_b = after.options[0].variant_for(tree.pack(&[0, 1], 2)).unwrap().id;
-        let after_absent = after.options[0].variant_for(tree.pack(&[1, 0], 2)).unwrap().id;
+        let after_a = after.options[0]
+            .variant_for(tree.pack(&[0, 0], 2))
+            .unwrap()
+            .id;
+        let after_b = after.options[0]
+            .variant_for(tree.pack(&[0, 1], 2))
+            .unwrap()
+            .id;
+        let after_absent = after.options[0]
+            .variant_for(tree.pack(&[1, 0], 2))
+            .unwrap()
+            .id;
         assert_ne!(after_a, after_b);
 
         let resolver = MockResolver::new();
@@ -5892,7 +5968,11 @@ layers:
         let b = Builder::from_yaml(yaml).unwrap();
         let tree = dialogue_tree(&b);
 
-        let outer_idx = tree.dims.iter().position(|d| d.selector_id == "outer").unwrap();
+        let outer_idx = tree
+            .dims
+            .iter()
+            .position(|d| d.selector_id == "outer")
+            .unwrap();
         let inner = tree.dims.iter().find(|d| d.selector_id == "inner").unwrap();
         // The nested group's toggle is gated by the OUTER group being present.
         assert_eq!(inner.gate, Some((outer_idx, 0)));
@@ -5902,9 +5982,18 @@ layers:
         // collapses the inner dim.
         let tail = tree.nodes.iter().find(|n| n.name == "tail").unwrap();
         assert_eq!(tail.options[0].variants.len(), 3);
-        let tail_pp = tail.options[0].variant_for(tree.pack(&[0, 0], 2)).unwrap().id;
-        let tail_pa = tail.options[0].variant_for(tree.pack(&[0, 1], 2)).unwrap().id;
-        let tail_absent = tail.options[0].variant_for(tree.pack(&[1, 0], 2)).unwrap().id;
+        let tail_pp = tail.options[0]
+            .variant_for(tree.pack(&[0, 0], 2))
+            .unwrap()
+            .id;
+        let tail_pa = tail.options[0]
+            .variant_for(tree.pack(&[0, 1], 2))
+            .unwrap()
+            .id;
+        let tail_absent = tail.options[0]
+            .variant_for(tree.pack(&[1, 0], 2))
+            .unwrap()
+            .id;
 
         let resolver = MockResolver::new();
         let proj = |outer: &str, inner: &str| -> Vec<SectionId> {
@@ -5931,8 +6020,8 @@ layers:
     /// the branch it lives in (here, tools-on).
     #[test]
     fn dialect_tree_section_is_live_prefilled_glue() {
-        use candle_transformers::models::dialect::Dialect;
         use crate::projection::{ProjectionMode, ProjectionSegment, SelectionState};
+        use candle_transformers::models::dialect::Dialect;
         let yaml = r#"
 layers:
   - name: dialogue
@@ -5972,8 +6061,7 @@ layers:
         selection: { kind: always_visible }
 "#;
         let dlct = Dialect::chat_ml();
-        let mut b =
-            Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+        let mut b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
         b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
             .unwrap();
 
@@ -6016,13 +6104,18 @@ layers:
             b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
                 .segments
                 .iter()
-                .any(|s| matches!(
-                    s,
-                    ProjectionSegment::Generated { identity, tokens }
-                        if identity.name == "tools_open" && !tokens.is_empty()
-                ))
+                .any(|s| {
+                    matches!(
+                        s,
+                        ProjectionSegment::Generated { identity, tokens }
+                            if identity.name == "tools_open" && !tokens.is_empty()
+                    )
+                })
         };
-        assert!(has_glue("present"), "glue emits a Generated run when tools on");
+        assert!(
+            has_glue("present"),
+            "glue emits a Generated run when tools on"
+        );
         assert!(!has_glue("absent"), "glue is omitted when tools off");
 
         // The GUI event surfaces the marker as a real glue ROW, never a section.
@@ -6031,15 +6124,8 @@ layers:
         sel.select("tools_on", "present");
         let proj =
             b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
-        let ev = crate::projection::from_projection(
-            &proj.segments,
-            b.schema(),
-            &resolver,
-            0,
-            0,
-            1,
-            1.0,
-        );
+        let ev =
+            crate::projection::from_projection(&proj.segments, b.schema(), &resolver, 0, 0, 1, 1.0);
         use crate::projection::SystemItem;
         assert!(
             ev.selection.system.iter().any(|it| matches!(
@@ -6140,8 +6226,16 @@ layers:
         // grounding_tools seals ONLY ×no_think on the present branch, grounding_no_tools
         // ONLY ×no_think on the absent branch — 2 + 2 = 4 total, no extra dim.
         let tree = dialogue_tree(&b);
-        let gt = tree.nodes.iter().find(|n| n.name == "grounding_tools").unwrap();
-        let gn = tree.nodes.iter().find(|n| n.name == "grounding_no_tools").unwrap();
+        let gt = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "grounding_tools")
+            .unwrap();
+        let gn = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "grounding_no_tools")
+            .unwrap();
         assert_eq!(gt.options[0].variants.len(), 2);
         assert_eq!(gn.options[0].variants.len(), 2);
 
@@ -6233,9 +6327,17 @@ layers:
 
         // Rewriting the content pre-prefill keeps the SAME variant id (the chain
         // is unchanged; only the bytes the prefill seals differ).
-        b.set_tree_section_content(dialogue, "tool_summary", "The tools are grouped by purpose.")
-            .unwrap();
-        assert_eq!(var(&b, "tool_summary"), summary_id, "variant id must not move");
+        b.set_tree_section_content(
+            dialogue,
+            "tool_summary",
+            "The tools are grouped by purpose.",
+        )
+        .unwrap();
+        assert_eq!(
+            var(&b, "tool_summary"),
+            summary_id,
+            "variant id must not move"
+        );
         let node = dialogue_tree(&b)
             .nodes
             .iter()

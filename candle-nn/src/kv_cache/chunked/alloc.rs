@@ -925,6 +925,90 @@ impl ChunkedKvBacking {
         Ok(())
     }
 
+    /// Reserve an in-place **glue gap**: a fresh chunk of `n_tokens` valid slots
+    /// appended at the slot tail, returning its block index. The gap's K/V is
+    /// left uninitialised — the glue forward fills it via explicit `(slice,
+    /// in_blk)` write targets, scattering before it streams, so nothing reads it
+    /// unfilled.
+    ///
+    /// **The gap is full by construction.** It is allocated `offset =
+    /// CHUNK_SIZE - n_tokens`, `usage = n_tokens`, so its valid window is the
+    /// tail `[offset, CHUNK_SIZE)` and `offset + usage == CHUNK_SIZE`. This is
+    /// the load-bearing invariant: a *partial* writer-owned chunk is, by the
+    /// cache's own rules, an extendable writable tail — `extend_for_write_region`
+    /// walks into it, `set_len` advances its usage, the writable-tail pass
+    /// CoW-extends it. A *full* chunk is immutable to all of them: `write_slice`
+    /// and `decode_write_chunk_idx` skip it, `set_len`'s cap is 0, `ensure`'s
+    /// available-space sum counts it as 0, and the writable-tail pass pushes a
+    /// fresh writer chunk instead of extending into it. The gap can therefore
+    /// never be mistaken for the live writer region — which is exactly what makes
+    /// the next prefill incapable of overflowing into it.
+    ///
+    /// `usage` is still exactly `n_tokens`, so the cumulative-usage `rope_base`
+    /// of every later chunk equals its logical position by construction — the
+    /// single positional convention the decode and glue kernels both read via
+    /// `slice_rope` (a column's position is `slice_rope(c) + (in_blk - offset)`,
+    /// so the tail window maps to `[rope_base, rope_base + n_tokens)`). The GIDs
+    /// are unique (rc=1), so the glue's explicit write is safe and the next
+    /// reproject's truncate frees them by refcount. `writer_start` is advanced
+    /// PAST the gap so a subsequent sealed inject lands after it.
+    ///
+    /// Returns `(gap_block_index, in_blk_base)`, where `in_blk_base == offset` is
+    /// the first valid slot of the tail window — the caller scatters the glue's
+    /// K/V into `[in_blk_base, in_blk_base + n_tokens)` so the write lands exactly
+    /// where this chunk's `slice_offset` expects it (no second, independent
+    /// computation of the window can drift from the reservation).
+    pub fn reserve_glue_gap_chunk(&self, batch_idx: usize, n_tokens: u32) -> Result<(usize, u32)> {
+        let batch = self.batch_capacity();
+        if batch_idx >= batch {
+            candle::bail!(
+                "batch_idx {} out of range for chunked backing (capacity {})",
+                batch_idx,
+                batch
+            )
+        }
+        if n_tokens == 0 || n_tokens as usize > CHUNK_SIZE {
+            candle::bail!(
+                "reserve_glue_gap_chunk: n_tokens {} must be in 1..={CHUNK_SIZE}",
+                n_tokens
+            )
+        }
+        let current_block_count = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+            state
+                .sequences
+                .get(batch_idx)
+                .and_then(|s| s.as_ref())
+                .map(|s| s.block_count())
+                .unwrap_or(0)
+        };
+        self.ensure_max_blocks(current_block_count + 1)?;
+        // Full-by-construction: valid window is the chunk tail `[offset, 32)` with
+        // `offset + usage == CHUNK_SIZE`, so the gap is immutable to every
+        // writer-region scan (see the doc above).
+        let offset = (CHUNK_SIZE as u32 - n_tokens) as u16;
+        let cw = self.alloc_block_chunks(n_tokens, offset)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        if let Some(Some(slot)) = state.sequences.get_mut(batch_idx) {
+            slot.push_chunk(cw);
+            let gap_idx = slot.block_count().saturating_sub(1);
+            // Advance the writer boundary PAST the gap so it is never the active
+            // writer; the glue forward fills it by explicit target, and the next
+            // sealed inject appends after it.
+            slot.set_writer_start_idx(gap_idx + 1);
+            slot.invalidate_gpu_chunks();
+            Ok((gap_idx, offset as u32))
+        } else {
+            candle::bail!("reserve_glue_gap_chunk: slot {} not allocated", batch_idx)
+        }
+    }
+
     /// Ensure chunks for a sparse batch of `(batch_idx, offset)` entries.
     ///
     /// This is the partial-batch analogue of [`ensure_for_offsets`]. It acquires

@@ -15,8 +15,9 @@
 //! - [`ThinkMode::Quick`] — a short primed thought, the model closes it.
 //! - [`ThinkMode::Balanced`] — a pure free flow, the model closes when ready.
 //! - [`ThinkMode::Deep`] — two continuation retries (the model's `</think>` is
-//!   suppressed and re-steered with `"But wait — "` then steered to a conclusion).
-//! - [`ThinkMode::Exhaustive`] — four continuation retries, the last concluding.
+//!   suppressed and re-steered with `"But wait, "`, then a closing statement).
+//! - [`ThinkMode::Exhaustive`] — three continuation retries (`"But wait, "`,
+//!   `"Alternatively, "`, then a closing statement).
 //!
 //! The retry mechanism is the new token-closed free span: a [`Terminator::Never`]
 //! span whose `close_token` is `</think>`.  With `suppress_close`, the sampled
@@ -38,9 +39,9 @@ pub enum ThinkMode {
     Quick,
     /// 2 — a pure free flow; the model closes when ready.
     Balanced,
-    /// 3 — two continuation retries, the last steering to a conclusion.
+    /// 3 — two continuation retries: `"But wait, "`, then a closing statement.
     Deep,
-    /// 4 — four continuation retries, the last steering to a conclusion.
+    /// 4 — three continuation retries: `"But wait, "`, `"Alternatively, "`, then close.
     Exhaustive,
 }
 
@@ -196,31 +197,31 @@ const BALANCED_SPAN_CAP: u32 = 512;
 const DEEP_SPAN_CAP: u32 = 512;
 const EXHAUSTIVE_SPAN_CAP: u32 = 768;
 
-/// `Deep`'s continuation phrases (reconsider, then settle) — each prefilled after a
-/// dropped close to re-steer the next span.  The dial therefore has `len() + 1`
-/// free-decode spans; this array is the single source for both the tree and
-/// [`ThinkMode::span_count`].
-const DEEP_PHRASES: &[&str] = &["\n\nBut wait — ", "\n\nSo, where I land: "];
+/// `Deep`'s continuation phrases — prefilled after a dropped close to re-steer
+/// the next span: one `"But wait, "` reconsideration, then a closing statement
+/// that lands the conclusion.  `"Alternatively, "` is reserved for Exhaustive.
+/// The dial therefore has `len() + 1` free-decode spans; this array is the
+/// single source for both the tree and [`ThinkMode::span_count`].
+const DEEP_PHRASES: &[&str] = &["\n\nBut wait, ", "\n\nSo, where I land: "];
 
-/// `Exhaustive`'s continuation phrases in order (reconsider, re-angle, check,
-/// settle).  Single source for the tree and [`ThinkMode::span_count`].
+/// `Exhaustive`'s continuation phrases in order: `"But wait, "`, then
+/// `"Alternatively, "`, then a closing statement.  Single source for the tree
+/// and [`ThinkMode::span_count`].
 const EXHAUSTIVE_PHRASES: &[&str] = &[
-    "\n\nBut wait — ",
-    "\n\nAlternatively — ",
-    "\n\nWait, let me check that — ",
+    "\n\nBut wait, ",
+    "\n\nAlternatively, ",
     "\n\nPutting it all together: ",
 ];
 
 /// Quick: a short opener static, one tight span, then the injected closing tag.
 ///
-/// `Static("\nLet me focus on what matters most. ")` → span(`QUICK_SPAN_CAP`) →
-/// `Static("</think>")` → `End`.
+/// `Static("\nOkay, ")` → span(`QUICK_SPAN_CAP`) → `Static("</think>")` → `End`.
 fn quick(env: &ThinkSteerEnvelope) -> TreeSpec {
     let mut spec = TreeSpec::new("think_quick");
     let close = close_tag_then_end(&mut spec);
     let span = think_span(&mut spec, env, QUICK_SPAN_CAP, close);
     let opener = spec.push(NodeSpec::Static {
-        text: "\nLet me focus on what matters most. ".to_string(),
+        text: "\nOkay, ".to_string(),
         next: span,
     });
     spec.root = opener;
@@ -229,14 +230,13 @@ fn quick(env: &ThinkSteerEnvelope) -> TreeSpec {
 
 /// Balanced: a short opener static, one span, then the injected closing tag.
 ///
-/// `Static("\nLet me think about this. ")` → span(`BALANCED_SPAN_CAP`) →
-/// `Static("</think>")` → `End`.
+/// `Static("\nOkay, ")` → span(`BALANCED_SPAN_CAP`) → `Static("</think>")` → `End`.
 fn balanced(env: &ThinkSteerEnvelope) -> TreeSpec {
     let mut spec = TreeSpec::new("think_balanced");
     let close = close_tag_then_end(&mut spec);
     let span = think_span(&mut spec, env, BALANCED_SPAN_CAP, close);
     let opener = spec.push(NodeSpec::Static {
-        text: "\nLet me think about this. ".to_string(),
+        text: "\nOkay, ".to_string(),
         next: span,
     });
     spec.root = opener;
@@ -279,25 +279,19 @@ fn continuation_chain(
     spec
 }
 
-/// Deep: an opener, then 2 continuation phrases (reconsider, then settle), each on
-/// its own line.
+/// Deep: an opener, then `"But wait, "` and a closing statement, each on its own
+/// line.  (No `"Alternatively, "` — that extender is Exhaustive-only.)
 fn deep(env: &ThinkSteerEnvelope) -> TreeSpec {
-    continuation_chain(
-        env,
-        "think_deep",
-        "\nLet me work this out. ",
-        DEEP_PHRASES,
-        DEEP_SPAN_CAP,
-    )
+    continuation_chain(env, "think_deep", "\nOkay, ", DEEP_PHRASES, DEEP_SPAN_CAP)
 }
 
-/// Exhaustive: an opener, then 4 continuation phrases in order (reconsider,
-/// re-angle, check, settle), each on its own line.
+/// Exhaustive: an opener, then `"But wait, "`, `"Alternatively, "`, and a closing
+/// statement, each on its own line.
 fn exhaustive(env: &ThinkSteerEnvelope) -> TreeSpec {
     continuation_chain(
         env,
         "think_exhaustive",
-        "\nLet me really work through this. ",
+        "\nOkay, ",
         EXHAUSTIVE_PHRASES,
         EXHAUSTIVE_SPAN_CAP,
     )
@@ -379,7 +373,7 @@ mod tests {
 
         // First step prefills the opener, then arrives at the free span.
         let (mask, primed) = step_to_decode(&mut d, &v);
-        assert_eq!(primed, "\nLet me focus on what matters most. ");
+        assert_eq!(primed, "\nOkay, ");
         assert!(matches!(mask, StepMask::Free { .. }));
 
         // A few free tokens, then the close → DROP (suppressed): the injected
@@ -405,7 +399,7 @@ mod tests {
 
         // The opener prefills, then the free span.
         let (mask, primed) = step_to_decode(&mut d, &v);
-        assert_eq!(primed, "\nLet me think about this. ");
+        assert_eq!(primed, "\nOkay, ");
         assert!(matches!(mask, StepMask::Free { .. }));
 
         // A few free tokens, then close → DROP (suppressed).
@@ -453,20 +447,20 @@ mod tests {
 
         // The opener prefills, then the first span.
         let (mask, primed) = step_to_decode(&mut d, &v);
-        assert_eq!(primed, "\nLet me work this out. ");
+        assert_eq!(primed, "\nOkay, ");
         assert!(matches!(mask, StepMask::Free { .. }));
 
-        // span 1: a few tokens, then close → DROP; next prefill "\n\nBut wait — ".
+        // span 1: a few tokens, then close → DROP; next prefill "\n\nBut wait, ".
         free_decode(&mut d, 4);
         assert_eq!(
             d.accept(THINK_CLOSE_ID, &v.token_bytes(THINK_CLOSE_ID)),
             Healed::Drop
         );
         let (mask, phrase) = step_to_decode(&mut d, &v);
-        assert_eq!(phrase, "\n\nBut wait — ");
+        assert_eq!(phrase, "\n\nBut wait, ");
         assert!(matches!(mask, StepMask::Free { .. }));
 
-        // span 2: close → DROP; next prefill "\n\nSo, where I land: ".
+        // span 2 (final extender): close → DROP; next prefill the closing statement.
         free_decode(&mut d, 4);
         assert_eq!(
             d.accept(THINK_CLOSE_ID, &v.token_bytes(THINK_CLOSE_ID)),
@@ -490,7 +484,7 @@ mod tests {
     }
 
     /// `deep_phrases_have_leading_newlines`: the prefilled continuation runs decode
-    /// to `"\n\nBut wait — "` then `"\n\nSo, where I land: "`, and the final prefill
+    /// to `"\n\nBut wait, "` then `"\n\nSo, where I land: "`, and the final prefill
     /// is `"</think>"`.
     #[test]
     fn deep_phrases_have_leading_newlines() {
@@ -501,7 +495,7 @@ mod tests {
         // The opener prefills first; then decode each span a little, close it, and
         // collect every prefilled run between spans.
         let (mask, first) = step_to_decode(&mut d, &v);
-        assert_eq!(first, "\nLet me work this out. ");
+        assert_eq!(first, "\nOkay, ");
         assert!(matches!(mask, StepMask::Free { .. }));
         loop {
             free_decode(&mut d, 3);
@@ -517,7 +511,7 @@ mod tests {
         assert_eq!(
             prefills,
             vec![
-                "\n\nBut wait — ".to_string(),
+                "\n\nBut wait, ".to_string(),
                 "\n\nSo, where I land: ".to_string(),
                 "</think>".to_string(),
             ]
@@ -542,7 +536,7 @@ mod tests {
             Healed::Drop
         );
         let (mask, phrase1) = step_to_decode(&mut d, &v);
-        assert_eq!(phrase1, "\n\nBut wait — ");
+        assert_eq!(phrase1, "\n\nBut wait, ");
         assert!(matches!(mask, StepMask::Free { .. }));
 
         // span 2 closed by EOS.
@@ -556,20 +550,19 @@ mod tests {
     }
 
     #[test]
-    fn exhaustive_intercepts_four_closes() {
+    fn exhaustive_steers_three_phrases_then_closes() {
         let v = vocab();
         let mut d = StencilDriver::new(tree_for(ThinkMode::Exhaustive));
 
         let phrases = [
-            "\n\nBut wait — ",
-            "\n\nAlternatively — ",
-            "\n\nWait, let me check that — ",
+            "\n\nBut wait, ",
+            "\n\nAlternatively, ",
             "\n\nPutting it all together: ",
         ];
 
         // The opener prefills, then the first span.
         let (mask, primed) = step_to_decode(&mut d, &v);
-        assert_eq!(primed, "\nLet me really work through this. ");
+        assert_eq!(primed, "\nOkay, ");
         assert!(matches!(mask, StepMask::Free { .. }));
 
         for phrase in phrases {
@@ -594,7 +587,7 @@ mod tests {
         assert_eq!(closed, "</think>");
         assert!(matches!(mask, StepMask::Done));
         assert!(d.is_done());
-        assert_eq!(d.stats().think_continuations, 5);
+        assert_eq!(d.stats().think_continuations, 4);
     }
 
     // ── Invariant: every produced tree compiles cleanly and reaches End ──────

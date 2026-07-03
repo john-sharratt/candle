@@ -55,7 +55,7 @@
       const sectionContent = {};
       (body.section_content || []).forEach((s) => { sectionContent[s.name] = s.content; });
       const turnContent = {};
-      (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.index] = { user: t.user, assistant: t.assistant }; });
+      (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
       return {
         id: String(id),
         history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, spans: m.spans || [] })),
