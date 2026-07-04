@@ -540,6 +540,12 @@ pub fn run_with_sink<R: ContentResolver>(
         layer_idx: usize,
         selected: Vec<(TurnIndex, f32)>, // (index, score), insertion order
         group_score: f32,
+        /// The §8 score-density selector produced `selected` (already
+        /// budget-fit and in chronological order — summaries ABOVE the turns
+        /// they cover). When set, downstream steps must NOT re-run the
+        /// rule-based selection or re-sort by raw `TurnIndex` (that would place
+        /// every summary AFTER its own content); the order is emitted verbatim.
+        score_density: bool,
     }
 
     let mut group_states: Vec<GroupState> = Vec::new();
@@ -557,7 +563,15 @@ pub fn run_with_sink<R: ContentResolver>(
             }
 
             let count = resolver.turn_count(group.id);
+            // Summary turns are FOREST nodes, not raw conversation turns — they
+            // may only enter the projection via the score-density selector, which
+            // drops a summary once its turns are selected and orders it ABOVE them.
+            // The rule-based path picks purely by index, so if summaries weren't
+            // excluded here it would inject a summary alongside the very turns it
+            // covers (and after them). Filter them out; when the forest actually
+            // needs to compress, score-density handles that path instead.
             let all_turns: Vec<(TurnIndex, f32)> = (0..count)
+                .filter(|&i| !resolver.turn_kind(group.id, TurnIndex(i)).is_summary())
                 .map(|i| {
                     let idx = TurnIndex(i);
                     let score = resolver.turn_score(group.id, idx, FIXED_FORMULA, &weights);
@@ -573,11 +587,20 @@ pub fn run_with_sink<R: ContentResolver>(
             // algorithm.  The result is already budget-fitted into
             // `layer.window` so the flexbox step caps the group's
             // natural consumption at the score-density total.
+            // The group's `recent` becomes the score-density FLOOR: the newest
+            // `recent` turns are kept raw even past the window, while the older
+            // tail budget-fits into `layer.window`. This is the hybrid of the
+            // rule-based recency guarantee and the budget-driven compression.
+            let recent_floor = match &group.selection {
+                SelectionRule::Sequence { recent, .. } => *recent as usize,
+                _ => 0,
+            };
             let mut score_density_used = false;
             let selected: Vec<(TurnIndex, f32)> = if layer_is_target && group.id == target.group {
                 if let Some(picks) = resolver.summary_tree_select(
                     target.timeline,
                     layer.window as u32,
+                    recent_floor,
                     FIXED_FORMULA,
                     &weights,
                 ) {
@@ -665,6 +688,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 layer_idx: li,
                 selected,
                 group_score: 0.0,
+                score_density: score_density_used,
             });
         }
     }
@@ -811,6 +835,20 @@ pub fn run_with_sink<R: ContentResolver>(
         let group_budgets = flexbox_distribute(&group_items, layer_budget);
 
         for (gi, gs) in layer_groups.iter().enumerate() {
+            if gs.score_density {
+                // The §8 selector already fit these picks into `layer.window`
+                // (the flexbox natural-cap equals their total, so the group
+                // gets exactly this budget back) and ordered them
+                // chronologically with each summary ABOVE the turns it covers.
+                // Re-running the rule-based `apply_selection` would re-sort by
+                // raw `TurnIndex` — placing every summary AFTER its content —
+                // and could silently drop picks via `historical_top_k`. Emit
+                // the picks verbatim, in their existing order.
+                for (idx, _) in &gs.selected {
+                    final_selected.push((gs.schema.id, *idx));
+                }
+                continue;
+            }
             let group_budget = group_budgets[gi];
             let tc = |idx: TurnIndex| resolver.turn_token_count(gs.schema.id, idx);
 
@@ -859,7 +897,15 @@ pub fn run_with_sink<R: ContentResolver>(
                     }
                 })
                 .collect();
-            group_turns.sort();
+            // Raw turns carry a chronological `TurnIndex`, so sorting yields the
+            // right reading order. Summary nodes do NOT — their index is the
+            // storage slot (always higher than the turns they summarise), so an
+            // index sort would drop each summary BELOW its own content. The
+            // score-density path already emitted the correct chronological order
+            // (summary above content); leave it untouched.
+            if !gs.score_density {
+                group_turns.sort();
+            }
 
             for idx in group_turns {
                 // Ghost summary turns (`record_summary_turn` →

@@ -561,7 +561,7 @@ mod tests {
             segments: Vec::new(),
         });
         let sid = 4242u64; // header stream id ties the two records to one stream
-        let proj_payload = br#"[{"start_token":0,"end_token":120,"buckets":[]}]"#.to_vec();
+        let proj_payload = br#"[{"start_token":0,"seconds":3.0,"buckets":[]}]"#.to_vec();
 
         let mut blob = Vec::new();
         blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));

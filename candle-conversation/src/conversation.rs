@@ -1544,13 +1544,17 @@ impl Sequence {
             &self.selection,
         );
         let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
+        // A projection is a POINT on the timeline, not a span. This is the
+        // post-seal projection: the turn has finished decoding and its answer is
+        // now materialized, so the point sits at the FINAL generated position
+        // (`tokens_generated`), governing the closing interval `[last_reproj, end]`.
+        // `seconds` is the full decode elapsed — the wall-clock at this final point.
         let mut ev = from_projection_with_origins(
             &projection.segments,
             &projection.selection_origins,
             self.projection.schema(),
             &resolver,
             substrate_total,
-            0,
             stats.tokens_generated as u32,
             stats.decode_ms / 1000.0,
         );

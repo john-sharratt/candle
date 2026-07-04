@@ -243,18 +243,14 @@ fn projections(log: &mut LogFile, only: Option<StreamId>) -> Result<()> {
     Ok(())
 }
 
-/// One `ProjectionEvent` — a single reprojection span within a turn: throughput,
-/// token buckets, and the per-section selected/skipped breakdown.
+/// One `ProjectionEvent` — a projection selected at a POINT in the decode
+/// (`start_token` is the generated-token position; it governs everything forward
+/// until the next event). Prints the point, its token buckets, and the
+/// per-section selected/skipped breakdown.
 fn print_projection_event(i: usize, ev: &ProjectionEvent) {
     println!(
-        "  span #{i}: {} gen tok [{}..{}] in {:.2}s = {:.1} tok/s   materialized {} / substrate {} tokens",
-        ev.end_token.saturating_sub(ev.start_token),
-        ev.start_token,
-        ev.end_token,
-        ev.seconds,
-        ev.tokens_per_second,
-        ev.materialized_tokens,
-        ev.substrate_tokens,
+        "  proj #{i}: @token {} (t={:.2}s)   materialized {} / substrate {} tokens",
+        ev.start_token, ev.seconds, ev.materialized_tokens, ev.substrate_tokens,
     );
     if !ev.buckets.is_empty() {
         let parts: Vec<String> = ev

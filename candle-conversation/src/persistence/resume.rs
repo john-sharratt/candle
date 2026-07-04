@@ -811,9 +811,7 @@ mod tests {
         let events = vec![
             ProjectionEvent {
                 start_token: 0,
-                end_token: 120,
                 seconds: 3.0,
-                tokens_per_second: 40.0,
                 materialized_tokens: 1120,
                 substrate_tokens: 42_000,
                 buckets: vec![
@@ -833,9 +831,7 @@ mod tests {
             },
             ProjectionEvent {
                 start_token: 120,
-                end_token: 512,
                 seconds: 8.0,
-                tokens_per_second: 49.0,
                 materialized_tokens: 540,
                 substrate_tokens: 42_000,
                 buckets: vec![ProjectionBucket {

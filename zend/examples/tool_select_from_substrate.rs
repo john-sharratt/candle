@@ -34,6 +34,7 @@ use candle_conversation::models::Model;
 use candle_conversation::persistence::resume::decode_signatures;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::SubstratePersistence;
+use candle_conversation::turn_layout::TurnLayout;
 use candle_conversation::projection::{
     Builder, DepthWeights, ProjectionMode, ProjectionTarget, ScoreFormula, SectionId,
     TimelineAllocator,
@@ -265,7 +266,9 @@ fn build_turn_probes(
     let mut probes = Vec::new();
     let mut diag_printed = false;
     for (stream_id, d) in turn_streams {
-        let Some(tool) = prompt_to_tool.get(&d.user_text) else {
+        // Content text/bounds now live in the segment-vector layout.
+        let layout = TurnLayout::new(d.segments.clone());
+        let Some(tool) = prompt_to_tool.get(layout.user_text()) else {
             continue; // not one of our tool-case captures
         };
         if !valid_tools.contains_key(tool) {
@@ -289,9 +292,9 @@ fn build_turn_probes(
             continue;
         }
         let (us, ue, ass) = (
-            d.user_content_start as usize,
-            d.user_content_end as usize,
-            d.assistant_content_start as usize,
+            layout.user_content_start() as usize,
+            layout.user_content_end() as usize,
+            layout.assistant_content_start() as usize,
         );
         // If the sig array spans the whole grid, slice by content bounds; if it
         // only covers the decoded assistant tail, the whole array IS that half.
@@ -338,7 +341,7 @@ fn build_turn_probes(
             .collect();
         probes.push(Probe {
             id: format!("{tool}/{half}"),
-            prompt: d.user_text.clone(),
+            prompt: layout.user_text().to_string(),
             expected: tool.clone(),
             scores,
             proj_scores: scanner.to_projection_scores(),
@@ -393,7 +396,8 @@ fn score_ngram(
     let (mut n, mut top1, mut top5) = (0usize, 0usize, 0usize);
     let mut mrr = 0.0f64;
     for (stream_id, d) in turn_streams {
-        let Some(tool) = prompt_to_tool.get(&d.user_text) else {
+        let layout = TurnLayout::new(d.segments.clone());
+        let Some(tool) = prompt_to_tool.get(layout.user_text()) else {
             continue;
         };
         let Some(&correct_sid) = name_to_sid.get(tool) else {
@@ -413,7 +417,7 @@ fn score_ngram(
             pr.extend(parse(&bytes[2 * nn * bl..3 * nn * bl]));
         }
         let nsig = sy.len();
-        let ass = (d.assistant_content_start as usize).min(nsig);
+        let ass = (layout.assistant_content_start() as usize).min(nsig);
         let hi = (ass + window).min(nsig);
         if hi <= ass {
             continue;
@@ -502,10 +506,16 @@ fn run_diag(
             Some(StreamDecl::Turn(d)) => Some((sid, d.clone())),
             _ => None,
         })
-        .find(|(_, d)| prompt_to_tool.get(&d.user_text).map(String::as_str) == Some(target_tool));
+        .find(|(_, d)| {
+            prompt_to_tool
+                .get(TurnLayout::new(d.segments.clone()).user_text())
+                .map(String::as_str)
+                == Some(target_tool)
+        });
     let Some((stream_id, d)) = turn else {
         anyhow::bail!("no captured turn for tool {target_tool}");
     };
+    let layout = TurnLayout::new(d.segments.clone());
     let payload = persistence
         .read_signatures(substrate, stream_id)?
         .ok_or_else(|| anyhow::anyhow!("no sigs for that turn"))?;
@@ -520,13 +530,13 @@ fn run_diag(
         prag.extend(parse(&bytes[2 * n * bl..3 * n * bl]));
     }
     let nsig = syn.len();
-    let ass = (d.assistant_content_start as usize).min(nsig);
+    let ass = (layout.assistant_content_start() as usize).min(nsig);
     let depths: [(&str, &Vec<TokenSignature>, usize); 3] =
         [("syn", &syn, 0), ("sem", &sem, 1), ("prag", &prag, 2)];
 
     eprintln!("diag tool={target_tool}");
-    eprintln!("  user_text     = {:?}", d.user_text);
-    eprintln!("  assistant_text= {:?}", d.assistant_text);
+    eprintln!("  user_text     = {:?}", layout.user_text());
+    eprintln!("  assistant_text= {:?}", layout.assistant_text());
     eprintln!(
         "  sigs={nsig}  assistant half = tokens {ass}..{nsig}  ({} tools in corpus)",
         section_sigs.len()

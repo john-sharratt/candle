@@ -174,24 +174,27 @@ pub struct ProjectionSelection {
     pub turns: Vec<SelectedTurn>,
 }
 
-/// A recorded projection: decode throughput + materialized-context composition.
+/// A recorded projection point: the `start_token` position it governs, the
+/// wall-clock `seconds` since decode start, and the materialized-context
+/// composition. Throughput and the governed interval are derived by the consumer
+/// from the sequence of points (see `start_token` / `seconds`).
 ///
 /// All fields are `#[serde(default)]` so the persisted redo-log record stays
 /// forward-compatible as the shape evolves.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectionEvent {
-    /// Generated-token index where this decode span began.
+    /// Generated-token position at which this projection was SELECTED — the start
+    /// of the interval it governs. A projection is a point that governs everything
+    /// forward until the next event supersedes it, so the consumer derives each
+    /// projection's effective interval `[start_token_i, start_token_{i+1})` (the
+    /// last one running to the turn's final token count) from the event sequence.
     #[serde(default)]
     pub start_token: u32,
-    /// Generated-token index where it ended (== tokens generated in the span).
-    #[serde(default)]
-    pub end_token: u32,
-    /// Wall-clock seconds the decode span took.
+    /// Wall-clock seconds since decode start, at selection. The consumer derives
+    /// each interval's throughput from the `(start_token, seconds)` deltas between
+    /// consecutive events.
     #[serde(default)]
     pub seconds: f64,
-    /// Decode throughput: `(end_token - start_token) / seconds`.
-    #[serde(default)]
-    pub tokens_per_second: f64,
     /// Sum of all bucket tokens — what provenance materialized into the window.
     #[serde(default)]
     pub materialized_tokens: u32,
@@ -233,7 +236,6 @@ pub fn aggregate(
     segments: &[SegmentTokens],
     substrate_tokens: u32,
     start_token: u32,
-    end_token: u32,
     seconds: f64,
 ) -> ProjectionEvent {
     let mut buckets: Vec<ProjectionBucket> = Vec::new();
@@ -254,18 +256,10 @@ pub fn aggregate(
     buckets.sort_by_key(|b| b.kind.rank());
 
     let materialized_tokens = buckets.iter().map(|b| b.tokens).sum();
-    let generated = end_token.saturating_sub(start_token);
-    let tokens_per_second = if seconds > 0.0 {
-        generated as f64 / seconds
-    } else {
-        0.0
-    };
 
     ProjectionEvent {
         start_token,
-        end_token,
         seconds,
-        tokens_per_second,
         materialized_tokens,
         substrate_tokens,
         buckets,
@@ -286,7 +280,6 @@ pub fn from_projection(
     resolver: &dyn ContentResolver,
     substrate_tokens: u32,
     start_token: u32,
-    end_token: u32,
     seconds: f64,
 ) -> ProjectionEvent {
     from_projection_with_origins(
@@ -296,7 +289,6 @@ pub fn from_projection(
         resolver,
         substrate_tokens,
         start_token,
-        end_token,
         seconds,
     )
 }
@@ -306,7 +298,6 @@ pub fn from_projection(
 /// [`super::Projection::selection_origins`]. Production callers pass it so the
 /// persisted record / GUI can show provenance vs recency vs coverage; tests and
 /// the no-origin wrapper above pass an empty map (every `reason` is then `None`).
-#[allow(clippy::too_many_arguments)]
 pub fn from_projection_with_origins(
     segments: &[ProjectionSegment],
     origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
@@ -314,7 +305,6 @@ pub fn from_projection_with_origins(
     resolver: &dyn ContentResolver,
     substrate_tokens: u32,
     start_token: u32,
-    end_token: u32,
     seconds: f64,
 ) -> ProjectionEvent {
     let classified: Vec<SegmentTokens> = segments
@@ -357,13 +347,7 @@ pub fn from_projection_with_origins(
         })
         .collect();
 
-    let mut event = aggregate(
-        &classified,
-        substrate_tokens,
-        start_token,
-        end_token,
-        seconds,
-    );
+    let mut event = aggregate(&classified, substrate_tokens, start_token, seconds);
     event.selection = build_selection(segments, origins, schema, resolver);
     event
 }
@@ -699,7 +683,7 @@ mod tests {
             seg(BucketKind::System, "system", 320),
             seg(BucketKind::Section, "repo_map", 200),
         ];
-        let ev = aggregate(&segs, 10_000, 0, 480, 10.0);
+        let ev = aggregate(&segs, 10_000, 0, 10.0);
         let order: Vec<(&str, BucketKind, u32)> = ev
             .buckets
             .iter()
@@ -723,27 +707,20 @@ mod tests {
             seg(BucketKind::Turns, "conversation", 60),
             seg(BucketKind::System, "system", 100),
         ];
-        let ev = aggregate(&segs, 5_000, 10, 110, 5.0);
+        let ev = aggregate(&segs, 5_000, 10, 5.0);
         // conversation merged to 100, system 100.
         assert_eq!(ev.buckets.len(), 2);
         assert_eq!(ev.materialized_tokens, 200);
         assert_eq!(ev.substrate_tokens, 5_000);
-        // throughput: 100 generated tokens / 5s = 20 t/s.
+        // The point sits at `start_token`; the interval it governs and its
+        // throughput are derived by the consumer from the event sequence.
         assert_eq!(ev.start_token, 10);
-        assert_eq!(ev.end_token, 110);
-        assert_eq!(ev.tokens_per_second, 20.0);
-    }
-
-    #[test]
-    fn aggregate_zero_seconds_is_zero_tps_not_nan() {
-        let ev = aggregate(&[seg(BucketKind::System, "system", 5)], 5, 0, 0, 0.0);
-        assert_eq!(ev.tokens_per_second, 0.0);
-        assert!(ev.tokens_per_second.is_finite());
+        assert_eq!(ev.seconds, 5.0);
     }
 
     #[test]
     fn aggregate_empty_is_empty() {
-        let ev = aggregate(&[], 0, 0, 0, 1.0);
+        let ev = aggregate(&[], 0, 0, 1.0);
         assert!(ev.buckets.is_empty());
         assert_eq!(ev.materialized_tokens, 0);
     }
@@ -758,14 +735,12 @@ mod tests {
                 ],
                 42_000,
                 0,
-                120,
                 3.0,
             ),
             aggregate(
                 &[seg(BucketKind::Turns, "conversation", 540)],
                 42_000,
                 120,
-                512,
                 8.0,
             ),
         ];
@@ -907,7 +882,7 @@ layers:
             },
         ];
 
-        let ev = from_projection(&segments, schema, &res, 99_999, 0, 480, 12.0);
+        let ev = from_projection(&segments, schema, &res, 99_999, 0, 12.0);
 
         // system (64) leftmost, then code_read (300+500=800), then turns:
         // conversation (120+80=200) and current message (4).
@@ -928,7 +903,7 @@ layers:
         // materialized excludes the skipped Generated run (3 tokens).
         assert_eq!(ev.materialized_tokens, 64 + 800 + 200 + 4);
         assert_eq!(ev.substrate_tokens, 99_999);
-        assert_eq!(ev.tokens_per_second, 40.0); // 480 / 12s
+        assert_eq!(ev.seconds, 12.0);
     }
 
     const TREE_GLUE_YAML: &str = r#"
@@ -1015,7 +990,7 @@ layers:
         let section =
             |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
         let segments = vec![section(a), section(bb)];
-        let ev = from_projection(&segments, schema, &res, 0, 0, 1, 1.0);
+        let ev = from_projection(&segments, schema, &res, 0, 0, 1.0);
 
         // The materialized system view is: member → REAL glue token → member,
         // not two members run together — so the GUI panel and its copy-all
@@ -1074,7 +1049,7 @@ layers:
             )),
         ];
 
-        let sel = from_projection(&segments, schema, &res, 1000, 0, 10, 1.0).selection;
+        let sel = from_projection(&segments, schema, &res, 1000, 0, 1.0).selection;
 
         // System prompt in order: bare `frame` section, then the `code_read`
         // collection (no template items in this fixture, so no glue rows).
@@ -1167,7 +1142,7 @@ layers:
             },
         ];
 
-        let sel = from_projection(&segments, schema, &res, 1000, 0, 10, 1.0).selection;
+        let sel = from_projection(&segments, schema, &res, 1000, 0, 1.0).selection;
 
         assert_eq!(sel.system.len(), 3, "glue + section + glue, in order");
         match &sel.system[0] {
@@ -1282,7 +1257,7 @@ layers:
                 },
             },
         ];
-        let sel = from_projection(&segments, schema, &res, 1000, 0, 10, 1.0).selection;
+        let sel = from_projection(&segments, schema, &res, 1000, 0, 1.0).selection;
 
         // The catalog summary must appear BEFORE the `tools_open` glue — i.e.
         // outside the `<tools>` block — in the panel composition.

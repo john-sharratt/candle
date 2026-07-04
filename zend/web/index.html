@@ -1030,16 +1030,31 @@
   // not measured pixels, so they reflow with the block on resize/think-toggle and
   // never drift — and only completed blocks split, so the live bar never shrinks.
   function applyProjSegments(zmd, m) {
-    const spans = (m.spans || []).slice().sort((a, b) => (a.end_token || 0) - (b.end_token || 0));
+    const spans = (m.spans || []).slice().sort((a, b) => (a.start_token || 0) - (b.start_token || 0));
     if (!spans.length) return;
     const isCursor = (el) => el.classList && el.classList.contains('zcursor');
     const all = Array.from(zmd.children);
     const cursor = all.find(isCursor);
     const blocks = all.filter((el) => !isCursor(el));
     if (!blocks.length) return;
-    const maxTok = Math.max(1, ...spans.map((s) => s.end_token || 0));
-    const boundary = (s) => s._blockEnd != null ? s._blockEnd : Math.round((s.end_token || 0) / maxTok * blocks.length);
-    const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(spans[i]) > bi) return i; } return -1; };
+    // Projections are POINTS at `start_token`; projection i governs `[start_i,
+    // start_{i+1})`. Its bar therefore ends at the NEXT projection's position (the
+    // last runs to the end). `maxTok` approximates the turn's total by the last
+    // projection's position, so the tail past it maps coarsely.
+    const maxTok = Math.max(1, ...spans.map((s) => s.start_token || 0));
+    const boundTok = (i) => (i + 1 < spans.length ? (spans[i + 1].start_token || 0) : maxTok);
+    const boundary = (i) => spans[i]._blockEnd != null ? spans[i]._blockEnd : Math.round(boundTok(i) / maxTok * blocks.length);
+    const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(i) > bi) return i; } return -1; };
+    // Points → intervals: stash each projection's governed length + throughput on
+    // the span so the hover popover and panel header (which see one span at a time)
+    // can show t/s. `seconds` is elapsed-since-decode-start; the delta to the next
+    // event's `seconds` times the token delta gives the interval's t/s.
+    spans.forEach((s, i) => {
+      const nextSec = (i + 1 < spans.length) ? (spans[i + 1].seconds || 0) : (s.seconds || 0);
+      s._gen = Math.max(0, boundTok(i) - (s.start_token || 0));
+      s._secs = Math.max(0, nextSec - (s.seconds || 0));
+      s._tps = s._secs > 0 ? s._gen / s._secs : 0;
+    });
 
     // A COMPLETED think block carries its raw char range (data-c0/c1). If two or
     // more projections fired inside it, return one sub-bar per overlapping
@@ -1055,11 +1070,12 @@
       let prev = 0;
       for (let i = 0; i < spans.length; i++) {
         // Exact char offset frozen at decode (`_charEnd`), or — for hydrated
-        // turns that only carry `end_token` — an end_token-proportional offset.
+        // turns — a projection-governed offset: the next point's `start_token`
+        // (`boundTok`) mapped proportionally into the char range.
         // The content is static post-hydrate, so this is stable (no shrink).
         const ce = spans[i]._charEnd != null
           ? spans[i]._charEnd
-          : Math.round(((spans[i].end_token || 0) / maxTok) * clen);
+          : Math.round((boundTok(i) / maxTok) * clen);
         const lo = Math.max(c0, prev), hi = Math.min(c1, ce);
         prev = ce;
         if (hi > lo) out.push({ i: i, pct: (hi - lo) / total * 100 });
@@ -1314,9 +1330,10 @@
     const mat = sp.materialized_tokens || buckets.reduce((a, b) => a + (b.tokens || 0), 0) || 1;
     const sub = Math.max(sp.substrate_tokens || 0, mat);
     const colorFor = (i) => PROJ_PALETTE[i % PROJ_PALETTE.length];
-    const gen = Math.max(0, (sp.end_token || 0) - (sp.start_token || 0));
-    const secs = sp.seconds || 0;
-    const tps = sp.tokens_per_second || (secs > 0 ? gen / secs : 0);
+    // `_gen`/`_secs`/`_tps` are derived from the point-event sequence in `applyProjSegments`.
+    const gen = sp._gen || 0;
+    const secs = sp._secs || 0;
+    const tps = sp._tps || 0;
 
     // Stacked bar map: one segment per category, width ∝ tokens. System (first
     // bucket) leftmost, then section groups, then turns — the order the engine
@@ -1394,9 +1411,9 @@
       else add(C[item.name]);
     });
     const TC = S.substrateTurnContent || {};
-    const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
-    const maxEnd = Math.max(1, ...ends);
-    const here = node && node.end_token != null ? node.end_token : maxEnd;
+    const positions = ((dm && dm.spans) || []).map((s) => s.start_token || 0);
+    const maxEnd = Math.max(1, ...positions);
+    const here = node && node.start_token != null ? node.start_token : maxEnd;
     const complete = here >= maxEnd;
     const noThink = !!(G && G.no_think && S.effortLevel === 0);
     const msg = (role, content, open, withNoThink, isSummary) => {
@@ -1701,10 +1718,15 @@
     // interleaved with the sealed turns — memory tiers + dialogue, summaries in
     // place. This is the literal injected order/glue, not a reconstruction.
     const dm = S.substrateMsg, um = S.substrateUserMsg;
-    const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
-    const maxEnd = Math.max(1, ...ends);
-    const here = node && node.end_token != null ? node.end_token : maxEnd;
-    const complete = here >= maxEnd;
+    // Projection events are POINTS: each `start_token` is the generated-token
+    // position at which that projection was selected (SubmitTurn = 0). A
+    // projection governs everything forward until the next event supersedes it,
+    // so clicking one shows the decode PREFIX up to its `start_token` — the
+    // content whose Q selected it. The decoded turn is never in its own
+    // projection (not sealed during decode), so there is no self-inclusion.
+    const positions = ((dm && dm.spans) || []).map((s) => s.start_token || 0);
+    const maxEnd = Math.max(1, ...positions);
+    const here = node && node.start_token != null ? node.start_token : maxEnd;
 
     // The sealed dialogue turns the projection actually selected (the live,
     // still-decoding turn is NOT one of them — it is rendered from `um`/`dm`
@@ -1726,29 +1748,17 @@
     const materialized = (node && node.materialized) || [];
     if (materialized.length) {
       // Walk the injected spine for turn ORDER; each turn renders its own glue in
-      // place. EXCEPT the decoded turn (#N) — the LAST dialogue turn — which is
-      // this projection's OUTPUT, not attended context: the event is built AFTER
-      // finish_turn, so the reprojection pulls the just-sealed turn back into the
-      // spine by recency, making the panel look like the model read its own answer.
-      // Skip it here and draw it below as the decoded-turn card, so the spine
-      // shows only what was actually attended (#0…#N-1).
-      let skipTurn = -1;
-      if (um || dm) {
-        for (let i = materialized.length - 1; i >= 0; i--) {
-          const p = materialized[i];
-          if (p.kind === 'turn' && p.turn && (p.turn.layer || targetLayer) === targetLayer) { skipTurn = i; break; }
-        }
-      }
-      materialized.forEach((p, i) => {
-        if (i === skipTurn) return;
+      // place. Every turn here is genuine attended CONTEXT — the turn being decoded
+      // is drawn separately below as the decoded-turn card (from `um`/`dm`) and is
+      // never in the spine, since projection events are emitted during decode
+      // before the turn seals. So there is nothing to skip.
+      materialized.forEach((p) => {
         if (p.kind === 'turn' && p.turn) renderTurn(p.turn);
       });
     } else {
       // Fallback for event records predating the materialized spine.
       otherTurns.forEach(renderTurn);
-      // Drop the decoded turn (the last dialogue turn) — drawn below as output.
-      const ctxTurns = (um || dm) ? dialogueTurns.slice(0, -1) : dialogueTurns;
-      ctxTurns.forEach((t) => renderTurn({ ...t, layer: targetLayer }));
+      dialogueTurns.forEach((t) => renderTurn({ ...t, layer: targetLayer }));
     }
     // The turn THIS event decoded — user prompt (the attended query) + the assistant
     // text that was actually IN SCOPE when provenance last selected, clipped there.
@@ -1759,12 +1769,12 @@
     // SAME clipped "decoding" view every other projection shows, never the whole
     // finished turn. Drawn below the attended context (it is this decode's output).
     if (um || dm) {
-      // `ends`/`maxEnd` (computed above) already hold every span's end_token + max.
-      let clipTok = here;
-      if (complete) {
-        const mids = ends.filter((e) => e < maxEnd);
-        clipTok = mids.length ? Math.max(...mids) : 0; // last mid-decode re-scan, else none
-      }
+      // This projection is a point at `here` (its `start_token`): show the decode
+      // PREFIX up to there — the content whose Q selected this context. The
+      // SubmitTurn event (`here == 0`) clips to nothing, since the turn opens
+      // against it before decoding a single token. `maxEnd` is the last
+      // projection's position, so the char mapping is approximate past it.
+      const clipTok = here;
       const clen = (dm && dm.content) ? dm.content.length : 0;
       const clipCut = Math.max(0, Math.min(clen, Math.round(clen * clipTok / maxEnd)));
       const scoped = (dm && dm.role === 'assistant') ? dm.content.slice(0, clipCut) : '';
@@ -1779,7 +1789,7 @@
       h('div', { style: 'flex-shrink:0; display:flex; align-items:flex-start; gap:12px; padding:15px 17px; border-bottom:1px solid #2e2b27;' },
         h('div', { style: 'flex:1; min-width:0;' },
           h('div', { style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, 'Projection selection'),
-          h('div', { style: 'font-size:0.73rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:3px; word-break:break-word;' }, !node ? '' : ((node.step || '') + ' · materialized ' + fmtTok(node.materialized_tokens) + ' / ' + fmtTok(node.substrate_tokens) + ' tokens' + (node.tokens_per_second ? ' · ' + Math.round(node.tokens_per_second) + ' t/s' : '')))),
+          h('div', { style: 'font-size:0.73rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:3px; word-break:break-word;' }, !node ? '' : ((node.step || '') + ' · materialized ' + fmtTok(node.materialized_tokens) + ' / ' + fmtTok(node.substrate_tokens) + ' tokens' + (node._tps ? ' · ' + Math.round(node._tps) + ' t/s' : '')))),
         empty ? null : h('button', { onClick: (e) => copyText(substrateAllText(node), e.currentTarget, 'Copied', 'Copy all'), style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy all'),
         h('button', { onClick: () => setState({ substrateOpen: false }), style: closeBtnStyle() }, '×')),
       empty ? h('div', { style: 'flex:1; padding:30px; color:#7c736a; font-size:0.85rem; background:#161412;' }, 'No selection recorded for this projection.') : body);

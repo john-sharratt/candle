@@ -5,13 +5,14 @@
 //! resolver (not the builder), so tests use `resolver.append(group)` rather
 //! than `builder.append(group)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::builder::Builder;
 use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::SummaryMode;
 use crate::substrate::ContentResolver;
+use crate::summary_tree::{SelectionOrigin, TurnKind};
 
 // —— Mock resolver —————————————————————————————————————————————————————————————
 
@@ -35,6 +36,14 @@ struct MockResolver {
     /// target-aware resolver, which returns `target.timeline` for the target
     /// group). `None` ⇒ the trait default (untracked).
     timeline: Option<TimelineId>,
+    /// Score-density picks returned verbatim by `summary_tree_select` —
+    /// `(turn_index, origin, score)` in the chronological order the real §8
+    /// selector produces (each summary node BEFORE the turns it covers).
+    /// `None` ⇒ trait default (no forest → rule-based path).
+    tree_picks: Option<Vec<(TurnIndex, SelectionOrigin, f32)>>,
+    /// Turn indices that are summary (forest) nodes, reported by `turn_kind`
+    /// as `SummaryOfSummaries`. Everything else is `Normal`.
+    summary_idx: HashSet<u32>,
 }
 
 impl MockResolver {
@@ -90,6 +99,18 @@ impl MockResolver {
         self.section_tokens.insert(section.raw(), tokens);
         self
     }
+
+    /// Make `summary_tree_select` return `picks` verbatim (the §8 score-density
+    /// path), and mark every summary-node index so `turn_kind` reports it.
+    fn with_tree_picks(
+        mut self,
+        picks: Vec<(TurnIndex, SelectionOrigin, f32)>,
+        summary_indices: &[u32],
+    ) -> Self {
+        self.tree_picks = Some(picks);
+        self.summary_idx = summary_indices.iter().copied().collect();
+        self
+    }
 }
 
 impl ContentResolver for MockResolver {
@@ -139,6 +160,25 @@ impl ContentResolver for MockResolver {
         // 0 unless explicitly marked sealed — mirrors a section not present in
         // the substrate. The tool-summary gate keys off `> 0`.
         *self.section_tokens.get(&section.raw()).unwrap_or(&0)
+    }
+
+    fn turn_kind(&self, _group: GroupId, index: TurnIndex) -> TurnKind {
+        if self.summary_idx.contains(&index.0) {
+            TurnKind::SummaryOfSummaries
+        } else {
+            TurnKind::Normal
+        }
+    }
+
+    fn summary_tree_select(
+        &self,
+        _timeline: TimelineId,
+        _budget: u32,
+        _floor: usize,
+        _formula: super::schema::ScoreFormula,
+        _weights: &super::schema::DepthWeights,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        self.tree_picks.clone()
     }
 }
 
@@ -784,6 +824,80 @@ layers:
     assert_eq!(proj.sealed_turns().count(), 2);
     let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert_eq!(indices, vec![0, 2]);
+}
+
+/// Regression: the §8 score-density path returns picks in chronological order
+/// with each SUMMARY node ABOVE the turns it covers. A summary's storage
+/// `TurnIndex` is always higher than the turns it summarises (it is sealed
+/// after them), so the old index-sorts — `select_conversation`'s `selected.sort()`
+/// and step-12's `group_turns.sort()` — dropped the summary BELOW its own
+/// content: a summary of turns 0–4 rendered *after* raw turn 6. The projection
+/// must emit score-density picks verbatim, honouring the trait contract that
+/// `summary_tree_select` returns an already-ordered, already-budget-fit list.
+#[test]
+fn score_density_summary_emitted_before_later_raw_turn() {
+    let yaml = r#"
+layers:
+  - name: dialogue
+    system_prompt:
+      sections:
+        - id: s1
+          content: "X"
+    window: 1200
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: convo
+        selection:
+          kind: conversation
+          recent: 2
+          historical_top_k: 8
+"#;
+    let b = Builder::from_yaml(yaml).unwrap();
+    let layer = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tl = TimelineId::for_test(1);
+
+    // 10 raw turns exist; index 7 is a SoS node covering the earliest turns.
+    let mut resolver = MockResolver::new();
+    for _ in 0..10 {
+        resolver.append(convo);
+    }
+    // Picks exactly as the real §8 selector emits them: the summary (idx 7,
+    // covering the early turns) sits BEFORE the later raw turns 6 and 9.
+    let picks = vec![
+        (TurnIndex(7), SelectionOrigin::CoverageFill, 0.5),
+        (TurnIndex(6), SelectionOrigin::RecencyDecay, 0.5),
+        (TurnIndex(9), SelectionOrigin::RecencyDecay, 0.5),
+    ];
+    let resolver = resolver.with_timeline(tl).with_tree_picks(picks, &[7]);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: convo,
+            timeline: tl,
+        },
+        &resolver,
+    );
+
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    // Verbatim pick order — the summary (7) stays ABOVE its later-indexed
+    // content (6), NOT re-sorted by TurnIndex to [6, 7, 9].
+    assert_eq!(
+        indices,
+        vec![7, 6, 9],
+        "score-density picks must emit in chronological (summary-above-content) \
+         order, not sorted by TurnIndex",
+    );
 }
 
 #[test]
@@ -6125,7 +6239,7 @@ layers:
         let proj =
             b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
         let ev =
-            crate::projection::from_projection(&proj.segments, b.schema(), &resolver, 0, 0, 1, 1.0);
+            crate::projection::from_projection(&proj.segments, b.schema(), &resolver, 0, 0, 1.0);
         use crate::projection::SystemItem;
         assert!(
             ev.selection.system.iter().any(|it| matches!(

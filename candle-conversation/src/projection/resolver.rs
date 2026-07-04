@@ -17,7 +17,7 @@ use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
     TurnPartWrite,
 };
-use crate::summary_tree::{SelectionDiagnostics, TurnKind};
+use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
@@ -1309,5 +1309,21 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         weights: &DepthWeights,
     ) -> f32 {
         ContentResolver::section_score(&self.read, section, formula, weights)
+    }
+
+    fn summary_tree_select(
+        &self,
+        timeline: TimelineId,
+        budget: u32,
+        floor: usize,
+        formula: ScoreFormula,
+        weights: &DepthWeights,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        // Delegate to the inner scored read: `select_budget_fit` keeps the newest
+        // `floor` turns raw unconditionally and budget-fits the older tail into
+        // `budget`, so it never compresses a raw turn that still fits (see
+        // `select.rs`).
+        self.read
+            .summary_tree_select(timeline, budget, floor, formula, weights)
     }
 }

@@ -1,7 +1,7 @@
 //! Tests for the dialogue layer's `tools` collection:
 //! per-tool BDP discrimination and projection top-3 selection.
 
-use candle_conversation::projection::{Reserved, SectionId};
+use candle_conversation::projection::SectionId;
 
 use crate::corpus::{load_fixtures, TOOLS};
 use crate::harness::Harness;
@@ -74,13 +74,17 @@ fn projection_top3_includes_probe_tool() {
 /// With 8 tools and a top-k smaller than 8, every projection drops at least one
 /// tool — so the catalog summary section must be emitted, and emitted *before*
 /// any tool section (it is a compact overview of everything, including what was
-/// dropped).
+/// dropped). The overview is the named `tool_summary` tree section that sits
+/// right before `<tools>`, exactly as `install_tool_catalog` leaves it.
 #[test]
 fn partial_selection_emits_summary_before_tools() {
     let (manifest, pf) = load_fixtures();
     let h = Harness::build();
     let target = h.target();
-    let summary_id = SectionId::reserved(Reserved::ToolSummary);
+    let summary_id = h
+        .builder
+        .id_for_section_in(h.dialogue_layer, "tool_summary")
+        .expect("tool_summary section not found in dialogue layer");
     let tool_ids: std::collections::HashSet<SectionId> =
         h.tool_section_ids.values().copied().collect();
 

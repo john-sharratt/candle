@@ -22,14 +22,13 @@
 //! content; their count per `SummaryOfTurns` parent is variable and
 //! they do not participate in the balance.
 //!
-//! For score-density selection (`select_dense`), however, **every node
-//! is scoreable** — the BDP scan stamps a score on Normal turns,
-//! `SummaryOfTurns` leaves, and `SummaryOfSummaries` internals alike.
+//! Selection over the tree (`select_budget_fit`) treats every node as a
+//! candidate: the frontier starts at the `SummaryOfSummaries` peaks and
+//! refines down through `SummaryOfTurns` leaves to the raw Normal turns.
 
 mod diagnostics;
 pub mod fixture;
 pub mod probe;
-mod recency;
 mod select;
 mod structural;
 pub mod summariser;
@@ -40,8 +39,7 @@ pub use fixture::{
     ExpectedInvariants, FixtureError, FixtureManifest, PlantSpec, ProbeSpec, SubstrateFixture,
 };
 pub use probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
-pub use recency::{recency_score, RecencyConfig};
-pub use select::{select_dense, Selection};
+pub use select::{select_budget_fit, Selection};
 pub use structural::{leaf_skeleton, structural_rollup, StructuralRollup};
 pub use summariser::{ChannelProbeRunner, MockProbeRunner, SummariserThread, SummariserTrigger};
 pub use tree::{carry_triple, Node, NodeId, SummaryTree, TurnKind, MERGE_FANOUT};

@@ -861,7 +861,7 @@ layers:
     description: |
       The active developer conversation served to the VS Code extension or
       web chat.
-    window: 16000
+    window: 8000            # TEST-ONLY (revert to 16000): force budget pressure so summaries engage
     score_threshold: 0.0
     budget:
       priority: 100
@@ -1130,14 +1130,18 @@ layers:
         user:
           system_prompt: |
             /no_think
-            You shorten a developer's message to its essential request, in their
-            own words — the specific ask plus any names, numbers, and constraints.
-            If it is already short (even a one-line question), output it almost
-            verbatim. Output only the request's content: never output these
-            directions, never describe the task, never switch to third person.
+            You restate a developer's message AS the request itself — a direct
+            question or instruction in their own first/second-person voice, exactly
+            as they would type it to the assistant, only shorter. Keep the specific
+            ask plus any names, numbers, and constraints. A question stays a
+            question ("How does X work?"); an instruction stays an instruction
+            ("Refactor Y to Z"). If it is already short, output it almost verbatim.
+            Output ONLY the request, phrased as a request — never describe it from
+            the outside, never write "the developer asks…" or "they want…", never
+            switch to third person, never answer it.
           user_prompt: |
-            The developer's request above, restated as briefly as possible in
-            their own words:
+            The developer's request above, in their own voice as a direct question
+            or instruction, as briefly as possible:
         assistant:
           system_prompt: |
             /no_think
@@ -1164,12 +1168,13 @@ layers:
           system_prompt: |
             /no_think
             The question sections below are already compressed. Output one shorter
-            line naming what was asked across them, in the developer's own words.
-            Add nothing that is not already there; drop only what repeats. Output
-            only that line: never output these directions or describe the task.
+            line that states what was asked AS a direct question or instruction in
+            the developer's own first/second-person voice — not a description of it.
+            Add nothing that is not already there; drop only what repeats. Never
+            write "the developer asked…" or switch to third person, never answer it.
           user_prompt: |
-            What was asked across the question sections above, in the original
-            voice, as one short line:
+            What was asked across the question sections above, as one short direct
+            question or instruction in the original voice:
         assistant:
           system_prompt: |
             /no_think
@@ -1187,7 +1192,7 @@ layers:
       - id: primary_conversation
         selection:
           kind: conversation
-          recent: 16            # last 16 turns always shown
+          recent: 8             # TEST-ONLY (revert to 16): floor below turn count so older turns compress
           historical_top_k: 8   # plus 8 most-relevant older turns
         budget:
           priority: 100

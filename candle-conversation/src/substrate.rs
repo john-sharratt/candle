@@ -70,8 +70,8 @@ use crate::projection::{
     TurnKey,
 };
 use crate::summary_tree::{
-    select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
-    TurnKind, MERGE_FANOUT,
+    select_budget_fit, Node, NodeId, SelectionDiagnostics, SelectionOrigin, SummaryTree, TurnKind,
+    MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn_layout::TurnLayout;
@@ -846,6 +846,7 @@ pub trait ContentResolver {
         &self,
         _timeline: TimelineId,
         _budget: u32,
+        _floor: usize,
         _formula: ScoreFormula,
         _weights: &DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
@@ -3667,6 +3668,48 @@ impl<'a> ScoredSubstrate<'a> {
     }
 }
 
+/// Shared body of [`ContentResolver::summary_tree_select`] — the top-down
+/// refinement pick: build the timeline's summary forest and run
+/// [`select_budget_fit`], which keeps the newest turns raw while they fit the
+/// window and covers the older tail with summaries. Returns the picked turns
+/// with their selection origins, each carrying its BDP provenance score for the
+/// diagnostics panel. `None` when the timeline has no summary nodes, in which
+/// case the projection falls through to the rule-based selector (which excludes
+/// summary turns). Used by the production [`SubstrateRead`] resolver and the
+/// test-only [`ScoredSubstrate`].
+fn select_summary_tree(
+    substrate: &Substrate,
+    scores: &ProjectionScores,
+    timeline: TimelineId,
+    budget: u32,
+    floor: usize,
+    formula: ScoreFormula,
+    weights: &DepthWeights,
+) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+    if !substrate.has_summary_nodes(timeline) {
+        return None;
+    }
+    let tree = substrate.build_summary_tree_in_memory(timeline);
+    if tree.is_empty() {
+        return None;
+    }
+    let sel = select_budget_fit(&tree, budget, floor);
+    let out: Vec<_> = sel
+        .selected
+        .iter()
+        .zip(sel.origins.iter())
+        .filter_map(|(id, origin)| {
+            let idx = TurnIndex(id.0);
+            // Skip orphan tree nodes (metadata without a backing turn).
+            substrate.turn(timeline, idx)?;
+            // Attach the node's BDP provenance score for the panel display.
+            let eff = combine_per_depth(scores.turn(timeline, idx), formula, weights);
+            Some((idx, *origin, eff))
+        })
+        .collect();
+    Some(out)
+}
+
 impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
     type Target = Substrate;
     fn deref(&self) -> &Substrate {
@@ -3754,56 +3797,19 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         &self,
         timeline: TimelineId,
         budget: u32,
+        floor: usize,
         formula: ScoreFormula,
         weights: &DepthWeights,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
-        // No summary nodes yet → fall through to the rule-based path.
-        if !self.substrate.has_summary_nodes(timeline) {
-            return None;
-        }
-        let tree = self.substrate.build_summary_tree_in_memory(timeline);
-        if tree.is_empty() {
-            return None;
-        }
-        let mut scores: ahash::AHashMap<NodeId, f32> = ahash::AHashMap::default();
-        for id in tree.all_ids() {
-            let idx = TurnIndex(id.0);
-            // A tree node without a backing substrate turn is an
-            // orphan — possible if the redo log holds TreeMetadata
-            // records whose matching TurnDecl never landed (e.g. an
-            // older session ran before summariser persistence was
-            // wired up).  These can't be elevated, so they must be
-            // excluded from the selection that flows into the
-            // projection / elevate path.  Leaving them in `scores`
-            // with a default 0.0 wouldn't help — `select_dense`
-            // walks the tree shape and would still return them.
-            if self.substrate.turn(timeline, idx).is_none() {
-                continue;
-            }
-            let s = combine_per_depth(self.scores.turn(timeline, idx), formula, weights);
-            scores.insert(id, s);
-        }
-        let cfg = RecencyConfig::default();
-        let sel = select_dense(&tree, &scores, cfg, budget);
-        // Convert (NodeId, SelectionOrigin) pairs back to TurnIndex,
-        // dropping any picks whose tree node has no backing
-        // substrate turn.  The substrate-turn check at scoring time
-        // (above) only guards scoring — `select_dense` walks the
-        // tree shape and can still return orphan NodeIds; this
-        // post-filter is what actually keeps them out of the
-        // elevate plan.
-        let out: Vec<_> = sel
-            .selected
-            .iter()
-            .zip(sel.origins.iter())
-            .filter_map(|(id, origin)| {
-                let idx = TurnIndex(id.0);
-                self.substrate.turn(timeline, idx)?;
-                let eff = sel.effective_scores.get(id).copied().unwrap_or(0.0);
-                Some((idx, *origin, eff))
-            })
-            .collect();
-        Some(out)
+        select_summary_tree(
+            self.substrate,
+            self.scores,
+            timeline,
+            budget,
+            floor,
+            formula,
+            weights,
+        )
     }
 
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {
@@ -3926,6 +3932,25 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
             return 0.0;
         }
         combine_per_depth(self.scores_or_empty().section(section), formula, weights)
+    }
+
+    fn summary_tree_select(
+        &self,
+        timeline: TimelineId,
+        budget: u32,
+        floor: usize,
+        formula: ScoreFormula,
+        weights: &DepthWeights,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        select_summary_tree(
+            &self.guard,
+            self.scores_or_empty(),
+            timeline,
+            budget,
+            floor,
+            formula,
+            weights,
+        )
     }
 
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {

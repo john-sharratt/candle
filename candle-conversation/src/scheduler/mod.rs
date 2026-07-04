@@ -704,7 +704,9 @@ struct CompressionJob {
     /// Projection target (layer, group, timeline) the node records into.
     target: ProjectionTarget,
     /// Scratch slot driving the user-half pass; freed once that half completes.
-    user_slot: SequenceId,
+    /// `None` when the question-half is echoed verbatim (short user content),
+    /// so no decode pass runs and `user_result` is pre-filled.
+    user_slot: Option<SequenceId>,
     /// Scratch slot driving the assistant-half pass.
     assistant_slot: SequenceId,
     /// Decoded user-half tokens (filled when the user pass finishes).
@@ -1164,12 +1166,6 @@ pub(crate) struct Scheduler {
     device: Device,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
-    /// Per-decode projection-span anchor, keyed by the decode's parent
-    /// sequence (stable across reprojections): `(generated-token index, time)`
-    /// of the last projection event. Each reproject (and the final seal) closes
-    /// the span `[anchor.token, now]` and re-anchors. Drives the t/s on each
-    /// `TurnEvent::Projection`. Pruned in `cleanup_finished`.
-    reproj_anchor: HashMap<SequenceId, (u32, Instant)>,
     /// Persistent sampling state per sequence ID (survives across turns).
     /// DRY penalty needs the recent-token window to span turn boundaries.
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
@@ -1466,7 +1462,6 @@ impl Scheduler {
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
-            reproj_anchor: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
@@ -1699,6 +1694,33 @@ impl Scheduler {
                             diag_to_write = Some((target.timeline, diag));
                         },
                     );
+                    // Emit the OPENING projection as a timeline event: a POINT at
+                    // token 0 (nothing decoded yet) carrying the initial composition
+                    // this turn decodes against. A projection governs everything
+                    // forward until the next reprojection supersedes it, so even a
+                    // short / no-think turn that never reprojects still gets this one
+                    // clickable record. `start_token`/`seconds` stay 0 — the turn's
+                    // opening point.
+                    {
+                        let mut opening = crate::projection::from_projection_with_origins(
+                            &projection.segments,
+                            &projection.selection_origins,
+                            inputs.projection.schema(),
+                            &view,
+                            view.total_token_count(target.timeline) as u32,
+                            0,
+                            0.0,
+                        );
+                        opening.materialized = projection_assembler::materialize_conversation(
+                            &projection.segments,
+                            &self.boundary_markers,
+                            &projection.selection_origins,
+                            &view,
+                            inputs.projection.schema(),
+                            |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+                        );
+                        let _ = event_tx.send(TurnEvent::Projection(opening));
+                    }
                     // The schema's projection is the single source
                     // of truth for system-side sections — emit
                     // exactly what the projection picked, in
@@ -2366,20 +2388,57 @@ impl Scheduler {
         let job_id = self.next_compression_job_id;
         self.next_compression_job_id += 1;
 
-        // Set up both half-passes. Each returns its scratch slot id (now a
-        // live `DecodeState` in `active_decodes`). On any failure, tear down
-        // whatever was already enqueued so no orphan slot or job lingers.
-        let user_slot = match self.enqueue_compression_pass(
-            &conv,
-            target,
-            &children,
-            Role::User,
-            &turn_summary.user,
-            turn_summary.max_tokens,
-            job_id,
-        ) {
-            Ok(slot) => slot,
-            Err(e) => return Err(e),
+        // Question-half VERBATIM shortcut. The compressor cannot be trusted to
+        // "restate" a short or self-referential user message — it confabulates a
+        // plausible-but-invented question ("what did I ask?" → "How does X
+        // work?"). And a summary IS the model's memory under score-density, so a
+        // fabricated question poisons recall permanently. When the raw user
+        // content already fits the summary budget there is nothing to compress:
+        // echo the user tokens verbatim as the question-half — ground truth by
+        // construction — and only run the model on genuinely oversized input.
+        let anchor_sep = self
+            .tokenizer
+            .encode("\n\n", false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
+        let verbatim_user: Vec<u32> = {
+            let view = conv.read();
+            let mut acc: Vec<u32> = Vec::new();
+            for &c in &children {
+                let half = view
+                    .turn_user_token_ids(target.timeline, c)
+                    .unwrap_or_default();
+                if half.is_empty() {
+                    continue;
+                }
+                if !acc.is_empty() {
+                    acc.extend_from_slice(&anchor_sep);
+                }
+                acc.extend(half);
+            }
+            acc
+        };
+        let user_verbatim =
+            !verbatim_user.is_empty() && verbatim_user.len() <= turn_summary.max_tokens;
+
+        // Set up the half-passes. Each enqueued pass returns its scratch slot id
+        // (now a live `DecodeState` in `active_decodes`). On any failure, tear
+        // down whatever was already enqueued so no orphan slot or job lingers.
+        let user_slot: Option<SequenceId> = if user_verbatim {
+            None
+        } else {
+            match self.enqueue_compression_pass(
+                &conv,
+                target,
+                &children,
+                Role::User,
+                &turn_summary.user,
+                turn_summary.max_tokens,
+                job_id,
+            ) {
+                Ok(slot) => Some(slot),
+                Err(e) => return Err(e),
+            }
         };
         let assistant_slot = match self.enqueue_compression_pass(
             &conv,
@@ -2392,16 +2451,20 @@ impl Scheduler {
         ) {
             Ok(slot) => slot,
             Err(e) => {
-                // The user pass is already an active decode; abandon it so it
+                // The user pass may already be an active decode; abandon it so it
                 // doesn't seal into a job that will never complete.
-                self.active_decodes.remove(&user_slot);
-                self.free_summary_slot(user_slot);
+                if let Some(slot) = user_slot {
+                    self.active_decodes.remove(&slot);
+                    self.free_summary_slot(slot);
+                }
                 return Err(e);
             }
         };
 
-        // Register the job. Both passes now ride the wave concurrently; the
-        // node stitches in `cleanup_finished` when both halves land.
+        // Register the job. The assistant pass rides the wave; the user pass too
+        // unless echoed verbatim (then `user_result` is pre-filled and the node
+        // stitches as soon as the assistant half lands). Stitch happens in
+        // `cleanup_finished` once both halves are present.
         self.compression_jobs.insert(
             job_id,
             CompressionJob {
@@ -2409,7 +2472,9 @@ impl Scheduler {
                 target,
                 user_slot,
                 assistant_slot,
-                user_result: None,
+                user_result: user_verbatim.then(|| CompressionPassResult {
+                    tokens: verbatim_user,
+                }),
                 assistant_result: None,
                 response_tx,
             },
@@ -2614,14 +2679,19 @@ impl Scheduler {
         // Rolling anchor: the most recent sealed *summary* turn before these
         // children — the running thread of the conversation so far, itself
         // bounded (it is a prior summary, not raw history, so this stays O(1)).
-        // Prepended as context so each half-summary is grounded in what came
-        // before instead of confabulating a request/answer from a bare turn.
+        // Grounds the ANSWER pass in what came before so a follow-up reply summary
+        // stays coherent with the running thread.
         //
-        // BOTH halves of the prior leaf are carried — its question summary AND
-        // its answer summary, separated. A stitched leaf is stored as
-        // `[question][user_end][assistant_start][answer]`; reading only the
-        // assistant half would amputate the running *question* thread, so the
-        // original ask would survive exactly one turn and then vanish.
+        // BOTH halves of the prior leaf are carried — its question summary AND its
+        // answer summary, separated. A stitched leaf is stored as
+        // `[question][user_end][assistant_start][answer]`.
+        //
+        // This is applied to the ASSISTANT pass ONLY (see below). The QUESTION
+        // pass must NOT see it: the question summary restates *this turn's* user
+        // message, and prior/answer context makes the model reverse-engineer a
+        // plausible-but-invented question from the surrounding answer text instead
+        // of the actual ask (observed: a "give me a tour" turn summarised as an
+        // unrelated, hallucinated API question).
         let anchor_sep = self
             .tokenizer
             .encode("\n\n", false)
@@ -2653,15 +2723,6 @@ impl Scheduler {
                 })
                 .unwrap_or_default()
         };
-        if !prior_summary.is_empty() {
-            prefix.push(ProjectionSegment::Generated {
-                tokens: Arc::new(prior_summary),
-                identity: GeneratedIdentity {
-                    name: "compress_prior".to_string(),
-                    position: 1,
-                },
-            });
-        }
 
         // Close glue: the compression instruction followed by `user_end`.
         let close: Vec<u32> = {
@@ -2700,42 +2761,18 @@ impl Scheduler {
                         },
                     )));
                 }
-                // Ground with the assistant half (text) so the user-request
-                // summary sees the response it produced — a bare tool-result
-                // turn is otherwise context-free and confabulates.
-                let asst_ctx: Vec<u32> = {
-                    let view = conv.read();
-                    let mut acc: Vec<u32> = Vec::new();
-                    for &c in children {
-                        let half = view
-                            .turn_assistant_token_ids(target.timeline, c)
-                            .unwrap_or_default();
-                        if half.is_empty() {
-                            continue;
-                        }
-                        // Separate consecutive children's halves (same `\n\n` as
-                        // the rolling anchor); single-child leaves are unchanged.
-                        if !acc.is_empty() {
-                            acc.extend_from_slice(&anchor_sep);
-                        }
-                        acc.extend(half);
-                    }
-                    acc
-                };
-                if !asst_ctx.is_empty() {
-                    segments.push(ProjectionSegment::Generated {
-                        tokens: Arc::new(asst_ctx),
-                        identity: GeneratedIdentity {
-                            name: "compress_asst_ctx".to_string(),
-                            position: 2,
-                        },
-                    });
-                }
+                // The question summary restates ONLY this turn's user message. It
+                // deliberately does NOT see the assistant answer or any prior
+                // context: given the reply text, the model reverse-engineers a
+                // plausible-but-invented question from it instead of compressing
+                // the actual ask (a "give me a tour" turn was summarised as an
+                // unrelated hallucinated API question). The user tokens injected
+                // above are self-sufficient for "what was asked".
                 segments.push(ProjectionSegment::Generated {
                     tokens: Arc::new(close),
                     identity: GeneratedIdentity {
                         name: "compress_close".to_string(),
-                        position: 3,
+                        position: 1,
                     },
                 });
                 if let Err(e) =
@@ -2754,8 +2791,22 @@ impl Scheduler {
             // the loop. `finish_compression_pass_setup` runs in the
             // wave-completion hook (`promote_finished_prefills_to_decodes`).
             Role::Assistant => {
+                // The rolling anchor (prior summary's question + answer) grounds
+                // the answer pass ONLY — it keeps a follow-up reply summary coherent
+                // with the running thread. It is deliberately absent from the
+                // question pass (see the `Role::User` arm).
+                let mut segments = prefix;
+                if !prior_summary.is_empty() {
+                    segments.push(ProjectionSegment::Generated {
+                        tokens: Arc::new(prior_summary),
+                        identity: GeneratedIdentity {
+                            name: "compress_prior".to_string(),
+                            position: 1,
+                        },
+                    });
+                }
                 if let Err(e) = self
-                    .apply_projection(slot, BlockCount(0), &prefix)
+                    .apply_projection(slot, BlockCount(0), &segments)
                     .map_err(|e| format!("SubmitSummaryProbe: assemble Assistant prefix: {e}"))
                 {
                     self.free_summary_slot(slot);
@@ -2998,16 +3049,20 @@ impl Scheduler {
                 // soft error and tear down the job + the partner slot.
                 let job = self.compression_jobs.remove(&job_id).unwrap();
                 let _ = job.response_tx.send(Err(ProbeError::Soft(e)));
+                // Free the partner slot. A verbatim question-half has no user
+                // slot (`None`), so there is nothing to tear down on that side.
                 let partner = match half {
-                    Role::User => job.assistant_slot,
+                    Role::User => Some(job.assistant_slot),
                     _ => job.user_slot,
                 };
-                self.active_decodes.remove(&partner);
-                // The partner may be the assistant half still mid-`CompressionSetup`
-                // on the wave — purge its pending prefill before freeing the slot,
-                // or a stale forward would hit the freed (and possibly reused) id.
-                self.discard_pending_prefill(partner);
-                self.free_summary_slot(partner);
+                if let Some(partner) = partner {
+                    self.active_decodes.remove(&partner);
+                    // The partner may be the assistant half still mid-`CompressionSetup`
+                    // on the wave — purge its pending prefill before freeing the slot,
+                    // or a stale forward would hit the freed (and possibly reused) id.
+                    self.discard_pending_prefill(partner);
+                    self.free_summary_slot(partner);
+                }
                 return;
             }
         }
@@ -3484,7 +3539,8 @@ impl Scheduler {
     fn abort_compression_job(&mut self, job_id: u64, err: String) {
         if let Some(job) = self.compression_jobs.remove(&job_id) {
             let _ = job.response_tx.send(Err(ProbeError::Soft(err)));
-            for slot in [job.user_slot, job.assistant_slot] {
+            // `user_slot` is `None` for a verbatim question-half (no decode pass).
+            for slot in job.user_slot.into_iter().chain([job.assistant_slot]) {
                 self.active_decodes.remove(&slot);
                 self.discard_pending_prefill(slot);
                 self.free_summary_slot(slot);
@@ -3758,8 +3814,6 @@ impl Scheduler {
             .collect();
 
         for seq_id in finished_seq_ids {
-            // Drop the projection-span anchor for this finished decode.
-            self.reproj_anchor.remove(&seq_id);
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // Compression half-passes complete through the job registry,
                 // not the substrate seal path: slice the decoded delta, deposit
@@ -5800,7 +5854,6 @@ impl Scheduler {
                 &view,
                 view.total_token_count(policy.target.timeline) as u32,
                 0,
-                0,
                 0.0,
             );
             // The dialogue glue, sourced from the SAME `assemble_pieces` decision
@@ -6104,30 +6157,22 @@ impl Scheduler {
             elevate_ms,
         } = inflight;
 
-        // Close the decode span that ran under the *previous* projection and
-        // emit it as a timeline event: `[anchor.token, now]` tokens at the
-        // measured t/s, paired with the composition this reprojection selected.
-        // The anchor is keyed by view id and migrated to `new_view_id` below
-        // (like the decode state), so the next reproject / final seal measures
-        // from here. First reproject has no anchor → measures from decode start.
+        // A projection is a POINT, not a span: it is selected here (by the Q of
+        // the tokens decoded so far) and governs everything forward until the next
+        // projection supersedes it. So emit it the instant it occurs — `start_token`
+        // is the generated-token position at which it was selected, `seconds` is the
+        // wall-clock elapsed since decode start. The consumer reconstructs each
+        // projection's effective interval `[pos_i, pos_{i+1})` and its throughput
+        // from the *sequence* of events; there is nothing to close or flush.
         let repro_now = Instant::now();
         let repro_gen = decode_state.generated_tokens.len() as u32;
         {
-            let (from_token, since) = self
-                .reproj_anchor
-                .remove(&view_id)
-                .unwrap_or((0, decode_state.decode_start));
-            let seconds = repro_now.duration_since(since).as_secs_f64();
-            let span = repro_gen.saturating_sub(from_token);
+            let elapsed = repro_now
+                .duration_since(decode_state.decode_start)
+                .as_secs_f64();
             let event = crate::projection::ProjectionEvent {
-                start_token: from_token,
-                end_token: repro_gen,
-                seconds,
-                tokens_per_second: if seconds > 0.0 {
-                    span as f64 / seconds
-                } else {
-                    0.0
-                },
+                start_token: repro_gen,
+                seconds: elapsed,
                 ..composition
             };
             let _ = decode_state.event_tx.send(TurnEvent::Projection(event));
@@ -6213,10 +6258,6 @@ impl Scheduler {
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }
-        // Migrate the projection-span anchor onto the new view id so the next
-        // reproject / final seal measures its span from this reprojection.
-        self.reproj_anchor
-            .insert(new_view_id, (repro_gen, repro_now));
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real
