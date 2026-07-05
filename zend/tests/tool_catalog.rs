@@ -158,9 +158,9 @@ fn install_tool_catalog_emits_valid_hermes_json_lines() {
 
 #[test]
 fn install_tool_catalog_leaves_static_sections_untouched() {
-    // The framing sections (mode, frame, history_stance, grounding,
-    // tools_intro, tools_outro) must remain top-level always-emit
-    // sections — outside the `tools` collection.
+    // The framing sections (mode, frame, grounding, tools_intro,
+    // tools_outro) must remain top-level always-emit sections — outside
+    // the `tools` collection.
     let mut builder = build_test_projection();
     let dialogue = builder.id_for_layer("dialogue").expect("dialogue layer");
     let n_top_before = builder
@@ -189,7 +189,7 @@ fn install_tool_catalog_leaves_static_sections_untouched() {
     // are `kind: template` items now and don't appear in the section
     // name map — see `projection.yaml`.)
     // (`grounding` / `grounding_no_tools` are commented out in projection.yaml.)
-    for name in ["frame", "history_stance", "tools_overview"] {
+    for name in ["frame", "tools_overview"] {
         assert!(
             builder.id_for_section_in(dialogue, name).is_some(),
             "static section {name:?} must still resolve",

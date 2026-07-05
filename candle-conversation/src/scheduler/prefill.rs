@@ -558,6 +558,23 @@ impl Scheduler {
                 }
                 continue;
             }
+            // A dialogue turn's reasoning-free re-prefill finished on the wave.
+            // Seal the clean K/V + fire the deferred `Done` (no decode, reports to
+            // the caller, not the summariser). On prefill error, surface it on the
+            // caller channel and drop the slot's chunks.
+            if let SealAction::TurnReprefill { pending_id } = &work.seal_action {
+                let pending_id = *pending_id;
+                match error {
+                    Some(e) => {
+                        if let Some(p) = self.pending_turn_seals.remove(&pending_id) {
+                            let _ = p.event_tx.send(TurnEvent::Error(e));
+                            let _ = self.session.truncate_sequence_to_blocks(p.parent_id.0, 0);
+                        }
+                    }
+                    None => self.complete_turn_reprefill(pending_id),
+                }
+                continue;
+            }
             // The assistant half's content prefill finished on the wave. Run the
             // synchronous tail (assistant_start + sample first + register the
             // `CompressionPass` decode); tear the whole node down on failure.

@@ -358,7 +358,7 @@ impl InferenceState {
         }
 
         // The dialogue layer's `system_prompt.items` start with a static
-        // prelude (mode/frame/history_stance/grounding/tools_intro) →
+        // prelude (mode/frame/grounding/tools_intro) →
         // then the `tools` collection (90+ tool sections, top_k=3) →
         // then `tools_outro`.  The pre-collection prelude is what we
         // pass as the engine's `system_prompt` so it gets ChatML-wrapped

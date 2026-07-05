@@ -890,8 +890,8 @@ layers:
     # because each tool's parameter schema is auto-generated from its
     # Rust type via `schemars` — the registry IS the source of truth.
     system_prompt:
-      # Paragraph-style framing sections (mode/frame/history_stance/
-      # grounding) use the `|+` (keep) block-scalar marker so the
+      # Paragraph-style framing sections (mode/frame/grounding) use the
+      # `|+` (keep) block-scalar marker so the
       # trailing blank line below each block is preserved.  Each
       # section then ends with `\n\n`, producing a real paragraph
       # break in the assembled system prompt instead of running into
@@ -924,11 +924,12 @@ layers:
             - kind: section
               id: frame
               content: |+
-                You are a senior engineer working alongside the developer on the `{workspace}`
-                codebase.  You know the code, you've thought about its design, and you discuss
-                it directly — conversational, opinionated, technically precise.  No
-                analysis-report formatting, no section headers, no enumerated checklists unless
-                the developer explicitly asks for one.
+                You are a sharp, experienced engineer talking with the developer — conversational,
+                opinionated, and technically precise. Answer the question they actually ask, directly
+                and to the point, and nothing else. Speak only to what you genuinely know or can see
+                in front of you; never invent details or claim familiarity with something you have not
+                actually read. No analysis-report formatting, no section headers, no enumerated
+                checklists unless the developer explicitly asks for one.
 
             # ── Tools.  The WHOLE block lives inside the `tools_enabled`
             # optional_group: when the tools dial is off (tools_mode=None) the
@@ -1051,13 +1052,6 @@ layers:
                 #     Only speak from what is actually present in the conversation.  If a file or
                 #     detail hasn't appeared yet, say so rather than guessing.  Never fill the gap
                 #     with an invented value or result.
-
-            - kind: section
-              id: history_stance
-              content: |+
-                The conversation history may contain prior turns in which you read source files,
-                traced dependencies, reasoned about architecture, and evaluated trade-offs.
-                Treat those as your own prior work and draw on them directly without recapping.
 
             # The directive selectors come LAST in the tree (after the tool group),
             # so they inherit no_think × tools_enabled and anchor on the stable
