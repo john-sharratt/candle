@@ -1017,8 +1017,36 @@ fn run_inference_stream(
         // Quick/Balanced suppress the "Wait"/"Hmm"/… family in-block, Deep/
         // Exhaustive leave it 0 (reconsideration is wanted there).
         let think_mode = think_mode_from_selection(&selection);
+        // An explicit caller-supplied config (e.g. a test's `argmax()`) is honoured
+        // verbatim; only the conversation default gets the per-turn adjustments
+        // below (thinking-vs-response sampling split + a fresh seed).
+        let sampling_defaulted = sampling.is_none();
         let mut sampling = sampling.unwrap_or_else(|| cs.conv.default_sampling());
         sampling.segment_suppress_penalty = think_mode.suppress_penalty();
+        if sampling_defaulted {
+            // A `/no_think` turn is a direct response, not reasoning: strip the
+            // thinking-only sampling machinery the conversation default carries.
+            // The thinking-temperature boost and DRY are meant for the `<think>`
+            // span and are gated to it, but they have no business shaping a plain
+            // answer — and if the `in_thinking` gate ever desynced (it has, twice)
+            // they would leak onto the response, DRY corrupting verbatim numbers
+            // and identifiers. Thinking turns keep their own (hotter, DRY-guarded)
+            // sampling untouched.
+            if think_mode == ThinkMode::Off {
+                sampling.segment_temp_boost = 0.0;
+                sampling.dry = None;
+            }
+            // Vary the RNG seed per turn from real entropy. The default base seed
+            // is a fixed constant, which makes a whole conversation a deterministic
+            // replay — the same context always samples the same tokens, so a turn
+            // that lands in a bad attractor can never sample its way out. A fresh
+            // per-turn seed restores genuine run-to-run variation. (The per-token
+            // `rng_offset` still advances within the turn.)
+            sampling.seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(sampling.seed);
+        }
         // Per-dial thinking budget: the EOT close ramp's graceful/force thresholds
         // scale with the effort level (exhaustive thinks longest).  `segment_len`
         // restarts each steered span, so these are per-span — higher dials get more
@@ -1059,8 +1087,9 @@ fn run_inference_stream(
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(sampling.clone()),
-                // Seed the response only on the first turn — forcing every chained
-                // tool iteration would prevent the model ever giving a final answer.
+                // Apply the caller's assistant prefill only on the first tool
+                // iteration — re-prefilling it on every chained iteration would
+                // prevent the model ever reaching a final answer.
                 assistant_prefill: if iteration == 0 {
                     assistant_prefill.clone()
                 } else {
