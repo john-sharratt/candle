@@ -645,6 +645,28 @@ impl Scheduler {
             .sequence_offset(work.sequence_id.0)
             .unwrap_or(token_count);
 
+        // Decode-start line: the effective sampling config this conversation turn
+        // will decode under. Confirms empirically whether a turn is stochastic
+        // (temp>0 + top_k/top_p) or greedy (temp≈0 → argmax), and at what context
+        // depth. Enable with
+        // `RUST_LOG=candle_conversation::scheduler::decode=debug`.
+        tracing::debug!(
+            target: "candle_conversation::scheduler::decode",
+            seq = work.sequence_id.0,
+            context_depth,
+            prefill_tokens = token_count,
+            max_decode_tokens = work.max_decode_tokens,
+            temperature = work.sampling.temperature,
+            top_k = work.sampling.top_k,
+            top_p = work.sampling.top_p,
+            repeat_penalty = work.sampling.repeat_penalty,
+            segment_temp_boost = work.sampling.segment_temp_boost,
+            dry = work.sampling.dry.is_some(),
+            greedy = work.sampling.temperature <= 0.01,
+            seed = work.sampling.seed,
+            "conversation decode start",
+        );
+
         let mut sampling_state = self
             .sampling_states
             .remove(&work.sequence_id)
