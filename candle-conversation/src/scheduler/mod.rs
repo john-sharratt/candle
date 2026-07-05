@@ -2453,7 +2453,7 @@ impl Scheduler {
         // content already fits the summary budget there is nothing to compress:
         // echo the user tokens verbatim as the question-half — ground truth by
         // construction — and only run the model on genuinely oversized input.
-        let anchor_sep = self
+        let child_sep = self
             .tokenizer
             .encode("\n\n", false)
             .map(|e| e.get_ids().to_vec())
@@ -2469,7 +2469,7 @@ impl Scheduler {
                     continue;
                 }
                 if !acc.is_empty() {
-                    acc.extend_from_slice(&anchor_sep);
+                    acc.extend_from_slice(&child_sep);
                 }
                 acc.extend(half);
             }
@@ -2733,53 +2733,23 @@ impl Scheduler {
             });
         }
 
-        // Rolling anchor: the most recent sealed *summary* turn before these
-        // children — the running thread of the conversation so far, itself
-        // bounded (it is a prior summary, not raw history, so this stays O(1)).
-        // Grounds the ANSWER pass in what came before so a follow-up reply summary
-        // stays coherent with the running thread.
-        //
-        // BOTH halves of the prior leaf are carried — its question summary AND its
-        // answer summary, separated. A stitched leaf is stored as
-        // `[question][user_end][assistant_start][answer]`.
-        //
-        // This is applied to the ASSISTANT pass ONLY (see below). The QUESTION
-        // pass must NOT see it: the question summary restates *this turn's* user
-        // message, and prior/answer context makes the model reverse-engineer a
-        // plausible-but-invented question from the surrounding answer text instead
-        // of the actual ask (observed: a "give me a tour" turn summarised as an
-        // unrelated, hallucinated API question).
-        let anchor_sep = self
+        // Each pass compresses ONLY its own children — no prior-summary anchor.
+        // We tried grounding the pass on the most recent prior summary (as raw
+        // prefill, then as a framed prior turn) so a follow-up summary could
+        // resolve "it" / "more" against what came before. Both leaked: the model
+        // reproduced the anchor VERBATIM as the "compressed reply" instead of
+        // compressing its actual children, and that propagated summary-to-summary
+        // (a summary of "1 + 1 = 2" came back as the codebase tour). An anchored
+        // pass reproduced its anchor; an anchor-free pass compressed cleanly. So
+        // the pass sees only its children and the compressor prompt — nothing to
+        // reproduce. (A vague follow-up like "tell me more" therefore summarises
+        // without expanding its referent; that is the correct trade for not
+        // hallucinating one.)
+        let child_sep = self
             .tokenizer
             .encode("\n\n", false)
             .map(|e| e.get_ids().to_vec())
             .unwrap_or_default();
-        let prior_summary: Vec<u32> = {
-            let first_child = children.iter().map(|t| t.0).min().unwrap_or(0);
-            let view = conv.read();
-            view.turn_indices(target.timeline)
-                .filter(|idx| {
-                    idx.0 < first_child
-                        && view
-                            .tree_meta_of(target.timeline, *idx)
-                            .is_some_and(|m| m.kind.is_summary())
-                })
-                .max_by_key(|idx| idx.0)
-                .map(|idx| {
-                    let mut q = view
-                        .turn_user_token_ids(target.timeline, idx)
-                        .unwrap_or_default();
-                    let a = view
-                        .turn_assistant_token_ids(target.timeline, idx)
-                        .unwrap_or_default();
-                    if !q.is_empty() && !a.is_empty() {
-                        q.extend_from_slice(&anchor_sep);
-                    }
-                    q.extend(a);
-                    q
-                })
-                .unwrap_or_default()
-        };
 
         // Close glue: the compression instruction followed by `user_end`.
         let close: Vec<u32> = {
@@ -2818,13 +2788,9 @@ impl Scheduler {
                         },
                     )));
                 }
-                // The question summary restates ONLY this turn's user message. It
-                // deliberately does NOT see the assistant answer or any prior
-                // context: given the reply text, the model reverse-engineers a
-                // plausible-but-invented question from it instead of compressing
-                // the actual ask (a "give me a tour" turn was summarised as an
-                // unrelated hallucinated API question). The user tokens injected
-                // above are self-sufficient for "what was asked".
+                // The question summary restates ONLY these children's user halves,
+                // injected just above — the sole content the pass sees. The
+                // compressor prompt (`turns.user`) keeps it a faithful restatement.
                 segments.push(ProjectionSegment::Generated {
                     tokens: Arc::new(close),
                     identity: GeneratedIdentity {
@@ -2848,20 +2814,12 @@ impl Scheduler {
             // the loop. `finish_compression_pass_setup` runs in the
             // wave-completion hook (`promote_finished_prefills_to_decodes`).
             Role::Assistant => {
-                // The rolling anchor (prior summary's question + answer) grounds
-                // the answer pass ONLY — it keeps a follow-up reply summary coherent
-                // with the running thread. It is deliberately absent from the
-                // question pass (see the `Role::User` arm).
-                let mut segments = prefix;
-                if !prior_summary.is_empty() {
-                    segments.push(ProjectionSegment::Generated {
-                        tokens: Arc::new(prior_summary),
-                        identity: GeneratedIdentity {
-                            name: "compress_prior".to_string(),
-                            position: 1,
-                        },
-                    });
-                }
+                // Only the cheap `[Section | user_start]` prefix lands
+                // synchronously; the children content + close ride the shared
+                // prefill wave (below). No prior-summary anchor — the pass
+                // compresses only its own children, so there is nothing to
+                // reproduce.
+                let segments = prefix;
                 if let Err(e) = self
                     .apply_projection(slot, BlockCount(0), &segments)
                     .map_err(|e| format!("SubmitSummaryProbe: assemble Assistant prefix: {e}"))
@@ -2875,8 +2833,8 @@ impl Scheduler {
                     // Ground with the user half (text) first so the response
                     // summary sees the request it answers, then the assistant
                     // half it actually summarizes. Consecutive children's halves
-                    // within each block are separated (same `\n\n` as the rolling
-                    // anchor); a single-child leaf is unchanged.
+                    // within each block are separated by `\n\n`; a single-child
+                    // leaf is unchanged.
                     let mut first = true;
                     for &child in children {
                         let half = view
@@ -2886,7 +2844,7 @@ impl Scheduler {
                             continue;
                         }
                         if !first {
-                            wave_tokens.extend_from_slice(&anchor_sep);
+                            wave_tokens.extend_from_slice(&child_sep);
                         }
                         first = false;
                         wave_tokens.extend(half);
@@ -2900,7 +2858,7 @@ impl Scheduler {
                             continue;
                         }
                         if !first {
-                            wave_tokens.extend_from_slice(&anchor_sep);
+                            wave_tokens.extend_from_slice(&child_sep);
                         }
                         first = false;
                         wave_tokens.extend(half);
