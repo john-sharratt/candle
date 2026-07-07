@@ -1227,9 +1227,7 @@ impl BatchedInferenceSession {
         #[cfg(feature = "cuda")]
         {
             if let Device::Cuda(d) = &self.device {
-                if let (Ok(used), Ok(reserved)) =
-                    (d.pool_used_bytes(), d.pool_reserved_bytes())
-                {
+                if let (Ok(used), Ok(reserved)) = (d.pool_used_bytes(), d.pool_reserved_bytes()) {
                     return Some((used, reserved));
                 }
             }
@@ -1567,6 +1565,21 @@ impl BatchedInferenceSession {
                 None => Ok(vec![]),
             })
             .collect()
+    }
+
+    /// Per-chunk `(offset, len, cum_before)` real-token window for a sequence — the
+    /// exact layout attention reads, so a provenance / diagnostic gather can check
+    /// only real slots and skip partial-chunk padding. Chunk structure is identical
+    /// across layer backings, so layer 0 is authoritative.
+    pub fn provenance_chunk_layout(
+        &self,
+        seq_idx: usize,
+        seq_offset: usize,
+    ) -> Vec<(u16, u16, usize)> {
+        self.backings
+            .first()
+            .map(|b| b.provenance_chunk_layout(seq_idx, seq_offset))
+            .unwrap_or_default()
     }
 
     /// Number of KV heads in this session's backing.

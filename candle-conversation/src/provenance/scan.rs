@@ -1,890 +1,181 @@
-//! Binary Directional Provenance scanner.
+//! Folded-provenance `z × margin` late-fusion retrieval — the belief scorer.
 //!
-//! Computes per-turn relevance scores by comparing a slice of probe Q
-//! signatures against every stored chunk-group signature in the
-//! [`ProvenanceFile`].  Produces five aggregation statistics per (turn,
-//! depth) in a single pass — the projection engine picks whichever statistic
-//! its layer schema asks for.
+//! Scores the compact folded provenance signature (see [`super::fold_provenance`]
+//! and `docs/tool_selection_provenance_results.md` §23) — `PROV_HEADS_PER_LAYER`-head
+//! layer groups (3 groups × 4 heads × 128 bits for the locked design). Each
+//! **layer-group** is scored independently and combined by **late fusion**: for
+//! each query token, each group votes for the **case** (tool) it best matches,
+//! weighted by two factors that mute different kinds of noise:
 //!
-//! # Algorithm
+//! - **z-score confidence** `(best − mean)/std` of the group's agreement
+//!   distribution — a discriminative group's match is a many-σ outlier (strong),
+//!   a noise group's best is only the expected-max of random (self-muted). This
+//!   mutes non-discriminative **groups**.
+//! - **margin** `(best_case − second_best_case)` — a token where one tool sharply
+//!   wins votes strongly; a generic token where the whole family ties votes ~0.
+//!   This mutes non-discriminative **tokens** (§80/§81).
 //!
-//! ```text
-//!  Input:
-//!    probe[depth]  : Vec<TokenSignature>     (user-message Q sigs, per depth)
-//!    corpus        : Vec<(group, idx, &[SigEntry])>   (turn → its chunks)
+//! The vote is `z × margin`; the two gates are orthogonal (group vs token noise).
 //!
-//!  For each (group, idx) in corpus, sorted by byte_offset:
-//!    For each depth in [syn, sem, prag]:
-//!      For each (probe_tok, corpus_tok) pair:
-//!        agreement = popcount(XNOR(probe_tok, corpus_tok))    // 0..=128
-//!      Aggregate:
-//!        max         = max(agreements)
-//!        sum         = Σ agreements
-//!        mean        = sum / count_pairs
-//!        top_k_mean  = mean of the K highest agreements (K configurable)
-//!        count       = number of pairs with agreement >= hit_threshold
-//!  Store: (group, idx) → PerDepthScores
-//! ```
+//! # Needle gate (§82)
 //!
-//! # Performance notes
-//!
-//! - Entries are sorted by `byte_offset` before scanning so the OS prefetcher
-//!   can pull pages sequentially from the mmap.
-//! - The mmap receives `MADV_SEQUENTIAL` via `with_mmap` to bias readahead.
-//! - The scanner's score map is **persistent** for the conversation's
-//!   lifetime — `scan` calls `clear` and re-inserts, reusing allocated
-//!   bucket capacity.
-//!
-//! # Multi-chunk turns
-//!
-//! A turn that spans multiple 32-token blocks produces multiple [`SigEntry`]
-//! records.  The scanner processes each entry separately and aggregates into
-//! the same per-turn stat record — an `agreement` against any chunk of the
-//! turn contributes to that turn's per-turn `max` / `sum` / `count` / etc.
-//!
-//! See `BdpScanner::scan` for the entry point.
+//! Finally, the belief is summed over only the **top [`NEEDLE_KEEP_FRAC`] of query
+//! tokens by vote magnitude** — the sparse discriminative tokens (the *needle*)
+//! carry the signal, the diffuse remainder (the *haystack* of generic/stale
+//! tokens) is dropped. This is **position-independent** (unlike a recency decay,
+//! it finds the needle wherever it sits in the window) and self-defensive: a wide
+//! probe window can't pull in wrong sections through its diffuse tail, because
+//! that tail never clears the gate.
 
-use ahash::AHashMap;
 use rayon::prelude::*;
 
-use super::store::{
-    depth_byte_range, DEPTH_PRAGMATIC, DEPTH_SEMANTIC, DEPTH_SYNTACTIC, ENTRY_BYTES_PER_TOKEN,
-    NUM_DEPTHS,
-};
-use super::{ProvenanceFile, SigEntry, TokenSignature};
-use crate::projection::{PerDepthScores, SectionId, TurnKey, TurnScores};
+use super::WideQSig;
 
-// ── Tunables ──────────────────────────────────────────────────────────────────
+/// KV heads per folded layer-group — equals `n_kv_head` (heads are kept separate
+/// through the fold). Mirrors [`super::wide_sig::PROV_HEADS_PER_LAYER`].
+const HEADS_PER_GROUP: usize = super::wide_sig::PROV_HEADS_PER_LAYER;
 
-/// Hamming-agreement threshold for the `count` metric.  Random baseline is
-/// 64; useful directional signal starts around 80–90.  90 is conservative.
-pub const DEFAULT_HIT_THRESHOLD: u32 = 90;
+/// Needle-gate keep-fraction: the belief is summed over only the top
+/// `NEEDLE_KEEP_FRAC` of query tokens by vote magnitude. Validated at 0.25 in
+/// §82 (holds 100% Tool-3/Tool-5, sharpens Tool-1, on ~75% fewer effective
+/// tokens) — and, being magnitude- not position-keyed, generalizes to content
+/// windows where the relevant reference is a sparse needle among boilerplate.
+const NEEDLE_KEEP_FRAC: f32 = 0.25;
 
-/// Expected XOR-popcount agreement between two independent 128-bit
-/// signatures — half the 128 bits agree by chance.  The `pertok_excess`
-/// metric scores agreement *relative to* this baseline so a pure-noise pair
-/// contributes ~0 rather than ~64.
-pub const AGREEMENT_BASELINE: f32 = 64.0;
-
-/// Default `K` for the `top_k_mean` metric.  Matches the projection schema's
-/// `score_formula_k` default.
-pub const DEFAULT_TOP_K: usize = 8;
-
-// ── Aggregator ────────────────────────────────────────────────────────────────
-
-/// Per-(turn, depth) running aggregator.  Folds in `(probe, corpus)`
-/// agreement values one at a time, then collapses to [`TurnScores`] at the
-/// end of the turn's chunk run.
-struct Aggregator {
-    max: u32,
-    sum: u64,
-    count_pairs: u64,
-    count_hits: u64,
-    /// Min-heap-of-size-K via a sorted ascending Vec: index 0 is the
-    /// smallest of the current top-K.  When a new value beats it, pop and
-    /// insert sorted.
-    top_k: Vec<u32>,
-    top_k_capacity: usize,
-    /// Span tracking: one bool per probe token position.  `true` when any
-    /// corpus token produced an above-threshold agreement with that probe
-    /// token.  Lazily allocated on first hit (saves the alloc when no
-    /// above-threshold pairs occur at all).
-    probe_hits: Vec<bool>,
-    /// Per-probe-token best (max) agreement across all corpus tokens — the
-    /// graded, threshold-free counterpart to `probe_hits`.  Drives the
-    /// `pertok_excess` metric.  Sized to the probe length on first
-    /// `accumulate_depth` call; accumulates the max across multi-chunk turns.
-    probe_best: Vec<u32>,
-    /// α exponent for the span score (default 2.0).
-    span_alpha: f32,
-}
-
-impl Aggregator {
-    fn new(top_k_capacity: usize, span_alpha: f32) -> Self {
-        Self {
-            max: 0,
-            sum: 0,
-            count_pairs: 0,
-            count_hits: 0,
-            top_k: Vec::with_capacity(top_k_capacity),
-            top_k_capacity,
-            probe_hits: Vec::new(),
-            probe_best: Vec::new(),
-            span_alpha,
+/// Sign-agreement between two layer-group signatures = `popcount(XNOR)` over the
+/// group's words. Fast-paths the locked 8-word (4-head × 128-bit) group width so
+/// it vectorizes; falls back to a generic loop for other widths.
+#[inline]
+fn group_agreement(a: &[u64], b: &[u64]) -> u32 {
+    if a.len() == 8 && b.len() == 8 {
+        let mut s = 0u32;
+        for k in 0..8 {
+            s += (!(a[k] ^ b[k])).count_ones();
         }
-    }
-
-    /// Ensure `probe_hits` is sized for `probe_len` tokens.  Called lazily
-    /// on the first above-threshold hit so we never allocate for cold turns.
-    #[inline]
-    fn ensure_probe_hits(&mut self, probe_len: usize) {
-        if self.probe_hits.is_empty() {
-            self.probe_hits.resize(probe_len, false);
+        s
+    } else {
+        let n = a.len().min(b.len());
+        let mut s = 0u32;
+        for k in 0..n {
+            s += (!(a[k] ^ b[k])).count_ones();
         }
-    }
-
-    /// Ensure `probe_best` is sized for `probe_len` tokens.  Called once per
-    /// `accumulate_depth` — unlike `probe_hits` it tracks every pair, not
-    /// just above-threshold ones, so it is sized eagerly.
-    #[inline]
-    fn ensure_probe_best(&mut self, probe_len: usize) {
-        if self.probe_best.len() < probe_len {
-            self.probe_best.resize(probe_len, 0);
-        }
-    }
-
-    #[inline]
-    fn observe(&mut self, agreement: u32, hit_threshold: u32) {
-        if agreement > self.max {
-            self.max = agreement;
-        }
-        self.sum += agreement as u64;
-        self.count_pairs += 1;
-        if agreement >= hit_threshold {
-            self.count_hits += 1;
-        }
-
-        // Maintain a sorted-ascending top-K.  O(K) insert; K is small (~8).
-        if self.top_k.len() < self.top_k_capacity {
-            let pos = self.top_k.partition_point(|&v| v <= agreement);
-            self.top_k.insert(pos, agreement);
-        } else if let Some(&min) = self.top_k.first() {
-            if agreement > min {
-                self.top_k.remove(0);
-                let pos = self.top_k.partition_point(|&v| v <= agreement);
-                self.top_k.insert(pos, agreement);
-            }
-        }
-    }
-
-    /// Top-K maintenance in isolation (the `observe` tail, without the
-    /// max/sum/count bookkeeping).  Used by the AVX-512 path, which derives
-    /// max/sum/count via SIMD reductions and routes only gate-passing
-    /// candidates here.  Keeps the sorted-ascending top-K invariant, so the
-    /// resulting `top_k` multiset — and thus `top_k_mean` — is identical to
-    /// what `observe` produces, regardless of insertion order.
-    #[inline]
-    fn insert_topk(&mut self, agreement: u32) {
-        if self.top_k.len() < self.top_k_capacity {
-            let pos = self.top_k.partition_point(|&v| v <= agreement);
-            self.top_k.insert(pos, agreement);
-        } else if let Some(&min) = self.top_k.first() {
-            if agreement > min {
-                self.top_k.remove(0);
-                let pos = self.top_k.partition_point(|&v| v <= agreement);
-                self.top_k.insert(pos, agreement);
-            }
-        }
-    }
-
-    /// Largest Hamming distance whose agreement still qualifies for the
-    /// top-K, as a SIMD pre-filter threshold.  A pair qualifies for
-    /// consideration when the top-K is not yet full (everything passes,
-    /// signalled by `128`), or when `agreement > current_min`, i.e.
-    /// `hd <= 127 - current_min`.  Returns `-1` ("nothing qualifies") once
-    /// the top-K is full of maximal (128) agreements.  The authoritative
-    /// accept/reject still happens in [`Self::insert_topk`]; this only has to
-    /// avoid false negatives, so a stale-but-more-permissive threshold within
-    /// a SIMD batch is safe.
-    #[inline]
-    fn topk_qual_hd(&self) -> i64 {
-        if self.top_k.len() < self.top_k_capacity {
-            128
-        } else {
-            127i64 - i64::from(*self.top_k.first().unwrap_or(&0))
-        }
-    }
-
-    fn finish(self) -> TurnScores {
-        let pairs = self.count_pairs.max(1) as f32;
-        let mean = self.sum as f32 / pairs;
-        let k = self.top_k.len().max(1) as f32;
-        let top_k_sum: u64 = self.top_k.iter().map(|&v| v as u64).sum();
-        let top_k_mean = top_k_sum as f32 / k;
-
-        // Span: Σ L^α over consecutive runs of hit probe positions.
-        let span: f32 = self
-            .probe_hits
-            .split(|&h| !h)
-            .filter(|run| !run.is_empty())
-            .map(|run| (run.len() as f32).powf(self.span_alpha))
-            .sum();
-
-        // PerTokenExcess: Σ over probe tokens of max(0, best_agreement − 64).
-        // Recentered (noise → ~0) and per-probe-token (one promiscuous token
-        // cannot inflate it), threshold-free so weak sub-90 signal survives.
-        let pertok_excess: f32 = self
-            .probe_best
-            .iter()
-            .map(|&a| (a as f32 - AGREEMENT_BASELINE).max(0.0))
-            .sum();
-
-        TurnScores {
-            max: self.max as f32,
-            sum: self.sum as f32,
-            mean,
-            top_k_mean,
-            count: self.count_hits as f32,
-            span,
-            pertok_excess,
-        }
+        s
     }
 }
 
-// ── Hit record ────────────────────────────────────────────────────────────────
-
-/// One above-threshold (probe, corpus) pair recorded during `scan_sections`
-/// when [`BdpScanner::with_record_hits`] is enabled.
+/// Score `n_cases` corpus cases against a `query` window of folded provenance
+/// signatures via `z × margin` late-fusion voting over the signature's layer-groups.
 ///
-/// `depth` is 0 = syntactic, 1 = semantic, 2 = pragmatic.
-#[derive(Debug, Clone)]
-pub struct TokenHit {
-    pub probe_tok: u16,
-    pub corpus_tok: u16,
-    pub agreement: u32,
-    pub depth: u8,
-}
-
-// ── Scanner ───────────────────────────────────────────────────────────────────
-
-/// Persistent per-conversation BDP scanner.
+/// For each query token and each layer-group, the group finds the **best
+/// agreement per case** over the gallery, identifies the leading case and the
+/// runner-up, and casts a vote weighted by the product of the leader's **z-score
+/// confidence** `(best − mean)/std` (an outlier vs the group's whole agreement
+/// distribution) and its **margin** over the runner-up case (`best − second`).
+/// Votes tally per case; the returned `Vec<f32>` is the per-case vote total
+/// (higher = more relevant), indexed `0..n_cases`. `gallery_case[j]` is the case
+/// index of gallery token `j` (both slices must be the same length).
 ///
-/// Holds an `ahash::AHashMap` keyed by [`TurnKey`].  Each
-/// [`Self::scan`] call refreshes that map: the existing keys are cleared,
-/// then repopulated from a fresh scan of the supplied corpus entries against
-/// the supplied probe signatures.  Reusing the map's internal storage
-/// across scans saves on allocator churn.
-/// Default α exponent for the span score.
-pub const DEFAULT_SPAN_ALPHA: f32 = 2.0;
-
-#[derive(Default)]
-pub struct BdpScanner {
-    scores: AHashMap<TurnKey, PerDepthScores>,
-    section_scores: AHashMap<SectionId, PerDepthScores>,
-    section_hit_log: AHashMap<SectionId, Vec<TokenHit>>,
-    hit_threshold: u32,
-    top_k: usize,
-    span_alpha: f32,
-    record_hits: bool,
-}
-
-impl BdpScanner {
-    /// Create a scanner with default tunables (`hit_threshold = 90`,
-    /// `top_k = 8`, `span_alpha = 2.0`).
-    pub fn new() -> Self {
-        Self {
-            scores: AHashMap::new(),
-            section_scores: AHashMap::new(),
-            section_hit_log: AHashMap::new(),
-            hit_threshold: DEFAULT_HIT_THRESHOLD,
-            top_k: DEFAULT_TOP_K,
-            span_alpha: DEFAULT_SPAN_ALPHA,
-            record_hits: false,
-        }
-    }
-
-    /// Configure the agreement threshold for the `count` metric.
-    pub fn with_hit_threshold(mut self, threshold: u32) -> Self {
-        self.hit_threshold = threshold;
-        self
-    }
-
-    /// Configure `K` for the `top_k_mean` metric.
-    pub fn with_top_k(mut self, k: usize) -> Self {
-        self.top_k = k.max(1);
-        self
-    }
-
-    /// Configure the α exponent for span scoring (default 2.0).
-    /// α=1.0 gives linear span (same as count); α=2.0 rewards long runs
-    /// quadratically; α>2.0 amplifies sustained attention further.
-    pub fn with_span_alpha(mut self, alpha: f32) -> Self {
-        self.span_alpha = alpha.max(1.0);
-        self
-    }
-
-    /// In-place sibling of [`Self::with_span_alpha`] for a persistent scanner
-    /// reused across scans.
-    pub fn set_span_alpha(&mut self, alpha: f32) {
-        self.span_alpha = alpha.max(1.0);
-    }
-
-    /// Enable per-hit recording for [`Self::scan_sections`].
-    ///
-    /// When `true`, every (probe, corpus) pair whose agreement meets
-    /// [`Self::hit_threshold`] is appended to [`Self::section_hit_log`].
-    /// Off by default — recording adds O(hits) allocation to each scan.
-    pub fn with_record_hits(mut self, record: bool) -> Self {
-        self.record_hits = record;
-        self
-    }
-
-    /// Read the score map produced by the most recent `scan`.
-    pub fn scores(&self) -> &AHashMap<TurnKey, PerDepthScores> {
-        &self.scores
-    }
-
-    /// Read the section-score map produced by the most recent
-    /// [`Self::scan_sections`].
-    pub fn section_scores(&self) -> &AHashMap<SectionId, PerDepthScores> {
-        &self.section_scores
-    }
-
-    /// Materialize the scanner's accumulated turn + section scores into a
-    /// fresh [`crate::substrate::ProjectionScores`] suitable for
-    /// [`crate::projection::resolver::Conversation::read_scored`]. The
-    /// scanner retains its own copy; this clone-out is for callers that
-    /// want a self-contained, owned scores value.
-    pub fn to_projection_scores(&self) -> crate::substrate::ProjectionScores {
-        let mut out = crate::substrate::ProjectionScores::new();
-        for (&key, scores) in &self.scores {
-            out.set_turn(key.timeline, key.index, *scores);
-        }
-        for (&section_id, scores) in &self.section_scores {
-            out.set_section(section_id, *scores);
-        }
-        out
-    }
-
-    /// Read the per-section hit log populated by the most recent
-    /// [`Self::scan_sections`] when [`Self::with_record_hits`] is enabled.
-    pub fn section_hit_log(&self) -> &AHashMap<SectionId, Vec<TokenHit>> {
-        &self.section_hit_log
-    }
-
-    /// Clear all scores without releasing the map's allocated capacity.
-    pub fn clear(&mut self) {
-        self.scores.clear();
-        self.section_scores.clear();
-        self.section_hit_log.clear();
-    }
-
-    /// Scan all `corpus` entries against the supplied per-depth probe
-    /// signatures.  The map is cleared first; each turn touched by the scan
-    /// produces a fresh [`PerDepthScores`].
-    ///
-    /// `corpus` is `&[(TurnKey, Vec<SigEntry>)]` — a single turn may
-    /// contribute multiple entries (one per sealed 32-token chunk), and
-    /// all of them aggregate into the same per-turn stat record.
-    pub fn scan(
-        &mut self,
-        provenance: &ProvenanceFile,
-        probe_syn: &[TokenSignature],
-        probe_sem: &[TokenSignature],
-        probe_prag: &[TokenSignature],
-        corpus: &[(TurnKey, Vec<SigEntry>)],
-    ) -> crate::Result<()> {
-        self.scores.clear();
-        if corpus.is_empty() {
-            return Ok(());
-        }
-
-        let entries_per_item: Vec<&[SigEntry]> = corpus.iter().map(|(_, e)| e.as_slice()).collect();
-        let (aggs, _) = scan_core(
-            provenance,
-            &entries_per_item,
-            probe_syn,
-            probe_sem,
-            probe_prag,
-            self.top_k,
-            self.span_alpha,
-            self.hit_threshold,
-            false,
-        )?;
-
-        for ((key, _), [syn_a, sem_a, prag_a]) in corpus.iter().zip(aggs) {
-            self.scores.insert(
-                *key,
-                PerDepthScores {
-                    syn: syn_a.finish(),
-                    sem: sem_a.finish(),
-                    prag: prag_a.finish(),
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Section-keyed sibling of [`Self::scan`].
-    ///
-    /// Same algorithm — sort by `byte_offset` for sequential mmap
-    /// access, accumulate per-(section, depth) Hamming agreements
-    /// against the probes, finalise into [`PerDepthScores`].  The only
-    /// difference is the corpus shape: keys are
-    /// [`crate::projection::SectionId`] not [`TurnKey`].
-    /// Results land in [`Self::section_scores`].
-    ///
-    /// Section scoring runs on the same probe as a turn scan; callers
-    /// typically issue both to score the full corpus (turns + sections)
-    /// against the same query in one round trip.
-    pub fn scan_sections(
-        &mut self,
-        provenance: &ProvenanceFile,
-        probe_syn: &[TokenSignature],
-        probe_sem: &[TokenSignature],
-        probe_prag: &[TokenSignature],
-        corpus: &[(SectionId, Vec<SigEntry>)],
-    ) -> crate::Result<()> {
-        self.section_scores.clear();
-        self.section_hit_log.clear();
-        if corpus.is_empty() {
-            return Ok(());
-        }
-
-        let entries_per_item: Vec<&[SigEntry]> = corpus.iter().map(|(_, e)| e.as_slice()).collect();
-        let (aggs, raw_hits) = scan_core(
-            provenance,
-            &entries_per_item,
-            probe_syn,
-            probe_sem,
-            probe_prag,
-            self.top_k,
-            self.span_alpha,
-            self.hit_threshold,
-            self.record_hits,
-        )?;
-
-        for ((section_id, _), [syn_a, sem_a, prag_a]) in corpus.iter().zip(aggs) {
-            self.section_scores.insert(
-                *section_id,
-                PerDepthScores {
-                    syn: syn_a.finish(),
-                    sem: sem_a.finish(),
-                    prag: prag_a.finish(),
-                },
-            );
-        }
-
-        if let Some(hits) = raw_hits {
-            for ((section_id, _), section_hits) in corpus.iter().zip(hits) {
-                self.section_hit_log.insert(*section_id, section_hits);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Core mmap-walk shared by [`BdpScanner::scan`] and [`BdpScanner::scan_sections`].
-///
-/// `entries_per_item[i]` is the slice of [`SigEntry`] records for corpus item `i`.
-/// Entries are sorted by byte offset before the walk so the OS prefetcher reads
-/// the mmap sequentially.
-///
-/// Returns one `[Aggregator; 3]` per item (in corpus order) and, when
-/// `record_hits` is `true`, one `Vec<TokenHit>` per item.
-fn scan_core(
-    provenance: &ProvenanceFile,
-    entries_per_item: &[&[SigEntry]],
-    probe_syn: &[TokenSignature],
-    probe_sem: &[TokenSignature],
-    probe_prag: &[TokenSignature],
-    top_k: usize,
-    span_alpha: f32,
-    hit_threshold: u32,
-    record_hits: bool,
-) -> crate::Result<(Vec<[Aggregator; 3]>, Option<Vec<Vec<TokenHit>>>)> {
-    let n_items = entries_per_item.len();
-
-    // Scan one corpus item's chunks into its own `[Aggregator; 3]`.  Each item's
-    // aggregators are private, so items scan fully in parallel with no shared
-    // state and no merge — the parallel width is the number of turns/sections,
-    // which is exactly what grows as the substrate gets large.
-    let scan_item = |ci: usize, mmap: &[u8]| -> ([Aggregator; 3], Option<Vec<TokenHit>>) {
-        let file_len = mmap.len();
-        let mut agg = [
-            Aggregator::new(top_k, span_alpha),
-            Aggregator::new(top_k, span_alpha),
-            Aggregator::new(top_k, span_alpha),
-        ];
-        let mut hits: Option<Vec<TokenHit>> = record_hits.then(Vec::new);
-
-        // The aggregates are order-independent, so the common path walks the
-        // item's entries as stored.  Only `record_hits` cares about emission
-        // order, so it alone pays for the byte-offset sort.
-        let mut visit: Vec<&SigEntry> = entries_per_item[ci].iter().collect();
-        if record_hits {
-            visit.sort_unstable_by_key(|e| e.byte_offset);
-        }
-
-        for entry in visit {
-            if entry.token_count == 0 {
-                continue;
-            }
-            let n = entry.token_count as usize;
-            let offset = entry.byte_offset as usize;
-            let total = n * ENTRY_BYTES_PER_TOKEN;
-            if offset + total > file_len {
-                continue;
-            }
-            let chunk = &mmap[offset..offset + total];
-            let depth_slices: [&[u8]; NUM_DEPTHS] = [
-                &chunk[depth_byte_range(DEPTH_SYNTACTIC, n)],
-                &chunk[depth_byte_range(DEPTH_SEMANTIC, n)],
-                &chunk[depth_byte_range(DEPTH_PRAGMATIC, n)],
-            ];
-            let probes: [&[TokenSignature]; NUM_DEPTHS] = [probe_syn, probe_sem, probe_prag];
-
-            for (di, (data, probe)) in depth_slices.iter().zip(probes.iter()).enumerate() {
-                accumulate_depth(data, n, probe, &mut agg[di], hit_threshold);
-
-                if let Some(ref mut hits) = hits {
-                    for ct in 0..n {
-                        let c_bytes = &data
-                            [ct * TokenSignature::BYTE_LEN..(ct + 1) * TokenSignature::BYTE_LEN];
-                        for (pt, p) in probe.iter().enumerate() {
-                            let agreement = popcount_xnor(c_bytes, p.as_bytes());
-                            if agreement >= hit_threshold {
-                                hits.push(TokenHit {
-                                    probe_tok: pt as u16,
-                                    corpus_tok: ct as u16,
-                                    agreement,
-                                    depth: di as u8,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (agg, hits)
+/// Parallel over query tokens (each token's per-group scan is independent). This
+/// is a flat O(gallery) scan — fine for the substrate-scale galleries here; large
+/// corpora want an index (LSH/kNN) or the GPU Hamming path.
+pub fn score_provenance_late_fusion(
+    query: &[WideQSig],
+    gallery: &[&WideQSig],
+    gallery_case: &[u32],
+    n_cases: usize,
+) -> Vec<f32> {
+    let shape: Option<&WideQSig> = query.first().or_else(|| gallery.first().copied());
+    let Some(shape) = shape else {
+        return vec![0.0; n_cases];
     };
-
-    // Run every item in parallel over the shared, read-only mmap.  Collecting an
-    // indexed range preserves item order, so the caller's `corpus.iter().zip`
-    // stays aligned.  The scan executes inside `with_mmap`, so all tasks finish
-    // before the mapping is released.
-    let results: Vec<([Aggregator; 3], Option<Vec<TokenHit>>)> = provenance.with_mmap(|mmap| {
-        (0..n_items)
-            .into_par_iter()
-            .map(|ci| scan_item(ci, mmap))
-            .collect()
-    })?;
-
-    let mut aggs: Vec<[Aggregator; 3]> = Vec::with_capacity(n_items);
-    let mut raw_hits: Option<Vec<Vec<TokenHit>>> = record_hits.then(|| Vec::with_capacity(n_items));
-    for (agg, hits) in results {
-        aggs.push(agg);
-        if let (Some(rh), Some(h)) = (raw_hits.as_mut(), hits) {
-            rh.push(h);
-        }
-    }
-
-    Ok((aggs, raw_hits))
-}
-
-/// Walk all `(probe_tok, corpus_tok)` pairs for one (turn, depth) chunk and
-/// fold each agreement into `agg`.  Dispatches at runtime to the fastest
-/// available kernel: AVX-512 (`VPOPCNTDQ`) → AVX2 → scalar.  All three paths
-/// produce byte-identical aggregates — the scalar path is the reference oracle
-/// the SIMD paths are tested against.
-#[inline]
-fn accumulate_depth(
-    data: &[u8],
-    n: usize,
-    probe: &[TokenSignature],
-    agg: &mut Aggregator,
-    hit_threshold: u32,
-) {
-    if probe.is_empty() || n == 0 {
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
+    let wph = shape.words_per_head();
+    let n_heads = shape.n_heads as usize;
+    if wph == 0
+        || n_heads < HEADS_PER_GROUP
+        || gallery.is_empty()
+        || gallery.len() != gallery_case.len()
     {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vpopcntdq") {
-            // SAFETY: both features detected at runtime immediately above.
-            unsafe {
-                accumulate_depth_avx512(data, n, probe, agg, hit_threshold);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: feature detected at runtime immediately above.
-            unsafe {
-                accumulate_depth_avx2(data, n, probe, agg, hit_threshold);
-            }
-            return;
-        }
+        return vec![0.0; n_cases];
     }
-    accumulate_depth_scalar(data, n, probe, agg, hit_threshold);
-}
+    let n_groups = n_heads / HEADS_PER_GROUP;
+    let gw = HEADS_PER_GROUP * wph; // words per layer-group
+    let need = n_groups * gw;
+    let n_gal = gallery.len() as f32;
 
-/// Scalar fallback: outer loop over corpus tokens, inner over probes.
-fn accumulate_depth_scalar(
-    data: &[u8],
-    n: usize,
-    probe: &[TokenSignature],
-    agg: &mut Aggregator,
-    hit_threshold: u32,
-) {
-    agg.ensure_probe_best(probe.len());
-    for ci in 0..n {
-        let c_bytes = &data[ci * TokenSignature::BYTE_LEN..(ci + 1) * TokenSignature::BYTE_LEN];
-        for (pi, p) in probe.iter().enumerate() {
-            let agreement = popcount_xnor(c_bytes, p.as_bytes());
-            agg.observe(agreement, hit_threshold);
-            if agreement > agg.probe_best[pi] {
-                agg.probe_best[pi] = agreement;
-            }
-            if agreement >= hit_threshold {
-                agg.ensure_probe_hits(probe.len());
-                agg.probe_hits[pi] = true;
-            }
-        }
-    }
-}
-
-/// AVX2 fast path: broadcasts each probe signature to a 256-bit register,
-/// then processes two corpus tokens (32 bytes) per SIMD iteration using the
-/// standard nibble-table popcount trick (`vpshufb` + `vpsadbw`).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn accumulate_depth_avx2(
-    data: &[u8],
-    n: usize,
-    probe: &[TokenSignature],
-    agg: &mut Aggregator,
-    hit_threshold: u32,
-) {
-    use std::arch::x86_64::*;
-
-    const B: usize = TokenSignature::BYTE_LEN; // 16
-
-    // Nibble → popcount lookup, duplicated for both 128-bit halves of a YMM.
-    let lut = _mm256_setr_epi8(
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
-        3, 4,
-    );
-    let lo_mask = _mm256_set1_epi8(0x0F_u8 as i8);
-    let zero = _mm256_setzero_si256();
-
-    agg.ensure_probe_best(probe.len());
-    for (pi, p) in probe.iter().enumerate() {
-        // Broadcast 16-byte probe → 32-byte YMM (same value in both halves).
-        let probe128 = _mm_loadu_si128(p.as_bytes().as_ptr() as *const __m128i);
-        let probe256 = _mm256_broadcastsi128_si256(probe128);
-
-        let mut ci = 0usize;
-        let mut probe_hit = false;
-        let mut best_pi = 0u32;
-        // Two corpus tokens (32 bytes) per AVX2 iteration.
-        while ci + 2 <= n {
-            let corpus256 = _mm256_loadu_si256(data.as_ptr().add(ci * B) as *const __m256i);
-
-            // Per-byte Hamming bits via nibble popcount of XOR.
-            let xor_v = _mm256_xor_si256(corpus256, probe256);
-            let lo = _mm256_and_si256(xor_v, lo_mask);
-            let hi = _mm256_and_si256(_mm256_srli_epi16(xor_v, 4), lo_mask);
-            let pc = _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo), _mm256_shuffle_epi8(lut, hi));
-
-            // vpsadbw sums bytes in 64-bit blocks → 4 × u64 partial sums.
-            let sad = _mm256_sad_epu8(pc, zero);
-            let lo128 = _mm256_castsi256_si128(sad);
-            let hi128 = _mm256_extracti128_si256(sad, 1);
-
-            // Token ci+0: Hamming = bytes 0..15 = sad lane0 + lane1.
-            let hdist0 =
-                (_mm_extract_epi64(lo128, 0) as u64 + _mm_extract_epi64(lo128, 1) as u64) as u32;
-            // Token ci+1: Hamming = bytes 16..31 = sad lane2 + lane3.
-            let hdist1 =
-                (_mm_extract_epi64(hi128, 0) as u64 + _mm_extract_epi64(hi128, 1) as u64) as u32;
-
-            let ag0 = 128 - hdist0;
-            let ag1 = 128 - hdist1;
-            agg.observe(ag0, hit_threshold);
-            agg.observe(ag1, hit_threshold);
-            best_pi = best_pi.max(ag0).max(ag1);
-            if ag0 >= hit_threshold || ag1 >= hit_threshold {
-                probe_hit = true;
-            }
-            ci += 2;
-        }
-
-        // Scalar tail for odd n.
-        if ci < n {
-            let c = &data[ci * B..(ci + 1) * B];
-            let ag = popcount_xnor(c, p.as_bytes());
-            agg.observe(ag, hit_threshold);
-            best_pi = best_pi.max(ag);
-            if ag >= hit_threshold {
-                probe_hit = true;
-            }
-        }
-
-        if best_pi > agg.probe_best[pi] {
-            agg.probe_best[pi] = best_pi;
-        }
-        if probe_hit {
-            agg.ensure_probe_hits(probe.len());
-            agg.probe_hits[pi] = true;
-        }
-    }
-}
-
-/// AVX-512 fast path (`VPOPCNTDQ`): broadcasts each probe signature across the
-/// four 128-bit lanes of a ZMM, processes **four corpus tokens (64 bytes) per
-/// iteration**, and — crucially — folds the aggregates with **SIMD reductions
-/// instead of a per-pair scalar `observe`**.  The Hamming distance is a single
-/// `_mm512_popcnt_epi64` over the XOR, and:
-///
-/// - `sum`  — accumulates the raw eight-lane popcounts (Σ hd = Σ per-64-bit
-///   popcounts), no pairing required;
-/// - `max` / `probe_best` — a running `_mm512_min_epu64` of the per-token
-///   distances (max agreement ⇔ min distance);
-/// - `count` — a `_mm512_cmple_epu64_mask` + `kpopcnt`;
-/// - `top_k` — a SIMD gate (`_mm512_cmple_epu64_mask` against the running
-///   K-th-largest) that routes only candidates to the authoritative
-///   [`Aggregator::insert_topk`], which re-checks against the live minimum so
-///   the result is identical to `observe` regardless of batch order.
-///
-/// Only the 1..=3-token scalar tail and the rare top-K inserts touch scalar
-/// code.  Output is byte-for-byte equal to the scalar oracle (see
-/// `simd_paths_match_scalar_randomized`).  Requires only `avx512f` +
-/// `avx512vpopcntdq` — no `avx512vl` or `avx512bw`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512vpopcntdq")]
-unsafe fn accumulate_depth_avx512(
-    data: &[u8],
-    n: usize,
-    probe: &[TokenSignature],
-    agg: &mut Aggregator,
-    hit_threshold: u32,
-) {
-    use std::arch::x86_64::*;
-
-    const B: usize = TokenSignature::BYTE_LEN; // 16
-
-    // The dispatcher guards this, but the kernel is called directly in tests:
-    // with no corpus tokens there are no pairs, so nothing to aggregate (and
-    // the empty-corpus sentinel `pbest = 0` must not register as a hit).
-    if n == 0 {
-        return;
-    }
-
-    // Gather even / odd u64 lanes so each 128-bit token's two lane-popcounts
-    // pair-sum into one Hamming distance.  After popcnt, lane layout is
-    // [t0a,t0b, t1a,t1b, t2a,t2b, t3a,t3b]; even+odd lands the four token
-    // distances in lanes 0..4 (duplicated into 4..8, which the reductions
-    // either tolerate — min — or mask off — count / top_k — via `& 0x0F`).
-    let even_idx = _mm512_setr_epi64(0, 2, 4, 6, 0, 2, 4, 6);
-    let odd_idx = _mm512_setr_epi64(1, 3, 5, 7, 1, 3, 5, 7);
-
-    // agreement >= threshold  ⟺  hd <= 128 - threshold.
-    let hit_hd_max: u64 = 128u64.saturating_sub(u64::from(hit_threshold));
-    let hit_hd_vec = _mm512_set1_epi64(hit_hd_max as i64);
-
-    agg.ensure_probe_best(probe.len());
-
-    // Accumulators shared across every probe in this call.
-    let mut gsum_pc = _mm512_setzero_si512(); // Σ raw per-64-bit popcounts = Σ hd
-    let mut tail_hd: u64 = 0;
-    let mut hits: u64 = 0;
-    let mut run_max: u32 = agg.max;
-    let mut lanes = [0u64; 8];
-
-    for (pi, p) in probe.iter().enumerate() {
-        // Broadcast the 16-byte probe to all four 128-bit lanes of a ZMM.
-        let probe128 = _mm_loadu_si128(p.as_bytes().as_ptr() as *const __m128i);
-        let probe512 = _mm512_broadcast_i32x4(probe128);
-
-        let mut pmin = _mm512_set1_epi64(128); // per-probe min hd → probe_best
-        let mut buf = [0u64; 4];
-
-        // Top-K gate threshold for this probe (refreshed on every insert).
-        let mut qual_hd: i64 = agg.topk_qual_hd();
-        let mut qual_vec = _mm512_set1_epi64(qual_hd.max(0));
-
-        let mut ci = 0usize;
-        // Four corpus tokens (64 bytes) per AVX-512 iteration.
-        while ci + 4 <= n {
-            let corpus512 = _mm512_loadu_si512(data.as_ptr().add(ci * B) as *const __m512i);
-            let pc = _mm512_popcnt_epi64(_mm512_xor_si512(corpus512, probe512));
-            gsum_pc = _mm512_add_epi64(gsum_pc, pc);
-
-            let even = _mm512_permutexvar_epi64(even_idx, pc);
-            let odd = _mm512_permutexvar_epi64(odd_idx, pc);
-            let hd = _mm512_add_epi64(even, odd);
-            pmin = _mm512_min_epu64(pmin, hd);
-
-            let hit_mask = _mm512_cmple_epu64_mask(hd, hit_hd_vec) & 0x0F;
-            hits += u64::from(hit_mask.count_ones());
-
-            // Top-K: gate first (cheap, rarely set once the heap is warm),
-            // then route only the qualifying lanes to the exact insert.
-            if qual_hd >= 0 {
-                let tk_mask = _mm512_cmple_epu64_mask(hd, qual_vec) & 0x0F;
-                if tk_mask != 0 {
-                    _mm256_storeu_si256(
-                        buf.as_mut_ptr() as *mut __m256i,
-                        _mm512_castsi512_si256(hd),
-                    );
-                    for (lane, &h) in buf.iter().enumerate() {
-                        if tk_mask & (1u8 << lane) != 0 {
-                            agg.insert_topk(128 - h as u32);
-                        }
+    // Each query token contributes, per group, one `z × margin` vote for the
+    // leading case (the tool whose best-matching gallery token agrees most).
+    let per_query: Vec<Vec<(usize, f32)>> = query
+        .par_iter()
+        .filter(|q| q.words.len() >= need)
+        .map(|q| {
+            let mut case_max = vec![0u32; n_cases];
+            let mut out = Vec::with_capacity(n_groups);
+            for g in 0..n_groups {
+                let base = g * gw;
+                let qg = &q.words[base..base + gw];
+                for m in case_max.iter_mut() {
+                    *m = 0;
+                }
+                let (mut sum, mut sumsq) = (0u64, 0u64);
+                for (j, cand) in gallery.iter().enumerate() {
+                    if cand.words.len() < base + gw {
+                        continue;
                     }
-                    qual_hd = agg.topk_qual_hd();
-                    qual_vec = _mm512_set1_epi64(qual_hd.max(0));
+                    let ag = group_agreement(qg, &cand.words[base..base + gw]);
+                    let c = gallery_case[j] as usize;
+                    if c < n_cases && ag > case_max[c] {
+                        case_max[c] = ag;
+                    }
+                    sum += ag as u64;
+                    sumsq += (ag as u64) * (ag as u64);
+                }
+                // Leader and runner-up case agreements → margin.
+                let (mut top1, mut top1c, mut top2) = (0u32, usize::MAX, 0u32);
+                for (c, &m) in case_max.iter().enumerate() {
+                    if m > top1 {
+                        top2 = top1;
+                        top1 = m;
+                        top1c = c;
+                    } else if m > top2 {
+                        top2 = m;
+                    }
+                }
+                if top1c != usize::MAX {
+                    let mean = sum as f32 / n_gal;
+                    let var = (sumsq as f32 / n_gal - mean * mean).max(1e-6);
+                    let z = ((top1 as f32 - mean) / var.sqrt()).max(0.0);
+                    let margin = top1.saturating_sub(top2) as f32;
+                    out.push((top1c, z * margin));
                 }
             }
-            ci += 4;
-        }
+            out
+        })
+        .collect();
 
-        // Scalar tail for the remaining 1..=3 tokens.
-        while ci < n {
-            let c = &data[ci * B..(ci + 1) * B];
-            let ag = popcount_xnor(c, p.as_bytes());
-            let hd = u64::from(128 - ag);
-            tail_hd += hd;
-            if hd <= hit_hd_max {
-                hits += 1;
-            }
-            pmin = _mm512_min_epu64(pmin, _mm512_set1_epi64(hd as i64));
-            if qual_hd >= 0 && (hd as i64) <= qual_hd {
-                agg.insert_topk(ag);
-                qual_hd = agg.topk_qual_hd();
-                // No `qual_vec` refresh here: the scalar tail gates on `qual_hd`
-                // directly, and the SIMD `qual_vec` broadcast is re-derived from
-                // `agg.topk_qual_hd()` at the top of the next probe (above).
-            }
-            ci += 1;
-        }
+    // Needle gate: keep only the top `NEEDLE_KEEP_FRAC` of query tokens by total
+    // vote magnitude, so a sparse discriminative signal dominates and the diffuse
+    // remainder is dropped — position-independently. See the module docs (§82).
+    if per_query.is_empty() {
+        return vec![0.0; n_cases];
+    }
+    let mags: Vec<f32> = per_query
+        .iter()
+        .map(|contribs| contribs.iter().map(|(_, v)| *v).sum())
+        .collect();
+    let keep_n = ((NEEDLE_KEEP_FRAC * mags.len() as f32).ceil() as usize).clamp(1, mags.len());
+    let mut sorted = mags.clone();
+    sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+    let thresh = sorted[keep_n - 1];
 
-        // Finalize this probe: min hd → best agreement.
-        _mm512_storeu_si512(lanes.as_mut_ptr() as *mut __m512i, pmin);
-        let pmin_hd = lanes.iter().copied().min().unwrap_or(128);
-        let pbest = 128u32.saturating_sub(pmin_hd as u32);
-        run_max = run_max.max(pbest);
-        if pbest > agg.probe_best[pi] {
-            agg.probe_best[pi] = pbest;
-        }
-        if pbest >= hit_threshold {
-            agg.ensure_probe_hits(probe.len());
-            agg.probe_hits[pi] = true;
+    let mut votes = vec![0f32; n_cases];
+    for (contribs, &mag) in per_query.iter().zip(&mags) {
+        if mag >= thresh {
+            for &(case, v) in contribs {
+                votes[case] += v;
+            }
         }
     }
-
-    // Fold the shared accumulators into the aggregator.
-    _mm512_storeu_si512(lanes.as_mut_ptr() as *mut __m512i, gsum_pc);
-    let total_hd: u64 = lanes.iter().sum::<u64>() + tail_hd;
-    let pairs = (n as u64) * (probe.len() as u64);
-    agg.sum += pairs * 128 - total_hd;
-    agg.count_pairs += pairs;
-    agg.count_hits += hits;
-    agg.max = run_max;
-}
-
-/// Hamming agreement between two `TokenSignature::BYTE_LEN`-byte signatures:
-/// `popcount(XNOR(a, b))`, in the range `0..=128`.
-/// Uses u128 XOR + NOT + count_ones → 2 POPCNT instructions on x86-64.
-#[inline]
-fn popcount_xnor(a: &[u8], b: &[u8; TokenSignature::BYTE_LEN]) -> u32 {
-    debug_assert_eq!(a.len(), TokenSignature::BYTE_LEN);
-    let a_arr: &[u8; TokenSignature::BYTE_LEN] = a.try_into().expect("BYTE_LEN == 16");
-    let a128 = u128::from_le_bytes(*a_arr);
-    let b128 = u128::from_le_bytes(*b);
-    (!(a128 ^ b128)).count_ones()
+    votes
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -892,553 +183,46 @@ fn popcount_xnor(a: &[u8], b: &[u8; TokenSignature::BYTE_LEN]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{TimelineId, TurnIndex, TurnKey, TurnScores};
 
-    /// Test fixture: synthesise a deterministic [`TimelineId`].  The
-    /// scanner doesn't care which timeline a corpus entry belongs to —
-    /// it just keys per-[`TurnKey`].
-    fn timeline_id() -> TimelineId {
-        TimelineId::for_test(1)
-    }
-
-    fn sig_with_first_byte(b: u8) -> TokenSignature {
-        let mut bytes = [0u8; 16];
-        bytes[0] = b;
-        TokenSignature::from_bytes(&bytes)
-    }
-
-    #[test]
-    fn aggregator_basic_stats() {
-        let mut agg = Aggregator::new(3, 2.0);
-        for &v in &[10u32, 50, 90, 100, 128, 60] {
-            agg.observe(v, 95);
-        }
-        let s = agg.finish();
-        assert_eq!(s.max, 128.0);
-        assert_eq!(s.sum, (10 + 50 + 90 + 100 + 128 + 60) as f32);
-        assert_eq!(s.mean, s.sum / 6.0);
-        // Top-3: 128, 100, 90 → mean = 318/3 = 106
-        assert_eq!(s.top_k_mean, 318.0 / 3.0);
-        // Hits >= 95: 100 and 128
-        assert_eq!(s.count, 2.0);
-    }
-
-    #[test]
-    fn aggregator_top_k_smaller_than_observations() {
-        let mut agg = Aggregator::new(2, 2.0);
-        for &v in &[10u32, 50, 90, 100, 128, 60] {
-            agg.observe(v, 95);
-        }
-        let s = agg.finish();
-        // Top-2: 128, 100 → mean = 114
-        assert_eq!(s.top_k_mean, 114.0);
-    }
-
-    #[test]
-    fn aggregator_top_k_capacity_one() {
-        let mut agg = Aggregator::new(1, 2.0);
-        for &v in &[5u32, 200, 50] {
-            agg.observe(v, 100);
-        }
-        let s = agg.finish();
-        assert_eq!(s.top_k_mean, 200.0);
-    }
-
-    #[test]
-    fn popcount_identical_signatures_is_128() {
-        let s = sig_with_first_byte(0xAB);
-        let bytes = s.as_bytes();
-        assert_eq!(popcount_xnor(bytes, bytes), 128);
-    }
-
-    #[test]
-    fn popcount_complement_signatures_is_0() {
-        let mut a_bytes = [0u8; 16];
-        let mut b_bytes = [0u8; 16];
-        for i in 0..16 {
-            a_bytes[i] = 0xFF;
-            b_bytes[i] = 0x00;
-        }
-        assert_eq!(popcount_xnor(&a_bytes, &b_bytes), 0);
-    }
-
-    #[test]
-    fn scanner_empty_corpus_returns_empty_scores() {
-        let provenance = ProvenanceFile::new().unwrap();
-        let mut scanner = BdpScanner::new();
-        scanner.scan(&provenance, &[], &[], &[], &[]).unwrap();
-        assert!(scanner.scores().is_empty());
-    }
-
-    #[test]
-    fn scanner_clears_between_calls() {
-        let provenance = ProvenanceFile::new().unwrap();
-        let probe = sig_with_first_byte(0x11);
-        let corpus_sig = sig_with_first_byte(0x11);
-        let entry = provenance
-            .append(&[corpus_sig], &[corpus_sig], &[corpus_sig])
-            .unwrap();
-        let t = timeline_id();
-        let i = TurnIndex(0);
-        let key = TurnKey::new(t, i);
-
-        let mut scanner = BdpScanner::new();
-        scanner
-            .scan(
-                &provenance,
-                &[probe],
-                &[probe],
-                &[probe],
-                &[(key, vec![entry])],
-            )
-            .unwrap();
-        assert_eq!(scanner.scores().len(), 1);
-
-        // Empty corpus on the next scan should clear the map.
-        scanner
-            .scan(&provenance, &[probe], &[probe], &[probe], &[])
-            .unwrap();
-        assert!(scanner.scores().is_empty());
-    }
-
-    #[test]
-    fn scanner_identical_probe_and_corpus_yields_max_128() {
-        let provenance = ProvenanceFile::new().unwrap();
-        let s = sig_with_first_byte(0x33);
-        let entry = provenance
-            .append(&[s, s, s], &[s, s, s], &[s, s, s])
-            .unwrap();
-        let t = timeline_id();
-        let i = TurnIndex(0);
-        let key = TurnKey::new(t, i);
-
-        let mut scanner = BdpScanner::new().with_hit_threshold(120);
-        scanner
-            .scan(&provenance, &[s], &[s], &[s], &[(key, vec![entry])])
-            .unwrap();
-
-        let scores = scanner.scores().get(&key).unwrap();
-        // 3 corpus tokens × 1 probe token = 3 pairs, each agreement = 128
-        assert_eq!(scores.syn.max, 128.0);
-        assert_eq!(scores.sem.max, 128.0);
-        assert_eq!(scores.prag.max, 128.0);
-        assert_eq!(scores.syn.sum, 384.0);
-        assert_eq!(scores.syn.mean, 128.0);
-        assert_eq!(scores.syn.top_k_mean, 128.0);
-        assert_eq!(scores.syn.count, 3.0);
-    }
-
-    // ── AVX2 fast-path tests ──────────────────────────────────────────────────
-
-    fn sigs_to_bytes(sigs: &[TokenSignature]) -> Vec<u8> {
-        sigs.iter()
-            .flat_map(|s| s.as_bytes().iter().copied())
-            .collect()
-    }
-
-    fn run_scalar_agg(data: &[u8], n: usize, probe: &[TokenSignature], thr: u32) -> TurnScores {
-        let mut agg = Aggregator::new(8, 2.0);
-        accumulate_depth_scalar(data, n, probe, &mut agg, thr);
-        agg.finish()
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn run_avx2_agg(
-        data: &[u8],
-        n: usize,
-        probe: &[TokenSignature],
-        thr: u32,
-    ) -> Option<TurnScores> {
-        if !is_x86_feature_detected!("avx2") {
-            return None;
-        }
-        let mut agg = Aggregator::new(8, 2.0);
-        unsafe {
-            accumulate_depth_avx2(data, n, probe, &mut agg, thr);
-        }
-        Some(agg.finish())
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    fn run_avx2_agg(_: &[u8], _: usize, _: &[TokenSignature], _: u32) -> Option<TurnScores> {
-        None
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn run_avx512_agg(
-        data: &[u8],
-        n: usize,
-        probe: &[TokenSignature],
-        thr: u32,
-    ) -> Option<TurnScores> {
-        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vpopcntdq")) {
-            return None;
-        }
-        let mut agg = Aggregator::new(8, 2.0);
-        unsafe {
-            accumulate_depth_avx512(data, n, probe, &mut agg, thr);
-        }
-        Some(agg.finish())
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    fn run_avx512_agg(_: &[u8], _: usize, _: &[TokenSignature], _: u32) -> Option<TurnScores> {
-        None
-    }
-
-    #[test]
-    fn avx2_identical_signatures_agreement_128() {
-        let sig = sig_with_first_byte(0xAB);
-        let corpus = [sig, sig];
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 2, &[sig], 90);
-        assert_eq!(s.max, 128.0);
-        if let Some(a) = run_avx2_agg(&data, 2, &[sig], 90) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
+    /// A folded signature: 12 heads (3 groups × 4), head_dim 128 → 24 u64 words.
+    fn folded_sig(fill: u64) -> WideQSig {
+        WideQSig {
+            n_heads: 12,
+            words: vec![fill; 24],
         }
     }
 
     #[test]
-    fn avx2_complement_signatures_agreement_0() {
-        let probe = {
-            let mut b = [0xFFu8; 16];
-            b[0] = 0xFF;
-            TokenSignature::from_bytes(&b)
-        };
-        let corpus_sig = TokenSignature::from_bytes(&[0x00u8; 16]);
-        let corpus = [corpus_sig, corpus_sig];
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 2, &[probe], 10);
-        assert_eq!(s.max, 0.0);
-        if let Some(a) = run_avx2_agg(&data, 2, &[probe], 10) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-        }
+    fn late_fusion_votes_for_best_matching_case() {
+        let a = folded_sig(0xAAAA_AAAA_AAAA_AAAA);
+        let b = folded_sig(0x5555_5555_5555_5555); // bitwise complement of a
+        let gallery = [&a, &b];
+        let cases = [0u32, 1];
+
+        // Query = A. Per group: case-0 max = A·A = 512, case-1 max = A·B = 0.
+        // mean=256, std=256, z=(512-256)/256 = 1.0; margin = 512 − 0 = 512; the
+        // vote is z×margin = 512 per group → 3 groups → votes[0] = 1536.
+        let votes = score_provenance_late_fusion(&[a.clone()], &gallery, &cases, 2);
+        assert!(
+            (votes[0] - 1536.0).abs() < 1e-2,
+            "case 0 exact match: {votes:?}"
+        );
+        assert_eq!(votes[1], 0.0, "case 1 (complement) gets no vote");
+
+        // Query = B → case 1 wins symmetrically.
+        let votes = score_provenance_late_fusion(&[b.clone()], &gallery, &cases, 2);
+        assert!((votes[1] - 1536.0).abs() < 1e-2);
+        assert_eq!(votes[0], 0.0);
     }
 
     #[test]
-    fn avx2_matches_scalar_n1_scalar_tail_only() {
-        // n=1: no full AVX2 pairs, only the scalar tail fires.
-        let probe = sig_with_first_byte(0x55);
-        let corpus = [sig_with_first_byte(0x55)];
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 1, &[probe], 90);
-        if let Some(a) = run_avx2_agg(&data, 1, &[probe], 90) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-        }
-    }
-
-    #[test]
-    fn avx2_matches_scalar_n3_pair_plus_tail() {
-        // n=3: one full AVX2 pair + one scalar tail.
-        let probe = sig_with_first_byte(0x33);
-        let c0 = sig_with_first_byte(0x33); // full match
-        let c1 = sig_with_first_byte(0x00); // partial
-        let c2 = sig_with_first_byte(0xFF); // partial
-        let corpus = [c0, c1, c2];
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 3, &[probe], 64);
-        if let Some(a) = run_avx2_agg(&data, 3, &[probe], 64) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-        }
-    }
-
-    #[test]
-    fn avx2_matches_scalar_multi_probe() {
-        // Multiple probe tokens — exercises the outer probe loop in AVX2 path.
-        let p0 = sig_with_first_byte(0xAA);
-        let p1 = sig_with_first_byte(0x55);
-        let c0 = sig_with_first_byte(0xAA);
-        let c1 = sig_with_first_byte(0x55);
-        let c2 = sig_with_first_byte(0xFF);
-        let c3 = sig_with_first_byte(0x00);
-        let corpus = [c0, c1, c2, c3];
-        let data = sigs_to_bytes(&corpus);
-        let probe = [p0, p1];
-        let s = run_scalar_agg(&data, 4, &probe, 64);
-        if let Some(a) = run_avx2_agg(&data, 4, &probe, 64) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-        }
-    }
-
-    #[test]
-    fn avx2_matches_scalar_n4_exact_two_pairs() {
-        // n=4: exactly two AVX2 pairs, no tail.
-        let probe = sig_with_first_byte(0xCC);
-        let corpus: Vec<TokenSignature> = (0u8..4)
-            .map(|i| sig_with_first_byte(0xCC ^ (i * 0x11)))
-            .collect();
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 4, &[probe], 80);
-        if let Some(a) = run_avx2_agg(&data, 4, &[probe], 80) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-        }
-    }
-
-    // ── AVX-512 fast-path tests ───────────────────────────────────────────────
-
-    #[test]
-    fn avx512_identical_signatures_agreement_128() {
-        let sig = sig_with_first_byte(0xAB);
-        let corpus = [sig, sig, sig, sig];
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 4, &[sig], 90);
-        assert_eq!(s.max, 128.0);
-        if let Some(a) = run_avx512_agg(&data, 4, &[sig], 90) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-        }
-    }
-
-    #[test]
-    fn avx512_matches_scalar_n1_tail_only() {
-        // n=1: no full ZMM iteration, only the scalar tail fires.
-        let probe = sig_with_first_byte(0x55);
-        let corpus = [sig_with_first_byte(0x55)];
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 1, &[probe], 90);
-        if let Some(a) = run_avx512_agg(&data, 1, &[probe], 90) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-        }
-    }
-
-    #[test]
-    fn avx512_matches_scalar_n4_exact_one_zmm() {
-        // n=4: exactly one ZMM iteration, no tail.
-        let probe = sig_with_first_byte(0xCC);
-        let corpus: Vec<TokenSignature> = (0u8..4)
-            .map(|i| sig_with_first_byte(0xCC ^ (i * 0x11)))
-            .collect();
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 4, &[probe], 80);
-        if let Some(a) = run_avx512_agg(&data, 4, &[probe], 80) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-            assert_eq!(a.top_k_mean, s.top_k_mean);
-        }
-    }
-
-    #[test]
-    fn avx512_matches_scalar_n7_zmm_plus_tail() {
-        // n=7: one ZMM iteration (4 tokens) + 3 scalar-tail tokens.
-        let probe = sig_with_first_byte(0x33);
-        let corpus: Vec<TokenSignature> = (0u8..7)
-            .map(|i| sig_with_first_byte(0x33 ^ (i.wrapping_mul(0x07))))
-            .collect();
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 7, &[probe], 64);
-        if let Some(a) = run_avx512_agg(&data, 7, &[probe], 64) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-            assert_eq!(a.top_k_mean, s.top_k_mean);
-        }
-    }
-
-    #[test]
-    fn avx512_matches_scalar_n8_two_zmm() {
-        // n=8: exactly two ZMM iterations, no tail.
-        let probe = sig_with_first_byte(0x5A);
-        let corpus: Vec<TokenSignature> = (0u8..8)
-            .map(|i| sig_with_first_byte(0x5A ^ (i.wrapping_mul(0x13))))
-            .collect();
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, 8, &[probe], 70);
-        if let Some(a) = run_avx512_agg(&data, 8, &[probe], 70) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-            assert_eq!(a.top_k_mean, s.top_k_mean);
-        }
-    }
-
-    #[test]
-    fn avx512_matches_scalar_multi_probe() {
-        let p0 = sig_with_first_byte(0xAA);
-        let p1 = sig_with_first_byte(0x55);
-        let corpus: Vec<TokenSignature> = (0u8..6)
-            .map(|i| sig_with_first_byte(i.wrapping_mul(0x21)))
-            .collect();
-        let data = sigs_to_bytes(&corpus);
-        let probe = [p0, p1];
-        let s = run_scalar_agg(&data, 6, &probe, 64);
-        if let Some(a) = run_avx512_agg(&data, 6, &probe, 64) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-            assert_eq!(a.top_k_mean, s.top_k_mean);
-        }
-    }
-
-    /// Randomized three-way cross-check: scalar (oracle) vs AVX2 vs AVX-512 must
-    /// agree bit-for-bit across a sweep of corpus lengths (well past the top-K
-    /// cap, so the gate's warm-and-rare regime is exercised), probe counts,
-    /// hit thresholds (including the `0` / `128` extremes), and full random
-    /// 16-byte signatures.
-    #[test]
-    fn simd_paths_match_scalar_randomized() {
-        // Deterministic xorshift64 — no external rng dependency.
-        let mut state: u64 = 0x1234_5678_9abc_def0;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let rand_sig = |next: &mut dyn FnMut() -> u64| {
-            let mut b = [0u8; 16];
-            let lo = next().to_le_bytes();
-            let hi = next().to_le_bytes();
-            b[..8].copy_from_slice(&lo);
-            b[8..].copy_from_slice(&hi);
-            TokenSignature::from_bytes(&b)
-        };
-
-        let lengths = [0usize, 1, 2, 3, 4, 7, 8, 15, 16, 31, 33, 48, 64, 70];
-        let thresholds = [0u32, 64, 70, 90, 128];
-        for &n in &lengths {
-            for n_probe in 1..=5usize {
-                for &thr in &thresholds {
-                    let corpus: Vec<TokenSignature> = (0..n).map(|_| rand_sig(&mut next)).collect();
-                    let probe: Vec<TokenSignature> =
-                        (0..n_probe).map(|_| rand_sig(&mut next)).collect();
-                    let data = sigs_to_bytes(&corpus);
-                    let s = run_scalar_agg(&data, n, &probe, thr);
-                    let ctx = format!("n={n} p={n_probe} thr={thr}");
-
-                    if let Some(a) = run_avx2_agg(&data, n, &probe, thr) {
-                        assert_eq!(a.max, s.max, "avx2 max {ctx}");
-                        assert_eq!(a.sum, s.sum, "avx2 sum {ctx}");
-                        assert_eq!(a.count, s.count, "avx2 count {ctx}");
-                        assert_eq!(a.top_k_mean, s.top_k_mean, "avx2 topk {ctx}");
-                        assert_eq!(a.span, s.span, "avx2 span {ctx}");
-                        assert_eq!(a.pertok_excess, s.pertok_excess, "avx2 excess {ctx}");
-                    }
-                    if let Some(a) = run_avx512_agg(&data, n, &probe, thr) {
-                        assert_eq!(a.max, s.max, "avx512 max {ctx}");
-                        assert_eq!(a.sum, s.sum, "avx512 sum {ctx}");
-                        assert_eq!(a.count, s.count, "avx512 count {ctx}");
-                        assert_eq!(a.top_k_mean, s.top_k_mean, "avx512 topk {ctx}");
-                        assert_eq!(a.span, s.span, "avx512 span {ctx}");
-                        assert_eq!(a.pertok_excess, s.pertok_excess, "avx512 excess {ctx}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Top-K gate-off path: a corpus of many identical-to-probe signatures
-    /// fills the top-K with maximal (128) agreements, driving `topk_qual_hd`
-    /// to `-1`.  The AVX-512 path must still match the scalar oracle — top-K
-    /// stays saturated, no spurious inserts, sums/counts exact.
-    #[test]
-    fn avx512_topk_saturated_matches_scalar() {
-        let probe = sig_with_first_byte(0x77);
-        // 20 exact matches (> top_k cap of 8) then two partials.
-        let mut corpus: Vec<TokenSignature> = vec![probe; 20];
-        corpus.push(sig_with_first_byte(0x00));
-        corpus.push(sig_with_first_byte(0xFF));
-        let n = corpus.len();
-        let data = sigs_to_bytes(&corpus);
-        let s = run_scalar_agg(&data, n, &[probe], 90);
-        assert_eq!(s.max, 128.0);
-        assert_eq!(s.top_k_mean, 128.0);
-        if let Some(a) = run_avx512_agg(&data, n, &[probe], 90) {
-            assert_eq!(a.max, s.max);
-            assert_eq!(a.sum, s.sum);
-            assert_eq!(a.count, s.count);
-            assert_eq!(a.top_k_mean, s.top_k_mean);
-        }
-    }
-
-    #[test]
-    fn scanner_multi_turn_aggregates_separately() {
-        let provenance = ProvenanceFile::new().unwrap();
-        let s_match = sig_with_first_byte(0x55);
-        let s_mismatch = {
-            let mut b = [0u8; 16];
-            for (i, slot) in b.iter_mut().enumerate() {
-                *slot = !s_match.as_bytes()[i];
-            }
-            TokenSignature::from_bytes(&b)
-        };
-        let entry_match = provenance
-            .append(&[s_match], &[s_match], &[s_match])
-            .unwrap();
-        let entry_mismatch = provenance
-            .append(&[s_mismatch], &[s_mismatch], &[s_mismatch])
-            .unwrap();
-
-        let t = timeline_id();
-        let k_match = TurnKey::new(t, TurnIndex(0));
-        let k_mismatch = TurnKey::new(t, TurnIndex(1));
-
-        let mut scanner = BdpScanner::new();
-        scanner
-            .scan(
-                &provenance,
-                &[s_match],
-                &[s_match],
-                &[s_match],
-                &[
-                    (k_match, vec![entry_match]),
-                    (k_mismatch, vec![entry_mismatch]),
-                ],
-            )
-            .unwrap();
-
-        let m = scanner.scores().get(&k_match).unwrap();
-        let mm = scanner.scores().get(&k_mismatch).unwrap();
-        assert_eq!(m.syn.max, 128.0);
-        assert_eq!(mm.syn.max, 0.0);
-    }
-
-    /// Parallel-scan order alignment: with many turns scanned concurrently, the
-    /// per-item results must stay aligned to their input keys.  Each turn `i`
-    /// gets the all-`i` signature; the probe is all-`50`, so only turn 50 can
-    /// score an exact 128.  If the parallel `collect` ever reordered results,
-    /// the wrong `TurnKey` would carry the 128.
-    #[test]
-    fn scanner_parallel_many_turns_stay_aligned() {
-        let provenance = ProvenanceFile::new().unwrap();
-        let t = timeline_id();
-        let n_turns = 64usize;
-        let mk = |b: u8| TokenSignature::from_bytes(&[b; 16]);
-
-        let mut corpus = Vec::with_capacity(n_turns);
-        for i in 0..n_turns {
-            let sig = mk(i as u8);
-            let entry = provenance.append(&[sig], &[sig], &[sig]).unwrap();
-            corpus.push((TurnKey::new(t, TurnIndex(i as u32)), vec![entry]));
-        }
-
-        let probe = mk(50);
-        let mut scanner = BdpScanner::new();
-        scanner
-            .scan(&provenance, &[probe], &[probe], &[probe], &corpus)
-            .unwrap();
-
-        for i in 0..n_turns {
-            let key = TurnKey::new(t, TurnIndex(i as u32));
-            let max = scanner.scores().get(&key).unwrap().syn.max;
-            if i == 50 {
-                assert_eq!(max, 128.0, "turn {i} (exact match) must score 128");
-            } else {
-                assert!(max < 128.0, "turn {i} scored 128 but should not match");
-            }
-        }
+    fn late_fusion_empty_is_zero() {
+        assert_eq!(score_provenance_late_fusion(&[], &[], &[], 3), vec![0.0; 3]);
+        // Empty gallery with a query still returns zeros (nothing to vote for).
+        let a = folded_sig(0xFF);
+        assert_eq!(
+            score_provenance_late_fusion(&[a], &[], &[], 2),
+            vec![0.0; 2]
+        );
     }
 }

@@ -34,6 +34,12 @@ impl Scheduler {
     /// `PrefillProgress(0, total)` events so callers see their submission
     /// was picked up.
     pub(super) fn promote_new_prefills(&mut self) {
+        // Concurrent in-flight prefills. Governs how many sections of a bulk
+        // collection ingest (`insert_section_collection` fires one prefill per
+        // section) — and how many calibration cases' prefill phases — run
+        // together before the VRAM-pressure backpressure below throttles
+        // admission. The decode side of those waves is bounded separately
+        // (calibration's `CALIBRATION_BATCH`).
         const MAX_ACTIVE_PREFILLS: usize = 16;
         while self.active_prefills.len() < MAX_ACTIVE_PREFILLS {
             // VRAM-pressure backpressure (wave budgeting). Each admitted prefill
@@ -114,6 +120,7 @@ impl Scheduler {
             self.active_prefills.push(ActivePrefill {
                 work,
                 offset: 0,
+                next_projection: 0,
                 final_logits: None,
                 error,
                 prefill_start: None,
@@ -376,7 +383,17 @@ impl Scheduler {
                 p.prefill_start = Some(Instant::now());
             }
             let off = p.offset;
-            let advance = (p.work.tokens.len() - off).min(cap);
+            let mut advance = (p.work.tokens.len() - off).min(cap);
+            // Staged calibration prefill: don't advance past the next projection
+            // point, so the wave stops exactly on it and the advance loop below can
+            // emit that segment's projection. Normal prefills carry no offsets and
+            // advance by the full cap, co-batching in this same ragged forward.
+            if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
+                let seg_remaining = (next_off as usize).saturating_sub(off);
+                if seg_remaining > 0 {
+                    advance = advance.min(seg_remaining);
+                }
+            }
             let tokens = &p.work.tokens[off..off + advance];
             match Tensor::new(tokens, &self.device).and_then(|t| t.unsqueeze(0)) {
                 Ok(t) => {
@@ -501,6 +518,29 @@ impl Scheduler {
             let advance_tokens = p.work.tokens[off..off + advance].to_vec();
             super::Scheduler::record_slot_tokens(&mut self.slot_tokens, seq_id, &advance_tokens);
             p.offset += advance;
+            // Staged prefill: if this pass landed on the next projection point,
+            // emit that segment's projection (the pinned composition, spanned to
+            // this segment's generated tokens) and move to the next point. The
+            // client collects these `TurnEvent::Projection`s and persists them, so
+            // the sealed turn carries the same per-segment projection sequence a
+            // real decode produced.
+            if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
+                if p.offset >= next_off as usize {
+                    if let Some(comp) = &p.work.staged_composition {
+                        let gen_start = p.work.content_bounds.asst_start;
+                        let prev_off = if p.next_projection == 0 {
+                            gen_start
+                        } else {
+                            p.work.projection_offsets[p.next_projection - 1]
+                        };
+                        let mut ev = comp.clone();
+                        ev.start_token = prev_off.saturating_sub(gen_start);
+                        ev.end_token = next_off.saturating_sub(gen_start);
+                        let _ = p.work.event_tx.send(TurnEvent::Projection(ev));
+                    }
+                    p.next_projection += 1;
+                }
+            }
             let total = p.work.tokens.len();
             let _ = p.work.event_tx.send(TurnEvent::PrefillProgress {
                 tokens_done: p.offset,
@@ -532,6 +572,7 @@ impl Scheduler {
             let ActivePrefill {
                 work,
                 offset: _,
+                next_projection: _,
                 final_logits,
                 error,
                 prefill_start,
@@ -725,8 +766,10 @@ impl Scheduler {
                         sampling_config: work.sampling,
                         seal_action: work.seal_action,
                         post_decode_tokens: work.post_decode_tokens,
+                        belief: crate::projection::PriorBelief::default(),
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
+                        tags: work.tags,
                         content_bounds: work.content_bounds,
                         prefill_assistant_text: work.prefill_assistant_text,
                         finished: true,
@@ -749,7 +792,9 @@ impl Scheduler {
                             hs
                         },
                         reprojection: work.reprojection,
-                        prov_sig_entries: Vec::new(),
+                        non_punct_since_reproject: 0,
+                        last_projection_end: 0,
+                        in_tool_call: false,
                     },
                 );
             } else {
@@ -776,8 +821,10 @@ impl Scheduler {
                 sampling_config: work.sampling,
                 seal_action: work.seal_action,
                 post_decode_tokens: work.post_decode_tokens,
+                belief: crate::projection::PriorBelief::default(),
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
+                tags: work.tags,
                 content_bounds: work.content_bounds,
                 prefill_assistant_text: work.prefill_assistant_text,
                 finished: false,
@@ -800,7 +847,9 @@ impl Scheduler {
                     hs
                 },
                 reprojection: work.reprojection,
-                prov_sig_entries: Vec::new(),
+                non_punct_since_reproject: 0,
+                last_projection_end: 0,
+                in_tool_call: false,
             },
         );
     }

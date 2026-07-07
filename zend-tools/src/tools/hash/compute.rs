@@ -9,10 +9,17 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ComputeRequest {
+    /// Hash algorithm. One of: sha256, sha512, sha1, md5, sha3_256, sha3_512, blake3. Required.
+    #[schemars(with = "super::HashAlgorithm")]
     #[validate(length(min = 1))]
     pub algorithm: String,
+    /// The data to hash, interpreted according to `data_encoding`.
     pub data: String,
+    /// How `data` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub data_encoding: Option<String>,
+    /// Encoding for the returned digest. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub output_encoding: Option<String>,
 }
 

@@ -9,6 +9,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
+    /// VFS path of the file to delete (session-relative, e.g. `src/main.rs`). Required.
     #[validate(length(min = 1))]
     pub path: String,
 }

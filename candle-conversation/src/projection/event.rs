@@ -22,10 +22,43 @@
 //! [`from_projection`] adapter that classifies real [`ProjectionSegment`]s
 //! against the live [`Schema`] + [`ContentResolver`].
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use super::ids::{GroupId, SectionId};
+use super::ids::{GroupId, SectionId, TurnIndex};
 use super::project::{ProjectionSegment, SealedKind};
+
+/// The belief confidence per selected section/turn at a projection, produced by
+/// the online selection loop and stamped onto the [`ProjectionEvent`] so the next
+/// reprojection can seed its belief from the prior event. Unscored ids read `0.0`.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionScores {
+    sections: HashMap<SectionId, f32>,
+    turns: HashMap<(GroupId, u32), f32>,
+}
+
+impl SelectionScores {
+    /// Belief score for a section, or `0.0` if it carried none.
+    pub fn section(&self, id: SectionId) -> f32 {
+        self.sections.get(&id).copied().unwrap_or(0.0)
+    }
+
+    /// Belief score for a turn, or `0.0` if it carried none.
+    pub fn turn(&self, group: GroupId, index: TurnIndex) -> f32 {
+        self.turns.get(&(group, index.0)).copied().unwrap_or(0.0)
+    }
+
+    /// Record a section's belief score.
+    pub fn set_section(&mut self, id: SectionId, score: f32) {
+        self.sections.insert(id, score);
+    }
+
+    /// Record a turn's belief score.
+    pub fn set_turn(&mut self, group: GroupId, index: TurnIndex, score: f32) {
+        self.turns.insert((group, index.0), score);
+    }
+}
 use super::schema::{Schema, SystemPromptItem};
 use crate::substrate::ContentResolver;
 
@@ -63,19 +96,24 @@ pub struct ProjectionBucket {
 }
 
 /// One system-prompt section (bare or inside a collection) with the tokens it
-/// holds and whether provenance selected it for this projection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// holds, whether provenance selected it for this projection, and the belief
+/// confidence it carried. The `score` is the section's RelLeak belief value at
+/// this projection — persisted so the next reprojection can seed the belief
+/// from the prior event (the online decay/reinforcement across a turn).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectedSection {
     pub name: String,
     pub tokens: u32,
     pub selected: bool,
+    #[serde(default)]
+    pub score: f32,
 }
 
 /// One item of the system prompt, in materialized (declaration) order. Carries
 /// the structural template glue (role/block markers) alongside content so the
 /// panel shows the *complete* prompt — including the bits that close the tool
 /// block and the system block — not just the retrieved content sections.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SystemItem {
     /// A structural template segment (e.g. `tool_block_close`, `system_end`) —
@@ -97,7 +135,7 @@ pub enum SystemItem {
 }
 
 /// A conversation turn provenance pulled into this projection's window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectedTurn {
     /// The schema layer this turn's group belongs to (`dialogue`, `code_reading`,
     /// …) — so the panel can surface every projected memory tier, not just the
@@ -107,6 +145,10 @@ pub struct SelectedTurn {
     pub index: u32,
     pub role: String,
     pub tokens: u32,
+    /// The turn's belief confidence at this projection (0 for structurally-pinned
+    /// turns like `recent` that were not score-selected).
+    #[serde(default)]
+    pub score: f32,
 }
 
 /// The exact materialized-context selection for a projection — what provenance
@@ -117,7 +159,7 @@ pub struct SelectedTurn {
 /// selected; a collection is listed (with all its members) when ≥1 of its
 /// sections was selected — which naturally scopes the view to the projection's
 /// own layer without threading a layer id through.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectionSelection {
     /// The system prompt in materialized order: structural glue, bare content
     /// sections, and contributing collections interleaved exactly as emitted.
@@ -227,6 +269,7 @@ pub fn from_projection(
     segments: &[ProjectionSegment],
     schema: &Schema,
     resolver: &dyn ContentResolver,
+    scores: &SelectionScores,
     substrate_tokens: u32,
     start_token: u32,
     end_token: u32,
@@ -279,8 +322,29 @@ pub fn from_projection(
         end_token,
         seconds,
     );
-    event.selection = build_selection(segments, schema, resolver);
+    event.selection = build_selection(segments, schema, resolver, scores);
     event
+}
+
+impl ProjectionEvent {
+    /// The per-section belief scores this event recorded for the named
+    /// collection, as `(section name, score)` in declaration order — empty if the
+    /// collection did not contribute. The next reprojection seeds its belief from
+    /// these, so the online decay/reinforcement carries across a turn's
+    /// projections without the scheduler holding belief state.
+    pub fn collection_scores<'a>(&'a self, collection: &str) -> Vec<(&'a str, f32)> {
+        for item in &self.selection.system {
+            if let SystemItem::Collection { name, sections } = item {
+                if name == collection {
+                    return sections
+                        .iter()
+                        .map(|s| (s.name.as_str(), s.score))
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
 }
 
 /// Build the structured [`ProjectionSelection`] from the selected segments and
@@ -292,6 +356,7 @@ fn build_selection(
     segments: &[ProjectionSegment],
     schema: &Schema,
     resolver: &dyn ContentResolver,
+    scores: &SelectionScores,
 ) -> ProjectionSelection {
     let mut selected: std::collections::HashSet<SectionId> = std::collections::HashSet::new();
     let mut turns: Vec<SelectedTurn> = Vec::new();
@@ -316,6 +381,7 @@ fn build_selection(
                     index: t.index().0,
                     role: role_str(*role).to_string(),
                     tokens: resolver.turn_token_count(t.group(), t.index()) as u32,
+                    score: scores.turn(t.group(), t.index()),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -325,6 +391,7 @@ fn build_selection(
                     index: u32::MAX,
                     role: "user".to_string(),
                     tokens: tokens.len() as u32,
+                    score: 0.0,
                 });
             }
             // Compression-internal turn-half — not a displayed dialogue turn.
@@ -385,6 +452,7 @@ fn build_selection(
                                     name: s.name.clone(),
                                     tokens: resolver.section_token_count(s.id) as u32,
                                     selected: selected.contains(&s.id),
+                                    score: scores.section(s.id),
                                 })
                                 .collect(),
                         });
@@ -493,8 +561,10 @@ mod tests {
     use super::super::project::{
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
-    use super::super::schema::{DepthWeights, ScoreFormula};
-    use super::{aggregate, from_projection, BucketKind, SegmentTokens, SystemItem};
+    use super::{
+        aggregate, from_projection, BucketKind, ProjectionEvent, ProjectionSelection,
+        SegmentTokens, SelectedSection, SelectionScores, SystemItem,
+    };
     use crate::substrate::ContentResolver;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -660,13 +730,7 @@ layers:
         fn turn_token_count(&self, group: GroupId, index: TurnIndex) -> usize {
             *self.turn_tokens.get(&(group.raw(), index.0)).unwrap_or(&0)
         }
-        fn turn_score(
-            &self,
-            _group: GroupId,
-            _index: TurnIndex,
-            _formula: ScoreFormula,
-            _weights: &DepthWeights,
-        ) -> f32 {
+        fn turn_score(&self, _group: GroupId, _index: TurnIndex) -> f32 {
             0.0
         }
         fn section_token_count(&self, section: SectionId) -> usize {
@@ -725,7 +789,16 @@ layers:
             },
         ];
 
-        let ev = from_projection(&segments, schema, &res, 99_999, 0, 480, 12.0);
+        let ev = from_projection(
+            &segments,
+            schema,
+            &res,
+            &SelectionScores::default(),
+            99_999,
+            0,
+            480,
+            12.0,
+        );
 
         // system (64) leftmost, then code_read (300+500=800), then turns:
         // conversation (120+80=200) and current message (4).
@@ -781,7 +854,17 @@ layers:
             )),
         ];
 
-        let sel = from_projection(&segments, schema, &res, 1000, 0, 10, 1.0).selection;
+        let sel = from_projection(
+            &segments,
+            schema,
+            &res,
+            &SelectionScores::default(),
+            1000,
+            0,
+            10,
+            1.0,
+        )
+        .selection;
 
         // System prompt in order: bare `frame` section, then the `code_read`
         // collection (no template items in this fixture, so no glue rows).
@@ -811,6 +894,83 @@ layers:
         assert_eq!(sel.turns[0].role, "user");
         assert_eq!(sel.turns[0].index, 0);
         assert_eq!(sel.turns[0].tokens, 120);
+    }
+
+    #[test]
+    fn from_projection_stamps_belief_scores_on_members_and_turns() {
+        let b = Builder::from_yaml(YAML).unwrap();
+        let schema = b.schema();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let conv = b.id_for_group("conversation").unwrap();
+        let frame = b.id_for_section_in(dialogue, "frame").unwrap();
+        let file_a = b.id_for_section_in(dialogue, "file_a").unwrap();
+        let file_b = b.id_for_section_in(dialogue, "file_b").unwrap();
+
+        let mut res = TokResolver::default();
+        res.section_tokens.insert(frame.raw(), 64);
+        res.section_tokens.insert(file_a.raw(), 300);
+        res.section_tokens.insert(file_b.raw(), 500);
+        res.turn_tokens.insert((conv.raw(), 0), 120);
+
+        // Only file_a is selected; file_b is skipped but still carries a belief.
+        let segments = vec![
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: frame })),
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: file_a })),
+            ProjectionSegment::Sealed(SealedKind::Turn(
+                ResolvedTurn {
+                    id: TurnId {
+                        layer_id: dialogue,
+                        group_id: conv,
+                        index: TurnIndex(0),
+                    },
+                },
+                crate::Role::User,
+            )),
+        ];
+
+        let mut scores = SelectionScores::default();
+        scores.set_section(file_a, 42.0);
+        scores.set_section(file_b, 7.0);
+        scores.set_turn(conv, TurnIndex(0), 5.5);
+
+        let ev = from_projection(&segments, schema, &res, &scores, 1000, 0, 10, 1.0);
+
+        // The rebuild hook reads every member's belief — selected or not — so the
+        // next reprojection can seed the full acc, including decayed skips.
+        assert_eq!(
+            ev.collection_scores("code_read"),
+            vec![("file_a", 42.0), ("file_b", 7.0)]
+        );
+        assert_eq!(ev.selection.turns[0].score, 5.5);
+    }
+
+    #[test]
+    fn collection_scores_scopes_by_name_and_missing_is_empty() {
+        let ev = ProjectionEvent {
+            selection: ProjectionSelection {
+                system: vec![SystemItem::Collection {
+                    name: "tools".into(),
+                    sections: vec![
+                        SelectedSection {
+                            name: "a".into(),
+                            tokens: 1,
+                            selected: true,
+                            score: 12.5,
+                        },
+                        SelectedSection {
+                            name: "b".into(),
+                            tokens: 1,
+                            selected: false,
+                            score: 3.0,
+                        },
+                    ],
+                }],
+                turns: vec![],
+            },
+            ..Default::default()
+        };
+        assert_eq!(ev.collection_scores("tools"), vec![("a", 12.5), ("b", 3.0)]);
+        assert!(ev.collection_scores("nope").is_empty());
     }
 
     #[test]
@@ -874,7 +1034,17 @@ layers:
             },
         ];
 
-        let sel = from_projection(&segments, schema, &res, 1000, 0, 10, 1.0).selection;
+        let sel = from_projection(
+            &segments,
+            schema,
+            &res,
+            &SelectionScores::default(),
+            1000,
+            0,
+            10,
+            1.0,
+        )
+        .selection;
 
         assert_eq!(sel.system.len(), 3, "glue + section + glue, in order");
         match &sel.system[0] {

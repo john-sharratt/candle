@@ -29,7 +29,7 @@ pub enum SelectionOrigin {
     /// Provenance score was below the recency-decay floor, but the
     /// recency decay still made it competitive enough to win a slot.
     RecencyDecay,
-    /// Provenance score won the slot — i.e. the BDP scan ruled this
+    /// Provenance score won the slot — i.e. the provenance scan ruled this
     /// node relevant to the current probe Q.
     ProvenanceScore,
     /// Greedy fit left a coverage gap; the smallest covering node was

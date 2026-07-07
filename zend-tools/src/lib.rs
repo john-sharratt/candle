@@ -66,6 +66,7 @@
 //! pub const REGISTRATION: RegisteredTool = RegisteredTool::new::<MyTool>();
 //! ```
 
+pub mod calibration;
 pub mod context;
 pub mod registry;
 pub mod runner;

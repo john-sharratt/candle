@@ -924,6 +924,25 @@ impl ChunkedKvBacking {
         Some(seq.writer_start_idx())
     }
 
+    /// Per-chunk `(offset, len, cum_before)` real-token window for a sequence — the
+    /// exact layout attention reads (writer chunk gets the `seq_offset`-derived
+    /// length). A provenance / diagnostic gather consults this to check only real
+    /// slots and skip partial-chunk padding. See
+    /// [`super::types::SequenceState::provenance_chunk_layout`].
+    pub fn provenance_chunk_layout(
+        &self,
+        batch_idx: usize,
+        seq_offset: usize,
+    ) -> Vec<(u16, u16, usize)> {
+        let Ok(state) = self.state.read() else {
+            return Vec::new();
+        };
+        match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
+            Some(seq) => seq.provenance_chunk_layout(seq_offset),
+            None => Vec::new(),
+        }
+    }
+
     pub fn live_chunks_as_sealed(
         &self,
         batch_idx: usize,

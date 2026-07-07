@@ -12,15 +12,25 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ReqRequest {
+    /// ID of an open session (from http_session_open). Must be non-empty.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// HTTP verb: GET, POST, PUT, PATCH, DELETE, HEAD, or OPTIONS. Default: GET.
     pub method: Option<String>,
+    /// Request path appended to the session's base_url, or an absolute http(s):// URL.
     pub path: String,
+    /// Per-request headers, merged over the session defaults. Omit for none.
     pub headers: Option<HashMap<String, String>>,
+    /// Query-string parameters appended to the URL. Omit for none.
     pub query: Option<HashMap<String, String>>,
+    /// Raw request body sent as-is. Use `body_json` instead for JSON. Omit for no body.
     pub body: Option<String>,
+    /// JSON request body; sets Content-Type to application/json. Takes precedence over `body`.
+    /// Omit for no JSON body.
     pub body_json: Option<serde_json::Value>,
+    /// Per-request timeout override in seconds. Omit to use the session timeout.
     pub timeout_sec: Option<u32>,
+    /// Cap on bytes read from the response body (max 1048576). Default: 32768.
     #[validate(range(max = 1048576))]
     pub max_response_bytes: Option<usize>,
 }

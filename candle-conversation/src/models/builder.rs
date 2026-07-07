@@ -106,6 +106,10 @@ pub struct ModelBuilder {
     /// Workspace root whose `.substrate/` directory backs the persistence
     /// redo log. `None` falls back to the process working directory.
     workspace_path: Option<PathBuf>,
+    /// When `true`, the engine does not spawn the async summariser thread and
+    /// new conversations are not registered for summarisation (the AVL summary
+    /// forest is left un-extended). Off by default.
+    disable_summariser: bool,
 }
 
 impl ModelBuilder {
@@ -130,8 +134,17 @@ impl ModelBuilder {
             health_config: DecodeHealthConfig::default(),
             max_hot_turns: 0,
             workspace_path: None,
+            disable_summariser: false,
             spec,
         }
+    }
+
+    /// Disable the background summariser thread (and the per-conversation
+    /// summarisation registration). Use to bring the engine up without the
+    /// AVL summary forest running — e.g. for bulk corpus prefill.
+    pub fn disable_summariser(mut self, disable: bool) -> Self {
+        self.disable_summariser = disable;
+        self
     }
 
     /// Set the workspace root whose `.substrate/` directory backs the
@@ -464,7 +477,11 @@ impl ModelBuilder {
             // initial `Builder::project()` happened to compute at
             // submit time.
             reproject_every_n_tokens: 64,
-            reproject_max_probe_tokens: 64,
+            // The belief probe covers the last N decode-window tokens. 256 spans
+            // a full tool-call turn's discriminative span; the §80.2 sweep shows
+            // the true tool is always within Top-3 at this width (100% recall at
+            // budget 3), where a 64-token tail needed budget 5. See docs §80.2.
+            reproject_max_probe_tokens: 256,
             // Linefeed is the most reliable paragraph/section break
             // signal across chat templates and content styles.
             reproject_trigger_texts: vec!["\n".to_string()],
@@ -551,6 +568,7 @@ impl ModelBuilder {
         );
 
         let mut ret = EngineConfig::new(eos_tokens.into());
+        ret.disable_summariser = self.disable_summariser;
         ret.batched_config.compression_level = Some(self.kv_compression_level);
         // Until decode's K-side honors non-identity pal_map with non-unit
         // outer scales, force K storage to uniform Q4_KS with identity

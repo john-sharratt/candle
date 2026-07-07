@@ -9,8 +9,11 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SearchRequest {
+    /// Content substring to search for. Defaults to "" (no text filter); at least one of query or tags must be supplied.
     pub query: Option<String>,
+    /// Tags that returned notes must include. Defaults to none; at least one of query or tags must be supplied.
     pub tags: Option<Vec<String>>,
+    /// Maximum results to return (1–50). Defaults to 10.
     #[validate(range(min = 1, max = 50))]
     pub max_results: Option<u32>,
 }

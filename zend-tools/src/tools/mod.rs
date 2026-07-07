@@ -66,3 +66,29 @@ pub mod unit_convert;
 pub mod weather;
 pub mod web_fetch;
 pub mod web_search;
+
+use schemars::JsonSchema;
+use serde::Serialize;
+
+// Schema-only mirrors of the encoding names the per-module decoders accept. Tool
+// request `*_encoding` fields stay `Option<String>` for decoding; these types are
+// referenced via `#[schemars(with = "Option<…>")]` purely so the generated JSON
+// schema carries a real `"enum"` of the allowed values. `BytesEncoding` lives in
+// `bytes` next to `decode_bytes`.
+
+/// Encoding format for crypto/hash byte inputs and outputs.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DataEncoding {
+    Text,
+    Hex,
+    Base64,
+}
+
+/// Encoding format for received session bytes.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecvEncoding {
+    Auto,
+    Hex,
+}

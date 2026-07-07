@@ -9,6 +9,10 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
+    /// Optional type filter (e.g. ssh_key, http_bearer). An "API key" may be
+    /// stored under more than one type, so prefer omitting the filter and
+    /// scanning the full list rather than guessing a single type.
+    #[schemars(with = "Option<super::CredType>")]
     #[serde(rename = "type")]
     pub cred_type: Option<String>,
 }

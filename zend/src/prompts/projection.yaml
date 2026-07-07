@@ -48,6 +48,20 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── Default selection policy ───────────────────────────────────────────────────
+#
+# The belief-update (RelLeak) + budget + tag-scope policy inherited by every
+# layer, collection, and group that declares none. Nodes override individual
+# fields or name a different preset; the `tools` collection uses
+# `committed_tool_scope`. See docs/tool_selection_provenance_results.md §24.
+#
+# Presets: committed_tool_scope (β0.40, min1000/evict750, budget 1..3) ·
+#          high_recall_scope (β0.40, min40/evict20, budget 1..5) ·
+#          single_pick (budget 1..1).
+default_policy:
+  preset: high_recall_scope
+
+
 # ── Layers ───────────────────────────────────────────────────────────────────
 #
 # Per-layer system prompts
@@ -175,12 +189,6 @@ layers:
       trims aggressively.
     window: 6000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: cross-corpus sweep, 640 probes × 64 items.
-    # sem+prag (prag-heavy): MRR=1.000, Top-1=100%.  Raw ratio: sem:3, prag:4.
-    depth_weights:
-      syntactic: 0.0
-      semantic:  3.0
-      pragmatic: 4.0
     budget:
       priority: 25
     system_prompt:
@@ -255,13 +263,6 @@ layers:
       enums, type aliases.  One turn per file.
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: syntactic-only: MRR=0.483, Top-1=42.5%.
-    # Weakest cross-corpus signal — confused with other code-analysis layers.
-    # Syntactic band best isolates file-level structural patterns.
-    depth_weights:
-      syntactic: 1.0
-      semantic:  0.0
-      pragmatic: 0.0
     budget:
       priority: 10
     system_prompt:
@@ -336,12 +337,6 @@ layers:
       deps, implicit couplings.  Crucial for cross-cutting questions.
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: syn+prag (prag-heavy): MRR=0.960, Top-1=93.8%.
-    # Raw ratio: syn:1, prag:3.
-    depth_weights:
-      syntactic: 1.0
-      semantic:  0.0
-      pragmatic: 3.0
     budget:
       priority: 15
     system_prompt:
@@ -419,12 +414,6 @@ layers:
       encodes (Phase 5).
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: syn+sem (syn-heavy): MRR=1.000, Top-1=100%.
-    # Raw ratio: syn:3, sem:2.
-    depth_weights:
-      syntactic: 3.0
-      semantic:  2.0
-      pragmatic: 0.0
     budget:
       priority: 20
     system_prompt:
@@ -505,12 +494,6 @@ layers:
       handling (Phase 6).
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: semantic-only: MRR=0.629, Top-1=58.7%.
-    # Weakest non-code layer — conceptual critique vocabulary is largely semantic.
-    depth_weights:
-      syntactic: 0.0
-      semantic:  1.0
-      pragmatic: 0.0
     budget:
       priority: 15
     system_prompt:
@@ -590,13 +573,6 @@ layers:
       suggestion (Phase 7).
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: syntactic-only: MRR=1.000, Top-1=100%.
-    # Bug analysis produces highly idiomatic low-level syntactic patterns
-    # (error checks, boundary conditions) that are perfectly distinctive.
-    depth_weights:
-      syntactic: 1.0
-      semantic:  0.0
-      pragmatic: 0.0
     budget:
       priority: 20
     system_prompt:
@@ -686,12 +662,6 @@ layers:
       Per-day converged summaries of prior developer conversations.
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: syn+sem (sem-heavy): MRR=0.981, Top-1=96.2%.
-    # Raw ratio: syn:1, sem:3.
-    depth_weights:
-      syntactic: 1.0
-      semantic:  3.0
-      pragmatic: 0.0
     budget:
       priority: 30
     system_prompt:
@@ -771,13 +741,6 @@ layers:
       Speculative exploration logs from the overnight dream phase.
     window: 8000
     score_threshold: 0.0
-    # Calibrated 2026-05-16: all three bands (syn-dominant): MRR=0.868, Top-1=78.8%.
-    # Raw ratio: syn:3, sem:1, prag:2.  Speculative content is stylistically
-    # varied — no single band dominates; all three contribute marginal SNR.
-    depth_weights:
-      syntactic: 3.0
-      semantic:  1.0
-      pragmatic: 2.0
     budget:
       priority: 10
     system_prompt:
@@ -1037,12 +1000,17 @@ layers:
 
         - kind: collection
           name: tools
-          selection: { kind: top_k, k: 5 }
-          score_threshold: 140.70  # calibrated: prag_only, TP=100%, FP=9% on tools corpus
-          depth_weights:
-            syntactic: 0.0
-            semantic: 0.0
-            pragmatic: 1.0
+          # The belief-driven tool scope: RelLeak β0.40, hysteresis min1000/evict750,
+          # budget 1..3, pinned-per-turn. `tags: [tool]` scopes the gather to
+          # tool-tagged calibration turns plus any live conversation that
+          # reinforces them. See docs/tool_selection_provenance_results.md §24.6.
+          policy:
+            preset: committed_tool_scope
+            tags: [tool]
+          # `selection` mirrors the policy budget (max 3) for the pre-belief
+          # selection path; once the belief loop drives selection the policy's
+          # budget is the single source of truth.
+          selection: { kind: top_k, k: 3 }
           # Config only this pass — the section-group compression *execution* path
           # is a follow-up. When built it is TWO stages, not a single prompt: the
           # model can reliably propose categories but cannot bulk-assign ~90 tools

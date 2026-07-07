@@ -93,14 +93,6 @@ impl Scheduler {
             );
         }
 
-        // Extract provenance Q-sigs after advance_sequence so the offset is
-        // current.  The newly-completed block (if any) is guaranteed R16 —
-        // it finished this step and the bg_quantizer cannot have touched it
-        // yet.  Results accumulate in DecodeState::prov_sig_entries and are
-        // passed to perform_seal_and_write, making seal-time extraction cover
-        // only the final partial block (also always R16).
-        self.extract_prov_after_step(&seq_ids);
-
         // Clone sampling configs before taking mutable references
         let configs: Vec<SamplingConfig> = seq_ids
             .iter()
@@ -533,23 +525,59 @@ impl Scheduler {
                 //       intervals even on long uninterrupted spans.
                 //   (b) Punctuation: the just-sampled token is in the
                 //       policy's `trigger_token_ids` set (linefeed, period,
-                //       etc.).  Re-orients attention at semantic
-                //       transitions — paragraph/sentence boundaries — which
-                //       are usually the natural moments to reconsider what
-                //       context the model needs next.
+                //       etc.) AND more than 16 non-trigger tokens have been
+                //       decoded since the last projection.  Re-orients attention
+                //       at semantic transitions, but the content gate stops short
+                //       lines and runs of trigger tokens from each re-projecting.
                 // De-duped so a token that satisfies BOTH only queues once.
                 // Skipped when the sequence just finished — finalize fires
                 // via `cleanup_finished` instead.
                 if !state.finished {
-                    if let Some(p) = state.reprojection.as_ref() {
-                        let cadence_fire = p.every_n_tokens > 0
-                            && state.generated_tokens.len() % p.every_n_tokens == 0;
-                        let punctuation_fire = !p.trigger_token_ids.is_empty()
-                            && p.trigger_token_ids.contains(&next_token);
-                        if (cadence_fire || punctuation_fire)
-                            && !self.pending_reprojections.contains(&seq_id)
-                        {
-                            self.pending_reprojections.push(seq_id);
+                    // Compute the flags via a match so the immutable borrow of
+                    // `state.reprojection` ends before we mutate the counter below.
+                    let flags = match state.reprojection.as_ref() {
+                        Some(p) => Some((
+                            !p.trigger_token_ids.is_empty()
+                                && p.trigger_token_ids.contains(&next_token),
+                            p.every_n_tokens > 0
+                                && state.generated_tokens.len() % p.every_n_tokens == 0,
+                            p.tool_call_open_id == Some(next_token),
+                            p.tool_call_close_id == Some(next_token),
+                        )),
+                        None => None,
+                    };
+                    if let Some((is_trigger, cadence_fire, is_tool_open, is_tool_close)) = flags {
+                        if is_tool_open {
+                            // Entering the tool call: fire one lock-in reprojection so
+                            // the tool committed from the reasoning so far is what the
+                            // model sees, then freeze — the generic call body must not
+                            // re-orient the selection.
+                            if !self.pending_reprojections.contains(&seq_id) {
+                                self.pending_reprojections.push(seq_id);
+                            }
+                            state.non_punct_since_reproject = 0;
+                            state.in_tool_call = true;
+                        } else if is_tool_close {
+                            // Leaving the call: reprojection re-enables for whatever
+                            // follows (further calls, or the seal).
+                            state.in_tool_call = false;
+                            state.non_punct_since_reproject = 0;
+                        } else if state.in_tool_call {
+                            // Inside the call body — every cadence/punctuation trigger
+                            // is suppressed so the committed tool stays fixed.
+                        } else {
+                            let punctuation_fire =
+                                is_trigger && state.non_punct_since_reproject > 16;
+                            if cadence_fire || punctuation_fire {
+                                if !self.pending_reprojections.contains(&seq_id) {
+                                    self.pending_reprojections.push(seq_id);
+                                }
+                                state.non_punct_since_reproject = 0;
+                            } else if !is_trigger {
+                                // A non-trigger token adds to the content accumulated
+                                // toward the next punctuation-driven reprojection.
+                                state.non_punct_since_reproject += 1;
+                            }
                         }
                     }
                 }
@@ -560,7 +588,7 @@ impl Scheduler {
     /// Drain the queue of views whose decoded count crossed an
     /// `every_n_tokens` boundary in the last `batch_decode_step`.
     ///
-    /// Each entry triggers a BDP scan + projection + view swap; on
+    /// Each entry triggers a provenance scan + projection + view swap; on
     /// success the view's `SequenceId` changes (the new id is internal
     /// to the scheduler — never visible to the caller).  Failures mark
     /// the view as finished with an error event.
@@ -571,7 +599,7 @@ impl Scheduler {
         let _t_drain = super::PhaseTimer::new("drain_reprojections");
         let pending = std::mem::take(&mut self.pending_reprojections);
 
-        // Phase 1 — prepare each view: BDP scan + projection + tier elevate +
+        // Phase 1 — prepare each view: provenance scan + projection + tier elevate +
         // inject the sealed prefix + build the gap-fill descriptor. Removes the
         // view's `DecodeState` into the in-flight; does NOT fire the forward.
         let mut inflights: Vec<super::ReprojectInFlight> = Vec::new();

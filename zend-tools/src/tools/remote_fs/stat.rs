@@ -11,8 +11,10 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct StatRequest {
+    /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Remote file or directory path to stat.
     #[validate(length(min = 1))]
     pub path: String,
 }

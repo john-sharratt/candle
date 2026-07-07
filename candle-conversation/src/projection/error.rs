@@ -125,18 +125,18 @@ pub enum ConstructionError {
     #[error("conversation rule for {name:?} must have recent >= 1 or historical_top_k >= 1")]
     InvalidConversationK { name: String },
 
-    /// A depth weight in the `depth_weights` block was negative.
-    #[error("depth_weights for {layer:?} must all be >= 0, got {value} for {depth}")]
-    NegativeDepthWeight {
-        layer: String,
-        depth: &'static str,
-        value: f32,
-    },
+    /// `named` selection had a missing or empty `selector` (nothing could
+    /// ever resolve a member to pick).
+    #[error("named rule for {name:?} must have a non-empty selector")]
+    EmptyNamedSelector { name: String },
 
-    /// All three depth weights were zero. At least one must be > 0 so the
-    /// combine formula has a non-zero denominator.
-    #[error("depth_weights for {layer:?} must have at least one positive weight")]
-    AllDepthWeightsZero { layer: String },
+    /// A `policy:` block named a preset that does not exist.
+    #[error("policy for {name:?} names unknown preset {preset:?}")]
+    UnknownPolicyPreset { name: String, preset: String },
+
+    /// A `policy:` block resolved to invalid values (bad beta, thresholds, or budget).
+    #[error("policy for {name:?} is invalid: {reason}")]
+    InvalidPolicy { name: String, reason: String },
 
     /// Runtime mutator (e.g. [`super::Builder::add_section`]) was given an
     /// id that no layer in the schema owns.

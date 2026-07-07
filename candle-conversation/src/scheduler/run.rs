@@ -48,7 +48,7 @@ impl Scheduler {
             // batch.  Must run BEFORE cleanup_finished so a swap that
             // re-keys an active_decodes entry doesn't race with finalize.
             // Timed separately (a sub-slice of the decode quantum) because the
-            // BDP scan + glue gap-fill here is a prime "grows over time" suspect.
+            // provenance scan + glue gap-fill here is a prime "grows over time" suspect.
             let t_reproj = Instant::now();
             self.drain_pending_reprojections();
             self.wave_stats

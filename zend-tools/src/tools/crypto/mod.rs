@@ -10,7 +10,7 @@
 //! |------|-----------|--------|
 //! | `aead_encrypt` | AES-128/256-GCM, ChaCha20-Poly1305 | `aes-gcm`, `chacha20poly1305` |
 //! | `aead_decrypt` | same | same |
-//! | `hmac_compute` | HMAC-SHA256/512 | `hmac`, `sha2` |
+//! | `hmac_compute` | HMAC-SHA256/512/1 | `hmac`, `sha2`, `sha1` |
 //! | `signature_sign` | Ed25519, ECDSA-P256 | `ed25519-dalek`, `p256` |
 //! | `signature_verify` | Ed25519, ECDSA-P256 | same |
 //! | `kdf_derive` | Argon2id, PBKDF2-SHA256, scrypt | `argon2`, `pbkdf2`, `scrypt` |
@@ -51,6 +51,8 @@
 //! | `expand_failed` | HKDF expand error |
 
 use crate::ToolError;
+use schemars::JsonSchema;
+use serde::Serialize;
 use thiserror::Error;
 
 pub mod aead_decrypt;
@@ -140,4 +142,74 @@ pub fn encode_output(bytes: &[u8], encoding: &str) -> String {
         }
         _ => hex::encode(bytes),
     }
+}
+
+/// Canonicalize an algorithm name for matching: lowercase, dropping every
+/// non-alphanumeric character. So `"AES-256-GCM"`, `"aes256gcm"`, and
+/// `"AES_256_GCM"` all map to `"aes256gcm"`, and `"SHA-256"` to `"sha256"`.
+/// The `match` arms below compare against this normalized form, so the model
+/// can spell an algorithm in its natural display casing and still hit the
+/// right branch.
+pub fn normalize_algorithm(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+// Schema-only mirrors of each tool's accepted `algorithm` values. The request
+// fields stay `String`; these are referenced via `#[schemars(with = "…")]` so
+// the generated JSON schema carries a real `"enum"` of canonical names, steering
+// the model to emit them. `normalize_algorithm` then matches case/separator
+// variants defensively.
+
+/// AEAD cipher.
+#[derive(JsonSchema, Serialize)]
+pub enum AeadAlgorithm {
+    #[serde(rename = "aes128gcm")]
+    Aes128Gcm,
+    #[serde(rename = "aes256gcm")]
+    Aes256Gcm,
+    #[serde(rename = "chacha20poly1305")]
+    ChaCha20Poly1305,
+}
+
+/// HMAC hash function.
+#[derive(JsonSchema, Serialize)]
+pub enum HmacAlgorithm {
+    #[serde(rename = "sha256")]
+    Sha256,
+    #[serde(rename = "sha512")]
+    Sha512,
+    #[serde(rename = "sha1")]
+    Sha1,
+}
+
+/// HKDF hash function.
+#[derive(JsonSchema, Serialize)]
+pub enum HkdfHash {
+    #[serde(rename = "sha256")]
+    Sha256,
+    #[serde(rename = "sha512")]
+    Sha512,
+}
+
+/// Digital-signature scheme.
+#[derive(JsonSchema, Serialize)]
+pub enum SignatureAlgorithm {
+    #[serde(rename = "ed25519")]
+    Ed25519,
+    #[serde(rename = "p256_sha256")]
+    P256Sha256,
+}
+
+/// Password-based key-derivation function.
+#[derive(JsonSchema, Serialize)]
+pub enum KdfAlgorithm {
+    #[serde(rename = "argon2id")]
+    Argon2id,
+    #[serde(rename = "pbkdf2_sha256")]
+    Pbkdf2Sha256,
+    #[serde(rename = "scrypt")]
+    Scrypt,
 }

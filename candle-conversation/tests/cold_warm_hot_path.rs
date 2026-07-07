@@ -193,7 +193,6 @@ fn seed_section(
             section,
             candle_conversation::persistence::streams::StreamId::default(),
             N_TOKENS_PER_TURN,
-            Vec::new(),
             Arc::new(sealed_per_layer),
             |seqs| Ok(seqs.to_vec()),
             Arc::new(vec![0u32; N_TOKENS_PER_TURN]),
@@ -456,9 +455,7 @@ fn full_cold_warm_hot_round_trip() {
     //  how the daemon's startup path sets up timelines.)
     conv.register_timeline(timeline, layer_id, group_id);
 
-    let restored = conv
-        .reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    let restored = conv.reconstruct_from_log(N_LAYERS, None).unwrap();
     assert_eq!(
         restored, N_TURNS,
         "all persisted turns recovered from the redo log"
@@ -833,8 +830,7 @@ fn single_format_cold_round_trip(label: &str, target_format: Option<KvFormat>) {
     let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
-    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    conv.reconstruct_from_log(N_LAYERS, None).unwrap();
 
     let key = TurnKey::new(timeline, TurnIndex(0));
     let main_stream = cuda_stream(&device);
@@ -938,8 +934,7 @@ fn cold_marker_turn_passes_existence_check() {
     let conv = open_conversation(&dir);
     let backings = make_backings(&device);
     conv.register_timeline(timeline, layer_id, group_id);
-    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    conv.reconstruct_from_log(N_LAYERS, None).unwrap();
 
     let key = TurnKey::new(timeline, TurnIndex(0));
 
@@ -1061,9 +1056,7 @@ fn cold_load_q8_single_chunk_diagnostic() {
     let conv = open_conversation(&dir);
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
-    let restored = conv
-        .reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    let restored = conv.reconstruct_from_log(N_LAYERS, None).unwrap();
     assert_eq!(restored, 1);
 
     // Inspect the recovered chunk grid before elevation runs.
@@ -1215,9 +1208,7 @@ fn quant_blend_cold_round_trip() {
     let backings = make_backings_f16(&device, QUANT_HEAD_DIM);
     conv.register_timeline(timeline, layer_id, group_id);
 
-    let restored = conv
-        .reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    let restored = conv.reconstruct_from_log(N_LAYERS, None).unwrap();
     assert_eq!(restored, formats.len(), "all mixed-format turns recovered");
 
     let main_stream = cuda_stream(&device);
@@ -1501,9 +1492,7 @@ fn multi_chunk_turn_round_trip() {
     let conv = open_conversation(&dir);
     let backings = make_backings(&device);
     conv.register_timeline(timeline, layer_id, group_id);
-    let restored = conv
-        .reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    let restored = conv.reconstruct_from_log(N_LAYERS, None).unwrap();
     assert_eq!(restored, 1);
 
     let st = turn_state(&conv, key);
@@ -1593,8 +1582,7 @@ fn archive_state_survives_restart() {
     {
         let conv = open_conversation(&dir);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS, None).unwrap();
         assert!(
             conv.is_conversation_archived(timeline),
             "archived flag must survive the restart-reload"
@@ -1610,8 +1598,7 @@ fn archive_state_survives_restart() {
     {
         let conv = open_conversation(&dir);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS, None).unwrap();
         assert!(
             !conv.is_conversation_archived(timeline),
             "unarchive must also survive — last-writer-wins on ConvState"
@@ -1834,8 +1821,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
     let conv = open_conversation(&dir);
     let backings = make_backings_adaptive(&device, QUANT_HEAD_DIM, &policy);
     conv.register_timeline(timeline, layer_id, group_id);
-    conv.reconstruct_from_log(N_LAYERS, |_| Ok(Vec::new()), None)
-        .unwrap();
+    conv.reconstruct_from_log(N_LAYERS, None).unwrap();
 
     // Pre-elevate: cold-marker only.
     let key = TurnKey::new(timeline, TurnIndex(0));
@@ -2395,8 +2381,7 @@ fn quantize_on_evict_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2432,8 +2417,7 @@ fn quantize_on_evict_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2462,8 +2446,7 @@ fn quantize_on_evict_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2566,8 +2549,7 @@ fn no_policy_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2591,8 +2573,7 @@ fn no_policy_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2631,8 +2612,7 @@ fn no_policy_metadata_round_trip() {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device);
         conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(N_LAYERS_METADATA, |_| Ok(Vec::new()), None)
-            .unwrap();
+        conv.reconstruct_from_log(N_LAYERS_METADATA, None).unwrap();
 
         let main_stream = cuda_stream(&device);
         let mut pinned: Option<PinnedBuf> = None;
@@ -2733,7 +2713,6 @@ fn seed_section_with_format(
             section,
             stream_id,
             n_tokens,
-            Vec::new(),
             Arc::new(sealed_per_layer),
             |seqs| Ok(seqs.to_vec()),
             Arc::new(vec![0u32; n_tokens]),

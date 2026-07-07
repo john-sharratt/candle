@@ -29,10 +29,14 @@ impl ToolError for TotpError {
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// Name of the stored totp_secret credential to read. Required, non-empty.
     #[validate(length(min = 1))]
     pub credential_name: String,
+    /// Number of digits in the generated code. Defaults to 6.
     pub digits: Option<u32>,
+    /// Time step in seconds for code rotation. Defaults to 30.
     pub period_sec: Option<u32>,
+    /// Hash algorithm. One of: "sha1", "sha256", "sha512". Defaults to "sha1".
     pub algorithm: Option<String>,
 }
 

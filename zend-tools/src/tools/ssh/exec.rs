@@ -12,10 +12,13 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ExecRequest {
+    /// The session id returned by the corresponding ssh_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// The shell command to run on the remote host.
     #[validate(length(min = 1))]
     pub command: String,
+    /// Maximum seconds to wait for the command. No default is applied.
     pub timeout_sec: Option<u32>,
 }
 

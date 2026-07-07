@@ -847,7 +847,11 @@ impl ModelWeights {
         let model_bytes = std::fs::metadata(file_path)
             .map(|m| m.len() as usize)
             .unwrap_or(0);
-        Self::from_gguf_by_path_with_int8(file_path, device, Int8Mode::auto_sized(device, model_bytes))
+        Self::from_gguf_by_path_with_int8(
+            file_path,
+            device,
+            Int8Mode::auto_sized(device, model_bytes),
+        )
     }
 
     /// Like from_gguf_by_path but with an explicit numeric int8mode (the test path selects it

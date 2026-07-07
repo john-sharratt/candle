@@ -4,18 +4,25 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::CryptoError;
+use super::{normalize_algorithm, CryptoError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HkdfExpandLabelRequest {
+    /// Pseudorandom key as hex (the `prk_hex` from hkdf_extract).
     #[validate(length(min = 1))]
     pub prk_hex: String,
+    /// The bare TLS 1.3 label, e.g. "c hs traffic" or "iv". The "tls13 " prefix
+    /// is prepended automatically — do not include it.
     #[validate(length(min = 1))]
     pub label: String,
+    /// Optional context (e.g. a transcript hash) as hex. Empty if omitted.
     pub context_hex: Option<String>,
+    /// Output length in bytes (1–8160).
     #[validate(range(min = 1, max = 8160))]
     pub length: u32,
+    /// HKDF hash function. One of: sha256, sha512.
+    #[schemars(with = "super::HkdfHash")]
     #[validate(length(min = 1))]
     pub algorithm: String,
 }
@@ -61,7 +68,7 @@ impl Tool for HkdfExpandLabel {
         info.extend_from_slice(&ctx);
 
         let mut okm = vec![0u8; req.length as usize];
-        match req.algorithm.as_str() {
+        match normalize_algorithm(&req.algorithm).as_str() {
             "sha256" => {
                 let hk = hkdf::Hkdf::<sha2::Sha256>::from_prk(&prk)
                     .map_err(|e| CryptoError::ExpandFailed(e.to_string()))?;

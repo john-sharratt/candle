@@ -18,7 +18,7 @@
 //! | [`TlsEntry`] | TLS over TCP (native-tls) | optional `tls_client_cert` credential |
 //! | [`SqlEntry`] | SQLite (rusqlite) | optional `sql_password` credential |
 //! | [`RemoteFsEntry`] | SFTP over SSH (ssh2) | `ssh_key` or `remote_fs_password` credential |
-//! | [`CodeEntry`] | Python/Node subprocess | none |
+//! | [`CodeEntry`] | Embedded JavaScript (boa) REPL | none |
 //!
 //! # Thread safety
 //!
@@ -29,8 +29,10 @@
 //! # Resource limits
 //!
 //! The session tool implementations (not this registry itself) enforce a cap of
-//! 5 active sessions per user per protocol.  The registry does no eviction; tools
-//! manage their own caps before inserting.
+//! 5 active sessions per user per protocol; tools manage their own caps before
+//! inserting.  The one exception is [`RemoteFsEntry`], which carries an optional
+//! idle timeout that `get_remote_fs` enforces lazily — expiring the session on
+//! access once it has been idle past the limit.
 
 #![allow(dead_code)]
 
@@ -168,18 +170,23 @@ pub struct RemoteFsEntry {
     pub credential_name: String,
     pub remote_prefix: String, // leading path from URI (e.g. "/home/user")
     pub conn: RemoteFsConn,
+    /// If set, the session lazily expires after this many seconds with no access.
+    pub idle_timeout_secs: Option<u32>,
 }
 
 // ── Code ─────────────────────────────────────────────────────────────────────
 
+/// A persistent JavaScript REPL session. There is no live VM here — the session
+/// state is the accumulated source of every successful `code_session_exec`,
+/// replayed into a fresh `boa_engine::Context` on each call. This keeps the
+/// entry `Send` (a `boa` `Context` is not) so it can live in the shared
+/// registry. See `tools::code`.
 pub struct CodeEntry {
     pub meta: SessionMeta,
     pub language: String,
-    pub child: std::process::Child,
-    pub stdin: std::process::ChildStdin,
-    pub stdout_reader: std::io::BufReader<std::process::ChildStdout>,
-    /// Temp script file that must stay alive until the process exits.
-    pub _temp_script: Option<std::path::PathBuf>,
+    /// Concatenated source of every successful exec, newline-separated, replayed
+    /// to rebuild variable / function state before each new snippet.
+    pub history: String,
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────────
@@ -353,7 +360,28 @@ impl SessionRegistry {
             .insert(id, Arc::new(Mutex::new(entry)));
     }
     pub fn get_remote_fs(&self, id: &str) -> Option<Arc<Mutex<RemoteFsEntry>>> {
-        self.remote_fs.read().unwrap().get(id).cloned()
+        let arc = self.remote_fs.read().unwrap().get(id).cloned()?;
+        // Lazily enforce the per-session idle timeout: expire the session if it
+        // has gone untouched for longer than the limit, otherwise refresh its
+        // activity timestamp so the window slides on each use.
+        {
+            let mut entry = arc.lock().unwrap();
+            if let Some(timeout) = entry.idle_timeout_secs {
+                let within_window = chrono::DateTime::parse_from_rfc3339(&entry.meta.last_activity)
+                    .map(|t| {
+                        (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds()
+                            <= i64::from(timeout)
+                    })
+                    .unwrap_or(true);
+                if !within_window {
+                    drop(entry);
+                    self.remote_fs.write().unwrap().remove(id);
+                    return None;
+                }
+                entry.meta.last_activity = chrono::Utc::now().to_rfc3339();
+            }
+        }
+        Some(arc)
     }
     pub fn remove_remote_fs(&self, id: &str) -> bool {
         self.remote_fs.write().unwrap().remove(id).is_some()

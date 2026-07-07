@@ -1010,7 +1010,14 @@ fn run_offset_window_case(
     let k_suf = k_master.narrow(2, window_start, win_len)?.contiguous()?;
     let v_suf = v_master.narrow(2, window_start, win_len)?.contiguous()?;
     let (backing_c, cache_c) = build_control_slot(
-        win_len, &q_suf, &k_suf, &v_suf, &rope_cs, &rope_offsets_b1, stager, device,
+        win_len,
+        &q_suf,
+        &k_suf,
+        &v_suf,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
 
     // Test slot B: full prefill into scratch, seal, window [window_start,
@@ -1022,7 +1029,15 @@ fn run_offset_window_case(
     let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
     let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
     let _ = run_prefill(
-        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+        &mut scratch,
+        &q_all,
+        &k_all,
+        &v_all,
+        total,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
     let real_chunks = total.div_ceil(CHUNK_SIZE);
     backing_b.truncate_sequence_to_blocks(1, real_chunks)?;
@@ -1110,7 +1125,9 @@ fn kernel_layout_quantized_offset_window_matches_fp16() -> Result<()> {
     for &(name, total, window_start, level) in OFFSET_WINDOW_QUANT_CASES {
         match run_offset_window_quant_case(name, total, window_start, level, &device, &stager) {
             Ok((base, win)) => {
-                eprintln!("quant-offset {name:24} baseline(off0)={base:.4e}  window(off>0)={win:.4e}")
+                eprintln!(
+                    "quant-offset {name:24} baseline(off0)={base:.4e}  window(off>0)={win:.4e}"
+                )
             }
             Err(e) => {
                 eprintln!("quant-offset {name:24} FAILED: {e}");
@@ -1192,7 +1209,15 @@ fn run_offset_window_quant_case(
     let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
     let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
     let _ = run_prefill(
-        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+        &mut scratch,
+        &q_all,
+        &k_all,
+        &v_all,
+        total,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
     let real_chunks = total.div_ceil(CHUNK_SIZE);
     backing.truncate_sequence_to_blocks(0, real_chunks)?;
@@ -1231,10 +1256,12 @@ fn run_offset_window_quant_case(
         inject_and_decode(&backing, 1, &src, &q2, &kn, &vn, &rope_cs, stager, device)?;
     let out_q_full =
         inject_and_decode(&backing, 2, &warm, &q2, &kn, &vn, &rope_cs, stager, device)?;
-    let out_fp16_win =
-        inject_and_decode(&backing, 3, &src_win, &q2, &kn, &vn, &rope_cs, stager, device)?;
-    let out_q_win =
-        inject_and_decode(&backing, 4, &warm_win, &q2, &kn, &vn, &rope_cs, stager, device)?;
+    let out_fp16_win = inject_and_decode(
+        &backing, 3, &src_win, &q2, &kn, &vn, &rope_cs, stager, device,
+    )?;
+    let out_q_win = inject_and_decode(
+        &backing, 4, &warm_win, &q2, &kn, &vn, &rope_cs, stager, device,
+    )?;
 
     let baseline = max_abs_diff_f32(
         &out_q_full.to_dtype(DType::F32)?,
@@ -1286,19 +1313,33 @@ fn build_quant_pair(
     let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
     let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
     let _ = run_prefill(
-        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+        &mut scratch,
+        &q_all,
+        &k_all,
+        &v_all,
+        total,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
     backing.truncate_sequence_to_blocks(0, total.div_ceil(CHUNK_SIZE))?;
     let src = backing.record_turn(0)?;
     let copy_stream = cuda_stream(device);
     let mut pinned: Option<PinnedBuf> = None;
-    let warm = quantize_sealed_in_place(&backing, &[&src], &policy, device, &copy_stream, &mut pinned)?;
+    let warm = quantize_sealed_in_place(
+        &backing,
+        &[&src],
+        &policy,
+        device,
+        &copy_stream,
+        &mut pinned,
+    )?;
     copy_stream
         .synchronize()
         .map_err(|e| candle::Error::Msg(format!("quant sync: {e}")))?;
     Ok((backing, src, warm.into_iter().next().unwrap(), rope_cs))
 }
-
 
 // ──────────────────────────────────────────────────────────────────────
 // Glue (gap-fill) offset>0 window coverage
@@ -1378,7 +1419,14 @@ fn run_offset_window_glue_case(
     let k_suf = k_master.narrow(2, window_start, win_len)?.contiguous()?;
     let v_suf = v_master.narrow(2, window_start, win_len)?.contiguous()?;
     let (backing_c, mut cache_c) = build_control_slot(
-        win_len, &q_suf, &k_suf, &v_suf, &rope_cs, &rope_offsets_b1, stager, device,
+        win_len,
+        &q_suf,
+        &k_suf,
+        &v_suf,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
 
     // Test slot B: full prefill into scratch, seal, window [window_start,
@@ -1390,7 +1438,15 @@ fn run_offset_window_glue_case(
     let k_all = k_master.narrow(2, 0, total)?.contiguous()?;
     let v_all = v_master.narrow(2, 0, total)?.contiguous()?;
     let _ = run_prefill(
-        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+        &mut scratch,
+        &q_all,
+        &k_all,
+        &v_all,
+        total,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
     backing_b.truncate_sequence_to_blocks(1, total.div_ceil(CHUNK_SIZE))?;
     let sealed = backing_b.record_turn(1)?;
@@ -1487,8 +1543,21 @@ fn glue_over(
     let col_t = Tensor::from_vec(col, win_len + GLUE_TOKENS, device)?;
     let gen = stager.begin_generation();
     let out = paged_glue_attn(
-        &mut [&mut cache], &[win_len], qgf, kgf, vgf, 1, &[GLUE_TOKENS],
-        N_HEAD, N_KV_HEAD, HEAD_DIM, None, &col_t, rope_cs, false, &gen,
+        &mut [&mut cache],
+        &[win_len],
+        qgf,
+        kgf,
+        vgf,
+        1,
+        &[GLUE_TOKENS],
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        None,
+        &col_t,
+        rope_cs,
+        false,
+        &gen,
     )?;
     device.synchronize()?;
     Ok(out)
@@ -1503,19 +1572,37 @@ fn kernel_layout_quantized_glue_offset_window() -> Result<()> {
     };
     let stager = PinnedStager::new_from_device(&device);
     let mut failures: Vec<String> = Vec::new();
-    for &(name, total, ws) in &[("qglue_off18", 64usize, 18usize), ("qglue_off40", 96, 40), ("qglue_off50", 128, 50)] {
+    for &(name, total, ws) in &[
+        ("qglue_off18", 64usize, 18usize),
+        ("qglue_off40", 96, 40),
+        ("qglue_off50", 128, 50),
+    ] {
         let r = (|| -> Result<(f32, f32)> {
             let (backing, src, warm, rope_cs) = build_quant_pair(total, 3, &device, &stager)?;
             let (qg, kg, vg) = make_qkv(GLUE_TOKENS, &device, 0x6C0E)?;
             let (qgf, kgf, vgf) = flatten_qkv(&qg, &kg, &vg)?;
             let src_win = window_suffix(&src, ws);
             let warm_win = window_suffix(&warm, ws);
-            let o_fp16_full = glue_over(&backing, 1, &src, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
-            let o_q_full = glue_over(&backing, 2, &warm, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
-            let o_fp16_win = glue_over(&backing, 3, &src_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
-            let o_q_win = glue_over(&backing, 4, &warm_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device)?;
-            let base = max_abs_diff_f32(&o_q_full.to_dtype(DType::F32)?, &o_fp16_full.to_dtype(DType::F32)?)?;
-            let win = max_abs_diff_f32(&o_q_win.to_dtype(DType::F32)?, &o_fp16_win.to_dtype(DType::F32)?)?;
+            let o_fp16_full = glue_over(
+                &backing, 1, &src, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+            )?;
+            let o_q_full = glue_over(
+                &backing, 2, &warm, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+            )?;
+            let o_fp16_win = glue_over(
+                &backing, 3, &src_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+            )?;
+            let o_q_win = glue_over(
+                &backing, 4, &warm_win, &qgf, &kgf, &vgf, &rope_cs, &stager, &device,
+            )?;
+            let base = max_abs_diff_f32(
+                &o_q_full.to_dtype(DType::F32)?,
+                &o_fp16_full.to_dtype(DType::F32)?,
+            )?;
+            let win = max_abs_diff_f32(
+                &o_q_win.to_dtype(DType::F32)?,
+                &o_fp16_win.to_dtype(DType::F32)?,
+            )?;
             Ok((base, win))
         })();
         match r {
@@ -1532,7 +1619,10 @@ fn kernel_layout_quantized_glue_offset_window() -> Result<()> {
         }
     }
     if !failures.is_empty() {
-        candle::bail!("quantized glue offset>0 divergence:\n  - {}", failures.join("\n  - "));
+        candle::bail!(
+            "quantized glue offset>0 divergence:\n  - {}",
+            failures.join("\n  - ")
+        );
     }
     Ok(())
 }
@@ -1639,7 +1729,14 @@ fn run_multiseg_case(
 
     // Reference slot: one fresh prefill of the whole logical sequence.
     let (backing_ref, cache_ref) = build_control_slot(
-        total, &q_all, &k_all, &v_all, &rope_cs, &rope_offsets_b1, stager, device,
+        total,
+        &q_all,
+        &k_all,
+        &v_all,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
 
     // Test slot: prefill+seal once, derive two windows sharing the boundary
@@ -1648,7 +1745,15 @@ fn run_multiseg_case(
     let mut cache = bind_kv_cache(&backing, 0)?;
     let mut scratch = bind_kv_cache(&backing, 1)?;
     let _ = run_prefill(
-        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+        &mut scratch,
+        &q_all,
+        &k_all,
+        &v_all,
+        total,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
     backing.truncate_sequence_to_blocks(1, total.div_ceil(CHUNK_SIZE))?;
     let sealed = backing.record_turn(1)?;
@@ -1665,7 +1770,10 @@ fn run_multiseg_case(
     };
     let a_last = seg_a.chunks.last().map(gid_id);
     let b_first = seg_b.chunks.first().map(gid_id);
-    assert_eq!(a_last, b_first, "[{name}] boundary chunk not shared across windows");
+    assert_eq!(
+        a_last, b_first,
+        "[{name}] boundary chunk not shared across windows"
+    );
     backing.inject_sealed_at_tail(0, &seg_a)?;
     backing.inject_sealed_at_tail(0, &seg_b)?;
     backing.push_empty_writer_chunk(0)?;
@@ -1677,11 +1785,21 @@ fn run_multiseg_case(
     let vn = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
 
     let out_ref = decode_one_slot(
-        &backing_ref, &cache_ref, &q2, &kn, &vn, &rope_cs, stager, device,
+        &backing_ref,
+        &cache_ref,
+        &q2,
+        &kn,
+        &vn,
+        &rope_cs,
+        stager,
+        device,
     )?;
     let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope_cs, stager, device)?;
 
-    let diff = max_abs_diff_f32(&out_test.to_dtype(DType::F32)?, &out_ref.to_dtype(DType::F32)?)?;
+    let diff = max_abs_diff_f32(
+        &out_test.to_dtype(DType::F32)?,
+        &out_ref.to_dtype(DType::F32)?,
+    )?;
     if diff >= DIFF_TOLERANCE {
         candle::bail!(
             "multiseg shared-boundary diverged (total={total}, split={split}): \
@@ -1728,7 +1846,10 @@ fn kernel_layout_glue_interspersed_matches_fresh() -> Result<()> {
         }
     }
     if !failures.is_empty() {
-        candle::bail!("interspersed-glue divergence:\n  - {}", failures.join("\n  - "));
+        candle::bail!(
+            "interspersed-glue divergence:\n  - {}",
+            failures.join("\n  - ")
+        );
     }
     Ok(())
 }
@@ -1753,7 +1874,14 @@ fn run_glue_interspersed_case(
     // Reference slot: fresh prefill of the whole logical sequence [A|glue|B],
     // then one decode step.
     let (backing_ref, cache_ref) = build_control_slot(
-        total, &q_all, &k_all, &v_all, &rope_cs, &rope_offsets_b1, stager, device,
+        total,
+        &q_all,
+        &k_all,
+        &v_all,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
 
     // Test slot: inject A=[0,la) and B=[la+g, total) (both sealed), then a glue
@@ -1763,7 +1891,15 @@ fn run_glue_interspersed_case(
     let mut cache = bind_kv_cache(&backing, 0)?;
     let mut scratch = bind_kv_cache(&backing, 1)?;
     let _ = run_prefill(
-        &mut scratch, &q_all, &k_all, &v_all, total, &rope_cs, &rope_offsets_b1, stager, device,
+        &mut scratch,
+        &q_all,
+        &k_all,
+        &v_all,
+        total,
+        &rope_cs,
+        &rope_offsets_b1,
+        stager,
+        device,
     )?;
     backing.truncate_sequence_to_blocks(1, total.div_ceil(CHUNK_SIZE))?;
     let sealed = backing.record_turn(1)?;
@@ -1810,10 +1946,20 @@ fn run_glue_interspersed_case(
     let kn = k_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
     let vn = v_new.squeeze(2)?.to_dtype(DType::F16)?.contiguous()?;
     let out_ref = decode_one_slot(
-        &backing_ref, &cache_ref, &q2, &kn, &vn, &rope_cs, stager, device,
+        &backing_ref,
+        &cache_ref,
+        &q2,
+        &kn,
+        &vn,
+        &rope_cs,
+        stager,
+        device,
     )?;
     let out_test = decode_one_slot(&backing, &cache, &q2, &kn, &vn, &rope_cs, stager, device)?;
-    let diff = max_abs_diff_f32(&out_test.to_dtype(DType::F32)?, &out_ref.to_dtype(DType::F32)?)?;
+    let diff = max_abs_diff_f32(
+        &out_test.to_dtype(DType::F32)?,
+        &out_ref.to_dtype(DType::F32)?,
+    )?;
     if diff >= DIFF_TOLERANCE {
         candle::bail!(
             "interspersed-glue diverged (la={la}, g={g}, lb={lb}): \

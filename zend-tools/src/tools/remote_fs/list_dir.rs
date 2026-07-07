@@ -11,8 +11,11 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListDirRequest {
+    /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Remote directory to list. Defaults to the session's remote_prefix (the
+    /// base path from the URI passed to remote_fs_session_open).
     pub path: Option<String>,
 }
 

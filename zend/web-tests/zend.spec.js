@@ -5,8 +5,12 @@ const { test, expect } = require('@playwright/test');
 
 const URL = '/index.html?mock=1';
 
-async function boot(page) {
-  await page.goto(URL);
+// Boot the app. By design the home page no longer auto-selects a conversation;
+// pass `{ conv: id }` to open one via the URL hash (the same path a reload uses to
+// restore the chat the user had open).
+async function boot(page, opts) {
+  const conv = opts && opts.conv;
+  await page.goto(conv ? (URL + '#conv=' + encodeURIComponent(conv)) : URL);
   await page.waitForFunction(() => window.__ZEND_READY__ === true);
 }
 
@@ -36,6 +40,20 @@ test.describe('1.0 smoke', () => {
     await boot(page);
     expect(await page.evaluate(() => window.ZEND_BACKEND_ACTIVE)).toBe('mock');
     expect(errors).toEqual([]);
+  });
+});
+
+test.describe('1.0b home page on load', () => {
+  test('reload with nothing open lands on the home page, not a chat', async ({ page }) => {
+    await boot(page); // no hash → nothing auto-selected
+    await expect(page.getByRole('heading', { name: /Good (Morning|Afternoon|Evening)\./ })).toBeVisible();
+    await expect(page.locator('.zmd')).toHaveCount(0);
+  });
+
+  test('reload restores the conversation carried in the URL hash', async ({ page }) => {
+    await boot(page, { conv: '1' }); // hash → restore that chat
+    await expect(page.locator('.code-block').first()).toBeVisible();
+    await expect(page.locator('.zmd').first()).toBeVisible();
   });
 });
 
@@ -73,14 +91,14 @@ test.describe('1.1 sidebar', () => {
 
 test.describe('1.2 chat rendering', () => {
   test('renders seeded markdown, code block, think + tool card', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await expect(page.locator('.code-block').first()).toBeVisible();
     await expect(page.locator('.code-lang').first()).toHaveText(/RUST/i);
     await expect(page.locator('.tool-call-card').first()).toBeVisible();
     await expect(page.locator('details.think-block').first()).toBeVisible();
   });
   test('code copy button copies', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await page.locator('.copy-btn').first().click();
     await expect(page.locator('.copy-btn').first()).toHaveText(/Copied/);
   });
@@ -101,7 +119,7 @@ test.describe('1.3 streaming', () => {
 
 test.describe('1.4 thinking block', () => {
   test('think block is collapsed by default', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     const det = page.locator('details.think-block').first();
     await expect(det).toBeVisible();
     expect(await det.evaluate((el) => el.open)).toBe(false);
@@ -143,7 +161,7 @@ test.describe('1.5 composer dials', () => {
 
 test.describe('1.6 projection timeline', () => {
   test('active conversation seeds dots; hover shows popover; click opens substrate', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await expect(page.locator('.z-dot')).toHaveCount(7);
     await page.locator('.z-dot').first().hover();
     await expect(page.getByText('unbounded context')).toBeVisible();
@@ -154,7 +172,7 @@ test.describe('1.6 projection timeline', () => {
 
 test.describe('1.7 windowed substrate', () => {
   test('opens with sections; assistant section expanded by default; copy all', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await page.locator('.z-dot').last().click();
     await expect(page.getByText('Windowed substrate')).toBeVisible();
     await expect(page.getByText('kv-inject').first()).toBeVisible();
@@ -165,7 +183,7 @@ test.describe('1.7 windowed substrate', () => {
 
 test.describe('1.8 files + upload', () => {
   test('files pane lists seeded files; viewer opens', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await page.getByTitle('Conversation files').click();
     await expect(page.locator('.z-file-row')).toHaveCount(4);
     await page.locator('.z-file-row').first().click();
@@ -173,7 +191,7 @@ test.describe('1.8 files + upload', () => {
   });
 
   test('drag-drop shows the upload modal with a per-part bar, then completes', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await dropFiles(page, [{ name: 'notes.py', content: 'print(1)\n'.repeat(400) }]);
     await expect(page.getByText(/Uploading|prefilling/)).toBeVisible();
     await expect(page.locator('.z-upbar')).toBeVisible();
@@ -206,7 +224,7 @@ test.describe('1.10 cross-cutting', () => {
   });
 
   test('Escape closes overlays in priority order', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await page.locator('.z-dot').first().click();
     await expect(page.getByText('Windowed substrate')).toBeVisible();
     await page.keyboard.press('Escape');
@@ -214,7 +232,7 @@ test.describe('1.10 cross-cutting', () => {
   });
 
   test('composer keeps focus when clicking a non-input element', async ({ page }) => {
-    await boot(page);
+    await boot(page, { conv: '1' });
     await page.locator('#zend-prompt').click();
     await page.locator('.z-chatscroll').click({ position: { x: 200, y: 50 } }).catch(() => {});
     expect(await page.evaluate(() => document.activeElement && document.activeElement.id)).toBe('zend-prompt');

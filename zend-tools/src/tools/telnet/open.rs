@@ -16,11 +16,18 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
+    /// Remote host to connect to: a HOSTNAME or IP address ONLY — do NOT include
+    /// a username.
     #[validate(length(min = 1))]
     pub host: String,
+    /// TCP port. Defaults to 23.
     pub port: Option<u16>,
+    /// Name of a stored credential to log in with. Defaults to none (no auto-login).
     pub credential_name: Option<String>,
+    /// Regex matching the device prompt, used to know when output is complete.
+    /// Defaults to "[$#>] *$".
     pub prompt_pattern: Option<String>,
+    /// Seconds to wait for the TCP connection. Defaults to 10.
     pub timeout_sec: Option<u32>,
 }
 

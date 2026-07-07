@@ -9,6 +9,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct CloseRequest {
+    /// The session id returned by tls_session_open.
     #[validate(length(min = 1))]
     pub session_id: String,
 }

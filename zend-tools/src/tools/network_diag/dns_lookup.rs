@@ -11,8 +11,11 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DnsRequest {
+    /// Hostname to look up (for A/AAAA) or IP address (for PTR reverse lookup).
     #[validate(length(min = 1))]
     pub host: String,
+    /// Record type: "A" (IPv4), "AAAA" (IPv6), or "PTR" (reverse). Case-insensitive.
+    /// MX/TXT/NS are not supported and return not_supported. Default: "A".
     pub record_type: Option<String>,
 }
 

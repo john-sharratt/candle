@@ -12,10 +12,14 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct GetRequest {
+    /// The session id returned by the remote_fs_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Path of the file to download on the remote host.
     #[validate(length(min = 1))]
     pub remote_path: String,
+    /// VFS path to write the downloaded content to. Defaults to the basename of
+    /// `remote_path`.
     pub local_vfs_path: Option<String>,
 }
 

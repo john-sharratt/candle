@@ -43,7 +43,21 @@
 //! `tcp_session_send` confirms every call.  Open, recv, list, and close do not.
 
 use crate::ToolError;
+use schemars::JsonSchema;
+use serde::Serialize;
 use thiserror::Error;
+
+// Schema-only mirror of the recv `format` values. The request field stays
+// `Option<String>`; referenced via `#[schemars(with = "…")]` so the JSON schema
+// carries a real `"enum"`.
+/// How received bytes are returned.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecvFormat {
+    Auto,
+    Text,
+    Hex,
+}
 
 pub mod close;
 pub mod list;

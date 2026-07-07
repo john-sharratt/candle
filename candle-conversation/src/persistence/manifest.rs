@@ -64,9 +64,6 @@ pub struct StreamEntry {
     /// Latest `Tokens` record for the stream.
     #[serde(default)]
     pub tokens: Option<RecordLoc>,
-    /// Latest `Signatures` record for the stream.
-    #[serde(default)]
-    pub signatures: Option<RecordLoc>,
     /// Highest chunk index the stream is durably committed through.
     #[serde(default)]
     pub committed_through: Option<u64>,
@@ -84,7 +81,7 @@ pub struct StreamEntry {
 /// in RAM and mirror them into the `Checkpoint` payload — making the
 /// payload scale with stream count, turn count, and tree-node count.
 /// Now it carries only the singleton fields below.  Per-entity state
-/// (chunks, tokens locations, signatures locations, stream decls,
+/// (chunks, tokens locations, stream decls,
 /// labels, conv states, tree metadata, debug ids) lives on the
 /// [`crate::substrate::Substrate`] directly; the walker dispatches
 /// each record through [`crate::substrate::Substrate::apply_walker_entry`]
@@ -106,9 +103,6 @@ pub struct Manifest {
     /// Latest `Tokenizer` record.
     #[serde(default)]
     pub tokenizer: Option<RecordLoc>,
-    /// Latest `ToolSummary` record (workspace singleton).
-    #[serde(default)]
-    pub tool_summary: Option<RecordLoc>,
     /// Offset of the most recent `Checkpoint` record seen.
     #[serde(default)]
     pub last_checkpoint_offset: Option<u64>,
@@ -192,7 +186,6 @@ impl Manifest {
             RecordType::ModelSpec => self.model_spec = Some(loc),
             RecordType::Template => self.template = Some(loc),
             RecordType::Tokenizer => self.tokenizer = Some(loc),
-            RecordType::ToolSummary => self.tool_summary = Some(loc),
             RecordType::Checkpoint => {
                 self.last_checkpoint_offset = Some(entry.offset);
             }
@@ -202,14 +195,15 @@ impl Manifest {
             RecordType::StreamDecl
             | RecordType::Chunk
             | RecordType::Tokens
-            | RecordType::Signatures
             | RecordType::Commit
             | RecordType::Label
             | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
+            | RecordType::Distilled
             | RecordType::ProjectionEvents
+            | RecordType::WideQSig
             | RecordType::Unknown => {}
         }
         Ok(())

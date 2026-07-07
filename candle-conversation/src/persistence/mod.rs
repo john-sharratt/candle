@@ -24,7 +24,6 @@ pub mod chunk_plan;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
-pub mod crc_validator;
 pub mod direct_io;
 pub mod elevate;
 pub mod inherit;
@@ -107,13 +106,6 @@ pub struct SubstratePersistence {
     /// Filesystem path of the active log — the rename target of a
     /// compaction swap (§5.8).
     active_path: PathBuf,
-    /// Chunks whose payload CRC failed the background validator's
-    /// sweep — filtered out of every cold-load plan. Shared with the
-    /// `crc_validator` thread.
-    bad_chunks: crc_validator::BadChunkRegistry,
-    /// Handle on the background CRC validator. Stop-on-drop, so the
-    /// thread exits cleanly when the substrate closes.
-    _crc_validator: crc_validator::CrcValidator,
 }
 
 /// SHA-256 of `bytes` — the tokenizer change-detection digest.
@@ -264,16 +256,6 @@ impl SubstratePersistence {
             })
             .transpose()?;
 
-        let bad_chunks = crc_validator::BadChunkRegistry::new();
-        let inherited_paths: Vec<PathBuf> = inherited_subs
-            .iter()
-            .map(|i| i.path().to_path_buf())
-            .collect();
-        let crc_validator_handle = crc_validator::CrcValidator::spawn(
-            active.to_path_buf(),
-            inherited_paths,
-            bad_chunks.clone(),
-        );
         Ok(SubstratePersistence {
             log,
             manifest,
@@ -282,22 +264,7 @@ impl SubstratePersistence {
             tokenizer_sha256,
             template,
             active_path: active.to_path_buf(),
-            bad_chunks,
-            _crc_validator: crc_validator_handle,
         })
-    }
-
-    /// Snapshot of the chunks the background validator has flagged
-    /// as CRC-corrupt. Exposed for diagnostics and tests; the cold-load
-    /// planner uses [`Self::is_bad_chunk`] directly.
-    pub fn bad_chunks(&self) -> Vec<crc_validator::BadChunkKey> {
-        self.bad_chunks.snapshot()
-    }
-
-    /// `true` if the validator has flagged this chunk as CRC-corrupt
-    /// since the substrate opened.
-    pub fn is_bad_chunk(&self, stream_id: StreamId, chunk_index: u64) -> bool {
-        self.bad_chunks.is_bad((stream_id, chunk_index))
     }
 
     /// The active log's manifest.
@@ -385,15 +352,15 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Append a stream's `Signatures` record.
-    pub fn append_signatures(&mut self, stream_id: StreamId, sigs: &[u8]) -> Result<()> {
-        self.append_record(RecordType::Signatures, 0, stream_id.0, 0, 0, sigs)?;
-        Ok(())
-    }
-
     /// Append a turn's `ProjectionEvents` record (opaque JSON payload).
     pub fn append_projection_events(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
         self.append_record(RecordType::ProjectionEvents, 0, stream_id.0, 0, 0, payload)?;
+        Ok(())
+    }
+
+    /// Append a turn's `WideQSig` record (opaque wide-Q window payload), keyed by stream id.
+    pub fn append_wide_q_sigs(&mut self, stream_id: StreamId, payload: &[u8]) -> Result<()> {
+        self.append_record(RecordType::WideQSig, 0, stream_id.0, 0, 0, payload)?;
         Ok(())
     }
 
@@ -467,14 +434,13 @@ impl SubstratePersistence {
         Ok(())
     }
 
-    /// Append a [`RecordType::ToolSummary`] record caching both tool-mode
-    /// summaries (comprehensive + restricted) in one payload. A workspace
-    /// singleton: this supersedes any prior tool summary (the walker keeps the
-    /// latest, the compactor reclaims the rest). Callers gate the write on a
-    /// changed catalog hash for either entry.
-    pub fn write_tool_summary(&mut self, payload: &record::ToolSummaryPayload) -> Result<()> {
+    /// Append a [`RecordType::Distilled`] record marking `timeline_id` for
+    /// distillation — its turns shed content (keep sig, drop tokens + KV) on the
+    /// next compaction pass. Idempotent — duplicate markers replay identically.
+    pub fn write_distill(&mut self, timeline_id: u64) -> Result<()> {
+        let payload = record::DistillPayload { timeline_id };
         let bytes = payload.encode();
-        self.append_record(RecordType::ToolSummary, 0, 0, 0, 0, &bytes)?;
+        self.append_record(RecordType::Distilled, 0, 0, 0, 0, &bytes)?;
         Ok(())
     }
 
@@ -751,13 +717,7 @@ impl SubstratePersistence {
             .iter()
             .map(|i| i.substrate().stream_of(stream_id).map(|s| &s.chunks))
             .collect();
-        chunk_plan::plan_chunked_read(
-            active_chunks,
-            &inherited_chunks,
-            stream_id,
-            buffer_size,
-            &self.bad_chunks,
-        )
+        chunk_plan::plan_chunked_read(active_chunks, &inherited_chunks, buffer_size)
     }
 
     /// Read a stream's latest `Tokens` record payload — from the active log,
@@ -776,30 +736,6 @@ impl SubstratePersistence {
                 .substrate()
                 .stream_of(stream_id)
                 .and_then(|s| s.tokens)
-            {
-                let record = inherited.read_record(loc.offset, loc.record_size)?;
-                return Ok(Some(record.payload));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Read a stream's latest `Signatures` record payload — from the active
-    /// log, else any inherited log. `None` if the stream has no `Signatures`.
-    pub fn read_signatures(
-        &mut self,
-        substrate: &Substrate,
-        stream_id: StreamId,
-    ) -> Result<Option<Vec<u8>>> {
-        if let Some(loc) = substrate.stream_of(stream_id).and_then(|s| s.signatures) {
-            let record = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
-            return Ok(Some(record.payload));
-        }
-        for inherited in &self.inherited {
-            if let Some(loc) = inherited
-                .substrate()
-                .stream_of(stream_id)
-                .and_then(|s| s.signatures)
             {
                 let record = inherited.read_record(loc.offset, loc.record_size)?;
                 return Ok(Some(record.payload));
@@ -1313,54 +1249,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_summary_survives_reopen_supersedes_and_compacts() {
-        let dir = tmp_dir("tool_summary");
-        {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            let entry = |h: u128, s: &str| record::ToolSummaryEntry {
-                catalog_hash: h,
-                summary: s.to_string(),
-            };
-            sp.write_tool_summary(&record::ToolSummaryPayload {
-                comprehensive: Some(entry(0xAAAA, "comp-A")),
-                restricted: Some(entry(0x1111, "restr-A")),
-            })
-            .unwrap();
-            sp.write_tool_summary(&record::ToolSummaryPayload {
-                comprehensive: Some(entry(0xBBBB, "comp-B")),
-                restricted: Some(entry(0x2222, "restr-B")),
-            })
-            .unwrap(); // supersedes A
-            sp.commit().unwrap();
-        }
-        // Reload: the latest record wins; both mode entries are readable.
-        {
-            let mut substrate = Substrate::new();
-            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            assert_eq!(substrate.tool_summary_hash(false), Some(0xBBBB));
-            assert_eq!(substrate.tool_summary_text(false), Some("comp-B"));
-            assert_eq!(substrate.tool_summary_hash(true), Some(0x2222));
-            assert_eq!(substrate.tool_summary_text(true), Some("restr-B"));
-        }
-        // The superseded copy is dead — compaction reclaims it (collect_live_records
-        // emits only `manifest.tool_summary`), keeping only the latest.
-        {
-            let mut substrate = Substrate::new();
-            let mut sp =
-                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            sp.compact(&mut substrate, None).unwrap();
-            assert_eq!(substrate.tool_summary_hash(false), Some(0xBBBB));
-        }
-        {
-            let mut substrate = Substrate::new();
-            let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
-            assert_eq!(substrate.tool_summary_hash(false), Some(0xBBBB));
-            assert_eq!(substrate.tool_summary_text(true), Some("restr-B"));
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn streams_and_turns_recover_across_reopen() {
         let dir = tmp_dir("recover");
         let turn = StreamDecl::Turn(TurnDecl {
@@ -1375,12 +1263,12 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: streams::PerDepthScores::default(),
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
+            tags: Vec::new(),
         });
         let turn_id;
         {
@@ -1448,12 +1336,12 @@ mod tests {
             group_id: 1,
             anchored_prefix: vec![sec.stream_id()],
             view: Vec::new(),
-            scores: streams::PerDepthScores::default(),
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
+            tags: Vec::new(),
         });
         child.declare_stream(&child_turn).unwrap();
         child.commit().unwrap();

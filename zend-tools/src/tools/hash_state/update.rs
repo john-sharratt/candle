@@ -9,10 +9,14 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct UpdateRequest {
+    /// State id returned by hash_state_init. Required.
     #[validate(length(min = 1))]
     pub id: String,
+    /// The chunk of data to absorb, interpreted according to `data_encoding`. Required.
     #[validate(length(min = 1))]
     pub data: String,
+    /// How `data` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub data_encoding: Option<String>,
 }
 

@@ -11,9 +11,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct RecvRequest {
+    /// The session id returned by udp_session_open.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// Receive timeout in seconds. Default 5.
     pub timeout_sec: Option<f64>,
+    /// Encoding for the returned bytes. "hex" forces hex; "auto" (default) returns UTF-8 text when valid, else hex.
+    #[schemars(with = "Option<super::super::RecvEncoding>")]
     pub output_encoding: Option<String>,
 }
 

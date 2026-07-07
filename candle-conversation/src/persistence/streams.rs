@@ -15,12 +15,6 @@ use serde::{Deserialize, Serialize};
 use super::content_hash::{section_stream_id, turn_stream_id, ContentHash};
 use super::{PersistenceError, Result};
 
-/// Per-`(timeline, turn)` count of cognitive-depth scores carried in
-/// a turn declaration: 3 depths (syntactic / semantic / pragmatic) ×
-/// 7 score fields (max, sum, mean, top-k mean, count, span,
-/// per-token excess).
-pub const SCORE_LANES: usize = 21;
-
 /// Globally unique stream identifier. `0` is reserved as the header's
 /// "not stream-scoped" sentinel and is never a real stream id.
 #[derive(
@@ -53,18 +47,6 @@ pub struct ContentAddress {
     pub prefix_hash: ContentHash,
     #[serde(default)]
     pub section_hash: ContentHash,
-}
-
-/// The cognitive-depth relevance scores of a turn — the
-/// `PerDepthScores` flattened to [`SCORE_LANES`] lanes.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PerDepthScores(pub [f32; SCORE_LANES]);
-
-impl Default for PerDepthScores {
-    fn default() -> PerDepthScores {
-        PerDepthScores([0.0; SCORE_LANES])
-    }
 }
 
 /// Declaration of a content-addressed prompt-section stream.
@@ -112,8 +94,6 @@ pub struct TurnDecl {
     /// The projection `view` — turn indices selected as this turn's context.
     #[serde(default)]
     pub view: Vec<u32>,
-    #[serde(default)]
-    pub scores: PerDepthScores,
     /// Content boundaries that frame the user-message body and the
     /// assistant-response body inside the sealed grid — see
     /// `substrate::TurnContentBounds`.  Persisted so the compressor can
@@ -135,6 +115,12 @@ pub struct TurnDecl {
     /// "store what the caller already has" rule as `user_text`.
     #[serde(default)]
     pub assistant_text: String,
+    /// Gather-scope tags for this turn (e.g. `"tool"` on calibration turns).
+    /// A projection node's policy `tags:` filter restricts its provenance
+    /// gallery to turns carrying a matching tag; an empty policy filter admits
+    /// every turn. Empty here means the turn is untagged (live conversation).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// The payload of a `StreamDecl` record — declares a stream and
@@ -202,10 +188,6 @@ mod tests {
 
     #[test]
     fn turn_decl_roundtrip() {
-        let mut lanes = [0.0f32; SCORE_LANES];
-        for (i, lane) in lanes.iter_mut().enumerate() {
-            *lane = i as f32 * 0.25;
-        }
         let decl = StreamDecl::Turn(TurnDecl {
             timeline_id: 0xABCD,
             turn_index: 12,
@@ -218,12 +200,12 @@ mod tests {
             group_id: 1,
             anchored_prefix: vec![StreamId(7), StreamId(8), StreamId(123)],
             view: vec![0, 2, 5],
-            scores: PerDepthScores(lanes),
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
+            tags: Vec::new(),
         });
         let bytes = decl.encode();
         let decoded = StreamDecl::decode(&bytes).unwrap();
@@ -245,12 +227,12 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: PerDepthScores::default(),
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
+            tags: Vec::new(),
         });
         assert_eq!(StreamDecl::decode(&decl.encode()).unwrap(), decl);
     }

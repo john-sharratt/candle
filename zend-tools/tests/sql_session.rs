@@ -138,6 +138,26 @@ fn sql_session_missing_credential() {
 }
 
 #[test]
+fn sql_session_open_without_credential() {
+    // SQLite needs no credential: opening :memory: with no credential_name
+    // succeeds and returns a usable session.
+    let ctx = ToolContext::new();
+    let open = harness::expect_success(harness::invoke_with_ctx(
+        "sql_session_open",
+        json!({"database": ":memory:"}),
+        &ctx,
+    ));
+    assert_eq!(open["driver"], "sqlite");
+    assert_eq!(open["database"], ":memory:");
+    let sid = open["session_id"].as_str().unwrap().to_string();
+    harness::expect_success(harness::invoke_with_ctx(
+        "sql_session_close",
+        json!({"session_id": sid}),
+        &ctx,
+    ));
+}
+
+#[test]
 fn sql_session_wrong_credential_type() {
     let ctx = ToolContext::new();
     harness::expect_success(harness::invoke_with_ctx(

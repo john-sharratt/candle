@@ -98,7 +98,7 @@ use std::collections::HashMap;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex};
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
-    DepthWeights, GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
+    GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem,
 };
 use super::selection::apply_selection;
@@ -137,13 +137,9 @@ pub enum ProjectionMode {
 
 /// Section-scoring configuration resolved from a [`ProjectionMode`].
 struct CollectionScoring {
-    /// Formula passed to `ContentResolver::section_score`.
-    formula: ScoreFormula,
-    /// When `Some`, overrides both the collection's and the layer's depth
-    /// weights.  When `None`, the collection/layer YAML weights apply.
-    weights_override: Option<DepthWeights>,
     /// When `false`, `score_threshold` is not used as a gate — every section
     /// competes on rank alone (the prefill ratio is too thin to threshold).
+    /// Belief-driven collections ignore this (the policy's `min_score` gates).
     apply_threshold: bool,
 }
 
@@ -151,17 +147,9 @@ impl ProjectionMode {
     fn collection_scoring(self) -> CollectionScoring {
         match self {
             ProjectionMode::Decode => CollectionScoring {
-                formula: FIXED_FORMULA,
-                weights_override: None,
                 apply_threshold: true,
             },
             ProjectionMode::Prefill => CollectionScoring {
-                formula: ScoreFormula::PerTokenExcess,
-                weights_override: Some(DepthWeights {
-                    syntactic: 0.0,
-                    semantic: 0.0,
-                    pragmatic: 1.0,
-                }),
                 apply_threshold: false,
             },
         }
@@ -285,6 +273,64 @@ pub struct Projection {
     /// selector emitted, addressed by their string ids.  Empty when the target
     /// layer has no [`super::SectionTree`].
     pub selections: Vec<ResolvedSelection>,
+    /// Per-section/turn belief confidence produced by the online selection loop,
+    /// stamped onto the recorded [`super::ProjectionEvent`] so the next
+    /// reprojection seeds its belief from this one.
+    pub selection_scores: super::SelectionScores,
+}
+
+/// The prior projection's per-collection belief, used to seed the current
+/// projection so the online decay/reinforcement carries across a turn's
+/// reprojections. Built by the scheduler from the previous
+/// [`super::ProjectionEvent`]; empty (the default) means a fresh, stateless
+/// belief for this projection.
+#[derive(Debug, Clone, Default)]
+pub struct PriorBelief {
+    collections: std::collections::HashMap<String, std::collections::HashMap<String, (f32, bool)>>,
+}
+
+impl PriorBelief {
+    /// Record a section's prior belief (score + whether it was selected).
+    pub fn set(&mut self, collection: &str, section: &str, score: f32, selected: bool) {
+        self.collections
+            .entry(collection.to_string())
+            .or_default()
+            .insert(section.to_string(), (score, selected));
+    }
+
+    /// Rebuild the prior belief from a completed projection's selection — every
+    /// collection member's `(score, selected)`. The scheduler stores this on the
+    /// decode state after each reprojection so the next one seeds from it,
+    /// carrying the online belief across a turn's reprojections.
+    pub fn from_selection(sel: &super::ProjectionSelection) -> PriorBelief {
+        let mut pb = PriorBelief::default();
+        for item in &sel.system {
+            if let super::SystemItem::Collection { name, sections } = item {
+                for s in sections {
+                    pb.set(name, &s.name, s.score, s.selected);
+                }
+            }
+        }
+        pb
+    }
+
+    /// Aligned `(scores, selected)` for a collection's sections in declaration
+    /// order — the seed for [`crate::provenance::belief_step`]. Unknown sections
+    /// read `(0.0, false)`.
+    fn collection(&self, name: &str, sections: &[SectionSchema]) -> (Vec<f32>, Vec<bool>) {
+        let map = self.collections.get(name);
+        let mut scores = vec![0.0f32; sections.len()];
+        let mut selected = vec![false; sections.len()];
+        if let Some(m) = map {
+            for (i, s) in sections.iter().enumerate() {
+                if let Some(&(sc, sel)) = m.get(&s.name) {
+                    scores[i] = sc;
+                    selected[i] = sel;
+                }
+            }
+        }
+        (scores, selected)
+    }
 }
 
 /// The section-tree selector id the engine reads to drive per-turn thinking
@@ -463,7 +509,15 @@ pub fn run<R: ContentResolver>(
     mode: ProjectionMode,
     selection: &SelectionState,
 ) -> Projection {
-    run_with_sink(schema, target, resolver, mode, selection, &mut |_| {})
+    run_with_sink(
+        schema,
+        target,
+        resolver,
+        mode,
+        selection,
+        &PriorBelief::default(),
+        &mut |_| {},
+    )
 }
 
 /// Variant of [`run`] that delivers score-density [`SelectionDiagnostics`]
@@ -478,14 +532,17 @@ pub fn run<R: ContentResolver>(
 /// diagnostic — token counts, origin tags, effective scores, pending
 /// backpressure metric — built from the resolver's existing
 /// `turn_token_count` + `pending_summary_len` methods.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_sink<R: ContentResolver>(
     schema: &Schema,
     target: ProjectionTarget,
     resolver: &R,
     mode: ProjectionMode,
     selection: &SelectionState,
+    prior: &PriorBelief,
     sink: &mut dyn FnMut(SelectionDiagnostics),
 ) -> Projection {
+    let mut selection_scores = super::SelectionScores::default();
     // ── Step 1: Mask ─────────────────────────────────────────────────────────
     let target_layer_idx = schema
         .layers
@@ -520,7 +577,6 @@ pub fn run_with_sink<R: ContentResolver>(
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = li == target_layer_idx;
-        let weights = layer.depth_weights;
         for group in &layer.groups {
             // Masking: for the target layer, only the target group is visible.
             if layer_is_target && group.id != target.group {
@@ -531,7 +587,7 @@ pub fn run_with_sink<R: ContentResolver>(
             let all_turns: Vec<(TurnIndex, f32)> = (0..count)
                 .map(|i| {
                     let idx = TurnIndex(i);
-                    let score = resolver.turn_score(group.id, idx, FIXED_FORMULA, &weights);
+                    let score = resolver.turn_score(group.id, idx);
                     (idx, score)
                 })
                 .collect();
@@ -546,12 +602,9 @@ pub fn run_with_sink<R: ContentResolver>(
             // natural consumption at the score-density total.
             let mut score_density_used = false;
             let selected: Vec<(TurnIndex, f32)> = if layer_is_target && group.id == target.group {
-                if let Some(picks) = resolver.summary_tree_select(
-                    target.timeline,
-                    layer.window as u32,
-                    FIXED_FORMULA,
-                    &weights,
-                ) {
+                if let Some(picks) =
+                    resolver.summary_tree_select(target.timeline, layer.window as u32)
+                {
                     score_density_used = true;
                     // Score-density diagnostics for the test harness
                     // (§10.8.4): assemble per-node selection metadata
@@ -668,13 +721,24 @@ pub fn run_with_sink<R: ContentResolver>(
         .layers
         .iter()
         .find(|l| l.id == target.layer)
-        .map(|l| emit_system_prompt_items(l, resolver, mode, selection, &mut resolved_selections))
+        .map(|l| {
+            emit_system_prompt_items(
+                l,
+                resolver,
+                mode,
+                selection,
+                prior,
+                &mut selection_scores,
+                &mut resolved_selections,
+            )
+        })
         .unwrap_or_default();
 
     if group_states.is_empty() {
         return Projection {
             segments: system_prompt_segments,
             selections: resolved_selections,
+            selection_scores,
         };
     }
 
@@ -858,6 +922,7 @@ pub fn run_with_sink<R: ContentResolver>(
     Projection {
         segments,
         selections: resolved_selections,
+        selection_scores,
     }
 }
 
@@ -867,11 +932,14 @@ pub fn run_with_sink<R: ContentResolver>(
 ///
 /// A [`SectionSchema`] with `depends_on = Some(cid)` only emits if the
 /// named collection materialised ≥ 1 section in this same emission pass.
+#[allow(clippy::too_many_arguments)]
 fn emit_system_prompt_items<R: ContentResolver>(
     layer: &LayerSchema,
     resolver: &R,
     mode: ProjectionMode,
     selection_state: &SelectionState,
+    prior: &PriorBelief,
+    scores: &mut super::SelectionScores,
     resolved_selections: &mut Vec<ResolvedSelection>,
 ) -> Vec<ProjectionSegment> {
     let scoring = mode.collection_scoring();
@@ -883,7 +951,14 @@ fn emit_system_prompt_items<R: ContentResolver>(
         std::collections::HashMap::new();
     for item in &layer.system_prompt.items {
         if let SystemPromptItem::Collection(coll) = item {
-            let selected = select_collection_sections(coll, layer, resolver, &scoring);
+            let selected = select_collection_sections(
+                coll,
+                resolver,
+                &scoring,
+                selection_state,
+                prior,
+                scores,
+            );
             collection_results.insert(coll.id, selected);
         }
     }
@@ -999,22 +1074,18 @@ fn push_section_segment(out: &mut Vec<ProjectionSegment>, s: &SectionSchema) {
 /// Selection picks by salience (score, then priority); emission
 /// preserves authored structure (declaration order).  Sections below
 /// `score_threshold` are filtered out before selection.
+#[allow(clippy::too_many_arguments)]
 fn select_collection_sections<R: ContentResolver>(
     coll: &SectionCollection,
-    layer: &LayerSchema,
     resolver: &R,
     scoring: &CollectionScoring,
+    selection_state: &SelectionState,
+    prior: &PriorBelief,
+    scores: &mut super::SelectionScores,
 ) -> Vec<ProjectionSegment> {
     if coll.sections.is_empty() {
         return Vec::new();
     }
-    // Mode-resolved depth weights: a prefill override beats the collection's
-    // own YAML weights, which in turn beat the layer fallback.
-    let dw = scoring
-        .weights_override
-        .as_ref()
-        .or(coll.depth_weights.as_ref())
-        .unwrap_or(&layer.depth_weights);
     match &coll.selection {
         SelectionRule::AlwaysVisible => {
             let mut out = Vec::with_capacity(coll.sections.len());
@@ -1023,59 +1094,49 @@ fn select_collection_sections<R: ContentResolver>(
             }
             out
         }
-        SelectionRule::TopK { k } => {
-            let all_scored: Vec<(usize, &SectionSchema, f32)> = coll
+        SelectionRule::TopK { .. } => {
+            // Belief-driven selection: the collection's policy (RelLeak budget +
+            // hysteresis) decides the surviving set from the per-section scores,
+            // seeded from the prior projection's belief so decay/reinforcement
+            // carries across a turn. The count budget subsumes the old `top_k` k
+            // and `min_score` the old `score_threshold`; emission stays in
+            // declaration order. Each member's belief is recorded on `scores`.
+            let fresh: Vec<f32> = coll
                 .sections
                 .iter()
-                .enumerate()
-                .map(|(decl, s)| {
-                    let score = resolver.section_score(s.id, scoring.formula, dw);
-                    (decl, s, score)
-                })
+                .map(|s| resolver.section_score(s.id))
                 .collect();
+            let (prior_scores, prior_selected) = prior.collection(&coll.name, &coll.sections);
+            let beliefs = crate::provenance::belief_step(
+                &fresh,
+                &prior_scores,
+                &prior_selected,
+                coll.policy.config.section_policy(0),
+                coll.policy.config.budget(),
+            );
             if tracing::enabled!(tracing::Level::TRACE) {
-                let mut by_score = all_scored.clone();
-                by_score.sort_by(|(_, _, a), (_, _, b)| {
-                    b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let scores_str = by_score
+                let scores_str = coll
+                    .sections
                     .iter()
-                    .map(|(_, s, sc)| format!("{}={:.1}", s.name, sc))
+                    .zip(&beliefs)
+                    .map(|(s, b)| {
+                        format!(
+                            "{}={:.1}{}",
+                            s.name,
+                            b.score,
+                            if b.selected { "*" } else { "" }
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                tracing::trace!(
-                    collection = %coll.name,
-                    threshold = coll.score_threshold,
-                    scores = %scores_str,
-                    "projection scores"
-                );
+                tracing::trace!(collection = %coll.name, scores = %scores_str, "belief selection");
             }
-            let mut scored: Vec<(usize, &SectionSchema, f32)> = all_scored
-                .into_iter()
-                .filter(|(_, _, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
-                .collect();
-            scored.sort_by(|(ai, a, asc), (bi, b, bsc)| {
-                bsc.partial_cmp(asc)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(
-                        b.priority
-                            .partial_cmp(&a.priority)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-                    .then(ai.cmp(bi))
-            });
-            scored.truncate(*k);
-            scored.sort_by_key(|(i, _, _)| *i);
-            let n = scored.len();
-            tracing::trace!(
-                collection = %coll.name,
-                selected = format!("{}/{}", n, coll.sections.len()),
-                sections = ?scored.iter().map(|(_, s, _)| s.name.as_str()).collect::<Vec<_>>(),
-                "projection"
-            );
-            let mut out = Vec::with_capacity(n);
-            for (_, s, _) in &scored {
-                push_section_segment(&mut out, s);
+            let mut out = Vec::new();
+            for (s, b) in coll.sections.iter().zip(&beliefs) {
+                scores.set_section(s.id, b.score);
+                if b.selected {
+                    push_section_segment(&mut out, s);
+                }
             }
             out
         }
@@ -1084,7 +1145,7 @@ fn select_collection_sections<R: ContentResolver>(
                 .sections
                 .iter()
                 .map(|s| {
-                    let score = resolver.section_score(s.id, scoring.formula, dw);
+                    let score = resolver.section_score(s.id);
                     (s, score)
                 })
                 .filter(|(_, score)| !scoring.apply_threshold || *score >= coll.score_threshold)
@@ -1101,6 +1162,26 @@ fn select_collection_sections<R: ContentResolver>(
             if let Some((s, _)) = best {
                 push_section_segment(&mut out, s);
             }
+            out
+        }
+        SelectionRule::Named { selector } => {
+            // Explicit by-name pick: emit exactly the member whose `name`
+            // matches the runtime selector value. Score-independent — no
+            // threshold, no provenance relevance. Nothing is emitted if the selector
+            // is unset or names no member.
+            let mut out = Vec::new();
+            if let Some(target) = selection_state.get(selector) {
+                if let Some(s) = coll.sections.iter().find(|s| s.name == target) {
+                    push_section_segment(&mut out, s);
+                }
+            }
+            tracing::trace!(
+                collection = %coll.name,
+                selector = %selector,
+                target = selection_state.get(selector).unwrap_or(""),
+                selected = out.len(),
+                "projection (named)"
+            );
             out
         }
         SelectionRule::Sequence { .. } => {

@@ -96,6 +96,10 @@ pub fn apply_selection(
             select_top_k(*k, threshold, turns, budget_tokens, token_counts)
         }
         SelectionRule::Single => select_single(threshold, turns, budget_tokens, token_counts),
+        // `Named` selects a collection member by name; turn groups have no
+        // member names, so nothing survives. (Collections resolve `Named` in
+        // `project::select_collection_sections`, not here.)
+        SelectionRule::Named { .. } => Vec::new(),
         SelectionRule::Sequence {
             recent,
             historical_top_k,

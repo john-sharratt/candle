@@ -9,6 +9,8 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct DeleteRequest {
+    /// Exact stored credential name (as shown by cred_list). If you only have a
+    /// description of the credential, call cred_list first to find its precise name.
     #[validate(length(min = 1))]
     pub name: String,
 }

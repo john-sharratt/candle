@@ -4,15 +4,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{DepthWeights, ScoreFormula};
-use crate::persistence::record::{ToolSummaryPayload, TreeMetadataPayload};
-use crate::persistence::streams::{
-    ContentAddress, PerDepthScores, SectionDecl, StreamDecl, StreamId, TurnDecl,
-};
+use super::schema::{LayerSchema, SystemPromptItem};
+use crate::persistence::record::TreeMetadataPayload;
+use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
-use crate::provenance::SigEntry;
+use crate::provenance::{decode_wide_sigs, score_slots, WideQSig};
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
     TurnContentBounds, TurnPartWrite,
@@ -21,6 +20,16 @@ use crate::summary_tree::SelectionDiagnostics;
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use candle_nn::kv_cache::SealedSequence;
+
+/// The name of the section a projection selected inside `collection`, if any.
+fn selected_in_collection(sel: &ProjectionSelection, collection: &str) -> Option<String> {
+    sel.system.iter().find_map(|item| match item {
+        SystemItem::Collection { name, sections } if name == collection => {
+            sections.iter().find(|s| s.selected).map(|s| s.name.clone())
+        }
+        _ => None,
+    })
+}
 
 // ── Conversation ──────────────────────────────────────────────────────────────
 
@@ -160,7 +169,7 @@ impl Conversation {
     /// sealed pointers) without projection.
     ///
     /// Use [`Self::read_scored`] when projecting against a freshly-built
-    /// [`ProjectionScores`] from a BDP scan.
+    /// [`ProjectionScores`] from the wide-Q belief scan.
     pub fn read(&self) -> SubstrateRead<'_> {
         SubstrateRead {
             guard: self.inner.read().unwrap(),
@@ -169,8 +178,8 @@ impl Conversation {
     }
 
     /// Acquire a read guard bound to an externally-owned
-    /// [`ProjectionScores`]. The scores are transient per-projection
-    /// state — typically populated by the BDP scanner on the call site's
+    /// [`ProjectionScores`]. The scores are transient per-projection state —
+    /// populated by the reprojection's wide-Q belief scan on the call site's
     /// stack and dropped at end of scope. They are **not** held by the
     /// substrate.
     pub fn read_scored<'a>(&'a self, scores: &'a ProjectionScores) -> SubstrateRead<'a> {
@@ -203,6 +212,110 @@ impl Conversation {
         }
     }
 
+    /// Assemble the belief gallery for a section `collection`: every in-scope
+    /// turn's wide-Q window mapped to the belief slot it stands for.
+    ///
+    /// Scope is a **tag partition**, so a tagged corpus and untagged live
+    /// conversation never bleed into each other:
+    /// - a **tagged** policy (`tags` non-empty, e.g. `["tool"]`) admits only
+    ///   turns carrying one of those tags — its fixed calibration corpus;
+    /// - an **untagged** policy (`tags` empty) admits only *untagged* turns —
+    ///   live conversation, the self-reinforcing case where a past turn that
+    ///   scored high gets pulled back in (tagged calibration turns are excluded
+    ///   so they don't leak into general memory).
+    ///
+    /// Label: a turn's tag that names a slot wins (so tagged calibration turns
+    /// are labelled directly — no cold-start bootstrap); otherwise the turn is
+    /// labelled by the section its own last projection selected in `collection`
+    /// (self-reinforcing). Turns that resolve to no slot are skipped. Returns
+    /// `(windows, slot_per_window)` for [`crate::provenance::score_slots`].
+    pub fn belief_gallery(
+        &self,
+        collection: &str,
+        tags: &[String],
+        slot_of: impl Fn(&str) -> Option<usize>,
+    ) -> (Vec<Vec<WideQSig>>, Vec<usize>) {
+        let sub = self.inner.read().unwrap();
+        let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+        let mut slots: Vec<usize> = Vec::new();
+        for (_sid, e) in sub.all_streams() {
+            let Some(StreamDecl::Turn(d)) = &e.decl else {
+                continue;
+            };
+            let in_scope = if tags.is_empty() {
+                d.tags.is_empty()
+            } else {
+                d.tags.iter().any(|t| tags.contains(t))
+            };
+            if !in_scope {
+                continue;
+            }
+            let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+                continue;
+            };
+            if window.is_empty() {
+                continue;
+            }
+            let slot = d.tags.iter().find_map(|t| slot_of(t)).or_else(|| {
+                e.projection_events
+                    .as_ref()
+                    .map(|b| decode_events(b))
+                    .and_then(|evs| {
+                        evs.iter()
+                            .rev()
+                            .find_map(|ev| selected_in_collection(&ev.selection, collection))
+                    })
+                    .and_then(|name| slot_of(&name))
+            });
+            let Some(slot) = slot else {
+                continue;
+            };
+            windows.push(window);
+            slots.push(slot);
+        }
+        (windows, slots)
+    }
+
+    /// Score every belief-driven collection in `layer` against its tag-scoped
+    /// gallery, using `probe` as the query window, into per-section
+    /// [`ProjectionScores`].
+    ///
+    /// Shared by the two probes that drive selection: the scheduler's live
+    /// reproject scan (probe = live wide-Q gather over the decode window) and
+    /// the post-turn projection event (probe = the finished turn's stored
+    /// signature). A collection with an empty gallery or no sections contributes
+    /// nothing — its sections read `0.0`.
+    pub fn score_belief_collections(
+        &self,
+        layer: &LayerSchema,
+        probe: &[WideQSig],
+    ) -> ProjectionScores {
+        let mut scores = ProjectionScores::new();
+        if probe.is_empty() {
+            return scores;
+        }
+        for item in &layer.system_prompt.items {
+            let SystemPromptItem::Collection(coll) = item else {
+                continue;
+            };
+            let n = coll.sections.len();
+            if n == 0 {
+                continue;
+            }
+            let slot_of = |name: &str| coll.sections.iter().position(|s| s.name == name);
+            let (windows, slots) = self.belief_gallery(&coll.name, &coll.policy.tags, slot_of);
+            if windows.is_empty() {
+                continue;
+            }
+            let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+            let fresh = score_slots(probe, &wref, &slots, n);
+            for (s, &score) in coll.sections.iter().zip(&fresh) {
+                scores.set_section(s.id, score);
+            }
+        }
+        scores
+    }
+
     /// Atomically append a turn to the substrate.
     ///
     /// `write` carries the turn's text, token IDs, block range, and
@@ -223,6 +336,7 @@ impl Conversation {
         // `assistant_text` without re-tokenising or scanning.
         let user_text = write.user_text.clone();
         let assistant_text = write.assistant_text.clone();
+        let tags = write.tags.clone();
         let content_bounds = write.content_bounds;
         let idx = {
             let mut view = self.inner.write().unwrap();
@@ -249,12 +363,12 @@ impl Conversation {
             group_id,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: PerDepthScores::default(),
             user_content_start: content_bounds.user_start,
             user_content_end: content_bounds.user_end,
             assistant_content_start: content_bounds.asst_start,
             user_text,
             assistant_text,
+            tags,
         });
         self.persistence
             .lock()
@@ -305,12 +419,12 @@ impl Conversation {
             group_id,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            scores: PerDepthScores::default(),
             user_content_start: 0,
             user_content_end: 0,
             assistant_content_start: 0,
             user_text: String::new(),
             assistant_text: String::new(),
+            tags: Vec::new(),
         });
         self.persistence
             .lock()
@@ -328,11 +442,8 @@ impl Conversation {
     /// and are demand-populated. Reload therefore:
     /// - Walks every persisted turn stream in `(timeline, turn_index)`
     ///   order.
-    /// - Replays **tokens** (for text history) and **BDP signatures** (for
-    ///   provenance retrieval over the full persisted corpus) into the
-    ///   in-RAM substrate. Sigs are small (RAM-resident) and load-bearing
-    ///   for the next BDP scan; tokens are small (RAM-resident) and
-    ///   load-bearing for text display.
+    /// - Replays **tokens** (for text history) into the in-RAM substrate —
+    ///   small (RAM-resident) and load-bearing for text display.
     /// - Records each turn's stream metadata (`block_start`/`block_end`,
     ///   role, timeline) so projection knows the turn exists and where its
     ///   KV lives on disk.
@@ -345,7 +456,6 @@ impl Conversation {
     pub fn reconstruct_from_log(
         &self,
         n_layers: usize,
-        restore_sigs: impl Fn(&[(u16, Vec<u8>)]) -> candle::Result<Vec<SigEntry>>,
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> candle::Result<usize> {
         // Substrate's per-stream / per-timeline state was populated
@@ -419,14 +529,6 @@ impl Conversation {
                     continue;
                 }
             };
-            // Re-append the BDP signatures into the (fresh) provenance file,
-            // yielding entries that point at the rebuilt offsets. Sigs are
-            // load-bearing — the BDP scan operates on signatures, not KV.
-            let sig_entries = if recovered.signatures.is_empty() {
-                Vec::new()
-            } else {
-                restore_sigs(&recovered.signatures)?
-            };
             let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
                 candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
             })?;
@@ -462,7 +564,7 @@ impl Conversation {
             // a recoverable-token-only turn (no persisted chunks) —
             // the substrate keeps it discoverable but it stays unable
             // to materialise KV.
-            let idx = view.restore_turn(
+            view.restore_turn(
                 timeline,
                 std::mem::take(&mut decl.user_text),
                 std::mem::take(&mut decl.assistant_text),
@@ -478,9 +580,6 @@ impl Conversation {
                 decl.block_start,
                 decl.block_end,
             );
-            if !sig_entries.is_empty() {
-                view.set_sig_entries(timeline, idx, sig_entries);
-            }
             restored += 1;
         }
         // Arm low-priority reconciliation per timeline. The summary forest is
@@ -826,6 +925,50 @@ impl Conversation {
         self.read().is_tombstoned(timeline)
     }
 
+    /// Mark `timeline` for distillation — in-RAM (so the compactor sees it this
+    /// session) and on disk (a [`crate::persistence::record::RecordType::Distilled`]
+    /// record, so it survives reload). Its turns shed content at the next
+    /// compaction. Idempotent; callers should gate on [`Self::is_timeline_distilled`].
+    pub fn distill_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
+        self.write().distill_timeline(timeline);
+        let mut p = self.persistence.lock().unwrap();
+        p.write_distill(timeline.raw())
+            .map_err(|e| candle::Error::Msg(format!("write_distill: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether `timeline` is marked for distillation.
+    pub fn is_timeline_distilled(&self, timeline: TimelineId) -> bool {
+        self.read().is_distilled(timeline)
+    }
+
+    /// Whether the substrate holds any reclaimable markers — tombstoned or
+    /// distilled timelines — so a compaction pass would do real work. The loader
+    /// uses this to run compaction only when there's something to reclaim.
+    pub fn has_reclaimable_records(&self) -> bool {
+        let s = self.read();
+        !s.tombstoned_timelines().is_empty() || !s.distilled_timelines().is_empty()
+    }
+
+    /// Whether `timeline` still has KV chunks on any of its turns — i.e. content
+    /// not yet reclaimed. Callers gate distill-marking on this so a
+    /// content-reclaimed timeline is never re-marked (which would keep triggering
+    /// compaction forever).
+    pub fn timeline_has_kv(&self, timeline: TimelineId) -> bool {
+        use crate::persistence::content_hash::turn_stream_id;
+        let sub = self.inner.read().unwrap();
+        // Scope to this timeline's own turn streams — O(turns), not a scan of the
+        // whole stream table.
+        for idx in 0..sub.turn_count(timeline) {
+            if let Some(e) = sub.stream_of(turn_stream_id(timeline.raw(), idx)) {
+                if !e.chunks.is_empty() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Set the substrate-side resume key (`debug_id`) for `timeline`
     /// and persist a `RecordType::DebugId` record to the redo log.
     /// Last-write-wins on replay.  Idempotent: if the substrate
@@ -878,22 +1021,6 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         p.write_tree_metadata(payload)
             .map_err(|e| candle::Error::Msg(format!("write_tree_metadata: {e}")))
-    }
-
-    /// Persist a cached tool-catalog summary to the redo log, keyed by
-    /// `catalog_hash`. Supersedes any prior summary (last-writer-wins; the
-    /// compactor reclaims the old copy). The in-RAM substrate's cached summary
-    /// is updated too, so a same-process re-read sees the new hash without a
-    /// reload. Callers gate this on a changed hash — see
-    /// [`crate::substrate::Substrate::tool_summary_hash`].
-    pub fn write_tool_summary(&self, payload: ToolSummaryPayload) -> candle::Result<()> {
-        {
-            let mut p = self.persistence.lock().unwrap();
-            p.write_tool_summary(&payload)
-                .map_err(|e| candle::Error::Msg(format!("write_tool_summary: {e}")))?;
-        }
-        self.write().apply_tool_summary(payload);
-        Ok(())
     }
 
     /// Persist a sealed turn's per-layer KV grid + token ids to the redo log
@@ -1011,15 +1138,6 @@ impl Conversation {
         Ok(())
     }
 
-    /// Persist a turn's BDP provenance signatures to the redo log — the
-    /// `Signatures` record. `sigs` is the [`crate::persistence::resume::encode_signatures`]
-    /// payload.
-    pub fn persist_signatures(&self, stream_id: StreamId, sigs: &[u8]) -> candle::Result<()> {
-        let mut p = self.persistence.lock().unwrap();
-        p.append_signatures(stream_id, sigs)
-            .map_err(|e| candle::Error::Msg(format!("persist signatures: {e}")))
-    }
-
     /// Persist a turn's projection-event timeline to the redo log — the
     /// `ProjectionEvents` record. `payload` is the
     /// [`crate::projection::encode_events`] JSON. Also mirrors the bytes into
@@ -1035,6 +1153,16 @@ impl Conversation {
         let mut p = self.persistence.lock().unwrap();
         p.append_projection_events(stream_id, payload)
             .map_err(|e| candle::Error::Msg(format!("persist projection events: {e}")))
+    }
+
+    /// Persist a turn's encoded wide-Q signature window to the redo log (`WideQSig`
+    /// record, last-writer-wins per stream) and mirror it into the in-RAM substrate.
+    pub fn persist_wide_q_sigs(&self, stream_id: StreamId, payload: &[u8]) -> candle::Result<()> {
+        self.write()
+            .set_wide_q_sigs_blob(stream_id, payload.to_vec());
+        let mut p = self.persistence.lock().unwrap();
+        p.append_wide_q_sigs(stream_id, payload)
+            .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
     }
 
     /// Declare a section stream — appends a `StreamDecl::PromptSection`
@@ -1071,15 +1199,10 @@ impl Conversation {
             .unwrap_or(false)
     }
 
-    /// Snapshot a persisted section stream's manifest metadata for the
-    /// cold-load path.  Returns `(chunks_per_layer, tokens_present,
-    /// signatures_present)` when the stream is known, otherwise `None`.
-    /// `chunks_per_layer = manifest.chunks.len() / n_layers`.
-    pub fn section_stream_layout(
-        &self,
-        stream_id: StreamId,
-        n_layers: usize,
-    ) -> Option<(usize, bool, bool)> {
+    /// Snapshot a persisted section stream's `chunks_per_layer` for the
+    /// cold-load path — `manifest.chunks.len() / n_layers` — when the
+    /// stream is known and its chunk count divides evenly, otherwise `None`.
+    pub fn section_stream_layout(&self, stream_id: StreamId, n_layers: usize) -> Option<usize> {
         drop(self.persistence.lock().unwrap());
         let substrate = self.read();
         let entry = substrate.stream_of(stream_id)?;
@@ -1090,12 +1213,7 @@ impl Conversation {
         if total % n_layers != 0 {
             return None;
         }
-        let chunks_per_layer = total / n_layers;
-        Some((
-            chunks_per_layer,
-            entry.tokens.is_some(),
-            entry.signatures.is_some(),
-        ))
+        Some(total / n_layers)
     }
 
     /// Cold-load a persisted section's chunks back into hot VRAM via
@@ -1145,25 +1263,6 @@ impl Conversation {
     /// consumers that pick scenarios out of a loaded workspace by id.
     pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<SectionId> {
         self.read().section_id_for_debug_name(debug_name)
-    }
-
-    /// Read a persisted section's `Signatures` record from disk and
-    /// decode it into the `(token_count, raw_bytes)` tuples the BDP
-    /// scanner re-ingests.  Returns an empty Vec if the section has
-    /// no signatures recorded.
-    pub fn read_section_signatures(
-        &self,
-        stream_id: StreamId,
-    ) -> candle::Result<Vec<(u16, Vec<u8>)>> {
-        let mut p = self.persistence.lock().unwrap();
-        let substrate = self.read();
-        let bytes = match p.read_signatures(&substrate, stream_id) {
-            Ok(Some(b)) => b,
-            Ok(None) => return Ok(Vec::new()),
-            Err(e) => return Err(candle::Error::Msg(format!("read section sigs: {e}"))),
-        };
-        crate::persistence::resume::decode_signatures(&bytes)
-            .map_err(|e| candle::Error::Msg(format!("decode section sigs: {e}")))
     }
 
     /// Durably flush the persistence redo log — the group-commit point.
@@ -1229,6 +1328,21 @@ impl Conversation {
         let p = self.persistence.lock().unwrap();
         f(p.manifest())
     }
+
+    /// Run `f` with a read view of the in-memory substrate and exclusive access to
+    /// the live persistence layer — for offline-style scans (e.g. the noise
+    /// calibration) that read sealed stream chunks/tokens back from the log.
+    /// Locks `inner` (read) then `persistence`, matching the write path's order.
+    /// Callers should `checkpoint_persistence` first so the records being read are
+    /// durable on disk at their recorded offsets.
+    pub fn with_substrate_and_persistence<R>(
+        &self,
+        f: impl FnOnce(&Substrate, &mut SubstratePersistence) -> R,
+    ) -> R {
+        let substrate = self.inner.read().unwrap();
+        let mut persistence = self.persistence.lock().unwrap();
+        f(&substrate, &mut persistence)
+    }
 }
 
 // ── TargetedRead ──────────────────────────────────────────────────────────────
@@ -1280,18 +1394,11 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.turn_token_count_of(timeline, index)
     }
 
-    fn turn_score(
-        &self,
-        group: GroupId,
-        index: TurnIndex,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
+    fn turn_score(&self, group: GroupId, index: TurnIndex) -> f32 {
         let Some(timeline) = self.timeline_for(group) else {
             return 0.0;
         };
-        self.read
-            .turn_score_for_timeline(timeline, index, formula, weights)
+        self.read.turn_score_for_timeline(timeline, index)
     }
 
     fn turn_origin(&self, group: GroupId, _index: TurnIndex) -> Option<LayerId> {
@@ -1304,12 +1411,40 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         ContentResolver::section_token_count(&self.read, section)
     }
 
-    fn section_score(
-        &self,
-        section: SectionId,
-        formula: ScoreFormula,
-        weights: &DepthWeights,
-    ) -> f32 {
-        ContentResolver::section_score(&self.read, section, formula, weights)
+    fn section_score(&self, section: SectionId) -> f32 {
+        ContentResolver::section_score(&self.read, section)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_in_collection;
+    use crate::projection::{ProjectionSelection, SelectedSection, SystemItem};
+
+    #[test]
+    fn selected_in_collection_finds_the_selected_member() {
+        let sel = ProjectionSelection {
+            system: vec![SystemItem::Collection {
+                name: "tools".into(),
+                sections: vec![
+                    SelectedSection {
+                        name: "a".into(),
+                        tokens: 1,
+                        selected: false,
+                        score: 2.0,
+                    },
+                    SelectedSection {
+                        name: "b".into(),
+                        tokens: 1,
+                        selected: true,
+                        score: 9.0,
+                    },
+                ],
+            }],
+            turns: vec![],
+        };
+        assert_eq!(selected_in_collection(&sel, "tools"), Some("b".to_string()));
+        // A different collection name matches nothing.
+        assert_eq!(selected_in_collection(&sel, "memory"), None);
     }
 }

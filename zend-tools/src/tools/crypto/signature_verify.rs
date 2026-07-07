@@ -7,17 +7,24 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{decode_data, CryptoError};
+use super::{decode_data, normalize_algorithm, CryptoError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SigVerifyRequest {
     pub data: String,
+    /// How `data` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub data_encoding: Option<String>,
+    /// The signature to check, as hex.
     #[validate(length(min = 1))]
     pub signature_hex: String,
+    /// The signer's public key in PEM form, including the
+    /// `-----BEGIN PUBLIC KEY-----`/`-----END PUBLIC KEY-----` armor lines.
     #[validate(length(min = 1))]
     pub public_key_pem: String,
+    /// Signature scheme. One of: ed25519, p256_sha256.
+    #[schemars(with = "super::SignatureAlgorithm")]
     #[validate(length(min = 1))]
     pub algorithm: String,
 }
@@ -47,7 +54,7 @@ impl Tool for SignatureVerify {
         let sig_bytes = hex::decode(&req.signature_hex)
             .map_err(|e| CryptoError::SigningFailed(e.to_string()))?;
 
-        let valid = match req.algorithm.as_str() {
+        let valid = match normalize_algorithm(&req.algorithm).as_str() {
             "ed25519" => {
                 use ed25519_dalek::pkcs8::DecodePublicKey;
                 let vk = ed25519_dalek::VerifyingKey::from_public_key_pem(&req.public_key_pem)
@@ -57,7 +64,7 @@ impl Tool for SignatureVerify {
                 use ed25519_dalek::Verifier;
                 vk.verify(&data, &sig).is_ok()
             }
-            "p256_sha256" => {
+            "p256sha256" => {
                 use p256::pkcs8::DecodePublicKey;
                 let vk = P256VerifyingKey::from_public_key_pem(&req.public_key_pem)
                     .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;

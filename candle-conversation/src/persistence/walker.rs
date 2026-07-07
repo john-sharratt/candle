@@ -115,6 +115,29 @@ pub fn walk(
             offset += total;
             continue;
         }
+        // Location-only records — `Chunk` (KV), `Tokens` — carry the
+        // overwhelming bulk of a large log's bytes, but the consumer indexes them by
+        // `(offset, payload_len, record_size)` and reads the payload lazily by offset
+        // later: `apply_walker_entry` never reads their `payload`. So skip the second
+        // read of the whole record (and the payload copy) and hand back just the header
+        // we already parsed from the probe sector. This is what makes a multi-GB walk
+        // cheap — without it the walk re-reads and copies the entire log into RAM. The
+        // walk's torn-record detection is header-framed (size/zero-fill), so skipping
+        // the payload read changes nothing there.
+        if matches!(header.record_type, RecordType::Chunk | RecordType::Tokens) {
+            let entry = WalkEntry {
+                offset,
+                record: Record {
+                    header,
+                    payload: Vec::new(),
+                },
+                size: total,
+            };
+            visit(&entry);
+            records += 1;
+            offset += total;
+            continue;
+        }
         let record_bytes = src.read_at(offset, total as usize)?;
         let (header, payload, consumed) = match decode_record(&record_bytes) {
             Ok(decoded) => decoded,
@@ -188,7 +211,44 @@ mod tests {
         assert_eq!(entries[0].record.header.chunk_index, 0);
         assert_eq!(entries[1].record.header.chunk_index, 1);
         assert_eq!(entries[2].record.header.stream_id, 2);
-        assert_eq!(entries[0].record.payload, b"aaa");
+        // Chunk is location-only: its payload is skip-loaded (the consumer reads KV
+        // lazily by offset). The header — including payload_len — is preserved.
+        assert!(entries[0].record.payload.is_empty());
+        assert_eq!(entries[0].record.header.payload_len, 3);
+    }
+
+    fn small_record(rt: RecordType, payload: &[u8]) -> Vec<u8> {
+        encode_record(
+            &RecordHeader {
+                record_type: rt,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            },
+            payload,
+        )
+    }
+
+    #[test]
+    fn location_records_skip_payload_other_records_retain_it() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&chunk(1, 0, b"chunk-kv-bytes"));
+        blob.extend_from_slice(&small_record(RecordType::Commit, b"commit-payload"));
+        let mut mem = MemLog::with_records(&blob);
+
+        let (entries, outcome) = collect(&mut mem, SUPERBLOCK_SIZE).unwrap();
+        assert_eq!(outcome.records, 2);
+        // Location-only record: payload skipped, header (incl. len) intact.
+        assert!(entries[0].record.payload.is_empty());
+        assert_eq!(
+            entries[0].record.header.payload_len,
+            b"chunk-kv-bytes".len() as u64
+        );
+        // Non-location record: payload fully read.
+        assert_eq!(entries[1].record.payload, b"commit-payload");
     }
 
     #[test]

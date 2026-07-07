@@ -9,7 +9,6 @@ use crate::persistence::SubstratePersistence;
 use crate::projection::{
     Builder, Conversation, GroupId, LayerId, ProjectionTarget, Reserved, TimelineId,
 };
-use crate::provenance::ProvenanceFile;
 use crate::scheduler::{Scheduler, SchedulerRequest};
 use crate::substrate::{ConvCompression, Substrate, TurnContentBounds};
 use crate::summary_tree::{ChannelProbeRunner, SelectionDiagnostics, SummariserThread};
@@ -131,12 +130,6 @@ pub struct ConversationEngine {
     /// [`Self::shutdown`] joins it after the persistence thread has
     /// drained, and `Drop` falls through to the same path.
     summariser_thread: SummariserThread,
-
-    /// Shared provenance signature file (anonymous temp, deleted on process exit).
-    ///
-    /// One file per engine, shared via `Arc` across all conversations so all
-    /// turns are indexed in the same mmap-backed store.
-    provenance: Arc<ProvenanceFile>,
 
     /// Static model properties captured before the model moves to the scheduler thread.
     model_core: ModelCoreProperties,
@@ -264,12 +257,6 @@ impl ConversationEngine {
         }
         let conversation = Conversation::from_parts(substrate, persistence);
 
-        // Workspace-shared `ProvenanceFile`: created up-front so the
-        // scheduler can append to it inline during `cleanup_finished`'s
-        // post-Done seal step.
-        let provenance = Arc::new(ProvenanceFile::new()?);
-        let scheduler_provenance = Arc::clone(&provenance);
-
         // Spawn the substrate persistence thread (§5s heartbeat + per-
         // seal trigger). Owns the redo-log write path; needs backings +
         // device for hot→warm migration and warm→cold gather. Spawn it
@@ -299,8 +286,12 @@ impl ConversationEngine {
             summary_concurrency,
             "summariser probe-batch concurrency set from total VRAM"
         );
-        let summariser_thread =
-            SummariserThread::spawn(conversation.clone(), summariser_runner, summary_concurrency);
+        let summariser_thread = if config.disable_summariser {
+            tracing::info!("disable_summariser: summariser thread not spawned");
+            SummariserThread::disabled()
+        } else {
+            SummariserThread::spawn(conversation.clone(), summariser_runner, summary_concurrency)
+        };
         // Hand the trigger to the scheduler so every assistant-turn
         // seal wakes the summariser immediately — design §4 step ③.
         let summariser_trigger = summariser_thread.trigger_handle();
@@ -331,8 +322,6 @@ impl ConversationEngine {
                     penalty_log,
                     health_config,
                     config.scheduler.large_prefill_max_tokens,
-                    scheduler_provenance,
-                    model_core,
                     persist_trigger,
                     summariser_trigger,
                     boundary_markers,
@@ -364,7 +353,6 @@ impl ConversationEngine {
             scheduler_handle: Mutex::new(Some(handle)),
             tokenizer: Arc::new(tokenizer),
             config,
-            provenance,
             model_core,
             conversation,
             persist_thread,
@@ -378,6 +366,21 @@ impl ConversationEngine {
     /// the GUI's "Loading substrate" step while the redo log replays.
     pub fn substrate_reload_status(&self) -> Arc<SubstrateReloadStatus> {
         Arc::clone(&self.substrate_reload_status)
+    }
+
+    /// Re-reconstruct the substrate on the scheduler thread (needs the model
+    /// backings for KV residence) — call after a compaction rewrites the redo log
+    /// so all offsets / KV pointers are rebuilt from the new log. Returns a fresh
+    /// status handle; poll [`SubstrateReloadStatus::snapshot`] until `finished`.
+    pub fn reload_substrate(&self) -> Arc<SubstrateReloadStatus> {
+        let status = Arc::new(SubstrateReloadStatus::default());
+        let _ = self
+            .scheduler_tx
+            .send(SchedulerRequest::ReconstructSubstrate {
+                conversation: self.conversation.clone(),
+                status: Arc::clone(&status),
+            });
+        status
     }
 
     /// Clone the workspace `Conversation` handle.
@@ -560,12 +563,47 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
+    /// Whether `timeline` is archived. Unlike [`Self::known_conversations`]
+    /// — which omits internal conversations that never set a `conv_id` — this
+    /// reads the flag directly, so it works for reserved/utility timelines too.
+    pub fn is_conversation_archived(&self, timeline: TimelineId) -> bool {
+        self.conversation.is_conversation_archived(timeline)
+    }
+
     /// Tombstone `timeline` — see
     /// [`crate::projection::Conversation::tombstone_timeline`].
     pub fn tombstone_timeline(&self, timeline: TimelineId) -> crate::Result<()> {
         self.conversation
             .tombstone_timeline(timeline)
             .map_err(ConversationError::Model)
+    }
+
+    /// Mark `timeline` for distillation (keep sig, drop content at compaction) —
+    /// see [`crate::projection::Conversation::distill_timeline`]. Idempotent;
+    /// gate on [`Self::is_timeline_distilled`] to skip already-distilled timelines.
+    pub fn distill_timeline(&self, timeline: TimelineId) -> crate::Result<()> {
+        self.conversation
+            .distill_timeline(timeline)
+            .map_err(ConversationError::Model)
+    }
+
+    /// Whether `timeline` is already marked for distillation.
+    pub fn is_timeline_distilled(&self, timeline: TimelineId) -> bool {
+        self.conversation.is_timeline_distilled(timeline)
+    }
+
+    /// Whether the loaded substrate holds tombstoned or distilled timelines —
+    /// i.e. compaction would reclaim something. The loader runs compaction only
+    /// when this is true.
+    pub fn substrate_has_reclaimable(&self) -> bool {
+        self.conversation.has_reclaimable_records()
+    }
+
+    /// Whether `timeline` still has KV content (not yet reclaimed by a distill
+    /// compaction). Gate distill-marking on this to keep it idempotent and avoid
+    /// looping compaction.
+    pub fn timeline_has_kv(&self, timeline: TimelineId) -> bool {
+        self.conversation.timeline_has_kv(timeline)
     }
 
     /// Build an **engine-internal** conversation that lives on the reserved
@@ -700,10 +738,11 @@ impl ConversationEngine {
         // Every layer summarises into its AVL summary tree; provenance scans then
         // expand the compressed nodes on retrieval. This is independent of
         // `disable_reprojection` — that flag only gates the per-turn reprojection
-        // and the O(n²) BDP scan for append-only utility layers. The AVL
-        // summariser runs on its own thread (wave-driven compression) and never
-        // blocks ingest, so even high-turn-count utility layers can summarise.
-        self.conversation.set_timeline_summarize(timeline, true);
+        // for append-only utility layers. The AVL summariser runs on its own
+        // thread (wave-driven compression) and never blocks ingest, so even
+        // high-turn-count utility layers can summarise.
+        self.conversation
+            .set_timeline_summarize(timeline, !self.config.disable_summariser);
         let target = ProjectionTarget {
             layer,
             group,
@@ -723,7 +762,6 @@ impl ConversationEngine {
             .recv()
             .map_err(|_| ConversationError::SchedulerGone)??;
 
-        let provenance = Arc::clone(&self.provenance);
         let conv = Sequence::new_with_projection(
             self.scheduler_tx.clone(),
             sequence_id,
@@ -733,7 +771,6 @@ impl ConversationEngine {
             target,
             config,
             CHUNK_SIZE,
-            provenance,
             self.model_core,
             self.conversation.clone(),
             section_progress,
@@ -745,15 +782,6 @@ impl ConversationEngine {
     /// Get the shared tokenizer.
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
-    }
-
-    /// Get a clone of the shared provenance file.
-    ///
-    /// Allows external code (e.g. data-generation tools) to read back
-    /// the signatures written during turn seals.  The Arc keeps the
-    /// backing file alive as long as any clone exists.
-    pub fn provenance_file(&self) -> Arc<ProvenanceFile> {
-        Arc::clone(&self.provenance)
     }
 
     /// Static model properties captured at engine construction.
@@ -800,7 +828,9 @@ impl ConversationEngine {
                 prefill_tokens: TokenBuffer::from(tokens.to_vec()),
                 prefill_text: String::new(),
                 user_text: String::new(),
+                tags: Vec::new(),
                 content_bounds: TurnContentBounds::default(),
+                projection_offsets: Vec::new(),
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
                 max_decode_tokens,

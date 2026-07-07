@@ -9,9 +9,14 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct UnpackRequest {
+    /// The byte buffer to decode, interpreted according to `data_encoding`. Required.
     #[validate(length(min = 1))]
     pub data: String,
+    /// How `data` is encoded. One of: hex, base64, base64url, utf8. Defaults to hex.
+    #[schemars(with = "Option<super::BytesEncoding>")]
     pub data_encoding: Option<String>,
+    /// Python struct-style format string: optional endianness prefix (`<` little-endian, `>` big-endian)
+    /// then type chars B/H/I/L/Q/b/h/i/l/q/f/d and `Ns` for an N-byte string. Required.
     #[validate(length(min = 1))]
     pub format: String,
 }
@@ -29,7 +34,8 @@ impl Tool for BytesUnpack {
     const DESCRIPTION: &'static str =
         "Decode a raw byte buffer back into structured values — fixed-width \
          integers, floats, and strings — using a struct-style format string. \
-         The inverse of bytes_pack.";
+         The inverse of bytes_pack. Always call this tool to decode the bytes; \
+         never work them out by hand.";
 
     type Request = UnpackRequest;
     type Response = UnpackResponse;

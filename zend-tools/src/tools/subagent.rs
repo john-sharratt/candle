@@ -26,11 +26,16 @@ impl ToolError for SubagentError {
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// The task/prompt for the nested agent. Must be non-empty.
     #[validate(length(min = 1))]
     pub instruction: String,
+    /// Names of REGISTERED tools to grant the subagent. Omit to inherit the parent's tools.
     pub tools: Option<Vec<String>>,
+    /// Model identifier for the subagent. Omit to use the host default.
     pub model: Option<String>,
+    /// Endpoint override for the subagent's model. Omit to use the host default.
     pub endpoint: Option<String>,
+    /// Maximum agent-loop turns (1-50). Default: 10.
     #[validate(range(min = 1, max = 50))]
     pub max_turns: Option<u32>,
 }

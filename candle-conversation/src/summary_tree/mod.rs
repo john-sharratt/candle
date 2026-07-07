@@ -23,7 +23,7 @@
 //! they do not participate in the balance.
 //!
 //! For score-density selection (`select_dense`), however, **every node
-//! is scoreable** — the BDP scan stamps a score on Normal turns,
+//! is scoreable** — the provenance scan stamps a score on Normal turns,
 //! `SummaryOfTurns` leaves, and `SummaryOfSummaries` internals alike.
 
 mod diagnostics;

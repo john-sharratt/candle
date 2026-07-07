@@ -557,6 +557,7 @@
       const vis = conversations.filter((c) => !c.archived && (c.turn_count > 0 || c.history.length));
       activeId = vis.length ? vis[0].id : null;
     }
+    writeHashConv(activeId);   // keep the URL in sync so a reload doesn't restore the just-archived chat
     setState({ conversations, activeId }, focusPrompt);
   }
   function unarchiveConv(id, e) {
@@ -569,6 +570,7 @@
     try { localStorage.setItem('zend.showArchived', showArchived ? '1' : '0'); } catch (_) {}
     let activeId = S.activeId;
     if (!showArchived) { const a = S.conversations.find((c) => c.id === activeId); if (a && a.archived) activeId = null; }
+    writeHashConv(activeId);
     setState({ showArchived, activeId }, focusPrompt);
   }
 
@@ -1626,10 +1628,15 @@
     Promise.resolve(API.seedConversations(now)).then((list) => {
       S.conversations = list || [];
       const hashId = readHashConv();
-      const hashConv = hashId && S.conversations.find((c) => String(c.id) === String(hashId));
-      const hydrated = S.conversations.find((c) => c.history && c.history.length);
-      const first = S.conversations[0];
-      S.activeId = hashConv ? hashConv.id : (hydrated ? hydrated.id : (first ? first.id : null));
+      // Restore ONLY the conversation the user actually had open (carried in the
+      // URL hash) — never auto-select one otherwise. A reload with nothing open,
+      // or with everything archived, lands on the new-conversation home page
+      // instead of jumping into some chat. The hash still has to point at a
+      // *visible* conversation (respects the "show archived" toggle), which is also
+      // how a daemon-rebuild auto-reload returns you to the chat you were in.
+      const visible = (c) => !!c && (S.showArchived || !c.archived);
+      const hashConv = hashId && S.conversations.find((c) => String(c.id) === String(hashId) && visible(c));
+      S.activeId = hashConv ? hashConv.id : null;
       if (S.activeId) {
         const a = S.conversations.find((c) => c.id === S.activeId);
         S.loaded[S.activeId] = !!(a && a.history && a.history.length);

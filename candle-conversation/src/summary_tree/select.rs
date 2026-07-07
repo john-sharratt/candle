@@ -49,7 +49,7 @@ impl Selection {
 /// Score-density selection over the entire summary tree.
 ///
 /// `provenance_scores` is the per-node Q-agreement score produced by
-/// the BDP scan; missing nodes default to `0.0`.  `recency_cfg`
+/// the provenance scan; missing nodes default to `0.0`.  `recency_cfg`
 /// controls the hard-anchor + decay (see [`RecencyConfig`]).  `budget`
 /// is the layer's `window` in tokens.
 pub fn select_dense(

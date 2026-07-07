@@ -11,19 +11,34 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct SaveRequest {
+    /// Unique friendly name to store and later reference this credential by.
     #[validate(length(min = 1))]
     pub name: String,
+    /// Credential type. Infer it from the secret: an API token (e.g. one starting
+    /// `sk-`, `ghp_`, `sk_live_`, `xoxb-`) is `http_bearer`; an SSH PEM/OpenSSH
+    /// private key is `ssh_key`; a PEM signing key is `signing_key`; a base32 2FA
+    /// seed is `totp_secret`; a DB login is `sql_password`.
+    #[schemars(with = "super::CredType")]
     #[validate(length(min = 1))]
     #[serde(rename = "type")]
     pub cred_type: String,
+    /// Login name. Required for ssh_key, ssh_password, telnet_password, http_basic,
+    /// sql_password, and remote_fs_password.
     pub username: Option<String>,
+    /// The secret material: API token, password, base32 TOTP seed, or PEM key block.
     #[validate(length(min = 1))]
     pub secret: String,
+    /// Passphrase protecting an encrypted `ssh_key`, if any.
     pub passphrase: Option<String>,
+    /// HTTP header name (e.g. "X-API-Key"). Required for type http_header.
     pub header_name: Option<String>,
+    /// Authentication domain (e.g. SMB/AD domain for remote_fs_password).
     pub domain: Option<String>,
+    /// Default host this credential connects to, if any.
     pub default_host: Option<String>,
+    /// Default port this credential connects to, if any.
     pub default_port: Option<u16>,
+    /// Default database name (for sql_password).
     pub default_database: Option<String>,
 }
 
@@ -138,7 +153,7 @@ impl Tool for CredentialSave {
         };
         ctx.credentials
             .save(cred)
-            .map_err(|e| CredError::DuplicateName(e))?;
+            .map_err(CredError::DuplicateName)?;
 
         Ok(SaveResponse {
             id,

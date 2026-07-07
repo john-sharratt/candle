@@ -14,10 +14,17 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
+    /// Name of the stored credential to authenticate with. The username and
+    /// auth secret come from this credential, not from `host`.
     #[validate(length(min = 1))]
     pub credential_name: String,
+    /// Remote host to connect to: a HOSTNAME or IP address ONLY — do NOT include
+    /// a username (e.g. use "example.com", not "user@example.com"); the username
+    /// comes from the credential. Defaults to the credential's default host.
     pub host: Option<String>,
+    /// TCP port. Defaults to the credential's default port, or 22 if unset.
     pub port: Option<u16>,
+    /// Seconds of inactivity before the session is auto-closed. Defaults to 900 (15 minutes).
     pub idle_timeout_sec: Option<u32>,
 }
 

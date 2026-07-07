@@ -3,6 +3,8 @@
 //! Runs a continuous loop alternating between prefill and decode.
 //! Phase 1 uses single-mode prefill (no small/large split).
 mod decode;
+#[cfg(feature = "kv-zero-check")]
+pub(crate) mod kv_zero_check;
 mod prefill;
 pub(crate) mod profile;
 pub(crate) mod projection_assembler;
@@ -20,7 +22,6 @@ use crate::persistence::cold_load::{
 };
 use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
 use crate::persistence::elevate::elevate_to_hot;
-use crate::persistence::resume::encode_signatures;
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
@@ -28,10 +29,7 @@ use crate::projection::{
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind, SectionId,
     SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey,
 };
-use crate::provenance::{
-    extract_mh_signatures_from_r16_dump, merge_turn_signatures_xor, BdpScanner, SigEntry,
-    TokenSignature, TurnSignatures,
-};
+use crate::provenance::{encode_wide_sigs, extract_q_vector_r16, fold_provenance, WideQSig};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::substrate::{ResidenceIndex, TurnContentBounds, TurnPartWrite};
 use crate::summary_tree::{
@@ -39,16 +37,14 @@ use crate::summary_tree::{
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
-use crate::{ProvenanceFile, SubstrateReloadStatus, TurnStats};
+use crate::{SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, IndexOp, Tensor};
-#[cfg(feature = "sig-trace")]
-use candle_nn::kv_cache::SealedChunk;
 use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
-    BatchedInferenceSession, ManagedBatchedModel, ModelCoreProperties, ProvenanceLayerIndices,
+    BatchedInferenceSession, ManagedBatchedModel,
 };
 use crossbeam::channel::{Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
@@ -153,6 +149,10 @@ pub(crate) enum SchedulerRequest {
         /// Empty for non-turn paths (RULER, summarisation) that
         /// have no user message.
         user_text: String,
+        /// Gather-scope tags for this turn (e.g. `["tool"]` on calibration
+        /// turns). Threaded to the turn's `TurnDecl` at seal so a projection
+        /// policy's `tags:` filter can scope its provenance gallery.
+        tags: Vec<String>,
         /// Content boundaries that frame the user-message body and the
         /// assistant-response body inside the sealed grid — computed CPU-side
         /// at submit time (the tokenizer lives on the conversation handle).
@@ -160,6 +160,13 @@ pub(crate) enum SchedulerRequest {
         /// compressor can window content-only halves. See
         /// [`TurnContentBounds`].
         content_bounds: TurnContentBounds,
+        /// Marker-delimited projection points — token offsets into `prefill_tokens`
+        /// where a staged calibration prefill fires a projection. The prefill wave
+        /// stops its per-pass advance on each offset and emits a `ProjectionEvent`,
+        /// reproducing the per-segment projection sequence a real decode produced
+        /// (`docs/tool_provenance_distillation.md`). Empty for every normal prefill
+        /// (one projection, single forward). The last offset is the trajectory end.
+        projection_offsets: Vec<u32>,
         /// The assistant half supplied by a PREFILL turn (e.g. repo_map /
         /// code_reading ingest), stored verbatim as `TurnPart::assistant_text`
         /// at seal time. A prefill never decodes, so the seal's decoded `text`
@@ -178,7 +185,7 @@ pub(crate) enum SchedulerRequest {
         sampling: SamplingConfig,
         event_tx: Sender<TurnEvent>,
         /// Optional continuous-re-projection policy.  When `Some`, the
-        /// scheduler re-runs BDP + projection mid-decode and swaps the
+        /// scheduler re-runs provenance + projection mid-decode and swaps the
         /// view's borrowed ranges in place; see [`ReprojectionPolicy`]
         /// for the full contract.  `None` skips re-projection entirely
         /// (used by single-shot paths like RULER eval and summarisation).
@@ -363,6 +370,14 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<TurnIndex, String>>,
     },
 
+    /// Re-run substrate reconstruction on the scheduler thread — used after a
+    /// compaction rewrites the redo log, so the scheduler-side view (KV residence
+    /// + offsets) is rebuilt from the new log. Marks `status` finished when done.
+    ReconstructSubstrate {
+        conversation: Conversation,
+        status: Arc<SubstrateReloadStatus>,
+    },
+
     /// Shut down the scheduler.
     Shutdown,
 }
@@ -433,7 +448,7 @@ fn record_phase(start: Instant, phase: &'static str) {
 /// 1. Tracks decoded-token count per-view.
 /// 2. After every `every_n_tokens` tokens, extracts live Q sigs from the
 ///    view's R16 backing at the three provenance layers.
-/// 3. Runs BDP against the substrate corpus and writes fresh per-turn
+/// 3. Runs provenance against the substrate corpus and writes fresh per-turn
 ///    scores under [`Conversation::write`].
 /// 4. Re-runs `Builder::project` for `target` to obtain a new
 ///    visible-block set.
@@ -450,34 +465,29 @@ pub(crate) struct ReprojectionPolicy {
     /// the same selector options as the initial prefill.
     pub(crate) selection: SelectionState,
     pub(crate) substrate: Conversation,
-    pub(crate) provenance: Arc<ProvenanceFile>,
-    pub(crate) provenance_layer_indices: ProvenanceLayerIndices,
     /// Cadence trigger: re-project after every `every_n_tokens` decoded
     /// tokens.  `0` disables the cadence trigger (punctuation triggers
     /// can still fire).
     pub(crate) every_n_tokens: usize,
     /// Maximum tokens looking back from the current decode position to
-    /// include in the BDP probe.  Caps the "thought window" — beyond
+    /// include in the wide-Q probe.  Caps the "thought window" — beyond
     /// this many tokens the prior reprojection already captured the
     /// older intent.  Must be `>= 1`.  Default: 64.
     pub(crate) max_probe_tokens: usize,
-    /// Token IDs to drop from the BDP probe.  Includes formatting
-    /// characters (whitespace, markdown punctuation) and chat-template
-    /// scaffolding (role markers, think-block boundaries).  Without
-    /// this filter every historical turn would inflate by roughly the
-    /// same amount on shared-structure matches rather than ranking by
-    /// shared content.
-    pub(crate) probe_filter_token_ids: Arc<Vec<u32>>,
     /// Token IDs that, when sampled, fire an immediate reprojection in
     /// addition to the every-`every_n_tokens` cadence.  Use for
     /// paragraph/sentence boundaries (`\n`, `. `, etc) so attention
     /// re-orients at semantic transition points rather than waiting
     /// for the next fixed-cadence trigger.
     pub(crate) trigger_token_ids: Arc<Vec<u32>>,
-    /// Span Î± for the BDP scanner.  Must match the Î± in `FIXED_FORMULA` so
-    /// scores produced during reprojection are consistent with the scores the
-    /// projection engine reads when computing group scores.
-    pub(crate) span_alpha: f32,
+    /// Token id of the `<tool_call>` open tag (when the tokenizer has it as a
+    /// single token). When sampled, one lock-in reprojection fires — committing
+    /// the tool from the reasoning so far — and reprojection is then suppressed
+    /// until `tool_call_close_id`, so the generic call body doesn't re-orient the
+    /// selection. `None` disables the gate (tag not a single token).
+    pub(crate) tool_call_open_id: Option<u32>,
+    /// Token id of the `</tool_call>` close tag — re-enables reprojection.
+    pub(crate) tool_call_close_id: Option<u32>,
 }
 
 /// Inputs the scheduler needs to run `Builder::project()` itself for a
@@ -565,14 +575,16 @@ struct DecodeState {
     /// time `generated_tokens.len()` becomes a multiple of
     /// `every_n_tokens`.  Carried across mid-decode swaps unchanged.
     reprojection: Option<ReprojectionPolicy>,
-    /// Provenance `SigEntry` records accumulated during decode by
-    /// `extract_prov_after_step`.  Each entry covers one 32-token
-    /// block extracted immediately after the forward pass that completed
-    /// it, while the R16 backing is still intact.  Passed to
-    /// `perform_seal_and_write` so seal-time extraction covers only the
-    /// residual partial block (and any post-decode tail tokens), not the
-    /// bulk that the bg_quantizer may have already compressed.
-    prov_sig_entries: Vec<SigEntry>,
+    /// Count of non-trigger tokens decoded since the last reprojection.
+    /// A punctuation trigger only fires a reprojection once this exceeds 16,
+    /// so short lines / runs of trigger tokens don't each re-project. Reset to
+    /// 0 whenever a reprojection (cadence or punctuation) is queued.
+    non_punct_since_reproject: usize,
+    /// Generated-token index of the previous projection point, so a reprojection
+    /// event's span is `[last_projection_end, current_gen)`. Lives on the decode
+    /// state (which migrates correctly across reprojection view swaps), unlike the
+    /// separate view-keyed anchor map.
+    last_projection_end: u32,
     /// Trailing structural tokens forwarded into the slot after
     /// decode finishes, before the seal.  Today's seal path leaves
     /// this empty (the `assistant_end` boundary is a live
@@ -580,6 +592,11 @@ struct DecodeState {
     /// persisted turn).  Kept on `DecodeState` for the no-decode
     /// `insert_turn` path that still needs to close its own brackets.
     post_decode_tokens: TokenBuffer,
+    /// Online belief accumulated across this turn's reprojections. Each
+    /// reprojection seeds `project()` from it and writes the result back, so the
+    /// RelLeak decay/reinforcement carries across the turn (§80). Migrates with
+    /// the decode state through view swaps.
+    belief: crate::projection::PriorBelief,
     /// Full prefill token sequence pinned into the slot at this
     /// turn's submit:
     /// `[user_msg][user_end][assistant_start]` — a *suppressed* turn bakes an
@@ -596,6 +613,10 @@ struct DecodeState {
     /// seal time as `TurnPart::user_text` so the sidebar reload
     /// path never has to re-tokenise or scan for boundary markers.
     user_text: String,
+    /// Gather-scope tags for this turn, from the submit request. Persisted onto
+    /// the turn's `TurnDecl` at seal so a projection policy's `tags:` filter can
+    /// scope its provenance gallery. Empty for live/untagged turns.
+    tags: Vec<String>,
     /// Content boundaries that frame the user-message body and the
     /// assistant-response body inside the sealed grid.  Set from the submit
     /// path (CPU-tokenised against the prefill prefix strings) and recorded
@@ -606,6 +627,12 @@ struct DecodeState {
     /// verbatim as `TurnPart::assistant_text` at seal time. Empty for decode
     /// turns, where the seal uses the model's decoded text instead.
     prefill_assistant_text: String,
+    /// `true` while decoding inside a `<tool_call>…</tool_call>` block. Set when
+    /// the open tag is sampled (which also fires one lock-in reprojection) and
+    /// cleared at the close tag. While set, cadence/punctuation reprojection is
+    /// suppressed so the generic call body can't re-orient the committed tool.
+    /// Migrates with the decode state across view swaps.
+    in_tool_call: bool,
 }
 
 /// Per-turn view bookkeeping carried in the scheduler's `turn_views` map.
@@ -767,6 +794,8 @@ pub(crate) enum SealAction {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TurnContent {
     pub role: Role,
+    /// Gather-scope tags for this turn, carried from submit to seal.
+    pub tags: Vec<String>,
     /// The user's message text — exactly what `submit_turn`
     /// received, no role-marker envelope, no `/no_think` prefix.
     pub user_text: String,
@@ -807,6 +836,8 @@ pub(super) struct PrefillWork {
     pub(super) prefill_text: String,
     /// Raw user message string — see [`DecodeState::user_text`].
     pub(super) user_text: String,
+    /// Gather-scope tags — see [`DecodeState::tags`].
+    pub(super) tags: Vec<String>,
     /// Content boundaries — see [`DecodeState::content_bounds`].
     pub(super) content_bounds: TurnContentBounds,
     /// Prefilled assistant half — see [`DecodeState::prefill_assistant_text`].
@@ -828,6 +859,15 @@ pub(super) struct PrefillWork {
     /// post-decode forward pass in `cleanup_finished` can run.  Empty
     /// for paths that don't append a closing tail.
     pub(super) post_decode_tokens: TokenBuffer,
+    /// Staged-prefill projection points — token offsets into `tokens` where the
+    /// wave stops and emits a projection. Empty for a normal (single-projection)
+    /// prefill. See [`SchedulerRequest::SubmitTurn::projection_offsets`].
+    pub(super) projection_offsets: Vec<u32>,
+    /// The projection composition emitted at each staged projection point (the
+    /// calibration projection is pinned, so one composition serves every segment;
+    /// only its `start_token`/`end_token` span differs per emission). `None` for a
+    /// normal prefill.
+    pub(super) staged_composition: Option<crate::projection::ProjectionEvent>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -837,6 +877,10 @@ pub(super) struct ActivePrefill {
     pub(super) work: PrefillWork,
     /// Tokens consumed so far.
     pub(super) offset: usize,
+    /// Index of the next `work.projection_offsets` entry the wave has yet to
+    /// reach and emit. Advances as the prefill crosses each staged projection
+    /// point. Unused (stays 0) for a normal prefill with no offsets.
+    pub(super) next_projection: usize,
     /// Set once `offset >= work.tokens.len()` by the chunk runner.
     /// Drained by `promote_finished_prefills_to_decodes`.
     pub(super) final_logits: Option<Tensor>,
@@ -1059,7 +1103,7 @@ impl WaveStats {
         tracing::info!("wave {:.1}s: {body}{vram}", elapsed.as_secs_f64());
         // Phase breakdown: where the wall-clock went on the scheduler thread.
         // `drain` rising over the run ⇒ per-turn reprojection/elevate growing;
-        // `reproj` rising ⇒ continuous-reproject (BDP scan/glue) growing;
+        // `reproj` rising ⇒ continuous-reproject (provenance scan/glue) growing;
         // `unaccounted` large ⇒ blocked off-thread (persistence thread / lock).
         tracing::info!(
             target: "candle_conversation::scheduler::timing",
@@ -1188,13 +1232,6 @@ pub(crate) struct Scheduler {
     /// threading: callers no longer pass the target on every submit.
     slot_targets: HashMap<SequenceId, ProjectionTarget>,
 
-    /// Per-slot count of provenance blocks already extracted and
-    /// appended to the workspace [`ProvenanceFile`].  The seal step
-    /// in `cleanup_finished` extracts only the new blocks
-    /// `[sig_blocks_processed, block_count)` and updates this counter.
-    /// Cleared on `FreeSequence`.
-    slot_sig_blocks_processed: HashMap<SequenceId, usize>,
-
     /// **Diagnostic**: per-slot record of every token that has been
     /// committed to the slot's K/V — in the exact order it landed
     /// in the kernel's view.  Updated by every write path:
@@ -1221,17 +1258,6 @@ pub(crate) struct Scheduler {
     /// `pending_user_part` capture (reserved infrastructure; no current
     /// code path emits `NewUserMessage`).  Cleared on `FreeSequence`.
     slot_projection_state: HashMap<SequenceId, projection_assembler::SlotState>,
-
-    /// Workspace-shared provenance signature file.  All seals across
-    /// all slots append into this same mmap-backed file.
-    provenance: Arc<ProvenanceFile>,
-
-    /// Reused across reprojections so the BDP score maps keep their allocated
-    /// capacity — `scan`/`scan_sections` clear and refill rather than realloc.
-    bdp_scanner: BdpScanner,
-
-    /// Static model properties captured at engine construction.
-    model_core: ModelCoreProperties,
 
     /// Reusable pinned host scratch for the cold→hot HtoD leg used
     /// by `elevate_to_hot` (cuMemHostAlloc'd once, grown on demand).
@@ -1316,57 +1342,6 @@ pub(crate) struct Scheduler {
     timeline_projections: HashMap<TimelineId, Arc<Builder>>,
 }
 
-/// Per-chunk debug trace of the BDP signatures emitted at seal time.
-///
-/// Each depth's per-token signatures are XOR-folded into a single chunk-level
-/// fingerprint (same semantics as `TokenSignature::from_q_multi`), so each
-/// chunk emits exactly three hex strings — one per depth.  The fold range is
-/// limited to the chunk's actual valid token count; slots beyond that are
-/// zero-initialised padding from the pre-allocated 32-slot signature buffer.
-///
-/// Enable with `RUST_LOG=candle_conversation::scheduler::signatures=trace`.
-///
-/// When the target is filtered out, the whole body is skipped via the
-/// `tracing::enabled!` gate — no lookups, no folds, no formatting.  The
-/// `#[inline]` hint lets the compiler hoist the gate to the call site.
-#[cfg(feature = "sig-trace")]
-fn trace_chunk_signatures(
-    sequence_id: usize,
-    chunk_idx: usize,
-    slot_count: usize,
-    chunks: &[SealedChunk],
-    syn_sigs: &[TokenSignature],
-    sem_sigs: &[TokenSignature],
-    prag_sigs: &[TokenSignature],
-) {
-    if !tracing::enabled!(
-        target: "candle_conversation::scheduler::signatures",
-        tracing::Level::TRACE,
-    ) {
-        return;
-    }
-    let valid = chunks
-        .get(chunk_idx)
-        .map(|c| c.token_count as usize)
-        .unwrap_or(slot_count)
-        .min(slot_count);
-    let fold = |sigs: &[TokenSignature]| -> u128 {
-        sigs.iter()
-            .take(valid)
-            .fold(0u128, |acc, s| acc ^ s.as_u128())
-    };
-    tracing::trace!(
-        target: "candle_conversation::scheduler::signatures",
-        sequence_id,
-        chunk = chunk_idx,
-        token_count = valid,
-        syn  = format!("{:032x}", fold(syn_sigs)),
-        sem  = format!("{:032x}", fold(sem_sigs)),
-        prag = format!("{:032x}", fold(prag_sigs)),
-        "chunk sealed",
-    );
-}
-
 impl Scheduler {
     /// Create a new scheduler. Called once by `ConversationEngine`.
     pub fn new(
@@ -1381,8 +1356,6 @@ impl Scheduler {
         penalty_log_path: Option<PathBuf>,
         health_config: DecodeHealthConfig,
         max_prefill_pass_tokens: usize,
-        provenance: Arc<ProvenanceFile>,
-        model_core: ModelCoreProperties,
         persist_trigger: PersistenceTrigger,
         summariser_trigger: SummariserTrigger,
         boundary_markers: projection_assembler::BoundaryMarkers,
@@ -1431,10 +1404,6 @@ impl Scheduler {
             max_prefill_pass_tokens,
             slot_conversations: HashMap::new(),
             slot_targets: HashMap::new(),
-            slot_sig_blocks_processed: HashMap::new(),
-            provenance,
-            bdp_scanner: BdpScanner::new(),
-            model_core,
             turn_views: HashMap::new(),
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
@@ -1545,7 +1514,9 @@ impl Scheduler {
                 prefill_tokens,
                 prefill_text,
                 user_text,
+                tags,
                 content_bounds,
+                projection_offsets,
                 prefill_assistant_text,
                 post_decode_tokens,
                 max_decode_tokens,
@@ -1610,6 +1581,12 @@ impl Scheduler {
                 // score-density path; written to the substrate's
                 // side-channel below, after the read guard drops.
                 let mut diag_to_write: Option<(TimelineId, SelectionDiagnostics)> = None;
+                // Staged calibration prefill: one projection composition, cloned
+                // per segment with its own span, emitted as the wave crosses each
+                // `projection_offsets` point. Computed inside the projection block
+                // (below) while the view read guard is live; `None` for a normal
+                // prefill.
+                let mut staged_composition: Option<crate::projection::ProjectionEvent> = None;
                 let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) = (
                     projection_inputs.as_ref().filter(|_| !skip_projection),
                     slot_target,
@@ -1639,11 +1616,15 @@ impl Scheduler {
                     // after `send_turn` returns.  Sink is never invoked
                     // when the rule-based path runs (no tree on the
                     // target timeline).
+                    // Submit-time projection is the first of the turn — the belief
+                    // starts fresh (no prior). Mid-decode reprojections seed from
+                    // the prior projection event to carry the online belief.
                     let projection = inputs.projection.project_with_mode_and_sink(
                         target,
                         &view,
                         ProjectionMode::Prefill,
                         &inputs.selection,
+                        &crate::projection::PriorBelief::default(),
                         &mut |diag| {
                             diag_to_write = Some((target.timeline, diag));
                         },
@@ -1742,6 +1723,24 @@ impl Scheduler {
                             position: pos,
                         },
                     });
+                    // Build the composition for a staged prefill's per-segment
+                    // projection events now, while the view guard is live. The
+                    // calibration projection is pinned (`SelectionRule::Named`), so
+                    // one composition serves every segment — the wave overrides its
+                    // `start_token`/`end_token` span per emission.
+                    if !projection_offsets.is_empty() {
+                        let total = view.total_token_count(target.timeline) as u32;
+                        staged_composition = Some(crate::projection::from_projection(
+                            &projection.segments,
+                            inputs.projection.schema(),
+                            &view,
+                            &projection.selection_scores,
+                            total,
+                            0,
+                            0,
+                            0.0,
+                        ));
+                    }
                     (sections, segments)
                 } else {
                     (Vec::new(), Vec::new())
@@ -1912,6 +1911,7 @@ impl Scheduler {
                     tokens: prefill_tokens,
                     prefill_text,
                     user_text,
+                    tags,
                     content_bounds,
                     prefill_assistant_text,
                     event_tx,
@@ -1921,6 +1921,8 @@ impl Scheduler {
                     reprojection,
                     seal_action,
                     post_decode_tokens,
+                    projection_offsets,
+                    staged_composition,
                 });
                 true
             }
@@ -1938,7 +1940,6 @@ impl Scheduler {
                 self.slot_targets.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
                 self.slot_projection_state.remove(&sequence_id);
-                self.slot_sig_blocks_processed.remove(&sequence_id);
                 true
             }
 
@@ -1993,7 +1994,6 @@ impl Scheduler {
                                         in_collection,
                                     },
                                     None,
-                                    vec![],
                                 )
                                 .and_then(|opt| {
                                     opt.ok_or_else(|| {
@@ -2165,6 +2165,14 @@ impl Scheduler {
                 {
                     let _ = response_tx.send(Err(e));
                 }
+                true
+            }
+
+            SchedulerRequest::ReconstructSubstrate {
+                conversation,
+                status,
+            } => {
+                self.reconstruct_substrate(&conversation, &status);
                 true
             }
 
@@ -2699,6 +2707,7 @@ impl Scheduler {
                     tokens: TokenBuffer::from(wave_tokens),
                     prefill_text: String::new(),
                     user_text: String::new(),
+                    tags: Vec::new(),
                     content_bounds: TurnContentBounds::default(),
                     prefill_assistant_text: String::new(),
                     event_tx,
@@ -2712,6 +2721,8 @@ impl Scheduler {
                         max_tokens,
                     },
                     post_decode_tokens: TokenBuffer::default(),
+                    projection_offsets: Vec::new(),
+                    staged_composition: None,
                 });
             }
             Role::System => {
@@ -2823,11 +2834,15 @@ impl Scheduler {
                 turn_start,
                 health,
                 reprojection: None,
-                prov_sig_entries: Vec::new(),
+                non_punct_since_reproject: 0,
+                last_projection_end: 0,
                 post_decode_tokens: TokenBuffer::default(),
+                belief: crate::projection::PriorBelief::default(),
                 prefill_tokens: TokenBuffer::default(),
                 user_text: String::new(),
+                tags: Vec::new(),
                 content_bounds: TurnContentBounds::default(),
+                in_tool_call: false,
             },
         );
         Ok(())
@@ -3043,6 +3058,7 @@ impl Scheduler {
             tokens: TokenBuffer::from(token_ids),
             prefill_text: String::new(),
             user_text: String::new(),
+            tags: Vec::new(),
             content_bounds: TurnContentBounds::default(),
             prefill_assistant_text: String::new(),
             event_tx,
@@ -3052,6 +3068,8 @@ impl Scheduler {
             reprojection: None,
             seal_action: SealAction::CompressionTurn { job_id },
             post_decode_tokens: TokenBuffer::default(),
+            projection_offsets: Vec::new(),
+            staged_composition: None,
         });
         Ok(())
     }
@@ -3080,11 +3098,6 @@ impl Scheduler {
                 return;
             }
         };
-        // Capture BDP signatures over the re-prefilled blocks BEFORE freeing the
-        // slot, so the score-density selector can retrieve this summary by
-        // relevance, not just recency/coverage. Same path the normal seal uses;
-        // the returned handles live in `self.provenance` and survive the free.
-        let sigs = self.capture_turn_sigs(slot, 0, block_count);
         // The slice holds RAII `ChunkGid` clones, so the K/V survives the free.
         self.free_summary_slot(slot);
         let block_end = sealed_gpu.first().map(|s| s.chunks.len()).unwrap_or(0);
@@ -3104,6 +3117,8 @@ impl Scheduler {
             token_ids: TokenBuffer::from(pending.token_ids),
             token_count,
             content_bounds: pending.content_bounds,
+            // Compression/summary turns are never a gather target — untagged.
+            tags: Vec::new(),
             block_start: 0,
             block_end: block_end as u64,
             sealed_gpu: Some(Arc::new(sealed_gpu)),
@@ -3130,117 +3145,17 @@ impl Scheduler {
         }
         self.persist_trigger.fire();
 
-        // Persist the captured signatures under the new turn's stream so
-        // relevance retrieval survives a restart (the normal seal's path).
-        if !sigs.is_empty() {
-            {
-                let mut view = conversation.write();
-                view.set_sig_entries(timeline, idx, sigs.clone());
-            }
-            let stream_id = turn_stream_id(timeline.raw(), idx.0);
-            let mut sig_bytes = Vec::with_capacity(sigs.len());
-            for e in &sigs {
-                match self.provenance.read_entry(*e) {
-                    Ok((syn, sem, prag)) => {
-                        let mut bytes = Vec::with_capacity(e.byte_len());
-                        for s in syn.iter().chain(sem.iter()).chain(prag.iter()) {
-                            bytes.extend_from_slice(s.as_bytes());
-                        }
-                        sig_bytes.push((e.token_count, bytes));
-                    }
-                    Err(err) => tracing::warn!("summary read provenance entry: {err}"),
-                }
-            }
-            let payload = encode_signatures(&sig_bytes);
-            if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
-                tracing::warn!("summary persist signatures failed: {e}");
-            }
-        }
         tracing::info!(
             target: "candle_conversation::summariser",
             timeline = %timeline,
             index = idx.0,
             tokens = token_count,
             blocks = block_end,
-            sigs = sigs.len(),
             question = %summary_question,
             answer = %summary_answer,
             "compression: summary turn decoded and injected into substrate",
         );
         let _ = response_tx.send(Ok(idx));
-    }
-
-    /// Extract BDP provenance signatures for blocks `[block_from, block_to)` of
-    /// `slot` (still R16 — freshly prefilled, the bg_quantizer hasn't touched
-    /// them) and append them to the provenance store, returning the entry
-    /// handles. Without this a summary turn scores 0.0 in score-density
-    /// selection and can only be picked by recency/coverage, never by relevance.
-    fn capture_turn_sigs(
-        &mut self,
-        slot: SequenceId,
-        block_from: usize,
-        block_to: usize,
-    ) -> Vec<SigEntry> {
-        if block_to <= block_from {
-            return Vec::new();
-        }
-        let snapshot = match self.session.snapshot_sequence(slot.0) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("summary sig snapshot failed: {e}");
-                return Vec::new();
-            }
-        };
-        // Strip zero-padded sigs the gather kernel reads from the partial tail
-        // block's uninitialized arena slots.
-        let tail_tokens = snapshot
-            .chunks
-            .get(block_to.saturating_sub(1))
-            .map(|c| c.token_count as usize)
-            .filter(|&t| t > 0)
-            .unwrap_or(candle_nn::CHUNK_SIZE);
-        let ProvenanceLayerIndices {
-            syn_l0,
-            syn_l4,
-            sem_l0,
-            sem_l4,
-            prag_l0,
-            prag_l4,
-        } = self.model_core.provenance_layer_indices;
-        let range = (block_from, block_to);
-        let mut entries: Vec<SigEntry> = Vec::new();
-        let syn = self.handle_extract_mh_dual_signatures(slot.0, syn_l0, syn_l4, Some(range));
-        let sem = self.handle_extract_mh_dual_signatures(slot.0, sem_l0, sem_l4, Some(range));
-        let prag = self.handle_extract_mh_dual_signatures(slot.0, prag_l0, prag_l4, Some(range));
-        if let (Ok(syn_b), Ok(sem_b), Ok(prag_b)) = (syn, sem, prag) {
-            let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
-            for j in 0..total {
-                let raw_n = syn_b[j]
-                    .sigs
-                    .len()
-                    .min(sem_b[j].sigs.len())
-                    .min(prag_b[j].sigs.len());
-                let n = if j + 1 == total {
-                    raw_n.min(tail_tokens)
-                } else {
-                    raw_n
-                };
-                match self.provenance.append(
-                    &syn_b[j].sigs[..n],
-                    &sem_b[j].sigs[..n],
-                    &prag_b[j].sigs[..n],
-                ) {
-                    Ok(entry) => entries.push(entry),
-                    Err(e) => {
-                        tracing::warn!(
-                            "summary sig append failed for block {}: {e}",
-                            block_from + j
-                        )
-                    }
-                }
-            }
-        }
-        entries
     }
 
     /// Tear down a compression node whose setup or decode failed: reply to the
@@ -3276,7 +3191,6 @@ impl Scheduler {
         self.slot_conversations.remove(&slot);
         self.slot_targets.remove(&slot);
         self.sampling_states.remove(&slot);
-        self.slot_sig_blocks_processed.remove(&slot);
         self.slot_projection_state.remove(&slot);
         self.compression_event_sinks.remove(&slot);
     }
@@ -3589,6 +3503,29 @@ impl Scheduler {
             .inject_sealed_at_tail(new_seq_idx, &gpu_per_layer)
             .map_err(ConversationError::Model)?;
 
+        // KV-zero check: scan the freshly-injected projected context — catches a
+        // corrupted turn's KV being reused as provenance context for a new turn.
+        #[cfg(feature = "kv-zero-check")]
+        {
+            let layers: Vec<usize> = (0..self.session.num_layers()).collect();
+            let n_real = self.session.sequence_offset(new_seq_idx).unwrap_or(0);
+            let layout = self.session.provenance_chunk_layout(new_seq_idx, n_real);
+            if let Ok(dump) =
+                self.session
+                    .gather_r16_kv_provenance_layers(new_seq_idx, &layers, None)
+            {
+                kv_zero_check::scan_gathered(
+                    "projection-inject",
+                    new_seq_idx,
+                    &dump,
+                    &layout,
+                    self.session.n_kv_head(),
+                    self.session.head_dim(),
+                    n_real, // pure projected context — everything is "prefix"
+                );
+            }
+        }
+
         Ok(new_seq_id)
     }
 
@@ -3649,6 +3586,36 @@ impl Scheduler {
                 // Done.  This keeps the entire view lifecycle invisible to
                 // the caller.
                 let finalized_view = self.turn_views.remove(&seq_id);
+
+                // KV-zero check: scan the VIEW slot right BEFORE finalize_view. If this
+                // is clean but `substrate-write-seal` (post-finalize) is not, the seal
+                // re-org drops blocks; if this is already dirty, the live decode arena
+                // held zeros during generation.
+                #[cfg(feature = "kv-zero-check")]
+                {
+                    let layers: Vec<usize> = (0..self.session.num_layers()).collect();
+                    let n_real = self.session.sequence_offset(seq_id.0).unwrap_or(0);
+                    // Boundary = where THIS turn's decode began = offset − generated,
+                    // so `region="own"` = decoded by this turn, `region="prefix"` =
+                    // present before decode (inherited projection or this turn's prefill).
+                    let turn_start = n_real.saturating_sub(tokens_generated);
+                    let layout = self.session.provenance_chunk_layout(seq_id.0, n_real);
+                    if let Ok(dump) = self
+                        .session
+                        .gather_r16_kv_provenance_layers(seq_id.0, &layers, None)
+                    {
+                        kv_zero_check::scan_gathered(
+                            "decode-final-view",
+                            seq_id.0,
+                            &dump,
+                            &layout,
+                            self.session.n_kv_head(),
+                            self.session.head_dim(),
+                            turn_start,
+                        );
+                    }
+                }
+
                 let (seal_slot, seal_block_from) = if let Some(view_state) = finalized_view {
                     if let Err(e) = self.session.finalize_view(
                         seq_id.0,
@@ -3742,17 +3709,11 @@ impl Scheduler {
                 }
 
                 // Seal-and-write step.  When `seal_action != None`, we
-                // snapshot `seal_slot`, extract sigs for the new blocks,
-                // append them to the workspace `ProvenanceFile`, and apply
-                // the appropriate substrate write (turn append or section
-                // pin).  The resulting `SealResult` rides along on the Done
-                // event so the conversation-side post-actions (cold store,
-                // BDP scan) can run without a second round trip.
-                //
-                // `pre_sigs` carries SigEntry records already extracted
-                // during decode (per-step, while R16 was intact).  Move them
-                // out before borrowing `state.seal_action` for the match.
-                let pre_sigs = state.prov_sig_entries;
+                // snapshot `seal_slot` and apply the appropriate substrate
+                // write (turn append or section pin).  The resulting
+                // `SealResult` rides along on the Done event so the
+                // conversation-side post-actions (cold store) can run
+                // without a second round trip.
                 let seal_result = match &state.seal_action {
                     SealAction::None => None,
                     action => {
@@ -3807,6 +3768,7 @@ impl Scheduler {
                             };
                             Some(TurnContent {
                                 role: Role::Assistant,
+                                tags: state.tags.clone(),
                                 user_text: state.user_text.clone(),
                                 assistant_text,
                                 token_ids: TokenBuffer::from(full_tokens),
@@ -3820,7 +3782,6 @@ impl Scheduler {
                             seal_block_from,
                             action,
                             turn_content,
-                            pre_sigs,
                         )
                         .unwrap_or_else(|e| {
                             tracing::warn!("post-Done seal failed for slot {}: {}", seal_slot, e,);
@@ -3895,48 +3856,7 @@ impl Scheduler {
             .map_err(ConversationError::Model)?
             .unwrap_or_default();
 
-        // 2. Read persisted BDP signatures back into SigEntry values
-        //    by re-appending the raw bytes to the workspace provenance
-        //    file.  Same machinery the turn-reload path uses
-        //    (see `reconstruct_from_log_in_place` in this file).
-        let sig_bytes = conversation
-            .read_section_signatures(stream_id)
-            .map_err(ConversationError::Model)?;
-        let sig_entries: Vec<SigEntry> = if sig_bytes.is_empty() {
-            Vec::new()
-        } else {
-            let n_bytes = TokenSignature::BYTE_LEN;
-            let mut out = Vec::with_capacity(sig_bytes.len());
-            for (token_count, bytes) in &sig_bytes {
-                let tc = *token_count as usize;
-                let want = tc * n_bytes * 3;
-                if bytes.len() != want {
-                    tracing::warn!(
-                        "restore_section: stream {stream_id:?} sig record has {} bytes, expected {want} — skipping",
-                        bytes.len()
-                    );
-                    continue;
-                }
-                let depth = |d: usize| -> Vec<TokenSignature> {
-                    bytes[d * tc * n_bytes..(d + 1) * tc * n_bytes]
-                        .chunks_exact(n_bytes)
-                        .map(|c| {
-                            let arr: [u8; TokenSignature::BYTE_LEN] = c.try_into().unwrap();
-                            TokenSignature::from_bytes(&arr)
-                        })
-                        .collect()
-                };
-                match self.provenance.append(&depth(0), &depth(1), &depth(2)) {
-                    Ok(entry) => out.push(entry),
-                    Err(e) => {
-                        tracing::warn!("restore_section sig append failed: {e}");
-                    }
-                }
-            }
-            out
-        };
-
-        // 3. Install as a cold-marker.  `sealed_hot = Vec::new()`
+        // 2. Install as a cold-marker.  `sealed_hot = Vec::new()`
         //    leaves `residence.hot = None`; `cold_refs` lands in
         //    `residence.cold` so `elevate_to_hot` can lift the
         //    section on the first projection that selects it.
@@ -3950,7 +3870,6 @@ impl Scheduler {
             section_id,
             stream_id,
             token_count,
-            sig_entries,
             Vec::new(),
             cold_refs,
             tokens_arc,
@@ -4140,20 +4059,20 @@ impl Scheduler {
                 in_collection,
             },
             None,
-            vec![],
         )?;
-        seal.ok_or_else(|| {
+        let seal = seal.ok_or_else(|| {
             ConversationError::Channel(
                 "ingest_section: seal returned None (slot had no content?)".into(),
             )
-        })
+        })?;
+
+        Ok(seal)
     }
 
-    /// Snapshot `seal_slot`, extract sigs for the new blocks
-    /// `[seal_block_from, block_count)`, append them to the workspace
-    /// `ProvenanceFile`, and apply the substrate write described by
-    /// `seal_action`.  Returns the [`SealResult`] payload, or
-    /// `Ok(None)` when there are no new blocks to seal.
+    /// Snapshot `seal_slot`, seal the new blocks
+    /// `[seal_block_from, block_count)`, and apply the substrate write
+    /// described by `seal_action`.  Returns the [`SealResult`] payload,
+    /// or `Ok(None)` when there are no new blocks to seal.
     ///
     /// Near-lossless compression policy for **boundary** sections —
     /// role markers, opening/closing tags, anything outside a schema
@@ -4365,7 +4284,6 @@ impl Scheduler {
         seal_block_from: usize,
         seal_action: &SealAction,
         turn_content: Option<TurnContent>,
-        pre_sigs: Vec<SigEntry>,
     ) -> Result<Option<SealResult>, ConversationError> {
         // The substrate target (where a `SealAction::Turn` write
         // lands) is read from `slot_targets` rather than threaded
@@ -4383,85 +4301,6 @@ impl Scheduler {
         if block_count <= seal_block_from {
             return Ok(None);
         }
-
-        // Per-slot sig-blocks-processed counter — extracted only for
-        // new blocks since the last seal.
-        let prev_processed = self
-            .slot_sig_blocks_processed
-            .get(&seal_slot)
-            .copied()
-            .unwrap_or(0);
-        let sig_from = prev_processed.max(seal_block_from);
-        let sig_range = if block_count > sig_from {
-            Some((sig_from, block_count))
-        } else {
-            None
-        };
-
-        // Extract sigs at all three depths (MH_XOR_QQ_l0xl4: dual-layer, all heads).
-        // `pre_sigs` carries entries already extracted during decode (while R16
-        // was intact); seal-time extraction covers only the residual range that
-        // wasn't reached before the bg_quantizer compressed earlier blocks.
-        let ProvenanceLayerIndices {
-            syn_l0,
-            syn_l4,
-            sem_l0,
-            sem_l4,
-            prag_l0,
-            prag_l4,
-        } = self.model_core.provenance_layer_indices;
-        let mut new_sig_entries: Vec<SigEntry> = pre_sigs;
-        let mut new_processed = prev_processed;
-
-        // Actual fill count of the last block — may be < CHUNK_SIZE for the
-        // partial tail.  Used below to strip zero-padded garbage signatures
-        // that the gather kernel reads from uninitialized arena slots.
-        let tail_tokens = snapshot
-            .chunks
-            .get(block_count.saturating_sub(1))
-            .map(|c| c.token_count as usize)
-            .filter(|&t| t > 0)
-            .unwrap_or(candle_nn::CHUNK_SIZE);
-
-        if let Some(range) = sig_range {
-            let syn =
-                self.handle_extract_mh_dual_signatures(seal_slot.0, syn_l0, syn_l4, Some(range));
-            let sem =
-                self.handle_extract_mh_dual_signatures(seal_slot.0, sem_l0, sem_l4, Some(range));
-            let prag =
-                self.handle_extract_mh_dual_signatures(seal_slot.0, prag_l0, prag_l4, Some(range));
-            if let (Ok(syn_b), Ok(sem_b), Ok(prag_b)) = (syn, sem, prag) {
-                let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
-                for j in 0..total {
-                    let raw_n = syn_b[j]
-                        .sigs
-                        .len()
-                        .min(sem_b[j].sigs.len())
-                        .min(prag_b[j].sigs.len());
-                    // Cap the final block to its actual fill to avoid appending
-                    // zero-padded signatures from uninitialized arena slots.
-                    let n = if j + 1 == total {
-                        raw_n.min(tail_tokens)
-                    } else {
-                        raw_n
-                    };
-                    match self.provenance.append(
-                        &syn_b[j].sigs[..n],
-                        &sem_b[j].sigs[..n],
-                        &prag_b[j].sigs[..n],
-                    ) {
-                        Ok(entry) => new_sig_entries.push(entry),
-                        Err(e) => tracing::warn!(
-                            "provenance append failed for block {}: {e}",
-                            sig_from + j,
-                        ),
-                    }
-                }
-                new_processed = sig_from + total;
-            }
-        }
-        self.slot_sig_blocks_processed
-            .insert(seal_slot, new_processed);
 
         // GPU-resident sealed sequences.  No CPU round-trip: the
         // substrate stores `Arc<Vec<SealedSequence>>` with the same
@@ -4491,6 +4330,39 @@ impl Scheduler {
             .map(|s| s.iter().map(|c| c.token_count as usize).sum())
             .unwrap_or(0);
 
+        // Capture the whole turn's wide per-token `sign(Q)` from R16 NOW — before
+        // `record_turn` (below) detaches the sealed KV. All heads / all layers,
+        // un-folded. Complete while the turn's KV is R16 (`kv_lossless`); a block
+        // whose R16 is already gone (compressed) simply contributes nothing.
+        let wide_sigs = self.gather_wide_sigs(seal_slot, (block_from, block_to));
+
+        // KV-zero check: scan the PARENT slot at the seal range, right before the
+        // chunks are persisted — i.e. exactly what gets written to the substrate.
+        #[cfg(feature = "kv-zero-check")]
+        {
+            let layers: Vec<usize> = (0..self.session.num_layers()).collect();
+            let seq_off = self.session.sequence_offset(seal_slot.0).unwrap_or(0);
+            let layout = self.session.provenance_chunk_layout(seal_slot.0, seq_off);
+            // The sealed range [block_from, block_to) is entirely this turn's own
+            // content, so the boundary is the real position where block_from begins.
+            let turn_start = layout.get(block_from).map(|l| l.2).unwrap_or(0);
+            if let Ok(dump) = self.session.gather_r16_kv_provenance_layers(
+                seal_slot.0,
+                &layers,
+                Some((block_from, block_to)),
+            ) {
+                kv_zero_check::scan_gathered(
+                    "substrate-write-seal",
+                    seal_slot.0,
+                    &dump,
+                    &layout,
+                    self.session.n_kv_head(),
+                    self.session.head_dim(),
+                    turn_start,
+                );
+            }
+        }
+
         // Apply the substrate write on the workspace conversation
         // bound to this slot.
         let conversation = self
@@ -4509,6 +4381,7 @@ impl Scheduler {
                 })?;
                 let TurnContent {
                     role,
+                    tags,
                     user_text,
                     assistant_text,
                     token_ids,
@@ -4545,6 +4418,7 @@ impl Scheduler {
                     token_ids,
                     token_count: turn_token_count,
                     content_bounds,
+                    tags,
                     block_start: block_from as u64,
                     block_end: block_to as u64,
                     sealed_gpu: Some(Arc::new(delta_gpu)),
@@ -4582,35 +4456,15 @@ impl Scheduler {
                         self.pending_section_quantize.clear();
                     }
                 }
-                if !new_sig_entries.is_empty() {
-                    {
-                        let mut view = conversation.write();
-                        view.set_sig_entries(target.timeline, idx, new_sig_entries.clone());
-                    }
-                    // Persist the BDP provenance signatures to the redo log
-                    // so attentional retrieval survives a restart. SigEntry
-                    // only references the (ephemeral) provenance file, so
-                    // read each entry's bytes and embed them in a
-                    // `Signatures` record.
+                // Persist the wide per-token sign(Q) captured above (pre-detach) as the
+                // turn's `WideQSig` record — continuous per-token shape, keyed to the
+                // same turn stream.
+                if !wide_sigs.is_empty() {
                     let stream_id = turn_stream_id(target.timeline.raw(), idx.0);
-                    let mut sig_bytes = Vec::with_capacity(new_sig_entries.len());
-                    for e in &new_sig_entries {
-                        match self.provenance.read_entry(*e) {
-                            Ok((syn, sem, prag)) => {
-                                let mut bytes = Vec::with_capacity(e.byte_len());
-                                for s in syn.iter().chain(sem.iter()).chain(prag.iter()) {
-                                    bytes.extend_from_slice(s.as_bytes());
-                                }
-                                sig_bytes.push((e.token_count, bytes));
-                            }
-                            Err(err) => {
-                                tracing::warn!("read provenance entry for persistence: {err}")
-                            }
-                        }
-                    }
-                    let payload = encode_signatures(&sig_bytes);
-                    if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
-                        tracing::warn!("persist signatures failed: {e}");
+                    if let Err(e) =
+                        conversation.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&wide_sigs))
+                    {
+                        tracing::warn!("persist wide-Q sigs failed: {e}");
                     }
                 }
                 // Synchronously persist the turn's `Tokens` record —
@@ -4665,7 +4519,6 @@ impl Scheduler {
                         *section_id,
                         stream_id,
                         turn_token_count,
-                        new_sig_entries.clone(),
                         Arc::new(delta_gpu),
                         |seqs| Ok(seqs.to_vec()),
                         Arc::clone(tokens),
@@ -4710,32 +4563,8 @@ impl Scheduler {
                 if let Err(e) = conversation.declare_section_stream(*address, debug_name) {
                     tracing::warn!("declare section stream failed: {e}");
                 }
-                // Persist BDP signatures (if any) and the section's
-                // token ids, then fire the persistence trigger so the
-                // chunks land on disk in the next pass.
-                if !new_sig_entries.is_empty() {
-                    let mut sig_bytes = Vec::with_capacity(new_sig_entries.len());
-                    for e in &new_sig_entries {
-                        match self.provenance.read_entry(*e) {
-                            Ok((syn, sem, prag)) => {
-                                let mut bytes = Vec::with_capacity(e.byte_len());
-                                for s in syn.iter().chain(sem.iter()).chain(prag.iter()) {
-                                    bytes.extend_from_slice(s.as_bytes());
-                                }
-                                sig_bytes.push((e.token_count, bytes));
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    "read provenance entry for section persistence: {err}"
-                                )
-                            }
-                        }
-                    }
-                    let payload = encode_signatures(&sig_bytes);
-                    if let Err(e) = conversation.persist_signatures(stream_id, &payload) {
-                        tracing::warn!("persist section signatures failed: {e}");
-                    }
-                }
+                // Persist the section's token ids, then fire the persistence
+                // trigger so the chunks land on disk in the next pass.
                 if let Err(e) = conversation.persist_tokens_only(stream_id, tokens) {
                     tracing::warn!("persist section tokens failed: {e}");
                 }
@@ -4762,9 +4591,7 @@ impl Scheduler {
             block_from,
             block_to,
             turn_token_count,
-            new_sig_entries,
             chunk_size,
-            sig_blocks_processed: new_processed,
         }))
     }
 
@@ -4787,7 +4614,7 @@ impl Scheduler {
     /// daemon startup (Â§16.12 substrate reload).
     ///
     /// **Cold-only restart.** Every persisted turn stream is recovered in
-    /// `(timeline, turn_index)` order; for each, tokens + BDP signatures
+    /// `(timeline, turn_index)` order; for each, tokens + wide-Q signatures
     /// are replayed into the in-RAM substrate and the turn is registered
     /// cold-marker (`hot/warm = None`, `cold = Some(...)` from the
     /// manifest). The KV bytes stay on disk until the runtime inject
@@ -4803,41 +4630,8 @@ impl Scheduler {
             status.finish();
             return;
         }
-        // Re-append each persisted chunk's signatures into the fresh
-        // provenance file; `(token_count, syn‖sem‖prag bytes)` → a
-        // SigEntry at the new offset, so attentional retrieval works
-        // after the reload.
-        let restore_sigs = |sigs: &[(u16, Vec<u8>)]| -> candle::Result<Vec<SigEntry>> {
-            let n_bytes = TokenSignature::BYTE_LEN;
-            let mut out = Vec::with_capacity(sigs.len());
-            for (token_count, bytes) in sigs {
-                let tc = *token_count as usize;
-                let want = tc * n_bytes * 3;
-                if bytes.len() != want {
-                    candle::bail!(
-                        "restore_sigs: chunk has {} sig bytes, expected {want}",
-                        bytes.len()
-                    );
-                }
-                let depth = |d: usize| -> Vec<TokenSignature> {
-                    bytes[d * tc * n_bytes..(d + 1) * tc * n_bytes]
-                        .chunks_exact(n_bytes)
-                        .map(|c| {
-                            let arr: [u8; TokenSignature::BYTE_LEN] = c.try_into().unwrap();
-                            TokenSignature::from_bytes(&arr)
-                        })
-                        .collect()
-                };
-                out.push(
-                    self.provenance
-                        .append(&depth(0), &depth(1), &depth(2))
-                        .map_err(|e| candle::Error::Msg(format!("restore sig: {e}")))?,
-                );
-            }
-            Ok(out)
-        };
         let progress = |done: usize, total: usize| status.record(done, total);
-        let result = conversation.reconstruct_from_log(n_layers, restore_sigs, Some(&progress));
+        let result = conversation.reconstruct_from_log(n_layers, Some(&progress));
         // Always unblock the daemon's loading-screen waiter, success or not.
         status.finish();
         match result {
@@ -4872,153 +4666,75 @@ impl Scheduler {
             .collect()
     }
 
-    // —— Provenance signature extraction ———————————————————————————————
-
-    /// Dual-layer multi-head variant for MH_XOR_QQ_l0xl4.
-    ///
-    /// Extracts R16 Q data for `layer_a` (band-start, l0) and `layer_b`
-    /// (band-centre, l4), builds a multi-head [`TurnSignatures`] for each,
-    /// then XOR-folds them token-by-token.  This is the production path for
-    /// the `MH_XOR_QQ_l0xl4` strategy.
-    fn handle_extract_mh_dual_signatures(
-        &self,
-        seq_idx: usize,
-        layer_a: usize,
-        layer_b: usize,
-        block_range: Option<(usize, usize)>,
-    ) -> Result<Vec<TurnSignatures>, ConversationError> {
-        let (blocks_a, blocks_b) = {
-            let mut layers = self
-                .session
-                .gather_r16_kv_provenance_layers(seq_idx, &[layer_a, layer_b], block_range)
-                .map_err(ConversationError::Model)?
-                .into_iter();
-            let a = layers.next().unwrap_or_default();
-            let b = layers.next().unwrap_or_default();
-            (a, b)
-        };
-
-        if blocks_a.is_empty() {
-            return Ok(vec![]);
-        }
-
+    /// Capture the turn's per-token provenance signature from R16, one [`WideQSig`] per
+    /// REAL token in token order. It walks each chunk's real-token window
+    /// `[offset, offset+len)` from [`provenance_chunk_layout`] — the exact slots attention
+    /// reads — so interior partial chunks (section / glue / reproject boundaries)
+    /// contribute only their real tokens, never their zero padding; the result is 1:1
+    /// aligned with the turn's `Tokens` record. Every token of each block is captured (no
+    /// structural filter; filtering is a query-time concern). Each token's raw all-heads /
+    /// all-layers `sign(Q)` is [`fold_provenance`]-folded to the compact locked signature
+    /// (46,1,1 layer groups, heads separate, 1536 bits) before storing. Blocks whose R16
+    /// backing is gone (compressed) contribute nothing — capture a turn while its KV is
+    /// still R16 (e.g. `kv_lossless`, or at seal before the bg-quantizer runs).
+    fn gather_wide_sigs(&self, seq_id: SequenceId, range: (usize, usize)) -> Vec<WideQSig> {
+        let n_layers = self.session.num_layers();
         let n_kv_head = self.session.n_kv_head();
         let head_dim = self.session.head_dim();
+        if n_layers == 0 || n_kv_head == 0 || head_dim == 0 || range.1 <= range.0 {
+            return Vec::new();
+        }
+        let seq_off = self.session.sequence_offset(seq_id.0).unwrap_or(0);
+        let layout = self.session.provenance_chunk_layout(seq_id.0, seq_off);
+        let layers: Vec<usize> = (0..n_layers).collect();
+        let dump =
+            match self
+                .session
+                .gather_r16_kv_provenance_layers(seq_id.0, &layers, Some(range))
+            {
+                Ok(d) if !d.is_empty() && !d[0].is_empty() => d,
+                _ => return Vec::new(),
+            };
         let chunk = candle_nn::CHUNK_SIZE;
-
-        let sigs_a = extract_mh_signatures_from_r16_dump(&blocks_a, n_kv_head, head_dim, chunk);
-        let sigs_b = extract_mh_signatures_from_r16_dump(&blocks_b, n_kv_head, head_dim, chunk);
-
-        let merged = sigs_a
-            .iter()
-            .zip(sigs_b.iter())
-            .map(|(a, b)| merge_turn_signatures_xor(a, b))
-            .collect();
-        Ok(merged)
-    }
-
-    /// Extract Q-vector provenance signatures for newly-completed 32-token
-    /// blocks across all active decode sequences, immediately after each
-    /// forward pass while the R16 backing is still intact.
-    ///
-    /// Called right after `forward_batched` returns.  Results are accumulated
-    /// in `DecodeState::prov_sig_entries` and passed wholesale to
-    /// `perform_seal_and_write` at Done time, so seal-time extraction only
-    /// covers the residual partial block (guaranteed to still be R16 since
-    /// the bg_quantizer never compresses the active block).
-    pub(super) fn extract_prov_after_step(&mut self, seq_ids: &[SequenceId]) {
-        let ProvenanceLayerIndices {
-            syn_l0,
-            syn_l4,
-            sem_l0,
-            sem_l4,
-            prag_l0,
-            prag_l4,
-        } = self.model_core.provenance_layer_indices;
-        let provenance = Arc::clone(&self.provenance);
-
-        for &seq_id in seq_ids {
-            // Only view-based sequences have entries in turn_views.
-            let view_state = match self.turn_views.get(&seq_id).copied() {
-                Some(v) => v,
-                None => continue,
+        let band_len = n_layers * n_kv_head * head_dim;
+        let n_blocks = dump[0].len();
+        let mut out = Vec::with_capacity(n_blocks * chunk);
+        for bi in 0..n_blocks {
+            // Absolute chunk index of this gathered block → its real-token window.
+            let block_idx = dump[0][bi].0;
+            let Some(&(offset, len, _cum)) = layout.get(block_idx) else {
+                continue; // no metadata for this chunk — skip (cannot place its tokens)
             };
-            let parent_id = view_state.parent_id;
-            let turn_start = view_state.turn_start_parent_blocks;
-
-            // Complete blocks = tokens written / CHUNK_SIZE.  The active
-            // (partial) block is excluded — not yet finalized, and the
-            // bg_quantizer never compresses it, so it's safely extractable
-            // at seal time.
-            let view_offset = self.session.sequence_offset(seq_id.0).unwrap_or(0);
-            let complete_view_blocks = view_offset / candle_nn::CHUNK_SIZE;
-
-            // prev = high-water mark from prior steps.  Also skip any
-            // borrowed blocks (indices < turn_start) which belong to the
-            // projected context, not this turn.
-            let prev = self
-                .slot_sig_blocks_processed
-                .get(&parent_id)
-                .copied()
-                .unwrap_or(0);
-            let extract_from = prev.max(turn_start);
-
-            if complete_view_blocks <= extract_from {
-                continue;
-            }
-            let range = (extract_from, complete_view_blocks);
-
-            // Extract Q-sigs from R16 blocks on the view slot (MH_XOR_QQ_l0xl4).
-            let syn = self.handle_extract_mh_dual_signatures(seq_id.0, syn_l0, syn_l4, Some(range));
-            let sem = self.handle_extract_mh_dual_signatures(seq_id.0, sem_l0, sem_l4, Some(range));
-            let prag =
-                self.handle_extract_mh_dual_signatures(seq_id.0, prag_l0, prag_l4, Some(range));
-
-            let (syn_b, sem_b, prag_b) = match (syn, sem, prag) {
-                (Ok(s), Ok(sm), Ok(p)) => (s, sm, p),
-                _ => continue,
-            };
-
-            let total = syn_b.len().min(sem_b.len()).min(prag_b.len());
-            if total == 0 {
-                continue;
-            }
-
-            let mut new_entries: Vec<SigEntry> = Vec::with_capacity(total);
-            let mut new_high = prev;
-            for j in 0..total {
-                let n = syn_b[j]
-                    .sigs
-                    .len()
-                    .min(sem_b[j].sigs.len())
-                    .min(prag_b[j].sigs.len());
-                match provenance.append(
-                    &syn_b[j].sigs[..n],
-                    &sem_b[j].sigs[..n],
-                    &prag_b[j].sigs[..n],
-                ) {
-                    Ok(entry) => {
-                        new_entries.push(entry);
-                        new_high = extract_from + j + 1;
+            let offset = offset as usize;
+            for j in 0..len as usize {
+                let t = offset + j; // physical slot of real token j
+                if t >= chunk {
+                    break;
+                }
+                let mut band = Vec::with_capacity(band_len);
+                let mut ok = true;
+                for layer in &dump {
+                    if bi >= layer.len() {
+                        ok = false;
+                        break;
                     }
-                    Err(e) => tracing::warn!(
-                        "prov extract: parent={} block={}: {e}",
-                        parent_id,
-                        extract_from + j,
-                    ),
+                    let q_flat = &layer[bi].3;
+                    for h in 0..n_kv_head {
+                        band.extend_from_slice(&extract_q_vector_r16(
+                            q_flat, t, h, n_kv_head, head_dim, chunk,
+                        ));
+                    }
+                }
+                if ok && band.len() == band_len {
+                    // Fold the raw all-heads/all-layers sign(Q) into the compact locked
+                    // provenance signature (46,1,1 layer groups, 32-bit stagger, heads
+                    // separate) before storing — 16× smaller than the full wide-Q, and
+                    // what the z-score late-fusion retrieval scores. See docs §23.
+                    out.push(fold_provenance(&WideQSig::from_band(&band, head_dim)));
                 }
             }
-
-            // Update high-water mark so the next step and seal skip
-            // already-extracted blocks.
-            if new_high > prev {
-                self.slot_sig_blocks_processed.insert(parent_id, new_high);
-            }
-            // Append new entries to the sequence's accumulated list.
-            if let Some(state) = self.active_decodes.get_mut(&seq_id) {
-                state.prov_sig_entries.extend(new_entries);
-            }
         }
+        out
     }
 
     /// Carve a view sequence borrowing the requested ranges from
@@ -5076,7 +4792,7 @@ impl Scheduler {
         Ok((view_id, borrowed))
     }
 
-    /// Run BDP scan + projection for the active view's policy, then
+    /// Run provenance scan + projection for the active view's policy, then
     /// rebuild the parent + view around the freshly-projected
     /// `(sections, turns)` selection, preserving the active turn's
     /// in-flight tokens **without any data copies or forward-pass
@@ -5087,7 +4803,7 @@ impl Scheduler {
     /// The previous implementation tried to keep the same parent slot
     /// and just narrow the view's borrow window onto it.  That assumed
     /// the new projection's selection was already materialised on
-    /// parent in a contiguous prefix.  BDP-driven `top_k` swaps broke
+    /// parent in a contiguous prefix.  provenance-driven `top_k` swaps broke
     /// that assumption: newly-picked sections only existed in the
     /// substrate, not in parent, so they got filtered out of the new
     /// borrow ranges, the view ended up borrowing a gappy subset,
@@ -5102,7 +4818,7 @@ impl Scheduler {
     /// no DMA, no kernel work, no forward pass.  Steps:
     ///
     /// 1. **Probe + scan + project**: probe live Q from the recent
-    ///    decode window, run BDP against substrate sigs to refresh
+    ///    decode window, run provenance against substrate sigs to refresh
     ///    section / turn scores, project the new
     ///    `(sections, turns)` selection.  Unchanged from the old
     ///    code.
@@ -5110,7 +4826,7 @@ impl Scheduler {
     ///    layer as `SealedSequence`s and slice off
     ///    `chunks[original_borrowed..]`.  Those chunks hold every
     ///    K/V byte computed since the view was carved (user prefill +
-    ///    decoded-so-far).  The Q vectors and BDP signatures for the
+    ///    decoded-so-far).  The Q vectors and provenance signatures for the
     ///    decoded tokens are already captured by provenance — nothing
     ///    in the tail needs regenerating.
     /// 3. **Free the old view**: drops its `ChunkGid` refs.  The
@@ -5151,7 +4867,7 @@ impl Scheduler {
     /// different attention output.  Re-prefilling would burn a
     /// forward pass to "fix" this; the zero-copy path doesn't.
     ///
-    /// For typical reproject use (small BDP-driven catalog swaps
+    /// For typical reproject use (small provenance-driven catalog swaps
     /// of semantically-adjacent sections), the staleness is
     /// negligible.  Compounded over many reprojects fired in quick
     /// succession (e.g. every newline via `trigger_token_ids`),
@@ -5225,7 +4941,7 @@ impl Scheduler {
             .evict_hot_to_free(sections, turns, needed)
     }
 
-    /// Prepare phase of reprojection: BDP scan + projection + tier elevate +
+    /// Prepare phase of reprojection: provenance scan + projection + tier elevate +
     /// inject the sealed prefix + build the gap-fill descriptor. Returns the
     /// in-flight state for [`Self::reproject_view_complete`] (after the caller
     /// fires the batched gap-fill), or `None` if the view needs no reprojection.
@@ -5245,6 +4961,14 @@ impl Scheduler {
             Some(p) => p,
             None => return Ok(None),
         };
+        // Seed this reprojection's belief from the last one on the decode state
+        // (empty on the first) — the RelLeak decay/reinforcement carries across
+        // the turn. The new belief is written back in `reproject_view_complete`.
+        let prior_belief = self
+            .active_decodes
+            .get(&view_id)
+            .map(|s| s.belief.clone())
+            .unwrap_or_default();
 
         // 1. Compute the probe window.
         //
@@ -5265,17 +4989,6 @@ impl Scheduler {
             return Ok(None);
         }
 
-        let (decoded_count, generated_tokens_snapshot, prefill_tokens_snapshot) = {
-            let state = self.active_decodes.get(&view_id).ok_or_else(|| {
-                ConversationError::Channel(format!("reproject: missing decode state {view_id}"))
-            })?;
-            (
-                state.generated_tokens.len(),
-                state.generated_tokens.clone(),
-                state.prefill_tokens.clone(),
-            )
-        };
-
         let max_probe = policy.max_probe_tokens.max(1);
         let window = max_probe.min(view_offset);
         if window == 0 {
@@ -5289,241 +5002,33 @@ impl Scheduler {
         // phase fields.
         let t_repro = Instant::now();
 
-        // 2. Gather live Q from a NARROW block range covering only the probe window.
-        //    The fast path (CUDA) launches one kernel per layer and does a single
-        //    DtoH copy, replacing O(n_head Ã— N_PALETTE Ã— n_blocks) memcpy_dtov stalls.
+        // 2. Block range covering only the probe window.
         let t_probe = Instant::now();
         let block_lo = probe_lo / self.chunk_size;
         let block_hi = probe_hi.div_ceil(self.chunk_size);
-        let range = Some((block_lo, block_hi));
 
-        let raw_layers = {
-            let mut layers = self
-                .session
-                .gather_r16_kv_provenance_layers(
-                    view_id.0,
-                    &policy.provenance_layer_indices.as_array(),
-                    range,
-                )
-                .map_err(ConversationError::Model)?
-                .into_iter();
-            let raw_syn_l0 = layers.next().unwrap_or_default();
-            let raw_syn_l4 = layers.next().unwrap_or_default();
-            let raw_sem_l0 = layers.next().unwrap_or_default();
-            let raw_sem_l4 = layers.next().unwrap_or_default();
-            let raw_prag_l0 = layers.next().unwrap_or_default();
-            let raw_prag_l4 = layers.next().unwrap_or_default();
-            (
-                raw_syn_l0,
-                raw_syn_l4,
-                raw_sem_l0,
-                raw_sem_l4,
-                raw_prag_l0,
-                raw_prag_l4,
-            )
-        };
-        let (raw_syn_l0, raw_syn_l4, raw_sem_l0, raw_sem_l4, raw_prag_l0, raw_prag_l4) = raw_layers;
-        if raw_syn_l0.is_empty() {
-            return Ok(None);
-        }
-
-        let n_kv_head = self.session.n_kv_head();
-        let head_dim = self.session.head_dim();
-        let chunk = self.chunk_size;
-        let block_indices: Vec<usize> = raw_syn_l0.iter().map(|(idx, _, _, _)| *idx).collect();
-
-        let merge = |a: &[_], b: &[_]| {
-            let sa = extract_mh_signatures_from_r16_dump(a, n_kv_head, head_dim, chunk);
-            let sb = extract_mh_signatures_from_r16_dump(b, n_kv_head, head_dim, chunk);
-            sa.iter()
-                .zip(sb.iter())
-                .map(|(x, y)| merge_turn_signatures_xor(x, y))
-                .collect::<Vec<_>>()
-        };
-        let syn_blocks = merge(&raw_syn_l0, &raw_syn_l4);
-        let sem_blocks = merge(&raw_sem_l0, &raw_sem_l4);
-        let prag_blocks = merge(&raw_prag_l0, &raw_prag_l4);
-
-        // 3. Build per-depth probe vectors from the window + structural
-        //    filter.  For a view position `p ∈ [probe_lo, probe_hi)`:
-        //      - block_idx = p / chunk_size
-        //      - slot       = p % chunk_size
-        //      - decoded_idx = decoded_count - (view_offset - p)
-        //      - skip if `generated_tokens[decoded_idx]` is in the
-        //        probe-filter set (whitespace, markdown, chat-template
-        //        scaffolding) — those tokens match across turns purely
-        //        on shared structure rather than on shared content,
-        //        biasing the BDP scan.
-        let filter: &[u32] = &policy.probe_filter_token_ids;
-        let chunk_size = self.chunk_size;
-        let extract_window = |sigs_per_block: &[TurnSignatures]| -> Vec<TokenSignature> {
-            let mut out: Vec<TokenSignature> = Vec::with_capacity(window);
-            for (block_idx, block_sigs) in block_indices.iter().zip(sigs_per_block.iter()) {
-                let block_start = block_idx * chunk_size;
-                let block_end = block_start + chunk_size;
-                if block_end <= probe_lo || block_start >= probe_hi {
-                    continue;
-                }
-                let lo = probe_lo.max(block_start);
-                let hi = probe_hi.min(block_end);
-                for p in lo..hi {
-                    let slot = p - block_start;
-                    // `view_offset - p` is the distance from the current
-                    // decode head back to position `p`.  If that distance
-                    // is within the decode buffer the token is a generated
-                    // token and may be filtered; positions further back
-                    // are prefill tokens — include them unconditionally.
-                    let dist = view_offset - p;
-                    if dist <= decoded_count {
-                        let decoded_idx = decoded_count - dist;
-                        if let Some(&tok) = generated_tokens_snapshot.get(decoded_idx) {
-                            if filter.contains(&tok) {
-                                continue;
-                            }
-                        }
-                    }
-                    if let Some(&sig) = block_sigs.sigs.get(slot) {
-                        out.push(sig);
-                    }
-                }
-            }
-            out
-        };
-
-        let probe_syn = extract_window(&syn_blocks);
-        let probe_sem = extract_window(&sem_blocks);
-        let probe_prag = extract_window(&prag_blocks);
-        if probe_syn.is_empty() {
+        // 3. Gather the live wide-Q probe over the window — folded per-token
+        //    sign(Q). A gather covering no real tokens means nothing to score.
+        let probe = self.gather_wide_sigs(view_id, (block_lo, block_hi));
+        if probe.is_empty() {
             return Ok(None);
         }
         let probe_ms = t_probe.elapsed().as_millis() as u64;
         record_phase(t_probe, "reproject_probe_extract");
 
-        // 4. Snapshot corpus (turns + sections) from substrate, run BDP
-        //    scan against both, write scores back.  Sections (e.g. tool
-        //    definitions prefilled at startup) compete on the same probe
-        //    as historical turns, so an "I want to compute" intent
-        //    surfaces the calculator section's sigs the same way it
-        //    surfaces a previously-asked computation turn.
+        // 4. Wide-Q belief scoring: scan the probe against each belief-driven
+        //    collection's tag-scoped gallery of past turns→selected-section,
+        //    producing the per-section scores the belief policy selects from in
+        //    `project()`. No provenance scan, no persisted scores — projection-local.
         let t_scan = Instant::now();
-        let (turn_corpus, section_corpus): (
-            Vec<(TurnKey, Vec<SigEntry>)>,
-            Vec<(SectionId, Vec<SigEntry>)>,
-        ) = {
-            let view = policy.substrate.read();
-            // BdpScanner is keyed by `TurnKey` natively — no group/timeline
-            // translation at the boundary.
-            let turns: Vec<_> = view
-                .all_turns()
-                .filter_map(|key| {
-                    let entries = view.sig_entries_of(key.timeline, key.index).to_vec();
-                    if entries.is_empty() {
-                        None
-                    } else {
-                        Some((key, entries))
-                    }
-                })
-                .collect();
-            let sections: Vec<_> = view
-                .all_sections()
-                .map(|sid| (sid, view.section_sig_entries(sid).to_vec()))
-                .filter(|(_, e)| !e.is_empty())
-                .collect();
-            (turns, sections)
+        let schema = policy.projection.schema();
+        let projection_scores = match schema.layers.iter().find(|l| l.id == policy.target.layer) {
+            Some(layer) => policy.substrate.score_belief_collections(layer, &probe),
+            None => crate::substrate::ProjectionScores::new(),
         };
 
-        if turn_corpus.is_empty() && section_corpus.is_empty() {
-            return Ok(None);
-        }
-
-        // —— Trace-only validation: probe health + section corpus health ————————
-        if tracing::enabled!(tracing::Level::TRACE) {
-            // Probe stats
-            let probe_n = probe_syn.len();
-            let probe_nonzero_syn = probe_syn.iter().filter(|s| s.as_u128() != 0).count();
-            let probe_nonzero_prag = probe_prag.iter().filter(|s| s.as_u128() != 0).count();
-            tracing::trace!(
-                probe_tokens = probe_n,
-                probe_window = format!("{}..{}", probe_lo, probe_hi),
-                nonzero_syn = probe_nonzero_syn,
-                nonzero_prag = probe_nonzero_prag,
-                "reproject probe health"
-            );
-
-            // Decode probe positions to text: decode + prefill regions only,
-            // positions that fall in the borrowed-parent region are marked <parent>.
-            let pf_len = prefill_tokens_snapshot.len();
-            let probe_text: Vec<String> = (probe_lo..probe_hi)
-                .map(|p| {
-                    let dist = view_offset - p;
-                    let tok = if dist <= decoded_count {
-                        generated_tokens_snapshot.get(decoded_count - dist).copied()
-                    } else {
-                        let pf_dist = dist - decoded_count;
-                        if pf_dist <= pf_len {
-                            prefill_tokens_snapshot.get(pf_len - pf_dist).copied()
-                        } else {
-                            None
-                        }
-                    };
-                    match tok {
-                        Some(id) => self
-                            .tokenizer
-                            .decode(&[id], true)
-                            .unwrap_or_else(|_| format!("[{}]", id)),
-                        None => "<parent>".to_string(),
-                    }
-                })
-                .collect();
-            tracing::trace!(
-                tokens = ?probe_text,
-                "reproject probe tokens"
-            );
-
-            // Section corpus health
-            for (sid, entries) in &section_corpus {
-                let total_tokens: usize = entries.iter().map(|e| e.token_count as usize).sum();
-                let nonzero_entries = entries.iter().filter(|e| e.token_count > 0).count();
-                let name = policy
-                    .projection
-                    .section(*sid)
-                    .map(|s| s.name.as_str())
-                    .unwrap_or("<unknown>");
-                tracing::trace!(
-                    section = name,
-                    sig_entries = entries.len(),
-                    nonzero_entries,
-                    total_tokens,
-                    "reproject section corpus"
-                );
-            }
-        }
-
-        // Reuse the persistent scanner so its score maps keep their capacity
-        // across reprojections (the scan clears and refills them).
-        self.bdp_scanner.set_span_alpha(policy.span_alpha);
-        self.bdp_scanner.scan(
-            &policy.provenance,
-            &probe_syn,
-            &probe_sem,
-            &probe_prag,
-            &turn_corpus,
-        )?;
-        self.bdp_scanner.scan_sections(
-            &policy.provenance,
-            &probe_syn,
-            &probe_sem,
-            &probe_prag,
-            &section_corpus,
-        )?;
-
-        // Build a transient per-projection scores cache from the scanner
-        // output. This lives on the stack for the duration of the
-        // re-projection; it is never stored in the substrate (scores are
-        // projection-local, not session-persistent).
-        let projection_scores = self.bdp_scanner.to_projection_scores();
         let scan_ms = t_scan.elapsed().as_millis() as u64;
-        record_phase(t_scan, "reproject_bdp_scan");
+        record_phase(t_scan, "reproject_belief_scan");
 
         // 5. Re-project against the freshly-scored substrate.
         //
@@ -5544,11 +5049,13 @@ impl Scheduler {
             // Prefill mode: the section corpus is prefill-Q of tool
             // descriptions, so reprojection scores it with the calibrated
             // prefill profile (Max / semantic, no threshold gate).
-            let projection = policy.projection.project_with_mode(
+            let projection = policy.projection.project_with_mode_and_sink(
                 policy.target,
                 &view,
                 ProjectionMode::Prefill,
                 &policy.selection,
+                &prior_belief,
+                &mut |_| {},
             );
             // Walk segments once, populating both the elevate side-lists
             // and the segment list `apply_projection` will diff against
@@ -5611,6 +5118,7 @@ impl Scheduler {
                 &projection.segments,
                 policy.projection.schema(),
                 &view,
+                &projection.selection_scores,
                 view.total_token_count(policy.target.timeline) as u32,
                 0,
                 0,
@@ -5634,7 +5142,7 @@ impl Scheduler {
         //    borrow window over a still-correct parent.  That assumed
         //    the new projection's selected sections / turns were
         //    already materialised on parent in a contiguous prefix.
-        //    BDP-driven `top_k` swaps invalidated that assumption mid-
+        //    provenance-driven `top_k` swaps invalidated that assumption mid-
         //    decode (newly-picked sections only exist in the substrate,
         //    not in parent), `finalize_view`'s truncate-to-borrowed
         //    step then dropped the in-parent sections that the new
@@ -5649,7 +5157,7 @@ impl Scheduler {
         //         `original_borrowed`; those are the active turn's
         //         writes (user prefill + decoded-so-far).  Their K
         //         bytes are un-rotated, V bytes are
-        //         position-independent, Q vectors and BDP signatures
+        //         position-independent, Q vectors and provenance signatures
         //         for the decoded tokens are already captured by
         //         provenance — nothing needs regenerating.
         //
@@ -5763,7 +5271,6 @@ impl Scheduler {
         self.session
             .truncate_sequence_to_blocks(parent_id.0, 0)
             .map_err(ConversationError::Model)?;
-        self.slot_sig_blocks_processed.insert(parent_id, 0);
         // Reset the slot_tokens diagnostic log so it stays in sync with
         // the post-rebuild slot contents.  apply_projection re-populates
         // it with the new prefix's tokens; the active turn tokens get
@@ -5889,7 +5396,7 @@ impl Scheduler {
             view_id,
             parent_id,
             tail_per_layer,
-            decode_state,
+            mut decode_state,
             sampling_state,
             sections_len,
             segments_len,
@@ -5905,6 +5412,12 @@ impl Scheduler {
             elevate_ms,
         } = inflight;
 
+        // Carry the belief forward: the next reprojection seeds from what this one
+        // selected, so the RelLeak decay/reinforcement accumulates across the turn.
+        // Migrates with the decode state into `new_view_id` below.
+        decode_state.belief =
+            crate::projection::PriorBelief::from_selection(&composition.selection);
+
         // Close the decode span that ran under the *previous* projection and
         // emit it as a timeline event: `[anchor.token, now]` tokens at the
         // measured t/s, paired with the composition this reprojection selected.
@@ -5914,10 +5427,16 @@ impl Scheduler {
         let repro_now = Instant::now();
         let repro_gen = decode_state.generated_tokens.len() as u32;
         {
-            let (from_token, since) = self
+            // Span start = the previous projection's end, carried on the decode state
+            // (which migrates correctly across view swaps) — NOT the view-keyed anchor
+            // map, whose migrated `from_token` was doubling. The anchor is still used
+            // only for the wall-clock `since` (its `Instant` is fine).
+            let from_token = decode_state.last_projection_end;
+            let since = self
                 .reproj_anchor
                 .remove(&view_id)
-                .unwrap_or((0, decode_state.decode_start));
+                .map(|(_, t)| t)
+                .unwrap_or(decode_state.decode_start);
             let seconds = repro_now.duration_since(since).as_secs_f64();
             let span = repro_gen.saturating_sub(from_token);
             let event = crate::projection::ProjectionEvent {
@@ -5933,6 +5452,10 @@ impl Scheduler {
             };
             let _ = decode_state.event_tx.send(TurnEvent::Projection(event));
         }
+        // Advance the span cursor for the next reprojection / final seal. (The wide
+        // `sign(Q)` history is captured continuously at decode time and persisted at
+        // seal — it is not tied to reprojections; the event is just a marker.)
+        decode_state.last_projection_end = repro_gen;
 
         let t_finish = Instant::now();
         self.apply_projection_finish(parent_id, plan)?;
@@ -6213,24 +5736,6 @@ mod tests {
             None,              // penalty_log_path
             DecodeHealthConfig::default(),
             512, // max_prefill_pass_tokens
-            Arc::new(ProvenanceFile::new().unwrap()),
-            ModelCoreProperties {
-                num_layers: 6,
-                n_kv_heads: 4,
-                head_dim: 128,
-                provenance_layer_indices: ProvenanceLayerIndices {
-                    syn_l0: 0,
-                    syn_l4: 1,
-                    sem_l0: 2,
-                    sem_l4: 3,
-                    prag_l0: 4,
-                    prag_l4: 5,
-                },
-                k_hi_error_threshold_factor: 1.0,
-                k_low_error_threshold_factor: 1.0,
-                v_hi_error_threshold_factor: 1.0,
-                v_low_error_threshold_factor: 1.0,
-            },
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
@@ -6334,24 +5839,6 @@ mod tests {
             None,
             DecodeHealthConfig::default(),
             512,
-            Arc::new(ProvenanceFile::new().unwrap()),
-            ModelCoreProperties {
-                num_layers: 6,
-                n_kv_heads: 4,
-                head_dim: 128,
-                provenance_layer_indices: ProvenanceLayerIndices {
-                    syn_l0: 0,
-                    syn_l4: 1,
-                    sem_l0: 2,
-                    sem_l4: 3,
-                    prag_l0: 4,
-                    prag_l4: 5,
-                },
-                k_hi_error_threshold_factor: 1.0,
-                k_low_error_threshold_factor: 1.0,
-                v_hi_error_threshold_factor: 1.0,
-                v_low_error_threshold_factor: 1.0,
-            },
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),
@@ -6403,24 +5890,6 @@ mod tests {
             None,
             DecodeHealthConfig::default(),
             512,
-            Arc::new(ProvenanceFile::new().unwrap()),
-            ModelCoreProperties {
-                num_layers: 6,
-                n_kv_heads: 4,
-                head_dim: 128,
-                provenance_layer_indices: ProvenanceLayerIndices {
-                    syn_l0: 0,
-                    syn_l4: 1,
-                    sem_l0: 2,
-                    sem_l4: 3,
-                    prag_l0: 4,
-                    prag_l4: 5,
-                },
-                k_hi_error_threshold_factor: 1.0,
-                k_low_error_threshold_factor: 1.0,
-                v_hi_error_threshold_factor: 1.0,
-                v_low_error_threshold_factor: 1.0,
-            },
             PersistenceTrigger::noop(),
             SummariserTrigger::noop(),
             projection_assembler::BoundaryMarkers::default(),

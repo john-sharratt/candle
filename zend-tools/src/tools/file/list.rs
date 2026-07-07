@@ -9,6 +9,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct ListRequest {
+    /// VFS path prefix to filter results (e.g. `src/`). Defaults to "" (lists all files).
     pub prefix: Option<String>,
 }
 

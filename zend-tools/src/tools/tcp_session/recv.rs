@@ -14,11 +14,20 @@ use crate::{RegisteredTool, Tool, ToolContext};
 pub struct RecvRequest {
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// recv_amt mode: read exactly this many bytes (blocks until satisfied or EOF).
+    /// Provide exactly one of recv_amt or recv_wait.
     #[validate(range(min = 1, max = 1048576))]
     pub recv_amt: Option<usize>,
+    /// recv_wait mode: read whatever arrives within this many seconds (0.1–60).
+    /// Provide exactly one of recv_amt or recv_wait.
     #[validate(range(min = 0.1, max = 60.0))]
     pub recv_wait: Option<f64>,
+    /// In recv_amt mode only, a hard read deadline in seconds (default 30).
+    /// Ignored in recv_wait mode, where recv_wait is the deadline.
     pub timeout_sec: Option<u32>,
+    /// How to return the bytes: "auto" (default — text if valid UTF-8, else hex),
+    /// "text" (lossy UTF-8), or "hex".
+    #[schemars(with = "Option<super::RecvFormat>")]
     pub format: Option<String>,
 }
 

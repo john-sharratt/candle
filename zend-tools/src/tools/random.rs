@@ -12,12 +12,25 @@ use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// Mode. One of: "integer" (whole number in a range), "float" (real in a
+    /// range), "choice" (pick from `choices`), "shuffle" (randomise `choices`
+    /// order), "dice" (roll `count` dice with `sides` faces). Required.
     pub kind: String,
+    /// Inclusive lower bound for "integer", lower bound for "float". Defaults to
+    /// 0 for both. Ignored by other kinds.
     pub min: Option<f64>,
+    /// Inclusive upper bound for "integer" (default 100), exclusive upper bound
+    /// for "float" (default 1). Ignored by other kinds. Must be greater than `min`.
     pub max: Option<f64>,
+    /// List of options for "choice" and "shuffle". Required for those kinds;
+    /// must be non-empty. Ignored by other kinds.
     pub choices: Option<Vec<String>>,
+    /// How many values to produce ("integer"/"float"/"choice"), or how many dice
+    /// to roll ("dice"). Defaults to 1; range 1–1000. Ignored by "shuffle".
     #[validate(range(min = 1, max = 1000))]
     pub count: Option<u32>,
+    /// Number of faces per die for "dice". Defaults to 6; must be >= 2. Ignored
+    /// by other kinds.
     pub sides: Option<u32>,
 }
 

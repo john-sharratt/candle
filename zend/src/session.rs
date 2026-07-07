@@ -11,12 +11,14 @@ use futures::{Stream, StreamExt};
 use notify::RecommendedWatcher;
 
 use candle_conversation::models::{Dialect, Model};
-use candle_conversation::persistence::record::{ToolSummaryEntry, ToolSummaryPayload};
 use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_DIR};
 use candle_conversation::projection::{
     self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
 };
-use candle_conversation::{ConversationEngine, GlueMarkers, Sequence, TokenDecoder, TurnEvent};
+use candle_conversation::{
+    ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, TokenDecoder, TurnEvent,
+    TurnHandle, TurnResponse,
+};
 
 use crate::code_read::CodeReadState;
 use crate::config::DaemonConfig;
@@ -171,6 +173,87 @@ No quotes, no period, no preamble — just the title.";
 const TITLER_HEAD_TOKENS: usize = 50;
 const TITLER_TAIL_TOKENS: usize = 50;
 const TITLER_MAX_TOKENS: usize = 16;
+/// Max tokens for a calibration turn's **decode fallback**. Calibration normally
+/// prefills the recorded `.md` trajectory verbatim (`max_decode = 0`), so this
+/// cap does nothing; it only applies to a case whose trajectory body can't be
+/// extracted and is decoded live instead. Generous so a verbose reasoner (or a
+/// long tool-call payload) finishes through `</tool_call>` rather than being cut
+/// mid-think; the decode still stops early on the natural `<|im_end|>`, so short
+/// cases pay nothing for the headroom. At 1280 the longest thinks (verbose
+/// TLS/HKDF spec musing, ~30+ reasoning lines) still truncated the `<tool_call>`;
+/// 2048 gives them room to finish.
+const CALIBRATION_MAX_TOKENS: usize = 2048;
+
+/// Seal a completed calibration turn the same way a normal decode does: finish the
+/// turn (which runs the BDP scan `projection_event` reads) and persist its
+/// projection event, so the substrate carries the durable turn→tool-section
+/// provenance link — the `tools` collection with the pinned tool marked selected.
+/// Best-effort: a failure only drops the supplementary provenance record, never the
+/// calibration case itself. The turn's tokens / KV signatures / wide-Q window are
+/// already sealed by the scheduler independently of this call.
+/// Mark a completed calibration `timeline` for distillation, idempotently. Only
+/// a timeline that still has KV to reclaim and isn't already marked is touched —
+/// so re-running calibration (or resuming an already-distilled corpus) neither
+/// re-marks nor re-triggers compaction. The `.md` trajectories are the source of
+/// truth, so once the wide-Q sig is captured the KV/token content is dead weight
+/// compaction can shed.
+fn mark_calibration_distill(engine: &ConversationEngine, timeline: TimelineId, tool: &str) {
+    if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
+        if let Err(e) = engine.distill_timeline(timeline) {
+            tracing::warn!(tool = tool, "calibration distill mark failed: {e}");
+        }
+    }
+}
+
+fn seal_calibration_turn(
+    conv: &mut Sequence,
+    handle: TurnHandle,
+    resp: &TurnResponse,
+    tool: &str,
+    mut events: Vec<ProjectionEvent>,
+) {
+    if let Err(e) = conv.finish_turn(handle, resp) {
+        tracing::warn!(tool = tool, "calibration finish_turn failed: {e}");
+        return;
+    }
+    // `events` holds the mid-decode reprojection events streamed during the turn;
+    // append the final projection (composition at seal, like the serve path), then
+    // persist the whole per-decode trajectory — the real projection sequence, each
+    // event's `tools` collection carrying the pinned tool as its selected section.
+    if let Some(event) = conv.projection_event(&resp.stats) {
+        events.push(event);
+    }
+    if events.is_empty() {
+        tracing::warn!(tool = tool, "calibration: no projection events to persist");
+        return;
+    }
+    if let Err(e) = conv.persist_projection_events(&events) {
+        tracing::warn!(
+            tool = tool,
+            "calibration persist projection events failed: {e}"
+        );
+    }
+}
+
+/// In-flight calibration cases held in the sliding window. Kept well above the
+/// `MAX_ACTIVE_PREFILLS` prefill gate (16) on purpose: with only ~16 in flight,
+/// the scheduler reaches an equilibrium where a few cases are prefilling and a
+/// few decoding, and since prefill and decode are different forward-pass shapes,
+/// each pass batches only the handful in the *same* phase — so waves hover low
+/// (~5). A deeper window keeps dozens of cases decoding while the 16-wide prefill
+/// gate refills underneath them, so decode waves stay large. Bounded by decode-KV
+/// VRAM, which the prefill backpressure defends (it throttles admission under
+/// memory pressure rather than the window).
+const CALIBRATION_BATCH: usize = 64;
+/// Conversation-metadata key tagging each calibration conversation with its
+/// `"{tool}|{example}"` case **at creation**, so it is findable by case on a
+/// later load — finished or half-finished. *Done* is signalled separately by
+/// **archiving** the conversation once its trajectory completes (`</tool_call>`);
+/// a tagged but un-archived conversation is a decode that was cut off mid-case,
+/// so the next load tombstones and regenerates it (the archive is the atomic
+/// commit). Changing an example's text changes its marker, so edited examples
+/// regenerate automatically.
+const CALIB_MARKER_KEY: &str = "calib";
 
 impl InferenceState {
     fn load(
@@ -181,6 +264,7 @@ impl InferenceState {
         skip_code_read: bool,
         skip_repo_scan: bool,
         compact_substrate: bool,
+        disable_summariser: bool,
         progress: Arc<LoadProgress>,
     ) -> anyhow::Result<Arc<Self>> {
         // Step 1: model. Engine ctor also reloads the substrate
@@ -273,7 +357,10 @@ impl InferenceState {
             // Thinking is ENABLED at the model level; per-turn suppression is
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
-            .thinking(true);
+            .thinking(true)
+            // `--disable-summariser`: bring the engine up without the AVL
+            // summary-forest thread (e.g. for bulk corpus prefill).
+            .disable_summariser(disable_summariser);
         let conv_config = builder.conversation_config();
 
         // Per-layer progress callback — the library reports
@@ -307,10 +394,13 @@ impl InferenceState {
             }
         }
 
-        // Optional one-shot redo-log compaction (after the reload so the live
-        // set is known; before serving). Opt-in via --compact-substrate; shows
-        // coarse phase progress on the loading screen.
-        if compact_substrate {
+        // Redo-log compaction (after the reload so the live set is known; before
+        // serving). On by default (opt out with `--no-compact-substrate`); runs
+        // only when the loaded substrate holds reclaimable markers (tombstoned or
+        // distilled timelines) — otherwise skipped, so a clean reload pays
+        // nothing. Since compaction consumes those markers, the next reload finds
+        // none and skips (no loop).
+        if compact_substrate && engine.substrate_has_reclaimable() {
             progress.set_step(LoadStep::Compacting);
             let cprog = Arc::clone(&progress);
             let cb = move |done: usize, total: usize| {
@@ -319,6 +409,19 @@ impl InferenceState {
             match engine.compact_substrate(Some(&cb)) {
                 Ok(()) => tracing::info!("substrate compaction complete"),
                 Err(e) => tracing::warn!("substrate compaction failed: {e:#}"),
+            }
+            // Compaction rewrote the log — re-reconstruct the substrate so the
+            // scheduler-side view (KV residence + offsets) matches the new log.
+            let reload = engine.reload_substrate();
+            loop {
+                let (done, total, finished) = reload.snapshot();
+                if total > 0 {
+                    progress.set_step_progress(done as u64, total as u64);
+                }
+                if finished {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
 
@@ -341,10 +444,15 @@ impl InferenceState {
         progress.set_step(LoadStep::Sections);
         // Per-section progress callback — bytes ingested out of total
         // section bytes (cheap proxy for tokens, smooth across uneven
-        // sections without a pre-tokenise pass).
+        // sections without a pre-tokenise pass). The "Prefilling tool
+        // sections" step is split in two: section prefill fills the first
+        // half (0..50%), the tool-catalog summary decode fills the second
+        // (50..100%) — both reported against a fixed 10_000-unit total so the
+        // two phases compose into one continuous bar.
         let section_progress = Arc::clone(&progress);
         let section_hook = move |done: u64, total: u64| {
-            section_progress.set_step_progress(done, total);
+            let scaled = if total == 0 { 0 } else { done * 5_000 / total };
+            section_progress.set_step_progress(scaled, 10_000);
         };
         // Two clones of the (tools-installed + templates-tokenised)
         // projection builder go to the repo_map and code_reading
@@ -385,119 +493,40 @@ impl InferenceState {
 
         // Tool-catalog summaries: one for "Comprehensive" tools mode (the full
         // catalog) and one for "Restricted" mode (the safe / non-high-risk
-        // subset). Each is hashed against the catalog content it summarises and
-        // both are cached together in one redo-log record; a restart with an
-        // unchanged catalog pays only the hash compares. Regeneration is gated
-        // per mode, so a changed catalog regenerates both.
+        // subset). Each is assembled **deterministically** from the catalog
+        // metadata — every tool grouped under its category — so there is no model
+        // call and nothing to cache: the text is rebuilt and its section prefilled
+        // on every startup, exactly like the tool sections themselves.
         {
-            let conv = engine.conversation();
-            let tools_gs = proj_builder_refresh
-                .schema()
-                .layers
-                .iter()
-                .find(|l| l.id == dialogue_layer)
-                .and_then(|l| l.system_prompt.collection_named("tools"))
-                .map(|c| c.summary.clone());
             let prelude = pre_tools_section_ids(&proj_builder_refresh);
-
-            // Resolve one mode's summary over `sections`: reuse the cached text
-            // on a hash match, else regenerate. Returns the record entry (built
-            // from cached or fresh text), the text to seal, and whether it was
-            // regenerated (drives the persist).
-            let resolve = |sections: &[crate::tool_summary::InstalledTool], restricted: bool| {
-                let hash = crate::tool_summary::catalog_hash(sections);
-                if conv.read().tool_summary_hash(restricted) == Some(hash) {
-                    tracing::info!(
-                        restricted,
-                        hash,
-                        "tool summary cache hit (catalog unchanged)"
-                    );
-                    let text = conv
-                        .read()
-                        .tool_summary_text(restricted)
-                        .map(str::to_string);
-                    let entry = text.clone().map(|summary| ToolSummaryEntry {
-                        catalog_hash: hash,
-                        summary,
-                    });
-                    return (entry, text, false);
-                }
-                let Some(gs) = tools_gs.as_ref() else {
-                    tracing::warn!("tool summary: dialogue layer has no 'tools' collection");
-                    return (None, None, false);
-                };
-                tracing::info!(
-                    restricted,
-                    hash,
-                    "tool catalog changed — regenerating summary"
-                );
-                match crate::tool_summary::generate_tool_summary(
-                    &engine,
-                    sections,
-                    gs,
-                    &conv_config,
-                ) {
-                    Ok(summary) => {
-                        let entry = ToolSummaryEntry {
-                            catalog_hash: hash,
-                            summary: summary.clone(),
-                        };
-                        (Some(entry), Some(summary), true)
-                    }
-                    Err(e) => {
-                        tracing::warn!(restricted, "tool summary generation failed: {e:#}");
-                        (None, None, false)
-                    }
-                }
-            };
-
             let safe_names = crate::tools::safe_tool_names();
             let safe_sections: Vec<crate::tool_summary::InstalledTool> = tool_sections
                 .iter()
                 .filter(|(name, _, _)| safe_names.contains(name))
                 .cloned()
                 .collect();
-            let (comp_entry, comp_text, comp_changed) = resolve(&tool_sections, false);
-            let (restr_entry, restr_text, restr_changed) = resolve(&safe_sections, true);
+            let comp_text = crate::tool_summary::build_tool_summary(&tool_sections);
+            let restr_text = crate::tool_summary::build_tool_summary(&safe_sections);
+            // Assembly is instant — the step's second half completes immediately.
+            progress.set_step_progress(10_000, 10_000);
 
-            // Persist both entries in one record when either regenerated. The
-            // unchanged mode keeps its cached entry so it is not lost.
-            if comp_changed || restr_changed {
-                let payload = ToolSummaryPayload {
-                    comprehensive: comp_entry,
-                    restricted: restr_entry,
-                };
-                match conv.write_tool_summary(payload) {
-                    Ok(()) => {
-                        // Force durable now — summaries are expensive to regenerate.
-                        if let Err(e) = engine.checkpoint_persistence() {
-                            tracing::warn!("tool summary checkpoint failed: {e}");
-                        }
-                        tracing::info!("tool summaries persisted (comprehensive + restricted)");
-                    }
-                    Err(e) => tracing::warn!("tool summary persist failed: {e}"),
-                }
-            }
-
-            // Seal each mode's summary under its reserved section id, re-prefilled
-            // with the same pre-tools prefix so its KV is position-correct for
-            // "just before the tools". The Restricted projection points the tools
+            // Seal each mode's summary under its reserved section id, prefilled with
+            // the same pre-tools prefix so its KV is position-correct for "just
+            // before the tools". The Restricted projection points the tools
             // collection at `ToolSummaryRestricted`, Comprehensive at `ToolSummary`;
             // None emits neither.
             for (text, reserved, label) in [
                 (comp_text, Reserved::ToolSummary, "comprehensive"),
                 (restr_text, Reserved::ToolSummaryRestricted, "restricted"),
             ] {
-                if let Some(text) = text {
-                    let sid = SectionId::reserved(reserved);
-                    match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
-                        Ok(()) => tracing::info!(
-                            section = sid.raw(),
-                            label,
-                            "tool summary section sealed (re-prefilled before tools)",
-                        ),
-                        Err(e) => tracing::warn!(label, "tool summary section seal failed: {e}"),
-                    }
+                let sid = SectionId::reserved(reserved);
+                match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
+                    Ok(()) => tracing::info!(
+                        section = sid.raw(),
+                        label,
+                        "tool summary section sealed (prefilled before tools)",
+                    ),
+                    Err(e) => tracing::warn!(label, "tool summary section seal failed: {e}"),
                 }
             }
         }
@@ -522,6 +551,325 @@ impl InferenceState {
             titler_timeline = ?titler_timeline,
             "titler conversation ready",
         );
+
+        // ── Calibrating sections ──────────────────────────────────────────────
+        // Free-decode each registered tool's authored examples into the hidden
+        // `Reserved::Calibration` layer, capturing the full think→call trajectory
+        // (and its per-reprojection wide-Q windows) for each.
+        //
+        // All cases share ONE projection: the whole catalog as a name-keyed `tools`
+        // collection governed by `SelectionRule::Named`. Each run pins exactly its
+        // tool by name (`TurnOptions::selection`), so the model sees a single
+        // available tool — the condition under which a free decode reliably calls
+        // the right one. The tool sections are sealed once (the first run); every
+        // later run reuses them via the idempotent section ingest. One throwaway
+        // conversation per (tool, example); a failing case is logged and skipped so
+        // it can never break daemon load.
+        progress.set_step(LoadStep::CalibratingSections);
+        {
+            let tools = zend_tools::registry::all_tools();
+            let total: usize = tools
+                .iter()
+                .map(|t| t.examples.iter().filter(|e| !e.is_empty()).count())
+                .sum();
+            tracing::info!(
+                cases = total,
+                "calibrating sections: per-tool example decodes (named tool selection)"
+            );
+            let (calib_builder, calib_layer, calib_group) =
+                crate::tools::build_calibration_projection(&conv_config.dialect)
+                    .map_err(|e| anyhow::anyhow!("build calibration projection: {e}"))?;
+            let calib_prelude = pre_collection_prelude(&calib_builder);
+            // Pin calibration turns to native R16/F16 (no hot→warm quantize) so every
+            // token's Q survives to the seal-time wide `sign(Q)` capture — the
+            // full-resolution provenance exemplars this phase exists to produce.
+            let calib_config = {
+                let mut c = conv_config.clone();
+                c.kv_lossless = true;
+                c
+            };
+            // Flatten to (tool, example, index) cases in registry order. The
+            // 1-based index is the position in the tool's `[_; 8]` examples array
+            // (before filtering empties) — it keys the exported `{tool}_{NN}.md`
+            // trajectory the prefill path loads.
+            let cases: Vec<(&str, &str, usize)> = tools
+                .iter()
+                .flat_map(|t| {
+                    t.examples
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| !e.is_empty())
+                        .map(move |(i, e)| (t.name, *e, i + 1))
+                })
+                .collect();
+
+            // A calibration case is "done" only once its conversation is
+            // ARCHIVED — the atomic commit. Each conversation is tagged with its
+            // case at creation, so a half-finished one (daemon cut off mid-decode)
+            // is still findable: present-but-unarchived → tombstone + regenerate.
+            // The archive flag is read per-timeline via `is_conversation_archived`
+            // (NOT `known_conversations`, which omits internal conversations with
+            // no `conv_id` — i.e. every calibration conversation, which is why an
+            // earlier snapshot-based check never matched and resume never worked).
+
+            // Resume filter: skip cases already archived, tombstone any
+            // half-finished prior, and collect the cases that still need running.
+            // Conversations are NOT created here — creation is a synchronous
+            // scheduler round-trip, so pre-creating one per case would allocate
+            // hundreds of (empty) slots at once. Instead each case's conversation
+            // is created lazily as the window refills (below), bounding the live
+            // slot count to `CALIBRATION_BATCH` — the concurrency the decode/prefill
+            // window can actually keep busy.
+            let mut done = 0usize;
+            let mut to_run: Vec<(&str, &str, usize)> = Vec::new();
+            for (name, example, idx) in cases.iter() {
+                let marker = format!("{name}|{example}");
+                let prior = engine.find_conversations_by_metadata(CALIB_MARKER_KEY, &marker);
+                // Done iff a prior conversation for this case is archived.
+                if prior.iter().any(|t| engine.is_conversation_archived(*t)) {
+                    // The completed corpus only needs its wide-Q sigs, so mark the
+                    // archived conversation for distillation — compaction reclaims
+                    // its trajectory content (`.md` files are the source of truth).
+                    // Idempotent: skip a timeline that's already distilled.
+                    for t in prior
+                        .iter()
+                        .filter(|t| engine.is_conversation_archived(**t))
+                    {
+                        mark_calibration_distill(&engine, *t, name);
+                    }
+                    done += 1;
+                    progress.set_step_progress(done as u64, total as u64);
+                    continue;
+                }
+                // Any non-archived prior conversation is a half-finished run —
+                // tombstone it before regenerating, so exactly one (complete)
+                // conversation per case survives.
+                for t in &prior {
+                    if let Err(e) = engine.tombstone_timeline(*t) {
+                        tracing::warn!(tool = name, "tombstone partial calibration failed: {e}");
+                    }
+                }
+                to_run.push((*name, *example, *idx));
+            }
+
+            // Non-blocking sweep: archive + retire every case finished since the
+            // last sweep. Archives only complete trajectories (`</tool_call>`); an
+            // incomplete/failed one stays un-archived to retry next load. Returns
+            // whether anything was retired.
+            // Each in-flight case carries the mid-decode reprojection events streamed
+            // so far, accumulated across sweeps (they arrive interleaved with tokens).
+            // The trailing `bool` is `is_prefill`: a prefilled trajectory is
+            // complete by construction (it's the validated exported `.md`), and
+            // its `Done` response carries no decoded text — so it must NOT be
+            // gated on `resp.text` the way a live decode is.
+            let mut inflight: Vec<(Sequence, TurnHandle, &str, Vec<ProjectionEvent>, bool)> =
+                Vec::new();
+            let retire_completed =
+                |inflight: &mut Vec<(Sequence, TurnHandle, &str, Vec<ProjectionEvent>, bool)>,
+                 done: &mut usize|
+                 -> bool {
+                    let mut retired = false;
+                    let mut i = 0;
+                    while i < inflight.len() {
+                        let mut collected: Vec<ProjectionEvent> = Vec::new();
+                        let terminal = loop {
+                            match inflight[i].1.try_recv() {
+                                Some(TurnEvent::Done(resp)) => break Some(Some(resp)),
+                                Some(TurnEvent::Error(_)) => break Some(None),
+                                Some(TurnEvent::Projection(ev)) => collected.push(ev),
+                                Some(_) => {}
+                                None => break None,
+                            }
+                        };
+                        inflight[i].3.append(&mut collected);
+                        match terminal {
+                            Some(result) => {
+                                let (mut conv, handle, name, events, is_prefill) =
+                                    inflight.remove(i);
+                                match result {
+                                    Some(resp)
+                                        if is_prefill || resp.text.contains("</tool_call>") =>
+                                    {
+                                        seal_calibration_turn(
+                                            &mut conv, handle, &resp, name, events,
+                                        );
+                                        if let Err(e) = engine
+                                            .set_conversation_archived(conv.timeline_id(), true)
+                                        {
+                                            tracing::warn!(
+                                                tool = name,
+                                                "calibration archive failed: {e}"
+                                            );
+                                        }
+                                        // Only the wide-Q sig is needed henceforth —
+                                        // mark for distillation so compaction sheds
+                                        // the trajectory content.
+                                        mark_calibration_distill(&engine, conv.timeline_id(), name);
+                                    }
+                                    Some(_) => tracing::warn!(
+                                    tool = name,
+                                    "calibration trajectory incomplete — left un-archived for retry"
+                                ),
+                                    None => tracing::warn!(tool = name, "calibration case failed"),
+                                }
+                                *done += 1;
+                                progress.set_step_progress(*done as u64, total as u64);
+                                retired = true;
+                            }
+                            None => i += 1,
+                        }
+                    }
+                    retired
+                };
+
+            // The assistant header marker the exported trajectory is split on —
+            // everything after it is the verbatim body we prefill.
+            let assistant_start = conv_config.dialect.active_assistant_start(false, false);
+            let mut to_run_iter = to_run.into_iter();
+            let mut warmed = false;
+            loop {
+                // Refill the window: create the next case's conversation lazily
+                // (only when there's window room) and submit it, so at most
+                // `CALIBRATION_BATCH` empty slots are ever live at once.
+                while inflight.len() < CALIBRATION_BATCH {
+                    let Some((name, example, idx)) = to_run_iter.next() else {
+                        break;
+                    };
+                    let mut conv = match engine.new_conversation_with_projection(
+                        &calib_prelude,
+                        calib_builder.clone(),
+                        calib_layer,
+                        calib_group,
+                        calib_config.clone(),
+                    ) {
+                        Ok(conv) => conv,
+                        Err(e) => {
+                            tracing::warn!(tool = name, "calibration create failed: {e}");
+                            done += 1;
+                            progress.set_step_progress(done as u64, total as u64);
+                            continue;
+                        }
+                    };
+                    // Tag at creation so a half-finished case is findable next load.
+                    let marker = format!("{name}|{example}");
+                    if let Err(e) = engine.set_conversation_metadata(
+                        conv.timeline_id(),
+                        CALIB_MARKER_KEY,
+                        &marker,
+                    ) {
+                        tracing::warn!(tool = name, "calibration tag failed: {e}");
+                    }
+                    let mut opts = candle_conversation::TurnOptions {
+                        max_tokens: Some(CALIBRATION_MAX_TOKENS),
+                        // Gather-scope tags: `"tool"` puts this turn in the tools
+                        // collection's belief gallery; the tool-name tag labels it
+                        // directly, so the seed corpus needs no cold-start bootstrap.
+                        tags: vec!["tool".to_string(), name.to_string()],
+                        ..Default::default()
+                    };
+                    // Pin exactly this tool: `SelectionRule::Named` emits only the
+                    // catalog member whose name matches the selector value.
+                    opts.selection
+                        .select(crate::tools::CALIB_TOOL_SELECTOR, name);
+                    // Fast path: prefill the exported trajectory verbatim in one
+                    // batched forward pass instead of decoding it token by token —
+                    // the wide-Q is captured identically at seal. The body is
+                    // everything after the assistant header (markers stripped). If
+                    // the case has no exported trajectory, or a malformed one where
+                    // the header isn't found, fall back to a live decode rather than
+                    // prefilling a wrong-grid body.
+                    // Keep the projection markers in the body: `submit_prefilled_turn`
+                    // strips them for the prefilled text and records each one's token
+                    // offset so the staged prefill wave fires a projection there,
+                    // reproducing the decode's per-segment projection sequence.
+                    let body =
+                        zend_tools::calibration::trajectory_for(name, idx).and_then(|traj| {
+                            traj.split_once(assistant_start.as_str())
+                                .map(|(_, b)| b.to_string())
+                        });
+                    let (submit_result, is_prefill) = match body {
+                        Some(body) => (
+                            conv.submit_prefilled_turn(
+                                example,
+                                &body,
+                                zend_tools::calibration::PROJECTION_MARKER,
+                                opts.selection.clone(),
+                                opts.tags.clone(),
+                            ),
+                            true,
+                        ),
+                        None => (conv.submit_turn_with_options(example, opts), false),
+                    };
+                    match submit_result {
+                        Ok(handle) => {
+                            if !warmed {
+                                // Warm-up: the first case decodes alone so the shared
+                                // tool sections upload once before concurrency.
+                                warmed = true;
+                                // Drain the event stream (blocking) so the warm-up
+                                // case collects its mid-decode reprojection events too.
+                                let mut events: Vec<ProjectionEvent> = Vec::new();
+                                let mut done_resp: Option<TurnResponse> = None;
+                                for ev in handle.stream() {
+                                    match ev {
+                                        TurnEvent::Projection(e) => events.push(e),
+                                        TurnEvent::Done(resp) => {
+                                            done_resp = Some(resp);
+                                            break;
+                                        }
+                                        TurnEvent::Error(e) => {
+                                            tracing::warn!(
+                                                tool = name,
+                                                "calibration case failed: {e}"
+                                            );
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                match done_resp {
+                                    Some(resp) if is_prefill || resp.text.contains("</tool_call>") => {
+                                        seal_calibration_turn(&mut conv, handle, &resp, name, events);
+                                        if let Err(e) = engine
+                                            .set_conversation_archived(conv.timeline_id(), true)
+                                        {
+                                            tracing::warn!(tool = name, "calibration archive failed: {e}");
+                                        }
+                                        // Sig captured — mark for distillation so
+                                        // compaction sheds the trajectory content.
+                                        mark_calibration_distill(&engine, conv.timeline_id(), name);
+                                    }
+                                    Some(_) => tracing::warn!(
+                                        tool = name,
+                                        "calibration trajectory incomplete — left un-archived for retry"
+                                    ),
+                                    None => {}
+                                }
+                                done += 1;
+                                progress.set_step_progress(done as u64, total as u64);
+                            } else {
+                                inflight.push((conv, handle, name, Vec::new(), is_prefill));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(tool = name, "calibration submit failed: {e}");
+                            done += 1;
+                            progress.set_step_progress(done as u64, total as u64);
+                        }
+                    }
+                }
+                if inflight.is_empty() {
+                    break;
+                }
+                // Retire finished cases; if none finished this pass, yield briefly
+                // (the unbounded channels buffer, so this never starves the wave).
+                if !retire_completed(&mut inflight, &mut done) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            progress.set_step_progress(total as u64, total as u64);
+            tracing::info!(cases = total, "calibrating sections complete");
+        }
 
         // Walk the workspace, cluster the directory tree under a
         // token budget, and prefill one (user, assistant) turn pair
@@ -1474,6 +1822,23 @@ impl ZendSession {
         Some(engine.set_conversation_archived(timeline, archived))
     }
 
+    /// Permanently tombstone a conversation — the delete path behind
+    /// `DELETE /v1/conversations/{id}`. Writes a durable `Tombstone` record so the
+    /// timeline is hidden from listings/resume immediately, and its records
+    /// (turns, KV, provenance) are physically reclaimed at the next compaction
+    /// (lazy — the tombstone is the commit, compaction does the delete). Also
+    /// drops the conversation from the in-RAM map so it vanishes from the sidebar
+    /// at once. Returns `None` when the model isn't loaded yet.
+    pub fn tombstone_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = timeline_for(conv_id);
+        let result = state.engine.lock().unwrap().tombstone_timeline(timeline);
+        if result.is_ok() {
+            state.conversations.lock().unwrap().remove(conv_id);
+        }
+        Some(result)
+    }
+
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
@@ -1557,15 +1922,11 @@ impl ZendSession {
             ToolMode::Restricted => true,
             ToolMode::Comprehensive => false,
         };
-        if let Some(text) = state
-            .engine
-            .lock()
-            .unwrap()
-            .conversation()
-            .read()
-            .tool_summary_text(restricted)
-            .map(str::to_string)
-        {
+        // The tools-collection summary is assembled deterministically from the
+        // catalog (the same text the startup seals); rebuild the mode-appropriate
+        // one for the panel rather than reading a cache.
+        let text = crate::tool_summary::tool_summary_for_mode(restricted);
+        if !text.is_empty() {
             out.push(("tools summary".to_string(), text));
         }
         Some(out)
@@ -1604,6 +1965,7 @@ impl ZendSession {
         let skip_code_read = self.config.skip_code_read;
         let skip_repo_scan = self.config.skip_repo_scan;
         let compact_substrate = self.config.compact_substrate;
+        let disable_summariser = self.config.disable_summariser;
         // Handle to the ambient Tokio runtime (if any). The loader runs on a
         // plain OS thread and drops its temporary download runtime before the
         // model load, so the workspace watcher's `tokio::spawn` would otherwise
@@ -1678,6 +2040,7 @@ impl ZendSession {
                     skip_code_read,
                     skip_repo_scan,
                     compact_substrate,
+                    disable_summariser,
                     load_progress_for_blocking,
                 ) {
                     Ok(state) => {

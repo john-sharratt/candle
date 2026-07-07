@@ -52,6 +52,7 @@
 //! `LayerSchema.window` has no default — it must be declared.
 
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
+use super::policy::SelectionPolicy;
 
 /// Schema for one layer's system-prompt content.
 ///
@@ -310,13 +311,13 @@ pub struct TreeVariant {
 /// A named bucket of system-prompt sections with its own selection rule.
 ///
 /// Sections inside a collection are individually scored (typically via
-/// per-section BDP sigs in the substrate) and filtered by
+/// per-section provenance sigs in the substrate) and filtered by
 /// [`Self::selection`].  The surviving subset emits in declaration order
 /// at the position of the collection within the system_prompt's items.
 ///
 /// Typical use is a `tools` collection embedded in a dialogue layer's
 /// system prompt: 93 tool-definition sections, `selection: TopK { k: 3 }`,
-/// driven by BDP scoring against the user's recent intent.
+/// driven by provenance scoring against the user's recent intent.
 #[derive(Debug, Clone)]
 pub struct SectionCollection {
     /// Crate-assigned id.
@@ -335,14 +336,11 @@ pub struct SectionCollection {
     /// Sections below this score are filtered before selection.
     /// Default `0.0`.
     pub score_threshold: f32,
-    /// Per-collection BDP depth weights for section scoring.  When
-    /// `Some`, overrides the enclosing layer's `depth_weights` for this
-    /// collection's selection.  When `None`, falls back to the layer's
-    /// value.  Allows different collections within the same layer to
-    /// weight the three BDP bands independently (e.g. a `tools`
-    /// collection calibrated for pragmatic-only while turn scoring uses
-    /// semantic-heavy weights).
-    pub depth_weights: Option<DepthWeights>,
+    /// Selection policy for this collection. Resolved at build time from the
+    /// collection's `policy:` or inherited from the enclosing layer. Its
+    /// budget/thresholds subsume the collection's `selection`/`score_threshold`
+    /// for belief-driven selection.
+    pub policy: SelectionPolicy,
     /// How this section group is compressed. Parsed, stored, and validated; no
     /// compression path reads a group summary yet (only layer summaries drive
     /// the live compression).
@@ -364,7 +362,7 @@ impl Default for SectionCollection {
             sections: Vec::new(),
             selection: SelectionRule::AlwaysVisible,
             score_threshold: 0.0,
-            depth_weights: None,
+            policy: SelectionPolicy::default_policy(),
             summary: GroupSummary::default(),
             summary_section: None,
         }
@@ -588,52 +586,21 @@ impl Default for GroupSummary {
     }
 }
 
-/// Per-layer weighting for the three Binary Directional Provenance depths.
+/// How a layer's turns are scoped into gather (provenance) trees.
 ///
-/// The BDP scanner produces a separate per-turn score for each depth
-/// (syntactic ~15%, semantic ~50%, pragmatic ~85%).  This struct says how
-/// the three are combined into a single per-turn score, computed as the
-/// normalised weighted sum:
+/// - [`GatherScope::Shared`] (default): one tree per layer, shared across all
+///   conversations — institutional memory / repo map / motivation.
+/// - [`GatherScope::Conversation`]: one tree per conversation (keyed by its
+///   `TimelineId`) — the live dialogue layer, private to each conversation.
 ///
-/// ```text
-///   combined = (w_syn * s_syn + w_sem * s_sem + w_prag * s_prag)
-///            / (w_syn + w_sem + w_prag)
-/// ```
-///
-/// All weights must be non-negative; at least one must be > 0.
-/// Default is `(1.0, 1.0, 1.0)` — the simple mean of the three depths.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DepthWeights {
-    pub syntactic: f32,
-    pub semantic: f32,
-    pub pragmatic: f32,
-}
-
-impl Default for DepthWeights {
-    fn default() -> Self {
-        // Universal calibration optimum (cross-corpus BDP sweep, 2026-05-16):
-        // syn:1 / sem:1 / prag:4 → 0.167 / 0.167 / 0.667 normalised.
-        // MRR=0.854, Top-1=81.6% across 640 probes × 64 items (8 layers).
-        Self {
-            syntactic: 1.0,
-            semantic: 1.0,
-            pragmatic: 4.0,
-        }
-    }
-}
-
-impl DepthWeights {
-    /// Combine three per-depth scores into a single per-turn score.
-    ///
-    /// Returns `0.0` if all weights are zero (defensive — validation rejects
-    /// this at construction time, but the math should still be safe).
-    pub fn combine(&self, syn: f32, sem: f32, prag: f32) -> f32 {
-        let total = self.syntactic + self.semantic + self.pragmatic;
-        if total <= 0.0 {
-            return 0.0;
-        }
-        (self.syntactic * syn + self.semantic * sem + self.pragmatic * prag) / total
-    }
+/// Section groups are always per-collection regardless of this flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GatherScope {
+    /// One shared tree across all conversations.
+    #[default]
+    Shared,
+    /// One private tree per conversation.
+    Conversation,
 }
 
 /// Schema for one cognitive layer.
@@ -682,9 +649,13 @@ pub struct LayerSchema {
     /// Groups in declaration order. At projection time they are sorted by
     /// derived group score for emission.
     pub groups: Vec<GroupSchema>,
-    /// Weights for combining per-depth BDP scores into a single per-turn
-    /// score.  Default is equal weighting across all three depths.
-    pub depth_weights: DepthWeights,
+    /// Selection policy (belief-update + budget + tag scope) for this layer's
+    /// turn groups, resolved from the layer's `policy:` or inherited from the
+    /// schema default. Collections and groups may override it.
+    pub policy: SelectionPolicy,
+    /// Gather-tree scoping for this layer's turns (`gather_scope:` in YAML).
+    /// Default [`GatherScope::Shared`].
+    pub gather_scope: GatherScope,
 }
 
 impl LayerSchema {
@@ -731,6 +702,9 @@ pub struct GroupSchema {
     /// Turns whose score is below this threshold are invisible to selection.
     /// Default `0.0` (no gate).
     pub score_threshold: f32,
+    /// Selection policy (belief-update + budget + tag scope) for this group,
+    /// resolved from the group's `policy:` or inherited from the enclosing layer.
+    pub policy: SelectionPolicy,
     pub budget: Budget,
 }
 
@@ -778,6 +752,7 @@ impl Default for Budget {
 ///   Selection rule ─┬─ AlwaysVisible        → all turns above threshold
 ///                   ├─ TopK { k }           → k highest-scored above threshold
 ///                   ├─ Single               → 1 highest-scored above threshold
+///                   ├─ Named { selector }   → the one member named by a runtime selector
 ///                   └─ Sequence         → recent-N (inviolate) + top-K historical
 /// ```
 ///
@@ -800,6 +775,18 @@ pub enum SelectionRule {
     /// one entry is ever relevant at a time (a single goal pressure, a
     /// single active threat).
     Single,
+
+    /// Collection-only: the single member whose `name` equals the runtime
+    /// value of the named selector (resolved from the projection's
+    /// `SelectionState`, e.g. set per turn via `TurnOptions::selection`).
+    /// This is an **explicit, score-independent** pick — it ignores provenance
+    /// relevance and the score threshold entirely, selecting exactly the
+    /// member the caller names (or nothing, if the selector is unset or
+    /// names no member). Used to force one section out of a catalog by name —
+    /// e.g. calibration pinning a single tool from the `tools` collection.
+    ///
+    /// On a turn group (which has no member names) this selects nothing.
+    Named { selector: String },
 
     /// Composite for the natural shape of an ongoing conversation: the most
     /// recent `recent` turns survive **unconditionally** (no score threshold,

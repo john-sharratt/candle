@@ -30,9 +30,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::crc_validator::BadChunkRegistry;
 use super::manifest::ChunkLoc;
-use super::streams::StreamId;
 
 /// Identifies which log a record's bytes live in. The orchestrator
 /// uses this to pick the correct [`super::direct_io::DirectFile`]
@@ -115,39 +113,21 @@ pub struct ChunkedReadPlan {
 /// `file_offset` and partitioned greedily into chunks of
 /// `<= buffer_size` bytes. Empty sources contribute no chunks; an
 /// empty turn yields an empty plan.
-///
-/// Chunks flagged in `bad_chunks` are skipped — the background CRC
-/// validator has marked them as bit-rot, and the cold-load would
-/// fail downstream anyway.
 pub fn plan_chunked_read(
     active_chunks: Option<&BTreeMap<u64, ChunkLoc>>,
     inherited_chunks: &[Option<&BTreeMap<u64, ChunkLoc>>],
-    stream_id: StreamId,
     buffer_size: usize,
-    bad_chunks: &BadChunkRegistry,
 ) -> ChunkedReadPlan {
     let mut seen: HashSet<u64> = HashSet::new();
     let mut plan = ChunkedReadPlan::default();
 
     {
-        let active_recs = collect_records(
-            active_chunks,
-            SourceLog::Active,
-            stream_id,
-            &mut seen,
-            bad_chunks,
-        );
+        let active_recs = collect_records(active_chunks, SourceLog::Active, &mut seen);
         partition_and_append(active_recs, buffer_size, &mut plan);
     }
 
     for (i, chunks) in inherited_chunks.iter().enumerate() {
-        let inh_recs = collect_records(
-            *chunks,
-            SourceLog::Inherited(i),
-            stream_id,
-            &mut seen,
-            bad_chunks,
-        );
+        let inh_recs = collect_records(*chunks, SourceLog::Inherited(i), &mut seen);
         partition_and_append(inh_recs, buffer_size, &mut plan);
     }
 
@@ -157,9 +137,7 @@ pub fn plan_chunked_read(
 fn collect_records(
     chunks: Option<&std::collections::BTreeMap<u64, ChunkLoc>>,
     source: SourceLog,
-    stream_id: StreamId,
     seen: &mut HashSet<u64>,
-    bad_chunks: &BadChunkRegistry,
 ) -> Vec<RawRecord> {
     let Some(chunks) = chunks else {
         return Vec::new();
@@ -167,9 +145,6 @@ fn collect_records(
     let mut out: Vec<RawRecord> = Vec::with_capacity(chunks.len());
     for (&chunk_idx, loc) in chunks {
         if !seen.insert(chunk_idx) {
-            continue;
-        }
-        if bad_chunks.is_bad((stream_id, chunk_idx)) {
             continue;
         }
         out.push(RawRecord {

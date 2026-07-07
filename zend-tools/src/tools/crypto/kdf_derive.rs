@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::{decode_data, encode_output, CryptoError};
+use super::{decode_data, encode_output, normalize_algorithm, CryptoError};
 use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
@@ -13,13 +13,24 @@ pub struct KdfRequest {
     pub password: String,
     #[validate(length(min = 1))]
     pub salt: String,
+    /// How `salt` is encoded. One of: text, hex, base64. Defaults to text.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub salt_encoding: Option<String>,
+    /// KDF algorithm. One of: argon2id, pbkdf2_sha256, scrypt.
+    #[schemars(with = "super::KdfAlgorithm")]
     #[validate(length(min = 1))]
     pub algorithm: String,
+    /// Derived-key length in bytes (1–64). Defaults to 32.
     #[validate(range(min = 1, max = 64))]
     pub length: Option<u32>,
+    /// Iteration count. Honored by argon2id (default 3) and pbkdf2_sha256
+    /// (default 100000); ignored by scrypt.
     pub iterations: Option<u32>,
+    /// Memory cost in KiB. Honored by argon2id only (default 65536); ignored by
+    /// pbkdf2_sha256 and scrypt.
     pub memory_kib: Option<u32>,
+    /// Encoding for the returned derived key. One of: text, hex, base64. Defaults to hex.
+    #[schemars(with = "Option<super::super::DataEncoding>")]
     pub output_encoding: Option<String>,
 }
 
@@ -51,7 +62,7 @@ impl Tool for KdfDerive {
         let out_enc = req.output_encoding.as_deref().unwrap_or("hex");
         let mut output = vec![0u8; length];
 
-        match req.algorithm.as_str() {
+        match normalize_algorithm(&req.algorithm).as_str() {
             "argon2id" => {
                 let iterations = req.iterations.unwrap_or(3);
                 let memory = req.memory_kib.unwrap_or(65536);
@@ -66,7 +77,7 @@ impl Tool for KdfDerive {
                     .hash_password_into(req.password.as_bytes(), &salt, &mut output)
                     .map_err(|e| CryptoError::DerivationFailed(e.to_string()))?;
             }
-            "pbkdf2_sha256" => {
+            "pbkdf2sha256" => {
                 let iters = req.iterations.unwrap_or(100000);
                 pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
                     req.password.as_bytes(),

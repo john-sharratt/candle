@@ -9,9 +9,12 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct WriteRequest {
+    /// Key identifying the note to create or update (1–256 chars). Required.
     #[validate(length(min = 1, max = 256))]
     pub key: String,
+    /// Full note body to store, replacing any existing content for this key. Required.
     pub content: String,
+    /// Tags to associate with the note. Defaults to none (empty tag list).
     pub tags: Option<Vec<String>>,
 }
 

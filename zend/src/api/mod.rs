@@ -52,7 +52,10 @@ pub fn router(session: Arc<ZendSession>) -> Router {
         .route("/v1/models", get(models::list))
         .route("/v1/status", get(status::status))
         .route("/v1/conversations", get(conversations::list))
-        .route("/v1/conversations/:id", get(conversations::get))
+        .route(
+            "/v1/conversations/:id",
+            get(conversations::get).delete(conversations::delete),
+        )
         .route(
             "/v1/conversations/:id/files",
             get(files::list).post(files::upload),

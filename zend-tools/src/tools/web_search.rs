@@ -9,8 +9,10 @@ use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// Search query string.
     #[validate(length(min = 1))]
     pub query: String,
+    /// Maximum number of ranked results to return (1-10). Default: 5.
     #[validate(range(min = 1, max = 10))]
     pub max_results: Option<u8>,
 }

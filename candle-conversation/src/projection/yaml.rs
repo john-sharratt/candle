@@ -26,10 +26,6 @@
 //!     window: <usize>              # total turn-budget when this layer is the
 //!                                  # projection target — distributed via flex
 //!                                  # across all visible layers below it.
-//!     depth_weights:               # optional; default 1.0/1.0/1.0 equal weights
-//!       syntactic: <float>
-//!       semantic: <float>
-//!       pragmatic: <float>
 //!     score_threshold: <float>     # default 0.0
 //!     budget: { priority, min_percent, max_percent }   # this layer's flex
 //!                                  # weight when some *other* layer is the
@@ -43,8 +39,9 @@
 //!     groups:
 //!       - id: <string>
 //!         selection:
-//!           kind: always_visible | top_k | single | conversation
+//!           kind: always_visible | top_k | single | named | conversation
 //!           k: <usize>                   # required for top_k
+//!           selector: <string>           # required for named (collection-only)
 //!           recent: <usize>              # for conversation
 //!           historical_top_k: <usize>    # for conversation
 //!         score_threshold: <float>
@@ -66,9 +63,10 @@ use serde::Deserialize;
 
 use super::error::ConstructionError;
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
+use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
-    Budget, CompressionPrompt, DepthWeights, GroupSchema, GroupSummary, GroupSummaryStage,
+    Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
     LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
     SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode,
     TreeOption, TreeVariant, TurnSummary,
@@ -137,6 +135,37 @@ pub fn from_yaml(
 #[derive(Deserialize)]
 struct YamlSchema {
     layers: Vec<YamlLayer>,
+    /// Schema-wide default selection policy, inherited by any layer/collection/
+    /// group that declares none. Absent → [`SelectionPolicy::default_policy`].
+    #[serde(default)]
+    default_policy: Option<YamlPolicy>,
+}
+
+/// A `policy:` block: an optional preset base plus per-field overrides and an
+/// optional gather-scope tag filter. Any field left unset inherits from the
+/// enclosing node (layer → collection/group) or the schema default.
+#[derive(Deserialize)]
+struct YamlPolicy {
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    beta: Option<f32>,
+    #[serde(default)]
+    min_score: Option<f32>,
+    #[serde(default)]
+    evict_score: Option<f32>,
+    #[serde(default)]
+    budget: Option<YamlPolicyBudget>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct YamlPolicyBudget {
+    #[serde(default)]
+    min: Option<usize>,
+    #[serde(default)]
+    max: Option<usize>,
 }
 
 #[derive(Deserialize, Default)]
@@ -278,8 +307,10 @@ enum YamlSystemPromptItem {
         selection: YamlSelection,
         #[serde(default)]
         score_threshold: f32,
+        /// Selection policy override; inherits the enclosing layer's when absent.
+        /// Its budget/thresholds subsume `selection`/`score_threshold`.
         #[serde(default)]
-        depth_weights: Option<YamlDepthWeights>,
+        policy: Option<YamlPolicy>,
         /// Required — how this section group is compressed (config only for now).
         summary: YamlGroupSummary,
         #[serde(default)]
@@ -373,20 +404,32 @@ struct YamlLayer {
     /// (`turns` + optional `summaries`, each with question/answer halves).
     summary: YamlLayerSummary,
     groups: Vec<YamlGroup>,
-    /// Optional weights for the three BDP signature depths.  Default is
-    /// `(1.0, 1.0, 1.0)` — equal mean.
+    /// Selection policy for this layer's turn groups; inherits the schema
+    /// default when absent. Collections/groups may override it.
     #[serde(default)]
-    depth_weights: Option<YamlDepthWeights>,
+    policy: Option<YamlPolicy>,
+    /// Gather-tree scope for this layer's turns. `shared` (default) → one tree
+    /// across all conversations; `conversation` → one private tree per conversation
+    /// (the dialogue layer).
+    #[serde(default)]
+    gather_scope: YamlGatherScope,
 }
 
-#[derive(Deserialize, Default)]
-struct YamlDepthWeights {
-    #[serde(default)]
-    syntactic: Option<f32>,
-    #[serde(default)]
-    semantic: Option<f32>,
-    #[serde(default)]
-    pragmatic: Option<f32>,
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum YamlGatherScope {
+    #[default]
+    Shared,
+    Conversation,
+}
+
+impl From<YamlGatherScope> for GatherScope {
+    fn from(s: YamlGatherScope) -> Self {
+        match s {
+            YamlGatherScope::Shared => GatherScope::Shared,
+            YamlGatherScope::Conversation => GatherScope::Conversation,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -398,6 +441,9 @@ struct YamlGroup {
     score_threshold: f32,
     #[serde(default)]
     budget: YamlBudget,
+    /// Selection policy override; inherits the enclosing layer's when absent.
+    #[serde(default)]
+    policy: Option<YamlPolicy>,
 }
 
 #[derive(Deserialize, Default)]
@@ -420,9 +466,79 @@ struct YamlSelection {
     recent: Option<usize>,
     #[serde(default)]
     historical_top_k: Option<usize>,
+    #[serde(default)]
+    selector: Option<String>,
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
+
+/// Resolve a `policy:` block against an inherited base. A named `preset:` sets
+/// the base config; individual fields then override it; `tags` replaces the
+/// inherited scope. An absent block yields the inherited policy verbatim.
+fn parse_policy(
+    name: &str,
+    yp: Option<&YamlPolicy>,
+    inherited: &SelectionPolicy,
+) -> Result<SelectionPolicy, ConstructionError> {
+    let Some(yp) = yp else {
+        return Ok(inherited.clone());
+    };
+    let mut config = match &yp.preset {
+        Some(p) => PolicyPreset::from_name(p)
+            .ok_or_else(|| ConstructionError::UnknownPolicyPreset {
+                name: name.to_string(),
+                preset: p.clone(),
+            })?
+            .config(),
+        None => inherited.config,
+    };
+    if let Some(v) = yp.beta {
+        config.beta = v;
+    }
+    if let Some(v) = yp.min_score {
+        config.min_score = v;
+    }
+    if let Some(v) = yp.evict_score {
+        config.evict_score = v;
+    }
+    if let Some(b) = &yp.budget {
+        if let Some(m) = b.min {
+            config.budget_min = m;
+        }
+        if let Some(m) = b.max {
+            config.budget_max = m;
+        }
+    }
+    validate_policy(name, &config)?;
+    let tags = match &yp.tags {
+        Some(t) => t.clone(),
+        None => inherited.tags.clone(),
+    };
+    Ok(SelectionPolicy { config, tags })
+}
+
+fn validate_policy(name: &str, c: &PolicyConfig) -> Result<(), ConstructionError> {
+    let bad = |reason: &str| ConstructionError::InvalidPolicy {
+        name: name.to_string(),
+        reason: reason.to_string(),
+    };
+    if !(0.0..=1.0).contains(&c.beta) {
+        return Err(bad("beta must be in [0, 1]"));
+    }
+    if c.min_score < 0.0 || c.evict_score < 0.0 {
+        return Err(bad("min_score and evict_score must be >= 0"));
+    }
+    if c.evict_score > c.min_score {
+        return Err(bad("evict_score must be <= min_score (hysteresis band)"));
+    }
+    if c.budget_max == 0 {
+        return Err(bad("budget.max must be > 0"));
+    }
+    if c.budget_min > c.budget_max {
+        return Err(bad("budget.min must be <= budget.max"));
+    }
+    Ok(())
+}
 
 fn build(
     raw: YamlSchema,
@@ -435,11 +551,20 @@ fn build(
     let mut layers = Vec::with_capacity(raw.layers.len());
     let mut global_group_counter: u32 = 0;
 
+    // Root of the policy inheritance chain: the schema `default_policy:` resolved
+    // against the built-in default. Layers inherit this; collections/groups the layer.
+    let schema_default = parse_policy(
+        "default_policy",
+        raw.default_policy.as_ref(),
+        &SelectionPolicy::default_policy(),
+    )?;
+
     for (li, yl) in raw.layers.iter().enumerate() {
         let lid = LayerId::new(li as u32 + 1);
         maps.layer_names.insert(yl.name.clone(), lid);
 
         let layer_budget = parse_budget(&yl.name, &yl.budget)?;
+        let layer_policy = parse_policy(&yl.name, yl.policy.as_ref(), &schema_default)?;
 
         // ── this layer's system_prompt items ─────────────────────────────────
         // Build the ordered Vec<SystemPromptItem> from the YAML.  Two
@@ -589,7 +714,7 @@ fn build(
                     name,
                     selection,
                     score_threshold,
-                    depth_weights: coll_depth_weights_yaml,
+                    policy: coll_policy_yaml,
                     summary,
                     sections,
                 } => {
@@ -625,11 +750,25 @@ fn build(
                         });
                     }
 
-                    let coll_dw = parse_depth_weights(&label, coll_depth_weights_yaml.as_ref())?;
-                    let coll_dw_opt = if coll_depth_weights_yaml.is_some() {
-                        Some(coll_dw)
-                    } else {
-                        None
+                    // A collection with no explicit `policy:` but a `top_k`
+                    // selection derives its belief budget from that rule — the
+                    // count `k` becomes the budget max and `score_threshold` the
+                    // min/evict floor, so it selects exactly like the old top_k.
+                    // An explicit `policy:` (e.g. the production `tools`
+                    // collection) always wins.
+                    let coll_policy = match (coll_policy_yaml.as_ref(), &coll_selection) {
+                        (None, SelectionRule::TopK { k }) => {
+                            let mut config = layer_policy.config;
+                            config.min_score = *score_threshold;
+                            config.evict_score = *score_threshold;
+                            config.budget_min = 0;
+                            config.budget_max = *k;
+                            SelectionPolicy {
+                                config,
+                                tags: layer_policy.tags.clone(),
+                            }
+                        }
+                        _ => parse_policy(&label, coll_policy_yaml.as_ref(), &layer_policy)?,
                     };
                     let coll_summary = build_group_summary(
                         &label,
@@ -643,7 +782,7 @@ fn build(
                         sections: sec_schemas,
                         selection: coll_selection,
                         score_threshold: *score_threshold,
-                        depth_weights: coll_dw_opt,
+                        policy: coll_policy,
                         summary: coll_summary,
                         summary_section: None,
                     }));
@@ -681,12 +820,14 @@ fn build(
 
             let selection = parse_selection(&yg.id, &yg.selection)?;
             let group_budget = parse_budget(&yg.id, &yg.budget)?;
+            let group_policy = parse_policy(&yg.id, yg.policy.as_ref(), &layer_policy)?;
 
             groups.push(GroupSchema {
                 id: gid,
                 name: yg.id.clone(),
                 selection,
                 score_threshold: yg.score_threshold,
+                policy: group_policy,
                 budget: group_budget,
             });
         }
@@ -697,8 +838,6 @@ fn build(
                 value: yl.score_threshold,
             });
         }
-
-        let depth_weights = parse_depth_weights(&yl.name, yl.depth_weights.as_ref())?;
 
         let layer_summary = build_layer_summary(&yl.name, &yl.summary, &mut section_alloc)?;
 
@@ -712,7 +851,8 @@ fn build(
             system_prompt: SystemPromptSchema { items },
             summary: layer_summary,
             groups,
-            depth_weights,
+            policy: layer_policy,
+            gather_scope: yl.gather_scope.into(),
         });
     }
 
@@ -1137,46 +1277,6 @@ fn parse_budget(name: &str, yb: &YamlBudget) -> Result<Budget, ConstructionError
     })
 }
 
-fn parse_depth_weights(
-    layer_name: &str,
-    yw: Option<&YamlDepthWeights>,
-) -> Result<DepthWeights, ConstructionError> {
-    let default = DepthWeights::default();
-    let Some(yw) = yw else {
-        return Ok(default);
-    };
-
-    let syntactic = yw.syntactic.unwrap_or(default.syntactic);
-    let semantic = yw.semantic.unwrap_or(default.semantic);
-    let pragmatic = yw.pragmatic.unwrap_or(default.pragmatic);
-
-    for (depth, value) in [
-        ("syntactic", syntactic),
-        ("semantic", semantic),
-        ("pragmatic", pragmatic),
-    ] {
-        if value < 0.0 {
-            return Err(ConstructionError::NegativeDepthWeight {
-                layer: layer_name.to_string(),
-                depth,
-                value,
-            });
-        }
-    }
-
-    if syntactic == 0.0 && semantic == 0.0 && pragmatic == 0.0 {
-        return Err(ConstructionError::AllDepthWeightsZero {
-            layer: layer_name.to_string(),
-        });
-    }
-
-    Ok(DepthWeights {
-        syntactic,
-        semantic,
-        pragmatic,
-    })
-}
-
 fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, ConstructionError> {
     match ys.kind.as_str() {
         "" | "always_visible" => Ok(SelectionRule::AlwaysVisible),
@@ -1192,6 +1292,17 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
             Ok(SelectionRule::TopK { k })
         }
         "single" => Ok(SelectionRule::Single),
+        "named" => {
+            let selector = ys
+                .selector
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ConstructionError::EmptyNamedSelector {
+                    name: name.to_string(),
+                })?;
+            Ok(SelectionRule::Named { selector })
+        }
         "conversation" => {
             let recent = ys.recent.unwrap_or(0);
             let historical_top_k = ys.historical_top_k.unwrap_or(0);

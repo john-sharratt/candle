@@ -157,3 +157,25 @@ fn convert_bytes_to_mib() {
     let result = resp["result"].as_f64().unwrap();
     assert!((result - 1.0).abs() < 0.0001);
 }
+
+#[test]
+fn convert_liters_to_spaced_fluid_ounce() {
+    // The model naturally writes "fluid ounce" (with a space) and "US fluid
+    // ounce"; both must normalize to the fluid-ounce unit. 2.5 L ≈ 84.535 fl oz.
+    for to in [
+        "fluid ounce",
+        "US fluid ounce",
+        "fluid-ounce",
+        "us_fluid_ounce",
+    ] {
+        let resp = harness::expect_success(harness::invoke(
+            "unit_convert",
+            json!({"value": 2.5, "from": "liters", "to": to}),
+        ));
+        let result = resp["result"].as_f64().unwrap();
+        assert!(
+            (result - 84.535).abs() < 0.1,
+            "to={to} gave {result}, expected ~84.535"
+        );
+    }
+}

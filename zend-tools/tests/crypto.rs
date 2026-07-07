@@ -395,3 +395,89 @@ fn bytes_xor_simple() {
     assert_eq!(resp["result"], "f0");
     assert_eq!(resp["bytes"], 1);
 }
+
+// AES-128-GCM, 16-byte key. NIST GCM test case 2: all-zero key/nonce, a single
+// all-zero 16-byte plaintext block. The ciphertext block C is the published
+// known-answer (the 16 bytes before the 16-byte auth tag):
+//   C = 0388dace60b6a392f328c2b971b2fe78
+const KEY128_HEX: &str = "00000000000000000000000000000000";
+const AES128GCM_TC2_C: &str = "0388dace60b6a392f328c2b971b2fe78";
+
+#[test]
+fn aead_aes128gcm_known_answer() {
+    let enc = harness::expect_success(harness::invoke(
+        "aead_encrypt",
+        json!({
+            "data": "00000000000000000000000000000000",
+            "data_encoding": "hex",
+            "key_hex": KEY128_HEX,
+            "algorithm": "aes128gcm",
+            "nonce_hex": NONCE_HEX
+        }),
+    ));
+    let ct = enc["ciphertext_hex"].as_str().unwrap();
+    // C || tag: the 16-byte ciphertext block matches the NIST vector exactly.
+    // The trailing 16-byte tag is exercised by the authenticated round-trip in
+    // `aead_algorithm_display_casing_roundtrips`.
+    assert_eq!(&ct[..32], AES128GCM_TC2_C);
+    assert_eq!(ct.len(), 64);
+    assert_eq!(enc["nonce_hex"], NONCE_HEX);
+}
+
+#[test]
+fn aead_aes128gcm_rejects_32_byte_key() {
+    // A 64-hex (32-byte) key is wrong for AES-128 and must be rejected, not panic.
+    let bad = harness::invoke(
+        "aead_encrypt",
+        json!({
+            "data": "hello",
+            "data_encoding": "text",
+            "key_hex": KEY_HEX,
+            "algorithm": "aes128gcm",
+            "nonce_hex": NONCE_HEX
+        }),
+    );
+    harness::expect_error(&bad, "invalid_key");
+}
+
+// The algorithm name is normalized (case + separators dropped), so the model
+// may spell ciphers in display form. "AES-128-GCM" must reach the aes128gcm arm
+// and round-trip, and "SHA-256" must reach the hmac sha256 arm identically to
+// the canonical "sha256".
+#[test]
+fn aead_algorithm_display_casing_roundtrips() {
+    let enc = harness::expect_success(harness::invoke(
+        "aead_encrypt",
+        json!({
+            "data": "display cased algorithm",
+            "data_encoding": "text",
+            "key_hex": KEY128_HEX,
+            "algorithm": "AES-128-GCM",
+            "nonce_hex": NONCE_HEX
+        }),
+    ));
+    let ct = enc["ciphertext_hex"].as_str().unwrap().to_string();
+    let dec = harness::expect_success(harness::invoke(
+        "aead_decrypt",
+        json!({
+            "ciphertext_hex": ct,
+            "key_hex": KEY128_HEX,
+            "nonce_hex": NONCE_HEX,
+            "algorithm": "AES-128-GCM"
+        }),
+    ));
+    assert_eq!(dec["plaintext"], "display cased algorithm");
+}
+
+#[test]
+fn hmac_algorithm_display_casing_matches_canonical() {
+    let display = harness::expect_success(harness::invoke(
+        "hmac_compute",
+        json!({ "data": "msg", "key": "key", "algorithm": "SHA-256" }),
+    ));
+    let canonical = harness::expect_success(harness::invoke(
+        "hmac_compute",
+        json!({ "data": "msg", "key": "key", "algorithm": "sha256" }),
+    ));
+    assert_eq!(display["mac"], canonical["mac"]);
+}

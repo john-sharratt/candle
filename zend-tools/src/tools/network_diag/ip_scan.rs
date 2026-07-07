@@ -12,8 +12,11 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct IpScanRequest {
+    /// IPv4 subnet in CIDR notation (e.g. "192.168.1.0/24"). At most 254 hosts are
+    /// probed; only TCP port 80 is tested per address. 169.254.x.x link-local is blocked.
     #[validate(length(min = 1))]
     pub subnet: String,
+    /// Per-host TCP connect timeout in milliseconds. Default: 200.
     pub timeout_ms: Option<u64>,
 }
 

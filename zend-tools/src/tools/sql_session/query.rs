@@ -29,10 +29,17 @@ fn sql_to_json(v: SqlValue) -> serde_json::Value {
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct QueryRequest {
+    /// The session id returned by the sql_session_open tool.
     #[validate(length(min = 1))]
     pub session_id: String,
+    /// A single SQL statement to execute (SQLite dialect). SELECT/WITH return
+    /// rows and columns; INSERT/UPDATE/DELETE return rows_affected and
+    /// last_insert_rowid.
     #[validate(length(min = 1))]
     pub query: String,
+    /// Values bound to positional `?` placeholders in `query`, in order. JSON
+    /// null/bool/number/string map to the corresponding SQLite type. Defaults to
+    /// an empty array (no parameters).
     pub params: Option<Vec<serde_json::Value>>,
 }
 

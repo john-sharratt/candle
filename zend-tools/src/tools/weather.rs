@@ -9,10 +9,13 @@ use crate::{RegisteredTool, Tool, ToolContext, ToolError};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct Request {
+    /// City name or location to look up; resolved via geocoding.
     #[validate(length(min = 1))]
     pub location: String,
+    /// Number of forecast days to return (0-7); 0 returns current conditions only. Default: 0.
     #[validate(range(max = 7))]
     pub forecast_days: Option<u8>,
+    /// Unit system: "metric" (Celsius, km/h) or "imperial" (Fahrenheit, mph). Default: "metric".
     pub units: Option<String>,
 }
 

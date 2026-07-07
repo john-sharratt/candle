@@ -49,6 +49,7 @@ hex = "0.4"
 base64 = { workspace = true }
 scraper = "0.21"
 byteorder = { workspace = true }
+boa_engine = "0.21.1"
 
 [dev-dependencies]
 tokio     = { version = "1", features = ["macros", "rt"] }

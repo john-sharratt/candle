@@ -37,6 +37,8 @@
 //! `credential_save` confirms before saving (shows type + name).
 //! `cred_list` and `credential_delete` do not confirm.
 
+use schemars::JsonSchema;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::ToolError;
@@ -48,6 +50,27 @@ pub mod save;
 pub use delete::CREDENTIAL_DELETE;
 pub use list::CREDENTIAL_LIST;
 pub use save::CREDENTIAL_SAVE;
+
+// Schema-only mirror of the accepted credential `type` values. The request field
+// stays `String` (the `api_key`/`ed25519_key` aliases remain accepted at
+// runtime); this is referenced via `#[schemars(with = "…")]` so the JSON schema
+// carries a real `"enum"` of the canonical types.
+/// Credential type.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredType {
+    SshKey,
+    SshPassword,
+    TelnetPassword,
+    HttpBearer,
+    HttpBasic,
+    HttpHeader,
+    TotpSecret,
+    SqlPassword,
+    RemoteFsPassword,
+    TlsClientCert,
+    SigningKey,
+}
 
 #[derive(Debug, Error)]
 pub enum CredError {

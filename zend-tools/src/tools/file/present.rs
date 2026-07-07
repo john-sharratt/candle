@@ -9,9 +9,13 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct PresentRequest {
+    /// VFS paths to surface to the user (1–10 entries, session-relative). Required.
     #[validate(length(min = 1, max = 10))]
     pub paths: Vec<String>,
+    /// Optional short heading shown above the presented files. Defaults to none.
     pub title: Option<String>,
+    /// One of: auto, inline, preview. auto renders inline if small else as a preview card;
+    /// inline always renders full content; preview always shows an openable card. Defaults to auto.
     pub mode: Option<String>,
 }
 

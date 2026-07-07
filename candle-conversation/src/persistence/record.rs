@@ -86,7 +86,6 @@ pub enum RecordType {
     StreamDecl = 3,
     Chunk = 4,
     Tokens = 5,
-    Signatures = 6,
     Commit = 7,
     Checkpoint = 8,
     /// The model's `tokenizer.json` digest — a workspace singleton.
@@ -120,12 +119,18 @@ pub enum RecordType {
     /// JSON payload: a `Vec<ProjectionEvent>` for one turn, keyed by the
     /// turn's `stream_id`. Last-writer-wins on replay.
     ProjectionEvents = 15,
-    /// Cached summary of a section collection (today: the tool catalog),
-    /// keyed by a hash of the ordered collection content. A workspace
-    /// singleton — last-writer-wins on replay, and the compactor keeps only
-    /// the latest, dropping every superseded copy. JSON payload
-    /// [`ToolSummaryPayload`]. Regenerated only when the catalog hash changes.
-    ToolSummary = 16,
+    /// Per-timeline distillation marker — the timeline's turns keep their
+    /// `StreamDecl` + `WideQSig` (the belief gallery reads only the sig) but shed
+    /// their content (`Tokens` + KV `Chunk`s) on the next compaction pass. Used to
+    /// collapse the calibration corpus to sig-only. JSON payload
+    /// [`DistillPayload`]. Idempotent — duplicate markers replay identically. The
+    /// marker itself is **consumed** by that compaction (not re-emitted), so the
+    /// next reload finds none and doesn't re-trigger — see `docs/tool_provenance_distillation.md`.
+    Distilled = 16,
+    /// A turn's wide per-token `sign(Q)` window (all heads, all layers) — the decode→decode
+    /// (`Q·Q`) consensus substrate. Opaque payload encoded by `provenance::wide_sig`, keyed
+    /// by the turn's stream id, last-writer-wins (each (re)projection overwrites the window).
+    WideQSig = 17,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
@@ -722,7 +727,7 @@ impl DebugIdPayload {
 
 /// JSON payload for a [`RecordType::Tombstone`] record.  Naming
 /// `timeline_id` marks it as logically deleted: every
-/// `StreamDecl::Turn`, `Chunk`, `Tokens`, `Signatures`, `Commit`,
+/// `StreamDecl::Turn`, `Chunk`, `Tokens`, `Commit`,
 /// `TreeMetadata`, `Label`, `ConvState`, and `DebugId` record bound
 /// to that timeline becomes inert on replay, and the compactor
 /// drops them from disk on the next compaction pass.
@@ -742,37 +747,21 @@ impl TombstonePayload {
     }
 }
 
-/// One cached tool-catalog summary: `catalog_hash` is a 128-bit hash of the
-/// ordered collection content the summary was generated from, and `summary` is
-/// the generated text. The caller hashes the freshly-injected catalog and
-/// compares to `catalog_hash`; an equal hash is a cache hit (no regeneration).
+/// JSON payload for a [`RecordType::Distilled`] record — names the timeline whose
+/// turns should shed their content (keep sig, drop tokens + KV) at compaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolSummaryEntry {
-    pub catalog_hash: u128,
-    pub summary: String,
+pub struct DistillPayload {
+    pub timeline_id: u64,
 }
 
-/// JSON payload for a [`RecordType::ToolSummary`] record. A workspace singleton
-/// (last-writer-wins) holding both tool-mode summaries in one record so the
-/// existing single-slot manifest/compaction logic is unchanged: `comprehensive`
-/// is the overview of the full catalog, `restricted` the overview of the safe
-/// (non-high-risk) subset. Either may be `None` when its generation was absent
-/// or failed. A mismatch on either entry's `catalog_hash` triggers a regenerate
-/// + rewrite of the whole record; the compactor reclaims the superseded copy.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolSummaryPayload {
-    pub comprehensive: Option<ToolSummaryEntry>,
-    pub restricted: Option<ToolSummaryEntry>,
-}
-
-impl ToolSummaryPayload {
+impl DistillPayload {
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("ToolSummaryPayload serialise infallible")
+        serde_json::to_vec(self).expect("DistillPayload serialise infallible")
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
         serde_json::from_slice(buf)
-            .map_err(|e| PersistenceError::Corrupt(format!("ToolSummary JSON parse: {e}")))
+            .map_err(|e| PersistenceError::Corrupt(format!("Distill JSON parse: {e}")))
     }
 }
 
@@ -828,39 +817,6 @@ mod tests {
         let bytes = p.encode();
         let back = TreeMetadataPayload::decode(&bytes).unwrap();
         assert_eq!(p, back);
-    }
-
-    #[test]
-    fn tool_summary_payload_round_trips_and_bytes() {
-        let p = ToolSummaryPayload {
-            comprehensive: Some(ToolSummaryEntry {
-                catalog_hash: 1u128 << 64, // 18446744073709551616 — exercises the high word
-                summary: "## A\n  x, y".to_string(),
-            }),
-            restricted: None,
-        };
-        // Exact wire bytes: serde_json emits the struct fields in order, the
-        // u128 as a decimal number and the string with its newline escaped.
-        let bytes = p.encode();
-        let expected = "{\"comprehensive\":{\"catalog_hash\":18446744073709551616,\"summary\":\"## A\\n  x, y\"},\"restricted\":null}";
-        assert_eq!(bytes, expected.as_bytes());
-        let back = ToolSummaryPayload::decode(&bytes).unwrap();
-        assert_eq!(p, back);
-
-        // Through a real record frame.
-        let header = RecordHeader {
-            record_type: RecordType::ToolSummary,
-            format: 0,
-            payload_len: bytes.len() as u64,
-            crc: crc32(&bytes),
-            stream_id: 0,
-            chunk_index: 0,
-            token_count: 0,
-        };
-        let frame = encode_record(&header, &bytes);
-        let (hdr2, payload2, _total) = decode_record(&frame).unwrap();
-        assert_eq!(hdr2.record_type, RecordType::ToolSummary);
-        assert_eq!(ToolSummaryPayload::decode(payload2).unwrap(), p);
     }
 
     #[test]

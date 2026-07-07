@@ -11,10 +11,17 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
-    /// URI — only sftp:// is supported, e.g. sftp://user@host:22/home/user
+    /// SFTP URI: `sftp://host[:port]/base/path` (port defaults to 22). Only the
+    /// host, port, and base path are read from the URI; the login identity comes
+    /// from the credential, so a `user@` in the URI is optional.
     #[validate(length(min = 1))]
     pub uri: String,
-    pub credential_name: Option<String>,
+    /// Name of a stored `ssh_key`, `ssh_password`, or `remote_fs_password`
+    /// credential to authenticate with. Required — SFTP needs authentication.
+    #[validate(length(min = 1))]
+    pub credential_name: String,
+    /// Optional idle timeout in seconds; the session is closed after this long
+    /// with no operations.
     pub idle_timeout_sec: Option<u32>,
 }
 
@@ -61,11 +68,10 @@ impl Tool for RemoteFsSessionOpen {
             return Err(RemoteFsError::SessionLimitExceeded);
         }
 
-        let cred_name = req.credential_name.unwrap_or_default();
         let cred = ctx
             .credentials
-            .get_by_name(&cred_name)
-            .ok_or_else(|| RemoteFsError::CredentialNotFound(cred_name.clone()))?;
+            .get_by_name(&req.credential_name)
+            .ok_or_else(|| RemoteFsError::CredentialNotFound(req.credential_name.clone()))?;
 
         let addr = format!("{host}:{port}");
         let stream = std::net::TcpStream::connect(&addr)
@@ -127,6 +133,7 @@ impl Tool for RemoteFsSessionOpen {
                     _stream: stream,
                 },
             },
+            idle_timeout_secs: req.idle_timeout_sec,
         });
 
         Ok(OpenResponse {

@@ -45,7 +45,23 @@
 //! | `unpack_failed` | Buffer too short for the format or read error |
 
 use crate::ToolError;
+use schemars::JsonSchema;
+use serde::Serialize;
 use thiserror::Error;
+
+// Schema-only mirror of the encoding names `decode_bytes`/`encode_bytes` accept.
+// Tool request fields stay `Option<String>` for decoding; this type is referenced
+// via `#[schemars(with = "Option<BytesEncoding>")]` purely so the generated JSON
+// schema carries a real `"enum"` of the allowed values.
+/// Byte encoding format.
+#[derive(JsonSchema, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BytesEncoding {
+    Hex,
+    Base64,
+    Base64Url,
+    Utf8,
+}
 
 pub mod pack;
 pub mod transcode;

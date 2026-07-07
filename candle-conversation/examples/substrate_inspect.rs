@@ -19,7 +19,6 @@
 //!   chunks  <stream-id>   KV chunk records for a stream (format, sizes, bytes)
 //!   tokens  <stream-id>   decode a stream's Tokens record to token ids
 //!   meta                  the live ModelSpec / Template payloads
-//!   tool-summary          the cached tool-catalog summary (hash + text)
 //!   checkpoint            latest checkpoint + what it recovers to
 //!   projections [stream]  per-decode projection composition (the GUI panel data)
 //!   tree                  per-timeline summary forest from TreeMetadata records
@@ -40,14 +39,12 @@ use candle_conversation::persistence::compaction;
 use candle_conversation::persistence::content_hash::ContentHash;
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
 use candle_conversation::persistence::manifest::Manifest;
-use candle_conversation::persistence::record::{
-    ChunkPayload, Record, RecordType, ToolSummaryPayload,
-};
+use candle_conversation::persistence::record::{ChunkPayload, Record, RecordType};
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId};
 use candle_conversation::persistence::walker;
 use candle_conversation::projection::{
-    decode_events, ProjectionEvent, SystemItem, TimelineId, TurnIndex,
+    decode_events, ProjectionEvent, SelectedSection, SystemItem, TimelineId, TurnIndex,
 };
 use candle_conversation::substrate::{StreamRuntime, Substrate};
 use candle_conversation::summary_tree::TurnKind;
@@ -107,9 +104,6 @@ enum Cmd {
     },
     /// The live `ModelSpec` / `Template` payloads.
     Meta,
-    /// The cached tool-catalog summary (the `ToolSummary` singleton): its
-    /// catalog hash and the full generated text.
-    ToolSummary,
     /// Latest checkpoint and the manifest it recovers.
     Checkpoint,
     /// Per-decode projection composition — the same data the GUI's projection
@@ -119,6 +113,133 @@ enum Cmd {
     Projections {
         /// One turn stream (decimal or `0x`-hex). Omit to dump every decoded turn.
         stream_id: Option<String>,
+    },
+    /// Score one turn's stored wide-Q signature against the tag-scoped tool
+    /// gallery, offline (no model / live gather). Isolates whether the belief
+    /// scoring discriminates on persisted data — the top slots should be the
+    /// probe turn's own tool.
+    BeliefProbe {
+        /// Probe turn stream id, decimal or `0x`-hex.
+        stream_id: String,
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+    },
+    /// §80 tool-selection accuracy: leave-one-out over every tagged turn — each
+    /// is scored against the gallery of all the others — reporting Top-1 / Top-5
+    /// / MRR ranking accuracy plus the selection policy's recall and set size.
+    BeliefEval {
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// `min_score` gate for the selection metrics (committed_tool_scope = 35).
+        #[arg(long, default_value_t = 35.0)]
+        min_score: f32,
+        /// `budget.max` for the selection metrics (committed_tool_scope = 3).
+        #[arg(long, default_value_t = 3)]
+        max_budget: usize,
+        /// Scorer: `fused` (shipped z-late-fusion), `margin` (per-token margin
+        /// vote, all groups), or `margin-id` (margin over identity groups only,
+        /// skipping the noise group L0–45).
+        #[arg(long, default_value = "fused")]
+        scorer: String,
+        /// Truncate each probe to its last N tokens (0 = full turn) to match the
+        /// live reproject window.
+        #[arg(long, default_value_t = 0)]
+        probe_tokens: usize,
+    },
+    /// §80.3 production-faithful replay: unlike `belief-eval` (which scores ONE
+    /// window per turn), this replays each turn's recorded reprojection sequence
+    /// through the online belief exactly as production does — sliding
+    /// `probe_tokens` window at each reprojection point, `score_slots` → RelLeak
+    /// `belief_step` with the `CommittedToolScope` policy (β0.40, min 1000 / evict
+    /// 750, budget 1..3), belief carried across projections.
+    /// Reports whether the true tool ends the turn in the committed selected set —
+    /// the metric a single-shot ranking can't see (an early pin survives the faded
+    /// tail). Leave-one-out over the tagged corpus.
+    BeliefReplay {
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// Probe window cap per reprojection (`reproject_max_probe_tokens` = 256).
+        #[arg(long, default_value_t = 256)]
+        probe_tokens: usize,
+        /// Reprojection cadence in tokens (`reproject_every_n_tokens` = 64).
+        #[arg(long, default_value_t = 64)]
+        cadence: usize,
+        /// Stream id(s) to print a per-reprojection belief trace for (repeatable).
+        #[arg(long)]
+        trace: Vec<String>,
+    },
+    /// §80.2 threshold derivation: compute the leave-one-out score matrix once,
+    /// then sweep `min_score` × `budget.max` over it — reporting recall (hit
+    /// rate), mean set size, mean/max false positives, and exact-1 — to find the
+    /// gate that holds 100% recall with the fewest false positives.
+    BeliefSweep {
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// Scorer to derive thresholds for: `fused`, `margin`, `margin-id`, `hybrid`.
+        #[arg(long, default_value = "hybrid")]
+        scorer: String,
+        /// Truncate each probe to its last N tokens to match the live reproject
+        /// window (`reproject_max_probe_tokens` = 64). 0 = full turn. Scores sum
+        /// over probe tokens, so this sets the threshold's scale.
+        #[arg(long, default_value_t = 64)]
+        probe_tokens: usize,
+    },
+    /// §82 — model a conditional-decay (adaptive) probe window: walk the window
+    /// backward in chunks, accumulate a weighted belief, and let each chunk's
+    /// weight decay by the accumulated confidence so a confident probe aborts
+    /// early instead of reaching into stale context. Sweeps decay α × abort
+    /// threshold, reporting retained hit rate vs mean tokens actually used.
+    BeliefDecay {
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// Full probe window before decay (matches `reproject_max_probe_tokens`).
+        #[arg(long, default_value_t = 256)]
+        window: usize,
+        /// Chunk size to walk backward in.
+        #[arg(long, default_value_t = 64)]
+        chunk: usize,
+    },
+    /// §81 — deep-dive the scoring of ONE probe against its rivals, broken down
+    /// per fold layer-group (L0–45 / L46 / L47) and per token. Isolates whether a
+    /// tool-identity signal survives in an upper layer but is drowned by the
+    /// generic lower-layer group in the late-fusion. Built for the lone Top-5
+    /// miss (`tcp_session_list` vs the session-list family).
+    BeliefDissect {
+        /// Probe turn stream id, decimal or `0x`-hex.
+        stream_id: String,
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// How many discriminative tokens to list.
+        #[arg(long, default_value_t = 20)]
+        tokens: usize,
+    },
+    /// Calibration-quality audit: decode every tagged turn and flag any whose
+    /// assistant response never emitted a completed `</tool_call>` — a prompt
+    /// that made the model deliberate/refuse instead of calling its tool poisons
+    /// that tool's reference signature.
+    CalibCheck {
+        /// Gallery tag scope (the calibration tag).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+    },
+    /// Dump a diffable per-turn calibration baseline, keyed by `tool|prompt`
+    /// (stable across rebuilds — stream ids are not), so a decode-built substrate
+    /// can be compared token-for-token and sig-for-sig against a prefill-built one
+    /// after a rebuild. Each row: key, token count + hash, wide-Q token count +
+    /// blob hash + mean popcount. Identical hashes ⇒ identical reproduction.
+    CalibBaseline {
+        /// Gallery tag scope (the calibration tag).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// Write the TSV baseline to this path (default: stdout).
+        #[arg(long)]
+        out: Option<String>,
     },
     /// Per-timeline summary forest reconstructed from `TreeMetadata` records:
     /// kind / level / children for every summary node, with peaks flagged.
@@ -159,8 +280,42 @@ fn main() -> Result<()> {
             projections(&mut log, only)?
         }
         Cmd::Meta => meta(&mut log, &log_path)?,
-        Cmd::ToolSummary => tool_summary(&mut log)?,
         Cmd::Checkpoint => checkpoint_view(&mut log)?,
+        Cmd::BeliefProbe { stream_id, tag } => {
+            belief_probe(&mut log, parse_stream_id(&stream_id)?, &tag)?
+        }
+        Cmd::BeliefEval {
+            tag,
+            min_score,
+            max_budget,
+            scorer,
+            probe_tokens,
+        } => belief_eval(&mut log, &tag, min_score, max_budget, &scorer, probe_tokens)?,
+        Cmd::BeliefReplay {
+            tag,
+            probe_tokens,
+            cadence,
+            trace,
+        } => {
+            let trace_ids = trace
+                .iter()
+                .map(|s| parse_stream_id(s))
+                .collect::<Result<Vec<_>>>()?;
+            belief_replay(&mut log, &tag, probe_tokens, cadence, &trace_ids)?
+        }
+        Cmd::BeliefDissect {
+            stream_id,
+            tag,
+            tokens,
+        } => belief_dissect(&mut log, parse_stream_id(&stream_id)?, &tag, tokens)?,
+        Cmd::CalibCheck { tag } => calib_check(&mut log, &log_path, &tag)?,
+        Cmd::CalibBaseline { tag, out } => calib_baseline(&mut log, &log_path, &tag, out)?,
+        Cmd::BeliefSweep {
+            tag,
+            scorer,
+            probe_tokens,
+        } => belief_sweep(&mut log, &tag, &scorer, probe_tokens)?,
+        Cmd::BeliefDecay { tag, window, chunk } => belief_decay(&mut log, &tag, window, chunk)?,
         Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
     }
     Ok(())
@@ -262,11 +417,16 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
                     "      [collect] {name}: {sel}/{} sections selected",
                     sections.len()
                 );
-                for s in sections {
+                // Rank by belief score so the scoring's shape is visible: if the
+                // top scores are all ~equal (or all zero), selection is degenerate.
+                let mut ranked: Vec<&SelectedSection> = sections.iter().collect();
+                ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+                for s in ranked {
                     println!(
-                        "          {} {} ({} tok)",
+                        "          {} {:<28} score {:>8.3}  ({} tok)",
                         if s.selected { "[x]" } else { "[ ]" },
                         s.name,
+                        s.score,
                         s.tokens
                     );
                 }
@@ -282,6 +442,1791 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
             );
         }
     }
+}
+
+/// Score one turn's stored wide-Q signature against the tag-scoped gallery,
+/// offline. Mirrors `Conversation::belief_gallery` + `score_slots`: the gallery
+/// is every turn whose tags intersect `tag`, each mapped to a slot keyed by its
+/// non-`tag` tag (the tool name); the probe is the given turn's own signature.
+fn belief_probe(log: &mut LogFile, probe_id: StreamId, tag: &str) -> Result<()> {
+    use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
+
+    let substrate = build_substrate(log)?;
+
+    let probe_window = substrate
+        .stream_of(probe_id)
+        .and_then(|e| e.wide_q_sigs.as_ref())
+        .and_then(|b| decode_wide_sigs(b))
+        .with_context(|| format!("probe stream {} has no wide-Q signature", probe_id.0))?;
+    let probe_tags: Vec<String> = substrate
+        .stream_of(probe_id)
+        .and_then(|e| match &e.decl {
+            Some(StreamDecl::Turn(t)) => Some(t.tags.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    // Slot table: distinct tool names (the non-scope tag) in first-seen order.
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    for (sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if sid == probe_id {
+            continue; // never let the probe match itself
+        }
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            continue;
+        };
+        if window.is_empty() {
+            continue;
+        }
+        let slot = slot_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| {
+                slot_names.push(name.clone());
+                slot_names.len() - 1
+            });
+        windows.push(window);
+        slots.push(slot);
+    }
+
+    if windows.is_empty() {
+        println!("gallery is EMPTY for tag {tag:?} — no tagged turns carry wide-Q. This alone forces degenerate selection.");
+        return Ok(());
+    }
+
+    let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+    let fresh = score_slots(&probe_window, &wref, &slots, slot_names.len());
+
+    println!(
+        "probe stream {}  tags={:?}  ({} probe tokens)",
+        probe_id.0,
+        probe_tags,
+        probe_window.len()
+    );
+    println!(
+        "gallery: {} windows over {} slots (tag scope {:?})\n",
+        windows.len(),
+        slot_names.len(),
+        tag
+    );
+
+    let mut ranked: Vec<(usize, f32)> = fresh.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let ground_truth = probe_tags.iter().find(|x| x.as_str() != tag);
+    for (rank, (slot, score)) in ranked.iter().enumerate().take(15) {
+        let name = &slot_names[*slot];
+        let mark = if Some(name) == ground_truth {
+            " ← ground truth"
+        } else {
+            ""
+        };
+        println!("  #{rank:<2} {name:<28} {score:>9.3}{mark}");
+    }
+    Ok(())
+}
+
+/// Margin-weighted per-token scorer. For each probe token and each requested
+/// fold group, find the best agreement **per tool** and vote the top tool's
+/// lead over the runner-up (`best − second_best`). A token where one tool
+/// sharply wins (an identity token) dominates; a token where the family ties
+/// (a generic "list sessions" token) contributes ~nothing. Complements the
+/// shipped z-fusion, which self-mutes non-discriminative *groups* but not
+/// non-discriminative *tokens*.
+fn score_slots_margin(
+    probe: &[candle_conversation::provenance::WideQSig],
+    gallery_windows: &[&[candle_conversation::provenance::WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    gw: usize,
+    groups: &[usize],
+) -> Vec<f32> {
+    let mut votes = vec![0f32; n_slots];
+    let mut case_max = vec![0u32; n_slots];
+    for q in probe {
+        for &g in groups {
+            let base = g * gw;
+            if q.words.len() < base + gw {
+                continue;
+            }
+            let qg = &q.words[base..base + gw];
+            for m in case_max.iter_mut() {
+                *m = 0;
+            }
+            for (wi, w) in gallery_windows.iter().enumerate() {
+                let c = gallery_slot[wi];
+                for cand in w.iter() {
+                    if cand.words.len() >= base + gw {
+                        let ag = word_agreement(qg, &cand.words[base..base + gw]);
+                        if ag > case_max[c] {
+                            case_max[c] = ag;
+                        }
+                    }
+                }
+            }
+            // Top-1 and top-2 tool agreements → margin vote for the leader.
+            let (mut top1, mut top1c, mut top2) = (0u32, usize::MAX, 0u32);
+            for (c, &m) in case_max.iter().enumerate() {
+                if m > top1 {
+                    top2 = top1;
+                    top1 = m;
+                    top1c = c;
+                } else if m > top2 {
+                    top2 = m;
+                }
+            }
+            if top1c != usize::MAX {
+                votes[top1c] += top1.saturating_sub(top2) as f32;
+            }
+        }
+    }
+    votes
+}
+
+/// Hybrid scorer: per token and group, vote `z × margin` for the leading tool —
+/// combining the shipped z-fusion's group self-muting (an outlier vs the group's
+/// whole agreement distribution) with the margin's token self-muting (the
+/// leader's lead over the runner-up tool). Stays on the z-scale (margin is a
+/// unitless multiplier only where a token is discriminative). The noise group
+/// L0–45 is auto-muted by the near-zero margin, so all groups can be passed.
+fn score_slots_hybrid(
+    probe: &[candle_conversation::provenance::WideQSig],
+    gallery_windows: &[&[candle_conversation::provenance::WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    gw: usize,
+    groups: &[usize],
+) -> Vec<f32> {
+    let mut votes = vec![0f32; n_slots];
+    let mut case_max = vec![0u32; n_slots];
+    for q in probe {
+        for &g in groups {
+            let base = g * gw;
+            if q.words.len() < base + gw {
+                continue;
+            }
+            let qg = &q.words[base..base + gw];
+            for m in case_max.iter_mut() {
+                *m = 0;
+            }
+            let (mut sum, mut sumsq, mut count) = (0u64, 0u64, 0u64);
+            for (wi, w) in gallery_windows.iter().enumerate() {
+                let c = gallery_slot[wi];
+                for cand in w.iter() {
+                    if cand.words.len() >= base + gw {
+                        let ag = word_agreement(qg, &cand.words[base..base + gw]);
+                        if ag > case_max[c] {
+                            case_max[c] = ag;
+                        }
+                        sum += ag as u64;
+                        sumsq += (ag as u64) * (ag as u64);
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let (mut top1, mut top1c, mut top2) = (0u32, usize::MAX, 0u32);
+            for (c, &m) in case_max.iter().enumerate() {
+                if m > top1 {
+                    top2 = top1;
+                    top1 = m;
+                    top1c = c;
+                } else if m > top2 {
+                    top2 = m;
+                }
+            }
+            if top1c != usize::MAX {
+                let n = count as f32;
+                let mean = sum as f32 / n;
+                let var = (sumsq as f32 / n - mean * mean).max(1e-6);
+                let z = ((top1 as f32 - mean) / var.sqrt()).max(0.0);
+                let margin = top1.saturating_sub(top2) as f32;
+                votes[top1c] += z * margin;
+            }
+        }
+    }
+    votes
+}
+
+/// §80 tool-selection accuracy over the whole tagged corpus. For every tagged
+/// turn, score its stored signature against the gallery of *all the others*
+/// (leave-one-out) and record where its true tool ranked; then apply the
+/// selection policy (`min_score` gate + `max_budget`, min-fill 1) to measure the
+/// projected set. Ranking metrics are policy-independent; selection metrics show
+/// what the shipped `committed_tool_scope` actually admits.
+fn belief_eval(
+    log: &mut LogFile,
+    tag: &str,
+    min_score: f32,
+    max_budget: usize,
+    scorer: &str,
+    probe_tokens: usize,
+) -> Result<()> {
+    use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
+    use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
+    use rayon::prelude::*;
+
+    let substrate = build_substrate(log)?;
+
+    // Corpus: every tagged turn with a wide-Q window → (stream id, tool slot, window).
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut corpus: Vec<(StreamId, usize, Vec<WideQSig>)> = Vec::new();
+    for (sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            continue;
+        };
+        if window.is_empty() {
+            continue;
+        }
+        let slot = slot_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| {
+                slot_names.push(name.clone());
+                slot_names.len() - 1
+            });
+        corpus.push((sid, slot, window));
+    }
+
+    let n_slots = slot_names.len();
+    if corpus.len() < 2 {
+        println!(
+            "corpus has {} tagged turn(s) — need at least 2 for leave-one-out.",
+            corpus.len()
+        );
+        return Ok(());
+    }
+
+    // Fold geometry for the margin scorers.
+    let shape = &corpus[0].2[0];
+    let gw = PROV_HEADS_PER_LAYER * shape.words_per_head();
+    let n_groups = shape.n_heads as usize / PROV_HEADS_PER_LAYER;
+    let groups: Vec<usize> = match scorer {
+        "margin" | "hybrid" => (0..n_groups).collect(),
+        "margin-id" => (1..n_groups).collect(), // skip the noise group L0–45
+        _ => Vec::new(),
+    };
+
+    struct Trial {
+        sid: StreamId,
+        gt_slot: usize,
+        rank: usize,
+        hit: bool, // ground truth scored > 0 (a real match, not an all-zero tie)
+        gt_score: f32,
+        best_slot: usize,
+        best_score: f32,
+        selected: Vec<usize>,
+    }
+
+    // Leave-one-out, parallel over probes. Each rebuilds its gallery from all
+    // corpus windows except its own — the probe never matches itself.
+    let trials: Vec<Trial> = (0..corpus.len())
+        .into_par_iter()
+        .map(|pi| {
+            let (sid, gt_slot, full) = &corpus[pi];
+            // Match the live reproject window when requested: the last N tokens.
+            let probe: &[WideQSig] = if probe_tokens > 0 && full.len() > probe_tokens {
+                &full[full.len() - probe_tokens..]
+            } else {
+                full.as_slice()
+            };
+            let mut gwin: Vec<&[WideQSig]> = Vec::with_capacity(corpus.len() - 1);
+            let mut gslot: Vec<usize> = Vec::with_capacity(corpus.len() - 1);
+            for (j, (_, s, w)) in corpus.iter().enumerate() {
+                if j != pi {
+                    gwin.push(w.as_slice());
+                    gslot.push(*s);
+                }
+            }
+            let fresh = match scorer {
+                "margin" | "margin-id" => {
+                    score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
+                }
+                "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
+                _ => score_slots(probe, &gwin, &gslot, n_slots),
+            };
+            let gt_score = fresh[*gt_slot];
+            let rank = 1 + fresh.iter().filter(|&&s| s > gt_score).count();
+
+            let mut ranked: Vec<(usize, f32)> = fresh.iter().copied().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let (best_slot, best_score) = ranked[0];
+            let mut selected: Vec<usize> = ranked
+                .iter()
+                .filter(|(_, s)| *s >= min_score)
+                .take(max_budget)
+                .map(|(i, _)| *i)
+                .collect();
+            if selected.is_empty() {
+                selected.push(ranked[0].0); // budget min = 1: force-fill the top
+            }
+
+            Trial {
+                sid: *sid,
+                gt_slot: *gt_slot,
+                rank,
+                hit: gt_score > 0.0,
+                gt_score,
+                best_slot,
+                best_score,
+                selected,
+            }
+        })
+        .collect();
+
+    let n = trials.len();
+    let pct = |k: usize| 100.0 * k as f64 / n as f64;
+    let top1 = trials.iter().filter(|t| t.rank == 1 && t.hit).count();
+    let top3 = trials.iter().filter(|t| t.rank <= 3 && t.hit).count();
+    let top5 = trials.iter().filter(|t| t.rank <= 5 && t.hit).count();
+    let misses = trials.iter().filter(|t| !t.hit).count();
+    let mrr: f64 = trials
+        .iter()
+        .map(|t| if t.hit { 1.0 / t.rank as f64 } else { 0.0 })
+        .sum::<f64>()
+        / n as f64;
+
+    let recall = trials
+        .iter()
+        .filter(|t| t.selected.contains(&t.gt_slot))
+        .count();
+    let mean_sz: f64 = trials.iter().map(|t| t.selected.len()).sum::<usize>() as f64 / n as f64;
+    let exact1 = trials
+        .iter()
+        .filter(|t| t.selected.len() == 1 && t.selected[0] == t.gt_slot)
+        .count();
+
+    println!("\n══ §80 tool-selection eval (leave-one-out over current substrate) ══\n");
+    println!("scorer:  {scorer}");
+    println!("corpus:  {n} tagged turns over {n_slots} tools   (tag scope {tag:?})",);
+    println!(
+        "gallery: leave-one-out — each probe scored against the other {} turns\n",
+        n - 1
+    );
+
+    println!("Ranking accuracy (belief argmax, policy-independent):");
+    println!("  Tool-1 : {:>5.1}%   ({top1}/{n})", pct(top1));
+    println!("  Tool-3 : {:>5.1}%   ({top3}/{n})", pct(top3));
+    println!("  Tool-5 : {:>5.1}%   ({top5}/{n})", pct(top5));
+    println!("  MRR    : {mrr:>6.3}");
+    if misses > 0 {
+        println!(
+            "  misses : {:>5.1}%   ({misses}/{n} scored 0 for their own tool)",
+            pct(misses)
+        );
+    }
+
+    println!("\nSelection policy (min_score {min_score} / budget 1..{max_budget}, min-fill 1):");
+    println!(
+        "  recall (true tool in set) : {:>5.1}%   ({recall}/{n})",
+        pct(recall)
+    );
+    println!(
+        "  exact-1 (only the right tool) : {:>5.1}%   ({exact1}/{n})",
+        pct(exact1)
+    );
+    println!("  mean selected-set size    : {mean_sz:>5.2}");
+
+    // The genuinely hard probes: those whose true tool fell outside Top-3 (the
+    // shipped `budget.max`). Listed so a Tool-3 regression names its offenders,
+    // not just its count. A `‖T5` marker flags the ones also outside Top-5.
+    let mut hardest: Vec<&Trial> = trials.iter().filter(|t| t.rank > 3 || !t.hit).collect();
+    hardest.sort_by(|a, b| b.rank.cmp(&a.rank));
+    println!(
+        "\nHardest probes (true tool outside Top-3): {}",
+        hardest.len()
+    );
+    for t in &hardest {
+        let t5 = if t.rank > 5 || !t.hit { " ‖T5" } else { "" };
+        println!(
+            "  stream {:#018x}  tool {:<22} rank #{:<3} score {:>7.3}   beaten by {} ({:.3}){t5}",
+            t.sid.0,
+            slot_names[t.gt_slot],
+            t.rank,
+            t.gt_score,
+            slot_names[t.best_slot],
+            t.best_score,
+        );
+    }
+
+    // Per-tool Tool-1, worst first — surfaces which tools are confusable.
+    let mut per_tool: Vec<(usize, usize)> = vec![(0, 0); n_slots]; // (correct, total)
+    for t in &trials {
+        per_tool[t.gt_slot].1 += 1;
+        if t.rank == 1 && t.hit {
+            per_tool[t.gt_slot].0 += 1;
+        }
+    }
+    let mut rows: Vec<(String, usize, usize)> = per_tool
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, total))| *total > 0)
+        .map(|(i, (c, total))| (slot_names[i].clone(), *c, *total))
+        .collect();
+    rows.sort_by(|a, b| {
+        let ra = a.1 as f64 / a.2 as f64;
+        let rb = b.1 as f64 / b.2 as f64;
+        ra.total_cmp(&rb).then(b.2.cmp(&a.2))
+    });
+    println!("\nPer-tool Tool-1 (worst first, showing up to 15):");
+    for (name, correct, total) in rows.iter().take(15) {
+        println!(
+            "  {name:<30} {:>5.1}%   ({correct}/{total})",
+            100.0 * *correct as f64 / *total as f64
+        );
+    }
+    Ok(())
+}
+
+/// §80.3 — replay each tagged turn's recorded reprojection sequence through the
+/// online belief exactly as production does, leave-one-out. See
+/// [`Cmd::BeliefReplay`].
+fn belief_replay(
+    log: &mut LogFile,
+    tag: &str,
+    probe_tokens: usize,
+    cadence: usize,
+    trace_ids: &[StreamId],
+) -> Result<()> {
+    use candle_conversation::provenance::{
+        belief_step, decode_wide_sigs, score_slots, GroupBudget, SectionPolicy, WideQSig,
+    };
+    use rayon::prelude::*;
+
+    let substrate = build_substrate(log)?;
+
+    // Corpus: every tagged turn with a wide-Q window, its tool slot, and its full
+    // per-token signature. The prefill-built calibration turns carry only a single
+    // degenerate projection event, so we cannot replay a *recorded* reprojection
+    // sequence — instead we synthesise production's cadence (a reprojection every
+    // `cadence` generated tokens) over the full signature, which is exactly what a
+    // live decode of the same trajectory would fire.
+    struct Turn {
+        sid: StreamId,
+        slot: usize,
+        sigs: Vec<WideQSig>,
+    }
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut corpus: Vec<Turn> = Vec::new();
+    for (sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(sigs) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            continue;
+        };
+        if sigs.is_empty() {
+            continue;
+        }
+        let slot = slot_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| {
+                slot_names.push(name.clone());
+                slot_names.len() - 1
+            });
+        corpus.push(Turn { sid, slot, sigs });
+    }
+
+    let n_slots = slot_names.len();
+    let n = corpus.len();
+    if n < 2 {
+        println!("corpus has {n} tagged turn(s) — need at least 2 for leave-one-out.");
+        return Ok(());
+    }
+
+    // The shipped `tools` collection policy — `CommittedToolScope` (policy.rs).
+    let policy = SectionPolicy {
+        group: 0,
+        beta: 0.40,
+        min_score: 1000.0,
+        evict_score: 750.0,
+    };
+    let budget = GroupBudget { min: 1, max: 3 };
+    let trace_set: std::collections::HashSet<u64> = trace_ids.iter().map(|s| s.0).collect();
+
+    struct Outcome {
+        sid: StreamId,
+        slot: usize,
+        committed: bool,         // true tool in the final (at-tool_call) selected set
+        ever: bool,              // true tool selected at any reprojection
+        first_pt: Option<usize>, // first generated-token point where it was selected
+        final_rank: usize,       // rank of the true tool by accumulated belief at the end
+        n_points: usize,
+        trace: Vec<String>,
+    }
+
+    let outcomes: Vec<Outcome> = (0..n)
+        .into_par_iter()
+        .map(|pi| {
+            let owner = &corpus[pi];
+            let mut gwin: Vec<&[WideQSig]> = Vec::with_capacity(n - 1);
+            let mut gslot: Vec<usize> = Vec::with_capacity(n - 1);
+            for (j, tj) in corpus.iter().enumerate() {
+                if j != pi {
+                    gwin.push(tj.sigs.as_slice());
+                    gslot.push(tj.slot);
+                }
+            }
+            // Synthesised production cadence: a reprojection every `cadence`
+            // generated tokens (the live decode's `reproject_every_n_tokens`),
+            // plus a final one at the tool_call. Each fires on the tokens generated
+            // *so far* — so early points see the discriminative head, late ones the
+            // faded tail, exactly as a real decode would.
+            let len = owner.sigs.len();
+            let step = cadence.max(1);
+            let mut points: Vec<usize> = (step..len).step_by(step).collect();
+            points.push(len);
+            let do_trace = trace_set.contains(&owner.sid.0);
+            let mut trace: Vec<String> = Vec::new();
+
+            let mut prior_scores: Vec<f32> = Vec::new();
+            let mut prior_selected: Vec<bool> = Vec::new();
+            let mut ever = false;
+            let mut first_pt = None;
+            for &p in &points {
+                let end_idx = p.min(owner.sigs.len());
+                let lo = end_idx.saturating_sub(probe_tokens);
+                let probe = &owner.sigs[lo..end_idx];
+                if probe.is_empty() {
+                    continue;
+                }
+                let fresh = score_slots(probe, &gwin, &gslot, n_slots);
+                let beliefs = belief_step(&fresh, &prior_scores, &prior_selected, policy, budget);
+                prior_scores = beliefs.iter().map(|b| b.score).collect();
+                prior_selected = beliefs.iter().map(|b| b.selected).collect();
+                let sel = prior_selected.get(owner.slot).copied().unwrap_or(false);
+                if sel {
+                    ever = true;
+                    if first_pt.is_none() {
+                        first_pt = Some(p);
+                    }
+                }
+                if do_trace {
+                    let (bi, bs) = prior_scores.iter().enumerate().fold(
+                        (0usize, f32::MIN),
+                        |(ai, as_), (i, &s)| if s > as_ { (i, s) } else { (ai, as_) },
+                    );
+                    trace.push(format!(
+                        "  tok@{p:<4} win[{lo}..{end_idx}] len {:>3}  true={:>9.1}{}  top={} ({bs:.1})  selected={:?}",
+                        probe.len(),
+                        prior_scores.get(owner.slot).copied().unwrap_or(0.0),
+                        if sel { " *SELECTED*" } else { "" },
+                        slot_names[bi],
+                        prior_selected
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &s)| s)
+                            .map(|(i, _)| slot_names[i].as_str())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
+            }
+            let gt = prior_scores.get(owner.slot).copied().unwrap_or(0.0);
+            let final_rank = 1 + prior_scores.iter().filter(|&&s| s > gt).count();
+            let committed = prior_selected.get(owner.slot).copied().unwrap_or(false);
+            Outcome {
+                sid: owner.sid,
+                slot: owner.slot,
+                committed,
+                ever,
+                first_pt,
+                final_rank,
+                n_points: points.len(),
+                trace,
+            }
+        })
+        .collect();
+
+    let pct = |k: usize| 100.0 * k as f64 / n as f64;
+    let committed = outcomes.iter().filter(|o| o.committed).count();
+    let ever = outcomes.iter().filter(|o| o.ever).count();
+    let top1 = outcomes.iter().filter(|o| o.final_rank == 1).count();
+    let top3 = outcomes.iter().filter(|o| o.final_rank <= 3).count();
+    let mean_pts: f64 = outcomes.iter().map(|o| o.n_points).sum::<usize>() as f64 / n as f64;
+
+    println!("\n══ §80.3 production-faithful reprojection replay (leave-one-out) ══\n");
+    println!("corpus:  {n} tagged turns over {n_slots} tools   (tag scope {tag:?})");
+    println!("policy:  CommittedToolScope — β0.40, min 1000 / evict 750, budget 1..3");
+    println!(
+        "probe:   sliding {probe_tokens}-token window, reprojecting every {cadence} tokens (synthesised cadence)"
+    );
+    println!(
+        "gallery: leave-one-out — each turn scored against the other {}\n",
+        n - 1
+    );
+
+    println!("mean reprojections per turn : {mean_pts:>5.2}");
+    let first_pts: Vec<usize> = outcomes.iter().filter_map(|o| o.first_pt).collect();
+    if !first_pts.is_empty() {
+        let mean_first = first_pts.iter().sum::<usize>() as f64 / first_pts.len() as f64;
+        println!(
+            "mean tokens to first lock-on: {mean_first:>5.1}   (when the true tool is first selected + pinned)"
+        );
+    }
+    println!("\nProduction outcome (what the model actually gets offered):");
+    println!(
+        "  committed (true tool in the selected set at tool_call) : {:>5.1}%   ({committed}/{n})",
+        pct(committed)
+    );
+    println!(
+        "  ever selected during the turn                          : {:>5.1}%   ({ever}/{n})",
+        pct(ever)
+    );
+    println!("\nFor reference — ranking by *accumulated* belief at turn end:");
+    println!("  Tool-1 : {:>5.1}%   ({top1}/{n})", pct(top1));
+    println!("  Tool-3 : {:>5.1}%   ({top3}/{n})", pct(top3));
+
+    let mut missed: Vec<&Outcome> = outcomes.iter().filter(|o| !o.committed).collect();
+    missed.sort_by(|a, b| b.final_rank.cmp(&a.final_rank));
+    println!(
+        "\nProduction misses (true tool NOT committed at tool_call): {}",
+        missed.len()
+    );
+    for o in &missed {
+        println!(
+            "  stream {:#018x}  tool {:<22} final-rank #{:<3} ever-selected={}",
+            o.sid.0, slot_names[o.slot], o.final_rank, o.ever,
+        );
+    }
+
+    // Detailed per-reprojection traces for the requested streams.
+    for o in &outcomes {
+        if o.trace.is_empty() {
+            continue;
+        }
+        println!(
+            "\n── trace {}  tool {} (slot {})  committed={} ever={} ──",
+            stream_hex(o.sid.0),
+            slot_names[o.slot],
+            o.slot,
+            o.committed,
+            o.ever,
+        );
+        for line in &o.trace {
+            println!("{line}");
+        }
+    }
+
+    Ok(())
+}
+
+/// One probe's selection outcome under a `(min_score, budget)` policy: whether
+/// the true tool made the set, and the set's size / false-positive count.
+fn evaluate_selection(
+    scores: &[f32],
+    gt_slot: usize,
+    min_score: f32,
+    budget: usize,
+) -> (bool, usize, usize) {
+    let mut ranked: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut selected: Vec<usize> = ranked
+        .iter()
+        .filter(|(_, s)| *s >= min_score)
+        .take(budget)
+        .map(|(i, _)| *i)
+        .collect();
+    if selected.is_empty() {
+        selected.push(ranked[0].0); // budget min = 1: force-fill the top
+    }
+    let hit = selected.contains(&gt_slot);
+    let size = selected.len();
+    let fp = size - usize::from(hit);
+    (hit, size, fp)
+}
+
+/// Per-token hybrid votes: for each probe token, the list of `(tool, z×margin)`
+/// contributions (one per fold group). Summing all tokens reproduces
+/// `score_slots_hybrid`; keeping them per-token lets the adaptive window
+/// re-weight and truncate by position without re-scanning the gallery.
+fn per_token_hybrid_votes(
+    probe: &[candle_conversation::provenance::WideQSig],
+    gallery_windows: &[&[candle_conversation::provenance::WideQSig]],
+    gallery_slot: &[usize],
+    n_slots: usize,
+    gw: usize,
+    groups: &[usize],
+) -> Vec<Vec<(usize, f32)>> {
+    let mut out = Vec::with_capacity(probe.len());
+    let mut case_max = vec![0u32; n_slots];
+    for q in probe {
+        let mut votes: Vec<(usize, f32)> = Vec::new();
+        for &g in groups {
+            let base = g * gw;
+            if q.words.len() < base + gw {
+                continue;
+            }
+            let qg = &q.words[base..base + gw];
+            for m in case_max.iter_mut() {
+                *m = 0;
+            }
+            let (mut sum, mut sumsq, mut count) = (0u64, 0u64, 0u64);
+            for (wi, w) in gallery_windows.iter().enumerate() {
+                let c = gallery_slot[wi];
+                for cand in w.iter() {
+                    if cand.words.len() >= base + gw {
+                        let ag = word_agreement(qg, &cand.words[base..base + gw]);
+                        if ag > case_max[c] {
+                            case_max[c] = ag;
+                        }
+                        sum += ag as u64;
+                        sumsq += (ag as u64) * (ag as u64);
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let (mut t1, mut t1c, mut t2) = (0u32, usize::MAX, 0u32);
+            for (c, &m) in case_max.iter().enumerate() {
+                if m > t1 {
+                    t2 = t1;
+                    t1 = m;
+                    t1c = c;
+                } else if m > t2 {
+                    t2 = m;
+                }
+            }
+            if t1c != usize::MAX {
+                let mean = sum as f32 / count as f32;
+                let var = (sumsq as f32 / count as f32 - mean * mean).max(1e-6);
+                let z = ((t1 as f32 - mean) / var.sqrt()).max(0.0);
+                votes.push((t1c, z * t1.saturating_sub(t2) as f32));
+            }
+        }
+        out.push(votes);
+    }
+    out
+}
+
+/// §82 — conditional-decay adaptive probe window. Walk `window` backward in
+/// `chunk`-token steps (most recent first); accumulate a weighted belief; after
+/// each chunk decay the next chunk's weight by the accumulated confidence
+/// `(top1−top2)/top1`; abort when the weight falls below the threshold. Sweeps
+/// α × abort and reports retained hit rate vs mean tokens actually consumed.
+fn belief_decay(log: &mut LogFile, tag: &str, window: usize, chunk: usize) -> Result<()> {
+    use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
+    use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
+    use rayon::prelude::*;
+
+    let substrate = build_substrate(log)?;
+
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut corpus: Vec<(usize, Vec<WideQSig>)> = Vec::new();
+    for (_sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(win) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            continue;
+        };
+        if win.is_empty() {
+            continue;
+        }
+        let slot = slot_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| {
+                slot_names.push(name.clone());
+                slot_names.len() - 1
+            });
+        corpus.push((slot, win));
+    }
+    let n_slots = slot_names.len();
+    if corpus.len() < 2 {
+        println!("corpus too small");
+        return Ok(());
+    }
+    let shape = &corpus[0].1[0];
+    let gw = PROV_HEADS_PER_LAYER * shape.words_per_head();
+    let n_groups = shape.n_heads as usize / PROV_HEADS_PER_LAYER;
+    let groups: Vec<usize> = (0..n_groups).collect();
+
+    // Phase 1 (expensive, once): per probe, the per-token votes over the last
+    // `window` tokens, leave-one-out.
+    let cached: Vec<(usize, Vec<Vec<(usize, f32)>>)> = (0..corpus.len())
+        .into_par_iter()
+        .map(|pi| {
+            let (gt, full) = &corpus[pi];
+            let probe: &[WideQSig] = if full.len() > window {
+                &full[full.len() - window..]
+            } else {
+                full.as_slice()
+            };
+            let mut gwin: Vec<&[WideQSig]> = Vec::new();
+            let mut gslot: Vec<usize> = Vec::new();
+            for (j, (s, w)) in corpus.iter().enumerate() {
+                if j != pi {
+                    gwin.push(w.as_slice());
+                    gslot.push(*s);
+                }
+            }
+            (
+                *gt,
+                per_token_hybrid_votes(probe, &gwin, &gslot, n_slots, gw, &groups),
+            )
+        })
+        .collect();
+
+    let n = cached.len();
+    let pct = |k: usize| 100.0 * k as f64 / n as f64;
+
+    // Phase 2 (cheap): apply the adaptive window for a given (α, abort).
+    let run = |alpha: f32, abort: f32| -> (usize, usize, usize, f64, f64) {
+        // returns (tool1, tool3, tool5, mean_tokens, mean_chunks)
+        let (mut t1, mut t3, mut t5, mut tok_sum, mut chunk_sum) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        for (gt, toks) in &cached {
+            let tlen = toks.len();
+            let mut acc = vec![0f32; n_slots];
+            let mut w = 1.0f32;
+            let n_chunks = tlen.div_ceil(chunk);
+            let mut used_tokens = 0usize;
+            let mut used_chunks = 0usize;
+            for k in 0..n_chunks {
+                if w < abort {
+                    break;
+                }
+                let hi = tlen.saturating_sub(k * chunk);
+                let lo = tlen.saturating_sub((k + 1) * chunk);
+                for t in lo..hi {
+                    for &(slot, v) in &toks[t] {
+                        acc[slot] += w * v;
+                    }
+                }
+                used_tokens += hi - lo;
+                used_chunks += 1;
+                // Accumulated confidence → decay the next chunk's weight.
+                let (mut top1, mut top2) = (0f32, 0f32);
+                for &s in &acc {
+                    if s > top1 {
+                        top2 = top1;
+                        top1 = s;
+                    } else if s > top2 {
+                        top2 = s;
+                    }
+                }
+                let conf = if top1 > 0.0 {
+                    (top1 - top2) / top1
+                } else {
+                    0.0
+                };
+                w *= 1.0 - alpha * conf;
+            }
+            let rank = 1 + acc.iter().filter(|&&s| s > acc[*gt]).count();
+            let hit = acc[*gt] > 0.0;
+            if hit && rank == 1 {
+                t1 += 1;
+            }
+            if hit && rank <= 3 {
+                t3 += 1;
+            }
+            if hit && rank <= 5 {
+                t5 += 1;
+            }
+            tok_sum += used_tokens;
+            chunk_sum += used_chunks;
+        }
+        (
+            t1,
+            t3,
+            t5,
+            tok_sum as f64 / n as f64,
+            chunk_sum as f64 / n as f64,
+        )
+    };
+
+    println!("\n══ §82 conditional-decay probe window  (window {window}, chunk {chunk}) ══\n");
+    println!("corpus: {n} tagged turns over {n_slots} tools\n");
+    println!(
+        "  {:>6} {:>6}  {:>7} {:>7} {:>7}  {:>9} {:>8}",
+        "alpha", "abort", "Tool-1", "Tool-3", "Tool-5", "mean_tok", "chunks"
+    );
+    // Baseline: no decay (full window).
+    let (b1, b3, b5, bt, bc) = run(0.0, 0.0);
+    println!(
+        "  {:>6} {:>6}  {:>6.1}% {:>6.1}% {:>6.1}%  {:>9.1} {:>8.2}   ← baseline (full window)",
+        "0.00",
+        "—",
+        pct(b1),
+        pct(b3),
+        pct(b5),
+        bt,
+        bc
+    );
+    for &alpha in &[0.5f32, 0.7, 0.9, 1.0] {
+        for &abort in &[0.10f32, 0.25, 0.40] {
+            let (a1, a3, a5, at, ac) = run(alpha, abort);
+            let flag = if a3 == b3 { "" } else { "  ← Tool-3 dropped" };
+            println!(
+                "  {alpha:>6.2} {abort:>6.2}  {:>6.1}% {:>6.1}% {:>6.1}%  {:>9.1} {:>8.2}{flag}",
+                pct(a1),
+                pct(a3),
+                pct(a5),
+                at,
+                ac
+            );
+        }
+    }
+    println!("\n(Tool-3 = recall at budget 3; mean_tok = tokens actually consumed before abort.)");
+
+    // Position-independent alternative: weight each chunk by its OWN confidence
+    // `(top1−top2)/top1` raised to γ, then sum. A sharp chunk (a needle, near or
+    // far) keeps full weight; a diffuse chunk (generic/stale, near or far) is
+    // muted. γ=0 ⇒ uniform (baseline); higher γ ⇒ sharper focus.
+    let run_quality = |gamma: f32| -> (usize, usize, usize) {
+        let (mut t1, mut t3, mut t5) = (0usize, 0usize, 0usize);
+        for (gt, toks) in &cached {
+            let tlen = toks.len();
+            let n_chunks = tlen.div_ceil(chunk);
+            let mut belief = vec![0f32; n_slots];
+            for k in 0..n_chunks {
+                let hi = tlen.saturating_sub(k * chunk);
+                let lo = tlen.saturating_sub((k + 1) * chunk);
+                let mut cs = vec![0f32; n_slots];
+                for t in lo..hi {
+                    for &(slot, v) in &toks[t] {
+                        cs[slot] += v;
+                    }
+                }
+                let (mut top1, mut top2) = (0f32, 0f32);
+                for &s in &cs {
+                    if s > top1 {
+                        top2 = top1;
+                        top1 = s;
+                    } else if s > top2 {
+                        top2 = s;
+                    }
+                }
+                let conf = if top1 > 0.0 {
+                    (top1 - top2) / top1
+                } else {
+                    0.0
+                };
+                let wt = conf.powf(gamma);
+                for (b, c) in belief.iter_mut().zip(&cs) {
+                    *b += wt * c;
+                }
+            }
+            let rank = 1 + belief.iter().filter(|&&s| s > belief[*gt]).count();
+            let hit = belief[*gt] > 0.0;
+            if hit && rank == 1 {
+                t1 += 1;
+            }
+            if hit && rank <= 3 {
+                t3 += 1;
+            }
+            if hit && rank <= 5 {
+                t5 += 1;
+            }
+        }
+        (t1, t3, t5)
+    };
+
+    println!("\n── per-chunk quality weighting (position-independent, no abort) ──");
+    println!(
+        "  {:>6}  {:>7} {:>7} {:>7}",
+        "gamma", "Tool-1", "Tool-3", "Tool-5"
+    );
+    for &g in &[0.0f32, 0.5, 1.0, 2.0, 3.0] {
+        let (q1, q3, q5) = run_quality(g);
+        let tag = if (g - 0.0).abs() < 1e-9 {
+            "  ← uniform baseline"
+        } else {
+            ""
+        };
+        println!(
+            "  {g:>6.2}  {:>6.1}% {:>6.1}% {:>6.1}%{tag}",
+            pct(q1),
+            pct(q3),
+            pct(q5)
+        );
+    }
+
+    // Per-token needle gate: keep only the top fraction of tokens by vote
+    // magnitude (the needles), drop the rest (the haystack), position-independent.
+    // If recall holds while keeping few tokens, the signal is sparse and the bulk
+    // of the window is droppable — the true defensive lever.
+    let run_gate = |frac: f32| -> (usize, usize, usize, f64) {
+        let (mut t1, mut t3, mut t5, mut kept_sum) = (0usize, 0usize, 0usize, 0usize);
+        for (gt, toks) in &cached {
+            let tlen = toks.len();
+            let mag: Vec<f32> = toks
+                .iter()
+                .map(|vs| vs.iter().map(|(_, v)| *v).sum())
+                .collect();
+            let mut sorted = mag.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let keep_n = ((frac * tlen as f32).ceil() as usize).clamp(1, tlen);
+            let thresh = sorted[keep_n - 1];
+            let mut belief = vec![0f32; n_slots];
+            let mut kept = 0usize;
+            for (t, vs) in toks.iter().enumerate() {
+                if mag[t] >= thresh {
+                    for &(slot, v) in vs {
+                        belief[slot] += v;
+                    }
+                    kept += 1;
+                }
+            }
+            let rank = 1 + belief.iter().filter(|&&s| s > belief[*gt]).count();
+            let hit = belief[*gt] > 0.0;
+            if hit && rank == 1 {
+                t1 += 1;
+            }
+            if hit && rank <= 3 {
+                t3 += 1;
+            }
+            if hit && rank <= 5 {
+                t5 += 1;
+            }
+            kept_sum += kept;
+        }
+        (t1, t3, t5, kept_sum as f64 / n as f64)
+    };
+
+    println!(
+        "\n── per-token needle gate (keep top-frac by vote magnitude, position-independent) ──"
+    );
+    println!(
+        "  {:>6}  {:>7} {:>7} {:>7}  {:>9}",
+        "frac", "Tool-1", "Tool-3", "Tool-5", "mean_kept"
+    );
+    for &f in &[1.0f32, 0.5, 0.25, 0.1, 0.05, 0.02] {
+        let (g1, g3, g5, mk) = run_gate(f);
+        let tag = if (f - 1.0).abs() < 1e-9 {
+            "  ← keep all (baseline)"
+        } else {
+            ""
+        };
+        println!(
+            "  {f:>6.2}  {:>6.1}% {:>6.1}% {:>6.1}%  {:>9.1}{tag}",
+            pct(g1),
+            pct(g3),
+            pct(g5),
+            mk
+        );
+    }
+    Ok(())
+}
+
+/// §80.2 threshold sweep: cache the leave-one-out score matrix, then sweep
+/// `min_score` × `budget.max` to chart the recall / false-positive frontier and
+/// pick the tightest gate that still holds 100% recall.
+fn belief_sweep(log: &mut LogFile, tag: &str, scorer: &str, probe_tokens: usize) -> Result<()> {
+    use candle_conversation::provenance::wide_sig::PROV_HEADS_PER_LAYER;
+    use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
+    use rayon::prelude::*;
+
+    let substrate = build_substrate(log)?;
+
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut corpus: Vec<(usize, Vec<WideQSig>)> = Vec::new();
+    for (_sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            continue;
+        };
+        if window.is_empty() {
+            continue;
+        }
+        let slot = slot_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| {
+                slot_names.push(name.clone());
+                slot_names.len() - 1
+            });
+        corpus.push((slot, window));
+    }
+    let n_slots = slot_names.len();
+    if corpus.len() < 2 {
+        println!("corpus too small");
+        return Ok(());
+    }
+
+    let shape = &corpus[0].1[0];
+    let gw = PROV_HEADS_PER_LAYER * shape.words_per_head();
+    let n_groups = shape.n_heads as usize / PROV_HEADS_PER_LAYER;
+    let groups: Vec<usize> = match scorer {
+        "margin" | "hybrid" => (0..n_groups).collect(),
+        "margin-id" => (1..n_groups).collect(),
+        _ => Vec::new(),
+    };
+
+    // Leave-one-out score matrix (probes × tools) + each probe's true slot.
+    let matrix: Vec<(usize, Vec<f32>)> = (0..corpus.len())
+        .into_par_iter()
+        .map(|pi| {
+            let (gt_slot, full) = &corpus[pi];
+            // Match the live reproject window: the last `probe_tokens` tokens.
+            let probe: &[WideQSig] = if probe_tokens > 0 && full.len() > probe_tokens {
+                &full[full.len() - probe_tokens..]
+            } else {
+                full.as_slice()
+            };
+            let mut gwin: Vec<&[WideQSig]> = Vec::with_capacity(corpus.len() - 1);
+            let mut gslot: Vec<usize> = Vec::with_capacity(corpus.len() - 1);
+            for (j, (s, w)) in corpus.iter().enumerate() {
+                if j != pi {
+                    gwin.push(w.as_slice());
+                    gslot.push(*s);
+                }
+            }
+            let fresh = match scorer {
+                "margin" | "margin-id" => {
+                    score_slots_margin(probe, &gwin, &gslot, n_slots, gw, &groups)
+                }
+                "hybrid" => score_slots_hybrid(probe, &gwin, &gslot, n_slots, gw, &groups),
+                _ => score_slots(probe, &gwin, &gslot, n_slots),
+            };
+            (*gt_slot, fresh)
+        })
+        .collect();
+
+    let n = matrix.len();
+    let pct = |k: usize| 100.0 * k as f64 / n as f64;
+
+    // Ranking: how deep the budget must reach (Tool-k).
+    let ranks: Vec<usize> = matrix
+        .iter()
+        .map(|(gt, s)| 1 + s.iter().filter(|&&x| x > s[*gt]).count())
+        .collect();
+    let tool_k = |k: usize| ranks.iter().filter(|&&r| r <= k).count();
+
+    // Ground-truth score distribution — the 100%-recall floor.
+    let mut gt_scores: Vec<f32> = matrix.iter().map(|(gt, s)| s[*gt]).collect();
+    gt_scores.sort_by(f32::total_cmp);
+    let q = |frac: f64| gt_scores[((frac * (n - 1) as f64).round() as usize).min(n - 1)];
+
+    let probe_desc = if probe_tokens == 0 {
+        "full turn".to_string()
+    } else {
+        format!("last {probe_tokens} tokens (live reproject window)")
+    };
+    println!("\n══ §80.2 threshold sweep  (scorer {scorer}, leave-one-out) ══\n");
+    println!("matrix: {n} probes × {n_slots} tools   probe: {probe_desc}\n");
+    println!("Recall ceiling by budget (min_score 0 ⇒ recall = Tool-k):");
+    for k in 1..=8 {
+        println!("  budget {k}: {:.1}%", pct(tool_k(k)));
+    }
+    println!("\nTrue-tool score distribution (min = 100%-recall ceiling):");
+    println!(
+        "  min {:.0}   p1 {:.0}   p5 {:.0}   p10 {:.0}   p25 {:.0}   p50 {:.0}   max {:.0}",
+        gt_scores[0],
+        q(0.01),
+        q(0.05),
+        q(0.10),
+        q(0.25),
+        q(0.50),
+        gt_scores[n - 1],
+    );
+
+    // Threshold grid: 0, then the sorted true-tool scores at a spread of ranks
+    // (each is where one more probe's true tool drops below the gate), plus p50.
+    let idxs = [0usize, 1, 2, 3, 4, 6, 9, 14, 24, 49, (n / 4).max(1), n / 2];
+    let mut grid: Vec<f32> = vec![0.0];
+    for &k in &idxs {
+        if k < n {
+            grid.push(gt_scores[k]);
+        }
+    }
+    grid.dedup();
+
+    for budget in [3usize, 4, 5, 6] {
+        println!("\n── budget max = {budget} ──");
+        println!(
+            "  {:>10}  {:>7}  {:>9}  {:>8}  {:>7}  {:>8}",
+            "min_score", "recall", "mean_sz", "mean_fp", "max_fp", "exact-1"
+        );
+        for &ms in &grid {
+            let mut hits = 0usize;
+            let (mut sz_sum, mut fp_sum, mut max_fp, mut exact1) = (0usize, 0usize, 0usize, 0usize);
+            for (gt, s) in &matrix {
+                let (hit, size, fp) = evaluate_selection(s, *gt, ms, budget);
+                if hit {
+                    hits += 1;
+                    if size == 1 {
+                        exact1 += 1;
+                    }
+                }
+                sz_sum += size;
+                fp_sum += fp;
+                max_fp = max_fp.max(fp);
+            }
+            let recall = pct(hits);
+            let flag = if (recall - 100.0).abs() < 1e-9 {
+                ""
+            } else {
+                "  ← <100%"
+            };
+            println!(
+                "  {ms:>10.0}  {recall:>6.1}%  {:>9.2}  {:>8.2}  {max_fp:>7}  {:>7.1}%{flag}",
+                sz_sum as f64 / n as f64,
+                fp_sum as f64 / n as f64,
+                pct(exact1),
+            );
+        }
+    }
+
+    // Recommendation: smallest budget whose Tool-k = 100% (min-fill can't rescue
+    // a rank-3 truth), then fine-scan for the highest min_score still at 100%
+    // recall — min-fill rescues rank-1 probes, so this ceiling sits above the raw
+    // true-tool floor.
+    let budget_floor = (1..=5).find(|&k| tool_k(k) == n).unwrap_or(5);
+    let recall_at = |ms: f32, b: usize| -> bool {
+        matrix
+            .iter()
+            .all(|(gt, s)| evaluate_selection(s, *gt, ms, b).0)
+    };
+    let hi = q(0.15);
+    let steps = 300usize;
+    let mut ceiling = 0.0f32;
+    for i in 0..=steps {
+        let ms = hi * i as f32 / steps as f32;
+        if recall_at(ms, budget_floor) {
+            ceiling = ms;
+        }
+    }
+    let stats_at = |ms: f32, b: usize| -> (f64, f64, f64) {
+        let (mut sz, mut fp, mut ex) = (0usize, 0usize, 0usize);
+        for (gt, s) in &matrix {
+            let (hit, size, f) = evaluate_selection(s, *gt, ms, b);
+            sz += size;
+            fp += f;
+            if hit && size == 1 {
+                ex += 1;
+            }
+        }
+        (
+            sz as f64 / n as f64,
+            fp as f64 / n as f64,
+            100.0 * ex as f64 / n as f64,
+        )
+    };
+    // Ship a hair below the ceiling (10% margin) so a slightly weaker future
+    // probe doesn't tip recall under 100%.
+    let robust = ceiling * 0.90;
+    let (c_sz, c_fp, c_ex) = stats_at(ceiling, budget_floor);
+    let (r_sz, r_fp, r_ex) = stats_at(robust, budget_floor);
+    let evict = gt_scores[0] * 0.75; // below the weakest true-tool score → never evict a correct tool
+
+    println!("\n── recommended for 100% recall, minimal FP ──");
+    println!("  budget 1..{budget_floor}   (Tool-{budget_floor} = 100%, so the truth is always reachable)");
+    println!(
+        "  ceiling  min_score {ceiling:.0}  → recall 100%, mean set {c_sz:.2}, mean FP {c_fp:.2}, exact-1 {c_ex:.1}%"
+    );
+    println!(
+        "  robust   min_score {robust:.0}  (10% margin) → recall 100%, mean set {r_sz:.2}, mean FP {r_fp:.2}, exact-1 {r_ex:.1}%"
+    );
+    println!("  evict_score ≈ {evict:.0}  (below the weakest true-tool score {:.0} so a correct pick is never evicted)", gt_scores[0]);
+    Ok(())
+}
+
+/// Popcount of XNOR agreement between two equal-length word slices.
+fn word_agreement(a: &[u64], b: &[u64]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (!(x ^ y)).count_ones()).sum()
+}
+
+/// §81 — dissect a probe's scoring against the tag-scoped gallery, per fold
+/// layer-group and per token, to locate (or rule out) a tool-identity signal
+/// that the full-signature late-fusion loses.
+fn belief_dissect(log: &mut LogFile, probe_id: StreamId, tag: &str, n_tokens: usize) -> Result<()> {
+    use candle_conversation::provenance::wide_sig::{PROV_FOLD_SIZES, PROV_HEADS_PER_LAYER};
+    use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
+
+    let substrate = build_substrate(log)?;
+
+    let probe: Vec<WideQSig> = substrate
+        .stream_of(probe_id)
+        .and_then(|e| e.wide_q_sigs.as_ref())
+        .and_then(|b| decode_wide_sigs(b))
+        .with_context(|| format!("probe stream {} has no wide-Q signature", probe_id.0))?;
+    let gt_name = substrate
+        .stream_of(probe_id)
+        .and_then(|e| match &e.decl {
+            Some(StreamDecl::Turn(t)) => t.tags.iter().find(|x| x.as_str() != tag).cloned(),
+            _ => None,
+        })
+        .with_context(|| "probe is not a tagged turn")?;
+
+    // Gallery flattened to tokens, each carrying its tool slot (case). Excludes
+    // the probe's own turn.
+    let mut slot_names: Vec<String> = Vec::new();
+    let mut gtoks: Vec<WideQSig> = Vec::new();
+    let mut gcase: Vec<usize> = Vec::new();
+    for (sid, e) in substrate.all_streams() {
+        if sid == probe_id {
+            continue;
+        }
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(win) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            continue;
+        };
+        let slot = slot_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| {
+                slot_names.push(name.clone());
+                slot_names.len() - 1
+            });
+        for tokn in win {
+            gtoks.push(tokn);
+            gcase.push(slot);
+        }
+    }
+    let n_slots = slot_names.len();
+    let gt_slot = slot_names.iter().position(|n| n == &gt_name).unwrap();
+
+    let shape = probe.first().or(gtoks.first()).context("no signatures")?;
+    let wph = shape.words_per_head();
+    let gw = PROV_HEADS_PER_LAYER * wph; // words per layer-group
+    let n_groups = shape.n_heads as usize / PROV_HEADS_PER_LAYER;
+
+    // Human labels for the fold groups from PROV_FOLD_SIZES ([46,1,1] → L0–45 / L46 / L47).
+    let group_label = |g: usize| -> String {
+        let mut lo = 0usize;
+        for (i, &sz) in PROV_FOLD_SIZES.iter().enumerate() {
+            if i == g {
+                return if sz == 1 {
+                    format!("L{lo}")
+                } else {
+                    format!("L{lo}\u{2013}{}", lo + sz - 1)
+                };
+            }
+            lo += sz;
+        }
+        format!("g{g}")
+    };
+
+    // z-score late-fusion restricted to one group → per-tool votes.
+    let group_scores = |g: usize| -> Vec<f32> {
+        let base = g * gw;
+        let n = gtoks.len() as f32;
+        let mut votes = vec![0f32; n_slots];
+        for q in &probe {
+            if q.words.len() < base + gw {
+                continue;
+            }
+            let qg = &q.words[base..base + gw];
+            let (mut best_ag, mut best_case) = (0u32, usize::MAX);
+            let (mut sum, mut sumsq) = (0u64, 0u64);
+            for (j, cand) in gtoks.iter().enumerate() {
+                if cand.words.len() < base + gw {
+                    continue;
+                }
+                let ag = word_agreement(qg, &cand.words[base..base + gw]);
+                if ag > best_ag {
+                    best_ag = ag;
+                    best_case = gcase[j];
+                }
+                sum += ag as u64;
+                sumsq += (ag as u64) * (ag as u64);
+            }
+            if best_case != usize::MAX {
+                let mean = sum as f32 / n;
+                let var = (sumsq as f32 / n - mean * mean).max(1e-6);
+                let z = ((best_ag as f32 - mean) / var.sqrt()).max(0.0);
+                votes[best_case] += z;
+            }
+        }
+        votes
+    };
+
+    let rank_of =
+        |scores: &[f32], slot: usize| 1 + scores.iter().filter(|&&s| s > scores[slot]).count();
+    let print_top = |scores: &[f32], k: usize| {
+        let mut r: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+        r.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (rank, (slot, sc)) in r.iter().enumerate().take(k) {
+            let mark = if *slot == gt_slot {
+                "  ← ground truth"
+            } else {
+                ""
+            };
+            println!("      #{rank:<2} {:<24} {sc:>8.2}{mark}", slot_names[*slot]);
+        }
+    };
+
+    println!(
+        "\n══ §81 dissect — probe {:#018x}  tool {gt_name:?}  ({} tokens) ══",
+        probe_id.0,
+        probe.len()
+    );
+    println!(
+        "gallery: {} tokens over {n_slots} tools ({} groups × {PROV_HEADS_PER_LAYER} heads)\n",
+        gtoks.len(),
+        n_groups
+    );
+
+    // Fused (all groups) — the shipped scorer — for the baseline rank.
+    let fused: Vec<f32> =
+        (0..n_groups)
+            .map(group_scores)
+            .fold(vec![0f32; n_slots], |mut acc, g| {
+                for (a, v) in acc.iter_mut().zip(&g) {
+                    *a += v;
+                }
+                acc
+            });
+    println!(
+        "FUSED (all layer-groups)  —  ground truth at #{}",
+        rank_of(&fused, gt_slot)
+    );
+    print_top(&fused, 8);
+
+    // Per-group rankings: does any single layer-group rank the true tool higher?
+    for g in 0..n_groups {
+        let s = group_scores(g);
+        println!(
+            "\ngroup {g} ({})  —  ground truth at #{}",
+            group_label(g),
+            rank_of(&s, gt_slot)
+        );
+        print_top(&s, 8);
+    }
+
+    // Token-level: the top rival that beats the truth in the fused score. For
+    // each probe token, per group, the best agreement against the truth's tokens
+    // vs the rival's tokens — tokens where truth wins in some group are the
+    // discriminative signal we'd want to amplify.
+    let rival_slot = {
+        let mut r: Vec<(usize, f32)> = fused.iter().copied().enumerate().collect();
+        r.sort_by(|a, b| b.1.total_cmp(&a.1));
+        r.iter().map(|(s, _)| *s).find(|&s| s != gt_slot).unwrap()
+    };
+    println!(
+        "\nPer-token discrimination — truth {gt_name:?} vs top rival {:?}:",
+        slot_names[rival_slot]
+    );
+    println!(
+        "  (agreement out of {} bits per group; ‘*’ = truth wins that group)",
+        gw * 64
+    );
+
+    // Pre-split gallery tokens by the two tools of interest.
+    let truth_toks: Vec<&WideQSig> = gtoks
+        .iter()
+        .zip(&gcase)
+        .filter(|(_, c)| **c == gt_slot)
+        .map(|(t, _)| t)
+        .collect();
+    let rival_toks: Vec<&WideQSig> = gtoks
+        .iter()
+        .zip(&gcase)
+        .filter(|(_, c)| **c == rival_slot)
+        .map(|(t, _)| t)
+        .collect();
+    let best_ag = |qg: &[u64], set: &[&WideQSig], base: usize| -> u32 {
+        set.iter()
+            .filter(|c| c.words.len() >= base + gw)
+            .map(|c| word_agreement(qg, &c.words[base..base + gw]))
+            .max()
+            .unwrap_or(0)
+    };
+
+    // Rank probe tokens by how strongly the truth beats the rival in the identity
+    // groups (1 + 2), surfacing the most discriminative first.
+    let mut scored: Vec<(usize, [(u32, u32); 8])> = Vec::new(); // (token, per-group (truth, rival))
+    for (ti, q) in probe.iter().enumerate() {
+        let mut per_g = [(0u32, 0u32); 8];
+        for g in 0..n_groups.min(8) {
+            let base = g * gw;
+            if q.words.len() < base + gw {
+                continue;
+            }
+            let qg = &q.words[base..base + gw];
+            per_g[g] = (
+                best_ag(qg, &truth_toks, base),
+                best_ag(qg, &rival_toks, base),
+            );
+        }
+        scored.push((ti, per_g));
+    }
+    // Sort by summed truth-minus-rival margin over the identity groups (1..n).
+    scored.sort_by(|a, b| {
+        let m = |x: &[(u32, u32); 8]| -> i64 {
+            (1..n_groups).map(|g| x[g].0 as i64 - x[g].1 as i64).sum()
+        };
+        m(&b.1).cmp(&m(&a.1))
+    });
+
+    print!("  {:>5}", "tok");
+    for g in 0..n_groups {
+        print!("   {:>14}", format!("{} (t/r)", group_label(g)));
+    }
+    println!();
+    for (ti, per_g) in scored.iter().take(n_tokens) {
+        print!("  {ti:>5}");
+        for g in 0..n_groups {
+            let (t, r) = per_g[g];
+            let win = if t > r { "*" } else { " " };
+            print!("   {t:>3}/{r:<3}{win:>7}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Decode every tagged turn and flag any that never produced a completed
+/// `</tool_call>` — the calibration decode was supposed to force a tool call, so
+/// a turn without one is a prompt that made the model deliberate or refuse, and
+/// its stored signature is off-tool (poisons that tool's reference set and fails
+/// as a probe). Groups the offenders by tool and shows the user prompt.
+fn calib_check(log: &mut LogFile, log_path: &std::path::Path, tag: &str) -> Result<()> {
+    let tok = load_log_tokenizer(log_path)?
+        .context("no tokenizer.json sidecar next to the log — cannot decode turns")?;
+    let substrate = build_substrate(log)?;
+
+    // Collect tagged turns with a Tokens record: (stream, tool, loc).
+    let mut turns: Vec<(
+        StreamId,
+        String,
+        candle_conversation::persistence::manifest::RecordLoc,
+    )> = Vec::new();
+    for (sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        if let Some(loc) = e.tokens {
+            turns.push((sid, name.clone(), loc));
+        }
+    }
+
+    // Decode each and classify: no `<tool_call>` at all (a refusal/deliberation),
+    // or an opening tag with no closing `</tool_call>` (truncated).
+    let mut no_call: Vec<(String, StreamId, String, usize)> = Vec::new();
+    let mut truncated: Vec<(String, StreamId, String, usize)> = Vec::new();
+    for (sid, name, loc) in &turns {
+        let rec = read_record_at(log, loc.offset, loc.record_size)?;
+        let ids = decode_token_ids(&rec.payload)?;
+        let text = tok.decode(&ids, false).unwrap_or_default();
+        let prompt = text
+            .split("<|im_end|>")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('\n', " ");
+        if !text.contains("<tool_call>") {
+            no_call.push((name.clone(), *sid, prompt, ids.len()));
+        } else if !text.contains("</tool_call>") {
+            truncated.push((name.clone(), *sid, prompt, ids.len()));
+        }
+    }
+    no_call.sort();
+    truncated.sort();
+
+    println!("\n══ calibration tool-call audit  (tag {tag:?}) ══\n");
+    println!("scanned {} tagged turns", turns.len());
+    println!(
+        "  {} with a completed tool call, {} missing any <tool_call>, {} truncated (no </tool_call>)\n",
+        turns.len() - no_call.len() - truncated.len(),
+        no_call.len(),
+        truncated.len()
+    );
+
+    if !no_call.is_empty() {
+        println!(
+            "── NO tool call (model deliberated/refused) — these poison the tool's signature ──"
+        );
+        for (name, sid, prompt, ntok) in &no_call {
+            println!("  {name:<26} {:#018x}  ({ntok} tok)  “{prompt}”", sid.0);
+        }
+    }
+    if !truncated.is_empty() {
+        println!("\n── truncated (opened <tool_call> but no close) — hit the decode cap ──");
+        for (name, sid, prompt, ntok) in &truncated {
+            println!("  {name:<26} {:#018x}  ({ntok} tok)  “{prompt}”", sid.0);
+        }
+    }
+    if no_call.is_empty() && truncated.is_empty() {
+        println!("All tagged turns produced a completed tool call. ✓");
+    }
+    Ok(())
+}
+
+/// FNV-1a over bytes — a small, stable (version-independent) hash so baseline
+/// files diff identically across separate `substrate_inspect` builds.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn fnv1a_ids(ids: &[u32]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &id in ids {
+        for b in id.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Dump a diffable per-turn calibration baseline keyed by `tool|prompt`.
+fn calib_baseline(
+    log: &mut LogFile,
+    log_path: &std::path::Path,
+    tag: &str,
+    out: Option<String>,
+) -> Result<()> {
+    use candle_conversation::provenance::decode_wide_sigs;
+
+    let tok = load_log_tokenizer(log_path)?
+        .context("no tokenizer.json sidecar next to the log — cannot decode turns")?;
+    let substrate = build_substrate(log)?;
+
+    // (stream, tool, tokens_loc, wide_q_blob) for every tagged turn.
+    struct Src {
+        tool: String,
+        loc: candle_conversation::persistence::manifest::RecordLoc,
+        wq: Option<Vec<u8>>,
+    }
+    let mut srcs: Vec<Src> = Vec::new();
+    for (_sid, e) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &e.decl else {
+            continue;
+        };
+        if !t.tags.iter().any(|x| x == tag) {
+            continue;
+        }
+        let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+            continue;
+        };
+        let Some(loc) = e.tokens else { continue };
+        srcs.push(Src {
+            tool: name.clone(),
+            loc,
+            wq: e.wide_q_sigs.clone(),
+        });
+    }
+
+    // Decode each and compute the stable per-turn fingerprint.
+    let mut rows: Vec<(String, usize, u64, usize, u64, f64)> = Vec::new();
+    let mut without_sig = 0usize;
+    for s in &srcs {
+        let rec = read_record_at(log, s.loc.offset, s.loc.record_size)?;
+        let ids = decode_token_ids(&rec.payload)?;
+        let text = tok.decode(&ids, false).unwrap_or_default();
+        // The prompt prefix (before the first `<|im_end|>`) is the authored
+        // example — stable across rebuilds, so it keys the row.
+        let prompt = text
+            .split("<|im_end|>")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('\n', " ");
+        let key = format!("{}|{}", s.tool, prompt);
+        let tok_hash = fnv1a_ids(&ids);
+        let (n_sig, wq_hash, mean_pop) = match &s.wq {
+            Some(b) => {
+                let wq_hash = fnv1a(b);
+                match decode_wide_sigs(b) {
+                    Some(w) if !w.is_empty() => {
+                        let mp =
+                            w.iter().map(|x| x.popcount() as f64).sum::<f64>() / w.len() as f64;
+                        (w.len(), wq_hash, mp)
+                    }
+                    _ => (0, wq_hash, 0.0),
+                }
+            }
+            None => {
+                without_sig += 1;
+                (0, 0, 0.0)
+            }
+        };
+        rows.push((key, ids.len(), tok_hash, n_sig, wq_hash, mean_pop));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Emit TSV: a header comment, then one row per turn. Hashes are the compare
+    // keys; token/sig counts and mean popcount aid diagnosis when a hash moves.
+    let mut buf = String::new();
+    buf.push_str(&format!(
+        "# calib-baseline  tag={tag}  turns={}  ({} without wide-Q)\n",
+        rows.len(),
+        without_sig
+    ));
+    buf.push_str("# key\tn_tok\ttok_hash\tn_sig\twq_hash\tmean_pop\n");
+    for (key, n_tok, th, n_sig, wh, mp) in &rows {
+        buf.push_str(&format!(
+            "{key}\t{n_tok}\t{th:016x}\t{n_sig}\t{wh:016x}\t{mp:.1}\n"
+        ));
+    }
+
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &buf).with_context(|| format!("writing baseline to {path}"))?;
+            println!(
+                "wrote calibration baseline: {} turns → {path}  ({} without wide-Q)",
+                rows.len(),
+                without_sig
+            );
+        }
+        None => print!("{buf}"),
+    }
+    Ok(())
 }
 
 /// Render the per-timeline summary tree reconstructed from `TreeMetadata`
@@ -560,6 +2505,25 @@ fn headers(log: &mut LogFile) -> Result<()> {
     Ok(())
 }
 
+/// Summarise a turn's stored wide-Q signature window for the stream listing:
+/// `wsig=<tokens>tok×<heads>h pop=<mean set bits>/<total bits>`. The mean popcount
+/// should sit near half the total bits — that's the signal the signs are real.
+fn wide_sig_summary(bytes: Option<&[u8]>) -> String {
+    match bytes {
+        None => "wsig=n".to_string(),
+        Some(b) => match candle_conversation::provenance::decode_wide_sigs(b) {
+            Some(w) if !w.is_empty() => {
+                let toks = w.len();
+                let heads = w[0].n_heads as usize;
+                let total_bits = heads * w[0].words_per_head() * 64;
+                let mean_pop = w.iter().map(|s| s.popcount() as f64).sum::<f64>() / toks as f64;
+                format!("wsig={toks}tok×{heads}h pop={mean_pop:.0}/{total_bits}")
+            }
+            _ => "wsig=bad".to_string(),
+        },
+    }
+}
+
 fn streams(log: &mut LogFile) -> Result<()> {
     let substrate = build_substrate(log)?;
     let mut streams: Vec<(StreamId, &StreamRuntime)> = substrate.all_streams().collect();
@@ -575,22 +2539,22 @@ fn streams(log: &mut LogFile) -> Result<()> {
 
     for (n, (id, entry)) in streams.into_iter().enumerate() {
         let tok = if entry.tokens.is_some() { "y" } else { "n" };
-        let sig = if entry.signatures.is_some() { "y" } else { "n" };
+        let wsig = wide_sig_summary(entry.wide_q_sigs.as_deref());
         let detail = match &entry.decl {
             Some(StreamDecl::Turn(t)) => format!(
-                "exchange  idx={} chunks={} tok={} sig={}  conv={}",
+                "exchange  idx={} chunks={} tok={} {}  conv={}  tags={:?}",
                 t.turn_index,
                 entry.chunks.len(),
                 tok,
-                sig,
+                wsig,
                 t.timeline_id,
+                t.tags,
             ),
             Some(StreamDecl::PromptSection(s)) => format!(
-                "section \"{}\"  chunks={} tok={} sig={}",
+                "section \"{}\"  chunks={} tok={}",
                 s.debug_name,
                 entry.chunks.len(),
                 tok,
-                sig,
             ),
             None => format!("(no decl)  chunks={}", entry.chunks.len()),
         };
@@ -891,10 +2855,34 @@ fn tokens(
     as_ids: bool,
 ) -> Result<()> {
     let substrate = build_substrate(log)?;
-    let loc = substrate
+    let entry = substrate
         .stream_of(stream_id)
-        .and_then(|s| s.tokens)
-        .with_context(|| format!("stream {} has no Tokens record", stream_hex(stream_id.0)))?;
+        .with_context(|| format!("stream {} not found", stream_hex(stream_id.0)))?;
+    let tokens_loc = entry.tokens;
+    // A distilled turn's `Tokens` record is reclaimed, but its `StreamDecl` still
+    // carries the verbatim user/assistant text — surface that instead of failing.
+    let decl_text = match &entry.decl {
+        Some(StreamDecl::Turn(t)) => Some((t.user_text.clone(), t.assistant_text.clone())),
+        _ => None,
+    };
+    let loc = match tokens_loc {
+        Some(loc) => loc,
+        None => match decl_text {
+            Some((user, assistant)) => {
+                println!(
+                    "stream {}  (no Tokens record — distilled; decl text below)\n",
+                    stream_hex(stream_id.0)
+                );
+                println!("── user ──\n{user}\n");
+                println!("── assistant ──\n{assistant}");
+                return Ok(());
+            }
+            None => anyhow::bail!(
+                "stream {} has no Tokens record and no turn decl",
+                stream_hex(stream_id.0)
+            ),
+        },
+    };
     let rec = read_record_at(log, loc.offset, loc.record_size)?;
     let ids = decode_token_ids(&rec.payload)?;
     println!("stream {}  ({} tokens)", stream_hex(stream_id.0), ids.len());
@@ -1008,7 +2996,7 @@ const ALL_TYPES: [RecordType; 17] = [
     RecordType::StreamDecl,
     RecordType::Chunk,
     RecordType::Tokens,
-    RecordType::Signatures,
+    RecordType::WideQSig,
     RecordType::Commit,
     RecordType::Checkpoint,
     RecordType::Tokenizer,
@@ -1017,44 +3005,13 @@ const ALL_TYPES: [RecordType; 17] = [
     RecordType::TreeMetadata,
     RecordType::DebugId,
     RecordType::Tombstone,
+    RecordType::Distilled,
     RecordType::ProjectionEvents,
-    RecordType::ToolSummary,
     RecordType::Unknown,
 ];
 
 fn type_index(rt: RecordType) -> usize {
     rt as usize - 1
-}
-
-/// Decode and print the cached tool-catalog summary (the `ToolSummary`
-/// singleton): its catalog hash and the full generated text.
-fn tool_summary(log: &mut LogFile) -> Result<()> {
-    let manifest = build_manifest(log)?;
-    match manifest.tool_summary {
-        None => {
-            println!("tool summary  (none — not generated yet; restart the daemon to create it)");
-        }
-        Some(loc) => {
-            let rec = read_record_at(log, loc.offset, loc.record_size)?;
-            let payload = ToolSummaryPayload::decode(&rec.payload)
-                .map_err(|e| anyhow::anyhow!("decode ToolSummary: {e}"))?;
-            for (label, entry) in [
-                ("comprehensive", &payload.comprehensive),
-                ("restricted", &payload.restricted),
-            ] {
-                println!("──── {label} ────");
-                match entry {
-                    None => println!("(none — not generated)\n"),
-                    Some(e) => {
-                        println!("catalog hash  {:032x}", e.catalog_hash);
-                        println!("text          {} bytes\n", e.summary.len());
-                        println!("{}\n", e.summary);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
@@ -1063,8 +3020,8 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
 
 /// Rebuild the in-RAM substrate from the log — the authoritative per-stream
 /// index. The manifest only carries singleton offsets (model spec, template,
-/// tokenizer, checkpoint); streams, chunks, tokens, and signatures live in the
-/// substrate, populated by the same walker pass `open_in_with_substrate` uses.
+/// tokenizer, checkpoint); streams, chunks, and tokens live in the substrate,
+/// populated by the same walker pass `open_in_with_substrate` uses.
 fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let mut substrate = Substrate::new();
     let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;

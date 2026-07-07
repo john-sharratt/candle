@@ -66,13 +66,19 @@ pub struct HashStateEntry {
 
 impl HashStateEntry {
     fn new(id: String, algo: &str) -> Result<Self, String> {
-        let inner = match algo {
+        // Canonicalize casing/separators so "MD5", "SHA-256", "SHA3-256" match.
+        let norm: String = algo
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let inner = match norm.as_str() {
             "sha256" => HashInner::Sha256(sha2::Sha256::new()),
             "sha512" => HashInner::Sha512(sha2::Sha512::new()),
             "sha1" => HashInner::Sha1(sha1::Sha1::new()),
             "md5" => HashInner::Md5(md5::Md5::new()),
-            "sha3_256" => HashInner::Sha3_256(sha3::Sha3_256::new()),
-            "sha3_512" => HashInner::Sha3_512(sha3::Sha3_512::new()),
+            "sha3256" => HashInner::Sha3_256(sha3::Sha3_256::new()),
+            "sha3512" => HashInner::Sha3_512(sha3::Sha3_512::new()),
             "blake3" => HashInner::Blake3(blake3::Hasher::new()),
             _ => return Err(format!("unknown algorithm: {algo}")),
         };

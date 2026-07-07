@@ -9,6 +9,7 @@ use crate::{RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct HostInfoRequest {
+    /// Hostname or IP address to profile.
     #[validate(length(min = 1))]
     pub host: String,
 }

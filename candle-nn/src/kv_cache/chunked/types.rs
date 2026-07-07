@@ -803,6 +803,35 @@ impl SequenceState {
         n - 1
     }
 
+    /// Per-chunk `(offset, len, cum_before)` window using the SAME derivation the
+    /// decode GPU buffer does ([`rebuild_decode`]): the writer chunk gets the
+    /// `seq_offset`-derived length, every other chunk keeps its stored `usage`, and
+    /// `offset` is the physical skip-count where valid data begins. This is exactly
+    /// the real-token window attention reads, so a provenance / diagnostic gather can
+    /// consult it to check only real slots and skip partial-chunk padding. Returned
+    /// in chunk order; `cum_before` is the running real-token count preceding a chunk.
+    pub(crate) fn provenance_chunk_layout(&self, seq_offset: usize) -> Vec<(u16, u16, usize)> {
+        let n = self.chunks.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let wi = self.decode_write_chunk_idx();
+        let before_wi: usize = self.chunks[..wi].iter().map(|c| c.usage as usize).sum();
+        let write_len = seq_offset.saturating_sub(before_wi).min(CHUNK_SIZE);
+        let mut out = Vec::with_capacity(n);
+        let mut cum = 0usize;
+        for (i, c) in self.chunks.iter().enumerate() {
+            let len = if i == wi {
+                write_len as u16
+            } else {
+                (c.usage as usize).min(CHUNK_SIZE) as u16
+            };
+            out.push((c.offset, len, cum));
+            cum += len as usize;
+        }
+        out
+    }
+
     pub(crate) fn rebuild_decode_gpu_chunks(
         &mut self,
         n_kv_head: usize,

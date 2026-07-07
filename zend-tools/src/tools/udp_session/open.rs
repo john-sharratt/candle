@@ -14,7 +14,12 @@ use crate::{ConfirmationDetails, RegisteredTool, Tool, ToolContext};
 
 #[derive(Deserialize, JsonSchema, Validate)]
 pub struct OpenRequest {
+    /// Default peer as "host:port". When set, the socket is connected to it so
+    /// later sends need no explicit peer. No datagram is sent on open. Default:
+    /// none (no default peer).
     pub default_peer: Option<String>,
+    /// Local bind address as "host:port". Default "0.0.0.0:0" (all interfaces,
+    /// OS-chosen ephemeral port).
     pub bind_addr: Option<String>,
 }
 

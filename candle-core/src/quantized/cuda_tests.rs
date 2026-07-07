@@ -115,7 +115,10 @@ fn cuda_to_dtype_mut_respects_start_offset() -> Result<()> {
     let mut up = gu.narrow(2, n, n)?; // contiguous, start_offset = n
     assert!(up.is_contiguous());
     up.to_dtype_mut(crate::DType::BF16)?;
-    let up_v = up.flatten_all()?.to_dtype(crate::DType::F32)?.to_vec1::<f32>()?;
+    let up_v = up
+        .flatten_all()?
+        .to_dtype(crate::DType::F32)?
+        .to_vec1::<f32>()?;
     assert!(
         up_v.iter().all(|&x| (x - 2.0).abs() < 1e-3),
         "up half aliased to gate: got {:?}",
@@ -124,7 +127,10 @@ fn cuda_to_dtype_mut_respects_start_offset() -> Result<()> {
 
     let mut gate = gu.narrow(2, 0, n)?; // contiguous, start_offset = 0
     gate.to_dtype_mut(crate::DType::BF16)?;
-    let gate_v = gate.flatten_all()?.to_dtype(crate::DType::F32)?.to_vec1::<f32>()?;
+    let gate_v = gate
+        .flatten_all()?
+        .to_dtype(crate::DType::F32)?
+        .to_vec1::<f32>()?;
     assert!(
         gate_v.iter().all(|&x| (x - 1.0).abs() < 1e-3),
         "gate half wrong: got {:?}",
