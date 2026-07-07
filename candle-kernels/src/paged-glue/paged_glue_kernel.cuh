@@ -283,6 +283,13 @@ __global__ void paged_glue_kernel(
                 }
                 cp_async_commit<true>();
                 cp_async_wait<0, true>();
+                // Cross-lane visibility barrier: the staging writes above land
+                // per-lane (cp.async by lanes 0-3 per palette for float sources,
+                // one-dim-per-lane direct stores for quant), while the gather
+                // below reads OTHER lanes' slots via the PalIter map. Every
+                // decode-kernel equivalent of this load→gather boundary carries
+                // the same __syncwarp.
+                __syncwarp();
 
                 // Un-permute palette → logical order; RoPE K at the column's true
                 // position. Each warp covers its own column across HEAD_DIM.

@@ -618,10 +618,9 @@ mod tests {
         assert_eq!(layout.kv_len(), 10);
 
         // The reasoning is recorded but ethereal (no span).
-        assert!(layout
-            .segments
-            .iter()
-            .any(|s| matches!(s, TurnSegment::Thinking { kv: None, text } if text == "<think>r</think>")));
+        assert!(layout.segments.iter().any(
+            |s| matches!(s, TurnSegment::Thinking { kv: None, text } if text == "<think>r</think>")
+        ));
 
         // `realize()` reproduces the clean grid EXACTLY — no reasoning tokens
         // appear in any real (K/V-bearing) segment.

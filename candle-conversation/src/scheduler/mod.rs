@@ -2335,7 +2335,18 @@ impl Scheduler {
                 if let Err(e) =
                     self.handle_summary_probe(timeline, kind, children, height, response_tx.clone())
                 {
-                    let _ = response_tx.send(Err(ProbeError::Soft(e)));
+                    // "no projection/summary" means this layer has no
+                    // summary-of-summaries projection to compress into — a permanent
+                    // structural condition, not a transient setup failure. Classify
+                    // it Permanent so the summariser disarms this timeline's reconcile
+                    // instead of re-submitting a doomed probe every pass forever
+                    // (which starves the summariser and floods the log).
+                    let pe = if e.contains("no projection/summary") {
+                        ProbeError::Permanent(e)
+                    } else {
+                        ProbeError::Soft(e)
+                    };
+                    let _ = response_tx.send(Err(pe));
                 }
                 true
             }
@@ -3519,7 +3530,11 @@ impl Scheduler {
         // Drop the slot's chunks now the residence owns them (the next projection
         // rebuilds from the substrate) — same housekeeping as the immediate seal.
         if let Err(e) = self.session.truncate_sequence_to_blocks(parent_id.0, 0) {
-            tracing::warn!("post-seal slot truncate failed for slot {}: {}", parent_id, e);
+            tracing::warn!(
+                "post-seal slot truncate failed for slot {}: {}",
+                parent_id,
+                e
+            );
         }
 
         let _ = event_tx.send(TurnEvent::Done(TurnResponse {
@@ -4177,7 +4192,13 @@ impl Scheduler {
                         prefill_token_count: state.prefill_token_count,
                         sequence: sequence_stats,
                     };
-                    self.enqueue_clean_turn_reprefill(seal_slot, seal_block_from, state, text, stats);
+                    self.enqueue_clean_turn_reprefill(
+                        seal_slot,
+                        seal_block_from,
+                        state,
+                        text,
+                        stats,
+                    );
                     continue;
                 }
 

@@ -46,7 +46,7 @@ pub use chunked::migrate::HostSealedChunk;
 pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
 #[cfg(feature = "cuda")]
-pub use chunked::quantize_sealed_in_place;
+pub use chunked::{dequantize_sealed_in_place, quantize_sealed_in_place};
 pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
 pub use chunked::vram_budget_available;

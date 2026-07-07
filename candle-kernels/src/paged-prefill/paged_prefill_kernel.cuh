@@ -2607,6 +2607,17 @@ paged_prefill_attn_fwd_chunks_kernel(
     //   ⇒ each tile lies within a single chunk slice).
     [[maybe_unused]] __shared__ uint8_t s_pal_table_k[NUM_STAGES][HEAD_DIM];
     [[maybe_unused]] __shared__ uint8_t s_pal_table_v[NUM_STAGES][HEAD_DIM];
+    // Second hoisted tables for the STRADDLE case. Under cum-token addressing a
+    // tile can straddle two slices (any prefix containing a partial chunk), and
+    // the two slices' pal_maps may differ — routing the second slice's bytes
+    // through the first slice's table reads the wrong (palette, block) with the
+    // wrong outer scale. These hold the routing for the slice covering the
+    // tile's LAST prefix position; the cold path selects table by each
+    // position's resolved slice. Tiles spanning ≥3 slices (several tiny slices
+    // in one 32-token window) resolve their middle-slice positions with a
+    // per-element prefill_pal_rank fallback.
+    [[maybe_unused]] __shared__ uint8_t s_pal_table_k2[NUM_STAGES][HEAD_DIM];
+    [[maybe_unused]] __shared__ uint8_t s_pal_table_v2[NUM_STAGES][HEAD_DIM];
 
     // ========================================================================
     // ACCESSORS — hide bit ops, recompute max_k on demand
@@ -3272,17 +3283,18 @@ paged_prefill_attn_fwd_chunks_kernel(
                 }
             }
 
-            // Populate the hoisted palette tables for this tile's slice once.
+            // Populate the hoisted palette tables for this tile's slices once.
             // Under cum-token addressing the slice covering the tile's start
-            // is the one position_map[k0_ld] resolves to; for boundary tiles
-            // that straddle two slices the tables are correct for the first
-            // slice and the cold-path per-position lookup handles the
-            // tail positions individually.
+            // is the one position_map[k0_ld] resolves to. A tile can straddle
+            // two slices whose pal_maps differ (any prefix with a partial
+            // chunk), so a SECOND table is built from the slice covering the
+            // tile's LAST prefix position; the cold path selects per position.
             int blk_for_tables = 0, _in_blk_unused = 0;
             if (k0_ld < prefix_len) {
                 resolve_pos(slot_hdr, k0_ld, blk_for_tables, _in_blk_unused);
             }
             bool tile_has_prefix = (k0_ld < prefix_len) && (blk_for_tables < (int)slot_hdr.n_slices);
+            int blk_for_tables2 = blk_for_tables;
             if (tile_has_prefix) {
                 const uint8_t* slice_pt = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, blk_for_tables, n_kv_head);
                 const uint8_t* r_head_pt = get_head<HEAD_DIM>(slice_pt, kv_head_idx);
@@ -3294,6 +3306,31 @@ paged_prefill_attn_fwd_chunks_kernel(
                     prefill_pal_rank(v_pal_map, d, &p_v, &rank_v);
                     s_pal_table_k[stage][d] = (uint8_t)(((p_k & 0x3) << 6) | (rank_k & 0x3F));
                     s_pal_table_v[stage][d] = (uint8_t)(((p_v & 0x3) << 6) | (rank_v & 0x3F));
+                }
+                // Straddle table: resolve the slice of the tile's last prefix
+                // position; when it differs, build the second table from ITS
+                // pal_maps (same cooperative build, +one 128-B smem table per
+                // side). Non-straddling tiles skip this entirely.
+                int last_ld = k0_ld + TILE_K;
+                if (last_ld > (int)prefix_len) last_ld = (int)prefix_len;
+                last_ld -= 1;
+                if (last_ld > k0_ld) {
+                    int _ib2 = 0;
+                    resolve_pos(slot_hdr, last_ld, blk_for_tables2, _ib2);
+                }
+                if (blk_for_tables2 != blk_for_tables
+                    && blk_for_tables2 < (int)slot_hdr.n_slices) {
+                    const uint8_t* slice2 = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, blk_for_tables2, n_kv_head);
+                    const uint8_t* head2 = get_head<HEAD_DIM>(slice2, kv_head_idx);
+                    const uint8_t* k_map2 = kvhead_k_pal_map<HEAD_DIM>(head2);
+                    const uint8_t* v_map2 = kvhead_v_pal_map<HEAD_DIM>(head2);
+                    for (int d = tid; d < HEAD_DIM; d += (int)blockDim.x) {
+                        int p_k2, rank_k2, p_v2, rank_v2;
+                        prefill_pal_rank(k_map2, d, &p_k2, &rank_k2);
+                        prefill_pal_rank(v_map2, d, &p_v2, &rank_v2);
+                        s_pal_table_k2[stage][d] = (uint8_t)(((p_k2 & 0x3) << 6) | (rank_k2 & 0x3F));
+                        s_pal_table_v2[stage][d] = (uint8_t)(((p_v2 & 0x3) << 6) | (rank_v2 & 0x3F));
+                    }
                 }
             }
             __syncthreads();  // tables visible to all threads
@@ -3506,11 +3543,28 @@ paged_prefill_attn_fwd_chunks_kernel(
                                 }
                                 int blk_within  = in_blk >> 5;   // /32
                                 int elem_in_blk = in_blk & 31;   // %32
+                                // Routing must come from THIS position's slice: select the
+                                // hoisted table matching the resolved slice (first-slice or
+                                // straddle table — one smem byte read per element, same cost
+                                // as the single-slice case). Only a ≥3-slice tile's middle
+                                // positions miss both tables and pay the per-element
+                                // prefill_pal_rank fallback.
+                                const uint8_t* k_tab = (blk == blk_for_tables)
+                                    ? s_pal_table_k[stage]
+                                    : (blk == blk_for_tables2) ? s_pal_table_k2[stage]
+                                                               : nullptr;
+                                const uint8_t* k_pal_map_cur =
+                                    kvhead_k_pal_map<HEAD_DIM>(r_head);
                                 #pragma unroll
                                 for (int j = 0; j < ELEMS_PER_CP_T; ++j) {
-                                    uint8_t pe_k    = s_pal_table_k[stage][d + j];
-                                    int p_k         = pal_palette(pe_k);
-                                    int local_d_k   = pal_rank(pe_k);
+                                    int p_k, local_d_k;
+                                    if (k_tab != nullptr) {
+                                        uint8_t pe_k = k_tab[d + j];
+                                        p_k       = pal_palette(pe_k);
+                                        local_d_k = pal_rank(pe_k);
+                                    } else {
+                                        prefill_pal_rank(k_pal_map_cur, d + j, &p_k, &local_d_k);
+                                    }
                                     const char* k_head_r = k_head_r_pal[p_k];
                                     int k_fmt       = k_fmt_pal[p_k];
                                     int k_elem_size = k_elem_size_pal[p_k];
@@ -3551,11 +3605,23 @@ paged_prefill_attn_fwd_chunks_kernel(
                                 }
                                 int blk_within_v  = in_blk >> 5;
                                 int elem_in_blk_v = in_blk & 31;
+                                // Same slice-matched table selection as the K side above.
+                                const uint8_t* v_tab = (blk == blk_for_tables)
+                                    ? s_pal_table_v[stage]
+                                    : (blk == blk_for_tables2) ? s_pal_table_v2[stage]
+                                                               : nullptr;
+                                const uint8_t* v_pal_map_cur =
+                                    kvhead_v_pal_map<HEAD_DIM>(r_head);
                                 #pragma unroll
                                 for (int j = 0; j < ELEMS_PER_CP_T; ++j) {
-                                    uint8_t pe_v    = s_pal_table_v[stage][d + j];
-                                    int p_v         = pal_palette(pe_v);
-                                    int local_d_v   = pal_rank(pe_v);
+                                    int p_v, local_d_v;
+                                    if (v_tab != nullptr) {
+                                        uint8_t pe_v = v_tab[d + j];
+                                        p_v       = pal_palette(pe_v);
+                                        local_d_v = pal_rank(pe_v);
+                                    } else {
+                                        prefill_pal_rank(v_pal_map_cur, d + j, &p_v, &local_d_v);
+                                    }
                                     const char* v_head_r = v_head_r_pal[p_v];
                                     int v_fmt       = v_fmt_pal[p_v];
                                     int v_elem_size = v_elem_size_pal[p_v];

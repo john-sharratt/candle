@@ -49,7 +49,7 @@ pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_pri
 pub use backing::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunk_ops::BlockAllocSpec;
 #[cfg(feature = "cuda")]
-pub use compress::quantize_sealed_in_place;
+pub use compress::{dequantize_sealed_in_place, quantize_sealed_in_place};
 pub use compression_policy::{
     production_adaptive_candidates, CompressionPolicy, KvErrorThresholdFactors, LLAMA_KV_FACTORS,
     PRODUCTION_K_QREL_HIGH_THRESHOLDS, PRODUCTION_K_QREL_LOW_THRESHOLDS, PRODUCTION_LEVEL_TIER,

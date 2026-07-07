@@ -528,14 +528,21 @@ impl ChunkedKvBacking {
                 let _h = idx / N_PALETTE;
                 let _p = idx % N_PALETTE;
 
+                // Quant/R16 arenas store each chunk DIM-major: block `pd` holds
+                // 32 tokens of dim `pd`, so the dequant flat is `[pd][t]`. The
+                // interleave below (line `k_flat[t*sub_head_dim+pd]`) expects
+                // token-major `[t][pd]`, so transpose the quant read. Float
+                // arenas are already `[t][pd]` and pass through untouched.
                 let k_flat = match arenas.get(&k_ai) {
                     None => candle::bail!("arena {k_ai} not found"),
                     Some(Arena::Quantized { data, .. }) => {
                         let arena_chunks = data.shape().elem_count() / (chunk_size * sub_head_dim);
                         data.dequantize(&candle::Device::Cpu)?
-                            .reshape((arena_chunks, chunk_size, sub_head_dim))?
+                            .reshape((arena_chunks, sub_head_dim, chunk_size))?
                             .narrow(0, k_ci, 1)?
                             .squeeze(0)?
+                            .transpose(0, 1)?
+                            .contiguous()?
                             .flatten_all()?
                             .to_vec1::<f32>()?
                     }
@@ -552,9 +559,11 @@ impl ChunkedKvBacking {
                     Some(Arena::Quantized { data, .. }) => {
                         let arena_chunks = data.shape().elem_count() / (chunk_size * sub_head_dim);
                         data.dequantize(&candle::Device::Cpu)?
-                            .reshape((arena_chunks, chunk_size, sub_head_dim))?
+                            .reshape((arena_chunks, sub_head_dim, chunk_size))?
                             .narrow(0, v_ci, 1)?
                             .squeeze(0)?
+                            .transpose(0, 1)?
+                            .contiguous()?
                             .flatten_all()?
                             .to_vec1::<f32>()?
                     }
