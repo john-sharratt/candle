@@ -179,12 +179,10 @@ pub const MAX_DECODE_FAILURES: usize = 16;
 pub const CODE_READ_PARALLELISM: usize = 16;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
-/// (no reprojection), inheriting the utility C6 compression level.
+/// (no reprojection), inheriting the utility C5 compression level.
 ///
-/// V is adaptively quantized at C6; K inherits the engine-wide uniform-K pin
-/// (Q8_KS, identity pal_map + unit scales) so the provenance recall path reads
-/// `code_reading` keys consistently when dialogue attends back over them (see
-/// `ModelBuilder::engine` / `CompressionPolicy::override_k_quant`).
+/// Both K and V are adaptively quantized at C5 (the engine-wide uniform-K pin
+/// is off in this config).
 fn code_read_config(config: SequenceConfig) -> SequenceConfig {
     utility_config(config)
 }

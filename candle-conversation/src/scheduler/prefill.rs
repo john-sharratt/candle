@@ -703,14 +703,16 @@ impl Scheduler {
                 // The block opens either way: the common case is the model
                 // sampling its OWN `<think>` as the first token; the rarer case is
                 // a caller-supplied assistant prefill that already opens one.  In
-                // BOTH cases the sampler's `in_segment` must flip — it gates DRY,
-                // the reflection-marker suppression, the thinking temperature
-                // boost, and the `</think>` EOT ramp (all keyed off `segment_len`,
-                // which only advances while `in_segment`).  Flipping it only for
-                // the prefilled case left the sampler's flag stuck false for a
-                // model-opened block, silently disabling every one of those
-                // controls for its whole duration even though the health flag
-                // (`inside_think_block`) correctly tracked it.
+                // BOTH cases the sampler's `in_segment` must flip — it gates the
+                // reflection-marker suppression, the thinking temperature boost,
+                // and the `</think>` EOT ramp (all keyed off `segment_len`, which
+                // only advances while `in_segment`).  (DRY is no longer gated
+                // here — it has its own `dry_span_len`/`dry_suppressed` scope,
+                // reset at `<think>`/`</think>` via `enter_segment`/`exit_segment`.)
+                // Flipping it only for the prefilled case left the sampler's flag
+                // stuck false for a model-opened block, silently disabling every
+                // one of those controls for its whole duration even though the
+                // health flag (`inside_think_block`) correctly tracked it.
                 let opens_think = prefill_has_think || first_token == tok;
                 if opens_think && !sampling_state.in_segment {
                     sampling_state.enter_segment();

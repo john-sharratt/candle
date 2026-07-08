@@ -251,6 +251,7 @@ pub fn cpu_sample_argmax(
     segment_close_ramp_len: i32,
     segment_close_max_multiplier: f32,
     segment_len: i32,
+    dry_len: i32,
     segment_temp_boost: f32,
     segment_suppress_tokens: &[i32],
     segment_suppress_penalty: f32,
@@ -266,13 +267,15 @@ pub fn cpu_sample_argmax(
     stencil: &[i32],
 ) -> u32 {
     // In-segment steering mirrors the kernel:
-    //   - while inside a segment, restrict the repeat/DRY recent window to the
-    //     last `effective_len = min(segment_len, recent_len)` tokens (the
-    //     in-segment span), and cap dry_range to that window;
-    //   - DRY is gated off entirely outside a segment (segment_len == 0);
-    //   - temperature is nudged by `segment_temp_boost` while in-segment.
-    // The scoped recent window is materialised as a fresh per-batch buffer whose
-    // `batch_idx` row holds the in-segment suffix, left-aligned, so the existing
+    //   - while inside a segment, restrict the REPEAT recent window to the last
+    //     `effective_len = min(segment_len, recent_len)` tokens (the in-segment
+    //     span);
+    //   - temperature is nudged by `segment_temp_boost` while in-segment;
+    //   - token suppression is gated to the segment.
+    // DRY is scoped separately, on its OWN `dry_len` span (see below), and gated
+    // off when `dry_len == 0` — independent of the segment.
+    // Each scoped window is materialised as a fresh per-batch buffer whose
+    // `batch_idx` row holds the span suffix, left-aligned, so the existing
     // index-by-batch helpers see exactly the scoped tokens.
     let in_segment = segment_len > 0;
     // Temperature boost applies whenever in-segment, independent of recent tokens.
@@ -294,11 +297,34 @@ pub fn cpu_sample_argmax(
         }
         v
     };
-    let (recent_tokens, recent_lens, dry_range, dry_multiplier) =
+    // Repeat-penalty window: segment-scoped (last `min(segment_len, recent_len)`
+    // tokens while in-segment, else the full window).
+    let (rep_recent, rep_lens) =
         if in_segment && !recent_tokens.is_empty() && !recent_lens.is_empty() {
-            // In-segment: scope repeat/DRY to the last `effective_len` recent tokens.
             let rlen = recent_lens[batch_idx] as usize;
             let effective_len = (segment_len as usize).min(rlen);
+            let offset = rlen - effective_len;
+            let base = batch_idx * max_recent_len;
+            let mut scoped = recent_tokens.to_vec();
+            for j in 0..effective_len {
+                scoped[base + j] = recent_tokens[base + offset + j];
+            }
+            let mut scoped_lens = recent_lens.to_vec();
+            scoped_lens[batch_idx] = effective_len as i32;
+            (scoped, scoped_lens)
+        } else {
+            (recent_tokens.to_vec(), recent_lens.to_vec())
+        };
+    let rep_recent: &[i32] = &rep_recent;
+    let rep_lens: &[i32] = &rep_lens;
+
+    // DRY window: scoped to its own `dry_len` span (the current structural span),
+    // and gated off entirely when `dry_len == 0`. Independent of the segment.
+    let dry_on = dry_len > 0;
+    let (dry_recent, dry_lens_v, dry_range, dry_multiplier) =
+        if dry_on && !recent_tokens.is_empty() && !recent_lens.is_empty() {
+            let rlen = recent_lens[batch_idx] as usize;
+            let effective_len = (dry_len as usize).min(rlen);
             let offset = rlen - effective_len;
             let base = batch_idx * max_recent_len;
             let mut scoped = recent_tokens.to_vec();
@@ -314,17 +340,10 @@ pub fn cpu_sample_argmax(
             };
             (scoped, scoped_lens, scoped_dry_range, dry_multiplier)
         } else {
-            // Outside a segment: DRY is gated off; repeat keeps its full window.
-            let gated_dry = if in_segment { dry_multiplier } else { 0.0 };
-            (
-                recent_tokens.to_vec(),
-                recent_lens.to_vec(),
-                dry_range,
-                gated_dry,
-            )
+            (recent_tokens.to_vec(), recent_lens.to_vec(), dry_range, 0.0)
         };
-    let recent_tokens: &[i32] = &recent_tokens;
-    let recent_lens: &[i32] = &recent_lens;
+    let dry_recent: &[i32] = &dry_recent;
+    let dry_lens_v: &[i32] = &dry_lens_v;
 
     // Stencil path
     if !stencil.is_empty() {
@@ -361,8 +380,8 @@ pub fn cpu_sample_argmax(
                 cross_turn_penalty,
                 cross_turn_counts,
                 token_counts,
-                recent_tokens,
-                recent_lens,
+                rep_recent,
+                rep_lens,
                 max_recent_len,
                 banned_tokens,
                 banned_per_seq,
@@ -380,10 +399,10 @@ pub fn cpu_sample_argmax(
 
     // Compute DRY penalties
     let dry_penalties =
-        if dry_multiplier != 0.0 && !recent_tokens.is_empty() && !recent_lens.is_empty() {
-            let rlen = recent_lens[batch_idx] as usize;
+        if dry_multiplier != 0.0 && !dry_recent.is_empty() && !dry_lens_v.is_empty() {
+            let rlen = dry_lens_v[batch_idx] as usize;
             cpu_compute_dry_penalties(
-                recent_tokens,
+                dry_recent,
                 rlen,
                 batch_idx,
                 max_recent_len,
@@ -424,8 +443,8 @@ pub fn cpu_sample_argmax(
             cross_turn_penalty,
             cross_turn_counts,
             token_counts,
-            recent_tokens,
-            recent_lens,
+            rep_recent,
+            rep_lens,
             max_recent_len,
             banned_tokens,
             banned_per_seq,
@@ -526,6 +545,9 @@ pub struct SamplingParams {
     pub segment_close_ramp_len: i32,
     pub segment_close_max_multiplier: f32,
     pub segment_lens: Vec<i32>,
+    /// Per-sequence DRY span length (gates + windows DRY, independent of the
+    /// segment). Empty => null => DRY off for every row.
+    pub dry_lens: Vec<i32>,
     pub segment_temp_boost: f32,
 
     /// Shared token IDs suppressed while inside a segment.
@@ -580,6 +602,7 @@ impl Default for SamplingParams {
             segment_close_ramp_len: 0,
             segment_close_max_multiplier: 0.0,
             segment_lens: vec![],
+            dry_lens: vec![],
             segment_temp_boost: 0.0,
             segment_suppress_tokens: vec![],
             segment_suppress_penalties: vec![],
@@ -628,6 +651,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
     let cross_turn_gpu = upload(stream, &p.cross_turn_counts);
     let current_lens_gpu = upload(stream, &p.current_lens);
     let segment_lens_gpu = upload(stream, &p.segment_lens);
+    let dry_lens_gpu = upload(stream, &p.dry_lens);
     let suppress_tokens_gpu = upload(stream, &p.segment_suppress_tokens);
     let suppress_penalties_gpu = upload(stream, &p.segment_suppress_penalties);
     let banned_gpu = upload(stream, &p.banned_tokens);
@@ -709,6 +733,13 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p as *const i32
             })
             .unwrap_or(std::ptr::null());
+        let dry_lens_ptr = dry_lens_gpu
+            .as_ref()
+            .map(|s| {
+                let (p, _) = s.device_ptr(stream);
+                p as *const i32
+            })
+            .unwrap_or(std::ptr::null());
         let ban_ptr = banned_gpu
             .as_ref()
             .map(|s| {
@@ -768,6 +799,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 p.segment_close_ramp_len,
                 p.segment_close_max_multiplier,
                 segment_lens_ptr,
+                dry_lens_ptr,
                 p.segment_temp_boost,
                 suppress_tok_ptr,
                 suppress_count,
@@ -831,6 +863,11 @@ pub fn run_cpu(p: &SamplingParams) -> Vec<u32> {
                 p.segment_close_max_multiplier,
                 if batch_idx < p.segment_lens.len() {
                     p.segment_lens[batch_idx]
+                } else {
+                    0
+                },
+                if batch_idx < p.dry_lens.len() {
+                    p.dry_lens[batch_idx]
                 } else {
                     0
                 },
@@ -934,6 +971,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
     let cross_turn_gpu = upload(stream, &p.cross_turn_counts);
     let current_lens_gpu = upload(stream, &p.current_lens);
     let segment_lens_gpu = upload(stream, &p.segment_lens);
+    let dry_lens_gpu = upload(stream, &p.dry_lens);
     let suppress_tokens_gpu = upload(stream, &p.segment_suppress_tokens);
     let suppress_penalties_gpu = upload(stream, &p.segment_suppress_penalties);
     let banned_gpu = upload(stream, &p.banned_tokens);
@@ -1015,6 +1053,13 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p as *const i32
             })
             .unwrap_or(std::ptr::null());
+        let dry_lens_ptr = dry_lens_gpu
+            .as_ref()
+            .map(|s| {
+                let (p, _) = s.device_ptr(stream);
+                p as *const i32
+            })
+            .unwrap_or(std::ptr::null());
         let ban_ptr = banned_gpu
             .as_ref()
             .map(|s| {
@@ -1074,6 +1119,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 p.segment_close_ramp_len,
                 p.segment_close_max_multiplier,
                 segment_lens_ptr,
+                dry_lens_ptr,
                 p.segment_temp_boost,
                 suppress_tok_ptr,
                 suppress_count,

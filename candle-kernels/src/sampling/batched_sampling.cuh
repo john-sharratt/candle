@@ -2619,6 +2619,11 @@ batched_penalty_sampling_kernel(
     int32_t segment_close_ramp_len,
     float segment_close_max_multiplier,
     const int32_t* __restrict__ segment_lens,      // [batch_size] or null
+    // Per-sequence DRY span length: the count of trailing `recent_tokens` that
+    // belong to the current structural span (<think>/</think>/<tool_call>/
+    // </tool_call> boundaries; 0 inside tool calls). Gates and scopes DRY
+    // independently of the think segment. Null / 0 => DRY off for that sequence.
+    const int32_t* __restrict__ dry_lens,          // [batch_size] or null
     // Added to `temperature` for sequences inside a segment (segment_lens[seq] > 0).
     float segment_temp_boost,
     // Token suppression: subtract `suppress_penalties[seq]` from each
@@ -2712,8 +2717,7 @@ batched_penalty_sampling_kernel(
     // In-segment steering (per-sequence, since each block = one sequence).
     // While this sequence is inside a segment (segment_lens[seq] > 0):
     //   - sample a touch hotter (temperature += segment_temp_boost)
-    //   - enable the DRY n-gram penalty (gated off entirely outside the segment
-    //     so verbatim code/number copying is never corrupted).
+    //   - activate token suppression (the in-segment ceiling lever).
     // Outside a segment both revert to the batch-wide values.
     // =========================================================
     const bool in_segment = (segment_lens != nullptr) && (segment_lens[batch_idx] > 0);
@@ -2725,8 +2729,23 @@ batched_penalty_sampling_kernel(
         if (suppress_penalties != nullptr) {
             penalty_params_local.suppress_penalty = suppress_penalties[batch_idx];
         }
-    } else {
-        // Disable DRY for the answer: zero the multiplier the precompute and
+    }
+
+    // =========================================================
+    // DRY gating (per-sequence), independent of the think segment.
+    // DRY is scoped to its own structural span via `dry_lens[seq]` — the count
+    // of trailing recent tokens that belong to the current span (reset at
+    // <think>/</think>/<tool_call>/</tool_call>, zeroed inside tool calls). So
+    // DRY runs in BOTH think and prose, but only ever sees the current span's
+    // own generated tokens — it breaks within-span loops without penalizing
+    // verbatim reproduction of the prompt or an earlier span. `dry_lens[seq] == 0`
+    // (tool calls, just-opened spans) disables DRY for that sequence without
+    // touching the segment-driven temp boost / suppression above.
+    // =========================================================
+    const int32_t dry_span_len = (dry_lens != nullptr) ? dry_lens[batch_idx] : 0;
+    const bool dry_on = (dry_span_len > 0);
+    if (!dry_on) {
+        // Disable DRY for this sequence: zero the multiplier the precompute and
         // cached-lookup paths key off.  Shared memory for the cache is still
         // allocated (USE_DRY is a batch-wide template param), but no penalties
         // are produced for this sequence.
@@ -2743,38 +2762,38 @@ batched_penalty_sampling_kernel(
             const int32_t* my_recent = recent_tokens + batch_idx * max_recent_len;
             int my_recent_len = recent_lens[batch_idx];
 
-            // In-segment scoping: while inside a segment, repeat/DRY must only
-            // see the tokens generated inside the current segment — never the
-            // prompt or prior turns that precede the segment-open token. The
-            // segment spans the last `segment_len` tokens, so restrict the recent
-            // window to that suffix. `recent_tokens` is newest-at-the-end, so the
-            // last `effective_len` entries are exactly the in-segment tokens.
-            // Outside a segment, keep the full window (existing behavior).
-            const int32_t* eff_recent = my_recent;
-            int eff_recent_len = my_recent_len;
-            int eff_dry_range = dry_range;
+            // Repeat-penalty window: segment-scoped. While inside a segment the
+            // repeat penalty must only see the tokens generated inside the
+            // current segment — never the prompt or prior turns that precede the
+            // segment-open token. The segment spans the last `segment_len`
+            // tokens, so restrict the window to that suffix (`recent_tokens` is
+            // newest-at-the-end). Outside a segment, keep the full window.
+            const int32_t* rep_recent = my_recent;
+            int rep_recent_len = my_recent_len;
             if (in_segment) {
                 int effective_len = min(segment_lens[batch_idx], my_recent_len);
-                int offset = my_recent_len - effective_len;
-                eff_recent = my_recent + offset;
-                eff_recent_len = effective_len;
-                // Cap the DRY look-back to the in-block window.
-                eff_dry_range = (dry_range > 0) ? min(dry_range, effective_len) : effective_len;
+                rep_recent = my_recent + (my_recent_len - effective_len);
+                rep_recent_len = effective_len;
             }
 
             build_recent_bitset<THREADS>(
                 recent_bitset,
-                eff_recent,
-                eff_recent_len,
+                rep_recent,
+                rep_recent_len,
                 bitset_words
             );
 
-            // Precompute DRY penalties (O(n²) once, then O(1) lookup per token)
-            // Only when USE_DRY template param is enabled
+            // Precompute DRY penalties (O(n²) once, then O(1) lookup per token).
+            // DRY has its OWN window: the last `dry_span_len` recent tokens (the
+            // current structural span), independent of the segment scoping above.
+            // Only when USE_DRY template param is enabled.
             if constexpr (USE_DRY) {
-                if (dry_multiplier != 0.0f && eff_recent_len >= 2) {
+                int dry_len = dry_on ? min(dry_span_len, my_recent_len) : 0;
+                if (dry_multiplier != 0.0f && dry_len >= 2) {
+                    const int32_t* dry_recent = my_recent + (my_recent_len - dry_len);
+                    int eff_dry_range = (dry_range > 0) ? min(dry_range, dry_len) : dry_len;
                     precompute_dry_penalties<THREADS>(
-                        eff_recent, eff_recent_len,
+                        dry_recent, dry_len,
                         dry_multiplier, dry_base, dry_allowed_length, eff_dry_range,
                         smem.dry_cache.as_ptr()
                     );
@@ -3094,6 +3113,7 @@ inline void dispatch_batched_sampling(
     int32_t segment_close_ramp_len,
     float segment_close_max_multiplier,
     const int32_t* segment_lens,
+    const int32_t* dry_lens,
     float segment_temp_boost,
     const int32_t* suppress_tokens,
     int32_t suppress_count,
@@ -3142,6 +3162,7 @@ inline void dispatch_batched_sampling(
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
                 segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                dry_lens,
                 segment_temp_boost,
                 suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
@@ -3158,6 +3179,7 @@ inline void dispatch_batched_sampling(
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
                 segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                dry_lens,
                 segment_temp_boost,
                 suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
@@ -3174,6 +3196,7 @@ inline void dispatch_batched_sampling(
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
                 segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                dry_lens,
                 segment_temp_boost,
                 suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
@@ -3190,6 +3213,7 @@ inline void dispatch_batched_sampling(
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
                 segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                dry_lens,
                 segment_temp_boost,
                 suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
@@ -3207,6 +3231,7 @@ inline void dispatch_batched_sampling(
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
                 segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                dry_lens,
                 segment_temp_boost,
                 suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
@@ -3224,6 +3249,7 @@ inline void dispatch_batched_sampling(
                 eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
                 cross_turn_penalty, cross_turn_counts, current_lens,
                 segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+                dry_lens,
                 segment_temp_boost,
                 suppress_tokens, suppress_count, suppress_penalties,
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
@@ -3263,6 +3289,7 @@ inline void launch_batched_sampling_typed(
     int32_t segment_close_ramp_len,
     float segment_close_max_multiplier,
     const int32_t* segment_lens,
+    const int32_t* dry_lens,
     float segment_temp_boost,
     const int32_t* suppress_tokens,
     int32_t suppress_count,
@@ -3329,6 +3356,7 @@ inline void launch_batched_sampling_typed(
             eos_boost, eos_token_id, eos_ramp_start, eos_ramp_len, eos_boost_max_multiplier,
             cross_turn_penalty, cross_turn_counts, current_lens,
             segment_close_boost, segment_close_token_id, segment_close_ramp_start, segment_close_ramp_len, segment_close_max_multiplier, segment_lens,
+            dry_lens,
             segment_temp_boost,
             suppress_tokens, suppress_count, suppress_penalties,
             token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,

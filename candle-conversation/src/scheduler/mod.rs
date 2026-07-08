@@ -4663,15 +4663,15 @@ impl Scheduler {
     /// token of every later turn the projection re-selects it into.
     ///
     /// So members sit between the boundary near-lossless policy
-    /// (C0 / Q8 / Q8) and the dialogue turn policy: **C3 with K
-    /// overridden to Q8_KS**, V uses adaptive level-3 selection.
+    /// (C0 / Q8 / Q8) and the dialogue turn policy: **C4, fully adaptive
+    /// for both K and V** — the uniform-K pin removed to match the
+    /// engine-wide adaptive-K stress config.
     /// `_turn_policy` is taken to keep the call sites future-proof
     /// for a per-engine override knob; today it's ignored.
     fn section_compression_policy_member(
         _turn_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> candle_nn::kv_cache::CompressionPolicy {
-        candle_nn::kv_cache::CompressionPolicy::new(3)
-            .with_override_k_quant(Some(QuantFormat::Q8_KS))
+        candle_nn::kv_cache::CompressionPolicy::new(4)
     }
 
     /// Drain [`Self::pending_section_quantize`]: re-read each section's

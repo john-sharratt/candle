@@ -49,6 +49,9 @@ extern "C" {
     /// - `segment_close_ramp_len`: Per-segment token count where the segment-close ramp reaches full
     /// - `segment_close_max_multiplier`: Multiplier at the segment-close ramp peak
     /// - `segment_lens`: Per-sequence in-segment token counts (nullable)
+    /// - `dry_lens`: Per-sequence DRY span length — count of trailing `recent_tokens`
+    ///   in the current structural span; gates and scopes DRY independently of the
+    ///   segment (nullable; 0 => DRY off for that sequence)
     /// - `segment_temp_boost`: Added to `temperature` for sequences inside a segment
     /// - `suppress_tokens`: Shared token IDs suppressed while in-segment (nullable)
     /// - `suppress_count`: Number of suppress tokens (0 = disabled)
@@ -94,6 +97,7 @@ extern "C" {
         segment_close_ramp_len: i32,
         segment_close_max_multiplier: f32,
         segment_lens: *const i32,
+        dry_lens: *const i32,
         segment_temp_boost: f32,
         suppress_tokens: *const i32,
         suppress_count: i32,

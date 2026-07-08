@@ -372,10 +372,10 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
-            // Near-lossless KV: dialogue turns compress at C1 (high-fidelity V
-            // for recall). The utility layers (repo_map, code_reading) match this
-            // at C1 too (see `repo_scan::utility_config` / `code_read`'s config).
-            .compression_level(1)
+            // Dialogue turns compress at C5 (moderate adaptive quantization).
+            // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
+            // so K is adaptive too.
+            .compression_level(5)
             // Thinking is ENABLED at the model level; per-turn suppression is
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
@@ -1025,16 +1025,18 @@ fn run_inference_stream(
         sampling.segment_suppress_penalty = think_mode.suppress_penalty();
         if sampling_defaulted {
             // A `/no_think` turn is a direct response, not reasoning: strip the
-            // thinking-only sampling machinery the conversation default carries.
-            // The thinking-temperature boost and DRY are meant for the `<think>`
-            // span and are gated to it, but they have no business shaping a plain
-            // answer — and if the `in_thinking` gate ever desynced (it has, twice)
-            // they would leak onto the response, DRY corrupting verbatim numbers
-            // and identifiers. Thinking turns keep their own (hotter, DRY-guarded)
-            // sampling untouched.
+            // thinking-temperature boost, which is meant for the `<think>` span
+            // and has no business heating a plain answer.  DRY stays on: it is now
+            // span-scoped (`dry_span_len` — it only ever sees the current prose
+            // span, never the prompt or a prior span), so it breaks answer loops
+            // without the old full-window DRY's failure of penalizing verbatim
+            // reproduction of numbers/identifiers lifted from the prompt.  (It can
+            // still nip content the model itself repeats WITHIN the current answer
+            // — e.g. a long list's `- ` scaffolding — which is a penalty-tuning
+            // question, not a scoping one.)  That span scoping is why disabling it
+            // here is no longer necessary.
             if think_mode == ThinkMode::Off {
                 sampling.segment_temp_boost = 0.0;
-                sampling.dry = None;
             }
             // Vary the RNG seed per turn from real entropy. The default base seed
             // is a fixed constant, which makes a whole conversation a deterministic

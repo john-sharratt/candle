@@ -540,6 +540,26 @@ impl Scheduler {
             }
         }
 
+        // Sync per-sequence DRY suppression to tool-call (stencil) state.  This
+        // is the single chokepoint every stencil open/close passes through,
+        // regardless of which path changed it (trigger start, completed,
+        // terminal, dropped, error).  On each edge the DRY span resets, so prose
+        // before and after a tool call never shares a DRY window with the call —
+        // and while the call runs DRY is off entirely (the grammar is steered).
+        for &seq_id in seq_ids.iter() {
+            let in_tool = self
+                .active_decodes
+                .get(&seq_id)
+                .is_some_and(|s| s.stencil.is_some());
+            if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
+                if in_tool && !ss.dry_suppressed {
+                    ss.enter_tool_call();
+                } else if !in_tool && ss.dry_suppressed {
+                    ss.exit_tool_call();
+                }
+            }
+        }
+
         // Heal merged exit tokens: the model closed a free-text value with a
         // token that also carries the next node's delimiter (e.g. `",`).  Commit
         // only the re-tokenized valid prefix (the value + closing char); the
