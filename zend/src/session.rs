@@ -15,10 +15,12 @@ use candle_conversation::persistence::{content_hash, ACTIVE_LOG_NAME, SUBSTRATE_
 use candle_conversation::projection::{
     self, Builder, Reserved, SectionId, SelectionRule, SystemPromptItem, TimelineId,
 };
+use candle_conversation::stencil::{ThinkMode, ToolSpec, TriggerRegistry};
 use candle_conversation::{
-    ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, TokenDecoder, TurnEvent,
-    TurnHandle, TurnResponse,
+    ConversationEngine, GlueMarkers, ProjectionEvent, Sequence, ThinkSteering, TokenDecoder,
+    TurnEvent, TurnHandle, TurnResponse,
 };
+use serde_json::Value;
 
 use crate::code_read::CodeReadState;
 use crate::config::DaemonConfig;
@@ -83,6 +85,25 @@ pub(crate) struct CodeReadConv {
 
 // ── Stream item ───────────────────────────────────────────────────────────────
 
+/// A tool-execution lifecycle notice for the GUI.  Tool calls run *between*
+/// streamed turns (the model emits the call, the daemon executes it, then a
+/// `<tool_response>` turn continues), a gap during which the client otherwise
+/// shows a static "no result" with no sign of activity.  Emitted with
+/// `phase = "running"` just before the batch executes and `phase = "done"` once
+/// results are back, so the GUI can show a spinner on the in-flight tool cards.
+#[derive(Clone, serde::Serialize)]
+pub struct ToolStatusOut {
+    /// `"running"` while the batch executes, `"done"` once results are back.
+    pub phase: &'static str,
+    /// The tool names in this batch, in call order.
+    pub tools: Vec<String>,
+    /// Each tool's JSON response, in the same order as `tools` — populated only
+    /// on the `"done"` notice (empty/omitted while running).  Lets the GUI
+    /// resolve the in-flight cards immediately, before the post-stream hydrate.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<Value>,
+}
+
 /// Items yielded by [`ZendSession::submit`].
 pub enum StreamItem {
     Status(String),
@@ -91,6 +112,9 @@ pub enum StreamItem {
     /// context's composition + decode throughput, driving the GUI timeline dots
     /// and the projection popover (docs/zend_ui_redesign.md §2.3).
     Projection(ProjectionEventOut),
+    /// A tool-execution lifecycle notice (running / done) for the in-flight
+    /// tool cards.  Display-only: never part of the collected completion body.
+    Tool(ToolStatusOut),
 }
 
 /// Process-global monotonic id for projection events, so dot ids stay unique
@@ -106,6 +130,55 @@ struct ConvState {
     /// the tool summary that was actually injected — the restricted (safe-subset)
     /// summary in Restricted mode, the full one in Comprehensive, none in None.
     tool_mode: ToolMode,
+}
+
+/// Map a turn's `thinking_effort` dial to the steering [`ThinkMode`].  Mirrors
+/// `dial_selection` in `api/chat.rs`: effort 0 → `off` (the `/no_think` glue
+/// yields the empty block, so no tree steers it); an unset dial defaults to the
+/// projection's `balanced` (free flow).
+fn think_mode_from_selection(selection: &candle_conversation::SelectionState) -> ThinkMode {
+    match selection.get("thinking_effort") {
+        Some("off") => ThinkMode::Off,
+        Some("quick") => ThinkMode::Quick,
+        Some("deep") => ThinkMode::Deep,
+        Some("exhaustive") => ThinkMode::Exhaustive,
+        // Explicit `balanced`, or no dial set (projection default) → free flow.
+        _ => ThinkMode::Balanced,
+    }
+}
+
+/// Maps the composer's `response_length` dial (terse/concise/standard/detailed/
+/// comprehensive = 0..4, the verbosity toggle) to the answer's token budget — the
+/// room reserved after the think block, which the total-length EOS ramp covers
+/// (`ThinkMode::eos_budget`).  These are generous hard caps (the typical answer is
+/// shorter); the EOS boost/failsafe makes them the turn-ender backstop.
+fn response_budget_from_selection(selection: &candle_conversation::SelectionState) -> i32 {
+    match selection.get("response_length") {
+        Some("terse") => 256,
+        Some("concise") => 512,
+        Some("detailed") => 2048,
+        Some("comprehensive") => 3584,
+        // Explicit `standard`, or no dial set (projection default).
+        _ => 1024,
+    }
+}
+
+/// Render the answer's held tool-call object for the client stream.  The GUI
+/// renders tool cards from `<tool_call>…</tool_call>` tags, but Qwen3 frequently
+/// emits the JSON object bare (no wrapper).  When `held` is a recognized tool call
+/// (via the registry-gated [`extract_tool_calls`]), wrap it so the card renders;
+/// otherwise return it verbatim (a bare object that isn't a call — e.g. a JSON
+/// answer — streams as plain text).  `None` when there's nothing to emit.
+fn render_held_tail(held: &str) -> Option<String> {
+    let held = held.trim();
+    if held.is_empty() {
+        return None;
+    }
+    if extract_tool_calls(held).is_empty() {
+        Some(held.to_string())
+    } else {
+        Some(format!("<tool_call>\n{held}\n</tool_call>"))
+    }
 }
 
 struct InferenceState {
@@ -164,15 +237,33 @@ struct InferenceState {
     /// VFS stores).  Cloned per-conversation if scoping is later
     /// needed; for now it's workspace-wide.
     tool_host: ToolHost,
+    /// Constrained-decoding stencil for the whole tool catalog, keyed by the
+    /// `<tool_call>` trigger token.  Passed on every user turn so a tool call
+    /// the model emits is forced to the catalog's exact JSON shape.  Compiled
+    /// once at startup from `zend_tools::registry`.
+    tool_stencil: Arc<TriggerRegistry>,
+    /// Per-effort-dial thinking-block steering trees, compiled once at startup.
+    /// `None` when the tokenizer has no single `<think>`/`</think>` token.  Each
+    /// turn replaces the `<think>` trigger with the dial's tree (see
+    /// `think_mode_from_selection`) atop the tool-call base registry.
+    think_steering: Option<Arc<ThinkSteering>>,
 }
 
-const TITLER_SYSTEM_PROMPT: &str = "You write short conversation titles. \
+// The titler uses this plain system prompt (not the projection schema), so the
+// dialogue `no_think` *section* never applies. `/no_think` is baked here for the
+// system side; the user side comes from the live `no_think_current` glue the
+// scheduler emits because generate_one_title sets `NO_THINK_SELECTOR` — one
+// glue mechanism shared with the dialogue, so Qwen3 suppresses reasoning instead
+// of burning the token budget on a `<think>` block.
+const TITLER_SYSTEM_PROMPT: &str = "/no_think\nYou write short conversation titles. \
 Given the user's first message, reply with a 3-6 word title that captures its topic. \
 No quotes, no period, no preamble — just the title.";
 
 const TITLER_HEAD_TOKENS: usize = 50;
 const TITLER_TAIL_TOKENS: usize = 50;
-const TITLER_MAX_TOKENS: usize = 16;
+// Room for the title plus the empty `<think></think>` Qwen3 still decodes under
+// /no_think (no longer prefilled for free) — the block is stripped afterwards.
+const TITLER_MAX_TOKENS: usize = 24;
 /// Max tokens for a calibration turn's **decode fallback**. Calibration normally
 /// prefills the recorded `.md` trajectory verbatim (`max_decode = 0`), so this
 /// cap does nothing; it only applies to a case whose trajectory body can't be
@@ -197,6 +288,37 @@ const CALIBRATION_MAX_TOKENS: usize = 2048;
 /// re-marks nor re-triggers compaction. The `.md` trajectories are the source of
 /// truth, so once the wide-Q sig is captured the KV/token content is dead weight
 /// compaction can shed.
+/// The non-template content sections that precede the `tools` collection in the
+/// dialogue layer. This is the prefix the tool sections are sealed against (the
+/// summariser excludes collection members + templates from the prefix chain), so
+/// sealing the tool-summary section with the *same* prefix puts its KV exactly
+/// where "just before the tools" is.
+fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
+    let Some(layer) = builder
+        .schema()
+        .layers
+        .iter()
+        .find(|l| l.name == "dialogue")
+    else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    for item in &layer.system_prompt.items {
+        match item {
+            SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
+            // Section-tree variants are sealed (not live templates), and
+            // `pre_collection_prelude` bakes their default content into the
+            // prefix — so the tool summary must seal against the same default
+            // variant ids to land at the right position.
+            SystemPromptItem::SectionTree(t) => ids.extend(t.default_present_ids.iter().copied()),
+            // The dialogue layer's only collection is `tools`; stop at it.
+            SystemPromptItem::Collection(_) => break,
+            SystemPromptItem::Section(_) => {}
+        }
+    }
+    ids
+}
+
 fn mark_calibration_distill(engine: &ConversationEngine, timeline: TimelineId, tool: &str) {
     if engine.timeline_has_kv(timeline) && !engine.is_timeline_distilled(timeline) {
         if let Err(e) = engine.distill_timeline(timeline) {
@@ -349,11 +471,10 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
-            // Normal (dialogue) conversation turns compress at C5 — the same as
-            // the library default, but zend sets it explicitly. The utility
-            // layers (repo_map, code_reading) override to C6 per-conversation
-            // (see `repo_scan::utility_config` / `code_read`'s sequence config).
-            .compression_level(5)
+            // Near-lossless KV: dialogue turns compress at C1 (high-fidelity V
+            // for recall). The utility layers (repo_map, code_reading) match this
+            // at C1 too (see `repo_scan::utility_config` / `code_read`'s config).
+            .compression_level(1)
             // Thinking is ENABLED at the model level; per-turn suppression is
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
@@ -374,6 +495,23 @@ impl InferenceState {
         let engine = builder
             .engine_with_progress(&device, Some(&model_hook))
             .map_err(|e| anyhow::anyhow!("engine build: {e}"))?;
+
+        // Compile the whole tool catalog into one constrained-decoding stencil,
+        // keyed by the `<tool_call>` trigger.  Passed on every user turn so any
+        // tool call the model starts is forced to the catalog's exact shape.
+        let tool_specs: Vec<ToolSpec> = zend_tools::registry::all_tools()
+            .iter()
+            .map(|t| ToolSpec::from_json_schema(t.name, &(t.schema)()))
+            .collect();
+        let tool_stencil = engine
+            .compile_tool_stencil(&tool_specs)
+            .map_err(|e| anyhow::anyhow!("tool stencil compile: {e}"))?;
+        // The thinking-block steering trees (one per non-off effort dial),
+        // compiled once and reused across turns alongside the tool-call base.
+        let think_steering = engine
+            .compile_think_steering()
+            .map_err(|e| anyhow::anyhow!("think steering compile: {e}"))?;
+
         // The substrate reload (redo-log replay) runs on the scheduler thread
         // spawned by the engine ctor. As the substrate grows this is no longer
         // instantaneous, so surface real progress and block here until it
@@ -724,7 +862,7 @@ impl InferenceState {
 
             // The assistant header marker the exported trajectory is split on —
             // everything after it is the verbatim body we prefill.
-            let assistant_start = conv_config.dialect.active_assistant_start(false, false);
+            let assistant_start = conv_config.dialect.assistant_start;
             let mut to_run_iter = to_run.into_iter();
             let mut warmed = false;
             loop {
@@ -784,8 +922,7 @@ impl InferenceState {
                     // reproducing the decode's per-segment projection sequence.
                     let body =
                         zend_tools::calibration::trajectory_for(name, idx).and_then(|traj| {
-                            traj.split_once(assistant_start.as_str())
-                                .map(|(_, b)| b.to_string())
+                            traj.split_once(assistant_start).map(|(_, b)| b.to_string())
                         });
                     let (submit_result, is_prefill) = match body {
                         Some(body) => (
@@ -943,6 +1080,8 @@ impl InferenceState {
             workspace,
             tokenizer,
             tool_host: ToolHost::new(),
+            tool_stencil,
+            think_steering,
         });
         let worker_state = Arc::clone(&state);
         let worker =
@@ -1049,12 +1188,13 @@ impl InferenceState {
 /// so the user sees the natural-language prefix streamed live and the
 /// tool markup appear at the end before the follow-up response begins.
 /// Build the projection for one tools mode by cloning `base` and filtering the
-/// `tools` collection: `Comprehensive` is the base unchanged (full catalog + the
-/// comprehensive summary); `Restricted` retains only the safe (non-high-risk)
-/// tool sections and points the collection summary at
-/// [`Reserved::ToolSummaryRestricted`]; `None` retains no members, so the
-/// `depends_on: tools` wrapper sections self-suppress and the conversation sees
-/// no tools at all. Called once per mode at startup by [`ModeBuilders::build`];
+/// `tools` collection MEMBERS: `Comprehensive` is the base unchanged (full
+/// catalog); `Restricted` retains only the safe (non-high-risk) tool sections;
+/// `None` retains none.  These builders control only WHICH members project — the
+/// WHOLE tool block (markers, catalog, summary) is gated separately by the
+/// `tools_enabled` optional_group, which chat.rs sets `absent` for `None`.  The
+/// `tool_summary` overview is the comprehensive one for every mode (sealed once on
+/// the base builder).  Called once per mode at startup by [`ModeBuilders::build`];
 /// the results are cached and handed out as cheap `Arc` clones each turn, since
 /// both projection and reprojection just read the swapped builder.
 fn build_mode_builder(
@@ -1069,17 +1209,10 @@ fn build_mode_builder(
     match mode {
         ToolMode::Comprehensive => {}
         ToolMode::Restricted => {
-            let coll = b
-                .id_for_collection_in(dialogue, "tools")
-                .ok_or_else(|| anyhow::anyhow!("dialogue layer missing 'tools' collection"))?;
+            // Drop the high-risk tools; the `tool_summary` overview (sealed on the
+            // base builder, in the K/V chain) rides along unchanged.
             b.retain_collection_sections(dialogue, "tools", safe_tool_names)
                 .map_err(|e| anyhow::anyhow!("restricted tools projection: {e}"))?;
-            b.set_collection_summary_section(
-                dialogue,
-                coll,
-                SectionId::reserved(Reserved::ToolSummaryRestricted),
-            )
-            .map_err(|e| anyhow::anyhow!("restricted tool summary: {e}"))?;
         }
         ToolMode::None => {
             b.retain_collection_sections(dialogue, "tools", &HashSet::new())
@@ -1304,6 +1437,41 @@ fn run_inference_stream(
         let original_user_message = user_message.clone();
         let mut current_message = user_message;
 
+        // The reflection-marker suppression ceiling is per-dial: derive the think
+        // mode once, materialise the turn's sampling config (the conversation
+        // default carries the resolved marker family), and bake in the penalty —
+        // Quick/Balanced suppress the "Wait"/"Hmm"/… family in-block, Deep/
+        // Exhaustive leave it 0 (reconsideration is wanted there).
+        let think_mode = think_mode_from_selection(&selection);
+        let mut sampling = sampling.unwrap_or_else(|| cs.conv.default_sampling());
+        sampling.segment_suppress_penalty = think_mode.suppress_penalty();
+        // Per-dial thinking budget: the EOT close ramp's graceful/force thresholds
+        // scale with the effort level (exhaustive thinks longest).  `segment_len`
+        // restarts each steered span, so these are per-span — higher dials get more
+        // room per span and, via more spans, far more total.
+        let (graceful_eot, force_eot) = think_mode.eot_budget();
+        sampling.graceful_segment_close_after = graceful_eot;
+        sampling.force_segment_close_after = force_eot;
+        // The per-span close boost ramps `</think>`+EOS over this dial's
+        // [graceful, force] thinking-token window (resets each span), so it builds
+        // pressure into the same point the force override hard-closes — and scales
+        // with the dial instead of a fixed global ramp that misses the short dials.
+        sampling.segment_close_ramp_start = graceful_eot;
+        sampling.segment_close_ramp_len = force_eot;
+        // The EOS (turn-ender) budget is the whole-turn backstop on total length,
+        // derived from BOTH dials: the think budget (spans × per-span cap) fixes
+        // where the answer starts, so the ramp begins as the think block ends and is
+        // dormant during reasoning (the per-span EOT/EOS boost handles that); the
+        // `response_length` dial sets the answer room above it.  So it can't truncate
+        // the thinking budget, and it scales with both knobs.  (Keeps the preset's
+        // eos_boost magnitude/mult; the boost ramps to the graceful threshold.)
+        let response_tokens = response_budget_from_selection(&selection);
+        let (eos_ramp_start, graceful_eos, forced_eos) = think_mode.eos_budget(response_tokens);
+        sampling.eos_ramp_start = eos_ramp_start;
+        sampling.eos_ramp_len = graceful_eos;
+        sampling.graceful_eos_after = graceful_eos;
+        sampling.forced_eos_after = forced_eos;
+
         // The tool loop runs until the model stops emitting tool calls (i.e.
         // produces a final answer) — there is no fixed iteration cap. A wedged
         // model that never stops calling tools is bounded only by the client
@@ -1316,7 +1484,7 @@ fn run_inference_stream(
             let mut turn_events: Vec<ProjectionEventOut> = Vec::new();
             let options = candle_conversation::TurnOptions {
                 max_tokens,
-                sampling: sampling.clone(),
+                sampling: Some(sampling.clone()),
                 // Seed the response only on the first turn — forcing every chained
                 // tool iteration would prevent the model ever giving a final answer.
                 assistant_prefill: if iteration == 0 {
@@ -1325,6 +1493,15 @@ fn run_inference_stream(
                     None
                 },
                 selection: selection.clone(),
+                // Force any `<tool_call>` the model emits to the catalog's exact
+                // JSON shape (name ∈ catalog, required params in order, valid
+                // JSON), and — atop that base — steer the `<think>` block per the
+                // effort dial (replacing the `<think>` trigger atomically).  An
+                // empty registry would just free-decode.
+                triggers: match &state.think_steering {
+                    Some(ts) => ts.registry_for(&state.tool_stencil, think_mode),
+                    None => Arc::clone(&state.tool_stencil),
+                },
                 ..Default::default()
             };
             let handle = match cs.conv.submit_turn_with_options(&current_message, options) {
@@ -1342,6 +1519,11 @@ fn run_inference_stream(
             // still contain U+FFFD are held back until the sequence completes.
             let mut tokens: Vec<u32> = Vec::new();
             let mut emitted_len: usize = 0;
+            // Byte offset where the answer's tool-call object begins: once set, the
+            // object is held back (not streamed live) and re-emitted wrapped in
+            // <tool_call> tags at the flush, so the GUI renders a card instead of
+            // showing the bare JSON the model emits when it drops the wrapper.
+            let mut hold_from: Option<usize> = None;
             let mut done_resp = None;
             let mut turn_error: Option<anyhow::Error> = None;
             let mut client_gone = false;
@@ -1352,8 +1534,25 @@ fn run_inference_stream(
                         if turn_error.is_none() {
                             tokens.push(id);
                             let text = state.decoder.decode(&tokens);
-                            if text.len() > emitted_len && text.is_char_boundary(emitted_len) {
-                                let new_part = &text[emitted_len..];
+                            // Once the post-</think> answer opens with `{`, it's a
+                            // (usually un-tagged) tool-call object: stop streaming
+                            // here and hold the rest, so the flush can wrap it.
+                            if hold_from.is_none() {
+                                let answer = text
+                                    .rfind("</think>")
+                                    .map(|i| i + "</think>".len())
+                                    .unwrap_or(0);
+                                let rest = text[answer..].trim_start();
+                                if rest.starts_with('{') {
+                                    hold_from = Some(text.len() - rest.len());
+                                }
+                            }
+                            let emit_to = hold_from.unwrap_or(text.len());
+                            if emit_to > emitted_len
+                                && text.is_char_boundary(emitted_len)
+                                && text.is_char_boundary(emit_to)
+                            {
+                                let new_part = &text[emitted_len..emit_to];
                                 if !new_part.contains('\u{FFFD}') {
                                     if tx
                                         .blocking_send(Ok(StreamItem::Token(new_part.to_string())))
@@ -1367,7 +1566,7 @@ fn run_inference_stream(
                                         client_gone = true;
                                         break;
                                     }
-                                    emitted_len = text.len();
+                                    emitted_len = emit_to;
                                 }
                             }
                         }
@@ -1440,8 +1639,18 @@ fn run_inference_stream(
                 }
             };
 
-            // Flush any tail that the byte-fallback guard held back.
-            if resp.text.len() > emitted_len && resp.text.is_char_boundary(emitted_len) {
+            // Flush the tail.  If we held back the answer's tool-call object, emit
+            // it wrapped in <tool_call> tags so the GUI renders a card (the model
+            // dropped the wrapper); a held object that isn't a recognized call is
+            // flushed verbatim by `render_held_tail`.  Otherwise flush the raw tail
+            // the byte-fallback guard held back.
+            if let Some(hf) = hold_from {
+                if resp.text.is_char_boundary(hf) {
+                    if let Some(out) = render_held_tail(&resp.text[hf..]) {
+                        let _ = tx.blocking_send(Ok(StreamItem::Token(out)));
+                    }
+                }
+            } else if resp.text.len() > emitted_len && resp.text.is_char_boundary(emitted_len) {
                 let tail = &resp.text[emitted_len..];
                 if !tail.is_empty() {
                     let _ = tx.blocking_send(Ok(StreamItem::Token(tail.to_string())));
@@ -1454,6 +1663,24 @@ fn run_inference_stream(
             // do NOT execute the tools — capture-only, so `code_run` / network
             // tools have no real side effects.
             let is_final = calls.is_empty() || force_hires.is_some();
+
+            // If tools will run, tell the GUI *now* — before sealing/persisting
+            // this turn — so the in-flight tool cards show their spinner across
+            // the whole execution window (seal + persist + dispatch), not just
+            // the instant before dispatch (which an instant tool coalesces away,
+            // making the card jump straight to a result).
+            let tool_names: Vec<String> = if is_final {
+                Vec::new()
+            } else {
+                calls.iter().map(|c| c.name.clone()).collect()
+            };
+            if !is_final {
+                let _ = tx.blocking_send(Ok(StreamItem::Tool(ToolStatusOut {
+                    phase: "running",
+                    tools: tool_names.clone(),
+                    results: Vec::new(),
+                })));
+            }
 
             if let Err(e) = cs.conv.finish_turn(handle, &resp) {
                 tracing::warn!(conv_id = %conv_id, "finish_turn error: {e}");
@@ -1497,8 +1724,36 @@ fn run_inference_stream(
                 n_calls = calls.len(),
                 "dispatching tool calls",
             );
+            // The "running" notice was already sent above (before the seal).  Run
+            // the tools — `run_tool_calls` blocks until every tool returns — then
+            // the "done" notice clears the spinner and carries each result so the
+            // cards resolve immediately, before the post-stream hydrate.
+            let n_calls = calls.len();
             let results = run_tool_calls(&state.tool_host.ctx, calls);
+            let _ = tx.blocking_send(Ok(StreamItem::Tool(ToolStatusOut {
+                phase: "done",
+                tools: tool_names,
+                results: results.iter().map(|r| r.response.clone()).collect(),
+            })));
             current_message = format_tool_responses(&results);
+            // A tool round that produces no response text must NOT spawn a
+            // follow-up turn. `format_tool_responses` wraps every real result in
+            // `<tool_response>…</tool_response>`, so an empty `current_message`
+            // means no tool actually ran (the model emitted a tool call that was
+            // filtered/failed). Submitting it would seal a phantom turn whose grid
+            // is nothing but boundary glue (no user content), which the model then
+            // "answers" with a generic greeting — derailing the conversation. The
+            // answer already streamed for this turn stands; end the loop here.
+            if current_message.trim().is_empty() {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    iteration,
+                    n_calls,
+                    "tool round yielded no response text; ending turn loop instead \
+                     of submitting an empty follow-up turn",
+                );
+                break;
+            }
         }
 
         // Title generation has already been fired in parallel from
@@ -1555,6 +1810,11 @@ fn generate_one_title(
         TITLER_HEAD_TOKENS,
         TITLER_TAIL_TOKENS,
     );
+    // No `/no_think` baked into the user text: the selector below makes the
+    // scheduler emit it as live glue (`no_think_current`) right after the user
+    // opener — the same single mechanism the dialogue uses — so the only other
+    // copy is in the system prompt. The titler must never reason, or it fills the
+    // short budget with a `<think>` block and the stripped title comes back empty.
 
     // Clear the titler's in-memory turn tree so each title-gen starts from
     // just the system prompt (no accumulated history).
@@ -1842,7 +2102,7 @@ impl ZendSession {
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.
-    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String)>> {
+    pub fn conversation_history(&self, conv_id: &str) -> Option<Vec<(Role, String, bool)>> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = timeline_for(conv_id);
         let raw = {
@@ -1852,13 +2112,13 @@ impl ZendSession {
         };
         let decoded = raw
             .into_iter()
-            .map(|(role, text)| {
+            .map(|(role, text, no_think)| {
                 let role = match role {
                     candle_conversation::Role::User => Role::User,
                     candle_conversation::Role::Assistant => Role::Assistant,
                     candle_conversation::Role::System => Role::System,
                 };
-                (role, text)
+                (role, text, no_think)
             })
             .collect();
         Some(decoded)
@@ -1939,12 +2199,45 @@ impl ZendSession {
         Some(base.target_layer_name())
     }
 
-    /// The `(user, assistant)` halves of a projected turn (`group` × `index`),
+    /// The `(user, assistant)` halves of a projected turn `index` in `timeline`,
     /// read from the substrate. Backs the projection panel's memory-tier bodies.
-    pub fn resolve_turn_text(&self, group: &str, index: u32) -> Option<(String, String)> {
+    /// `timeline` is the turn's resolved identity from `SelectedTurn::timeline` —
+    /// never a group→timeline guess (the shared substrate holds many
+    /// conversations under one group).
+    pub fn resolve_turn_text(
+        &self,
+        timeline: candle_conversation::projection::TimelineId,
+        index: u32,
+    ) -> Option<(String, String)> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let base = state.base_conv.lock().unwrap();
-        base.resolve_turn_text(group, index)
+        base.resolve_turn_text(timeline, index)
+    }
+
+    /// The entire turn `index` in `timeline` as one continuous string (the full
+    /// sealed token range, decoded verbatim). Backs the projection panel's turn
+    /// cards — emit the whole turn rather than the split user/assistant halves.
+    pub fn resolve_turn_full_text(
+        &self,
+        timeline: candle_conversation::projection::TimelineId,
+        index: u32,
+    ) -> Option<String> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        base.resolve_turn_full_text(timeline, index)
+    }
+
+    /// The turn's segment-vector `TurnLayout` — the complete K/V description
+    /// (glue / user / thinking / assistant, real vs ethereal). Backs the panel's
+    /// exact-segment rendering. `timeline` is the turn's resolved identity.
+    pub fn turn_layout(
+        &self,
+        timeline: candle_conversation::projection::TimelineId,
+        index: u32,
+    ) -> Option<candle_conversation::turn_layout::TurnLayout> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let base = state.base_conv.lock().unwrap();
+        base.turn_layout(timeline, index)
     }
 
     /// The dialect's framing markers — the glue wrapped around the system prompt
@@ -2345,7 +2638,11 @@ fn head_tail_truncate(
 /// Clean a model-generated title: strip wrapping quotes, trailing
 /// punctuation, and any leading "Title:" prefix the model might add.
 fn clean_title(raw: &str) -> String {
-    let s = raw.trim();
+    // The titler runs under `/no_think`, but Qwen3 still emits an empty
+    // `<think></think>` (and may reason despite it) — strip any think block so it
+    // never lands in the sidebar label.
+    let stripped = candle_conversation::think_strip::strip_think_blocks(raw);
+    let s = stripped.trim();
     let s = s.strip_prefix("Title:").unwrap_or(s).trim();
     let s = s
         .strip_prefix('"')
@@ -2398,8 +2695,19 @@ fn pre_collection_prelude(builder: &Builder) -> String {
         match item {
             SystemPromptItem::Section(s) => out.push_str(&s.content),
             SystemPromptItem::SectionTree(t) => {
-                // Default selection: each node's default option content, in order.
+                // Default selection: each node's default option content, in order,
+                // STOPPING at the embedded `tools` collection node (the prelude is
+                // the text that precedes the tools; a collection node has no
+                // options to render and everything below it is post-tools).
                 for n in &t.nodes {
+                    if n.collection.is_some() {
+                        return out;
+                    }
+                    // Glue markers (`<tools>` etc.) are live-prefilled at projection,
+                    // not part of the static system-prompt prelude — skip them here.
+                    if n.glue.is_some() {
+                        continue;
+                    }
                     out.push_str(&n.options[n.chosen(&t.default_selection)].content);
                 }
             }
@@ -2409,33 +2717,66 @@ fn pre_collection_prelude(builder: &Builder) -> String {
     out
 }
 
-/// The non-template content sections that precede the `tools` collection in the
-/// dialogue layer. This is the prefix the tool sections are sealed against (the
-/// summariser excludes collection members + templates from the prefix chain), so
-/// sealing the tool-summary section with the *same* prefix puts its KV exactly
-/// where "just before the tools" is.
-fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
-    let Some(layer) = builder
-        .schema()
-        .layers
-        .iter()
-        .find(|l| l.name == "dialogue")
-    else {
-        return Vec::new();
-    };
-    let mut ids = Vec::new();
-    for item in &layer.system_prompt.items {
-        match item {
-            SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
-            // Section-tree variants are sealed (not live templates), and
-            // `pre_collection_prelude` bakes their default content into the
-            // prefix — so the tool summary must seal against the same default
-            // variant ids to land at the right position.
-            SystemPromptItem::SectionTree(t) => ids.extend(t.default_present_ids.iter().copied()),
-            // The dialogue layer's only collection is `tools`; stop at it.
-            SystemPromptItem::Collection(_) => break,
-            SystemPromptItem::Section(_) => {}
-        }
+#[cfg(test)]
+mod held_tail_tests {
+    use super::render_held_tail;
+
+    #[test]
+    fn wraps_a_bare_tool_call_so_the_gui_renders_a_card() {
+        // The 584 shape: bare object, `parameters` key — the GUI needs the wrapper.
+        let held = r#"{"name":"datetime","parameters":{"timezone":"Australia/Sydney"}}"#;
+        let out = render_held_tail(held).expect("held tail");
+        assert!(out.starts_with("<tool_call>"), "not wrapped: {out}");
+        assert!(
+            out.trim_end().ends_with("</tool_call>"),
+            "not closed: {out}"
+        );
+        assert!(out.contains("Australia/Sydney"), "lost the args: {out}");
     }
-    ids
+
+    #[test]
+    fn leaves_a_non_tool_json_object_verbatim() {
+        // A bare object that isn't a registered call must stream as plain text.
+        let held = r#"{"answer": 42, "note": "not a tool"}"#;
+        let out = render_held_tail(held).expect("held tail");
+        assert!(!out.contains("<tool_call>"), "wrongly wrapped: {out}");
+        assert_eq!(out, held);
+    }
+
+    #[test]
+    fn empty_tail_emits_nothing() {
+        assert!(render_held_tail("   \n  ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::clean_title;
+
+    #[test]
+    fn strips_empty_no_think_block() {
+        // Qwen3 under /no_think still emits an empty think block before the label.
+        assert_eq!(
+            clean_title("<think>\n\n</think>\n\nUnbounded Context Engine"),
+            "Unbounded Context Engine"
+        );
+    }
+
+    #[test]
+    fn strips_reasoned_think_block() {
+        assert_eq!(
+            clean_title("<think>The user is asking about X, so a good title is…</think>\nProjection Bar Rendering"),
+            "Projection Bar Rendering"
+        );
+    }
+
+    #[test]
+    fn keeps_existing_cleanup() {
+        // Think-strip composes with the prefix/quote/punctuation trimming.
+        assert_eq!(
+            clean_title("<think></think>Title: \"KV Cache Tiering.\""),
+            "KV Cache Tiering"
+        );
+        assert_eq!(clean_title("Plain Title"), "Plain Title");
+    }
 }

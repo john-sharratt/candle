@@ -149,7 +149,8 @@ mod wave {
                     text.push_str(&t);
                     n += 1;
                 }
-                StreamItem::Projection(projection_event_out) => {}
+                StreamItem::Projection(_) => {}
+                StreamItem::Tool(_) => {}
             }
         }
         (n, text)

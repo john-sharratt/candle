@@ -213,12 +213,16 @@ mod bench {
                     0.0,              // cross_turn_penalty
                     std::ptr::null(), // cross_turn_counts
                     std::ptr::null(), // current_lens
-                    0.0,              // eot_boost (disabled)
-                    -1,               // eot_token_id (disabled)
-                    0,                // eot_ramp_start (disabled)
-                    0,                // eot_ramp_len (disabled)
-                    0.0,              // eot_boost_max_multiplier (disabled)
-                    std::ptr::null(), // thinking_lens
+                    0.0,              // segment_close_boost (disabled)
+                    -1,               // segment_close_token_id (disabled)
+                    0,                // segment_close_ramp_start (disabled)
+                    0,                // segment_close_ramp_len (disabled)
+                    0.0,              // segment_close_max_multiplier (disabled)
+                    std::ptr::null(), // segment_lens
+                    0.0,              // segment_temp_boost (disabled)
+                    std::ptr::null(), // suppress_tokens (disabled)
+                    0,                // suppress_count (disabled)
+                    std::ptr::null(), // suppress_penalties (disabled)
                     std::ptr::null(), // token_counts
                     std::ptr::null(), // banned_tokens
                     0,
@@ -270,12 +274,16 @@ mod bench {
                     0.0,              // cross_turn_penalty
                     std::ptr::null(), // cross_turn_counts
                     std::ptr::null(), // current_lens
-                    0.0,              // eot_boost (disabled)
-                    -1,               // eot_token_id (disabled)
-                    0,                // eot_ramp_start (disabled)
-                    0,                // eot_ramp_len (disabled)
-                    0.0,              // eot_boost_max_multiplier (disabled)
-                    std::ptr::null(), // thinking_lens
+                    0.0,              // segment_close_boost (disabled)
+                    -1,               // segment_close_token_id (disabled)
+                    0,                // segment_close_ramp_start (disabled)
+                    0,                // segment_close_ramp_len (disabled)
+                    0.0,              // segment_close_max_multiplier (disabled)
+                    std::ptr::null(), // segment_lens
+                    0.0,              // segment_temp_boost (disabled)
+                    std::ptr::null(), // suppress_tokens (disabled)
+                    0,                // suppress_count (disabled)
+                    std::ptr::null(), // suppress_penalties (disabled)
                     std::ptr::null(),
                     std::ptr::null(),
                     0,
@@ -408,12 +416,16 @@ mod bench {
                     0.0,              // cross_turn_penalty
                     std::ptr::null(), // cross_turn_counts
                     std::ptr::null(), // current_lens
-                    0.0,              // eot_boost (disabled)
-                    -1,               // eot_token_id (disabled)
-                    0,                // eot_ramp_start (disabled)
-                    0,                // eot_ramp_len (disabled)
-                    0.0,              // eot_boost_max_multiplier (disabled)
-                    std::ptr::null(), // thinking_lens
+                    0.0,              // segment_close_boost (disabled)
+                    -1,               // segment_close_token_id (disabled)
+                    0,                // segment_close_ramp_start (disabled)
+                    0,                // segment_close_ramp_len (disabled)
+                    0.0,              // segment_close_max_multiplier (disabled)
+                    std::ptr::null(), // segment_lens
+                    0.0,              // segment_temp_boost (disabled)
+                    std::ptr::null(), // suppress_tokens (disabled)
+                    0,                // suppress_count (disabled)
+                    std::ptr::null(), // suppress_penalties (disabled)
                     tcp as *const i32,
                     banp as *const i32,
                     (banned_per_seq * batch_size as usize) as i32,
@@ -468,12 +480,16 @@ mod bench {
                     0.0,              // cross_turn_penalty
                     std::ptr::null(), // cross_turn_counts
                     std::ptr::null(), // current_lens
-                    0.0,              // eot_boost (disabled)
-                    -1,               // eot_token_id (disabled)
-                    0,                // eot_ramp_start (disabled)
-                    0,                // eot_ramp_len (disabled)
-                    0.0,              // eot_boost_max_multiplier (disabled)
-                    std::ptr::null(), // thinking_lens
+                    0.0,              // segment_close_boost (disabled)
+                    -1,               // segment_close_token_id (disabled)
+                    0,                // segment_close_ramp_start (disabled)
+                    0,                // segment_close_ramp_len (disabled)
+                    0.0,              // segment_close_max_multiplier (disabled)
+                    std::ptr::null(), // segment_lens
+                    0.0,              // segment_temp_boost (disabled)
+                    std::ptr::null(), // suppress_tokens (disabled)
+                    0,                // suppress_count (disabled)
+                    std::ptr::null(), // suppress_penalties (disabled)
                     tcp as *const i32,
                     banp as *const i32,
                     (banned_per_seq * batch_size as usize) as i32,

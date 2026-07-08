@@ -152,6 +152,8 @@ mod control {
                     text.push_str(&t);
                     n += 1;
                 }
+                StreamItem::Projection(_) => {}
+                StreamItem::Tool(_) => {}
             }
         }
         // Print the decoded text so coherence can be eyeballed — a wrong

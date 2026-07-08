@@ -29,6 +29,7 @@ use std::time::Duration;
 use crossbeam::channel::{Receiver, TryRecvError};
 
 use crate::sequence_handle::SequenceId;
+use crate::stencil::TriggerRegistry;
 use crate::token_buffer::TokenBuffer;
 
 use super::config::ConversationTreeConfig;
@@ -197,7 +198,6 @@ impl SummarizationTask {
         use crate::config::SamplingConfig;
         use crate::error::ConversationError;
         use crate::scheduler::SchedulerRequest;
-        use crate::substrate::TurnContentBounds;
 
         // Tokenize the system prompt and window text together — the
         // summarisation slot is its own short-lived workspace; we
@@ -253,8 +253,11 @@ impl SummarizationTask {
                 prefill_tokens,
                 prefill_text: window_text,
                 user_text: String::new(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
                 tags: Vec::new(),
-                content_bounds: TurnContentBounds::default(),
                 projection_offsets: Vec::new(),
                 prefill_assistant_text: String::new(),
                 post_decode_tokens: TokenBuffer::new(),
@@ -263,6 +266,8 @@ impl SummarizationTask {
                 event_tx,
                 reprojection: None,
                 disable_reprojection: false,
+                // Summarization decodes free text only — no tool stencils.
+                triggers: Arc::new(TriggerRegistry::new()),
             })
             .is_err()
         {

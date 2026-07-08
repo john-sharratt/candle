@@ -527,15 +527,17 @@ impl Scheduler {
             if let Some(&next_off) = p.work.projection_offsets.get(p.next_projection) {
                 if p.offset >= next_off as usize {
                     if let Some(comp) = &p.work.staged_composition {
-                        let gen_start = p.work.content_bounds.asst_start;
+                        let gen_start = p.work.assistant_content_start;
                         let prev_off = if p.next_projection == 0 {
                             gen_start
                         } else {
                             p.work.projection_offsets[p.next_projection - 1]
                         };
+                        // A projection is a POINT: this segment's projection was
+                        // selected at `prev_off` and governs forward to `next_off`
+                        // (the next event's point). Emit it at its start position.
                         let mut ev = comp.clone();
                         ev.start_token = prev_off.saturating_sub(gen_start);
-                        ev.end_token = next_off.saturating_sub(gen_start);
                         let _ = p.work.event_tx.send(TurnEvent::Projection(ev));
                     }
                     p.next_projection += 1;
@@ -589,7 +591,9 @@ impl Scheduler {
                         if let Some(p) = self.pending_compression_seals.remove(&job_id) {
                             let _ = p
                                 .response_tx
-                                .send(Err(format!("SubmitSummaryProbe: reproject prefill: {e}")));
+                                .send(Err(crate::summary_tree::ProbeError::Soft(format!(
+                                    "SubmitSummaryProbe: reproject prefill: {e}"
+                                ))));
                         }
                         self.free_summary_slot(slot);
                     }
@@ -692,16 +696,30 @@ impl Scheduler {
             }
         };
 
-        // Detect think-mode entry from injected <think> in the prefill.
+        // Detect think-mode entry: the model opens its OWN `<think>` as the first
+        // decoded token (we never prefill one). The `work.tokens` check covers a
+        // caller-supplied assistant prefill that itself opens a think block.
         let initial_inside_think_block = {
-            let tid = work.sampling.think_start_token_id;
+            let tid = work.sampling.segment_open_token_id;
             if tid >= 0 {
                 let tok = tid as u32;
                 let prefill_has_think = work.tokens.iter().rev().take(5).any(|&t| t == tok);
-                if prefill_has_think && !sampling_state.in_thinking {
-                    sampling_state.enter_thinking();
+                // The block opens either way: the common case is the model
+                // sampling its OWN `<think>` as the first token; the rarer case is
+                // a caller-supplied assistant prefill that already opens one.  In
+                // BOTH cases the sampler's `in_segment` must flip — it gates DRY,
+                // the reflection-marker suppression, the thinking temperature
+                // boost, and the `</think>` EOT ramp (all keyed off `segment_len`,
+                // which only advances while `in_segment`).  Flipping it only for
+                // the prefilled case left the sampler's flag stuck false for a
+                // model-opened block, silently disabling every one of those
+                // controls for its whole duration even though the health flag
+                // (`inside_think_block`) correctly tracked it.
+                let opens_think = prefill_has_think || first_token == tok;
+                if opens_think && !sampling_state.in_segment {
+                    sampling_state.enter_segment();
                 }
-                prefill_has_think || first_token == tok
+                opens_think
             } else {
                 false
             }
@@ -770,7 +788,10 @@ impl Scheduler {
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
                         tags: work.tags,
-                        content_bounds: work.content_bounds,
+                        user_content_start: work.user_content_start,
+                        user_content_end: work.user_content_end,
+                        assistant_content_start: work.assistant_content_start,
+                        no_think: work.no_think,
                         prefill_assistant_text: work.prefill_assistant_text,
                         finished: true,
                         decode_start: Instant::now(),
@@ -795,6 +816,9 @@ impl Scheduler {
                         non_punct_since_reproject: 0,
                         last_projection_end: 0,
                         in_tool_call: false,
+                        triggers: work.triggers,
+                        stencil: None,
+                        pending_mask: None,
                     },
                 );
             } else {
@@ -812,6 +836,23 @@ impl Scheduler {
 
         let _ = work.event_tx.send(TurnEvent::Token(first_token));
 
+        // The first sampled token can itself be a stencil trigger — e.g. the
+        // model emits `<tool_call>` as its very first response token, the common
+        // case under /no_think (the think block is prefilled, so the model goes
+        // straight to the call). The decode-loop trigger check runs only on
+        // tokens sampled in `batch_decode_step`, never this one, so check it here
+        // too — otherwise steering silently never engages for those calls.
+        let stencil = work.triggers.driver_for(first_token);
+        if let Some(d) = &stencil {
+            tracing::debug!(
+                target: "candle_conversation::stencil",
+                seq_id = work.sequence_id.0,
+                tree = d.tree().label(),
+                trigger = first_token,
+                "stencil steering started (trigger on the first decoded token)",
+            );
+        }
+
         self.active_decodes.insert(
             work.sequence_id,
             DecodeState {
@@ -825,7 +866,10 @@ impl Scheduler {
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
                 tags: work.tags,
-                content_bounds: work.content_bounds,
+                user_content_start: work.user_content_start,
+                user_content_end: work.user_content_end,
+                assistant_content_start: work.assistant_content_start,
+                no_think: work.no_think,
                 prefill_assistant_text: work.prefill_assistant_text,
                 finished: false,
                 decode_start: Instant::now(),
@@ -850,11 +894,13 @@ impl Scheduler {
                 non_punct_since_reproject: 0,
                 last_projection_end: 0,
                 in_tool_call: false,
+                triggers: work.triggers,
+                stencil,
+                pending_mask: None,
             },
         );
     }
 
-    #[allow(dead_code)]
     pub(super) fn run_prefill_with_shift(
         &mut self,
         sequence_id: SequenceId,

@@ -49,6 +49,23 @@ pub struct SamplingConfig {
     /// Higher values increase randomness. Typical range: 0.0 - 2.0.
     pub temperature: f32,
 
+    /// Added to `temperature` for sequences currently inside a segment;
+    /// `0.0` = disabled. Lets the in-segment span sample a touch hotter
+    /// without affecting tokens outside the segment.
+    pub segment_temp_boost: f32,
+
+    /// Token IDs whose logits are suppressed while a sequence is inside a
+    /// segment.  Shared across the batch; resolved once from the caller at
+    /// engine start.  Empty = disabled.
+    pub segment_suppress_tokens: Vec<i32>,
+
+    /// Penalty subtracted from each [`Self::segment_suppress_tokens`] logit while
+    /// inside a segment — the *ceiling* lever.  Set per turn by the caller: a
+    /// large value HARD-suppresses the token family, a moderate value
+    /// SOFT-discourages it, `0.0` = disabled.  Only applied while `in_segment`,
+    /// so tokens outside the segment are untouched.
+    pub segment_suppress_penalty: f32,
+
     /// Top-K sampling: only consider the K most likely tokens.
     /// `0` = disabled. Uses O(n) radix select algorithm.
     pub top_k: i32,
@@ -117,62 +134,62 @@ pub struct SamplingConfig {
     /// `1.0` = no extra multiplier. Ignored when `dynamic_eos_boost` is `false`.
     pub eos_boost_max_multiplier: f32,
 
-    // ── End-of-Thinking (EOT) Boost ─────────────────────────────────────
-    // Ramps up a boost on the `</think>` token during thinking phases so
-    // the model exits thinking with budget left for the response.
-    // Only active while the sampler detects an open `<think>` block.
-    /// Additive boost applied to the EOT (`</think>`) token logit.
-    /// Uses the same ramp formula as EOS boost but keyed on thinking-token
-    /// count instead of total generation length.
+    // ── Segment-Close Boost ─────────────────────────────────────────────
+    // Ramps up a boost on the segment-close token while a segment is open so
+    // the model closes the segment within its budget.  Only active while the
+    // sampler is inside a segment.
+    /// Additive boost applied to the segment-close token logit.
+    /// Uses the same ramp formula as EOS boost but keyed on the per-segment
+    /// token count instead of total generation length.
     /// `0.0` = disabled.
-    pub eot_boost: f32,
+    pub segment_close_boost: f32,
 
-    /// Token ID of the `</think>` end-of-thinking token.
-    /// Resolved automatically from the tokenizer by the engine builder.
-    /// `-1` = disabled (no thinking support detected).
-    pub eot_token_id: i32,
+    /// Token ID of the segment-close token.
+    /// Resolved and supplied by the caller.
+    /// `-1` = disabled (no segment tracking).
+    pub segment_close_token_id: i32,
 
-    /// Token ID of the `<think>` start-of-thinking token.
-    /// Resolved automatically from the tokenizer by the engine builder.
+    /// Token ID of the segment-open token.
+    /// Resolved and supplied by the caller.
     /// `-1` = disabled.
-    pub think_start_token_id: i32,
+    pub segment_open_token_id: i32,
 
-    /// Thinking-token count where the EOT ramp begins (e.g. 150).
-    pub eot_ramp_start: i32,
+    /// Per-segment token count where the segment-close ramp begins (e.g. 150).
+    pub segment_close_ramp_start: i32,
 
-    /// Thinking-token count where the EOT ramp reaches full strength (e.g. 200).
-    pub eot_ramp_len: i32,
+    /// Per-segment token count where the segment-close ramp reaches full strength (e.g. 200).
+    pub segment_close_ramp_len: i32,
 
-    /// Multiplier applied to `eot_boost` at the end of the ramp.
-    pub eot_boost_max_multiplier: f32,
+    /// Multiplier applied to `segment_close_boost` at the end of the ramp.
+    pub segment_close_max_multiplier: f32,
 
     // ── Generation Failsafes ────────────────────────────────────────────
-    /// After this many thinking tokens, unconditionally force `</think>`.
-    /// Hard failsafe that guarantees the model exits its think block even if
-    /// it would otherwise continue reasoning indefinitely.
+    /// After this many in-segment tokens, unconditionally force the segment-close token.
+    /// Hard failsafe that guarantees the segment closes even if the model would
+    /// otherwise keep generating inside it indefinitely.
     ///
-    /// Operates on `thinking_len` (tokens since entering `<think>`), not total
-    /// generated tokens.  `0` = disabled.  EOT token ID must also be resolved
-    /// (done automatically by the engine builder).  No-op when not in thinking mode.
-    pub force_eot_after: i32,
+    /// Operates on `segment_len` (tokens since the segment opened), not total
+    /// generated tokens.  `0` = disabled.  The segment-close token ID must also be
+    /// resolved.  No-op when no segment is open.
+    pub force_segment_close_after: i32,
 
-    /// After this many thinking tokens, emit `</think>` at the next sentence
-    /// boundary (`.`, `!`, `?`, or `\n`).  Softer than `force_eot_after`:
-    /// the model finishes its current sentence before the think block closes.
-    /// Operates on `thinking_len`.  `0` = disabled.  Pair with `force_eot_after`
+    /// After this many in-segment tokens, emit the segment-close token at the next
+    /// sentence boundary (`.`, `!`, `?`, or `\n`).  Softer than `force_segment_close_after`:
+    /// the model finishes its current sentence before the segment closes.
+    /// Operates on `segment_len`.  `0` = disabled.  Pair with `force_segment_close_after`
     /// as the hard backstop.
-    pub graceful_eot_after: i32,
+    pub graceful_segment_close_after: i32,
 
-    /// Token IDs that count as sentence-end boundaries for `graceful_eot_after`.
+    /// Token IDs that count as sentence-end boundaries for `graceful_segment_close_after`.
     ///
     /// Resolved automatically from the tokenizer at engine startup (looks up
-    /// `.`, `!`, `?`, `\n`).  If empty, `graceful_eot_after` is a no-op.
+    /// `.`, `!`, `?`, `\n`).  If empty, `graceful_segment_close_after` is a no-op.
     pub sentence_end_token_ids: Vec<i32>,
 
     /// After this many generated tokens, wait for the next sentence-ending
     /// token (`.`, `!`, `?`, or `\n` — resolved from the tokenizer at engine
-    /// startup) and then emit EOS.  Mirrors the `graceful_eot_after` mechanism
-    /// for think-block exit: the current sentence is allowed to complete before
+    /// startup) and then emit EOS.  Mirrors the `graceful_segment_close_after` mechanism
+    /// for closing a segment: the current sentence is allowed to complete before
     /// generation stops, preventing mid-sentence truncation.
     ///
     /// If no sentence-boundary token occurs before `forced_eos_after`, the hard
@@ -203,6 +220,9 @@ impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
             temperature: 1.0,
+            segment_temp_boost: 0.0,
+            segment_suppress_tokens: Vec::new(),
+            segment_suppress_penalty: 0.0,
             top_k: 0,
             top_p: 1.0,
             repeat_penalty: 1.0,
@@ -216,14 +236,14 @@ impl Default for SamplingConfig {
             eos_ramp_start: 0,
             eos_ramp_len: 0,
             eos_boost_max_multiplier: 1.0,
-            eot_boost: 0.0,
-            eot_token_id: -1,
-            think_start_token_id: -1,
-            eot_ramp_start: 0,
-            eot_ramp_len: 0,
-            eot_boost_max_multiplier: 1.0,
-            force_eot_after: 0,
-            graceful_eot_after: 0,
+            segment_close_boost: 0.0,
+            segment_close_token_id: -1,
+            segment_open_token_id: -1,
+            segment_close_ramp_start: 0,
+            segment_close_ramp_len: 0,
+            segment_close_max_multiplier: 1.0,
+            force_segment_close_after: 0,
+            graceful_segment_close_after: 0,
             sentence_end_token_ids: Vec::new(),
             graceful_eos_after: 0,
             forced_eos_after: 0,
@@ -304,27 +324,39 @@ impl SamplingConfig {
             // `resolve_thinking_tokens()` during engine startup.
             "qwen3" | "qwen3moe" | "qwen2moe" => Self::top_k_top_p(40, 0.95, 0.8)
                 // Matched to the LM Studio reference run: temp=0.8, top_k=40,
-                // top_p=0.95, repeat_penalty=1.1.  The DRY, presence, and
-                // cross-turn penalties were dropped (2026-05-17): DRY's
-                // exponential n-gram penalty corrupts verbatim copying of
-                // numbers, identifiers, and code — unacceptable for a coding
-                // assistant — and the reference run uses none of them.  Only
-                // a gentle multiplicative repeat_penalty remains.
+                // top_p=0.95, repeat_penalty=1.1.  A gentle multiplicative
+                // repeat_penalty applies batch-wide.
+                //
+                // DRY is re-enabled but applied **only inside `<think>` blocks**
+                // (the kernel gates it on `segment_lens[seq] > 0`).  DRY's
+                // exponential n-gram penalty would corrupt verbatim copying of
+                // numbers, identifiers, and code in the answer — unacceptable
+                // for a coding assistant — so it never touches the response;
+                // confined to thinking, it breaks reasoning loops without harm.
+                // The thinking-only temperature boost lets reasoning sample a
+                // touch hotter while the answer stays at the reference temp.
+                .with_segment_temp_boost(0.05)
+                .with_dry_penalty(0.8, 1.75, 2, 512)
                 .with_repeat_penalty(1.1)
                 .with_repeat_last_n(128)
-                // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400.
-                // eot_ramp_start/len are in thinking-token counts; these IDs are resolved
-                // from the tokenizer at engine startup.
-                .with_eot_boost(2.0, 200, 200, 5.0)
-                .with_graceful_eot_after(220)
-                .with_force_eot_after(300)
+                // EOT ramp: nudge </think> after 200 thinking tokens, full boost by 400
+                // (segment_close_ramp_len is the ramp's absolute end, not a span).  zend overrides
+                // segment_close_ramp_start/len per turn from `ThinkMode::eot_budget()`; this is the
+                // fallback for non-steered callers.  These IDs are resolved from the
+                // tokenizer at engine startup.
+                .with_segment_close_boost(2.0, 200, 400, 5.0)
+                .with_graceful_segment_close_after(220)
+                .with_force_segment_close_after(300)
                 // EOS limits are in total generated tokens (thinking + response).
                 // Think block consumes ~200-300 tokens; leave ~500-700 for the response.
-                // EOS boost ramp starts nudging at 700 total tokens, full boost by 800.
+                // EOS boost ramp starts nudging at 700 total tokens, full boost by 800
+                // (eos_ramp_len is the ramp's absolute end, not a span).
                 // graceful_eos fires at the next sentence boundary after 800 tokens;
                 // forced_eos fires unconditionally at 1000 tokens.
                 // non_thinking_for_gguf_architecture overrides these back to tighter limits.
-                .with_dynamic_eos_boost(1.0, 700, 100, 3.0)
+                // zend overrides all four per turn from `ThinkMode::eos_budget()`; this
+                // is the fallback for non-steered callers.
+                .with_dynamic_eos_boost(1.0, 700, 800, 3.0)
                 .with_eos_failsafe(800, 1000),
 
             // Qwen2 instruct models.
@@ -355,7 +387,7 @@ impl SamplingConfig {
             // forced_eos fires unconditionally at 700 tokens.
             "qwen3" | "qwen3moe" | "qwen2moe" => Some(
                 Self::for_gguf_architecture(arch)
-                    .with_no_eot()
+                    .with_no_segment_close()
                     .with_dynamic_eos_boost(1.0, 400, 100, 3.0)
                     .with_eos_failsafe(512, 700),
             ),
@@ -424,6 +456,21 @@ impl SamplingConfig {
     /// Set temperature.
     pub fn with_temperature(mut self, t: f32) -> Self {
         self.temperature = t;
+        self
+    }
+
+    /// Set the in-segment temperature boost (added to `temperature` while a
+    /// sequence is inside a segment). `0.0` disables it.
+    pub fn with_segment_temp_boost(mut self, v: f32) -> Self {
+        self.segment_temp_boost = v;
+        self
+    }
+
+    /// Set the in-segment token suppression: the token list and the per-turn
+    /// penalty (large = HARD, moderate = SOFT, `0.0` = off).
+    pub fn with_segment_suppression(mut self, tokens: Vec<i32>, penalty: f32) -> Self {
+        self.segment_suppress_tokens = tokens;
+        self.segment_suppress_penalty = penalty;
         self
     }
 
@@ -517,47 +564,45 @@ impl SamplingConfig {
         self
     }
 
-    /// Enable end-of-thinking (EOT) boost for thinking-mode models.
+    /// Enable the segment-close boost.
     ///
-    /// During a `<think>` block the sampler ramps up a boost on the
-    /// `</think>` token so the model exits thinking with generation
-    /// budget remaining for the response.
+    /// While a segment is open the sampler ramps up a boost on the
+    /// segment-close token so the segment closes within its budget.
     ///
-    /// The actual `<think>` / `</think>` token IDs are resolved
-    /// automatically from the tokenizer during engine startup — callers
-    /// only need to specify the ramp parameters.
+    /// The segment-open / segment-close token IDs are supplied separately by
+    /// the caller — this setter only configures the ramp parameters.
     ///
     /// * `boost`          – base additive boost
-    /// * `ramp_start`     – thinking-token count where ramp begins (e.g. 150)
-    /// * `ramp_len`       – thinking-token count where ramp reaches full (e.g. 200)
+    /// * `ramp_start`     – per-segment token count where ramp begins (e.g. 150)
+    /// * `ramp_len`       – per-segment token count where ramp reaches full (e.g. 200)
     /// * `max_multiplier` – multiplier at full ramp
-    pub fn with_eot_boost(
+    pub fn with_segment_close_boost(
         mut self,
         boost: f32,
         ramp_start: i32,
         ramp_len: i32,
         max_multiplier: f32,
     ) -> Self {
-        self.eot_boost = boost;
-        self.eot_ramp_start = ramp_start;
-        self.eot_ramp_len = ramp_len;
-        self.eot_boost_max_multiplier = max_multiplier;
+        self.segment_close_boost = boost;
+        self.segment_close_ramp_start = ramp_start;
+        self.segment_close_ramp_len = ramp_len;
+        self.segment_close_max_multiplier = max_multiplier;
         self
     }
 
-    /// Disable EOT boost entirely.
+    /// Disable the segment-close boost entirely.
     ///
-    /// Clears all EOT ramp parameters so the `</think>` token receives no
-    /// additive boost.  Use this when building non-thinking configs on top of
-    /// a base that already has an EOT ramp configured (e.g. chaining on
+    /// Clears all segment-close ramp parameters so the segment-close token
+    /// receives no additive boost.  Use this when building configs on top of a
+    /// base that already has a segment-close ramp configured (e.g. chaining on
     /// `for_gguf_architecture`).
-    pub fn with_no_eot(mut self) -> Self {
-        self.eot_boost = 0.0;
-        self.eot_ramp_start = 0;
-        self.eot_ramp_len = 0;
-        self.eot_boost_max_multiplier = 1.0;
-        self.force_eot_after = 0;
-        self.graceful_eot_after = 0;
+    pub fn with_no_segment_close(mut self) -> Self {
+        self.segment_close_boost = 0.0;
+        self.segment_close_ramp_start = 0;
+        self.segment_close_ramp_len = 0;
+        self.segment_close_max_multiplier = 1.0;
+        self.force_segment_close_after = 0;
+        self.graceful_segment_close_after = 0;
         self
     }
 
@@ -568,14 +613,14 @@ impl SamplingConfig {
     /// disabled (token IDs remain `-1`).
     pub fn resolve_thinking_tokens(&mut self, tokenizer: &tokenizers::Tokenizer) {
         if let Some(id) = tokenizer.token_to_id("</think>") {
-            self.eot_token_id = id as i32;
+            self.segment_close_token_id = id as i32;
             tracing::debug!("Resolved </think> token ID: {}", id);
         }
         if let Some(id) = tokenizer.token_to_id("<think>") {
-            self.think_start_token_id = id as i32;
+            self.segment_open_token_id = id as i32;
             tracing::debug!("Resolved <think> token ID: {}", id);
         }
-        // Resolve sentence-end token IDs for graceful_eot_after.
+        // Resolve sentence-end token IDs for graceful_segment_close_after.
         // We probe both the bare character and common BPE compound forms.
         self.sentence_end_token_ids.clear();
         for boundary in [".", "\n", ".\n", "!\n", "?\n", "!", "?"] {
@@ -591,31 +636,63 @@ impl SamplingConfig {
             self.sentence_end_token_ids.len(),
             self.sentence_end_token_ids
         );
+
+        // Resolve the reflection-marker family (`Wait`/`Hmm`/`Alternatively`/
+        // `Actually`) — the overthinking drivers whose logits the steering
+        // suppresses while in a `<think>` block.  Each keyword is expanded to all
+        // single-token variants (bare / leading-space / lower / upper) so the bias
+        // can't leak through a capitalised or space-prefixed form; multi-token
+        // markers (e.g. "hold on", "let me check") can't be logit-suppressed and
+        // are skipped.  The per-turn penalty is set from the effort dial elsewhere.
+        self.segment_suppress_tokens.clear();
+        for keyword in ["Wait", "Hmm", "Alternatively", "Actually"] {
+            for cand in [
+                keyword.to_string(),
+                format!(" {keyword}"),
+                keyword.to_lowercase(),
+                format!(" {}", keyword.to_lowercase()),
+                keyword.to_uppercase(),
+            ] {
+                if let Ok(enc) = tokenizer.encode(cand.as_str(), false) {
+                    if let [id] = enc.get_ids() {
+                        let id = *id as i32;
+                        if !self.segment_suppress_tokens.contains(&id) {
+                            self.segment_suppress_tokens.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            "Resolved {} reflection-marker suppress token IDs: {:?}",
+            self.segment_suppress_tokens.len(),
+            self.segment_suppress_tokens
+        );
     }
 
-    /// Set a hard thinking-token limit after which `</think>` is forced.
+    /// Set a hard per-segment token limit after which the segment-close token is forced.
     ///
-    /// When `thinking_len >= n`, the next sampled token is replaced with the
-    /// `</think>` token regardless of the model's distribution.  This is the
-    /// reliable way to guarantee the model exits its think block within a
-    /// budget, complementing the softer `eot_boost` ramp.
+    /// When `segment_len >= n`, the next sampled token is replaced with the
+    /// segment-close token regardless of the model's distribution.  This is the
+    /// reliable way to guarantee the segment closes within a budget,
+    /// complementing the softer `segment_close_boost` ramp.
     /// `0` = disabled.
-    pub fn with_force_eot_after(mut self, n: i32) -> Self {
-        self.force_eot_after = n;
+    pub fn with_force_segment_close_after(mut self, n: i32) -> Self {
+        self.force_segment_close_after = n;
         self
     }
 
-    /// Set a soft thinking-token limit: emit `</think>` at the next sentence boundary.
+    /// Set a soft per-segment token limit: emit the segment-close token at the next sentence boundary.
     ///
-    /// Once `thinking_len >= n`, the *following* step after a sentence-ending token
-    /// (`.`, `!`, `?`, or `\n` — resolved from the tokenizer) forces `</think>`.
-    /// This lets the current sentence complete naturally before the think block closes.
+    /// Once `segment_len >= n`, the *following* step after a sentence-ending token
+    /// (`.`, `!`, `?`, or `\n` — resolved from the tokenizer) forces the segment-close token.
+    /// This lets the current sentence complete naturally before the segment closes.
     ///
-    /// Pair with `with_force_eot_after` as the hard backstop (e.g. `graceful=220,
-    /// force=300`) so the model always exits within budget even if it avoids
+    /// Pair with `with_force_segment_close_after` as the hard backstop (e.g. `graceful=220,
+    /// force=300`) so the segment always closes within budget even if the model avoids
     /// sentence-ending tokens.  `0` = disabled.
-    pub fn with_graceful_eot_after(mut self, n: i32) -> Self {
-        self.graceful_eot_after = n;
+    pub fn with_graceful_segment_close_after(mut self, n: i32) -> Self {
+        self.graceful_segment_close_after = n;
         self
     }
 
@@ -634,7 +711,7 @@ impl SamplingConfig {
     /// The existing `forced_eos_after` value is treated as the implicit default
     /// budget the config was tuned for.  All EOS fields (graceful, forced, ramp
     /// start, ramp length) are scaled by `max_response_tokens / forced_eos_after`
-    /// so the shape of the curve is preserved at any budget.  EOT (thinking)
+    /// so the shape of the curve is preserved at any budget.  Segment-close
     /// limits are absolute and are not changed.  No-ops when `forced_eos_after`
     /// is zero (EOS failsafe disabled).
     pub fn with_max_response_tokens(mut self, max_response_tokens: usize) -> Self {
@@ -1265,25 +1342,6 @@ pub struct SequenceConfig {
     /// Default sampling configuration.
     pub sampling: SamplingConfig,
 
-    /// When `true`, an empty `<think></think>` block is prefilled after
-    /// the assistant header to suppress thinking/reasoning output on
-    /// models that support it.
-    pub suppress_thinking: bool,
-
-    /// When `true`, the model supports thinking mode and the dialect's
-    /// thinking/no-think blocks should be injected into the assistant header.
-    /// Set to `false` for models where `ModelSpec::supports_thinking` is
-    /// `false` — prevents `<think>` from being injected into the prefill for
-    /// non-thinking models.
-    pub thinking_capable: bool,
-
-    /// When `true` and `suppress_thinking` is also `true`, prefill an empty
-    /// `<think>\n\n</think>\n\n` block after the assistant header to explicitly
-    /// close the think channel before generation.  When `false` the assistant
-    /// header is left clean and the model relies on `/no_think` alone (preferred
-    /// for models like Qwen3-30B-A3B that honour the token without the block).
-    pub inject_no_think_block: bool,
-
     /// Sequence tree policy: summarization cadence, KV tier formats,
     /// cognitive task prompts, etc.
     pub tree: ConversationTreeConfig,
@@ -1394,4 +1452,43 @@ pub struct SequenceConfig {
     /// to capture full-resolution tool-call exemplars for the provenance work.
     /// Overrides the level/force fields above. **Default: `false`.**
     pub kv_lossless: bool,
+}
+
+#[cfg(test)]
+mod sampling_config_tests {
+    use super::SamplingConfig;
+
+    #[test]
+    fn segment_temp_boost_defaults_to_zero() {
+        assert_eq!(SamplingConfig::default().segment_temp_boost, 0.0);
+        assert_eq!(SamplingConfig::argmax().segment_temp_boost, 0.0);
+        assert_eq!(SamplingConfig::top_p(0.9, 0.7).segment_temp_boost, 0.0);
+    }
+
+    #[test]
+    fn with_segment_temp_boost_sets_value() {
+        let cfg = SamplingConfig::default().with_segment_temp_boost(0.05);
+        assert_eq!(cfg.segment_temp_boost, 0.05);
+    }
+
+    #[test]
+    fn qwen3_preset_enables_thinking_steering() {
+        for arch in ["qwen3", "qwen3moe", "qwen2moe"] {
+            let cfg = SamplingConfig::for_gguf_architecture(arch);
+            // Thinking-only temperature boost is enabled.
+            assert_eq!(
+                cfg.segment_temp_boost, 0.05,
+                "{arch} should set segment_temp_boost to 0.05"
+            );
+            // DRY is re-enabled (kernel-gated to <think> blocks).
+            let dry = cfg
+                .dry
+                .as_ref()
+                .unwrap_or_else(|| panic!("{arch} should enable DRY"));
+            assert_eq!(dry.multiplier, 0.8);
+            assert_eq!(dry.base, 1.75);
+            assert_eq!(dry.allowed_length, 2);
+            assert_eq!(dry.range, 512);
+        }
+    }
 }

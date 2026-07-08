@@ -57,6 +57,7 @@ pub mod provenance;
 pub(crate) mod scheduler;
 mod sequence_handle;
 mod stats;
+pub mod stencil;
 pub mod store;
 pub mod substrate;
 pub mod summary_tree;
@@ -65,13 +66,14 @@ mod time_source;
 pub mod token_buffer;
 pub mod tree;
 pub mod turn;
+pub mod turn_layout;
 
 pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
 pub use conversation::{GlueMarkers, Sequence};
-pub use engine::{ConversationEngine, SubstrateReloadStatus};
+pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use projection::{

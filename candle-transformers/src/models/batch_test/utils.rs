@@ -133,8 +133,8 @@ impl TestParams {
     }
 
     /// Enable or disable thinking-mode suppression.
-    /// When true, `no_think` is injected in user content and
-    /// `assistant_start + no_think_block` is used as the assistant header.
+    /// When true, `no_think` is injected into the user content (the assistant
+    /// header stays the plain `assistant_start`).
     pub fn with_suppress_thinking(mut self, suppress: bool) -> Self {
         self.suppress_thinking = suppress;
         self
@@ -274,8 +274,7 @@ impl TestParams {
             no_think,
             user_text,
             self.dialect.user_end,
-            self.dialect
-                .active_assistant_start(self.suppress_thinking, false)
+            self.dialect.assistant_start
         );
         self.tokenizer
             .encode(prompt, true)
@@ -668,12 +667,7 @@ impl TestParams {
         // pad tokens inside the user turn where they are harmless trailing
         // whitespace, rather than after <|im_start|>assistant where they
         // would cause the model to emit EOS immediately.
-        let suffix_str = format!(
-            "{}{}",
-            self.dialect.user_end,
-            self.dialect
-                .active_assistant_start(self.suppress_thinking, false)
-        );
+        let suffix_str = format!("{}{}", self.dialect.user_end, self.dialect.assistant_start);
         let suffix_tokens: Vec<u32> = self
             .tokenizer
             .encode(suffix_str.as_str(), false)

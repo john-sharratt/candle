@@ -577,16 +577,24 @@ impl SlotStateHost {
             // freshly-pushed empty chunks this is 0.
             while cur_in_blk as usize >= chunk_size {
                 cur_slice += 1;
-                debug_assert!(
-                    cur_slice < self.slices.len(),
-                    "extend_for_write_region: ran out of slices at cur_slice={} \
-                     (n_slices={}, seq_len={}, chunk_size={}) — caller \
-                     must pre-allocate enough write chunks",
-                    cur_slice,
-                    self.slices.len(),
-                    seq_len,
-                    chunk_size,
-                );
+                if cur_slice >= self.slices.len() {
+                    // Dump the full slot layout so the desync is diagnosable in
+                    // release (the bare index panic hides which chunk overflowed).
+                    let layout: String = self
+                        .slices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("[{i}] off={} len={}", s.offset, s.len))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    panic!(
+                        "extend_for_write_region overflow: ran out of slices at \
+                         cur_slice={cur_slice} (n_slices={}, write_slice={}, seq_len={seq_len}, \
+                         chunk_size={chunk_size}). Slot layout: {layout}",
+                        self.slices.len(),
+                        self.write_slice,
+                    );
+                }
                 cur_in_blk = self.slices[cur_slice].offset as u32;
             }
             self.position_map

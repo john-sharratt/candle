@@ -38,8 +38,6 @@ impl DialectType {
 /// Structural tokens for a chat template dialect.
 ///
 /// Each field is a static string fragment used to assemble prompts.
-/// Models that support thinking mode use [`no_think_block`]
-/// as a prefill to suppress `<think>` blocks.
 #[derive(Debug, Clone)]
 pub struct Dialect {
     pub dialect_type: DialectType,
@@ -58,9 +56,11 @@ pub struct Dialect {
     pub assistant_end: &'static str,
     pub recent_start: &'static str,
     pub recent_end: &'static str,
-    /// The empty/closed reasoning header injected after `assistant_start` to
-    /// SUPPRESS thinking (`"<think>\n\n</think>\n\n"` for Qwen3).  See
-    /// [`Self::active_assistant_start`].
+    /// The empty/closed reasoning block a thinking model emits under `/no_think`
+    /// (`"<think>\n\n</think>\n\n"` for Qwen3).  Descriptive only — never
+    /// force-prefilled into the assistant header (the model produces it itself,
+    /// or the `/no_think` text alone suppresses reasoning); retained as a
+    /// structural-noise seed for the BDP scan.
     pub no_think_block: &'static str,
     /// The `/no_think` soft-switch text — emitted by the section tree's
     /// `no_think` node and prepended to prefilled (never-decoded) turns.
@@ -276,36 +276,6 @@ impl Dialect {
             "{}{}{}{}",
             self.turn_end, self.user_start, user_prompt, self.user_end
         )
-    }
-
-    /// Whether this dialect supports thinking mode suppression.
-    pub fn supports_no_think(&self) -> bool {
-        !self.no_think_block.is_empty()
-    }
-
-    /// Returns the assistant header, optionally followed by a forced no-think block.
-    ///
-    /// | `thinking_capable` | `suppress_thinking` | suffix injected |
-    /// |---|---|---|
-    /// | `true`  | `true`  | `no_think_block` (`"<think>\n\n</think>\n\n"`) — closes the block
-    ///   immediately so the model emits no reasoning. |
-    /// | `true`  | `false` | none — the model opens its OWN `<think>` as the first generated
-    ///   token (matching the official chat template). The opener is therefore a
-    ///   *decoded* token: it streams and persists as part of the response, and the
-    ///   decode-health think tracking (`inside_think_block`) observes it. Forcing it
-    ///   into the prefill instead buries the tag where no consumer — renderer or
-    ///   health check — can see it. |
-    /// | `false` | *any*   | none — non-thinking model, plain header. |
-    pub fn active_assistant_start(
-        &self,
-        suppress_thinking: bool,
-        thinking_capable: bool,
-    ) -> String {
-        if thinking_capable && suppress_thinking && !self.no_think_block.is_empty() {
-            format!("{}{}", self.assistant_start, self.no_think_block)
-        } else {
-            self.assistant_start.to_string()
-        }
     }
 }
 

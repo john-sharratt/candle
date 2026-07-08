@@ -66,6 +66,8 @@
   .zmd .tool-call-badge.ok { color: #8fce9b; background: rgba(110,179,154,.12); }
   .zmd .tool-call-badge.err { color: #d99a8f; background: rgba(200,90,80,.13); }
   .zmd .tool-call-badge.pend { color: #8a8074; background: rgba(120,114,108,.12); }
+  .zmd .tool-call-badge.run { color: #c9a86a; background: rgba(201,168,106,.13); }
+  .zmd .tool-call-spin { display: inline-block; width: .62em; height: .62em; margin-right: .32em; vertical-align: -.04em; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: zspin .7s linear infinite; }
   .zmd .tool-call-out { padding: .35rem .75rem .55rem; border-top: 1px solid #2e2b27; }
   .zmd .tool-call-out-label { font-size: .68rem; color: #9a9490; margin-bottom: .25rem; text-transform: uppercase; letter-spacing: .04em; }
   .zmd .tool-call-out-body { margin: 0; padding: .4rem .55rem; background: #1a1816; border: 1px solid #2e2b27; border-radius: 5px; color: #c7bdb0; font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 18rem; overflow: auto; }
@@ -399,6 +401,10 @@
   // Pull the inner payload out of a `<tool_response>…</tool_response>` turn and
   // classify it (an `error`/`detail` key ⇒ the call failed).
   function toolResponseInfo(content) {
+    // Hydrated turns supply `<tool_response>…</tool_response>` text; live `tool`
+    // done events stash the raw response object. Normalize to a string first —
+    // calling `.trim()` on an object throws and would freeze the live render.
+    if (content != null && typeof content !== 'string') content = JSON.stringify(content);
     const m = /<tool_response>([\s\S]*?)<\/tool_response>/.exec(content || '');
     const raw = (m ? m[1] : (content || '')).trim();
     let obj = null; try { obj = JSON.parse(raw); } catch (_) {}
@@ -408,7 +414,7 @@
   // An expandable tool-call block: header (name + result badge), then the call
   // parameters and — when the matching `<tool_response>` is paired in — the tool
   // output. Defaults open while still streaming or when there's a result to read.
-  function toolCard(json, complete, output) {
+  function toolCard(json, complete, output, running) {
     if (!complete) return '<div class="tool-call-card pending"><div class="tool-call-header"><span class="tool-call-icon">⚙</span><span class="tool-call-name">Calling tool…</span></div></div>';
     let parsed;
     try { parsed = JSON.parse(json.trim()); } catch (e) { parsed = null; }
@@ -417,10 +423,18 @@
     const argsHtml = Object.entries(args).map(([k, v]) =>
       '<div class="tool-call-arg"><span class="tool-call-arg-key">' + esc(k) + '</span><span class="tool-call-arg-sep">:</span><span class="tool-call-arg-val">' + esc(typeof v === 'string' ? v : JSON.stringify(v)) + '</span></div>'
     ).join('');
-    const resp = output != null ? toolResponseInfo(output) : null;
-    const badge = resp
-      ? '<span class="tool-call-badge ' + (resp.isError ? 'err' : 'ok') + '">' + (resp.isError ? 'error' : 'result') + '</span>'
-      : '<span class="tool-call-badge pend">no result</span>';
+    // The running state takes precedence over any stashed output: while a `tool`
+    // running event still names this call, show the spinner — never a "result"
+    // badge — even if a result for an earlier same-named call is present. The
+    // result is shown only once the call is no longer running (its `done` event
+    // cleared it from `running`).
+    const isRunning = running && running.indexOf(name) !== -1;
+    const resp = !isRunning && output != null ? toolResponseInfo(output) : null;
+    const badge = isRunning
+      ? '<span class="tool-call-badge run"><span class="tool-call-spin"></span>running…</span>'
+      : resp
+        ? '<span class="tool-call-badge ' + (resp.isError ? 'err' : 'ok') + '">' + (resp.isError ? 'error' : 'result') + '</span>'
+        : '<span class="tool-call-badge pend">no result</span>';
     const outHtml = resp
       ? '<div class="tool-call-out' + (resp.isError ? ' err' : '') + '"><div class="tool-call-out-label">' + (resp.isError ? 'Error' : 'Output') + '</div><pre class="tool-call-out-body">' + esc(resp.raw) + '</pre></div>'
       : '';
@@ -434,7 +448,10 @@
     const label = (seg.complete ? 'Thought process' : 'Thinking…') + ' · ' + words + (words === 1 ? ' word' : ' words');
     const labelCls = seg.complete ? '' : ' think-pulse';
     const body = renderMd((seg.body || '').trim());
-    return '<details class="think-block"' + (open ? ' open' : '') + '>' +
+    // Carry the think's raw char range so applyProjSegments can split its bar
+    // proportionally when several projections fired inside it (completed only).
+    const range = (seg.complete && seg.c0 != null) ? ' data-c0="' + seg.c0 + '" data-c1="' + seg.c1 + '"' : '';
+    return '<details class="think-block"' + range + (open ? ' open' : '') + '>' +
       '<summary class="think-summary">' +
       '<svg class="think-brain" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">' +
       '<path d="M12.4 18.4C12.5 19.8 12.2 21 12.6 22L13.8 22C14 21 13.8 19.6 14 18.4 15.1 18.8 16.4 18.6 17 17.6 18.4 17.6 19.4 16.3 19.2 14.9 20.3 14.4 20.6 13 19.8 12.1 20.5 11.2 20.4 9.8 19.3 9.4 19.3 7.9 18 6.8 16.5 7 16 5.9 14.6 5.4 13.4 5.9 12.7 5 11.3 5 10.5 5.7 9.6 5.1 8.2 5.4 7.8 6.6 6.4 6.6 5.3 7.8 5.6 9.1 4.5 9.4 4 10.7 4.7 11.7 4 12.5 4.1 13.9 5.1 14.4 5 15.7 5.7 17 7 17.3 7.6 18.5 9.1 19 10.4 18.6 11 18.5 11.8 18.4 12.4 18.4Z" fill="#f3d2bd" stroke="#3f2c25" stroke-width="0.9"/>' +
@@ -444,10 +461,13 @@
       '<svg class="think-chevron" viewBox="0 0 10 10" fill="none"><path d="M3 1l4 4-4 4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
       '</summary><div class="think-body">' + body + '</div></details>';
   }
-  function renderContent(text, streaming, open, toolOutputs) {
+  function renderContent(text, streaming, open, toolOutputs, running) {
     const segs = [];
     let rem = text;
-    rem = rem.replace(/<think>([\s\S]*?)<\/think>/g, (m, body) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: true, body }); return mk; });
+    // `offset` is this `<think>…</think>`'s exact char range in the raw text
+    // (the regex runs first, on the original `text`), so a completed think can
+    // map projection char-offsets onto its own span for proportional sub-bars.
+    rem = rem.replace(/<think>([\s\S]*?)<\/think>/g, (m, body, offset) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'think', complete: true, body, c0: offset, c1: offset + m.length }); return mk; });
     rem = rem.replace(/<tool_call>([\s\S]*?)<\/tool_call>/g, (m, json) => { const mk = ' SEG:' + segs.length + ' '; segs.push({ kind: 'tool', complete: true, json }); return mk; });
     let openIdx = rem.lastIndexOf('<think>');
     if (openIdx !== -1) {
@@ -472,7 +492,7 @@
       else {
         const s = segs[parseInt(parts[i], 10)];
         if (s.kind === 'think') { html += renderThink(s, open); }
-        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null); toolIdx++; }
+        else { html += toolCard(s.json, s.complete, toolOutputs ? toolOutputs[toolIdx] : null, running); toolIdx++; }
       }
     }
     return html;
@@ -484,7 +504,10 @@
       const status = msg.status ? '<span class="zstatus">' + esc(msg.status) + '</span>' : '';
       return '<span class="zdots"><i></i><i></i><i></i>' + status + '</span>';
     }
-    let html = renderContent(msg.content, !!msg.streaming, open, toolOutputs);
+    // During streaming `toolOutputs` isn't passed, so fall back to the results
+    // stashed on the message by `tool` done events; `runningTools` drives the
+    // in-flight spinners.  Both are discarded when the stream hydrates.
+    let html = renderContent(msg.content, !!msg.streaming, open, toolOutputs || msg.toolOutputs, msg.runningTools);
     if (msg.streaming) html += '<span class="zcursor"></span>';
     return html;
   }
@@ -625,15 +648,17 @@
       for (let i = history.length - 1; i >= 0; i--) {
         if (history[i].role === 'assistant') {
           const m = Object.assign({}, history[i]);
-          // Freeze the content-block COUNT at this projection's boundary —
-          // computed by rendering the current content into a DETACHED node, so
-          // it's layout-free and scroll-independent (the old offsetHeight read
-          // was neither, which is why it was unreliable). The bar later wraps
-          // exactly the blocks [previous._blockEnd, this._blockEnd), pinning it
-          // to in-flow content at both ends.
+          // Freeze the content-block COUNT at this projection's boundary,
+          // computed by rendering the current content into a DETACHED node so
+          // it's layout-free. The bar wraps whole blocks [prev._blockEnd,
+          // this._blockEnd) — coarse but stable.
           const tmp = document.createElement('div');
           tmp.innerHTML = renderContent(m.content || '', true, false);
           span._blockEnd = tmp.children.length;
+          // Also freeze the raw char offset, so a COMPLETED block that several
+          // projections fired inside (a finished think block) can split its bar
+          // into proportional sub-bars by char fraction (see applyProjSegments).
+          span._charEnd = (m.content || '').length;
           m.spans = (m.spans || []).concat([span]);
           history[i] = m; break;
         }
@@ -650,6 +675,17 @@
       onStatus: (s) => patchStream(convId, (m) => { m.status = s; }),
       onToken: (delta) => { patchStream(convId, (m) => { m.content += delta; m.status = ''; }); },
       onProjection: (span) => appendProjection(convId, span),
+      // Tool lifecycle: `running` names the in-flight tools (drives the card
+      // spinners); `done` stashes their results so the cards resolve at once,
+      // and clears the spinners. Both are superseded by the post-stream hydrate.
+      onTool: (st) => patchStream(convId, (m) => {
+        if (st && st.phase === 'running') {
+          m.runningTools = st.tools || [];
+        } else {
+          m.toolOutputs = (m.toolOutputs || []).concat((st && st.results) || []);
+          m.runningTools = [];
+        }
+      }),
       onLog: () => addLog(API.nextLogLine()),
       onDone: () => {
         patchStream(convId, (m) => { m.streaming = false; });
@@ -958,8 +994,11 @@
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
         const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtml(m, open, toolOut[idx]) });
-        // Wrap the content blocks into per-projection segments, each carrying an
-        // in-flow colored bar — pinned to the text at both ends, reflows with it.
+        // Draw the projection bars by measuring the inline anchors — deferred to
+        // the next frame because `zmd` isn't in the document yet (the scroller is
+        // attached by the caller after buildChat returns), and getBoundingClientRect
+        // needs it laid out. The live-stream path measures an already-attached
+        // node, so it calls applyProjSegments synchronously.
         if (!S.narrow) applyProjSegments(zmd, m);
         scroller.appendChild(h('div', { 'data-msg': idx, style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd));
       }
@@ -975,60 +1014,127 @@
 
   // Wrap each projection's run of content blocks in an IN-FLOW segment carrying
   // a thin colored bar. The bar is an absolutely-positioned child of the wrapper
-  // (top:0 → bottom:0), so it spans exactly from the start of the projection's
-  // first block to the end of its last — both ends pinned to in-flow text. It
-  // therefore reflows with the content on every render, resize, and
-  // think-toggle, with NO measurement and nothing that can drift.
+  // (top:0 -> bottom:0), so it spans from the start of the projection's first
+  // block to the end of its last, both ends pinned to in-flow text. It reflows
+  // with the content on every render, resize and think-toggle, with NO
+  // measurement and nothing that can drift.
   //
   // Block membership is frozen per projection: `_blockEnd` is the content-block
   // count captured (layout-free) the instant each projection fired (see
   // appendProjection). Projection i owns blocks [prev._blockEnd, this._blockEnd);
-  // blocks past the last boundary are the not-yet-projected tail (kept aligned
-  // via the same left pad, just no bar). Reloaded conversations have no
-  // `_blockEnd`, so boundaries fall back to a token-fraction of the block count
-  // (stable there, since reloaded content is static).
+  // blocks past the last boundary are the not-yet-projected tail (no bar).
+  // Reloaded conversations have no `_blockEnd`, so boundaries fall back to a
+  // token-fraction of the block count (stable, since reloaded content is static).
+  //
+  // Sub-block refinement: a COMPLETED think block that several projections fired
+  // inside splits its single bar into stacked %-height sub-bars by char fraction
+  // (`_charEnd` vs the think's own data-c0/c1 range). The percentages are CSS,
+  // not measured pixels, so they reflow with the block on resize/think-toggle and
+  // never drift — and only completed blocks split, so the live bar never shrinks.
   function applyProjSegments(zmd, m) {
-    const spans = (m.spans || []).slice().sort((a, b) => (a.end_token || 0) - (b.end_token || 0));
+    const spans = (m.spans || []).slice().sort((a, b) => (a.start_token || 0) - (b.start_token || 0));
     if (!spans.length) return;
     const isCursor = (el) => el.classList && el.classList.contains('zcursor');
     const all = Array.from(zmd.children);
     const cursor = all.find(isCursor);
     const blocks = all.filter((el) => !isCursor(el));
     if (!blocks.length) return;
-    const maxTok = Math.max(1, ...spans.map((s) => s.end_token || 0));
-    const boundary = (s) => s._blockEnd != null ? s._blockEnd : Math.round((s.end_token || 0) / maxTok * blocks.length);
-    const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(spans[i]) > bi) return i; } return -1; };
+    // Projections are POINTS at `start_token`; projection i governs `[start_i,
+    // start_{i+1})`. Its bar therefore ends at the NEXT projection's position (the
+    // last runs to the end). `maxTok` approximates the turn's total by the last
+    // projection's position, so the tail past it maps coarsely.
+    const maxTok = Math.max(1, ...spans.map((s) => s.start_token || 0));
+    const boundTok = (i) => (i + 1 < spans.length ? (spans[i + 1].start_token || 0) : maxTok);
+    const boundary = (i) => spans[i]._blockEnd != null ? spans[i]._blockEnd : Math.round(boundTok(i) / maxTok * blocks.length);
+    const projOf = (bi) => { for (let i = 0; i < spans.length; i++) { if (boundary(i) > bi) return i; } return -1; };
+    // Points → intervals: stash each projection's governed length + throughput on
+    // the span so the hover popover and panel header (which see one span at a time)
+    // can show t/s. `seconds` is elapsed-since-decode-start; the delta to the next
+    // event's `seconds` times the token delta gives the interval's t/s.
+    spans.forEach((s, i) => {
+      const nextSec = (i + 1 < spans.length) ? (spans[i + 1].seconds || 0) : (s.seconds || 0);
+      s._gen = Math.max(0, boundTok(i) - (s.start_token || 0));
+      s._secs = Math.max(0, nextSec - (s.seconds || 0));
+      s._tps = s._secs > 0 ? s._gen / s._secs : 0;
+    });
+
+    // A COMPLETED think block carries its raw char range (data-c0/c1). If two or
+    // more projections fired inside it, return one sub-bar per overlapping
+    // projection sized by char fraction; else null — the block keeps a single
+    // whole-block bar. Needs `_charEnd` (live decode); reloaded turns lack it, so
+    // they stay coarse. Incomplete (still-decoding) thinks have no range, so they
+    // never split — that's what keeps the active bar from shrinking.
+    const clen = Math.max(1, (m.content || '').length);
+    const subBars = (el) => {
+      if (!(el.dataset && el.dataset.c0 != null)) return null;
+      const c0 = +el.dataset.c0, c1 = +el.dataset.c1, total = Math.max(1, c1 - c0);
+      const out = [];
+      let prev = 0;
+      for (let i = 0; i < spans.length; i++) {
+        // Exact char offset frozen at decode (`_charEnd`), or — for hydrated
+        // turns — a projection-governed offset: the next point's `start_token`
+        // (`boundTok`) mapped proportionally into the char range.
+        // The content is static post-hydrate, so this is stable (no shrink).
+        const ce = spans[i]._charEnd != null
+          ? spans[i]._charEnd
+          : Math.round((boundTok(i) / maxTok) * clen);
+        const lo = Math.max(c0, prev), hi = Math.min(c1, ce);
+        prev = ce;
+        if (hi > lo) out.push({ i: i, pct: (hi - lo) / total * 100 });
+      }
+      return out.length > 1 ? out : null;
+    };
+    const barFor = (sp, idx) => h('div', {
+      onMouseEnter: (e) => { e.currentTarget.style.filter = 'brightness(1.4)'; showProjPopover(sp, e.currentTarget); },
+      onMouseLeave: (e) => { e.currentTarget.style.filter = 'none'; hideProjPopover(); },
+      onClick: () => { hideProjPopover(); openSubstrate(sp, m); },
+      style: 'position:absolute; left:0; width:5px; border-radius:3px; background:' + projBarColor(idx) + '; cursor:pointer; transition:filter .12s;',
+    });
+
     const frag = document.createDocumentFragment();
     const segs = [];
     let gi = 0;
     while (gi < blocks.length) {
+      // A splittable completed think gets its own segment with stacked %-height
+      // sub-bars — CSS-relative, so they reflow on resize/think-toggle with no
+      // measurement and don't drift.
+      const split = subBars(blocks[gi]);
+      if (split) {
+        const seg = h('div', { style: 'position:relative; padding-left:1.15rem;' });
+        let cum = 0;
+        split.forEach((part) => {
+          const bar = barFor(spans[part.i], part.i);
+          bar.style.top = 'calc(' + cum + '% + 1px)';
+          bar.style.height = 'calc(' + part.pct + '% - 2px)';
+          seg.appendChild(bar);
+          cum += part.pct;
+        });
+        seg.appendChild(blocks[gi]);
+        blocks[gi].style.marginBottom = '0';
+        segs.push(seg);
+        frag.appendChild(seg);
+        gi += 1;
+        continue;
+      }
+      // Otherwise a run of consecutive same-owner blocks shares one whole-run bar
+      // (top→bottom). The run stops at a splittable think so it gets its own seg.
       const a = projOf(gi);
       let gj = gi;
-      while (gj < blocks.length && projOf(gj) === a) gj++;
-      // Same left pad whether or not this run has a bar, so content never shifts
-      // horizontally when the not-yet-projected tail later gains a bar.
+      while (gj < blocks.length && projOf(gj) === a && !subBars(blocks[gj])) gj++;
       const seg = h('div', { style: 'position:relative; padding-left:1.15rem;' });
       if (a >= 0) {
-        const sp = spans[a];
-        seg.appendChild(h('div', {
-          onMouseEnter: (e) => { e.currentTarget.style.filter = 'brightness(1.4)'; showProjPopover(sp, e.currentTarget); },
-          onMouseLeave: (e) => { e.currentTarget.style.filter = 'none'; hideProjPopover(); },
-          onClick: () => { hideProjPopover(); openSubstrate(sp, m); },
-          style: 'position:absolute; left:0; top:1px; bottom:1px; width:5px; border-radius:3px; background:' + projBarColor(a) + '; cursor:pointer; transition:filter .12s;',
-        }));
+        const bar = barFor(spans[a], a);
+        bar.style.top = '1px';
+        bar.style.bottom = '1px';
+        seg.appendChild(bar);
       }
       for (let k = gi; k < gj; k++) seg.appendChild(blocks[k]);
-      // Zero this span's last block so its in-paragraph margin doesn't collapse
-      // through the seg and dictate the inter-span gap — the gap is set on the
-      // seg itself below. Within-span paragraph gaps (non-last blocks) are
-      // untouched. The final span gets no gap, so the bubble keeps a clean bottom.
       blocks[gj - 1].style.marginBottom = '0';
       segs.push(seg);
       frag.appendChild(seg);
       gi = gj;
     }
-    // Inter-span gap: ~30% tighter than the in-paragraph gap (.85rem → .6rem).
-    for (let s = 0; s < segs.length - 1; s++) segs[s].style.marginBottom = '0.6rem';
+    for (let si = 0; si < segs.length - 1; si++) segs[si].style.marginBottom = '0.6rem';
     if (cursor) frag.appendChild(cursor);
     zmd.innerHTML = '';
     zmd.appendChild(frag);
@@ -1226,9 +1332,10 @@
     const mat = sp.materialized_tokens || buckets.reduce((a, b) => a + (b.tokens || 0), 0) || 1;
     const sub = Math.max(sp.substrate_tokens || 0, mat);
     const colorFor = (i) => PROJ_PALETTE[i % PROJ_PALETTE.length];
-    const gen = Math.max(0, (sp.end_token || 0) - (sp.start_token || 0));
-    const secs = sp.seconds || 0;
-    const tps = sp.tokens_per_second || (secs > 0 ? gen / secs : 0);
+    // `_gen`/`_secs`/`_tps` are derived from the point-event sequence in `applyProjSegments`.
+    const gen = sp._gen || 0;
+    const secs = sp._secs || 0;
+    const tps = sp._tps || 0;
 
     // Stacked bar map: one segment per category, width ∝ tokens. System (first
     // bucket) leftmost, then section groups, then turns — the order the engine
@@ -1290,7 +1397,8 @@
   // The full materialized context as plain text, reconstructed by CONCATENATING
   // each piece's authored bytes in materialized order — glue markers, section
   // content, turn framing, decoded tail. No trimming and no inserted separators:
-  // the dialect markers and section content already carry their own newlines, so
+  // every separator is itself a materialized piece (dialect markers, and the
+  // collection `member_glue` rows the engine emits BETWEEN selected members), so
   // splicing anything in (or stripping anything off) would corrupt the spacing.
   // Backs the projection panel's "Copy all".
   function substrateAllText(node) {
@@ -1304,41 +1412,58 @@
       else if (item.kind === 'collection') item.sections.forEach((s) => { if (s.selected) add(C[s.name]); });
       else add(C[item.name]);
     });
-    // Memory-tier turns (non-dialogue layers) sit between the system prompt and
-    // the dialogue conversation; each is framed as full ChatML (user half, then
-    // assistant half), bodies read from the substrate (turnContent).
     const TC = S.substrateTurnContent || {};
-    (sel.turns || []).filter((t) => t.layer && t.layer !== 'dialogue').forEach((t) => {
-      const tc = TC[t.group + '::' + t.index] || {};
-      add(G && G.user_start); add(tc.user);
-      // Prefilled memory turns always carry the empty (suppressed) think header.
-      add(G && G.user_end); add(G && G.assistant_start); add(G && G.no_think_block); add(tc.assistant);
-      add(G && G.assistant_end);
-    });
-    // The conversation, from the REAL messages: prior exchanges, the active user
-    // prompt, then the response decoded up to THIS dot's `end_token` (token
-    // fraction). Each message is framed by its own role markers; the trailing
-    // assistant is left open while still decoding.
-    const hist = S.substrateHistory || [];
-    const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
-    const maxEnd = Math.max(1, ...ends);
-    const here = node && node.end_token != null ? node.end_token : maxEnd;
+    const positions = ((dm && dm.spans) || []).map((s) => s.start_token || 0);
+    const maxEnd = Math.max(1, ...positions);
+    const here = node && node.start_token != null ? node.start_token : maxEnd;
     const complete = here >= maxEnd;
-    // Only a suppressed dialogue turn (effort Off) carries a forced think header;
-    // a thinking turn's `<think>` is a decoded token in the body, not glue.
-    const dialogueThink = (G && S.effortLevel === 0) ? G.no_think_block : '';
-    const msg = (role, content, open) => {
+    const noThink = !!(G && G.no_think && S.effortLevel === 0);
+    const msg = (role, content, open, withNoThink, isSummary) => {
       const isUser = role === 'user';
-      add(isUser ? (G && G.user_start) : (G && G.assistant_start));
-      if (!isUser) add(dialogueThink);
+      // Full framing (live turn / fallback): every turn opens `user_start` (a
+      // summary has no user half but is still `user_start`-framed) and closes
+      // `assistant_end`; intra markers are baked into the body.
+      add(isUser || isSummary ? (G && G.user_start) : (G && G.assistant_start));
+      if (isUser && withNoThink) add(G.no_think);
       add(content);
-      if (!open) add(isUser ? (G && G.user_end) : (G && G.assistant_end));
+      if (!open) add(isSummary ? (G && G.assistant_end) : isUser ? (G && G.user_end) : (G && G.assistant_end));
     };
-    hist.forEach((m) => msg(m.role, m.content));
-    if (um) msg('user', um.content);
-    if (dm && dm.role === 'assistant' && (dm.content || '').length) {
-      const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
-      msg('assistant', dm.content.slice(0, cut), !complete);
+    // The WHOLE turn as one continuous string (full sealed token range, with the
+    // intra-turn boundary baked in) — never split-and-re-glued. Inter-turn glue
+    // comes from the spine. Falls back to the old halves only if `text` is absent.
+    const turnInner = (t) => {
+      const tc = TC[t.group + '::' + t.index] || {};
+      if (tc.text != null) { add(tc.text); return; }
+      if (t.kind && t.kind !== 'normal') { add(tc.assistant || tc.user || ''); return; }
+      add(tc.user); add(G && G.user_end); add(G && G.assistant_start); add(tc.assistant);
+    };
+    const materialized = (node && node.materialized) || [];
+    if (materialized.length) {
+      // Truth: the copied text is the engine's injected spine verbatim — real
+      // glue islands (which carry user_start / no_think / assistant_end) plus the
+      // sealed turn bodies, in materialized order.
+      materialized.forEach((p) => { if (p.kind === 'glue') add(p.text); else if (p.turn) turnInner(p.turn); });
+    } else {
+      // Pre-spine fallback: reconstruct the inter-turn glue around each
+      // continuous full-turn body.
+      const reglued = (t) => { add(G && G.user_start); turnInner(t); add(G && G.assistant_end); };
+      (sel.turns || []).filter((t) => t.layer && t.layer !== 'dialogue').forEach(reglued);
+      (sel.turns || []).filter((t) => (t.layer || 'dialogue') === 'dialogue' && t.index !== 4294967295).forEach(reglued);
+    }
+    // The live, in-flight turn as one continuous run: user_start (+ /no_think),
+    // the user message, the baked role boundary, the assistant decoded-so-far,
+    // and assistant_end once complete — matching the panel's single live card.
+    if (um || dm) {
+      add(G && G.user_start);
+      if (noThink) add(G && G.no_think);
+      add(um ? um.content : '');
+      add(G && G.user_end);
+      add(G && G.assistant_start);
+      if (dm && dm.role === 'assistant' && (dm.content || '').length) {
+        const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
+        add(dm.content.slice(0, cut));
+      }
+      if (complete) add(G && G.assistant_end);
     }
     return out;
   }
@@ -1396,59 +1521,192 @@
     // A glue row — structural template markers (system/tool block envelopes)
     // and the per-turn dialect framing — shown verbatim in materialized order.
     const G = S.substrateGlue;
-    const glueRow = (text) => h('div', { style: 'padding:3px 13px 3px 15px; font-size:10.5px; font-family:ui-monospace,monospace; color:#7d7468; letter-spacing:0.02em; white-space:pre-wrap; word-break:break-word;' },
-      h('span', { style: 'color:#9a8f80; margin-right:6px;' }, '⟐'), (text || '').replace(/\n+$/, ''));
+    // Whitespace-only glue (e.g. the newline BETWEEN selected tools) would render
+    // as a blank row; name it instead so the panel reads "newline" rather than
+    // showing nothing. Visible markers stay verbatim (trailing newlines trimmed
+    // for layout).
+    const wsGlueLabel = (s) => {
+      if (/^\n+$/.test(s)) return s.length === 1 ? 'newline' : s.length + ' newlines';
+      if (/^\t+$/.test(s)) return s.length === 1 ? 'tab' : s.length + ' tabs';
+      if (/^ +$/.test(s)) return s.length === 1 ? 'space' : s.length + ' spaces';
+      return s.replace(/\t/g, '\\t').replace(/\n/g, '\\n'); // mixed whitespace → escapes
+    };
+    const glueRow = (text) => {
+      const raw = text || '';
+      const trimmed = raw.replace(/\n+$/, '');
+      const wsOnly = raw !== '' && trimmed.trim() === '';
+      const body = wsOnly
+        ? h('span', { style: 'opacity:0.6; font-style:italic;' }, wsGlueLabel(raw))
+        : trimmed;
+      return h('div', { style: 'padding:3px 13px 3px 15px; font-size:10.5px; font-family:ui-monospace,monospace; color:#7d7468; letter-spacing:0.02em; white-space:pre-wrap; word-break:break-word;' },
+        h('span', { style: 'color:#9a8f80; margin-right:6px;' }, '⟐'), body);
+    };
 
     // System prompt in materialized order: the engine's structural glue rows
-    // (always visible — incl. the markers that CLOSE the tool block and system
-    // block) interleaved with collapsible content sections and the contributing
-    // collection. This mirrors exactly what the projection emitted.
+    // (incl. the markers that CLOSE the tool block and system block) interleaved
+    // with collapsible content sections and the contributing collection — exactly
+    // what the projection emitted. The whole thing is nested in ONE collapsible
+    // card, COLLAPSED by default, so the panel opens focused on the conversation;
+    // expand it to inspect the full system framing.
+    const systemRows = [];
+    let sysTokens = 0, sysSel = 0, sysTotal = 0;
     sel.system.forEach((item) => {
       if (item.kind === 'glue') {
-        body.appendChild(glueRow(item.content));
+        sysTokens += item.tokens || 0;
+        systemRows.push(glueRow(item.content));
       } else if (item.kind === 'collection') {
         const picked = item.sections.filter((s) => s.selected).length;
+        sysSel += picked; sysTotal += item.sections.length;
+        item.sections.forEach((s) => { sysTokens += s.tokens || 0; });
         const gkey = 'col::' + item.name;
-        body.appendChild(group(item.name, picked + ' / ' + item.sections.length + ' selected', '#6f9ed8', gkey, item.sections.map((s) => sectionRow(s, gkey))));
+        systemRows.push(group(item.name, picked + ' / ' + item.sections.length + ' selected', '#6f9ed8', gkey, item.sections.map((s) => sectionRow(s, gkey))));
       } else {
-        body.appendChild(sectionRow({ name: item.name, tokens: item.tokens, selected: true }, 'sys'));
+        sysTokens += item.tokens || 0; sysSel++; sysTotal++;
+        systemRows.push(sectionRow({ name: item.name, tokens: item.tokens, selected: true }, 'sys'));
       }
     });
+    if (systemRows.length) {
+      const secSub = sysTotal ? sysSel + '/' + sysTotal + ' sections' : 'framing';
+      const sysSub = secSub + (sysTokens ? ' · ' + fmtTok(sysTokens) + ' tok' : '');
+      body.appendChild(group('system prompt', sysSub, '#6f9ed8', 'system', systemRows));
+    }
 
     // Verbatim body text in a pre-wrap block (preserves every space/newline).
     const bodyPre = (txt) => h('pre', { style: 'margin:0; padding:8px 13px 11px 13px; font-size:11px; line-height:1.5; color:#cdc6bd; background:#141210; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; border-top:1px solid #2e2b27;' }, txt);
+
+    // Colorized turn body: a turn is one continuous string (user content, the
+    // baked role boundary `user_end`/`assistant_start`, then assistant content).
+    // Split on the dialect markers and tint each part — user purple, assistant
+    // green, the boundary markers gray — so the roles are legible at a glance.
+    const turnBody = (txt) => {
+      let t = txt || '';
+      const us = (G && G.user_start) || '', nt = (G && G.no_think) || '';
+      const ue = (G && G.user_end) || '', as = (G && G.assistant_start) || '';
+      // Peel a leading turn-opener glue (user_start, optional /no_think) so it
+      // colors gray as glue, not purple as user content.
+      let lead = '';
+      if (us && t.startsWith(us)) { lead = us; t = t.slice(us.length); if (nt && t.startsWith(nt)) { lead += nt; t = t.slice(nt.length); } }
+      let userPart = '', boundary = '', asstPart = t;
+      const i = ue ? t.indexOf(ue) : -1;
+      if (i !== -1) {
+        userPart = t.slice(0, i);
+        let bEnd = i + ue.length;
+        const k = as ? t.indexOf(as, i) : -1;
+        if (k !== -1) bEnd = k + as.length;
+        boundary = t.slice(i, bEnd);
+        asstPart = t.slice(bEnd);
+      }
+      const span = (s, color) => s ? h('span', { style: 'color:' + color + ';' }, s) : null;
+      return h('pre', { style: 'margin:0; padding:8px 13px 11px 13px; font-size:11px; line-height:1.5; background:#141210; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace; border-top:1px solid #2e2b27;' },
+        span(lead, '#6a6258'), span(userPart, '#a99cd6'), span(boundary, '#6a6258'), span(asstPart, '#7fc6a4'));
+    };
+
+    // Render an expanded turn body from its segment-vector LAYOUT (the engine's
+    // complete K/V description): each segment colored by role — user purple,
+    // assistant green, thinking amber, glue gray — and ETHEREAL segments (glue /
+    // thinking with no K/V: the spine-materialized prefix/suffix, a dropped
+    // reasoning block) dimmed + italic so "recorded but not in this turn's K/V"
+    // is visible at a glance.
+    const segMarker = (m) => ({
+      system_start: G && G.system_start, user_start: G && G.user_start,
+      assistant_start: G && G.assistant_start, im_end: G && (G.user_end || G.assistant_end),
+      no_think: G && G.no_think,
+    }[m] || ('<' + m + '>'));
+    // The turn's segment vector, rendered the SAME way the system prompt is:
+    // boundary glue as flat `⟐` rows (so it reads identically to the system
+    // framing) interleaved with the content blocks — user (purple), thinking
+    // (amber), assistant (green). Ethereal segments (glue/thinking with no K/V:
+    // the spine-materialized opener/closer, a dropped reasoning block) dim +
+    // italicize so "recorded but not in this turn's K/V" reads at a glance.
+    const segmentBody = (layout) => {
+      const segs = (layout && layout.segments) || [];
+      const wrap = h('div', { style: 'background:#141210; border-top:1px solid #2e2b27; padding:5px 0 7px 0;' });
+      segs.forEach((s) => {
+        const ethereal = s.kv == null;
+        if (s.kind === 'glue') {
+          const r = glueRow(segMarker(s.marker));
+          // Ethereal glue (the turn's opener/closer, materialized by the spine)
+          // stays legible — italic marks it as "not in this turn's own grid"
+          // without washing the text out.
+          if (ethereal) { r.style.opacity = '0.78'; r.style.fontStyle = 'italic'; }
+          wrap.appendChild(r);
+          return;
+        }
+        const color = s.kind === 'user' ? '#a99cd6' : s.kind === 'thinking' ? '#c9a14a' : '#7fc6a4';
+        const text = s.text != null ? s.text : (s.kind === 'assistant' ? '∅' : '');
+        wrap.appendChild(h('pre', { style: 'margin:0; padding:4px 13px 5px 26px; font-size:11px; line-height:1.5; color:' + color + '; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,monospace;' + (ethereal ? ' opacity:0.45; font-style:italic;' : '') }, text));
+      });
+      return wrap;
+    };
 
     // One ChatML message as a collapsible card — shared by BOTH the memory tiers
     // and the dialogue so they look identical. Header: "<layer> · <role> message"
     // + token estimate, role-accented left border, clean body. The role markers
     // are flat glue rows OUTSIDE the card; the closer is omitted while
     // `opts.open` (a still-decoding assistant).
+    // Per-card badges: FOREST KIND (a `SoT`/`SoS` summary node standing in for
+    // the turns beneath it) and WHY the projection picked it (provenance /
+    // coverage / recency / anchor, or recent / historical on the rule-based
+    // path). Both render inline on the card header so the materialized view
+    // shows, in place, when a slot holds a summary instead of the raw turn.
+    const tagBadge = (txt, fg, bg) => h('span', { style: 'font-size:8.5px; font-weight:700; letter-spacing:0.04em; padding:1px 6px; border-radius:4px; white-space:nowrap; flex-shrink:0; color:' + fg + '; background:' + bg + ';' }, txt);
+    const REASON_NAME = { hard_anchor: 'anchor', provenance_score: 'provenance', recency_decay: 'recency', coverage_fill: 'coverage', refill: 'refill', pending: 'pending', recent: 'recent', historical: 'historical' };
+    const kindBadge = (k) => k === 'summary_of_summaries' ? tagBadge('SUMMARY · SoS', '#e8893c', 'rgba(232,137,60,0.18)')
+      : k === 'summary_of_turns' ? tagBadge('SUMMARY · SoT', '#d8a23a', 'rgba(216,162,58,0.18)') : null;
+    const reasonBadge = (r) => r ? tagBadge('why: ' + (REASON_NAME[r] || r), '#a99cd6', 'rgba(169,156,214,0.15)') : null;
+
     const pushMsg = (role, content, opts) => {
       opts = opts || {};
       const isUser = role === 'user';
-      const accent = isUser ? '#9b8fdf' : '#6cb39a';
+      const isSummary = opts.kind && opts.kind !== 'normal';
+      const accent = isSummary ? '#d8a23a' : isUser ? '#9b8fdf' : '#6cb39a';
       const exp = !!S.substrateExpanded[opts.key];
-      if (G) body.appendChild(glueRow(isUser ? G.user_start : G.assistant_start));
-      // The reasoning header baked after assistant_start — open <think> when the
-      // turn reasons, empty <think></think> when suppressed. Shown verbatim so
-      // the think framing is visible, not hidden inside the turn.
-      if (!isUser && opts.thinkBlock) body.appendChild(glueRow(opts.thinkBlock));
-      const tok = fmtTok(Math.max(1, Math.round((content || '').length / 4)));
+      // INTER-turn markers (user_start / no_think / assistant_end) are the real
+      // boundary glue the assembler injects; when `spineGlue` is set they come
+      // from the materialized spine (real Glue pieces) and are suppressed here.
+      // INTRA-turn markers (user_end before the assistant half, assistant_start
+      // opening it) are baked into the turn body and always shown in place. A
+      // summary has no user half, so it is `user_start … assistant_end`-framed.
+      // `noGlue`: the whole turn is one continuous card — inter-turn glue comes
+      // from the materialized spine, intra-turn markers are baked into the body —
+      // so the card emits NO glue rows itself.
+      const spine = !!opts.spineGlue;
+      const noGlue = !!opts.noGlue;
+      if (G && !noGlue) {
+        const openInter = isUser || isSummary; // user_start (inter) vs assistant_start (intra)
+        if (!(spine && openInter)) body.appendChild(glueRow(openInter ? G.user_start : G.assistant_start));
+      }
+      // `/no_think` glue after `user_start` (inter): prior turns pass their
+      // recorded flag, the in-flight turn passes the live effort dial.
+      if (isUser && opts.noThink && !spine && !noGlue && G && G.no_think) body.appendChild(glueRow(G.no_think));
+      const tok = opts.tokens != null ? fmtTok(opts.tokens) : fmtTok(Math.max(1, Math.round((content || '').length / 4)));
+      // A summary is its own thing; a full continuous turn is "turn"; otherwise a
+      // single user/assistant half (fallback). `opts.label` overrides.
+      const label = (opts.layer ? opts.layer + ' · ' : '') + (opts.label || (isSummary ? 'summary' : role + ' message')) + (opts.suffix || '');
       const wrap = h('div', { style: 'border:1px solid #2e2b27; border-left:3px solid ' + accent + '; border-radius:6px; overflow:hidden; margin:3px 0; background:#1a1816;' },
-        h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateExpanded', opts.key), style: 'cursor:pointer; display:flex; align-items:center; gap:9px; padding:7px 11px; background:#201d1b;' },
+        h('div', { class: 'zsub-hdr', onClick: () => toggle('substrateExpanded', opts.key), style: 'cursor:pointer; display:flex; align-items:center; gap:8px; padding:7px 11px; background:#201d1b;' },
           chev(exp),
-          h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace; font-size:12px; color:#ece8e4; font-weight:600;' }, (opts.layer ? opts.layer + ' · ' : '') + role + ' message' + (opts.suffix || '')),
-          h('span', { style: 'margin-left:auto; font-size:10.5px; color:#7c736a; font-family:ui-monospace,monospace; flex-shrink:0;' }, tok + ' tokens')));
-      if (exp) wrap.appendChild(bodyPre(content || ''));
+          h('span', { style: 'min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace; font-size:12px; color:#ece8e4; font-weight:600;' }, label),
+          kindBadge(opts.kind),
+          reasonBadge(opts.reason),
+          h('span', { style: 'flex:1;' }),
+          h('span', { style: 'font-size:10.5px; color:#7c736a; font-family:ui-monospace,monospace; flex-shrink:0;' }, tok + ' tokens')));
+      if (exp) {
+        // Truth-first: when the turn carries its stored segment vector, render it
+        // verbatim (glue/user/thinking/assistant, real vs ethereal). Only when no
+        // vector is present (a turn sealed before the layout existed) do we fall
+        // back to colorized / plain body text.
+        const hasSegs = opts.layout && opts.layout.segments && opts.layout.segments.length;
+        wrap.appendChild(hasSegs ? segmentBody(opts.layout) : opts.colorize ? turnBody(content || '') : bodyPre(content || ''));
+      }
       body.appendChild(wrap);
-      if (G && !opts.open) body.appendChild(glueRow(isUser ? G.user_end : G.assistant_end));
+      if (G && !opts.open && !noGlue) {
+        const closeInter = isSummary || !isUser; // assistant_end (inter) vs user_end (intra)
+        if (!(spine && closeInter)) body.appendChild(glueRow(closeInter ? G.assistant_end : G.user_end));
+      }
     };
 
     const targetLayer = S.substrateTargetLayer || 'dialogue';
-    // Only a SUPPRESSED dialogue turn (effort Off) carries a forced think header;
-    // a thinking turn emits its own `<think>` as a decoded token, so it appears
-    // in the body, not as glue. Memory tiers are always prefilled-suppressed.
-    const dialogueThink = (G && S.effortLevel === 0) ? G.no_think_block : '';
 
     // Lower-layer memory tiers (repo_map, code_reading, …) projected into the
     // window — between the system prompt and the dialogue. Each turn renders as
@@ -1456,43 +1714,84 @@
     // prefixed with the originating layer.
     const otherTurns = (sel.turns || []).filter((t) => t.layer && t.layer !== targetLayer)
       .slice().sort((a, b) => ((a.layer || '') + (a.group || '')).localeCompare((b.layer || '') + (b.group || '')) || (a.index || 0) - (b.index || 0));
-    otherTurns.forEach((t) => {
-      const tc = (S.substrateTurnContent || {})[t.group + '::' + t.index] || {};
-      const base = 'turn::' + t.group + '::' + t.index;
-      pushMsg('user', tc.user, { layer: t.layer, key: base + '::user' });
-      pushMsg('assistant', tc.assistant, { layer: t.layer, key: base + '::assistant', thinkBlock: G && G.no_think_block });
-    });
 
-    // The conversation, rendered from the REAL messages (the GUI holds them with
-    // correct roles + bodies; `sel.turns` has neither — it tags every sealed turn
-    // `assistant` and carries no text). Sequence: prior exchanges, the active user
-    // prompt, then the response decoded SO FAR. Each projection dot fired at its
-    // own `end_token`; truncate the trailing response to THIS dot's progress (by
-    // token fraction — the panel has text, not token offsets) so an earlier dot
-    // shows proportionally less, not the whole final answer.
-    const dm = S.substrateMsg, um = S.substrateUserMsg, hist = S.substrateHistory || [];
-    const ends = ((dm && dm.spans) || []).map((s) => s.end_token || 0);
-    const maxEnd = Math.max(1, ...ends);
-    const here = node && node.end_token != null ? node.end_token : maxEnd;
-    const complete = here >= maxEnd;
-    let decoded = '';
-    if (dm && dm.role === 'assistant' && (dm.content || '').length) {
-      const cut = Math.max(0, Math.min(dm.content.length, Math.round(dm.content.length * here / maxEnd)));
-      decoded = dm.content.slice(0, cut);
+    // The conversation is rendered from the engine's MATERIALIZED spine (the
+    // `assemble_pieces` output carried on the event): real boundary-glue islands
+    // interleaved with the sealed turns — memory tiers + dialogue, summaries in
+    // place. This is the literal injected order/glue, not a reconstruction.
+    const dm = S.substrateMsg, um = S.substrateUserMsg;
+    // Projection events are POINTS: each `start_token` is the generated-token
+    // position at which that projection was selected (SubmitTurn = 0). A
+    // projection governs everything forward until the next event supersedes it,
+    // so clicking one shows the decode PREFIX up to its `start_token` — the
+    // content whose Q selected it. The decoded turn is never in its own
+    // projection (not sealed during decode), so there is no self-inclusion.
+    const positions = ((dm && dm.spans) || []).map((s) => s.start_token || 0);
+    const maxEnd = Math.max(1, ...positions);
+    const here = node && node.start_token != null ? node.start_token : maxEnd;
+
+    // The sealed dialogue turns the projection actually selected (the live,
+    // still-decoding turn is NOT one of them — it is rendered from `um`/`dm`
+    // below, and the current user message carries index u32::MAX).
+    const dialogueTurns = (sel.turns || []).filter((t) => (t.layer || targetLayer) === targetLayer && t.index !== 4294967295);
+    const TCd = S.substrateTurnContent || {};
+    // Render one materialized turn (memory tier or dialogue) as ONE card. Its body
+    // (on expand) is the turn's stored segment vector — user / assistant / thinking
+    // with boundary glue rendered INSIDE it (`segmentBody`) — falling back to
+    // colorized text when a turn has no vector. `noGlue`: the card emits no glue
+    // rows of its own; all glue lives inside the segment vector.
+    const renderTurn = (t) => {
+      const tc = TCd[t.group + '::' + t.index] || {};
+      const isSummary = t.kind && t.kind !== 'normal';
+      const full = tc.text != null ? tc.text
+        : (isSummary ? (tc.assistant || tc.user || '') : ((tc.user || '') + (tc.assistant || '')));
+      pushMsg('assistant', full, { layer: t.layer || targetLayer, key: 'conv::' + t.group + '::' + t.index, kind: t.kind, reason: t.reason, noGlue: true, colorize: true, layout: tc.layout, label: isSummary ? 'summary' : 'turn', tokens: t.tokens });
+    };
+    const materialized = (node && node.materialized) || [];
+    if (materialized.length) {
+      // Walk the injected spine for turn ORDER; each turn renders its own glue in
+      // place. Every turn here is genuine attended CONTEXT — the turn being decoded
+      // is drawn separately below as the decoded-turn card (from `um`/`dm`) and is
+      // never in the spine, since projection events are emitted during decode
+      // before the turn seals. So there is nothing to skip.
+      materialized.forEach((p) => {
+        if (p.kind === 'turn' && p.turn) renderTurn(p.turn);
+      });
+    } else {
+      // Fallback for event records predating the materialized spine.
+      otherTurns.forEach(renderTurn);
+      dialogueTurns.forEach((t) => renderTurn({ ...t, layer: targetLayer }));
+    }
+    // The turn THIS event decoded — user prompt (the attended query) + the assistant
+    // text that was actually IN SCOPE when provenance last selected, clipped there.
+    // A mid-decode reprojection carries that point directly in `here`. The post-seal
+    // "answer" event is stamped t=full, but its selection was computed from the
+    // decode as of the LAST mid-decode re-scan — so for it we clip at that point
+    // (or at nothing for a short turn that never re-scanned mid-decode), giving the
+    // SAME clipped "decoding" view every other projection shows, never the whole
+    // finished turn. Drawn below the attended context (it is this decode's output).
+    if (um || dm) {
+      // This projection is a point at `here` (its `start_token`): show the decode
+      // PREFIX up to there — the content whose Q selected this context. The
+      // SubmitTurn event (`here == 0`) clips to nothing, since the turn opens
+      // against it before decoding a single token. `maxEnd` is the last
+      // projection's position, so the char mapping is approximate past it.
+      const clipTok = here;
+      const clen = (dm && dm.content) ? dm.content.length : 0;
+      const clipCut = Math.max(0, Math.min(clen, Math.round(clen * clipTok / maxEnd)));
+      const scoped = (dm && dm.role === 'assistant') ? dm.content.slice(0, clipCut) : '';
+      const liveNoThink = !!(G && G.no_think && S.effortLevel === 0);
+      const lead = G ? (G.user_start + (liveNoThink && G.no_think ? G.no_think : '')) : '';
+      const liveText = lead + (um ? um.content : '') + (G ? (G.user_end + G.assistant_start) : '') + scoped;
+      pushMsg('assistant', liveText, { layer: targetLayer, key: 'conv::live', noGlue: true, colorize: true, label: 'turn', suffix: ' · decoding', open: true });
     }
 
-    // Same card style + layer prefix as the memory tiers above, so the whole
-    // panel is uniform. The trailing assistant is open-ended while still decoding.
-    hist.forEach((m, i) => pushMsg(m.role, m.content, { layer: targetLayer, key: 'conv::' + i, thinkBlock: dialogueThink }));
-    if (um) pushMsg('user', um.content, { layer: targetLayer, key: 'conv::um' });
-    if (dm) pushMsg('assistant', decoded, { layer: targetLayer, suffix: complete ? '' : ' · decoded so far', open: !complete, key: 'conv::dm', thinkBlock: dialogueThink });
-
-    const empty = !sel.system.length && !hist.length && !um && !dm;
+    const empty = !sel.system.length && !(sel.turns || []).length && !um && !dm;
     const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(880px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:flex-start; gap:12px; padding:15px 17px; border-bottom:1px solid #2e2b27;' },
         h('div', { style: 'flex:1; min-width:0;' },
           h('div', { style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, 'Projection selection'),
-          h('div', { style: 'font-size:0.73rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:3px; word-break:break-word;' }, !node ? '' : ((node.step || '') + ' · materialized ' + fmtTok(node.materialized_tokens) + ' / ' + fmtTok(node.substrate_tokens) + ' tokens' + (node.tokens_per_second ? ' · ' + Math.round(node.tokens_per_second) + ' t/s' : '')))),
+          h('div', { style: 'font-size:0.73rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:3px; word-break:break-word;' }, !node ? '' : ((node.step || '') + ' · materialized ' + fmtTok(node.materialized_tokens) + ' / ' + fmtTok(node.substrate_tokens) + ' tokens' + (node._tps ? ' · ' + Math.round(node._tps) + ' t/s' : '')))),
         empty ? null : h('button', { onClick: (e) => copyText(substrateAllText(node), e.currentTarget, 'Copied', 'Copy all'), style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy all'),
         h('button', { onClick: () => setState({ substrateOpen: false }), style: closeBtnStyle() }, '×')),
       empty ? h('div', { style: 'flex:1; padding:30px; color:#7c736a; font-size:0.85rem; background:#161412;' }, 'No selection recorded for this projection.') : body);
@@ -1614,7 +1913,7 @@
   window.addEventListener('resize', () => {
     const narrow = window.innerWidth < NARROW_W;
     const wide = window.innerWidth >= WIDE_W;
-    if (narrow !== S.narrow || wide !== S.wide) setState({ narrow, wide });   // re-renders: gutter visibility + right margin
+    if (narrow !== S.narrow || wide !== S.wide) setState({ narrow, wide });
   });
 
   // ── boot ─────────────────────────────────────────────────────────────────

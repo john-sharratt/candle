@@ -5,13 +5,14 @@
 //! resolver (not the builder), so tests use `resolver.append(group)` rather
 //! than `builder.append(group)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::builder::Builder;
-use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex};
+use super::ids::{GroupId, Reserved, SectionId, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::{GatherScope, SummaryMode};
 use crate::substrate::ContentResolver;
+use crate::summary_tree::{SelectionOrigin, TurnKind};
 
 // —— Mock resolver —————————————————————————————————————————————————————————————
 
@@ -31,6 +32,18 @@ struct MockResolver {
     section_tokens: HashMap<u32, usize>,
     default_score: f32,
     default_tokens: usize,
+    /// Conversation stamped onto every emitted turn (mirrors the real
+    /// target-aware resolver, which returns `target.timeline` for the target
+    /// group). `None` ⇒ the trait default (untracked).
+    timeline: Option<TimelineId>,
+    /// Score-density picks returned verbatim by `summary_tree_select` —
+    /// `(turn_index, origin, score)` in the chronological order the real §8
+    /// selector produces (each summary node BEFORE the turns it covers).
+    /// `None` ⇒ trait default (no forest → rule-based path).
+    tree_picks: Option<Vec<(TurnIndex, SelectionOrigin, f32)>>,
+    /// Turn indices that are summary (forest) nodes, reported by `turn_kind`
+    /// as `SummaryOfSummaries`. Everything else is `Normal`.
+    summary_idx: HashSet<u32>,
 }
 
 impl MockResolver {
@@ -70,6 +83,11 @@ impl MockResolver {
         self
     }
 
+    fn with_timeline(mut self, timeline: TimelineId) -> Self {
+        self.timeline = Some(timeline);
+        self
+    }
+
     fn with_section_score(mut self, section: SectionId, score: f32) -> Self {
         self.section_scores.insert(section.raw(), score);
         self
@@ -79,6 +97,18 @@ impl MockResolver {
     /// gate emits the summary only when its `section_token_count` is `> 0`.
     fn with_section_tokens(mut self, section: SectionId, tokens: usize) -> Self {
         self.section_tokens.insert(section.raw(), tokens);
+        self
+    }
+
+    /// Make `summary_tree_select` return `picks` verbatim (the §8 score-density
+    /// path), and mark every summary-node index so `turn_kind` reports it.
+    fn with_tree_picks(
+        mut self,
+        picks: Vec<(TurnIndex, SelectionOrigin, f32)>,
+        summary_indices: &[u32],
+    ) -> Self {
+        self.tree_picks = Some(picks);
+        self.summary_idx = summary_indices.iter().copied().collect();
         self
     }
 }
@@ -103,6 +133,12 @@ impl ContentResolver for MockResolver {
             .unwrap_or(&self.default_score)
     }
 
+    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
+        // Mirror the real target-aware resolver: stamp the configured timeline
+        // onto every emitted turn.
+        self.timeline
+    }
+
     fn section_score(&self, section: SectionId) -> f32 {
         // Default 0.0 for any section the test didn't assign a score to.
         // Sections without explicit scores will lose to those with scores.
@@ -113,6 +149,22 @@ impl ContentResolver for MockResolver {
         // 0 unless explicitly marked sealed — mirrors a section not present in
         // the substrate. The tool-summary gate keys off `> 0`.
         *self.section_tokens.get(&section.raw()).unwrap_or(&0)
+    }
+
+    fn turn_kind(&self, _group: GroupId, index: TurnIndex) -> TurnKind {
+        if self.summary_idx.contains(&index.0) {
+            TurnKind::SummaryOfSummaries
+        } else {
+            TurnKind::Normal
+        }
+    }
+
+    fn summary_tree_select(
+        &self,
+        _timeline: TimelineId,
+        _budget: u32,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        self.tree_picks.clone()
     }
 }
 
@@ -391,6 +443,45 @@ fn turns_appear_after_append() {
         &resolver,
     );
     assert_eq!(proj.sealed_turns().count(), 3);
+}
+
+/// By design, a projected turn carries its resolved conversation: the timeline is
+/// stamped ONCE at projection (from the target-aware resolver) onto every emitted
+/// turn, so no downstream consumer re-derives `group → timeline` — which is what
+/// once let the reproject pick the wrong conversation and drop a slot's history.
+#[test]
+fn projected_turn_carries_its_resolved_timeline() {
+    let b = Builder::from_yaml(SIMPLE_YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let conv = b.id_for_group("conversation").unwrap();
+
+    let tl = TimelineId::for_test(42);
+    let mut resolver = MockResolver::new().with_timeline(tl);
+    resolver.append(conv);
+    resolver.append(conv);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: conv,
+            timeline: tl,
+        },
+        &resolver,
+    );
+
+    let turns: Vec<_> = proj.sealed_turns().collect();
+    assert_eq!(turns.len(), 2);
+    for t in turns {
+        // The conversation is carried on the turn — not re-derived downstream.
+        assert_eq!(t.timeline, Some(tl));
+        assert_eq!(
+            t.key(),
+            Some(TurnKey {
+                timeline: tl,
+                index: t.index()
+            })
+        );
+    }
 }
 
 // —— Masking ———————————————————————————————————————————————————————————————————
@@ -788,6 +879,80 @@ layers:
     assert_eq!(proj.sealed_turns().count(), 2);
     let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert_eq!(indices, vec![0, 2]);
+}
+
+/// Regression: the §8 score-density path returns picks in chronological order
+/// with each SUMMARY node ABOVE the turns it covers. A summary's storage
+/// `TurnIndex` is always higher than the turns it summarises (it is sealed
+/// after them), so the old index-sorts — `select_conversation`'s `selected.sort()`
+/// and step-12's `group_turns.sort()` — dropped the summary BELOW its own
+/// content: a summary of turns 0–4 rendered *after* raw turn 6. The projection
+/// must emit score-density picks verbatim, honouring the trait contract that
+/// `summary_tree_select` returns an already-ordered, already-budget-fit list.
+#[test]
+fn score_density_summary_emitted_before_later_raw_turn() {
+    let yaml = r#"
+layers:
+  - name: dialogue
+    system_prompt:
+      sections:
+        - id: s1
+          content: "X"
+    window: 1200
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: convo
+        selection:
+          kind: conversation
+          recent: 2
+          historical_top_k: 8
+"#;
+    let b = Builder::from_yaml(yaml).unwrap();
+    let layer = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tl = TimelineId::for_test(1);
+
+    // 10 raw turns exist; index 7 is a SoS node covering the earliest turns.
+    let mut resolver = MockResolver::new();
+    for _ in 0..10 {
+        resolver.append(convo);
+    }
+    // Picks exactly as the real §8 selector emits them: the summary (idx 7,
+    // covering the early turns) sits BEFORE the later raw turns 6 and 9.
+    let picks = vec![
+        (TurnIndex(7), SelectionOrigin::CoverageFill, 0.5),
+        (TurnIndex(6), SelectionOrigin::RecencyDecay, 0.5),
+        (TurnIndex(9), SelectionOrigin::RecencyDecay, 0.5),
+    ];
+    let resolver = resolver.with_timeline(tl).with_tree_picks(picks, &[7]);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: convo,
+            timeline: tl,
+        },
+        &resolver,
+    );
+
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    // Verbatim pick order — the summary (7) stays ABOVE its later-indexed
+    // content (6), NOT re-sorted by TurnIndex to [6, 7, 9].
+    assert_eq!(
+        indices,
+        vec![7, 6, 9],
+        "score-density picks must emit in chronological (summary-above-content) \
+         order, not sorted by TurnIndex",
+    );
 }
 
 #[test]
@@ -3131,6 +3296,203 @@ fn collection_partial_but_unsealed_summary_omitted() {
     );
 }
 
+/// With a structural open marker (`<tools>`), the catalog summary emits OUTSIDE
+/// it — after the preamble section, before the open template — not inside the
+/// markers next to the members.
+#[test]
+fn collection_summary_emits_outside_structural_markers() {
+    use super::project::{ProjectionSegment, SealedKind};
+    use candle_transformers::models::dialect::Dialect;
+
+    let yaml = r#"
+layers:
+  - name: dialogue
+    window: 4000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section
+          id: tools_overview
+          depends_on: tools
+          content: "overview"
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: tools
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 1 }
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: x
+              user_prompt: x
+            assign:
+              max_tokens: 128
+              system_prompt: x
+              user_prompt: x
+          sections:
+            - id: tool_a
+              content: "A"
+            - id: tool_b
+              content: "B"
+            - id: tool_c
+              content: "C"
+        - kind: template
+          id: tools_close
+          dialect: tool_block_close
+          depends_on: tools
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let dlct = Dialect::chat_ml();
+    let mut b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+    b.tokenize_templates::<std::convert::Infallible, _>(|s| Ok(s.bytes().map(u32::from).collect()))
+        .unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+    let summary = SectionId::reserved(Reserved::ToolSummary);
+    b.set_collection_summary_section(dialogue, tools, summary)
+        .unwrap();
+    let tool_a = b.id_for_section_in(dialogue, "tool_a").unwrap();
+
+    // top_k=1 over 3 members → partial; summary sealed.
+    let resolver = MockResolver::new()
+        .with_section_score(tool_a, 0.9)
+        .with_section_tokens(summary, 100);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer: dialogue,
+            group: convo,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+
+    let order: Vec<String> = proj
+        .segments
+        .iter()
+        .map(|seg| match seg {
+            ProjectionSegment::Generated { identity, .. } => identity.name.clone(),
+            ProjectionSegment::Sealed(SealedKind::Section(s)) if s.id == summary => {
+                "SUMMARY".to_string()
+            }
+            _ => "_".to_string(),
+        })
+        .collect();
+    let sp = order
+        .iter()
+        .position(|s| s == "SUMMARY")
+        .unwrap_or_else(|| panic!("summary not emitted: {order:?}"));
+    let op = order
+        .iter()
+        .position(|s| s == "tools_open")
+        .unwrap_or_else(|| panic!("tools_open not emitted: {order:?}"));
+    // Summary sits OUTSIDE the markers: before `<tools>` opens.
+    assert!(
+        sp < op,
+        "summary must emit before the <tools> open marker: {order:?}"
+    );
+}
+
+/// `depends_on_absent` is the inverse of `depends_on`: its section emits only
+/// when the collection materialised zero members (the no-tools variant), and is
+/// suppressed when the collection has members.
+#[test]
+fn depends_on_absent_emits_only_when_collection_empty() {
+    const YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: c
+          user_prompt: c
+        assistant:
+          system_prompt: c
+          user_prompt: c
+    system_prompt:
+      items:
+        - kind: section
+          id: with_tools
+          depends_on: tools
+          content: "WITH"
+        - kind: section
+          id: no_tools
+          depends_on_absent: tools
+          content: "NO"
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 2 }
+          score_threshold: 0.5
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: x
+              user_prompt: x
+            assign:
+              max_tokens: 128
+              system_prompt: x
+              user_prompt: x
+          sections:
+            - id: t1
+              content: "tool one"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+    let b = Builder::from_yaml(YAML).unwrap();
+    let dialogue = b.id_for_layer("dialogue").unwrap();
+    let convo = b.id_for_group("convo").unwrap();
+    let with = b.id_for_section_in(dialogue, "with_tools").unwrap();
+    let no = b.id_for_section_in(dialogue, "no_tools").unwrap();
+    let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+    let target = ProjectionTarget {
+        layer: dialogue,
+        group: convo,
+        timeline: TimelineId::for_test(1),
+    };
+
+    // Tools present (t1 above threshold) → `with_tools` emits, `no_tools` not.
+    let present = MockResolver::new().with_section_score(t1, 0.9);
+    let ids: Vec<SectionId> = b
+        .project(target, &present)
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        ids.contains(&with) && !ids.contains(&no),
+        "tools present → only the tool-aware grounding: {ids:?}"
+    );
+
+    // No tools (t1 below threshold → collection empty) → `no_tools` emits.
+    let empty = MockResolver::new();
+    let ids: Vec<SectionId> = b
+        .project(target, &empty)
+        .sealed_sections()
+        .map(|s| s.id)
+        .collect();
+    assert!(
+        ids.contains(&no) && !ids.contains(&with),
+        "no tools → only the no-tools grounding: {ids:?}"
+    );
+}
+
 #[test]
 fn collection_top_k_keeps_highest_scored_in_declaration_order() {
     let b = Builder::from_yaml(COLLECTION_YAML).unwrap();
@@ -4452,6 +4814,1201 @@ layers:
             std.variant_for(0).unwrap().in_tree_prefix,
             vec![present.variants[0].id, role_opt.variant_for(0).unwrap().id]
         );
+    }
+
+    /// A nested `section_tree` whose inner selector sits BELOW static content +
+    /// a fake-tool anchor.  The point: content above the nested tree multiplies
+    /// only by the OUTER selector (no_think), never the inner one (effort).
+    const NESTED_TREE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: no_think
+              content: "/no_think"
+              default: present
+            - kind: section
+              id: framing
+              content: "You are an assistant."
+            - kind: section
+              id: noop_tool
+              content: "noop anchor tool"
+            - kind: section_tree
+              nodes:
+                - kind: selector
+                  id: effort
+                  default: balanced
+                  options:
+                    - id: off
+                      content: "Answer directly."
+                    - id: balanced
+                      content: "Reason."
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+    #[test]
+    fn nested_section_tree_inner_selector_inherits_outer_dims() {
+        let b = Builder::from_yaml(NESTED_TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+
+        // The inner `effort` selector was lifted into the outer tree's dim list,
+        // declared AFTER no_think.
+        assert_eq!(tree.dims.len(), 2);
+        assert_eq!(tree.dims[0].selector_id, "no_think");
+        assert_eq!(tree.dims[1].selector_id, "effort");
+        assert_eq!(tree.default_selection, vec![0, 1]); // present, balanced
+
+        let noop = tree.nodes.iter().find(|n| n.name == "noop_tool").unwrap();
+        let effort = tree.nodes.iter().find(|n| n.name == "effort").unwrap();
+
+        // The anchor sits above the nested tree → it multiplies ONLY by the
+        // outer dim (no_think, radix 2). effort never multiplies it.
+        assert_eq!(noop.ancestor_dims, 1);
+        assert_eq!(noop.options[0].variants.len(), 2);
+
+        // The inner selector fans out across the outer dim: 2 options × 2
+        // no_think branches = 4 variants; its ancestor width is the outer dim.
+        assert_eq!(effort.ancestor_dims, 1);
+        assert_eq!(
+            effort
+                .options
+                .iter()
+                .map(|o| o.variants.len())
+                .sum::<usize>(),
+            4
+        );
+    }
+
+    #[test]
+    fn nested_section_tree_inner_variant_prefix_includes_outer_anchor() {
+        let b = Builder::from_yaml(NESTED_TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+        let node = |name: &str| tree.nodes.iter().find(|n| n.name == name).unwrap();
+
+        // present-no_think branch: ancestor key over [no_think] = 0.
+        let key = tree.pack(&[0, 0], 1);
+        let no_think_present = node("no_think")
+            .options
+            .iter()
+            .find(|o| o.id == "present")
+            .unwrap();
+        let framing_var = node("framing").options[0].variant_for(0).unwrap();
+        let noop_var = node("noop_tool").options[0].variant_for(0).unwrap();
+        let off_var = node("effort")
+            .options
+            .iter()
+            .find(|o| o.id == "off")
+            .unwrap()
+            .variant_for(key)
+            .unwrap();
+
+        // effort.off on the present branch seals against the full outer chain,
+        // anchor included: [no_think.present, framing, noop_tool].
+        assert_eq!(
+            off_var.in_tree_prefix,
+            vec![no_think_present.variants[0].id, framing_var.id, noop_var.id]
+        );
+    }
+
+    #[test]
+    fn nested_section_tree_outer_content_stable_across_inner_selection() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let b = Builder::from_yaml(NESTED_TREE_YAML).unwrap();
+        let resolver = MockResolver::new();
+
+        let proj = |effort: &str| {
+            let mut sel = SelectionState::new();
+            sel.select("effort", effort);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        let off = proj("off");
+        let balanced = proj("balanced");
+
+        // Four sections emit: no_think, framing, noop_tool, effort. The first
+        // three (static content + anchor) are IDENTICAL across the inner
+        // directive selection — only the last differs. That is the continuity
+        // win: switching the inner selector never re-prefills the content above.
+        assert_eq!(off.len(), 4);
+        assert_eq!(off[..3], balanced[..3]);
+        assert_ne!(off[3], balanced[3]);
+    }
+
+    /// A collection embedded as a tree node, sitting UNDER no_think but ABOVE
+    /// the noop anchor + inner directive tree.  The tools must seal ×2 (no_think)
+    /// and be prefix-transparent: the anchor + directives below seal as if the
+    /// variable tool members were not there.
+    const COLLECTION_TREE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: no_think
+              content: "/no_think"
+              default: present
+            - kind: section
+              id: framing
+              content: "You are an assistant."
+            - kind: collection
+              name: tools
+              selection: { kind: top_k, k: 2 }
+              summary:
+                chunk: 4
+                categorize:
+                  max_tokens: 256
+                  system_prompt: cat
+                  user_prompt: cat
+                assign:
+                  max_tokens: 128
+                  system_prompt: assign
+                  user_prompt: assign
+              sections:
+                - id: tool_a
+                  content: "tool a"
+                - id: tool_b
+                  content: "tool b"
+            - kind: section
+              id: noop_tool
+              content: "noop anchor"
+            - kind: section_tree
+              nodes:
+                - kind: selector
+                  id: effort
+                  default: balanced
+                  options:
+                    - id: off
+                      content: "direct"
+                    - id: balanced
+                      content: "reason"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+    #[test]
+    fn collection_tree_node_members_seal_per_outer_branch() {
+        let b = Builder::from_yaml(COLLECTION_TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+
+        // no_think + effort are the dims; the collection is NOT a dim.
+        assert_eq!(tree.dims.len(), 2);
+        assert_eq!(tree.dims[0].selector_id, "no_think");
+        assert_eq!(tree.dims[1].selector_id, "effort");
+
+        let tools = tree.nodes.iter().find(|n| n.name == "tools").unwrap();
+        let tc = tools
+            .collection
+            .as_ref()
+            .expect("tools is a collection node");
+        // Two members, each sealed ×2 (no_think present/absent).
+        assert_eq!(tc.variants.len(), 2);
+        assert_eq!(tc.variants[0].len(), 2);
+        assert_eq!(tc.variants[1].len(), 2);
+        // present vs absent no_think → distinct member seals.
+        assert_ne!(
+            tc.member_variant(0, 0).unwrap().id,
+            tc.member_variant(0, 1).unwrap().id
+        );
+        // The canonical (default-branch = no_think present, key 0) ids back the
+        // SectionCollection used for scoring + depends_on gating.
+        assert_eq!(tc.collection.sections.len(), 2);
+        assert_eq!(
+            tc.collection.sections[0].id,
+            tc.member_variant(0, 0).unwrap().id
+        );
+    }
+
+    #[test]
+    fn collection_tree_node_is_prefix_transparent() {
+        let b = Builder::from_yaml(COLLECTION_TREE_YAML).unwrap();
+        let tree = dialogue_tree(&b);
+        let node = |name: &str| tree.nodes.iter().find(|n| n.name == name).unwrap();
+
+        let no_think_present = node("no_think")
+            .options
+            .iter()
+            .find(|o| o.id == "present")
+            .unwrap();
+        let framing_var = node("framing").options[0].variant_for(0).unwrap();
+
+        // The tool members seal against the static base above them only:
+        // [no_think.present, framing] on the present branch.
+        let tc = node("tools").collection.as_ref().unwrap();
+        assert_eq!(
+            tc.member_variant(0, 0).unwrap().in_tree_prefix,
+            vec![no_think_present.variants[0].id, framing_var.id]
+        );
+
+        // The noop anchor sits AFTER the collection, but its prefix is still just
+        // [no_think, framing] — the variable tool members are NOT in it.
+        let noop_var = node("noop_tool").options[0].variant_for(0).unwrap();
+        assert_eq!(
+            noop_var.in_tree_prefix,
+            vec![no_think_present.variants[0].id, framing_var.id]
+        );
+
+        // The inner effort selector anchors on the noop, still excluding tools.
+        let off_present = node("effort")
+            .options
+            .iter()
+            .find(|o| o.id == "off")
+            .unwrap()
+            .variant_for(tree.pack(&[0, 0], 1))
+            .unwrap();
+        assert_eq!(
+            off_present.in_tree_prefix,
+            vec![no_think_present.variants[0].id, framing_var.id, noop_var.id]
+        );
+    }
+
+    #[test]
+    fn collection_tree_node_projects_active_branch_stable_across_directive() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let b = Builder::from_yaml(COLLECTION_TREE_YAML).unwrap();
+        let resolver = MockResolver::new();
+
+        let proj = |no_think: &str, effort: &str| {
+            let mut sel = SelectionState::new();
+            sel.select("no_think", no_think);
+            sel.select("effort", effort);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+
+        // present branch: no_think, framing, tool_a, tool_b, noop, effort = 6.
+        let base = proj("present", "balanced");
+        assert_eq!(base.len(), 6);
+
+        // Switching the inner directive does NOT change the static/tool prefix —
+        // the collection never re-prefills for the directive below it.
+        let other = proj("present", "off");
+        assert_eq!(base[..5], other[..5]);
+        assert_ne!(base[5], other[5]);
+
+        // Switching no_think DOES swap the tools to their absent-branch seals.
+        let tools = dialogue_tree(&b)
+            .nodes
+            .iter()
+            .find(|n| n.name == "tools")
+            .unwrap()
+            .collection
+            .as_ref()
+            .unwrap();
+        let present = proj("present", "balanced");
+        let absent = proj("absent", "balanced");
+        assert!(present.contains(&tools.member_variant(0, 0).unwrap().id));
+        assert!(absent.contains(&tools.member_variant(0, 1).unwrap().id));
+        assert!(!absent.contains(&tools.member_variant(0, 0).unwrap().id));
+    }
+
+    #[test]
+    fn inject_collection_replaces_placeholder_with_collection_selection() {
+        use crate::projection::{ProjectionMode, ProjectionSegment, SealedKind, SelectionState};
+        // The noop placeholder declares `inject_collection: tools`: it still seals
+        // its own anchor (the directive below attends to it) but at projection its
+        // content is REPLACED by the tools collection's top-k, and the collection
+        // itself defers its own emission.  `member_glue` puts a REAL newline token
+        // between the selected tools (not baked into any tool's seal).
+        let yaml = COLLECTION_TREE_YAML
+            .replace(
+                "            - kind: section\n              id: noop_tool\n              content: \"noop anchor\"",
+                "            - kind: section\n              id: noop_tool\n              inject_collection: tools\n              content: \"noop anchor\"",
+            )
+            .replace(
+                "              selection: { kind: top_k, k: 2 }",
+                "              selection: { kind: top_k, k: 2 }\n              member_glue: \"\\n\"",
+            );
+        let mut b = Builder::from_yaml(&yaml).unwrap();
+        // The glue is a live-prefilled structural token, so it must be tokenised
+        // before projection (mock: one byte → one token, so "\n" → [10]).
+        b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
+            .unwrap();
+
+        // Wiring: the tools collection is marked deferred, and the noop node points
+        // at it.
+        let cid = b
+            .id_for_collection_in(b.id_for_layer("dialogue").unwrap(), "tools")
+            .unwrap();
+        let tree = dialogue_tree(&b);
+        let tools = tree.nodes.iter().find(|n| n.name == "tools").unwrap();
+        assert!(
+            tools.collection.as_ref().unwrap().deferred_projection,
+            "the injected collection must defer its own projection"
+        );
+        let noop = tree.nodes.iter().find(|n| n.name == "noop_tool").unwrap();
+        assert_eq!(noop.inject_collection, Some(cid));
+
+        // The noop STILL seals its own anchor variant (so the directive below it
+        // anchors on a stable prefix) — that seal exists even though it isn't
+        // projected.
+        let noop_anchor = noop.options[0].variant_for(0).unwrap().id;
+        let tc = tools.collection.as_ref().unwrap();
+        let tool_a = tc.member_variant(0, 0).unwrap().id;
+        let tool_b = tc.member_variant(1, 0).unwrap().id;
+        let framing = opt_var(&b, "framing", "content", &[0]);
+        let effort = opt_var(&b, "effort", "balanced", &[0, 0]);
+
+        // Project the present/balanced branch and read the FULL segment list.
+        let resolver = MockResolver::new();
+        let mut sel = SelectionState::new();
+        sel.select("no_think", "present");
+        sel.select("effort", "balanced");
+        let proj =
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
+
+        let ids: Vec<SectionId> = proj.sealed_sections().map(|s| s.id).collect();
+        // The placeholder's own anchor is NOT emitted; the two real tools take its
+        // place, and the directive below still emits.
+        assert!(
+            !ids.contains(&noop_anchor),
+            "the noop anchor must not appear in the projection"
+        );
+        assert!(ids.contains(&tool_a) && ids.contains(&tool_b));
+        let pos = |id: SectionId| ids.iter().position(|x| *x == id).unwrap();
+        assert!(pos(framing) < pos(tool_a));
+        assert!(pos(tool_a) < pos(tool_b));
+        assert!(pos(tool_b) < pos(effort));
+
+        // The glue is a REAL token between the two tools: in the full segment list,
+        // tool_a → Generated("\n" = [10]) → tool_b, contiguous and in that order.
+        let seg_pos = |id: SectionId| {
+            proj.segments
+                .iter()
+                .position(|s| {
+                    matches!(s, ProjectionSegment::Sealed(SealedKind::Section(r)) if r.id == id)
+                })
+                .unwrap()
+        };
+        let a = seg_pos(tool_a);
+        let bseg = seg_pos(tool_b);
+        assert_eq!(
+            bseg,
+            a + 2,
+            "exactly one segment sits between the two tools"
+        );
+        match &proj.segments[a + 1] {
+            ProjectionSegment::Generated { tokens, .. } => {
+                assert_eq!(
+                    tokens.as_ref(),
+                    &vec![10u32],
+                    "glue must be the newline token"
+                );
+            }
+            other => panic!("expected a Generated glue token between tools, got {other:?}"),
+        }
+        // No glue leads the first tool (the segment before tool_a is not the glue).
+        assert!(
+            !matches!(&proj.segments[a - 1], ProjectionSegment::Generated { tokens, .. } if tokens.as_ref() == &vec![10u32]),
+            "glue must not lead the first selected tool"
+        );
+    }
+
+    /// An `optional_group` gates a whole sub-tree (markers + collection + inject
+    /// placeholder) on a binary dim: `absent` omits the entire block (markers
+    /// included), and nodes BELOW it seal distinctly per (tools present/absent).
+    const GROUP_TREE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: no_think
+              content: "/no_think"
+              default: present
+            - kind: section
+              id: framing
+              content: "You are an assistant."
+            - kind: optional_group
+              id: tools_on
+              default: present
+              nodes:
+                - kind: section
+                  id: tools_open
+                  content: "<tools>"
+                - kind: collection
+                  name: tools
+                  selection: { kind: top_k, k: 2 }
+                  member_glue: "\n"
+                  summary:
+                    chunk: 4
+                    categorize:
+                      max_tokens: 256
+                      system_prompt: cat
+                      user_prompt: cat
+                    assign:
+                      max_tokens: 128
+                      system_prompt: assign
+                      user_prompt: assign
+                  sections:
+                    - id: tool_a
+                      content: "tool a"
+                    - id: tool_b
+                      content: "tool b"
+                - kind: section
+                  id: noop_tool
+                  inject_collection: tools
+                  content: "noop anchor"
+                - kind: section
+                  id: tools_close
+                  content: "</tools>"
+            - kind: section
+              id: directive
+              content: "Respond."
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+
+    #[test]
+    fn optional_group_omits_subtree_when_absent_and_reprefixes_below() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let mut b = Builder::from_yaml(GROUP_TREE_YAML).unwrap();
+        b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
+            .unwrap();
+        let resolver = MockResolver::new();
+
+        let proj = |no_think: &str, tools: &str| -> Vec<SectionId> {
+            let mut sel = SelectionState::new();
+            sel.select("no_think", no_think);
+            sel.select("tools_on", tools);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        // `tools_on` is a real dim (after no_think).
+        let tree = dialogue_tree(&b);
+        assert_eq!(tree.dims.len(), 2);
+        assert_eq!(tree.dims[0].selector_id, "no_think");
+        assert_eq!(tree.dims[1].selector_id, "tools_on");
+
+        let tc = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "tools")
+            .unwrap()
+            .collection
+            .as_ref()
+            .unwrap();
+        // Members seal ONLY under the present branch — ×no_think (2), not ×4.
+        let member_ids: std::collections::HashSet<SectionId> =
+            tc.variants.iter().flatten().map(|v| v.id).collect();
+        assert_eq!(
+            member_ids.len(),
+            2 * 2,
+            "2 members × 2 no_think (present only)"
+        );
+
+        let present = proj("present", "present");
+        let absent = proj("present", "absent");
+
+        // Present: the whole block emits (markers + ≥1 tool).
+        let topen = opt_var(&b, "tools_open", "content", &[0, 0]);
+        let tclose = opt_var(&b, "tools_close", "content", &[0, 0]);
+        assert!(present.contains(&topen) && present.contains(&tclose));
+        assert!(
+            present.iter().any(|id| member_ids.contains(id)),
+            "present branch must inject tools"
+        );
+
+        // Absent: NOTHING tool-related — markers, members, and the noop anchor all
+        // gone (the block is omitted, not an empty <tools></tools> shell).
+        assert!(!absent.contains(&topen) && !absent.contains(&tclose));
+        assert!(
+            !absent.iter().any(|id| member_ids.contains(id)),
+            "absent branch must emit no tools"
+        );
+
+        // The directive below seals DISTINCTLY per tools state (the permutation
+        // increase) and both variants project on their branch.
+        let dir_present = opt_var(&b, "directive", "content", &[0, 0]);
+        let dir_absent = opt_var(&b, "directive", "content", &[0, 1]);
+        assert_ne!(
+            dir_present, dir_absent,
+            "directive must seal a distinct variant per tools-on/off"
+        );
+        assert!(present.contains(&dir_present));
+        assert!(absent.contains(&dir_absent));
+    }
+
+    /// A `selector` declared INSIDE an `optional_group` present branch is a GATED
+    /// dim: it multiplies only the present side, the absent side seals at the
+    /// selector's default, and `pack` masks an out-of-scope runtime value back to
+    /// that default — so a node after the group projects correctly for EVERY
+    /// combination, including the dangerous one (group absent + non-default inner).
+    #[test]
+    fn selector_inside_optional_group_is_gated() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional_group
+              id: grp
+              default: present
+              nodes:
+                - kind: selector
+                  id: inner
+                  default: a
+                  options:
+                    - id: a
+                      content: "INNER-A"
+                    - id: b
+                      content: "INNER-B"
+              absent:
+                - kind: section
+                  id: alt
+                  content: "ALT"
+            - kind: section
+              id: after
+              content: "AFTER"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        // No panic at build (the whole point) — the absent side never multiplied
+        // by `inner`, yet every branch's assignment stays width-consistent.
+        let b = Builder::from_yaml(yaml).unwrap();
+        let tree = dialogue_tree(&b);
+
+        // `inner` is gated by `grp` being present (option 0).
+        let grp_idx = tree
+            .dims
+            .iter()
+            .position(|d| d.selector_id == "grp")
+            .unwrap();
+        let inner_dim = tree.dims.iter().find(|d| d.selector_id == "inner").unwrap();
+        assert_eq!(inner_dim.gate, Some((grp_idx, 0)));
+
+        // `after` seals exactly THREE variants — (present,a), (present,b), (absent)
+        // — NOT four: the absent side does not multiply by `inner`.
+        let after = tree.nodes.iter().find(|n| n.name == "after").unwrap();
+        assert_eq!(after.options[0].variants.len(), 3);
+        let after_a = after.options[0]
+            .variant_for(tree.pack(&[0, 0], 2))
+            .unwrap()
+            .id;
+        let after_b = after.options[0]
+            .variant_for(tree.pack(&[0, 1], 2))
+            .unwrap()
+            .id;
+        let after_absent = after.options[0]
+            .variant_for(tree.pack(&[1, 0], 2))
+            .unwrap()
+            .id;
+        assert_ne!(after_a, after_b);
+
+        let resolver = MockResolver::new();
+        let proj = |grp: &str, inner: &str| -> Vec<SectionId> {
+            let mut sel = SelectionState::new();
+            sel.select("grp", grp);
+            sel.select("inner", inner);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        // Present: `after` follows the inner selection; the inner content emits.
+        assert!(proj("present", "a").contains(&after_a));
+        assert!(proj("present", "b").contains(&after_b));
+
+        // THE DANGEROUS CASE: group absent + a NON-DEFAULT inner value. `pack`
+        // masks `inner` back to its default, so `after` lands on its single absent
+        // variant — no build panic, no silent missing section.
+        assert!(proj("absent", "b").contains(&after_absent));
+        assert!(proj("absent", "a").contains(&after_absent));
+        assert!(!proj("absent", "b").contains(&after_a));
+        assert!(!proj("absent", "b").contains(&after_b));
+
+        // The `inner` selector itself only emits when the group is present.
+        let inner_a_id = opt_var(&b, "inner", "a", &[0]);
+        assert!(proj("present", "a").contains(&inner_a_id));
+        assert!(!proj("absent", "a").contains(&inner_a_id));
+    }
+
+    /// An `optional_group` nested inside another: the inner group's toggle is
+    /// itself gated by the outer group's side, so `dim_active` chains both gates.
+    /// A node after both groups must project correctly even when the inner group
+    /// is selected present while the outer is absent (inner is out of scope).
+    #[test]
+    fn nested_optional_group_chains_gates() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional_group
+              id: outer
+              default: present
+              nodes:
+                - kind: optional_group
+                  id: inner
+                  default: present
+                  nodes:
+                    - kind: section
+                      id: deep
+                      content: "DEEP"
+                  absent:
+                    - kind: section
+                      id: inner_alt
+                      content: "INNER-ALT"
+              absent:
+                - kind: section
+                  id: outer_alt
+                  content: "OUTER-ALT"
+            - kind: section
+              id: tail
+              content: "TAIL"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let b = Builder::from_yaml(yaml).unwrap();
+        let tree = dialogue_tree(&b);
+
+        let outer_idx = tree
+            .dims
+            .iter()
+            .position(|d| d.selector_id == "outer")
+            .unwrap();
+        let inner = tree.dims.iter().find(|d| d.selector_id == "inner").unwrap();
+        // The nested group's toggle is gated by the OUTER group being present.
+        assert_eq!(inner.gate, Some((outer_idx, 0)));
+
+        // `tail` seals three variants: (outer present, inner present),
+        // (outer present, inner absent), (outer absent) — the absent outer side
+        // collapses the inner dim.
+        let tail = tree.nodes.iter().find(|n| n.name == "tail").unwrap();
+        assert_eq!(tail.options[0].variants.len(), 3);
+        let tail_pp = tail.options[0]
+            .variant_for(tree.pack(&[0, 0], 2))
+            .unwrap()
+            .id;
+        let tail_pa = tail.options[0]
+            .variant_for(tree.pack(&[0, 1], 2))
+            .unwrap()
+            .id;
+        let tail_absent = tail.options[0]
+            .variant_for(tree.pack(&[1, 0], 2))
+            .unwrap()
+            .id;
+
+        let resolver = MockResolver::new();
+        let proj = |outer: &str, inner: &str| -> Vec<SectionId> {
+            let mut sel = SelectionState::new();
+            sel.select("outer", outer);
+            sel.select("inner", inner);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        assert!(proj("present", "present").contains(&tail_pp));
+        assert!(proj("present", "absent").contains(&tail_pa));
+        // Outer absent + inner present: inner is out of scope, masked away — `tail`
+        // lands on its single absent variant, never the inner-present one.
+        assert!(proj("absent", "present").contains(&tail_absent));
+        assert!(!proj("absent", "present").contains(&tail_pp));
+    }
+
+    /// A `dialect:` mandatory tree section is LIVE-PREFILLED glue, not a sealed
+    /// section: it allocates no sealed variant, is prefix-transparent (the node
+    /// below seals as if it weren't there), and emits a `Generated` run gated to
+    /// the branch it lives in (here, tools-on).
+    #[test]
+    fn dialect_tree_section_is_live_prefilled_glue() {
+        use crate::projection::{ProjectionMode, ProjectionSegment, SelectionState};
+        use candle_transformers::models::dialect::Dialect;
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: no_think
+              content: "/no_think"
+              default: present
+            - kind: optional_group
+              id: tools_on
+              default: present
+              nodes:
+                - kind: section
+                  id: tools_open
+                  dialect: tool_block_open
+                - kind: section
+                  id: inner
+                  content: "inner"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let mut b = Builder::from_yaml_with_vars_and_dialect(yaml, &[], Some(&dlct)).unwrap();
+        b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
+            .unwrap();
+
+        let tree = dialogue_tree(&b);
+        let tools_open = tree.nodes.iter().find(|n| n.name == "tools_open").unwrap();
+        assert!(tools_open.glue.is_some(), "a dialect section is glue");
+        assert!(
+            tools_open.options[0].variants.is_empty(),
+            "glue allocates no sealed variant"
+        );
+
+        // Prefix-transparent: `inner` (present branch, right after the glue) anchors
+        // only on no_think — the glue contributes NOTHING to its prefix.
+        let no_think_present = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "no_think")
+            .unwrap()
+            .options
+            .iter()
+            .find(|o| o.id == "present")
+            .unwrap()
+            .variants[0]
+            .id;
+        let inner = tree.nodes.iter().find(|n| n.name == "inner").unwrap();
+        let inner_present = inner.options[0].variant_for(tree.pack(&[0, 0], 2)).unwrap();
+        assert_eq!(
+            inner_present.in_tree_prefix,
+            vec![no_think_present],
+            "glue must not appear in the K/V prefix below it"
+        );
+
+        // Projection: tools on → a `Generated` run named `tools_open`; tools off →
+        // none (gated to the present branch).
+        let resolver = MockResolver::new();
+        let has_glue = |tools: &str| {
+            let mut sel = SelectionState::new();
+            sel.select("no_think", "present");
+            sel.select("tools_on", tools);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .segments
+                .iter()
+                .any(|s| {
+                    matches!(
+                        s,
+                        ProjectionSegment::Generated { identity, tokens }
+                            if identity.name == "tools_open" && !tokens.is_empty()
+                    )
+                })
+        };
+        assert!(
+            has_glue("present"),
+            "glue emits a Generated run when tools on"
+        );
+        assert!(!has_glue("absent"), "glue is omitted when tools off");
+
+        // The GUI event surfaces the marker as a real glue ROW, never a section.
+        let mut sel = SelectionState::new();
+        sel.select("no_think", "present");
+        sel.select("tools_on", "present");
+        let proj =
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel);
+        let ev = crate::projection::from_projection(
+            &proj.segments,
+            b.schema(),
+            &resolver,
+            &crate::projection::SelectionScores::default(),
+            0,
+            0,
+            1.0,
+        );
+        use crate::projection::SystemItem;
+        assert!(
+            ev.selection.system.iter().any(|it| matches!(
+                it, SystemItem::Glue { name, .. } if name == "tools_open"
+            )),
+            "marker renders as a glue row"
+        );
+        assert!(
+            !ev.selection.system.iter().any(|it| matches!(
+                it, SystemItem::Section { name, .. } if name == "tools_open"
+            )),
+            "marker is NOT a section row"
+        );
+    }
+
+    /// An `optional_group` with an `absent:` branch carries DIFFERENT content per
+    /// branch under the SAME binary dim (no new permutations): present emits the
+    /// tools-aware grounding, absent the tools-free one, and the directive below
+    /// genuinely anchors on whichever grounding fired in its branch.
+    #[test]
+    fn optional_group_absent_branch_carries_alternative_grounding() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: optional
+              id: no_think
+              content: "/no_think"
+              default: present
+            - kind: section
+              id: frame
+              content: "frame"
+            - kind: optional_group
+              id: tools_on
+              default: present
+              nodes:
+                - kind: section
+                  id: tools_open
+                  content: "<tools>"
+                - kind: section
+                  id: grounding_tools
+                  content: "fetch it with a tool"
+              absent:
+                - kind: section
+                  id: grounding_no_tools
+                  content: "say so rather than guessing"
+            - kind: section
+              id: directive
+              content: "respond"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let b = Builder::from_yaml(yaml).unwrap();
+        let resolver = MockResolver::new();
+        let proj = |tools: &str| -> Vec<SectionId> {
+            let mut sel = SelectionState::new();
+            sel.select("no_think", "present");
+            sel.select("tools_on", tools);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        // present: no_think=0, tools=0 ; absent: no_think=0, tools=1.
+        let g_tools = opt_var(&b, "grounding_tools", "content", &[0, 0]);
+        let g_no = opt_var(&b, "grounding_no_tools", "content", &[0, 1]);
+
+        let present = proj("present");
+        let absent = proj("absent");
+        assert!(
+            present.contains(&g_tools) && !present.contains(&g_no),
+            "present branch shows the tools grounding only"
+        );
+        assert!(
+            absent.contains(&g_no) && !absent.contains(&g_tools),
+            "absent branch shows the tools-free grounding only"
+        );
+
+        // grounding_tools seals ONLY ×no_think on the present branch, grounding_no_tools
+        // ONLY ×no_think on the absent branch — 2 + 2 = 4 total, no extra dim.
+        let tree = dialogue_tree(&b);
+        let gt = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "grounding_tools")
+            .unwrap();
+        let gn = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "grounding_no_tools")
+            .unwrap();
+        assert_eq!(gt.options[0].variants.len(), 2);
+        assert_eq!(gn.options[0].variants.len(), 2);
+
+        // KV continuity: the directive below anchors on the grounding that fired
+        // in ITS branch (and never the other branch's grounding).
+        let dir = tree.nodes.iter().find(|n| n.name == "directive").unwrap();
+        let dir_present = dir.options[0].variant_for(tree.pack(&[0, 0], 2)).unwrap();
+        let dir_absent = dir.options[0].variant_for(tree.pack(&[0, 1], 2)).unwrap();
+        assert!(dir_present.in_tree_prefix.contains(&g_tools));
+        assert!(!dir_present.in_tree_prefix.contains(&g_no));
+        assert!(dir_absent.in_tree_prefix.contains(&g_no));
+        assert!(!dir_absent.in_tree_prefix.contains(&g_tools));
+    }
+
+    /// The tool-catalog overview is a REAL sealed tree section before `<tools>`:
+    /// `tools_open` anchors on it (its variant id is in `tools_open`'s prefix),
+    /// and the content is rewritable pre-prefill WITHOUT changing the variant id
+    /// — so the K/V chain stays intact while the daemon writes the real overview.
+    #[test]
+    fn tool_summary_section_anchors_chain_and_content_is_settable() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let yaml = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: section
+              id: frame
+              content: "frame"
+            - kind: section
+              id: tool_summary
+              content: "placeholder"
+            - kind: section
+              id: tools_open
+              content: "<tools>"
+            - kind: section
+              id: directive
+              content: "respond"
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let mut b = Builder::from_yaml(yaml).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+
+        let var = |b: &Builder, name: &str| {
+            dialogue_tree(b)
+                .nodes
+                .iter()
+                .find(|n| n.name == name)
+                .unwrap()
+                .options[0]
+                .variant_for(0)
+                .unwrap()
+                .id
+        };
+        let summary_id = var(&b, "tool_summary");
+        // `tools_open` (and everything below) genuinely attends the summary: its
+        // sealed variant id is in `tools_open`'s in-tree prefix.
+        let tools_open_node = dialogue_tree(&b)
+            .nodes
+            .iter()
+            .find(|n| n.name == "tools_open")
+            .unwrap()
+            .clone();
+        assert!(
+            tools_open_node.options[0]
+                .variant_for(0)
+                .unwrap()
+                .in_tree_prefix
+                .contains(&summary_id),
+            "tools_open must anchor on the tool_summary K/V"
+        );
+
+        // Rewriting the content pre-prefill keeps the SAME variant id (the chain
+        // is unchanged; only the bytes the prefill seals differ).
+        b.set_tree_section_content(
+            dialogue,
+            "tool_summary",
+            "The tools are grouped by purpose.",
+        )
+        .unwrap();
+        assert_eq!(
+            var(&b, "tool_summary"),
+            summary_id,
+            "variant id must not move"
+        );
+        let node = dialogue_tree(&b)
+            .nodes
+            .iter()
+            .find(|n| n.name == "tool_summary")
+            .unwrap()
+            .clone();
+        assert_eq!(node.options[0].content, "The tools are grouped by purpose.");
+
+        // Setting an unknown section errors.
+        assert!(b.set_tree_section_content(dialogue, "nope", "x").is_err());
+
+        // Projects in order: frame → tool_summary → <tools> → directive.
+        let resolver = MockResolver::new();
+        let ids: Vec<SectionId> = b
+            .project_with_selection(
+                tree_target(&b),
+                &resolver,
+                ProjectionMode::Decode,
+                &SelectionState::new(),
+            )
+            .sealed_sections()
+            .map(|s| s.id)
+            .collect();
+        let pos = |id: SectionId| ids.iter().position(|x| *x == id).unwrap();
+        assert!(pos(var(&b, "frame")) < pos(summary_id));
+        assert!(pos(summary_id) < pos(var(&b, "tools_open")));
+    }
+
+    #[test]
+    fn runtime_add_to_tree_collection_seals_per_branch_no_alias() {
+        // Like COLLECTION_TREE_YAML but the tools collection starts empty — the
+        // real catalog is installed at runtime (the daemon's install_tool_catalog).
+        let yaml = COLLECTION_TREE_YAML.replace(
+            "              sections:\n                - id: tool_a\n                  content: \"tool a\"\n                - id: tool_b\n                  content: \"tool b\"",
+            "              sections: []",
+        );
+        let mut b = Builder::from_yaml(&yaml).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let cid = b.id_for_collection_in(dialogue, "tools").unwrap();
+
+        // Runtime add, exactly as install_tool_catalog does (by CollectionId).
+        let ws = b
+            .add_section_to_collection(dialogue, cid, "web_search", "ws def", 100.0)
+            .unwrap();
+        let calc = b
+            .add_section_to_collection(dialogue, cid, "calc", "calc def", 100.0)
+            .unwrap();
+
+        let tree = dialogue_tree(&b);
+        let tools = tree
+            .nodes
+            .iter()
+            .find(|n| n.name == "tools")
+            .unwrap()
+            .collection
+            .as_ref()
+            .unwrap();
+
+        // Two members, each sealed ×2 (no_think branches).
+        assert_eq!(tools.variants.len(), 2);
+        assert_eq!(tools.variants[0].len(), 2);
+        assert_eq!(tools.variants[1].len(), 2);
+
+        // Each member's canonical id is its default-branch variant, and resolves
+        // by name.
+        assert_eq!(
+            ws,
+            tools.member_variant(0, tools.default_branch).unwrap().id
+        );
+        assert_eq!(b.id_for_section_in(dialogue, "web_search").unwrap(), ws);
+
+        // No id aliasing: every sealed id across both members + both branches is
+        // distinct (the ×branch block sits above the prior max each add).
+        let mut ids: Vec<_> = tools
+            .variants
+            .iter()
+            .flatten()
+            .map(|v| v.id.raw())
+            .collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "all per-branch member ids must be unique");
+        // calc was added after web_search → its block is strictly higher.
+        assert!(calc.raw() > ws.raw());
     }
 
     #[test]

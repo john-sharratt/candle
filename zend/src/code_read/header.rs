@@ -6,7 +6,7 @@
 //! the canonical "use a tool, read the response" pattern, and the
 //! conversation ends with a single DECODED whole-file summary:
 //!
-//! ```text
+//! ````text
 //! Part turn (user, prefilled):
 //!   Source excerpt — `src/auth/handler.rs` lines 47-93:
 //!
@@ -31,7 +31,7 @@
 //! Final turn (assistant, DECODED):
 //!   Summarize the entire file `src/auth/handler.rs` in no more than
 //!   200 words. → <whole-file summary, generated live by the model>
-//! ```
+//! ````
 //!
 //! The per-part prompt is rendered by [`render_part_user_prompt`] and
 //! the parts are inserted via [`crate::turn_sink::InsertTurnSink::

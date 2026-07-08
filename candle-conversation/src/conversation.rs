@@ -10,17 +10,17 @@ use crate::handle::{SealResult, TurnHandle, TurnResponse};
 use crate::persistence::content_hash::{hash_tokens, ContentChain};
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    from_projection, Builder, Conversation, OptionalState, ProjectionEvent, ProjectionMode,
+    from_projection_with_origins, Builder, Conversation, ProjectionEvent, ProjectionMode,
     ProjectionTarget, SectionId, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
-    NO_THINK_SELECTOR,
 };
+use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
 use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
 use crate::sequence_handle::{BlockCount, SequenceId};
-use crate::substrate::TurnContentBounds;
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
 use crate::tree::{CognitiveTask, ConversationTree, TaskPoll, TurnType};
 use crate::turn::{Role, Turn, TurnOptions};
+use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 
@@ -135,6 +135,7 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
+use crate::stencil::TriggerRegistry;
 use crossbeam::channel::Sender;
 use std::sync::Arc;
 
@@ -240,13 +241,11 @@ pub struct GlueMarkers {
     pub user_end: String,
     pub assistant_start: String,
     pub assistant_end: String,
-    /// The empty/closed reasoning header forced after `assistant_start` when a
-    /// turn is *suppressed* (`<think>\n\n</think>\n\n` for Qwen3) — what the
-    /// composer effort dial's Off setting injects, and what every prefilled
-    /// memory-tier turn carries. (A *thinking* turn has no forced header: the
-    /// model emits its own `<think>` as a decoded token, so it shows up in the
-    /// turn body, not here.) Surfaced so the panel renders the framing verbatim.
-    pub no_think_block: String,
+    /// The `/no_think` soft-switch, emitted as live glue right after `user_start`
+    /// on a suppressed (effort-off) turn — see the scheduler's `no_think_current`
+    /// segment. Empty for non-thinking dialects. The panel renders it so its view
+    /// matches the actual prefill.
+    pub no_think: String,
 }
 
 impl Sequence {
@@ -387,8 +386,23 @@ impl Sequence {
                 SystemPromptItem::SectionTree(t) => t
                     .nodes
                     .iter()
-                    .flat_map(|n| n.options.iter())
-                    .map(|o| o.content.len() as u64 * o.variants.len() as u64)
+                    .map(|n| {
+                        let opt_bytes: u64 = n
+                            .options
+                            .iter()
+                            .map(|o| o.content.len() as u64 * o.variants.len() as u64)
+                            .sum();
+                        // A collection node seals each member ×branch.
+                        let coll_bytes: u64 = n.collection.as_ref().map_or(0, |tc| {
+                            tc.collection
+                                .sections
+                                .iter()
+                                .zip(tc.variants.iter())
+                                .map(|(s, vs)| s.content.len() as u64 * vs.len() as u64)
+                                .sum()
+                        });
+                        opt_bytes + coll_bytes
+                    })
                     .sum::<u64>(),
             })
             .sum::<u64>();
@@ -491,6 +505,61 @@ impl Sequence {
                     // dependency-safe: a variant's in-tree prefix references only
                     // earlier nodes' variants, which are already sealed.
                     for node in &tree.nodes {
+                        // A prefix-transparent embedded collection: seal each
+                        // member ONCE PER ancestor branch (the ×outer-selector
+                        // fan-out), batching all members of a branch under that
+                        // branch's prefix with the aggressive collection quantize
+                        // policy.  It never extends `linear_prefix` — nodes below
+                        // anchor on the next mandatory node, not these members.
+                        if let Some(tc) = &node.collection {
+                            let members = &tc.collection.sections;
+                            // The branch set is identical across members; read it
+                            // off member 0's per-branch variant list.
+                            if let Some(branch_list) = tc.variants.first() {
+                                for (bi, bvar) in branch_list.iter().enumerate() {
+                                    let mut prefix = linear_prefix.clone();
+                                    prefix.extend_from_slice(&bvar.in_tree_prefix);
+                                    let batch: Vec<(SectionId, &str)> = members
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(mi, sec)| {
+                                            (tc.variants[mi][bi].id, sec.content.as_str())
+                                        })
+                                        .collect();
+                                    if !batch.is_empty() {
+                                        let done_bytes_ref = &mut done_bytes;
+                                        let report_ref = &report;
+                                        conv.insert_section_collection_with_progress(
+                                            &batch,
+                                            &prefix,
+                                            true,
+                                            |_sid, content_len| {
+                                                *done_bytes_ref += content_len as u64;
+                                                report_ref(*done_bytes_ref);
+                                            },
+                                        )?;
+                                        // Offload-as-we-go: quantize + persist +
+                                        // evict THIS branch's members before the
+                                        // next branch prefills, so the native
+                                        // catalog never exceeds one branch.  Safe
+                                        // because members are prefix-transparent —
+                                        // nothing attends back over them in the
+                                        // build — and the per-turn elevate reloads
+                                        // the projection's top-k on demand.
+                                        let (tx, rx) = crossbeam::channel::bounded(1);
+                                        conv.scheduler_tx
+                                            .send(SchedulerRequest::OffloadCollectionMembers {
+                                                conversation: conv.substrate.clone(),
+                                                response_tx: tx,
+                                            })
+                                            .map_err(|_| ConversationError::SchedulerGone)?;
+                                        rx.recv()
+                                            .map_err(|_| ConversationError::SchedulerGone)??;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         for option in &node.options {
                             for v in &option.variants {
                                 let mut prefix = linear_prefix.clone();
@@ -1038,24 +1107,8 @@ impl Sequence {
         // `apply_projection`; the upload cache amortises after the
         // first turn.
 
-        // Thinking suppression is PER-TURN, driven by the section-tree
-        // `no_think` selector (the composer effort dial): `present` suppresses
-        // this turn, `absent` enables thinking.  Falls back to the
-        // conversation's configured default when the turn carries no selection
-        // (e.g. the titler).  The `/no_think` *text*, when suppressing, is
-        // emitted by the projection's `no_think` section — so it shows in the
-        // glue / section-tree view rather than being baked invisibly into the
-        // user turn here.  Only the assistant-header think block is set below.
-        let suppress = match self.selection.optional(NO_THINK_SELECTOR) {
-            Some(OptionalState::Present) => true,
-            Some(OptionalState::Absent) => false,
-            None => self.config.suppress_thinking,
-        };
         // The persisted turn shape is
-        //     user_message + user_end + assistant_start [+ no_think_block] + decoded_body
-        // where `no_think_block` (`<think></think>`) is present only when this
-        // turn is suppressed; a thinking turn opens its own `<think>` as the
-        // first decoded token, so it lives in `decoded_body`.
+        //     user_message + user_end + assistant_start + decoded_body
         // — i.e. `user_start` is **not** in the prefill and `assistant_end`
         // is **not** appended after decode.  Both boundary markers are
         // emitted as live `Generated` segments by the projection engine
@@ -1068,12 +1121,16 @@ impl Sequence {
         // context changes.  The intra-turn `user_end` and
         // `assistant_start` markers stay baked — their hidden state is
         // dominated by the turn's own (invariant) content.
-        let assistant_start_marker = self.config.dialect.active_assistant_start(
-            suppress,
-            self.config.thinking_capable
-                && (!suppress || self.config.inject_no_think_block)
-                && self.config.dialect.supports_no_think(),
-        );
+        //
+        // Thinking suppression is PER-TURN, driven by the composer effort dial.
+        // Qwen3's `/no_think` soft-switch is only honoured from the user turn (not
+        // the system prompt), so when suppressed it is emitted as live GLUE right
+        // before this user message by the scheduler (`no_think_current`, gated on
+        // the same selector — see `reproject` + `BoundaryMarkers`), never baked
+        // into the turn.  The assistant header itself is never modified: a
+        // suppressed turn decodes its own empty `<think></think>`, a thinking turn
+        // opens its own `<think>`.
+        let assistant_start_marker = self.config.dialect.assistant_start;
         // Optional assistant prefill: text seeded as the start of the response so
         // the decode is forced to continue from it (e.g. `<tool_call>` commits to
         // the tool-call grammar). It is pinned into the prefill grid and sealed
@@ -1117,12 +1174,10 @@ impl Sequence {
 
         let reprojection = self.build_reprojection_policy();
         // Content boundaries inside the sealed grid.  The prefill grid is
-        // `[user_msg][user_end][assistant_start]` — the leading `user_start`
-        // marker is a live `Generated` segment (not part of the prefill), and
-        // the `/no_think` text, when suppressing, is a projection section rather
-        // than baked here — so the user message body spans `[0, len(user_msg))`
-        // and the assistant content begins where decode starts, at the full
-        // prefill length.
+        // `[user_msg][user_end][assistant_start]` — the leading `user_start` (and,
+        // when suppressing, `/no_think`) are live `Generated` glue segments emitted
+        // by the scheduler, NOT part of the prefill — so the user body spans
+        // `[0, len(user_msg))`.
         let user_content_start = 0;
         let user_content_end = self.tokenize(user_message)?.len();
         // Assistant content begins at the `assistant_start` boundary — before any
@@ -1134,11 +1189,23 @@ impl Sequence {
         } else {
             self.tokenize(&assistant_head)?.len()
         };
-        let content_bounds = TurnContentBounds::clamped(
-            user_content_start,
-            user_content_end,
-            assistant_content_start,
-            prefill_tokens.len(),
+        // Clamp to the prefill length and force monotonic so a tokenizer that
+        // merges across a join can never invert the windows at seal time.
+        let total = prefill_tokens.len();
+        let user_content_start = (user_content_start.min(total)) as u32;
+        let user_content_end =
+            (user_content_end.min(total).max(user_content_start as usize)) as u32;
+        let assistant_content_start = (assistant_content_start
+            .min(total)
+            .max(user_content_end as usize)) as u32;
+        // Record whether the composer's `/no_think` dial is active for this
+        // turn, so the projection re-injects the soft-switch into this turn's
+        // user opener when it is later re-rendered as history.
+        let no_think = matches!(
+            options
+                .selection
+                .optional(crate::projection::NO_THINK_SELECTOR),
+            Some(crate::projection::OptionalState::Present)
         );
         let handle = self.submit_prefill_unit(
             self.id,
@@ -1146,8 +1213,11 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            no_think,
             options.tags.clone(),
-            content_bounds,
             // Decode path: reprojection fires from the decode loop, not staged
             // prefill offsets.
             Vec::new(),
@@ -1158,6 +1228,7 @@ impl Sequence {
             max_tokens,
             sampling,
             reprojection,
+            options.triggers,
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1199,7 +1270,7 @@ impl Sequence {
 
         // Thinking turn: no forced `no_think_block` — the trajectory carries its
         // own `<think>` in the body, matching the decode grid exactly.
-        let assistant_start_marker = self.config.dialect.active_assistant_start(false, false);
+        let assistant_start_marker = self.config.dialect.assistant_start;
         let assistant_head = format!(
             "{}{}{}",
             user_message, self.config.dialect.user_end, assistant_start_marker,
@@ -1223,16 +1294,16 @@ impl Sequence {
         self.pending_user = Some(TokenizedText::new(user_message, user_tokens));
 
         // Content boundaries: user body `[0, len(user_msg))`; the supplied
-        // assistant trajectory begins right after the head.
-        let user_content_start = 0;
-        let user_content_end = self.tokenize(user_message)?.len();
-        let assistant_content_start = self.tokenize(&assistant_head)?.len();
-        let content_bounds = TurnContentBounds::clamped(
-            user_content_start,
-            user_content_end,
-            assistant_content_start,
-            prefill_tokens.len(),
-        );
+        // assistant trajectory begins right after the head. Clamp/monotonise so a
+        // tokenizer that merges across a join can never invert the windows.
+        let total = prefill_tokens.len();
+        let user_content_start = 0u32;
+        let user_content_end = self.tokenize(user_message)?.len().min(total) as u32;
+        let assistant_content_start = self
+            .tokenize(&assistant_head)?
+            .len()
+            .min(total)
+            .max(user_content_end as usize) as u32;
 
         // Grid-token offset of each projection marker: tokenize `head + trajectory
         // up to the marker`. `split` yields one segment per marker plus a trailing
@@ -1262,8 +1333,12 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            // Thinking calibration turn: the trajectory carries its own `<think>`.
+            false,
             tags,
-            content_bounds,
             projection_offsets,
             // Prefill path: the assistant half is supplied — stored verbatim
             // (markers stripped) as the turn's assistant_text.
@@ -1274,6 +1349,8 @@ impl Sequence {
             self.config.sampling.clone(),
             // No reprojection policy: there is no decode loop to trigger it.
             None,
+            // No tool stencils on a calibration prefill.
+            Arc::new(TriggerRegistry::new()),
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -1307,14 +1384,18 @@ impl Sequence {
         prefill_text: String,
         prefill_tokens: TokenBuffer,
         user_text: String,
+        user_content_start: u32,
+        user_content_end: u32,
+        assistant_content_start: u32,
+        no_think: bool,
         tags: Vec<String>,
-        content_bounds: TurnContentBounds,
         projection_offsets: Vec<u32>,
         prefill_assistant_text: String,
         post_decode_tokens: TokenBuffer,
         max_decode_tokens: usize,
         sampling: SamplingConfig,
         reprojection: Option<ReprojectionPolicy>,
+        triggers: Arc<TriggerRegistry>,
     ) -> crate::Result<TurnHandle> {
         let disable_reprojection = self.config.disable_reprojection;
         // Append-only ingests skip the per-turn projection rebuild and also
@@ -1332,8 +1413,11 @@ impl Sequence {
                 prefill_tokens,
                 prefill_text,
                 user_text,
+                user_content_start,
+                user_content_end,
+                assistant_content_start,
+                no_think,
                 tags,
-                content_bounds,
                 projection_offsets,
                 prefill_assistant_text,
                 post_decode_tokens,
@@ -1342,6 +1426,7 @@ impl Sequence {
                 event_tx,
                 reprojection,
                 disable_reprojection,
+                triggers,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))
@@ -1403,13 +1488,12 @@ impl Sequence {
         //
         // Prefilled content turns (repo_map, code_reading, tool ingests, …)
         // carry SUPPLIED content — they never run a decoded reasoning pass — so
-        // the assistant think block is ALWAYS suppressed here (an empty
-        // `<think></think>`, never an open `<think>` that would swallow the
-        // content), independent of the model's thinking mode.  That's why the
-        // `/no_think` prefix and `active_assistant_start`'s suppress flag are
-        // hard `true` below, not derived from a per-turn selection.
+        // the `/no_think` prefix is hard-applied here (independent of any
+        // per-turn dial) to keep the model out of a reasoning frame over the
+        // supplied text.  The assistant header is left clean: no block is baked
+        // into it.
         let no_think_prefix = self.config.dialect.no_think;
-        // Format: {user_start}/no_think{user}{user_end}{assistant_start}<think></think>{assistant_text}.
+        // Format: {user_start}/no_think{user}{user_end}{assistant_start}{assistant_text}.
         // The assistant role-end comes through `post_decode_tokens`
         // — there is no decode in this path so the EOS isn't emitted
         // by the model; we append the full `assistant_end` (EOS +
@@ -1426,12 +1510,7 @@ impl Sequence {
             no_think_prefix,
             user_message,
             self.config.dialect.user_end,
-            self.config.dialect.active_assistant_start(
-                true,
-                self.config.thinking_capable
-                    && self.config.inject_no_think_block
-                    && self.config.dialect.supports_no_think(),
-            ),
+            self.config.dialect.assistant_start,
             assistant_text,
         );
         let prefill_tokens = self.tokenize(&formatted)?;
@@ -1446,12 +1525,7 @@ impl Sequence {
         // against the SAME strings the prefill is built from so the indices
         // land on the real grid; clamp/monotonise so a tokenizer that
         // merges across a join can never invert the windows.
-        let assistant_start_marker = self.config.dialect.active_assistant_start(
-            self.config.suppress_thinking,
-            self.config.thinking_capable
-                && (!self.config.suppress_thinking || self.config.inject_no_think_block)
-                && self.config.dialect.supports_no_think(),
-        );
+        let assistant_start_marker = self.config.dialect.assistant_start;
         let user_content_start = self.tokenize(no_think_prefix)?.len();
         let user_content_end = self
             .tokenize(&format!("{no_think_prefix}{user_message}"))?
@@ -1462,12 +1536,13 @@ impl Sequence {
                 no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
             ))?
             .len();
-        let content_bounds = TurnContentBounds::clamped(
-            user_content_start,
-            user_content_end,
-            assistant_content_start,
-            prefill_tokens.len(),
-        );
+        let total = prefill_tokens.len();
+        let user_content_start = (user_content_start.min(total)) as u32;
+        let user_content_end =
+            (user_content_end.min(total).max(user_content_start as usize)) as u32;
+        let assistant_content_start = (assistant_content_start
+            .min(total)
+            .max(user_content_end as usize)) as u32;
 
         // Build the TokenizedText for both halves now — assistant
         // text is supplied directly, not decoded, so we can fill it
@@ -1488,8 +1563,13 @@ impl Sequence {
             formatted,
             prefill_tokens,
             user_message.to_string(),
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            // Prefill content turns hard-apply `/no_think` (see the prefix above)
+            // — record it so the re-render is consistent with the sealed grid.
+            true,
             tags,
-            content_bounds,
             // Structured ingest: one projection, no staged prefill segments.
             Vec::new(),
             // Prefill path: the assistant half is supplied (not decoded), so
@@ -1499,6 +1579,8 @@ impl Sequence {
             0,
             self.config.sampling.clone(),
             None,
+            // A no-decode insert never samples, so no stencil can fire.
+            Arc::new(TriggerRegistry::new()),
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
@@ -1624,16 +1706,40 @@ impl Sequence {
             &self.selection,
         );
         let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
-        Some(from_projection(
+        // A projection is a POINT on the timeline, not a span. This is the
+        // post-seal projection: the turn has finished decoding and its answer is
+        // now materialized, so the point sits at the FINAL generated position
+        // (`tokens_generated`), governing the closing interval `[last_reproj, end]`.
+        // `seconds` is the full decode elapsed — the wall-clock at this final point.
+        let mut ev = from_projection_with_origins(
             &projection.segments,
+            &projection.selection_origins,
             self.projection.schema(),
             &resolver,
             &projection.selection_scores,
             substrate_total,
-            0,
             stats.tokens_generated as u32,
             stats.decode_ms / 1000.0,
-        ))
+        );
+        // Materialized dialogue glue, from the SAME `assemble_pieces` decision the
+        // engine injects from, so the persisted panel shows the real boundary
+        // markers. Best-effort: if the markers can't be tokenised, leave it empty
+        // and the panel reconstructs the framing.
+        if let Ok(markers) = BoundaryMarkers::from_dialect(&self.config.dialect, |s| {
+            self.tokenizer
+                .encode(s, false)
+                .map(|e| e.get_ids().to_vec())
+        }) {
+            ev.materialized = materialize_conversation(
+                &projection.segments,
+                &markers,
+                &projection.selection_origins,
+                &resolver,
+                self.projection.schema(),
+                |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+            );
+        }
+        Some(ev)
     }
 
     /// `(section name, authored content)` for every system-prompt section in the
@@ -1665,12 +1771,26 @@ impl Sequence {
                                 };
                                 out.push((name, o.content.clone()));
                             }
+                            // An embedded collection node lists its members.
+                            if let Some(tc) = &n.collection {
+                                for s in &tc.collection.sections {
+                                    out.push((s.name.clone(), s.content.clone()));
+                                }
+                            }
                         }
                     }
                 }
             }
         }
         out
+    }
+
+    /// The conversation's default sampling config (with the model's resolved
+    /// thinking / reflection-marker token IDs).  Callers clone this to derive a
+    /// per-turn config — e.g. to set the dial's `segment_suppress_penalty` — and
+    /// pass it back via `TurnOptions::sampling`.
+    pub fn default_sampling(&self) -> SamplingConfig {
+        self.config.sampling.clone()
     }
 
     /// The dialect's framing markers — the "glue" the assembler wraps around the
@@ -1686,7 +1806,7 @@ impl Sequence {
             user_end: d.user_end.to_string(),
             assistant_start: d.assistant_start.to_string(),
             assistant_end: d.assistant_end.to_string(),
-            no_think_block: d.no_think_block.to_string(),
+            no_think: d.no_think.to_string(),
         }
     }
 
@@ -2037,13 +2157,18 @@ impl Sequence {
     /// (`SummaryOfTurns` / `SummaryOfSummaries` tree nodes) are skipped — they
     /// exist for provenance/projection, not for the conversation view. Pass
     /// `true` for substrate-level views that legitimately surface them.
+    /// Recover the conversation as `(role, text, no_think)` bubbles — one per
+    /// non-empty half of each turn, in order.  `no_think` is the turn's recorded
+    /// thinking-suppressed flag, set on the USER bubble so the GUI can re-render
+    /// the `/no_think` soft-switch on prior turns exactly as the assembler does
+    /// for the model (see `turn_no_think`); the assistant bubble carries `false`.
     pub fn recovered_history(
         &self,
         timeline: TimelineId,
         include_ghost_summaries: bool,
-    ) -> Vec<(Role, String)> {
+    ) -> Vec<(Role, String, bool)> {
         let read = self.substrate.read();
-        let mut out: Vec<(Role, String)> = Vec::new();
+        let mut out: Vec<(Role, String, bool)> = Vec::new();
         for idx in read.turn_indices(timeline) {
             if !include_ghost_summaries
                 && read
@@ -2054,34 +2179,30 @@ impl Sequence {
             }
             let user_text = read.user_text_of(timeline, idx);
             let assistant_text = read.assistant_text_of(timeline, idx);
+            let no_think = read.turn_no_think(timeline, idx);
             if !user_text.is_empty() {
-                out.push((Role::User, user_text));
+                out.push((Role::User, user_text, no_think));
             }
             if !assistant_text.is_empty() {
-                out.push((Role::Assistant, assistant_text));
+                out.push((Role::Assistant, assistant_text, false));
             }
         }
         out
     }
 
-    /// The two verbatim halves — `(user_text, assistant_text)` — of projected
-    /// turn `index` in the group named `group_name`, read from the substrate.
-    /// Returned UNFRAMED (no dialect markers): the caller places the glue around
-    /// and between them. Both halves are stored verbatim (decoded for dialogue
-    /// turns, supplied for prefill ingests like repo_map/code_reading; see
-    /// `insert_turn` → the seal). `None` if the group/turn isn't found or is
-    /// entirely empty.
-    pub fn resolve_turn_text(&self, group_name: &str, index: u32) -> Option<(String, String)> {
-        let gid = self
-            .projection
-            .schema()
-            .layers
-            .iter()
-            .flat_map(|l| l.groups.iter())
-            .find(|g| g.name == group_name)
-            .map(|g| g.id)?;
+    /// The two verbatim halves — `(user_text, assistant_text)` — of turn `index`
+    /// in `timeline`, read from the substrate. Returned UNFRAMED (no dialect
+    /// markers): the caller places the glue around and between them. Both halves
+    /// are stored verbatim (decoded for dialogue turns, supplied for prefill
+    /// ingests like repo_map/code_reading; see `insert_turn` → the seal).
+    ///
+    /// `timeline` is the turn's resolved identity, stamped by the projection at
+    /// selection time (`SelectedTurn::timeline`) — it is NEVER re-derived from a
+    /// group here, because the shared substrate registers many conversations under
+    /// one group and that re-derivation is non-deterministic. `None` if the turn
+    /// isn't found or is entirely empty.
+    pub fn resolve_turn_text(&self, timeline: TimelineId, index: u32) -> Option<(String, String)> {
         let read = self.substrate.read();
-        let timeline = read.active_timelines_for_group(gid).next()?;
         let idx = TurnIndex(index);
         let user = read.user_text_of(timeline, idx);
         let assistant = read.assistant_text_of(timeline, idx);
@@ -2089,6 +2210,32 @@ impl Sequence {
             return None;
         }
         Some((user, assistant))
+    }
+
+    /// The ENTIRE turn `index` in `timeline` as one continuous string: the full
+    /// sealed token range — user content, the baked intra-turn boundary
+    /// (`user_end` / `assistant_start`), and assistant content — decoded verbatim,
+    /// exactly as it sits in the KV. `timeline` is the turn's resolved identity
+    /// (`SelectedTurn::timeline`); see [`Self::resolve_turn_text`]. `None` if the
+    /// turn isn't found or has no tokens.
+    pub fn resolve_turn_full_text(&self, timeline: TimelineId, index: u32) -> Option<String> {
+        let read = self.substrate.read();
+        let ids = read.token_ids_of(timeline, TurnIndex(index));
+        if ids.is_empty() {
+            return None;
+        }
+        self.tokenizer.decode(&ids, false).ok()
+    }
+
+    /// The segment-vector [`TurnLayout`] for turn `index` in `timeline` — the
+    /// complete, validated description of its K/V (user / thinking / assistant /
+    /// boundary glue). Built at seal time and stored on the turn, so this is a
+    /// direct fetch. `timeline` is the turn's resolved identity
+    /// (`SelectedTurn::timeline`); see [`Self::resolve_turn_text`]. `None` if the
+    /// turn isn't found.
+    pub fn turn_layout(&self, timeline: TimelineId, index: u32) -> Option<TurnLayout> {
+        let read = self.substrate.read();
+        read.turn_layout(timeline, TurnIndex(index))
     }
 
     /// Persist this conversation's projection-event timeline for the most

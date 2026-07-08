@@ -22,6 +22,7 @@ mod conv_files;
 mod download;
 mod loading;
 mod log_broadcast;
+mod log_file;
 mod log_line;
 mod projection_event;
 mod refresh_ctx;
@@ -119,11 +120,18 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    let workspace = cli
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| cli.workspace.clone());
+
     // ── Logging ───────────────────────────────────────────────────────────────
     //
-    // Two fmt layers sharing the same filter:
-    //  • stdout  — ANSI colours for the terminal
+    // Three fmt layers sharing the same filter:
+    //  • stdout    — ANSI colours for the terminal
     //  • broadcast — plain text piped to the web log pane via WebSocket
+    //  • file      — the full configured stream to <workspace>/.substrate/zend.log,
+    //                fresh per run, size-capped with rotation (see `log_file`).
 
     let log = LogBus::new();
 
@@ -141,17 +149,22 @@ async fn main() -> anyhow::Result<()> {
     let ws_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(BusWriter(Arc::clone(&log)))
-        .with_filter(filter);
+        .with_filter(filter.clone());
+
+    // None (open failure) degrades to the stdout + bus sinks rather than
+    // aborting boot; `Option<Layer>` is itself a `Layer` (None = no-op).
+    let file_layer = log_file::RotatingFileLog::new(&workspace.join(".substrate")).map(|w| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(w)
+            .with_filter(filter)
+    });
 
     tracing_subscriber::registry()
         .with(stdout_layer)
         .with(ws_layer)
+        .with(file_layer)
         .init();
-
-    let workspace = cli
-        .workspace
-        .canonicalize()
-        .unwrap_or_else(|_| cli.workspace.clone());
 
     let config = DaemonConfig {
         workspace: workspace.clone(),

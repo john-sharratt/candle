@@ -1482,6 +1482,7 @@ fn run_offset_window_glue_case(
         &col_t,
         &rope_cs,
         false,
+        0, // fwd_window: backward-only
         &gen_c,
     )?;
     let gen_b = stager.begin_generation();
@@ -1500,6 +1501,7 @@ fn run_offset_window_glue_case(
         &col_t,
         &rope_cs,
         false,
+        0, // fwd_window: backward-only
         &gen_b,
     )?;
     let _ = (&backing_b, &backing_c);
@@ -1557,6 +1559,7 @@ fn glue_over(
         &col_t,
         rope_cs,
         false,
+        0, // fwd_window: backward-only
         &gen,
     )?;
     device.synchronize()?;
@@ -1936,6 +1939,7 @@ fn run_glue_interspersed_case(
         &col_t,
         &rope_cs,
         false,
+        0, // fwd_window: backward-only
         &gen,
     )?;
     device.synchronize()?;

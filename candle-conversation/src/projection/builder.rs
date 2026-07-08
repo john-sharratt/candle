@@ -47,7 +47,7 @@ use super::project::{
 use super::schema::{
     Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, LayerSchema, LayerSummary,
     Schema, SectionCollection, SectionSchema, SelectionRule, SummaryMode, SystemPromptItem,
-    SystemPromptSchema, TurnSummary,
+    SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
 };
 use super::yaml::{from_yaml, NameMaps};
 use crate::substrate::ContentResolver;
@@ -355,10 +355,32 @@ impl Builder {
                                     Some(std::sync::Arc::new(tokenize(&s.content)?));
                             }
                         }
+                        if !c.member_glue.is_empty() && c.member_glue_tokens.is_none() {
+                            c.member_glue_tokens =
+                                Some(std::sync::Arc::new(tokenize(&c.member_glue)?));
+                        }
                     }
-                    // Tree nodes are always sealed content (never templates),
-                    // so there is nothing to pre-tokenise here.
-                    SystemPromptItem::SectionTree(_) => {}
+                    // Tree-node sections are sealed content, but a `glue` node
+                    // (e.g. `<tools>`) is a live-prefilled structural marker, and
+                    // an embedded collection's `member_glue` is one too — pre-tokenise
+                    // both here.
+                    SystemPromptItem::SectionTree(tree) => {
+                        for node in tree.nodes.iter_mut() {
+                            let need_glue = node.glue.as_ref().is_some_and(|g| g.tokens.is_none());
+                            if need_glue {
+                                let content = node.options[0].content.clone();
+                                let toks = std::sync::Arc::new(tokenize(&content)?);
+                                node.glue.as_mut().unwrap().tokens = Some(toks);
+                            }
+                            if let Some(tc) = node.collection.as_mut() {
+                                let c = &mut tc.collection;
+                                if !c.member_glue.is_empty() && c.member_glue_tokens.is_none() {
+                                    c.member_glue_tokens =
+                                        Some(std::sync::Arc::new(tokenize(&c.member_glue)?));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -469,15 +491,24 @@ impl Builder {
     ) -> Result<(), ConstructionError> {
         validate_selection(name, &selection)?;
         let layer_idx = self.layer_idx(layer)?;
-        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
-            if let SystemPromptItem::Collection(coll) = item {
-                if coll.name == name {
+        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        match locate_collection(items, |c| c.name == name) {
+            Some(CollLoc::TopLevel(ii)) => {
+                if let SystemPromptItem::Collection(coll) = &mut items[ii] {
                     coll.selection = selection;
-                    return Ok(());
                 }
+                Ok(())
             }
+            Some(CollLoc::Tree { item, node }) => {
+                if let SystemPromptItem::SectionTree(t) = &mut items[item] {
+                    if let Some(tc) = t.nodes[node].collection.as_mut() {
+                        tc.collection.selection = selection;
+                    }
+                }
+                Ok(())
+            }
+            None => Err(ConstructionError::UnknownCollection(name.to_string())),
         }
-        Err(ConstructionError::UnknownCollection(name.to_string()))
     }
 
     /// Restrict a collection to a single named member and force it
@@ -493,19 +524,35 @@ impl Builder {
         section: &str,
     ) -> Result<(), ConstructionError> {
         let layer_idx = self.layer_idx(layer)?;
-        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
-            if let SystemPromptItem::Collection(coll) = item {
-                if coll.name == collection {
-                    coll.sections.retain(|s| s.name == section);
-                    if coll.sections.is_empty() {
-                        return Err(ConstructionError::UnknownSection(section.to_string()));
-                    }
-                    coll.selection = SelectionRule::AlwaysVisible;
-                    return Ok(());
+        let keep: std::collections::HashSet<String> =
+            std::iter::once(section.to_string()).collect();
+        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        match locate_collection(items, |c| c.name == collection) {
+            Some(CollLoc::TopLevel(ii)) => {
+                let SystemPromptItem::Collection(coll) = &mut items[ii] else {
+                    unreachable!()
+                };
+                coll.sections.retain(|s| s.name == section);
+                if coll.sections.is_empty() {
+                    return Err(ConstructionError::UnknownSection(section.to_string()));
                 }
+                coll.selection = SelectionRule::AlwaysVisible;
+                Ok(())
             }
+            Some(CollLoc::Tree { item, node }) => {
+                let SystemPromptItem::SectionTree(t) = &mut items[item] else {
+                    unreachable!()
+                };
+                let tc = t.nodes[node].collection.as_mut().expect("collection node");
+                retain_tree_members(tc, &keep);
+                if tc.collection.sections.is_empty() {
+                    return Err(ConstructionError::UnknownSection(section.to_string()));
+                }
+                tc.collection.selection = SelectionRule::AlwaysVisible;
+                Ok(())
+            }
+            None => Err(ConstructionError::UnknownCollection(collection.to_string())),
         }
-        Err(ConstructionError::UnknownCollection(collection.to_string()))
     }
 
     /// Retain only the collection members whose name is in `keep`, dropping the
@@ -524,15 +571,24 @@ impl Builder {
         keep: &std::collections::HashSet<String>,
     ) -> Result<(), ConstructionError> {
         let layer_idx = self.layer_idx(layer)?;
-        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
-            if let SystemPromptItem::Collection(coll) = item {
-                if coll.name == collection {
+        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        match locate_collection(items, |c| c.name == collection) {
+            Some(CollLoc::TopLevel(ii)) => {
+                if let SystemPromptItem::Collection(coll) = &mut items[ii] {
                     coll.sections.retain(|s| keep.contains(&s.name));
-                    return Ok(());
                 }
+                Ok(())
             }
+            Some(CollLoc::Tree { item, node }) => {
+                if let SystemPromptItem::SectionTree(t) = &mut items[item] {
+                    if let Some(tc) = t.nodes[node].collection.as_mut() {
+                        retain_tree_members(tc, keep);
+                    }
+                }
+                Ok(())
+            }
+            None => Err(ConstructionError::UnknownCollection(collection.to_string())),
         }
-        Err(ConstructionError::UnknownCollection(collection.to_string()))
     }
 
     // ── Runtime mutators ─────────────────────────────────────────────────────
@@ -584,6 +640,7 @@ impl Builder {
                 content,
                 priority,
                 depends_on: None,
+                depends_on_absent: None,
                 is_template: false,
                 template_tokens: None,
             }));
@@ -653,6 +710,8 @@ impl Builder {
                 // compression path reads a group summary.
                 summary: GroupSummary::default(),
                 summary_section: None,
+                member_glue: String::new(),
+                member_glue_tokens: None,
             }));
         self.name_maps
             .collection_names
@@ -686,42 +745,74 @@ impl Builder {
         }
         let layer_idx = self.layer_idx(layer)?;
         self.assert_section_name_free(layer_idx, &name)?;
-        // Validate the collection exists before any mutation.
-        let coll_exists = self.schema.layers[layer_idx]
-            .system_prompt
-            .items
-            .iter()
-            .any(|it| {
-                matches!(it,
-                SystemPromptItem::Collection(c) if c.id == collection)
-            });
-        if !coll_exists {
-            return Err(ConstructionError::UnknownCollection(format!(
-                "CollectionId({:?})",
-                collection
-            )));
-        }
-        // Allocate id while only holding an immutable borrow.
-        let new_id = SectionId::new(self.next_section_id_raw());
-        // Now take a fresh mutable borrow to push.
-        let coll = self.schema.layers[layer_idx]
-            .system_prompt
-            .items
-            .iter_mut()
-            .find_map(|it| match it {
-                SystemPromptItem::Collection(c) if c.id == collection => Some(c),
-                _ => None,
-            })
-            .expect("existence checked above");
-        coll.sections.push(SectionSchema {
-            id: new_id,
-            name: name.clone(),
-            content,
-            priority,
-            depends_on: None,
-            is_template: false,
-            template_tokens: None,
-        });
+        // Locate the collection (top-level OR tree-embedded) before any mutation.
+        let items = &self.schema.layers[layer_idx].system_prompt.items;
+        let loc = locate_collection(items, |c| c.id == collection).ok_or_else(|| {
+            ConstructionError::UnknownCollection(format!("CollectionId({collection:?})"))
+        })?;
+        // Allocate id(s) while only holding an immutable borrow.  A tree-embedded
+        // collection seals each member ×branch, so it takes one CONTIGUOUS id per
+        // branch (above the current max — guaranteed disjoint).
+        let base = self.next_section_id_raw();
+        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        let new_id = match loc {
+            CollLoc::TopLevel(ii) => {
+                let SystemPromptItem::Collection(coll) = &mut items[ii] else {
+                    unreachable!("located a top-level collection")
+                };
+                let id = SectionId::new(base);
+                coll.sections.push(SectionSchema {
+                    id,
+                    name: name.clone(),
+                    content,
+                    priority,
+                    depends_on: None,
+                    depends_on_absent: None,
+                    is_template: false,
+                    template_tokens: None,
+                });
+                id
+            }
+            CollLoc::Tree { item, node } => {
+                let SystemPromptItem::SectionTree(t) = &mut items[item] else {
+                    unreachable!("located a section tree")
+                };
+                let tc = t.nodes[node]
+                    .collection
+                    .as_mut()
+                    .expect("located a collection node");
+                // One sealed variant per branch, ids `base..base+n` contiguous.
+                let variants: Vec<TreeVariant> = tc
+                    .branches
+                    .iter()
+                    .enumerate()
+                    .map(|(bi, (ancestors, prefix))| TreeVariant {
+                        ancestors: *ancestors,
+                        id: SectionId::new(base + bi as u32),
+                        in_tree_prefix: prefix.clone(),
+                    })
+                    .collect();
+                // The canonical (default-branch) id backs scoring / gating / name
+                // resolution — the same role the build-time path assigns.
+                let canonical = variants
+                    .iter()
+                    .find(|v| v.ancestors == tc.default_branch)
+                    .map(|v| v.id)
+                    .unwrap_or_else(|| variants[0].id);
+                tc.collection.sections.push(SectionSchema {
+                    id: canonical,
+                    name: name.clone(),
+                    content,
+                    priority,
+                    depends_on: None,
+                    depends_on_absent: None,
+                    is_template: false,
+                    template_tokens: None,
+                });
+                tc.variants.push(variants);
+                canonical
+            }
+        };
         self.name_maps.section_names.insert((layer, name), new_id);
         Ok(new_id)
     }
@@ -738,19 +829,63 @@ impl Builder {
         section: SectionId,
     ) -> Result<(), ConstructionError> {
         let layer_idx = self.layer_idx(layer)?;
-        let coll = self.schema.layers[layer_idx]
-            .system_prompt
-            .items
-            .iter_mut()
-            .find_map(|it| match it {
-                SystemPromptItem::Collection(c) if c.id == collection => Some(c),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                ConstructionError::UnknownCollection(format!("CollectionId({collection:?})"))
-            })?;
-        coll.summary_section = Some(section);
-        Ok(())
+        let items = &mut self.schema.layers[layer_idx].system_prompt.items;
+        match locate_collection(items, |c| c.id == collection) {
+            Some(CollLoc::TopLevel(ii)) => {
+                if let SystemPromptItem::Collection(coll) = &mut items[ii] {
+                    coll.summary_section = Some(section);
+                }
+                Ok(())
+            }
+            Some(CollLoc::Tree { item, node }) => {
+                if let SystemPromptItem::SectionTree(t) = &mut items[item] {
+                    if let Some(tc) = t.nodes[node].collection.as_mut() {
+                        tc.collection.summary_section = Some(section);
+                    }
+                }
+                Ok(())
+            }
+            None => Err(ConstructionError::UnknownCollection(format!(
+                "CollectionId({collection:?})"
+            ))),
+        }
+    }
+
+    /// Replace a mandatory tree section's content BEFORE prefill, so its sealed
+    /// variants carry runtime-generated text (e.g. the tool-catalog summary,
+    /// resolved deterministically once the catalog is installed).  The variant
+    /// ids and in-tree prefixes were fixed at build time; only the content the
+    /// prefill seals changes — so nodes below still anchor on this section's K/V,
+    /// keeping the chain intact.  The node must already exist with non-empty
+    /// authored content (so its per-branch variants were allocated).  Errors if
+    /// no such single-option tree section is found in the layer.
+    pub fn set_tree_section_content(
+        &mut self,
+        layer: LayerId,
+        name: &str,
+        content: impl Into<String>,
+    ) -> Result<(), ConstructionError> {
+        let layer_idx = self.layer_idx(layer)?;
+        let content = content.into();
+        for item in self.schema.layers[layer_idx].system_prompt.items.iter_mut() {
+            if let SystemPromptItem::SectionTree(t) = item {
+                for node in t.nodes.iter_mut() {
+                    // A glue node also has `collection: None` + one option, but its
+                    // emitted tokens come from `glue.tokens` (tokenised separately) —
+                    // rewriting its content here would desync label vs output, so
+                    // reject it.
+                    if node.name == name
+                        && node.collection.is_none()
+                        && node.glue.is_none()
+                        && node.options.len() == 1
+                    {
+                        node.options[0].content = content;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(ConstructionError::UnknownSection(name.to_string()))
     }
 
     /// Look up a layer's index in `self.schema.layers` by id, returning
@@ -782,7 +917,13 @@ impl Builder {
                     }
                 }
                 SystemPromptItem::SectionTree(t) => {
-                    if t.nodes.iter().any(|n| n.name == name) {
+                    let clash = t.nodes.iter().any(|n| {
+                        n.name == name
+                            || n.collection.as_ref().is_some_and(|tc| {
+                                tc.collection.sections.iter().any(|s| s.name == name)
+                            })
+                    });
+                    if clash {
                         return Err(ConstructionError::DuplicateSectionName(name.to_string()));
                     }
                 }
@@ -1016,6 +1157,7 @@ impl Builder {
                         content: system_prompt_text.to_string(),
                         priority: 50.0,
                         depends_on: None,
+                        depends_on_absent: None,
                         is_template: false,
                         template_tokens: None,
                     })],
@@ -1039,6 +1181,7 @@ impl Builder {
                                     .to_string(),
                                 priority: 50.0,
                                 depends_on: None,
+                                depends_on_absent: None,
                                 is_template: false,
                                 template_tokens: None,
                             },
@@ -1058,6 +1201,7 @@ impl Builder {
                                     .to_string(),
                                 priority: 50.0,
                                 depends_on: None,
+                                depends_on_absent: None,
                                 is_template: false,
                                 template_tokens: None,
                             },
@@ -1110,4 +1254,62 @@ impl Builder {
             source_yaml: None,
         }
     }
+}
+
+/// Where a collection lives in a layer's system prompt — a top-level item or a
+/// node inside a section tree.  Returned by [`locate_collection`] so the runtime
+/// mutators re-borrow the located item mutably by index without fighting the
+/// borrow checker.
+enum CollLoc {
+    TopLevel(usize),
+    Tree { item: usize, node: usize },
+}
+
+/// Find the first collection in `items` matching `matches`, descending into
+/// section-tree collection nodes.  Pure (immutable) index lookup — the single
+/// place the runtime mutators resolve a collection, so a tool catalog installed
+/// into a tree-embedded `tools` collection is found exactly like a top-level one.
+fn locate_collection(
+    items: &[SystemPromptItem],
+    mut matches: impl FnMut(&SectionCollection) -> bool,
+) -> Option<CollLoc> {
+    for (ii, item) in items.iter().enumerate() {
+        match item {
+            SystemPromptItem::Collection(c) if matches(c) => return Some(CollLoc::TopLevel(ii)),
+            SystemPromptItem::SectionTree(t) => {
+                for (ni, node) in t.nodes.iter().enumerate() {
+                    if let Some(tc) = &node.collection {
+                        if matches(&tc.collection) {
+                            return Some(CollLoc::Tree { item: ii, node: ni });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parallel-retain a tree collection's members (canonical schemas + per-branch
+/// variant lists stay index-aligned) by member name.
+fn retain_tree_members(tc: &mut TreeCollection, keep: &std::collections::HashSet<String>) {
+    let keepers: Vec<bool> = tc
+        .collection
+        .sections
+        .iter()
+        .map(|s| keep.contains(&s.name))
+        .collect();
+    let mut i = 0;
+    tc.collection.sections.retain(|_| {
+        let k = keepers[i];
+        i += 1;
+        k
+    });
+    let mut i = 0;
+    tc.variants.retain(|_| {
+        let k = keepers[i];
+        i += 1;
+        k
+    });
 }

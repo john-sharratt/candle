@@ -109,6 +109,7 @@ mod conversation {
                     response.push_str(&tok);
                 }
                 StreamItem::Projection(_) => {}
+                StreamItem::Tool(_) => {}
             }
         }
 

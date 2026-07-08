@@ -182,7 +182,10 @@ fn run_loop(
                 );
                 return;
             }
-            Err(ProbeError::Soft(msg)) => {
+            Err(ProbeError::Soft(msg) | ProbeError::Permanent(msg)) => {
+                // Permanent is handled per-turn inside `run_pass` and doesn't
+                // reach here; kept exhaustive so a future propagation path can't
+                // silently stop the thread.
                 tracing::warn!(
                     target: "candle_conversation::summariser",
                     "summariser pass soft-failed, continuing: {msg}"
@@ -226,7 +229,7 @@ pub fn run_pass(
     for timeline in &timeline_ids {
         let pending = conversation.read().pending_summary_len(*timeline);
         if pending > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 target: "candle_conversation::summariser",
                 timeline = %timeline,
                 pending,
@@ -243,7 +246,7 @@ pub fn run_pass(
         if let Err(e) = absorb_pending_turns(conversation, runner, timeline, max_concurrent) {
             match e {
                 ProbeError::Hard(_) => return Err(e),
-                ProbeError::Soft(msg) => {
+                ProbeError::Soft(msg) | ProbeError::Permanent(msg) => {
                     tracing::warn!(
                         target: "candle_conversation::summariser",
                         timeline = %timeline,
@@ -261,7 +264,7 @@ pub fn run_pass(
             if let Err(e) = reconcile_pass(conversation, runner, timeline) {
                 match e {
                     ProbeError::Hard(_) => return Err(e),
-                    ProbeError::Soft(msg) => {
+                    ProbeError::Soft(msg) | ProbeError::Permanent(msg) => {
                         tracing::warn!(
                             target: "candle_conversation::summariser",
                             timeline = %timeline,
@@ -311,7 +314,7 @@ fn absorb_pending_turns(
                 .map(|m| m.kind != TurnKind::Normal)
                 .unwrap_or(false);
             if already_in_tree {
-                tracing::debug!(
+                tracing::trace!(
                     target: "candle_conversation::summariser",
                     timeline = %timeline,
                     normal = %normal_idx,
@@ -324,7 +327,7 @@ fn absorb_pending_turns(
         if batch.is_empty() {
             return Ok(());
         }
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::summariser",
             timeline = %timeline,
             batch = batch.len(),
@@ -374,6 +377,18 @@ fn absorb_pending_turns(
                         .write()
                         .push_pending_summary(timeline, normal_idx);
                     soft_failed = true;
+                }
+                Err(ProbeError::Permanent(msg)) => {
+                    // Retrying is futile (an empty compression half under argmax
+                    // reproduces identically), so DO NOT re-enqueue — that would
+                    // loop forever. Log an error and leave the turn a raw `Normal`
+                    // node; it stays uncompressed but the conversation is correct.
+                    tracing::error!(
+                        target: "candle_conversation::summariser",
+                        timeline = %timeline,
+                        normal = %normal_idx,
+                        "permanent probe error: {msg}; giving up — turn left un-summarised"
+                    );
                 }
                 Err(e @ ProbeError::Hard(_)) => return Err(e),
             }
@@ -547,7 +562,7 @@ impl ProbeRunner for ChannelProbeRunner {
             Ok(Ok(turn_idx)) => Ok(ProbeResponse {
                 sealed_turn: turn_idx,
             }),
-            Ok(Err(msg)) => Err(ProbeError::Soft(msg)),
+            Ok(Err(pe)) => Err(pe),
             Err(e) => Err(ProbeError::Hard(format!("scheduler response channel: {e}"))),
         }
     }
@@ -556,7 +571,7 @@ impl ProbeRunner for ChannelProbeRunner {
         // Submit every probe first (non-blocking sends) so the scheduler
         // registers all their decodes before the next decode quantum — they
         // then batch into a single forward instead of running one at a time.
-        let mut receivers: Vec<Result<Receiver<Result<TurnIndex, String>>, ProbeError>> =
+        let mut receivers: Vec<Result<Receiver<Result<TurnIndex, ProbeError>>, ProbeError>> =
             Vec::with_capacity(requests.len());
         for request in requests {
             let (response_tx, response_rx) = crossbeam::channel::bounded(1);
@@ -583,7 +598,7 @@ impl ProbeRunner for ChannelProbeRunner {
                     Ok(Ok(turn_idx)) => Ok(ProbeResponse {
                         sealed_turn: turn_idx,
                     }),
-                    Ok(Err(msg)) => Err(ProbeError::Soft(msg)),
+                    Ok(Err(pe)) => Err(pe),
                     Err(e) => Err(ProbeError::Hard(format!("scheduler response channel: {e}"))),
                 },
                 Err(e) => Err(e),

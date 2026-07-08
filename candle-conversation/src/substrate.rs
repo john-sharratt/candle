@@ -58,13 +58,15 @@ use crate::persistence::record::{
 use crate::persistence::streams::{StreamDecl, StreamId};
 use crate::persistence::walker::WalkEntry;
 use crate::projection::{
-    GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
+    GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId, TurnIndex,
+    TurnKey,
 };
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
     TurnKind, MERGE_FANOUT,
 };
 use crate::token_buffer::TokenBuffer;
+use crate::turn_layout::TurnLayout;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 
@@ -288,6 +290,13 @@ pub struct SequenceResidence {
     /// across tier transitions since the payload itself doesn't change.
     /// `0` for a freshly-allocated residence with no bytes anywhere.
     pub byte_size: u64,
+    /// When `true`, the persistence thread frees `hot` the moment a cold
+    /// copy lands (Phase 2.5 `install_cold`) — offloading VRAM as the build
+    /// runs.  Set only for **collection-member** sections (prefix-transparent:
+    /// nothing attends back over them during the build, and the per-turn
+    /// `elevate_to_hot` reloads the projection's top-k selection on demand).
+    /// Boundary/turn residences leave this `false` and stay hot.
+    pub evict_when_cold: bool,
 }
 
 /// One layer's KV sequence as it lives in the redo log. Mirrors
@@ -586,23 +595,21 @@ pub struct SectionEntryData {
 /// alone; prefilled (inserted) turns additionally prepend a
 /// `/no_think` and are always suppressed.
 ///
-/// The text fields (`user_text` / `assistant_text`) carry the
-/// human-readable strings exactly as the caller had them at
-/// submit time — no role markers, no `/no_think` prefix.
-/// `assistant_text` is the verbatim decoded reply, **including** any
-/// `<think>…</think>` reasoning, so the sidebar reload path renders
+/// The [`TurnLayout`] describes the turn as an ordered segment vector,
+/// the complete description of its K/V.  It carries the human-readable
+/// strings (`user_text` / `assistant_text` / `thinking_text`) exactly as
+/// the caller had them at submit time — no role markers, no `/no_think`
+/// prefix — alongside the per-segment spans.  The assistant body is the
+/// verbatim decoded reply (its `<think>…</think>` reasoning is split into a
+/// dedicated `Thinking` segment), so the sidebar reload path renders
 /// exactly what streamed without re-tokenising or boundary scanning.
 #[derive(Debug, Clone)]
 pub struct TurnPart {
-    /// The user's message text, exactly as `submit_turn` received it
-    /// — no role-marker envelope, no `/no_think` prefix, no
-    /// boundary tokens.  Stored verbatim so the sidebar can render
-    /// it without re-tokenising or pattern-matching at read time.
-    pub user_text: String,
-    /// The assistant's reply text — the decoded body of the model's
-    /// response with special tokens skipped.  Same "what the caller
-    /// already has" rule as `user_text`.
-    pub assistant_text: String,
+    /// The turn's segment-vector layout — the complete description of its K/V:
+    /// user / thinking / assistant text, each real segment's span, and the
+    /// `/no_think` glue.  The per-half text and the content-boundary offsets the
+    /// compressor windows on are read via [`TurnLayout`]'s accessors.
+    pub layout: TurnLayout,
     /// Total token count this turn pins onto the slot — sum of the
     /// K/V chunk's `token_count` fields.  Holds the invariant
     /// `token_count == token_ids.len()` — every persisted token id
@@ -619,67 +626,9 @@ pub struct TurnPart {
     /// same bytes so cross-process replay (`recover_turn`)
     /// reconstructs the slot K/V exactly.
     pub token_ids: TokenBuffer,
-    /// Content boundaries that frame the user-message body and the
-    /// assistant-response body inside the sealed grid — see
-    /// [`TurnContentBounds`].  The compressor windows the sealed K/V to
-    /// these boundaries so it injects content-only halves with no template
-    /// markers.  All-zero where the boundaries are genuinely unknown.
-    pub content_bounds: TurnContentBounds,
     /// Slot in [`Substrate::residence`] holding this turn's
     /// hot/warm/cold KV state.
     pub residence: ResidenceIndex,
-}
-
-/// The three content boundaries that frame a turn's user-message body
-/// and assistant-response body inside the sealed K/V grid.
-///
-/// A turn is sealed with the chat template's role markers baked into the
-/// grid:
-/// `[user_start][no_think][user_msg][user_end][assistant_start][response]`.
-/// The compressor injects *content-only* halves — the user message body
-/// or the assistant response body — with no surrounding markers, so it
-/// needs to know where each body begins and ends in token-index terms:
-///
-/// - `user_start` — token index where the user *message* begins, after
-///   the leading `[user_start][no_think]` markers.
-/// - `user_end` — token index where the user message ends, before the
-///   `[user_end]` marker.
-/// - `asst_start` — token index where the assistant *response* begins,
-///   after the `[user_end][assistant_start]` markers.
-///
-/// The assistant content runs from `asst_start` to the turn's total token
-/// count.  The boundaries are kept monotonic and clamped to the turn's
-/// length at every seal site:
-/// `user_start <= user_end <= asst_start <= total`.
-///
-/// [`turn_user_sealed_half`](Substrate::turn_user_sealed_half) windows the
-/// sealed grid to `[user_start, user_end)` for the injected user half via
-/// [`window_sealed_tokens`](crate::conversation::window_sealed_tokens), and
-/// [`turn_assistant_token_ids`](Substrate::turn_assistant_token_ids) slices
-/// `[asst_start, total)` for the text-prefilled assistant half — so neither
-/// half carries a leading or trailing template marker.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TurnContentBounds {
-    pub user_start: u32,
-    pub user_end: u32,
-    pub asst_start: u32,
-}
-
-impl TurnContentBounds {
-    /// Build clamped, monotonic bounds for a turn of `total` tokens.
-    /// Each boundary is clamped to `total` and forced non-decreasing so a
-    /// tokenizer that merges across a join (producing a prefix length
-    /// longer than the body it sits in) can never invert the windows.
-    pub fn clamped(user_start: usize, user_end: usize, asst_start: usize, total: usize) -> Self {
-        let us = user_start.min(total);
-        let ue = user_end.min(total).max(us);
-        let as_ = asst_start.min(total).max(ue);
-        TurnContentBounds {
-            user_start: us as u32,
-            user_end: ue as u32,
-            asst_start: as_ as u32,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -693,15 +642,11 @@ pub struct TurnEntryData {
 /// Caller-supplied content for a turn at append / restore time.
 #[derive(Debug, Clone, Default)]
 pub struct TurnPartWrite {
-    /// The user's message text, exactly as the caller had it before
-    /// concatenation with role markers — see [`TurnPart::user_text`].
-    pub user_text: String,
-    /// The decoded assistant body — see [`TurnPart::assistant_text`].
-    pub assistant_text: String,
+    /// The turn's segment-vector layout — user / thinking / assistant text and
+    /// each real segment's K/V span.  See [`TurnPart::layout`].
+    pub layout: TurnLayout,
     pub token_ids: TokenBuffer,
     pub token_count: usize,
-    /// Content boundaries — see [`TurnPart::content_bounds`].
-    pub content_bounds: TurnContentBounds,
     pub block_start: u64,
     pub block_end: u64,
     pub sealed_gpu: Option<Arc<Vec<SealedSequence>>>,
@@ -759,6 +704,40 @@ pub trait ContentResolver {
     /// `layer_id` — which is correct for tests using mock resolvers.
     fn turn_origin(&self, _group: GroupId, _index: TurnIndex) -> Option<LayerId> {
         None
+    }
+
+    /// The timeline (conversation) a projected turn belongs to.  The target-aware
+    /// resolver resolves this from the projection target, so it is stamped ONCE
+    /// onto the emitted [`crate::projection::ResolvedTurn`] and read directly
+    /// downstream — no consumer re-derives `group → timeline` (which is what let
+    /// the reproject pick the wrong conversation and drop a slot's history).
+    ///
+    /// Default impl returns `None` (mock resolvers in tests don't track
+    /// timelines; their turns never reach the apply path).
+    fn turn_timeline(&self, _group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
+        None
+    }
+
+    /// Forest kind of a projected turn — `Normal` (a raw conversation turn) vs
+    /// `SummaryOfTurns` / `SummaryOfSummaries` (a summary node standing in for
+    /// the turns beneath it). Lets the projection record (and the GUI / inspector
+    /// that read it) show whether a slot was filled with a real turn or a summary
+    /// — the distinction that is otherwise invisible once a node is materialized
+    /// as a `Sealed(Turn)` segment.
+    ///
+    /// Default impl returns `Normal` (mock resolvers and non-summarised timelines
+    /// have no forest, so every turn is raw).
+    fn turn_kind(&self, _group: GroupId, _index: TurnIndex) -> TurnKind {
+        TurnKind::Normal
+    }
+
+    /// Whether a sealed turn was decoded with `/no_think` thinking suppression —
+    /// the assembler re-renders the `/no_think` soft-switch glue after
+    /// `user_start` for such turns, so the materialized-glue builder needs the
+    /// same bit to reproduce the engine's boundary run exactly. Default `false`
+    /// (mock resolvers / non-substrate timelines have no suppression record).
+    fn turn_no_think(&self, _timeline: TimelineId, _index: TurnIndex) -> bool {
+        false
     }
 
     /// Token count for a system-prompt section.  Returns `0` for
@@ -1053,6 +1032,7 @@ impl Substrate {
             warm: None,
             cold: None,
             byte_size: 0,
+            evict_when_cold: false,
         });
         idx
     }
@@ -1234,7 +1214,25 @@ impl Substrate {
     /// the redo log. Cold has no LRU (it's already the cheapest tier).
     pub fn install_cold(&mut self, residence: ResidenceIndex, cold: Vec<StoredSequence>) {
         debug_assert!(!cold.is_empty(), "install_cold called with empty Vec");
-        self.residence[residence.0].cold = Some(cold);
+        let slot = &mut self.residence[residence.0];
+        slot.cold = Some(cold);
+        // Offload-as-we-go: a flagged collection-member section now has its
+        // (quantized) bytes safely on disk, so free the VRAM immediately.  The
+        // drop returns the arena chunks to the pool for the next prefill; the
+        // per-turn `elevate_to_hot` reloads this section if the projection's
+        // top-k re-selects it.  Runs under the persistence thread's substrate
+        // write lock (Phase 2.5), so the arena free is serialised with the
+        // scheduler's allocations.
+        if slot.evict_when_cold {
+            slot.hot = None;
+        }
+    }
+
+    /// Flag a section residence so the persistence thread frees its `hot` the
+    /// moment a cold copy lands — see [`SequenceResidence::evict_when_cold`].
+    /// Set by the scheduler's collection-member quantize drain.
+    pub fn mark_section_evict_when_cold(&mut self, residence: ResidenceIndex) {
+        self.residence[residence.0].evict_when_cold = true;
     }
 
     /// Snapshot indices of hot-resident slots that lack a warm copy —
@@ -1788,6 +1786,34 @@ impl Substrate {
             .get(&group)
             .into_iter()
             .flat_map(|v| v.iter().copied())
+    }
+
+    /// Resolve which timeline a projected turn in `group` belongs to.
+    ///
+    /// The projection `target` pins the ACTIVE conversation: a turn in the
+    /// target's own group resolves to `target.timeline` (the conversation being
+    /// projected/decoded); every other group has a single registered timeline,
+    /// taken in registration order.  A `None` target (e.g. a utility pass with no
+    /// active conversation) falls back to that registration-order pick for all
+    /// groups.
+    ///
+    /// This is the SINGLE source of truth for turn → timeline resolution.  It
+    /// exists because open-coding `timelines_for_group(g).next()` WITHOUT the
+    /// target-group special case resolves the wrong conversation's timeline as
+    /// soon as more than one conversation shares a group — which silently dropped
+    /// every turn of any non-first conversation on mid-decode reproject (the slot
+    /// rebuilt with `turns=0`, i.e. the model lost its whole history).  Every call
+    /// site — the SubmitTurn prefill, the reproject rebuild, and
+    /// `inject_sealed_turn` — routes through here so they can never diverge again.
+    pub fn resolve_turn_timeline(
+        &self,
+        target: Option<ProjectionTarget>,
+        group: GroupId,
+    ) -> Option<TimelineId> {
+        match target {
+            Some(t) if group == t.group => Some(t.timeline),
+            _ => self.timelines_for_group(group).next(),
+        }
     }
 
     /// Like [`Self::timelines_for_group`] but excludes timelines
@@ -2552,11 +2578,9 @@ impl Substrate {
             TurnEntryData {
                 block_range: (block_start, block_end),
                 content: TurnPart {
-                    user_text: String::new(),
-                    assistant_text: String::new(),
+                    layout: TurnLayout::default(),
                     token_count,
                     token_ids: TokenBuffer::default(),
-                    content_bounds: TurnContentBounds::default(),
                     residence,
                 },
             },
@@ -2616,11 +2640,9 @@ impl Substrate {
                 TurnEntryData {
                     block_range: (block_start, block_end),
                     content: TurnPart {
-                        user_text: write.user_text,
-                        assistant_text: write.assistant_text,
+                        layout: write.layout,
                         token_count,
                         token_ids: write.token_ids,
-                        content_bounds: write.content_bounds,
                         residence,
                     },
                 },
@@ -2654,11 +2676,9 @@ impl Substrate {
     pub fn restore_turn(
         &mut self,
         timeline: TimelineId,
-        user_text: String,
-        assistant_text: String,
+        layout: TurnLayout,
         token_ids: TokenBuffer,
         token_count: usize,
-        content_bounds: TurnContentBounds,
         cold: Option<Vec<StoredSequence>>,
         block_start: u64,
         block_end: u64,
@@ -2677,11 +2697,9 @@ impl Substrate {
                 TurnEntryData {
                     block_range: (block_start, block_end),
                     content: TurnPart {
-                        user_text,
-                        assistant_text,
+                        layout,
                         token_count,
                         token_ids,
-                        content_bounds,
                         residence,
                     },
                 },
@@ -2800,14 +2818,15 @@ impl Substrate {
     /// `submit_turn` received it.
     pub fn user_text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {
         self.turn(timeline, index)
-            .map(|e| e.content.user_text.clone())
+            .map(|e| e.content.layout.user_text().to_string())
             .unwrap_or_default()
     }
 
-    /// The assistant's decoded reply text for this turn.
+    /// The assistant's decoded reply text for this turn — the full message
+    /// (reasoning block + answer), reconstructed by [`TurnLayout::assistant_text`].
     pub fn assistant_text_of(&self, timeline: TimelineId, index: TurnIndex) -> String {
         self.turn(timeline, index)
-            .map(|e| e.content.assistant_text.clone())
+            .map(|e| e.content.layout.assistant_text().unwrap_or_default())
             .unwrap_or_default()
     }
 
@@ -2816,6 +2835,14 @@ impl Substrate {
         self.turn(timeline, index)
             .map(|e| e.content.token_ids[..].to_vec())
             .unwrap_or_default()
+    }
+
+    /// The turn's [`TurnLayout`] — its segment-vector description: the complete,
+    /// validated description of its K/V (user / thinking / assistant / boundary
+    /// glue). Built at seal time and stored on the turn, so this is a direct
+    /// clone with no re-derivation. `None` if the turn isn't found.
+    pub fn turn_layout(&self, timeline: TimelineId, index: TurnIndex) -> Option<TurnLayout> {
+        self.turn(timeline, index).map(|e| e.content.layout.clone())
     }
 
     /// Turn token IDs as a borrowed slice (zero-copy).
@@ -2871,7 +2898,7 @@ impl Substrate {
     }
 
     /// Sealed K/V for the turn's *user-message body* `[user_start, user_end)`
-    /// (see [`TurnContentBounds`]), derived on demand as a zero-copy window
+    /// (the layout's user span), derived on demand as a zero-copy window
     /// view over the turn's existing chunks via [`window_sealed_tokens`].
     /// Content-only — no leading or trailing chat-template role marker — so
     /// the compression assembler can inject it into the user-input region as
@@ -2887,9 +2914,12 @@ impl Substrate {
         index: TurnIndex,
     ) -> Option<Arc<Vec<SealedSequence>>> {
         let full = self.turn_sealed_of(timeline, index)?;
-        let bounds = self.turn(timeline, index)?.content.content_bounds;
-        let half =
-            window_sealed_tokens(&full, bounds.user_start as usize, bounds.user_end as usize);
+        let layout = &self.turn(timeline, index)?.content.layout;
+        let half = window_sealed_tokens(
+            &full,
+            layout.user_content_start() as usize,
+            layout.user_content_end() as usize,
+        );
         Some(Arc::new(half))
     }
 
@@ -2904,9 +2934,9 @@ impl Substrate {
         index: TurnIndex,
     ) -> Option<Vec<u32>> {
         let toks = self.token_ids_of(timeline, index);
-        let bounds = self.turn(timeline, index)?.content.content_bounds;
+        let layout = &self.turn(timeline, index)?.content.layout;
         let total = toks.len();
-        let start = (bounds.asst_start as usize).min(total);
+        let start = (layout.assistant_content_start() as usize).min(total);
         Some(toks[start..total].to_vec())
     }
 
@@ -2916,10 +2946,10 @@ impl Substrate {
     /// from one half in isolation (see [`Self::turn_assistant_token_ids`]).
     pub fn turn_user_token_ids(&self, timeline: TimelineId, index: TurnIndex) -> Option<Vec<u32>> {
         let toks = self.token_ids_of(timeline, index);
-        let bounds = self.turn(timeline, index)?.content.content_bounds;
+        let layout = &self.turn(timeline, index)?.content.layout;
         let total = toks.len();
-        let start = (bounds.user_start as usize).min(total);
-        let end = (bounds.user_end as usize).min(total).max(start);
+        let start = (layout.user_content_start() as usize).min(total);
+        let end = (layout.user_content_end() as usize).min(total).max(start);
         Some(toks[start..end].to_vec())
     }
 
@@ -2927,6 +2957,15 @@ impl Substrate {
     pub fn turn_token_count_of(&self, timeline: TimelineId, index: TurnIndex) -> usize {
         self.turn(timeline, index)
             .map_or(0, |e| e.content.token_count)
+    }
+
+    /// Whether this turn was generated with thinking suppressed (the
+    /// `/no_think` dial active at submit).  The projection re-injects the
+    /// `/no_think` soft-switch into this turn's user opener when it re-renders
+    /// the turn as history.  `false` for unknown turns.
+    pub fn turn_no_think(&self, timeline: TimelineId, index: TurnIndex) -> bool {
+        self.turn(timeline, index)
+            .is_some_and(|e| e.content.layout.no_think())
     }
 
     pub fn turn_count(&self, timeline: TimelineId) -> u32 {
@@ -3476,6 +3515,59 @@ impl<'a> ScoredSubstrate<'a> {
     }
 }
 
+/// Shared body of [`ContentResolver::summary_tree_select`] — the score-density
+/// pick: build the timeline's summary forest, stamp each node with its
+/// provenance turn score, and run [`select_dense`], which selects the most
+/// relevant nodes (with recency anchoring/decay) that fit the window. Returns
+/// the picked turns with their selection origins, each carrying its effective
+/// provenance score for the diagnostics panel. `None` when the timeline has no
+/// summary nodes, in which case the projection falls through to the rule-based
+/// selector (which excludes summary turns). Used by the production
+/// [`SubstrateRead`] resolver and the test-only [`ScoredSubstrate`].
+fn select_summary_tree(
+    substrate: &Substrate,
+    scores: &ProjectionScores,
+    timeline: TimelineId,
+    budget: u32,
+) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+    // No summary nodes yet → fall through to the rule-based path.
+    if !substrate.has_summary_nodes(timeline) {
+        return None;
+    }
+    let tree = substrate.build_summary_tree_in_memory(timeline);
+    if tree.is_empty() {
+        return None;
+    }
+    let mut node_scores: ahash::AHashMap<NodeId, f32> = ahash::AHashMap::default();
+    for id in tree.all_ids() {
+        let idx = TurnIndex(id.0);
+        // A tree node without a backing substrate turn is an orphan (redo-log
+        // TreeMetadata whose matching TurnDecl never landed). It can't be
+        // elevated, so exclude it from the selection that flows into the
+        // projection / elevate path.
+        if substrate.turn(timeline, idx).is_none() {
+            continue;
+        }
+        node_scores.insert(id, scores.turn(timeline, idx));
+    }
+    let cfg = RecencyConfig::default();
+    let sel = select_dense(&tree, &node_scores, cfg, budget);
+    // Convert (NodeId, SelectionOrigin) pairs back to TurnIndex, post-filtering
+    // orphan NodeIds `select_dense` may have walked in via the tree shape.
+    let out: Vec<_> = sel
+        .selected
+        .iter()
+        .zip(sel.origins.iter())
+        .filter_map(|(id, origin)| {
+            let idx = TurnIndex(id.0);
+            substrate.turn(timeline, idx)?;
+            let eff = sel.effective_scores.get(id).copied().unwrap_or(0.0);
+            Some((idx, *origin, eff))
+        })
+        .collect();
+    Some(out)
+}
+
 impl<'a> std::ops::Deref for ScoredSubstrate<'a> {
     type Target = Substrate;
     fn deref(&self) -> &Substrate {
@@ -3541,52 +3633,7 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         timeline: TimelineId,
         budget: u32,
     ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
-        // No summary nodes yet → fall through to the rule-based path.
-        if !self.substrate.has_summary_nodes(timeline) {
-            return None;
-        }
-        let tree = self.substrate.build_summary_tree_in_memory(timeline);
-        if tree.is_empty() {
-            return None;
-        }
-        let mut scores: ahash::AHashMap<NodeId, f32> = ahash::AHashMap::default();
-        for id in tree.all_ids() {
-            let idx = TurnIndex(id.0);
-            // A tree node without a backing substrate turn is an
-            // orphan — possible if the redo log holds TreeMetadata
-            // records whose matching TurnDecl never landed (e.g. an
-            // older session ran before summariser persistence was
-            // wired up).  These can't be elevated, so they must be
-            // excluded from the selection that flows into the
-            // projection / elevate path.  Leaving them in `scores`
-            // with a default 0.0 wouldn't help — `select_dense`
-            // walks the tree shape and would still return them.
-            if self.substrate.turn(timeline, idx).is_none() {
-                continue;
-            }
-            scores.insert(id, self.scores.turn(timeline, idx));
-        }
-        let cfg = RecencyConfig::default();
-        let sel = select_dense(&tree, &scores, cfg, budget);
-        // Convert (NodeId, SelectionOrigin) pairs back to TurnIndex,
-        // dropping any picks whose tree node has no backing
-        // substrate turn.  The substrate-turn check at scoring time
-        // (above) only guards scoring — `select_dense` walks the
-        // tree shape and can still return orphan NodeIds; this
-        // post-filter is what actually keeps them out of the
-        // elevate plan.
-        let out: Vec<_> = sel
-            .selected
-            .iter()
-            .zip(sel.origins.iter())
-            .filter_map(|(id, origin)| {
-                let idx = TurnIndex(id.0);
-                self.substrate.turn(timeline, idx)?;
-                let eff = sel.effective_scores.get(id).copied().unwrap_or(0.0);
-                Some((idx, *origin, eff))
-            })
-            .collect();
-        Some(out)
+        select_summary_tree(self.substrate, self.scores, timeline, budget)
     }
 
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {
@@ -3686,6 +3733,14 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         self.scores_or_empty().section(section)
     }
 
+    fn summary_tree_select(
+        &self,
+        timeline: TimelineId,
+        budget: u32,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        select_summary_tree(&self.guard, self.scores_or_empty(), timeline, budget)
+    }
+
     fn pending_summary_len(&self, timeline: TimelineId) -> usize {
         self.guard.pending_summary_len(timeline)
     }
@@ -3715,7 +3770,9 @@ impl<'a> std::ops::DerefMut for SubstrateWrite<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId};
+    use crate::projection::{
+        GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
+    };
     use crate::token_buffer::TokenBuffer;
 
     fn make_timeline() -> (LayerId, GroupId, TimelineId, Substrate) {
@@ -3726,6 +3783,76 @@ mod tests {
         let mut sub = Substrate::new();
         sub.register_timeline(timeline, layer, group);
         (layer, group, timeline, sub)
+    }
+
+    /// Regression: two conversations (timelines) in the SAME group is the case
+    /// that lost history on reproject.  `timelines_for_group(group).next()`
+    /// returns the FIRST-registered timeline, so a turn in the SECOND
+    /// conversation was looked up under the first and dropped (`turn_tier_state`
+    /// `None` → the slot rebuilt with `turns=0`).  `resolve_turn_timeline` pins
+    /// the target group to the conversation actually being projected, so the
+    /// second conversation's turns survive.  Every turn-timeline call site routes
+    /// through it, so the SubmitTurn / reproject / inject paths can't disagree.
+    #[test]
+    fn resolve_turn_timeline_pins_target_group_to_its_own_timeline() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let first = alloc.next();
+        let second = alloc.next();
+        let mut sub = Substrate::new();
+        sub.register_timeline(first, layer, group);
+        sub.register_timeline(second, layer, group);
+
+        // A turn lives ONLY in the second conversation.
+        let idx = sub.append_with_blocks(second, 10, 0, 1);
+        let target = |tl| ProjectionTarget {
+            layer,
+            group,
+            timeline: tl,
+        };
+
+        // Registration order makes `.next()` resolve to `first` — the old bug.
+        assert_eq!(sub.timelines_for_group(group).next(), Some(first));
+
+        // The fix: a target pinned to the second conversation resolves to it, not
+        // the first-registered timeline.
+        assert_eq!(
+            sub.resolve_turn_timeline(Some(target(second)), group),
+            Some(second)
+        );
+        assert_eq!(
+            sub.resolve_turn_timeline(Some(target(first)), group),
+            Some(first)
+        );
+
+        // And that's what keeps the turn: under the correctly-resolved timeline
+        // the second conversation's turn is found (kept); under the timeline the
+        // old `.next()` picked it does not exist (dropped — the history loss).
+        let resolved = sub
+            .resolve_turn_timeline(Some(target(second)), group)
+            .unwrap();
+        assert!(
+            sub.turn_tier_state(resolved, idx).is_some(),
+            "turn is kept under the correctly-resolved timeline"
+        );
+        assert!(
+            sub.turn_tier_state(first, idx).is_none(),
+            "the old `.next()` timeline drops the second conversation's turn"
+        );
+
+        // A non-target group has a single timeline, so it still falls back to
+        // registration order (the target only pins the target's own group).
+        let other_group = GroupId::for_test(2);
+        let other_tl = alloc.next();
+        sub.register_timeline(other_tl, layer, other_group);
+        assert_eq!(
+            sub.resolve_turn_timeline(Some(target(second)), other_group),
+            Some(other_tl)
+        );
+
+        // No target (utility pass) falls back to registration order everywhere.
+        assert_eq!(sub.resolve_turn_timeline(None, group), Some(first));
     }
 
     // ── Phase 1: TreeNodeMeta + debug_id substrate APIs ──────────────────
@@ -3923,7 +4050,17 @@ mod tests {
             .append_complete(
                 timeline,
                 TurnPartWrite {
-                    assistant_text: "hello".to_string(),
+                    layout: TurnLayout::from_flat_grid(
+                        0,
+                        0,
+                        0,
+                        3,
+                        0,
+                        0,
+                        String::new(),
+                        Some("hello".to_string()),
+                        false,
+                    ),
                     token_count: 3,
                     block_end: 1,
                     sealed_gpu: Some(Arc::new(vec![])),
@@ -4284,6 +4421,61 @@ mod tests {
         assert!(sub.residence[b.0].hot.is_none(), "b evicted instead");
     }
 
+    /// `install_cold` frees a section's hot VRAM only when its residence is
+    /// flagged `evict_when_cold` (the prefix-transparent collection-member
+    /// offload path); a plain/boundary section keeps its hot copy resident.
+    #[test]
+    fn install_cold_frees_section_hot_only_when_evict_flagged() {
+        let mut sub = Substrate::new();
+        let install = |sub: &mut Substrate, id: u32| {
+            let sealed = Arc::new(vec![minimal_sealed_layer()]);
+            sub.set_section_full(
+                SectionId::new(id),
+                StreamId::default(),
+                32,
+                sealed,
+                identity_migrate,
+                Arc::new(vec![]),
+            )
+            .unwrap();
+            sub.section_residence(SectionId::new(id)).unwrap()
+        };
+        let cold = || {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+
+        let member = install(&mut sub, 1);
+        let boundary = install(&mut sub, 2);
+        assert!(sub.residence[member.0].hot.is_some());
+        assert!(sub.residence[boundary.0].hot.is_some());
+
+        // Only the collection member is flagged for offload-on-persist.
+        sub.mark_section_evict_when_cold(member);
+
+        sub.install_cold(member, cold());
+        sub.install_cold(boundary, cold());
+
+        // Flagged member: cold copy lands AND hot VRAM is freed.
+        assert!(
+            sub.residence[member.0].hot.is_none(),
+            "flagged member: VRAM offloaded once cold lands"
+        );
+        assert!(sub.residence[member.0].cold.is_some());
+        // Boundary section: cold copy lands but it stays hot for the build.
+        assert!(
+            sub.residence[boundary.0].hot.is_some(),
+            "boundary section stays hot"
+        );
+        assert!(sub.residence[boundary.0].cold.is_some());
+    }
+
     /// A zero target evicts nothing — there's no incoming load to make room
     /// for, so the working set is left fully hot.
     #[test]
@@ -4321,11 +4513,9 @@ mod tests {
         // The reconstruct loop then restores turn 0.
         let idx = sub.restore_turn(
             timeline,
-            String::new(),
-            String::new(),
+            TurnLayout::default(),
             TokenBuffer::default(),
             20,
-            TurnContentBounds::default(),
             None,
             0,
             0,
@@ -4342,11 +4532,9 @@ mod tests {
         // A turn with no prior tree meta still defaults to Normal.
         let idx2 = sub.restore_turn(
             timeline,
-            String::new(),
-            String::new(),
+            TurnLayout::default(),
             TokenBuffer::default(),
             10,
-            TurnContentBounds::default(),
             None,
             0,
             0,
@@ -4376,11 +4564,9 @@ mod tests {
         }];
         let idx = sub.restore_turn(
             timeline,
-            String::new(),
-            String::new(),
+            TurnLayout::default(),
             TokenBuffer::default(),
             32,
-            TurnContentBounds::default(),
             Some(cold_payload),
             0,
             1,
@@ -4400,11 +4586,9 @@ mod tests {
         // None branch — no cold payload.
         let idx2 = sub.restore_turn(
             timeline,
-            String::new(),
-            String::new(),
+            TurnLayout::default(),
             TokenBuffer::default(),
             0,
-            TurnContentBounds::default(),
             None,
             0,
             0,

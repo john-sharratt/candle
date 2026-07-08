@@ -14,11 +14,12 @@ use crate::persistence::SubstratePersistence;
 use crate::provenance::{decode_wide_sigs, score_slots, WideQSig};
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
-    TurnContentBounds, TurnPartWrite,
+    TurnPartWrite,
 };
-use crate::summary_tree::SelectionDiagnostics;
+use crate::summary_tree::{SelectionDiagnostics, SelectionOrigin, TurnKind};
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
+use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::SealedSequence;
 
 /// The name of the section a projection selected inside `collection`, if any.
@@ -330,14 +331,13 @@ impl Conversation {
     ) -> candle::Result<TurnIndex> {
         let block_start = write.block_start;
         let block_end = write.block_end;
-        // Capture the per-half text strings before the write moves
-        // into the substrate — the redo-log `TurnDecl` carries them
-        // verbatim so reload can re-populate `TurnPart::user_text` /
-        // `assistant_text` without re-tokenising or scanning.
-        let user_text = write.user_text.clone();
-        let assistant_text = write.assistant_text.clone();
+        // Capture the segment layout and gather-scope tags before the write
+        // moves into the substrate — the redo-log `TurnDecl` carries them
+        // verbatim so reload can reconstruct `TurnPart::layout` (per-half text +
+        // spans + `/no_think`) without re-tokenising, and re-tag the turn for the
+        // provenance gallery's `tags:` scoping.
+        let segments = write.layout.segments.clone();
         let tags = write.tags.clone();
-        let content_bounds = write.content_bounds;
         let idx = {
             let mut view = self.inner.write().unwrap();
             view.append_complete(timeline, write, migrate_to_cpu)?
@@ -363,11 +363,7 @@ impl Conversation {
             group_id,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: content_bounds.user_start,
-            user_content_end: content_bounds.user_end,
-            assistant_content_start: content_bounds.asst_start,
-            user_text,
-            assistant_text,
+            segments,
             tags,
         });
         self.persistence
@@ -419,11 +415,7 @@ impl Conversation {
             group_id,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             tags: Vec::new(),
         });
         self.persistence
@@ -566,16 +558,9 @@ impl Conversation {
             // to materialise KV.
             view.restore_turn(
                 timeline,
-                std::mem::take(&mut decl.user_text),
-                std::mem::take(&mut decl.assistant_text),
+                TurnLayout::new(std::mem::take(&mut decl.segments)),
                 TokenBuffer::from(recovered.token_ids),
                 token_count,
-                TurnContentBounds::clamped(
-                    decl.user_content_start as usize,
-                    decl.user_content_end as usize,
-                    decl.assistant_content_start as usize,
-                    token_count,
-                ),
                 cold_refs,
                 decl.block_start,
                 decl.block_end,
@@ -1364,11 +1349,7 @@ impl<'a> TargetedRead<'a> {
     }
 
     fn timeline_for(&self, group: GroupId) -> Option<TimelineId> {
-        if group == self.target.group {
-            Some(self.target.timeline)
-        } else {
-            self.read.timelines_for_group(group).next()
-        }
+        self.read.resolve_turn_timeline(Some(self.target), group)
     }
 }
 
@@ -1407,12 +1388,40 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         Some(layer)
     }
 
+    fn turn_timeline(&self, group: GroupId, _index: TurnIndex) -> Option<TimelineId> {
+        self.timeline_for(group)
+    }
+
+    fn turn_kind(&self, group: GroupId, index: TurnIndex) -> TurnKind {
+        let Some(timeline) = self.timeline_for(group) else {
+            return TurnKind::Normal;
+        };
+        self.read
+            .tree_meta_of(timeline, index)
+            .map(|m| m.kind)
+            .unwrap_or(TurnKind::Normal)
+    }
+
+    fn turn_no_think(&self, timeline: TimelineId, index: TurnIndex) -> bool {
+        self.read.turn_no_think(timeline, index)
+    }
+
     fn section_token_count(&self, section: SectionId) -> usize {
         ContentResolver::section_token_count(&self.read, section)
     }
 
     fn section_score(&self, section: SectionId) -> f32 {
         ContentResolver::section_score(&self.read, section)
+    }
+
+    fn summary_tree_select(
+        &self,
+        timeline: TimelineId,
+        budget: u32,
+    ) -> Option<Vec<(TurnIndex, SelectionOrigin, f32)>> {
+        // Delegate to the inner scored read: score-density selection over the
+        // timeline's summary forest (see `select_dense` in `select.rs`).
+        self.read.summary_tree_select(timeline, budget)
     }
 }
 

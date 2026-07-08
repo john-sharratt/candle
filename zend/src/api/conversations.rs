@@ -93,10 +93,21 @@ pub async fn get(
     // so the client renders one bubble per role without any ChatML parsing.
     let mut messages: Vec<HistoryMessage> = history
         .into_iter()
-        .flat_map(|(role, content)| crate::chatml::split_turn(role, &content))
-        .map(|(role, content)| HistoryMessage {
+        .flat_map(|(role, content, no_think)| {
+            // The turn's `no_think` belongs on the USER bubble only — a bundled
+            // turn can split into both roles, so tag the assistant half `false`
+            // (the GUI renders the `/no_think` glue only on user bubbles anyway).
+            crate::chatml::split_turn(role, &content)
+                .into_iter()
+                .map(move |(r, c)| {
+                    let user_no_think = no_think && r == Role::User;
+                    (r, c, user_no_think)
+                })
+        })
+        .map(|(role, content, no_think)| HistoryMessage {
             role: role_str(role),
             content,
+            no_think,
             spans: Vec::new(),
         })
         .collect();
@@ -130,24 +141,46 @@ pub async fn get(
         .map(|(name, content)| SectionContent { name, content })
         .collect();
 
-    // Memory-tier turn bodies (every projected layer except the dialogue, whose
-    // bodies the GUI already holds): read from the substrate so the panel can
-    // expand them, exactly like section content. Deduped across spans.
+    // Bodies for EVERY projected turn — memory tiers AND the dialogue, including
+    // summary nodes — read from the substrate so the projection panel renders the
+    // materialized KV exactly as selected (summaries shown in place of the turns
+    // they replaced), not the raw message history. Deduped across spans. The live
+    // user message (`u32::MAX`) has no sealed body and is skipped.
     let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     let mut turn_content: Vec<TurnContent> = Vec::new();
     for span_list in &buckets {
         for ev in span_list {
             for t in &ev.event.selection.turns {
-                if t.layer == "dialogue" || t.index == u32::MAX {
+                if t.index == u32::MAX {
                     continue;
                 }
                 if seen.insert((t.group.clone(), t.index)) {
-                    if let Some((user, assistant)) = session.resolve_turn_text(&t.group, t.index) {
+                    // Resolve the body by the turn's STAMPED timeline identity
+                    // (`SelectedTurn::timeline`), never by group: the shared
+                    // substrate registers many conversations under one group, so a
+                    // group→timeline lookup is non-deterministic. A turn with no
+                    // stamped timeline (only the live user message) is skipped.
+                    let Some(timeline) = t
+                        .timeline
+                        .and_then(candle_conversation::projection::TimelineId::from_raw)
+                    else {
+                        continue;
+                    };
+                    // The whole turn, continuous (what the panel renders). Fall
+                    // back to the split halves only to populate the legacy fields.
+                    let text = session.resolve_turn_full_text(timeline, t.index);
+                    let (user, assistant) = session
+                        .resolve_turn_text(timeline, t.index)
+                        .unwrap_or_default();
+                    let layout = session.turn_layout(timeline, t.index);
+                    if let Some(text) = text {
                         turn_content.push(TurnContent {
                             group: t.group.clone(),
                             index: t.index,
+                            text,
                             user,
                             assistant,
+                            layout,
                         });
                     }
                 }
@@ -198,17 +231,32 @@ pub struct HistoryBody {
     pub target_layer: String,
 }
 
-/// One projected turn's two halves, read from the substrate on demand. Returned
-/// unframed; the GUI places the dialect glue around and between them.
+/// One projected turn's body, read from the substrate on demand. `text` is the
+/// ENTIRE turn as one continuous string — the full sealed token range decoded
+/// verbatim (user content, the baked intra-turn boundary, and assistant content)
+/// — which the panel renders as a single card; the turn is stored continuously,
+/// so this is the truth, not two re-glued halves. `user`/`assistant` are the
+/// legacy split halves, retained only for the pre-materialized fallback.
 #[derive(Serialize)]
 pub struct TurnContent {
     pub group: String,
     pub index: u32,
+    pub text: String,
     pub user: String,
     pub assistant: String,
+    /// The turn's segment-vector layout (real/ethereal glue, user, thinking,
+    /// assistant) — the complete K/V description, surfaced so the panel renders
+    /// the exact segments instead of re-splitting the text on markers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<candle_conversation::turn_layout::TurnLayout>,
 }
 
 /// The dialect framing markers the assembler wraps around the prompt and turns.
+/// These are the role markers the backend frames turns with, plus `no_think` —
+/// the `/no_think` soft-switch the scheduler emits as live glue right after
+/// `user_start` on a suppressed turn. The reasoning *block* is deliberately NOT
+/// here: it's never glue (a suppressed turn decodes its own empty
+/// `<think></think>` into the body), only the `/no_think` directive is.
 #[derive(Serialize)]
 pub struct Glue {
     pub system_start: String,
@@ -217,10 +265,7 @@ pub struct Glue {
     pub user_end: String,
     pub assistant_start: String,
     pub assistant_end: String,
-    /// Empty/closed reasoning header forced when a turn is suppressed — what the
-    /// effort dial's Off injects and what every prefilled memory-tier turn carries.
-    /// A thinking turn has none (its `<think>` is a decoded token in the body).
-    pub no_think_block: String,
+    pub no_think: String,
 }
 
 impl From<candle_conversation::GlueMarkers> for Glue {
@@ -232,7 +277,7 @@ impl From<candle_conversation::GlueMarkers> for Glue {
             user_end: m.user_end,
             assistant_start: m.assistant_start,
             assistant_end: m.assistant_end,
-            no_think_block: m.no_think_block,
+            no_think: m.no_think,
         }
     }
 }
@@ -247,6 +292,13 @@ pub struct SectionContent {
 pub struct HistoryMessage {
     pub role: &'static str,
     pub content: String,
+    /// Whether this turn was generated with thinking suppressed (the `/no_think`
+    /// dial active at submit).  Set on USER bubbles; the GUI re-renders the
+    /// `/no_think` soft-switch (`Glue.no_think`) right after `user_start` on each
+    /// prior user bubble where this is true — mirroring what the engine's
+    /// assembler now injects into the real model input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_think: bool,
     /// Projection-event timeline for this bubble (assistant turns only).
     /// Omitted from the wire when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]

@@ -1263,11 +1263,7 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             tags: Vec::new(),
         });
         let turn_id;
@@ -1336,11 +1332,7 @@ mod tests {
             group_id: 1,
             anchored_prefix: vec![sec.stream_id()],
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             tags: Vec::new(),
         });
         child.declare_stream(&child_turn).unwrap();

@@ -197,7 +197,7 @@
 
 mod builder;
 mod error;
-mod event;
+pub(crate) mod event;
 mod ids;
 mod policy;
 mod project;
@@ -217,9 +217,9 @@ pub use crate::substrate::{ContentResolver, Substrate, SubstrateRead, SubstrateW
 pub use builder::Builder;
 pub use error::ConstructionError;
 pub use event::{
-    aggregate, decode_events, encode_events, from_projection, BucketKind, ProjectionBucket,
-    ProjectionEvent, ProjectionSelection, SelectedSection, SelectedTurn, SelectionScores,
-    SystemItem,
+    aggregate, decode_events, encode_events, from_projection, from_projection_with_origins,
+    BucketKind, MaterializedPiece, ProjectionBucket, ProjectionEvent, ProjectionSelection,
+    SelectedSection, SelectedTurn, SelectionScores, SystemItem,
 };
 pub use ids::{
     CollectionId, GroupId, LayerId, Reserved, SectionId, TimelineAllocator, TimelineId, TurnId,

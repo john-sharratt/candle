@@ -17,7 +17,14 @@ use ahash::AHashMap;
 use super::tree::NodeId;
 
 /// How a node entered the selected set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The first group is produced by the score-density selection over the summary
+/// forest (`select_dense`, §8); the last two (`Recent` / `Historical`) by the
+/// plain rule-based `conversation` selection used when a timeline has no summary
+/// tree yet. Surfacing the tag per projected turn is what makes "why is this in
+/// my context?" answerable from the GUI / persisted projection record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SelectionOrigin {
     /// Not yet absorbed into the tree by the async summariser.  Lives
     /// in the foreground's `pending` queue and is injected verbatim
@@ -38,6 +45,12 @@ pub enum SelectionOrigin {
     /// Added by the step-5 multi-pass refill loop after some redundant
     /// ancestor was eliminated.
     Refill,
+    /// Rule-based path (no summary tree): inside the inviolate recency
+    /// window (`conversation.recent`) — always shown, regardless of score.
+    Recent,
+    /// Rule-based path (no summary tree): an older turn pulled back by
+    /// relevance score (`conversation.historical_top_k`).
+    Historical,
 }
 
 /// Per-turn selection diagnostics, attached to `TurnResponse`.

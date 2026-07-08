@@ -25,18 +25,20 @@ use crate::persistence::elevate::elevate_to_hot;
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
-    Builder, CompressionPrompt, Conversation, GeneratedIdentity, GroupId, ProjectionMode,
+    Builder, CompressionPrompt, Conversation, GeneratedIdentity, OptionalState, ProjectionMode,
     ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind, SectionId,
-    SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey,
+    SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey, NO_THINK_SELECTOR,
 };
 use crate::provenance::{encode_wide_sigs, extract_q_vector_r16, fold_provenance, WideQSig};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
-use crate::substrate::{ResidenceIndex, TurnContentBounds, TurnPartWrite};
+use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry};
+use crate::substrate::{ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::{
-    leaf_skeleton, structural_rollup, SelectionDiagnostics, SummariserTrigger, TurnKind,
+    leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
 };
 use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
+use crate::turn_layout::TurnLayout;
 use crate::{SubstrateReloadStatus, TurnStats};
 
 use candle::quantized::pinned_staging::PinnedBuf;
@@ -156,10 +158,15 @@ pub(crate) enum SchedulerRequest {
         /// Content boundaries that frame the user-message body and the
         /// assistant-response body inside the sealed grid — computed CPU-side
         /// at submit time (the tokenizer lives on the conversation handle).
-        /// Carried into `TurnPart::content_bounds` at seal time so the
-        /// compressor can window content-only halves. See
-        /// [`TurnContentBounds`].
-        content_bounds: TurnContentBounds,
+        /// Used at seal time to build the turn's [`TurnLayout`] so the
+        /// compressor can window content-only halves.
+        user_content_start: u32,
+        user_content_end: u32,
+        assistant_content_start: u32,
+        /// Thinking suppressed at submit (the `/no_think` dial) — recorded into
+        /// the turn's [`TurnLayout`] at seal so prior turns re-render their
+        /// switch.
+        no_think: bool,
         /// Marker-delimited projection points — token offsets into `prefill_tokens`
         /// where a staged calibration prefill fires a projection. The prefill wave
         /// stops its per-pass advance on each offset and emits a `ProjectionEvent`,
@@ -202,6 +209,10 @@ pub(crate) enum SchedulerRequest {
         /// re-projecting the whole trunk every turn is both unnecessary
         /// and O(n²) — see `zend::code_read`.
         disable_reprojection: bool,
+        /// Tool-call stencils that may fire during this turn's decode, keyed by
+        /// their trigger token (e.g. `<tool_call>`).  An empty registry means no
+        /// constrained decoding — the turn free-decodes.
+        triggers: Arc<TriggerRegistry>,
     },
 
     /// Free a sequence slot.
@@ -319,6 +330,18 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
+    /// Quantize + offload the collection-member sections sealed so far, freeing
+    /// their VRAM mid-build.  Sent by the section-ingest loop after each batch
+    /// of prefix-transparent members (e.g. one `no_think` branch of the tool
+    /// catalog) so the native catalog never piles up past one batch.  The
+    /// handler quantizes the pending members, then blocks on a persistence pass
+    /// so their cold copies land and `install_cold` frees the hot VRAM before
+    /// the next batch prefills.
+    OffloadCollectionMembers {
+        conversation: Conversation,
+        response_tx: Sender<Result<(), ConversationError>>,
+    },
+
     /// Extract raw K and Q float vectors from the KV cache for a list of
     /// layer indices, synchronously on the scheduler thread.
     ///
@@ -363,11 +386,12 @@ pub(crate) enum SchedulerRequest {
         children: Vec<TurnIndex>,
         /// The node's tree height — drives the structural roll-up's depth prune.
         height: u8,
-        /// `Ok(turn_index)` on success — the sealed substrate
-        /// `TurnIndex` of the new compressed turn.  `Err(msg)` on a
-        /// soft failure (model output unparseable, transient GPU
-        /// error); the summariser retries.
-        response_tx: Sender<Result<TurnIndex, String>>,
+        /// `Ok(turn_index)` on success — the sealed substrate `TurnIndex` of the
+        /// new compressed turn.  `Err(ProbeError::Soft)` on a transient failure
+        /// (GPU contention, snapshot/record I/O) the summariser retries;
+        /// `Err(ProbeError::Permanent)` when retrying is futile (an empty
+        /// compression half under argmax) — the summariser gives up.
+        response_tx: Sender<Result<TurnIndex, ProbeError>>,
     },
 
     /// Re-run substrate reconstruction on the scheduler thread — used after a
@@ -599,10 +623,11 @@ struct DecodeState {
     belief: crate::projection::PriorBelief,
     /// Full prefill token sequence pinned into the slot at this
     /// turn's submit:
-    /// `[user_msg][user_end][assistant_start]` — a *suppressed* turn bakes an
-    /// empty `<think></think>` right after `assistant_start`, and the
-    /// `insert_turn` path additionally prepends `/no_think`.  A *thinking*
-    /// turn's `<think>` is NOT here: the model emits it into `generated_tokens`.
+    /// `[user_msg][user_end][assistant_start]` — the assistant header is clean,
+    /// and the `insert_turn` path additionally prepends `/no_think`.  The think
+    /// block is NEVER baked here: a suppressed turn decodes its own empty
+    /// `<think></think>` and a thinking turn opens its own `<think>`, so either
+    /// way it lands in `generated_tokens`.
     /// Concatenated with `generated_tokens` and `post_decode_tokens`
     /// at seal time to form `TurnContent::token_ids` — the
     /// cross-process replay sequence persisted to the redo log.
@@ -619,10 +644,17 @@ struct DecodeState {
     tags: Vec<String>,
     /// Content boundaries that frame the user-message body and the
     /// assistant-response body inside the sealed grid.  Set from the submit
-    /// path (CPU-tokenised against the prefill prefix strings) and recorded
-    /// into `TurnPart::content_bounds` at seal time so the compressor can
-    /// window content-only halves on demand. See [`TurnContentBounds`].
-    content_bounds: TurnContentBounds,
+    /// path (CPU-tokenised against the prefill prefix strings) and used at seal
+    /// time to build the turn's [`TurnLayout`] so the compressor can window
+    /// content-only halves on demand.
+    user_content_start: u32,
+    user_content_end: u32,
+    assistant_content_start: u32,
+    /// Whether this turn was submitted with thinking SUPPRESSED (the composer
+    /// `/no_think` dial active).  Recorded into the turn's [`TurnLayout`] at
+    /// seal so the projection re-injects the `/no_think` soft-switch into this
+    /// turn's user opener when it re-renders the turn as history.
+    no_think: bool,
     /// The prefilled assistant half (repo_map / code_reading ingest), stored
     /// verbatim as `TurnPart::assistant_text` at seal time. Empty for decode
     /// turns, where the seal uses the model's decoded text instead.
@@ -633,6 +665,19 @@ struct DecodeState {
     /// suppressed so the generic call body can't re-orient the committed tool.
     /// Migrates with the decode state across view swaps.
     in_tool_call: bool,
+    /// Tool-call stencils available this turn, keyed by trigger token.  Empty
+    /// registry = free decode.  Carried from the turn's `SubmitTurn`.
+    triggers: Arc<TriggerRegistry>,
+    /// The constrained-decoding walk currently in progress (a `<tool_call>` is
+    /// mid-emission).  `None` whenever the model is free-decoding — a genuine
+    /// present/absent, not a feature flag.
+    stencil: Option<StencilDriver>,
+    /// The decode action (`Branch`/`Free`/`Done`) the stencil yielded for the
+    /// upcoming decode step.  Set by `inject_stencil_prefills` once any preceding
+    /// static runs are injected; consumed by `batch_decode_step` (apply the mask,
+    /// then `accept` the sampled token and clear).  `None` ⇒ the driver needs
+    /// advancing again.
+    pending_mask: Option<StepMask>,
 }
 
 /// Per-turn view bookkeeping carried in the scheduler's `turn_views` map.
@@ -686,7 +731,9 @@ struct CompressionJob {
     /// Projection target (layer, group, timeline) the node records into.
     target: ProjectionTarget,
     /// Scratch slot driving the user-half pass; freed once that half completes.
-    user_slot: SequenceId,
+    /// `None` when the question-half is echoed verbatim (short user content),
+    /// so no decode pass runs and `user_result` is pre-filled.
+    user_slot: Option<SequenceId>,
     /// Scratch slot driving the assistant-half pass.
     assistant_slot: SequenceId,
     /// Decoded user-half tokens (filled when the user pass finishes).
@@ -695,7 +742,7 @@ struct CompressionJob {
     assistant_result: Option<CompressionPassResult>,
     /// Summariser channel — receives the stitched node's `TurnIndex` once both
     /// halves complete, or an `Err` if either pass produces no forwarded tokens.
-    response_tx: Sender<Result<TurnIndex, String>>,
+    response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
 /// A compressed turn whose marker-framed text has been enqueued for re-prefill
@@ -706,11 +753,11 @@ struct CompressionJob {
 struct PendingCompressionSeal {
     conversation: Conversation,
     target: ProjectionTarget,
-    user_text: String,
-    assistant_text: String,
+    /// The compressed turn's segment-vector layout (user / assistant text +
+    /// spans), built when the exchange was framed.
+    layout: TurnLayout,
     token_ids: Vec<u32>,
-    content_bounds: TurnContentBounds,
-    response_tx: Sender<Result<TurnIndex, String>>,
+    response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
@@ -796,18 +843,13 @@ pub(crate) struct TurnContent {
     pub role: Role,
     /// Gather-scope tags for this turn, carried from submit to seal.
     pub tags: Vec<String>,
-    /// The user's message text — exactly what `submit_turn`
-    /// received, no role-marker envelope, no `/no_think` prefix.
-    pub user_text: String,
-    /// The assistant's decoded reply text — the model's response
-    /// body with special tokens skipped.
-    pub assistant_text: String,
+    /// The turn's segment-vector layout — user / thinking / assistant text and
+    /// each real segment's K/V span, built at the seal site.
+    pub layout: TurnLayout,
     /// The combined token sequence pinned onto the slot, in slot
     /// order.  Must match the K/V chunk grid 1-1; consumed by
     /// `persist_tokens_only` for cross-process replay.
     pub token_ids: TokenBuffer,
-    /// Content boundaries — see [`DecodeState::content_bounds`].
-    pub content_bounds: TurnContentBounds,
 }
 
 /// A section whose hot bytes are in their native (prefill-output) form
@@ -838,8 +880,12 @@ pub(super) struct PrefillWork {
     pub(super) user_text: String,
     /// Gather-scope tags — see [`DecodeState::tags`].
     pub(super) tags: Vec<String>,
-    /// Content boundaries — see [`DecodeState::content_bounds`].
-    pub(super) content_bounds: TurnContentBounds,
+    /// Content boundaries — see [`DecodeState`].
+    pub(super) user_content_start: u32,
+    pub(super) user_content_end: u32,
+    pub(super) assistant_content_start: u32,
+    /// Thinking suppressed at submit — see [`DecodeState::no_think`].
+    pub(super) no_think: bool,
     /// Prefilled assistant half — see [`DecodeState::prefill_assistant_text`].
     pub(super) prefill_assistant_text: String,
     pub(super) event_tx: Sender<TurnEvent>,
@@ -868,6 +914,9 @@ pub(super) struct PrefillWork {
     /// only its `start_token`/`end_token` span differs per emission). `None` for a
     /// normal prefill.
     pub(super) staged_composition: Option<crate::projection::ProjectionEvent>,
+    /// Tool-call stencils carried through prefill and installed on the
+    /// [`DecodeState`] at decode start.  Empty registry = no constrained decode.
+    pub(super) triggers: Arc<TriggerRegistry>,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -1161,12 +1210,6 @@ pub(crate) struct Scheduler {
     device: Device,
     /// Active decode state per sequence ID.
     active_decodes: HashMap<SequenceId, DecodeState>,
-    /// Per-decode projection-span anchor, keyed by the decode's parent
-    /// sequence (stable across reprojections): `(generated-token index, time)`
-    /// of the last projection event. Each reproject (and the final seal) closes
-    /// the span `[anchor.token, now]` and re-anchors. Drives the t/s on each
-    /// `TurnEvent::Projection`. Pruned in `cleanup_finished`.
-    reproj_anchor: HashMap<SequenceId, (u32, Instant)>,
     /// Persistent sampling state per sequence ID (survives across turns).
     /// DRY penalty needs the recent-token window to span turn boundaries.
     sampling_states: HashMap<SequenceId, SequenceSamplingState>,
@@ -1392,7 +1435,6 @@ impl Scheduler {
             eos_tokens,
             device,
             active_decodes: HashMap::new(),
-            reproj_anchor: HashMap::new(),
             sampling_states: HashMap::new(),
             prefill_queue: VecDeque::new(),
             active_prefills: Vec::new(),
@@ -1515,7 +1557,10 @@ impl Scheduler {
                 prefill_text,
                 user_text,
                 tags,
-                content_bounds,
+                user_content_start,
+                user_content_end,
+                assistant_content_start,
+                no_think,
                 projection_offsets,
                 prefill_assistant_text,
                 post_decode_tokens,
@@ -1524,6 +1569,7 @@ impl Scheduler {
                 event_tx,
                 reprojection,
                 disable_reprojection,
+                triggers,
             } => {
                 // The sequence acts as the parent slot for a carved
                 // view inside this handler — rebind for clarity.
@@ -1629,6 +1675,34 @@ impl Scheduler {
                             diag_to_write = Some((target.timeline, diag));
                         },
                     );
+                    // Emit the OPENING projection as a timeline event: a POINT at
+                    // token 0 (nothing decoded yet) carrying the initial composition
+                    // this turn decodes against. A projection governs everything
+                    // forward until the next reprojection supersedes it, so even a
+                    // short / no-think turn that never reprojects still gets this one
+                    // clickable record. `start_token`/`seconds` stay 0 — the turn's
+                    // opening point.
+                    {
+                        let mut opening = crate::projection::from_projection_with_origins(
+                            &projection.segments,
+                            &projection.selection_origins,
+                            inputs.projection.schema(),
+                            &view,
+                            &projection.selection_scores,
+                            view.total_token_count(target.timeline) as u32,
+                            0,
+                            0.0,
+                        );
+                        opening.materialized = projection_assembler::materialize_conversation(
+                            &projection.segments,
+                            &self.boundary_markers,
+                            &projection.selection_origins,
+                            &view,
+                            inputs.projection.schema(),
+                            |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+                        );
+                        let _ = event_tx.send(TurnEvent::Projection(opening));
+                    }
                     // The schema's projection is the single source
                     // of truth for system-side sections — emit
                     // exactly what the projection picked, in
@@ -1645,18 +1719,9 @@ impl Scheduler {
                     //     by the persistence API).
                     //   - `segments` carries the same items in
                     //     declaration order for `apply_projection`.
-                    // For the target's own group route via
-                    // `target.timeline`; for other groups fall back to
-                    // first-of-group (a Phase-1 single-timeline
-                    // assumption that holds for cross-group references
-                    // in our current schema).
-                    let resolve_timeline = |g: GroupId| -> Option<TimelineId> {
-                        if g == target.group {
-                            Some(target.timeline)
-                        } else {
-                            view.timelines_for_group(g).next()
-                        }
-                    };
+                    // Each turn already carries its resolved timeline
+                    // (stamped at projection), so no group→timeline
+                    // resolution happens here.
                     let mut sections: Vec<SectionId> = Vec::new();
                     let mut segments: Vec<ProjectionSegment> = Vec::new();
                     for seg in &projection.segments {
@@ -1678,23 +1743,17 @@ impl Scheduler {
                             }
                             ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
                             | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
-                                let g = rt.group();
-                                let t = rt.index();
-                                let Some(timeline) = resolve_timeline(g) else {
+                                // The turn carries its conversation (stamped at
+                                // projection); read it directly — no group→timeline
+                                // re-derivation.  `elevate_to_hot` below brings
+                                // cold-marker turns into hot before apply runs; a
+                                // timeline-less (mock/untracked) turn is skipped, a
+                                // `TurnHalf` elevates the same underlying turn.
+                                let Some(timeline) = rt.timeline else {
                                     continue;
                                 };
-                                // Include any tracked turn regardless
-                                // of tier — cold-marker turns must
-                                // survive this filter; `elevate_to_hot`
-                                // below brings them into hot before
-                                // apply_projection runs.  A `TurnHalf`
-                                // elevates the same underlying turn; the
-                                // half-window is derived after the turn's
-                                // chunks are hot.
-                                if view.turn_tier_state(timeline, t).is_some() {
-                                    turn_keys_for_elevate.push(TurnKey::new(timeline, t));
-                                    segments.push(seg.clone());
-                                }
+                                turn_keys_for_elevate.push(TurnKey::new(timeline, rt.index()));
+                                segments.push(seg.clone());
                             }
                             ProjectionSegment::Generated { .. }
                             | ProjectionSegment::NewUserMessage { .. } => {
@@ -1727,7 +1786,7 @@ impl Scheduler {
                     // projection events now, while the view guard is live. The
                     // calibration projection is pinned (`SelectionRule::Named`), so
                     // one composition serves every segment — the wave overrides its
-                    // `start_token`/`end_token` span per emission.
+                    // point `start_token` per emission.
                     if !projection_offsets.is_empty() {
                         let total = view.total_token_count(target.timeline) as u32;
                         staged_composition = Some(crate::projection::from_projection(
@@ -1737,9 +1796,30 @@ impl Scheduler {
                             &projection.selection_scores,
                             total,
                             0,
-                            0,
                             0.0,
                         ));
+                    }
+                    // When the composer dial suppresses thinking, follow the user
+                    // opener with a live `/no_think` run.  Qwen3 only honours the
+                    // soft-switch from the user turn (not the system prompt), and
+                    // emitting it as GLUE here — re-decided from the current dial
+                    // every projection, never sealed into a turn — keeps it out of
+                    // the substrate and prevents a past suppressed turn from leaking
+                    // a stale switch onto a later thinking-on turn.  The assembler
+                    // batches it into the same live-prefill run as `user_start`.
+                    let suppress = matches!(
+                        inputs.selection.optional(NO_THINK_SELECTOR),
+                        Some(OptionalState::Present)
+                    );
+                    if suppress && !self.boundary_markers.no_think.is_empty() {
+                        let pos = segments.len();
+                        segments.push(ProjectionSegment::Generated {
+                            tokens: self.boundary_markers.no_think.clone(),
+                            identity: GeneratedIdentity {
+                                name: "no_think_current".into(),
+                                position: pos,
+                            },
+                        });
                     }
                     (sections, segments)
                 } else {
@@ -1912,7 +1992,10 @@ impl Scheduler {
                     prefill_text,
                     user_text,
                     tags,
-                    content_bounds,
+                    user_content_start,
+                    user_content_end,
+                    assistant_content_start,
+                    no_think,
                     prefill_assistant_text,
                     event_tx,
                     max_decode_tokens,
@@ -1923,6 +2006,7 @@ impl Scheduler {
                     post_decode_tokens,
                     projection_offsets,
                     staged_composition,
+                    triggers,
                 });
                 true
             }
@@ -2135,6 +2219,37 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::OffloadCollectionMembers {
+                conversation,
+                response_tx,
+            } => {
+                let result = (|| -> Result<(), ConversationError> {
+                    if let Some(turn_policy) = self.session.compression_policy() {
+                        let boundary_policy = Self::section_compression_policy_boundary();
+                        let member_policy = Self::section_compression_policy_member(&turn_policy);
+                        // Quantize just the prefix-transparent members + flag
+                        // them for offload; boundary sections stay pending for
+                        // the turn-seal boundary.
+                        self.quantize_pending_collection_members(
+                            &conversation,
+                            &boundary_policy,
+                            &member_policy,
+                        )?;
+                    }
+                    // Block on a full persistence pass so the members' cold
+                    // copies land and `install_cold` frees their VRAM before the
+                    // next batch prefills.  The wave-batched prefill within a
+                    // batch keeps its own concurrency; this seam only gates
+                    // between batches so the native catalog can't outrun the
+                    // offload under VRAM pressure.
+                    self.persist_trigger
+                        .flush_blocking(std::time::Duration::from_secs(30));
+                    Ok(())
+                })();
+                let _ = response_tx.send(result);
+                true
+            }
+
             SchedulerRequest::ExtractRawKvq {
                 sequence_id,
                 layer_indices,
@@ -2163,7 +2278,7 @@ impl Scheduler {
                 if let Err(e) =
                     self.handle_summary_probe(timeline, kind, children, height, response_tx.clone())
                 {
-                    let _ = response_tx.send(Err(e));
+                    let _ = response_tx.send(Err(ProbeError::Soft(e)));
                 }
                 true
             }
@@ -2205,9 +2320,9 @@ impl Scheduler {
         kind: TurnKind,
         children: Vec<TurnIndex>,
         height: u8,
-        response_tx: Sender<Result<TurnIndex, String>>,
+        response_tx: Sender<Result<TurnIndex, ProbeError>>,
     ) -> Result<(), String> {
-        tracing::debug!(
+        tracing::trace!(
             target: "candle_conversation::summariser",
             timeline = %timeline,
             children = ?children,
@@ -2281,20 +2396,57 @@ impl Scheduler {
         let job_id = self.next_compression_job_id;
         self.next_compression_job_id += 1;
 
-        // Set up both half-passes. Each returns its scratch slot id (now a
-        // live `DecodeState` in `active_decodes`). On any failure, tear down
-        // whatever was already enqueued so no orphan slot or job lingers.
-        let user_slot = match self.enqueue_compression_pass(
-            &conv,
-            target,
-            &children,
-            Role::User,
-            &turn_summary.user,
-            turn_summary.max_tokens,
-            job_id,
-        ) {
-            Ok(slot) => slot,
-            Err(e) => return Err(e),
+        // Question-half VERBATIM shortcut. The compressor cannot be trusted to
+        // "restate" a short or self-referential user message — it confabulates a
+        // plausible-but-invented question ("what did I ask?" → "How does X
+        // work?"). And a summary IS the model's memory under score-density, so a
+        // fabricated question poisons recall permanently. When the raw user
+        // content already fits the summary budget there is nothing to compress:
+        // echo the user tokens verbatim as the question-half — ground truth by
+        // construction — and only run the model on genuinely oversized input.
+        let anchor_sep = self
+            .tokenizer
+            .encode("\n\n", false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
+        let verbatim_user: Vec<u32> = {
+            let view = conv.read();
+            let mut acc: Vec<u32> = Vec::new();
+            for &c in &children {
+                let half = view
+                    .turn_user_token_ids(target.timeline, c)
+                    .unwrap_or_default();
+                if half.is_empty() {
+                    continue;
+                }
+                if !acc.is_empty() {
+                    acc.extend_from_slice(&anchor_sep);
+                }
+                acc.extend(half);
+            }
+            acc
+        };
+        let user_verbatim =
+            !verbatim_user.is_empty() && verbatim_user.len() <= turn_summary.max_tokens;
+
+        // Set up the half-passes. Each enqueued pass returns its scratch slot id
+        // (now a live `DecodeState` in `active_decodes`). On any failure, tear
+        // down whatever was already enqueued so no orphan slot or job lingers.
+        let user_slot: Option<SequenceId> = if user_verbatim {
+            None
+        } else {
+            match self.enqueue_compression_pass(
+                &conv,
+                target,
+                &children,
+                Role::User,
+                &turn_summary.user,
+                turn_summary.max_tokens,
+                job_id,
+            ) {
+                Ok(slot) => Some(slot),
+                Err(e) => return Err(e),
+            }
         };
         let assistant_slot = match self.enqueue_compression_pass(
             &conv,
@@ -2307,16 +2459,20 @@ impl Scheduler {
         ) {
             Ok(slot) => slot,
             Err(e) => {
-                // The user pass is already an active decode; abandon it so it
+                // The user pass may already be an active decode; abandon it so it
                 // doesn't seal into a job that will never complete.
-                self.active_decodes.remove(&user_slot);
-                self.free_summary_slot(user_slot);
+                if let Some(slot) = user_slot {
+                    self.active_decodes.remove(&slot);
+                    self.free_summary_slot(slot);
+                }
                 return Err(e);
             }
         };
 
-        // Register the job. Both passes now ride the wave concurrently; the
-        // node stitches in `cleanup_finished` when both halves land.
+        // Register the job. The assistant pass rides the wave; the user pass too
+        // unless echoed verbatim (then `user_result` is pre-filled and the node
+        // stitches as soon as the assistant half lands). Stitch happens in
+        // `cleanup_finished` once both halves are present.
         self.compression_jobs.insert(
             job_id,
             CompressionJob {
@@ -2324,7 +2480,9 @@ impl Scheduler {
                 target,
                 user_slot,
                 assistant_slot,
-                user_result: None,
+                user_result: user_verbatim.then(|| CompressionPassResult {
+                    tokens: verbatim_user,
+                }),
                 assistant_result: None,
                 response_tx,
             },
@@ -2345,7 +2503,7 @@ impl Scheduler {
         kind: TurnKind,
         children: &[TurnIndex],
         height: u8,
-        response_tx: Sender<Result<TurnIndex, String>>,
+        response_tx: Sender<Result<TurnIndex, ProbeError>>,
     ) -> Result<(), String> {
         // Read each child's assistant-half *tokens* and decode them. Normal scan
         // turns are prefill-only (no stored `assistant_text`), so we slice the
@@ -2510,18 +2668,38 @@ impl Scheduler {
                 position: 0,
             },
         });
+        // `/no_think` rides the user opener as live glue — the same single
+        // mechanism the dialogue's `no_think_current` uses — so the compressor
+        // never reasons (the summary budget is tiny). Unconditional: a summary
+        // pass always suppresses, independent of the user's effort dial. The only
+        // other copy is in the compressor system prompt; it is never in the
+        // instruction text.
+        if !self.boundary_markers.no_think.is_empty() {
+            prefix.push(ProjectionSegment::Generated {
+                tokens: self.boundary_markers.no_think.clone(),
+                identity: GeneratedIdentity {
+                    name: "compress_no_think".to_string(),
+                    position: 0,
+                },
+            });
+        }
 
         // Rolling anchor: the most recent sealed *summary* turn before these
         // children — the running thread of the conversation so far, itself
         // bounded (it is a prior summary, not raw history, so this stays O(1)).
-        // Prepended as context so each half-summary is grounded in what came
-        // before instead of confabulating a request/answer from a bare turn.
+        // Grounds the ANSWER pass in what came before so a follow-up reply summary
+        // stays coherent with the running thread.
         //
-        // BOTH halves of the prior leaf are carried — its question summary AND
-        // its answer summary, separated. A stitched leaf is stored as
-        // `[question][user_end][assistant_start][answer]`; reading only the
-        // assistant half would amputate the running *question* thread, so the
-        // original ask would survive exactly one turn and then vanish.
+        // BOTH halves of the prior leaf are carried — its question summary AND its
+        // answer summary, separated. A stitched leaf is stored as
+        // `[question][user_end][assistant_start][answer]`.
+        //
+        // This is applied to the ASSISTANT pass ONLY (see below). The QUESTION
+        // pass must NOT see it: the question summary restates *this turn's* user
+        // message, and prior/answer context makes the model reverse-engineer a
+        // plausible-but-invented question from the surrounding answer text instead
+        // of the actual ask (observed: a "give me a tour" turn summarised as an
+        // unrelated, hallucinated API question).
         let anchor_sep = self
             .tokenizer
             .encode("\n\n", false)
@@ -2553,15 +2731,6 @@ impl Scheduler {
                 })
                 .unwrap_or_default()
         };
-        if !prior_summary.is_empty() {
-            prefix.push(ProjectionSegment::Generated {
-                tokens: Arc::new(prior_summary),
-                identity: GeneratedIdentity {
-                    name: "compress_prior".to_string(),
-                    position: 1,
-                },
-            });
-        }
 
         // Close glue: the compression instruction followed by `user_end`.
         let close: Vec<u32> = {
@@ -2595,45 +2764,23 @@ impl Scheduler {
                                 group_id: target.group,
                                 index: child,
                             },
+                            // Compression operates on the target conversation.
+                            timeline: Some(target.timeline),
                         },
                     )));
                 }
-                // Ground with the assistant half (text) so the user-request
-                // summary sees the response it produced — a bare tool-result
-                // turn is otherwise context-free and confabulates.
-                let asst_ctx: Vec<u32> = {
-                    let view = conv.read();
-                    let mut acc: Vec<u32> = Vec::new();
-                    for &c in children {
-                        let half = view
-                            .turn_assistant_token_ids(target.timeline, c)
-                            .unwrap_or_default();
-                        if half.is_empty() {
-                            continue;
-                        }
-                        // Separate consecutive children's halves (same `\n\n` as
-                        // the rolling anchor); single-child leaves are unchanged.
-                        if !acc.is_empty() {
-                            acc.extend_from_slice(&anchor_sep);
-                        }
-                        acc.extend(half);
-                    }
-                    acc
-                };
-                if !asst_ctx.is_empty() {
-                    segments.push(ProjectionSegment::Generated {
-                        tokens: Arc::new(asst_ctx),
-                        identity: GeneratedIdentity {
-                            name: "compress_asst_ctx".to_string(),
-                            position: 2,
-                        },
-                    });
-                }
+                // The question summary restates ONLY this turn's user message. It
+                // deliberately does NOT see the assistant answer or any prior
+                // context: given the reply text, the model reverse-engineers a
+                // plausible-but-invented question from it instead of compressing
+                // the actual ask (a "give me a tour" turn was summarised as an
+                // unrelated hallucinated API question). The user tokens injected
+                // above are self-sufficient for "what was asked".
                 segments.push(ProjectionSegment::Generated {
                     tokens: Arc::new(close),
                     identity: GeneratedIdentity {
                         name: "compress_close".to_string(),
-                        position: 3,
+                        position: 1,
                     },
                 });
                 if let Err(e) =
@@ -2652,8 +2799,22 @@ impl Scheduler {
             // the loop. `finish_compression_pass_setup` runs in the
             // wave-completion hook (`promote_finished_prefills_to_decodes`).
             Role::Assistant => {
+                // The rolling anchor (prior summary's question + answer) grounds
+                // the answer pass ONLY — it keeps a follow-up reply summary coherent
+                // with the running thread. It is deliberately absent from the
+                // question pass (see the `Role::User` arm).
+                let mut segments = prefix;
+                if !prior_summary.is_empty() {
+                    segments.push(ProjectionSegment::Generated {
+                        tokens: Arc::new(prior_summary),
+                        identity: GeneratedIdentity {
+                            name: "compress_prior".to_string(),
+                            position: 1,
+                        },
+                    });
+                }
                 if let Err(e) = self
-                    .apply_projection(slot, BlockCount(0), &prefix)
+                    .apply_projection(slot, BlockCount(0), &segments)
                     .map_err(|e| format!("SubmitSummaryProbe: assemble Assistant prefix: {e}"))
                 {
                     self.free_summary_slot(slot);
@@ -2708,7 +2869,10 @@ impl Scheduler {
                     prefill_text: String::new(),
                     user_text: String::new(),
                     tags: Vec::new(),
-                    content_bounds: TurnContentBounds::default(),
+                    user_content_start: 0,
+                    user_content_end: 0,
+                    assistant_content_start: 0,
+                    no_think: false,
                     prefill_assistant_text: String::new(),
                     event_tx,
                     max_decode_tokens: 0,
@@ -2723,6 +2887,7 @@ impl Scheduler {
                     post_decode_tokens: TokenBuffer::default(),
                     projection_offsets: Vec::new(),
                     staged_composition: None,
+                    triggers: Arc::new(TriggerRegistry::new()),
                 });
             }
             Role::System => {
@@ -2841,8 +3006,14 @@ impl Scheduler {
                 prefill_tokens: TokenBuffer::default(),
                 user_text: String::new(),
                 tags: Vec::new(),
-                content_bounds: TurnContentBounds::default(),
+                user_content_start: 0,
+                user_content_end: 0,
+                assistant_content_start: 0,
+                no_think: false,
                 in_tool_call: false,
+                triggers: Arc::new(TriggerRegistry::new()),
+                stencil: None,
+                pending_mask: None,
             },
         );
         Ok(())
@@ -2892,17 +3063,21 @@ impl Scheduler {
                 // One half failed → the whole node cannot stitch. Report the
                 // soft error and tear down the job + the partner slot.
                 let job = self.compression_jobs.remove(&job_id).unwrap();
-                let _ = job.response_tx.send(Err(e));
+                let _ = job.response_tx.send(Err(ProbeError::Soft(e)));
+                // Free the partner slot. A verbatim question-half has no user
+                // slot (`None`), so there is nothing to tear down on that side.
                 let partner = match half {
-                    Role::User => job.assistant_slot,
+                    Role::User => Some(job.assistant_slot),
                     _ => job.user_slot,
                 };
-                self.active_decodes.remove(&partner);
-                // The partner may be the assistant half still mid-`CompressionSetup`
-                // on the wave — purge its pending prefill before freeing the slot,
-                // or a stale forward would hit the freed (and possibly reused) id.
-                self.discard_pending_prefill(partner);
-                self.free_summary_slot(partner);
+                if let Some(partner) = partner {
+                    self.active_decodes.remove(&partner);
+                    // The partner may be the assistant half still mid-`CompressionSetup`
+                    // on the wave — purge its pending prefill before freeing the slot,
+                    // or a stale forward would hit the freed (and possibly reused) id.
+                    self.discard_pending_prefill(partner);
+                    self.free_summary_slot(partner);
+                }
                 return;
             }
         }
@@ -2967,6 +3142,26 @@ impl Scheduler {
 
     /// Frame a compressed exchange (a user-half + assistant-half, already as
     /// token ids) as one clean marker-framed turn and enqueue it for the seal.
+    /// Decode `tokens`, strip any `<think>…</think>` block, and re-encode the
+    /// cleaned summary text. Returns the original tokens unchanged when there is
+    /// no think tag (the common case pays only a decode + scan), so the
+    /// deterministic structural path — which never emits a think block — is a
+    /// no-op.
+    fn strip_think_from_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+        let Ok(text) = self.tokenizer.decode(tokens, true) else {
+            return tokens.to_vec();
+        };
+        let lower = text.to_ascii_lowercase();
+        if !lower.contains("<think>") && !lower.contains("</think>") {
+            return tokens.to_vec();
+        }
+        let stripped = crate::think_strip::strip_think_blocks(&text);
+        self.tokenizer
+            .encode(stripped.as_str(), false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_else(|_| tokens.to_vec())
+    }
+
     /// Shared by the model-decode path ([`Self::enqueue_compression_turn`]) and
     /// the deterministic structural path ([`Self::handle_summary_probe`]).
     fn seal_compression_turn(
@@ -2976,8 +3171,16 @@ impl Scheduler {
         target: ProjectionTarget,
         user_tokens: Vec<u32>,
         assistant_tokens: Vec<u32>,
-        response_tx: Sender<Result<TurnIndex, String>>,
+        response_tx: Sender<Result<TurnIndex, ProbeError>>,
     ) -> Result<(), String> {
+        // Despite the `/no_think` directive the model may still emit an (empty)
+        // `<think></think>` block before the summary. Summaries are stored as
+        // plain content, so strip the block from each half here — before the
+        // halves are stitched, re-prefilled, and recorded — so it never leaks
+        // into the substrate or the GUI's summary view.
+        let user_tokens = self.strip_think_from_tokens(&user_tokens);
+        let assistant_tokens = self.strip_think_from_tokens(&assistant_tokens);
+
         // Frame the compressed exchange as a clean, marker-framed turn — the
         // question body, then `[user_end][assistant_start]`, then the answer body.
         // No leading `no_think` / `user_start` head: those are live `Generated`
@@ -2995,7 +3198,6 @@ impl Scheduler {
         let asst_start_at = token_ids.len();
         token_ids.extend_from_slice(&assistant_tokens);
         let token_count = token_ids.len();
-        let content_bounds = TurnContentBounds::clamped(0, user_end_at, asst_start_at, token_count);
 
         // Decode both halves' display text. On failure reply to the summariser
         // before returning — otherwise `response_tx` drops and its `recv()` turns
@@ -3004,7 +3206,7 @@ impl Scheduler {
             Ok(t) => t,
             Err(e) => {
                 let e = format!("SubmitSummaryProbe: decode user-half: {e}");
-                let _ = response_tx.send(Err(e.clone()));
+                let _ = response_tx.send(Err(ProbeError::Soft(e.clone())));
                 return Err(e);
             }
         };
@@ -3012,7 +3214,7 @@ impl Scheduler {
             Ok(t) => t,
             Err(e) => {
                 let e = format!("SubmitSummaryProbe: decode assistant-half: {e}");
-                let _ = response_tx.send(Err(e.clone()));
+                let _ = response_tx.send(Err(ProbeError::Soft(e.clone())));
                 return Err(e);
             }
         };
@@ -3025,7 +3227,7 @@ impl Scheduler {
             Ok(s) => s,
             Err(e) => {
                 let e = format!("SubmitSummaryProbe: reproject slot: {e}");
-                let _ = response_tx.send(Err(e.clone()));
+                let _ = response_tx.send(Err(ProbeError::Soft(e.clone())));
                 return Err(e);
             }
         };
@@ -3041,15 +3243,29 @@ impl Scheduler {
         // prefills it alongside the live turn and other summaries;
         // `complete_compression_turn` snapshots + records it when the prefill
         // finishes.
+        // Build the compressed turn's segment layout. The exchange is framed
+        // `[question][user_end][assistant_start][answer]` with no leading head,
+        // so the user body spans `[0, user_end_at)` and the answer body starts at
+        // `asst_start_at`. Summaries strip their think block, so there is no
+        // thinking split here.
+        let layout = TurnLayout::from_flat_grid(
+            0,
+            user_end_at as u32,
+            asst_start_at as u32,
+            token_count as u32,
+            user_end.len() as u32,
+            assistant_start.len() as u32,
+            user_text,
+            Some(assistant_text),
+            false,
+        );
         self.pending_compression_seals.insert(
             job_id,
             PendingCompressionSeal {
                 conversation,
                 target,
-                user_text,
-                assistant_text,
+                layout,
                 token_ids: token_ids.clone(),
-                content_bounds,
                 response_tx,
             },
         );
@@ -3059,7 +3275,10 @@ impl Scheduler {
             prefill_text: String::new(),
             user_text: String::new(),
             tags: Vec::new(),
-            content_bounds: TurnContentBounds::default(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
             prefill_assistant_text: String::new(),
             event_tx,
             max_decode_tokens: 0,
@@ -3070,8 +3289,59 @@ impl Scheduler {
             post_decode_tokens: TokenBuffer::default(),
             projection_offsets: Vec::new(),
             staged_composition: None,
+            triggers: Arc::new(TriggerRegistry::new()),
         });
         Ok(())
+    }
+
+    /// Build a turn's [`TurnLayout`] at seal time from the submit-time content
+    /// boundaries and the per-half display text. The dialect marker lengths come
+    /// from the scheduler's `boundary_markers`; when the assistant body carries a
+    /// `<think>…</think>` block it is split into a real `Thinking` segment whose
+    /// token length is measured by re-tokenising the block (the answer span
+    /// absorbs any tokeniser round-trip remainder, so the layout still tiles).
+    #[allow(clippy::too_many_arguments)]
+    fn build_turn_layout(
+        &self,
+        user_content_start: u32,
+        user_content_end: u32,
+        assistant_content_start: u32,
+        total: u32,
+        user_text: String,
+        assistant_text: String,
+        no_think: bool,
+    ) -> TurnLayout {
+        let im_end_len = self.boundary_markers.user_end.len() as u32;
+        let assistant_start_len = self.boundary_markers.assistant_start.len() as u32;
+        let layout = TurnLayout::from_flat_grid(
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+            total,
+            im_end_len,
+            assistant_start_len,
+            user_text,
+            (!assistant_text.is_empty()).then(|| assistant_text.clone()),
+            no_think,
+        );
+        // Split the `<think>…</think>` reasoning out of the assistant body. The
+        // stored grid contains it, so it is a REAL segment; its token length is
+        // measured by re-tokenising the block.
+        if let (Some(o), Some(c)) = (
+            assistant_text.find("<think>"),
+            assistant_text.find("</think>"),
+        ) {
+            if c >= o {
+                let block = assistant_text[o..c + "</think>".len()].to_string();
+                let think_len = self
+                    .tokenizer
+                    .encode(block.as_str(), false)
+                    .map(|t| t.get_ids().len() as u32)
+                    .unwrap_or(0);
+                return layout.with_thinking_split(block, think_len, false);
+            }
+        }
+        layout
     }
 
     /// Seal a re-prefilled compressed turn once the shared wave finishes its
@@ -3091,9 +3361,9 @@ impl Scheduler {
         let sealed_gpu = match self.session.snapshot_sequence_per_layer(slot.0) {
             Ok(snap) => slice_per_layer_sealed(&snap, 0, block_count),
             Err(e) => {
-                let _ = pending
-                    .response_tx
-                    .send(Err(format!("SubmitSummaryProbe: reproject snapshot: {e}")));
+                let _ = pending.response_tx.send(Err(ProbeError::Soft(format!(
+                    "SubmitSummaryProbe: reproject snapshot: {e}"
+                ))));
                 self.free_summary_slot(slot);
                 return;
             }
@@ -3108,15 +3378,34 @@ impl Scheduler {
         let response_tx = pending.response_tx;
         // Kept for the post-injection log + token persistence below — the rest
         // move into the write.
-        let summary_question = pending.user_text.clone();
-        let summary_answer = pending.assistant_text.clone();
+        let summary_question = pending.layout.user_text().to_string();
+        let summary_answer = pending.layout.assistant_text().unwrap_or_default();
+        // A summary node stands in for the real turns it compressed and is injected
+        // as a synthetic user→assistant exchange. If EITHER half's decode pass
+        // produced no text, the node is hollow — it would silently drop that slice
+        // of history behind an empty slot. Refuse to seal it and surface the
+        // failure to the summariser rather than committing a malformed summary.
+        if summary_question.trim().is_empty() || summary_answer.trim().is_empty() {
+            let msg = format!(
+                "summary seal aborted for timeline {timeline}: a compression pass produced an \
+                 empty half (question {} chars, answer {} chars) — refusing to seal a hollow \
+                 summary node",
+                summary_question.trim().chars().count(),
+                summary_answer.trim().chars().count(),
+            );
+            tracing::error!(
+                target: "candle_conversation::summariser",
+                timeline = %timeline,
+                "{msg}",
+            );
+            let _ = response_tx.send(Err(ProbeError::Permanent(msg)));
+            return;
+        }
         let persist_token_ids = pending.token_ids.clone();
         let write = TurnPartWrite {
-            user_text: pending.user_text,
-            assistant_text: pending.assistant_text,
+            layout: pending.layout,
             token_ids: TokenBuffer::from(pending.token_ids),
             token_count,
-            content_bounds: pending.content_bounds,
             // Compression/summary turns are never a gather target — untagged.
             tags: Vec::new(),
             block_start: 0,
@@ -3128,9 +3417,9 @@ impl Scheduler {
         {
             Ok(idx) => idx,
             Err(e) => {
-                let _ = response_tx.send(Err(format!(
+                let _ = response_tx.send(Err(ProbeError::Soft(format!(
                     "SubmitSummaryProbe: record compressed turn: {e}"
-                )));
+                ))));
                 return;
             }
         };
@@ -3164,8 +3453,9 @@ impl Scheduler {
     /// registered). Used when the wave-driven assistant setup can't complete.
     fn abort_compression_job(&mut self, job_id: u64, err: String) {
         if let Some(job) = self.compression_jobs.remove(&job_id) {
-            let _ = job.response_tx.send(Err(err));
-            for slot in [job.user_slot, job.assistant_slot] {
+            let _ = job.response_tx.send(Err(ProbeError::Soft(err)));
+            // `user_slot` is `None` for a verbatim question-half (no decode pass).
+            for slot in job.user_slot.into_iter().chain([job.assistant_slot]) {
                 self.active_decodes.remove(&slot);
                 self.discard_pending_prefill(slot);
                 self.free_summary_slot(slot);
@@ -3426,109 +3716,6 @@ impl Scheduler {
         r
     }
 
-    /// (Dead code, retained for future use; rewritten to take a
-    /// `Conversation` parameter so it can read from the right
-    /// substrate under the multi-workspace scheduler model.)
-    #[allow(dead_code)]
-    pub(crate) fn assemble_projected_parent(
-        &mut self,
-        conversation: &Conversation,
-        projected_turns: &[(GroupId, TurnIndex)],
-    ) -> Result<SequenceId, ConversationError> {
-        let n_layers = self.session.num_layers();
-
-        // 1. Read substrate; collect per-turn per-layer sealed sequences.
-        // Expects the caller to have run `elevate_to_hot` upstream so
-        // every projected turn is hot-resident — any miss is logged
-        // and skipped.
-        let turn_keys: Vec<(GroupId, TurnIndex, TimelineId)> = {
-            let view = conversation.read();
-            projected_turns
-                .iter()
-                .filter_map(|&(g, t)| view.timelines_for_group(g).next().map(|tl| (g, t, tl)))
-                .collect()
-        };
-        let mut per_turn_sealed: Vec<Arc<Vec<SealedSequence>>> =
-            Vec::with_capacity(turn_keys.len());
-        for (_g, t, timeline) in turn_keys {
-            if let Some(s) = Self::hot_turn_or_skip(conversation, timeline, t) {
-                per_turn_sealed.push(s);
-            }
-        }
-
-        // 2. Concatenate per-layer.  Result: Vec<Arc<SealedSequence>>
-        // of length `n_layers`, where each SealedSequence's chunks are
-        // the concatenation of every projected turn's chunks for that
-        // layer (in projection order).
-        let mut per_layer_chunks: Vec<Vec<candle_nn::kv_cache::SealedChunk>> =
-            (0..n_layers).map(|_| Vec::new()).collect();
-        let mut per_layer_token_count: Vec<usize> = vec![0; n_layers];
-        let chunk_size = self.chunk_size;
-        for turn in &per_turn_sealed {
-            if turn.len() != n_layers {
-                tracing::warn!(
-                    "assemble_projected_parent: turn has {} layers, expected {}; skipping",
-                    turn.len(),
-                    n_layers
-                );
-                continue;
-            }
-            for layer_idx in 0..n_layers {
-                let layer_seq = &turn[layer_idx];
-                per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
-                per_layer_token_count[layer_idx] += layer_seq.token_count;
-            }
-        }
-        let gpu_per_layer: Vec<SealedSequence> = per_layer_chunks
-            .into_iter()
-            .zip(per_layer_token_count)
-            .map(|(chunks, tokens)| SealedSequence {
-                chunks,
-                token_count: tokens,
-                chunk_size,
-                location: candle_nn::kv_cache::ArenaLocation::Gpu,
-            })
-            .collect();
-
-        // 3. Allocate the fresh GPU sequence; it'll receive the
-        // projected chunks via inject_sealed_at_tail.
-        let new_seq_idx = self
-            .session
-            .create_sequence()
-            .map_err(ConversationError::Model)?;
-        let new_seq_id = SequenceId(new_seq_idx);
-
-        // 4. Inject as live ChunkWindows on the new sequence.
-        self.session
-            .inject_sealed_at_tail(new_seq_idx, &gpu_per_layer)
-            .map_err(ConversationError::Model)?;
-
-        // KV-zero check: scan the freshly-injected projected context — catches a
-        // corrupted turn's KV being reused as provenance context for a new turn.
-        #[cfg(feature = "kv-zero-check")]
-        {
-            let layers: Vec<usize> = (0..self.session.num_layers()).collect();
-            let n_real = self.session.sequence_offset(new_seq_idx).unwrap_or(0);
-            let layout = self.session.provenance_chunk_layout(new_seq_idx, n_real);
-            if let Ok(dump) =
-                self.session
-                    .gather_r16_kv_provenance_layers(new_seq_idx, &layers, None)
-            {
-                kv_zero_check::scan_gathered(
-                    "projection-inject",
-                    new_seq_idx,
-                    &dump,
-                    &layout,
-                    self.session.n_kv_head(),
-                    self.session.head_dim(),
-                    n_real, // pure projected context — everything is "prefix"
-                );
-            }
-        }
-
-        Ok(new_seq_id)
-    }
-
     // —— Cleanup ————————————————————————————————————————————————————————
 
     /// Remove finished sequences and send `Done` events.
@@ -3541,8 +3728,6 @@ impl Scheduler {
             .collect();
 
         for seq_id in finished_seq_ids {
-            // Drop the projection-span anchor for this finished decode.
-            self.reproj_anchor.remove(&seq_id);
             if let Some(state) = self.active_decodes.remove(&seq_id) {
                 // Compression half-passes complete through the job registry,
                 // not the substrate seal path: slice the decoded delta, deposit
@@ -3766,13 +3951,21 @@ impl Scheduler {
                             } else {
                                 state.prefill_assistant_text.clone()
                             };
+                            let total = full_tokens.len() as u32;
+                            let layout = self.build_turn_layout(
+                                state.user_content_start,
+                                state.user_content_end,
+                                state.assistant_content_start,
+                                total,
+                                state.user_text.clone(),
+                                assistant_text,
+                                state.no_think,
+                            );
                             Some(TurnContent {
                                 role: Role::Assistant,
                                 tags: state.tags.clone(),
-                                user_text: state.user_text.clone(),
-                                assistant_text,
+                                layout,
                                 token_ids: TokenBuffer::from(full_tokens),
-                                content_bounds: state.content_bounds,
                             })
                         } else {
                             None
@@ -4138,6 +4331,52 @@ impl Scheduler {
         boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
         member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
+        let drained: Vec<PendingSectionQuantize> =
+            self.pending_section_quantize.drain(..).collect();
+        self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
+    }
+
+    /// Quantize + offload ONLY the collection-member sections currently
+    /// pending, leaving boundary sections pending for the turn-seal boundary.
+    ///
+    /// Collection members are prefix-transparent — nothing attends back over
+    /// them during the build (priming uses the collections-empty projection),
+    /// so it is safe to quantize them mid-build the moment their ingest wave
+    /// has sealed.  This is what lets a large catalog (e.g. the tool list,
+    /// sealed ×no_think) be shrunk and offloaded as the build runs instead of
+    /// piling up native until the end.  Each member's residence is flagged
+    /// `evict_when_cold` so the persistence thread frees its VRAM the instant
+    /// the redo-log write lands.
+    fn quantize_pending_collection_members(
+        &mut self,
+        conversation: &Conversation,
+        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
+        member_policy: &candle_nn::kv_cache::CompressionPolicy,
+    ) -> Result<(), ConversationError> {
+        let mut members: Vec<PendingSectionQuantize> = Vec::new();
+        let mut keep: Vec<PendingSectionQuantize> = Vec::new();
+        for p in self.pending_section_quantize.drain(..) {
+            if p.in_collection {
+                members.push(p);
+            } else {
+                keep.push(p);
+            }
+        }
+        self.pending_section_quantize = keep;
+        self.quantize_section_batch(conversation, members, boundary_policy, member_policy, true)
+    }
+
+    /// Quantize an already-drained pending list and atomically swap each
+    /// residence's hot to its quantized form.  `mark_evict` additionally flags
+    /// every section's residence for offload-on-persist (collection-member path).
+    fn quantize_section_batch(
+        &mut self,
+        conversation: &Conversation,
+        pending_list: Vec<PendingSectionQuantize>,
+        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
+        member_policy: &candle_nn::kv_cache::CompressionPolicy,
+        mark_evict: bool,
+    ) -> Result<(), ConversationError> {
         // Snapshot per-section native hot + residence + which policy
         // applies under a brief read lock; the heavy GPU work runs
         // unlocked.  Pending list is partitioned into (residence,
@@ -4145,8 +4384,8 @@ impl Scheduler {
         // in_collection so each policy gets its own batched launch.
         let pending: Vec<(SectionId, ResidenceIndex, Vec<SealedSequence>, bool)> = {
             let view = conversation.read();
-            self.pending_section_quantize
-                .drain(..)
+            pending_list
+                .into_iter()
                 .filter_map(|p| {
                     let residence = view.section_residence(p.section_id)?;
                     let sealed = view.section_sealed_of(p.section_id)?;
@@ -4264,6 +4503,11 @@ impl Scheduler {
                 }
                 view.replace_section_hot(residence, q_per_layer);
                 view.clear_section_pending_quantize(residence);
+                // Collection-member path: free this section's VRAM as soon as
+                // the persistence thread lands its cold copy.
+                if mark_evict {
+                    view.mark_section_evict_when_cold(residence);
+                }
             }
         }
         // Now that the substrate holds the final (quantized) form for
@@ -4382,21 +4626,9 @@ impl Scheduler {
                 let TurnContent {
                     role,
                     tags,
-                    user_text,
-                    assistant_text,
+                    layout,
                     token_ids,
-                    content_bounds,
                 } = turn_content.unwrap_or_default();
-                // Re-clamp the content boundaries to the sealed token count
-                // so `window_sealed_tokens` can never window past the turn's
-                // own grid.  The assistant content end is the total token
-                // count; the three boundaries stay monotonic.
-                let content_bounds = TurnContentBounds::clamped(
-                    content_bounds.user_start as usize,
-                    content_bounds.user_end as usize,
-                    content_bounds.asst_start as usize,
-                    turn_token_count,
-                );
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to);
                 // Snapshot what the resume path needs before the substrate
                 // consumes `delta_gpu` / `token_ids` (Â§16.12 seal-time gather).
@@ -4408,16 +4640,13 @@ impl Scheduler {
                      (off-by-one usually means an unforwarded token slipped through)"
                 );
 
-                // The turn is sealed as one indivisible K/V block but
-                // the substrate stores the user and assistant text
-                // separately — clean strings the sidebar can render
-                // without re-tokenising at read time.
+                // The turn is sealed as one indivisible K/V block; its
+                // segment-vector `layout` carries the per-half text + spans the
+                // sidebar and compressor read without re-tokenising.
                 let write = TurnPartWrite {
-                    user_text,
-                    assistant_text,
+                    layout,
                     token_ids,
                     token_count: turn_token_count,
-                    content_bounds,
                     tags,
                     block_start: block_from as u64,
                     block_end: block_to as u64,
@@ -4593,21 +4822,6 @@ impl Scheduler {
             turn_token_count,
             chunk_size,
         }))
-    }
-
-    /// Substrate lookup: a turn's hot-resident sealed sequences, or
-    /// `None` if not hot. Post-elevate this is the working contract —
-    /// `elevate_to_hot` ahead of `apply_projection` populates every
-    /// projected turn's hot tier, so a `None` here means the
-    /// elevation orchestrator missed it (logged as `missing` or
-    /// `failed` in the [`ElevationReport`]) and the caller skips
-    /// the inject borrow rather than trying to recover.
-    fn hot_turn_or_skip(
-        conversation: &Conversation,
-        timeline: TimelineId,
-        index: TurnIndex,
-    ) -> Option<Arc<Vec<SealedSequence>>> {
-        conversation.read().turn_sealed_of(timeline, index)
     }
 
     /// Rebuild the workspace substrate from the persistence redo log on
@@ -5077,15 +5291,18 @@ impl Scheduler {
                     }
                     ProjectionSegment::Sealed(SealedKind::Turn(rt, _))
                     | ProjectionSegment::Sealed(SealedKind::TurnHalf(rt)) => {
-                        let g = rt.group();
-                        let t = rt.index();
-                        let Some(timeline) = view.timelines_for_group(g).next() else {
+                        // The turn carries its conversation (stamped at projection),
+                        // so read it directly — no group→timeline re-derivation,
+                        // which is what once resolved the first-registered timeline
+                        // and dropped every non-first conversation's turns here (the
+                        // reproject `turns=0` history loss).  A timeline-less turn
+                        // (mock/untracked) is skipped; a genuinely-missing one is
+                        // surfaced loudly at inject, not silently filtered.
+                        let Some(timeline) = rt.timeline else {
                             continue;
                         };
-                        if view.turn_tier_state(timeline, t).is_some() {
-                            turn_keys_for_elevate.push(TurnKey::new(timeline, t));
-                            segments.push(seg.clone());
-                        }
+                        turn_keys_for_elevate.push(TurnKey::new(timeline, rt.index()));
+                        segments.push(seg.clone());
                     }
                     ProjectionSegment::Generated { .. } => {
                         // Keep prefix structural / live-prefill runs in the
@@ -5114,15 +5331,27 @@ impl Scheduler {
             // panel's conversation section empty on a first turn. The decode-end
             // path (`projection_event`) buckets the full segments too, so this
             // keeps the live reproject view consistent with it.
-            let composition = crate::projection::from_projection(
+            let mut composition = crate::projection::from_projection_with_origins(
                 &projection.segments,
+                &projection.selection_origins,
                 policy.projection.schema(),
                 &view,
                 &projection.selection_scores,
                 view.total_token_count(policy.target.timeline) as u32,
                 0,
-                0,
                 0.0,
+            );
+            // The dialogue glue, sourced from the SAME `assemble_pieces` decision
+            // the engine injects from — so the panel shows the real boundary
+            // markers, never a reconstruction. `decode` keeps special tokens (the
+            // markers ARE special tokens).
+            composition.materialized = projection_assembler::materialize_conversation(
+                &projection.segments,
+                &self.boundary_markers,
+                &projection.selection_origins,
+                &view,
+                policy.projection.schema(),
+                |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
             );
             (sections, segments, composition)
         };
@@ -5418,36 +5647,22 @@ impl Scheduler {
         decode_state.belief =
             crate::projection::PriorBelief::from_selection(&composition.selection);
 
-        // Close the decode span that ran under the *previous* projection and
-        // emit it as a timeline event: `[anchor.token, now]` tokens at the
-        // measured t/s, paired with the composition this reprojection selected.
-        // The anchor is keyed by view id and migrated to `new_view_id` below
-        // (like the decode state), so the next reproject / final seal measures
-        // from here. First reproject has no anchor → measures from decode start.
+        // A projection is a POINT, not a span: it is selected here (by the Q of
+        // the tokens decoded so far) and governs everything forward until the next
+        // projection supersedes it. So emit it the instant it occurs — `start_token`
+        // is the generated-token position at which it was selected, `seconds` is the
+        // wall-clock elapsed since decode start. The consumer reconstructs each
+        // projection's effective interval `[pos_i, pos_{i+1})` and its throughput
+        // from the *sequence* of events; there is nothing to close or flush.
         let repro_now = Instant::now();
         let repro_gen = decode_state.generated_tokens.len() as u32;
         {
-            // Span start = the previous projection's end, carried on the decode state
-            // (which migrates correctly across view swaps) — NOT the view-keyed anchor
-            // map, whose migrated `from_token` was doubling. The anchor is still used
-            // only for the wall-clock `since` (its `Instant` is fine).
-            let from_token = decode_state.last_projection_end;
-            let since = self
-                .reproj_anchor
-                .remove(&view_id)
-                .map(|(_, t)| t)
-                .unwrap_or(decode_state.decode_start);
-            let seconds = repro_now.duration_since(since).as_secs_f64();
-            let span = repro_gen.saturating_sub(from_token);
+            let elapsed = repro_now
+                .duration_since(decode_state.decode_start)
+                .as_secs_f64();
             let event = crate::projection::ProjectionEvent {
-                start_token: from_token,
-                end_token: repro_gen,
-                seconds,
-                tokens_per_second: if seconds > 0.0 {
-                    span as f64 / seconds
-                } else {
-                    0.0
-                },
+                start_token: repro_gen,
+                seconds: elapsed,
                 ..composition
             };
             let _ = decode_state.event_tx.send(TurnEvent::Projection(event));
@@ -5537,10 +5752,6 @@ impl Scheduler {
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }
-        // Migrate the projection-span anchor onto the new view id so the next
-        // reproject / final seal measures its span from this reprojection.
-        self.reproj_anchor
-            .insert(new_view_id, (repro_gen, repro_now));
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real

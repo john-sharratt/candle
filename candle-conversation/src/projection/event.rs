@@ -26,8 +26,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::{GroupId, SectionId, TurnIndex};
+use super::ids::{CollectionId, GroupId, SectionId, TurnIndex};
 use super::project::{ProjectionSegment, SealedKind};
+use super::schema::{Schema, SystemPromptItem};
+use crate::substrate::ContentResolver;
+use crate::summary_tree::{SelectionOrigin, TurnKind};
 
 /// The belief confidence per selected section/turn at a projection, produced by
 /// the online selection loop and stamped onto the [`ProjectionEvent`] so the next
@@ -59,8 +62,6 @@ impl SelectionScores {
         self.turns.insert((group, index.0), score);
     }
 }
-use super::schema::{Schema, SystemPromptItem};
-use crate::substrate::ContentResolver;
 
 /// Which category a materialized segment falls into. Drives the GUI bar-map
 /// color and ordering (system leftmost, then section groups, then turns).
@@ -96,15 +97,16 @@ pub struct ProjectionBucket {
 }
 
 /// One system-prompt section (bare or inside a collection) with the tokens it
-/// holds, whether provenance selected it for this projection, and the belief
-/// confidence it carried. The `score` is the section's RelLeak belief value at
-/// this projection — persisted so the next reprojection can seed the belief
-/// from the prior event (the online decay/reinforcement across a turn).
+/// holds and whether provenance selected it for this projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectedSection {
     pub name: String,
     pub tokens: u32,
     pub selected: bool,
+    /// The section's belief score at this projection — stamped so the next
+    /// reprojection can seed its [`PriorBelief`](super::project::PriorBelief) from
+    /// the prior event (RelLeak decay/reinforcement across a turn). `0.0` when the
+    /// section carried no belief score.
     #[serde(default)]
     pub score: f32,
 }
@@ -135,7 +137,7 @@ pub enum SystemItem {
 }
 
 /// A conversation turn provenance pulled into this projection's window.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedTurn {
     /// The schema layer this turn's group belongs to (`dialogue`, `code_reading`,
     /// …) — so the panel can surface every projected memory tier, not just the
@@ -145,10 +147,51 @@ pub struct SelectedTurn {
     pub index: u32,
     pub role: String,
     pub tokens: u32,
-    /// The turn's belief confidence at this projection (0 for structurally-pinned
-    /// turns like `recent` that were not score-selected).
+    /// Forest kind: `normal` for a raw conversation turn, or
+    /// `summary_of_turns` / `summary_of_summaries` when a summary node stood in
+    /// for the turns beneath it. This is the "did my context get a summary
+    /// instead of the real turn?" signal — otherwise invisible once a node is
+    /// materialized as a turn segment.
+    #[serde(default = "default_turn_kind")]
+    pub kind: TurnKind,
+    /// Why this turn won its slot, when known: score-density origin (hard anchor /
+    /// provenance / coverage / …) from the summary-forest path, or `recent` /
+    /// `historical` from the rule-based path. `None` for the live user message.
     #[serde(default)]
-    pub score: f32,
+    pub reason: Option<SelectionOrigin>,
+    /// The resolved source timeline (raw id) this turn belongs to — stamped from
+    /// [`ResolvedTurn::timeline`], which the projection fixed unambiguously at
+    /// selection time. A turn's identity is `(timeline, index)`; consumers resolve
+    /// its body by this key directly, NEVER by re-deriving `group → timeline`
+    /// (the shared substrate holds many conversations under one group, so that
+    /// re-derivation is non-deterministic). `None` only for the live user message.
+    #[serde(default)]
+    pub timeline: Option<u64>,
+}
+
+/// Serde default for [`SelectedTurn::kind`] on records written before the field
+/// existed — a missing tag means a plain conversation turn.
+fn default_turn_kind() -> TurnKind {
+    TurnKind::Normal
+}
+
+/// One piece of the materialized conversation, in injection order, exactly as
+/// the assembler's `assemble_pieces` produced it — the single source of truth
+/// for the inter-turn boundary glue. The panel renders the dialogue region from
+/// this so the glue it shows is literally what the engine injected, not a
+/// client-side reconstruction. The system prompt is covered separately by
+/// [`ProjectionSelection::system`]; this is the conversation region only (and
+/// excludes the live, still-decoding user turn).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaterializedPiece {
+    /// A glue island the assembler gap-fills verbatim — the inter-turn boundary
+    /// markers (`user_start`, the `/no_think` soft-switch, `assistant_end`),
+    /// merged into one island and decoded to text.
+    Glue { text: String },
+    /// A sealed turn (memory tier or dialogue), carrying its forest kind + why so
+    /// the card can show summary-vs-raw in place.
+    Turn { turn: SelectedTurn },
 }
 
 /// The exact materialized-context selection for a projection — what provenance
@@ -168,24 +211,27 @@ pub struct ProjectionSelection {
     pub turns: Vec<SelectedTurn>,
 }
 
-/// A recorded projection: decode throughput + materialized-context composition.
+/// A recorded projection point: the `start_token` position it governs, the
+/// wall-clock `seconds` since decode start, and the materialized-context
+/// composition. Throughput and the governed interval are derived by the consumer
+/// from the sequence of points (see `start_token` / `seconds`).
 ///
 /// All fields are `#[serde(default)]` so the persisted redo-log record stays
 /// forward-compatible as the shape evolves.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectionEvent {
-    /// Generated-token index where this decode span began.
+    /// Generated-token position at which this projection was SELECTED — the start
+    /// of the interval it governs. A projection is a point that governs everything
+    /// forward until the next event supersedes it, so the consumer derives each
+    /// projection's effective interval `[start_token_i, start_token_{i+1})` (the
+    /// last one running to the turn's final token count) from the event sequence.
     #[serde(default)]
     pub start_token: u32,
-    /// Generated-token index where it ended (== tokens generated in the span).
-    #[serde(default)]
-    pub end_token: u32,
-    /// Wall-clock seconds the decode span took.
+    /// Wall-clock seconds since decode start, at selection. The consumer derives
+    /// each interval's throughput from the `(start_token, seconds)` deltas between
+    /// consecutive events.
     #[serde(default)]
     pub seconds: f64,
-    /// Decode throughput: `(end_token - start_token) / seconds`.
-    #[serde(default)]
-    pub tokens_per_second: f64,
     /// Sum of all bucket tokens — what provenance materialized into the window.
     #[serde(default)]
     pub materialized_tokens: u32,
@@ -199,6 +245,14 @@ pub struct ProjectionEvent {
     /// backs the projection bubble's substrate view.
     #[serde(default)]
     pub selection: ProjectionSelection,
+    /// The conversation in materialized injection order, exactly as the assembler
+    /// laid it out (`assemble_pieces`): real boundary-glue islands interleaved
+    /// with the sealed turns. The panel renders the dialogue region from this so
+    /// its glue is what the engine truly injected. Empty on records written
+    /// before this field, or when the boundary markers weren't available to the
+    /// builder (the panel then falls back to reconstructing the framing).
+    #[serde(default)]
+    pub materialized: Vec<MaterializedPiece>,
 }
 
 /// One classified segment before aggregation — `(kind, label, tokens)`.
@@ -219,7 +273,6 @@ pub fn aggregate(
     segments: &[SegmentTokens],
     substrate_tokens: u32,
     start_token: u32,
-    end_token: u32,
     seconds: f64,
 ) -> ProjectionEvent {
     let mut buckets: Vec<ProjectionBucket> = Vec::new();
@@ -240,22 +293,15 @@ pub fn aggregate(
     buckets.sort_by_key(|b| b.kind.rank());
 
     let materialized_tokens = buckets.iter().map(|b| b.tokens).sum();
-    let generated = end_token.saturating_sub(start_token);
-    let tokens_per_second = if seconds > 0.0 {
-        generated as f64 / seconds
-    } else {
-        0.0
-    };
 
     ProjectionEvent {
         start_token,
-        end_token,
         seconds,
-        tokens_per_second,
         materialized_tokens,
         substrate_tokens,
         buckets,
         selection: ProjectionSelection::default(),
+        materialized: Vec::new(),
     }
 }
 
@@ -272,7 +318,33 @@ pub fn from_projection(
     scores: &SelectionScores,
     substrate_tokens: u32,
     start_token: u32,
-    end_token: u32,
+    seconds: f64,
+) -> ProjectionEvent {
+    from_projection_with_origins(
+        segments,
+        &HashMap::new(),
+        schema,
+        resolver,
+        scores,
+        substrate_tokens,
+        start_token,
+        seconds,
+    )
+}
+
+/// As [`from_projection`], but also stamps each selected turn with *why* it was
+/// chosen — the `(group, turn) → SelectionOrigin` map carried on
+/// [`super::Projection::selection_origins`]. Production callers pass it so the
+/// persisted record / GUI can show provenance vs recency vs coverage; tests and
+/// the no-origin wrapper above pass an empty map (every `reason` is then `None`).
+pub fn from_projection_with_origins(
+    segments: &[ProjectionSegment],
+    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
+    schema: &Schema,
+    resolver: &dyn ContentResolver,
+    scores: &SelectionScores,
+    substrate_tokens: u32,
+    start_token: u32,
     seconds: f64,
 ) -> ProjectionEvent {
     let classified: Vec<SegmentTokens> = segments
@@ -315,36 +387,9 @@ pub fn from_projection(
         })
         .collect();
 
-    let mut event = aggregate(
-        &classified,
-        substrate_tokens,
-        start_token,
-        end_token,
-        seconds,
-    );
-    event.selection = build_selection(segments, schema, resolver, scores);
+    let mut event = aggregate(&classified, substrate_tokens, start_token, seconds);
+    event.selection = build_selection(segments, origins, schema, resolver, scores);
     event
-}
-
-impl ProjectionEvent {
-    /// The per-section belief scores this event recorded for the named
-    /// collection, as `(section name, score)` in declaration order — empty if the
-    /// collection did not contribute. The next reprojection seeds its belief from
-    /// these, so the online decay/reinforcement carries across a turn's
-    /// projections without the scheduler holding belief state.
-    pub fn collection_scores<'a>(&'a self, collection: &str) -> Vec<(&'a str, f32)> {
-        for item in &self.selection.system {
-            if let SystemItem::Collection { name, sections } = item {
-                if name == collection {
-                    return sections
-                        .iter()
-                        .map(|s| (s.name.as_str(), s.score))
-                        .collect();
-                }
-            }
-        }
-        Vec::new()
-    }
 }
 
 /// Build the structured [`ProjectionSelection`] from the selected segments and
@@ -354,6 +399,7 @@ impl ProjectionEvent {
 /// conversation segments plus the current message.
 fn build_selection(
     segments: &[ProjectionSegment],
+    origins: &HashMap<(GroupId, TurnIndex), SelectionOrigin>,
     schema: &Schema,
     resolver: &dyn ContentResolver,
     scores: &SelectionScores,
@@ -381,7 +427,9 @@ fn build_selection(
                     index: t.index().0,
                     role: role_str(*role).to_string(),
                     tokens: resolver.turn_token_count(t.group(), t.index()) as u32,
-                    score: scores.turn(t.group(), t.index()),
+                    kind: resolver.turn_kind(t.group(), t.index()),
+                    reason: origins.get(&(t.group(), t.index())).copied(),
+                    timeline: t.timeline.map(|tl| tl.raw()),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -391,7 +439,11 @@ fn build_selection(
                     index: u32::MAX,
                     role: "user".to_string(),
                     tokens: tokens.len() as u32,
-                    score: 0.0,
+                    // The live message is the probe, not a selected memory — it
+                    // is always a raw turn and has no selection origin.
+                    kind: TurnKind::Normal,
+                    reason: None,
+                    timeline: None,
                 });
             }
             // Compression-internal turn-half — not a displayed dialogue turn.
@@ -408,11 +460,49 @@ fn build_selection(
     // with a selected member. Template glue interleaves with content exactly as
     // the prompt is assembled, so the closing markers appear in place.
     let mut system: Vec<SystemItem> = Vec::new();
+    // A collection's catalog summary shows just before its opening structural
+    // marker (OUTSIDE it), matching the projected order in
+    // `emit_system_prompt_items`. Captured up front, drained as it emits.
+    //
+    // The `selected.contains(&sum)` gate is *inherited* from the projection: a
+    // summary section only lands in `selected` if `project.rs` already emitted it
+    // (its own `partial && token_count > 0` gate), so the panel can't show a
+    // summary the prompt didn't — no need to re-derive that gate here.
+    let mut pending_summaries: std::collections::HashMap<CollectionId, (String, u32)> =
+        std::collections::HashMap::new();
+    for layer in &schema.layers {
+        for item in &layer.system_prompt.items {
+            if let SystemPromptItem::Collection(c) = item {
+                if let Some(sum) = c.summary_section {
+                    if selected.contains(&sum) {
+                        pending_summaries.insert(
+                            c.id,
+                            (
+                                format!("{} summary", c.name),
+                                resolver.section_token_count(sum) as u32,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
     for layer in &schema.layers {
         for item in &layer.system_prompt.items {
             match item {
                 SystemPromptItem::Section(s) if s.is_template => {
                     if let Some(&tokens) = emitted_glue.get(s.name.as_str()) {
+                        // Emit the collection's summary just before its opening
+                        // marker (e.g. `<tools>`), so it sits OUTSIDE the block —
+                        // mirroring the projection.
+                        if let Some(cid) = s.depends_on {
+                            if let Some((name, sum_tokens)) = pending_summaries.remove(&cid) {
+                                system.push(SystemItem::Section {
+                                    name,
+                                    tokens: sum_tokens,
+                                });
+                            }
+                        }
                         system.push(SystemItem::Glue {
                             name: s.name.clone(),
                             content: s.content.clone(),
@@ -428,19 +518,14 @@ fn build_selection(
                 }
                 SystemPromptItem::Section(_) => {}
                 SystemPromptItem::Collection(c) => {
-                    // The collection's runtime summary section materializes just
-                    // before the members on partial selection. It is a reserved
-                    // section (not a schema item), so emit it explicitly here when
-                    // it fired — otherwise it is silently folded into `system` and
-                    // invisible in the panel. Named `"<collection> summary"`; the
-                    // daemon serves its text under the same key.
-                    if let Some(sum) = c.summary_section {
-                        if selected.contains(&sum) {
-                            system.push(SystemItem::Section {
-                                name: format!("{} summary", c.name),
-                                tokens: resolver.section_token_count(sum) as u32,
-                            });
-                        }
+                    // The runtime summary section (a reserved section, not a schema
+                    // item) shows just before the collection's opening marker, so
+                    // it was already drained above. This is the fallback for a
+                    // collection with no opening marker — show it before members.
+                    // Named `"<collection> summary"`; the daemon serves its text
+                    // under the same key.
+                    if let Some((name, tokens)) = pending_summaries.remove(&c.id) {
+                        system.push(SystemItem::Section { name, tokens });
                     }
                     if c.sections.iter().any(|s| selected.contains(&s.id)) {
                         system.push(SystemItem::Collection {
@@ -462,6 +547,22 @@ fn build_selection(
                     // A node emitted exactly one option's branch variant; show
                     // the node (and chosen option, for selectors) with its tokens.
                     for n in &t.nodes {
+                        // A live-prefilled structural marker (`<tools>` etc.): if it
+                        // fired this projection (its Generated run is in
+                        // `emitted_glue`), surface it as a real glue row.
+                        if n.glue.is_some() {
+                            if let Some(&tokens) = emitted_glue.get(n.name.as_str()) {
+                                system.push(SystemItem::Glue {
+                                    name: n.name.clone(),
+                                    content: n
+                                        .options
+                                        .first()
+                                        .map_or(String::new(), |o| o.content.clone()),
+                                    tokens,
+                                });
+                            }
+                            continue;
+                        }
                         for o in &n.options {
                             if let Some(v) = o.variants.iter().find(|v| selected.contains(&v.id)) {
                                 let name = if n.options.len() > 1 {
@@ -475,6 +576,44 @@ fn build_selection(
                                 });
                             }
                         }
+                        // An embedded collection node: show each selected member
+                        // (its active-branch variant landed in `selected`),
+                        // interleaving the collection's `member_glue` as a real
+                        // structural glue row BETWEEN consecutive members —
+                        // mirroring the `Generated` glue token the projection emits
+                        // (and NOT baked into any member's seal), so the panel and
+                        // its copy-all reproduce the exact materialized bytes.
+                        if let Some(tc) = &n.collection {
+                            let glue = &tc.collection.member_glue;
+                            // Mirror the projection EXACTLY: it interleaves member
+                            // glue only when the tokens exist (`member_glue_tokens`),
+                            // so gate the panel row on the same condition (not just
+                            // the non-empty string) or the panel would show a 0-token
+                            // glue row the materialized prompt never contained.
+                            let glue_tokens = tc
+                                .collection
+                                .member_glue_tokens
+                                .as_ref()
+                                .map(|t| t.len() as u32);
+                            let mut emitted_member = false;
+                            for (s, member) in tc.collection.sections.iter().zip(tc.variants.iter())
+                            {
+                                if let Some(v) = member.iter().find(|v| selected.contains(&v.id)) {
+                                    if let (true, Some(toks)) = (emitted_member, glue_tokens) {
+                                        system.push(SystemItem::Glue {
+                                            name: format!("{}__member_glue", tc.collection.name),
+                                            content: glue.clone(),
+                                            tokens: toks,
+                                        });
+                                    }
+                                    emitted_member = true;
+                                    system.push(SystemItem::Section {
+                                        name: s.name.clone(),
+                                        tokens: resolver.section_token_count(v.id) as u32,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -485,7 +624,7 @@ fn build_selection(
 }
 
 /// Role → wire string for [`SelectedTurn`].
-fn role_str(role: crate::Role) -> &'static str {
+pub(crate) fn role_str(role: crate::Role) -> &'static str {
     match role {
         crate::Role::User => "user",
         crate::Role::Assistant => "assistant",
@@ -536,7 +675,7 @@ fn collection_of_summary(schema: &Schema, id: SectionId) -> Option<&str> {
 }
 
 /// The YAML name of a group by its globally-unique id.
-fn group_name_of(schema: &Schema, id: GroupId) -> Option<&str> {
+pub(crate) fn group_name_of(schema: &Schema, id: GroupId) -> Option<&str> {
     schema
         .layers
         .iter()
@@ -546,7 +685,7 @@ fn group_name_of(schema: &Schema, id: GroupId) -> Option<&str> {
 }
 
 /// The YAML name of the layer that owns the group with this id.
-fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> {
+pub(crate) fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> {
     schema
         .layers
         .iter()
@@ -557,13 +696,12 @@ fn layer_name_of_group(schema: &Schema, id: GroupId) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::super::builder::Builder;
-    use super::super::ids::{GroupId, SectionId, TurnId, TurnIndex};
+    use super::super::ids::{GroupId, Reserved, SectionId, TurnId, TurnIndex};
     use super::super::project::{
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
     use super::{
-        aggregate, from_projection, BucketKind, ProjectionEvent, ProjectionSelection,
-        SegmentTokens, SelectedSection, SelectionScores, SystemItem,
+        aggregate, from_projection, BucketKind, SegmentTokens, SelectionScores, SystemItem,
     };
     use crate::substrate::ContentResolver;
     use std::collections::HashMap;
@@ -588,7 +726,7 @@ mod tests {
             seg(BucketKind::System, "system", 320),
             seg(BucketKind::Section, "repo_map", 200),
         ];
-        let ev = aggregate(&segs, 10_000, 0, 480, 10.0);
+        let ev = aggregate(&segs, 10_000, 0, 10.0);
         let order: Vec<(&str, BucketKind, u32)> = ev
             .buckets
             .iter()
@@ -612,27 +750,20 @@ mod tests {
             seg(BucketKind::Turns, "conversation", 60),
             seg(BucketKind::System, "system", 100),
         ];
-        let ev = aggregate(&segs, 5_000, 10, 110, 5.0);
+        let ev = aggregate(&segs, 5_000, 10, 5.0);
         // conversation merged to 100, system 100.
         assert_eq!(ev.buckets.len(), 2);
         assert_eq!(ev.materialized_tokens, 200);
         assert_eq!(ev.substrate_tokens, 5_000);
-        // throughput: 100 generated tokens / 5s = 20 t/s.
+        // The point sits at `start_token`; the interval it governs and its
+        // throughput are derived by the consumer from the event sequence.
         assert_eq!(ev.start_token, 10);
-        assert_eq!(ev.end_token, 110);
-        assert_eq!(ev.tokens_per_second, 20.0);
-    }
-
-    #[test]
-    fn aggregate_zero_seconds_is_zero_tps_not_nan() {
-        let ev = aggregate(&[seg(BucketKind::System, "system", 5)], 5, 0, 0, 0.0);
-        assert_eq!(ev.tokens_per_second, 0.0);
-        assert!(ev.tokens_per_second.is_finite());
+        assert_eq!(ev.seconds, 5.0);
     }
 
     #[test]
     fn aggregate_empty_is_empty() {
-        let ev = aggregate(&[], 0, 0, 0, 1.0);
+        let ev = aggregate(&[], 0, 0, 1.0);
         assert!(ev.buckets.is_empty());
         assert_eq!(ev.materialized_tokens, 0);
     }
@@ -647,14 +778,12 @@ mod tests {
                 ],
                 42_000,
                 0,
-                120,
                 3.0,
             ),
             aggregate(
                 &[seg(BucketKind::Turns, "conversation", 540)],
                 42_000,
                 120,
-                512,
                 8.0,
             ),
         ];
@@ -763,6 +892,7 @@ layers:
                         group_id: conv,
                         index: TurnIndex(idx),
                     },
+                    timeline: None,
                 },
                 crate::Role::Assistant,
             ))
@@ -796,7 +926,6 @@ layers:
             &SelectionScores::default(),
             99_999,
             0,
-            480,
             12.0,
         );
 
@@ -819,7 +948,125 @@ layers:
         // materialized excludes the skipped Generated run (3 tokens).
         assert_eq!(ev.materialized_tokens, 64 + 800 + 200 + 4);
         assert_eq!(ev.substrate_tokens, 99_999);
-        assert_eq!(ev.tokens_per_second, 40.0); // 480 / 12s
+        assert_eq!(ev.seconds, 12.0);
+    }
+
+    const TREE_GLUE_YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    system_prompt:
+      items:
+        - kind: section_tree
+          nodes:
+            - kind: collection
+              name: tools
+              selection: { kind: top_k, k: 3 }
+              member_glue: "\n"
+              summary:
+                chunk: 4
+                categorize:
+                  max_tokens: 256
+                  system_prompt: cat
+                  user_prompt: cat
+                assign:
+                  max_tokens: 128
+                  system_prompt: assign
+                  user_prompt: assign
+              sections:
+                - id: tool_a
+                  content: "a"
+                - id: tool_b
+                  content: "b"
+    groups:
+      - id: conversation
+        selection:
+          kind: conversation
+          recent: 4
+          historical_top_k: 8
+"#;
+
+    #[test]
+    fn from_projection_interleaves_member_glue_between_tree_collection_members() {
+        use super::super::schema::SystemPromptItem;
+        let mut b = Builder::from_yaml(TREE_GLUE_YAML).unwrap();
+        // Tokenise so the glue carries a real token count (mock: byte → token).
+        b.tokenize_templates(|s: &str| Ok::<_, ()>(s.bytes().map(u32::from).collect()))
+            .unwrap();
+        let schema = b.schema();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+
+        // The tools tree-collection node + its (single-branch) member variants.
+        let tc = schema
+            .layers
+            .iter()
+            .find(|l| l.id == dialogue)
+            .unwrap()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|it| match it {
+                SystemPromptItem::SectionTree(t) => {
+                    t.nodes.iter().find_map(|n| n.collection.as_ref())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let key = tc.default_branch;
+        let a = tc.member_variant(0, key).unwrap().id;
+        let bb = tc.member_variant(1, key).unwrap().id;
+
+        let mut res = TokResolver::default();
+        res.section_tokens.insert(a.raw(), 10);
+        res.section_tokens.insert(bb.raw(), 20);
+
+        let section =
+            |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id }));
+        let segments = vec![section(a), section(bb)];
+        let ev = from_projection(
+            &segments,
+            schema,
+            &res,
+            &SelectionScores::default(),
+            0,
+            0,
+            1.0,
+        );
+
+        // The materialized system view is: member → REAL glue token → member,
+        // not two members run together — so the GUI panel and its copy-all
+        // reproduce the exact bytes (the glue is no longer baked into a seal).
+        let sys = &ev.selection.system;
+        assert_eq!(sys.len(), 3, "expected member, glue, member; got {sys:?}");
+        match &sys[0] {
+            SystemItem::Section { name, .. } => assert_eq!(name, "tool_a"),
+            o => panic!("expected tool_a section, got {o:?}"),
+        }
+        match &sys[1] {
+            SystemItem::Glue {
+                content, tokens, ..
+            } => {
+                assert_eq!(content, "\n", "glue content must be the literal newline");
+                assert_eq!(*tokens, 1, "glue must report its token count");
+            }
+            o => panic!("expected a glue row between members, got {o:?}"),
+        }
+        match &sys[2] {
+            SystemItem::Section { name, .. } => assert_eq!(name, "tool_b"),
+            o => panic!("expected tool_b section, got {o:?}"),
+        }
     }
 
     #[test]
@@ -849,6 +1096,7 @@ layers:
                         group_id: conv,
                         index: TurnIndex(0),
                     },
+                    timeline: None,
                 },
                 crate::Role::User,
             )),
@@ -861,7 +1109,6 @@ layers:
             &SelectionScores::default(),
             1000,
             0,
-            10,
             1.0,
         )
         .selection;
@@ -894,83 +1141,6 @@ layers:
         assert_eq!(sel.turns[0].role, "user");
         assert_eq!(sel.turns[0].index, 0);
         assert_eq!(sel.turns[0].tokens, 120);
-    }
-
-    #[test]
-    fn from_projection_stamps_belief_scores_on_members_and_turns() {
-        let b = Builder::from_yaml(YAML).unwrap();
-        let schema = b.schema();
-        let dialogue = b.id_for_layer("dialogue").unwrap();
-        let conv = b.id_for_group("conversation").unwrap();
-        let frame = b.id_for_section_in(dialogue, "frame").unwrap();
-        let file_a = b.id_for_section_in(dialogue, "file_a").unwrap();
-        let file_b = b.id_for_section_in(dialogue, "file_b").unwrap();
-
-        let mut res = TokResolver::default();
-        res.section_tokens.insert(frame.raw(), 64);
-        res.section_tokens.insert(file_a.raw(), 300);
-        res.section_tokens.insert(file_b.raw(), 500);
-        res.turn_tokens.insert((conv.raw(), 0), 120);
-
-        // Only file_a is selected; file_b is skipped but still carries a belief.
-        let segments = vec![
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: frame })),
-            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: file_a })),
-            ProjectionSegment::Sealed(SealedKind::Turn(
-                ResolvedTurn {
-                    id: TurnId {
-                        layer_id: dialogue,
-                        group_id: conv,
-                        index: TurnIndex(0),
-                    },
-                },
-                crate::Role::User,
-            )),
-        ];
-
-        let mut scores = SelectionScores::default();
-        scores.set_section(file_a, 42.0);
-        scores.set_section(file_b, 7.0);
-        scores.set_turn(conv, TurnIndex(0), 5.5);
-
-        let ev = from_projection(&segments, schema, &res, &scores, 1000, 0, 10, 1.0);
-
-        // The rebuild hook reads every member's belief — selected or not — so the
-        // next reprojection can seed the full acc, including decayed skips.
-        assert_eq!(
-            ev.collection_scores("code_read"),
-            vec![("file_a", 42.0), ("file_b", 7.0)]
-        );
-        assert_eq!(ev.selection.turns[0].score, 5.5);
-    }
-
-    #[test]
-    fn collection_scores_scopes_by_name_and_missing_is_empty() {
-        let ev = ProjectionEvent {
-            selection: ProjectionSelection {
-                system: vec![SystemItem::Collection {
-                    name: "tools".into(),
-                    sections: vec![
-                        SelectedSection {
-                            name: "a".into(),
-                            tokens: 1,
-                            selected: true,
-                            score: 12.5,
-                        },
-                        SelectedSection {
-                            name: "b".into(),
-                            tokens: 1,
-                            selected: false,
-                            score: 3.0,
-                        },
-                    ],
-                }],
-                turns: vec![],
-            },
-            ..Default::default()
-        };
-        assert_eq!(ev.collection_scores("tools"), vec![("a", 12.5), ("b", 3.0)]);
-        assert!(ev.collection_scores("nope").is_empty());
     }
 
     #[test]
@@ -1041,7 +1211,6 @@ layers:
             &SelectionScores::default(),
             1000,
             0,
-            10,
             1.0,
         )
         .selection;
@@ -1078,5 +1247,116 @@ layers:
             }
             other => panic!("expected system_close glue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_projection_summary_shows_outside_tools_markers() {
+        use candle_transformers::models::dialect::Dialect;
+        const YAML: &str = r#"
+layers:
+  - name: dialogue
+    window: 1000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: c
+          user_prompt: c
+        assistant:
+          system_prompt: c
+          user_prompt: c
+    system_prompt:
+      items:
+        - kind: template
+          id: tools_open
+          dialect: tool_block_open
+          depends_on: tools
+        - kind: collection
+          name: tools
+          selection: { kind: top_k, k: 1 }
+          summary:
+            chunk: 4
+            categorize:
+              max_tokens: 256
+              system_prompt: x
+              user_prompt: x
+            assign:
+              max_tokens: 128
+              system_prompt: x
+              user_prompt: x
+          sections:
+            - id: t1
+              content: "tool"
+        - kind: template
+          id: tools_close
+          dialect: tool_block_close
+          depends_on: tools
+    groups:
+      - id: conversation
+        selection: { kind: always_visible }
+"#;
+        let dlct = Dialect::chat_ml();
+        let mut b = Builder::from_yaml_with_vars_and_dialect(YAML, &[], Some(&dlct)).unwrap();
+        let dialogue = b.id_for_layer("dialogue").unwrap();
+        let tools = b.id_for_collection_in(dialogue, "tools").unwrap();
+        let summary = SectionId::reserved(Reserved::ToolSummary);
+        b.set_collection_summary_section(dialogue, tools, summary)
+            .unwrap();
+        let t1 = b.id_for_section_in(dialogue, "t1").unwrap();
+        let schema = b.schema();
+
+        let mut res = TokResolver::default();
+        res.section_tokens.insert(summary.raw(), 40);
+        res.section_tokens.insert(t1.raw(), 8);
+
+        // The projected order: summary OUTSIDE, then <tools>, member, </tools>.
+        let segments = vec![
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: summary })),
+            ProjectionSegment::Generated {
+                tokens: Arc::new(vec![1]),
+                identity: GeneratedIdentity {
+                    name: "tools_open".to_string(),
+                    position: 0,
+                },
+            },
+            ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection { id: t1 })),
+            ProjectionSegment::Generated {
+                tokens: Arc::new(vec![2]),
+                identity: GeneratedIdentity {
+                    name: "tools_close".to_string(),
+                    position: 2,
+                },
+            },
+        ];
+        let sel = from_projection(
+            &segments,
+            schema,
+            &res,
+            &SelectionScores::default(),
+            1000,
+            0,
+            1.0,
+        )
+        .selection;
+
+        // The catalog summary must appear BEFORE the `tools_open` glue — i.e.
+        // outside the `<tools>` block — in the panel composition.
+        let sum_pos = sel
+            .system
+            .iter()
+            .position(
+                |it| matches!(it, SystemItem::Section { name, .. } if name == "tools summary"),
+            )
+            .unwrap_or_else(|| panic!("summary not in composition: {:?}", sel.system));
+        let open_pos = sel
+            .system
+            .iter()
+            .position(|it| matches!(it, SystemItem::Glue { name, .. } if name == "tools_open"))
+            .unwrap_or_else(|| panic!("tools_open glue not in composition: {:?}", sel.system));
+        assert!(
+            sum_pos < open_pos,
+            "summary must show before <tools>: {:?}",
+            sel.system
+        );
     }
 }

@@ -40,7 +40,8 @@ pub const DEFAULT_INTERNAL_TOKENS: u32 = 20;
 ///
 /// Every persisted turn carries one of these tags so the cold-load path can
 /// reconstruct the forest from a flat list of turn records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnKind {
     /// Ordinary user / assistant content. Lives as a content sub-leaf under a
     /// [`SummaryOfTurns`](TurnKind::SummaryOfTurns) parent; not part of the

@@ -325,7 +325,8 @@ fn projection_probe_cases(substrate: &Substrate, back: usize) -> Vec<ProbeCase> 
         let Some(events) = e.projection_events.as_ref().map(|b| decode_events(b)) else {
             continue;
         };
-        let asst = d.assistant_content_start as usize;
+        let asst = candle_conversation::turn_layout::TurnLayout::new(d.segments.clone())
+            .assistant_content_start() as usize;
         for ev in &events {
             let Some(tool) = ev.selection.system.iter().find_map(|item| match item {
                 SystemItem::Collection { name, sections } if name == "tools" => {
@@ -335,7 +336,9 @@ fn projection_probe_cases(substrate: &Substrate, back: usize) -> Vec<ProbeCase> 
             }) else {
                 continue;
             };
-            let point = (asst + ev.end_token as usize).min(history.len());
+            // Point-model event: `start_token` is the generated position at which
+            // this projection was selected (the old span model's `end_token`).
+            let point = (asst + ev.start_token as usize).min(history.len());
             let lo = point.saturating_sub(back);
             let window = history[lo..point].to_vec();
             if window.is_empty() {

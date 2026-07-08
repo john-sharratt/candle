@@ -484,11 +484,7 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             tags: Vec::new(),
         };
         let dead_decl = StreamDecl::Turn(turn_decl(dead_tl));
@@ -585,15 +581,11 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             tags: Vec::new(),
         });
         let sid = 4242u64; // header stream id ties the two records to one stream
-        let proj_payload = br#"[{"start_token":0,"end_token":120,"buckets":[]}]"#.to_vec();
+        let proj_payload = br#"[{"start_token":0,"seconds":3.0,"buckets":[]}]"#.to_vec();
 
         let mut blob = Vec::new();
         blob.extend_from_slice(&record(RecordType::StreamDecl, sid, 0, &decl.encode()));
@@ -627,11 +619,7 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             tags: Vec::new(),
         });
         let sid = 4343u64; // header stream id ties the two records to one stream
@@ -675,11 +663,7 @@ mod tests {
             group_id: 1,
             anchored_prefix: Vec::new(),
             view: Vec::new(),
-            user_content_start: 0,
-            user_content_end: 0,
-            assistant_content_start: 0,
-            user_text: String::new(),
-            assistant_text: String::new(),
+            segments: Vec::new(),
             // A calibration turn: gather-scope tags (unchanged by distillation).
             tags: vec!["tool".to_string(), "calculator".to_string()],
         });

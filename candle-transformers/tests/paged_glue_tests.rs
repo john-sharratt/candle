@@ -270,8 +270,14 @@ fn dev_ptr_f16(t: &Tensor) -> Result<u64> {
     let (p, _g) = s.device_ptr(&stream);
     Ok(p)
 }
-
 /// Append `glue` tokens over the cache's prefix via the glue kernel.
+///
+/// `fwd_window` is the forward B-head window cap; `b_section`, when present, is
+/// staged into this slot's `position_map` at `[kv_len, kv_len+b_len)` so the glue
+/// rows attend `min(fwd_window, b_len)` B columns. `(0, None)` is the
+/// backward-only path (bit-identical to the pre-window kernel).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_glue(
     backing: &ChunkedKvBacking,
     cache: &mut KvCache,
@@ -282,7 +288,13 @@ fn run_glue(
     rope_cs: &Tensor,
     stager: &PinnedStager,
     device: &Device,
+    // Per glue token: forward bridge window (tokens). `0` == backward-only
+    // (causal). The kernel positions every column by its chunk `rope_base`
+    // (`slice_rope`); a glue row at `row_pos` attends column `c` iff
+    // `cpos <= row_pos + fwd_ahead[t]`. Length `glue`.
+    fwd_ahead: &[u32],
 ) -> Result<(Tensor, f64)> {
+    assert_eq!(fwd_ahead.len(), glue, "fwd_ahead is per glue token");
     let prefix_len = cache.current_seq_len();
     let kv_len = prefix_len + glue;
     let arena_info = backing.resolve_arena_info()?;
@@ -360,16 +372,13 @@ fn run_glue(
     let glue_write_slice = Tensor::from_vec(wslice, glue, device)?;
     let glue_write_in_blk = Tensor::from_vec(winblk, glue, device)?;
 
-    // Varlen meta (single slot) + identity col_actual_pos.
+    // Varlen meta (single slot). `kv_len` is the slot's total columns; the kernel
+    // reads every column's position from its chunk `rope_base` (`slice_rope`), so
+    // there is no `col_actual_pos`. `fwd_ahead` is the per-token bridge window.
     let cu_seqlens_q = Tensor::from_vec(vec![0u32, glue as u32], 2, device)?;
     let q_lens = Tensor::from_vec(vec![glue as u32], 1, device)?;
     let kv_lens = Tensor::from_vec(vec![kv_len as u32], 1, device)?;
-    let cu_kvlens = Tensor::from_vec(vec![0u32, kv_len as u32], 2, device)?;
-    let col_actual_pos = Tensor::from_vec(
-        (0..kv_len as u32).collect::<Vec<_>>(),
-        kv_len.max(1),
-        device,
-    )?;
+    let fwd_ahead_t = Tensor::from_vec(fwd_ahead.to_vec(), glue.max(1), device)?;
 
     // 24-byte SlotHeader.
     let mut hdr = Vec::with_capacity(24);
@@ -425,10 +434,9 @@ fn run_glue(
             dev_ptr_u32(&cu_seqlens_q)? as *const u32,
             dev_ptr_u32(&q_lens)? as *const u32,
             dev_ptr_u32(&kv_lens)? as *const u32,
-            dev_ptr_u32(&col_actual_pos)? as *const u32,
-            dev_ptr_u32(&cu_kvlens)? as *const u32,
             dev_ptr_u32(&glue_write_slice)? as *const u32,
             dev_ptr_u32(&glue_write_in_blk)? as *const u32,
+            dev_ptr_u32(&fwd_ahead_t)? as *const u32,
             stream_ptr,
         );
     }
@@ -448,6 +456,83 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
         .flatten_all()?
         .max(0)?;
     d.to_scalar::<f32>()
+}
+
+/// Position-aware f32 reference: like [`reference_attn`] but causality is by the
+/// per-column `col_pos` map, NOT packed order. Column `c` (`< sealed` → sealed,
+/// else glue) has logical position `col_pos[c]`; glue token `t` (column
+/// `sealed+t`, position `col_pos[sealed+t]`) attends every column `c` with
+/// `col_pos[c] <= col_pos[sealed+t]`. Identity RoPE. This is the ground truth for
+/// the INTERLEAVED-gap layout: the glue is physically a trailing run but
+/// logically interspersed, exactly what the interleaved-gap design produces and
+/// the `slice_rope` convention must reproduce (kernel positions by assigned
+/// position, not packed order).
+#[allow(clippy::too_many_arguments)]
+fn reference_attn_positioned(
+    q_glue: &Tensor,
+    k_seal: &Tensor,
+    v_seal: &Tensor,
+    k_glue: &Tensor,
+    v_glue: &Tensor,
+    col_pos: &[u32],
+    fwd_ahead: &[u32],
+    sealed: usize,
+    glue: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    assert_eq!(col_pos.len(), sealed + glue, "col_pos covers every column");
+    assert_eq!(fwd_ahead.len(), glue, "fwd_ahead is per glue token");
+    let hpg = N_HEAD / N_KV_HEAD;
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let flat =
+        |t: &Tensor| -> Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1() };
+    let qd = flat(q_glue)?;
+    let ks = flat(k_seal)?;
+    let vs = flat(v_seal)?;
+    let kg = flat(k_glue)?;
+    let vg = flat(v_glue)?;
+    let kv_at = |col: usize, kvh: usize, d: usize, src: &[f32], srcg: &[f32]| -> f32 {
+        if col < sealed {
+            src[(col * N_KV_HEAD + kvh) * HEAD_DIM + d]
+        } else {
+            srcg[((col - sealed) * N_KV_HEAD + kvh) * HEAD_DIM + d]
+        }
+    };
+    let mut out = vec![0f32; glue * N_HEAD * HEAD_DIM];
+    for t in 0..glue {
+        let row_pos = col_pos[sealed + t];
+        let limit = row_pos + fwd_ahead[t];
+        // Columns attended: backward over everything, forward up to `fwd_ahead`.
+        let cols: Vec<usize> = (0..sealed + glue)
+            .filter(|&c| col_pos[c] <= limit)
+            .collect();
+        for h in 0..N_HEAD {
+            let kvh = h / hpg;
+            let mut scores = vec![0f32; cols.len()];
+            let mut m = f32::NEG_INFINITY;
+            for (si, &c) in cols.iter().enumerate() {
+                let mut dot = 0f32;
+                for d in 0..HEAD_DIM {
+                    dot += qd[(t * N_HEAD + h) * HEAD_DIM + d] * kv_at(c, kvh, d, &ks, &kg);
+                }
+                scores[si] = dot * scale;
+                m = m.max(scores[si]);
+            }
+            let mut denom = 0f32;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - m).exp();
+                denom += *sc;
+            }
+            for d in 0..HEAD_DIM {
+                let mut acc = 0f32;
+                for (si, &c) in cols.iter().enumerate() {
+                    acc += scores[si] * kv_at(c, kvh, d, &vs, &vg);
+                }
+                out[(t * N_HEAD + h) * HEAD_DIM + d] = acc / denom;
+            }
+        }
+    }
+    Tensor::from_vec(out, (glue, N_HEAD, HEAD_DIM), device)
 }
 
 /// A/B gate: glue kernel == normal prefill over the same sealed prefix.
@@ -493,6 +578,7 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
             &rope_cs,
             &stager,
             &device,
+            &vec![0u32; glue],
         )?;
 
         let diff = max_abs_diff(&out_a, &out_b)?;
@@ -505,6 +591,70 @@ fn paged_glue_matches_normal_prefill_f16() -> Result<()> {
     if !failures.is_empty() {
         candle::bail!(
             "paged-glue diverged from normal prefill in {} case(s):\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// PER-TOKEN forward window (`fwd_ahead`): with the glue at contiguous trailing
+/// positions, a glue token whose `fwd_ahead[t] > 0` must ALSO attend the next
+/// `fwd_ahead[t]` columns forward (here, later glue tokens) — its bridge window —
+/// while a `0` token stays strictly causal. Per-token, so one batched forward
+/// mixes causal and bridging rows. A/B against the position-aware golden with the
+/// matching `fwd_ahead`.
+#[test]
+fn paged_glue_fwd_ahead_f16() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+
+    // (sealed, glue, fwd_ahead). Contiguous positions: sealed [0,sealed), glue
+    // [sealed, sealed+glue). Token `t` (pos sealed+t) with window `w` attends
+    // [0, sealed+t+w] — opening `w` later glue tokens forward.
+    let cases: &[(usize, usize, &[u32])] = &[
+        (8, 4, &[0, 0, 0, 0]),       // all causal (matches-prefill, via this path)
+        (8, 4, &[2, 0, 0, 0]),       // token 0 bridges 2 forward; rest causal
+        (16, 5, &[1, 3, 0, 10, 0]),  // mixed; window 10 saturates at the slot end
+        (5, 6, &[1, 1, 1, 1, 1, 1]), // every token bridges 1 forward
+    ];
+    let mut failures = Vec::new();
+
+    for (ci, &(sealed, glue, fwd)) in cases.iter().enumerate() {
+        assert_eq!(fwd.len(), glue);
+        let (_q_seal, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ ci as u64, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ ci as u64, &device)?;
+        let col_pos: Vec<u32> = (0..(sealed + glue) as u32).collect();
+
+        let out_ref = reference_attn_positioned(
+            &q_glue, &k_seal, &v_seal, &k_glue, &v_glue, &col_pos, fwd, sealed, glue, &device,
+        )?;
+
+        let backing = fresh_backing(&device)?;
+        let mut cache = bind_cache(&backing, 0)?;
+        build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
+        let (out, _ms) = run_glue(
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+        )?;
+
+        let diff = max_abs_diff(&out, &out_ref)?;
+        eprintln!("paged-glue fwd_ahead case {ci} (fwd={fwd:?}): max abs diff = {diff:.6e}");
+        if !(diff < DIFF_TOLERANCE) {
+            failures.push(format!("case {ci} (fwd={fwd:?}): diff={diff:.6e}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        candle::bail!(
+            "paged-glue per-token fwd_ahead wrong in {} case(s):\n  - {}",
             failures.len(),
             failures.join("\n  - ")
         );
@@ -544,7 +694,16 @@ fn paged_glue_kernel_timing() -> Result<()> {
             &backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device,
         )?;
         let (_out, ms) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
+            &backing,
+            &mut cache,
+            &q_glue,
+            &k_glue,
+            &v_glue,
+            glue,
+            &rope_cs,
+            &stager,
+            &device,
+            &vec![0u32; glue],
         )?;
         Ok(ms)
     };
@@ -610,7 +769,16 @@ fn paged_glue_matches_golden_quant() -> Result<()> {
             &backing, &mut cache, &k_seal, &v_seal, sealed, &policy, &device,
         )?;
         let (out, _ms) = run_glue(
-            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device,
+            &backing,
+            &mut cache,
+            &q_glue,
+            &k_glue,
+            &v_glue,
+            glue,
+            &rope_cs,
+            &stager,
+            &device,
+            &vec![0u32; glue],
         )?;
 
         let diff = max_abs_diff(&out_ref, &out)?;
@@ -623,6 +791,324 @@ fn paged_glue_matches_golden_quant() -> Result<()> {
         candle::bail!(
             "paged-glue quant diverged from golden in {} case(s):\n  - {}",
             failures.len(),
+            failures.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// One slot's device-resident header inputs (kept alive for the kernel launch),
+/// built exactly as `run_glue` builds its single slot.
+struct SlotBuild {
+    n_slices: u32,
+    write_slice: u32,
+    slices_ptr: u64,
+    pm_ptr: u64,
+    glue: usize,
+    kv_len: usize,
+    wslice: Vec<u32>,
+    winblk: Vec<u32>,
+    _slices_tensor: Tensor,
+    _pm_tensor: Tensor,
+    _records_tensor: Tensor,
+}
+
+fn build_glue_slot(
+    backing: &ChunkedKvBacking,
+    cache: &mut KvCache,
+    glue: usize,
+    device: &Device,
+) -> Result<SlotBuild> {
+    let prefix_len = cache.current_seq_len();
+    let kv_len = prefix_len + glue;
+    let arena_info = backing.resolve_arena_info()?;
+    backing.ensure_for_batch_entries(&[(0, prefix_len)], glue)?;
+    let chunks = cache
+        .k_cache()
+        .chunked_live_chunks_as_sealed()
+        .unwrap_or_default();
+    let writer_start = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
+    let mut slot = SlotStateHost::from_sealed_chunks(
+        &chunks,
+        N_KV_HEAD,
+        HEAD_DIM,
+        &arena_info,
+        writer_start,
+        true,
+    );
+    slot.extend_for_write_region(glue, CHUNK_SIZE);
+
+    enum KvSrc {
+        Resident(u64),
+        Scratch(usize),
+    }
+    let mut records_buf: Vec<u8> = Vec::new();
+    let mut srcs: Vec<KvSrc> = Vec::with_capacity(slot.slices.len());
+    for s in &slot.slices {
+        match &s.meta {
+            Some(meta) => {
+                let addr = cache.k_cache().chunked_meta_device_addr(meta);
+                assert_ne!(addr, 0, "resident slice has no device record");
+                srcs.push(KvSrc::Resident(addr));
+            }
+            None => {
+                let off = records_buf.len();
+                s.serialize_record(&mut records_buf);
+                srcs.push(KvSrc::Scratch(off));
+            }
+        }
+    }
+    if records_buf.is_empty() {
+        records_buf.push(0u8);
+    }
+    let records_tensor = Tensor::from_slice(&records_buf, records_buf.len(), device)?;
+    let records_base = tensor_u8_device_ptr(&records_tensor)?;
+
+    let mut slice_buf = Vec::with_capacity(slot.slices.len() * TokenSliceHost::SLICE_HEADER_SIZE);
+    for (i, s) in slot.slices.iter().enumerate() {
+        let kvheads_ptr = match srcs[i] {
+            KvSrc::Resident(addr) => addr,
+            KvSrc::Scratch(off) => records_base + off as u64,
+        };
+        s.serialize_slice_header(&mut slice_buf, kvheads_ptr);
+    }
+    let slices_tensor = Tensor::from_slice(&slice_buf, slice_buf.len(), device)?;
+    let slices_ptr = tensor_u8_device_ptr(&slices_tensor)?;
+
+    let pm = slot.position_map.clone();
+    let pm_tensor = Tensor::from_slice(&pm, pm.len().max(1), device)?;
+    let pm_ptr = dev_ptr_u32(&pm_tensor)?;
+
+    let mut wslice = Vec::with_capacity(glue);
+    let mut winblk = Vec::with_capacity(glue);
+    for t in 0..glue {
+        let e = pm[prefix_len + t];
+        wslice.push(e >> 16);
+        winblk.push(e & 0xffff);
+    }
+    cache.set_current_seq_len(kv_len)?;
+    Ok(SlotBuild {
+        n_slices: slot.slices.len() as u32,
+        write_slice: slot.write_slice,
+        slices_ptr,
+        pm_ptr,
+        glue,
+        kv_len,
+        wslice,
+        winblk,
+        _slices_tensor: slices_tensor,
+        _pm_tensor: pm_tensor,
+        _records_tensor: records_tensor,
+    })
+}
+
+/// Run the glue kernel over `b` slots in ONE batched launch. Each `inputs[i]` is
+/// `(backing, cache, q, k, v, glue, fwd_ahead)`. Returns each slot's output
+/// `[glue_i, N_HEAD, HEAD_DIM]`. The kernel is per-slot (blockIdx.x reads only
+/// its own header) — the vehicle for the no-cross-leak gate.
+#[allow(clippy::type_complexity)]
+fn run_glue_batched(
+    inputs: &mut [(
+        &ChunkedKvBacking,
+        &mut KvCache,
+        Tensor,
+        Tensor,
+        Tensor,
+        usize,
+        Vec<u32>,
+    )],
+    rope_cs: &Tensor,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Vec<Tensor>> {
+    let b = inputs.len();
+    let mut builds: Vec<SlotBuild> = Vec::with_capacity(b);
+    for (backing, cache, _, _, _, glue, _) in inputs.iter_mut() {
+        builds.push(build_glue_slot(backing, cache, *glue, device)?);
+    }
+
+    let mut hdr = Vec::with_capacity(b * 24);
+    let mut cu = vec![0u32];
+    let mut q_lens_v: Vec<u32> = Vec::with_capacity(b);
+    let mut kv_lens_v: Vec<u32> = Vec::with_capacity(b);
+    let mut wslice_v: Vec<u32> = Vec::new();
+    let mut winblk_v: Vec<u32> = Vec::new();
+    let mut fwd_v: Vec<u32> = Vec::new();
+    let mut acc = 0u32;
+    for (i, sb) in builds.iter().enumerate() {
+        hdr.extend_from_slice(&sb.n_slices.to_le_bytes());
+        hdr.extend_from_slice(&sb.write_slice.to_le_bytes());
+        hdr.extend_from_slice(&sb.slices_ptr.to_le_bytes());
+        hdr.extend_from_slice(&sb.pm_ptr.to_le_bytes());
+        acc += sb.glue as u32;
+        cu.push(acc);
+        q_lens_v.push(sb.glue as u32);
+        kv_lens_v.push(sb.kv_len as u32);
+        wslice_v.extend_from_slice(&sb.wslice);
+        winblk_v.extend_from_slice(&sb.winblk);
+        fwd_v.extend_from_slice(&inputs[i].6);
+    }
+    let total_q: usize = q_lens_v.iter().map(|&l| l as usize).sum();
+
+    let qf = Tensor::cat(&inputs.iter().map(|t| t.2.clone()).collect::<Vec<_>>(), 0)?
+        .to_dtype(DType::F16)?
+        .contiguous()?;
+    let kf = Tensor::cat(&inputs.iter().map(|t| t.3.clone()).collect::<Vec<_>>(), 0)?
+        .to_dtype(DType::F16)?
+        .contiguous()?;
+    let vf = Tensor::cat(&inputs.iter().map(|t| t.4.clone()).collect::<Vec<_>>(), 0)?
+        .to_dtype(DType::F16)?
+        .contiguous()?;
+    let out = Tensor::zeros((total_q.max(1), N_HEAD, HEAD_DIM), DType::F16, device)?;
+
+    let cu_seqlens_q = Tensor::from_vec(cu, b + 1, device)?;
+    let q_lens = Tensor::from_vec(q_lens_v.clone(), b, device)?;
+    let kv_lens = Tensor::from_vec(kv_lens_v, b, device)?;
+    let glue_write_slice = Tensor::from_vec(wslice_v, total_q.max(1), device)?;
+    let glue_write_in_blk = Tensor::from_vec(winblk_v, total_q.max(1), device)?;
+    let fwd_ahead = Tensor::from_vec(fwd_v, total_q.max(1), device)?;
+    let max_glue = q_lens_v.iter().copied().max().unwrap_or(0);
+
+    let generation = stager.begin_generation();
+    let mut pinned = generation.alloc(hdr.len())?;
+    pinned.copy_from_slice(&hdr);
+    let headers_gpu = generation.submit(pinned)?;
+    let headers_ptr = headers_gpu.dev_ptr();
+
+    let softmax_scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let stream = match device {
+        Device::Cuda(d) => d.cuda_stream(),
+        _ => candle::bail!("cuda only"),
+    };
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
+    device.synchronize()?;
+    unsafe {
+        candle_kernels::paged_glue::run_paged_glue_fp16(
+            dev_ptr_f16(&qf)? as *const std::ffi::c_void,
+            headers_ptr as *const u8,
+            dev_ptr_f16(&out)? as *mut std::ffi::c_void,
+            b as i32,
+            max_glue as i32,
+            N_HEAD as i32,
+            N_KV_HEAD as i32,
+            HEAD_DIM as i32,
+            softmax_scale,
+            dev_ptr_f16(&kf)? as *const std::ffi::c_void,
+            dev_ptr_f16(&vf)? as *const std::ffi::c_void,
+            {
+                let (s, l) = rope_cs.storage_and_layout();
+                let c = match &*s {
+                    candle::Storage::Cuda(c) => c,
+                    _ => candle::bail!("cuda"),
+                };
+                let sl = c.as_cuda_slice::<f32>()?.slice(l.start_offset()..);
+                let (pp, _g) = sl.device_ptr(&stream);
+                pp as *const f32
+            },
+            0,
+            dev_ptr_u32(&cu_seqlens_q)? as *const u32,
+            dev_ptr_u32(&q_lens)? as *const u32,
+            dev_ptr_u32(&kv_lens)? as *const u32,
+            dev_ptr_u32(&glue_write_slice)? as *const u32,
+            dev_ptr_u32(&glue_write_in_blk)? as *const u32,
+            dev_ptr_u32(&fwd_ahead)? as *const u32,
+            stream_ptr,
+        );
+    }
+    device.synchronize()?;
+    drop(headers_gpu);
+    drop(builds);
+
+    let mut outs = Vec::with_capacity(b);
+    let mut off = 0usize;
+    for &gl in &q_lens_v {
+        let gl = gl as usize;
+        outs.push(out.narrow(0, off, gl)?);
+        off += gl;
+    }
+    Ok(outs)
+}
+
+/// BATCHED ISOLATION (no cross-conversation leak): two DIFFERENT conversations in
+/// one wave must each produce bit-for-bit what they produce alone. The kernel is
+/// per-slot (blockIdx.x reads only header[slot]) and bounds its stream to that
+/// slot's own `kv_len`, so slot B's presence cannot perturb slot A. The direct,
+/// testable statement of the batched-boundary requirement.
+#[test]
+fn paged_glue_batched_isolation_f16() -> Result<()> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let inv_freq = Tensor::zeros(HEAD_DIM / 2, DType::F32, &device)?;
+    let rope_cs = compute_rope_cs(&inv_freq, MAX_BLOCKS, HEAD_DIM, &device)?;
+
+    let conv: &[(usize, usize, Vec<u32>, u64)] = &[
+        (20, 6, vec![0, 2, 0, 0, 1, 0], 0xA11CE),
+        (37, 4, vec![1, 0, 3, 0], 0xB0B),
+    ];
+
+    let mut alone: Vec<Tensor> = Vec::new();
+    for &(sealed, glue, ref fwd, seed) in conv {
+        let (_qs, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ seed, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ seed, &device)?;
+        let backing = fresh_backing(&device)?;
+        let mut cache = bind_cache(&backing, 0)?;
+        build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
+        let (out, _) = run_glue(
+            &backing, &mut cache, &q_glue, &k_glue, &v_glue, glue, &rope_cs, &stager, &device, fwd,
+        )?;
+        alone.push(out);
+    }
+
+    let mut owned: Vec<(
+        ChunkedKvBacking,
+        KvCache,
+        Tensor,
+        Tensor,
+        Tensor,
+        usize,
+        Vec<u32>,
+    )> = Vec::new();
+    for &(sealed, glue, ref fwd, seed) in conv {
+        let (_qs, k_seal, v_seal) = make_qkv(sealed, 0x5EA1 ^ seed, &device)?;
+        let (q_glue, k_glue, v_glue) = make_qkv(glue, 0x61E ^ seed, &device)?;
+        let backing = fresh_backing(&device)?;
+        let mut cache = bind_cache(&backing, 0)?;
+        build_sealed_arena(&backing, &mut cache, &k_seal, &v_seal, sealed)?;
+        owned.push((backing, cache, q_glue, k_glue, v_glue, glue, fwd.clone()));
+    }
+    let mut refs: Vec<(
+        &ChunkedKvBacking,
+        &mut KvCache,
+        Tensor,
+        Tensor,
+        Tensor,
+        usize,
+        Vec<u32>,
+    )> = owned
+        .iter_mut()
+        .map(|(b, c, q, k, v, g, f)| (&*b, c, q.clone(), k.clone(), v.clone(), *g, f.clone()))
+        .collect();
+    let batched = run_glue_batched(&mut refs, &rope_cs, &stager, &device)?;
+
+    let mut failures = Vec::new();
+    for (i, (a, bt)) in alone.iter().zip(batched.iter()).enumerate() {
+        let diff = max_abs_diff(a, bt)?;
+        eprintln!("paged-glue batched-isolation slot {i}: |alone - in_batch| = {diff:.6e}");
+        if diff != 0.0 {
+            failures.push(format!(
+                "slot {i}: diff={diff:.6e} (batch perturbed the slot)"
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        candle::bail!(
+            "cross-conversation leak detected:\n  - {}",
             failures.join("\n  - ")
         );
     }

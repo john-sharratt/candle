@@ -79,6 +79,12 @@ pub enum ProbeError {
     /// the next pass.  Typical causes: model output wasn't valid
     /// JSON, GPU contention timeout, transient I/O failure.
     Soft(String),
+    /// A PERMANENT failure for *this* request: retrying would deterministically
+    /// fail again, so the summariser must NOT re-enqueue it.  Under argmax
+    /// (temperature 0) compression, a pass that produced an empty half will
+    /// produce the same empty half on every retry — re-enqueueing would loop
+    /// forever.  The turn is left a raw `Normal` node and logged as an error.
+    Permanent(String),
     /// Unrecoverable failure — GPU error, scheduler shutdown, etc.
     /// The summariser thread logs and stops.  Engine teardown
     /// proceeds normally.
@@ -89,6 +95,7 @@ impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProbeError::Soft(msg) => write!(f, "soft probe error: {msg}"),
+            ProbeError::Permanent(msg) => write!(f, "permanent probe error: {msg}"),
             ProbeError::Hard(msg) => write!(f, "hard probe error: {msg}"),
         }
     }
