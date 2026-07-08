@@ -327,14 +327,17 @@ impl SamplingConfig {
                 // top_p=0.95, repeat_penalty=1.1.  A gentle multiplicative
                 // repeat_penalty applies batch-wide.
                 //
-                // DRY is re-enabled but applied **only inside `<think>` blocks**
-                // (the kernel gates it on `segment_lens[seq] > 0`).  DRY's
-                // exponential n-gram penalty would corrupt verbatim copying of
-                // numbers, identifiers, and code in the answer — unacceptable
-                // for a coding assistant — so it never touches the response;
-                // confined to thinking, it breaks reasoning loops without harm.
-                // The thinking-only temperature boost lets reasoning sample a
-                // touch hotter while the answer stays at the reference temp.
+                // DRY is span-scoped: the kernel gates and windows it on
+                // `dry_lens[seq]` — the current structural span (reset at
+                // `<think>`/`</think>`/`<tool_call>`/`</tool_call>`, off inside
+                // tool calls).  So it runs in both thinking AND the answer but
+                // only ever sees the current span's own tokens.  That is what
+                // makes it safe on the answer: it breaks a repeating loop without
+                // penalizing verbatim reproduction of numbers, identifiers, or
+                // code lifted from the prompt or an earlier span — those live
+                // outside the span DRY can see.  The thinking-only temperature
+                // boost lets reasoning sample a touch hotter while the answer
+                // stays at the reference temp.
                 .with_segment_temp_boost(0.05)
                 .with_dry_penalty(0.8, 1.75, 2, 512)
                 .with_repeat_penalty(1.1)

@@ -264,7 +264,20 @@ pub fn run_pass(
             if let Err(e) = reconcile_pass(conversation, runner, timeline) {
                 match e {
                     ProbeError::Hard(_) => return Err(e),
-                    ProbeError::Soft(msg) | ProbeError::Permanent(msg) => {
+                    ProbeError::Permanent(msg) => {
+                        // Structural, won't self-heal (e.g. the target layer has no
+                        // summary-of-summaries projection). Disarm reconcile for this
+                        // timeline so we stop re-submitting a doomed probe every pass;
+                        // it only re-arms on a fresh load via `mark_for_reconcile`.
+                        conversation.write().set_needs_reconcile(timeline, false);
+                        tracing::warn!(
+                            target: "candle_conversation::summariser",
+                            timeline = %timeline,
+                            "reconcile permanently unavailable; disarming this timeline: {msg}"
+                        );
+                        continue;
+                    }
+                    ProbeError::Soft(msg) => {
                         tracing::warn!(
                             target: "candle_conversation::summariser",
                             timeline = %timeline,

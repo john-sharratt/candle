@@ -40,7 +40,7 @@ use candle::quantized::pinned_staging::PinnedBuf;
 #[cfg(feature = "cuda")]
 use candle::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
-use candle::{Device, Result};
+use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
 use super::arena::ArenaKey;
@@ -772,6 +772,352 @@ pub fn quantize_sealed_in_place(
                     return Err(candle::Error::Msg(format!(
                         "quantize_sealed_in_place: seq {seq_idx} chunk {chunk_idx} \
                          missing from both full-quant and partial-preserve buckets"
+                    )));
+                }
+            }
+            Ok(SealedSequence {
+                chunks,
+                token_count: orig.token_count,
+                chunk_size: orig.chunk_size,
+                location: ArenaLocation::Gpu,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(merged)
+}
+
+/// Inverse of [`quantize_sealed_in_place`]: decompress GPU-quant sealed chunks
+/// back to GPU **F16 float** arenas, applying each `(head, palette)`'s stored
+/// outer scale and un-permuting the palette map to logical dim order — i.e. the
+/// exact values the attention kernel would decode, materialised into a plain
+/// float arena instead of left compressed.
+///
+/// It drives the *same* `quantize_palette4_convert` kernel as the forward path,
+/// run in reverse: the source is the sealed chunk's per-`(h, p)` quant/R16
+/// sub-bands (with the chunk's stored pal_map + outer scales), the destination
+/// is a fresh F16 arena with identity pal_map and unit scale. The kernel's
+/// stage-1 dequant applies `src_outer` and its `xlat` gather un-permutes to
+/// logical order, so the result is faithful with no host-side re-derivation.
+///
+/// Eligible chunks are full chunks whose every `(h, p)` GID lives in a GPU
+/// `Quantized` (incl. `R16`) arena. Chunks already in GPU `Float` (partial
+/// tails) pass through the preserve bucket unchanged. `head_dim` must be 128.
+#[cfg(feature = "cuda")]
+pub fn dequantize_sealed_in_place(
+    backing: &ChunkedKvBacking,
+    sequences: &[&SealedSequence],
+    device: &Device,
+    copy_stream: &Arc<CudaStream>,
+    pinned_scratch: &mut Option<PinnedBuf>,
+) -> Result<Vec<SealedSequence>> {
+    let _ = pinned_scratch; // kept for signature symmetry with quantize; no DtoH here.
+    if sequences.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cuda_dev = match device {
+        Device::Cuda(d) => d,
+        _ => candle::bail!("dequantize_sealed_in_place: requires a CUDA device"),
+    };
+
+    let n_kv_head = backing.n_kv_head();
+    let head_dim = backing.head_dim();
+    if head_dim != identity_pal_map_128().len() * 4 {
+        candle::bail!(
+            "dequantize_sealed_in_place: palette4 conversion requires head_dim=128, got {head_dim}"
+        );
+    }
+    let sub_head_dim = head_dim / N_PALETTE;
+    let elems_per_head = CHUNK_SIZE * sub_head_dim;
+    let r16_bytes_per_head = (elems_per_head / 32) * 128;
+    let pal_bytes_per_head = head_dim / 4;
+
+    // ── Bucket each source chunk: decompress vs preserve ────────────
+    // A chunk is eligible for the reverse kernel when it is full and every
+    // (h, p) source GID lives in a GPU `Quantized` arena (R16 included — the
+    // kernel's issue_load handles R16 raw). Partial tails (already GPU Float)
+    // and any non-GPU chunk go to the preserve bucket unchanged.
+    let mut chunk_jobs: Vec<&SealedChunk> = Vec::new();
+    let mut seq_chunk_map: Vec<(usize, usize)> = Vec::new();
+    let mut preserve_per_seq: Vec<Vec<(usize, SealedChunk)>> =
+        sequences.iter().map(|_| Vec::new()).collect();
+    backing.inner.storage.read(|storage| {
+        for (seq_idx, seq) in sequences.iter().enumerate() {
+            for (chunk_idx, chunk) in seq.chunks.iter().enumerate() {
+                let is_full = usize::from(chunk.token_count) >= CHUNK_SIZE;
+                let mut all_gids_quant = is_full;
+                if all_gids_quant {
+                    for gid in chunk.gids.as_slice() {
+                        let ok = matches!(
+                            storage.arena_key(gid.arena_idx()),
+                            Some(k) if k.location == ArenaLocation::Gpu
+                                && matches!(k.format, KvFormat::Quantized(_))
+                        );
+                        if !ok {
+                            all_gids_quant = false;
+                            break;
+                        }
+                    }
+                }
+                if all_gids_quant {
+                    seq_chunk_map.push((seq_idx, chunk_idx));
+                    chunk_jobs.push(chunk);
+                } else {
+                    preserve_per_seq[seq_idx].push((chunk_idx, chunk.clone()));
+                }
+            }
+        }
+        Ok::<(), candle::Error>(())
+    })??;
+    if chunk_jobs.is_empty() {
+        return Ok(sequences.iter().map(|s| (*s).clone()).collect());
+    }
+
+    let n_chunks = chunk_jobs.len();
+
+    // ── Allocate GPU F16 destination GIDs ─────────────────────────────
+    // One F16 dst GID per (chunk, head, palette, K/V) — identity layout,
+    // unit scale.
+    let mut new_gids_per_chunk: Vec<Vec<ChunkGid>> = Vec::with_capacity(n_chunks);
+    for _ in 0..n_chunks {
+        let mut chunk_gids: Vec<ChunkGid> = Vec::with_capacity(n_kv_head * GIDS_PER_HEAD);
+        for _h in 0..n_kv_head {
+            for _p in 0..N_PALETTE {
+                let k_gid = backing.alloc_chunk_for_key(ArenaKey::gpu_float(DType::F16))?;
+                let v_gid = backing.alloc_chunk_for_key(ArenaKey::gpu_float(DType::F16))?;
+                chunk_gids.push(k_gid);
+                chunk_gids.push(v_gid);
+            }
+        }
+        new_gids_per_chunk.push(chunk_gids);
+    }
+
+    // ── Build PalHeadDesc structs (src quant → dst F16) ───────────────
+    let ident = identity_pal_map_128();
+    let mut descs: Vec<PalHeadDesc> = Vec::with_capacity(n_chunks * n_kv_head);
+    backing.inner.storage.try_write(|storage| {
+        for (chunk_i, src_chunk) in chunk_jobs.iter().enumerate() {
+            let src_gids = &src_chunk.gids;
+            for h in 0..n_kv_head {
+                let mut k_src_ptrs = [0u64; N_PALETTE];
+                let mut v_src_ptrs = [0u64; N_PALETTE];
+                let mut k_src_fmts = [GgmlDType::F16; N_PALETTE];
+                let mut v_src_fmts = [GgmlDType::F16; N_PALETTE];
+                let mut k_src_scales = [1.0f32; N_PALETTE];
+                let mut v_src_scales = [1.0f32; N_PALETTE];
+                let mut k_dst_ptrs = [0u64; N_PALETTE];
+                let mut v_dst_ptrs = [0u64; N_PALETTE];
+
+                // Resolve one side's source pointer/format for palette `p`.
+                let resolve_src = |storage: &super::arena::ArenaStorageState,
+                                   gid: &ChunkGid|
+                 -> Result<(u64, GgmlDType)> {
+                    let ai = gid.arena_idx();
+                    let arena = storage
+                        .arenas()
+                        .get(&ai)
+                        .ok_or_else(|| candle::Error::Msg(format!("src arena {ai} not found")))?;
+                    match arena.format() {
+                        KvFormat::Quantized(QuantFormat::R16) => {
+                            let qt = arena.quantized_data()?;
+                            let ptr = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
+                                qt,
+                                gid.chunk_idx() * r16_bytes_per_head,
+                            )?;
+                            Ok((ptr, GgmlDType::R16))
+                        }
+                        KvFormat::Quantized(qf) => {
+                            let qt = arena.quantized_data()?;
+                            let d = qf.to_ggml_dtype();
+                            let bpc = (elems_per_head / d.block_size()) * d.type_size();
+                            let ptr = ChunkedKvBacking::qtensor_ptr_at_byte_offset(
+                                qt,
+                                gid.chunk_idx() * bpc,
+                            )?;
+                            Ok((ptr, d))
+                        }
+                        KvFormat::Float(dt) => {
+                            let ptr = ChunkedKvBacking::tensor_ptr_at_offset(
+                                arena.float_data()?,
+                                gid.chunk_idx() * elems_per_head,
+                            )?;
+                            Ok((ptr, dtype_to_ggml_float(dt)?))
+                        }
+                    }
+                };
+
+                for p in 0..N_PALETTE {
+                    let (kp, kf) = resolve_src(&*storage, &src_gids.k_gid_pal(h, p))?;
+                    k_src_ptrs[p] = kp;
+                    k_src_fmts[p] = kf;
+                    let (vp, vf) = resolve_src(&*storage, &src_gids.v_gid_pal(h, p))?;
+                    v_src_ptrs[p] = vp;
+                    v_src_fmts[p] = vf;
+
+                    // Stored per-(h, p) outer scale (empty scale vec ⇒ unit).
+                    let sidx = h * N_PALETTE + p;
+                    k_src_scales[p] = src_chunk.k_scale.get(sidx).copied().unwrap_or(1.0);
+                    v_src_scales[p] = src_chunk.v_scale.get(sidx).copied().unwrap_or(1.0);
+
+                    // F16 dst pointers.
+                    let k_dst = &new_gids_per_chunk[chunk_i][h * GIDS_PER_HEAD + p * 2];
+                    let v_dst = &new_gids_per_chunk[chunk_i][h * GIDS_PER_HEAD + p * 2 + 1];
+                    let k_dst_arena = storage
+                        .arenas()
+                        .get(&k_dst.arena_idx())
+                        .ok_or_else(|| candle::Error::Msg("k dst arena not found".into()))?;
+                    k_dst_ptrs[p] = ChunkedKvBacking::tensor_ptr_at_offset(
+                        k_dst_arena.float_data()?,
+                        k_dst.chunk_idx() * elems_per_head,
+                    )?;
+                    let v_dst_arena = storage
+                        .arenas()
+                        .get(&v_dst.arena_idx())
+                        .ok_or_else(|| candle::Error::Msg("v dst arena not found".into()))?;
+                    v_dst_ptrs[p] = ChunkedKvBacking::tensor_ptr_at_offset(
+                        v_dst_arena.float_data()?,
+                        v_dst.chunk_idx() * elems_per_head,
+                    )?;
+                }
+
+                // Source palette maps: the chunk's stored per-head slice (fall
+                // back to identity when absent). Dst is identity (logical order).
+                let head_pal = |pal: &[u8]| -> [u8; 32] {
+                    let start = h * pal_bytes_per_head;
+                    let end = start + pal_bytes_per_head;
+                    if pal.len() >= end {
+                        let mut m = ident;
+                        m.copy_from_slice(&pal[start..end]);
+                        m
+                    } else {
+                        ident
+                    }
+                };
+
+                descs.push(PalHeadDesc {
+                    k_src_arena_ptrs: k_src_ptrs,
+                    v_src_arena_ptrs: v_src_ptrs,
+                    k_src_fmts,
+                    v_src_fmts,
+                    k_src_pal_map: head_pal(&src_chunk.k_pal),
+                    v_src_pal_map: head_pal(&src_chunk.v_pal),
+                    k_src_scales,
+                    v_src_scales,
+                    k_dst_arena_ptrs: k_dst_ptrs,
+                    v_dst_arena_ptrs: v_dst_ptrs,
+                    k_dst_fmts: [GgmlDType::F16; N_PALETTE],
+                    v_dst_fmts: [GgmlDType::F16; N_PALETTE],
+                    k_dst_pal_map: ident,
+                    v_dst_pal_map: ident,
+                    k_dst_scales: [1.0f32; N_PALETTE],
+                    v_dst_scales: [1.0f32; N_PALETTE],
+                });
+            }
+        }
+        Ok(())
+    })?;
+
+    // One launch per chunk on the primary stream (same convention as the
+    // forward path: per-chunk dst-state variance must not share a launch).
+    let stager_generation = backing.begin_stager_generation_required();
+    let primary_stream = cuda_dev.cuda_stream();
+    for chunk_i in 0..n_chunks {
+        let start = chunk_i * n_kv_head;
+        let end = start + n_kv_head;
+        candle::quantized::cuda::quantize_palette4_convert_buffered(
+            &descs[start..end],
+            n_kv_head,
+            1,
+            1,
+            &stager_generation,
+            &primary_stream,
+        )?;
+    }
+    let _ = copy_stream; // convert runs on primary, matching quantize_sealed_in_place.
+    drop(stager_generation);
+
+    // ── Reassemble per-sequence F16 SealedSequences ──────────────────
+    let arena_infos = backing.resolve_arena_info()?;
+    // Float chunks carry an identity palette map and unit (empty) scales.
+    let mut identity_head_bytes = vec![0u8; n_kv_head * pal_bytes_per_head];
+    for h in 0..n_kv_head {
+        identity_head_bytes[h * pal_bytes_per_head..(h + 1) * pal_bytes_per_head]
+            .copy_from_slice(&ident);
+    }
+    let identity_head_bytes = Arc::new(identity_head_bytes);
+    let empty_scale: Arc<Vec<f32>> = Arc::new(Vec::new());
+
+    let mut float_chunks: std::collections::HashMap<(usize, usize), SealedChunk> =
+        std::collections::HashMap::with_capacity(seq_chunk_map.len());
+    let mut float_keys: Vec<(usize, usize)> = Vec::with_capacity(seq_chunk_map.len());
+    for (job_idx, &(seq_idx, chunk_idx)) in seq_chunk_map.iter().enumerate() {
+        let new_gids = HeadGids::from_vec(new_gids_per_chunk[job_idx].clone());
+        let byte_size = new_gids.arena_byte_size(&arena_infos);
+        let src = chunk_jobs[job_idx];
+        float_chunks.insert(
+            (seq_idx, chunk_idx),
+            SealedChunk {
+                gids: new_gids,
+                offset: src.offset,
+                token_count: src.token_count,
+                k_pal: identity_head_bytes.clone(),
+                v_pal: identity_head_bytes.clone(),
+                k_scale: empty_scale.clone(),
+                v_scale: empty_scale.clone(),
+                byte_size,
+                meta: None,
+            },
+        );
+        float_keys.push((seq_idx, chunk_idx));
+    }
+
+    // Co-resident KV-head records at the F16 placement — identity pal, unit
+    // scale, F16 pointers — in one batched, coalesced upload.
+    {
+        let metas = {
+            let refs: Vec<(&HeadGids, &[u8], &[u8], &[f32], &[f32])> = float_keys
+                .iter()
+                .map(|key| {
+                    let c = &float_chunks[key];
+                    (
+                        &c.gids,
+                        c.k_pal.as_slice(),
+                        c.v_pal.as_slice(),
+                        c.k_scale.as_slice(),
+                        c.v_scale.as_slice(),
+                    )
+                })
+                .collect();
+            backing.build_meta_records(&refs, &arena_infos)?
+        };
+        for (key, meta) in float_keys.iter().zip(metas) {
+            if let Some(c) = float_chunks.get_mut(key) {
+                c.meta = meta;
+            }
+        }
+    }
+
+    // Merge decompressed float chunks with preserve-bucket chunks in order.
+    let merged: Vec<SealedSequence> = sequences
+        .iter()
+        .enumerate()
+        .map(|(seq_idx, orig)| {
+            let partial_pos_lookup: std::collections::HashMap<usize, usize> = preserve_per_seq
+                [seq_idx]
+                .iter()
+                .enumerate()
+                .map(|(pos, (chunk_idx, _))| (*chunk_idx, pos))
+                .collect();
+            let mut chunks: Vec<SealedChunk> = Vec::with_capacity(orig.chunks.len());
+            for chunk_idx in 0..orig.chunks.len() {
+                if let Some(new_chunk) = float_chunks.remove(&(seq_idx, chunk_idx)) {
+                    chunks.push(new_chunk);
+                } else if let Some(&pos) = partial_pos_lookup.get(&chunk_idx) {
+                    chunks.push(preserve_per_seq[seq_idx][pos].1.clone());
+                } else {
+                    return Err(candle::Error::Msg(format!(
+                        "dequantize_sealed_in_place: seq {seq_idx} chunk {chunk_idx} \
+                         missing from both float and preserve buckets"
                     )));
                 }
             }

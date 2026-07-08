@@ -453,6 +453,593 @@ mod cuda_impl {
     mod tests {
         use super::*;
 
+        // ── Forensic decoder for the persist path (V-corruption hunt) ──
+        //
+        // Reproduces decode → `quantize_sealed_in_place` (hot→warm) →
+        // `seal_to_chunk_images` (warm→cold CPU gather) and dequantizes
+        // the gathered `ChunkPayload` back to `[h][d][t]` so we can cosine
+        // K and V against the distinct float patterns we seeded. If V comes
+        // back orthogonal (≈0) while K survives, the CPU gather corrupts V.
+        use candle::quantized::{GgmlDType, QStorage, QTensor};
+        use candle::{DType, Tensor};
+        use candle_nn::kv_cache::{
+            arena_gid_stride, quantize_sealed_in_place, CompressionPolicy, KvFormat, QuantFormat,
+            N_PALETTE,
+        };
+        use half::f16;
+
+        use candle::cuda_backend::cudarc::driver::CudaStream;
+        use candle::quantized::pinned_staging::PinnedBuf;
+        use std::sync::Arc;
+
+        use crate::persistence::record::ChunkPayload;
+
+        const FZ_N_KV_HEAD: usize = 4;
+        const FZ_HEAD_DIM: usize = 128;
+        const FZ_ARENA_CAPACITY: usize = 256;
+
+        fn cuda_device_or_skip() -> Option<candle::Device> {
+            match candle::Device::cuda_if_available(0) {
+                Ok(d @ candle::Device::Cuda(_)) => Some(d),
+                _ => None,
+            }
+        }
+
+        fn cuda_stream(device: &candle::Device) -> Arc<CudaStream> {
+            match device {
+                candle::Device::Cuda(d) => d.cuda_stream(),
+                _ => unreachable!("gated on a CUDA device"),
+            }
+        }
+
+        /// Resolve a persisted `KvFormat` tag to its GGML block dtype.
+        /// Errors on a Float band — C1 seals both K and V quantized here.
+        fn kv_tag_to_ggml(tag: u8) -> Result<GgmlDType> {
+            let fmt = KvFormat::from_tag(tag)
+                .ok_or_else(|| candle::Error::Msg(format!("unrecognised KvFormat tag {tag}")))?;
+            match fmt {
+                KvFormat::Quantized(qf) => Ok(qf.to_ggml_dtype()),
+                KvFormat::Float(dt) => Err(candle::Error::Msg(format!(
+                    "sub-band is Float({dt:?}) (tag {tag}); this decoder handles \
+                     quantized sub-bands only"
+                ))),
+            }
+        }
+
+        /// Bytes one sub-band (`band_elems` elements) occupies for `ggml`.
+        fn band_byte_size(ggml: GgmlDType, band_elems: usize) -> usize {
+            (band_elems / ggml.block_size()) * ggml.type_size()
+        }
+
+        /// Dequantize one palette sub-band's raw arena bytes to a
+        /// `sub_head_dim * chunk_size` f32 vector in **dim-major** `[pd][t]`
+        /// order — the layout the quant/R16 arenas physically store (one
+        /// 32-token block per head-dimension). Index as `band[pd*chunk_size+t]`.
+        fn dequant_sub_band(
+            ggml: GgmlDType,
+            raw: &[u8],
+            chunk_size: usize,
+            sub_head_dim: usize,
+        ) -> Result<Vec<f32>> {
+            let elem_count = chunk_size * sub_head_dim;
+            let blocks = ggml.cpu_zeros(elem_count);
+            let need = blocks.storage_size_in_bytes();
+            if raw.len() != need {
+                return Err(candle::Error::Msg(format!(
+                    "{ggml:?} sub-band: raw {} bytes != block storage {need} bytes",
+                    raw.len()
+                )));
+            }
+            let dst = blocks.as_ptr() as *mut u8;
+            // SAFETY: `dst` owns `need` bytes; `raw` is a disjoint slice of
+            // exactly `need` bytes; block types are POD.
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), dst, need);
+            }
+            let storage = QStorage::Cpu(blocks);
+            let qt = QTensor::new(storage, vec![chunk_size, sub_head_dim])?;
+            let t = qt.dequantize(&candle::Device::Cpu)?;
+            Ok(t.flatten_all()?.to_vec1::<f32>()?)
+        }
+
+        /// Reassemble one block from its `ChunkPayload`, walking `kv_bytes`
+        /// in interleaved arena-GID order `[K(h,p) V(h,p) …]` (h outer, p
+        /// inner) and dequantizing each K/V sub-band into the per-layer
+        /// `[n_kv_head][head_dim][chunk_size]` layout
+        /// (`out[(h*head_dim + d)*chunk_size + t]`).
+        fn reassemble_block(
+            payload: &ChunkPayload,
+            n_kv_head: usize,
+            head_dim: usize,
+            chunk_size: usize,
+            sub_head_dim: usize,
+            per_layer: usize,
+        ) -> Result<(Vec<f32>, Vec<f32>)> {
+            let band_elems = chunk_size * sub_head_dim;
+            let expect_bands = n_kv_head * N_PALETTE;
+            if payload.k_formats.len() != expect_bands || payload.v_formats.len() != expect_bands {
+                return Err(candle::Error::Msg(format!(
+                    "payload has {}/{} K/V sub-bands, expected {expect_bands}",
+                    payload.k_formats.len(),
+                    payload.v_formats.len(),
+                )));
+            }
+            let mut k_out = vec![0.0f32; per_layer];
+            let mut v_out = vec![0.0f32; per_layer];
+            let mut cursor = 0usize;
+            let blob = &payload.kv_bytes;
+            let pal_bytes = head_dim / 4;
+            // Palette routing: per head, the ordered global dims each palette
+            // owns. Sub-band `p`'s local dim `pd` → `pal_dims[p][pd]`. Empty pal
+            // map (identity routing) falls back to contiguous `p*sub + pd`.
+            let dims_for = |pal: &[u8], head: usize| -> [Vec<usize>; N_PALETTE] {
+                let mut out: [Vec<usize>; N_PALETTE] = Default::default();
+                if pal.len() < (head + 1) * pal_bytes {
+                    for d in 0..head_dim {
+                        out[d / sub_head_dim].push(d);
+                    }
+                } else {
+                    for d in 0..head_dim {
+                        let byte = pal[head * pal_bytes + d / 4];
+                        let p = ((byte >> (2 * (d % 4))) & 0x3) as usize;
+                        out[p].push(d);
+                    }
+                }
+                out
+            };
+            for h in 0..n_kv_head {
+                let k_dims = dims_for(&payload.k_pal, h);
+                let v_dims = dims_for(&payload.v_pal, h);
+                for p in 0..N_PALETTE {
+                    let sb = h * N_PALETTE + p;
+                    let k_ggml = kv_tag_to_ggml(payload.k_formats[sb])?;
+                    let k_bytes = band_byte_size(k_ggml, band_elems);
+                    if cursor + k_bytes > blob.len() {
+                        return Err(candle::Error::Msg(format!(
+                            "kv_bytes underrun at K(h={h},p={p}): need {k_bytes} at {cursor}, have {}",
+                            blob.len()
+                        )));
+                    }
+                    let k_band = dequant_sub_band(
+                        k_ggml,
+                        &blob[cursor..cursor + k_bytes],
+                        chunk_size,
+                        sub_head_dim,
+                    )?;
+                    let k_off = cursor;
+                    cursor += k_bytes;
+
+                    let v_ggml = kv_tag_to_ggml(payload.v_formats[sb])?;
+                    let v_bytes = band_byte_size(v_ggml, band_elems);
+                    if cursor + v_bytes > blob.len() {
+                        return Err(candle::Error::Msg(format!(
+                            "kv_bytes underrun at V(h={h},p={p}): need {v_bytes} at {cursor}, have {}",
+                            blob.len()
+                        )));
+                    }
+                    let v_band = dequant_sub_band(
+                        v_ggml,
+                        &blob[cursor..cursor + v_bytes],
+                        chunk_size,
+                        sub_head_dim,
+                    )?;
+                    let v_off = cursor;
+                    cursor += v_bytes;
+
+                    // Only noisy when hunting the bug — per-sub-band offsets
+                    // help localise a K/V swap or a misaligned V band.
+                    if std::env::var("FZ_TRACE").is_ok() {
+                        eprintln!(
+                            "  sb {sb:>2} (h={h},p={p})  K@{k_off} {k_ggml:?} ({k_bytes}B)  \
+                             V@{v_off} {v_ggml:?} ({v_bytes}B)"
+                        );
+                    }
+
+                    // Bands are dim-major (`band[pd*chunk_size+t]`); route each
+                    // local dim `pd` to its global head dim via the palette map.
+                    for (pd, &kd) in k_dims[p].iter().take(sub_head_dim).enumerate() {
+                        for t in 0..chunk_size {
+                            k_out[(h * head_dim + kd) * chunk_size + t] =
+                                k_band[pd * chunk_size + t];
+                        }
+                    }
+                    for (pd, &vd) in v_dims[p].iter().take(sub_head_dim).enumerate() {
+                        for t in 0..chunk_size {
+                            v_out[(h * head_dim + vd) * chunk_size + t] =
+                                v_band[pd * chunk_size + t];
+                        }
+                    }
+                }
+            }
+            Ok((k_out, v_out))
+        }
+
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let n = a.len().min(b.len());
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            for i in 0..n {
+                let (x, y) = (a[i] as f64, b[i] as f64);
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na == 0.0 || nb == 0.0 {
+                return 0.0;
+            }
+            (dot / (na.sqrt() * nb.sqrt())) as f32
+        }
+
+        /// The PERSIST path, end to end, on synthetic K/V:
+        ///
+        ///   decode float write → `quantize_sealed_in_place` (hot→warm) →
+        ///   `seal_to_chunk_images` (warm→cold CPU gather).
+        ///
+        /// K and V are seeded with **distinct** float patterns (different
+        /// sign and slope) so a K/V swap or a V-orthogonal corruption in
+        /// the gather is visible in the cosine. We dequantize block 0's
+        /// gathered payload and cosine-compare against the seeded inputs.
+        ///
+        /// K validates the decoder + `[h][d][t]` transpose (must be >0.9).
+        /// Only then is the V verdict trustworthy.
+        #[test]
+        fn persist_gather_preserves_v_vectors() {
+            let Some(device) = cuda_device_or_skip() else {
+                eprintln!("no CUDA device — skipping persist_gather_preserves_v_vectors");
+                return;
+            };
+            let n_kv_head = FZ_N_KV_HEAD;
+            let head_dim = FZ_HEAD_DIM;
+            let n_tokens = 32usize; // one full 32-token block
+            let chunk_size = candle_nn::CHUNK_SIZE;
+            let sub_head_dim = head_dim / N_PALETTE;
+            let per_layer = n_kv_head * head_dim * chunk_size;
+            assert_eq!(n_tokens, chunk_size, "one full block");
+
+            // C1 — production recall level: K→Q8_KS, V→Q4_0/Q8_0.
+            let policy = CompressionPolicy::new(1);
+
+            // `new_with_format_adaptive(..., Some(policy))` warms the shared
+            // adaptive candidate arenas at construction — the public path the
+            // substrate engine uses (the internal `warm_protected_arenas` is
+            // `pub(super)` to candle-nn).
+            let backing = ChunkedKvBacking::new_with_format_adaptive(
+                4,
+                n_kv_head,
+                head_dim,
+                KvFormat::Float(DType::F16),
+                KvFormat::Float(DType::F16),
+                &device,
+                FZ_ARENA_CAPACITY,
+                Some(policy.clone()),
+            )
+            .expect("create chunked backing with warmed candidate arenas");
+
+            // ── Seed distinct K and V float patterns ──────────────────
+            // Input layout from `write_contiguous((1, n_kv_head, n_tokens,
+            // head_dim))`: element (h,t,d) at ((h*n_tokens)+t)*head_dim + d.
+            let slot = backing.alloc_sequence().unwrap();
+            backing.ensure_for_offset(slot, 0, n_tokens).unwrap();
+            let total = n_kv_head * n_tokens * head_dim;
+            let k_data: Vec<f16> = (0..total)
+                .map(|i| f16::from_f32(((1000 + i) as f32) * 0.0005))
+                .collect();
+            let v_data: Vec<f16> = (0..total)
+                .map(|i| f16::from_f32(-((1000 + i) as f32) * 0.0007))
+                .collect();
+            let k = Tensor::from_vec(
+                k_data.clone(),
+                (1, n_kv_head, n_tokens, head_dim),
+                &candle::Device::Cpu,
+            )
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+            let v = Tensor::from_vec(
+                v_data.clone(),
+                (1, n_kv_head, n_tokens, head_dim),
+                &candle::Device::Cpu,
+            )
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+            backing.write_contiguous(slot, 0, &k, &v).unwrap();
+            backing.set_len(slot, n_tokens);
+            let src = backing.record_turn(slot).unwrap();
+
+            // Reindex the inputs into the reassembled `[h][d][t]` layout so
+            // the cosine compares matched element sets.
+            let idx_in = |h: usize, t: usize, d: usize| ((h * n_tokens) + t) * head_dim + d;
+            let idx_out = |h: usize, d: usize, t: usize| (h * head_dim + d) * chunk_size + t;
+            let mut k_in = vec![0.0f32; per_layer];
+            let mut v_in = vec![0.0f32; per_layer];
+            for h in 0..n_kv_head {
+                for d in 0..head_dim {
+                    for t in 0..n_tokens {
+                        k_in[idx_out(h, d, t)] = k_data[idx_in(h, t, d)].to_f32();
+                        v_in[idx_out(h, d, t)] = v_data[idx_in(h, t, d)].to_f32();
+                    }
+                }
+            }
+
+            // ── Step 1: hot→warm quantize (CPU-resident output) ───────
+            let copy_stream = cuda_stream(&device);
+            let mut pinned: Option<PinnedBuf> = None;
+            let warm = quantize_sealed_in_place(
+                &backing,
+                &[&src],
+                &policy,
+                &device,
+                &copy_stream,
+                &mut pinned,
+            )
+            .expect("quantize_sealed_in_place");
+            assert_eq!(warm.len(), 1);
+            let warm = &warm[0];
+
+            // ── Step 2: warm→cold CPU gather ──────────────────────────
+            // `seal_to_chunk_images` dispatches to the CPU gather when the
+            // sequence is CPU-resident (the recall persist path). If warm
+            // stayed on GPU, migrate it to CPU so we exercise the CPU gather
+            // (the suspected corrupting step).
+            let _stride = arena_gid_stride();
+            let cpu_seq;
+            let seq_ref: &SealedSequence = if warm.location == ArenaLocation::Cpu {
+                warm
+            } else {
+                let migrated = backing
+                    .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[warm])
+                    .expect("migrate warm → CPU for the cold gather");
+                cpu_seq = migrated.into_iter().next().unwrap();
+                &cpu_seq
+            };
+            assert_eq!(
+                seq_ref.location,
+                ArenaLocation::Cpu,
+                "gather must run over a CPU-resident sequence (cold write path)"
+            );
+
+            let images =
+                seal_to_chunk_images(&backing, &device, seq_ref).expect("seal_to_chunk_images");
+            assert!(!images.is_empty(), "expected at least one gathered block");
+            let payload = &images[0].payload;
+
+            // ── Dequantize + cosine ───────────────────────────────────
+            let (k_rt, v_rt) = reassemble_block(
+                payload,
+                n_kv_head,
+                head_dim,
+                chunk_size,
+                sub_head_dim,
+                per_layer,
+            )
+            .expect("reassemble block 0");
+
+            let k_cos = cosine(&k_rt, &k_in);
+            let v_cos = cosine(&v_rt, &v_in);
+            let v_vs_k = cosine(&v_rt, &k_in); // detect a K/V swap
+            eprintln!("PERSIST-GATHER  K cosine = {k_cos:.5}   V cosine = {v_cos:.5}   (V-vs-inputK = {v_vs_k:.5})");
+
+            // K validates the decoder + layout transpose. Do not trust V
+            // until K is high.
+            assert!(
+                k_cos > 0.9,
+                "K cosine {k_cos:.5} <= 0.9 — decoder/layout/transpose is wrong; \
+                 fix the input↔[h][d][t] transpose before trusting V"
+            );
+
+            if v_cos > 0.9 {
+                eprintln!(
+                    "VERDICT: gather is CLEAN here — V survives the persist path \
+                     (bug NOT reproduced by this synthetic path)."
+                );
+                assert!(
+                    v_cos > 0.9,
+                    "V cosine {v_cos:.5} — documents that the CPU gather preserves V"
+                );
+            } else if v_cos.abs() <= 0.30 {
+                eprintln!(
+                    "VERDICT: BUG REPRODUCED — the CPU gather corrupts V \
+                     (V cosine {v_cos:.5} ≈ orthogonal). V-vs-inputK = {v_vs_k:.5} \
+                     ({}).",
+                    if v_vs_k.abs() > 0.9 {
+                        "K/V SWAP: gathered V matches input K"
+                    } else {
+                        "not a clean K/V swap"
+                    }
+                );
+                eprintln!("  re-run with FZ_TRACE=1 for per-sub-band byte offsets");
+                panic!(
+                    "V cosine {v_cos:.5} orthogonal while K cosine {k_cos:.5} survived — \
+                     seal_to_chunk_images_cpu corrupts V (bug reproduced)"
+                );
+            } else {
+                panic!(
+                    "V cosine {v_cos:.5} is neither clean (>0.9) nor orthogonal (<=0.30) \
+                     while K cosine {k_cos:.5} — inspect per-sub-band layout (FZ_TRACE=1)"
+                );
+            }
+        }
+
+        /// Same persist path as `persist_gather_preserves_v_vectors`, but the
+        /// K arena is seeded as `Quantized(R16)` — the decode-time raw
+        /// "F16 K + captured Q" carrier (128 B/sub-band) — while V stays F16
+        /// (64 B/sub-band), the exact live-decode residency.
+        ///
+        /// This is a regression guard for the persist V-corruption bug: the
+        /// `reassemble_block` CPU decoder used to read the quantized sub-bands
+        /// as token-major and ignored the palette map, so V came back
+        /// orthogonal (cosine ≈ 0) once the block was sealed to a quant format.
+        /// The bands are dim-major and palette-routed; both K and V must now
+        /// survive the seal → gather → dequant round-trip.
+        #[test]
+        fn persist_gather_preserves_v_vectors_r16_k() {
+            let Some(device) = cuda_device_or_skip() else {
+                eprintln!("no CUDA device — skipping persist_gather_preserves_v_vectors_r16_k");
+                return;
+            };
+            let n_kv_head = FZ_N_KV_HEAD;
+            let head_dim = FZ_HEAD_DIM;
+            let n_tokens = 32usize;
+            let chunk_size = candle_nn::CHUNK_SIZE;
+            let sub_head_dim = head_dim / N_PALETTE;
+            let per_layer = n_kv_head * head_dim * chunk_size;
+            assert_eq!(n_tokens, chunk_size, "one full block");
+
+            let policy = CompressionPolicy::new(1);
+
+            // K arena = R16 (the decode-time carrier), V arena = F16.
+            let backing = ChunkedKvBacking::new_with_format_adaptive(
+                4,
+                n_kv_head,
+                head_dim,
+                KvFormat::Quantized(QuantFormat::R16),
+                KvFormat::Float(DType::F16),
+                &device,
+                FZ_ARENA_CAPACITY,
+                Some(policy.clone()),
+            )
+            .expect("create chunked backing with R16 K + F16 V arenas");
+
+            // ── Seed the R16-K decode residency EXACTLY ───────────────────
+            // Build the raw dim-major R16 K bytes and the token-major F16 V
+            // bytes and install them with `write_raw_sealed_chunk`, matching the
+            // layout the decode kernel produces and the palette4 convert kernel
+            // reads. `write_contiguous` would quantize K into R16 in the wrong
+            // token-major layout — a test artifact — so it is deliberately not
+            // used here.
+            //
+            // Orthogonal K/V patterns (different sinusoid frequencies) so a K/V
+            // swap or a V-orthogonal corruption is visible in the cosines.
+            let val_k = |h: usize, t: usize, d: usize| -> f32 {
+                let i = (h * n_tokens + t) * head_dim + d;
+                (i as f32 * 0.11).sin() + 0.3
+            };
+            let val_v = |h: usize, t: usize, d: usize| -> f32 {
+                let i = (h * n_tokens + t) * head_dim + d;
+                (i as f32 * 0.37).cos() - 0.2
+            };
+
+            // R16 K bytes, dim-major per (h, p) sub-band — sub_head_dim blocks of
+            // 128 B; block[pd] = { F16 K[t=0..32] , u16 Q[t=0..32] }. Q is left
+            // zero (the corruption is Q-value-independent). Matches
+            // `dump_sequence_r16_kv_chunks` / the kernel's R16 src read.
+            let mut k_bytes: Vec<u8> = Vec::new();
+            for h in 0..n_kv_head {
+                for p in 0..N_PALETTE {
+                    for pd in 0..sub_head_dim {
+                        let d = p * sub_head_dim + pd;
+                        for t in 0..n_tokens {
+                            let kh = f16::from_f32(val_k(h, t, d));
+                            k_bytes.extend_from_slice(&kh.to_le_bytes());
+                        }
+                        k_bytes.extend_from_slice(&[0u8; 64]);
+                    }
+                }
+            }
+            // F16 V bytes, token-major per (h, p) sub-band: (token, dim).
+            let mut v_bytes: Vec<u8> = Vec::new();
+            for h in 0..n_kv_head {
+                for p in 0..N_PALETTE {
+                    for t in 0..n_tokens {
+                        for pd in 0..sub_head_dim {
+                            let d = p * sub_head_dim + pd;
+                            let vh = f16::from_f32(val_v(h, t, d));
+                            v_bytes.extend_from_slice(&vh.to_le_bytes());
+                        }
+                    }
+                }
+            }
+
+            let slot = backing.alloc_sequence().unwrap();
+            backing
+                .write_raw_sealed_chunk(
+                    slot,
+                    0,
+                    &k_bytes,
+                    &v_bytes,
+                    Arc::new(Vec::new()),
+                    Arc::new(Vec::new()),
+                    Arc::new(Vec::new()),
+                    Arc::new(Vec::new()),
+                )
+                .expect("seed raw R16 K + F16 V chunk");
+            backing.set_len(slot, n_tokens);
+            let src = backing.record_turn(slot).unwrap();
+
+            let idx_out = |h: usize, d: usize, t: usize| (h * head_dim + d) * chunk_size + t;
+            let mut k_in = vec![0.0f32; per_layer];
+            let mut v_in = vec![0.0f32; per_layer];
+            for h in 0..n_kv_head {
+                for d in 0..head_dim {
+                    for t in 0..n_tokens {
+                        k_in[idx_out(h, d, t)] = f16::from_f32(val_k(h, t, d)).to_f32();
+                        v_in[idx_out(h, d, t)] = f16::from_f32(val_v(h, t, d)).to_f32();
+                    }
+                }
+            }
+
+            let copy_stream = cuda_stream(&device);
+            let mut pinned: Option<PinnedBuf> = None;
+            let warm = quantize_sealed_in_place(
+                &backing,
+                &[&src],
+                &policy,
+                &device,
+                &copy_stream,
+                &mut pinned,
+            )
+            .expect("quantize_sealed_in_place (R16 K)");
+            assert_eq!(warm.len(), 1);
+            let warm = &warm[0];
+
+            let cpu_seq;
+            let seq_ref: &SealedSequence = if warm.location == ArenaLocation::Cpu {
+                warm
+            } else {
+                let migrated = backing
+                    .migrate_sealed_to_cpu_batch_async(&device, &copy_stream, &mut pinned, &[warm])
+                    .expect("migrate warm → CPU for the cold gather");
+                cpu_seq = migrated.into_iter().next().unwrap();
+                &cpu_seq
+            };
+            assert_eq!(seq_ref.location, ArenaLocation::Cpu);
+
+            let images =
+                seal_to_chunk_images(&backing, &device, seq_ref).expect("seal_to_chunk_images");
+            assert!(!images.is_empty());
+            let payload = &images[0].payload;
+
+            let (k_rt, v_rt) = reassemble_block(
+                payload,
+                n_kv_head,
+                head_dim,
+                chunk_size,
+                sub_head_dim,
+                per_layer,
+            )
+            .expect("reassemble block 0");
+
+            let k_cos = cosine(&k_rt, &k_in);
+            let v_cos = cosine(&v_rt, &v_in);
+            let v_vs_k = cosine(&v_rt, &k_in);
+            eprintln!(
+                "PERSIST-GATHER (R16 K)  K cosine = {k_cos:.5}   V cosine = {v_cos:.5}   \
+                 (V-vs-inputK = {v_vs_k:.5})"
+            );
+
+            assert!(
+                k_cos > 0.9,
+                "K cosine {k_cos:.5} <= 0.9 — decoder/layout wrong before trusting V"
+            );
+            assert!(
+                v_cos > 0.9,
+                "V cosine {v_cos:.5} — V must survive the R16-K persist path \
+                 (K cosine {k_cos:.5}, V-vs-inputK {v_vs_k:.5})"
+            );
+        }
+
         #[test]
         fn gather_then_scatter_round_trip_is_byte_identical() {
             let device = match candle::Device::cuda_if_available(0) {

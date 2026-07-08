@@ -45,8 +45,6 @@ pub use chunked::migrate::HostSealedChunk;
 #[cfg(feature = "cuda")]
 pub use chunked::migrate::{kv_migrate, kv_migrate_on};
 pub use chunked::migrate::{MigrationPlan, MigrationRecord};
-#[cfg(feature = "cuda")]
-pub use chunked::quantize_sealed_in_place;
 pub use chunked::sampled_selection::SampleFormat;
 #[cfg(feature = "cuda")]
 pub use chunked::vram_budget_available;
@@ -55,6 +53,8 @@ pub use chunked::{
     arena_chunks_for_format, arena_gid_stride, MetaGid, SealedChunk, SealedSequence, WriterTail,
     CHUNK_SIZE,
 };
+#[cfg(feature = "cuda")]
+pub use chunked::{dequantize_sealed_in_place, quantize_sealed_in_place};
 pub use chunked::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use chunked::{is_device_oom, KV_DEVICE_OOM_MARKER};
 pub use chunked::{

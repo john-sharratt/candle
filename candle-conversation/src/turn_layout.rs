@@ -585,6 +585,62 @@ mod tests {
         );
     }
 
+    /// The clean-reprefill seal contract: the sealed grid physically OMITS the
+    /// `<think>…</think>` tokens (they were re-prefilled away), so `realize()`
+    /// reproduces a think-free grid and the K/V carries no reasoning — while the
+    /// ethereal `Thinking` segment KEEPS the reasoning text, so `assistant_text()`
+    /// still yields the full verbatim reply for display/history. This is what
+    /// makes a projected past turn stop attending its own reasoning.
+    #[test]
+    fn clean_grid_seals_thinking_text_without_its_kv() {
+        // CLEAN grid — no `<think>` tokens at all:
+        // [user(3)][im_end(2)][a_start(3)][answer(2)] = 10 tokens.
+        let clean_grid: Vec<u32> = vec![
+            10, 11, 12, /*im_end*/ 90, 91, /*a_start*/ 80, 81, 82, /*answer*/ 1, 2,
+        ];
+        let layout = TurnLayout::from_flat_grid(
+            0,  // user_content_start
+            3,  // user_content_end
+            8,  // assistant_start (3 + 2 + 3)
+            10, // total — the CLEAN length (reasoning tokens absent)
+            2,  // im_end_len
+            3,  // assistant_start_len
+            "u".into(),
+            // The decoded text still carries the reasoning; the split moves it
+            // onto an ethereal Thinking segment.
+            Some("<think>r</think>a".into()),
+            false,
+        )
+        .with_thinking_split("<think>r</think>".into(), 5, true);
+
+        // Tiles the CLEAN grid — the reasoning contributes ZERO K/V positions.
+        assert_eq!(layout.validate_tiling(10), Ok(()));
+        assert_eq!(layout.kv_len(), 10);
+
+        // The reasoning is recorded but ethereal (no span).
+        assert!(layout.segments.iter().any(
+            |s| matches!(s, TurnSegment::Thinking { kv: None, text } if text == "<think>r</think>")
+        ));
+
+        // `realize()` reproduces the clean grid EXACTLY — no reasoning tokens
+        // appear in any real (K/V-bearing) segment.
+        let rebuilt: Vec<u32> = layout
+            .realize(&clean_grid)
+            .iter()
+            .flat_map(|(_, t)| t.iter().copied())
+            .collect();
+        assert_eq!(rebuilt, clean_grid);
+
+        // …yet the reasoning text survives for display: `assistant_text()`
+        // rejoins Thinking + Assistant into the full verbatim reply.
+        assert_eq!(
+            layout.assistant_text().as_deref(),
+            Some("<think>r</think>a")
+        );
+        // The answer span itself is reasoning-free (answer-only tokens).
+        assert_eq!(layout.assistant_span(), KvSpan::new(8, 2));
+    }
+
     /// Dropping the reasoning K/V (ethereal) leaves the answer holding the whole
     /// region — still tiled.
     #[test]

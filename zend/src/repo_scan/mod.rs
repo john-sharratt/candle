@@ -46,10 +46,10 @@ pub(crate) fn utility_config(mut config: SequenceConfig) -> SequenceConfig {
     // parallel workers' prefills/decodes actually batch instead of serialising
     // behind reprojection.
     config.disable_reprojection = true;
-    // Utility ingests share dialogue's near-lossless C1 V selection (high
-    // fidelity for retrieval), with the engine-wide uniform-K pin (Q8_KS) left
-    // on. The code-reading layer inherits this same C1 level via `code_read_config`.
-    config.kv_compression_level = Some(1);
+    // Utility ingests quantize at C5, fully adaptive for both K and V (the
+    // engine-wide uniform-K pin is off in this config). The code-reading layer
+    // inherits this same C5 level via `code_read_config`.
+    config.kv_compression_level = Some(5);
     config
 }
 

@@ -457,7 +457,7 @@ impl InferenceState {
         );
 
         // The dialogue layer's `system_prompt.items` start with a static
-        // prelude (mode/frame/history_stance/grounding/tools_intro) →
+        // prelude (mode/frame/grounding/tools_intro) →
         // then the `tools` collection (90+ tool sections, top_k=3) →
         // then `tools_outro`.  The pre-collection prelude is what we
         // pass as the engine's `system_prompt` so it gets ChatML-wrapped
@@ -471,10 +471,10 @@ impl InferenceState {
             .model_path(model_path)
             .tokenizer_path(tokenizer_path)
             .workspace_path(workspace.clone())
-            // Near-lossless KV: dialogue turns compress at C1 (high-fidelity V
-            // for recall). The utility layers (repo_map, code_reading) match this
-            // at C1 too (see `repo_scan::utility_config` / `code_read`'s config).
-            .compression_level(1)
+            // Dialogue turns compress at C5 (moderate adaptive quantization).
+            // Paired with the removed uniform-K pin (see `ModelBuilder::engine`),
+            // so K is adaptive too.
+            .compression_level(5)
             // Thinking is ENABLED at the model level; per-turn suppression is
             // driven by the section-tree `no_think` selector (the composer
             // effort dial), not this static flag.
@@ -1443,8 +1443,38 @@ fn run_inference_stream(
         // Quick/Balanced suppress the "Wait"/"Hmm"/… family in-block, Deep/
         // Exhaustive leave it 0 (reconsideration is wanted there).
         let think_mode = think_mode_from_selection(&selection);
+        // An explicit caller-supplied config (e.g. a test's `argmax()`) is honoured
+        // verbatim; only the conversation default gets the per-turn adjustments
+        // below (thinking-vs-response sampling split + a fresh seed).
+        let sampling_defaulted = sampling.is_none();
         let mut sampling = sampling.unwrap_or_else(|| cs.conv.default_sampling());
         sampling.segment_suppress_penalty = think_mode.suppress_penalty();
+        if sampling_defaulted {
+            // A `/no_think` turn is a direct response, not reasoning: strip the
+            // thinking-temperature boost, which is meant for the `<think>` span
+            // and has no business heating a plain answer.  DRY stays on: it is now
+            // span-scoped (`dry_span_len` — it only ever sees the current prose
+            // span, never the prompt or a prior span), so it breaks answer loops
+            // without the old full-window DRY's failure of penalizing verbatim
+            // reproduction of numbers/identifiers lifted from the prompt.  (It can
+            // still nip content the model itself repeats WITHIN the current answer
+            // — e.g. a long list's `- ` scaffolding — which is a penalty-tuning
+            // question, not a scoping one.)  That span scoping is why disabling it
+            // here is no longer necessary.
+            if think_mode == ThinkMode::Off {
+                sampling.segment_temp_boost = 0.0;
+            }
+            // Vary the RNG seed per turn from real entropy. The default base seed
+            // is a fixed constant, which makes a whole conversation a deterministic
+            // replay — the same context always samples the same tokens, so a turn
+            // that lands in a bad attractor can never sample its way out. A fresh
+            // per-turn seed restores genuine run-to-run variation. (The per-token
+            // `rng_offset` still advances within the turn.)
+            sampling.seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(sampling.seed);
+        }
         // Per-dial thinking budget: the EOT close ramp's graceful/force thresholds
         // scale with the effort level (exhaustive thinks longest).  `segment_len`
         // restarts each steered span, so these are per-span — higher dials get more
@@ -1485,8 +1515,9 @@ fn run_inference_stream(
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(sampling.clone()),
-                // Seed the response only on the first turn — forcing every chained
-                // tool iteration would prevent the model ever giving a final answer.
+                // Apply the caller's assistant prefill only on the first tool
+                // iteration — re-prefilling it on every chained iteration would
+                // prevent the model ever reaching a final answer.
                 assistant_prefill: if iteration == 0 {
                     assistant_prefill.clone()
                 } else {
@@ -2097,6 +2128,19 @@ impl ZendSession {
             state.conversations.lock().unwrap().remove(conv_id);
         }
         Some(result)
+    }
+
+    /// Enable or disable AVL summarisation for `conv_id`'s timeline. Only takes
+    /// effect once the timeline exists (i.e. after its first turn has been
+    /// submitted). Returns `None` if the model isn't loaded. Used by tests to
+    /// isolate whether the async summariser's concurrent activity influences a
+    /// conversation's decode.
+    pub fn set_conversation_summarize(&self, conv_id: &str, summarize: bool) -> Option<()> {
+        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
+        let timeline = timeline_for(conv_id);
+        let engine = state.engine.lock().unwrap();
+        engine.set_timeline_summarize(timeline, summarize);
+        Some(())
     }
 
     /// Decoded turn history for a single recovered conversation — backs

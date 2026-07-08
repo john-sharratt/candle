@@ -440,6 +440,23 @@ fn run_pass(
     compression_policy: Option<&CompressionPolicy>,
     pinned_scratch: &mut Option<PinnedBuf>,
 ) {
+    // Cross-thread write→read barrier. This persist pass runs on the background
+    // persistence thread and reads each freshly-sealed turn's K/V for the
+    // hot→warm migrate below. Those K/V bytes were WRITTEN by the scheduler
+    // thread's decode. Both threads queue on the same primary CUDA stream, but
+    // the ordering between two host threads issuing onto one stream is not
+    // guaranteed — the migrate could begin reading a turn's arena before the
+    // decode's writes to it have retired on the GPU, capturing half-written
+    // K/V. Synchronize the device once, up front, so every prior decode write
+    // is retired before we read any source arena. This is on the background
+    // thread, off the decode hot path.
+    if let Err(e) = device.synchronize() {
+        tracing::warn!(
+            target: "candle_conversation::persistence::tier",
+            "persist: pre-migrate device sync failed: {e:?}"
+        );
+    }
+
     // ── Phase 1: hot → warm ─────────────────────────────────────────────
     //
     // Snapshot the work list under a brief read lock, then run the
@@ -506,18 +523,19 @@ fn run_pass(
     // can start before the GPU has finished writing the new Q-format
     // arenas the slot now references.
     //
-    // Hoisted out of the per-group/per-layer loops because primary-stream
-    // operations are FIFO: every group's and layer's work queues in order
-    // on the GPU. A single sync at the end covers everything.
-    if let Device::Cuda(cuda_dev) = device {
-        if let Err(e) = cuda_dev.cuda_stream().synchronize() {
-            tracing::warn!(
-                "cache: primary-stream sync after hot→warm batch failed: {e:?} (last CUDA kernel on this thread: {})",
-                candle::last_cuda_kernel_launch()
-            );
-            // The whole batch's GPU work is suspect — don't install any of it.
-            installs.clear();
-        }
+    // Device-wide (not just primary-stream) sync: the reproject on the scheduler
+    // thread reads these freshly-installed Q-arenas for the NEXT turn's context,
+    // and if any of the convert's V work retires on a stream the primary-stream
+    // sync doesn't cover, the reproject captures incomplete V (K, whose convert
+    // retires earlier, is fine) — the V-only multi-turn duplication corruption.
+    // `device.synchronize()` waits for every stream, closing that window.
+    if let Err(e) = device.synchronize() {
+        tracing::warn!(
+            "cache: device sync after hot→warm batch failed: {e:?} (last CUDA kernel on this thread: {})",
+            candle::last_cuda_kernel_launch()
+        );
+        // The whole batch's GPU work is suspect — don't install any of it.
+        installs.clear();
     }
     let mut hot_to_warm_bytes: u64 = 0;
     let mut hot_to_warm_count: usize = 0;

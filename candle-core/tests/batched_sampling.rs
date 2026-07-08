@@ -1006,11 +1006,13 @@ fn qwen3_recommended_full_combination() {
         // penalty = 0.4 * 1.75^(3-2) = 0.4 * 1.75 = 0.70 applied to
         // loop_tok (the continuation token at position 10).
         //
-        // DRY is segment-only: it is gated on (and scoped to) the active
-        // segment. segment_lens >= the full recent window so the whole
-        // n-gram pattern (positions 7-127) stays in scope and the DRY math
-        // above holds unchanged (effective_len == recent_len, offset == 0).
+        // DRY is gated on (and scoped to) its own `dry_lens` span. dry_lens >=
+        // the full recent window so the whole n-gram pattern (positions 7-127)
+        // stays in scope and the DRY math above holds unchanged (effective_len
+        // == recent_len, offset == 0). segment_lens is set to the same width so
+        // the repeat-penalty window is likewise the full history (a no-op scope).
         segment_lens: vec![max_recent as i32],
+        dry_lens: vec![max_recent as i32],
         dry_multiplier: 0.4,
         dry_base: 1.75,
         dry_allowed_length: 2,
@@ -1115,19 +1117,19 @@ fn qwen3_recommended_full_combination() {
 /// A single repeated n-gram whose continuation is `loop_tok` is placed in the
 /// recent window.  `loop_tok` has the top raw logit, so without a DRY penalty it
 /// is the argmax; the penalty is sized to drop it below `alt_tok`.  Three rows
-/// share the SAME logits and recent history and differ ONLY in `segment_lens`,
+/// share the SAME logits and recent history and differ ONLY in `dry_lens`,
 /// proving the gate and the scope in one test:
 ///
-///   row 0 — in-segment, whole n-gram in scope   → DRY fires   → winner = alt_tok
-///   row 1 — outside a segment (segment_lens == 0)→ DRY gated   → winner = loop_tok
-///   row 2 — in-segment, but the n-gram precedes  → DRY scoped  → winner = loop_tok
-///           the segment (effective_len too small)   out
+///   row 0 — full span, whole n-gram in scope    → DRY fires   → winner = alt_tok
+///   row 1 — dry_lens == 0                        → DRY gated   → winner = loop_tok
+///   row 2 — span too short, n-gram precedes it   → DRY scoped  → winner = loop_tok
+///           (effective_len too small)               out
 ///
 /// Repeat/frequency/presence penalties are all disabled so the result isolates
 /// DRY.  Argmax (temperature 0) keeps it deterministic, and `assert_gpu_cpu_match`
 /// confirms the CPU reference applies the identical gate/scope.
 #[test]
-fn dry_penalty_is_segment_scoped() {
+fn dry_penalty_is_span_scoped() {
     let stream = test_stream();
     let vocab = 64usize;
     let rlen = 20usize;
@@ -1189,35 +1191,35 @@ fn dry_penalty_is_segment_scoped() {
         dry_allowed_length: 1,
         dry_range: 0,
 
-        // The gate/scope signal:
-        //   row 0: full segment in scope (effective_len == rlen, offset == 0)
-        //   row 1: outside a segment → DRY disabled entirely
-        //   row 2: only the last 2 tokens are in-segment → the earlier n-gram
+        // The gate/scope signal is DRY's OWN span, independent of the segment:
+        //   row 0: full span in scope (effective_len == rlen, offset == 0)
+        //   row 1: dry_lens == 0 → DRY disabled entirely
+        //   row 2: only the last 2 tokens are in the span → the earlier n-gram
         //          occurrence at pos 5-7 is scoped out, so no match is found
-        segment_lens: vec![rlen as i32, 0, 2],
+        dry_lens: vec![rlen as i32, 0, 2],
 
         ..Default::default()
     };
 
     // CPU reference must apply the identical gate/scope.
-    assert_gpu_cpu_match(&stream, &p, "dry_penalty_is_segment_scoped");
+    assert_gpu_cpu_match(&stream, &p, "dry_penalty_is_span_scoped");
 
     let result = run_gpu(&stream, &p);
     assert_eq!(
         result[0], alt_tok as u32,
-        "row 0 (in-segment, n-gram in scope): DRY should penalize loop_tok so \
+        "row 0 (full span, n-gram in scope): DRY should penalize loop_tok so \
          alt_tok ({alt_tok}) wins, got {}",
         result[0]
     );
     assert_eq!(
         result[1], loop_tok as u32,
-        "row 1 (outside a segment): DRY must be gated off so loop_tok ({loop_tok}) \
+        "row 1 (dry_lens == 0): DRY must be gated off so loop_tok ({loop_tok}) \
          stays the argmax, got {}",
         result[1]
     );
     assert_eq!(
         result[2], loop_tok as u32,
-        "row 2 (in-segment but n-gram precedes the segment): DRY is scoped out so \
+        "row 2 (span too short, n-gram precedes it): DRY is scoped out so \
          loop_tok ({loop_tok}) stays the argmax, got {}",
         result[2]
     );
@@ -1376,7 +1378,7 @@ fn dry_backs_off_a_repeated_sentence() {
         dry_allowed_length: 2,
         dry_range: 512,
 
-        segment_lens: vec![rlen as i32; 2], // both fully in-segment
+        dry_lens: vec![rlen as i32; 2], // DRY span = the full window for both rows
 
         ..Default::default()
     };

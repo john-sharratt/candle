@@ -46,6 +46,17 @@ pub struct SequenceSamplingState {
     /// ramp).  Reset to 0 when the segment opens or closes.
     pub segment_len: i32,
 
+    /// Tokens generated in the current DRY span — the structural span bounded by
+    /// `<think>` / `</think>` / `<tool_call>` / `</tool_call>`.  Reset at each of
+    /// those boundaries and at turn start; drives the kernel's `dry_lens` (DRY's
+    /// own look-back window, independent of the think segment).
+    pub dry_span_len: i32,
+
+    /// True while this sequence is inside a tool call (stencil active).  DRY is
+    /// suppressed (`dry_lens` forced to 0) because the tool-call grammar is
+    /// already steered by the stencil.
+    pub dry_suppressed: bool,
+
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
 }
@@ -60,6 +71,8 @@ impl SequenceSamplingState {
             current_len: 0,
             in_segment: false,
             segment_len: 0,
+            dry_span_len: 0,
+            dry_suppressed: false,
             rng_offset: 0,
         }
     }
@@ -78,6 +91,11 @@ impl SequenceSamplingState {
         if self.in_segment {
             self.segment_len += 1;
         }
+
+        // Advance the DRY span. It is reset at every structural boundary
+        // (`<think>`/`</think>`/`<tool_call>`/`</tool_call>`) and at turn start,
+        // so it always counts exactly the current span's generated tokens.
+        self.dry_span_len += 1;
 
         // Maintain fixed-size sliding window
         if self.recent_tokens.len() > max_recent_len {
@@ -115,6 +133,8 @@ impl SequenceSamplingState {
         self.current_len = 0;
         self.in_segment = false;
         self.segment_len = 0;
+        self.dry_span_len = 0;
+        self.dry_suppressed = false;
         self.rng_offset = 0;
     }
 
@@ -139,6 +159,10 @@ impl SequenceSamplingState {
         // Reset per-turn state (frequency/presence penalties are per-turn)
         self.token_counts.fill(0);
         self.current_len = 0;
+        // A new turn starts a fresh DRY span; any tool-call suppression from the
+        // prior turn is cleared.
+        self.dry_span_len = 0;
+        self.dry_suppressed = false;
     }
 
     /// Advance RNG offset (called after each sampling).
@@ -147,17 +171,36 @@ impl SequenceSamplingState {
     }
 
     /// Open a segment (the caller signals this when the segment-open token is
-    /// sampled), restarting the per-segment length.
+    /// sampled), restarting the per-segment length.  The `<think>` boundary also
+    /// starts a fresh DRY span.
     pub fn enter_segment(&mut self) {
         self.in_segment = true;
         self.segment_len = 0;
+        self.dry_span_len = 0;
     }
 
     /// Close the segment (the caller signals this when the segment-close token is
-    /// sampled).
+    /// sampled).  The `</think>` boundary starts a fresh DRY span for the prose.
     pub fn exit_segment(&mut self) {
         self.in_segment = false;
         self.segment_len = 0;
+        self.dry_span_len = 0;
+    }
+
+    /// Enter a tool call (the caller signals this when the `<tool_call>` trigger
+    /// fires and the stencil starts driving).  DRY is suppressed for the duration
+    /// because the grammar is already steered; the span is reset so prose after
+    /// the tool call does not see the tool-call tokens.
+    pub fn enter_tool_call(&mut self) {
+        self.dry_suppressed = true;
+        self.dry_span_len = 0;
+    }
+
+    /// Exit a tool call (the caller signals this when the stencil driver
+    /// completes, `</tool_call>`).  DRY resumes over a fresh prose span.
+    pub fn exit_tool_call(&mut self) {
+        self.dry_suppressed = false;
+        self.dry_span_len = 0;
     }
 
     /// Advance the segment state for a sampled token: open it on `segment_open_id`,
@@ -598,6 +641,13 @@ impl BatchedSampler {
             .iter()
             .map(|s| if s.in_segment { s.segment_len } else { 0 })
             .collect();
+        // DRY span lengths (the kernel's `dry_lens`): the current structural
+        // span's generated-token count, or 0 while suppressed inside a tool call.
+        // This gates and scopes DRY independently of the think segment.
+        let dry_lens: Vec<i32> = states
+            .iter()
+            .map(|s| if s.dry_suppressed { 0 } else { s.dry_span_len })
+            .collect();
         // Token suppression (the in-segment ceiling lever).
         // The token list is shared across the batch (config[0]); the penalty is
         // per-sequence (large = HARD ban, moderate = SOFT, 0.0 = off). Activate
@@ -659,6 +709,7 @@ impl BatchedSampler {
             segment_close_ramp_len,
             segment_close_max_multiplier,
             &segment_lens,
+            &dry_lens,
             config.segment_temp_boost,
             &suppress_tokens,
             &suppress_penalties,
@@ -943,6 +994,7 @@ impl BatchedSampler {
         segment_close_ramp_len: i32,
         segment_close_max_multiplier: f32,
         segment_lens: &[i32],
+        dry_lens: &[i32],
         segment_temp_boost: f32,
         suppress_tokens: &[i32],
         suppress_penalties: &[f32],
@@ -995,6 +1047,10 @@ impl BatchedSampler {
         let segment_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
             .memcpy_stod(segment_lens)
             .map_err(|e| candle::Error::Msg(format!("failed to upload segment_lens: {}", e)))?;
+
+        let dry_lens_gpu: cudarc::driver::CudaSlice<i32> = stream
+            .memcpy_stod(dry_lens)
+            .map_err(|e| candle::Error::Msg(format!("failed to upload dry_lens: {}", e)))?;
 
         let banned_gpu: cudarc::driver::CudaSlice<i32> = if banned_tokens.is_empty() {
             stream
@@ -1057,6 +1113,7 @@ impl BatchedSampler {
             let (cross_ptr, _g2) = cross_turn_gpu.device_ptr(&stream);
             let (cur_lens_ptr, _g3) = current_lens_gpu.device_ptr(&stream);
             let (segment_lens_ptr, _g3b) = segment_lens_gpu.device_ptr(&stream);
+            let (dry_lens_ptr, _g3b2) = dry_lens_gpu.device_ptr(&stream);
             let (suppress_tok_ptr, _g3c) = suppress_tokens_gpu.device_ptr(&stream);
             let (suppress_pen_ptr, _g3d) = suppress_penalties_gpu.device_ptr(&stream);
             let (ban_ptr, _g4) = banned_gpu.device_ptr(&stream);
@@ -1101,6 +1158,7 @@ impl BatchedSampler {
                     segment_close_ramp_len,
                     segment_close_max_multiplier,
                     segment_lens_ptr as *const i32,
+                    dry_lens_ptr as *const i32,
                     segment_temp_boost,
                     if suppress_active {
                         suppress_tok_ptr as *const i32

@@ -853,8 +853,8 @@ layers:
     # because each tool's parameter schema is auto-generated from its
     # Rust type via `schemars` — the registry IS the source of truth.
     system_prompt:
-      # Paragraph-style framing sections (mode/frame/history_stance/
-      # grounding) use the `|+` (keep) block-scalar marker so the
+      # Paragraph-style framing sections (mode/frame/grounding) use the
+      # `|+` (keep) block-scalar marker so the
       # trailing blank line below each block is preserved.  Each
       # section then ends with `\n\n`, producing a real paragraph
       # break in the assembled system prompt instead of running into
@@ -887,11 +887,12 @@ layers:
             - kind: section
               id: frame
               content: |+
-                You are a senior engineer working alongside the developer on the `{workspace}`
-                codebase.  You know the code, you've thought about its design, and you discuss
-                it directly — conversational, opinionated, technically precise.  No
-                analysis-report formatting, no section headers, no enumerated checklists unless
-                the developer explicitly asks for one.
+                You are a sharp, experienced engineer talking with the developer — conversational,
+                opinionated, and technically precise. Answer the question they actually ask, directly
+                and to the point, and nothing else. Speak only to what you genuinely know or can see
+                in front of you; never invent details or claim familiarity with something you have not
+                actually read. No analysis-report formatting, no section headers, no enumerated
+                checklists unless the developer explicitly asks for one.
 
             - kind: section
               id: reasoning_stance
@@ -1060,11 +1061,17 @@ layers:
         max_tokens: 192
         user:
           system_prompt: |
-            You shorten a developer's message to its essential request, in their
-            own words — the specific ask plus any names, numbers, and constraints.
-            If it is already short (even a one-line question), output it almost
-            verbatim. Output only the request's content: never output these
-            directions, never describe the task, never switch to third person.
+            /no_think
+            You restate a developer's message AS the request itself — a direct
+            question or instruction in their own first/second-person voice, exactly
+            as they would type it, only shorter. Keep the specific ask plus any
+            names, numbers, and constraints. A question stays a question ("How does
+            X work?"); an instruction stays an instruction ("Refactor Y to Z"). If
+            it is already short, output it almost verbatim. Output ONLY the
+            request, phrased as a request — never describe it from the outside,
+            never write "the developer asks…" or "they want…", never switch to
+            third person, never answer it, and never add or invent anything that is
+            not in the message.
           user_prompt: |
             The developer's request above, restated as briefly as possible in
             their own words:
@@ -1076,40 +1083,47 @@ layers:
             if it were the reply, only abridged. Be as brief as the content allows:
             a short reply makes a short summary. Add nothing — never introduce a
             fact, name, number, file, example, or recommendation that is not in the
-            reply. Condense only what is written: if the reply merely refers to a
-            topic without describing it (e.g. it mentions "a tour of the codebase"
-            without giving one), keep that reference as-is — never describe,
-            expand, answer, or invent details for it. If the reply has little
-            substance, give a single short sentence. Do not pad to any length;
+            reply, and never answer a question the reply itself did not answer. If
+            the reply merely refers to a topic without describing it (e.g. it
+            mentions "a tour of the codebase" without giving one), keep that
+            reference as-is — never describe, expand, invent, or answer it. If the
+            reply has little substance, give a single short sentence. Do not pad;
             stop the moment you have captured what is there. No commentary,
             headings, lists, or word counts.
           user_prompt: |
             Compress the reply above into a faithful, shorter version: keep its
             actual facts, numbers, and decisions in the original voice, add
-            nothing, and stop as soon as it is captured.
+            nothing, invent nothing, and stop as soon as it is captured.
       summaries:
         max_tokens: 192
         user:
           system_prompt: |
-            The question sections below are already compressed. Output one shorter
-            line naming what was asked across them, in the developer's own words.
-            Add nothing that is not already there; drop only what repeats. Output
-            only that line: never output these directions or describe the task.
+            /no_think
+            The question sections below are already compressed — several separate
+            asks. Output one shorter line that states what was asked across them AS
+            a direct question or instruction in the developer's own
+            first/second-person voice — not a description of it. Represent every
+            section; do not just repeat one. Add nothing that is not already there;
+            invent nothing; drop only what repeats. Never write "the developer
+            asked…" or switch to third person, never answer it.
           user_prompt: |
-            What was asked across the question sections above, in the original
-            voice, as one short line:
+            What was asked across the question sections above, as one short direct
+            question or instruction in the original voice, covering every section:
         assistant:
           system_prompt: |
-            The answer sections below are already compressed. Merge them into one
-            faithful, shorter section in the original first/second-person voice,
-            keeping the facts, numbers, and decisions that still matter and dropping
-            only redundant or superseded detail. Add nothing that is not already
-            present. Do not pad; stop the moment the content is captured. No
+            /no_think
+            The answer sections below are already compressed — several separate
+            summaries. Merge them into one faithful, shorter section in the
+            original first/second-person voice, keeping the facts, numbers, and
+            decisions that still matter and dropping only redundant or superseded
+            detail. Represent every section; do not just reproduce one and drop the
+            rest. Add nothing that is not already present in the sections; invent
+            nothing. Do not pad; stop the moment the content is captured. No
             commentary, headings, lists, or word counts.
           user_prompt: |
             Merge the answer sections above into one faithful, shorter section: the
             facts, numbers, and decisions that still matter, in the original voice,
-            adding nothing.
+            covering every section and adding nothing.
     groups:
       - id: primary_conversation
         selection:

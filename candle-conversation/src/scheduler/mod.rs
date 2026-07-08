@@ -760,6 +760,46 @@ struct PendingCompressionSeal {
     response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
+/// A finished dialogue turn whose reasoning-free tokens have been enqueued for
+/// re-prefill on the shared wave, awaiting its seal. Keyed by `pending_id` in
+/// [`Scheduler::pending_turn_seals`]. When the prefill completes,
+/// `complete_turn_reprefill` snapshots the clean K/V, seals the turn (via the
+/// normal `SealAction::Turn` write), and fires the deferred `Done` — the seal
+/// therefore lands one wave after decode, but the client's streamed tokens are
+/// unaffected and `Done` still carries the seal result.
+struct PendingTurnSeal {
+    /// Parent slot the clean turn is re-prefilled onto (the view was already
+    /// finalized in `cleanup_finished`, so this is the plain parent sequence).
+    parent_id: SequenceId,
+    /// First block of the turn's own region on `parent_id` — the clean re-prefill
+    /// appends here, and the seal captures `[seal_block_from, block_count)`.
+    seal_block_from: usize,
+    /// The turn's segment layout: the `<think>…</think>` block is an ETHEREAL
+    /// `Thinking` segment (its text is kept for display, its K/V dropped).
+    layout: TurnLayout,
+    /// Clean replay tokens (reasoning stripped) — pinned as the turn's `token_ids`
+    /// so they match the reasoning-free sealed K/V.
+    token_ids: Vec<u32>,
+    /// Gather-scope tags carried from the decode's `DecodeState`, re-stamped onto
+    /// the sealed turn. (Wide-Q provenance sigs are NOT carried — the seal
+    /// re-gathers them from the reasoning-free re-prefilled grid via
+    /// `gather_wide_sigs`, so they match the sealed K/V.)
+    tags: Vec<String>,
+    /// The caller's event channel — the deferred `Done` fires here once sealed.
+    event_tx: Sender<TurnEvent>,
+    /// `Done` payload, captured at decode-end: the FULL decoded reply (reasoning
+    /// included, exactly as streamed) and the decode stats. Only the SEALED K/V
+    /// is reasoning-free; the client's view is unchanged.
+    done_text: String,
+    done_token_ids: TokenBuffer,
+    stats: TurnStats,
+    /// The re-prefill `PrefillWork`'s private event sink. The prefill machinery
+    /// sends progress/errors on the paired `Sender`; keeping the receiver alive
+    /// here stops those sends from failing before the wave completes. Dropped
+    /// when the pending seal is drained.
+    _sink_rx: Receiver<TurnEvent>,
+}
+
 /// What the scheduler does after a [`SubmitTurn`] decode completes,
 /// just before sending `Done`.
 ///
@@ -818,6 +858,16 @@ pub(crate) enum SealAction {
     /// seal stashed in [`Scheduler::pending_compression_seals`], and replies to
     /// the summariser. `max_decode_tokens` is 0 — prefill + seal, no decode.
     CompressionTurn { job_id: u64 },
+    /// The clean re-prefill of a finished dialogue turn, keyed by `pending_id`
+    /// in [`Scheduler::pending_turn_seals`]. The decode's K/V carried the
+    /// `<think>…</think>` reasoning; this unit re-prefills the turn with the
+    /// reasoning stripped so the SEALED K/V never lets a future projection attend
+    /// its own thoughts. Rides the shared prefill wave (batched with the live
+    /// turn + summaries); once it finishes,
+    /// `promote_finished_prefills_to_decodes` snapshots the clean K/V, seals the
+    /// turn (reasoning kept as ethereal text), and fires the deferred `Done`.
+    /// `max_decode_tokens` is 0 — prefill + seal, no decode.
+    TurnReprefill { pending_id: u64 },
     /// The assistant half's `[content … instruction user_end]` prefill, riding
     /// the shared wave so its (potentially large) content batches with the live
     /// turn instead of stalling the loop. `max_decode_tokens` is 0; once the
@@ -1370,6 +1420,14 @@ pub(crate) struct Scheduler {
     /// Monotonic id source for `compression_jobs`.
     next_compression_job_id: u64,
 
+    /// Finished dialogue turns whose reasoning-free tokens are re-prefilling on
+    /// the shared wave, keyed by `pending_id`. Drained when the prefill completes
+    /// — see [`PendingTurnSeal`] and `complete_turn_reprefill`.
+    pending_turn_seals: HashMap<u64, PendingTurnSeal>,
+
+    /// Monotonic id source for `pending_turn_seals`.
+    next_turn_seal_id: u64,
+
     /// Per-slot live receiver for a compression pass's private event channel.
     /// A compression decode's `DecodeState::event_tx` reports through the job,
     /// not to a caller, so its `TurnEvent`s drain into this sink. Holding the
@@ -1463,6 +1521,8 @@ impl Scheduler {
             compression_jobs: HashMap::new(),
             pending_compression_seals: HashMap::new(),
             next_compression_job_id: 0,
+            pending_turn_seals: HashMap::new(),
+            next_turn_seal_id: 0,
             compression_event_sinks: HashMap::new(),
             timeline_projections: HashMap::new(),
         }
@@ -2278,7 +2338,18 @@ impl Scheduler {
                 if let Err(e) =
                     self.handle_summary_probe(timeline, kind, children, height, response_tx.clone())
                 {
-                    let _ = response_tx.send(Err(ProbeError::Soft(e)));
+                    // "no projection/summary" means this layer has no
+                    // summary-of-summaries projection to compress into — a permanent
+                    // structural condition, not a transient setup failure. Classify
+                    // it Permanent so the summariser disarms this timeline's reconcile
+                    // instead of re-submitting a doomed probe every pass forever
+                    // (which starves the summariser and floods the log).
+                    let pe = if e.contains("no projection/summary") {
+                        ProbeError::Permanent(e)
+                    } else {
+                        ProbeError::Soft(e)
+                    };
+                    let _ = response_tx.send(Err(pe));
                 }
                 true
             }
@@ -2404,7 +2475,7 @@ impl Scheduler {
         // content already fits the summary budget there is nothing to compress:
         // echo the user tokens verbatim as the question-half — ground truth by
         // construction — and only run the model on genuinely oversized input.
-        let anchor_sep = self
+        let child_sep = self
             .tokenizer
             .encode("\n\n", false)
             .map(|e| e.get_ids().to_vec())
@@ -2420,7 +2491,7 @@ impl Scheduler {
                     continue;
                 }
                 if !acc.is_empty() {
-                    acc.extend_from_slice(&anchor_sep);
+                    acc.extend_from_slice(&child_sep);
                 }
                 acc.extend(half);
             }
@@ -2684,53 +2755,23 @@ impl Scheduler {
             });
         }
 
-        // Rolling anchor: the most recent sealed *summary* turn before these
-        // children — the running thread of the conversation so far, itself
-        // bounded (it is a prior summary, not raw history, so this stays O(1)).
-        // Grounds the ANSWER pass in what came before so a follow-up reply summary
-        // stays coherent with the running thread.
-        //
-        // BOTH halves of the prior leaf are carried — its question summary AND its
-        // answer summary, separated. A stitched leaf is stored as
-        // `[question][user_end][assistant_start][answer]`.
-        //
-        // This is applied to the ASSISTANT pass ONLY (see below). The QUESTION
-        // pass must NOT see it: the question summary restates *this turn's* user
-        // message, and prior/answer context makes the model reverse-engineer a
-        // plausible-but-invented question from the surrounding answer text instead
-        // of the actual ask (observed: a "give me a tour" turn summarised as an
-        // unrelated, hallucinated API question).
-        let anchor_sep = self
+        // Each pass compresses ONLY its own children — no prior-summary anchor.
+        // We tried grounding the pass on the most recent prior summary (as raw
+        // prefill, then as a framed prior turn) so a follow-up summary could
+        // resolve "it" / "more" against what came before. Both leaked: the model
+        // reproduced the anchor VERBATIM as the "compressed reply" instead of
+        // compressing its actual children, and that propagated summary-to-summary
+        // (a summary of "1 + 1 = 2" came back as the codebase tour). An anchored
+        // pass reproduced its anchor; an anchor-free pass compressed cleanly. So
+        // the pass sees only its children and the compressor prompt — nothing to
+        // reproduce. (A vague follow-up like "tell me more" therefore summarises
+        // without expanding its referent; that is the correct trade for not
+        // hallucinating one.)
+        let child_sep = self
             .tokenizer
             .encode("\n\n", false)
             .map(|e| e.get_ids().to_vec())
             .unwrap_or_default();
-        let prior_summary: Vec<u32> = {
-            let first_child = children.iter().map(|t| t.0).min().unwrap_or(0);
-            let view = conv.read();
-            view.turn_indices(target.timeline)
-                .filter(|idx| {
-                    idx.0 < first_child
-                        && view
-                            .tree_meta_of(target.timeline, *idx)
-                            .is_some_and(|m| m.kind.is_summary())
-                })
-                .max_by_key(|idx| idx.0)
-                .map(|idx| {
-                    let mut q = view
-                        .turn_user_token_ids(target.timeline, idx)
-                        .unwrap_or_default();
-                    let a = view
-                        .turn_assistant_token_ids(target.timeline, idx)
-                        .unwrap_or_default();
-                    if !q.is_empty() && !a.is_empty() {
-                        q.extend_from_slice(&anchor_sep);
-                    }
-                    q.extend(a);
-                    q
-                })
-                .unwrap_or_default()
-        };
 
         // Close glue: the compression instruction followed by `user_end`.
         let close: Vec<u32> = {
@@ -2769,13 +2810,9 @@ impl Scheduler {
                         },
                     )));
                 }
-                // The question summary restates ONLY this turn's user message. It
-                // deliberately does NOT see the assistant answer or any prior
-                // context: given the reply text, the model reverse-engineers a
-                // plausible-but-invented question from it instead of compressing
-                // the actual ask (a "give me a tour" turn was summarised as an
-                // unrelated hallucinated API question). The user tokens injected
-                // above are self-sufficient for "what was asked".
+                // The question summary restates ONLY these children's user halves,
+                // injected just above — the sole content the pass sees. The
+                // compressor prompt (`turns.user`) keeps it a faithful restatement.
                 segments.push(ProjectionSegment::Generated {
                     tokens: Arc::new(close),
                     identity: GeneratedIdentity {
@@ -2799,20 +2836,12 @@ impl Scheduler {
             // the loop. `finish_compression_pass_setup` runs in the
             // wave-completion hook (`promote_finished_prefills_to_decodes`).
             Role::Assistant => {
-                // The rolling anchor (prior summary's question + answer) grounds
-                // the answer pass ONLY — it keeps a follow-up reply summary coherent
-                // with the running thread. It is deliberately absent from the
-                // question pass (see the `Role::User` arm).
-                let mut segments = prefix;
-                if !prior_summary.is_empty() {
-                    segments.push(ProjectionSegment::Generated {
-                        tokens: Arc::new(prior_summary),
-                        identity: GeneratedIdentity {
-                            name: "compress_prior".to_string(),
-                            position: 1,
-                        },
-                    });
-                }
+                // Only the cheap `[Section | user_start]` prefix lands
+                // synchronously; the children content + close ride the shared
+                // prefill wave (below). No prior-summary anchor — the pass
+                // compresses only its own children, so there is nothing to
+                // reproduce.
+                let segments = prefix;
                 if let Err(e) = self
                     .apply_projection(slot, BlockCount(0), &segments)
                     .map_err(|e| format!("SubmitSummaryProbe: assemble Assistant prefix: {e}"))
@@ -2826,8 +2855,8 @@ impl Scheduler {
                     // Ground with the user half (text) first so the response
                     // summary sees the request it answers, then the assistant
                     // half it actually summarizes. Consecutive children's halves
-                    // within each block are separated (same `\n\n` as the rolling
-                    // anchor); a single-child leaf is unchanged.
+                    // within each block are separated by `\n\n`; a single-child
+                    // leaf is unchanged.
                     let mut first = true;
                     for &child in children {
                         let half = view
@@ -2837,7 +2866,7 @@ impl Scheduler {
                             continue;
                         }
                         if !first {
-                            wave_tokens.extend_from_slice(&anchor_sep);
+                            wave_tokens.extend_from_slice(&child_sep);
                         }
                         first = false;
                         wave_tokens.extend(half);
@@ -2851,7 +2880,7 @@ impl Scheduler {
                             continue;
                         }
                         if !first {
-                            wave_tokens.extend_from_slice(&anchor_sep);
+                            wave_tokens.extend_from_slice(&child_sep);
                         }
                         first = false;
                         wave_tokens.extend(half);
@@ -3162,6 +3191,27 @@ impl Scheduler {
             .unwrap_or_else(|_| tokens.to_vec())
     }
 
+    /// As [`Self::strip_think_from_tokens`], but PRESERVES the surviving answer's
+    /// formatting (newlines, indentation, code blocks) — only the
+    /// `<think>…</think>` block and the whitespace immediately around it are
+    /// removed. Used for a dialogue turn's clean re-prefill, where collapsing the
+    /// answer's whitespace (as the summary path does) would mangle its layout in
+    /// the re-injected K/V.
+    fn strip_think_from_tokens_keep_layout(&self, tokens: &[u32]) -> Vec<u32> {
+        let Ok(text) = self.tokenizer.decode(tokens, true) else {
+            return tokens.to_vec();
+        };
+        let lower = text.to_ascii_lowercase();
+        if !lower.contains("<think>") && !lower.contains("</think>") {
+            return tokens.to_vec();
+        }
+        let stripped = crate::think_strip::strip_think_blocks_keep_layout(&text);
+        self.tokenizer
+            .encode(stripped.as_str(), false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_else(|_| tokens.to_vec())
+    }
+
     /// Shared by the model-decode path ([`Self::enqueue_compression_turn`]) and
     /// the deterministic structural path ([`Self::handle_summary_probe`]).
     fn seal_compression_turn(
@@ -3301,6 +3351,14 @@ impl Scheduler {
     /// token length is measured by re-tokenising the block (the answer span
     /// absorbs any tokeniser round-trip remainder, so the layout still tiles).
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// `ethereal_thinking` chooses how the `<think>…</think>` block is
+    /// represented: `false` keeps its K/V (the grid still contains the reasoning
+    /// tokens — a REAL `Thinking` span); `true` drops its K/V (the grid was
+    /// re-prefilled reasoning-free, so the block is an ETHEREAL `Thinking`
+    /// segment whose prose is kept for display but never materializes into the
+    /// slot). The clean-reprefill seal passes `true`.
+    #[allow(clippy::too_many_arguments)]
     fn build_turn_layout(
         &self,
         user_content_start: u32,
@@ -3310,6 +3368,7 @@ impl Scheduler {
         user_text: String,
         assistant_text: String,
         no_think: bool,
+        ethereal_thinking: bool,
     ) -> TurnLayout {
         let im_end_len = self.boundary_markers.user_end.len() as u32;
         let assistant_start_len = self.boundary_markers.assistant_start.len() as u32;
@@ -3324,9 +3383,9 @@ impl Scheduler {
             (!assistant_text.is_empty()).then(|| assistant_text.clone()),
             no_think,
         );
-        // Split the `<think>…</think>` reasoning out of the assistant body. The
-        // stored grid contains it, so it is a REAL segment; its token length is
-        // measured by re-tokenising the block.
+        // Split the `<think>…</think>` reasoning out of the assistant body. Its
+        // token length is measured by re-tokenising the block; `ethereal_thinking`
+        // decides whether that length is a real K/V span or dropped.
         if let (Some(o), Some(c)) = (
             assistant_text.find("<think>"),
             assistant_text.find("</think>"),
@@ -3338,10 +3397,176 @@ impl Scheduler {
                     .encode(block.as_str(), false)
                     .map(|t| t.get_ids().len() as u32)
                     .unwrap_or(0);
-                return layout.with_thinking_split(block, think_len, false);
+                return layout.with_thinking_split(block, think_len, ethereal_thinking);
             }
         }
         layout
+    }
+
+    /// Defer a finished dialogue turn's seal: re-prefill it with the
+    /// `<think>…</think>` reasoning stripped so the SEALED K/V is reasoning-free
+    /// (a future projection of the turn can no longer attend its own thoughts),
+    /// then seal + fire the deferred `Done` once the re-prefill wave completes.
+    /// The reasoning TEXT is kept as an ethereal `Thinking` segment, so
+    /// display / history / summaries are unchanged. The caller has already
+    /// truncated the slot to `seal_block_from` (its go/no-go); this only builds
+    /// the clean grid, stashes the [`PendingTurnSeal`], and enqueues the unit.
+    fn enqueue_clean_turn_reprefill(
+        &mut self,
+        parent_id: SequenceId,
+        seal_block_from: usize,
+        state: DecodeState,
+        text: String,
+        stats: TurnStats,
+    ) {
+        // Forwarded generated: drop the last, un-forwarded sampled token (its K/V
+        // never landed in the slot), matching the immediate-seal path.
+        let forwarded_generated: &[u32] = state
+            .generated_tokens
+            .split_last()
+            .map(|(_, rest)| rest)
+            .unwrap_or(&[]);
+        // Reasoning-free answer: strip `<think>…</think>` (+ the whitespace around
+        // it) while keeping the answer's own formatting. A turn with no think
+        // block re-prefills byte-identical (a clean no-op).
+        let clean_answer = self.strip_think_from_tokens_keep_layout(forwarded_generated);
+        // Clean grid: [user_msg][user_end][assistant_start] (already
+        // `/no_think`-free — that glue lives in the prefix, before
+        // `seal_block_from`) + the reasoning-free answer + the closing tail.
+        let mut clean_tokens: Vec<u32> = Vec::with_capacity(
+            state.prefill_tokens.len() + clean_answer.len() + state.post_decode_tokens.len(),
+        );
+        clean_tokens.extend_from_slice(&state.prefill_tokens);
+        clean_tokens.extend_from_slice(&clean_answer);
+        clean_tokens.extend_from_slice(&state.post_decode_tokens);
+        let total = clean_tokens.len() as u32;
+
+        // Display text (verbatim, reasoning included): prefill turns supply it,
+        // decode turns fall back to the streamed text.
+        let assistant_text = if state.prefill_assistant_text.is_empty() {
+            text.clone()
+        } else {
+            state.prefill_assistant_text.clone()
+        };
+        // The `<think>` block becomes an ETHEREAL `Thinking` segment over the
+        // reasoning-free grid — text kept, K/V dropped.
+        let layout = self.build_turn_layout(
+            state.user_content_start,
+            state.user_content_end,
+            state.assistant_content_start,
+            total,
+            state.user_text.clone(),
+            assistant_text,
+            state.no_think,
+            true,
+        );
+
+        let pending_id = self.next_turn_seal_id;
+        self.next_turn_seal_id += 1;
+
+        // Private sink for the re-prefill unit's `PrefillWork`; the real caller
+        // channel (`state.event_tx`) fires `Done` from `complete_turn_reprefill`.
+        let (sink_tx, sink_rx) = crossbeam::channel::unbounded();
+
+        self.pending_turn_seals.insert(
+            pending_id,
+            PendingTurnSeal {
+                parent_id,
+                seal_block_from,
+                layout,
+                token_ids: clean_tokens.clone(),
+                tags: state.tags,
+                event_tx: state.event_tx,
+                done_text: text,
+                done_token_ids: state.generated_tokens,
+                stats,
+                _sink_rx: sink_rx,
+            },
+        );
+
+        // Enqueue the clean grid as a `max_decode=0` prefill unit — it rides the
+        // SAME wave as the next turn's prefill and any summaries, so the
+        // re-prefill batches for maximum parallelism. `complete_turn_reprefill`
+        // seals + fires the deferred `Done`.
+        self.prefill_queue.push_back(PrefillWork {
+            sequence_id: parent_id,
+            tokens: TokenBuffer::from(clean_tokens),
+            prefill_text: String::new(),
+            user_text: String::new(),
+            user_content_start: 0,
+            user_content_end: 0,
+            assistant_content_start: 0,
+            no_think: false,
+            tags: Vec::new(),
+            prefill_assistant_text: String::new(),
+            event_tx: sink_tx,
+            max_decode_tokens: 0,
+            sampling: SamplingConfig::compression(),
+            submitted_at: Instant::now(),
+            reprojection: None,
+            seal_action: SealAction::TurnReprefill { pending_id },
+            post_decode_tokens: TokenBuffer::default(),
+            projection_offsets: Vec::new(),
+            staged_composition: None,
+            triggers: Arc::new(TriggerRegistry::new()),
+        });
+    }
+
+    /// Seal a finished dialogue turn once its reasoning-free re-prefill completes
+    /// on the wave: snapshot the clean K/V (via the normal `SealAction::Turn`
+    /// write), drop the slot's chunks, and fire the deferred `Done` (the client's
+    /// full reply + the seal result). Mirrors `complete_compression_turn`.
+    fn complete_turn_reprefill(&mut self, pending_id: u64) {
+        let Some(pending) = self.pending_turn_seals.remove(&pending_id) else {
+            return;
+        };
+        let PendingTurnSeal {
+            parent_id,
+            seal_block_from,
+            layout,
+            token_ids,
+            tags,
+            event_tx,
+            done_text,
+            done_token_ids,
+            stats,
+            _sink_rx,
+        } = pending;
+
+        let turn_content = TurnContent {
+            role: Role::Assistant,
+            tags,
+            layout,
+            token_ids: TokenBuffer::from(token_ids),
+        };
+        let seal_result = self
+            .perform_seal_and_write(
+                parent_id,
+                seal_block_from,
+                &SealAction::Turn,
+                Some(turn_content),
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!("clean turn seal failed for slot {}: {}", parent_id, e);
+                None
+            });
+
+        // Drop the slot's chunks now the residence owns them (the next projection
+        // rebuilds from the substrate) — same housekeeping as the immediate seal.
+        if let Err(e) = self.session.truncate_sequence_to_blocks(parent_id.0, 0) {
+            tracing::warn!(
+                "post-seal slot truncate failed for slot {}: {}",
+                parent_id,
+                e
+            );
+        }
+
+        let _ = event_tx.send(TurnEvent::Done(TurnResponse {
+            text: done_text,
+            token_ids: done_token_ids,
+            stats,
+            seal: seal_result,
+        }));
     }
 
     /// Seal a re-prefilled compressed turn once the shared wave finishes its
@@ -3893,6 +4118,40 @@ impl Scheduler {
                     }
                 }
 
+                // Clean-reprefill defer (dialogue turns only). The decode's K/V
+                // carries the `<think>…</think>` reasoning; sealing it as-is would
+                // let a future projection of this turn attend its own thoughts. So
+                // re-prefill the turn reasoning-free and seal THAT instead. The
+                // truncate that resets the slot to the turn boundary is the
+                // go/no-go: on success the seal + `Done` defer to the re-prefill
+                // wave (batched with the next wave's normal prefills); on the rare
+                // truncate failure we fall through to the immediate,
+                // reasoning-bearing seal so the turn is never lost.
+                if matches!(state.seal_action, SealAction::Turn)
+                    && self
+                        .session
+                        .truncate_sequence_to_blocks(seal_slot.0, seal_block_from)
+                        .is_ok()
+                {
+                    let stats = TurnStats {
+                        prefill_ms: state.prefill_ms,
+                        decode_ms,
+                        total_ms,
+                        tokens_generated,
+                        tokens_per_second,
+                        prefill_token_count: state.prefill_token_count,
+                        sequence: sequence_stats,
+                    };
+                    self.enqueue_clean_turn_reprefill(
+                        seal_slot,
+                        seal_block_from,
+                        state,
+                        text,
+                        stats,
+                    );
+                    continue;
+                }
+
                 // Seal-and-write step.  When `seal_action != None`, we
                 // snapshot `seal_slot` and apply the appropriate substrate
                 // write (turn append or section pin).  The resulting
@@ -3952,6 +4211,9 @@ impl Scheduler {
                                 state.prefill_assistant_text.clone()
                             };
                             let total = full_tokens.len() as u32;
+                            // Immediate (non-deferred) seal: no re-prefill ran, so
+                            // the grid still contains the reasoning tokens — the
+                            // `<think>` block is a REAL span (`ethereal = false`).
                             let layout = self.build_turn_layout(
                                 state.user_content_start,
                                 state.user_content_end,
@@ -3960,6 +4222,7 @@ impl Scheduler {
                                 state.user_text.clone(),
                                 assistant_text,
                                 state.no_think,
+                                false,
                             );
                             Some(TurnContent {
                                 role: Role::Assistant,
@@ -4302,15 +4565,15 @@ impl Scheduler {
     /// token of every later turn the projection re-selects it into.
     ///
     /// So members sit between the boundary near-lossless policy
-    /// (C0 / Q8 / Q8) and the dialogue turn policy: **C3 with K
-    /// overridden to Q8_KS**, V uses adaptive level-3 selection.
+    /// (C0 / Q8 / Q8) and the dialogue turn policy: **C4, fully adaptive
+    /// for both K and V** — the uniform-K pin removed to match the
+    /// engine-wide adaptive-K stress config.
     /// `_turn_policy` is taken to keep the call sites future-proof
     /// for a per-engine override knob; today it's ignored.
     fn section_compression_policy_member(
         _turn_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> candle_nn::kv_cache::CompressionPolicy {
-        candle_nn::kv_cache::CompressionPolicy::new(3)
-            .with_override_k_quant(Some(QuantFormat::Q8_KS))
+        candle_nn::kv_cache::CompressionPolicy::new(4)
     }
 
     /// Drain [`Self::pending_section_quantize`]: re-read each section's
@@ -4811,6 +5074,11 @@ impl Scheduler {
             SealAction::CompressionSetup { .. } => {
                 unreachable!(
                     "compression setup finishes in promote_finished_prefills_to_decodes, not here"
+                )
+            }
+            SealAction::TurnReprefill { .. } => {
+                unreachable!(
+                    "clean turn re-prefill seals via SealAction::Turn in complete_turn_reprefill"
                 )
             }
         }

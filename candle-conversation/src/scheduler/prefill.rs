@@ -601,6 +601,23 @@ impl Scheduler {
                 }
                 continue;
             }
+            // A dialogue turn's reasoning-free re-prefill finished on the wave.
+            // Seal the clean K/V + fire the deferred `Done` (no decode, reports to
+            // the caller, not the summariser). On prefill error, surface it on the
+            // caller channel and drop the slot's chunks.
+            if let SealAction::TurnReprefill { pending_id } = &work.seal_action {
+                let pending_id = *pending_id;
+                match error {
+                    Some(e) => {
+                        if let Some(p) = self.pending_turn_seals.remove(&pending_id) {
+                            let _ = p.event_tx.send(TurnEvent::Error(e));
+                            let _ = self.session.truncate_sequence_to_blocks(p.parent_id.0, 0);
+                        }
+                    }
+                    None => self.complete_turn_reprefill(pending_id),
+                }
+                continue;
+            }
             // The assistant half's content prefill finished on the wave. Run the
             // synchronous tail (assistant_start + sample first + register the
             // `CompressionPass` decode); tear the whole node down on failure.
@@ -671,6 +688,28 @@ impl Scheduler {
             .sequence_offset(work.sequence_id.0)
             .unwrap_or(token_count);
 
+        // Decode-start line: the effective sampling config this conversation turn
+        // will decode under. Confirms empirically whether a turn is stochastic
+        // (temp>0 + top_k/top_p) or greedy (temp≈0 → argmax), and at what context
+        // depth. Enable with
+        // `RUST_LOG=candle_conversation::scheduler::decode=debug`.
+        tracing::debug!(
+            target: "candle_conversation::scheduler::decode",
+            seq = work.sequence_id.0,
+            context_depth,
+            prefill_tokens = token_count,
+            max_decode_tokens = work.max_decode_tokens,
+            temperature = work.sampling.temperature,
+            top_k = work.sampling.top_k,
+            top_p = work.sampling.top_p,
+            repeat_penalty = work.sampling.repeat_penalty,
+            segment_temp_boost = work.sampling.segment_temp_boost,
+            dry = work.sampling.dry.is_some(),
+            greedy = work.sampling.temperature <= 0.01,
+            seed = work.sampling.seed,
+            "conversation decode start",
+        );
+
         let mut sampling_state = self
             .sampling_states
             .remove(&work.sequence_id)
@@ -707,14 +746,16 @@ impl Scheduler {
                 // The block opens either way: the common case is the model
                 // sampling its OWN `<think>` as the first token; the rarer case is
                 // a caller-supplied assistant prefill that already opens one.  In
-                // BOTH cases the sampler's `in_segment` must flip — it gates DRY,
-                // the reflection-marker suppression, the thinking temperature
-                // boost, and the `</think>` EOT ramp (all keyed off `segment_len`,
-                // which only advances while `in_segment`).  Flipping it only for
-                // the prefilled case left the sampler's flag stuck false for a
-                // model-opened block, silently disabling every one of those
-                // controls for its whole duration even though the health flag
-                // (`inside_think_block`) correctly tracked it.
+                // BOTH cases the sampler's `in_segment` must flip — it gates the
+                // reflection-marker suppression, the thinking temperature boost,
+                // and the `</think>` EOT ramp (all keyed off `segment_len`, which
+                // only advances while `in_segment`).  (DRY is no longer gated
+                // here — it has its own `dry_span_len`/`dry_suppressed` scope,
+                // reset at `<think>`/`</think>` via `enter_segment`/`exit_segment`.)
+                // Flipping it only for the prefilled case left the sampler's flag
+                // stuck false for a model-opened block, silently disabling every
+                // one of those controls for its whole duration even though the
+                // health flag (`inside_think_block`) correctly tracked it.
                 let opens_think = prefill_has_think || first_token == tok;
                 if opens_think && !sampling_state.in_segment {
                     sampling_state.enter_segment();

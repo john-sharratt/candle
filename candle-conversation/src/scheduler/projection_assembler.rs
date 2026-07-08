@@ -424,13 +424,15 @@ pub(super) fn apply_segments_build(
     let no_think_for = |timeline: Option<TimelineId>, index: TurnIndex| -> bool {
         timeline.is_some_and(|tl| conversation.read().turn_no_think(tl, index))
     };
-    for piece in assemble_pieces(new_segments, ctx.boundary_markers, no_think_for) {
-        match piece {
+    let pieces = assemble_pieces(new_segments, ctx.boundary_markers, no_think_for);
+    for i in 0..pieces.len() {
+        match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
-                reserve_glue_island(ctx, &mut walker, &tokens)?;
+                let fwd = glue_bridge_window(pieces.get(i + 1));
+                reserve_glue_island(ctx, &mut walker, tokens, fwd)?;
             }
             AssembledPiece::Section(id) => {
-                inject_sealed_section(ctx, &mut walker, id)?;
+                inject_sealed_section(ctx, &mut walker, *id)?;
             }
             AssembledPiece::Turn {
                 group,
@@ -438,17 +440,17 @@ pub(super) fn apply_segments_build(
                 role,
                 timeline,
             } => {
-                inject_sealed_turn(ctx, &mut walker, timeline, group, index, role)?;
+                inject_sealed_turn(ctx, &mut walker, *timeline, *group, *index, *role)?;
             }
             AssembledPiece::DeferredUser(tokens) => {
-                walker.deferred_user = Some(tokens);
+                walker.deferred_user = Some(tokens.clone());
             }
             AssembledPiece::TurnHalf {
                 group,
                 index,
                 timeline,
             } => {
-                inject_sealed_turn_half(ctx, &mut walker, timeline, group, index)?;
+                inject_sealed_turn_half(ctx, &mut walker, *timeline, *group, *index)?;
             }
         }
     }
@@ -575,10 +577,37 @@ impl SegmentWalker {
 /// kernel scatters before it streams). An island longer than one chunk is split
 /// across consecutive gap chunks — the per-token targets stay contiguous, so the
 /// `slice_rope` position of token `t` is exactly its logical position.
+/// Forward bridge window (tokens) for boundary glue that leads INTO a
+/// conversation turn or summary. Opening it lets the `user_start`/`assistant_end`
+/// glue attend the first `TURN_BRIDGE_FWD_AHEAD` tokens of the turn it introduces
+/// (which is resident in-place downstream in the same slot), so the glue is
+/// generated as a lead-in to that turn instead of a blind continuation of what
+/// precedes it. B is read-only and only meaningful as far as its heads reach back
+/// (~16-32 tokens), so the window is small. All other glue (section boundaries,
+/// the pre-user tail) stays backward-only (`0`).
+const TURN_BRIDGE_FWD_AHEAD: u32 = 16;
+
+/// Forward bridge window for the glue island that immediately precedes `next` in
+/// the assembled piece stream. Open it (`TURN_BRIDGE_FWD_AHEAD`) only when the
+/// glue leads INTO a conversation turn/summary — a `Turn`/`TurnHalf` piece, which
+/// is injected in-place downstream in the same slot and so is already resident in
+/// `[0, kv_len)` for the glue forward to attend. Section boundaries and the glue
+/// before the deferred (still un-prefilled) user message have no resident turn
+/// ahead, so they stay backward-only (`0`).
+fn glue_bridge_window(next: Option<&AssembledPiece>) -> u32 {
+    match next {
+        Some(AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. }) => {
+            TURN_BRIDGE_FWD_AHEAD
+        }
+        _ => 0,
+    }
+}
+
 fn reserve_glue_island(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
     tokens: &[u32],
+    fwd_ahead: u32,
 ) -> Result<(), ConversationError> {
     let n = tokens.len();
     if n == 0 {
@@ -602,9 +631,10 @@ fn reserve_glue_island(
         for i in 0..take as u32 {
             walker.glue_write_slice.push(gap_blk as u32);
             walker.glue_write_in_blk.push(in_blk_base + i);
-            // Backward-only for now; future code sets this per glue-island type
-            // (e.g. a `user_start` bridging into its turn) with no kernel change.
-            walker.fwd_ahead.push(0);
+            // Per-island forward bridge window, chosen by the caller from the
+            // following piece: nonzero when this glue leads into a conversation
+            // turn/summary (see `TURN_BRIDGE_FWD_AHEAD`), `0` (causal) otherwise.
+            walker.fwd_ahead.push(fwd_ahead);
         }
         placed += take;
     }
@@ -1229,6 +1259,62 @@ mod tests {
                 // in-flight user message deferred past the gap-fill
                 AssembledPiece::DeferredUser(Arc::new(vec![9, 9])),
             ]
+        );
+    }
+
+    #[test]
+    fn glue_bridge_window_opens_only_into_turns() {
+        let turn = AssembledPiece::Turn {
+            group: GroupId::for_test(2),
+            index: TurnIndex(3),
+            role: crate::Role::Assistant,
+            timeline: Some(TimelineId::for_test(2)),
+        };
+        let turn_half = AssembledPiece::TurnHalf {
+            group: GroupId::for_test(2),
+            index: TurnIndex(3),
+            timeline: Some(TimelineId::for_test(2)),
+        };
+        // Leads into a resident turn/summary → bridge window opens.
+        assert_eq!(glue_bridge_window(Some(&turn)), TURN_BRIDGE_FWD_AHEAD);
+        assert_eq!(glue_bridge_window(Some(&turn_half)), TURN_BRIDGE_FWD_AHEAD);
+        // No resident turn ahead → backward-only.
+        assert_eq!(
+            glue_bridge_window(Some(&AssembledPiece::Section(SectionId::new(7)))),
+            0
+        );
+        assert_eq!(
+            glue_bridge_window(Some(&AssembledPiece::DeferredUser(Arc::new(vec![9])))),
+            0
+        );
+        assert_eq!(glue_bridge_window(None), 0);
+    }
+
+    #[test]
+    fn glue_bridge_window_matches_assembled_stream() {
+        // Walk the same stream as `assemble_pieces_wraps_turns_…`: every glue
+        // island's window is decided by the piece that follows it.
+        let m = test_markers();
+        let segments = vec![
+            generated_seg("a", 0, &[1, 2]),
+            section_seg(7),
+            turn_seg(1, 2, 3),
+            turn_seg(1, 2, 4),
+            generated_seg("b", 0, &[3]),
+            ProjectionSegment::NewUserMessage {
+                tokens: Arc::new(vec![9, 9]),
+            },
+        ];
+        let pieces = assemble_pieces(&segments, &m, |_, _| false);
+        let windows: Vec<u32> = (0..pieces.len())
+            .filter(|&i| matches!(pieces[i], AssembledPiece::Glue(_)))
+            .map(|i| glue_bridge_window(pieces.get(i + 1)))
+            .collect();
+        // Glue islands in order: leading run→Section (0), user_start→Turn (16),
+        // assistant_end++user_start→Turn (16), assistant_end++run→DeferredUser (0).
+        assert_eq!(
+            windows,
+            vec![0, TURN_BRIDGE_FWD_AHEAD, TURN_BRIDGE_FWD_AHEAD, 0]
         );
     }
 

@@ -2458,6 +2458,146 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: prefix palette ROUTING across a slice straddle.
+    ///
+    /// The prefix is a sealed partial chunk 0 (`p` tokens, identity palette
+    /// map) followed by a full chunk 1 whose palette map is SHUFFLED
+    /// (dim `d` → palette `d % 4`, rank `d / 4`) with its data permuted to
+    /// match, so a correct reader reconstructs the same logical values. Under
+    /// cum-token addressing the first 32-position prefill tile then straddles
+    /// both slices, and chunk 1's positions must be routed with CHUNK 1's map:
+    /// routing them through chunk 0's map (a stale per-tile hoisted table)
+    /// gathers a dim-permutation of the true values — order-1 garbage on
+    /// random data. Float chunks keep the check quantization-free, so the
+    /// tolerance is tight fp16 noise and any routing regression fails hard.
+    /// The second tile starts inside chunk 1, exercising the shuffled map as
+    /// a FIRST-slice table too.
+    #[test]
+    fn correctness_prefill_straddle_shuffled_pal_map() -> Result<()> {
+        use candle_nn::kv_cache::ChunkedKvBacking;
+
+        let device = Device::new_cuda(0)?;
+        let dtype = DType::F16;
+        const CHUNK: usize = 32;
+        let (n_head, n_kv_head, head_dim) = (32usize, 8usize, 128usize);
+        let p = 20usize; // partial chunk 0 → every later tile straddles
+        let new_len = 8usize;
+        let prefix_len = p + CHUNK;
+        let b_sz = 1;
+
+        // Logical prefix K/V and the new segment.
+        let k0 = Tensor::randn(0f32, 1f32, (1, n_kv_head, p, head_dim), &device)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+        let v0 = Tensor::randn(0f32, 1f32, (1, n_kv_head, p, head_dim), &device)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+        let k1 = Tensor::randn(0f32, 1f32, (1, n_kv_head, CHUNK, head_dim), &device)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+        let v1 = Tensor::randn(0f32, 1f32, (1, n_kv_head, CHUNK, head_dim), &device)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+        let new_q =
+            Tensor::randn(0f32, 1f32, (1, n_head, new_len, head_dim), &device)?.to_dtype(dtype)?;
+        let new_k = Tensor::randn(0f32, 1f32, (1, n_kv_head, new_len, head_dim), &device)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+        let new_v = Tensor::randn(0f32, 1f32, (1, n_kv_head, new_len, head_dim), &device)?
+            .to_dtype(dtype)?
+            .contiguous()?;
+
+        // Shuffled map: dim d → palette d % 4 (balanced: 32 dims per palette,
+        // maximally different from identity's d / 32). The write path places
+        // logical dim d' at (palette d'/32, rank d'%32) — identity placement —
+        // so for logical dim d to land where the shuffled map expects it
+        // (palette d%4, rank d/4), permute the head_dim axis by
+        // d ↦ (d % 4) * 32 + d / 4 before writing.
+        let mut inv = vec![0u32; head_dim];
+        for d in 0..head_dim {
+            inv[(d % 4) * 32 + d / 4] = d as u32;
+        }
+        let inv_t = Tensor::from_vec(inv, head_dim, &device)?;
+        let k1p = k1.index_select(&inv_t, 3)?.contiguous()?;
+        let v1p = v1.index_select(&inv_t, 3)?.contiguous()?;
+
+        // Packed 2-bit shuffled map, repeated per head.
+        let mut shuf = vec![0u8; head_dim / 4];
+        for d in 0..head_dim {
+            shuf[d / 4] |= ((d % 4) as u8) << ((d % 4) * 2);
+        }
+        let pal_all: Vec<u8> = (0..n_kv_head).flat_map(|_| shuf.iter().copied()).collect();
+
+        // Backing: chunk 0 = sealed partial (identity map), chunk 1 = full
+        // (shuffled map + permuted data), chunk 2 = empty writer.
+        let backing = ChunkedKvBacking::new(b_sz, n_kv_head, head_dim, dtype, &device, 3 * CHUNK)?;
+        backing.ensure_for_offset(0, 0, 2 * CHUNK + new_len)?;
+        backing.write_contiguous(0, 0, &k0, &v0)?;
+        backing.write_contiguous(0, CHUNK, &k1p, &v1p)?;
+        backing.set_block_window(0, 0, 0, p as u32)?;
+        backing.set_block_window(0, 1, 0, CHUNK as u32)?;
+        backing.test_set_block_palette(0, 1, pal_all.clone(), pal_all, Vec::new(), Vec::new())?;
+        backing.test_set_writer_start(0, 2)?;
+
+        let mut cache0 = KvCache::new(2, 4096);
+        cache0.force_dtype(dtype);
+        cache0.set_chunked_backing(&backing, 0, None)?;
+        cache0.set_current_seq_len(prefix_len)?;
+
+        let offsets = [prefix_len];
+        let mut caches: [&mut KvCache; 1] = [&mut cache0];
+        let rope_zeros = Tensor::zeros(b_sz, DType::U32, &device)?;
+        let generation = backing.begin_stager_generation_required();
+
+        let out = paged_prefill_uniform(
+            &mut caches,
+            &offsets,
+            &new_q,
+            &new_k,
+            &new_v,
+            b_sz,
+            new_len,
+            n_head,
+            n_kv_head,
+            head_dim,
+            None,
+            &rope_zeros,
+            &make_zero_rope_cs(head_dim, 16, &device)?,
+            false, // rope_interleaved
+            {
+                let mut b = generation.alloc(b_sz * 4)?;
+                b.fill(0u8);
+                generation.submit(b)?.dev_ptr()
+            }, // write_offset_shifts
+            &generation,
+        )?;
+        assert_eq!(out.len(), 1);
+        let paged_out = &out[0];
+
+        // Reference attends the LOGICAL prefix (un-permuted) + new segment.
+        let full_k = Tensor::cat(&[&k0, &k1, &new_k], 2)?;
+        let full_v = Tensor::cat(&[&v0, &v1, &new_v], 2)?;
+        let ref_out = reference_attention(
+            &new_q, &full_k, &full_v, n_head, n_kv_head, head_dim, prefix_len,
+        )?;
+
+        let paged_f32 = paged_out.to_dtype(DType::F32)?;
+        let mae = mean_abs_error(&paged_f32, &ref_out)?;
+        let max_err = max_abs_error(&paged_f32, &ref_out)?;
+        assert!(
+            mae < 0.05,
+            "straddle shuffled-pal-map prefill mean error too large: {mae} — \
+             the prefix tile loader routed a straddle slice through the wrong \
+             palette table"
+        );
+        assert!(
+            max_err < 0.2,
+            "straddle shuffled-pal-map prefill max error too large: {max_err}"
+        );
+        println!("straddle shuffled-pal-map prefill OK: mae={mae:.4e} max_err={max_err:.4e}");
+        Ok(())
+    }
+
     #[test]
     fn correctness_prefill_with_prefix_f16() -> Result<()> {
         use candle_nn::kv_cache::ChunkedKvBacking;

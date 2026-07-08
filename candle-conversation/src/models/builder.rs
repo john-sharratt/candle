@@ -9,7 +9,6 @@ use crate::error::ConversationError;
 use crate::models::DialectType;
 use crate::tree::ConversationTreeConfig;
 use candle::Device;
-use candle_nn::kv_cache::QuantFormat;
 use candle_nn::{arena_chunks_for_format, CHUNK_SIZE};
 use candle_transformers::models::batched_model::BatchedInference;
 use std::path::{Path, PathBuf};
@@ -566,13 +565,15 @@ impl ModelBuilder {
         let mut ret = EngineConfig::new(eos_tokens.into());
         ret.disable_summariser = self.disable_summariser;
         ret.batched_config.compression_level = Some(self.kv_compression_level);
-        // K is pinned to a UNIFORM format with identity pal_map + unit outer
-        // scales. The provenance recall path's K-signature reader assumes that
-        // layout; adaptive (non-identity pal_map / non-unit scale) K measurably
-        // degrades recall when dialogue attends back over it. Q8_KS keeps the
-        // recall-safe uniform layout while giving K full 8-bit fidelity (vs the
-        // harder 4-bit Q4_KS). V stays fully adaptive.
-        ret.batched_config.override_k_quant = Some(QuantFormat::Q8_KS);
+        // Stress test: uniform-K pin REMOVED — both K and V now use fully
+        // adaptive per-(head,palette) selection with non-identity pal_maps,
+        // exercising the palette-straddle decode path on BOTH sides.
+        // (Production pins K to a uniform Q8_KS/identity layout because the
+        // provenance recall K-signature reader assumes it; adaptive K measurably
+        // degrades recall. Restore `Some(QuantFormat::Q8_KS)` if recall
+        // regresses — the duplication control asserts on verbatim reproduction,
+        // not recall quality, so this isolates the straddle path.)
+        ret.batched_config.override_k_quant = None;
         ret.batched_config.override_v_quant = None;
         ret.vocab_size = vocab_size;
         ret.max_concurrent_conversations = self.max_concurrent;

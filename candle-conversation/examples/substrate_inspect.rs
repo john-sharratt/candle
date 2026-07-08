@@ -267,6 +267,21 @@ enum Cmd {
         #[arg(long)]
         text: bool,
     },
+    /// Combined linear dump of a whole conversation in one pass: every turn in
+    /// append (chronological) order with its forest kind (normal / SoT / SoS),
+    /// `no_think`, token + per-layer KV counts, decoded user/assistant text, and
+    /// the projection events that ran on it. The union of `streams` + `tree` +
+    /// `turn-audit` + `tokens` + `projections`, so a conversation reads
+    /// top-to-bottom without stitching several slow commands together.
+    Dump {
+        /// Restrict to one timeline (raw u64 id, as printed by `streams`). Omit
+        /// to dump every conversation.
+        #[arg(long)]
+        timeline: Option<u64>,
+        /// Untruncated text + every projection's full section/turn selection.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -333,6 +348,7 @@ fn main() -> Result<()> {
         Cmd::BeliefDecay { tag, window, chunk } => belief_decay(&mut log, &tag, window, chunk)?,
         Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
         Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, &log_path, timeline, text)?,
+        Cmd::Dump { timeline, full } => dump(&mut log, timeline, full)?,
     }
     Ok(())
 }
@@ -2535,6 +2551,172 @@ fn turn_audit(
     Ok(())
 }
 
+/// Combined linear dump of a conversation — see [`Cmd::Dump`]. One metadata
+/// scan builds the substrate; then each turn is printed in append order with its
+/// forest kind, `no_think`, token/KV counts, decoded text, and projection
+/// events. Replaces stitching `streams` + `tree` + `turn-audit` + `tokens` +
+/// `projections` together across several slow full-log passes.
+fn dump(log: &mut LogFile, only_timeline: Option<u64>, full: bool) -> Result<()> {
+    let substrate = build_substrate(log)?;
+    let first_seen = first_seen_offsets(log)?;
+
+    struct TurnRec {
+        id: StreamId,
+        decl: TurnDecl,
+        chunk_locs: Vec<(u64, u64)>,
+        tokens_loc: Option<(u64, u64)>,
+        kind: TurnKind,
+        children: Vec<u32>,
+        proj: Option<Vec<u8>>,
+    }
+    let mut turns: Vec<TurnRec> = Vec::new();
+    for (id, entry) in substrate.all_streams() {
+        let Some(StreamDecl::Turn(t)) = &entry.decl else {
+            continue;
+        };
+        if only_timeline.is_some_and(|o| t.timeline_id != o) {
+            continue;
+        }
+        let tl = TimelineId::from_raw(t.timeline_id);
+        let (kind, children) =
+            match tl.and_then(|tl| substrate.tree_meta_of(tl, TurnIndex(t.turn_index))) {
+                Some(m) => (m.kind, m.children.iter().map(|c| c.0).collect()),
+                None => (TurnKind::Normal, Vec::new()),
+            };
+        let proj = tl
+            .and_then(|tl| substrate.projection_events_blob(tl, TurnIndex(t.turn_index)))
+            .map(|b| b.to_vec());
+        turns.push(TurnRec {
+            id,
+            decl: t.clone(),
+            chunk_locs: entry
+                .chunks
+                .values()
+                .map(|l| (l.offset, l.record_size))
+                .collect(),
+            tokens_loc: entry.tokens.map(|l| (l.offset, l.record_size)),
+            kind,
+            children,
+            proj,
+        });
+    }
+    drop(substrate);
+    turns.sort_by_key(|t| first_seen.get(&t.id).copied().unwrap_or(u64::MAX));
+
+    if turns.is_empty() {
+        println!("(no turn streams matching that filter)");
+        return Ok(());
+    }
+
+    let role_name = |r: u8| match r {
+        0 => "sys",
+        1 => "user",
+        2 => "asst",
+        _ => "?",
+    };
+    let kind_str = |k: TurnKind, ch: &[u32]| match k {
+        TurnKind::Normal => "NORMAL".to_string(),
+        TurnKind::SummaryOfTurns => format!("SoT ←{ch:?}"),
+        TurnKind::SummaryOfSummaries => format!("SoS ←{ch:?}"),
+    };
+
+    let mut cur_tl: Option<u64> = None;
+    for t in &turns {
+        let d = &t.decl;
+        if cur_tl != Some(d.timeline_id) {
+            cur_tl = Some(d.timeline_id);
+            let n = turns
+                .iter()
+                .filter(|x| x.decl.timeline_id == d.timeline_id)
+                .count();
+            println!(
+                "\n════════ conversation timeline {}  ({} turns) ════════",
+                d.timeline_id, n
+            );
+        }
+        let layout = candle_conversation::turn_layout::TurnLayout::new(d.segments.clone());
+        let ids = match t.tokens_loc {
+            Some((off, sz)) => decode_token_ids(&read_record_at(log, off, sz)?.payload)?,
+            None => Vec::new(),
+        };
+        let n_tok = ids.len();
+        let mut kv_tok = 0u64;
+        for &(off, sz) in &t.chunk_locs {
+            kv_tok += read_record_at(log, off, sz)?.header.token_count;
+        }
+        let blks = d.block_end.saturating_sub(d.block_start);
+        let n_chunks = t.chunk_locs.len() as u64;
+        let n_layers = if blks > 0 { n_chunks / blks } else { 0 };
+        let kv_per_layer = if n_layers > 0 {
+            kv_tok / n_layers
+        } else {
+            kv_tok
+        };
+        let events = t.proj.as_deref().map(decode_events).unwrap_or_default();
+
+        println!(
+            "\n── #{:<3} {:<12} {}  no_think={}  n_tok={} kv/layer={} chunks={}({}blk×{}L) proj={}",
+            d.turn_index,
+            kind_str(t.kind, &t.children),
+            role_name(d.role),
+            layout.no_think(),
+            n_tok,
+            kv_per_layer,
+            n_chunks,
+            blks,
+            n_layers,
+            events.len(),
+        );
+        let user_text = layout.user_text();
+        let asst_text = layout.assistant_text().unwrap_or_default();
+        let (umax, amax) = if full {
+            (usize::MAX, usize::MAX)
+        } else {
+            (240, 500)
+        };
+        println!(
+            "   user({:>3}): {}",
+            user_text.chars().count(),
+            trunc(user_text, umax)
+        );
+        println!(
+            "   asst({:>3}): {}",
+            asst_text.chars().count(),
+            trunc(&asst_text, amax)
+        );
+        if full {
+            for (i, ev) in events.iter().enumerate() {
+                print_projection_event(i, ev);
+            }
+        } else {
+            for (i, ev) in events.iter().enumerate() {
+                let sel: Vec<String> = ev
+                    .selection
+                    .turns
+                    .iter()
+                    .map(|st| {
+                        let tag = match st.kind {
+                            TurnKind::Normal => "",
+                            TurnKind::SummaryOfTurns => "(SoT)",
+                            TurnKind::SummaryOfSummaries => "(SoS)",
+                        };
+                        format!("#{}{tag}", st.index)
+                    })
+                    .collect();
+                println!(
+                    "   proj #{i} @tok{} t={:.2}s  mat={}/sub={}  sel=[{}]",
+                    ev.start_token,
+                    ev.seconds,
+                    ev.materialized_tokens,
+                    ev.substrate_tokens,
+                    sel.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decode a turn's text from its Tokens record (looked up by `(timeline, idx)`).
 fn decode_turn(
     log: &mut LogFile,
@@ -2744,7 +2926,9 @@ fn streams(log: &mut LogFile) -> Result<()> {
 /// returns records in ascending offset (append) order, the first occurrence
 /// of a `stream_id` is its creation point — the chronological key.
 fn first_seen_offsets(log: &mut LogFile) -> Result<std::collections::HashMap<StreamId, u64>> {
-    let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
+    // Headers only — first_seen needs each record's `(stream_id, offset)`, never
+    // its payload, so skip every payload read.
+    let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |_| false)?;
     let mut first = std::collections::HashMap::new();
     for e in &entries {
         let sid = e.record.header.stream_id;
@@ -3207,7 +3391,17 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
 /// populated by the same walker pass `open_in_with_substrate` uses.
 fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let mut substrate = Substrate::new();
-    let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
+    // Fast metadata scan: skip the large reference-stored payloads (KV chunks,
+    // token blobs, signatures). `apply_walker_entry` keeps only their
+    // `(offset, len)` — never the bytes — and the inspector reads specific
+    // payloads on demand, so reading them here would scan the whole multi-GB log
+    // for nothing. This is the single biggest cost in every command.
+    let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |rt| {
+        !matches!(
+            rt,
+            RecordType::Chunk | RecordType::Tokens | RecordType::Signatures
+        )
+    })?;
     for e in &entries {
         substrate.apply_walker_entry(e);
     }

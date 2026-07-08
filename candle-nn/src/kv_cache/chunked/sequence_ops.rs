@@ -261,6 +261,52 @@ impl ChunkedKvBacking {
         Ok(())
     }
 
+    /// Test-only: set one block's palette maps and outer scales directly.
+    ///
+    /// `k_pal` / `v_pal` are packed 2-bit maps, `n_kv_head × (head_dim/4)` bytes
+    /// each (empty ⇒ identity routing); `k_scale` / `v_scale` are
+    /// `n_kv_head × N_PALETTE` f32s (empty ⇒ unity). Drops the block's resident
+    /// meta record (the pal/scale it captured are now stale) and invalidates the
+    /// cached GPU slot buffer so the next forward serializes the new routing.
+    /// Combined with [`Self::set_block_window`] + [`Self::test_set_writer_start`],
+    /// this builds a prefix whose adjacent chunks carry *different* palette maps —
+    /// what the prefill straddle-routing regression test needs.
+    pub fn test_set_block_palette(
+        &self,
+        batch_idx: usize,
+        block_idx: usize,
+        k_pal: Vec<u8>,
+        v_pal: Vec<u8>,
+        k_scale: Vec<f32>,
+        v_scale: Vec<f32>,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let seq = state
+            .sequences
+            .get_mut(batch_idx)
+            .and_then(|s| s.as_mut())
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "test_set_block_palette: slot {batch_idx} not allocated"
+                ))
+            })?;
+        let cw = seq.chunk_at_mut(block_idx).ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "test_set_block_palette: block {block_idx} not allocated in slot {batch_idx}"
+            ))
+        })?;
+        cw.k_pal = Arc::new(k_pal);
+        cw.v_pal = Arc::new(v_pal);
+        cw.k_scale = Arc::new(k_scale);
+        cw.v_scale = Arc::new(v_scale);
+        cw.meta = None;
+        seq.invalidate_gpu_chunks();
+        Ok(())
+    }
+
     /// Append borrowed chunk references to an existing sequence's block table.
     ///
     /// Unlike [`inject_prefix_chunks`] (which resets a fresh, empty slot),

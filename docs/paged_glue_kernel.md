@@ -82,9 +82,11 @@ streams overlap. `block = WARPS_PER_BLOCK × 32` threads. Per block:
 4. **Score.** One warp per row; lanes own `VEC` head dims; a manual dot +
    warp-shuffle reduce per `(row, column)` (the dot is negligible vs. the
    streaming — §2 — so no MMA), then an online-softmax update of the smem `O`
-   accumulator. The causal mask is by **actual** position (`col_actual_pos[col]
-   > col_actual_pos[row]` → skip), so it generalizes to scattered glue islands;
-   today glue is the contiguous tail, so this reduces to ordinary causal.
+   accumulator. The mask is by **true position** — each column's position is read
+   from its chunk `rope_base` (stashed during dequant), and glue row `t` skips
+   column `c` iff `cpos > row_pos + fwd_ahead[t]`: backward-unbounded,
+   forward-windowed (§6). This generalizes to scattered glue islands and to the
+   forward bridge; `fwd_ahead[t] == 0` is ordinary causal.
 5. **Normalize + write** `O / l` to the output.
 
 There is no split-KV/combine: the single per-block prefix stream plus the
@@ -107,32 +109,42 @@ op). Other head dims fall through to plain `paged_prefill_batched`.
 
 By default glue rows attend **backward only** — the sealed prefix (A) plus
 earlier glue, masked causally by true position. The optional **forward window**
-additionally opens the first `fwd_b` columns of the *next* section (B), so glue
-is generated as a bridge **into** B rather than a blind continuation of A.
+additionally opens a few columns *past* a glue token's own position, so glue is
+generated as a bridge **into** the following section (B) rather than a blind
+continuation of A.
 
-- **Kernel** (`fwd_window` / `b_avail`): `fwd_b = min(fwd_window, b_avail[slot])`
-  extends the column stream to `[0, kv_len + fwd_b)`. Columns `[kv_len,
-  kv_len+fwd_b)` are B; the causal test is skipped for them (always visible),
-  while glue↔glue causality is unchanged. B is **read-only** — the scatter still
-  writes only `t < g_total`. `fwd_b == 0` is bit-identical to the backward-only
-  kernel (same column set, same mask).
+- **Kernel** (per-token `fwd_ahead`): the mask is `cpos <= row_pos +
+  fwd_ahead[t]` by **true position**, not packed order. The whole slot `[0,
+  kv_len)` is streamed as always; `fwd_ahead[t]` just widens which columns glue
+  row `t` may see forward. `fwd_ahead[t] == 0` is ordinary causal (bit-identical
+  to backward-only); `> 0` opens exactly that many tokens of whatever is
+  physically downstream of the glue. B is **read-only** — the scatter still writes
+  only `t < g_total`. The window is per glue token (not per slot), so different
+  islands can carry different windows with no kernel change.
 - **Asymmetric by design.** Backward is unbounded (A is true, fixed context —
   free and consistent to read); forward is capped at B's leading keys, which are
-  stale (written against B's original, now-deleted neighbourhood) and only
-  meaningful as far as B's heads reach back (~16–32 tokens).
-- **Layout assumption.** B's leading columns must already be resident in the
-  slot's `position_map` at `[kv_len, kv_len+fwd_b)`, with `col_actual_pos`
-  carrying their assembled (downstream-of-glue) positions — then the existing
-  dequant-once + per-column RoPE path handles them with no special case. If B
-  lives in a separate slot/allocation it is **not** in this position_map and the
-  window must stay closed (`b_avail == 0`); staging it there is a separate path.
-- **Status.** Threaded end-to-end (kernel → FFI → `PagedGlueChunks` →
-  `paged_glue_attn`). The production reproject path passes `fwd_window == 0` (B is
-  not yet staged downstream of the glue in the slot's position_map), so the window
-  is **landed dark**; the kernel gate `paged_glue_forward_window_f16` proves
-  correctness by staging B into the slot's position_map and matching a glue→B-head
-  cross-attention golden, while requiring the output to differ from the
-  backward-only run.
+  stale (written against B's original neighbourhood) and only meaningful as far
+  as B's heads reach back (~16–32 tokens).
+- **Two layouts, two behaviours.**
+  - *Interspersed glue (the projection reproject path).* The gap-fill assembles
+    the whole projection in logical order — sealed turns injected in place, glue
+    gaps reserved between them — so the **next turn/summary B is already resident
+    within `[0, kv_len)`** immediately downstream of the glue gap (positions are
+    contiguous; the convention assert enforces it). Nothing extra to stage: a
+    nonzero `fwd_ahead` on that boundary glue attends straight into the resident
+    turn.
+  - *Glue-at-tail bridging to a not-yet-appended section.* If B lives beyond
+    `kv_len` (a separate slot/allocation, or a section not yet assembled), it is
+    **not** in this position_map and the window must stay closed; staging it is a
+    separate path.
+- **Status — lit for inter-turn glue.** `candle-conversation`'s reproject
+  assembler sets `fwd_ahead = TURN_BRIDGE_FWD_AHEAD (16)` for glue whose next
+  piece is a `Turn`/`TurnHalf` (`glue_bridge_window`), i.e. the boundary glue
+  leading into each projected turn/summary; all other glue (section boundaries,
+  the pre-deferred-user tail) stays `0`. The kernel gate
+  `paged_glue_forward_window_f16` proves correctness by staging B downstream and
+  matching a glue→B-head cross-attention golden while requiring the output to
+  differ from the backward-only run.
 
 ## 7. Reuse from paged-decode
 

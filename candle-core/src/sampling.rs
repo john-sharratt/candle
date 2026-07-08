@@ -512,6 +512,7 @@ impl CustomOp1 for BatchedSampling {
                     0,                // segment_close_ramp_len (disabled)
                     0.0,              // segment_close_max_multiplier (disabled)
                     std::ptr::null(), // segment_lens
+                    std::ptr::null(), // dry_lens
                     0.0,              // segment_temp_boost (disabled)
                     std::ptr::null(), // suppress_tokens (disabled)
                     0,                // suppress_count (disabled)

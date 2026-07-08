@@ -55,6 +55,24 @@ fn all_zero(bytes: &[u8]) -> bool {
 pub fn walk(
     src: &mut dyn LogSource,
     start: u64,
+    visit: impl FnMut(&WalkEntry),
+) -> Result<WalkOutcome> {
+    walk_filtered(src, start, |_| true, visit)
+}
+
+/// Like [`walk`], but `read_payload(record_type)` decides whether a record's
+/// payload bytes are read. When it returns `false` the payload is skipped and
+/// the visited entry carries an empty payload — the walk still advances by the
+/// header's declared length, so framing is unaffected.
+///
+/// A metadata-only pass can thus skip the multi-GB `Chunk` / `Tokens` /
+/// `Signatures` payloads (which the substrate stores by `(offset, len)`
+/// reference, never by value — see `Substrate::apply_walker_entry`), turning a
+/// full-log read into an essentially header-only scan.
+pub fn walk_filtered(
+    src: &mut dyn LogSource,
+    start: u64,
+    mut read_payload: impl FnMut(RecordType) -> bool,
     mut visit: impl FnMut(&WalkEntry),
 ) -> Result<WalkOutcome> {
     let size = src.size()?;
@@ -123,8 +141,13 @@ pub fn walk(
         // we already parsed from the probe sector. This is what makes a multi-GB walk
         // cheap — without it the walk re-reads and copies the entire log into RAM. The
         // walk's torn-record detection is header-framed (size/zero-fill), so skipping
-        // the payload read changes nothing there.
-        if matches!(header.record_type, RecordType::Chunk | RecordType::Tokens) {
+        // the payload read changes nothing there.  `WideQSig` / `ProjectionEvents`
+        // are NOT skipped — the belief gallery re-populates their blobs from the
+        // payload on reload.  `Chunk` / `Tokens` are ALWAYS skipped (never read by
+        // value); `read_payload` lets a caller skip additional types on top.
+        if matches!(header.record_type, RecordType::Chunk | RecordType::Tokens)
+            || !read_payload(header.record_type)
+        {
             let entry = WalkEntry {
                 offset,
                 record: Record {
@@ -170,6 +193,19 @@ pub fn walk(
 pub fn collect(src: &mut dyn LogSource, start: u64) -> Result<(Vec<WalkEntry>, WalkOutcome)> {
     let mut entries = Vec::new();
     let outcome = walk(src, start, |e| entries.push(e.clone()))?;
+    Ok((entries, outcome))
+}
+
+/// As [`collect`], but skips reading payloads for which `read_payload` returns
+/// `false` (their entries carry an empty payload). Use for a fast metadata-only
+/// scan that avoids reading large reference-stored payloads.
+pub fn collect_filtered(
+    src: &mut dyn LogSource,
+    start: u64,
+    read_payload: impl FnMut(RecordType) -> bool,
+) -> Result<(Vec<WalkEntry>, WalkOutcome)> {
+    let mut entries = Vec::new();
+    let outcome = walk_filtered(src, start, read_payload, |e| entries.push(e.clone()))?;
     Ok((entries, outcome))
 }
 
