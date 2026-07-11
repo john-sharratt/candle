@@ -1129,7 +1129,6 @@ impl ModelWeights {
     ///     offset: 0,
     ///     input_ids: &seq1_tokens,
     ///     input_len: 3,
-    ///     write_offset_shift: 0,
     /// };
     /// let output1 = model.forward_with_context(ctx1)?;
     ///
@@ -1140,7 +1139,6 @@ impl ModelWeights {
     ///     offset: 0,
     ///     input_ids: &seq2_tokens,
     ///     input_len: 3,
-    ///     write_offset_shift: 0,
     /// };
     /// let output2 = model.forward_with_context(ctx2)?;
     /// # Ok(())
@@ -1181,7 +1179,6 @@ impl ModelWeights {
             offset,
             input_ids: input,
             input_len: input.dims2()?.1,
-            write_offset_shift: 0,
         })
     }
 

@@ -611,11 +611,7 @@ fn turn_audit(
 /// forest kind, `no_think`, token/KV counts, decoded text, and projection
 /// events. Replaces stitching `streams` + `tree` + `turn-audit` + `tokens` +
 /// `projections` together across several slow full-log passes.
-fn dump(
-    log: &mut LogFile,
-    only_timeline: Option<u64>,
-    full: bool,
-) -> Result<()> {
+fn dump(log: &mut LogFile, only_timeline: Option<u64>, full: bool) -> Result<()> {
     let substrate = build_substrate(log)?;
     let first_seen = first_seen_offsets(log)?;
 
@@ -706,7 +702,11 @@ fn dump(
         let blks = d.block_end.saturating_sub(d.block_start);
         let n_chunks = t.chunk_locs.len() as u64;
         let n_layers = if blks > 0 { n_chunks / blks } else { 0 };
-        let kv_per_layer = if n_layers > 0 { kv_tok / n_layers } else { kv_tok };
+        let kv_per_layer = if n_layers > 0 {
+            kv_tok / n_layers
+        } else {
+            kv_tok
+        };
         let events = t.proj.as_deref().map(decode_events).unwrap_or_default();
 
         println!(

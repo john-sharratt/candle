@@ -596,7 +596,9 @@ const TURN_BRIDGE_FWD_AHEAD: u32 = 16;
 /// ahead, so they stay backward-only (`0`).
 fn glue_bridge_window(next: Option<&AssembledPiece>) -> u32 {
     match next {
-        Some(AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. }) => TURN_BRIDGE_FWD_AHEAD,
+        Some(AssembledPiece::Turn { .. } | AssembledPiece::TurnHalf { .. }) => {
+            TURN_BRIDGE_FWD_AHEAD
+        }
         _ => 0,
     }
 }
@@ -1277,7 +1279,10 @@ mod tests {
         assert_eq!(glue_bridge_window(Some(&turn)), TURN_BRIDGE_FWD_AHEAD);
         assert_eq!(glue_bridge_window(Some(&turn_half)), TURN_BRIDGE_FWD_AHEAD);
         // No resident turn ahead → backward-only.
-        assert_eq!(glue_bridge_window(Some(&AssembledPiece::Section(SectionId::new(7)))), 0);
+        assert_eq!(
+            glue_bridge_window(Some(&AssembledPiece::Section(SectionId::new(7)))),
+            0
+        );
         assert_eq!(
             glue_bridge_window(Some(&AssembledPiece::DeferredUser(Arc::new(vec![9])))),
             0
@@ -1307,7 +1312,10 @@ mod tests {
             .collect();
         // Glue islands in order: leading run→Section (0), user_start→Turn (16),
         // assistant_end++user_start→Turn (16), assistant_end++run→DeferredUser (0).
-        assert_eq!(windows, vec![0, TURN_BRIDGE_FWD_AHEAD, TURN_BRIDGE_FWD_AHEAD, 0]);
+        assert_eq!(
+            windows,
+            vec![0, TURN_BRIDGE_FWD_AHEAD, TURN_BRIDGE_FWD_AHEAD, 0]
+        );
     }
 
     #[test]

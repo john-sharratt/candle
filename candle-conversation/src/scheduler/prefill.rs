@@ -891,17 +891,14 @@ impl Scheduler {
         );
     }
 
-    pub(super) fn run_prefill_with_shift(
+    pub(super) fn run_prefill(
         &mut self,
         sequence_id: SequenceId,
         tokens: &[u32],
-        write_offset_shift: usize,
     ) -> Result<Tensor, ConversationError> {
         // Chunked prefill: split large prompts into bounded chunks to keep
         // intermediate activation buffers from growing unboundedly.
-        // Boundary-injection shifts are always small partial blocks and are
-        // handled as a single pass.
-        if write_offset_shift == 0 && tokens.len() > self.max_prefill_pass_tokens {
+        if tokens.len() > self.max_prefill_pass_tokens {
             let mut last_logits: Option<Tensor> = None;
             for chunk in tokens.chunks(self.max_prefill_pass_tokens) {
                 let input = Tensor::new(chunk, &self.device)
@@ -926,20 +923,10 @@ impl Scheduler {
             .and_then(|t| t.unsqueeze(0))
             .map_err(ConversationError::Model)?;
 
-        let logits_vec = if write_offset_shift == 0 {
-            self.model
-                .forward_batched(&mut self.session, &[sequence_id.0], &[input])
-                .map_err(ConversationError::Model)?
-        } else {
-            self.model
-                .forward_batched_with_write_shifts(
-                    &mut self.session,
-                    &[sequence_id.0],
-                    &[input],
-                    &[write_offset_shift as u32],
-                )
-                .map_err(ConversationError::Model)?
-        };
+        let logits_vec = self
+            .model
+            .forward_batched(&mut self.session, &[sequence_id.0], &[input])
+            .map_err(ConversationError::Model)?;
 
         self.session
             .advance_sequence(sequence_id.0, tokens.len())

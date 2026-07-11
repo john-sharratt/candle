@@ -138,6 +138,32 @@ __device__ __forceinline__ void load_a_frag_m16k32_ldmatrix(
     );
 }
 
+// ldmatrix variant of the 8x32 INT8 B load (sm_75+). The B operand is 8 rows x
+// 32 int8 = 8 x 16 b16 = exactly ldmatrix.x2's two 8x8 b16 tiles:
+//   tile0 = rows 0-7 / K 0-15 -> b[0]      tile1 = rows 0-7 / K 16-31 -> b[1]
+// Within a tile ldmatrix hands thread t the two contiguous b16 (= 4 contiguous
+// int8) at (row t>>2, K (t&3)*4..+3) - byte-identical to the strided loader's
+// b[i], no permute. Row addresses come from lanes 0-15 (tile = lane>>3, row =
+// lane&7; upper lanes' addresses are ignored); smem_b rows must be 16B-aligned
+// with a PADDED stride (multiple of 16, not of 128) so the 8 tile rows land in
+// distinct banks.
+__device__ __forceinline__ void load_b_frag_n8k32_ldmatrix(
+    uint32_t      (&b)[2],
+    const int8_t* smem_b,
+    int           ldb_bytes,
+    int           lane
+) {
+    const int tile_idx    = (lane >> 3) & 1;
+    const int row_in_tile = lane & 7;
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+        smem_b + (int64_t)row_in_tile * ldb_bytes + tile_idx * 16));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+        : "=r"(b[0]), "=r"(b[1])
+        : "r"(addr)
+    );
+}
+
 // Load an 8x32 INT8 B fragment. Per PTX ISA m16n8k32 the B operand uses the
 // SAME (groupID, threadID) lane decomposition as A — groupID = laneid>>2 selects
 // the column n (0..7), threadID = laneid&3 selects the k-quad — NOT (lane%8,

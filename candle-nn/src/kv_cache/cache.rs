@@ -417,6 +417,19 @@ impl Cache {
         }
     }
 
+    /// Visit this slot's live chunks as zero-clone [`super::LiveChunkRef`]s
+    /// (see `ChunkedKvBacking::visit_live_chunks`). `None` for contiguous
+    /// storage or an unallocated slot.
+    pub fn chunked_visit_live_chunks<R>(
+        &self,
+        f: impl FnOnce(&mut dyn Iterator<Item = super::LiveChunkRef<'_>>) -> R,
+    ) -> Option<R> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.visit_live_chunks(c.batch_idx, f),
+            CacheStorage::Contiguous { .. } => None,
+        }
+    }
+
     /// First chunk index that is writer-owned for the slot bound to
     /// this cache.  Chunks before this index are Arc-shared with
     /// substrate/parent and immutable; chunks at or after it are

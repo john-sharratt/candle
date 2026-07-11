@@ -124,3 +124,7 @@ name = "substrate_inspect"
 [[test]]
 name = "projection_harness"
 path = "tests/projection_harness/main.rs"
+
+[[test]]
+name = "prefill_ab"
+path = "tests/prefill_ab/main.rs"

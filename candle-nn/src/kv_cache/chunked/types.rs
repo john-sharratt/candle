@@ -188,6 +188,30 @@ impl ChunkMeta {
 /// **injected at any absolute position** in any sequence and the
 /// kernel will apply the correct RoPE for that new position.  No
 /// re-rotation, no byte copy, no CoW required.
+/// Borrowed view of one live chunk, for per-forward metadata builds
+/// ([`super::ChunkedKvBacking::visit_live_chunks`]). The zero-clone
+/// counterpart of [`SealedChunk`]: no `HeadGids` refcount traffic, no
+/// `arena_byte_size` walk, no Arc bumps. The owned-snapshot path cost
+/// ~0.5 ms of pure clone work per layer-call at deep prefixes — the
+/// dominant host cost of a prefill call (measured, prefill_ab profiled
+/// bench) — while the slice build itself is ~15 µs.
+pub struct LiveChunkRef<'a> {
+    /// Per-head RAII chunk IDs, indexed `head * 2 + is_value`.
+    pub gids: &'a HeadGids,
+    /// Start position within the physical chunk where this window begins.
+    pub offset: u16,
+    /// Number of valid tokens in this window (from `offset`).
+    pub token_count: u16,
+    /// Packed K/V palette maps (`n_kv_head × head_dim/4` bytes; empty =
+    /// identity) and outer scales (`n_kv_head × N_PALETTE`; empty = 1.0).
+    pub k_pal: &'a [u8],
+    pub v_pal: &'a [u8],
+    pub k_scale: &'a [f32],
+    pub v_scale: &'a [f32],
+    /// Device-resident KvHead record handle, when the chunk has one.
+    pub meta: Option<&'a MetaGid>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SealedChunk {

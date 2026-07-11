@@ -398,22 +398,22 @@ pub fn cpu_sample_argmax(
     }
 
     // Compute DRY penalties
-    let dry_penalties =
-        if dry_multiplier != 0.0 && !dry_recent.is_empty() && !dry_lens_v.is_empty() {
-            let rlen = dry_lens_v[batch_idx] as usize;
-            cpu_compute_dry_penalties(
-                dry_recent,
-                rlen,
-                batch_idx,
-                max_recent_len,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                dry_range,
-            )
-        } else {
-            vec![]
-        };
+    let dry_penalties = if dry_multiplier != 0.0 && !dry_recent.is_empty() && !dry_lens_v.is_empty()
+    {
+        let rlen = dry_lens_v[batch_idx] as usize;
+        cpu_compute_dry_penalties(
+            dry_recent,
+            rlen,
+            batch_idx,
+            max_recent_len,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            dry_range,
+        )
+    } else {
+        vec![]
+    };
 
     // Apply all penalties to get effective logits
     let mut penalized: Vec<f32> = Vec::with_capacity(vocab_size);

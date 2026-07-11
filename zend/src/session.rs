@@ -1687,19 +1687,6 @@ impl ZendSession {
         Some(engine.set_conversation_archived(timeline, archived))
     }
 
-    /// Enable or disable AVL summarisation for `conv_id`'s timeline. Only takes
-    /// effect once the timeline exists (i.e. after its first turn has been
-    /// submitted). Returns `None` if the model isn't loaded. Used by tests to
-    /// isolate whether the async summariser's concurrent activity influences a
-    /// conversation's decode.
-    pub fn set_conversation_summarize(&self, conv_id: &str, summarize: bool) -> Option<()> {
-        let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
-        let timeline = timeline_for(conv_id);
-        let engine = state.engine.lock().unwrap();
-        engine.set_timeline_summarize(timeline, summarize);
-        Some(())
-    }
-
     /// Decoded turn history for a single recovered conversation — backs
     /// `GET /v1/conversations/{id}`. Returns `None` when the model isn't
     /// loaded yet; an empty `Vec` when the conv_id has no recovered turns.

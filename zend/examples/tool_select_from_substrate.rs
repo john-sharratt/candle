@@ -34,13 +34,13 @@ use candle_conversation::models::Model;
 use candle_conversation::persistence::resume::decode_signatures;
 use candle_conversation::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::SubstratePersistence;
-use candle_conversation::turn_layout::TurnLayout;
 use candle_conversation::projection::{
     Builder, DepthWeights, ProjectionMode, ProjectionTarget, ScoreFormula, SectionId,
     TimelineAllocator,
 };
 use candle_conversation::provenance::BdpScanner;
 use candle_conversation::substrate::{PerDepthScores, ScoredSubstrate, Substrate, TurnScores};
+use candle_conversation::turn_layout::TurnLayout;
 use candle_conversation::{ProvenanceFile, SigEntry, TokenSignature};
 use serde::{Deserialize, Serialize};
 use zend::tools::install_tool_catalog;

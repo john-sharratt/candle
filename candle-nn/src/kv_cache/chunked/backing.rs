@@ -17,7 +17,7 @@ use candle::{DType, Device, Result, Tensor};
 
 use super::{
     Arena, ArenaStorage, ArenaStorageState, BlockTableState, ChunkMeta, CompressionPolicy,
-    SealedChunk, StoragePolicy,
+    LiveChunkRef, SealedChunk, StoragePolicy,
 };
 use crate::kv_cache::arena_table::{ArenaLocation, PerHeadEntry};
 use crate::kv_cache::{HeadGids, KvFormat, ResolvedArenaInfo};
@@ -922,6 +922,32 @@ impl ChunkedKvBacking {
         let state = self.state.read().ok()?;
         let seq = state.sequences.get(batch_idx)?.as_ref()?;
         Some(seq.writer_start_idx())
+    }
+
+    /// Visit `batch_idx`'s live chunks as borrowed [`LiveChunkRef`]s under
+    /// the state read lock — the zero-clone path for per-forward metadata
+    /// builds. [`Self::live_chunks_as_sealed`] stays for callers that need
+    /// OWNED snapshots (seal/persist/migration); this path exists because
+    /// its per-chunk clones + `arena_byte_size` walks were the dominant
+    /// host cost of a prefill call at deep prefixes.
+    pub fn visit_live_chunks<R>(
+        &self,
+        batch_idx: usize,
+        f: impl FnOnce(&mut dyn Iterator<Item = LiveChunkRef<'_>>) -> R,
+    ) -> Option<R> {
+        let state = self.state.read().ok()?;
+        let seq = state.sequences.get(batch_idx)?.as_ref()?;
+        let mut it = seq.chunks_slice().iter().map(|cw| LiveChunkRef {
+            gids: &cw.gids,
+            offset: cw.offset,
+            token_count: cw.usage as u16,
+            k_pal: cw.k_pal.as_slice(),
+            v_pal: cw.v_pal.as_slice(),
+            k_scale: cw.k_scale.as_slice(),
+            v_scale: cw.v_scale.as_slice(),
+            meta: cw.meta.as_ref(),
+        });
+        Some(f(&mut it))
     }
 
     pub fn live_chunks_as_sealed(

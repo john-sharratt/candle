@@ -2518,28 +2518,6 @@ pub trait ManagedBatchedModel {
         inputs: &[Tensor],
     ) -> Result<Vec<Tensor>>;
 
-    /// Run a batched forward pass with per-sequence KV write offset shifts.
-    ///
-    /// This is used by the static chunk cache to right-pack partial blocks: the prefill
-    /// kernel writes KV at physical positions `shift..shift+token_count` instead of
-    /// `0..token_count`, so the injected prefix reads from the correct physical locations.
-    ///
-    /// For sequences where `write_offset_shifts[i] == 0`, behaviour is identical to
-    /// `forward_batched`.
-    ///
-    /// The default implementation ignores the shifts (safe for non-paged paths).
-    fn forward_batched_with_write_shifts(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
-        inputs: &[Tensor],
-        write_offset_shifts: &[u32],
-    ) -> Result<Vec<Tensor>> {
-        // Default: ignore shifts (correct for non-CUDA / non-paged paths)
-        let _ = write_offset_shifts;
-        self.forward_batched(session, seq_indices, inputs)
-    }
-
     /// Create a batched inference session configured for this model.
     fn create_batched_session(&self, config: BatchedConfig) -> Result<BatchedInferenceSession> {
         let mut config = config;
@@ -2758,7 +2736,6 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
                 kv_caches: caches,
                 input_ids: &inputs[i],
                 input_len: input_lens[i],
-                write_offset_shift: 0,
             });
         }
 
@@ -2804,100 +2781,6 @@ impl<M: BatchedModelCore> ManagedBatchedModel for BatchedInference<M> {
         }
 
         Ok(outputs)
-    }
-
-    fn forward_batched_with_write_shifts(
-        &self,
-        session: &mut BatchedInferenceSession,
-        seq_indices: &[usize],
-        inputs: &[Tensor],
-        write_offset_shifts: &[u32],
-    ) -> Result<Vec<Tensor>> {
-        if inputs.len() != seq_indices.len() || write_offset_shifts.len() != seq_indices.len() {
-            candle::bail!(
-                "Input count {}, shift count {}, sequence count {} must all match",
-                inputs.len(),
-                write_offset_shifts.len(),
-                seq_indices.len()
-            );
-        }
-
-        let stager_generation = session.begin_stager_generation();
-
-        let max_input_len = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .max()
-            .unwrap_or(1);
-
-        // Build the final decode/prefill headers before the mutable caches borrow.
-        let seq_offsets: Vec<usize> = seq_indices
-            .iter()
-            .map(|&i| session.sequence_offset(i).unwrap_or(0))
-            .collect();
-        #[cfg(feature = "cuda")]
-        let (_pm_guard, decode_headers) = if max_input_len == 1 {
-            let (pm_guard, buf, stride) =
-                session.build_decode_metadata(seq_indices, &stager_generation)?;
-            (pm_guard, DecodeHeaders::Decode { buf, stride })
-        } else {
-            let meta = BatchedPrefillMeta::new(&seq_offsets, max_input_len, self.device())?;
-            (None, DecodeHeaders::Prefill(meta))
-        };
-        #[cfg(not(feature = "cuda"))]
-        let decode_headers = if max_input_len == 1 {
-            DecodeHeaders::Decode {
-                buf: None,
-                stride: 0,
-            }
-        } else {
-            let meta = BatchedPrefillMeta::new(&seq_offsets, max_input_len, self.device())?;
-            DecodeHeaders::Prefill(meta)
-        };
-
-        let mut caches_data = session.caches_for_sequences_mut(seq_indices);
-        let input_lens: Vec<usize> = inputs
-            .iter()
-            .map(|t| t.dims().get(1).copied().unwrap_or(1))
-            .collect();
-
-        let mut contexts: Vec<SequenceContext<'_>> = Vec::with_capacity(inputs.len());
-        for (i, (_seq_idx, offset, caches)) in caches_data.iter_mut().enumerate() {
-            contexts.push(SequenceContext {
-                offset: *offset,
-                kv_caches: caches,
-                input_ids: &inputs[i],
-                input_len: input_lens[i],
-                write_offset_shift: write_offset_shifts[i] as usize,
-            });
-        }
-
-        let total_tokens = contexts.len() * max_input_len;
-        if total_tokens > MAX_PREFILL_TOKENS && max_input_len > 1 {
-            let raw_seqs = MAX_PREFILL_TOKENS / max_input_len;
-            let seqs_per_slice = if raw_seqs >= 32 {
-                (raw_seqs / 32) * 32
-            } else {
-                raw_seqs.max(1)
-            };
-
-            let mut all_logits = Vec::with_capacity(contexts.len());
-            for slice_start in (0..contexts.len()).step_by(seqs_per_slice) {
-                let slice_end = (slice_start + seqs_per_slice).min(contexts.len());
-                let slice = &mut contexts[slice_start..slice_end];
-                let offsets: Vec<usize> = slice.iter().map(|c| c.offset).collect();
-                let meta = BatchedPrefillMeta::new(&offsets, max_input_len, self.device())?;
-                let slice_logits =
-                    self.forward_batch(slice, &stager_generation, DecodeHeaders::Prefill(meta))?;
-                all_logits.extend(slice_logits.into_vec()?);
-            }
-            Ok(all_logits)
-        } else {
-            let result = self
-                .forward_batch(&mut contexts, &stager_generation, decode_headers)?
-                .into_vec()?;
-            Ok(result)
-        }
     }
 
     fn prune(&self) -> Result<()> {

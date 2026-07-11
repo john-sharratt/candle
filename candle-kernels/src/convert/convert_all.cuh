@@ -476,7 +476,7 @@ struct ArenaAccessor {
         }
     }
     
-    __device__ __forceinline__ int get_quant_block_bytes(int fmt) const {
+    static __device__ __forceinline__ int get_quant_block_bytes(int fmt) {
         switch (fmt) {
             case ArenaFormat::Q4_0: return 18;
             case ArenaFormat::Q4_1: return 20;

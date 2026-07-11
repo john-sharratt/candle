@@ -673,7 +673,6 @@ fn run_prefill(
         rope_offsets,
         rope_cs,
         false,
-        0,
         &generation,
         &std::cell::RefCell::new(None),
     )?;

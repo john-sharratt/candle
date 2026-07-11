@@ -40,7 +40,7 @@ use candle::quantized::pinned_staging::PinnedBuf;
 #[cfg(feature = "cuda")]
 use candle::quantized::GgmlDType;
 #[cfg(feature = "cuda")]
-use candle::{Device, DType, Result};
+use candle::{DType, Device, Result};
 
 #[cfg(feature = "cuda")]
 use super::arena::ArenaKey;

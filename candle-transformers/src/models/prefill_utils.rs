@@ -94,24 +94,34 @@ fn build_slot_headers(
     // each slot's slices WITHOUT its position_map.
     let pm_cached = shared_pm.borrow().is_some();
 
-    let mut slots: Vec<SlotStateHost> = caches
-        .iter()
-        .map(|cache| {
-            let chunks = cache
-                .k_cache()
-                .chunked_live_chunks_as_sealed_with(&arena_info)
-                .unwrap_or_default();
-            let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
-            SlotStateHost::from_sealed_chunks(
-                &chunks,
-                n_kv_head,
-                head_dim,
-                &arena_info,
-                writer_start_idx,
-                !pm_cached,
-            )
-        })
-        .collect();
+    // Zero-clone slice build: visit each cache's live chunks by reference
+    // (no SealedChunk materialization — its per-chunk clones and
+    // arena_byte_size walks measured ~0.5 ms per layer-call at deep
+    // prefixes, ~30x the slice build itself).
+    let mut slots: Vec<SlotStateHost> = Vec::with_capacity(caches.len());
+    for cache in caches.iter() {
+        let writer_start_idx = cache.k_cache().chunked_writer_start_idx().unwrap_or(0);
+        let mut slices: Vec<TokenSliceHost> = Vec::new();
+        let mut cum: u32 = 0;
+        cache.k_cache().chunked_visit_live_chunks(|it| {
+            for c in it {
+                let rope_base = cum;
+                cum = cum.saturating_add(c.token_count as u32);
+                slices.push(TokenSliceHost::from_live_chunk(
+                    &c,
+                    rope_base,
+                    n_kv_head,
+                    head_dim,
+                    &arena_info,
+                ));
+            }
+        });
+        slots.push(SlotStateHost::from_slices(
+            slices,
+            writer_start_idx,
+            !pm_cached,
+        ));
+    }
 
     // Extend each slot's position_map to cover the write region. Ragged: slot i
     // writes q_lens[i] new tokens, so after this `position_map.len() ==
@@ -291,11 +301,10 @@ fn paged_prefill_batched_impl(
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     rope_offsets: &Tensor,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-    write_offset_shifts_ptr: u64,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
@@ -398,6 +407,12 @@ fn paged_prefill_batched_impl(
     // tripping the `ws_offset + ws_len < CHUNK_SIZE` assert on its next decode.
     // Per-cache calls use each cache's real batch_idx, so a single-element slice
     // targets the correct slot.
+    // Entry drain: attributes GPU work still in flight when the prefill
+    // call begins (enqueued by the caller) separately from this call's own
+    // spans — without it the first sync'd span absorbs the caller's tail.
+    let t_entry = profile_now();
+    profile_sync(q.device());
+    pipeline_record("prefill:entry", t_entry);
     let t_alloc = profile_now();
     for (i, &add) in q_lens.iter().enumerate() {
         KvCache::ensure_chunked_capacity_batch(&mut caches[i..i + 1], &offsets[i..i + 1], add)?;
@@ -406,7 +421,7 @@ fn paged_prefill_batched_impl(
     pipeline_record("prefill:alloc", t_alloc);
 
     let t_meta = profile_now();
-    let (compute_dtype, _chunk_size, max_blocks) = {
+    let (compute_dtype, _chunk_size) = {
         let first = caches
             .first()
             .ok_or_else(|| candle::Error::Msg("expected non-empty caches".into()))?;
@@ -435,8 +450,7 @@ fn paged_prefill_batched_impl(
             .k_cache()
             .chunked_chunk_size()
             .ok_or_else(|| candle::Error::Msg("expected chunked chunk_size".into()))?;
-        let max_blocks = first.k_cache().chunked_max_blocks();
-        (compute_dtype, chunk_size, max_blocks)
+        (compute_dtype, chunk_size)
     };
 
     pipeline_record("prefill:metadata", t_meta);
@@ -469,36 +483,34 @@ fn paged_prefill_batched_impl(
 
     // Varlen metadata (device tensors). Renamed to `*_dev` so the host
     // `q_lens: &[usize]` param stays in scope for the per-seq seqlen update.
-    let (cu_seqlens_q, q_lens_dev, kv_lens, has_prefix) =
-        if let Some((cu, ql, kv, has_prefix)) = prefill_meta {
-            (cu.clone(), ql.clone(), kv.clone(), has_prefix)
-        } else {
-            // Fallback: rebuild the ragged metadata from the host q_lens.
-            let mut cu = Vec::with_capacity(b_sz + 1);
-            cu.push(0u32);
-            let mut acc = 0u32;
-            for &l in q_lens {
-                acc += l as u32;
-                cu.push(acc);
-            }
-            let cu_seqlens_q = Tensor::from_vec(cu, b_sz + 1, q.device())?;
-            let q_lens_dev = Tensor::from_vec(
-                q_lens.iter().map(|&l| l as u32).collect::<Vec<_>>(),
-                b_sz,
-                q.device(),
-            )?;
-            let kv_lens = Tensor::from_vec(
-                offsets
-                    .iter()
-                    .zip(q_lens.iter())
-                    .map(|(&o, &l)| (o + l) as u32)
-                    .collect::<Vec<_>>(),
-                b_sz,
-                q.device(),
-            )?;
-            let has_prefix = offsets.iter().any(|&o| o > 0);
-            (cu_seqlens_q, q_lens_dev, kv_lens, has_prefix)
-        };
+    let (cu_seqlens_q, q_lens_dev, kv_lens) = if let Some((cu, ql, kv)) = prefill_meta {
+        (cu.clone(), ql.clone(), kv.clone())
+    } else {
+        // Fallback: rebuild the ragged metadata from the host q_lens.
+        let mut cu = Vec::with_capacity(b_sz + 1);
+        cu.push(0u32);
+        let mut acc = 0u32;
+        for &l in q_lens {
+            acc += l as u32;
+            cu.push(acc);
+        }
+        let cu_seqlens_q = Tensor::from_vec(cu, b_sz + 1, q.device())?;
+        let q_lens_dev = Tensor::from_vec(
+            q_lens.iter().map(|&l| l as u32).collect::<Vec<_>>(),
+            b_sz,
+            q.device(),
+        )?;
+        let kv_lens = Tensor::from_vec(
+            offsets
+                .iter()
+                .zip(q_lens.iter())
+                .map(|(&o, &l)| (o + l) as u32)
+                .collect::<Vec<_>>(),
+            b_sz,
+            q.device(),
+        )?;
+        (cu_seqlens_q, q_lens_dev, kv_lens)
+    };
 
     let softmax_scale = 1f32 / (head_dim as f32).sqrt();
 
@@ -559,16 +571,14 @@ fn paged_prefill_batched_impl(
         &v_packed,
         headers_ptr,
         compute_dtype,
-        max_blocks,
         n_head,
         n_kv_head,
         head_dim,
         softmax_scale,
-        has_prefix,
         rope_offsets,
         rope_cs,
         rope_interleaved,
-        write_offset_shifts_ptr,
+        max_add,
     )?;
     profile_sync(q.device());
     pipeline_record("prefill:kernel", t_kernel);
@@ -605,7 +615,10 @@ fn paged_prefill_batched_impl(
     Ok(out_packed)
 }
 
-/// Public wrapper: full-context prefill (no windowing).
+/// Public wrapper: full-context prefill through the INT8 prefix-attention
+/// kernel (docs/archived/prefill_optimization.md) — GQA-packed M,
+/// slice-aligned tiles, int8 m16n8k32 QK/PV computed directly over the
+/// quantized arena.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn paged_prefill_batched(
@@ -619,11 +632,10 @@ pub fn paged_prefill_batched(
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     rope_offsets: &Tensor,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-    write_offset_shifts_ptr: u64,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
@@ -642,7 +654,6 @@ pub fn paged_prefill_batched(
         rope_offsets,
         rope_cs,
         rope_interleaved,
-        write_offset_shifts_ptr,
         generation,
         shared_pm,
     )
@@ -661,11 +672,10 @@ pub fn paged_prefill_batched(
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    _prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    _prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     _rope_offsets: &Tensor,
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
-    _write_offset_shifts_ptr: u64,
     _generation: &Generation,
     _shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<Tensor> {
@@ -758,7 +768,7 @@ pub fn paged_glue_attn(
     _n_head: usize,
     _n_kv_head: usize,
     _head_dim: usize,
-    _prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    _prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     _col_actual_pos: &Tensor,
     _rope_cs: &Tensor,
     _rope_interleaved: bool,
@@ -770,7 +780,10 @@ pub fn paged_glue_attn(
 
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
-struct PagedPrefillChunks {
+struct PagedPrefillInt8 {
+    /// Longest per-sequence q_len in the batch — sizes the kernel's
+    /// query-tile grid exactly.
+    max_q_len: usize,
     softmax_scale: f32,
     cu_seqlens_q: Tensor,
     q_lens: Tensor,
@@ -783,8 +796,6 @@ struct PagedPrefillChunks {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    max_blocks: usize,
-    has_prefix: bool,
     /// Compute dtype for K/V/Q — F16 or BF16. Pre-resolved from K and V arena formats.
     compute_dtype: DType,
     /// RoPE position offsets per batch element, shape [batch_size], dtype U32.
@@ -795,14 +806,10 @@ struct PagedPrefillChunks {
     rope_cs: Tensor,
     /// RoPE pairing style: false=non-interleaved half-split (Qwen/GPT2), true=interleaved adjacent-pairs (Llama).
     rope_interleaved: bool,
-    /// Per-batch write position shift [batch_size], dtype U32.
-    /// Zero values = no shift (left-packed). Non-zero = SSO right-pack offset.
-    /// Raw GPU device pointer (u64) into a u32 array of length batch_size.
-    write_offset_shifts_ptr: u64,
 }
 
 #[cfg(feature = "cuda")]
-impl PagedPrefillChunks {
+impl PagedPrefillInt8 {
     fn cuda_fwd_t<
         Q: candle::cuda_backend::CudaDType + DeviceRepr, // Query type
         KV: candle::cuda_backend::CudaDType + DeviceRepr, // KV cache type
@@ -815,7 +822,7 @@ impl PagedPrefillChunks {
         let (total_q, n_head, head_dim) = q_l.shape().dims3()?;
         if n_head != self.n_head || head_dim != self.head_dim {
             candle::bail!(
-                "paged-prefill-chunks: q shape mismatch got {:?} expected (total_q, {}, {})",
+                "paged-prefill-int8: q shape mismatch got {:?} expected (total_q, {}, {})",
                 q_l.shape(),
                 self.n_head,
                 self.head_dim
@@ -833,19 +840,19 @@ impl PagedPrefillChunks {
 
         if cu_seqlens_q_l.shape().dims1()? != self.batch_size + 1 {
             candle::bail!(
-                "paged-prefill-chunks: cu_seqlens_q must have len batch+1 ({})",
+                "paged-prefill-int8: cu_seqlens_q must have len batch+1 ({})",
                 self.batch_size + 1
             )
         }
         if q_lens_l.shape().dims1()? != self.batch_size {
             candle::bail!(
-                "paged-prefill-chunks: q_lens must have len batch ({})",
+                "paged-prefill-int8: q_lens must have len batch ({})",
                 self.batch_size
             )
         }
         if kv_lens_l.shape().dims1()? != self.batch_size {
             candle::bail!(
-                "paged-prefill-chunks: kv_lens must have len batch ({})",
+                "paged-prefill-int8: kv_lens must have len batch ({})",
                 self.batch_size
             )
         }
@@ -853,36 +860,36 @@ impl PagedPrefillChunks {
             || self.q_lens.dtype() != DType::U32
             || self.kv_lens.dtype() != DType::U32
         {
-            candle::bail!("paged-prefill-chunks: cu_seqlens_q/q_lens/kv_lens must be U32")
+            candle::bail!("paged-prefill-int8: cu_seqlens_q/q_lens/kv_lens must be U32")
         }
 
         let cu_seqlens_q = match &*cu_seqlens_q_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-            _ => candle::bail!("paged-prefill-chunks: cu_seqlens_q must be a cuda tensor"),
+            _ => candle::bail!("paged-prefill-int8: cu_seqlens_q must be a cuda tensor"),
         }
         .slice(cu_seqlens_q_l.start_offset()..);
 
         let q_lens = match &*q_lens_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-            _ => candle::bail!("paged-prefill-chunks: q_lens must be a cuda tensor"),
+            _ => candle::bail!("paged-prefill-int8: q_lens must be a cuda tensor"),
         }
         .slice(q_lens_l.start_offset()..);
 
         let kv_lens = match &*kv_lens_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?,
-            _ => candle::bail!("paged-prefill-chunks: kv_lens must be a cuda tensor"),
+            _ => candle::bail!("paged-prefill-int8: kv_lens must be a cuda tensor"),
         }
         .slice(kv_lens_l.start_offset()..);
 
         let k_packed = match &*k_packed_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<KV>()?,
-            _ => candle::bail!("paged-prefill-chunks: k_packed must be a cuda tensor"),
+            _ => candle::bail!("paged-prefill-int8: k_packed must be a cuda tensor"),
         }
         .slice(k_packed_l.start_offset()..);
 
         let v_packed = match &*v_packed_s {
             candle::Storage::Cuda(c) => c.as_cuda_slice::<KV>()?,
-            _ => candle::bail!("paged-prefill-chunks: v_packed must be a cuda tensor"),
+            _ => candle::bail!("paged-prefill-int8: v_packed must be a cuda tensor"),
         }
         .slice(v_packed_l.start_offset()..);
 
@@ -942,12 +949,11 @@ impl PagedPrefillChunks {
                 cs_ptr as *const f32
             };
 
-            let write_offset_shifts_ptr = self.write_offset_shifts_ptr as *const u32;
             let headers_ptr = self.headers_ptr as *const u8;
 
-            candle::set_kernel_breadcrumb("run_paged_prefill_chunks", file!(), line!());
             let raw_stream = stream.cu_stream() as *mut core::ffi::c_void;
-            run_paged_prefill_chunks(
+            candle::set_kernel_breadcrumb("run_paged_prefill_int8", file!(), line!());
+            run_paged_prefill_int8(
                 q_ptr as *const core::ffi::c_void,
                 k_ptr as *const core::ffi::c_void,
                 v_ptr as *const core::ffi::c_void,
@@ -961,14 +967,12 @@ impl PagedPrefillChunks {
                 self.n_head as i32,
                 self.n_kv_head as i32,
                 self.head_dim as i32,
-                self.max_blocks as i32,
+                self.max_q_len as i32,
                 self.softmax_scale,
                 q_dtype_code,
-                if self.has_prefix { 1 } else { 0 },
                 rope_offsets_ptr,
                 rope_cs_ptr,
                 self.rope_interleaved as i32,
-                write_offset_shifts_ptr,
                 raw_stream,
             );
         }
@@ -979,13 +983,13 @@ impl PagedPrefillChunks {
 }
 
 #[cfg(feature = "cuda")]
-impl candle::CustomOp1 for PagedPrefillChunks {
+impl candle::CustomOp1 for PagedPrefillInt8 {
     fn name(&self) -> &'static str {
-        "paged-prefill-chunks"
+        "paged-prefill-int8"
     }
 
     fn cpu_fwd(&self, _: &candle::CpuStorage, _: &Layout) -> Result<(candle::CpuStorage, Shape)> {
-        candle::bail!("no cpu support for paged-prefill-chunks")
+        candle::bail!("no cpu support for paged-prefill-int8")
     }
 
     fn cuda_fwd(
@@ -995,7 +999,7 @@ impl candle::CustomOp1 for PagedPrefillChunks {
     ) -> Result<(candle::CudaStorage, Shape)> {
         if q.dtype() != self.compute_dtype {
             candle::bail!(
-                "paged-prefill-chunks: expected {:?} Q, got {:?}",
+                "paged-prefill-int8: expected {:?} Q, got {:?}",
                 self.compute_dtype,
                 q.dtype()
             );
@@ -1003,22 +1007,20 @@ impl candle::CustomOp1 for PagedPrefillChunks {
         match self.compute_dtype {
             candle::DType::F16 => self.cuda_fwd_t::<f16, f16, f16>(q, q_l),
             candle::DType::BF16 => self.cuda_fwd_t::<bf16, bf16, bf16>(q, q_l),
-            dt => candle::bail!("paged-prefill-chunks: unsupported compute dtype {:?}", dt),
+            dt => candle::bail!("paged-prefill-int8: unsupported compute dtype {:?}", dt),
         }
     }
 }
 
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-/// Paged prefill attention over chunked KV arenas (no KV materialization).
+/// Paged prefill attention over chunked KV arenas (no KV materialization),
+/// through the INT8 prefix-attention kernel.
 ///
 /// `q` has shape `(total_q, n_head, head_dim)`.
 /// `headers_ptr` is the raw GPU address of `SlotHeader[batch_size]`, reusing the
 /// same persistent slot-payload representation as decode.
 /// `compute_dtype` is the pre-resolved F16 or BF16 dtype for Q/K/V (derived from arena formats).
-///
-/// `has_prefix` should be true if any sequence has existing KV cache (kv_len > q_len).
-/// When false, uses an optimized async path. When true, uses synchronous scattered loads.
 pub(crate) fn paged_prefill_attn_varlen_chunks(
     q: &Tensor,
     cu_seqlens_q: &Tensor,
@@ -1028,20 +1030,23 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
     v_packed: &Tensor,
     headers_ptr: u64,
     compute_dtype: DType,
-    max_blocks: usize,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
     softmax_scale: f32,
-    has_prefix: bool,
     rope_offsets: &Tensor,
     rope_cs: &Tensor,
     rope_interleaved: bool,
-    write_offset_shifts_ptr: u64,
+    max_q_len: usize,
 ) -> Result<Tensor> {
-    // HEAD_DIM must be a multiple of 32 and <= 256
-    if head_dim % 32 != 0 || head_dim > 256 {
-        candle::bail!("paged-prefill-chunks only supports head_dim multiple of 32 and <= 256 (got {head_dim})")
+    // The kernel's in-thread RoPE pairing needs head_dim % 64 == 0 with the
+    // non-interleaved half-split pairing (Qwen/GPT2 style), and head_dim
+    // 256's staging slabs exceed the 25.6 KB 4-blocks/SM union-arena budget.
+    if head_dim != 64 && head_dim != 128 {
+        candle::bail!("paged-prefill-int8 supports head_dim 64 or 128 (got {head_dim})")
+    }
+    if rope_interleaved {
+        candle::bail!("paged-prefill-int8 does not support interleaved RoPE")
     }
 
     let q = q.to_dtype(compute_dtype)?;
@@ -1050,27 +1055,28 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
 
     let (_total_q, q_n_head, q_head_dim) = q.dims3()?;
     if q_n_head != n_head || q_head_dim != head_dim {
-        candle::bail!("paged-prefill-chunks: q shape mismatch {:?}", q.dims())
+        candle::bail!("paged-prefill-int8: q shape mismatch {:?}", q.dims())
     }
 
     let (kp_total_q, kp_n_kv, kp_hd) = k_packed.dims3()?;
     if kp_total_q != _total_q || kp_n_kv != n_kv_head || kp_hd != head_dim {
         candle::bail!(
-            "paged-prefill-chunks: k_packed shape mismatch {:?}",
+            "paged-prefill-int8: k_packed shape mismatch {:?}",
             k_packed.dims()
         )
     }
     let (vp_total_q, vp_n_kv, vp_hd) = v_packed.dims3()?;
     if vp_total_q != _total_q || vp_n_kv != n_kv_head || vp_hd != head_dim {
         candle::bail!(
-            "paged-prefill-chunks: v_packed shape mismatch {:?}",
+            "paged-prefill-int8: v_packed shape mismatch {:?}",
             v_packed.dims()
         )
     }
 
     let batch_size = cu_seqlens_q.dim(0)?.saturating_sub(1);
 
-    let op = PagedPrefillChunks {
+    let op = PagedPrefillInt8 {
+        max_q_len,
         softmax_scale,
         cu_seqlens_q: cu_seqlens_q.clone(),
         q_lens: q_lens.clone(),
@@ -1082,13 +1088,10 @@ pub(crate) fn paged_prefill_attn_varlen_chunks(
         n_head,
         n_kv_head,
         head_dim,
-        max_blocks,
-        has_prefix,
         compute_dtype,
         rope_offsets: rope_offsets.clone(),
         rope_cs: rope_cs.clone(),
         rope_interleaved,
-        write_offset_shifts_ptr,
     };
     q.apply_op1(op)
 }
@@ -1118,7 +1121,7 @@ type GlueFfi = unsafe extern "C" fn(
     *mut c_void,   // stream
 );
 
-/// Op for the paged-glue reprojection forward. Mirrors [`PagedPrefillChunks`]
+/// Op for the paged-glue reprojection forward. Mirrors [`PagedPrefillInt8`]
 /// but launches the decode-derivative glue kernel: each slot's `G` glue queries
 /// attend its quantized sealed prefix (streamed-once dequant) plus earlier glue,
 /// write their own K/V into the writer chunks, and mask by TRUE sequence
@@ -1302,7 +1305,7 @@ pub fn paged_glue_attn(
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     glue_write_slice: &Tensor,
     glue_write_in_blk: &Tensor,
     fwd_ahead: &Tensor,
@@ -1373,7 +1376,7 @@ pub fn paged_glue_attn(
 
     let device = q.device();
     let _ = total_q;
-    let (cu_seqlens_q, q_lens_dev) = if let Some((cu, ql, _kv, _hp)) = prefill_meta {
+    let (cu_seqlens_q, q_lens_dev) = if let Some((cu, ql, _kv)) = prefill_meta {
         (cu.clone(), ql.clone())
     } else {
         let mut cu = Vec::with_capacity(b_sz + 1);
@@ -1835,6 +1838,15 @@ impl candle::CustomOp1 for PagedDecode {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::paged_prefill_batched as paged_prefill_flat;
+
+    /// Serialize the GPU tests: the split-KV launcher's grow-on-demand
+    /// partial pool is a function-local static sized for the production
+    /// single-scheduler-thread model — concurrent test launches interleave
+    /// its free/realloc. Same idiom as the prefill_ab harness's guard.
+    fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        M.lock().unwrap_or_else(|e| e.into_inner())
+    }
     use candle::quantized::pinned_staging::{Generation, PinnedStager};
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::kv_cache::KvCache;
@@ -1856,11 +1868,10 @@ mod tests {
         n_head: usize,
         n_kv_head: usize,
         head_dim: usize,
-        _prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+        _prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
         rope_offsets: &Tensor,
         rope_cs: &Tensor,
         rope_interleaved: bool,
-        write_offset_shifts_ptr: u64,
         generation: &Generation,
     ) -> Result<Vec<Tensor>> {
         let total_q = b_sz * seq_len;
@@ -1892,7 +1903,6 @@ mod tests {
             rope_offsets,
             rope_cs,
             rope_interleaved,
-            write_offset_shifts_ptr,
             generation,
             &std::cell::RefCell::new(None),
         )?;
@@ -1986,11 +1996,6 @@ mod tests {
             &rope_zeros,
             &make_test_rope_cs(head_dim, 16, &device)?,
             false, // rope_interleaved
-            {
-                let mut b = generation.alloc(b_sz * 4)?;
-                b.fill(0u8);
-                generation.submit(b)?.dev_ptr()
-            }, // write_offset_shifts
             &generation,
         )
         .expect("expected paged prefill to be applicable");
@@ -2169,11 +2174,6 @@ mod tests {
             &rope_zeros,
             &make_zero_rope_cs(head_dim, 16, q.device())?,
             false, // rope_interleaved
-            {
-                let mut b = generation.alloc(b_sz * 4)?;
-                b.fill(0u8);
-                generation.submit(b)?.dev_ptr()
-            }, // write_offset_shifts
             &generation,
         )?;
         assert_eq!(out.len(), 1);
@@ -2191,6 +2191,7 @@ mod tests {
     /// model), so it runs on every `cargo test`.
     #[test]
     fn int8_mma_m16n8k32_fragment_layout() -> Result<()> {
+        let _gpu = gpu_serial();
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         let device = Device::new_cuda(0)?;
         let cuda = device.as_cuda_device()?;
@@ -2246,6 +2247,7 @@ mod tests {
 
     #[test]
     fn correctness_prefill_no_prefix_bf16() -> Result<()> {
+        let _gpu = gpu_serial();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
 
@@ -2307,6 +2309,7 @@ mod tests {
 
     #[test]
     fn correctness_prefill_no_prefix_f16() -> Result<()> {
+        let _gpu = gpu_serial();
         let device = Device::new_cuda(0)?;
         let dtype = DType::F16;
 
@@ -2359,6 +2362,7 @@ mod tests {
 
     #[test]
     fn correctness_prefill_with_prefix_bf16() -> Result<()> {
+        let _gpu = gpu_serial();
         use candle_nn::kv_cache::ChunkedKvBacking;
 
         let device = Device::new_cuda(0)?;
@@ -2424,11 +2428,6 @@ mod tests {
                 &rope_zeros,
                 &make_zero_rope_cs(head_dim, 16, &device)?,
                 false, // rope_interleaved
-                {
-                    let mut b = generation.alloc(b_sz * 4)?;
-                    b.fill(0u8);
-                    generation.submit(b)?.dev_ptr()
-                }, // write_offset_shifts
                 &generation,
             )?;
             assert_eq!(out.len(), 1);
@@ -2458,29 +2457,29 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: prefix palette ROUTING across a slice straddle.
+    /// Regression: prefix palette ROUTING across mixed per-slice maps.
     ///
     /// The prefix is a sealed partial chunk 0 (`p` tokens, identity palette
     /// map) followed by a full chunk 1 whose palette map is SHUFFLED
     /// (dim `d` → palette `d % 4`, rank `d / 4`) with its data permuted to
-    /// match, so a correct reader reconstructs the same logical values. Under
-    /// cum-token addressing the first 32-position prefill tile then straddles
-    /// both slices, and chunk 1's positions must be routed with CHUNK 1's map:
-    /// routing them through chunk 0's map (a stale per-tile hoisted table)
-    /// gathers a dim-permutation of the true values — order-1 garbage on
-    /// random data. Float chunks keep the check quantization-free, so the
-    /// tolerance is tight fp16 noise and any routing regression fails hard.
-    /// The second tile starts inside chunk 1, exercising the shuffled map as
-    /// a FIRST-slice table too.
+    /// match, so a correct reader reconstructs the same logical values.
+    /// Each slice-aligned tile must be routed with ITS OWN slice's map:
+    /// routing chunk 1's positions through chunk 0's map (a stale cached
+    /// table) gathers a dim-permutation of the true values — order-1
+    /// garbage on random data. Float chunks keep the check
+    /// quantization-free, so the tolerance is tight fp16 noise and any
+    /// routing regression fails hard. The partial chunk 0 also exercises
+    /// the gap walk ahead of the shuffled map.
     #[test]
     fn correctness_prefill_straddle_shuffled_pal_map() -> Result<()> {
+        let _gpu = gpu_serial();
         use candle_nn::kv_cache::ChunkedKvBacking;
 
         let device = Device::new_cuda(0)?;
         let dtype = DType::F16;
         const CHUNK: usize = 32;
         let (n_head, n_kv_head, head_dim) = (32usize, 8usize, 128usize);
-        let p = 20usize; // partial chunk 0 → every later tile straddles
+        let p = 20usize; // partial chunk 0 → a gap before every later slice
         let new_len = 8usize;
         let prefix_len = p + CHUNK;
         let b_sz = 1;
@@ -2498,8 +2497,8 @@ mod tests {
         let v1 = Tensor::randn(0f32, 1f32, (1, n_kv_head, CHUNK, head_dim), &device)?
             .to_dtype(dtype)?
             .contiguous()?;
-        let new_q = Tensor::randn(0f32, 1f32, (1, n_head, new_len, head_dim), &device)?
-            .to_dtype(dtype)?;
+        let new_q =
+            Tensor::randn(0f32, 1f32, (1, n_head, new_len, head_dim), &device)?.to_dtype(dtype)?;
         let new_k = Tensor::randn(0f32, 1f32, (1, n_kv_head, new_len, head_dim), &device)?
             .to_dtype(dtype)?
             .contiguous()?;
@@ -2530,21 +2529,13 @@ mod tests {
 
         // Backing: chunk 0 = sealed partial (identity map), chunk 1 = full
         // (shuffled map + permuted data), chunk 2 = empty writer.
-        let backing =
-            ChunkedKvBacking::new(b_sz, n_kv_head, head_dim, dtype, &device, 3 * CHUNK)?;
+        let backing = ChunkedKvBacking::new(b_sz, n_kv_head, head_dim, dtype, &device, 3 * CHUNK)?;
         backing.ensure_for_offset(0, 0, 2 * CHUNK + new_len)?;
         backing.write_contiguous(0, 0, &k0, &v0)?;
         backing.write_contiguous(0, CHUNK, &k1p, &v1p)?;
         backing.set_block_window(0, 0, 0, p as u32)?;
         backing.set_block_window(0, 1, 0, CHUNK as u32)?;
-        backing.test_set_block_palette(
-            0,
-            1,
-            pal_all.clone(),
-            pal_all,
-            Vec::new(),
-            Vec::new(),
-        )?;
+        backing.test_set_block_palette(0, 1, pal_all.clone(), pal_all, Vec::new(), Vec::new())?;
         backing.test_set_writer_start(0, 2)?;
 
         let mut cache0 = KvCache::new(2, 4096);
@@ -2572,11 +2563,6 @@ mod tests {
             &rope_zeros,
             &make_zero_rope_cs(head_dim, 16, &device)?,
             false, // rope_interleaved
-            {
-                let mut b = generation.alloc(b_sz * 4)?;
-                b.fill(0u8);
-                generation.submit(b)?.dev_ptr()
-            }, // write_offset_shifts
             &generation,
         )?;
         assert_eq!(out.len(), 1);
@@ -2602,14 +2588,13 @@ mod tests {
             max_err < 0.2,
             "straddle shuffled-pal-map prefill max error too large: {max_err}"
         );
-        println!(
-            "straddle shuffled-pal-map prefill OK: mae={mae:.4e} max_err={max_err:.4e}"
-        );
+        println!("straddle shuffled-pal-map prefill OK: mae={mae:.4e} max_err={max_err:.4e}");
         Ok(())
     }
 
     #[test]
     fn correctness_prefill_with_prefix_f16() -> Result<()> {
+        let _gpu = gpu_serial();
         use candle_nn::kv_cache::ChunkedKvBacking;
 
         let device = Device::new_cuda(0)?;
@@ -2670,11 +2655,6 @@ mod tests {
                 &rope_zeros,
                 &make_zero_rope_cs(head_dim, 16, &device)?,
                 false, // rope_interleaved
-                {
-                    let mut b = generation.alloc(b_sz * 4)?;
-                    b.fill(0u8);
-                    generation.submit(b)?.dev_ptr()
-                }, // write_offset_shifts
                 &generation,
             )?;
             let paged_out = &out[0];
@@ -2715,6 +2695,7 @@ mod tests {
     /// num_groups is not a multiple of WARPS_TC (e.g., 40/8 = 5 groups).
     #[test]
     fn correctness_prefill_gqa_head_mapping_regression() -> Result<()> {
+        let _gpu = gpu_serial();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
 
@@ -2775,6 +2756,7 @@ mod tests {
     /// GQA group cross-contamination patterns.
     #[test]
     fn correctness_prefill_diagnostic_per_head() -> Result<()> {
+        let _gpu = gpu_serial();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
 
@@ -2874,11 +2856,6 @@ mod tests {
             rope,
             &make_test_rope_cs(head_dim, 16, device)?,
             false, // rope_interleaved
-            {
-                let mut b = generation.alloc(b_sz * 4)?;
-                b.fill(0u8);
-                generation.submit(b)?.dev_ptr()
-            }, // write_offset_shifts
             &generation,
         )?;
         Ok(out.into_iter().next().unwrap())
@@ -2886,6 +2863,7 @@ mod tests {
 
     #[test]
     fn rope_offset_prefill_none_succeeds() -> candle::Result<()> {
+        let _gpu = gpu_serial();
         let device = Device::new_cuda(0)?;
         let dtype = DType::BF16;
         let (n_head, n_kv_head, head_dim, seq_len) = (8, 8, 64, 16);
@@ -2928,6 +2906,7 @@ mod tests {
 
     #[test]
     fn rope_offset_prefill_zeros_differs_from_none() -> candle::Result<()> {
+        let _gpu = gpu_serial();
         // Now that both paths always apply RoPE, this test confirms that different rope_offsets
         // values produce different outputs.
         let device = Device::new_cuda(0)?;
@@ -3015,6 +2994,7 @@ mod tests {
 
     #[test]
     fn rope_offset_prefill_functional() -> candle::Result<()> {
+        let _gpu = gpu_serial();
         // Verifies: reference_attention(rotated_Q, rotated_K, V) â‰ˆ paged_kernel(unrotated_Q, unrotated_K, V, rope=zeros)
         // Tolerance < 0.05 for BF16.
         let device = Device::new_cuda(0)?;

@@ -21,9 +21,6 @@ use crate::{kv_caches::CausalMaskProvider, KvCaches};
 /// * `offset` - Position offset (number of tokens already cached)
 /// * `input_ids` - Input token IDs for this forward pass
 /// * `input_len` - Length of the input sequence
-/// * `write_offset_shift` - Physical KV write offset shift (0 = no shift). Used for right-packed
-///   partial blocks: shift = `chunk_size - token_count`, so tokens are stored at physical positions
-///   `shift..shift+token_count` rather than `0..token_count`.
 ///
 /// # Example
 /// ```ignore
@@ -32,7 +29,6 @@ use crate::{kv_caches::CausalMaskProvider, KvCaches};
 ///     offset: 10,  // Already processed 10 tokens
 ///     input_ids: &tokens,
 ///     input_len: tokens.dims2()?.1,
-///     write_offset_shift: 0,
 /// };
 /// let output = model.forward_with_context(ctx)?;
 /// ```
@@ -45,11 +41,6 @@ pub struct SequenceContext<'a, C> {
     pub input_ids: &'a Tensor,
     /// Length of the input sequence (number of tokens in input_ids)
     pub input_len: usize,
-    /// Physical KV write offset shift for right-packed partial blocks (0 = no shift).
-    /// When non-zero, the prefill kernel writes KV at physical positions
-    /// `write_offset_shift..write_offset_shift + seq_len` rather than `0..seq_len`.
-    /// Must be 0 for normal (non-static-chunk) prefills.
-    pub write_offset_shift: usize,
 }
 
 impl<'a, M> SequenceContext<'a, KvCaches<M>>

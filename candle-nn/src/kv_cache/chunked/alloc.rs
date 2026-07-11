@@ -1054,20 +1054,25 @@ impl ChunkedKvBacking {
                     match state.sequences.get(batch_idx).and_then(|s| s.as_ref()) {
                         Some(slot) => {
                             let chunks = slot.chunks_slice();
-                            if chunks.is_empty() {
-                                (0usize, 0usize)
+                            // Writer-owned capacity ONLY: chunks before
+                            // `writer_start_idx` are Arc-shared/sealed, and a
+                            // partial sealed tail is a GAP — its free slots
+                            // are dead, never a write target. When the
+                            // boundary sits past the last chunk (a freshly
+                            // injected prefix), available is ZERO; clamping
+                            // into the sealed tail counts its gap as writer
+                            // capacity and under-allocates the write region
+                            // by up to one chunk.
+                            let start = slot.writer_start_idx();
+                            let avail: usize = if start >= chunks.len() {
+                                0
                             } else {
-                                // Writer-owned region starts at
-                                // `writer_start_idx` (set by the host).
-                                // Available capacity = remaining slots in
-                                // each chunk from that index onward.
-                                let start = slot.writer_start_idx().min(chunks.len() - 1);
-                                let avail: usize = chunks[start..]
+                                chunks[start..]
                                     .iter()
                                     .map(|c| chunk_size - (c.offset as usize + c.usage as usize))
-                                    .sum();
-                                (chunks.len(), avail)
-                            }
+                                    .sum()
+                            };
+                            (chunks.len(), avail)
                         }
                         None => (0usize, 0usize),
                     };
