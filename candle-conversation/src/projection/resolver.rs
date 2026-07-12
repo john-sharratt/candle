@@ -415,12 +415,25 @@ impl Conversation {
             segments,
             tags,
         });
-        self.persistence
+        self.declare_and_mirror(decl, "persist turn")?;
+        Ok(idx)
+    }
+
+    /// Declare a stream in the persistence redo log AND mirror the decl into
+    /// the LIVE substrate. The reload walker only installs decls at startup,
+    /// but live readers — the tag-scoped belief gallery reading a turn's tags,
+    /// section-by-name lookups — consult the in-memory decls, so a stream
+    /// declared in the current session (every calibration turn or section on
+    /// a fresh substrate) must be visible to them without a restart.
+    fn declare_and_mirror(&self, decl: StreamDecl, err_ctx: &str) -> candle::Result<StreamId> {
+        let stream_id = self
+            .persistence
             .lock()
             .unwrap()
             .declare_stream(&decl)
-            .map_err(|e| candle::Error::Msg(format!("persist turn: {e}")))?;
-        Ok(idx)
+            .map_err(|e| candle::Error::Msg(format!("{err_ctx}: {e}")))?;
+        self.write().apply_stream_decl(stream_id, decl);
+        Ok(stream_id)
     }
 
     /// Append a summariser-allocated turn (SoT leaf or SoS internal)
@@ -467,11 +480,7 @@ impl Conversation {
             segments: Vec::new(),
             tags: Vec::new(),
         });
-        self.persistence
-            .lock()
-            .unwrap()
-            .declare_stream(&decl)
-            .map_err(|e| candle::Error::Msg(format!("persist summary turn: {e}")))?;
+        self.declare_and_mirror(decl, "persist summary turn")?;
         Ok(idx)
     }
 
@@ -1213,11 +1222,7 @@ impl Conversation {
             address,
             debug_name: debug_name.to_string(),
         });
-        self.persistence
-            .lock()
-            .unwrap()
-            .declare_stream(&decl)
-            .map_err(|e| candle::Error::Msg(format!("declare section stream: {e}")))
+        self.declare_and_mirror(decl, "declare section stream")
     }
 
     /// True when the workspace's manifest already holds durable

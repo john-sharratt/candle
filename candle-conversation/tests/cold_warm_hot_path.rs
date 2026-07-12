@@ -34,16 +34,18 @@ use candle_conversation::persistence::cold_load::ColdLoadStager;
 use candle_conversation::persistence::elevate::{elevate_to_hot, evict_from_hot};
 use candle_conversation::persistence::thread::PersistenceThread;
 use candle_conversation::persistence::transfer::seal_to_chunk_images;
-use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::projection::{
     Conversation, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey,
 };
-use candle_conversation::substrate::{Substrate, TierState};
+use candle_conversation::substrate::TierState;
 use candle_conversation::turn::Role;
 use candle_nn::kv_cache::{
     ArenaKey, ArenaLocation, ChunkedKvBacking, KvFormat, QuantFormat, SealedChunk, SealedSequence,
 };
 use half::bf16;
+
+mod common;
+use common::open_conversation;
 
 const N_LAYERS: usize = 2;
 const N_KV_HEAD: usize = 2;
@@ -59,20 +61,6 @@ const ARENA_CAPACITY: usize = 256;
 /// the per-(h,p) quant blocks to land cleanly. 128 / 4 = 32 — exactly
 /// one block per sub-band, matching the R16 unit-test pattern.
 const QUANT_HEAD_DIM: usize = 128;
-
-/// Open the redo log under `dir`, driving every record through the substrate
-/// walker in one pass (exactly as the daemon does in `ConversationEngine::new`),
-/// then bind the populated substrate to a fresh conversation.
-///
-/// This is the only correct way to reopen for recovery: `open_in` with an empty
-/// `Substrate::new()` (the old `Conversation::with_persistence` path) leaves the
-/// substrate unpopulated, so `reconstruct_from_log` finds no turn decls and
-/// recovers nothing. For a fresh (empty) log the walker is simply a no-op.
-fn open_conversation(dir: &std::path::Path) -> Conversation {
-    let mut substrate = Substrate::new();
-    let persistence = SubstratePersistence::open_in_with_substrate(dir, &mut substrate).unwrap();
-    Conversation::from_parts(substrate, persistence)
-}
 
 fn cuda_device_or_skip() -> Option<Device> {
     match Device::cuda_if_available(0) {
