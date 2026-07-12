@@ -52,10 +52,19 @@ pub struct SequenceSamplingState {
     /// own look-back window, independent of the think segment).
     pub dry_span_len: i32,
 
-    /// True while this sequence is inside a tool call (stencil active).  DRY is
-    /// suppressed (`dry_lens` forced to 0) because the tool-call grammar is
-    /// already steered by the stencil.
+    /// True while this sequence is inside ANY stencil-steered span (think block
+    /// OR tool call).  DRY is suppressed (`dry_lens` forced to 0) because the
+    /// grammar is already steered.
     pub dry_suppressed: bool,
+
+    /// True while this sequence is inside a TOOL CALL specifically (not the think
+    /// block).  The remaining repetition penalties (repeat/frequency/presence)
+    /// are suppressed for these rows: a tool call's arguments legitimately
+    /// reproduce prompt content verbatim — the query's numbers, file paths,
+    /// identifiers — which those penalties would otherwise demote, corrupting the
+    /// value.  Kept distinct from `dry_suppressed` so reasoning (the think block)
+    /// retains full repetition control.
+    pub in_tool_call: bool,
 
     /// Current RNG offset (for deterministic sampling across calls).
     pub rng_offset: u64,
@@ -73,6 +82,7 @@ impl SequenceSamplingState {
             segment_len: 0,
             dry_span_len: 0,
             dry_suppressed: false,
+            in_tool_call: false,
             rng_offset: 0,
         }
     }
@@ -839,16 +849,36 @@ impl BatchedSampler {
     ) -> candle::Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
         let batch_size = states.len();
 
+        // Inside a TOOL CALL, all repetition penalties are suppressed, not just
+        // DRY.  Tool-call arguments legitimately reproduce content verbatim from
+        // the prompt or an earlier span — the query's numbers, file paths,
+        // identifiers — so frequency/presence/repeat penalties (which see the
+        // `<think>`/prior-span tokens via `token_counts` and `recent_tokens`)
+        // would demote exactly those tokens, corrupting the value.  This mirrors
+        // the DRY gate but is scoped to tool calls only (`in_tool_call`), so the
+        // think block keeps full repetition control.  Presenting empty penalty
+        // state for these rows is the per-row equivalent of turning them off;
+        // `resize` appends the zeros in place (no scratch buffer on this
+        // per-decode-step path).
+
         // Flatten token counts: [batch_size * vocab_size]
         let mut token_counts = Vec::with_capacity(batch_size * self.vocab_size);
         for state in states.iter() {
-            token_counts.extend_from_slice(&state.token_counts);
+            if state.in_tool_call {
+                token_counts.resize(token_counts.len() + self.vocab_size, 0);
+            } else {
+                token_counts.extend_from_slice(&state.token_counts);
+            }
         }
 
         // Flatten cross-turn counts: [batch_size * vocab_size]
         let mut cross_turn_counts = Vec::with_capacity(batch_size * self.vocab_size);
         for state in states.iter() {
-            cross_turn_counts.extend_from_slice(&state.cross_turn_counts);
+            if state.in_tool_call {
+                cross_turn_counts.resize(cross_turn_counts.len() + self.vocab_size, 0);
+            } else {
+                cross_turn_counts.extend_from_slice(&state.cross_turn_counts);
+            }
         }
 
         // Log penalty state if a log path is configured
@@ -887,7 +917,11 @@ impl BatchedSampler {
             let window = repeat_win.max(dry_win).min(total);
             // Copy the newest `window` tokens (tail of the oldest-first buffer)
             let start = total - window;
-            recent_lens.push(window as i32);
+            // Inside a tool call, present a zero-length repeat window so the repeat
+            // penalty sees no history (DRY is already gated via `dry_lens`).  Tool
+            // arguments must be free to reproduce the query's numbers/paths/names
+            // verbatim. The buffer is still padded to keep the batch stride fixed.
+            recent_lens.push(if state.in_tool_call { 0 } else { window as i32 });
             recent_tokens.extend_from_slice(&state.recent_tokens[start..]);
             recent_tokens.extend(std::iter::repeat_n(0, self.max_recent_len - window));
         }
@@ -1354,6 +1388,35 @@ mod tests {
 
     fn make_state() -> SequenceSamplingState {
         SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT)
+    }
+
+    // ── Tool-call penalty suppression ──────────────────────────────────
+
+    #[test]
+    fn tool_call_row_penalty_state_is_zeroed_and_think_row_is_not() {
+        let sampler = make_sampler();
+        let mut in_call = make_state();
+        let mut thinking = make_state();
+        // Both rows generated the same tokens (e.g. digits reasoned in <think>).
+        for _ in 0..5 {
+            in_call.record_token(42, MAX_RECENT);
+            thinking.record_token(42, MAX_RECENT);
+        }
+        in_call.in_tool_call = true;
+
+        let (token_counts, cross_turn_counts, _recent, recent_lens, _cur) = sampler
+            .build_penalty_buffers_from_states(&[&mut in_call, &mut thinking], 0.0, 16, 0)
+            .expect("buffers");
+
+        // Row 0 (tool call): all penalty inputs empty — the model is free to
+        // reproduce the query's tokens verbatim in the arguments.
+        assert!(token_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
+        assert!(cross_turn_counts[..VOCAB_SIZE].iter().all(|&c| c == 0));
+        assert_eq!(recent_lens[0], 0);
+
+        // Row 1 (think block): full repetition control retained.
+        assert_eq!(token_counts[VOCAB_SIZE + 42], 5);
+        assert_eq!(recent_lens[1], 5);
     }
 
     // ── EOS failsafe override tests ────────────────────────────────────

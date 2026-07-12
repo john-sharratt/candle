@@ -25,13 +25,14 @@ use crate::persistence::elevate::elevate_to_hot;
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::projection::{
-    Builder, CompressionPrompt, Conversation, GeneratedIdentity, OptionalState, ProjectionMode,
-    ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind, SectionId,
-    SelectionState, SummaryMode, TimelineId, TurnId, TurnIndex, TurnKey, NO_THINK_SELECTOR,
+    Builder, CompressionPrompt, Conversation, GeneratedIdentity, OptionalState, PriorBelief,
+    ProjectionMode, ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind,
+    SectionId, SelectionState, SummaryMode, SystemPromptItem, TimelineId, TurnId, TurnIndex,
+    TurnKey, NO_THINK_SELECTOR,
 };
 use crate::provenance::{encode_wide_sigs, extract_q_vector_r16, fold_provenance, WideQSig};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
-use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry};
+use crate::stencil::{Healed, StencilDriver, StepMask, TriggerRegistry, TOOL_CALL_TREE_LABEL};
 use crate::substrate::{ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -462,6 +463,12 @@ fn record_phase(start: Instant, phase: &'static str) {
     );
 }
 
+/// Chunks of the turn's head (the user query) that stay in every reprojection
+/// probe once the trailing `max_probe_tokens` window has slid past them. The
+/// query is the strongest intent signal in the belief-gallery domain, so long
+/// turns keep scoring it alongside the most recent reasoning.
+const QUERY_HEAD_CHUNKS: usize = 2;
+
 /// All the per-conversation context the scheduler needs to do continuous
 /// re-projection on its own thread, without round-tripping back to the
 /// caller.  Built once at [`SchedulerRequest::SubmitTurn`] time and stored
@@ -512,6 +519,28 @@ pub(crate) struct ReprojectionPolicy {
     pub(crate) tool_call_open_id: Option<u32>,
     /// Token id of the `</tool_call>` close tag — re-enables reprojection.
     pub(crate) tool_call_close_id: Option<u32>,
+}
+
+impl ReprojectionPolicy {
+    /// Whether the target layer declares any belief-driven collection. The
+    /// immediate first-reprojection at prefill promotion only pays off when
+    /// there is a belief scan to run against the query's wide-Q — a
+    /// plain-prompt layer (e.g. the titler's single-section schema) gains
+    /// nothing from the extra view swap, so its turns skip it. Cadence and
+    /// punctuation reprojections are unaffected.
+    pub(crate) fn has_belief_collections(&self) -> bool {
+        self.projection
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.id == self.target.layer)
+            .is_some_and(|l| {
+                l.system_prompt
+                    .items
+                    .iter()
+                    .any(|i| matches!(i, SystemPromptItem::Collection(_)))
+            })
+    }
 }
 
 /// Inputs the scheduler needs to run `Builder::project()` itself for a
@@ -620,7 +649,7 @@ struct DecodeState {
     /// reprojection seeds `project()` from it and writes the result back, so the
     /// RelLeak decay/reinforcement carries across the turn (§80). Migrates with
     /// the decode state through view swaps.
-    belief: crate::projection::PriorBelief,
+    belief: PriorBelief,
     /// Full prefill token sequence pinned into the slot at this
     /// turn's submit:
     /// `[user_msg][user_end][assistant_start]` — the assistant header is clean,
@@ -946,6 +975,12 @@ pub(super) struct PrefillWork {
     /// when the prefill promotes to decode.  `None` when the caller
     /// disabled re-projection.
     pub(super) reprojection: Option<ReprojectionPolicy>,
+    /// The turn's opening belief — the conversation's carried belief stepped
+    /// through the submit-time projection. Installed onto `DecodeState` so the
+    /// first mid-decode reprojection evolves it rather than starting empty.
+    /// Default for paths with no belief-driven selection (sections, resume,
+    /// compression).
+    pub(super) belief: PriorBelief,
     /// Carried through prefill so the post-Done substrate write fires
     /// on the right key.  The substrate target is looked up from
     /// [`Scheduler::slot_targets`] at seal time, not carried here.
@@ -1300,6 +1335,15 @@ pub(crate) struct Scheduler {
     /// finalized, new entry inserted for the replacement view, with
     /// `turn_start_parent_blocks` carried across unchanged).
     turn_views: HashMap<SequenceId, ViewState>,
+    /// Each conversation's belief as of its last completed turn, keyed by the
+    /// conversation's parent slot. Harvested in `cleanup_finished` when a turn
+    /// seals, and seeded into the NEXT turn's submit-time projection and
+    /// decode state — the belief is conversation-state that evolves across
+    /// turns, never resetting at a turn boundary (a tool-retry turn opens with
+    /// the prior turn's committed tool already materialized, not the catalog
+    /// fallback). In-memory only: a daemon restart begins from an empty belief
+    /// and the first turn's reprojections rebuild it.
+    carried_beliefs: HashMap<SequenceId, PriorBelief>,
     /// Pending mid-decode view swaps, queued during `batch_decode_step`
     /// (which holds shared/exclusive borrows on `active_decodes`) and
     /// drained immediately after the batch completes.  Values are
@@ -1505,6 +1549,7 @@ impl Scheduler {
             slot_conversations: HashMap::new(),
             slot_targets: HashMap::new(),
             turn_views: HashMap::new(),
+            carried_beliefs: HashMap::new(),
             pending_reprojections: Vec::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
@@ -1693,6 +1738,10 @@ impl Scheduler {
                 // (below) while the view read guard is live; `None` for a normal
                 // prefill.
                 let mut staged_composition: Option<crate::projection::ProjectionEvent> = None;
+                // The turn's opening belief — assigned by the projection path
+                // below (carried belief stepped through the submit projection);
+                // default when projection is skipped.
+                let mut turn_belief = PriorBelief::default();
                 let (projected_sections, projected_segments) = if let (Some(inputs), Some(target)) = (
                     projection_inputs.as_ref().filter(|_| !skip_projection),
                     slot_target,
@@ -1722,15 +1771,23 @@ impl Scheduler {
                     // after `send_turn` returns.  Sink is never invoked
                     // when the rule-based path runs (no tree on the
                     // target timeline).
-                    // Submit-time projection is the first of the turn — the belief
-                    // starts fresh (no prior). Mid-decode reprojections seed from
-                    // the prior projection event to carry the online belief.
+                    // Submit-time projection seeds from the conversation's belief
+                    // as of its last completed turn (`carried_beliefs`) — empty
+                    // only for a genuinely fresh conversation. The belief then
+                    // evolves through this turn's reprojections and is harvested
+                    // back at seal, so provenance selection is continuous across
+                    // turn boundaries instead of resetting to catalog order.
+                    let carried_belief = self
+                        .carried_beliefs
+                        .get(&parent_id)
+                        .cloned()
+                        .unwrap_or_default();
                     let projection = inputs.projection.project_with_mode_and_sink(
                         target,
                         &view,
                         ProjectionMode::Prefill,
                         &inputs.selection,
-                        &crate::projection::PriorBelief::default(),
+                        &carried_belief,
                         &mut |diag| {
                             diag_to_write = Some((target.timeline, diag));
                         },
@@ -1753,6 +1810,11 @@ impl Scheduler {
                             0,
                             0.0,
                         );
+                        // The turn's decode state seeds its belief from what this
+                        // opening projection actually selected (the carried belief
+                        // stepped against this turn's selection), so the first
+                        // mid-decode reprojection continues the evolution.
+                        turn_belief = PriorBelief::from_selection(&opening.selection);
                         opening.materialized = projection_assembler::materialize_conversation(
                             &projection.segments,
                             &self.boundary_markers,
@@ -2062,6 +2124,7 @@ impl Scheduler {
                     sampling,
                     submitted_at: Instant::now(),
                     reprojection,
+                    belief: turn_belief,
                     seal_action,
                     post_decode_tokens,
                     projection_offsets,
@@ -2082,6 +2145,7 @@ impl Scheduler {
                 // bound to this slot.
                 self.slot_conversations.remove(&sequence_id);
                 self.slot_targets.remove(&sequence_id);
+                self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
                 self.slot_projection_state.remove(&sequence_id);
                 true
@@ -2102,6 +2166,10 @@ impl Scheduler {
                     if let Some(state) = self.sampling_states.get_mut(&sequence_id) {
                         state.end_turn();
                     }
+                    // A reset slot is reused for NEW content (the titler resets
+                    // between title jobs): the previous occupant's belief must
+                    // not seed the next occupant's projections.
+                    self.carried_beliefs.remove(&sequence_id);
                 }
                 let _ = response_tx.send(result);
                 true
@@ -2908,6 +2976,7 @@ impl Scheduler {
                     sampling: SamplingConfig::compression(),
                     submitted_at: Instant::now(),
                     reprojection: None,
+                    belief: PriorBelief::default(),
                     seal_action: SealAction::CompressionSetup {
                         job_id,
                         half: role,
@@ -3031,7 +3100,7 @@ impl Scheduler {
                 non_punct_since_reproject: 0,
                 last_projection_end: 0,
                 post_decode_tokens: TokenBuffer::default(),
-                belief: crate::projection::PriorBelief::default(),
+                belief: PriorBelief::default(),
                 prefill_tokens: TokenBuffer::default(),
                 user_text: String::new(),
                 tags: Vec::new(),
@@ -3335,6 +3404,7 @@ impl Scheduler {
             sampling: SamplingConfig::compression(),
             submitted_at: Instant::now(),
             reprojection: None,
+            belief: PriorBelief::default(),
             seal_action: SealAction::CompressionTurn { job_id },
             post_decode_tokens: TokenBuffer::default(),
             projection_offsets: Vec::new(),
@@ -3504,6 +3574,7 @@ impl Scheduler {
             sampling: SamplingConfig::compression(),
             submitted_at: Instant::now(),
             reprojection: None,
+            belief: PriorBelief::default(),
             seal_action: SealAction::TurnReprefill { pending_id },
             post_decode_tokens: TokenBuffer::default(),
             projection_offsets: Vec::new(),
@@ -4060,6 +4131,25 @@ impl Scheduler {
                     // and seal from offset 0.
                     (seq_id, 0)
                 };
+
+                // Harvest the turn's final belief onto the conversation's parent
+                // slot: the NEXT turn's submit-time projection seeds from it, so
+                // provenance selection evolves across turn boundaries instead of
+                // resetting to catalog order.
+                //
+                // MERGE, never replace: a turn whose projection lacked a
+                // collection (tools dial off, projection skipped) harvests a
+                // belief without that collection's key, and overwriting would
+                // erase the conversation's accumulated lock-on for it. Gated on
+                // the slot still being registered — a mid-decode FreeSequence
+                // (client disconnect) must not resurrect a dead conversation's
+                // belief under a slot id the allocator is about to recycle.
+                if finalized_view.is_some() && self.slot_conversations.contains_key(&seal_slot) {
+                    self.carried_beliefs
+                        .entry(seal_slot)
+                        .or_default()
+                        .merge_from(&state.belief);
+                }
 
                 tracing::info!(
                     target: "sched",
@@ -5452,46 +5542,56 @@ impl Scheduler {
             .map(|s| s.belief.clone())
             .unwrap_or_default();
 
-        // 1. Compute the probe window.
+        // 1. Compute the probe's CHUNK range — the turn's own content, in the
+        //    same chunk coordinates the seal captures for the belief gallery.
         //
-        //    R16 captures Q on every forward pass (prefill *and* decode),
-        //    so live signatures cover the full view — both the user's
-        //    prefill query and any decode tokens emitted so far.
+        //    The seal gathers `gather_wide_sigs(seal_slot, (seal_block_from,
+        //    block_count))` where `seal_block_from == turn_start_parent_blocks`
+        //    (see the turn-complete handler) and `block_count ==
+        //    sequence_block_count`.  Those stored signatures are the belief
+        //    gallery, so the live probe covers the same turn-content domain:
+        //      • It never reaches before the turn boundary into the materialized
+        //        system-prompt / tools prefix — a probe that swept the prefix
+        //        would score the selected tool's own definition against its
+        //        gallery and pin the selection to it with a turn-independent
+        //        constant.
+        //      • Chunk indices are partial-aware: `sequence_block_count` is the
+        //        authoritative chunk total (the same call the seal uses), so
+        //        partial chunks from glue/section boundaries can't shrink the
+        //        probe below the turn's real tokens.
         //
-        //    The window is: min(max_probe_tokens, view_offset)
-        //
-        //    No lower bound on the decoded-delta; structural/turn-boundary
-        //    tokens are already excluded by `probe_filter_token_ids`, so
-        //    there is no need to clip to decode-only positions.  Including
-        //    the prefill query is essential: at first reprojection (e.g.
-        //    after `<tool_call>\n`) the decode delta is tiny and would
-        //    miss the user's intent entirely.
-        let view_offset = self.session.sequence_offset(view_id.0).unwrap_or(0);
-        if view_offset == 0 {
+        //    For turns longer than `max_probe_tokens`, the probe is the most
+        //    recent chunks capped to that budget PLUS the turn's first chunks
+        //    (the user query): the query is the strongest intent signal in the
+        //    gallery domain, so it stays in every scan of the turn rather than
+        //    sliding out of a purely trailing window.
+        let view_state = self.turn_views.get(&view_id).copied().ok_or_else(|| {
+            ConversationError::Channel(format!("reproject: missing view state {view_id}"))
+        })?;
+        let turn_start_chunk = view_state.turn_start_parent_blocks;
+        let cur_chunks = self.session.sequence_block_count(view_id.0).unwrap_or(0);
+        if cur_chunks <= turn_start_chunk {
             return Ok(None);
         }
-
-        let max_probe = policy.max_probe_tokens.max(1);
-        let window = max_probe.min(view_offset);
-        if window == 0 {
-            return Ok(None);
-        }
-        let probe_lo = view_offset - window; // inclusive
-        let probe_hi = view_offset; // exclusive
+        let max_probe_chunks = policy.max_probe_tokens.max(1).div_ceil(self.chunk_size);
+        let tail_lo = turn_start_chunk.max(cur_chunks.saturating_sub(max_probe_chunks));
 
         // Wall-clock start of the whole reproject — drives `total_ms` so the log
         // reports the real end-to-end cost, not a sum of (partly overlapping)
         // phase fields.
         let t_repro = Instant::now();
 
-        // 2. Block range covering only the probe window.
+        // 2. Gather the live wide-Q probe — folded per-token sign(Q): the query
+        //    head (when the trailing window has slid past it) followed by the
+        //    most recent turn chunks. A gather covering no real tokens means
+        //    nothing to score.
         let t_probe = Instant::now();
-        let block_lo = probe_lo / self.chunk_size;
-        let block_hi = probe_hi.div_ceil(self.chunk_size);
-
-        // 3. Gather the live wide-Q probe over the window — folded per-token
-        //    sign(Q). A gather covering no real tokens means nothing to score.
-        let probe = self.gather_wide_sigs(view_id, (block_lo, block_hi));
+        let mut probe = Vec::new();
+        if tail_lo > turn_start_chunk {
+            let head_hi = (turn_start_chunk + QUERY_HEAD_CHUNKS).min(tail_lo);
+            probe.extend(self.gather_wide_sigs(view_id, (turn_start_chunk, head_hi)));
+        }
+        probe.extend(self.gather_wide_sigs(view_id, (tail_lo, cur_chunks)));
         if probe.is_empty() {
             return Ok(None);
         }
@@ -5519,9 +5619,6 @@ impl Scheduler {
         //    sealed substrate entries make the cut.  These two lists
         //    drive the zero-copy rebuild in step 6.
         let t_project = Instant::now();
-        let view_state = self.turn_views.get(&view_id).copied().ok_or_else(|| {
-            ConversationError::Channel(format!("reproject: missing view state {view_id}"))
-        })?;
         let parent_id = view_state.parent_id;
         let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
         let (projected_sections, projected_segments, composition) = {
@@ -5912,8 +6009,7 @@ impl Scheduler {
         // Carry the belief forward: the next reprojection seeds from what this one
         // selected, so the RelLeak decay/reinforcement accumulates across the turn.
         // Migrates with the decode state into `new_view_id` below.
-        decode_state.belief =
-            crate::projection::PriorBelief::from_selection(&composition.selection);
+        decode_state.belief = PriorBelief::from_selection(&composition.selection);
 
         // A projection is a POINT, not a span: it is selected here (by the Q of
         // the tokens decoded so far) and governs everything forward until the next
@@ -6396,4 +6492,56 @@ mod tests {
     // migrate to the new view id, `DecodeState.event_tx` survives —
     // are now exercised end-to-end by the `zend` coherence integration
     // test, which fires reproject many times in a real decode loop.
+
+    // —— Carried-belief slot lifecycle ————————————————————————————————————————
+    //
+    // The belief carried across a conversation's turns is keyed by its parent
+    // slot; slot teardown and reuse must never let one occupant's belief seed
+    // another's projections.
+
+    /// A carried belief for a slot.
+    fn seeded_belief() -> PriorBelief {
+        let mut b = PriorBelief::default();
+        b.set("tools", "calculator", 2500.0, true);
+        b
+    }
+
+    #[test]
+    fn reset_sequence_clears_the_slots_carried_belief() {
+        let (mut scheduler, _tx) = make_test_scheduler(RecordingModel::new());
+        let raw_id = scheduler.session.create_sequence().expect("create");
+        let seq_id = SequenceId(raw_id);
+        scheduler.carried_beliefs.insert(seq_id, seeded_belief());
+
+        let (rtx, rrx) = crossbeam::channel::bounded(1);
+        scheduler.handle_request(SchedulerRequest::ResetSequence {
+            sequence_id: seq_id,
+            response_tx: rtx,
+        });
+        rrx.recv().expect("reset response").expect("reset ok");
+
+        assert!(
+            !scheduler.carried_beliefs.contains_key(&seq_id),
+            "a reset slot is reused for new content — the previous occupant's \
+             belief must not survive the reset"
+        );
+    }
+
+    #[test]
+    fn free_sequence_clears_the_slots_carried_belief() {
+        let (mut scheduler, _tx) = make_test_scheduler(RecordingModel::new());
+        let raw_id = scheduler.session.create_sequence().expect("create");
+        let seq_id = SequenceId(raw_id);
+        scheduler.carried_beliefs.insert(seq_id, seeded_belief());
+
+        scheduler.handle_request(SchedulerRequest::FreeSequence {
+            sequence_id: seq_id,
+        });
+
+        assert!(
+            !scheduler.carried_beliefs.contains_key(&seq_id),
+            "a freed slot id is recycled by the allocator — the dead \
+             conversation's belief must not seed the next occupant"
+        );
+    }
 }

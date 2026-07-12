@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::content_hash::{section_stream_id, turn_stream_id, ContentHash};
 use super::{PersistenceError, Result};
-use crate::turn_layout::TurnSegment;
+use crate::turn_layout::{TurnLayout, TurnSegment};
 
 /// Globally unique stream identifier. `0` is reserved as the header's
 /// "not stream-scoped" sentinel and is never a real stream id.
@@ -110,6 +110,20 @@ pub struct TurnDecl {
     /// lives here on the decl rather than inside a segment.
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+impl TurnDecl {
+    /// The turn's segment-vector layout, rebuilt from the persisted segments.
+    pub fn layout(&self) -> TurnLayout {
+        TurnLayout::new(self.segments.clone())
+    }
+
+    /// Offset of the assistant half's first content token within the turn —
+    /// the single most-read layout fact, exposed directly so consumers don't
+    /// each rebuild the layout to ask it.
+    pub fn assistant_content_start(&self) -> u32 {
+        self.layout().assistant_content_start()
+    }
 }
 
 /// The payload of a `StreamDecl` record — declares a stream and

@@ -619,6 +619,42 @@ impl SequenceState {
         self.gpu_chunks.as_mut().clear();
     }
 
+    /// Re-serialise just the WRITER chunk's slice in the cached decode GPU
+    /// buffer after a mid-decode prefill wrote tokens into that chunk in
+    /// place (a stencil static run, a think-steer continuation).
+    ///
+    /// The prefill write path keeps host state authoritative: `set_len` tops
+    /// the writer chunk's usage up to the sequence length, and a
+    /// chunk-boundary append clears the whole buffer at the mutation site
+    /// (`push_chunk`). A live buffer here therefore differs from host state
+    /// only in this one slice, and patching it under the guard (async H→D on
+    /// drop) is the O(1) alternative to dropping and re-uploading the entire
+    /// per-layer table — which at depth costs megabytes of pinned realloc and
+    /// a stream sync per layer. A missing buffer is left for the next decode
+    /// sync's full rebuild; a shape mismatch (defensive) falls back to full
+    /// invalidation.
+    pub(crate) fn refresh_decode_writer_slice(
+        &mut self,
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) -> candle::Result<()> {
+        let gpu_n = self.gpu_chunks.n_chunks();
+        if gpu_n == 0 {
+            return Ok(());
+        }
+        if gpu_n != self.chunks.len() {
+            self.invalidate_gpu_chunks();
+            return Ok(());
+        }
+        let wi = self.decode_write_chunk_idx();
+        if wi >= gpu_n {
+            self.invalidate_gpu_chunks();
+            return Ok(());
+        }
+        self.update_gpu_chunk(wi, n_kv_head, head_dim, arena_info)
+    }
+
     /// Re-serialise the GPU buffer slot at `blk` from the current host state
     /// (including updated GIDs), scheduling an async H→D copy on the guard drop.
     ///

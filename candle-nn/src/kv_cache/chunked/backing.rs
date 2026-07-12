@@ -974,22 +974,26 @@ impl ChunkedKvBacking {
         Some(chunks)
     }
 
-    /// Rebuild the GPU slot-state buffers for all sequences in `batch_entries`
-    /// and return `(device_ptr, n_chunks, write_chunk_idx)` per entry.
-    ///
-    /// Invalidate the persistent GPU slot-state buffers for all sequences in
-    /// `batch_entries`.
-    ///
-    /// Explicitly clear the persistent decode GPU buffers for the selected
-    /// sequences so the next decode sync is forced to rebuild them.
-    pub fn invalidate_decode_gpu_chunks(&self, batch_entries: &[(usize, usize)]) {
-        if let Ok(mut state) = self.state.write() {
-            for &(seq_idx, _) in batch_entries {
-                if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
-                    seq.invalidate_gpu_chunks();
-                }
+    /// Patch each sequence's cached decode slot-state WRITER slice after a
+    /// mid-decode prefill wrote tokens into the writer chunk in place — see
+    /// [`super::types::SequenceState::refresh_decode_writer_slice`]. O(1) per
+    /// sequence per layer; sequences with no cached buffer (never decoded, or
+    /// cleared by a chunk-boundary append) rebuild fully on the next decode
+    /// sync instead.
+    pub fn refresh_decode_writer_slice(&self, batch_entries: &[(usize, usize)]) -> Result<()> {
+        let n_kv_head = self.inner.n_kv_head;
+        let head_dim = self.inner.head_dim;
+        let arena_info = self.resolve_arena_info()?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        for &(seq_idx, _) in batch_entries {
+            if let Some(Some(seq)) = state.sequences.get_mut(seq_idx) {
+                seq.refresh_decode_writer_slice(n_kv_head, head_dim, &arena_info)?;
             }
         }
+        Ok(())
     }
 
     /// Lightweight host-side validation for the paged decode hot path.

@@ -1,8 +1,9 @@
 //! [`Conversation`] — the workspace-shared substrate handle, and
 //! [`TargetedRead`] — the target-aware [`ContentResolver`] wrapper.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
@@ -306,10 +307,58 @@ impl Conversation {
             let slot_of = |name: &str| coll.sections.iter().position(|s| s.name == name);
             let (windows, slots) = self.belief_gallery(&coll.name, &coll.policy.tags, slot_of);
             if windows.is_empty() {
+                // The belief loop has nothing to score against, so selection falls
+                // back to declaration order (the first tool in the catalog) and
+                // pins there. This is THE signature of "wrong tool every turn".
+                // An empty gallery is also the persistent steady state of an
+                // uncalibrated workspace, and the scan runs several times per
+                // turn — WARN once per collection, then demote repeats to DEBUG
+                // so the actionable signal isn't buried in its own repetition.
+                static EMPTY_GALLERY_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+                let first = EMPTY_GALLERY_WARNED
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .map(|mut seen| seen.insert(coll.name.clone()))
+                    .unwrap_or(false);
+                if first {
+                    tracing::warn!(
+                        target: "candle_conversation::belief",
+                        collection = %coll.name,
+                        tags = ?coll.policy.tags,
+                        sections = n,
+                        probe_windows = probe.len(),
+                        "belief gallery EMPTY — no tag-scoped gallery turns; tool selection \
+                         falls back to catalog order (repeats logged at debug)"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "candle_conversation::belief",
+                        collection = %coll.name,
+                        "belief gallery still empty"
+                    );
+                }
                 continue;
             }
             let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
             let fresh = score_slots(probe, &wref, &slots, n);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let nonzero = fresh.iter().filter(|&&s| s != 0.0).count();
+                let top = fresh
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, s)| format!("{}={:.1}", coll.sections[i].name, s))
+                    .unwrap_or_default();
+                tracing::debug!(
+                    target: "candle_conversation::belief",
+                    collection = %coll.name,
+                    probe_windows = probe.len(),
+                    gallery_windows = windows.len(),
+                    nonzero_scores = nonzero,
+                    top = %top,
+                    "belief scan"
+                );
+            }
             for (s, &score) in coll.sections.iter().zip(&fresh) {
                 scores.set_section(s.id, score);
             }

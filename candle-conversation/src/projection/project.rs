@@ -340,6 +340,18 @@ impl PriorBelief {
         pb
     }
 
+    /// Overlay `newer` onto this belief, per collection: collections present in
+    /// `newer` replace this belief's entry wholesale; collections absent from
+    /// `newer` keep their existing state. A turn whose projection never ran a
+    /// collection (e.g. tools dial off → the tools collection materialised
+    /// nothing and is absent from the selection) says nothing about that
+    /// collection's belief, so carrying it across the turn must not erase it.
+    pub fn merge_from(&mut self, newer: &PriorBelief) {
+        for (name, sections) in &newer.collections {
+            self.collections.insert(name.clone(), sections.clone());
+        }
+    }
+
     /// Aligned `(scores, selected)` for a collection's sections in declaration
     /// order — the seed for [`crate::provenance::belief_step`]. Unknown sections
     /// read `(0.0, false)`.
@@ -356,6 +368,66 @@ impl PriorBelief {
             }
         }
         (scores, selected)
+    }
+}
+
+#[cfg(test)]
+mod prior_belief_tests {
+    use super::PriorBelief;
+
+    #[test]
+    fn merge_from_overlays_present_collections_and_preserves_absent_ones() {
+        // The carried belief holds a tools lock-on from earlier turns.
+        let mut carried = PriorBelief::default();
+        carried.set("tools", "calculator", 2500.0, true);
+        carried.set("tools", "datetime", 400.0, false);
+
+        // A tools-off turn harvests a belief WITHOUT the tools key (the
+        // collection materialised nothing, so the selection omitted it) but
+        // with fresh state for another collection.
+        let mut newer = PriorBelief::default();
+        newer.set("notes", "pinned", 40.0, true);
+
+        carried.merge_from(&newer);
+
+        // The absent collection survives untouched — the tools lock-on is
+        // NOT erased by a turn that said nothing about tools...
+        assert_eq!(carried.collections["tools"]["calculator"], (2500.0, true));
+        assert_eq!(carried.collections["tools"]["datetime"], (400.0, false));
+        // ...and the present collection is overlaid.
+        assert_eq!(carried.collections["notes"]["pinned"], (40.0, true));
+    }
+
+    #[test]
+    fn merge_from_replaces_a_present_collection_wholesale() {
+        let mut carried = PriorBelief::default();
+        carried.set("tools", "calculator", 2500.0, true);
+        carried.set("tools", "datetime", 400.0, false);
+
+        // A newer turn re-projected tools with a different member set: the
+        // collection entry is replaced, not unioned — sections absent from the
+        // newer selection are gone (their belief genuinely ended).
+        let mut newer = PriorBelief::default();
+        newer.set("tools", "web_search", 900.0, true);
+
+        carried.merge_from(&newer);
+
+        let tools = &carried.collections["tools"];
+        assert_eq!(tools.get("web_search"), Some(&(900.0, true)));
+        assert_eq!(tools.get("calculator"), None);
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn merge_from_empty_belief_is_a_no_op() {
+        // A projection-skipped turn harvests a default belief: merging it must
+        // not disturb the carry.
+        let mut carried = PriorBelief::default();
+        carried.set("tools", "calculator", 2500.0, true);
+
+        carried.merge_from(&PriorBelief::default());
+
+        assert_eq!(carried.collections["tools"]["calculator"], (2500.0, true));
     }
 }
 

@@ -2464,7 +2464,7 @@ fn turn_audit(
     );
     for t in &turns {
         let d = &t.decl;
-        let layout = candle_conversation::turn_layout::TurnLayout::new(d.segments.clone());
+        let layout = d.layout();
         let n_tok = match t.tokens_loc {
             Some((off, sz)) => decode_token_ids(&read_record_at(log, off, sz)?.payload)?.len(),
             None => 0,
@@ -2634,7 +2634,7 @@ fn dump(log: &mut LogFile, only_timeline: Option<u64>, full: bool) -> Result<()>
                 d.timeline_id, n
             );
         }
-        let layout = candle_conversation::turn_layout::TurnLayout::new(d.segments.clone());
+        let layout = d.layout();
         let ids = match t.tokens_loc {
             Some((off, sz)) => decode_token_ids(&read_record_at(log, off, sz)?.payload)?,
             None => Vec::new(),
@@ -2895,9 +2895,7 @@ fn streams(log: &mut LogFile) -> Result<()> {
         let wsig = wide_sig_summary(entry.wide_q_sigs.as_deref());
         let detail = match &entry.decl {
             Some(StreamDecl::Turn(t)) => {
-                let no_think =
-                    candle_conversation::turn_layout::TurnLayout::new(t.segments.clone())
-                        .no_think();
+                let no_think = t.layout().no_think();
                 format!(
                     "exchange  idx={} chunks={} tok={} {}  no_think={}  conv={}  tags={:?}",
                     t.turn_index,
@@ -3224,7 +3222,7 @@ fn tokens(
     // carries the verbatim user/assistant text — surface that instead of failing.
     let decl_text = match &entry.decl {
         Some(StreamDecl::Turn(t)) => {
-            let layout = candle_conversation::turn_layout::TurnLayout::new(t.segments.clone());
+            let layout = t.layout();
             Some((
                 layout.user_text().to_string(),
                 layout.assistant_text().unwrap_or_default(),
@@ -3392,15 +3390,14 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
 fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let mut substrate = Substrate::new();
     // Fast metadata scan: skip the large reference-stored payloads (KV chunks,
-    // token blobs, signatures). `apply_walker_entry` keeps only their
-    // `(offset, len)` — never the bytes — and the inspector reads specific
-    // payloads on demand, so reading them here would scan the whole multi-GB log
-    // for nothing. This is the single biggest cost in every command.
+    // token blobs). `apply_walker_entry` keeps only their `(offset, len)` — never
+    // the bytes — and the inspector reads specific payloads on demand, so reading
+    // them here would scan the whole multi-GB log for nothing. This is the single
+    // biggest cost in every command. `WideQSig` / `ProjectionEvents` are NOT
+    // skipped — `apply_walker_entry` mirrors their payload into the stream blob the
+    // belief gallery reads.
     let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |rt| {
-        !matches!(
-            rt,
-            RecordType::Chunk | RecordType::Tokens | RecordType::Signatures
-        )
+        !matches!(rt, RecordType::Chunk | RecordType::Tokens)
     })?;
     for e in &entries {
         substrate.apply_walker_entry(e);

@@ -61,6 +61,7 @@ pub use terminator::{Feed, Terminator, TerminatorState};
 pub use think::{compile_think_tree, ThinkMode, ThinkSteerEnvelope};
 pub use tool_call::{
     compile_tool_call_tree, parse_tools, Param, ParamType, ToolCallEnvelope, ToolSpec,
+    TOOL_CALL_TREE_LABEL,
 };
 pub use tree::{FreeTextLimits, FreeTextSpan, NodeId, StencilNode, StencilTree};
 pub use trie::{Step, TokenTrie, TrieNodeId};

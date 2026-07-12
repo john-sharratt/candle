@@ -539,16 +539,25 @@ impl Scheduler {
         // before and after a tool call never shares a DRY window with the call —
         // and while the call runs DRY is off entirely (the grammar is steered).
         for &seq_id in seq_ids.iter() {
-            let in_tool = self
+            // `in_stencil` covers ANY steered span (think or tool call) and gates
+            // DRY, as before.  `in_tool_call` is the tool call specifically (by
+            // tree label) and gates the remaining repetition penalties — reasoning
+            // keeps full repetition control, only tool-call arguments are freed to
+            // reproduce the prompt's numbers/paths verbatim.
+            let label: Option<&str> = self
                 .active_decodes
                 .get(&seq_id)
-                .is_some_and(|s| s.stencil.is_some());
+                .and_then(|s| s.stencil.as_ref())
+                .map(|d| d.tree().label());
+            let in_stencil = label.is_some();
+            let in_tool_call = label == Some(super::TOOL_CALL_TREE_LABEL);
             if let Some(ss) = self.sampling_states.get_mut(&seq_id) {
-                if in_tool && !ss.dry_suppressed {
+                if in_stencil && !ss.dry_suppressed {
                     ss.enter_tool_call();
-                } else if !in_tool && ss.dry_suppressed {
+                } else if !in_stencil && ss.dry_suppressed {
                     ss.exit_tool_call();
                 }
+                ss.in_tool_call = in_tool_call;
             }
         }
 
@@ -990,9 +999,7 @@ impl Scheduler {
                             // the tool committed from the reasoning so far is what the
                             // model sees, then freeze — the generic call body must not
                             // re-orient the selection.
-                            if !self.pending_reprojections.contains(&seq_id) {
-                                self.pending_reprojections.push(seq_id);
-                            }
+                            Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                             state.non_punct_since_reproject = 0;
                             state.in_tool_call = true;
                         } else if is_tool_close {
@@ -1007,9 +1014,7 @@ impl Scheduler {
                             let punctuation_fire =
                                 is_trigger && state.non_punct_since_reproject > 16;
                             if cadence_fire || punctuation_fire {
-                                if !self.pending_reprojections.contains(&seq_id) {
-                                    self.pending_reprojections.push(seq_id);
-                                }
+                                Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                                 state.non_punct_since_reproject = 0;
                             } else if !is_trigger {
                                 // A non-trigger token adds to the content accumulated
@@ -1020,6 +1025,18 @@ impl Scheduler {
                     }
                 }
             }
+        }
+    }
+
+    /// Queue a view for reprojection at the next drain, deduplicating against
+    /// entries already pending. Every reprojection trigger — cadence,
+    /// punctuation, tool-call lock-in, prefill promotion — enqueues through
+    /// here so the queue's invariants live in one place. An associated fn over
+    /// the queue field (not `&mut self`) so trigger sites that hold a
+    /// `DecodeState` borrow can still call it.
+    pub(super) fn queue_reprojection(pending: &mut Vec<SequenceId>, seq_id: SequenceId) {
+        if !pending.contains(&seq_id) {
+            pending.push(seq_id);
         }
     }
 

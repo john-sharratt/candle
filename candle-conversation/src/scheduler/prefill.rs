@@ -825,7 +825,7 @@ impl Scheduler {
                         sampling_config: work.sampling,
                         seal_action: work.seal_action,
                         post_decode_tokens: work.post_decode_tokens,
-                        belief: crate::projection::PriorBelief::default(),
+                        belief: work.belief,
                         prefill_tokens: work.tokens,
                         user_text: work.user_text,
                         tags: work.tags,
@@ -893,6 +893,25 @@ impl Scheduler {
                 "stencil steering started (trigger on the first decoded token)",
             );
         }
+        // A first-token `<tool_call>` trigger enters the call immediately, so the
+        // in-call state must be set HERE — the decode loop's `is_tool_open` scan
+        // (which normally sets it) only sees tokens sampled in `batch_decode_step`,
+        // never this one. Without it the in-call reprojection freeze never engages
+        // for these turns and cadence/punctuation triggers re-orient the selection
+        // mid-call. The early first-reprojection push below still fires once — it
+        // is this turn's lock-in reprojection, exactly like the one `is_tool_open`
+        // fires before freezing.
+        let first_token_opens_call = stencil
+            .as_ref()
+            .is_some_and(|d| d.tree().label() == super::TOOL_CALL_TREE_LABEL);
+        // Captured before `work.reprojection` moves into the DecodeState: the
+        // early first-reprojection below fires only for turns whose target
+        // layer runs belief-driven selection — a plain-prompt layer (the
+        // titler's single-section schema) gains nothing from the extra swap.
+        let wants_early_reprojection = work
+            .reprojection
+            .as_ref()
+            .is_some_and(|p| p.has_belief_collections());
 
         self.active_decodes.insert(
             work.sequence_id,
@@ -903,7 +922,7 @@ impl Scheduler {
                 sampling_config: work.sampling,
                 seal_action: work.seal_action,
                 post_decode_tokens: work.post_decode_tokens,
-                belief: crate::projection::PriorBelief::default(),
+                belief: work.belief,
                 prefill_tokens: work.tokens,
                 user_text: work.user_text,
                 tags: work.tags,
@@ -934,12 +953,25 @@ impl Scheduler {
                 reprojection: work.reprojection,
                 non_punct_since_reproject: 0,
                 last_projection_end: 0,
-                in_tool_call: false,
+                in_tool_call: first_token_opens_call,
                 triggers: work.triggers,
                 stencil,
                 pending_mask: None,
             },
         );
+        // Fire the turn's FIRST reprojection immediately (drained right after
+        // the next decode step, ~token 1). The prefill just wrote the user
+        // query's wide-Q into R16, so the belief scan can score it and
+        // materialize the right sections BEFORE the model's plan forms in the
+        // early <think> tokens — waiting for the 64-token cadence lets a
+        // wrong-tool prefix anchor the reasoning first (the submit-time
+        // projection only carries the PREVIOUS turn's belief; it cannot see
+        // this turn's query). For a first-token tool call this is the turn's
+        // lock-in reprojection: `in_tool_call` is already set above, so the
+        // call body stays frozen afterwards.
+        if wants_early_reprojection {
+            Self::queue_reprojection(&mut self.pending_reprojections, work.sequence_id);
+        }
     }
 
     pub(super) fn run_prefill_with_shift(
@@ -952,7 +984,7 @@ impl Scheduler {
         // intermediate activation buffers from growing unboundedly.
         // Boundary-injection shifts are always small partial blocks and are
         // handled as a single pass.
-        if write_offset_shift == 0 && tokens.len() > self.max_prefill_pass_tokens {
+        let logits = if write_offset_shift == 0 && tokens.len() > self.max_prefill_pass_tokens {
             let mut last_logits: Option<Tensor> = None;
             for chunk in tokens.chunks(self.max_prefill_pass_tokens) {
                 let input = Tensor::new(chunk, &self.device)
@@ -968,42 +1000,55 @@ impl Scheduler {
                 super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, chunk);
                 last_logits = logits_vec.into_iter().next();
             }
-            return last_logits.ok_or_else(|| {
+            last_logits.ok_or_else(|| {
                 ConversationError::Channel("no logits returned from chunked prefill".into())
-            });
-        }
-
-        let input = Tensor::new(tokens, &self.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(ConversationError::Model)?;
-
-        let logits_vec = if write_offset_shift == 0 {
-            self.model
-                .forward_batched(&mut self.session, &[sequence_id.0], &[input])
-                .map_err(ConversationError::Model)?
+            })?
         } else {
-            self.model
-                .forward_batched_with_write_shifts(
-                    &mut self.session,
-                    &[sequence_id.0],
-                    &[input],
-                    &[write_offset_shift as u32],
-                )
-                .map_err(ConversationError::Model)?
+            let input = Tensor::new(tokens, &self.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(ConversationError::Model)?;
+
+            let logits_vec = if write_offset_shift == 0 {
+                self.model
+                    .forward_batched(&mut self.session, &[sequence_id.0], &[input])
+                    .map_err(ConversationError::Model)?
+            } else {
+                self.model
+                    .forward_batched_with_write_shifts(
+                        &mut self.session,
+                        &[sequence_id.0],
+                        &[input],
+                        &[write_offset_shift as u32],
+                    )
+                    .map_err(ConversationError::Model)?
+            };
+
+            self.session
+                .advance_sequence(sequence_id.0, tokens.len())
+                .map_err(ConversationError::Model)?;
+
+            // Mirror these tokens into the slot's diagnostic log so the
+            // turn-complete dump can reconstruct the exact context the
+            // kernel saw (compiled out without the `context-dump` feature).
+            super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, tokens);
+
+            logits_vec.into_iter().next().ok_or_else(|| {
+                ConversationError::Channel("no logits returned from prefill".into())
+            })?
         };
 
+        // Single exit for every prefill path: the forward wrote KV without the
+        // decode kernel's self-increment, so refresh the cached decode
+        // slot-state's writer slice with the advanced tail length. Without
+        // this, a mid-decode injection (a stencil static run, a think-steer
+        // continuation) is INVISIBLE to the following decode steps — the
+        // kernel attends the tail chunk at its stale pre-prefill length and
+        // the model decodes as if the injected tokens were never written.
+        // No-op for slots that haven't decoded yet.
         self.session
-            .advance_sequence(sequence_id.0, tokens.len())
+            .refresh_decode_slot_state(sequence_id.0)
             .map_err(ConversationError::Model)?;
 
-        // Mirror these tokens into the slot's diagnostic log so the
-        // turn-complete dump can reconstruct the exact context the
-        // kernel saw (compiled out without the `context-dump` feature).
-        super::Scheduler::record_slot_tokens(&mut self.slot_tokens, sequence_id, tokens);
-
-        logits_vec
-            .into_iter()
-            .next()
-            .ok_or_else(|| ConversationError::Channel("no logits returned from prefill".into()))
+        Ok(logits)
     }
 }

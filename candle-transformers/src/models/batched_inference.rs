@@ -702,6 +702,27 @@ impl BatchedInferenceSession {
         Ok(idx)
     }
 
+    /// Refresh the persistent decode GPU slot-state for `seq_idx` across every
+    /// layer after a multi-token prefill wrote tokens without the decode
+    /// kernel's self-increment (a stencil static-run injection, a think-steer
+    /// continuation prefill).
+    ///
+    /// The decode hot path trusts the cached GPU slot buffer, whose tail
+    /// length self-increments only on decode steps — without this refresh the
+    /// injected tokens sit beyond the buffer's stale tail length, invisible to
+    /// subsequent decode attention (and progressively clobbered by the next
+    /// decode writes). Only the WRITER chunk's slice is re-serialised (O(1)
+    /// per layer); a prefill that crossed a chunk boundary already dropped the
+    /// buffer at the mutation site, and a sequence that has not decoded yet
+    /// has none — both rebuild fully on the next decode sync. No-op on
+    /// contiguous backings.
+    pub fn refresh_decode_slot_state(&self, seq_idx: usize) -> Result<()> {
+        for backing in &self.backings {
+            backing.refresh_decode_writer_slice(&[(seq_idx, 0)])?;
+        }
+        Ok(())
+    }
+
     /// Create KvCaches for a sequence, wiring up chunked backing.
     fn create_kv_caches_for_sequence(&self, seq_idx: usize) -> Result<KvCaches> {
         let compression = self.compression_policy();
