@@ -9,16 +9,21 @@
 //!
 //! The live set is streamed into a fresh file in dependency order
 //! (`ModelSpec`, `Template`, then per stream its `StreamDecl`, `Chunk`s,
-//! `Tokens`, `Commit`), closed with a fresh `Checkpoint`. The
-//! orchestration that swaps the new file in is [`SubstratePersistence::compact`].
+//! `Tokens`, `Commit`). The orchestration that swaps the new
+//! file in is [`SubstratePersistence::compact`], and the automatic trigger
+//! is the O(1) dead-byte accounting behind
+//! [`SubstratePersistence::should_compact`] (see [`super::accounting`]).
+//!
+//! [`SubstratePersistence::compact`]: super::SubstratePersistence::compact
+//! [`SubstratePersistence::should_compact`]: super::SubstratePersistence::should_compact
 
 use std::path::Path;
 
-use super::checkpoint;
-use super::log_file::{read_record_at, LogFile, LogSource, SUPERBLOCK_SIZE};
+use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
+use super::log_file::{read_record_at, LogFile, LogSource};
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest};
 use super::record::{encode_record, DebugIdPayload, Record, RecordHeader, RecordType};
-use super::walker::{self, WalkEntry};
+use super::walker::WalkEntry;
 use super::Result;
 use crate::substrate::Substrate;
 
@@ -235,9 +240,11 @@ pub fn collect_live_records(
     Ok(out)
 }
 
-/// Write the live records to a fresh log at `path`, closed with a
-/// `Checkpoint`. Returns the open [`LogFile`] and its manifest. `path` is
-/// removed first if it already exists.
+/// Write the live records to a fresh log at `path`, interleaving a
+/// fresh `HeaderIndex` chain and publishing its head in the superblock
+/// — a just-compacted log recovers through the chain like any other.
+/// Returns the open [`LogFile`] and its manifest. `path` is removed
+/// first if it already exists.
 pub fn write_compacted_log(
     path: &Path,
     live: &[(RecordHeader, Vec<u8>)],
@@ -247,6 +254,26 @@ pub fn write_compacted_log(
     }
     let mut log = LogFile::create(path)?;
     let mut manifest = Manifest::new();
+
+    let mut pending: Vec<IndexEntry> = Vec::new();
+    let mut last_index: (u64, u64) = (0, 0);
+    let flush_index =
+        |log: &mut LogFile, pending: &mut Vec<IndexEntry>, last_index: &mut (u64, u64)| {
+            let payload = encode_index_payload(*last_index, pending);
+            let h = RecordHeader {
+                record_type: RecordType::HeaderIndex,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            };
+            let bytes = encode_record(&h, &payload);
+            let offset = log.stage(&bytes);
+            *last_index = (offset, bytes.len() as u64);
+            pending.clear();
+        };
 
     for (header, payload) in live {
         let mut h = *header;
@@ -261,88 +288,26 @@ pub fn write_compacted_log(
             },
             size: bytes.len() as u64,
         })?;
+        pending.push(IndexEntry::from_header(&h, offset, bytes.len() as u64));
+        if pending.len() >= INDEX_FLUSH_ENTRIES {
+            flush_index(&mut log, &mut pending, &mut last_index);
+        }
+    }
+    if !pending.is_empty() {
+        flush_index(&mut log, &mut pending, &mut last_index);
     }
     log.commit()?;
-
-    // Close with a fresh Checkpoint over the just-built manifest.
-    let ckpt_payload = checkpoint::encode_checkpoint(&manifest);
-    let ckpt_header = RecordHeader {
-        record_type: RecordType::Checkpoint,
-        format: 0,
-        payload_len: ckpt_payload.len() as u64,
-        crc: 0,
-        stream_id: 0,
-        chunk_index: 0,
-        token_count: 0,
-    };
-    let ckpt_offset = log.stage(&encode_record(&ckpt_header, &ckpt_payload));
-    log.commit()?;
-    log.set_latest_checkpoint(ckpt_offset)?;
-    manifest.last_checkpoint_offset = Some(ckpt_offset);
+    if last_index != (0, 0) {
+        log.set_last_index(last_index)?;
+    }
 
     Ok((log, manifest))
-}
-
-/// Fraction of the log's records that are dead weight — the heuristic that
-/// drives the automatic compaction trigger. `0.0` = nothing to reclaim.
-pub fn dead_record_ratio(
-    log: &mut dyn LogSource,
-    manifest: &Manifest,
-    substrate: &Substrate,
-) -> Result<f32> {
-    let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
-    let total = entries.len();
-    if total == 0 {
-        return Ok(0.0);
-    }
-    // Live on-disk records: read-back records (model/template/chunk/
-    // tokens) — synthesised entries (StreamDecl, Commit,
-    // Label, ConvState, TreeMetadata, DebugId) are not on disk in the
-    // active log; they're re-emitted from substrate state during
-    // compaction.
-    let live_on_disk = collect_live_records(log, manifest, substrate)?
-        .iter()
-        .filter(|(h, _)| {
-            !matches!(
-                h.record_type,
-                RecordType::StreamDecl
-                    | RecordType::Commit
-                    | RecordType::Label
-                    | RecordType::ConvState
-                    | RecordType::TreeMetadata
-                    | RecordType::DebugId
-                    | RecordType::ProjectionEvents
-                    | RecordType::WideQSig
-            )
-        })
-        .count()
-        + substrate
-            .all_streams()
-            .filter(|(_, s)| s.decl.is_some())
-            .count()
-        + substrate
-            .all_streams()
-            .filter(|(_, s)| s.committed_through.is_some())
-            .count()
-        + substrate
-            .all_streams()
-            .filter(|(_, s)| s.projection_events.is_some())
-            .count()
-        + substrate
-            .all_streams()
-            .filter(|(_, s)| s.wide_q_sigs.is_some())
-            .count()
-        + substrate.live_conv_meta().len()
-        + substrate.live_tree_metadata_payloads().len()
-        + substrate.live_debug_ids().len();
-    let dead = total.saturating_sub(live_on_disk.min(total));
-    Ok(dead as f32 / total as f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::log_file::MemLog;
+    use crate::persistence::log_file::{MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::record::encode_record;
 
     fn record(rt: RecordType, stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
@@ -416,41 +381,21 @@ mod tests {
 
         // The compacted log re-walked into a substrate has the same
         // live streams + chunks as the source.
-        let hint = new_log.superblock().latest_checkpoint_offset;
+        let hint = new_log.superblock().last_index;
+        assert_ne!(hint, (0, 0), "compacted log must carry an index chain");
         let mut after_sub = Substrate::new();
-        let _ =
-            checkpoint::recover_with_sink(&mut new_log, hint, |e| after_sub.apply_walker_entry(e))
-                .unwrap();
+        let recovered = super::super::recovery::recover_with_sink(&mut new_log, hint, |e| {
+            after_sub.apply_walker_entry(e)
+        })
+        .unwrap();
+        assert_eq!(
+            recovered.last_index,
+            Some(hint),
+            "recovery of a compacted log must take the chain path"
+        );
         assert_eq!(before_sub.live_chunk_count(), after_sub.live_chunk_count());
         assert_eq!(after_sub.live_chunk_count(), 2);
         std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn dead_ratio_is_zero_for_a_clean_log() {
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&record(RecordType::Chunk, 1, 0, b"only"));
-        let mut mem = MemLog::with_records(&blob);
-        let (manifest, substrate, _) =
-            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        assert_eq!(
-            dead_record_ratio(&mut mem, &manifest, &substrate).unwrap(),
-            0.0
-        );
-    }
-
-    #[test]
-    fn dead_ratio_rises_with_superseded_records() {
-        let mut blob = Vec::new();
-        for i in 0..8u32 {
-            // Eight writes to the same key — seven are dead.
-            blob.extend_from_slice(&record(RecordType::Chunk, 1, 0, format!("v{i}").as_bytes()));
-        }
-        let mut mem = MemLog::with_records(&blob);
-        let (manifest, substrate, _) =
-            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        let ratio = dead_record_ratio(&mut mem, &manifest, &substrate).unwrap();
-        assert!(ratio > 0.8, "7 of 8 records are dead, got ratio {ratio}");
     }
 
     /// Compactor drops every record bound to a tombstoned timeline.

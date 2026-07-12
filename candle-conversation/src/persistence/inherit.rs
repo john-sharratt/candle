@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::checkpoint;
 use super::direct_io::DirectFile;
 use super::log_file::LogSource;
 use super::log_file::{read_record_at, LogFile};
 use super::manifest::Manifest;
 use super::record::Record;
+use super::recovery;
 use super::streams::StreamId;
 use super::Result;
 use crate::substrate::Substrate;
@@ -26,7 +26,7 @@ pub struct InheritedSubstrate {
     /// Canonical path of the inherited log file.
     path: PathBuf,
     /// The recovered manifest — carries only the singleton offsets
-    /// (`ModelSpec`, `Template`, `Tokenizer`, `last_checkpoint_offset`).
+    /// (`ModelSpec`, `Template`, `Tokenizer`).
     manifest: Manifest,
     /// In-RAM substrate populated by walking the inherited log during
     /// `load`.  Holds per-stream / per-timeline state (chunks, tokens,
@@ -68,8 +68,8 @@ impl InheritedSubstrate {
     }
 
     /// Read a record at `offset` from the inherited log. `record_size`
-    /// is the padded on-disk size from the manifest entry — captured at
-    /// walk time, persisted through checkpoints. Single read.
+    /// is the padded on-disk size from the stream-index entry —
+    /// captured at walk time. Single read.
     pub fn read_record(&self, offset: u64, record_size: u64) -> Result<Record> {
         let mut file = self.file.lock().unwrap();
         read_record_at(&mut *file, offset, record_size)
@@ -111,12 +111,12 @@ impl InheritedSubstrate {
         // Recover outside the cache lock so a slow load does not block
         // other paths.  The walker drives both the manifest's
         // singleton offsets AND the substrate's per-entity state in a
-        // single pass — checkpoint::recover_with_sink dispatches each
+        // single pass — recovery::recover_with_sink dispatches each
         // record through `substrate.apply_walker_entry`.
         let mut file = LogFile::open(&canonical)?;
-        let hint = file.superblock().latest_checkpoint_offset;
+        let hint = file.superblock().last_index;
         let mut substrate = Substrate::new();
-        let recovered = checkpoint::recover_with_sink(&mut file, hint, |entry| {
+        let recovered = recovery::recover_with_sink(&mut file, hint, |entry| {
             substrate.apply_walker_entry(entry)
         })?;
         let direct = DirectFile::open(&canonical)?;

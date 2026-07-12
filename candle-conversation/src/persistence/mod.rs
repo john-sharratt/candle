@@ -9,28 +9,32 @@
 //! The module is built bottom-up, one concern per file (§13.3):
 //!
 //! - [`content_hash`] — the deterministic content-hash chain.
-//! - [`record`] — the eight record types and the framing codec.
+//! - [`record`] — the record types and the framing codec.
 //! - [`streams`] — stream identity and the `StreamDecl` payload.
 //! - [`log_file`] — the append-only redo-log file.
 //! - [`walker`] — the skip-load record walk.
-//! - [`manifest`] — the in-RAM last-writer-wins index.
-//! - [`checkpoint`] — checkpoint serialisation and recovery.
+//! - [`manifest`] — the in-RAM last-writer-wins singleton index.
+//! - [`header_index`] — the batched record-digest chain (§5.6).
+//! - [`recovery`] — chain-first recovery with a forward-walk fallback.
+//! - [`accounting`] — O(1) live/dead byte accounting for compaction.
 //! - [`inherit`] — multi-log inheritance and the shared cache.
 //!
 //! [`SubstratePersistence`] is the public API tying them together.
 
-pub mod checkpoint;
+pub mod accounting;
 pub mod chunk_plan;
 pub mod cold_load;
 pub mod compaction;
 pub mod content_hash;
 pub mod direct_io;
 pub mod elevate;
+pub mod header_index;
 pub mod inherit;
 pub mod log_file;
 pub mod manifest;
 pub mod pipeline;
 pub mod record;
+pub mod recovery;
 pub mod resume;
 pub mod streams;
 pub mod thread;
@@ -44,13 +48,15 @@ use thiserror::Error;
 
 use crate::substrate::Substrate;
 
+use accounting::RecordAccounting;
 use chunk_plan::ChunkedReadPlan;
+use header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use inherit::InheritedSubstrate;
-use log_file::{read_record_at, LogFile, LogSource};
+use log_file::{read_record_at, LogFile, LogSource, SUPERBLOCK_SIZE};
 use manifest::{ChunkLoc, Manifest};
 use record::{
-    decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
-    TreeMetadataPayload,
+    decode_record, encode_record, verify_record_crc, ChunkPayload, DebugIdPayload, Record,
+    RecordHeader, RecordType, TreeMetadataPayload,
 };
 use streams::{ContentAddress, StreamDecl, StreamId, StreamKind, StreamRef};
 use walker::WalkEntry;
@@ -99,13 +105,32 @@ pub struct SubstratePersistence {
     inherited: Vec<Arc<InheritedSubstrate>>,
     model_spec: Option<Vec<u8>>,
     template: Option<Vec<u8>>,
-    /// SHA-256 of the on-disk `Tokenizer` record's bytes — kept (32 bytes)
+    /// SHA-256 of the `Tokenizer` record's payload — kept (32 bytes)
     /// instead of the full ~11 MB so [`SubstratePersistence::set_tokenizer`]
-    /// can decide whether to re-embed by comparing hashes.
+    /// can decide whether to re-embed by comparing hashes. The bytes
+    /// themselves stay on disk and are read on demand via
+    /// [`SubstratePersistence::read_tokenizer_bytes`].
     tokenizer_sha256: Option<[u8; 32]>,
     /// Filesystem path of the active log — the rename target of a
     /// compaction swap (§5.8).
     active_path: PathBuf,
+    /// O(1) live/dead byte accounting over the active log — fed by
+    /// every append and by the recovery walk, read by
+    /// [`SubstratePersistence::should_compact`]. Reset and rebuilt when
+    /// compaction rewrites the file.
+    accounting: RecordAccounting,
+    /// Digests of appended records not yet covered by a `HeaderIndex`
+    /// record — seeded at open with the un-indexed tail recovery
+    /// reports, flushed every [`INDEX_FLUSH_ENTRIES`] appends.
+    pending_index: Vec<IndexEntry>,
+    /// `(offset, padded_size)` of the newest `HeaderIndex` record —
+    /// the link the next flush chains to and the superblock hint's
+    /// source of truth. `None` starts a fresh chain.
+    last_index: Option<(u64, u64)>,
+    /// Data records replayed by the open-time recovery (chain digests +
+    /// walked tail). Diagnostic: startup logging reports it alongside
+    /// the open latency.
+    recovered_records: usize,
 }
 
 /// SHA-256 of `bytes` — the tokenizer change-detection digest.
@@ -116,61 +141,13 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Sidecar path for a given active log path:
-/// `<log_dir>/tokenizer.json` (siblings of the redo log).
-fn tokenizer_sidecar_for(active_path: &Path) -> PathBuf {
-    active_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("tokenizer.json")
-}
-
-/// Decode a `Tokenizer` record payload into the 32-byte SHA-256 digest it
-/// always carries.
-fn hash_from_tokenizer_payload(payload: &[u8]) -> Result<[u8; 32]> {
-    if payload.len() != 32 {
-        return Err(PersistenceError::Corrupt(format!(
-            "Tokenizer record payload must be a 32-byte SHA-256 digest, got {} bytes",
-            payload.len()
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(payload);
-    Ok(out)
-}
-
-/// Write `bytes` to the tokenizer sidecar atomically:
-/// write to `<path>.tmp`, fsync, rename over `<path>`. Renaming an existing
-/// file is sound on Windows (Rust opens with `FILE_SHARE_DELETE`) and POSIX.
-fn write_tokenizer_sidecar(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-/// Short hex prefix for diagnostics — first 8 bytes (`16` hex chars) is
-/// already unique enough to spot a hash mismatch in logs without dumping
-/// the full digest.
-fn hex_short(h: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(16);
-    for &b in &h[..8] {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{b:02x}");
-    }
-    s
-}
-
-/// Dead-record ratio at which [`SubstratePersistence::should_compact`] fires
+/// Dead-byte ratio at which [`SubstratePersistence::should_compact`] fires
 /// — half the log being dead weight is enough to justify a rewrite (§5.8).
 pub const COMPACTION_DEAD_RATIO_THRESHOLD: f32 = 0.5;
+
+/// Logs shorter than this never auto-compact — a rewrite of a small file
+/// reclaims nothing worth the pause, regardless of its dead ratio.
+pub const COMPACTION_MIN_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 impl SubstratePersistence {
     /// Open the persistence layer at `<cwd>/.substrate/substrate.log`,
@@ -229,7 +206,7 @@ impl SubstratePersistence {
     fn from_paths_with_sink<F>(
         active: &Path,
         inherited: &[PathBuf],
-        sink: F,
+        mut sink: F,
     ) -> Result<SubstratePersistence>
     where
         F: FnMut(&walker::WalkEntry),
@@ -239,7 +216,16 @@ impl SubstratePersistence {
             inherited_subs.push(InheritedSubstrate::load(path)?);
         }
 
-        let (mut log, manifest) = open_or_create_active_with_sink(active, sink)?;
+        // Feed the recovery replay into the dead-weight accounting in the
+        // same pass that populates the manifest and the caller's sink.
+        let mut accounting = RecordAccounting::new();
+        let mut recovered_records = 0usize;
+        let (mut log, manifest, last_index, pending_index) =
+            open_or_create_active_with_sink(active, |entry| {
+                recovered_records += 1;
+                accounting.record(&entry.record.header, entry.size);
+                sink(entry);
+            })?;
         let model_spec = manifest
             .model_spec
             .map(|loc| read_record_at(&mut log, loc.offset, loc.record_size).map(|r| r.payload))
@@ -252,11 +238,11 @@ impl SubstratePersistence {
             .tokenizer
             .map(|loc| {
                 let r = read_record_at(&mut log, loc.offset, loc.record_size)?;
-                hash_from_tokenizer_payload(&r.payload)
+                Ok::<_, PersistenceError>(sha256(&r.payload))
             })
             .transpose()?;
 
-        Ok(SubstratePersistence {
+        let mut sp = SubstratePersistence {
             log,
             manifest,
             inherited: inherited_subs,
@@ -264,7 +250,18 @@ impl SubstratePersistence {
             tokenizer_sha256,
             template,
             active_path: active.to_path_buf(),
-        })
+            accounting,
+            pending_index,
+            last_index,
+            recovered_records,
+        };
+        // Self-heal a large un-indexed tail (a crash window, or a log
+        // that predates the index chain entirely): flush it now so the
+        // next open takes the chain path instead of re-walking it.
+        if sp.pending_index.len() >= INDEX_FLUSH_ENTRIES {
+            sp.flush_header_index()?;
+        }
+        Ok(sp)
     }
 
     /// The active log's manifest.
@@ -326,6 +323,7 @@ impl SubstratePersistence {
         let bytes = encode_record(&header, payload);
         let offset = self.log.stage(&bytes);
         let size = bytes.len() as u64;
+        self.accounting.record(&header, size);
         let entry = WalkEntry {
             offset,
             record: Record {
@@ -335,7 +333,61 @@ impl SubstratePersistence {
             size,
         };
         self.manifest.ingest(&entry)?;
+        // Digest every data record for the header-index chain. Index
+        // records themselves are self-describing via their `prev` links
+        // and are never digested.
+        if header.record_type != RecordType::HeaderIndex {
+            self.pending_index
+                .push(IndexEntry::from_header(&header, offset, size));
+            if self.pending_index.len() >= INDEX_FLUSH_ENTRIES {
+                self.flush_header_index()?;
+            }
+        }
         Ok((offset, size))
+    }
+
+    /// Flush the accumulated digests as `HeaderIndex` record(s) chained
+    /// to the previous index, commit them durably, and publish the new
+    /// chain head in the superblock. The commit-before-publish order
+    /// means the hint never points at un-flushed bytes; recovery's
+    /// fallback covers the crash window between the two writes either
+    /// way.
+    fn flush_header_index(&mut self) -> Result<()> {
+        if self.pending_index.is_empty() {
+            return Ok(());
+        }
+        while !self.pending_index.is_empty() {
+            let take = self.pending_index.len().min(INDEX_FLUSH_ENTRIES);
+            let batch: Vec<IndexEntry> = self.pending_index.drain(..take).collect();
+            let payload = encode_index_payload(self.last_index.unwrap_or((0, 0)), &batch);
+            let (offset, size) =
+                self.append_record(RecordType::HeaderIndex, 0, 0, 0, 0, &payload)?;
+            self.last_index = Some((offset, size));
+        }
+        self.log.commit()?;
+        if let Some(li) = self.last_index {
+            self.log.set_last_index(li)?;
+        }
+        Ok(())
+    }
+
+    /// The newest committed `HeaderIndex` chain head, if any — the
+    /// record the next flush chains to and the superblock hint's value.
+    /// Diagnostic accessor.
+    pub fn last_index(&self) -> Option<(u64, u64)> {
+        self.last_index
+    }
+
+    /// Number of appended records not yet covered by a `HeaderIndex`
+    /// record. Diagnostic accessor.
+    pub fn pending_index_len(&self) -> usize {
+        self.pending_index.len()
+    }
+
+    /// Data records the open-time recovery replayed (chain digests +
+    /// walked tail). Diagnostic accessor.
+    pub fn recovered_record_count(&self) -> usize {
+        self.recovered_records
     }
 
     /// Declare a stream — append its `StreamDecl` record. Returns the
@@ -660,7 +712,11 @@ impl SubstratePersistence {
                     let within = (c.file_offset - stripe.file_offset) as usize;
                     let start = buf_cur + within;
                     let end = start + c.record_size as usize;
-                    let (_header, payload_bytes, _) = decode_record(&buf[start..end])?;
+                    let (header, payload_bytes, _) = decode_record(&buf[start..end])?;
+                    // Bit-rot check at the consumption point (see
+                    // `verify_record_crc`) — corrupt KV must fail
+                    // loudly, not dequantise into garbage.
+                    verify_record_crc(&header, payload_bytes)?;
                     let payload = ChunkPayload::decode(payload_bytes)?;
                     out.push((c.chunk_idx, payload));
                     chunk_iter.next();
@@ -684,7 +740,8 @@ impl SubstratePersistence {
                     let within = (c.file_offset - stripe.file_offset) as usize;
                     let start = buf_cur + within;
                     let end = start + c.record_size as usize;
-                    let (_header, payload_bytes, _) = decode_record(&buf[start..end])?;
+                    let (header, payload_bytes, _) = decode_record(&buf[start..end])?;
+                    verify_record_crc(&header, payload_bytes)?;
                     let payload = ChunkPayload::decode(payload_bytes)?;
                     out.push((c.chunk_idx, payload));
                     chunk_iter.next();
@@ -701,10 +758,6 @@ impl SubstratePersistence {
     /// chunk's bytes fit within `buffer_size`. Used by the cold-load
     /// orchestrator to stream a turn through a fixed-size pinned
     /// scratch — see [`chunk_plan`] for the partition semantics.
-    ///
-    /// Chunks flagged by the background CRC validator are filtered
-    /// out of the plan — they would fail to load anyway and the
-    /// validator has already warned about them via `tracing`.
     pub fn plan_chunked_read(
         &self,
         substrate: &Substrate,
@@ -767,16 +820,6 @@ impl SubstratePersistence {
         Ok(true)
     }
 
-    /// Write a `Checkpoint` record snapshotting the manifest, commit it
-    /// durably, and update the superblock's latest-checkpoint hint.
-    pub fn checkpoint(&mut self) -> Result<()> {
-        let payload = checkpoint::encode_checkpoint(&self.manifest);
-        let (offset, _) = self.append_record(RecordType::Checkpoint, 0, 0, 0, 0, &payload)?;
-        self.log.commit()?;
-        self.log.set_latest_checkpoint(offset)?;
-        Ok(())
-    }
-
     /// Set the model spec — last-writer-wins. Appends a fresh `ModelSpec`
     /// record only when the bytes differ from the latest on file. Returns
     /// `true` if a record was written.
@@ -801,80 +844,35 @@ impl SubstratePersistence {
     }
 
     /// Set the model's `tokenizer.json` bytes — last-writer-wins, like
-    /// [`SubstratePersistence::set_model_spec`]. Appends only when the bytes
-    /// differ from the latest on file.
+    /// [`SubstratePersistence::set_model_spec`]. Appends only when the
+    /// bytes differ from the latest on file (compared by SHA-256).
     ///
-    /// The bytes themselves live in a **sidecar file** at
-    /// `<log_dir>/tokenizer.json` (written atomically via a `.tmp` rename);
-    /// the `Tokenizer` record in the log stores only the 32-byte SHA-256
-    /// digest of those bytes. Keeping the ~11 MB tokenizer JSON out of the
-    /// append-only log shrinks every log dramatically — see
-    /// [`SubstratePersistence::tokenizer_sidecar_path`] /
-    /// [`SubstratePersistence::read_tokenizer_bytes`].
+    /// The full bytes are the `Tokenizer` record's payload, so the log is
+    /// a self-contained substrate image (§5.7) — no companion files.
+    /// Recovery never reads the payload (the walk skips it and the digest
+    /// chain carries only its header), so the ~11 MB record costs one
+    /// on-demand read at open to compute the change-detection hash and
+    /// nothing else.
     pub fn set_tokenizer(&mut self, tokenizer: &[u8]) -> Result<bool> {
         let hash = sha256(tokenizer);
-        let sidecar = self.tokenizer_sidecar_path();
-        let hash_matches_log = self.tokenizer_sha256 == Some(hash);
-        let sidecar_missing = !sidecar.exists();
-        if hash_matches_log && !sidecar_missing {
+        if self.tokenizer_sha256 == Some(hash) {
             return Ok(false);
         }
-        // Sidecar write first (durably), so a crash between sidecar write
-        // and record append leaves us with a recoverable hash → bytes
-        // mapping at the next open: read_tokenizer_bytes verifies the
-        // sidecar's hash against the record's payload, so a stale sidecar
-        // is detected, not silently trusted.
-        //
-        // When the hash already matches the log but the sidecar is gone
-        // (e.g. it was deleted out from under us), we restore the sidecar
-        // without re-appending the Tokenizer record — graceful sidecar
-        // recovery, no log churn.
-        write_tokenizer_sidecar(&sidecar, tokenizer)?;
-        if !hash_matches_log {
-            self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, &hash)?;
-            self.tokenizer_sha256 = Some(hash);
-        }
+        self.append_record(RecordType::Tokenizer, 0, 0, 0, 0, tokenizer)?;
+        self.tokenizer_sha256 = Some(hash);
         Ok(true)
     }
 
-    /// Filesystem path of the tokenizer sidecar that pairs with this log.
-    /// Lives next to the active log as `<log_dir>/tokenizer.json`.
-    pub fn tokenizer_sidecar_path(&self) -> PathBuf {
-        tokenizer_sidecar_for(&self.active_path)
-    }
-
-    /// Read the tokenizer bytes from the sidecar file, verifying the
-    /// SHA-256 matches the digest recorded in the active log.
-    ///
-    /// Returns `Ok(None)` when:
-    /// - the log has no [`RecordType::Tokenizer`] record yet (no model has
-    ///   ever called `set_tokenizer` against this substrate), or
-    /// - the sidecar file is missing (e.g. a fresh log that's about to be
-    ///   populated, or the sidecar was deleted out from under us).
-    ///
-    /// Returns `Err` only when the sidecar exists but its hash disagrees
-    /// with the recorded digest — a torn or tampered sidecar.
-    pub fn read_tokenizer_bytes(&self) -> Result<Option<Vec<u8>>> {
-        let Some(expected) = self.tokenizer_sha256 else {
+    /// Read the tokenizer bytes embedded in the active log's `Tokenizer`
+    /// record. `Ok(None)` when the log has no such record yet (no model
+    /// has ever called `set_tokenizer` against this substrate). The read
+    /// CRC-verifies the payload, so bit rot surfaces as `BadChecksum`.
+    pub fn read_tokenizer_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(loc) = self.manifest.tokenizer else {
             return Ok(None);
         };
-        let path = self.tokenizer_sidecar_path();
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let got = sha256(&bytes);
-                if got != expected {
-                    return Err(PersistenceError::Corrupt(format!(
-                        "tokenizer sidecar {} hash mismatch (expected {} got {})",
-                        path.display(),
-                        hex_short(&expected),
-                        hex_short(&got),
-                    )));
-                }
-                Ok(Some(bytes))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(PersistenceError::Io(e)),
-        }
+        let r = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
+        Ok(Some(r.payload))
     }
 
     /// The latest model spec payload, if any.
@@ -915,13 +913,32 @@ impl SubstratePersistence {
     }
 
     /// Whether the active log has accumulated enough dead weight to justify
-    /// a compaction pass — the dead-record ratio (§5.8) crossing
-    /// [`COMPACTION_DEAD_RATIO_THRESHOLD`]. Flushes pending writes first so
-    /// the measurement reflects the durable log.
-    pub fn should_compact(&mut self, substrate: &Substrate) -> Result<bool> {
-        self.log.commit()?;
-        let ratio = compaction::dead_record_ratio(&mut self.log, &self.manifest, substrate)?;
-        Ok(ratio >= COMPACTION_DEAD_RATIO_THRESHOLD)
+    /// a compaction pass — the dead-byte ratio (§5.8) crossing
+    /// [`COMPACTION_DEAD_RATIO_THRESHOLD`] on a log at least
+    /// [`COMPACTION_MIN_LOG_BYTES`] long.
+    ///
+    /// Cheap enough to poll every persistence-thread pass: the dead-byte
+    /// counter is maintained O(1) per append (see [`accounting`]), and the
+    /// tombstoned-stream sum is a walk of the in-RAM stream index — no
+    /// disk I/O.
+    pub fn should_compact(&self, substrate: &Substrate) -> bool {
+        let total = (self.log.write_offset() + self.log.pending_len() as u64)
+            .saturating_sub(SUPERBLOCK_SIZE);
+        total >= COMPACTION_MIN_LOG_BYTES
+            && self.dead_ratio(substrate) >= COMPACTION_DEAD_RATIO_THRESHOLD
+    }
+
+    /// Fraction of the log's record bytes that are dead weight —
+    /// superseded last-writer-wins records plus everything owned by a
+    /// tombstoned timeline. `0.0` for an empty or freshly-compacted log.
+    pub fn dead_ratio(&self, substrate: &Substrate) -> f32 {
+        let total = (self.log.write_offset() + self.log.pending_len() as u64)
+            .saturating_sub(SUPERBLOCK_SIZE);
+        if total == 0 {
+            return 0.0;
+        }
+        let dead = self.accounting.dead_bytes() + substrate.tombstoned_stream_bytes();
+        dead as f32 / total as f32
     }
 
     /// Compact the active log — the whole-file dead-record rewrite (§5.8).
@@ -987,7 +1004,7 @@ impl SubstratePersistence {
             .tokenizer
             .map(|loc| {
                 let r = read_record_at(&mut self.log, loc.offset, loc.record_size)?;
-                hash_from_tokenizer_payload(&r.payload)
+                Ok::<_, PersistenceError>(sha256(&r.payload))
             })
             .transpose()?;
         // 6. The substrate's stream / timeline state still holds
@@ -995,11 +1012,14 @@ impl SubstratePersistence {
         //    collections and replay the new compacted log to rebuild
         //    them with the new offsets.  Per-turn KV residence and
         //    timeline registrations survive (they're not walker-built).
+        //    The dead-weight accounting restarts from the fresh file in
+        //    the same pass (a just-compacted log is all-live).
         substrate.clear_walker_state();
-        let hint = self.log.superblock().latest_checkpoint_offset;
-        // Build a fresh manifest snapshot from the new log + dispatch
-        // every record back into substrate.
-        let recovered = checkpoint::recover_with_sink(&mut self.log, hint, |entry| {
+        self.accounting.reset();
+        let hint = self.log.superblock().last_index;
+        let accounting = &mut self.accounting;
+        let recovered = recovery::recover_with_sink(&mut self.log, hint, |entry| {
+            accounting.record(&entry.record.header, entry.size);
             substrate.apply_walker_entry(entry);
         })?;
         if recovered.torn {
@@ -1007,6 +1027,14 @@ impl SubstratePersistence {
         }
         self.log.set_write_offset(recovered.tail_offset);
         self.manifest = recovered.manifest;
+        // The compacted file carries a fresh index chain (written by
+        // `write_compacted_log`); chain the next flush onto it.
+        self.last_index = recovered.last_index;
+        self.pending_index = recovered.tail_digests;
+        // 7. Every residence's cold tier still references the OLD file's
+        //    offsets. Re-point them at the rebuilt stream index so a
+        //    mid-session cold→hot elevation reads the right bytes.
+        substrate.refresh_cold_refs();
         report(5);
         Ok(())
     }
@@ -1033,22 +1061,29 @@ fn ensure_active_path(dir: &Path) -> Result<PathBuf> {
 /// Open the active log, recovering and truncating a torn tail; or create it.
 /// Each [`walker::WalkEntry`] surfaced during recovery is handed to the sink
 /// so the caller can populate substrate state in the same pass.
-fn open_or_create_active_with_sink<F>(path: &Path, sink: F) -> Result<(LogFile, Manifest)>
+type OpenedActive = (LogFile, Manifest, Option<(u64, u64)>, Vec<IndexEntry>);
+
+fn open_or_create_active_with_sink<F>(path: &Path, sink: F) -> Result<OpenedActive>
 where
     F: FnMut(&walker::WalkEntry),
 {
     if path.exists() {
         let mut log = LogFile::open(path)?;
-        let hint = log.superblock().latest_checkpoint_offset;
-        let recovered = checkpoint::recover_with_sink(&mut log, hint, sink)?;
+        let hint = log.superblock().last_index;
+        let recovered = recovery::recover_with_sink(&mut log, hint, sink)?;
         if recovered.torn {
             log.truncate_to(recovered.tail_offset)?;
         }
         log.set_write_offset(recovered.tail_offset);
-        Ok((log, recovered.manifest))
+        Ok((
+            log,
+            recovered.manifest,
+            recovered.last_index,
+            recovered.tail_digests,
+        ))
     } else {
         let log = LogFile::create(path)?;
-        Ok((log, Manifest::new()))
+        Ok((log, Manifest::new(), None, Vec::new()))
     }
 }
 
@@ -1141,7 +1176,6 @@ mod tests {
             );
             assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
             sp.commit().unwrap();
-            sp.checkpoint().unwrap();
         }
         {
             // The hash is recovered from disk, so an unchanged tokenizer on a
@@ -1156,78 +1190,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The tokenizer bytes are the `Tokenizer` record's payload — the
+    /// log is a self-contained substrate image with no companion files.
+    /// (Payload bit-rot coverage lives with `read_record_at`, which
+    /// CRC-verifies every record it returns.)
     #[test]
-    fn tokenizer_bytes_live_in_sidecar_not_the_log() {
-        let dir = tmp_dir("tok_sidecar");
+    fn tokenizer_bytes_live_in_the_log() {
+        let dir = tmp_dir("tok_embed");
         let bytes = (0..8192u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
-        let log_path = ensure_active_path(&dir).unwrap();
-        let sidecar_path = tokenizer_sidecar_for(&log_path);
-        assert!(
-            !sidecar_path.exists(),
-            "sidecar must not exist before set_tokenizer"
-        );
-
         {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             assert!(sp.set_tokenizer(&bytes).unwrap());
             sp.commit().unwrap();
-            // The sidecar holds the bytes; the on-disk log carries only the
-            // 32-byte hash payload.
-            let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
-            assert_eq!(sidecar_bytes, bytes, "sidecar matches input bytes");
-            // The Tokenizer record payload is exactly 32 bytes — the
-            // SHA-256 digest — regardless of how big the tokenizer is.
             let tok_loc = sp.manifest().tokenizer.expect("manifest has tokenizer loc");
             assert_eq!(
-                tok_loc.payload_len, 32,
-                "Tokenizer record payload must be the 32-byte SHA-256 digest, \
-                 not the full tokenizer bytes"
+                tok_loc.payload_len,
+                bytes.len() as u64,
+                "Tokenizer record payload must be the full tokenizer bytes"
             );
-            // Reader returns the verified sidecar bytes.
-            let read_back = sp.read_tokenizer_bytes().unwrap().unwrap();
-            assert_eq!(read_back, bytes);
+            assert_eq!(sp.read_tokenizer_bytes().unwrap(), Some(bytes.clone()));
         }
-
-        // The sidecar persists across reopens; the log only stores the hash.
+        // Bytes survive a reopen, recovered from the record on demand.
         {
-            let sp = SubstratePersistence::open_in(&dir).unwrap();
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             assert_eq!(sp.tokenizer_sha256(), Some(sha256(&bytes)));
             assert_eq!(sp.read_tokenizer_bytes().unwrap(), Some(bytes.clone()));
         }
-
-        // A missing sidecar after a hash-bearing log opens cleanly and
-        // reports `Ok(None)` — the substrate is "optional": absent sidecar
-        // is not an error, it just means the bytes will be re-supplied
-        // by the next `set_tokenizer` call.
-        std::fs::remove_file(&sidecar_path).unwrap();
-        {
-            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
-            assert_eq!(
-                sp.read_tokenizer_bytes().unwrap(),
-                None,
-                "missing sidecar yields Ok(None), not an error"
-            );
-            // Re-supplying the same bytes is a hash-match no-op against the
-            // log — but the sidecar has to be re-written, so we don't gate
-            // sidecar restoration on the hash. This matters for graceful
-            // recovery from accidental sidecar deletion.
-            sp.set_tokenizer(&bytes).unwrap();
-            assert!(sidecar_path.exists(), "sidecar restored on next set");
-        }
-
-        // A tampered sidecar (hash mismatch) is a hard error so we never
-        // silently feed wrong bytes back to the daemon.
-        std::fs::write(&sidecar_path, b"not the same tokenizer").unwrap();
-        {
-            let sp = SubstratePersistence::open_in(&dir).unwrap();
-            let err = sp.read_tokenizer_bytes().unwrap_err();
-            let msg = format!("{err}");
-            assert!(
-                msg.contains("hash mismatch"),
-                "tampered sidecar must surface a hash-mismatch corruption error, got: {msg}"
-            );
-        }
-
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1238,7 +1226,7 @@ mod tests {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.set_model_spec(b"the-model").unwrap();
             sp.set_template(b"the-template").unwrap();
-            sp.checkpoint().unwrap();
+            sp.commit().unwrap();
         }
         {
             let sp = SubstratePersistence::open_in(&dir).unwrap();
@@ -1351,11 +1339,9 @@ mod tests {
         // production path uses open_in_with_substrate.)
         {
             let mut log = LogFile::open(&child_log).unwrap();
-            let hint = log.superblock().latest_checkpoint_offset;
-            checkpoint::recover_with_sink(&mut log, hint, |e| {
-                child_substrate.apply_walker_entry(e)
-            })
-            .unwrap();
+            let hint = log.superblock().last_index;
+            recovery::recover_with_sink(&mut log, hint, |e| child_substrate.apply_walker_entry(e))
+                .unwrap();
         }
         assert!(child_substrate.has_stream(child_turn.stream_id()));
         assert!(child.inherited_substrates()[0]
@@ -1441,6 +1427,110 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// End-to-end index chain: appending past the flush threshold
+    /// writes `HeaderIndex` records and publishes the superblock hint;
+    /// a reopen recovers through the chain to identical state, seeds
+    /// the accumulator with the un-indexed tail, and reads records at
+    /// the recovered locations.
+    #[test]
+    fn header_index_chain_survives_reopen() {
+        let dir = tmp_dir("index_chain");
+        let sid = StreamId(4040);
+        let n = INDEX_FLUSH_ENTRIES + 7; // one flush + an un-indexed tail
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            assert!(sp.last_index().is_none(), "fresh log has no chain");
+            for i in 0..n {
+                sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i as u32))
+                    .unwrap();
+            }
+            assert!(
+                sp.last_index().is_some(),
+                "crossing the threshold flushes an index record"
+            );
+            assert_eq!(sp.pending_index_len(), 7);
+            sp.commit().unwrap();
+        }
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(substrate.live_chunk_count(), n);
+            assert!(
+                sp.last_index().is_some(),
+                "reopen recovers through the published chain"
+            );
+            assert_eq!(
+                sp.pending_index_len(),
+                7,
+                "the un-indexed tail seeds the accumulator"
+            );
+            // The recovered chunk locations are exact — read one from
+            // each side of the index flush boundary.
+            assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), chunk_payload(0));
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, (n - 1) as u64).unwrap(),
+                chunk_payload((n - 1) as u32)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The self-heal path: a log whose chain is unusable (garbage hint)
+    /// falls back to the full walk, and — because the walk reported every
+    /// record as an un-indexed digest — the open immediately back-fills a
+    /// fresh chain, so the *next* open takes the chain path again. A
+    /// pre-chain log pays the slow walk exactly once.
+    #[test]
+    fn broken_chain_backfills_at_open_and_heals() {
+        let dir = tmp_dir("index_heal");
+        let sid = StreamId(5050);
+        let n = INDEX_FLUSH_ENTRIES + 3;
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            for i in 0..n {
+                sp.write_chunk(sid, i as u64, 32, 4, &chunk_payload(i as u32))
+                    .unwrap();
+            }
+            sp.commit().unwrap();
+        }
+        // Sabotage the hint: point it at a data record (wrong type), the
+        // shape an out-of-band corruption or a retired-format superblock
+        // produces.
+        {
+            let active = ensure_active_path(&dir).unwrap();
+            let mut log = LogFile::open(&active).unwrap();
+            log.set_last_index((SUPERBLOCK_SIZE, 4096)).unwrap();
+        }
+        // Open 1: fallback walk, then back-fill — the whole log is
+        // pending, which exceeds the threshold, so a fresh chain is
+        // flushed before the open returns.
+        {
+            let mut substrate = Substrate::new();
+            let sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(substrate.live_chunk_count(), n);
+            assert!(
+                sp.last_index().is_some(),
+                "the open back-fills a fresh chain"
+            );
+            assert_eq!(sp.pending_index_len(), 0, "everything is indexed now");
+        }
+        // Open 2: the back-filled chain is taken and state is identical.
+        {
+            let mut substrate = Substrate::new();
+            let mut sp =
+                SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+            assert_eq!(substrate.live_chunk_count(), n);
+            assert!(sp.last_index().is_some());
+            assert_eq!(sp.pending_index_len(), 0);
+            assert_eq!(
+                sp.read_chunk(&substrate, sid, (n - 1) as u64).unwrap(),
+                chunk_payload((n - 1) as u32)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn compact_drops_dead_records_and_reopens_identical() {
         let dir = tmp_dir("compact");
@@ -1470,8 +1560,13 @@ mod tests {
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
 
             assert!(
-                sp.should_compact(&substrate).unwrap(),
-                "a log half dead weight wants compaction"
+                sp.dead_ratio(&substrate) >= COMPACTION_DEAD_RATIO_THRESHOLD,
+                "a log half dead weight wants compaction, ratio = {}",
+                sp.dead_ratio(&substrate)
+            );
+            assert!(
+                !sp.should_compact(&substrate),
+                "a small log never auto-compacts regardless of its ratio"
             );
             sp.compact(&mut substrate, None).unwrap();
 
@@ -1479,8 +1574,9 @@ mod tests {
             assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
-            assert!(
-                !sp.should_compact(&substrate).unwrap(),
+            assert_eq!(
+                sp.dead_ratio(&substrate),
+                0.0,
                 "a freshly compacted log has no dead weight"
             );
         }

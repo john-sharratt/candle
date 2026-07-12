@@ -114,10 +114,15 @@ directly:
   Records are 4 KB-aligned so a future move to unbuffered/`O_DIRECT` I/O
   remains open, but it is a perf option, not a correctness requirement.
 - **Self-describing records + checksums.** Every record carries a header
-  and a checksum; crash recovery scans from a checkpoint and stops at the
-  first bad checksum (torn-write detection).
-- **Checkpoint / manifest.** A periodic index snapshot makes load a seek,
-  not a full-log replay.
+  and a checksum; crash recovery walks the log and stops at the first
+  torn record (torn-write detection).
+- **Indexed recovery + compaction.** Recovery follows the backward
+  `HeaderIndex` digest chain from a superblock hint (§5.6) — a handful
+  of reads regardless of log size — and falls back to a filtered
+  forward walk on any inconsistency; compaction (§5.8) bounds the log
+  to the live record set. There is no manifest snapshot: the chain
+  carries record *headers*, and all live state is still rebuilt from
+  the records themselves.
 - **Content-addressed storage** (Git objects, CAS dedup stores). A
   system-prompt section is keyed by a hash of its content and its prefix,
   so identical sections share storage automatically and any change forks a
@@ -364,7 +369,7 @@ no prefill, no recompute. The load path stays pure data movement.
 The cold tier is a **single, pre-grown file** — an append-only redo log.
 (Segmented files were considered and rejected: segments only bought
 bounded recovery scan and cold-tier-on-slow-media — both moot under
-checkpoint-based recovery and the NVMe-only assumption; compaction is a
+header-only recovery and the NVMe-only assumption; compaction is a
 whole-file rewrite, §5.8, so it needs no per-segment unit.) The file is
 grown ahead in large extents (e.g. 1–4 GB via
 `SetFileValidData`/`set_len`) so appends write into already-allocated
@@ -539,8 +544,11 @@ rest are *per-stream*:
 - **`Commit`** — "stream `stream_id` is durable through `chunk_index`." A
   stream is recoverable only up to its last commit; the group-commit
   boundary.
-- **`Checkpoint`** — an inline snapshot of the live manifest (see §5.6).
-  Inline (not a sidecar) keeps crash recovery single-source.
+- **`HeaderIndex`** — a batch of fixed-width header digests for the
+  records appended since the previous index, plus a link to that
+  previous index record. The backward chain recovery follows instead of
+  probing every record header (§5.6). Derived data: compaction drops
+  every copy and the writer regenerates the chain in the new file.
 
 All records are **4 KB-aligned** (payloads padded; the header's `length`
 is the true unpadded size) for clean sector-aligned record boundaries.
@@ -607,25 +615,48 @@ type rather than `(stream_id, chunk_index)`: the walker simply keeps the
 latest valid one. `Tokens` and `Signatures` are superseded per stream the
 same way a stream's tail grows.)
 
-### 5.6 Manifest and recovery
+### 5.6 Recovery — the header-index chain
 
-The **manifest** is the in-RAM index built by §5.4's walk:
+Even a header-only forward walk is latency-bound: each header read
+reveals where the *next* record starts, so a multi-GB log degenerates
+into hundreds of thousands of serial queue-depth-1 sector reads. The
+`HeaderIndex` chain removes the serial dependency. Every
+`INDEX_FLUSH_ENTRIES` appends, the writer flushes one `HeaderIndex`
+record whose payload holds a fixed-width **digest** — `(type, format,
+stream_id, chunk_index, token_count, offset, record_size,
+payload_len)` — of each record appended since the previous index, plus
+the `(offset, size)` of that previous index record. The superblock
+carries an advisory hint to the newest committed index (updated after
+the index record's bytes are durably committed).
 
-- the latest `ModelSpec` and `Template`;
-- the stream DAG and per-stream structural metadata (from `StreamDecl`s);
-- `(stream_id, chunk_index) → (offset, len, token_count, format)` for every
-  `Chunk`, and the offsets of each stream's `Tokens` / `Signatures`.
+Recovery is then:
 
-To avoid a full header walk every start, a `Checkpoint` record periodically
-serialises this whole manifest into the log itself. Recovery is then:
+1. **Follow the chain backwards** from the superblock hint — a handful
+   of CRC-verified reads for the whole log — and reverse the collected
+   digests into append order.
+2. **Replay the digests** through the same per-record dispatch a walk
+   uses (manifest singletons, `Substrate::apply_walker_entry`, the
+   dead-byte accounting), last-writer-wins in append order.
+3. **Batch-fetch metadata payloads.** The digest types whose payload
+   feeds in-RAM state (`StreamDecl`, `Label`, `TreeMetadata`,
+   `ProjectionEvents`, …) expose their offsets up front, so their
+   records are read in coalesced spans — no serial probing. The bulk
+   types (`Chunk`, `Tokens`, `Signatures`) stay by-reference and their
+   payloads are never read.
+4. **Forward-walk only the un-indexed tail** — everything after the
+   hinted index record, at most one flush interval plus the crash
+   window — with the filtered walk (§5.4). Torn-tail detection and
+   truncation live here, unchanged. The tail's digests seed the
+   writer's accumulator so the next flush covers them: the chain heals
+   forward across restarts.
 
-1. Find the **latest valid `Checkpoint`** record (scan backward from the
-   tail, or via a small superblock pointer).
-2. Load its manifest snapshot — including the `ModelSpec` / `Template` in
-   force at checkpoint time.
-3. **Replay only the tail** — skip-walk headers from the checkpoint's
-   offset forward, applying last-writer-wins, stopping at the first bad
-   checksum (the torn tail) and truncating there.
+Every failure mode of the fast path — a zero or garbage hint (old
+superblocks carry the retired checkpoint offset in these bytes), a hint
+into the pre-grown zero tail, a torn / wrong-typed / wrong-version
+index record, a non-monotonic chain — degrades to the **full filtered
+forward walk**: correct on any log, just slower. Index records are
+derived data; nothing is ever reconstructed *from* them that the
+records themselves don't also carry.
 
 A stream is recoverable through its last `Commit`; the open turn stream's
 tail is whatever partial `Chunk` snapshot most recently survived
@@ -648,7 +679,6 @@ state to a record:
 | Token IDs (turn text = `detokenize`) | `Tokens` |
 | Provenance signatures | `Signatures` |
 | Durability boundary | `Commit` |
-| Fast-start index | `Checkpoint` |
 
 Runtime-only state (the `SubstrateCache` VRAM accounting, the warm-pool LRU
 order) is **not** persisted — it is rebuilt on load. `PerDepthScores` *is*
@@ -666,25 +696,38 @@ task.
 
 Compaction is a **whole-file rewrite**:
 
-1. **Quiesce.** Flush and `Commit` all in-flight writes; the active log is
+1. **Quiesce.** Flush and commit all in-flight writes; the active log is
    now consistent on disk.
-2. **Rebuild the manifest** from a clean skip-load walk (§5.4) so only the
-   live, winning record for each key is known.
-3. **Rewrite.** Stream every *live* record — the latest `ModelSpec` /
-   `Template`, every reachable `StreamDecl` / `Chunk` / `Tokens` /
-   `Signatures`, a fresh `Checkpoint` — into a new file
-   `.substrate/substrate.log.compact`, in dependency order (model/template
-   first, then streams). Dead records are simply not copied.
-4. **Swap.** `fsync` the new file, atomically rename it over
-   `.substrate/substrate.log`, and **flush VRAM** — the substrate then
-   does a full reload (§5.6) from the compacted file. The reload is the
-   simplifying assumption that lets compaction ignore live VRAM/warm state:
-   everything comes back from the freshly compacted log.
+2. **Collect the live set** from the in-RAM state — the substrate's
+   stream index and the manifest's singletons already resolve
+   last-writer-wins, and tombstoned timelines' records are excluded.
+3. **Rewrite.** Stream every *live* record — the latest singletons, then
+   per stream its `StreamDecl` / `Chunk`s / `Tokens` / `Signatures` /
+   `Commit` — into a new file `.substrate/substrate.log.compact`, in
+   dependency order, interleaving a fresh `HeaderIndex` chain (§5.6)
+   whose head lands in the new superblock. Dead records — including
+   every old index record — are simply not copied.
+4. **Swap.** `fsync` the new file and atomically rename it over
+   `.substrate/substrate.log`. Every record now sits at a new offset, so
+   the substrate's walker-built state is cleared and re-walked from the
+   compacted file (§5.6), and each residence's cold-tier references are
+   re-pointed at the rebuilt stream index. KV bytes in VRAM/RAM are
+   untouched — only the on-disk references move.
 
-Compaction is triggered when the dead-record ratio crosses a threshold
-(measured during the manifest rebuild) or on an explicit request. Inherited
-logs (§13.5) are read-only and are **never** compacted by a child; a base
-log is compacted only by a process that opens it as its own active log.
+**Triggering.** The dead weight is tracked incrementally, O(1) per
+append: every record type that resolves last-writer-wins by header key
+(`Chunk` by `(stream, chunk_index)`; `Tokens` / `Signatures` /
+`StreamDecl` / `Commit` / `ProjectionEvents` per stream; the singletons
+per type) charges its superseded predecessor's bytes to a dead-byte
+counter, and tombstoned timelines' stream bytes are summed from the
+in-RAM index. The persistence thread polls the resulting dead-byte
+ratio every pass — pure in-RAM arithmetic — and compacts automatically
+when it crosses the threshold on a log past the minimum size (small
+logs never auto-compact; a rewrite there reclaims nothing worth the
+pause). The daemon's startup flag forces a compaction regardless of the
+ratio. Inherited logs (§13.5) are read-only and are **never** compacted
+by a child; a base log is compacted only by a process that opens it as
+its own active log.
 
 ---
 
@@ -1025,14 +1068,16 @@ unit-testable**, most with no GPU. One concern per file:
 ```
 candle-conversation/src/persistence/
   mod.rs           public API — `SubstratePersistence`
-  record.rs        the 9 record types + header; encode/decode codec
+  record.rs        the record types + header; encode/decode codec
   log_file.rs      append-only file: create / pre-grow extents,
                    buffered append, fsync durability, group commit
   walker.rs        skip-load header walk (§5.4)
-  manifest.rs      layered in-RAM index; last-writer-wins (§5.5)
+  manifest.rs      in-RAM singleton index; last-writer-wins (§5.5)
   streams.rs       stream registry — StreamId, StreamKind, StreamDecl
   content_hash.rs  the prefix-hash chain (§5.2)
-  checkpoint.rs    checkpoint serialise + recovery (§5.6)
+  header_index.rs  the batched record-digest chain (§5.6)
+  recovery.rs      chain-first recovery + forward-walk fallback (§5.6)
+  accounting.rs    O(1) live/dead byte accounting (§5.8)
   compaction.rs    whole-file dead-record rewrite (§5.8)
   warm_pool.rs     RAM warm tier — pinned buffers, LRU (§10)
   inherit.rs       multi-log loading, the inherited chain, shared reuse
@@ -1043,9 +1088,9 @@ candle-conversation/src/persistence/
 (`transfer.rs` is the persistence-side orchestrator; the kernel itself is
 `candle-nn`'s `kv_cache/chunked/migrate.rs` — see §13.4.)
 
-`record.rs`, `walker.rs`, `manifest.rs`, `content_hash.rs`, and
-`checkpoint.rs` are **pure CPU logic** — tested with in-memory byte buffers,
-no GPU, no real files. `log_file.rs` and `compaction.rs` are tested against
+`record.rs`, `walker.rs`, `manifest.rs`, `content_hash.rs`,
+`header_index.rs`, `recovery.rs`, and `accounting.rs` are **pure CPU
+logic** — tested with in-memory byte buffers, no GPU, no real files. `log_file.rs` and `compaction.rs` are tested against
 a temp directory. `warm_pool.rs` and `transfer.rs` need CUDA, but their
 non-GPU logic (LRU bookkeeping, plan-building) is factored into GPU-free
 units. See §13.7.
@@ -1083,12 +1128,11 @@ impl SubstratePersistence {
     /// Force a durable group-commit flush and a Commit record now.
     pub fn commit(&mut self) -> Result<()>;
 
-    /// Snapshot the manifest into a Checkpoint record.
-    pub fn checkpoint(&mut self) -> Result<()>;
-
     /// Compact the active log — whole-file rewrite dropping dead records
-    /// (§5.8). Triggered automatically past a dead-record-ratio threshold,
-    /// or called explicitly. Followed by a VRAM flush + full reload.
+    /// (§5.8). Triggered automatically past the dead-byte-ratio threshold
+    /// (`should_compact`, O(1) from the incremental accounting), or
+    /// called explicitly. The in-RAM state is re-walked from the
+    /// compacted file and cold-tier references are re-pointed in place.
     pub fn compact(&mut self) -> Result<()>;
 
     /// Resolve a content-addressed prompt section across the active log and
@@ -1127,8 +1171,8 @@ pub fn kv_unpack(/* staging, dst_per_head_table, plan */) -> Result<()>;
 
 `open_concat(&[base, … , active])` loads an ordered chain of logs:
 
-- **Active log** — the last entry; the only **writable** one. All appends,
-  `Commit`s, and `Checkpoint`s go here.
+- **Active log** — the last entry; the only **writable** one. All appends
+  and `Commit`s go here.
 - **Inherited logs** — every earlier entry; **read-only**. Their streams
   are visible to the child for resolution but never mutated.
 
@@ -1178,7 +1222,7 @@ The scheduler tick (§11.2) drives evict/load through the same layer.
   §13.3 ships with its own tests. The codec (`record.rs`) is tested with
   **raw-byte round-trip assertions** — encode, compare against a fixed
   expected byte image, decode, assert structural equality — not tolerance
-  checks. `walker.rs` / `manifest.rs` / `checkpoint.rs` are tested by
+  checks. `walker.rs` / `manifest.rs` / `recovery.rs` are tested by
   constructing in-memory log byte buffers and asserting the recovered
   manifest. `content_hash.rs` is tested for the cascade property (§5.2).
 - **No backward compatibility.** This design may break everything before
@@ -1203,7 +1247,7 @@ commit gates per phase. At a glance:
 - **P0 — Persistence primitives.** `record.rs`, `content_hash.rs`,
   `streams.rs` — pure-CPU codec, checksums, content-hash chain.
 - **P1 — Log file, walker, manifest, recovery.** The append-only file,
-  skip-load walk, last-writer-wins manifest, checkpoint — still pure CPU.
+  skip-load walk, last-writer-wins manifest, recovery — still pure CPU.
 - **P2 — `SubstratePersistence` + inheritance.** The public API, multi-log
   `open_concat`, the shared `InheritedSubstrate` cache.
 - **P3 — The migration kernel.** `kv_pack` / `kv_unpack` in `candle-kernels`
@@ -1309,15 +1353,29 @@ tasks, tests, and commit gates.
 | P5 — disk path (`Chunk` records, cold load) | **done** | uncommitted (grouped) | 71 CPU tests, builds + GPU |
 | P6 — substrate integration | **core done** | uncommitted (grouped) | `Conversation` carries mandatory persistence; turns persist; 289 candle-conversation tests pass |
 | P7 — log compaction | **done** | uncommitted (grouped) | 73 persistence tests; compact → reopen-identical, dead-ratio trigger |
-| P8 — `zend` daemon integration | **wiring done** | uncommitted (grouped) | daemon opens substrate at `<workdir>/.substrate/`; per-turn group-commit; graceful Ctrl-C/SIGTERM shutdown checkpoints + compacts; GPU-gated e2e test asserts turns recover across restart |
+| P8 — `zend` daemon integration | **wiring done** | uncommitted (grouped) | daemon opens substrate at `<workdir>/.substrate/`; per-turn group-commit; graceful Ctrl-C/SIGTERM shutdown commits durably; GPU-gated e2e test asserts turns recover across restart |
+
+> **Post-P8 revision.** The `Checkpoint` record and its superblock hint
+> were removed: the checkpoint snapshot carried only singleton offsets
+> (per-entity state had already moved to the substrate), so it never
+> shortened the walk. Recovery was then rebuilt around the
+> **`HeaderIndex` chain** (§5.6, `header_index.rs` + `recovery.rs`):
+> batched header digests chained backwards from a superblock hint, with
+> the filtered forward walk as the universal fallback. `accounting.rs`
+> tracks the dead-byte ratio O(1) per append, and the persistence
+> thread compacts automatically past the threshold (§5.8). References
+> to `checkpoint.rs` / `checkpoint()` in the phase records below are
+> historical.
 
 > **P8 resume reconstruction — status.** The recording path is live (per-turn
-> group-commit, checkpoint + compaction on shutdown). The §5.6/§5.7 resume
+> group-commit, durable commit on shutdown). The §5.6/§5.7 resume
 > reconstruction is built **device-free-first**:
 >
 > - **Done (CPU-tested).** `persistence/resume.rs` — the Option-A on-disk
 >   layout (`chunk_index = layer*C + chunk`), the `L×C` demux, the `Tokens`
->   codec, and `persist_turn_kv` / `recover_turn` round-trip. `read_tokens`
+>   codec, and `persist_turn_kv` / `recover_turn_grid` +
+>   `recover_turn_meta` round-trips (the restore loop reads metadata only;
+>   chunk payloads load on cold→hot elevation). `read_tokens`
 >   on `SubstratePersistence`. 7 unit tests; persist→reopen→recover verified.
 > - **Remaining (GPU-coupled).** The byte legs that move KV across the PCIe
 >   bus, built on the **layout-agnostic migration primitives** so the

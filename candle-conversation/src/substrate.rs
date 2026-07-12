@@ -146,13 +146,9 @@ pub struct Substrate {
     /// committed-through watermark sits on disk.
     /// Built by replaying the redo log on startup (and updated on
     /// every fresh append).  Cold-load and seal-time persistence read
-    /// this directly — it used to live as `Manifest.streams`, but
-    /// since the manifest gets serialised into every `Checkpoint`
-    /// record, mirroring per-chunk pointers there forced the
-    /// checkpoint payload to scale with chunk count.  Holding the
-    /// index in the substrate's RAM instead bounds the checkpoint
-    /// payload to a few hundred bytes regardless of stream size; the
-    /// per-stream `BTreeMap` only ever sits in memory.
+    /// this directly; the manifest holds only the workspace
+    /// singletons.  The per-stream `BTreeMap` only ever sits in
+    /// memory — reload rebuilds it from record headers.
     streams: HashMap<StreamId, StreamRuntime>,
 
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
@@ -952,10 +948,8 @@ fn leftmost_normal_in(tree_meta: &BTreeMap<TurnIndex, TreeNodeMeta>, idx: TurnIn
 /// Per-stream in-RAM runtime state — built by replaying the redo log
 /// on startup and updated on every fresh append.
 ///
-/// Holds everything `Manifest.streams.<id>` used to hold; moving it
-/// here keeps the `Checkpoint` record payload bounded by singleton
-/// count instead of per-chunk count.  The chunk index supports O(1)
-/// `(stream_id, chunk_idx) → ChunkLoc` lookup for cold-load.
+/// The chunk index supports O(1) `(stream_id, chunk_idx) → ChunkLoc`
+/// lookup for cold-load.
 #[derive(Debug, Clone, Default)]
 pub struct StreamRuntime {
     /// The decoded stream declaration (`StreamDecl` record).
@@ -2395,12 +2389,75 @@ impl Substrate {
         &self.distilled_timelines
     }
 
+    /// On-disk bytes held by streams of tombstoned timelines — dead
+    /// weight the header-keyed accounting can't see (a tombstone names
+    /// its timeline in the payload, and the doomed records were live
+    /// appends at write time).  Summed from the in-RAM stream index, no
+    /// disk I/O; the compaction trigger adds this to the incremental
+    /// dead-byte counter.
+    pub fn tombstoned_stream_bytes(&self) -> u64 {
+        if self.tombstoned_timelines.is_empty() {
+            return 0;
+        }
+        self.streams
+            .values()
+            .filter(|s| match &s.decl {
+                Some(StreamDecl::Turn(t)) => TimelineId::from_raw(t.timeline_id)
+                    .is_some_and(|tl| self.tombstoned_timelines.contains(&tl)),
+                _ => false,
+            })
+            .map(|s| {
+                s.chunks.values().map(|c| c.record_size).sum::<u64>()
+                    + s.tokens.map_or(0, |l| l.record_size)
+            })
+            .sum()
+    }
+
+    /// Re-point every residence's cold-tier references at the current
+    /// stream index.  Compaction rewrites the log — every record moves
+    /// to a new offset — then re-walks the new file into `streams`; the
+    /// per-residence [`StoredSequence`]s still hold the old offsets and
+    /// would read garbage on the next cold→hot elevation.  The chunk
+    /// grid shape (layers × chunks per layer) is preserved by
+    /// compaction, so only offsets and record sizes change.
+    ///
+    /// Residences whose stream is absent from the active index are left
+    /// untouched: a borrowed inherited-log stream lives in its own
+    /// (uncompacted) file and its references remain valid, and a
+    /// tombstoned stream's records were dropped from the compacted log
+    /// but its turns are filtered from every projection, so its stale
+    /// references are never followed.
+    pub fn refresh_cold_refs(&mut self) {
+        let streams = &self.streams;
+        for slot in &mut self.residence {
+            let Some(cold) = &mut slot.cold else { continue };
+            let Some(stream) = streams.get(&slot.stream_id) else {
+                continue;
+            };
+            let n_layers = cold.len();
+            let chunks_per_layer = cold.first().map_or(0, |s| s.chunks.len());
+            if chunks_per_layer == 0 || stream.chunks.len() != n_layers * chunks_per_layer {
+                continue;
+            }
+            for (layer, seq) in cold.iter_mut().enumerate() {
+                for (c, chunk) in seq.chunks.iter_mut().enumerate() {
+                    let flat = (layer * chunks_per_layer + c) as u64;
+                    if let Some(loc) = stream.chunks.get(&flat) {
+                        chunk.log_offset = loc.offset;
+                        chunk.record_len = loc.record_size;
+                        chunk.token_count = loc.token_count as u16;
+                    }
+                }
+            }
+        }
+    }
+
     /// Apply one walked redo-log record directly into the substrate's
     /// in-RAM state.  The dispatch lives here (not on `Manifest`)
     /// because per-entity records — chunks, stream decls, labels,
     /// tree metadata, debug ids — are substrate state, not manifest
     /// state.  The manifest only sees singletons (`ModelSpec`,
-    /// `Template`, `Tokenizer`, `Checkpoint`).
+    /// `Template`, `Tokenizer`, `ToolSummary`).
     ///
     /// Called from `SubstratePersistence::recover_with_substrate_sink`
     /// during startup so the walker pass populates both the manifest's
@@ -2483,11 +2540,12 @@ impl Substrate {
                 self.streams.entry(stream_id).or_default().wide_q_sigs =
                     Some(entry.record.payload.clone());
             }
-            // Singletons go to the manifest, not the substrate.
+            // Singletons go to the manifest, not the substrate; the
+            // header-index chain is consumed by recovery, never here.
             RecordType::ModelSpec
             | RecordType::Template
             | RecordType::Tokenizer
-            | RecordType::Checkpoint
+            | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }
     }
@@ -3770,6 +3828,7 @@ impl<'a> std::ops::DerefMut for SubstrateWrite<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::streams::TurnDecl;
     use crate::projection::{
         GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId,
     };
@@ -4597,6 +4656,164 @@ mod tests {
         assert!(sub.residence[r2.0].cold.is_none());
         assert!(sub.residence[r2.0].hot.is_none());
         assert!(sub.residence[r2.0].warm.is_none());
+    }
+
+    /// Compaction moves every record to a new offset and re-walks the
+    /// stream index; `refresh_cold_refs` must re-point each residence's
+    /// `StoredSequence`s at the rebuilt index (same grid shape, new
+    /// offsets), and must leave residences whose stream is absent from
+    /// the active index untouched (inherited-log streams).
+    #[test]
+    fn refresh_cold_refs_repoints_residences_at_the_stream_index() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let stream_id = turn_stream_id(timeline.raw(), 0);
+        let n_layers = 2usize;
+        let chunks_per_layer = 2usize;
+
+        // Pre-compaction stream index + matching cold refs.
+        let old_loc = |flat: u64| ChunkLoc {
+            offset: 4096 + flat * 4096,
+            payload_len: 100,
+            record_size: 4096,
+            token_count: if flat % 2 == 1 { 12 } else { 32 },
+            format: 4,
+        };
+        for flat in 0..(n_layers * chunks_per_layer) as u64 {
+            sub.apply_chunk_loc(stream_id, flat, old_loc(flat));
+        }
+        let cold: Vec<StoredSequence> = (0..n_layers)
+            .map(|l| StoredSequence {
+                chunks: (0..chunks_per_layer)
+                    .map(|c| {
+                        let loc = old_loc((l * chunks_per_layer + c) as u64);
+                        StoredChunk {
+                            log_offset: loc.offset,
+                            record_len: loc.record_size,
+                            token_count: loc.token_count as u16,
+                        }
+                    })
+                    .collect(),
+                token_count: 44,
+            })
+            .collect();
+        let idx = sub.restore_turn(
+            timeline,
+            TurnLayout::default(),
+            TokenBuffer::default(),
+            44,
+            Some(cold),
+            0,
+            chunks_per_layer as u64,
+        );
+
+        // An unrelated residence whose stream is NOT in the active
+        // index (an inherited-log borrow) — must stay untouched.
+        let other_timeline = TimelineId::from_raw(4242).unwrap();
+        sub.register_timeline(other_timeline, LayerId::for_test(1), GroupId::for_test(1));
+        let untouched = vec![StoredSequence {
+            chunks: vec![StoredChunk {
+                log_offset: 777_216,
+                record_len: 4096,
+                token_count: 32,
+            }],
+            token_count: 32,
+        }];
+        let other_idx = sub.restore_turn(
+            other_timeline,
+            TurnLayout::default(),
+            TokenBuffer::default(),
+            32,
+            Some(untouched),
+            0,
+            1,
+        );
+
+        // "Compaction": every chunk record lands at a new offset with a
+        // new padded size.
+        let new_loc = |flat: u64| ChunkLoc {
+            offset: 100_000 + flat * 8192,
+            payload_len: 100,
+            record_size: 8192,
+            token_count: old_loc(flat).token_count,
+            format: 4,
+        };
+        for flat in 0..(n_layers * chunks_per_layer) as u64 {
+            sub.apply_chunk_loc(stream_id, flat, new_loc(flat));
+        }
+        sub.refresh_cold_refs();
+
+        let residence = sub.turn_residence(timeline, idx).unwrap();
+        let cold = sub.residence[residence.0].cold.as_ref().unwrap();
+        for (l, seq) in cold.iter().enumerate() {
+            for (c, chunk) in seq.chunks.iter().enumerate() {
+                let flat = (l * chunks_per_layer + c) as u64;
+                assert_eq!(chunk.log_offset, new_loc(flat).offset);
+                assert_eq!(chunk.record_len, 8192);
+                assert_eq!(chunk.token_count, new_loc(flat).token_count as u16);
+            }
+        }
+        let other_res = sub.turn_residence(other_timeline, other_idx).unwrap();
+        let other_cold = sub.residence[other_res.0].cold.as_ref().unwrap();
+        assert_eq!(
+            other_cold[0].chunks[0].log_offset, 777_216,
+            "residence without an active-index stream stays untouched"
+        );
+    }
+
+    /// `tombstoned_stream_bytes` sums the on-disk record bytes of every
+    /// tombstoned timeline's turn streams — the dead weight the
+    /// header-keyed accounting can't attribute.
+    #[test]
+    fn tombstoned_stream_bytes_sums_dead_timelines() {
+        let mut sub = Substrate::new();
+        let decl_for = |tl: u64| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: 0,
+                turn_id_day: 0,
+                turn_id_seq: 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: Vec::new(),
+            })
+        };
+        let dead_sid = turn_stream_id(7, 0);
+        let live_sid = turn_stream_id(8, 0);
+        for (sid, tl) in [(dead_sid, 7u64), (live_sid, 8u64)] {
+            sub.apply_stream_decl(sid, decl_for(tl));
+            sub.apply_chunk_loc(
+                sid,
+                0,
+                ChunkLoc {
+                    offset: 4096,
+                    payload_len: 100,
+                    record_size: 8192,
+                    token_count: 32,
+                    format: 4,
+                },
+            );
+            sub.apply_tokens_loc(
+                sid,
+                RecordLoc {
+                    offset: 20_480,
+                    payload_len: 64,
+                    record_size: 4096,
+                },
+            );
+        }
+        assert_eq!(sub.tombstoned_stream_bytes(), 0, "nothing tombstoned yet");
+        sub.tombstone_timeline(TimelineId::from_raw(7).unwrap());
+        assert_eq!(
+            sub.tombstoned_stream_bytes(),
+            8192 + 4096,
+            "only the tombstoned timeline's chunk + tokens bytes count"
+        );
     }
 
     /// Archive flag defaults to `false`, can be toggled, and the

@@ -540,12 +540,12 @@ impl Conversation {
             let recover_result = {
                 let mut p = self.persistence.lock().unwrap();
                 let substrate_read = self.read();
-                let r = crate::persistence::resume::recover_turn(
-                    &mut p,
-                    &substrate_read,
-                    &decl,
-                    n_layers,
-                );
+                // Metadata only — token ids, signatures, and the chunk-index
+                // token count. The turn's KV payload bytes stay on disk; a
+                // later projection reads them via the cold→hot elevation
+                // (`recover_turn_grid`).
+                let r =
+                    crate::persistence::resume::recover_turn_meta(&mut p, &substrate_read, &decl);
                 let cr = if r.is_ok() {
                     crate::persistence::resume::recover_turn_cold_refs(
                         &substrate_read,
@@ -582,16 +582,7 @@ impl Conversation {
             let timeline = TimelineId::from_raw(decl.timeline_id).ok_or_else(|| {
                 candle::Error::Msg("reconstruct: turn has zero timeline_id".into())
             })?;
-            let token_count: usize = if recovered.layers.n_layers() == 0 {
-                0
-            } else {
-                recovered
-                    .layers
-                    .layer(0)
-                    .iter()
-                    .map(|c| c.token_count as usize)
-                    .sum()
-            };
+            let token_count = recovered.token_count;
             let mut view = self.write();
             if let (Some(layer), Some(group)) = (
                 LayerId::from_raw(decl.layer_id),
@@ -677,13 +668,13 @@ impl Conversation {
         index: TurnIndex,
         n_layers: usize,
     ) -> candle::Result<Option<crate::persistence::resume::TurnChunkGrid>> {
-        use crate::persistence::resume::{recover_turn, recovered_turn_decls};
+        use crate::persistence::resume::{recover_turn_grid, recovered_turn_decls};
         let stream_id = crate::persistence::content_hash::turn_stream_id(timeline.raw(), index.0);
         let mut p = self.persistence.lock().unwrap();
-        // We need the turn's `StreamDecl` to drive `recover_turn`. Walk
-        // the substrate's persisted decls and pick the one matching this
-        // (timeline, index). The decl set is small and rebuilt once at
-        // restart, so a linear scan is fine.
+        // We need the turn's `StreamDecl` to drive `recover_turn_grid`.
+        // Walk the substrate's persisted decls and pick the one matching
+        // this (timeline, index). The decl set is small and rebuilt once
+        // at restart, so a linear scan is fine.
         let substrate_read = self.read();
         let decls = recovered_turn_decls(&substrate_read);
         let decl = match decls
@@ -694,13 +685,13 @@ impl Conversation {
             None => return Ok(None),
         };
         let substrate = self.read();
-        let recovered = recover_turn(&mut p, &substrate, &decl, n_layers)
+        let grid = recover_turn_grid(&mut p, &substrate, &decl, n_layers)
             .map_err(|e| candle::Error::Msg(format!("recover_turn_chunks: {e}")))?;
-        if recovered.layers.is_empty() {
+        if grid.is_empty() {
             return Ok(None);
         }
         let _ = stream_id; // (computed for diagnostics if needed later)
-        Ok(Some(recovered.layers))
+        Ok(Some(grid))
     }
 
     /// Batched cold→hot load. Loads every key in `keys`, taking the
@@ -1326,34 +1317,42 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("persist commit_if_pending: {e}")))
     }
 
-    /// Flush and write a `Checkpoint` over the substrate manifest — the
-    /// fast-recovery snapshot. Does NOT compact: compaction is an explicit,
-    /// startup-only operation (see [`Self::compact_substrate`]) so it never
-    /// blocks the checkpoint cadence or a graceful shutdown.
-    pub fn checkpoint_persistence(&self) -> candle::Result<()> {
-        let mut p = self.persistence.lock().unwrap();
-        p.commit()
-            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
-        p.checkpoint()
-            .map_err(|e| candle::Error::Msg(format!("persist checkpoint: {e}")))
-    }
-
     /// Force a full redo-log compaction — the whole-file dead-record rewrite
-    /// (§5.8). Unlike the (now removed) checkpoint path this ignores the
-    /// dead-ratio threshold: the operator opted in explicitly via the daemon's
-    /// startup flag. `progress` reports coarse phase progress (0..=5) for the
-    /// loading screen.
+    /// (§5.8). Ignores the dead-ratio threshold: the operator opted in
+    /// explicitly via the daemon's startup flag. `progress` reports coarse
+    /// phase progress (0..=5) for the loading screen.
     pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> candle::Result<()> {
         let mut p = self.persistence.lock().unwrap();
         p.commit()
             .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
+        let mut substrate = self.write();
+        p.compact(&mut substrate, progress)
+            .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))
+    }
+
+    /// Compact the redo log when its dead-weight ratio crosses the
+    /// threshold — the automatic reclaim the persistence thread polls
+    /// every pass. The check is pure in-RAM arithmetic (O(1) dead-byte
+    /// counter + tombstoned-stream sum), so the common no-op path costs
+    /// nothing. When compaction runs it holds the persistence lock and
+    /// the substrate write lock for the duration of the rewrite —
+    /// cold-loads and persists queue behind it.
+    ///
+    /// Returns `true` when a compaction actually ran.
+    pub fn compact_persistence_if_needed(&self) -> candle::Result<bool> {
+        let mut p = self.persistence.lock().unwrap();
         {
-            let mut substrate = self.write();
-            p.compact(&mut substrate, progress)
-                .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
+            let substrate = self.read();
+            if !p.should_compact(&substrate) {
+                return Ok(false);
+            }
         }
-        p.checkpoint()
-            .map_err(|e| candle::Error::Msg(format!("persist checkpoint: {e}")))
+        p.commit()
+            .map_err(|e| candle::Error::Msg(format!("persist commit: {e}")))?;
+        let mut substrate = self.write();
+        p.compact(&mut substrate, None)
+            .map_err(|e| candle::Error::Msg(format!("persist compaction: {e}")))?;
+        Ok(true)
     }
 
     /// Run `f` against the persistence layer's current manifest snapshot.

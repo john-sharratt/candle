@@ -2500,10 +2500,10 @@ impl ZendSession {
             .expect("spawn zend-loader thread");
     }
 
-    /// Graceful shutdown: durably checkpoint the substrate redo log, then
+    /// Graceful shutdown: durably commit the substrate redo log, then
     /// stop the scheduler thread. Idempotent — safe to call when the model
     /// never finished loading (nothing to flush). Runs on the blocking pool
-    /// since `checkpoint_persistence` does synchronous `fsync` I/O.
+    /// since `commit_persistence` does synchronous `fsync` I/O.
     pub async fn shutdown(&self) {
         let state: Option<Arc<InferenceState>> =
             { self.inference.read().unwrap().as_ref().map(Arc::clone) };
@@ -2519,9 +2519,9 @@ impl ZendSession {
         let _ = tokio::task::spawn_blocking(move || {
             {
                 let engine = state.engine.lock().unwrap();
-                match engine.checkpoint_persistence() {
-                    Ok(()) => tracing::info!("shutdown: substrate checkpointed"),
-                    Err(e) => tracing::error!("shutdown: checkpoint failed: {e}"),
+                match engine.commit_persistence() {
+                    Ok(()) => tracing::info!("shutdown: substrate committed"),
+                    Err(e) => tracing::error!("shutdown: commit failed: {e}"),
                 }
                 if let Err(e) = engine.shutdown() {
                     tracing::error!("shutdown: scheduler stop failed: {e}");

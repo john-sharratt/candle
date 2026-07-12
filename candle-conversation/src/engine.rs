@@ -211,9 +211,14 @@ impl ConversationEngine {
         // Create the batched inference session on this thread, then move
         // it to the scheduler thread. Session creation touches the GPU
         // (arena allocation) but is a one-time cost.
+        let session_start = std::time::Instant::now();
         let session = model
             .create_batched_session(config.batched_config.clone())
             .map_err(ConversationError::Model)?;
+        tracing::info!(
+            session_init_ms = session_start.elapsed().as_millis() as u64,
+            "batched session created (KV arenas allocated)"
+        );
 
         let eos_tokens = config.eos_tokens.clone();
         let vocab_size = config.vocab_size;
@@ -256,6 +261,7 @@ impl ConversationEngine {
             Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
             None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         };
+        let open_start = std::time::Instant::now();
         let mut persistence = SubstratePersistence::open_in_with_substrate(
             &workspace_dir,
             &mut substrate,
@@ -263,9 +269,18 @@ impl ConversationEngine {
         .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
         })?;
+        tracing::info!(
+            open_ms = open_start.elapsed().as_millis() as u64,
+            log_bytes = persistence.write_offset(),
+            records = persistence.recovered_record_count(),
+            indexed = persistence.last_index().is_some(),
+            streams = substrate.all_streams().count(),
+            "substrate persistence opened"
+        );
         // Persist the model identity into the substrate's `ModelSpec` record —
         // compare-and-insert, so it only appends when the model differs from
         // what the log already records. Makes the log a self-contained image.
+        let singletons_start = std::time::Instant::now();
         if let Some(spec) = &config.model_spec {
             let wrote = persistence.set_model_spec(spec).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("persist model spec: {e}")))
@@ -289,6 +304,10 @@ impl ConversationEngine {
                 })?;
             }
         }
+        tracing::info!(
+            singletons_ms = singletons_start.elapsed().as_millis() as u64,
+            "model spec + tokenizer records reconciled"
+        );
         let conversation = Conversation::from_parts(substrate, persistence);
 
         // Spawn the substrate persistence thread (§5s heartbeat + per-
@@ -1036,17 +1055,12 @@ impl ConversationEngine {
         Ok(self.conversation.commit_persistence_if_pending()?)
     }
 
-    /// Flush, optionally compact, and checkpoint the substrate redo log —
-    /// the fast-recovery snapshot. Call on the daemon's checkpoint cadence
-    /// and as part of graceful shutdown.
-    pub fn checkpoint_persistence(&self) -> crate::Result<()> {
-        Ok(self.conversation.checkpoint_persistence()?)
-    }
-
-    /// Force a full redo-log compaction (startup-only, operator opt-in).
-    /// Rewrites the log to just the live record set, reclaiming the dead
-    /// weight that accrues from superseded turns and tombstoned timelines.
-    /// `progress` reports coarse phase progress (0..=5) for the loading screen.
+    /// Force a full redo-log compaction (operator opt-in via the startup
+    /// flag). Rewrites the log to just the live record set, reclaiming the
+    /// dead weight that accrues from superseded turns and tombstoned
+    /// timelines. The persistence thread also compacts automatically when
+    /// the dead-byte ratio crosses the threshold. `progress` reports coarse
+    /// phase progress (0..=5) for the loading screen.
     pub fn compact_substrate(&self, progress: Option<&dyn Fn(usize, usize)>) -> crate::Result<()> {
         Ok(self.conversation.compact_substrate(progress)?)
     }
