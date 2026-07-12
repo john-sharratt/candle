@@ -325,8 +325,7 @@ fn projection_probe_cases(substrate: &Substrate, back: usize) -> Vec<ProbeCase> 
         let Some(events) = e.projection_events.as_ref().map(|b| decode_events(b)) else {
             continue;
         };
-        let asst = candle_conversation::turn_layout::TurnLayout::new(d.segments.clone())
-            .assistant_content_start() as usize;
+        let asst = d.assistant_content_start() as usize;
         for ev in &events {
             let Some(tool) = ev.selection.system.iter().find_map(|item| match item {
                 SystemItem::Collection { name, sections } if name == "tools" => {

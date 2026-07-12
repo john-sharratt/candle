@@ -206,3 +206,39 @@ fn calculator_invalid_expression() {
     // Should be parse_error
     assert!(resp.get("error").is_some());
 }
+
+#[test]
+fn calculator_small_result_has_no_display() {
+    // 2 + 2 = 4 — unambiguous as-is; the runner attaches no display rendering.
+    let resp = harness::expect_success(harness::invoke(
+        "calculator",
+        json!({"expression": "2 + 2"}),
+    ));
+    assert!(resp.get("result_display").is_none());
+}
+
+#[test]
+fn calculator_large_float_display_carries_grouping_and_magnitude() {
+    // The live-run misread case: sqrt(237849273487234283743) ≈ 1.5422e10 was
+    // reported as ×10¹⁹ by the model off the bare digit run. The runner's
+    // `result_display` annotation makes the magnitude explicit.
+    let resp = harness::expect_success(harness::invoke(
+        "calculator",
+        json!({"expression": "sqrt(237849273487234283743)"}),
+    ));
+    assert_eq!(
+        resp["result_display"].as_str().unwrap(),
+        "15,422,362,772.520761 (≈1.5422e10)"
+    );
+}
+
+#[test]
+fn calculator_large_int_display_is_grouped() {
+    // 123456 * 1000 = 123,456,000 — integer path, grouped, no magnitude tag.
+    let resp = harness::expect_success(harness::invoke(
+        "calculator",
+        json!({"expression": "123456 * 1000"}),
+    ));
+    assert_eq!(resp["result"].as_i64().unwrap(), 123_456_000);
+    assert_eq!(resp["result_display"].as_str().unwrap(), "123,456,000");
+}

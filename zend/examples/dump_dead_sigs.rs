@@ -161,7 +161,7 @@ fn main() -> anyhow::Result<()> {
             chosen = Some((
                 sid,
                 ids.clone(),
-                d.assistant_content_start as usize,
+                d.assistant_content_start() as usize,
                 hist,
                 dead,
             ));

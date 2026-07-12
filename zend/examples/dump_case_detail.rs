@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
         };
         let text = tok.decode(&ids, false).unwrap_or_default();
         if want.is_empty() || text.contains(&want) {
-            chosen = Some((sid, ids, d.assistant_content_start));
+            chosen = Some((sid, ids, d.assistant_content_start()));
             break;
         }
     }
@@ -154,12 +154,12 @@ fn main() -> anyhow::Result<()> {
         );
     }
     println!(
-        "\n  PROJECTION EVENTS: {}   (each spans generated-token start..end)",
+        "\n  PROJECTION EVENTS: {}   (point model: each applies at one generated-token position)",
         events.len()
     );
     for (i, ev) in events.iter().enumerate() {
         // generated-token index → absolute position = asst_start + gen_index.
-        let (ps, pe) = (asst + ev.start_token as usize, asst + ev.end_token as usize);
+        let ps = asst + ev.start_token as usize;
         let sel: Vec<&str> = ev
             .selection
             .system
@@ -173,9 +173,8 @@ fn main() -> anyhow::Result<()> {
             })
             .collect();
         println!(
-            "    [{i}] gen {}..{}  → positions {ps}..{pe}   selects: {}",
+            "    [{i}] gen {}  → position {ps}   selects: {}",
             ev.start_token,
-            ev.end_token,
             sel.join(", ")
         );
     }
@@ -239,16 +238,13 @@ fn main() -> anyhow::Result<()> {
         println!("    cal {}", scale(&bar(a, b + 1, 'C')));
     }
     for (i, ev) in events.iter().enumerate() {
-        let (ps, pe) = (
-            asst + ev.start_token as usize,
-            (asst + ev.end_token as usize).min(n_tok),
-        );
-        println!("    p{i:<2} {}", scale(&bar(ps, pe, 'P')));
+        let ps = (asst + ev.start_token as usize).min(n_tok.saturating_sub(1));
+        println!("    p{i:<2} {}", scale(&bar(ps, ps + 1, 'P')));
     }
     // The wide-Q history is one per-token signature covering the whole turn (its
     // length maps to the turn's tokens, prefill + decode).
     println!("    wQ  {}", scale(&bar(0, history.len().min(n_tok), 'W')));
-    println!("\n    legend: U=user prefill  D=asst decode  T=<think>  C=<tool_call>  P=projection-event span");
+    println!("\n    legend: U=user prefill  D=asst decode  T=<think>  C=<tool_call>  P=projection-event point");
     println!("            W=wide-Q per-token sign(Q) history");
     Ok(())
 }

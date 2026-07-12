@@ -64,7 +64,9 @@ impl Tool for CalculatorTool {
          ^, sqrt, sin, cos, tan, ln, log (base 10), log2, exp, abs, min, max, floor, ceil, \
          round. Triggered by \"calculate\", \"compute\", \"what is X times Y\", \"how much is\", \
          \"what's the square root of\", or any explicit math problem. Returns the numeric \
-         result. Use unit_convert for unit conversions; use random for generating random values.";
+         result, plus a `result_display` rendering (digit-grouped, with magnitude) for large \
+         or tiny values — quote `result_display` when reporting such a result. Use \
+         unit_convert for unit conversions; use random for generating random values.";
 
     type Request = Request;
     type Response = Response;

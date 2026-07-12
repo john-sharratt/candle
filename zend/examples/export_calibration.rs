@@ -106,14 +106,14 @@ fn roundtrip_divergence(
 }
 
 /// Reconstruct the trajectory text with a [`MARKER`] at every projection point,
-/// using the substrate's persisted [`ProjectionEvent`] spans.
+/// using the substrate's persisted point-model [`ProjectionEvent`]s.
 ///
 /// `think_ids` is the tokenization of `<think>`, the generated-token-0 anchor;
 /// `assistant_ids` is `<|im_start|>assistant`, and the `<think>` search begins
 /// after it so a `<think>` inside the user prompt is never matched by mistake.
-/// The span boundaries (`{0, start_token, end_token, …, N}`) become marker
-/// positions: `0` right after the user turn, each reprojection where it fired,
-/// and `N` at the seal. Returns `(marked_text, marker_count)`.
+/// The marker positions (`{0, each start_token, …, N}`) are: `0` right after
+/// the user turn, each reprojection where it fired, and `N` (the generated
+/// length) at the seal. Returns `(marked_text, marker_count)`.
 fn inject_projection_markers(
     ids: &[u32],
     tok: &Tokenizer,
@@ -125,16 +125,18 @@ fn inject_projection_markers(
         tok.decode(slice, false)
             .map_err(|e| anyhow::anyhow!("detokenize segment: {e}"))
     };
-    // Total generated tokens = the last span's end. With no spans there is
-    // nothing to place; emit verbatim with a single trailing seal marker.
-    let n = events
-        .iter()
-        .map(|e| e.end_token as usize)
-        .max()
-        .unwrap_or(0);
-    if n == 0 {
+    // With no events there is nothing to place; emit verbatim with a single
+    // trailing seal marker.
+    if events.is_empty() {
         return Ok((format!("{}{MARKER}", decode(ids)?), 1));
     }
+    // The last projection point — used only by the defensive no-anchor fallback
+    // below to approximate where generation starts.
+    let last_point = events
+        .iter()
+        .map(|e| e.start_token as usize)
+        .max()
+        .unwrap_or(0);
 
     // Generated-token 0 sits at the first `<think>` *after the assistant header*;
     // everything before is prefilled scaffold. Anchoring the search past the
@@ -146,18 +148,17 @@ fn inject_projection_markers(
         .unwrap_or(0);
     let gen_start = find_subseq(&ids[search_from..], think_ids)
         .map(|r| search_from + r)
-        .unwrap_or_else(|| ids.len().saturating_sub(n));
+        .unwrap_or_else(|| ids.len().saturating_sub(last_point));
     let gen = &ids[gen_start..];
-    let cap = n.min(gen.len());
+    let cap = gen.len();
 
-    // Span boundaries in generated-token space = the projection points. Always
+    // Marker positions in generated-token space = the projection points. Always
     // include 0 (initial, after the user turn) and `cap` (seal).
     let mut bset: BTreeSet<usize> = BTreeSet::new();
     bset.insert(0);
     bset.insert(cap);
     for e in events {
         bset.insert((e.start_token as usize).min(cap));
-        bset.insert((e.end_token as usize).min(cap));
     }
     let boundaries: Vec<usize> = bset.into_iter().collect();
 

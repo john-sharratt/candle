@@ -68,6 +68,7 @@
 
 pub mod calibration;
 pub mod context;
+mod numfmt;
 pub mod registry;
 pub mod runner;
 pub mod state;

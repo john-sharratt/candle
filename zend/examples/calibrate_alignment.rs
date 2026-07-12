@@ -553,7 +553,7 @@ fn projection_probe_cases(substrate: &Substrate) -> Vec<ProbeCase> {
         let Some(events) = e.projection_events.as_ref().map(|b| decode_events(b)) else {
             continue;
         };
-        let asst = d.assistant_content_start as usize;
+        let asst = d.assistant_content_start() as usize;
         for ev in &events {
             // The `tools` section this projection locked — the provenance label.
             let Some(tool) = ev.selection.system.iter().find_map(|item| match item {
@@ -564,8 +564,10 @@ fn projection_probe_cases(substrate: &Substrate) -> Vec<ProbeCase> {
             }) else {
                 continue; // this projection didn't lock a tool — not a scorable probe
             };
-            // Rolling-`ROLLING_BACK` wide-Q window ending at the projection point.
-            let point = (asst + ev.end_token as usize).min(history.len());
+            // Rolling-`ROLLING_BACK` wide-Q window ending at the projection point
+            // (point-model event: `start_token` is the generated position at
+            // which the projection was applied).
+            let point = (asst + ev.start_token as usize).min(history.len());
             let lo = point.saturating_sub(ROLLING_BACK);
             let window = history[lo..point].to_vec();
             if window.is_empty() {
@@ -5679,14 +5681,6 @@ fn main() -> anyhow::Result<()> {
         fn pidx(n: usize, p: f32) -> usize {
             ((((n.max(1) - 1) as f32) * p).round() as usize).min(n.saturating_sub(1))
         }
-        fn stem(n: &str) -> String {
-            let p: Vec<&str> = n.rsplitn(3, '_').collect();
-            if p.len() >= 2 {
-                format!("{}_{}", p[1], p[0])
-            } else {
-                n.to_string()
-            }
-        }
         const HEAD_P: f32 = 0.25;
         const LAYER_P: f32 = 0.75;
         let i: usize = std::env::var("S51_CASE")
@@ -5707,14 +5701,6 @@ fn main() -> anyhow::Result<()> {
             .filter(|(_, (t, _))| *t == truth)
             .map(|(j, _)| j)
             .collect();
-        let tstem = stem(&truth);
-        let family: Vec<usize> = def_sign
-            .iter()
-            .enumerate()
-            .filter(|(j, (t, _))| stem(t) == tstem && !truth_defs.contains(j))
-            .map(|(j, _)| j)
-            .collect();
-
         let head_val: Vec<Vec<f32>> = def_sign
             .par_iter()
             .map(|(_, toks)| {

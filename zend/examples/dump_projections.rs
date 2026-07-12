@@ -117,9 +117,8 @@ fn main() -> anyhow::Result<()> {
                 .map(|b| format!("{}={}t", b.label, b.tokens))
                 .collect();
             println!(
-                "  [{ei}] tokens {}..{} ({} materialized / {} substrate)  buckets: {}",
+                "  [{ei}] token {} ({} materialized / {} substrate)  buckets: {}",
                 ev.start_token,
-                ev.end_token,
                 ev.materialized_tokens,
                 ev.substrate_tokens,
                 bucket_labels.join(", ")
