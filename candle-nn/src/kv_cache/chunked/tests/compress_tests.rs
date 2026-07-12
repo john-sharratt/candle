@@ -221,7 +221,7 @@ fn quantize_to_cpu_empty_input_is_noop() {
 /// projection flow for any conversation whose turns didn't land on
 /// exact CHUNK_SIZE boundaries.
 #[test]
-fn quantize_to_cpu_preserves_partial_chunk_format() {
+fn quantize_to_cpu_quantizes_partial_tail() {
     let Some(device) = cuda_device_or_skip() else {
         return;
     };
@@ -230,9 +230,11 @@ fn quantize_to_cpu_preserves_partial_chunk_format() {
     let copy_stream = cuda_stream(&device);
 
     // 50 tokens = 1 full sealed chunk (32 tokens) + 1 partial (18 tokens).
-    // The bug only fires on partials, so we need at least one of each
-    // — the full chunk also pins that full-chunk quantization keeps
-    // working alongside the partial-skip branch.
+    // Partial chunks quantize like full ones: their dead token slots are
+    // zero (arena zeroing at creation/recycle), and the selection kernel
+    // receives the valid range to correct its count-normalized metrics.
+    // The full chunk pins that full-chunk quantization keeps working
+    // alongside the partial path.
     let src = seed_f16_sealed(&backing, &device, 50, 1);
     assert_eq!(src.chunks.len(), 2, "50 tokens → 1 full + 1 partial");
     assert_eq!(src.chunks[0].token_count, 32);
@@ -257,72 +259,55 @@ fn quantize_to_cpu_preserves_partial_chunk_format() {
     assert_eq!(warm.chunks[1].token_count, 18, "partial chunk preserved");
     assert_eq!(warm.location, ArenaLocation::Gpu);
 
-    // Full chunk must land in a Quantized GPU arena; partial chunk
-    // must stay in the source F16 Float GPU arena (the backing's K/V
-    // active format).
+    // BOTH chunks must land in Quantized GPU arenas — the partial is
+    // no longer preserved as float (readers address it by
+    // [offset, offset+len); views/decode never append to a sealed
+    // partial — `create_view_sequence` borrows it read-only and
+    // `ensure_writable_tail` starts a fresh float chunk past it).
     backing
         .inner
         .storage
         .read(|storage| {
-            for gid in warm.chunks[0].gids.as_slice() {
-                let key = storage
-                    .arena_key(gid.arena_idx())
-                    .expect("full chunk arena exists");
-                assert_eq!(key.location, ArenaLocation::Gpu);
-                assert!(
-                    matches!(key.format, KvFormat::Quantized(_)),
-                    "full chunk gid {} must live in a Quantized GPU arena, got {:?}",
-                    gid.raw(),
-                    key.format,
-                );
-            }
-            for gid in warm.chunks[1].gids.as_slice() {
-                let key = storage
-                    .arena_key(gid.arena_idx())
-                    .expect("partial chunk arena exists");
-                assert_eq!(
-                    key.location,
-                    ArenaLocation::Gpu,
-                    "partial chunk gid {} location",
-                    gid.raw()
-                );
-                assert_eq!(
-                    key.format,
-                    KvFormat::Float(candle::DType::F16),
-                    "partial chunk gid {} must stay in the source F16 Float \
-                     arena — quantizing would break `create_view_sequence`'s \
-                     COW partial-tail byte copy",
-                    gid.raw(),
-                );
+            for (ci, chunk) in warm.chunks.iter().enumerate() {
+                for gid in chunk.gids.as_slice() {
+                    let key = storage
+                        .arena_key(gid.arena_idx())
+                        .expect("chunk arena exists");
+                    assert_eq!(key.location, ArenaLocation::Gpu);
+                    assert!(
+                        matches!(key.format, KvFormat::Quantized(_)),
+                        "chunk {ci} gid {} must live in a Quantized GPU arena \
+                         (partials quantize like full chunks), got {:?}",
+                        gid.raw(),
+                        key.format,
+                    );
+                }
             }
             Ok::<(), candle::Error>(())
         })
         .unwrap()
         .unwrap();
 
-    // Source-format preservation extends to byte_size: the partial's
-    // arena_byte_size reflects the F16 footprint, not a (smaller)
-    // quantized footprint. This is the field `install_warm` writes
-    // into the residence's `byte_size` accounting.
+    // The partial's byte footprint shrinks accordingly — this is the
+    // field `install_warm` writes into the residence's `byte_size`
+    // accounting, and the whole point of quantizing tails: a float
+    // partial pinned a full F16 chunk slot per layer.
     let arena_infos = backing.resolve_arena_info().unwrap();
     let partial_bytes = warm.chunks[1].gids.arena_byte_size(&arena_infos);
-    let expected_min_bytes = (N_KV_HEAD * 2 * HEAD_DIM * 32 * 2) as u64;
+    let f16_footprint = (N_KV_HEAD * 2 * HEAD_DIM * 32 * 2) as u64;
     assert!(
-        partial_bytes >= expected_min_bytes,
-        "partial chunk byte_size {} should reflect an F16-sized \
-         arena slot (≥ {} bytes), not a quantized footprint",
+        partial_bytes < f16_footprint,
+        "quantized partial byte_size {} must be below the F16 footprint {}",
         partial_bytes,
-        expected_min_bytes,
+        f16_footprint,
     );
 }
 
-/// The "now-full" cycle: a chunk that started life as a partial in
-/// turn 1 becomes full after turn 2's decode fills the remaining
-/// slots. On turn 2's persist pass, `quantize_sealed_in_place` must
-/// treat the now-full chunk like any other full chunk and route it
-/// through the palette4 selector. This pins the resume → continue →
-/// re-quantize lifecycle: the second persist actually re-compresses
-/// the previously-skipped block.
+/// The "now-full" cycle: a live float chunk that a later turn filled
+/// to 32 tokens quantizes like any other full chunk on that turn's
+/// persist pass. (Turn 1's own snapshot of the then-partial chunk
+/// quantizes independently into its own arenas — snapshots never share
+/// quantized storage with the live slot.)
 #[test]
 fn quantize_to_cpu_requantizes_filled_partials() {
     let Some(device) = cuda_device_or_skip() else {
@@ -333,10 +318,9 @@ fn quantize_to_cpu_requantizes_filled_partials() {
     let copy_stream = cuda_stream(&device);
 
     // Simulate turn 2's sealed sequence after the previously-partial
-    // chunk got filled: pretend every chunk is full now. (The bytes
-    // come from a fresh 64-token seed; the relevant property is
-    // `token_count == CHUNK_SIZE` on every chunk, which is what the
-    // quantize-vs-skip decision keys on.)
+    // live chunk got filled: every chunk is full now. (The bytes come
+    // from a fresh 64-token seed; the relevant property is
+    // `token_count == CHUNK_SIZE` on every chunk.)
     let src = seed_f16_sealed(&backing, &device, 64, 2);
     assert_eq!(src.chunks.len(), 2);
     assert!(
@@ -389,13 +373,14 @@ fn quantize_to_cpu_requantizes_filled_partials() {
 /// without needing the substrate scheduler:
 ///
 /// 1. **Turn 1** seals at 50 tokens (1 full chunk + 1 partial of 18).
-/// 2. **Persist**: `quantize_sealed_in_place` quantizes the full chunk
-///    to Q* and leaves the partial in float — both still on GPU. A
+/// 2. **Persist**: `quantize_sealed_in_place` quantizes BOTH chunks to
+///    Q* (partials quantize like full chunks) — both still on GPU. A
 ///    separate `migrate_sealed_to_cpu` evicts the sealed turn to the
 ///    warm (CPU) tier, formats preserved.
 /// 3. **Cold-elevate**: `migrate_sealed_to_gpu_batch_async` brings the
 ///    warm SealedSequence back to GPU with the same per-chunk formats
-///    (Q* full + F16 partial).
+///    (Q* full + Q* partial) — the round-trip validates quantized
+///    partials through the warm tier.
 /// 4. **Inject + view**: `inject_sealed_at_tail` puts the elevated turn
 ///    into a parent slot; `create_view_sequence` borrows all blocks —
 ///    including the partial tail — read-only via Arc (this is the
@@ -406,11 +391,10 @@ fn quantize_to_cpu_requantizes_filled_partials() {
 ///    fill one fresh full 32-token chunk.
 /// 6. **Turn 2 sealed**: `record_turn(view)` snapshots a 3-chunk
 ///    sequence: borrowed turn-1 full (Q*), borrowed turn-1 partial
-///    (F16, unchanged), new full chunk (F16).
-/// 7. **Re-persist**: `quantize_sealed_in_place` runs again. The
-///    borrowed Q* chunk passes through unchanged (already compressed),
-///    the borrowed partial passes through unchanged (still float), and
-///    the new full chunk is freshly quantized.
+///    (Q*, unchanged), new full chunk (F16).
+/// 7. **Re-persist**: `quantize_sealed_in_place` runs again. Both
+///    borrowed Q* chunks pass through unchanged (already compressed)
+///    and the new full chunk is freshly quantized.
 ///
 /// This pins the entire "resume → continue → re-quantize" contract
 /// in one self-contained test.
@@ -431,8 +415,8 @@ fn cold_load_partial_extend_then_requantize() {
     assert_eq!(sealed_t1.chunks[1].token_count, 18);
 
     // ── Phase 2: persist = quantize-in-place (GPU) then evict (DtoH) ──
-    // `quantize_sealed_in_place` compresses the full chunk to Q* and leaves
-    // the partial tail in float — both still GPU-resident. Eviction to the
+    // `quantize_sealed_in_place` compresses BOTH chunks to Q* — the
+    // 18-token partial included — still GPU-resident. Eviction to the
     // warm tier is the separate `migrate_sealed_to_cpu` step.
     let quantized_gpu = quantize_sealed_in_place(
         &backing,
@@ -457,9 +441,9 @@ fn cold_load_partial_extend_then_requantize() {
     let elevated_seq = &elevated[0];
     assert_eq!(elevated_seq.chunks.len(), 2);
 
-    // Sanity: the elevated partial is back on GPU in F16 Float — the
-    // format-preserving migrate round-trip (Q* full, float partial)
-    // must not have quantized it on the way out or back.
+    // Sanity: the elevated partial is back on GPU in a Quantized arena —
+    // the format-preserving migrate round-trip carries the quantized
+    // partial out and back unchanged.
     backing
         .inner
         .storage
@@ -467,12 +451,12 @@ fn cold_load_partial_extend_then_requantize() {
             for gid in elevated_seq.chunks[1].gids.as_slice() {
                 let key = storage.arena_key(gid.arena_idx()).unwrap();
                 assert_eq!(key.location, ArenaLocation::Gpu);
-                assert_eq!(
-                    key.format,
-                    KvFormat::Float(DType::F16),
-                    "cold-loaded partial gid {} must elevate back to GPU F16 \
-                     Float so the COW partial-tail path can byte-copy it",
+                assert!(
+                    matches!(key.format, KvFormat::Quantized(_)),
+                    "cold-loaded partial gid {} must elevate back to a GPU \
+                     Quantized arena (format-preserving round-trip), got {:?}",
                     gid.raw(),
+                    key.format,
                 );
             }
             // Also sanity-check that the elevated full chunk is on GPU
@@ -562,8 +546,8 @@ fn cold_load_partial_extend_then_requantize() {
     // The bucketing must handle three distinct cases in one call:
     //   chunks[0]: borrowed cold-loaded full → already Quantized →
     //              eligibility check skips it, preserve bucket keeps it.
-    //   chunks[1]: borrowed partial → token_count < CHUNK_SIZE → preserve
-    //              (stays F16, never quantized).
+    //   chunks[1]: borrowed cold-loaded partial → already Quantized →
+    //              preserve bucket keeps it (no re-quantization).
     //   chunks[2]: new full F16 chunk → eligible for the kernel → quantized.
     let warm_t2 = quantize_sealed_in_place(
         &backing,
@@ -587,7 +571,7 @@ fn cold_load_partial_extend_then_requantize() {
         .inner
         .storage
         .read(|storage| {
-            let check = |chunk_idx: usize, expect_quant: bool, label: &str| {
+            let check = |chunk_idx: usize, label: &str| {
                 for gid in warm_t2_seq.chunks[chunk_idx].gids.as_slice() {
                     let key = storage.arena_key(gid.arena_idx()).unwrap();
                     assert_eq!(
@@ -596,32 +580,21 @@ fn cold_load_partial_extend_then_requantize() {
                         "warm_t2 chunk {chunk_idx} ({label}) gid {} location",
                         gid.raw()
                     );
-                    if expect_quant {
-                        assert!(
-                            matches!(key.format, KvFormat::Quantized(_)),
-                            "warm_t2 chunk {chunk_idx} ({label}) gid {} must be \
-                             in a Quantized GPU arena, got {:?}",
-                            gid.raw(),
-                            key.format,
-                        );
-                    } else {
-                        assert_eq!(
-                            key.format,
-                            KvFormat::Float(DType::F16),
-                            "warm_t2 chunk {chunk_idx} ({label}) gid {} must be \
-                             F16 Float (preserved), got {:?}",
-                            gid.raw(),
-                            key.format,
-                        );
-                    }
+                    assert!(
+                        matches!(key.format, KvFormat::Quantized(_)),
+                        "warm_t2 chunk {chunk_idx} ({label}) gid {} must be \
+                         in a Quantized GPU arena, got {:?}",
+                        gid.raw(),
+                        key.format,
+                    );
                 }
             };
             // chunks[0]: borrowed cold-loaded full → already Q*, preserved.
-            check(0, true, "borrowed cold-loaded full (Q* preserved)");
-            // chunks[1]: borrowed partial → F16 preserved (never quantized).
-            check(1, false, "borrowed partial (F16 preserved)");
+            check(0, "borrowed cold-loaded full (Q* preserved)");
+            // chunks[1]: borrowed cold-loaded partial → already Q*, preserved.
+            check(1, "borrowed partial (Q* preserved)");
             // chunks[2]: new full F16 chunk → freshly quantized.
-            check(2, true, "new full chunk (freshly quantized)");
+            check(2, "new full chunk (freshly quantized)");
             Ok::<(), candle::Error>(())
         })
         .unwrap()

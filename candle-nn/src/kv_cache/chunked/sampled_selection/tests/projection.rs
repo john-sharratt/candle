@@ -183,6 +183,7 @@ fn gpu_palette4_reduction_does_not_invent_float_formats_from_uniform_quant_input
             PRODUCTION_V_QREL_HIGH_THRESHOLDS[4],
             PRODUCTION_V_QREL_LOW_THRESHOLDS[4],
             None,
+            None,
         )
         .expect("GPU fused palette4 selection for uniform quant input");
 
@@ -295,6 +296,7 @@ fn gpu_quant_only_selector_never_returns_float_formats() {
             K_QREL_LOW_THRESHOLDS[4],
             PRODUCTION_V_QREL_HIGH_THRESHOLDS[4],
             PRODUCTION_V_QREL_LOW_THRESHOLDS[4],
+            None,
             None,
         )
         .expect("GPU fused palette4 selection");

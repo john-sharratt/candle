@@ -554,16 +554,25 @@ fn determinism_and_reset() -> Result<()> {
 // developed against.
 // ──────────────────────────────────────────────────────────────────────
 
-fn bench_spec(name: &'static str, prefix: usize, q_len: usize) -> Scenario {
+fn bench_spec_level(
+    name: &'static str,
+    prefix: usize,
+    q_len: usize,
+    level: Option<u8>,
+) -> Scenario {
     Scenario {
         name,
-        seqs: single(vec![seg(prefix, Some(5))], q_len),
+        seqs: single(vec![seg(prefix, level)], q_len),
         theta: 1e6,
         seed: 0xBE7C,
         golden_band: f32::INFINITY, // bench only — no golden assertion
         min_cos: -1.0,
         structured_dims: false,
     }
+}
+
+fn bench_spec(name: &'static str, prefix: usize, q_len: usize) -> Scenario {
+    bench_spec_level(name, prefix, q_len, Some(5))
 }
 
 fn bench_prefill_table() -> Result<()> {
@@ -573,6 +582,11 @@ fn bench_prefill_table() -> Result<()> {
         bench_spec("q8_prefix8k", 8192, 8),
         bench_spec("q256_prefix2k", 2048, 256),
         bench_spec("q64_prefix2k", 2048, 64),
+        // Unquantized float prefix — the bulk-ingest regime (live prefix
+        // not yet sealed/quantized): every palette takes the kernel's
+        // non-hop dtype path.
+        bench_spec_level("q64_f16_prefix8k", 8192, 64, None),
+        bench_spec_level("q512_f16_prefix4k", 4096, 512, None),
     ];
     println!("── int8 prefix-attention prefill ──");
     for spec in shapes {
@@ -677,10 +691,14 @@ fn ab_level_matrix() -> Result<()> {
     // the production policy: C0 R16/Q8 K, C4 asymmetric Q4_1 V (the
     // FP-fallback staging path), C8/C9 the Q2/Q1/Q0 extreme families.
     for level in 0u8..=9 {
+        // Floors re-measured after partial-tail quantization landed
+        // (partials used to stay float and contribute zero error): C6
+        // measured cos 0.9492 with the two partial tails (4 + 13 tokens)
+        // carrying C6-ladder error.
         let golden = match level {
             0..=5 => (3e-1, 0.97),
-            6 | 7 => (4.5e-1, 0.95),
-            _ => (7e-1, 0.90),
+            6 | 7 => (4.5e-1, 0.92),
+            _ => (7e-1, 0.88),
         };
         println!("── ab_level_matrix: C{level} ──");
         sweep(
@@ -701,9 +719,9 @@ fn ab_structured_palettes() -> Result<()> {
     // not contiguous bands), asymmetric V picks, and different maps per
     // segment (a table-cache miss at every segment boundary).
     // Golden floor sized to evidence: the planted 300:1 dynamic range is
-    // the quantizer's adversarial case (measured golden cos 0.8817 while
-    // kernel behavior was verified drift-free — the loss is the arena's,
-    // not the kernel's).
+    // the quantizer's adversarial case (cos 0.8817 measured with float
+    // partial tails; 0.8172 once the three partial tails — 46 of 206
+    // tokens — quantize too). The loss is the arena's, not the kernel's.
     sweep(
         "ab_structured_palettes",
         single(
@@ -712,7 +730,7 @@ fn ab_structured_palettes() -> Result<()> {
         ),
         0xAB20,
         true,
-        (4e-1, 0.86),
+        (4e-1, 0.79),
     )?;
     // Determinism only: C7/C9's 2-bit-class blocks on the planted dynamic
     // range lose most of the signal at the QUANTIZER (measured golden cos
@@ -810,12 +828,15 @@ fn ab_splits_partial_interplay() -> Result<()> {
         false,
         (3e-1, 0.97),
     )?;
+    // Floor sized to evidence: the 1-token partial tail quantizes with
+    // C7's (coarse) ladder — measured cos 0.9361 once partial tails
+    // stopped being float.
     sweep(
         "ab_splits_prefix33",
         single(vec![seg(33, Some(7))], 3),
         0xAB72,
         false,
-        (4.5e-1, 0.95),
+        (4.5e-1, 0.91),
     )
 }
 

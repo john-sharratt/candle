@@ -1609,6 +1609,7 @@ extern "C" {
         blocks_per_head: c_int,
         n_kv_head: c_int,
         arena_chunks: c_int,
+        valid_ranges: *const c_int,
         k_palette_tags: *mut c_int,
         v_palette_tags: *mut c_int,
         k_palette_scale: *mut f32,

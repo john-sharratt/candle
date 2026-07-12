@@ -993,6 +993,8 @@ impl PagedSelectionGpuInputs {
         let gids_ptr = self.head_gids_buf.dev_ptr();
         let n_chunks = self.chunk_gids_keepalive.len();
         let total_heads = n_chunks * self.n_kv_head;
+        // Per-block selection is only used on full chunks.
+        let valid_ranges_arg = vec![32i32; n_chunks];
 
         let (
             k_pal_tags_gpu,
@@ -1022,6 +1024,7 @@ impl PagedSelectionGpuInputs {
                 blocks_per_head,
                 self.n_kv_head,
                 self.arena_chunks,
+                &valid_ranges_arg,
                 &self.dev,
                 &self.dev.cuda_stream(),
             )?
@@ -1167,6 +1170,12 @@ impl PagedSelectionGpuInputs {
         k_threshold_lo: f32,
         v_threshold_hi: f32,
         v_threshold_lo: f32,
+        // Per-chunk valid token range, packed (offset << 8) | len with len
+        // in [1, 32]; `None` = every chunk is full. Corrects the
+        // count-normalized error metrics and sink statistics for partial
+        // chunks (whose dead slots are zero — arena zeroing at
+        // creation/recycle).
+        valid_ranges: Option<&[i32]>,
         _generation: Option<&Generation>,
     ) -> Result<(
         Vec<[SampleFormat; 4]>,
@@ -1193,6 +1202,15 @@ impl PagedSelectionGpuInputs {
 
         let pht_ptr = self.per_head_table_buf.dev_ptr();
         let gids_ptr = self.head_gids_buf.dev_ptr();
+        let valid_ranges_arg: Vec<i32> = match valid_ranges {
+            Some(r) => {
+                if r.len() != n_chunks {
+                    candle::bail!("valid_ranges length {} != n_chunks {}", r.len(), n_chunks);
+                }
+                r.to_vec()
+            }
+            None => vec![32i32; n_chunks],
+        };
 
         let (
             k_pal_tags_gpu,
@@ -1222,6 +1240,7 @@ impl PagedSelectionGpuInputs {
                 blocks_per_head,
                 self.n_kv_head,
                 self.arena_chunks,
+                &valid_ranges_arg,
                 &self.dev,
                 &self.dev.cuda_stream(),
             )?

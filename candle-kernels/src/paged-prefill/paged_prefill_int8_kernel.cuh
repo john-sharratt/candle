@@ -25,8 +25,10 @@
  *    read-through or FP requant — extracts from that smem copy in
  *    natural dim order via the rank tables. There is no FP16 exchange
  *    slab: the rank→natural permutation happens in the table-indexed
- *    reads themselves. Non-hop palettes (R16, dtype, unaligned spans)
- *    decode element-wise straight from global — rare (glue slices).
+ *    reads themselves. Dtype palettes (unsealed float prefixes) stage
+ *    their raw element spans the same way, K and V phased sequentially
+ *    through one scratch region. Non-hop palettes (R16, F32, unaligned
+ *    spans) decode element-wise straight from global — rare.
  *
  *  - FRESH TOKENS FROM THE INPUTS: the q_len new tokens are staged straight
  *    from the packed q/k/v tensors (never read back from the arena); the
@@ -339,11 +341,19 @@ paged_prefill_int8_kernel(
     // keeps every slot a multiple of 16 bytes (cp.async-aligned).
     constexpr int RAW_SLOT = SUB * 36;
     constexpr int RAW_BYTES = N_PALETTE * RAW_SLOT;
+    // Dtype-tile slot: a float palette span is 32 tokens × SUB dims × 2 B
+    // (F16/BF16; F8 is half that, F32 does not fit and stays non-hop).
+    // Both sides cannot fit simultaneously, so dtype tiles stage K and V
+    // SEQUENTIALLY through one N_PALETTE × RAW_SLOT_D region (see the
+    // staging phase below).
+    constexpr int RAW_SLOT_D = I8_TILE_TOK * SUB * 2;
     constexpr int FRESH_BYTES = I8_TILE_TOK * HEAD_DIM * 2;
     constexpr int SCRATCH_BYTES =
         (2 * RAW_BYTES > P8_BYTES)
             ? ((2 * RAW_BYTES > FRESH_BYTES) ? 2 * RAW_BYTES : FRESH_BYTES)
             : ((P8_BYTES > FRESH_BYTES) ? P8_BYTES : FRESH_BYTES);
+    static_assert(N_PALETTE * RAW_SLOT_D <= SCRATCH_BYTES,
+                  "one side's dtype spans must fit the scratch region");
 
     constexpr int ALIGN16 = 15;
     // Tile overlay offsets (all 16-aligned).
@@ -561,43 +571,72 @@ paged_prefill_int8_kernel(
             const uint8_t* k_pal = kvhead_k_pal_map<HEAD_DIM>(sl_head);
             const uint8_t* v_pal = kvhead_v_pal_map<HEAD_DIM>(sl_head);
 
-            // Raw-span fill: bulk-copy each palette's 32-token block run
-            // into smem with 16-byte cp.async. This is the coalescing fix
-            // for the profiler's dominant finding — per-element extraction
-            // straight from global wasted ~79% of its sectors (each decode
-            // touched a whole 32-byte sector for a few bytes); the bulk
+            // Raw-span fill: bulk-copy each palette's 32-token span into
+            // smem with 16-byte cp.async. This is the coalescing fix for
+            // the profiler's dominant finding — per-element extraction
+            // straight from global wasted ~79% of its sectors; the bulk
             // copy is fully coalesced and the decodes below hit smem.
-            // Non-hop palettes (R16, dtype, unaligned span) keep their
-            // global base and decode element-wise — rare (glue slices;
-            // production C4+ prefixes are all-quant).
-            #pragma unroll 1
-            for (int sp = 0; sp < 2 * N_PALETTE; ++sp) {
-                const int p = sp & (N_PALETTE - 1);
-                const int side = sp / N_PALETTE; // 0 = K, 1 = V
-                const char* gb = (const char*)(uintptr_t)(
-                    side ? kvhead_v_ptr<HEAD_DIM>(sl_head, p)
-                         : kvhead_k_ptr<HEAD_DIM>(sl_head, p));
-                const int fmt = side ? kvhead_v_fmt<HEAD_DIM>(sl_head, p)
-                                     : kvhead_k_fmt<HEAD_DIM>(sl_head, p);
-                int bb = 0;
-                const char* eb = gb;
-                if (ArenaFormat::float_elem_size(fmt) == 0) {
-                    bb = ArenaAccessor::get_quant_block_bytes(fmt);
-                    if (bb * SUB <= RAW_SLOT && (((uintptr_t)gb & 15) == 0)) {
-                        char* rb = (side ? s_raw_v : s_raw_k) + p * RAW_SLOT;
-                        const int span = SUB * bb; // multiple of 16 (SUB ≥ 16)
+            //
+            // Quant palettes copy their block run (≤ 36 B/dim). Dtype
+            // palettes (F16/BF16/F8 — unsealed float prefixes, glue) copy
+            // the raw element span; both sides' dtype spans cannot fit the
+            // scratch simultaneously, so a tile containing ANY dtype
+            // palette stages K and V SEQUENTIALLY through one
+            // RAW_SLOT_D-strided region (two extra barriers). All-quant
+            // tiles — the sealed production path — keep the simultaneous
+            // K+V fill. Non-hop palettes (R16, F32, unaligned spans) keep
+            // their global base and decode element-wise.
+            auto issue_side = [&](int side, int slot_bytes, char* region) {
+                #pragma unroll 1
+                for (int p = 0; p < N_PALETTE; ++p) {
+                    const char* gb = (const char*)(uintptr_t)(
+                        side ? kvhead_v_ptr<HEAD_DIM>(sl_head, p)
+                             : kvhead_k_ptr<HEAD_DIM>(sl_head, p));
+                    const int fmt = side ? kvhead_v_fmt<HEAD_DIM>(sl_head, p)
+                                         : kvhead_k_fmt<HEAD_DIM>(sl_head, p);
+                    const int es = ArenaFormat::float_elem_size(fmt);
+                    int bb = 0;
+                    int span = 0;
+                    if (es == 0) {
+                        bb = ArenaAccessor::get_quant_block_bytes(fmt);
+                        if (bb * SUB <= slot_bytes) span = SUB * bb;
+                    } else if (I8_TILE_TOK * SUB * es <= slot_bytes) {
+                        span = I8_TILE_TOK * SUB * es;
+                    }
+                    const char* eb = gb;
+                    if (span > 0 && (((uintptr_t)gb & 15) == 0)) {
+                        char* rb = region + p * slot_bytes;
+                        // span is a multiple of 16 (SUB ≥ 16, even sizes).
                         for (int u = tid * 16; u < span; u += I8_THREADS * 16)
                             i8_cp_async16(rb + u, gb + u);
                         eb = rb;
                     }
+                    if (tid == 0) {
+                        s_ext_base[side][p] = eb;
+                        s_ext_fmt[side][p] = fmt;
+                        s_ext_bb[side][p] = (es == 0) ? bb : 0;
+                        s_ext_scl[side][p] = side
+                            ? kvhead_v_scale<HEAD_DIM>(sl_head, p)
+                            : kvhead_k_scale<HEAD_DIM>(sl_head, p);
+                    }
                 }
-                if (tid == 0) {
-                    s_ext_base[side][p] = eb;
-                    s_ext_fmt[side][p] = fmt;
-                    s_ext_bb[side][p] = bb;
-                    s_ext_scl[side][p] = side ? kvhead_v_scale<HEAD_DIM>(sl_head, p)
-                                              : kvhead_k_scale<HEAD_DIM>(sl_head, p);
-                }
+            };
+            bool tile_has_dtype = false;
+            #pragma unroll 1
+            for (int sp = 0; sp < 2 * N_PALETTE; ++sp) {
+                const int p = sp & (N_PALETTE - 1);
+                const int fmt = (sp >= N_PALETTE)
+                    ? kvhead_v_fmt<HEAD_DIM>(sl_head, p)
+                    : kvhead_k_fmt<HEAD_DIM>(sl_head, p);
+                const int es = ArenaFormat::float_elem_size(fmt);
+                tile_has_dtype |= (es == 1 || es == 2);
+            }
+            if (tile_has_dtype) {
+                // Phase K only; V fills after the K extract reuses the region.
+                issue_side(0, RAW_SLOT_D, s_raw_k);
+            } else {
+                issue_side(0, RAW_SLOT, s_raw_k);
+                issue_side(1, RAW_SLOT, s_raw_v);
             }
             i8_cp_commit();
             i8_cp_wait0();
@@ -679,6 +718,18 @@ paged_prefill_int8_kernel(
                     s_k8[j][lane + 32 * w] = i8_quant(x[w], inv);
                     if (lane == 0) s_k_scale[j][w] = __float2half(scale);
                 }
+            }
+
+            if (tile_has_dtype) {
+                // Dtype tiles: every warp is done reading the K spans (each
+                // warp's K extract completed above in program order, and the
+                // barrier makes that global), so the region can host the V
+                // spans. The second barrier publishes them + s_ext[1].
+                __syncthreads();
+                issue_side(1, RAW_SLOT_D, s_raw_k);
+                i8_cp_commit();
+                i8_cp_wait0();
+                __syncthreads();
             }
 
             // V: read-through when every palette's format is an int8
