@@ -141,7 +141,7 @@ pub fn walk_filtered(
             let entry = WalkEntry {
                 offset,
                 record: Record {
-                    header: header.clone(),
+                    header,
                     payload: Vec::new(),
                 },
                 size: total,

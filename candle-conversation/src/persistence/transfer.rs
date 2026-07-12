@@ -317,7 +317,7 @@ mod cuda_impl {
         let plan = persistence.plan_chunked_read(substrate, stream_id, buffer_size);
 
         // Empty turn — no chunks. Build empty sealed sequences per
-        // layer (matches the legacy `recover_turn` + `load_to_hot`
+        // layer (matches the `recover_turn_grid` + `load_to_hot`
         // pair on an empty grid).
         if plan.n_records == 0 {
             let mut out = Vec::with_capacity(n_layers);

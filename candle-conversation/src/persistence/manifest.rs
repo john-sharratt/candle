@@ -1,11 +1,11 @@
-//! The in-RAM manifest — the index a walk reconstructs.
+//! The in-RAM manifest — the singleton index a walk reconstructs.
 //!
 //! The manifest resolves the live state of the log under
 //! **last-writer-wins**: ingesting records in append order, a later
 //! record for the same key simply overwrites an earlier one. It
-//! indexes the stream DAG, every chunk's location, and the latest
-//! singleton records, and it serialises into a `Checkpoint` record so
-//! a restart need not re-walk the whole log.
+//! indexes the latest singleton records; per-entity state (streams,
+//! chunks, labels, tree metadata, …) lives on the
+//! [`crate::substrate::Substrate`], populated by the same walker pass.
 //!
 //! All structured metadata payloads in this module are encoded as
 //! UTF-8 JSON via serde, with `#[serde(default)]` on every field so
@@ -19,14 +19,13 @@ use serde::{Deserialize, Serialize};
 
 use super::log_file::LogSource;
 use super::record::RecordType;
-use super::streams::StreamDecl;
 use super::walker::{self, WalkEntry, WalkOutcome};
 use super::{PersistenceError, Result};
 #[cfg(test)]
 use crate::substrate::Substrate;
 
 /// Location of a whole record in the log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordLoc {
     pub offset: u64,
     pub payload_len: u64,
@@ -35,12 +34,12 @@ pub struct RecordLoc {
     /// NDJSON header framing the padded size depends on the header's
     /// serialized length and can't be recomputed from `payload_len`
     /// alone. Always populated — load-bearing for the batched cold-read
-    /// path (one read per stripe, sized exactly from the manifest).
+    /// path (one read per stripe, sized exactly from the index).
     pub record_size: u64,
 }
 
 /// Location and shape of one chunk record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkLoc {
     pub offset: u64,
     pub payload_len: u64,
@@ -50,68 +49,27 @@ pub struct ChunkLoc {
     pub format: u8,
 }
 
-/// The indexed state of one stream.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct StreamEntry {
-    /// The decoded stream declaration, once a `StreamDecl` record is seen.
-    #[serde(default)]
-    pub decl: Option<StreamDecl>,
-    /// Live chunk locations by local chunk index — last-writer-wins.
-    /// Serialised as a `Vec<(idx, loc)>` so the JSON map-key constraint
-    /// (keys are strings) doesn't force stringified u64s on disk.
-    #[serde(default, with = "u64_btreemap_as_pairs")]
-    pub chunks: BTreeMap<u64, ChunkLoc>,
-    /// Latest `Tokens` record for the stream.
-    #[serde(default)]
-    pub tokens: Option<RecordLoc>,
-    /// Latest `Signatures` record for the stream.
-    #[serde(default)]
-    pub signatures: Option<RecordLoc>,
-    /// Highest chunk index the stream is durably committed through.
-    #[serde(default)]
-    pub committed_through: Option<u64>,
-}
-
-/// The whole-log index.
+/// The singleton-record index of one log.
 ///
-/// Serialised as the `Checkpoint` record payload, in JSON, so any
-/// future field can be added or removed without breaking older
-/// readers.
-/// The set of singleton record locations the `Checkpoint` payload
-/// carries.
-///
-/// **Phase 3.** The manifest used to hold every per-entity collection
-/// in RAM and mirror them into the `Checkpoint` payload — making the
-/// payload scale with stream count, turn count, and tree-node count.
-/// Now it carries only the singleton fields below.  Per-entity state
-/// (chunks, tokens locations, signatures locations, stream decls,
-/// labels, conv states, tree metadata, debug ids) lives on the
+/// The manifest carries only the singleton fields below. Per-entity
+/// state (chunks, tokens locations, signatures locations, stream
+/// decls, labels, conv states, tree metadata, debug ids) lives on the
 /// [`crate::substrate::Substrate`] directly; the walker dispatches
 /// each record through [`crate::substrate::Substrate::apply_walker_entry`]
-/// during the same pass that populates the manifest's singletons.
-///
-/// On reload the walker rebuilds substrate state from records
-/// directly; the manifest just records "where the singletons sit."
+/// during the same recovery pass that populates these singletons.
 /// Compaction bounds the live log to the working set, which bounds
-/// reload wall-clock.  This is the "atomic per-record entries + walk
+/// reload wall-clock. This is the "atomic per-record entries + walk
 /// to reconstruct" pattern.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Manifest {
     /// Latest `ModelSpec` record.
-    #[serde(default)]
     pub model_spec: Option<RecordLoc>,
     /// Latest `Template` record.
-    #[serde(default)]
     pub template: Option<RecordLoc>,
     /// Latest `Tokenizer` record.
-    #[serde(default)]
     pub tokenizer: Option<RecordLoc>,
     /// Latest `ToolSummary` record (workspace singleton).
-    #[serde(default)]
     pub tool_summary: Option<RecordLoc>,
-    /// Offset of the most recent `Checkpoint` record seen.
-    #[serde(default)]
-    pub last_checkpoint_offset: Option<u64>,
 }
 
 /// Per-timeline conversation metadata persisted in `RecordType::Label`.
@@ -174,12 +132,12 @@ impl Manifest {
         Manifest::default()
     }
 
-    /// Apply one walked record, last-writer-wins.  After Phase 3 the
-    /// manifest only tracks the singleton record types — every
-    /// per-entity record (`StreamDecl`, `Chunk`, `Tokens`,
-    /// `Signatures`, `Commit`, `Label`, `ConvState`, `TreeMetadata`,
-    /// `DebugId`) is handled by the walker's per-record sink, which
-    /// dispatches into the substrate via
+    /// Apply one walked record, last-writer-wins.  The manifest only
+    /// tracks the singleton record types — every per-entity record
+    /// (`StreamDecl`, `Chunk`, `Tokens`, `Signatures`, `Commit`,
+    /// `Label`, `ConvState`, `TreeMetadata`, `DebugId`) is handled by
+    /// the walker's per-record sink, which dispatches into the
+    /// substrate via
     /// [`crate::substrate::Substrate::apply_walker_entry`].
     pub fn ingest(&mut self, entry: &WalkEntry) -> Result<()> {
         let h = &entry.record.header;
@@ -193,9 +151,6 @@ impl Manifest {
             RecordType::Template => self.template = Some(loc),
             RecordType::Tokenizer => self.tokenizer = Some(loc),
             RecordType::ToolSummary => self.tool_summary = Some(loc),
-            RecordType::Checkpoint => {
-                self.last_checkpoint_offset = Some(entry.offset);
-            }
             // Per-entity records flow to the substrate via the walker
             // sink — see `Substrate::apply_walker_entry`.  They never
             // enter the manifest.
@@ -258,27 +213,6 @@ impl Manifest {
         }
         Ok((manifest, outcome))
     }
-
-    /// Always 0 after Phase 3 — chunks live on the substrate, not the
-    /// manifest.  Test helpers that need the live chunk count should
-    /// query `Substrate::live_chunk_count` instead.
-    pub fn live_chunk_count(&self) -> usize {
-        0
-    }
-
-    /// Serialise to the `Checkpoint` record payload bytes — UTF-8
-    /// JSON. Forward-compatible: adding fields is a no-op for older
-    /// readers (they ignore unknown keys), removing fields decodes
-    /// to defaults.
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("Manifest JSON encoding is infallible")
-    }
-
-    /// Reconstruct from `Checkpoint` record payload bytes.
-    pub fn decode(payload: &[u8]) -> Result<Manifest> {
-        serde_json::from_slice(payload)
-            .map_err(|e| PersistenceError::Corrupt(format!("Manifest JSON decode: {e}")))
-    }
 }
 
 /// Encode a `Label` record's payload — JSON.
@@ -336,38 +270,12 @@ pub fn decode_conv_state_payload(payload: &[u8]) -> Result<(u64, ConvState)> {
     ))
 }
 
-/// Serde shim: serialise a `BTreeMap<u64, V>` as a `Vec<(u64, V)>`
-/// pair list, since JSON object keys are strings. Round-trips
-/// preserve ordering (BTreeMap iterates by key).
-mod u64_btreemap_as_pairs {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::collections::BTreeMap;
-
-    pub fn serialize<V, S>(map: &BTreeMap<u64, V>, ser: S) -> Result<S::Ok, S::Error>
-    where
-        V: Serialize,
-        S: Serializer,
-    {
-        let pairs: Vec<(u64, &V)> = map.iter().map(|(k, v)| (*k, v)).collect();
-        pairs.serialize(ser)
-    }
-
-    pub fn deserialize<'de, V, D>(de: D) -> Result<BTreeMap<u64, V>, D::Error>
-    where
-        V: Deserialize<'de>,
-        D: Deserializer<'de>,
-    {
-        let pairs: Vec<(u64, V)> = Vec::deserialize(de)?;
-        Ok(pairs.into_iter().collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::persistence::log_file::{MemLog, SUPERBLOCK_SIZE};
     use crate::persistence::record::{encode_record, RecordHeader};
-    use crate::persistence::streams::{ContentAddress, SectionDecl, StreamId};
+    use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId};
     use crate::projection::{GroupId, LayerId, TimelineId};
 
     fn record(rt: RecordType, stream_id: u64, chunk_index: u64, payload: &[u8]) -> Vec<u8> {
@@ -435,43 +343,6 @@ mod tests {
             manifest.model_spec.unwrap().payload_len,
             "v2-newer".len() as u64
         );
-    }
-
-    /// Phase 3: only the singleton offsets (model_spec, template,
-    /// tokenizer, last_checkpoint_offset) survive an encode/decode
-    /// round-trip.  Per-entity collections (`streams`, `labels`,
-    /// `conv_states`, `tree_metadata`, `debug_ids`) are
-    /// `#[serde(skip)]` — they get rebuilt by the walker on reload.
-    #[test]
-    fn manifest_encode_decode_singletons_only() {
-        let decl = StreamDecl::PromptSection(SectionDecl {
-            address: ContentAddress::default(),
-            debug_name: "roundtrip".to_string(),
-        });
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&record(RecordType::Template, 0, 0, b"template-blob"));
-        blob.extend_from_slice(&record(RecordType::StreamDecl, 3, 0, &decl.encode()));
-        blob.extend_from_slice(&record(RecordType::Chunk, 3, 0, b"c0"));
-        blob.extend_from_slice(&record(RecordType::Tokens, 3, 0, b"tok"));
-        let mut mem = MemLog::with_records(&blob);
-        let (manifest, substrate, _) =
-            Manifest::build_with_substrate(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        // Walker built a non-empty in-RAM streams index on substrate.
-        assert!(substrate.live_chunk_count() > 0);
-        assert!(manifest.template.is_some());
-
-        let encoded = manifest.encode();
-        let decoded = Manifest::decode(&encoded).unwrap();
-        // Singletons round-trip.
-        assert_eq!(decoded.template, manifest.template);
-        assert_eq!(decoded.model_spec, manifest.model_spec);
-        assert_eq!(decoded.tokenizer, manifest.tokenizer);
-    }
-
-    #[test]
-    fn empty_manifest_roundtrips() {
-        let m = Manifest::new();
-        assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
     }
 
     /// `ConvState` payload encodes / decodes correctly with the
@@ -548,22 +419,6 @@ mod tests {
         // Pending until register_timeline drains, but `is_tombstoned`
         // sees the pending entry immediately.
         assert!(substrate.is_tombstoned(tl));
-    }
-
-    /// `conv_states` is `#[serde(skip)]` — it does NOT survive a
-    /// checkpoint encode/decode cycle.  ConvState records are
-    /// recovered by walking the log on reload (the
-    /// `conv_state_last_writer_wins_in_manifest` test covers that).
-    #[test]
-    fn conv_state_dropped_from_checkpoint_payload() {
-        // ConvState state lives on the substrate after Phase 3, not
-        // on the manifest.  This test is a regression guard that the
-        // manifest itself stays empty + small regardless of whether
-        // conv-state records are walked.
-        let m = Manifest::new();
-        let bytes = m.encode();
-        let decoded = Manifest::decode(&bytes).unwrap();
-        assert_eq!(m, decoded);
     }
 
     /// A future-version writer adds a JSON field we don't model. The
@@ -647,18 +502,5 @@ mod tests {
             !s.contains("custom"),
             "empty custom must not be serialized: {s}"
         );
-    }
-
-    /// The Manifest itself must tolerate added/removed top-level
-    /// JSON fields — a future field doesn't fail-load, a missing
-    /// field decodes to its `Default` value.
-    #[test]
-    fn manifest_ignores_unknown_top_level_fields() {
-        let payload = br#"{"streams":[],"labels":[],"conv_states":[],"future_top_level":42}"#;
-        let decoded = Manifest::decode(payload).unwrap();
-        // After Phase 3 the per-entity fields don't exist on Manifest;
-        // unknown / legacy fields in the JSON payload are silently
-        // ignored.  The decoder must produce an empty manifest.
-        assert_eq!(decoded, Manifest::new());
     }
 }

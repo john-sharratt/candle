@@ -9,7 +9,7 @@
 //! The header is a single line of UTF-8 JSON terminated by a newline.
 //! The payload is `payload_len` raw bytes, contents type-dependent —
 //! either binary (chunks, tokens, model spec, tokenizer hash) or
-//! JSON (label, conv state, stream decl, manifest checkpoint).
+//! JSON (label, conv state, stream decl, tree metadata).
 //!
 //! Records are zero-padded out to a 4 KB sector boundary so the
 //! walker can do unbuffered, sector-aligned reads and the zero tail
@@ -88,7 +88,9 @@ pub enum RecordType {
     Tokens = 5,
     Signatures = 6,
     Commit = 7,
-    Checkpoint = 8,
+    // Tag 8 is retired (it was the manifest checkpoint snapshot —
+    // recovery is a pure walk now, and old logs' checkpoint records
+    // decode as `Unknown` and are skipped by the walker).
     /// The model's `tokenizer.json` digest — a workspace singleton.
     Tokenizer = 9,
     /// Per-timeline conversation display label + conv_id (sidebar

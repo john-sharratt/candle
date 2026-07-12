@@ -9,17 +9,18 @@
 //! The module is built bottom-up, one concern per file (§13.3):
 //!
 //! - [`content_hash`] — the deterministic content-hash chain.
-//! - [`record`] — the eight record types and the framing codec.
+//! - [`record`] — the record types and the framing codec.
 //! - [`streams`] — stream identity and the `StreamDecl` payload.
 //! - [`log_file`] — the append-only redo-log file.
 //! - [`walker`] — the skip-load record walk.
-//! - [`manifest`] — the in-RAM last-writer-wins index.
-//! - [`checkpoint`] — checkpoint serialisation and recovery.
+//! - [`manifest`] — the in-RAM last-writer-wins singleton index.
+//! - [`recovery`] — the filtered recovery walk.
+//! - [`accounting`] — O(1) live/dead byte accounting for compaction.
 //! - [`inherit`] — multi-log inheritance and the shared cache.
 //!
 //! [`SubstratePersistence`] is the public API tying them together.
 
-pub mod checkpoint;
+pub mod accounting;
 pub mod chunk_plan;
 pub mod cold_load;
 pub mod compaction;
@@ -32,6 +33,7 @@ pub mod log_file;
 pub mod manifest;
 pub mod pipeline;
 pub mod record;
+pub mod recovery;
 pub mod resume;
 pub mod streams;
 pub mod thread;
@@ -45,9 +47,10 @@ use thiserror::Error;
 
 use crate::substrate::Substrate;
 
+use accounting::RecordAccounting;
 use chunk_plan::ChunkedReadPlan;
 use inherit::InheritedSubstrate;
-use log_file::{read_record_at, LogFile, LogSource};
+use log_file::{read_record_at, LogFile, LogSource, SUPERBLOCK_SIZE};
 use manifest::{ChunkLoc, Manifest};
 use record::{
     decode_record, encode_record, ChunkPayload, DebugIdPayload, Record, RecordHeader, RecordType,
@@ -111,6 +114,11 @@ pub struct SubstratePersistence {
     /// sweep — filtered out of every cold-load plan. Shared with the
     /// `crc_validator` thread.
     bad_chunks: crc_validator::BadChunkRegistry,
+    /// O(1) live/dead byte accounting over the active log — fed by
+    /// every append and by the recovery walk, read by
+    /// [`SubstratePersistence::should_compact`]. Reset and rebuilt when
+    /// compaction rewrites the file.
+    accounting: RecordAccounting,
     /// Handle on the background CRC validator. Stop-on-drop, so the
     /// thread exits cleanly when the substrate closes.
     _crc_validator: crc_validator::CrcValidator,
@@ -176,9 +184,13 @@ fn hex_short(h: &[u8; 32]) -> String {
     s
 }
 
-/// Dead-record ratio at which [`SubstratePersistence::should_compact`] fires
+/// Dead-byte ratio at which [`SubstratePersistence::should_compact`] fires
 /// — half the log being dead weight is enough to justify a rewrite (§5.8).
 pub const COMPACTION_DEAD_RATIO_THRESHOLD: f32 = 0.5;
+
+/// Logs shorter than this never auto-compact — a rewrite of a small file
+/// reclaims nothing worth the pause, regardless of its dead ratio.
+pub const COMPACTION_MIN_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 impl SubstratePersistence {
     /// Open the persistence layer at `<cwd>/.substrate/substrate.log`,
@@ -237,7 +249,7 @@ impl SubstratePersistence {
     fn from_paths_with_sink<F>(
         active: &Path,
         inherited: &[PathBuf],
-        sink: F,
+        mut sink: F,
     ) -> Result<SubstratePersistence>
     where
         F: FnMut(&walker::WalkEntry),
@@ -247,7 +259,13 @@ impl SubstratePersistence {
             inherited_subs.push(InheritedSubstrate::load(path)?);
         }
 
-        let (mut log, manifest) = open_or_create_active_with_sink(active, sink)?;
+        // Feed the recovery walk into the dead-weight accounting in the
+        // same pass that populates the manifest and the caller's sink.
+        let mut accounting = RecordAccounting::new();
+        let (mut log, manifest) = open_or_create_active_with_sink(active, |entry| {
+            accounting.record(&entry.record.header, entry.size);
+            sink(entry);
+        })?;
         let model_spec = manifest
             .model_spec
             .map(|loc| read_record_at(&mut log, loc.offset, loc.record_size).map(|r| r.payload))
@@ -283,6 +301,7 @@ impl SubstratePersistence {
             template,
             active_path: active.to_path_buf(),
             bad_chunks,
+            accounting,
             _crc_validator: crc_validator_handle,
         })
     }
@@ -359,6 +378,7 @@ impl SubstratePersistence {
         let bytes = encode_record(&header, payload);
         let offset = self.log.stage(&bytes);
         let size = bytes.len() as u64;
+        self.accounting.record(&header, size);
         let entry = WalkEntry {
             offset,
             record: Record {
@@ -831,16 +851,6 @@ impl SubstratePersistence {
         Ok(true)
     }
 
-    /// Write a `Checkpoint` record snapshotting the manifest, commit it
-    /// durably, and update the superblock's latest-checkpoint hint.
-    pub fn checkpoint(&mut self) -> Result<()> {
-        let payload = checkpoint::encode_checkpoint(&self.manifest);
-        let (offset, _) = self.append_record(RecordType::Checkpoint, 0, 0, 0, 0, &payload)?;
-        self.log.commit()?;
-        self.log.set_latest_checkpoint(offset)?;
-        Ok(())
-    }
-
     /// Set the model spec — last-writer-wins. Appends a fresh `ModelSpec`
     /// record only when the bytes differ from the latest on file. Returns
     /// `true` if a record was written.
@@ -979,13 +989,32 @@ impl SubstratePersistence {
     }
 
     /// Whether the active log has accumulated enough dead weight to justify
-    /// a compaction pass — the dead-record ratio (§5.8) crossing
-    /// [`COMPACTION_DEAD_RATIO_THRESHOLD`]. Flushes pending writes first so
-    /// the measurement reflects the durable log.
-    pub fn should_compact(&mut self, substrate: &Substrate) -> Result<bool> {
-        self.log.commit()?;
-        let ratio = compaction::dead_record_ratio(&mut self.log, &self.manifest, substrate)?;
-        Ok(ratio >= COMPACTION_DEAD_RATIO_THRESHOLD)
+    /// a compaction pass — the dead-byte ratio (§5.8) crossing
+    /// [`COMPACTION_DEAD_RATIO_THRESHOLD`] on a log at least
+    /// [`COMPACTION_MIN_LOG_BYTES`] long.
+    ///
+    /// Cheap enough to poll every persistence-thread pass: the dead-byte
+    /// counter is maintained O(1) per append (see [`accounting`]), and the
+    /// tombstoned-stream sum is a walk of the in-RAM stream index — no
+    /// disk I/O.
+    pub fn should_compact(&self, substrate: &Substrate) -> bool {
+        let total = (self.log.write_offset() + self.log.pending_len() as u64)
+            .saturating_sub(SUPERBLOCK_SIZE);
+        total >= COMPACTION_MIN_LOG_BYTES
+            && self.dead_ratio(substrate) >= COMPACTION_DEAD_RATIO_THRESHOLD
+    }
+
+    /// Fraction of the log's record bytes that are dead weight —
+    /// superseded last-writer-wins records plus everything owned by a
+    /// tombstoned timeline. `0.0` for an empty or freshly-compacted log.
+    pub fn dead_ratio(&self, substrate: &Substrate) -> f32 {
+        let total = (self.log.write_offset() + self.log.pending_len() as u64)
+            .saturating_sub(SUPERBLOCK_SIZE);
+        if total == 0 {
+            return 0.0;
+        }
+        let dead = self.accounting.dead_bytes() + substrate.tombstoned_stream_bytes();
+        dead as f32 / total as f32
     }
 
     /// Compact the active log — the whole-file dead-record rewrite (§5.8).
@@ -1059,11 +1088,13 @@ impl SubstratePersistence {
         //    collections and replay the new compacted log to rebuild
         //    them with the new offsets.  Per-turn KV residence and
         //    timeline registrations survive (they're not walker-built).
+        //    The dead-weight accounting restarts from the fresh file in
+        //    the same pass (a just-compacted log is all-live).
         substrate.clear_walker_state();
-        let hint = self.log.superblock().latest_checkpoint_offset;
-        // Build a fresh manifest snapshot from the new log + dispatch
-        // every record back into substrate.
-        let recovered = checkpoint::recover_with_sink(&mut self.log, hint, |entry| {
+        self.accounting.reset();
+        let accounting = &mut self.accounting;
+        let recovered = recovery::recover_with_sink(&mut self.log, |entry| {
+            accounting.record(&entry.record.header, entry.size);
             substrate.apply_walker_entry(entry);
         })?;
         if recovered.torn {
@@ -1071,6 +1102,10 @@ impl SubstratePersistence {
         }
         self.log.set_write_offset(recovered.tail_offset);
         self.manifest = recovered.manifest;
+        // 7. Every residence's cold tier still references the OLD file's
+        //    offsets. Re-point them at the rebuilt stream index so a
+        //    mid-session cold→hot elevation reads the right bytes.
+        substrate.refresh_cold_refs();
         report(5);
         Ok(())
     }
@@ -1103,8 +1138,7 @@ where
 {
     if path.exists() {
         let mut log = LogFile::open(path)?;
-        let hint = log.superblock().latest_checkpoint_offset;
-        let recovered = checkpoint::recover_with_sink(&mut log, hint, sink)?;
+        let recovered = recovery::recover_with_sink(&mut log, sink)?;
         if recovered.torn {
             log.truncate_to(recovered.tail_offset)?;
         }
@@ -1205,7 +1239,6 @@ mod tests {
             );
             assert_eq!(sp.tokenizer_sha256(), Some(sha256(&v2)));
             sp.commit().unwrap();
-            sp.checkpoint().unwrap();
         }
         {
             // The hash is recovered from disk, so an unchanged tokenizer on a
@@ -1302,7 +1335,7 @@ mod tests {
             let mut sp = SubstratePersistence::open_in(&dir).unwrap();
             sp.set_model_spec(b"the-model").unwrap();
             sp.set_template(b"the-template").unwrap();
-            sp.checkpoint().unwrap();
+            sp.commit().unwrap();
         }
         {
             let sp = SubstratePersistence::open_in(&dir).unwrap();
@@ -1463,11 +1496,8 @@ mod tests {
         // production path uses open_in_with_substrate.)
         {
             let mut log = LogFile::open(&child_log).unwrap();
-            let hint = log.superblock().latest_checkpoint_offset;
-            checkpoint::recover_with_sink(&mut log, hint, |e| {
-                child_substrate.apply_walker_entry(e)
-            })
-            .unwrap();
+            recovery::recover_with_sink(&mut log, |e| child_substrate.apply_walker_entry(e))
+                .unwrap();
         }
         assert!(child_substrate.has_stream(child_turn.stream_id()));
         assert!(child.inherited_substrates()[0]
@@ -1582,8 +1612,13 @@ mod tests {
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
 
             assert!(
-                sp.should_compact(&substrate).unwrap(),
-                "a log half dead weight wants compaction"
+                sp.dead_ratio(&substrate) >= COMPACTION_DEAD_RATIO_THRESHOLD,
+                "a log half dead weight wants compaction, ratio = {}",
+                sp.dead_ratio(&substrate)
+            );
+            assert!(
+                !sp.should_compact(&substrate),
+                "a small log never auto-compacts regardless of its ratio"
             );
             sp.compact(&mut substrate, None).unwrap();
 
@@ -1591,8 +1626,9 @@ mod tests {
             assert_eq!(sp.model_spec(), Some(b"qwen3-235b-live".as_slice()));
             assert_eq!(sp.template(), Some(b"the-template".as_slice()));
             assert_eq!(sp.read_chunk(&substrate, sid, 0).unwrap(), live_chunk);
-            assert!(
-                !sp.should_compact(&substrate).unwrap(),
+            assert_eq!(
+                sp.dead_ratio(&substrate),
+                0.0,
                 "a freshly compacted log has no dead weight"
             );
         }

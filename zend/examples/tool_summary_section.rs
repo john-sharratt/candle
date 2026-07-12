@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
         println!("load 1: sealed={sealed}  tokens={toks}  blocks=[{b0},{b1})");
         assert!(sealed, "summary section must be pinned in the substrate");
         assert!(toks > 0, "summary section must carry its tokens");
-        engine.checkpoint_persistence()?;
+        engine.commit_persistence()?;
         println!("load 1: sealed + persisted ✓");
     }
 

@@ -20,7 +20,7 @@
 //!   tokens  <stream-id>   decode a stream's Tokens record to token ids
 //!   meta                  the live ModelSpec / Template payloads
 //!   tool-summary          the cached tool-catalog summary (hash + text)
-//!   checkpoint            latest checkpoint + what it recovers to
+//!   recover               what a recovery walk reconstructs (streams + tail)
 //!   projections [stream]  per-decode projection composition (the GUI panel data)
 //!   tree                  per-timeline summary forest from TreeMetadata records
 //! ```
@@ -35,14 +35,14 @@ use clap::{Parser, Subcommand};
 
 use std::collections::BTreeMap;
 
-use candle_conversation::persistence::checkpoint;
-use candle_conversation::persistence::compaction;
+use candle_conversation::persistence::accounting::RecordAccounting;
 use candle_conversation::persistence::content_hash::ContentHash;
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
 use candle_conversation::persistence::manifest::Manifest;
 use candle_conversation::persistence::record::{
     ChunkPayload, Record, RecordType, ToolSummaryPayload,
 };
+use candle_conversation::persistence::recovery;
 use candle_conversation::persistence::resume::decode_token_ids;
 use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::walker;
@@ -110,8 +110,8 @@ enum Cmd {
     /// The cached tool-catalog summary (the `ToolSummary` singleton): its
     /// catalog hash and the full generated text.
     ToolSummary,
-    /// Latest checkpoint and the manifest it recovers.
-    Checkpoint,
+    /// What a recovery walk reconstructs — stream counts + tail state.
+    Recover,
     /// Per-decode projection composition — the same data the GUI's projection
     /// panel draws: for each decoded turn, the throughput plus what provenance
     /// materialized (token buckets) and which system-prompt sections it selected
@@ -190,7 +190,7 @@ fn main() -> Result<()> {
         }
         Cmd::Meta => meta(&mut log, &log_path)?,
         Cmd::ToolSummary => tool_summary(&mut log)?,
-        Cmd::Checkpoint => checkpoint_view(&mut log)?,
+        Cmd::Recover => recover_view(&mut log)?,
         Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
         Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, &log_path, timeline, text)?,
         Cmd::Dump { timeline, full } => dump(&mut log, timeline, full)?,
@@ -806,7 +806,9 @@ fn trunc(s: &str, max: usize) -> String {
 fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let sb = log.superblock();
-    let (entries, _) = walker::collect(log, SUPERBLOCK_SIZE)?;
+    // Header-only walk — the histogram and the dead-byte accounting need
+    // no payload bytes.
+    let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |_| false)?;
 
     // Record-type histogram. `type_index` maps each discriminant to
     // `rt as usize - 1`, so `Unknown` (the highest discriminant) maps to the
@@ -814,16 +816,27 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     // added without re-counting by hand.
     let mut counts = [0usize; RecordType::Unknown as usize];
     let mut payload_bytes = 0u64;
+    let mut record_bytes = 0u64;
+    let mut acc = RecordAccounting::new();
     for e in &entries {
         counts[type_index(e.record.header.record_type)] += 1;
         payload_bytes += e.record.header.payload_len;
+        record_bytes += e.size;
+        acc.record(&e.record.header, e.size);
     }
 
     let manifest = build_manifest(log)?;
     let substrate = build_substrate(log)?;
     let (turns, sections) = stream_kind_counts(&substrate);
     let live_chunks: usize = substrate.all_streams().map(|(_, s)| s.chunks.len()).sum();
-    let dead = compaction::dead_record_ratio(log, &manifest, &substrate)?;
+    // The same dead-byte measure the daemon's auto-compaction trigger
+    // polls: superseded last-writer-wins records + tombstoned streams.
+    let dead_bytes = acc.dead_bytes() + substrate.tombstoned_stream_bytes();
+    let dead = if record_bytes == 0 {
+        0.0
+    } else {
+        dead_bytes as f32 / record_bytes as f32
+    };
 
     println!("file              {}", path.display());
     println!(
@@ -831,14 +844,6 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
         file_len / 1024
     );
     println!("format version    {}", sb.format_version);
-    println!(
-        "latest checkpoint {}",
-        if sb.latest_checkpoint_offset == 0 {
-            "none".to_string()
-        } else {
-            format!("offset {}", sb.latest_checkpoint_offset)
-        }
-    );
     println!();
     println!(
         "records           {} ({} payload bytes)",
@@ -883,7 +888,7 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     };
     println!("tokenizer sidecar {sidecar_status}");
     println!(
-        "dead-record ratio {:.1}% {}",
+        "dead-byte ratio   {:.1}% {}",
         dead * 100.0,
         compaction_hint(dead)
     );
@@ -1341,21 +1346,16 @@ fn meta(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn checkpoint_view(log: &mut LogFile) -> Result<()> {
-    let hint = log.superblock().latest_checkpoint_offset;
-    if hint == 0 {
-        println!("no checkpoint has been written to this log");
-        return Ok(());
-    }
-    println!("latest checkpoint at offset {hint}");
-    // The checkpoint payload carries only singleton offsets; streams are
-    // rebuilt by replaying the tail through the substrate sink.
+fn recover_view(log: &mut LogFile) -> Result<()> {
+    // The same filtered walk the production open path runs — headers for
+    // the bulk record types, payloads only where they feed in-RAM state.
     let mut substrate = Substrate::new();
-    let recovered = checkpoint::recover_with_sink(log, hint, |e| substrate.apply_walker_entry(e))?;
+    let recovered = recovery::recover_with_sink(log, |e| substrate.apply_walker_entry(e))?;
     let (turns, sections) = stream_kind_counts(&substrate);
     println!(
-        "recovers to: {} streams ({turns} turn, {sections} section), torn-tail={}",
+        "recovers to: {} streams ({turns} turn, {sections} section), tail offset {}, torn-tail={}",
         substrate.all_streams().count(),
+        recovered.tail_offset,
         recovered.torn,
     );
     Ok(())
@@ -1363,7 +1363,7 @@ fn checkpoint_view(log: &mut LogFile) -> Result<()> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const ALL_TYPES: [RecordType; 17] = [
+const ALL_TYPES: [RecordType; 16] = [
     RecordType::ModelSpec,
     RecordType::Template,
     RecordType::StreamDecl,
@@ -1371,7 +1371,6 @@ const ALL_TYPES: [RecordType; 17] = [
     RecordType::Tokens,
     RecordType::Signatures,
     RecordType::Commit,
-    RecordType::Checkpoint,
     RecordType::Tokenizer,
     RecordType::Label,
     RecordType::ConvState,
@@ -1424,8 +1423,9 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
 
 /// Rebuild the in-RAM substrate from the log — the authoritative per-stream
 /// index. The manifest only carries singleton offsets (model spec, template,
-/// tokenizer, checkpoint); streams, chunks, tokens, and signatures live in the
-/// substrate, populated by the same walker pass `open_in_with_substrate` uses.
+/// tokenizer, tool summary); streams, chunks, tokens, and signatures live in
+/// the substrate, populated by the same walker pass `open_in_with_substrate`
+/// uses.
 fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let mut substrate = Substrate::new();
     // Fast metadata scan: skip the large reference-stored payloads (KV chunks,

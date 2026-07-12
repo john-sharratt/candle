@@ -1850,8 +1850,8 @@ fn quantize_on_evict_cold_reload_round_trip() {
         "reloaded turn must be cold-marker before elevation"
     );
 
-    // Reopen must not have appended any records (no torn-tail truncation,
-    // no extra checkpoint write during recovery).
+    // Reopen must not have appended any records (recovery is a pure
+    // read — no torn-tail truncation, no writes of any kind).
     let log_len_after_reload = std::fs::metadata(&log_path).unwrap().len();
     assert_eq!(
         log_len_after_reload, log_len_before,

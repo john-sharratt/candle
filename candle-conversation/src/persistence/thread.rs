@@ -725,6 +725,25 @@ fn run_pass(
         tracing::warn!("persist: fsync failed: {e}");
     }
 
+    // ── Phase 4: compaction ────────────────────────────────────────────
+    //
+    // Reclaim the log's dead weight once it crosses the threshold. The
+    // check is pure in-RAM arithmetic (the O(1) dead-byte counter plus
+    // the tombstoned-stream sum), so polling it every pass is free; the
+    // rewrite itself holds the persistence + substrate locks for its
+    // duration, which is why it lives here on the background thread
+    // rather than anywhere near the decode path.
+    match conversation.compact_persistence_if_needed() {
+        Ok(true) => {
+            tracing::info!(
+                target: "candle_conversation::persistence::tier",
+                "persist: redo log compacted (dead-byte threshold crossed)"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!("persist: auto-compaction failed: {e}"),
+    }
+
     // Per-pass aggregate. Only logged when something actually moved.
     if hot_to_warm_count > 0 || warm_to_cold_count > 0 || section_to_cold_count > 0 {
         tracing::trace!(

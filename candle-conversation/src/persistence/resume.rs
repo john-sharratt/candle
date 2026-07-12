@@ -119,17 +119,20 @@ impl TurnChunkGrid {
     }
 }
 
-/// A turn fully recovered from the redo log — its declaration, token ids,
-/// and the per-layer sealed-chunk grid.
+/// A turn's reload metadata — everything the substrate's restore loop
+/// needs, none of the KV bytes. Recovered from the `Tokens` /
+/// `Signatures` records plus the in-RAM chunk index; the chunk
+/// **payloads** stay on disk until a cold→hot elevation reads them via
+/// [`recover_turn_grid`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct RecoveredTurn {
-    pub decl: TurnDecl,
+pub struct RecoveredTurnMeta {
     pub token_ids: Vec<u32>,
-    /// Per-layer ordered chunks for the turn. See [`TurnChunkGrid`].
-    pub layers: TurnChunkGrid,
     /// Per-chunk BDP provenance signatures `(token_count, syn‖sem‖prag bytes)`,
     /// in chunk order — empty if the turn has no `Signatures` record.
     pub signatures: Vec<(u16, Vec<u8>)>,
+    /// Sum of the turn's per-chunk token counts (one layer's worth — all
+    /// layers seal in lockstep). `0` when no `Chunk` records exist yet.
+    pub token_count: usize,
 }
 
 /// Flat 1-D chunk index for `(layer, chunk)` under the Option A layout.
@@ -414,15 +417,17 @@ pub fn demux_layers(
     Ok(TurnChunkGrid::new(materialised?))
 }
 
-/// Recover a single turn fully from the log: its `Tokens` and the demuxed
-/// `L × C` chunk grid. `decl` is the turn's already-decoded `StreamDecl`;
+/// Recover a turn's KV chunk grid from the log: the demuxed `L × C`
+/// [`TurnChunkGrid`] with every chunk's payload bytes. This is the
+/// cold→hot elevation read — the only reload path that touches chunk
+/// payloads. `decl` is the turn's already-decoded `StreamDecl`;
 /// `n_layers` is the running model's layer count.
-pub fn recover_turn(
+pub fn recover_turn_grid(
     p: &mut SubstratePersistence,
     substrate: &Substrate,
     decl: &TurnDecl,
     n_layers: usize,
-) -> Result<RecoveredTurn> {
+) -> Result<TurnChunkGrid> {
     let stream_id = super::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
     let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
 
@@ -459,11 +464,39 @@ pub fn recover_turn(
     // configured with `compression_policy = None` — is still valid: its
     // tokens and signatures are preserved and the layer grid is reconstructed
     // empty. The substrate's reload path handles empty sealed sequences.
-    let layers = if flat.is_empty() {
-        TurnChunkGrid::empty_grid(n_layers)
+    if flat.is_empty() {
+        Ok(TurnChunkGrid::empty_grid(n_layers))
     } else {
-        demux_layers(flat, n_layers, chunks_per_layer)?
-    };
+        demux_layers(flat, n_layers, chunks_per_layer)
+    }
+}
+
+/// Recover a turn's reload metadata: token ids, BDP signatures, and the
+/// per-layer token count. Reads only the (small) `Tokens` and
+/// `Signatures` records; the token count comes straight from the in-RAM
+/// chunk index, so the turn's KV payload bytes are never touched. This
+/// is what the startup restore loop calls per turn — cold KV stays on
+/// disk until a projection elevates it via [`recover_turn_grid`].
+pub fn recover_turn_meta(
+    p: &mut SubstratePersistence,
+    substrate: &Substrate,
+    decl: &TurnDecl,
+) -> Result<RecoveredTurnMeta> {
+    let stream_id = super::content_hash::turn_stream_id(decl.timeline_id, decl.turn_index);
+    let chunks_per_layer = (decl.block_end - decl.block_start) as usize;
+
+    // One layer's worth of token counts — chunk indices below
+    // `chunks_per_layer` are layer 0 under the flat Option A layout,
+    // and all layers seal in lockstep.
+    let token_count: usize = substrate
+        .stream_of(stream_id)
+        .map(|s| {
+            s.chunks
+                .range(..chunks_per_layer as u64)
+                .map(|(_, l)| l.token_count as usize)
+                .sum()
+        })
+        .unwrap_or(0);
 
     let token_ids = match p.read_tokens(substrate, stream_id)? {
         Some(bytes) => decode_token_ids(&bytes)?,
@@ -475,11 +508,10 @@ pub fn recover_turn(
         None => Vec::new(),
     };
 
-    Ok(RecoveredTurn {
-        decl: decl.clone(),
+    Ok(RecoveredTurnMeta {
         token_ids,
-        layers,
         signatures,
+        token_count,
     })
 }
 
@@ -780,7 +812,6 @@ mod tests {
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
             persist_turn_kv(&mut sp, stream_id, &layers, &token_ids).unwrap();
             sp.commit().unwrap();
-            sp.checkpoint().unwrap();
         }
         // Reopen — a simulated restart — and recover the turn from disk.
         {
@@ -790,9 +821,14 @@ mod tests {
             let decls = recovered_turn_decls(&substrate);
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0], decl);
-            let recovered = recover_turn(&mut sp, &substrate, &decls[0], n_layers).unwrap();
-            assert_eq!(recovered.token_ids, token_ids);
-            assert_eq!(recovered.layers, layers);
+            // Metadata half: token ids + per-layer token count, no
+            // chunk-payload I/O.
+            let meta = recover_turn_meta(&mut sp, &substrate, &decls[0]).unwrap();
+            assert_eq!(meta.token_ids, token_ids);
+            assert_eq!(meta.token_count, 32 + 12, "layer-0 chunk token counts");
+            // Payload half: the full grid, byte-identical.
+            let grid = recover_turn_grid(&mut sp, &substrate, &decls[0], n_layers).unwrap();
+            assert_eq!(grid, layers);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -850,7 +886,6 @@ mod tests {
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
             sp.append_projection_events(stream_id, &payload).unwrap();
             sp.commit().unwrap();
-            sp.checkpoint().unwrap();
         }
         // Reopen — a simulated daemon restart — and recover the timeline.
         {
@@ -887,7 +922,7 @@ mod tests {
             let mut sp =
                 SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             // The turn was written with 3 layers; recovering as 4 must fail.
-            assert!(recover_turn(&mut sp, &substrate, &decl, 4).is_err());
+            assert!(recover_turn_grid(&mut sp, &substrate, &decl, 4).is_err());
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -928,7 +963,6 @@ mod tests {
             sp.declare_stream(&StreamDecl::Turn(decl.clone())).unwrap();
             persist_turn_kv(&mut sp, stream_id, &layers, &[1, 2, 3]).unwrap();
             sp.commit().unwrap();
-            sp.checkpoint().unwrap();
         }
         {
             let mut substrate = Substrate::new();

@@ -551,8 +551,8 @@ impl InferenceState {
                 match conv.write_tool_summary(payload) {
                     Ok(()) => {
                         // Force durable now — summaries are expensive to regenerate.
-                        if let Err(e) = engine.checkpoint_persistence() {
-                            tracing::warn!("tool summary checkpoint failed: {e}");
+                        if let Err(e) = engine.commit_persistence() {
+                            tracing::warn!("tool summary commit failed: {e}");
                         }
                         tracing::info!("tool summaries persisted (comprehensive + restricted)");
                     }
@@ -2022,10 +2022,10 @@ impl ZendSession {
             .expect("spawn zend-loader thread");
     }
 
-    /// Graceful shutdown: durably checkpoint the substrate redo log, then
+    /// Graceful shutdown: durably commit the substrate redo log, then
     /// stop the scheduler thread. Idempotent — safe to call when the model
     /// never finished loading (nothing to flush). Runs on the blocking pool
-    /// since `checkpoint_persistence` does synchronous `fsync` I/O.
+    /// since `commit_persistence` does synchronous `fsync` I/O.
     pub async fn shutdown(&self) {
         let state: Option<Arc<InferenceState>> =
             { self.inference.read().unwrap().as_ref().map(Arc::clone) };
@@ -2041,9 +2041,9 @@ impl ZendSession {
         let _ = tokio::task::spawn_blocking(move || {
             {
                 let engine = state.engine.lock().unwrap();
-                match engine.checkpoint_persistence() {
-                    Ok(()) => tracing::info!("shutdown: substrate checkpointed"),
-                    Err(e) => tracing::error!("shutdown: checkpoint failed: {e}"),
+                match engine.commit_persistence() {
+                    Ok(()) => tracing::info!("shutdown: substrate committed"),
+                    Err(e) => tracing::error!("shutdown: commit failed: {e}"),
                 }
                 if let Err(e) = engine.shutdown() {
                     tracing::error!("shutdown: scheduler stop failed: {e}");

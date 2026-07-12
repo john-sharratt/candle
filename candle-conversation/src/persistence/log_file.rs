@@ -3,8 +3,8 @@
 //! A single pre-grown file: a 4 KB superblock followed by 4 KB-aligned
 //! records. Writes are buffered into a group-commit staging buffer and
 //! flushed as one sequential write; `commit` additionally `fsync`s for
-//! durability. Records are never rewritten in place — only the superblock
-//! is (it carries a hint to the latest checkpoint).
+//! durability. Records are never rewritten in place, and the superblock
+//! (file identity + format version) is written once at create time.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -15,7 +15,7 @@ use super::record::{crc32, decode_header, decode_record, Record, RecordHeader, A
 use super::{PersistenceError, Result};
 
 /// Size of the file superblock — the first block, holding file identity
-/// and the latest-checkpoint hint.
+/// and the format version.
 pub const SUPERBLOCK_SIZE: u64 = 4096;
 
 /// File-level magic — ASCII `"SLOG"`, little-endian. Distinct from the
@@ -40,9 +40,6 @@ const GROW_EXTENT: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Superblock {
     pub format_version: u32,
-    /// File offset of the most recently written `Checkpoint` record, or 0
-    /// if none has been written yet. A recovery hint, not authoritative.
-    pub latest_checkpoint_offset: u64,
 }
 
 impl Superblock {
@@ -50,7 +47,9 @@ impl Superblock {
         let mut b = [0u8; SUPERBLOCK_SIZE as usize];
         b[0..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
         b[4..8].copy_from_slice(&self.format_version.to_le_bytes());
-        b[8..16].copy_from_slice(&self.latest_checkpoint_offset.to_le_bytes());
+        // Bytes 8..SUPERBLOCK_SIZE-4 are reserved (zero). They are
+        // covered by the CRC, so a reader validates whatever a writer
+        // put there without interpreting it.
         let crc = crc32(&b[0..SUPERBLOCK_SIZE as usize - 4]);
         b[SUPERBLOCK_SIZE as usize - 4..].copy_from_slice(&crc.to_le_bytes());
         b
@@ -88,11 +87,7 @@ impl Superblock {
                 "unsupported log format version {format_version}"
             )));
         }
-        let latest_checkpoint_offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        Ok(Superblock {
-            format_version,
-            latest_checkpoint_offset,
-        })
+        Ok(Superblock { format_version })
     }
 }
 
@@ -127,7 +122,6 @@ impl LogFile {
             .open(path)?;
         let superblock = Superblock {
             format_version: FILE_FORMAT_VERSION,
-            latest_checkpoint_offset: 0,
         };
         let direct = DirectFile::open(path)?;
         let mut log = LogFile {
@@ -156,7 +150,6 @@ impl LogFile {
             direct,
             superblock: Superblock {
                 format_version: FILE_FORMAT_VERSION,
-                latest_checkpoint_offset: 0,
             },
             write_offset: SUPERBLOCK_SIZE,
             allocated,
@@ -257,14 +250,6 @@ impl LogFile {
         Ok(())
     }
 
-    /// Record the latest-checkpoint offset in the superblock and persist it.
-    pub fn set_latest_checkpoint(&mut self, offset: u64) -> Result<()> {
-        self.superblock.latest_checkpoint_offset = offset;
-        self.write_superblock()?;
-        self.file.sync_data()?;
-        Ok(())
-    }
-
     /// Physically truncate the file to `len` (used by recovery after a torn
     /// tail, and by compaction).
     pub fn truncate_to(&mut self, len: u64) -> Result<()> {
@@ -345,7 +330,6 @@ impl MemLog {
     pub fn with_records(records: &[u8]) -> MemLog {
         let sb = Superblock {
             format_version: FILE_FORMAT_VERSION,
-            latest_checkpoint_offset: 0,
         };
         let mut bytes = sb.encode().to_vec();
         bytes.extend_from_slice(records);
@@ -398,9 +382,9 @@ pub fn read_header_at(src: &mut dyn LogSource, offset: u64) -> Result<RecordHead
 }
 
 /// Read and decode (checksum-verify) the whole record at `offset`.
-/// `record_size` is the exact padded on-disk size from the manifest's
-/// `RecordLoc` / `ChunkLoc` — captured at walk time, persisted through
-/// checkpoints. Single read, no probe.
+/// `record_size` is the exact padded on-disk size from a `RecordLoc` /
+/// `ChunkLoc` — captured at walk time or write time. Single read, no
+/// probe.
 ///
 /// Returns an owned [`Record`] — the on-disk bytes go out of scope at
 /// return time. Callers on the hot path that want to read the payload
@@ -453,7 +437,7 @@ mod tests {
         }
         {
             let log = LogFile::open(&path).unwrap();
-            assert_eq!(log.superblock().latest_checkpoint_offset, 0);
+            assert_eq!(log.superblock().format_version, FILE_FORMAT_VERSION);
         }
         std::fs::remove_file(&path).ok();
     }
@@ -506,16 +490,30 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Superblocks written by earlier builds carry a stale checkpoint
+    /// hint in the reserved bytes (8..16). Decode must accept them —
+    /// the bytes are CRC-covered but uninterpreted.
     #[test]
-    fn checkpoint_hint_persists() {
-        let path = tmp_path("ckpt_hint");
+    fn nonzero_reserved_bytes_are_accepted() {
+        let path = tmp_path("reserved_bytes");
         {
-            let mut log = LogFile::create(&path).unwrap();
-            log.set_latest_checkpoint(123_456).unwrap();
+            LogFile::create(&path).unwrap();
+        }
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut b = vec![0u8; SUPERBLOCK_SIZE as usize];
+            b[0..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
+            b[4..8].copy_from_slice(&FILE_FORMAT_VERSION.to_le_bytes());
+            b[8..16].copy_from_slice(&123_456u64.to_le_bytes());
+            let crc = crc32(&b[0..SUPERBLOCK_SIZE as usize - 4]);
+            b[SUPERBLOCK_SIZE as usize - 4..].copy_from_slice(&crc.to_le_bytes());
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&b).unwrap();
         }
         {
             let log = LogFile::open(&path).unwrap();
-            assert_eq!(log.superblock().latest_checkpoint_offset, 123_456);
+            assert_eq!(log.superblock().format_version, FILE_FORMAT_VERSION);
         }
         std::fs::remove_file(&path).ok();
     }

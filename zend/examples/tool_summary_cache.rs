@@ -94,7 +94,7 @@ fn main() -> anyhow::Result<()> {
         println!("load 1: catalog hash = {hash1:032x}, cached = {before:?}");
         assert_eq!(before, None, "fresh workspace must have no cached summary");
         conv.write_tool_summary(comp_payload(hash1, "FAKE SUMMARY v1"))?;
-        engine.checkpoint_persistence()?;
+        engine.commit_persistence()?;
         println!("load 1: persisted summary for hash {hash1:032x}");
     }
 
@@ -118,7 +118,7 @@ fn main() -> anyhow::Result<()> {
         // ── Supersede: a different hash overwrites; last-writer-wins.
         let conv = engine.conversation();
         conv.write_tool_summary(comp_payload(hash1 ^ 0xFFFF, "FAKE SUMMARY v2"))?;
-        engine.checkpoint_persistence()?;
+        engine.commit_persistence()?;
         assert_eq!(conv.read().tool_summary_hash(false), Some(hash1 ^ 0xFFFF));
         assert_eq!(
             conv.read().tool_summary_text(false),
