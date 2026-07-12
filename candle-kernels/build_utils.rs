@@ -127,10 +127,10 @@ const FLASH_KERNELS: [&str; 12] = [
     // Paged decode: per-dtype dispatchers (hdim 64/96/128/256)
     "src/paged-decode/paged_decode_api_fp16.cu",
     "src/paged-decode/paged_decode_api_bf16.cu",
-    // Paged prefill (1 api dispatcher + 2 per-dtype variants: fp16, bf16)
-    "src/paged-prefill/paged_prefill_api.cu",
-    "src/paged-prefill/paged_prefill_api_fp16.cu",
-    "src/paged-prefill/paged_prefill_api_bf16.cu",
+    // INT8 prefix-attention prefill (1 api dispatcher + fp16, bf16)
+    "src/paged-prefill/paged_prefill_int8_api.cu",
+    "src/paged-prefill/paged_prefill_int8_fp16.cu",
+    "src/paged-prefill/paged_prefill_int8_bf16.cu",
     // Paged glue: reprojection glue forward (decode-derivative; fp16, bf16)
     "src/paged-glue/paged_glue_api_fp16.cu",
     "src/paged-glue/paged_glue_api_bf16.cu",

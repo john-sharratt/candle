@@ -173,9 +173,14 @@ The path off the GPU has three stages:
    a *clean* page — droppable under LRU pressure with no write-back.
 
 The **partial tail chunk** is persisted too — losing it on restart would
-truncate the end of every conversation. It is written as a normal `Chunk`
-record (float, `token_count < 32`), force-flushed on eviction so an evicted
-or idle sequence is always fully durable. For a hot, actively-decoding
+truncate the end of every conversation. The live, still-mutable tail is
+written as a normal `Chunk` record (float, `token_count < 32`),
+force-flushed on eviction so an evicted or idle sequence is always fully
+durable. A partial that belongs to a **sealed** turn or section is
+different: the seal-time quantize pass compresses it like a full chunk
+(its dead token slots are zero — arena chunks are zeroed at creation and
+recycle — and the selection kernel receives the valid range for its
+count-normalized metrics), so it persists in its quantized format. For a hot, actively-decoding
 sequence the tail is flushed on the group-commit timer, so crash loss is
 bounded by the q2 time-bound. During fast decode a chunk usually seals
 faster than the timer fires, so most chunks are written once, sealed, with
@@ -417,8 +422,10 @@ There are **two kinds of stream**:
   tokens); the substrate already seals these partial section tails
   deliberately — `types.rs` notes that dropping them would "silently lose
   up to `(sections-1)*(CHUNK_SIZE-1)` tokens when sections are projected
-  back-to-back." The partial-`Chunk` machinery (§3, §5.5) persists them
-  with no padding and no dummy tokens.
+  back-to-back." Sealed section tails quantize like full chunks and
+  persist in their quantized block format (block bytes cover all 32 token
+  slots, dead slots zeroed); only the live mutable tail uses the float
+  no-padding `Chunk` form (§3, §5.5).
 
 A **conversation** is an emergent grouping, not a stream: it is *all turn
 streams sharing a `timeline_id`, ordered by `turn_index`*, anchored to the

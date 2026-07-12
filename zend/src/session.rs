@@ -2132,9 +2132,9 @@ impl ZendSession {
 
     /// Enable or disable AVL summarisation for `conv_id`'s timeline. Only takes
     /// effect once the timeline exists (i.e. after its first turn has been
-    /// submitted). Returns `None` if the model isn't loaded. Used by tests to
-    /// isolate whether the async summariser's concurrent activity influences a
-    /// conversation's decode.
+    /// submitted). Returns `None` if the model isn't loaded. Called by the
+    /// CUDA-gated `duplication_replay` control to isolate whether the async
+    /// summariser's concurrent activity influences a conversation's decode.
     pub fn set_conversation_summarize(&self, conv_id: &str, summarize: bool) -> Option<()> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = timeline_for(conv_id);

@@ -1,7 +1,9 @@
 //! Host-side slot state for paged attention kernels (decode and prefill).
 
 use candle::{Result, Tensor};
-use candle_nn::kv_cache::{HeadGids, MetaGid, ResolvedArenaInfo, SealedChunk, N_PALETTE};
+use candle_nn::kv_cache::{
+    HeadGids, LiveChunkRef, MetaGid, ResolvedArenaInfo, SealedChunk, N_PALETTE,
+};
 
 // ---------------------------------------------------------------------------
 // Device pointer extraction
@@ -273,6 +275,63 @@ impl TokenSliceHost {
         head_dim: usize,
         arena_info: &[ResolvedArenaInfo],
     ) -> Self {
+        Self::from_parts(
+            chunk.offset,
+            chunk.token_count,
+            chunk.meta.as_ref(),
+            &chunk.gids,
+            &chunk.k_pal,
+            &chunk.v_pal,
+            &chunk.k_scale,
+            &chunk.v_scale,
+            rope_base,
+            n_kv_head,
+            head_dim,
+            arena_info,
+        )
+    }
+
+    /// Zero-clone entry: build from a borrowed live-chunk view (see
+    /// `ChunkedKvBacking::visit_live_chunks`) — identical output to
+    /// [`Self::from_sealed_chunk`] without materializing a `SealedChunk`.
+    pub fn from_live_chunk(
+        c: &LiveChunkRef<'_>,
+        rope_base: u32,
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) -> Self {
+        Self::from_parts(
+            c.offset,
+            c.token_count,
+            c.meta,
+            c.gids,
+            c.k_pal,
+            c.v_pal,
+            c.k_scale,
+            c.v_scale,
+            rope_base,
+            n_kv_head,
+            head_dim,
+            arena_info,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        offset: u16,
+        token_count: u16,
+        meta: Option<&MetaGid>,
+        gids: &HeadGids,
+        k_pal: &[u8],
+        v_pal: &[u8],
+        k_scale: &[f32],
+        v_scale: &[f32],
+        rope_base: u32,
+        n_kv_head: usize,
+        head_dim: usize,
+        arena_info: &[ResolvedArenaInfo],
+    ) -> Self {
         debug_assert!(
             head_dim >= 4,
             "head_dim must be >= 4 for 2-bit pal_map packing"
@@ -281,24 +340,24 @@ impl TokenSliceHost {
         let pal_total = n_kv_head * pal_bytes;
         let scale_total = n_kv_head * N_PALETTE;
         debug_assert!(
-            chunk.k_pal.is_empty() || chunk.k_pal.len() == pal_total,
+            k_pal.is_empty() || k_pal.len() == pal_total,
             "k_pal length must be 0 or {pal_total}, got {}",
-            chunk.k_pal.len()
+            k_pal.len()
         );
         debug_assert!(
-            chunk.v_pal.is_empty() || chunk.v_pal.len() == pal_total,
+            v_pal.is_empty() || v_pal.len() == pal_total,
             "v_pal length must be 0 or {pal_total}, got {}",
-            chunk.v_pal.len()
+            v_pal.len()
         );
         debug_assert!(
-            chunk.k_scale.is_empty() || chunk.k_scale.len() == scale_total,
+            k_scale.is_empty() || k_scale.len() == scale_total,
             "k_scale length must be 0 or {scale_total}, got {}",
-            chunk.k_scale.len()
+            k_scale.len()
         );
         debug_assert!(
-            chunk.v_scale.is_empty() || chunk.v_scale.len() == scale_total,
+            v_scale.is_empty() || v_scale.len() == scale_total,
             "v_scale length must be 0 or {scale_total}, got {}",
-            chunk.v_scale.len()
+            v_scale.len()
         );
         // A chunk with a resident record (`meta.is_some()`) already has its
         // KvHead[n_kv_head] bytes in a device meta-pool slab — built once at
@@ -306,35 +365,35 @@ impl TokenSliceHost {
         // (the dominant per-layer-per-forward cost); the slice will carry the
         // record's device address as `kvheads_ptr`. Only transient/float chunks
         // (`meta.is_none()`) build a scratch record from `heads`.
-        let heads: Vec<KvHeadHost> = if chunk.meta.is_some() {
+        let heads: Vec<KvHeadHost> = if meta.is_some() {
             Vec::new()
         } else {
             (0..n_kv_head)
                 .map(|h| {
-                    let k_pal_head = if chunk.k_pal.len() >= (h + 1) * pal_bytes {
-                        &chunk.k_pal[h * pal_bytes..(h + 1) * pal_bytes]
+                    let k_pal_head = if k_pal.len() >= (h + 1) * pal_bytes {
+                        &k_pal[h * pal_bytes..(h + 1) * pal_bytes]
                     } else {
                         &[]
                     };
-                    let v_pal_head = if chunk.v_pal.len() >= (h + 1) * pal_bytes {
-                        &chunk.v_pal[h * pal_bytes..(h + 1) * pal_bytes]
+                    let v_pal_head = if v_pal.len() >= (h + 1) * pal_bytes {
+                        &v_pal[h * pal_bytes..(h + 1) * pal_bytes]
                     } else {
                         &[]
                     };
-                    let k_scale_head = if chunk.k_scale.len() >= (h + 1) * N_PALETTE {
-                        &chunk.k_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
+                    let k_scale_head = if k_scale.len() >= (h + 1) * N_PALETTE {
+                        &k_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
                     } else {
                         &[][..]
                     };
-                    let v_scale_head = if chunk.v_scale.len() >= (h + 1) * N_PALETTE {
-                        &chunk.v_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
+                    let v_scale_head = if v_scale.len() >= (h + 1) * N_PALETTE {
+                        &v_scale[h * N_PALETTE..(h + 1) * N_PALETTE]
                     } else {
                         &[][..]
                     };
                     KvHeadHost::from_gids(
                         h,
                         head_dim,
-                        &chunk.gids,
+                        gids,
                         arena_info,
                         k_pal_head,
                         v_pal_head,
@@ -346,11 +405,11 @@ impl TokenSliceHost {
         };
 
         Self {
-            offset: chunk.offset,
-            len: chunk.token_count,
+            offset,
+            len: token_count,
             rope: rope_base,
             heads,
-            meta: chunk.meta.clone(),
+            meta: meta.cloned(),
         }
     }
 
@@ -454,7 +513,18 @@ impl SlotStateHost {
                 TokenSliceHost::from_sealed_chunk(c, rope_base, n_kv_head, head_dim, arena_info)
             })
             .collect();
+        Self::from_slices(slices, writer_start_idx, build_position_map)
+    }
 
+    /// Assemble a slot from already-built slices: writer selection + the
+    /// per-cum-token position map. The slice list comes from either
+    /// [`TokenSliceHost::from_sealed_chunk`] (owned snapshots) or
+    /// [`TokenSliceHost::from_live_chunk`] (the zero-clone visitor path).
+    pub fn from_slices(
+        slices: Vec<TokenSliceHost>,
+        writer_start_idx: usize,
+        build_position_map: bool,
+    ) -> Self {
         // Under cum_token addressing the writer is the *first chunk
         // at or after the writer boundary that still has capacity*.
         // The boundary is set by the host: `inject_sealed_at_tail`
@@ -466,10 +536,18 @@ impl SlotStateHost {
         // Within the writer region, prefer the first non-full chunk —
         // this extends partial tails (CoW, decode-extending) and
         // starts fresh empties from in_blk=0.
-        let write_slice = if slices.is_empty() {
-            0
+        let write_slice = if writer_start_idx >= slices.len() {
+            // The writer region has no chunks (freshly injected prefix whose
+            // sealed partial tail is a gap). There is NO valid write target:
+            // point write_slice at the end so an actual write attempt fails
+            // loudly in `extend_for_write_region` instead of silently landing
+            // in an Arc-shared sealed chunk. Writers (prefill with new
+            // tokens) allocate writer chunks first via
+            // `ensure_for_batch_entries`, which brings the boundary back
+            // inside the slice list.
+            slices.len() as u32
         } else {
-            let start = writer_start_idx.min(slices.len() - 1);
+            let start = writer_start_idx;
             let mut wi = start;
             for i in start..slices.len() {
                 let s = &slices[i];
@@ -560,12 +638,15 @@ impl SlotStateHost {
         if seq_len == 0 {
             return;
         }
-        debug_assert!(
-            !self.slices.is_empty(),
-            "extend_for_write_region: slot has no slices — caller must \
-             push at least one writer chunk before prefill",
-        );
         let mut cur_slice = self.write_slice as usize;
+        assert!(
+            cur_slice < self.slices.len(),
+            "extend_for_write_region: no writer chunk (write_slice={} of {} \
+             slices, seq_len={seq_len}) — the write region was not allocated \
+             before prefill (ensure_for_batch_entries)",
+            self.write_slice,
+            self.slices.len(),
+        );
         let mut cur_in_blk = {
             let ws = &self.slices[cur_slice];
             ws.offset as u32 + ws.len as u32

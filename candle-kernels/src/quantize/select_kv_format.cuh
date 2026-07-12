@@ -2004,6 +2004,14 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
     int blocks_per_head,    // must equal FUSED_HEAD_BLOCKS = 128
     int n_kv_head,
     int arena_chunks,
+    // Per-chunk valid token range, packed (offset << 8) | len with
+    // len in [1, 32]. Dead slots outside [offset, offset+len) are ZERO
+    // (arena chunks are zeroed at creation and on free-list recycle —
+    // alloc.rs `zero_recycled_chunk`), so they contribute nothing to
+    // amax or the error sums; the range only fixes the COUNT-normalized
+    // metrics (V's mean-over-32 MSE, K's top-4 mean) and the sink
+    // statistics, which would otherwise be diluted by the zero lanes.
+    const int* __restrict__ valid_ranges,          // [n_chunks]
     int*   __restrict__ k_palette_tags,            // [total_heads * 4]
     int*   __restrict__ v_palette_tags,            // [total_heads * 4]
     float* __restrict__ k_palette_scale,           // [total_heads * 4] outer scale per slot
@@ -2119,6 +2127,16 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
 
     const int chunk_id = head_id / n_kv_head;
     const int head_idx = head_id % n_kv_head;
+
+    // Valid token window of this chunk (see the parameter comment).
+    const int vr        = __ldg(&valid_ranges[chunk_id]);
+    const int valid_lo  = (vr >> 8) & 0xff;
+    const int valid_len = max(1, min(32, vr & 0xff));
+    const int valid_hi  = valid_lo + valid_len;
+    // Count corrections for the fixed-count metric normalizations:
+    // V pass_metric divides the error sum by 32 lanes; K's by top-4.
+    const float v_valid_corr = 32.0f / (float)valid_len;
+    const float k_valid_corr = 4.0f / (float)min(4, valid_len);
 
     const int     gid_base        = chunk_id * n_kv_head * 2;
     const int64_t k_gid           = __ldg(&head_gids[gid_base + head_idx * 2]);
@@ -2290,28 +2308,32 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
         sink_score[lane] = score * rsqrtf((float)FUSED_HEAD_BLOCKS);
         __syncwarp();
 
-        // (c) Chunk-local statistics: mean and std of sink_score across 32 tokens.
-        //     Warp reductions; mu and sigma broadcast to all lanes.
+        // (c) Chunk-local statistics: mean and std of sink_score across the
+        //     VALID tokens (dead lanes of a partial chunk have zero K and
+        //     would drag mu toward zero, granting every real token spurious
+        //     sink weight). Warp reductions; mu and sigma broadcast.
+        const bool  in_window = (lane >= valid_lo) && (lane < valid_hi);
         const float s = sink_score[lane];
-        float ssum = s;
+        float ssum = in_window ? s : 0.0f;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             ssum += __shfl_xor_sync(0xffffffff, ssum, off, 32);
-        const float mu = ssum * (1.0f / 32.0f);
+        const float mu = ssum / (float)valid_len;
 
-        const float dev = s - mu;
+        const float dev = in_window ? (s - mu) : 0.0f;
         float dev2 = dev * dev;
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             dev2 += __shfl_xor_sync(0xffffffff, dev2, off, 32);
-        const float sigma = sqrtf(dev2 * (1.0f / 32.0f));
+        const float sigma = sqrtf(dev2 / (float)valid_len);
 
         // (d) Per-token sink_weight via z-score → tanh, clamped at zero.
         //     Below-average tokens (z < 0) get 0 (no protection).
         //     Above-average tokens get tanh(z) ∈ (0, 1), saturating at z≈2.
+        //     Dead lanes get no weight — a zero K vector is not a sink.
         const float safe_sigma = fmaxf(sigma, 1.0e-8f);
         const float z = (s - mu) / safe_sigma;
-        sink_weight[lane] = fmaxf(0.0f, tanhf(z));
+        sink_weight[lane] = in_window ? fmaxf(0.0f, tanhf(z)) : 0.0f;
     }
     __syncthreads();
 
@@ -2436,8 +2458,14 @@ extern "C" __global__ __launch_bounds__(FUSED_THREADS_PER_BLOCK, 8) void select_
         // Hoisted per-side constants used by every search/claim metric eval.
         // `inv_head_amax` replaces the prior `err / head_amax` divide; on
         // the V side the squared form is used against pre-squared `v_thr_sq`.
-        const float inv_head_amax    = 1.0f / head_amax;
-        const float inv_head_amax_sq = inv_head_amax * inv_head_amax;
+        // The valid-count corrections are folded in here: partial chunks'
+        // dead lanes are zero and contribute no error, so multiplying by
+        // 4/min(4,len) (K top-4 mean) and 32/len (V mean-over-32 MSE)
+        // restores per-VALID-token normalization without threading the
+        // count through the metric plumbing.
+        const float inv_head_amax    = (1.0f / head_amax) * k_valid_corr;
+        const float inv_head_amax_sq =
+            (1.0f / head_amax) * (1.0f / head_amax) * v_valid_corr;
 
         for (int s = 0; s < 4; s++) {
             // Snapshot alive masks so search can read consistent state without
@@ -2808,6 +2836,7 @@ extern "C" void run_select_kv_format_palette4_paged(
     int blocks_per_head,
     int n_kv_head,
     int arena_chunks,
+    const int* valid_ranges,
     int*   k_palette_tags,
     int*   v_palette_tags,
     float* k_palette_scale,
@@ -2869,6 +2898,7 @@ extern "C" void run_select_kv_format_palette4_paged(
         blocks_per_head,
         n_kv_head,
         arena_chunks,
+        valid_ranges,
         k_palette_tags,
         v_palette_tags,
         k_palette_scale,

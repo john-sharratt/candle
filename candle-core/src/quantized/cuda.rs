@@ -1275,6 +1275,7 @@ pub unsafe fn select_kv_format_palette4_paged(
     blocks_per_head: i32,
     n_kv_head: i32,
     arena_chunks: i32,
+    valid_ranges_ptr: u64,
     k_palette_tags_ptr: u64,
     v_palette_tags_ptr: u64,
     k_palette_scale_ptr: u64,
@@ -1310,6 +1311,7 @@ pub unsafe fn select_kv_format_palette4_paged(
         blocks_per_head,
         n_kv_head,
         arena_chunks,
+        valid_ranges_ptr as *const i32,
         k_palette_tags_ptr as *mut i32,
         v_palette_tags_ptr as *mut i32,
         k_palette_scale_ptr as *mut f32,
@@ -1356,6 +1358,8 @@ pub fn select_kv_format_paged_batched_raw(
     }
 
     let gids_gpu = dev.memcpy_stod(head_gids)?;
+    // Test-oriented wrapper: full chunks only (offset 0, all 32 tokens).
+    let full_ranges = vec![32i32; n_chunks];
 
     let (_kpt, _vpt, _ksi, _vsi, _kpm, _vpm, _ka, _va, k_eff, v_eff, _kht, _vht, _qr) = unsafe {
         let stream = dev.cuda_stream();
@@ -1374,6 +1378,7 @@ pub fn select_kv_format_paged_batched_raw(
             blocks_per_head,
             n_kv_head,
             arena_chunks,
+            &full_ranges,
             dev,
             &stream,
         )?
@@ -1405,6 +1410,11 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
     blocks_per_head: usize,
     n_kv_head: usize,
     arena_chunks: usize,
+    // Per-chunk valid token range, packed (offset << 8) | len, len in
+    // [1, 32]. Partial chunks' dead slots are zero (arena zeroing at
+    // creation/recycle); the range corrects the count-normalized error
+    // metrics and sink statistics for the missing lanes.
+    valid_ranges: &[i32],
     dev: &CudaDevice,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
 ) -> Result<(
@@ -1467,6 +1477,14 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
 
     let k_cand_gpu = stream.memcpy_stod(&k_codes).w()?;
     let v_cand_gpu = stream.memcpy_stod(&v_codes).w()?;
+    if valid_ranges.len() != n_chunks {
+        crate::bail!(
+            "valid_ranges length {} != n_chunks {}",
+            valid_ranges.len(),
+            n_chunks
+        );
+    }
+    let valid_ranges_gpu = stream.memcpy_stod(valid_ranges).w()?;
 
     let mut q_rel_median_out = stream.alloc_zeros::<f32>(total_heads).w()?;
     let mut q_rel_spread_out = stream.alloc_zeros::<f32>(total_heads).w()?;
@@ -1508,6 +1526,7 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
         let (k_htag_ptr, _kht) = k_head_tags_out.device_ptr_mut(stream);
         let (v_htag_ptr, _vht) = v_head_tags_out.device_ptr_mut(stream);
         let (q_rel_ptr, _qrel) = q_rel_out.device_ptr_mut(stream);
+        let (valid_ranges_ptr, _vr_guard) = valid_ranges_gpu.device_ptr(stream);
 
         select_kv_format_palette4_paged(
             per_head_table_ptr,
@@ -1530,6 +1549,7 @@ pub unsafe fn select_kv_format_palette4_paged_batched_raw_from_device_ptrs(
             blocks_per_head as i32,
             n_kv_head as i32,
             arena_chunks as i32,
+            valid_ranges_ptr,
             k_pal_tag_ptr,
             v_pal_tag_ptr,
             k_pal_scale_ptr,
@@ -1636,6 +1656,8 @@ pub fn select_kv_format_paged_per_head(
     }
 
     let gids_gpu = dev.memcpy_stod(head_gids)?;
+    // Test-oriented wrapper: full chunks only (offset 0, all 32 tokens).
+    let full_ranges = vec![32i32; n_chunks];
 
     let (_kpt, _vpt, _ksi, _vsi, _kpm, _vpm, _ka, _va, _keff, _veff, k_head_tags, v_head_tags, _qr) = unsafe {
         let stream = dev.cuda_stream();
@@ -1654,6 +1676,7 @@ pub fn select_kv_format_paged_per_head(
             blocks_per_head,
             n_kv_head,
             arena_chunks,
+            &full_ranges,
             dev,
             &stream,
         )?

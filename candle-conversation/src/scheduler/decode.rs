@@ -109,7 +109,7 @@ impl Scheduler {
                 // model-sampled EOS).  Either way it is excluded from the prefill.
                 input.extend_from_slice(&run[..run.len() - 1]);
 
-                if let Err(e) = self.run_prefill_with_shift(id, &input, 0) {
+                if let Err(e) = self.run_prefill(id, &input) {
                     tracing::warn!(
                         seq_id = id.0,
                         "stencil prefill forward failed: {e} — dropping"
@@ -578,7 +578,7 @@ impl Scheduler {
             let Some((&last, prefix)) = healed.split_last() else {
                 continue; // nothing valid to commit (degenerate) — leave as-is
             };
-            if !prefix.is_empty() && self.run_prefill_with_shift(seq_id, prefix, 0).is_ok() {
+            if !prefix.is_empty() && self.run_prefill(seq_id, prefix).is_ok() {
                 if let Some(state) = self.active_decodes.get_mut(&seq_id) {
                     for &t in prefix {
                         state.generated_tokens.push(t);

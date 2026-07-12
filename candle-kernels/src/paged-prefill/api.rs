@@ -4,11 +4,11 @@ use core::ffi::c_void;
 
 extern "C" {
     // ========================================================================
-    // Main dispatcher - q_dtype determines Q/K/V/O type for prefill
-    // Delegates to per-dtype dispatchers (fp16, bf16, f32) which each
-    // contain a switch(head_dim) over supported head dimensions.
+    // INT8 prefix-attention prefill (docs/archived/prefill_optimization.md): GQA-packed
+    // M, slice-aligned tiles, int8 m16n8k32 QK/PV directly over the quantized
+    // arena. q_dtype: 1=F16, 2=BF16 (hard error otherwise).
     // ========================================================================
-    pub fn run_paged_prefill_chunks(
+    pub fn run_paged_prefill_int8(
         q_ptr: *const c_void,
         k_ptr: *const c_void,
         v_ptr: *const c_void,
@@ -22,14 +22,13 @@ extern "C" {
         n_head: i32,
         n_kv_head: i32,
         head_dim: i32,
-        max_blocks: i32,
+        max_q_len: i32,
         softmax_scale: f32,
-        q_dtype: i32, // Q/K/V/O dtype: 0=F32, 1=F16, 2=BF16
-        has_prefix: i32,
+        q_dtype: i32,
         rope_offsets: *const u32,
         rope_cs: *const f32,
         rope_interleaved: i32,
-        write_offset_shifts: *const u32,
         stream: *mut c_void,
     );
+
 }

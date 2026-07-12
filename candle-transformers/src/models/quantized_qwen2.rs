@@ -1016,7 +1016,6 @@ impl ModelWeights {
             offset: index_pos,
             input_ids: x,
             input_len: x.dims2()?.1,
-            write_offset_shift: 0,
         })
     }
 

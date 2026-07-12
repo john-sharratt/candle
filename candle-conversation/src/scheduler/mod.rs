@@ -1375,7 +1375,7 @@ pub(crate) struct Scheduler {
     ///
     ///   - `apply_projection` appends each injected section's
     ///     tokens (looked up from substrate).
-    ///   - `run_prefill_with_shift` appends the prefilled tokens.
+    ///   - `run_prefill` appends the prefilled tokens.
     ///   - prefill's first sampled token gets appended.
     ///   - each decode step's sampled token gets appended.
     ///   - `run_one_section_ingest_chunk` appends the section's tokens
@@ -2738,7 +2738,7 @@ impl Scheduler {
         let slot = self.create_sequence(conv.clone(), None)?;
         let result = (|| -> Result<(), ConversationError> {
             let seal_block_from = self.prepare_section_ingest(slot, section_id, &[], &tokens)?;
-            self.run_prefill_with_shift(slot, &tokens[..], 0)?;
+            self.run_prefill(slot, &tokens[..])?;
             self.finalize_section_ingest(
                 slot,
                 section_id,
@@ -3030,7 +3030,7 @@ impl Scheduler {
         // model to *answer* rather than continue the prompt.
         let asst_start = self.boundary_markers.assistant_start.as_ref().clone();
         let prefill_logits = self
-            .run_prefill_with_shift(slot, &asst_start, 0)
+            .run_prefill(slot, &asst_start)
             .map_err(|e| format!("SubmitSummaryProbe: prefill assistant_start: {e}"))?;
         let prefill_ms = turn_start.elapsed().as_secs_f64() * 1000.0;
         let prefill_token_count = self.session.sequence_offset(slot.0).unwrap_or(0);
@@ -4165,9 +4165,7 @@ impl Scheduler {
                 // model didn't emit these — we synthesise them as if
                 // it did.
                 if !state.post_decode_tokens.is_empty() {
-                    if let Err(e) =
-                        self.run_prefill_with_shift(seal_slot, &state.post_decode_tokens[..], 0)
-                    {
+                    if let Err(e) = self.run_prefill(seal_slot, &state.post_decode_tokens[..]) {
                         tracing::warn!("post-decode prefill failed for slot {}: {}", seal_slot, e,);
                     }
                 }
@@ -6151,22 +6149,12 @@ impl Scheduler {
 }
 
 // •••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
-// Scheduler dispatch unit tests
+// Scheduler unit tests
 // •••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••
 //
-// These tests verify that `run_prefill_with_shift` dispatches to
-// `forward_batched_with_write_shifts` when shift ≠ 0, and to plain
-// `forward_batched` when shift = 0.  The bug was previously invisible
-// because the mock model used the default trait impl which silently
-// drops the shifts.
-//
-// The `RecordingModel` is a minimal `ManagedBatchedModel` that:
-//  - records which dispatch method was used last
-//  - records the write_offset_shifts slice it received
-//  - returns dummy CPU tensors so no GPU is needed
-//
-// `BatchedInferenceSession` is constructed on `Device::Cpu` with tiny arena
-// dimensions so these tests run without CUDA.
+// The `DummyModel` is a minimal `ManagedBatchedModel` that returns dummy CPU
+// tensors so no GPU is needed. `BatchedInferenceSession` is constructed on
+// `Device::Cpu` with tiny arena dimensions so these tests run without CUDA.
 
 #[cfg(test)]
 mod tests {
@@ -6176,42 +6164,21 @@ mod tests {
         BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
     };
     use std::str::FromStr;
-    use std::sync::{Arc, Mutex};
 
-    // —— Recording model ——————————————————————————————————————————————————————
+    // —— Dummy model ——————————————————————————————————————————————————————————
 
     #[derive(Clone)]
-    struct RecordingModel {
+    struct DummyModel {
         device: candle::Device,
         vocab_size: usize,
-        /// Stores the name of the last dispatch method called.
-        last_call: Arc<Mutex<Option<String>>>,
-        /// Stores the write_offset_shifts passed to `forward_batched_with_write_shifts`,
-        /// or `None` if `forward_batched` was called instead.
-        last_shifts: Arc<Mutex<Option<Vec<u32>>>>,
     }
 
-    impl RecordingModel {
+    impl DummyModel {
         fn new() -> Self {
             Self {
                 device: candle::Device::Cpu,
                 vocab_size: 64,
-                last_call: Arc::new(Mutex::new(None)),
-                last_shifts: Arc::new(Mutex::new(None)),
             }
-        }
-
-        fn record(&self, method: &str, shifts: Option<Vec<u32>>) {
-            *self.last_call.lock().unwrap() = Some(method.to_owned());
-            *self.last_shifts.lock().unwrap() = shifts;
-        }
-
-        fn last_call(&self) -> Option<String> {
-            self.last_call.lock().unwrap().clone()
-        }
-
-        fn last_shifts(&self) -> Option<Vec<u32>> {
-            self.last_shifts.lock().unwrap().clone()
         }
 
         fn dummy_logits(&self, n: usize) -> candle::Result<Vec<Tensor>> {
@@ -6221,7 +6188,7 @@ mod tests {
         }
     }
 
-    impl ManagedBatchedModel for RecordingModel {
+    impl ManagedBatchedModel for DummyModel {
         fn num_layers(&self) -> usize {
             1
         }
@@ -6241,21 +6208,6 @@ mod tests {
             seq_indices: &[usize],
             _inputs: &[Tensor],
         ) -> candle::Result<Vec<Tensor>> {
-            self.record("forward_batched", None);
-            self.dummy_logits(seq_indices.len())
-        }
-
-        fn forward_batched_with_write_shifts(
-            &self,
-            _session: &mut BatchedInferenceSession,
-            seq_indices: &[usize],
-            _inputs: &[Tensor],
-            write_offset_shifts: &[u32],
-        ) -> candle::Result<Vec<Tensor>> {
-            self.record(
-                "forward_batched_with_write_shifts",
-                Some(write_offset_shifts.to_vec()),
-            );
             self.dummy_logits(seq_indices.len())
         }
 
@@ -6293,15 +6245,16 @@ mod tests {
         .expect("failed to build dummy tokenizer")
     }
 
-    fn make_test_scheduler(
-        model: RecordingModel,
-    ) -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>) {
+    /// A scheduler over the CPU test session and a `DummyModel`, plus its
+    /// request sender — for tests that drive handler-level state (belief
+    /// lifecycle) rather than forwards.
+    fn make_test_scheduler() -> (Scheduler, crossbeam::channel::Sender<SchedulerRequest>) {
         let (tx, rx) = crossbeam::channel::bounded(16);
         let session = make_test_session();
         let tokenizer = make_dummy_tokenizer();
         let scheduler = Scheduler::new(
             rx,
-            Box::new(model),
+            Box::new(DummyModel::new()),
             session,
             tokenizer,
             vec![0u32].into(), // eos_tokens
@@ -6320,84 +6273,12 @@ mod tests {
 
     // —— Tests ————————————————————————————————————————————————————————————————
 
-    /// `run_prefill_with_shift` with a non-zero shift must dispatch to
-    /// `forward_batched_with_write_shifts` and carry the exact shift value.
-    ///
-    /// Before the fix the `_wos` field was silently discarded and the call
-    /// fell through to `forward_batched`.
-    #[test]
-    fn run_prefill_nonzero_shift_dispatches_with_write_shifts() {
-        let model = RecordingModel::new();
-        let model_ref = model.clone();
-        let (mut scheduler, _tx) = make_test_scheduler(model);
-
-        let raw_id = scheduler
-            .session
-            .create_sequence()
-            .expect("create_sequence failed");
-        let seq_id = SequenceId(raw_id);
-        let shift = 7usize;
-
-        let result = scheduler.run_prefill_with_shift(seq_id, &[10u32, 20, 30], shift);
-
-        assert_eq!(
-            model_ref.last_call().as_deref(),
-            Some("forward_batched_with_write_shifts"),
-            "run_prefill_with_shift(non-zero) must dispatch to \
-             forward_batched_with_write_shifts"
-        );
-        assert_eq!(
-            model_ref.last_shifts(),
-            Some(vec![shift as u32]),
-            "run_prefill_with_shift must pass the exact shift value ({shift})"
-        );
-        assert!(
-            result.is_ok(),
-            "run_prefill_with_shift failed: {:?}",
-            result.err()
-        );
-    }
-
-    /// `run_prefill_with_shift` with shift = 0 must use plain `forward_batched`
-    /// (no pointless overhead for the common case).
-    #[test]
-    fn run_prefill_zero_shift_dispatches_to_forward_batched() {
-        let model = RecordingModel::new();
-        let model_ref = model.clone();
-        let (mut scheduler, _tx) = make_test_scheduler(model);
-
-        let raw_id = scheduler
-            .session
-            .create_sequence()
-            .expect("create_sequence failed");
-        let seq_id = SequenceId(raw_id);
-
-        let result = scheduler.run_prefill_with_shift(seq_id, &[1u32, 2], 0);
-
-        assert_eq!(
-            model_ref.last_call().as_deref(),
-            Some("forward_batched"),
-            "run_prefill_with_shift(0) must dispatch to plain forward_batched, \
-             not forward_batched_with_write_shifts"
-        );
-        assert_eq!(
-            model_ref.last_shifts(),
-            None,
-            "plain forward_batched does not receive a shifts slice"
-        );
-        assert!(
-            result.is_ok(),
-            "run_prefill_with_shift(0) failed: {:?}",
-            result.err()
-        );
-    }
-
     // —— view-creation tests —————————————————————————————————————————————————
 
     /// Explicit `visible_block_ranges` over a populated parent must create a valid view.
     #[test]
     fn create_view_with_explicit_ranges_creates_view() {
-        let model = RecordingModel::new();
+        let model = DummyModel::new();
         let (_tx, rx) = crossbeam::channel::bounded(16);
         let model_box = Box::new(model) as Box<dyn ManagedBatchedModel + Send>;
         let session = make_test_session();
@@ -6448,7 +6329,7 @@ mod tests {
     /// zero-block view (borrowing zero blocks is valid).
     #[test]
     fn create_view_sentinel_with_zero_block_parent_yields_empty_view() {
-        let model = RecordingModel::new();
+        let model = DummyModel::new();
         let (_tx, rx) = crossbeam::channel::bounded(16);
         let model_box = Box::new(model) as Box<dyn ManagedBatchedModel + Send>;
         let session = make_test_session();
@@ -6508,7 +6389,7 @@ mod tests {
 
     #[test]
     fn reset_sequence_clears_the_slots_carried_belief() {
-        let (mut scheduler, _tx) = make_test_scheduler(RecordingModel::new());
+        let (mut scheduler, _tx) = make_test_scheduler();
         let raw_id = scheduler.session.create_sequence().expect("create");
         let seq_id = SequenceId(raw_id);
         scheduler.carried_beliefs.insert(seq_id, seeded_belief());
@@ -6529,7 +6410,7 @@ mod tests {
 
     #[test]
     fn free_sequence_clears_the_slots_carried_belief() {
-        let (mut scheduler, _tx) = make_test_scheduler(RecordingModel::new());
+        let (mut scheduler, _tx) = make_test_scheduler();
         let raw_id = scheduler.session.create_sequence().expect("create");
         let seq_id = SequenceId(raw_id);
         scheduler.carried_beliefs.insert(seq_id, seeded_belief());

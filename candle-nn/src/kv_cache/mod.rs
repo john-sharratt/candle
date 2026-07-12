@@ -50,8 +50,8 @@ pub use chunked::sampled_selection::SampleFormat;
 pub use chunked::vram_budget_available;
 pub(crate) use chunked::Arena; // Internal use only
 pub use chunked::{
-    arena_chunks_for_format, arena_gid_stride, MetaGid, SealedChunk, SealedSequence, WriterTail,
-    CHUNK_SIZE,
+    arena_chunks_for_format, arena_gid_stride, LiveChunkRef, MetaGid, SealedChunk, SealedSequence,
+    WriterTail, CHUNK_SIZE,
 };
 #[cfg(feature = "cuda")]
 pub use chunked::{dequantize_sealed_in_place, quantize_sealed_in_place};

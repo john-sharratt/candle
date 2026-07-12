@@ -201,6 +201,7 @@ pub fn quantize_sealed_in_place(
     // lets us reassemble per-sequence outputs in the original chunk
     // order at the end.
     let mut chunk_jobs: Vec<HeadGids> = Vec::new();
+    let mut chunk_valid_ranges: Vec<i32> = Vec::new();
     let mut seq_chunk_map: Vec<(usize, usize)> = Vec::new();
     let mut source_seq_chunks: Vec<&SealedChunk> = Vec::new();
     // Per-sequence preserve list, recorded as `(chunk_idx_within_seq,
@@ -212,33 +213,25 @@ pub fn quantize_sealed_in_place(
     backing.inner.storage.read(|storage| {
         for (seq_idx, seq) in sequences.iter().enumerate() {
             for (chunk_idx, chunk) in seq.chunks.iter().enumerate() {
-                // Partial trailing chunks (token_count < CHUNK_SIZE) are
-                // never quantized. They stay in their source float format and
-                // pass through the preserve bucket unchanged: the active
-                // writer chunk is GPU-float while it fills, and the persist
-                // path writes the partial tail as a plain float `Chunk`
-                // record (see docs/kv_tier_migration.md §3 / §5.5).
+                // Partial chunks (token_count < CHUNK_SIZE) quantize like
+                // full ones. Their dead token slots are ZERO — arena chunks
+                // are zeroed at creation (`Tensor::zeros`) and on free-list
+                // recycle (`zero_recycled_chunk`) — so they contribute
+                // nothing to the selection kernel's amax or error sums; the
+                // per-chunk valid range passed below corrects the
+                // count-normalized metrics (V's mean-over-32 MSE, K's top-4
+                // mean) and the sink statistics for the missing lanes.
                 //
-                // Quantizing a partial is unsafe: the palette4 selection
-                // (`select_palette4_formats_fused`) is token_count-blind — it
-                // computes per-(h, p) amax over the full 32-token block. The
-                // active writer chunk is allocated via `alloc_block_chunks`,
-                // whose pool path does NOT zero recycled slots, so positions
-                // [token_count..32] hold stale bytes from the prior tenant.
-                // Feeding that garbage into amax inflates the outer scale and
-                // corrupts the precision of the real tokens [0..token_count].
-                //
-                // A full chunk goes through the fused palette4 kernel when
-                // every (h, p) source GID lives in a GPU `Float` or
+                // A chunk goes through the fused palette4 kernel when every
+                // (h, p) source GID lives in a GPU `Float` or
                 // `Quantized(R16)` arena — the formats the selection + convert
                 // kernels read directly. Otherwise (e.g. a view borrowing
                 // older chunks that came back from cold storage in mixed
                 // Q-formats) it goes to the preserve bucket: those GIDs
                 // already carry the format/pal_map/scale an earlier persist
                 // pass selected, and re-quantizing would be redundant.
-                let is_full = usize::from(chunk.token_count) >= CHUNK_SIZE;
-                let mut all_gids_kernel_eligible = is_full;
-                if all_gids_kernel_eligible {
+                let mut all_gids_kernel_eligible = true;
+                {
                     for gid in chunk.gids.as_slice() {
                         let ok = matches!(
                             storage.arena_key(gid.arena_idx()),
@@ -253,6 +246,10 @@ pub fn quantize_sealed_in_place(
                 }
                 if all_gids_kernel_eligible {
                     chunk_jobs.push(chunk.gids.clone());
+                    // Packed (offset << 8) | len valid window for the
+                    // selection kernel's count-normalized metrics.
+                    let len = usize::from(chunk.token_count).clamp(1, CHUNK_SIZE) as i32;
+                    chunk_valid_ranges.push(((chunk.offset as i32) << 8) | len);
                     seq_chunk_map.push((seq_idx, chunk_idx));
                     source_seq_chunks.push(chunk);
                 } else {
@@ -333,6 +330,7 @@ pub fn quantize_sealed_in_place(
         k_threshold_lo,
         v_threshold_hi,
         v_threshold_lo,
+        Some(&chunk_valid_ranges),
         Some(&stager_generation),
     )?;
 

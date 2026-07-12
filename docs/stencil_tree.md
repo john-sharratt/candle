@@ -120,7 +120,7 @@ Entering: in the `Free` state, `observe` checks the decoded token against the
 token has already been emitted, so walking starts after it.
 
 `Prefill` is a single forward pass over the node's whole buffer (the existing
-`run_prefill_with_shift`), not a decode per token — this is the §1 speedup.
+`run_prefill`), not a decode per token — this is the §1 speedup.
 
 ---
 
@@ -574,7 +574,7 @@ the scheduler in the `TriggerRegistry`. Only two scheduler changes:
    `Option<AllowedSet>` mask and a per-row close-token boost (§6.3), applied
    after penalties.
 2. **Pre-wave prefill drain** in `scheduler/decode.rs`: a sequence owing a
-   `Prefill` runs it on its slot (`run_prefill_with_shift`) before rejoining the
+   `Prefill` runs it on its slot (`run_prefill`) before rejoining the
    next decode wave; the §3 inner loop drains chained actions.
 
 KV cache, projection, and persistence are untouched. The rare healing rewind

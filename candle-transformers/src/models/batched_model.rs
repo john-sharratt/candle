@@ -300,12 +300,10 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // Collect offsets, input tensors, and per-sequence new-token lengths.
         let mut offsets = Vec::with_capacity(batch_size);
         let mut input_tensors = Vec::with_capacity(batch_size);
-        let mut write_shifts_raw = Vec::with_capacity(batch_size);
         let mut q_lens = Vec::with_capacity(batch_size);
         for ctx in contexts.iter() {
             offsets.push(ctx.offset);
             input_tensors.push(ctx.input_ids.clone());
-            write_shifts_raw.push(ctx.write_offset_shift as u32);
             q_lens.push(ctx.input_len);
         }
 
@@ -408,23 +406,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         let x_tensor = embedded.to_dtype(embed_dtype)?;
         let mut x = TensorCat::from_cat_tensor(x_tensor, 0)?;
 
-        // Build write_offset_shifts buffer once (zeros when no SSO shifts needed).
-        // Use the pinned staging system for a zero-copy device-visible buffer.
-        #[cfg(feature = "cuda")]
-        let (write_offset_shifts_ptr, _write_offset_shifts_guard) = {
-            let byte_len = batch_size * 4;
-            let mut buf = generation.alloc(byte_len)?;
-            let src = unsafe {
-                std::slice::from_raw_parts(write_shifts_raw.as_ptr() as *const u8, byte_len)
-            };
-            buf.copy_from_slice(src);
-            let gpu_buf = generation.submit(buf)?;
-            let ptr = gpu_buf.dev_ptr();
-            (ptr, gpu_buf)
-        };
-        #[cfg(not(feature = "cuda"))]
-        let write_offset_shifts_ptr: u64 = 0;
-
         // Process through all layers
         let stage_is_decode = seq_len == 1;
         let t_layers = profile_now();
@@ -441,7 +422,6 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                 &offsets,
                 &params,
                 embed_dtype,
-                write_offset_shifts_ptr,
                 layer_idx,
             )?;
         }

@@ -117,7 +117,7 @@ pub(super) const FIXED_FORMULA: ScoreFormula = ScoreFormula::Span { alpha: 2.0 }
 ///
 /// Decode and prefill produce structurally different Q vectors and so need
 /// different collection-scoring configs (calibrated 2026-05-17 against real
-/// Qwen3-30B-A3B data — see `tests/projection_harness/cases/`):
+/// Qwen3-30B-A3B data):
 ///
 /// - **Decode** — Q vectors captured while the model *generates* a tool-call
 ///   response.  They form a coherent run, so `Span{alpha:2.0}` on pragmatic

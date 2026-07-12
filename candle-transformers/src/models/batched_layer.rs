@@ -145,7 +145,6 @@ pub struct BatchedPrefillMeta {
     pub cu_seqlens_q: Tensor,
     pub q_lens: Tensor,
     pub kv_lens: Tensor,
-    pub has_prefix: bool,
     /// Set when this prefill is a reprojection-glue forward (HD128 routes to the
     /// paged-glue kernel). `None` for an ordinary prefill.
     pub glue: Option<GlueMeta>,
@@ -189,7 +188,6 @@ impl BatchedPrefillMeta {
             batch_size,
             device,
         )?;
-        let has_prefix = offsets.iter().any(|&o| o > 0);
         let kv_lens = Tensor::from_vec(
             offsets
                 .iter()
@@ -203,7 +201,6 @@ impl BatchedPrefillMeta {
             cu_seqlens_q,
             q_lens: q_lens_t,
             kv_lens,
-            has_prefix,
             glue: None,
         })
     }
@@ -316,7 +313,6 @@ pub fn forward_layer_batched<L: BatchedAttentionLayer>(
     offsets: &[usize],
     params: &BatchedAttentionParams<'_>,
     act_dtype: DType,
-    write_offset_shifts_ptr: u64,
     layer_idx: usize,
 ) -> Result<()> {
     // Apply attention norm and compute attention
@@ -350,16 +346,7 @@ pub fn forward_layer_batched<L: BatchedAttentionLayer>(
     // the FP normed activation on the int8 path. `attn_norm_name` timing folds into attn:core.
     let _ = attn_norm_name;
     let t_attn_core = profile_now();
-    let h_attn = forward_attn_batched(
-        layer,
-        caches,
-        &*x,
-        offsets,
-        params,
-        write_offset_shifts_ptr,
-        layer_idx,
-    )?
-    .to_tensor();
+    let h_attn = forward_attn_batched(layer, caches, &*x, offsets, params, layer_idx)?.to_tensor();
     profile_sync(h_attn.device());
     pipeline_record(attn_core_name, t_attn_core);
 
@@ -429,7 +416,6 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
     x: &TensorCat,
     offsets: &[usize],
     params: &BatchedAttentionParams<'_>,
-    write_offset_shifts_ptr: u64,
     layer_idx: usize,
 ) -> Result<TensorCat> {
     let seq_len = x.dim(1)?;
@@ -457,9 +443,7 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
         Ok(ret)
     } else {
         let prefill_meta = match &params.decode_headers {
-            DecodeHeaders::Prefill(m) => {
-                Some((&m.cu_seqlens_q, &m.q_lens, &m.kv_lens, m.has_prefix))
-            }
+            DecodeHeaders::Prefill(m) => Some((&m.cu_seqlens_q, &m.q_lens, &m.kv_lens)),
             _ => None,
         };
         let glue_meta = match &params.decode_headers {
@@ -478,7 +462,6 @@ pub fn forward_attn_batched<L: BatchedAttentionLayer>(
             prefill_meta,
             glue_meta,
             params.rope_cs,
-            write_offset_shifts_ptr,
             params.generation,
             params.shared_prefill_pm,
         )?;
@@ -632,10 +615,9 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
     cos: &Tensor,
     sin: &Tensor,
     rope_interleaved: bool,
-    prefill_meta: Option<(&Tensor, &Tensor, &Tensor, bool)>,
+    prefill_meta: Option<(&Tensor, &Tensor, &Tensor)>,
     glue_meta: Option<&GlueMeta>,
     rope_cs: &Tensor,
-    write_offset_shifts_ptr: u64,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
 ) -> Result<TensorCat> {
@@ -745,6 +727,12 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             rope_interleaved,
             generation,
         )?,
+        // Ordinary prefill (fresh or over an existing prefix): the INT8
+        // prefix-attention kernel (docs/archived/prefill_optimization.md) —
+        // GQA-packed M, slice-aligned tiles, int8 MMA directly over the
+        // quantized arena, split-KV for the short-q/long-prefix regime.
+        // Head dims outside {64, 128} and interleaved RoPE fail loudly in
+        // paged_prefill_attn_varlen_chunks.
         _ => paged_prefill_batched(
             caches,
             offsets,
@@ -760,7 +748,6 @@ fn forward_attn_batched_multi<L: BatchedAttentionLayer>(
             &rope_zeros,
             rope_cs,
             rope_interleaved,
-            write_offset_shifts_ptr,
             generation,
             shared_pm,
         )?,
@@ -1187,8 +1174,6 @@ mod tests {
         assert_eq!(m.q_lens.to_vec1::<u32>().unwrap(), vec![3, 7, 2]);
         // kv_lens[i] = offset[i] + q_len[i].
         assert_eq!(m.kv_lens.to_vec1::<u32>().unwrap(), vec![3, 12, 102]);
-        // A non-zero offset is present.
-        assert!(m.has_prefix);
     }
 
     #[test]
@@ -1202,6 +1187,5 @@ mod tests {
         assert_eq!(u.cu_seqlens_q.to_vec1::<u32>().unwrap(), vec![0, 4, 8, 12]);
         assert_eq!(u.q_lens.to_vec1::<u32>().unwrap(), vec![4, 4, 4]);
         assert_eq!(u.kv_lens.to_vec1::<u32>().unwrap(), vec![4, 4, 4]);
-        assert!(!u.has_prefix);
     }
 }

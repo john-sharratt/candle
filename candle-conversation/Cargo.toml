@@ -116,3 +116,7 @@ required-features = ["hub"]
 
 [[example]]
 name = "substrate_inspect"
+
+[[test]]
+name = "prefill_ab"
+path = "tests/prefill_ab/main.rs"
