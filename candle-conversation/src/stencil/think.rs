@@ -375,6 +375,65 @@ mod tests {
         assert!(compile_think_tree(ThinkMode::Off, &env()).is_none());
     }
 
+    /// The hard-cap closer gate: a close in quick/balanced's single span (and
+    /// in deep's FINAL span) ends the block — the sampler's closing-statement
+    /// script applies. A close in deep's earlier spans is re-steered into more
+    /// reasoning ("But wait, ") — the script must not play there, and it must
+    /// never play while the cursor is outside free text (static prefill).
+    #[test]
+    fn in_terminal_close_span_distinguishes_terminal_spans_from_continuations() {
+        let v = vocab();
+
+        // Quick: single span straight to the injected close — terminal. Before
+        // the free span (opener prefill pending) the cursor is not in free
+        // text, so the gate is closed there.
+        let mut d = StencilDriver::new(tree_for(ThinkMode::Quick));
+        assert!(
+            !d.in_terminal_close_span(),
+            "not in free text yet — the gate is closed during static prefill"
+        );
+        let (mask, _) = step_to_decode(&mut d, &v);
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            d.in_terminal_close_span(),
+            "quick's only span is terminal — the closer script applies"
+        );
+
+        // Deep: spans 1..n retire into continuation phrases; only the last is
+        // terminal.
+        let mut d = StencilDriver::new(tree_for(ThinkMode::Deep));
+        let (mask, _) = step_to_decode(&mut d, &v);
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            !d.in_terminal_close_span(),
+            "deep span 1 retires into 'But wait, ' — more reasoning follows"
+        );
+        free_decode(&mut d, 3);
+        assert_eq!(
+            d.accept(THINK_CLOSE_ID, &v.token_bytes(THINK_CLOSE_ID)),
+            Healed::Drop
+        );
+        let (mask, text) = step_to_decode(&mut d, &v);
+        assert!(text.contains("But wait"));
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            !d.in_terminal_close_span(),
+            "the 'But wait' span still retires into the closing statement"
+        );
+        free_decode(&mut d, 3);
+        assert_eq!(
+            d.accept(THINK_CLOSE_ID, &v.token_bytes(THINK_CLOSE_ID)),
+            Healed::Drop
+        );
+        let (mask, text) = step_to_decode(&mut d, &v);
+        assert!(text.contains("So, where I land"));
+        assert!(matches!(mask, StepMask::Free { .. }));
+        assert!(
+            d.in_terminal_close_span(),
+            "deep's final span is terminal — the closer script applies"
+        );
+    }
+
     #[test]
     fn quick_primes_then_closes() {
         let v = vocab();

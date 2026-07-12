@@ -332,10 +332,24 @@ impl Scheduler {
         let mut removed_states: Vec<(SequenceId, SequenceSamplingState)> = seq_ids
             .iter()
             .map(|&id| {
-                let state = self
+                let mut state = self
                     .sampling_states
                     .remove(&id)
                     .expect("sampling state must exist for active sequence");
+                // Sync the steering span's close semantics into the sampler for
+                // THIS step (only consulted inside a segment): the hard-cap
+                // closer script may play only in a TERMINAL free-text span (or
+                // an unsteered block, where there is no stencil). Everywhere
+                // else — a continuation span whose close is dropped and
+                // re-steered into "But wait, " reasoning, a tool-call value,
+                // a static prefill — a forced close stays bare.
+                if state.in_segment {
+                    state.close_would_continue = self
+                        .active_decodes
+                        .get(&id)
+                        .and_then(|s| s.stencil.as_ref())
+                        .is_some_and(|d| !d.in_terminal_close_span());
+                }
                 (id, state)
             })
             .collect();

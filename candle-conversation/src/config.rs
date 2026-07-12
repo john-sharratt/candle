@@ -186,6 +186,18 @@ pub struct SamplingConfig {
     /// `.`, `!`, `?`, `\n`).  If empty, `graceful_segment_close_after` is a no-op.
     pub sentence_end_token_ids: Vec<i32>,
 
+    /// Closer phrase played when the HARD segment cap
+    /// (`force_segment_close_after`) fires mid-sentence: a canned
+    /// self-interruption (e.g. `" — actually, I've reasoned enough and know
+    /// what to do."`), emitted one token per decode step; the sampler then
+    /// emits the segment-close token itself.  Turns a mid-sentence amputation
+    /// into sensible prose and primes the answer with an explicit commitment
+    /// frame.  Never played at a completed sentence (graceful closes, or a
+    /// hard cap that happens to land on a sentence boundary — no rescue
+    /// needed) nor in a steering span that would continue reasoning after the
+    /// close. Empty = the hard cap emits the bare close token.
+    pub segment_close_script: Vec<u32>,
+
     /// After this many generated tokens, wait for the next sentence-ending
     /// token (`.`, `!`, `?`, or `\n` — resolved from the tokenizer at engine
     /// startup) and then emit EOS.  Mirrors the `graceful_segment_close_after` mechanism
@@ -245,6 +257,7 @@ impl Default for SamplingConfig {
             force_segment_close_after: 0,
             graceful_segment_close_after: 0,
             sentence_end_token_ids: Vec::new(),
+            segment_close_script: Vec::new(),
             graceful_eos_after: 0,
             forced_eos_after: 0,
             banned_tokens: Vec::new(),

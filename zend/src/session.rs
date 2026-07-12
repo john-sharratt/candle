@@ -247,6 +247,12 @@ struct InferenceState {
     /// turn replaces the `<think>` trigger with the dial's tree (see
     /// `think_mode_from_selection`) atop the tool-call base registry.
     think_steering: Option<Arc<ThinkSteering>>,
+    /// Tokenized closer phrase for the think block's HARD length cap: played
+    /// (followed by `</think>`) instead of a bare mid-sentence close, so the
+    /// amputated reasoning ends as intentional prose with an explicit
+    /// commitment. Tokenized once at startup; empty when the tokenizer failed
+    /// to encode it. See `SamplingConfig::segment_close_script`.
+    think_closer_phrase: Vec<u32>,
 }
 
 // The titler uses this plain system prompt (not the projection schema), so the
@@ -274,6 +280,13 @@ const TITLER_MAX_TOKENS: usize = 24;
 /// TLS/HKDF spec musing, ~30+ reasoning lines) still truncated the `<tool_call>`;
 /// 2048 gives them room to finish.
 const CALIBRATION_MAX_TOKENS: usize = 2048;
+
+/// Closer phrase the sampler plays (followed by `</think>`) when the think
+/// block's HARD per-span cap fires mid-sentence — the em-dash lead-in reads as
+/// a deliberate self-interruption after any dangling fragment, and the
+/// commitment ("know what to do") primes the answer that follows. Tokenized
+/// once at startup into `InferenceState::think_closer_phrase`.
+const THINK_CLOSER_PHRASE: &str = " — actually, I've reasoned enough and know what to do.";
 
 /// Seal a completed calibration turn the same way a normal decode does: finish the
 /// turn (which runs the BDP scan `projection_event` reads) and persist its
@@ -1058,6 +1071,10 @@ impl InferenceState {
         // ~93-section schema (see `ModeBuilders`).
         let mode_builders =
             ModeBuilders::build(&proj_builder_refresh, &crate::tools::safe_tool_names());
+        let think_closer_phrase = tokenizer
+            .encode(THINK_CLOSER_PHRASE, false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
         let state = Arc::new(Self {
             decoder,
             engine,
@@ -1078,6 +1095,7 @@ impl InferenceState {
             refresh_config: conv_config.clone(),
             mode_builders,
             workspace,
+            think_closer_phrase,
             tokenizer,
             tool_host: ToolHost::new(),
             tool_stencil,
@@ -1501,6 +1519,13 @@ fn run_inference_stream(
         sampling.eos_ramp_len = graceful_eos;
         sampling.graceful_eos_after = graceful_eos;
         sampling.forced_eos_after = forced_eos;
+        // Hard-cap closer: when the per-span force budget amputates the think
+        // block mid-sentence, the sampler plays this phrase and then closes
+        // the block itself, so the reasoning ends as intentional prose with an
+        // explicit commitment. All dials; the sampler skips it in continuation
+        // spans (deep/exhaustive "But wait" retirement) where more reasoning
+        // follows, and at completed sentences, which need no rescue.
+        sampling.segment_close_script = state.think_closer_phrase.clone();
 
         // The tool loop runs until the model stops emitting tool calls (i.e.
         // produces a final answer) — there is no fixed iteration cap. A wedged
