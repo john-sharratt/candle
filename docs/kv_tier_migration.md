@@ -116,11 +116,13 @@ directly:
 - **Self-describing records + checksums.** Every record carries a header
   and a checksum; crash recovery walks the log and stops at the first
   torn record (torn-write detection).
-- **Header-only recovery + compaction.** Recovery is one filtered walk
-  that reads bulk payloads' headers only (§5.4/§5.6); compaction (§5.8)
-  bounds the log to the live record set, which bounds recovery
-  wall-clock. There is no checkpoint snapshot — a compacted log *is*
-  the fast-start form.
+- **Indexed recovery + compaction.** Recovery follows the backward
+  `HeaderIndex` digest chain from a superblock hint (§5.6) — a handful
+  of reads regardless of log size — and falls back to a filtered
+  forward walk on any inconsistency; compaction (§5.8) bounds the log
+  to the live record set. There is no manifest snapshot: the chain
+  carries record *headers*, and all live state is still rebuilt from
+  the records themselves.
 - **Content-addressed storage** (Git objects, CAS dedup stores). A
   system-prompt section is keyed by a hash of its content and its prefix,
   so identical sections share storage automatically and any change forks a
@@ -542,6 +544,11 @@ rest are *per-stream*:
 - **`Commit`** — "stream `stream_id` is durable through `chunk_index`." A
   stream is recoverable only up to its last commit; the group-commit
   boundary.
+- **`HeaderIndex`** — a batch of fixed-width header digests for the
+  records appended since the previous index, plus a link to that
+  previous index record. The backward chain recovery follows instead of
+  probing every record header (§5.6). Derived data: compaction drops
+  every copy and the writer regenerates the chain in the new file.
 
 All records are **4 KB-aligned** (payloads padded; the header's `length`
 is the true unpadded size) for clean sector-aligned record boundaries.
@@ -608,26 +615,48 @@ type rather than `(stream_id, chunk_index)`: the walker simply keeps the
 latest valid one. `Tokens` and `Signatures` are superseded per stream the
 same way a stream's tail grows.)
 
-### 5.6 Recovery
+### 5.6 Recovery — the header-index chain
 
-Recovery rebuilds the in-RAM index in **one filtered walk** (§5.4) from
-the first record:
+Even a header-only forward walk is latency-bound: each header read
+reveals where the *next* record starts, so a multi-GB log degenerates
+into hundreds of thousands of serial queue-depth-1 sector reads. The
+`HeaderIndex` chain removes the serial dependency. Every
+`INDEX_FLUSH_ENTRIES` appends, the writer flushes one `HeaderIndex`
+record whose payload holds a fixed-width **digest** — `(type, format,
+stream_id, chunk_index, token_count, offset, record_size,
+payload_len)` — of each record appended since the previous index, plus
+the `(offset, size)` of that previous index record. The superblock
+carries an advisory hint to the newest committed index (updated after
+the index record's bytes are durably committed).
 
-- the manifest — the latest `ModelSpec` / `Template` / `Tokenizer` /
-  `ToolSummary` singleton locations;
-- the substrate's per-stream state — the stream DAG (from `StreamDecl`s),
-  `(stream_id, chunk_index) → (offset, len, token_count, format)` for
-  every `Chunk`, and the offsets of each stream's `Tokens` / `Signatures`;
-- the dead-byte accounting (§5.8) — fed from the same headers.
+Recovery is then:
 
-The walk reads payload bytes only for the record types whose payload
-feeds in-RAM state (`StreamDecl`, `Label`, `TreeMetadata`, …); the bulk
-types — `Chunk`, `Tokens`, `Signatures` — and the read-on-demand
-singletons contribute headers only, so recovery costs O(records) small
-reads regardless of how many gigabytes of KV the log holds. It stops at
-the first torn record and truncates there. There is no checkpoint
-snapshot: compaction (§5.8) keeps the log at its live record set, which
-is what bounds recovery wall-clock.
+1. **Follow the chain backwards** from the superblock hint — a handful
+   of CRC-verified reads for the whole log — and reverse the collected
+   digests into append order.
+2. **Replay the digests** through the same per-record dispatch a walk
+   uses (manifest singletons, `Substrate::apply_walker_entry`, the
+   dead-byte accounting), last-writer-wins in append order.
+3. **Batch-fetch metadata payloads.** The digest types whose payload
+   feeds in-RAM state (`StreamDecl`, `Label`, `TreeMetadata`,
+   `ProjectionEvents`, …) expose their offsets up front, so their
+   records are read in coalesced spans — no serial probing. The bulk
+   types (`Chunk`, `Tokens`, `Signatures`) stay by-reference and their
+   payloads are never read.
+4. **Forward-walk only the un-indexed tail** — everything after the
+   hinted index record, at most one flush interval plus the crash
+   window — with the filtered walk (§5.4). Torn-tail detection and
+   truncation live here, unchanged. The tail's digests seed the
+   writer's accumulator so the next flush covers them: the chain heals
+   forward across restarts.
+
+Every failure mode of the fast path — a zero or garbage hint (old
+superblocks carry the retired checkpoint offset in these bytes), a hint
+into the pre-grown zero tail, a torn / wrong-typed / wrong-version
+index record, a non-monotonic chain — degrades to the **full filtered
+forward walk**: correct on any log, just slower. Index records are
+derived data; nothing is ever reconstructed *from* them that the
+records themselves don't also carry.
 
 A stream is recoverable through its last `Commit`; the open turn stream's
 tail is whatever partial `Chunk` snapshot most recently survived
@@ -675,7 +704,9 @@ Compaction is a **whole-file rewrite**:
 3. **Rewrite.** Stream every *live* record — the latest singletons, then
    per stream its `StreamDecl` / `Chunk`s / `Tokens` / `Signatures` /
    `Commit` — into a new file `.substrate/substrate.log.compact`, in
-   dependency order. Dead records are simply not copied.
+   dependency order, interleaving a fresh `HeaderIndex` chain (§5.6)
+   whose head lands in the new superblock. Dead records — including
+   every old index record — are simply not copied.
 4. **Swap.** `fsync` the new file and atomically rename it over
    `.substrate/substrate.log`. Every record now sits at a new offset, so
    the substrate's walker-built state is cleared and re-walked from the
@@ -1044,7 +1075,8 @@ candle-conversation/src/persistence/
   manifest.rs      in-RAM singleton index; last-writer-wins (§5.5)
   streams.rs       stream registry — StreamId, StreamKind, StreamDecl
   content_hash.rs  the prefix-hash chain (§5.2)
-  recovery.rs      the filtered recovery walk (§5.6)
+  header_index.rs  the batched record-digest chain (§5.6)
+  recovery.rs      chain-first recovery + forward-walk fallback (§5.6)
   accounting.rs    O(1) live/dead byte accounting (§5.8)
   compaction.rs    whole-file dead-record rewrite (§5.8)
   warm_pool.rs     RAM warm tier — pinned buffers, LRU (§10)
@@ -1057,8 +1089,8 @@ candle-conversation/src/persistence/
 `candle-nn`'s `kv_cache/chunked/migrate.rs` — see §13.4.)
 
 `record.rs`, `walker.rs`, `manifest.rs`, `content_hash.rs`,
-`recovery.rs`, and `accounting.rs` are **pure CPU logic** — tested with
-in-memory byte buffers, no GPU, no real files. `log_file.rs` and `compaction.rs` are tested against
+`header_index.rs`, `recovery.rs`, and `accounting.rs` are **pure CPU
+logic** — tested with in-memory byte buffers, no GPU, no real files. `log_file.rs` and `compaction.rs` are tested against
 a temp directory. `warm_pool.rs` and `transfer.rs` need CUDA, but their
 non-GPU logic (LRU bookkeeping, plan-building) is factored into GPU-free
 units. See §13.7.
@@ -1326,11 +1358,13 @@ tasks, tests, and commit gates.
 > **Post-P8 revision.** The `Checkpoint` record and its superblock hint
 > were removed: the checkpoint snapshot carried only singleton offsets
 > (per-entity state had already moved to the substrate), so it never
-> shortened the walk. Recovery is now the single **filtered** walk of
-> §5.6 (`recovery.rs`) that skips bulk payloads, `accounting.rs` tracks
-> the dead-byte ratio O(1) per append, and the persistence thread
-> compacts automatically past the threshold (§5.8). References to
-> `checkpoint.rs` / `checkpoint()` in the phase records below are
+> shortened the walk. Recovery was then rebuilt around the
+> **`HeaderIndex` chain** (§5.6, `header_index.rs` + `recovery.rs`):
+> batched header digests chained backwards from a superblock hint, with
+> the filtered forward walk as the universal fallback. `accounting.rs`
+> tracks the dead-byte ratio O(1) per append, and the persistence
+> thread compacts automatically past the threshold (§5.8). References
+> to `checkpoint.rs` / `checkpoint()` in the phase records below are
 > historical.
 
 > **P8 resume reconstruction — status.** The recording path is live (per-turn

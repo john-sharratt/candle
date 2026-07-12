@@ -218,9 +218,14 @@ impl ConversationEngine {
         // Create the batched inference session on this thread, then move
         // it to the scheduler thread. Session creation touches the GPU
         // (arena allocation) but is a one-time cost.
+        let session_start = std::time::Instant::now();
         let session = model
             .create_batched_session(config.batched_config.clone())
             .map_err(ConversationError::Model)?;
+        tracing::info!(
+            session_init_ms = session_start.elapsed().as_millis() as u64,
+            "batched session created (KV arenas allocated)"
+        );
 
         let eos_tokens = config.eos_tokens.clone();
         let vocab_size = config.vocab_size;
@@ -263,6 +268,7 @@ impl ConversationEngine {
             Some(p) => AsRef::<std::path::Path>::as_ref(p).to_path_buf(),
             None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         };
+        let open_start = std::time::Instant::now();
         let mut persistence = SubstratePersistence::open_in_with_substrate(
             &workspace_dir,
             &mut substrate,
@@ -270,9 +276,18 @@ impl ConversationEngine {
         .map_err(|e| {
             ConversationError::from(candle::Error::Msg(format!("substrate persistence: {e}")))
         })?;
+        tracing::info!(
+            open_ms = open_start.elapsed().as_millis() as u64,
+            log_bytes = persistence.write_offset(),
+            records = persistence.recovered_record_count(),
+            indexed = persistence.last_index().is_some(),
+            streams = substrate.all_streams().count(),
+            "substrate persistence opened"
+        );
         // Persist the model identity into the substrate's `ModelSpec` record —
         // compare-and-insert, so it only appends when the model differs from
         // what the log already records. Makes the log a self-contained image.
+        let singletons_start = std::time::Instant::now();
         if let Some(spec) = &config.model_spec {
             let wrote = persistence.set_model_spec(spec).map_err(|e| {
                 ConversationError::from(candle::Error::Msg(format!("persist model spec: {e}")))
@@ -296,6 +311,10 @@ impl ConversationEngine {
                 })?;
             }
         }
+        tracing::info!(
+            singletons_ms = singletons_start.elapsed().as_millis() as u64,
+            "model spec + tokenizer records reconciled"
+        );
         let conversation = Conversation::from_parts(substrate, persistence);
 
         // Workspace-shared `ProvenanceFile`: created up-front so the

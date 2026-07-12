@@ -165,6 +165,7 @@ impl Manifest {
             | RecordType::DebugId
             | RecordType::Tombstone
             | RecordType::ProjectionEvents
+            | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }
         Ok(())

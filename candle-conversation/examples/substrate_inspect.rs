@@ -177,22 +177,20 @@ fn main() -> Result<()> {
         Cmd::Summary => summary(&log_path, &mut log)?,
         Cmd::Headers => headers(&mut log)?,
         Cmd::Streams => streams(&mut log)?,
-        Cmd::Sections => sections(&mut log, &log_path)?,
+        Cmd::Sections => sections(&mut log)?,
         Cmd::Chunks { stream_id, preview } => {
             chunks(&mut log, parse_stream_id(&stream_id)?, preview)?
         }
-        Cmd::Tokens { stream_id, ids } => {
-            tokens(&mut log, &log_path, parse_stream_id(&stream_id)?, ids)?
-        }
+        Cmd::Tokens { stream_id, ids } => tokens(&mut log, parse_stream_id(&stream_id)?, ids)?,
         Cmd::Projections { stream_id } => {
             let only = stream_id.as_deref().map(parse_stream_id).transpose()?;
             projections(&mut log, only)?
         }
-        Cmd::Meta => meta(&mut log, &log_path)?,
+        Cmd::Meta => meta(&mut log)?,
         Cmd::ToolSummary => tool_summary(&mut log)?,
         Cmd::Recover => recover_view(&mut log)?,
-        Cmd::Tree { timeline, text } => tree(&mut log, &log_path, timeline, text)?,
-        Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, &log_path, timeline, text)?,
+        Cmd::Tree { timeline, text } => tree(&mut log, timeline, text)?,
+        Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, timeline, text)?,
         Cmd::Dump { timeline, full } => dump(&mut log, timeline, full)?,
     }
     Ok(())
@@ -325,16 +323,11 @@ fn print_projection_event(i: usize, ev: &ProjectionEvent) {
 
 /// Render the per-timeline summary tree reconstructed from `TreeMetadata`
 /// records. With `with_text`, decode each summary node (and a SoT's source
-/// turn) using the tokenizer sidecar so faithfulness is visible.
-fn tree(
-    log: &mut LogFile,
-    log_path: &std::path::Path,
-    only_timeline: Option<u64>,
-    with_text: bool,
-) -> Result<()> {
+/// turn) using the embedded tokenizer so faithfulness is visible.
+fn tree(log: &mut LogFile, only_timeline: Option<u64>, with_text: bool) -> Result<()> {
     let substrate = build_substrate(log)?;
     let tok = if with_text {
-        load_log_tokenizer(log_path)?
+        load_log_tokenizer(log)?
     } else {
         None
     };
@@ -464,15 +457,10 @@ fn tree(
 /// the leading tokens; when `kv_tok ≈ n_tok − assistant_content_start` those
 /// missing tokens are exactly the USER half — the turn was sealed assistant-only,
 /// so reprojection re-injects a turn the model reads as having no user message.
-fn turn_audit(
-    log: &mut LogFile,
-    log_path: &std::path::Path,
-    only_timeline: Option<u64>,
-    with_text: bool,
-) -> Result<()> {
+fn turn_audit(log: &mut LogFile, only_timeline: Option<u64>, with_text: bool) -> Result<()> {
     let substrate = build_substrate(log)?;
     let first_seen = first_seen_offsets(log)?;
-    let tok = load_log_tokenizer(log_path)?;
+    let tok = load_log_tokenizer(log)?;
 
     struct TurnRec {
         id: StreamId,
@@ -870,23 +858,13 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
     println!(
         "tokenizer         {}",
         match manifest.tokenizer {
-            Some(_) => "hash-only (32 bytes — sidecar holds the JSON)".to_string(),
+            Some(l) => format!(
+                "embedded ({:.1} MB record payload)",
+                l.payload_len as f64 / 1_048_576.0
+            ),
             None => "no".to_string(),
         }
     );
-    let sidecar_path = path
-        .parent()
-        .map(|p| p.join("tokenizer.json"))
-        .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
-    let sidecar_status = match std::fs::metadata(&sidecar_path) {
-        Ok(m) => format!(
-            "{} ({:.1} MB)",
-            sidecar_path.display(),
-            m.len() as f64 / 1_048_576.0
-        ),
-        Err(_) => format!("{} (missing)", sidecar_path.display()),
-    };
-    println!("tokenizer sidecar {sidecar_status}");
     println!(
         "dead-byte ratio   {:.1}% {}",
         dead * 100.0,
@@ -1069,12 +1047,12 @@ fn print_fmt_distribution(label: &str, dist: &std::collections::HashMap<u8, usiz
 /// straight from the persisted bytes: it reads every variant's chunk records and
 /// hashes the quantized `kv_bytes`, then flags whether the branches' content
 /// matches while their prefix + KV diverge.
-fn sections(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
+fn sections(log: &mut LogFile) -> Result<()> {
     let substrate = build_substrate(log)?;
     // Decode a short content preview per group so each branched node is
     // identifiable (`frame`, `thinking_effort.deep`, …) — the persisted
     // debug_name is only `section_<id>`.
-    let tok = load_log_tokenizer(log_path)?;
+    let tok = load_log_tokenizer(log)?;
 
     // Collect every prompt-section stream with its content address. Section
     // NAMES are per-layer (titler, repo_map, dialogue all declare a `frame`), so
@@ -1163,7 +1141,7 @@ fn sections(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
 
 /// Decode a stream's first non-blank content line (truncated) from its `Tokens`
 /// record, for an at-a-glance "which section is this".  Falls back to a token
-/// count when no tokenizer sidecar is present.
+/// count when the log carries no tokenizer.
 fn stream_preview(
     log: &mut LogFile,
     substrate: &Substrate,
@@ -1250,12 +1228,7 @@ fn yn(b: bool) -> &'static str {
     }
 }
 
-fn tokens(
-    log: &mut LogFile,
-    log_path: &std::path::Path,
-    stream_id: StreamId,
-    as_ids: bool,
-) -> Result<()> {
+fn tokens(log: &mut LogFile, stream_id: StreamId, as_ids: bool) -> Result<()> {
     let substrate = build_substrate(log)?;
     let loc = substrate
         .stream_of(stream_id)
@@ -1270,10 +1243,10 @@ fn tokens(
         return Ok(());
     }
 
-    // Default: decode to text using the tokenizer sidecar next to the log.
-    // Special tokens are kept so chat-format markers (`<|im_start|>` …) stay
-    // visible — useful for inspecting a turn.
-    match load_log_tokenizer(log_path)? {
+    // Default: decode to text using the tokenizer embedded in the log's
+    // `Tokenizer` record. Special tokens are kept so chat-format markers
+    // (`<|im_start|>` …) stay visible — useful for inspecting a turn.
+    match load_log_tokenizer(log)? {
         Some(tok) => {
             let text = tok
                 .decode(&ids, false)
@@ -1282,7 +1255,7 @@ fn tokens(
         }
         None => {
             eprintln!(
-                "note: no `tokenizer.json` sidecar next to the log — showing raw ids. \
+                "note: the log carries no Tokenizer record — showing raw ids. \
                  Use --ids to silence this."
             );
             println!("{ids:?}");
@@ -1291,26 +1264,21 @@ fn tokens(
     Ok(())
 }
 
-/// Load the tokenizer from the sidecar file next to the active log
-/// (`<log_dir>/tokenizer.json`). Returns `Ok(None)` when the sidecar is
-/// missing — the substrate is then opaque to text decoding and the
-/// caller should fall back to `--ids`.
-fn load_log_tokenizer(log_path: &std::path::Path) -> Result<Option<Tokenizer>> {
-    let sidecar = log_path
-        .parent()
-        .map(|p| p.join("tokenizer.json"))
-        .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
-    let bytes = match std::fs::read(&sidecar) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context(format!("read tokenizer sidecar {}", sidecar.display())),
+/// Load the tokenizer embedded in the log's `Tokenizer` record. Returns
+/// `Ok(None)` when the log has no such record — the substrate is then
+/// opaque to text decoding and the caller should fall back to `--ids`.
+fn load_log_tokenizer(log: &mut LogFile) -> Result<Option<Tokenizer>> {
+    let manifest = build_manifest(log)?;
+    let Some(loc) = manifest.tokenizer else {
+        return Ok(None);
     };
-    let tok = Tokenizer::from_bytes(&bytes)
-        .map_err(|e| anyhow::anyhow!("load tokenizer from {}: {e}", sidecar.display()))?;
+    let rec = read_record_at(log, loc.offset, loc.record_size)?;
+    let tok = Tokenizer::from_bytes(&rec.payload)
+        .map_err(|e| anyhow::anyhow!("load tokenizer from Tokenizer record: {e}"))?;
     Ok(Some(tok))
 }
 
-fn meta(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
+fn meta(log: &mut LogFile) -> Result<()> {
     let manifest = build_manifest(log)?;
     print_singleton(
         log,
@@ -1322,35 +1290,22 @@ fn meta(log: &mut LogFile, log_path: &std::path::Path) -> Result<()> {
         "template",
         manifest.template.map(|l| (l.offset, l.record_size)),
     )?;
-    // Tokenizer bytes live in a sidecar; the record itself is just the
-    // 32-byte SHA-256 digest.
+    // Tokenizer bytes are embedded as the record payload — the log is
+    // self-contained.
     match manifest.tokenizer {
         None => println!("tokenizer   (none)"),
-        Some(l) => {
-            let sidecar = log_path
-                .parent()
-                .map(|p| p.join("tokenizer.json"))
-                .unwrap_or_else(|| PathBuf::from("tokenizer.json"));
-            let sidecar_size = std::fs::metadata(&sidecar)
-                .ok()
-                .map(|m| m.len())
-                .unwrap_or(0);
-            println!(
-                "tokenizer   record {} bytes (hash-only) ;  sidecar {} ({} bytes)",
-                l.payload_len,
-                sidecar.display(),
-                sidecar_size,
-            );
-        }
+        Some(l) => println!("tokenizer   record {} bytes (embedded)", l.payload_len),
     }
     Ok(())
 }
 
 fn recover_view(log: &mut LogFile) -> Result<()> {
-    // The same filtered walk the production open path runs — headers for
-    // the bulk record types, payloads only where they feed in-RAM state.
+    // The same chain-first recovery the production open path runs —
+    // the header-index chain when the superblock hint validates, the
+    // filtered forward walk otherwise.
+    let hint = log.superblock().last_index;
     let mut substrate = Substrate::new();
-    let recovered = recovery::recover_with_sink(log, |e| substrate.apply_walker_entry(e))?;
+    let recovered = recovery::recover_with_sink(log, hint, |e| substrate.apply_walker_entry(e))?;
     let (turns, sections) = stream_kind_counts(&substrate);
     println!(
         "recovers to: {} streams ({turns} turn, {sections} section), tail offset {}, torn-tail={}",
@@ -1358,12 +1313,20 @@ fn recover_view(log: &mut LogFile) -> Result<()> {
         recovered.tail_offset,
         recovered.torn,
     );
+    println!(
+        "path: {}  (un-indexed tail digests: {})",
+        match recovered.last_index {
+            Some((off, size)) => format!("header-index chain (hint offset {off}, size {size})"),
+            None => "full forward walk (no usable index chain)".to_string(),
+        },
+        recovered.tail_digests.len(),
+    );
     Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const ALL_TYPES: [RecordType; 16] = [
+const ALL_TYPES: [RecordType; 17] = [
     RecordType::ModelSpec,
     RecordType::Template,
     RecordType::StreamDecl,
@@ -1379,6 +1342,7 @@ const ALL_TYPES: [RecordType; 16] = [
     RecordType::Tombstone,
     RecordType::ProjectionEvents,
     RecordType::ToolSummary,
+    RecordType::HeaderIndex,
     RecordType::Unknown,
 ];
 
@@ -1436,7 +1400,10 @@ fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let (entries, _) = walker::collect_filtered(log, SUPERBLOCK_SIZE, |rt| {
         !matches!(
             rt,
-            RecordType::Chunk | RecordType::Tokens | RecordType::Signatures
+            RecordType::Chunk
+                | RecordType::Tokens
+                | RecordType::Signatures
+                | RecordType::HeaderIndex
         )
     })?;
     for e in &entries {

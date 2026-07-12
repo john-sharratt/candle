@@ -1,11 +1,11 @@
 //! The skip-load walk.
 //!
 //! A walk steps record by record from a start offset, framing each
-//! record by the `payload_len` declared in its JSON header and
-//! verifying the payload CRC. It stops cleanly at the zero-filled
-//! pre-grown tail (or EOF) and reports a torn record at the first
-//! unparseable / truncated / bad-CRC record — the recovery
-//! truncation point.
+//! record by the `payload_len` declared in its JSON header. It stops
+//! cleanly at the zero-filled pre-grown tail (or EOF) and reports a
+//! torn record at the first unparseable or truncated header — the
+//! recovery truncation point. Payload CRCs are not checked here;
+//! `verify_record_crc` runs at each payload's consumption point.
 //!
 //! Records whose header carries an unrecognised `type` are silently
 //! skipped (their padded size is still known from the header's
@@ -263,10 +263,10 @@ mod tests {
         assert_eq!(outcome.tail_offset, SUPERBLOCK_SIZE + real_len as u64);
     }
 
-    /// Header corruption stops the walk as torn — the new boundary
-    /// for synchronous recovery now that walker no longer CRCs
-    /// payloads inline. (Payload bit-rot is caught out-of-band by the
-    /// background CRC validator.)
+    /// Header corruption stops the walk as torn — the boundary for
+    /// synchronous recovery; the walker does not CRC payloads inline.
+    /// (Payload bit-rot is caught at the consumption point by
+    /// `verify_record_crc`.)
     #[test]
     fn torn_tail_header_stops_the_walk() {
         let mut blob = Vec::new();
@@ -287,8 +287,8 @@ mod tests {
     }
 
     /// Payload bit-rot is **not** a synchronous torn write — the walker
-    /// passes it through. The background CRC validator surfaces it
-    /// later via [`verify_record_crc`].
+    /// passes it through. [`verify_record_crc`] surfaces it at the
+    /// payload's consumption point (cold load / `read_record_at`).
     #[test]
     fn payload_bit_rot_passes_walker_silently() {
         let mut blob = Vec::new();

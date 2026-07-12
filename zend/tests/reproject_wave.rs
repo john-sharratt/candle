@@ -86,10 +86,6 @@ mod wave {
             dst_log.display()
         );
         std::fs::copy(&src_log, &dst_log).expect("copy substrate.log");
-        let tok = src_sub.join("tokenizer.json");
-        if tok.exists() {
-            std::fs::copy(&tok, dst_sub.join("tokenizer.json")).ok();
-        }
         (dst_root, true)
     }
 

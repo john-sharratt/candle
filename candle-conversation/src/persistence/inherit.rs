@@ -114,9 +114,11 @@ impl InheritedSubstrate {
         // single pass — recovery::recover_with_sink dispatches each
         // record through `substrate.apply_walker_entry`.
         let mut file = LogFile::open(&canonical)?;
+        let hint = file.superblock().last_index;
         let mut substrate = Substrate::new();
-        let recovered =
-            recovery::recover_with_sink(&mut file, |entry| substrate.apply_walker_entry(entry))?;
+        let recovered = recovery::recover_with_sink(&mut file, hint, |entry| {
+            substrate.apply_walker_entry(entry)
+        })?;
         let direct = DirectFile::open(&canonical)?;
         let loaded = Arc::new(InheritedSubstrate {
             path: canonical.clone(),

@@ -128,10 +128,53 @@ pub enum RecordType {
     /// the latest, dropping every superseded copy. JSON payload
     /// [`ToolSummaryPayload`]. Regenerated only when the catalog hash changes.
     ToolSummary = 16,
+    /// A batch of header digests for the records appended since the
+    /// previous `HeaderIndex`, plus a link to that previous index — the
+    /// backward chain recovery follows instead of probing every record
+    /// header (§5.6). Binary payload — see
+    /// [`header_index`](super::header_index). Derived data: the
+    /// compactor drops every copy and the writer regenerates the chain
+    /// in the new file.
+    HeaderIndex = 17,
     /// Catch-all for record-type tags this version doesn't recognise.
     /// Records that deserialize as `Unknown` are skipped by the walker.
     #[serde(other)]
     Unknown,
+}
+
+impl RecordType {
+    /// The numeric wire tag used inside `HeaderIndex` digests (the
+    /// enum's explicit discriminant). The JSON header keeps its
+    /// snake_case string form; this compact form exists only for the
+    /// fixed-width digest entries.
+    pub fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`RecordType::tag`]. Unrecognised tags decode to
+    /// [`RecordType::Unknown`] — the same forward-compatibility rule as
+    /// the JSON header's `#[serde(other)]`.
+    pub fn from_tag(tag: u8) -> RecordType {
+        match tag {
+            1 => RecordType::ModelSpec,
+            2 => RecordType::Template,
+            3 => RecordType::StreamDecl,
+            4 => RecordType::Chunk,
+            5 => RecordType::Tokens,
+            6 => RecordType::Signatures,
+            7 => RecordType::Commit,
+            9 => RecordType::Tokenizer,
+            10 => RecordType::Label,
+            11 => RecordType::ConvState,
+            12 => RecordType::TreeMetadata,
+            13 => RecordType::DebugId,
+            14 => RecordType::Tombstone,
+            15 => RecordType::ProjectionEvents,
+            16 => RecordType::ToolSummary,
+            17 => RecordType::HeaderIndex,
+            _ => RecordType::Unknown,
+        }
+    }
 }
 
 /// The decoded record header — the wire fields we carry per record.
@@ -261,10 +304,10 @@ pub fn decode_header(probe: &[u8]) -> Result<(RecordHeader, usize)> {
 /// advance.
 ///
 /// **Does not CRC-verify the payload.** Verification is a separate
-/// concern handled by [`verify_record_crc`] — the cold-load hot path
-/// skips it entirely (the background validator catches latent bit rot
-/// out-of-band), and the walker only verifies on demand for torn-write
-/// detection at recovery time.
+/// concern handled by [`verify_record_crc`] at the payload's
+/// consumption point (cold-load decode, `read_record_at`); the
+/// recovery walk skips payload bytes entirely for the bulk record
+/// types and never pays for verification it can't use.
 ///
 /// Cold-load uses the payload slice in place against the pinned
 /// scratch buffer; callers that need owned bytes — typically
@@ -286,11 +329,13 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordHeader, &[u8], usize)> {
 
 /// CRC-verify the payload of a record against the header's stored CRC.
 ///
-/// Used by the **background validator thread** to catch latent bit rot
-/// after startup, and by the walker only when explicitly asked (e.g.
-/// torn-write probes during recovery). `RecordType::Unknown` records
-/// are skipped — the payload format may not be readable in our world
-/// view and the walker has already decided to advance past them.
+/// Called at every payload **consumption point** — the pipelined
+/// cold-load decode, the batched stream read, and `read_record_at` —
+/// so latent bit rot fails loudly exactly where the bytes are about to
+/// be used, at the cost of one CRC pass over bytes just read from
+/// disk. `RecordType::Unknown` records are skipped — the payload
+/// format may not be readable in our world view and the walker has
+/// already decided to advance past them.
 pub fn verify_record_crc(header: &RecordHeader, payload: &[u8]) -> Result<()> {
     if header.record_type == RecordType::Unknown {
         return Ok(());
@@ -1093,13 +1138,46 @@ mod tests {
         ));
     }
 
+    /// The digest wire tag is the enum discriminant — pinned by raw
+    /// value so a reordering of the enum can't silently change the
+    /// on-disk `HeaderIndex` format.
+    #[test]
+    fn record_type_tags_round_trip_with_pinned_values() {
+        let pinned: [(RecordType, u8); 16] = [
+            (RecordType::ModelSpec, 1),
+            (RecordType::Template, 2),
+            (RecordType::StreamDecl, 3),
+            (RecordType::Chunk, 4),
+            (RecordType::Tokens, 5),
+            (RecordType::Signatures, 6),
+            (RecordType::Commit, 7),
+            (RecordType::Tokenizer, 9),
+            (RecordType::Label, 10),
+            (RecordType::ConvState, 11),
+            (RecordType::TreeMetadata, 12),
+            (RecordType::DebugId, 13),
+            (RecordType::Tombstone, 14),
+            (RecordType::ProjectionEvents, 15),
+            (RecordType::ToolSummary, 16),
+            (RecordType::HeaderIndex, 17),
+        ];
+        for (rt, tag) in pinned {
+            assert_eq!(rt.tag(), tag, "{rt:?} wire tag");
+            assert_eq!(RecordType::from_tag(tag), rt);
+        }
+        // Retired tag 8 (the removed checkpoint) and future tags decode
+        // to Unknown.
+        assert_eq!(RecordType::from_tag(8), RecordType::Unknown);
+        assert_eq!(RecordType::from_tag(200), RecordType::Unknown);
+    }
+
     #[test]
     fn flipped_header_byte_caught_by_json_or_crc() {
         // Mutating a byte inside the header line either breaks JSON
         // parsing or — if the JSON still parses — leaves a stale
         // `crc` value in the header that no longer matches the
-        // payload. The fast path catches the first case; the
-        // background validator catches the second.
+        // payload. The fast path catches the first case; verification
+        // at the consumption point catches the second.
         let payload = [1u8, 2, 3, 4];
         let mut bytes = encode_record(&sample_header(payload.len() as u64, &payload), &payload);
         let newline_pos = bytes.iter().position(|&b| b == b'\n').unwrap();

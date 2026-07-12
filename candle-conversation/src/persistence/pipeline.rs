@@ -48,7 +48,7 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 
 use super::chunk_plan::{ChunkBatch, SourceLog, UnitPlan, UNIT_BYTES};
 use super::cold_load::ColdLoadStager;
-use super::record::{decode_record, ChunkPayload};
+use super::record::{decode_record, verify_record_crc, ChunkPayload};
 use super::SubstratePersistence;
 
 /// Cross-thread raw pointer to the pinned scratch's base. Bundled into
@@ -473,8 +473,14 @@ fn allocator_worker(
                 // is a borrowed view into `record_bytes`, so we recover
                 // the header byte count from the pointer offset instead
                 // of re-decoding the header.
-                let (_header, payload, _total) = decode_record(record_bytes)
+                let (header, payload, _total) = decode_record(record_bytes)
                     .map_err(|e| candle::Error::Msg(format!("pipeline decode_record: {e}")))?;
+                // Bit-rot check at the consumption point: the bytes were
+                // just read off disk and are about to be scattered into
+                // GPU arenas — a corrupt chunk must fail loudly here, not
+                // decode into garbage KV.
+                verify_record_crc(&header, payload)
+                    .map_err(|e| candle::Error::Msg(format!("pipeline chunk CRC: {e}")))?;
                 let header_bytes = payload.as_ptr() as usize - record_bytes.as_ptr() as usize;
                 let payload_buf_offset = rec.buf_offset + header_bytes;
                 let (meta, kv_range) = ChunkPayload::decode_with_kv_range(payload)

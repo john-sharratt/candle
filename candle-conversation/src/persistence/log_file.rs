@@ -3,19 +3,20 @@
 //! A single pre-grown file: a 4 KB superblock followed by 4 KB-aligned
 //! records. Writes are buffered into a group-commit staging buffer and
 //! flushed as one sequential write; `commit` additionally `fsync`s for
-//! durability. Records are never rewritten in place, and the superblock
-//! (file identity + format version) is written once at create time.
+//! durability. Records are never rewritten in place — only the
+//! superblock is (file identity, format version, and the advisory
+//! `HeaderIndex` hint recovery anchors its backward chain on).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use super::direct_io::DirectFile;
-use super::record::{crc32, decode_header, decode_record, Record, RecordHeader, ALIGN};
+use super::record::{crc32, decode_record, verify_record_crc, Record, ALIGN};
 use super::{PersistenceError, Result};
 
-/// Size of the file superblock — the first block, holding file identity
-/// and the format version.
+/// Size of the file superblock — the first block, holding file identity,
+/// the format version, and the latest `HeaderIndex` hint.
 pub const SUPERBLOCK_SIZE: u64 = 4096;
 
 /// File-level magic — ASCII `"SLOG"`, little-endian. Distinct from the
@@ -40,6 +41,15 @@ const GROW_EXTENT: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Superblock {
     pub format_version: u32,
+    /// `(offset, padded_size)` of the newest committed `HeaderIndex`
+    /// record — the anchor of recovery's backward digest chain (§5.6).
+    /// `(0, 0)` means no index has been written. A **hint**, not
+    /// authoritative: recovery validates the record it points at and
+    /// falls back to the full forward walk on any mismatch, so a stale
+    /// or garbage value (including the retired checkpoint offset that
+    /// logs written by earlier builds carry in these bytes, with a
+    /// zero size alongside it) costs a fallback, never corruption.
+    pub last_index: (u64, u64),
 }
 
 impl Superblock {
@@ -47,7 +57,9 @@ impl Superblock {
         let mut b = [0u8; SUPERBLOCK_SIZE as usize];
         b[0..4].copy_from_slice(&FILE_MAGIC.to_le_bytes());
         b[4..8].copy_from_slice(&self.format_version.to_le_bytes());
-        // Bytes 8..SUPERBLOCK_SIZE-4 are reserved (zero). They are
+        b[8..16].copy_from_slice(&self.last_index.0.to_le_bytes());
+        b[16..24].copy_from_slice(&self.last_index.1.to_le_bytes());
+        // Bytes 24..SUPERBLOCK_SIZE-4 are reserved (zero). They are
         // covered by the CRC, so a reader validates whatever a writer
         // put there without interpreting it.
         let crc = crc32(&b[0..SUPERBLOCK_SIZE as usize - 4]);
@@ -87,7 +99,14 @@ impl Superblock {
                 "unsupported log format version {format_version}"
             )));
         }
-        Ok(Superblock { format_version })
+        let last_index = (
+            u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            u64::from_le_bytes(b[16..24].try_into().unwrap()),
+        );
+        Ok(Superblock {
+            format_version,
+            last_index,
+        })
     }
 }
 
@@ -122,6 +141,7 @@ impl LogFile {
             .open(path)?;
         let superblock = Superblock {
             format_version: FILE_FORMAT_VERSION,
+            last_index: (0, 0),
         };
         let direct = DirectFile::open(path)?;
         let mut log = LogFile {
@@ -141,6 +161,14 @@ impl LogFile {
     /// Open an existing log file and validate its superblock. The write
     /// offset is left at the start of the record region; a recovery pass
     /// must call [`LogFile::set_write_offset`] once the true tail is known.
+    ///
+    /// The superblock is rewritten on every index flush, so a crash can
+    /// tear it. A torn superblock (valid magic, bad CRC) is **self-healed**:
+    /// it holds nothing authoritative — only the format version and the
+    /// advisory index hint — so it is rewritten fresh with a zero hint and
+    /// recovery takes the full-walk path. A wrong magic stays a hard error
+    /// (the file isn't a substrate log), and a valid-CRC superblock with an
+    /// unsupported version stays a hard error (a genuinely old format).
     pub fn open(path: &Path) -> Result<LogFile> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let allocated = file.metadata()?.len();
@@ -150,13 +178,25 @@ impl LogFile {
             direct,
             superblock: Superblock {
                 format_version: FILE_FORMAT_VERSION,
+                last_index: (0, 0),
             },
             write_offset: SUPERBLOCK_SIZE,
             allocated,
             pending: Vec::new(),
         };
         let head = log.read_at(0, SUPERBLOCK_SIZE as usize)?;
-        log.superblock = Superblock::decode(&head)?;
+        match Superblock::decode(&head) {
+            Ok(sb) => log.superblock = sb,
+            Err(PersistenceError::BadChecksum { .. }) => {
+                tracing::warn!(
+                    "torn superblock (magic valid, CRC mismatch) — rewriting it; \
+                     recovery falls back to the full walk"
+                );
+                log.write_superblock()?;
+                log.file.sync_data()?;
+            }
+            Err(e) => return Err(e),
+        }
         Ok(log)
     }
 
@@ -250,6 +290,18 @@ impl LogFile {
         Ok(())
     }
 
+    /// Record the newest committed `HeaderIndex` location in the
+    /// superblock and persist it. Called after the index record's bytes
+    /// are durably committed, so the hint never points past the flushed
+    /// region on an ordered-write device; recovery tolerates a stale or
+    /// dangling hint either way (full-walk fallback).
+    pub fn set_last_index(&mut self, last_index: (u64, u64)) -> Result<()> {
+        self.superblock.last_index = last_index;
+        self.write_superblock()?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// Physically truncate the file to `len` (used by recovery after a torn
     /// tail, and by compaction).
     pub fn truncate_to(&mut self, len: u64) -> Result<()> {
@@ -330,6 +382,7 @@ impl MemLog {
     pub fn with_records(records: &[u8]) -> MemLog {
         let sb = Superblock {
             format_version: FILE_FORMAT_VERSION,
+            last_index: (0, 0),
         };
         let mut bytes = sb.encode().to_vec();
         bytes.extend_from_slice(records);
@@ -368,23 +421,12 @@ impl LogSource for MemLog {
     }
 }
 
-/// Read and decode the record header at `offset` from any [`LogSource`].
-/// Returns the decoded header. The number of bytes the header occupies
-/// (including its trailing newline) is not exposed — callers that need
-/// it should call [`read_record_at`] for the full record.
-pub fn read_header_at(src: &mut dyn LogSource, offset: u64) -> Result<RecordHeader> {
-    let size = src.size()?;
-    let remaining = size.saturating_sub(offset);
-    let probe_len = remaining.min(ALIGN as u64) as usize;
-    let probe = src.read_at(offset, probe_len)?;
-    let (header, _) = decode_header(&probe)?;
-    Ok(header)
-}
-
-/// Read and decode (checksum-verify) the whole record at `offset`.
+/// Read, decode, and CRC-verify the whole record at `offset`.
 /// `record_size` is the exact padded on-disk size from a `RecordLoc` /
 /// `ChunkLoc` — captured at walk time or write time. Single read, no
-/// probe.
+/// probe. Bit-rot in the payload surfaces here as `BadChecksum` — the
+/// random-access reads this serves (singletons, tokens, signatures,
+/// compaction's live-set copy) all consume the payload immediately.
 ///
 /// Returns an owned [`Record`] — the on-disk bytes go out of scope at
 /// return time. Callers on the hot path that want to read the payload
@@ -393,6 +435,7 @@ pub fn read_header_at(src: &mut dyn LogSource, offset: u64) -> Result<RecordHead
 pub fn read_record_at(src: &mut dyn LogSource, offset: u64, record_size: u64) -> Result<Record> {
     let bytes = src.read_at(offset, record_size as usize)?;
     let (header, payload, _) = decode_record(&bytes)?;
+    verify_record_crc(&header, payload)?;
     Ok(Record {
         header,
         payload: payload.to_vec(),
@@ -490,11 +533,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Superblocks written by earlier builds carry a stale checkpoint
-    /// hint in the reserved bytes (8..16). Decode must accept them —
-    /// the bytes are CRC-covered but uninterpreted.
+    /// Superblocks written by earlier builds carry the retired
+    /// checkpoint offset in bytes 8..16 (now the index hint's offset
+    /// half) and zeros in 16..24 (its size half). Decode must accept
+    /// them — the bogus hint has a zero size, which recovery rejects
+    /// into the full-walk fallback.
     #[test]
-    fn nonzero_reserved_bytes_are_accepted() {
+    fn legacy_checkpoint_bytes_decode_as_a_rejectable_hint() {
         let path = tmp_path("reserved_bytes");
         {
             LogFile::create(&path).unwrap();
@@ -514,6 +559,68 @@ mod tests {
         {
             let log = LogFile::open(&path).unwrap();
             assert_eq!(log.superblock().format_version, FILE_FORMAT_VERSION);
+            assert_eq!(log.superblock().last_index, (123_456, 0));
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A torn superblock (valid magic, bad CRC — the crash window of the
+    /// per-index-flush superblock rewrite) self-heals on open instead of
+    /// bricking the log: the hint zeroes out and the records survive.
+    #[test]
+    fn torn_superblock_self_heals_on_open() {
+        let path = tmp_path("torn_sb");
+        let r = rec(3, 0, b"survives");
+        {
+            let mut log = LogFile::create(&path).unwrap();
+            log.stage(&r);
+            log.commit().unwrap();
+            log.set_last_index((SUPERBLOCK_SIZE, r.len() as u64))
+                .unwrap();
+        }
+        // Tear the superblock: flip a byte in the CRC-covered reserved
+        // region, leaving the magic + version intact.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(100)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+        }
+        {
+            let mut log = LogFile::open(&path).unwrap();
+            assert_eq!(
+                log.superblock().last_index,
+                (0, 0),
+                "healed superblock starts with a zero hint"
+            );
+            // The record region is untouched.
+            let back = log.read_at(SUPERBLOCK_SIZE, r.len()).unwrap();
+            assert_eq!(back, r);
+            // The healed superblock is durable and writable again.
+            log.set_last_index((SUPERBLOCK_SIZE, r.len() as u64))
+                .unwrap();
+        }
+        {
+            let log = LogFile::open(&path).unwrap();
+            assert_eq!(
+                log.superblock().last_index,
+                (SUPERBLOCK_SIZE, r.len() as u64)
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn last_index_hint_persists_across_reopen() {
+        let path = tmp_path("last_index");
+        {
+            let mut log = LogFile::create(&path).unwrap();
+            assert_eq!(log.superblock().last_index, (0, 0));
+            log.set_last_index((45_056, 8192)).unwrap();
+        }
+        {
+            let log = LogFile::open(&path).unwrap();
+            assert_eq!(log.superblock().last_index, (45_056, 8192));
         }
         std::fs::remove_file(&path).ok();
     }
@@ -541,8 +648,25 @@ mod tests {
         let mut blob = Vec::new();
         blob.extend_from_slice(&r0);
         let mut mem = MemLog::with_records(&blob);
-        let header = read_header_at(&mut mem, SUPERBLOCK_SIZE).unwrap();
-        assert_eq!(header.stream_id, 5);
-        assert_eq!(header.record_type, RecordType::Chunk);
+        let record = read_record_at(&mut mem, SUPERBLOCK_SIZE, r0.len() as u64).unwrap();
+        assert_eq!(record.header.stream_id, 5);
+        assert_eq!(record.header.record_type, RecordType::Chunk);
+        assert_eq!(record.payload, b"alpha");
+    }
+
+    /// A flipped payload byte surfaces as `BadChecksum` at the
+    /// consumption point — `read_record_at` CRC-verifies every payload
+    /// it returns.
+    #[test]
+    fn read_record_at_rejects_payload_bit_rot() {
+        let mut r0 = rec(5, 0, b"alpha-payload");
+        let newline = r0.iter().position(|&b| b == b'\n').unwrap();
+        r0[newline + 1] ^= 0x5A;
+        let mut mem = MemLog::with_records(&r0);
+        let err = read_record_at(&mut mem, SUPERBLOCK_SIZE, r0.len() as u64).unwrap_err();
+        assert!(
+            matches!(err, PersistenceError::BadChecksum { .. }),
+            "expected BadChecksum, got {err:?}"
+        );
     }
 }

@@ -57,11 +57,15 @@ impl RecordAccounting {
             | RecordType::Tokenizer
             | RecordType::ToolSummary => (header.record_type, 0, 0),
             // Payload-keyed metadata records — excluded (see module doc).
+            // `HeaderIndex` records are excluded too: they're derived
+            // data with no supersession key, reclaimed wholesale at
+            // compaction.
             RecordType::Label
             | RecordType::ConvState
             | RecordType::TreeMetadata
             | RecordType::DebugId
             | RecordType::Tombstone
+            | RecordType::HeaderIndex
             | RecordType::Unknown => return,
         };
         if let Some(old) = self.live_sizes.insert(key, padded_size) {
@@ -132,13 +136,15 @@ mod tests {
         assert_eq!(acc.dead_bytes(), 4096);
     }
 
-    /// Payload-keyed metadata types are excluded — never counted dead.
+    /// Payload-keyed metadata types and the derived `HeaderIndex`
+    /// records are excluded — never counted dead.
     #[test]
     fn payload_keyed_types_are_skipped() {
         let mut acc = RecordAccounting::new();
         for _ in 0..3 {
             acc.record(&header(RecordType::Label, 0, 0), 4096);
             acc.record(&header(RecordType::TreeMetadata, 0, 0), 4096);
+            acc.record(&header(RecordType::HeaderIndex, 0, 0), 4096);
         }
         assert_eq!(acc.dead_bytes(), 0);
     }

@@ -724,9 +724,12 @@ fn main() -> anyhow::Result<()> {
         Some(&dialect),
     )
     .map_err(|e| anyhow::anyhow!("projection parse: {e}"))?;
-    let tok_path = workspace.join(".substrate").join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tok_path.display()))?;
+    let tok_bytes = persistence
+        .read_tokenizer_bytes()
+        .map_err(|e| anyhow::anyhow!("read Tokenizer record: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("substrate log carries no Tokenizer record"))?;
+    let tokenizer = tokenizers::Tokenizer::from_bytes(&tok_bytes)
+        .map_err(|e| anyhow::anyhow!("load embedded tokenizer: {e}"))?;
     proj.tokenize_templates::<String, _>(|s| {
         tokenizer
             .encode(s, false)

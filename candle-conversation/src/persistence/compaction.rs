@@ -19,6 +19,7 @@
 
 use std::path::Path;
 
+use super::header_index::{encode_index_payload, IndexEntry, INDEX_FLUSH_ENTRIES};
 use super::log_file::{read_record_at, LogFile, LogSource};
 use super::manifest::{encode_conv_state_payload, ConvState, Manifest};
 use super::record::{encode_record, DebugIdPayload, Record, RecordHeader, RecordType};
@@ -220,9 +221,11 @@ pub fn collect_live_records(
     Ok(out)
 }
 
-/// Write the live records to a fresh log at `path`. Returns the open
-/// [`LogFile`] and its manifest. `path` is removed first if it already
-/// exists.
+/// Write the live records to a fresh log at `path`, interleaving a
+/// fresh `HeaderIndex` chain and publishing its head in the superblock
+/// — a just-compacted log recovers through the chain like any other.
+/// Returns the open [`LogFile`] and its manifest. `path` is removed
+/// first if it already exists.
 pub fn write_compacted_log(
     path: &Path,
     live: &[(RecordHeader, Vec<u8>)],
@@ -232,6 +235,26 @@ pub fn write_compacted_log(
     }
     let mut log = LogFile::create(path)?;
     let mut manifest = Manifest::new();
+
+    let mut pending: Vec<IndexEntry> = Vec::new();
+    let mut last_index: (u64, u64) = (0, 0);
+    let flush_index =
+        |log: &mut LogFile, pending: &mut Vec<IndexEntry>, last_index: &mut (u64, u64)| {
+            let payload = encode_index_payload(*last_index, pending);
+            let h = RecordHeader {
+                record_type: RecordType::HeaderIndex,
+                format: 0,
+                payload_len: payload.len() as u64,
+                crc: 0,
+                stream_id: 0,
+                chunk_index: 0,
+                token_count: 0,
+            };
+            let bytes = encode_record(&h, &payload);
+            let offset = log.stage(&bytes);
+            *last_index = (offset, bytes.len() as u64);
+            pending.clear();
+        };
 
     for (header, payload) in live {
         let mut h = *header;
@@ -246,8 +269,18 @@ pub fn write_compacted_log(
             },
             size: bytes.len() as u64,
         })?;
+        pending.push(IndexEntry::from_header(&h, offset, bytes.len() as u64));
+        if pending.len() >= INDEX_FLUSH_ENTRIES {
+            flush_index(&mut log, &mut pending, &mut last_index);
+        }
+    }
+    if !pending.is_empty() {
+        flush_index(&mut log, &mut pending, &mut last_index);
     }
     log.commit()?;
+    if last_index != (0, 0) {
+        log.set_last_index(last_index)?;
+    }
 
     Ok((log, manifest))
 }
@@ -329,11 +362,18 @@ mod tests {
 
         // The compacted log re-walked into a substrate has the same
         // live streams + chunks as the source.
+        let hint = new_log.superblock().last_index;
+        assert_ne!(hint, (0, 0), "compacted log must carry an index chain");
         let mut after_sub = Substrate::new();
-        let _ = super::super::recovery::recover_with_sink(&mut new_log, |e| {
+        let recovered = super::super::recovery::recover_with_sink(&mut new_log, hint, |e| {
             after_sub.apply_walker_entry(e)
         })
         .unwrap();
+        assert_eq!(
+            recovered.last_index,
+            Some(hint),
+            "recovery of a compacted log must take the chain path"
+        );
         assert_eq!(before_sub.live_chunk_count(), after_sub.live_chunk_count());
         assert_eq!(after_sub.live_chunk_count(), 2);
         std::fs::remove_file(&path).ok();

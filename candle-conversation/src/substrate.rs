@@ -2617,10 +2617,12 @@ impl Substrate {
                 self.streams.entry(stream_id).or_default().projection_events =
                     Some(entry.record.payload.clone());
             }
-            // Singletons go to the manifest, not the substrate.
+            // Singletons go to the manifest, not the substrate; the
+            // header-index chain is consumed by recovery, never here.
             RecordType::ModelSpec
             | RecordType::Template
             | RecordType::Tokenizer
+            | RecordType::HeaderIndex
             | RecordType::Unknown => {}
         }
     }
@@ -4963,15 +4965,12 @@ mod tests {
 
         let residence = sub.turn_residence(timeline, idx).unwrap();
         let cold = sub.residence[residence.0].cold.as_ref().unwrap();
-        for l in 0..n_layers {
-            for c in 0..chunks_per_layer {
+        for (l, seq) in cold.iter().enumerate() {
+            for (c, chunk) in seq.chunks.iter().enumerate() {
                 let flat = (l * chunks_per_layer + c) as u64;
-                assert_eq!(cold[l].chunks[c].log_offset, new_loc(flat).offset);
-                assert_eq!(cold[l].chunks[c].record_len, 8192);
-                assert_eq!(
-                    cold[l].chunks[c].token_count,
-                    new_loc(flat).token_count as u16
-                );
+                assert_eq!(chunk.log_offset, new_loc(flat).offset);
+                assert_eq!(chunk.record_len, 8192);
+                assert_eq!(chunk.token_count, new_loc(flat).token_count as u16);
             }
         }
         let other_res = sub.turn_residence(other_timeline, other_idx).unwrap();
