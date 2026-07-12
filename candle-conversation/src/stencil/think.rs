@@ -69,20 +69,29 @@ impl ThinkMode {
     /// closes the block at the next clause boundary once passed, `force` is the
     /// hard token cap that rewrites the next token to `</think>`.  Higher dials get
     /// more room per span — and, because they also have more spans, far more total
-    /// (Quick: 1×80; Balanced: 1×240; Deep: 3×360; Exhaustive: 5×560).
+    /// (Quick: 1×300; Balanced: 1×400; Deep: 3×672; Exhaustive: 4×1120).
     ///
-    /// Each `force` sits below that mode's tree `forced_after` (Quick 96, Balanced
-    /// /Deep 512, Exhaustive 768 — the stencil's hard backstop) so the EOT ramp
+    /// Each `force` sits below that mode's tree `forced_after` (Quick/Balanced 512,
+    /// Deep 1024, Exhaustive 1536 — the stencil's hard backstop) so the EOT ramp
     /// closes a span gracefully before the stencil force-cuts it.  `Off` has no
-    /// steered spans, so its budget bounds the whole block.  Worth A/B-ing on the
-    /// real checkpoint.
+    /// steered spans, so its budget bounds the whole block.
+    ///
+    /// Tuned on Qwen3-30B-A3B: the model's tool-decision pattern spends ~40–60
+    /// tokens surveying the request and the available tools before the call
+    /// decision forms (~token 90–150), so every dial's force cap sits well
+    /// above that point — a block cut before the decision forms leaves the
+    /// plan unresolved and the model falls into answer mode, fabricating a
+    /// result instead of calling.  `Quick` matches `Off`'s whole-block budget
+    /// exactly: quick steering primes a short thought, it must never allow
+    /// LESS room than an unsteered block gets.  The dials above blend up to
+    /// Exhaustive's ceiling (graceful ≈ ⅔ of force).
     pub fn eot_budget(self) -> (i32, i32) {
         match self {
             ThinkMode::Off => (220, 300),
-            ThinkMode::Quick => (48, 80),
-            ThinkMode::Balanced => (160, 240),
-            ThinkMode::Deep => (240, 360),
-            ThinkMode::Exhaustive => (384, 560),
+            ThinkMode::Quick => (220, 300),
+            ThinkMode::Balanced => (264, 400),
+            ThinkMode::Deep => (448, 672),
+            ThinkMode::Exhaustive => (744, 1120),
         }
     }
 
@@ -192,10 +201,10 @@ fn close_tag_then_end(spec: &mut TreeSpec) -> SpecId {
 /// The EOT close ramp ([`ThinkMode::eot_budget`]) is tuned to fire below these, so
 /// a span closes gracefully on a clause boundary before the stencil force-cuts it;
 /// these are the last-resort caps that apply only if the ramp never fires.
-const QUICK_SPAN_CAP: u32 = 96;
+const QUICK_SPAN_CAP: u32 = 512;
 const BALANCED_SPAN_CAP: u32 = 512;
-const DEEP_SPAN_CAP: u32 = 512;
-const EXHAUSTIVE_SPAN_CAP: u32 = 768;
+const DEEP_SPAN_CAP: u32 = 1024;
+const EXHAUSTIVE_SPAN_CAP: u32 = 1536;
 
 /// `Deep`'s continuation phrases — prefilled after a dropped close to re-steer
 /// the next span: one `"But wait, "` reconsideration, then a closing statement
