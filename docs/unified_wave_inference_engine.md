@@ -218,8 +218,12 @@ time-sharing between them.
   They ride along whatever decode + glue + a little prefill is pending.
 
 - **Large wave (throughput mode).** Triggered only when the pending-token backlog
-  exceeds a threshold (**~8192 tokens**, tunable) — enough that streaming all 128
-  experts is worth it. Packs as many backlogged **prefill + glue** tokens as VRAM
+  exceeds a threshold (**~2048 tokens**, tunable) — enough that streaming all 128
+  experts is worth it. (Lowered from an initial 8192 once the ingest went 24-way
+  parallel with the rolling-window-bounded per-scope KV: a burst of ~24 small
+  scopes reaches ~2048 readily, so the trigger fires without waiting for an
+  8192-token backlog that a bounded-KV parallel ingest rarely accumulates.) Packs
+  as many backlogged **prefill + glue** tokens as VRAM
   allows (see §4.4) into one forward. Amortises the all-expert load over thousands
   of tokens (~2000+ t/s territory, §6). **A large wave carries NO decode.**
 
