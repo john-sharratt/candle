@@ -988,22 +988,14 @@ pub(super) fn sum_pending_prefill_tokens(items: impl IntoIterator<Item = (usize,
         .sum()
 }
 
-/// Rolling-window size (turns) for append-only ingest prefills, from
-/// `CANDLE_CODEREAD_WINDOW_TURNS` (default 0 = unbounded — exactly the prior
-/// whole-parent borrow). Cached: read once. See design
-/// `docs/unified_wave_inference_engine.md` §4.7 and
-/// [`crate::conversation::Conversation::windowed_ingest_ranges`]. **Gated OFF by
-/// default**; enabling it changes the KV a code_read prefill attends over and
-/// needs golden-token validation on a live model before production use.
-fn coderead_window_turns() -> usize {
-    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("CANDLE_CODEREAD_WINDOW_TURNS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    })
-}
+/// Rolling-window size (turns) for append-only ingest prefills (the
+/// `disable_reprojection` path — `code_reading` / `repo_map`): each such turn
+/// attends only the system prompt + the last `CODE_READ_WINDOW_TURNS` sealed
+/// turns, bounding otherwise-unbounded ingest context that would exhaust the
+/// window and blow up KV VRAM (design `docs/unified_wave_inference_engine.md`
+/// §4.7 and [`crate::projection::resolver::Conversation::windowed_ingest_ranges`]).
+/// `0` = unbounded (whole-parent borrow).
+const CODE_READ_WINDOW_TURNS: usize = 8;
 
 #[derive(Default)]
 struct WaveChannel {
@@ -2075,13 +2067,13 @@ impl Scheduler {
                     "view borrow plan",
                 );
                 // Rolling window over an append-only ingest (design §4.7): on the
-                // disable-reprojection path (`skip_projection`), and only when
-                // `CANDLE_CODEREAD_WINDOW_TURNS > 0`, borrow just the system
-                // prompt + the last N sealed turns instead of the whole growing
-                // parent — bounding otherwise-unbounded ingest context. Default
-                // (window 0) is byte-for-byte the whole-parent borrow.
+                // disable-reprojection path (`skip_projection`), borrow just the
+                // system prompt + the last `CODE_READ_WINDOW_TURNS` sealed turns
+                // instead of the whole growing parent — bounding otherwise-
+                // unbounded ingest context. `window == 0` is the whole-parent
+                // borrow.
                 let window = if skip_projection {
-                    coderead_window_turns()
+                    CODE_READ_WINDOW_TURNS
                 } else {
                     0
                 };

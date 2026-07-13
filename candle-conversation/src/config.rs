@@ -1278,11 +1278,11 @@ pub struct SchedulerConfig {
     pub small_prefill_threshold: usize,
 
     /// **Per-forward prefill token cap** (`max_prefill_pass_tokens`): the maximum
-    /// tokens one sequence advances in a single prefill forward. This is the
-    /// primary knob for the expert-load amortization curve (design §1.2/§6) — a
-    /// larger cap streams the same all-expert load over more tokens. Honors the
-    /// `CANDLE_PREFILL_MAX_TOKENS` env override so the curve can be swept on
-    /// hardware without a recompile; default 512.
+    /// tokens one sequence advances in a single prefill forward. The primary knob
+    /// for the expert-load amortization curve (design §1.2/§6) — a larger cap
+    /// streams the same all-expert weight load over more tokens. Set to the
+    /// model-side per-forward ceiling ([`crate::models::batched_inference`]'s
+    /// `MAX_PREFILL_TOKENS`) so the scheduler never chunks below it.
     pub large_prefill_max_tokens: usize,
 }
 
@@ -1290,21 +1290,13 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             small_prefill_threshold: 128,
-            large_prefill_max_tokens: env_prefill_max_tokens(),
+            // Matches the model-side `MAX_PREFILL_TOKENS`: let a single prefill
+            // forward carry as many tokens as the model will take, so the
+            // all-expert load amortises (design §6) instead of being chunked at
+            // 512.
+            large_prefill_max_tokens: 4096,
         }
     }
-}
-
-/// Per-forward prefill token cap, honoring `CANDLE_PREFILL_MAX_TOKENS` so the
-/// amortization curve (design §6) is measurable on the 4090 without a recompile.
-/// Clamped to a floor of one KV chunk (`candle_nn::CHUNK_SIZE` = 32) so a
-/// mistyped override can't stall prefill to a crawl; default 512.
-fn env_prefill_max_tokens() -> usize {
-    std::env::var("CANDLE_PREFILL_MAX_TOKENS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.max(candle_nn::CHUNK_SIZE))
-        .unwrap_or(512)
 }
 
 /// Pick a reasonable `max_hot_turns` ceiling from arena dimensions and
@@ -1466,11 +1458,11 @@ mod scheduler_config_tests {
     use super::SchedulerConfig;
 
     #[test]
-    fn prefill_cap_default_is_512() {
-        // No env override in the test process → the documented default. The
-        // `CANDLE_PREFILL_MAX_TOKENS` override lets the amortization curve
-        // (design §6) be swept on hardware without a recompile.
-        assert_eq!(SchedulerConfig::default().large_prefill_max_tokens, 512);
+    fn prefill_cap_matches_model_ceiling() {
+        // The scheduler cap matches the model-side per-forward ceiling so a
+        // large prefill turn goes in one forward (amortization, design §6),
+        // not chunked at 512.
+        assert_eq!(SchedulerConfig::default().large_prefill_max_tokens, 4096);
     }
 }
 
