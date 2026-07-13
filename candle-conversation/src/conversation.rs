@@ -2574,6 +2574,75 @@ impl Drop for Sequence {
     }
 }
 
+/// Pure block-range windowing for a bounded rolling-window ingest (design
+/// `docs/unified_wave_inference_engine.md` §4.7): given the system-prompt end
+/// block `sys_end`, the ascending per-turn start blocks `turn_starts` (one per
+/// sealed turn), the current `total` block count, and `window_turns`, return the
+/// parent block ranges the next prefill should attend — the system prompt plus
+/// the most recent `window_turns` sealed turns.
+///
+/// `window_turns == 0` (unbounded) or fewer sealed turns than the window returns
+/// the whole parent `[(0, total)]` — a no-op, byte-for-byte the unwindowed
+/// behaviour. Split out from [`Conversation::windowed_ingest_ranges`] so it is
+/// unit-testable without a live substrate.
+pub(crate) fn windowed_ingest_ranges_impl(
+    sys_end: usize,
+    turn_starts: &[usize],
+    total: usize,
+    window_turns: usize,
+) -> Vec<(usize, usize)> {
+    let whole = || {
+        if total == 0 {
+            Vec::new()
+        } else {
+            vec![(0, total)]
+        }
+    };
+    if window_turns == 0 || turn_starts.len() <= window_turns {
+        return whole();
+    }
+    let keep_from = turn_starts[turn_starts.len() - window_turns];
+    // If the window already reaches back into (or to) the system prompt, the two
+    // pieces are contiguous — borrow the whole parent.
+    if keep_from <= sys_end {
+        return whole();
+    }
+    let mut ranges = Vec::with_capacity(2);
+    if sys_end > 0 {
+        ranges.push((0, sys_end));
+    }
+    ranges.push((keep_from, total));
+    ranges
+}
+
+#[cfg(test)]
+mod windowed_ingest_tests {
+    use super::windowed_ingest_ranges_impl as w;
+
+    #[test]
+    fn window_bounds_to_system_prompt_plus_last_n_turns() {
+        // system prompt occupies [0,2); five sealed turns start at 2,5,9,12,16;
+        // current total is 20 blocks.
+        let sys = 2;
+        let starts = [2usize, 5, 9, 12, 16];
+        // Unbounded (0) or window >= turn count → whole parent (no-op).
+        assert_eq!(w(sys, &starts, 20, 0), vec![(0, 20)]);
+        assert_eq!(w(sys, &starts, 20, 5), vec![(0, 20)]);
+        assert_eq!(w(sys, &starts, 20, 9), vec![(0, 20)]);
+        // Keep last 2 turns → system [0,2) + [starts[3]=12, 20).
+        assert_eq!(w(sys, &starts, 20, 2), vec![(0, 2), (12, 20)]);
+        // Keep last 1 → [0,2) + [16, 20).
+        assert_eq!(w(sys, &starts, 20, 1), vec![(0, 2), (16, 20)]);
+        // No system prompt → single tail range.
+        assert_eq!(w(0, &starts, 20, 2), vec![(12, 20)]);
+        // Empty parent → no ranges.
+        assert_eq!(w(0, &[], 0, 3), Vec::<(usize, usize)>::new());
+        // Window reaches into the system-prompt region (keep_from <= sys_end) →
+        // contiguous → whole parent.
+        assert_eq!(w(13, &starts, 20, 2), vec![(0, 20)]);
+    }
+}
+
 #[cfg(test)]
 mod window_sealed_tokens_tests {
     use super::window_sealed_tokens;

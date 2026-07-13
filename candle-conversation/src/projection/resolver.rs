@@ -197,6 +197,39 @@ impl Conversation {
         TargetedRead::new(self.read_scored(scores), target)
     }
 
+    /// Bounded rolling-window view ranges for an append-only ingest — the
+    /// system-prompt blocks plus the most recent `window_turns` sealed turns of
+    /// `timeline` (design `docs/unified_wave_inference_engine.md` §4.7). Returned
+    /// as raw `(start_block, end_block)` pairs for the scheduler's view borrow.
+    ///
+    /// `window_turns == 0` (unbounded) or fewer sealed turns than the window
+    /// returns `[(0, total_blocks)]` — the whole parent, byte-for-byte the
+    /// unwindowed behaviour. Used only on the disable-reprojection ingest path
+    /// and only when `CANDLE_CODEREAD_WINDOW_TURNS > 0`; the KV-windowing effect
+    /// itself requires golden-token validation on a live model.
+    pub fn windowed_ingest_ranges(
+        &self,
+        timeline: TimelineId,
+        window_turns: usize,
+        total_blocks: usize,
+    ) -> Vec<(usize, usize)> {
+        let sub = self.inner.read().unwrap();
+        let turn_count = sub.turn_count(timeline);
+        // Per-turn start block in the sealed block grid the view borrow indexes.
+        // `block_range_of` is `(start, end)`; the system prompt is the blocks
+        // before turn 0's start.
+        let turn_starts: Vec<usize> = (0..turn_count)
+            .map(|i| sub.block_range_of(timeline, TurnIndex(i)).0 as usize)
+            .collect();
+        let sys_end = turn_starts.first().copied().unwrap_or(0);
+        crate::conversation::windowed_ingest_ranges_impl(
+            sys_end,
+            &turn_starts,
+            total_blocks,
+            window_turns,
+        )
+    }
+
     /// Acquire a write guard for mutating operations (append, set_*).
     pub fn write(&self) -> SubstrateWrite<'_> {
         SubstrateWrite {

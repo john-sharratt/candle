@@ -1271,14 +1271,18 @@ impl EngineConfig {
 }
 
 /// Scheduler-specific configuration.
-///
-/// Phase 1 uses single-mode prefill; these thresholds are reserved for Phase 2.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Small-prefill threshold (Phase 2+). Prefills below this go to the fast queue.
+    /// Small-prefill threshold. Reserved for the unified-wave small/large batch
+    /// flip (design `docs/unified_wave_inference_engine.md`); not yet read.
     pub small_prefill_threshold: usize,
 
-    /// Maximum aggregate tokens in one large-prefill step (Phase 2+).
+    /// **Per-forward prefill token cap** (`max_prefill_pass_tokens`): the maximum
+    /// tokens one sequence advances in a single prefill forward. This is the
+    /// primary knob for the expert-load amortization curve (design §1.2/§6) — a
+    /// larger cap streams the same all-expert load over more tokens. Honors the
+    /// `CANDLE_PREFILL_MAX_TOKENS` env override so the curve can be swept on
+    /// hardware without a recompile; default 512.
     pub large_prefill_max_tokens: usize,
 }
 
@@ -1286,9 +1290,21 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             small_prefill_threshold: 128,
-            large_prefill_max_tokens: 512,
+            large_prefill_max_tokens: env_prefill_max_tokens(),
         }
     }
+}
+
+/// Per-forward prefill token cap, honoring `CANDLE_PREFILL_MAX_TOKENS` so the
+/// amortization curve (design §6) is measurable on the 4090 without a recompile.
+/// Clamped to a floor of one KV chunk (`candle_nn::CHUNK_SIZE` = 32) so a
+/// mistyped override can't stall prefill to a crawl; default 512.
+fn env_prefill_max_tokens() -> usize {
+    std::env::var("CANDLE_PREFILL_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.max(candle_nn::CHUNK_SIZE))
+        .unwrap_or(512)
 }
 
 /// Pick a reasonable `max_hot_turns` ceiling from arena dimensions and
@@ -1443,6 +1459,19 @@ pub struct SequenceConfig {
     /// to capture full-resolution tool-call exemplars for the provenance work.
     /// Overrides the level/force fields above. **Default: `false`.**
     pub kv_lossless: bool,
+}
+
+#[cfg(test)]
+mod scheduler_config_tests {
+    use super::SchedulerConfig;
+
+    #[test]
+    fn prefill_cap_default_is_512() {
+        // No env override in the test process → the documented default. The
+        // `CANDLE_PREFILL_MAX_TOKENS` override lets the amortization curve
+        // (design §6) be swept on hardware without a recompile.
+        assert_eq!(SchedulerConfig::default().large_prefill_max_tokens, 512);
+    }
 }
 
 #[cfg(test)]

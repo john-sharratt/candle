@@ -165,7 +165,8 @@ impl Scheduler {
                     .vram_budget_available()
                     .zip(self.session.vram_pool_stats())
                     .map(|(budget, (used, _reserved))| (budget, used));
-                self.wave_stats.flush(kv_vram);
+                let backlog = self.pending_prefill_tokens();
+                self.wave_stats.flush(kv_vram, backlog);
             }
         }
 

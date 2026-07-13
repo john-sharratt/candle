@@ -974,6 +974,37 @@ pub(super) struct ActiveSectionIngest {
 /// The scheduler: single thread that owns all GPU resources.
 ///
 /// One forward-pass "channel" (prefill or decode) accumulator for [`WaveStats`].
+/// Sum of not-yet-processed prefill tokens across pending/in-flight work — the
+/// scheduler's prefill **backlog**. `items` yields `(total_tokens,
+/// consumed_offset)` per work unit (queued work has `consumed == 0`; an
+/// in-flight prefill/section has `consumed == offset`). This is the signal the
+/// unified-wave engine's large-batch trigger keys on (design
+/// `docs/unified_wave_inference_engine.md` §4.5). Pure over its input so it is
+/// unit-testable without a live scheduler.
+pub(super) fn sum_pending_prefill_tokens(items: impl IntoIterator<Item = (usize, usize)>) -> u64 {
+    items
+        .into_iter()
+        .map(|(total, consumed)| total.saturating_sub(consumed) as u64)
+        .sum()
+}
+
+/// Rolling-window size (turns) for append-only ingest prefills, from
+/// `CANDLE_CODEREAD_WINDOW_TURNS` (default 0 = unbounded — exactly the prior
+/// whole-parent borrow). Cached: read once. See design
+/// `docs/unified_wave_inference_engine.md` §4.7 and
+/// [`crate::conversation::Conversation::windowed_ingest_ranges`]. **Gated OFF by
+/// default**; enabling it changes the KV a code_read prefill attends over and
+/// needs golden-token validation on a live model before production use.
+fn coderead_window_turns() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CANDLE_CODEREAD_WINDOW_TURNS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 #[derive(Default)]
 struct WaveChannel {
     fwds: u64,
@@ -1096,9 +1127,14 @@ impl WaveStats {
     /// `(pool_budget_available, pool_used)` in bytes — the pool-accounting
     /// numbers our eviction gate keys on (NOT the driver's raw free, which the
     /// pool's retained reservation pins low). `None` on non-CUDA / query miss.
+    /// `backlog` is the point-in-time prefill backlog in tokens
+    /// ([`Scheduler::pending_prefill_tokens`]) — the signal the unified-wave
+    /// engine's large-batch trigger keys on (see
+    /// `docs/unified_wave_inference_engine.md` §4.5); the line reports
+    /// *executed* forwards, so this is the only view of pending *work*.
     /// Call only when [`Self::due`] — windows with NO forwards still flush so
     /// stalls surface their phase split.
-    fn flush(&mut self, kv_vram: Option<(usize, usize)>) {
+    fn flush(&mut self, kv_vram: Option<(usize, usize)>, backlog: u64) {
         let elapsed = self.window_start.elapsed();
         let avg = |sum: u64, n: u64| if n > 0 { sum as f64 / n as f64 } else { 0.0 };
         let phase_sum =
@@ -1152,7 +1188,18 @@ impl WaveStats {
             ),
             None => String::new(),
         };
-        tracing::info!("wave {:.1}s: {body}{vram}", elapsed.as_secs_f64());
+        // Prefill backlog (pending, not-yet-executed tokens) — the large-batch
+        // trigger signal. Only emitted when non-zero to keep the line quiet at
+        // idle.
+        let backlog_str = if backlog > 0 {
+            format!(" | backlog={backlog}tok")
+        } else {
+            String::new()
+        };
+        tracing::info!(
+            "wave {:.1}s: {body}{vram}{backlog_str}",
+            elapsed.as_secs_f64()
+        );
         // Phase breakdown: where the wall-clock went on the scheduler thread.
         // `drain` rising over the run ⇒ per-turn reprojection/elevate growing;
         // `reproj` rising ⇒ continuous-reproject (BDP scan/glue) growing;
@@ -1584,6 +1631,27 @@ impl Scheduler {
     // —— Submission handling —————————————————————————————————————————————
 
     /// Drain all pending submissions. Returns `false` if shutdown requested.
+    /// Point-in-time prefill **backlog** in tokens: not-yet-processed tokens
+    /// across the queued FIFO plus the in-flight prefills and section ingests.
+    /// The unified-wave large-batch trigger (design §4.5) reads this; today it
+    /// only feeds the wave log line. Cheap (a few small iterations), computed
+    /// once per emitted wave.
+    pub(super) fn pending_prefill_tokens(&self) -> u64 {
+        let queued = self
+            .prefill_queue
+            .iter()
+            .map(|w| (w.tokens.token_count(), 0));
+        let active = self
+            .active_prefills
+            .iter()
+            .map(|p| (p.work.tokens.token_count(), p.offset));
+        let sections = self
+            .active_section_ingests
+            .iter()
+            .map(|s| (s.tokens.token_count(), s.offset));
+        sum_pending_prefill_tokens(queued.chain(active).chain(sections))
+    }
+
     fn drain_submissions(&mut self) -> bool {
         loop {
             match self.rx.try_recv() {
@@ -2006,7 +2074,34 @@ impl Scheduler {
                     offset_div_ceil = parent_offset_for_log.div_ceil(self.chunk_size),
                     "view borrow plan",
                 );
-                let effective_ranges: Vec<BlockRange> = if parent_block_count == 0 {
+                // Rolling window over an append-only ingest (design §4.7): on the
+                // disable-reprojection path (`skip_projection`), and only when
+                // `CANDLE_CODEREAD_WINDOW_TURNS > 0`, borrow just the system
+                // prompt + the last N sealed turns instead of the whole growing
+                // parent — bounding otherwise-unbounded ingest context. Default
+                // (window 0) is byte-for-byte the whole-parent borrow.
+                let window = if skip_projection {
+                    coderead_window_turns()
+                } else {
+                    0
+                };
+                let effective_ranges: Vec<BlockRange> = if window > 0 {
+                    self.slot_targets
+                        .get(&parent_id)
+                        .map(|t| t.timeline)
+                        .zip(self.slot_conversations.get(&parent_id))
+                        .map(|(tl, c)| c.windowed_ingest_ranges(tl, window, parent_block_count))
+                        .unwrap_or_else(|| {
+                            if parent_block_count == 0 {
+                                Vec::new()
+                            } else {
+                                vec![(0, parent_block_count)]
+                            }
+                        })
+                        .into_iter()
+                        .map(|(s, e)| BlockRange::new(s, e))
+                        .collect()
+                } else if parent_block_count == 0 {
                     Vec::new()
                 } else {
                     vec![BlockRange::new(0, parent_block_count)]
@@ -6564,6 +6659,24 @@ impl Scheduler {
 mod tests {
     use super::*;
     use candle::{DType, Tensor};
+
+    #[test]
+    fn pending_prefill_backlog_sums_remaining_tokens() {
+        // queued (offset 0), partially-advanced, and fully-consumed units.
+        let items = [
+            (512, 0),   // queued: all 512 pending
+            (300, 120), // in-flight: 180 remaining
+            (64, 64),   // finished but not yet drained: 0 remaining
+            (0, 0),     // empty unit
+        ];
+        assert_eq!(sum_pending_prefill_tokens(items), 512 + 180 + 0 + 0);
+        // Empty backlog.
+        assert_eq!(sum_pending_prefill_tokens(std::iter::empty()), 0);
+        // Defensive: consumed > total (should never happen) saturates to 0, not
+        // underflow.
+        assert_eq!(sum_pending_prefill_tokens([(10, 25)]), 0);
+    }
+
     use candle_transformers::models::batched_inference::{
         BatchedConfig, BatchedInferenceSession, ManagedBatchedModel,
     };
