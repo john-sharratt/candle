@@ -72,29 +72,65 @@ pub async fn get(
     let history = session
         .conversation_history(&id)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // Uploaded files recorded against this conversation (substrate event),
+    // grouped by their turn position so a burst dropped together tiles into
+    // one inline marker. Recovered with the conversation, so they replay on
+    // resume. Also returned as a flat `uploads` list for the files pane.
+    let recovered_uploads = session.conversation_uploads(&id);
+    let uploads: Vec<UploadOut> = recovered_uploads.iter().map(UploadOut::from).collect();
+    let mut groups: std::collections::BTreeMap<u32, Vec<UploadOut>> =
+        std::collections::BTreeMap::new();
+    for u in &recovered_uploads {
+        groups
+            .entry(u.turn_index)
+            .or_default()
+            .push(UploadOut::from(u));
+    }
+    // Emit an `upload` marker message for every upload group whose turn
+    // boundary is `<= boundary`, draining them in turn order.
+    let mut emit_uploads = |messages: &mut Vec<HistoryMessage>, boundary: u32| {
+        while let Some(&k) = groups.keys().next() {
+            if k > boundary {
+                break;
+            }
+            let files = groups.remove(&k).unwrap();
+            messages.push(HistoryMessage {
+                role: "upload",
+                content: String::new(),
+                no_think: false,
+                spans: Vec::new(),
+                files,
+            });
+        }
+    };
+
     // Each recovered turn is one stored ChatML stream; split it back into
     // role-attributed bubbles server-side (docs/zend_ui_redesign.md decision 9)
     // so the client renders one bubble per role without any ChatML parsing.
-    let mut messages: Vec<HistoryMessage> = history
-        .into_iter()
-        .flat_map(|(role, content, no_think)| {
+    // Upload markers are interleaved at their recorded turn boundaries.
+    let mut messages: Vec<HistoryMessage> = Vec::new();
+    emit_uploads(&mut messages, 0); // uploads before the first turn
+    let mut turn_no: u32 = 0;
+    for (role, content, no_think) in history {
+        turn_no += 1;
+        for (r, c) in crate::chatml::split_turn(role, &content) {
             // The turn's `no_think` belongs on the USER bubble only — a bundled
-            // turn can split into both roles, so tag the assistant half `false`
-            // (the GUI renders the `/no_think` glue only on user bubbles anyway).
-            crate::chatml::split_turn(role, &content)
-                .into_iter()
-                .map(move |(r, c)| {
-                    let user_no_think = no_think && r == Role::User;
-                    (r, c, user_no_think)
-                })
-        })
-        .map(|(role, content, no_think)| HistoryMessage {
-            role: role_str(role),
-            content,
-            no_think,
-            spans: Vec::new(),
-        })
-        .collect();
+            // turn can split into both roles, so tag the assistant half `false`.
+            let user_no_think = no_think && r == Role::User;
+            messages.push(HistoryMessage {
+                role: role_str(r),
+                content: c,
+                no_think: user_no_think,
+                spans: Vec::new(),
+                files: Vec::new(),
+            });
+        }
+        emit_uploads(&mut messages, turn_no);
+    }
+    // Any uploads recorded past the last turn (uploaded after the final turn)
+    // append at the end.
+    emit_uploads(&mut messages, u32::MAX);
 
     // Re-attach projection-event timelines banked this daemon session. Buckets
     // correspond to the most recent decodes, so align them to the *trailing*
@@ -181,6 +217,7 @@ pub async fn get(
         section_content,
         turn_content,
         target_layer,
+        uploads,
     }))
 }
 
@@ -213,6 +250,9 @@ pub struct HistoryBody {
     /// The target layer's name (e.g. `dialogue`) — the panel prefixes the
     /// conversation messages with it.
     pub target_layer: String,
+    /// Every file uploaded to this conversation (recovered from the
+    /// substrate), newest-last — hydrates the files pane on resume.
+    pub uploads: Vec<UploadOut>,
 }
 
 /// One projected turn's body, read from the substrate on demand. `text` is the
@@ -287,4 +327,40 @@ pub struct HistoryMessage {
     /// Omitted from the wire when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<crate::projection_event::ProjectionEventOut>,
+    /// Uploaded files — set only on `role: "upload"` marker messages, which
+    /// the GUI renders as an inline row of clickable file tiles. Omitted
+    /// (empty) on ordinary user/assistant bubbles.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<UploadOut>,
+}
+
+/// One uploaded file as the history/pane wire shape — the metadata the GUI
+/// needs to render a tile and open the file's content by `id`.
+#[derive(Serialize)]
+pub struct UploadOut {
+    pub id: u64,
+    pub name: String,
+    pub ext: String,
+    pub kind: String,
+    pub size: String,
+    pub added: String,
+    /// Measured throughput of the upload batch (shared by every file dropped
+    /// together). Absent on older events or model-less uploads; drives the
+    /// inline stat line and the file viewer's upload-time note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<crate::session::UploadStats>,
+}
+
+impl From<&crate::session::UploadInfo> for UploadOut {
+    fn from(u: &crate::session::UploadInfo) -> Self {
+        UploadOut {
+            id: u.id,
+            name: u.name.clone(),
+            ext: u.ext.clone(),
+            kind: u.kind.clone(),
+            size: u.size.clone(),
+            added: u.added.clone(),
+            stats: u.stats.clone(),
+        }
+    }
 }

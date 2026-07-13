@@ -29,14 +29,20 @@ use candle_conversation::{SamplingConfig, Sequence, TurnEvent, TurnOptions};
 /// workspace-ingestion paths.
 pub trait InsertTurnSink {
     /// Prefill a complete user/assistant exchange with no model
-    /// decode.
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<()>;
+    /// decode.  Returns the number of tokens prefilled — the ingest
+    /// path sums it into the upload's "tokens ingested" stat.
+    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<usize>;
 
     /// Submit `user` and decode the assistant response with the
-    /// supplied `max_tokens` cap.  Returns the decoded text so the
-    /// caller can inspect it; the summary's K/V lands on the
+    /// supplied `max_tokens` cap.  Returns the decoded text (so the
+    /// caller can inspect it) and the number of tokens decoded (the
+    /// upload's "summarized" stat); the summary's K/V lands on the
     /// sequence automatically as part of `finish_turn`.
-    fn decode_summary_turn(&mut self, user: &str, max_tokens: usize) -> anyhow::Result<String>;
+    fn decode_summary_turn(
+        &mut self,
+        user: &str,
+        max_tokens: usize,
+    ) -> anyhow::Result<(String, usize)>;
 
     /// Restart-resume cache probe: whether some conversation in the
     /// substrate already carries `key == value` in its `custom` metadata
@@ -66,7 +72,7 @@ impl<'a> SequenceTurnSink<'a> {
 }
 
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<()> {
+    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<usize> {
         let start = std::time::Instant::now();
         tracing::debug!(
             target: "zend::turn_sink",
@@ -87,7 +93,11 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         result
     }
 
-    fn decode_summary_turn(&mut self, user: &str, max_tokens: usize) -> anyhow::Result<String> {
+    fn decode_summary_turn(
+        &mut self,
+        user: &str,
+        max_tokens: usize,
+    ) -> anyhow::Result<(String, usize)> {
         let options = TurnOptions {
             max_tokens: Some(max_tokens),
             sampling: Some(SamplingConfig::argmax()),
@@ -191,7 +201,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
             ms = finish_start.elapsed().as_millis() as u64,
             "decode_summary_turn: finish_turn returned",
         );
-        Ok(text)
+        Ok((text, token_count))
     }
 
     fn unit_cached(&self, key: &str, value: &str) -> bool {
@@ -236,15 +246,23 @@ impl RecordingTurnSink {
 }
 
 impl InsertTurnSink for RecordingTurnSink {
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<()> {
+    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<usize> {
         self.turns
             .push((user.to_string(), assistant.to_string(), false));
-        Ok(())
+        // No tokenizer in the recording sink — approximate the prefilled token
+        // count by whitespace words so callers that surface a stat see a
+        // plausible non-zero value in model-less tests.
+        Ok(user.split_whitespace().count() + assistant.split_whitespace().count())
     }
 
-    fn decode_summary_turn(&mut self, user: &str, _max_tokens: usize) -> anyhow::Result<String> {
+    fn decode_summary_turn(
+        &mut self,
+        user: &str,
+        _max_tokens: usize,
+    ) -> anyhow::Result<(String, usize)> {
         self.turns
             .push((user.to_string(), self.summary_stub.clone(), true));
-        Ok(self.summary_stub.clone())
+        let tokens = self.summary_stub.split_whitespace().count();
+        Ok((self.summary_stub.clone(), tokens))
     }
 }

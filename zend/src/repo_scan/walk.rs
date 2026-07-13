@@ -52,6 +52,13 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
         {
             continue;
         }
+        // Uploaded files are DELIBERATELY invisible to the RepoMap — explicitly
+        // excluded here (see `is_upload_dir`). They are endpoint-managed, not
+        // part of the project tree, so they must never appear in name-based
+        // (repo_map) retrieval.
+        if is_upload_dir(path, root) {
+            continue;
+        }
         map.files_scanned += 1;
 
         let Some(rel) = path.strip_prefix(root).ok().and_then(|p| p.to_str()) else {
@@ -100,6 +107,35 @@ pub fn walk_workspace(root: &Path) -> RepoMap {
 
     map.files.sort_by(|a, b| a.path.cmp(&b.path));
     map
+}
+
+/// Whether `path` is under the daemon's TOP-LEVEL `uploads/` dir, which
+/// [`walk_workspace`] explicitly excludes.
+///
+/// **Design decision — uploads are invisible to the `RepoMap`.** Uploaded files
+/// are owned by the upload endpoint, not the workspace: the endpoint ingests
+/// each one into the `code_reading` (content) layer itself and measures the
+/// work, and the bytes live under `<workspace>/uploads/`, outside the project
+/// tree. They must therefore NOT appear in name-based (repo_map) retrieval, and
+/// the workspace walk must not touch them at all:
+///   * walking them would pre-ingest an upload on the startup pass or a
+///     watcher-driven refresh, racing the endpoint and making its measured
+///     read_file stage cache-hit ("instant, 0 tokens"); and
+///   * paired with the `uploads/` skip in [`crate::code_read`]'s
+///     `reconcile_deleted`, excluding them here keeps the walk from tombstoning
+///     freshly-uploaded content — uploads are absent from the walk's
+///     `present_paths` precisely because of this exclusion.
+///
+/// Matched on the FIRST workspace-relative component only, case-insensitively
+/// (the win32 FS is case-insensitive), so a nested `src/uploads/` in a real
+/// project is untouched. Mirrors `watcher::is_top_level_uploads` and
+/// `code_read::is_upload_path` so all three agree on what "an upload" is.
+fn is_upload_dir(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("uploads"))
 }
 
 /// Count lines + extract any manifest hint.  Returns `(line_count, hint)`.
@@ -333,6 +369,43 @@ mod tests {
         assert!(paths.contains(&"src/lib.rs"));
         assert!(!paths.iter().any(|p| p.starts_with(".zend/")));
         assert!(!paths.iter().any(|p| p.starts_with(".substrate/")));
+    }
+
+    #[test]
+    fn is_upload_dir_matches_top_level_uploads_only() {
+        let root = Path::new("ws");
+        // Top-level uploads/ (any case — win32 FS is case-insensitive).
+        assert!(is_upload_dir(Path::new("ws/uploads/notes.py"), root));
+        assert!(is_upload_dir(Path::new("ws/uploads/nested/a.rs"), root));
+        assert!(is_upload_dir(Path::new("ws/Uploads/notes.py"), root));
+        // A nested `src/uploads/` in a real project keeps its visibility.
+        assert!(!is_upload_dir(Path::new("ws/src/uploads/real.rs"), root));
+        assert!(!is_upload_dir(Path::new("ws/src/main.rs"), root));
+        assert!(!is_upload_dir(Path::new("other/uploads/a"), root));
+    }
+
+    #[test]
+    fn walk_excludes_top_level_uploads_but_keeps_nested() {
+        let dir = fixture("uploads");
+        let root = dir.path().to_path_buf();
+        write(&root, "src/main.rs", b"// keep\n");
+        // Top-level uploads/ is endpoint-managed and DELIBERATELY invisible to
+        // the RepoMap — the walk must skip it (no name-based retrieval).
+        write(&root, "uploads/notes.py", b"print(1)\n");
+        // A nested `src/uploads/` in a real project is NOT the daemon's dir.
+        write(&root, "src/uploads/real.rs", b"// keep\n");
+
+        let map = walk_workspace(&root);
+        let paths: Vec<&str> = map.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"src/main.rs"));
+        assert!(
+            paths.contains(&"src/uploads/real.rs"),
+            "nested uploads/ is real source"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("uploads/")),
+            "top-level uploads/ must be excluded"
+        );
     }
 
     #[test]

@@ -6835,6 +6835,94 @@ fn cuda_moe_route_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// Degenerate-logit guard: a token whose logits are all `-inf`/`NaN`, or that has
+/// fewer finite experts than `k`, must NEVER route to an out-of-range expert. The
+/// kernel seeds its argmax with `bi = n_experts` as a "not found" sentinel; if that
+/// leaks to the output it indexes past the per-layer expert tables and panics the
+/// expert-paging pipeline (bricking decode). Assert every emitted index is in range
+/// and every weight is finite, and that a short-finite row keeps its real experts
+/// with a zero-weight fallback filling the rest.
+#[test]
+fn cuda_moe_route_never_emits_out_of_range_index() -> Result<()> {
+    let dev = CudaDevice::new(0)?;
+    let device = crate::Device::Cuda(dev.clone());
+    let n_experts = 128usize;
+    let k = 8usize;
+    let ninf = f32::NEG_INFINITY;
+
+    let rows = 5usize;
+    let mut data = vec![0f32; rows * n_experts];
+    // Row 0: all -inf — no finite candidate for any slot.
+    for e in 0..n_experts {
+        data[e] = ninf;
+    }
+    // Row 1: all NaN — NaN loses every `>` compare, so the sentinel would survive.
+    for e in 0..n_experts {
+        data[n_experts + e] = f32::NAN;
+    }
+    // Row 2: only 3 finite experts, rest -inf (fewer finite than k).
+    for e in 0..n_experts {
+        data[2 * n_experts + e] = ninf;
+    }
+    data[2 * n_experts + 10] = 3.0;
+    data[2 * n_experts + 20] = 2.0;
+    data[2 * n_experts + 30] = 1.0;
+    // Row 3: ordinary distinct logits — normal routing.
+    for e in 0..n_experts {
+        data[3 * n_experts + e] = (e as f32) * 0.5;
+    }
+    // Row 4: 3 finite experts, rest NaN (not -inf). This is the case whose KEPT
+    // slots' weights depend on the warp `gmax` reduction dropping NaN (CUDA
+    // `fmaxf`) so `gmax` stays finite (3.0) — otherwise the kept weights would
+    // be `exp(finite - NaN) = NaN` and the index-based clamp would NOT catch it.
+    for e in 0..n_experts {
+        data[4 * n_experts + e] = f32::NAN;
+    }
+    data[4 * n_experts + 5] = 3.0;
+    data[4 * n_experts + 15] = 2.0;
+    data[4 * n_experts + 25] = 1.0;
+
+    let logits = crate::Tensor::from_vec(data, (rows, n_experts), &device)?;
+    for &norm in &[true, false] {
+        let (w, idx) = moe_route(&logits, k, norm)?;
+        let idx = idx.to_vec2::<u32>()?;
+        let w = w.to_vec2::<f32>()?;
+        for t in 0..rows {
+            for p in 0..k {
+                assert!(
+                    (idx[t][p] as usize) < n_experts,
+                    "row {t} slot {p}: index {} must be < n_experts {n_experts} (norm={norm})",
+                    idx[t][p]
+                );
+                assert!(
+                    w[t][p].is_finite(),
+                    "row {t} slot {p}: weight {} must be finite (norm={norm})",
+                    w[t][p]
+                );
+            }
+        }
+        // Rows 2 & 4: the three finite experts are selected in descending order,
+        // with real (non-zero) kept weights; the remaining slots are the
+        // zero-weight fallback (not a phantom expert).
+        for (base, e0, e1, e2) in [(2usize, 10u32, 20u32, 30u32), (4, 5, 15, 25)] {
+            assert_eq!(idx[base][0], e0, "row{base} norm={norm}");
+            assert_eq!(idx[base][1], e1, "row{base} norm={norm}");
+            assert_eq!(idx[base][2], e2, "row{base} norm={norm}");
+            assert!(
+                w[base][0] > 0.0,
+                "row{base} kept slot 0 weight (norm={norm})"
+            );
+            for p in 3..k {
+                assert_eq!(
+                    w[base][p], 0.0,
+                    "row{base} slot {p} must be zero-weight fallback (norm={norm})"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Perf probe: fused `moe_route` vs the op-chain it replaced (softmax -> sort -> narrow -> renorm),
 /// bf16 logits [num_tokens, 128] top-8, across decode (small) -> prefill (large) token counts.
 /// Both include their output allocation (the real per-call cost). Run with:

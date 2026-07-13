@@ -58,11 +58,12 @@
       (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
       return {
         id: String(id),
-        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, spans: m.spans || [] })),
+        history: (body.messages || []).map((m) => ({ role: m.role, content: m.content, no_think: !!m.no_think, spans: m.spans || [], files: m.files || [] })),
         glue: body.glue || null,
         sectionContent,
         turnContent,
         targetLayer: body.target_layer || '',
+        uploads: body.uploads || [],
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },
@@ -209,6 +210,9 @@
     if (event === 'file_start' && handlers.onFileStart) handlers.onFileStart(obj.fileId, obj.name, obj.totalParts);
     else if (event === 'part' && handlers.onPart) handlers.onPart(obj.fileId, obj.partIndex, obj.totalParts);
     else if (event === 'file_done') { if (obj.meta) metas.push(obj.meta); if (handlers.onFileDone) handlers.onFileDone(obj.fileId, obj.meta); }
+    else if (event === 'file_rejected' && handlers.onFileRejected) handlers.onFileRejected(obj.name, obj.reason);
+    else if (event === 'phase' && handlers.onPhase) handlers.onPhase(obj.phase, obj.state, obj);
+    else if (event === 'stats' && handlers.onStats) handlers.onStats(obj);
   }
 
   // Parse one SSE frame: a named `status` event, or an OpenAI chunk / [DONE].

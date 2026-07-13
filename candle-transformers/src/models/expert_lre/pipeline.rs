@@ -612,7 +612,24 @@ impl PipelineState {
         let mut hits: Vec<(usize, usize)> = Vec::new();
         let mut to_load: Vec<(usize, usize)> = Vec::new(); // (expert_idx, slot_idx)
 
+        // Defence in depth: every index into the per-layer expert tables below
+        // assumes `expert_idx < n_experts`. A routing index at or past that
+        // bound (e.g. a degenerate-token sentinel that slipped through) would
+        // panic here and take down the whole expert-pipeline thread — after
+        // which every forward fails forever. Drop such ids and log instead:
+        // that token loses one expert (negligible) rather than bricking decode.
+        let n_experts = self.expert_locations[moe_idx].len();
+
         for &expert_idx in expert_ids {
+            if expert_idx >= n_experts {
+                tracing::warn!(
+                    moe_idx,
+                    expert_idx,
+                    n_experts,
+                    "classify_and_load: routing index out of range — dropping (would otherwise panic the pipeline)"
+                );
+                continue;
+            }
             if let Some(&slot_idx) = self.inner.key_to_slot.get(&(moe_idx, expert_idx)) {
                 if self.inner.slots[slot_idx].is_some() {
                     self.inner.promote(slot_idx);

@@ -1351,7 +1351,15 @@ impl Sequence {
     ///   the original decodes.
     ///
     /// Returns `Err(TurnInFlight)` if a turn is currently in progress.
-    pub fn insert_turn(&mut self, user_message: &str, assistant_text: &str) -> crate::Result<()> {
+    /// Prefill a complete user/assistant exchange with no decode. Returns the
+    /// number of tokens prefilled (the full formatted grid: `/no_think`
+    /// prefix + user + markers + assistant text) — callers surface it as the
+    /// "tokens ingested" metric for prefill-only ingests (repo map, code read).
+    pub fn insert_turn(
+        &mut self,
+        user_message: &str,
+        assistant_text: &str,
+    ) -> crate::Result<usize> {
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -1463,7 +1471,7 @@ impl Sequence {
 
         // Run the same post-Done finalize as a regular turn.
         self.finalize_turn_post_done(user_tt, asst_tt, response.seal.as_ref())?;
-        Ok(())
+        Ok(total)
     }
 
     /// Blocking convenience: submit + wait.

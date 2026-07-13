@@ -96,6 +96,8 @@ fn emit_file_turns<S: InsertTurnSink>(
     language: Language,
     scopes: &[Scope],
     bytes: &[u8],
+    mut on_prefill: impl FnMut(usize),
+    mut on_summary: impl FnMut(usize, std::time::Duration),
 ) -> anyhow::Result<()> {
     let line_offsets = compute_line_offsets(bytes);
     for scope in scopes {
@@ -106,11 +108,29 @@ fn emit_file_turns<S: InsertTurnSink>(
             header::render_tool_call(path, scope),
             header::render_tool_response(path, scope, language, &body),
         );
-        sink.insert_prefill_turn(&user, &assistant)?;
+        let tokens = sink.insert_prefill_turn(&user, &assistant)?;
+        // Report progress + tokens per part so a single-file ingest's bar moves
+        // as the file is read (not 0% → 100% at the end) and the "ingested
+        // tokens" stat ticks up live.
+        on_prefill(tokens);
     }
     let summary_prompt = header::render_file_summary_prompt(path);
-    sink.decode_summary_turn(&summary_prompt, header::FILE_SUMMARY_MAX_TOKENS)?;
+    let started = std::time::Instant::now();
+    let (_text, summary_tokens) =
+        sink.decode_summary_turn(&summary_prompt, header::FILE_SUMMARY_MAX_TOKENS)?;
+    // The summary decode is its own progress unit (see the `+ 1` in the ingest
+    // totals) — it's the slow tail of a file, so counting it keeps the bar from
+    // sitting at 100% while it still decodes. Its token count + wall-clock feed
+    // the upload's "summarized in Xs (@ t/s)" stat.
+    on_summary(summary_tokens, started.elapsed());
     Ok(())
+}
+
+/// Progress units one file contributes: one per carved scope (prefill) plus
+/// one for the whole-file summary decode. Keeps the `total` fed to
+/// [`LoadProgress`] in step with the [`emit_file_turns`] `on_part` callbacks.
+fn file_progress_units(scopes: &[Scope]) -> usize {
+    scopes.len() + 1
 }
 
 /// Sink-driven reference for the per-file `code_reading` ingest — carves
@@ -133,6 +153,10 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
     progress: &LoadProgress,
 ) -> anyhow::Result<(usize, CodeReadState)> {
     let (per_file, state) = carve_workspace(workspace, map);
+    // This test/reference path reports and RETURNS the part (scope) count, not
+    // the summary-inclusive progress unit — its callers assert one prefill turn
+    // per part. (The production ingest bar's per-part + summary accounting lives
+    // in `process_one_file`/`file_progress_units`.)
     let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
     tracing::info!(
         n_files = per_file.len(),
@@ -143,7 +167,15 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
 
     let mut done = 0usize;
     for (file, scopes, bytes, _fhash) in &per_file {
-        emit_file_turns(sink, &file.path, file.language, scopes, bytes)?;
+        emit_file_turns(
+            sink,
+            &file.path,
+            file.language,
+            scopes,
+            bytes,
+            |_tokens| {},
+            |_tokens, _elapsed| {},
+        )?;
         done += scopes.len();
         progress.set_step_progress(done as u64, total as u64);
     }
@@ -241,6 +273,108 @@ fn carve_workspace(
     (per_file, state)
 }
 
+/// Ingest ONLY `rel_paths` into the `code_reading` layer — the upload
+/// pipeline's read_file phase.
+///
+/// Unlike [`ingest_code_reading`] / [`refresh_code_reading`], this does **not**
+/// walk or reconcile the whole workspace: it carves and prefills just these
+/// files, dedupes against already-ingested identical content, and **never**
+/// tombstones anything. That matters for two reasons: (1) a full-workspace
+/// re-ingest triggered by one upload is a huge, GPU-overloading amount of work
+/// (and with `--skip-code-read` the empty prior state makes the refresh treat
+/// *every* file as new — the exact overload that killed the expert pipeline
+/// thread); (2) a partial file set fed to the workspace refresh would make
+/// `reconcile_deleted` tombstone the entire rest of the corpus. This path is
+/// bounded to the uploaded files' scopes and safe under `--skip-code-read`.
+///
+/// Files whose extension isn't a recognised code language are skipped (there is
+/// nothing to read). Returns the per-file content-hash state for the files that
+/// were ingested, to merge into the running [`CodeReadState`].
+pub fn ingest_files(
+    engine: &Mutex<ConversationEngine>,
+    proj_builder: &Builder,
+    workspace: &Path,
+    rel_paths: &[String],
+    config: SequenceConfig,
+    progress: &LoadProgress,
+) -> anyhow::Result<CodeReadState> {
+    // Build a minimal RepoMap for just these files — `carve_workspace` needs
+    // only the path + language; the other `FileEntry` fields are unused by the
+    // carve, so they're left at defaults.
+    let mut map = RepoMap::default();
+    for rel in rel_paths {
+        let norm = rel.replace('\\', "/");
+        let ext = norm.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let Some(language) = Language::from_extension(&ext) else {
+            continue; // not a recognised code language — nothing to read
+        };
+        map.files.push(FileEntry {
+            path: norm,
+            line_count: 0,
+            language,
+            size_bytes: 0,
+            module_hint: None,
+        });
+    }
+    if map.files.is_empty() {
+        return Ok(CodeReadState::default());
+    }
+
+    let layer = proj_builder
+        .id_for_layer("code_reading")
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'code_reading' layer"))?;
+    let group = proj_builder
+        .id_for_group("scopes")
+        .ok_or_else(|| anyhow::anyhow!("projection schema missing 'scopes' group"))?;
+    let system_prompt = layer_system_prompt(proj_builder, "code_reading", &config);
+    let utility_cfg = code_read_config(config);
+
+    let (per_file, state) = carve_workspace(workspace, &map);
+    let total: usize = per_file
+        .iter()
+        .map(|(_, s, _, _)| file_progress_units(s))
+        .sum();
+    progress.set_step_progress(0, total as u64);
+
+    // Dedup against already-ingested content so re-uploading identical bytes is
+    // a no-op — but NO `reconcile_deleted`: a partial file set must never
+    // tombstone the rest of the corpus.
+    let present_hashes = engine
+        .lock()
+        .unwrap()
+        .conversation_metadata_values("content_sha256");
+
+    run_file_pool(
+        engine,
+        proj_builder,
+        &system_prompt,
+        &utility_cfg,
+        layer,
+        group,
+        &per_file,
+        &present_hashes,
+        total,
+        progress,
+        parallelism(),
+    )?;
+    Ok(state)
+}
+
+/// Whether a workspace-relative `path` (with `/` separators) lives under the
+/// daemon's top-level `uploads/` dir. Matched on the FIRST segment only, and
+/// case-insensitively (the win32 FS is case-insensitive, so an existing
+/// `Uploads/` dir still resolves to the daemon's uploads dir) — so a nested
+/// `src/uploads/…` in a real project is NOT matched. Keeps `reconcile_deleted`
+/// in step with [`crate::repo_scan::walk_workspace`]'s uploads exclusion:
+/// uploads are endpoint-managed and deliberately absent from the walk, so they
+/// must never be tombstoned merely for being absent from `present_paths`.
+pub(crate) fn is_upload_path(path: &str) -> bool {
+    path.split('/')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("uploads")
+}
+
 /// Tombstone every live `code_read` conversation whose `path` is no longer
 /// present in `present_paths`. Covers files deleted while the daemon was
 /// down (the startup ingest only visits files that still exist) and files
@@ -250,6 +384,13 @@ fn carve_workspace(
 fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present_paths: &HashSet<&str>) {
     let e = engine.lock().unwrap();
     for (tl, path) in e.conversations_with_metadata_key("path") {
+        // Uploaded files live under the endpoint-managed `uploads/` dir, which
+        // `walk_workspace` deliberately skips — so they're always absent from
+        // `present_paths`. Never tombstone them here; that would delete
+        // freshly-uploaded content on the next workspace refresh.
+        if is_upload_path(&path) {
+            continue;
+        }
         if !present_paths.contains(path.as_str()) {
             if let Err(err) = e.tombstone_timeline(tl) {
                 tracing::warn!(
@@ -298,7 +439,10 @@ pub fn ingest_code_reading(
     let n_workers = parallelism();
 
     let (per_file, state) = carve_workspace(workspace, map);
-    let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
+    let total: usize = per_file
+        .iter()
+        .map(|(_, s, _, _)| file_progress_units(s))
+        .sum();
 
     // Retire conversations whose source file is gone, then snapshot the
     // surviving content hashes once for O(1) per-file resume-cache probes.
@@ -411,6 +555,11 @@ fn run_file_pool(
     if let Some(e) = first_error.into_inner().unwrap() {
         return Err(e);
     }
+    // Reconcile the final progress to exactly `total`. Workers store
+    // `set_step_progress` from their own `done` snapshot without a max, so
+    // under the pool the last stored value can settle a step short even though
+    // every unit ran; pin it to 100% now that the pool has fully drained.
+    progress.set_step_progress(total as u64, total as u64);
     tracing::info!(
         n_files = per_file.len(),
         n_decode_failures = decode_failures.load(Ordering::Relaxed),
@@ -446,7 +595,8 @@ fn process_one_file(
     // Resume cache: this content hash was already in the (live, non-
     // tombstoned) substrate at ingest start — skip the prefill+decode.
     if present_hashes.contains(file_hash) {
-        let done_now = done.fetch_add(scopes.len(), Ordering::Relaxed) + scopes.len();
+        let units = file_progress_units(scopes);
+        let done_now = done.fetch_add(units, Ordering::Relaxed) + units;
         progress.set_step_progress(done_now as u64, total as u64);
         tracing::debug!(
             target: "zend::code_read::ingest",
@@ -483,16 +633,47 @@ fn process_one_file(
         .map_err(|err| anyhow::anyhow!("code_reading conv create: {err}"))?
     };
 
-    // Shape the file's turns (per-part prefills + final summary decode).
+    // Shape the file's turns (per-part prefills + final summary decode),
+    // bumping shared progress after each part so the bar moves during the
+    // ingest (a single-file upload otherwise sits at 0% until the whole file
+    // completes).
+    // Count the progress units this file actually reported, so a tolerated
+    // failure can reconcile the rest (the per-part callbacks only fire for
+    // parts that completed).
+    let fired = std::cell::Cell::new(0usize);
     let emit_result = {
         let mut sink = SequenceTurnSink::new(&mut conv);
-        emit_file_turns(&mut sink, &file.path, file.language, scopes, bytes)
+        emit_file_turns(
+            &mut sink,
+            &file.path,
+            file.language,
+            scopes,
+            bytes,
+            |tokens| {
+                fired.set(fired.get() + 1);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                progress.set_step_progress(d as u64, total as u64);
+                progress.add_prefill_tokens(tokens as u64);
+            },
+            |tokens, elapsed| {
+                fired.set(fired.get() + 1);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                progress.set_step_progress(d as u64, total as u64);
+                progress.add_summary(tokens as u64, elapsed.as_millis() as u64);
+            },
+        )
     };
-    // Progress is per-file (the unit is now the file, not the scope).
-    let done_now = done.fetch_add(scopes.len(), Ordering::Relaxed) + scopes.len();
-    progress.set_step_progress(done_now as u64, total as u64);
 
     if let Err(e) = emit_result {
+        // Reconcile this file's progress share: the callbacks above only fired
+        // for parts that completed, so a tolerated failure below would leave
+        // `done` short of `total` and the bar never reaches 100%. Advance
+        // `done` by the units this file didn't get to report.
+        let missing = file_progress_units(scopes).saturating_sub(fired.get());
+        if missing > 0 {
+            let d = done.fetch_add(missing, Ordering::Relaxed) + missing;
+            progress.set_step_progress(d as u64, total as u64);
+        }
         // Prefill/decode failed. Do NOT tag the conversation: leaving it
         // untagged means the next run misses the resume cache and retries
         // this file (the stale partial is tombstoned by the path scan
@@ -590,7 +771,10 @@ pub fn refresh_code_reading(
     let system_prompt = layer_system_prompt(&ctx.proj_builder, "code_reading", &ctx.config);
     let utility_cfg = code_read_config(ctx.config.clone());
     let n_workers = parallelism();
-    let total: usize = per_file.iter().map(|(_, s, _, _)| s.len()).sum();
+    let total: usize = per_file
+        .iter()
+        .map(|(_, s, _, _)| file_progress_units(s))
+        .sum();
     progress.set_step_progress(0, total as u64);
 
     // Tombstone conversations for deleted files, then snapshot surviving
@@ -673,6 +857,20 @@ fn slice_lines(bytes: &[u8], offsets: &[usize], start_line: u32, end_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_upload_path_matches_top_level_uploads_only() {
+        // Top-level uploads/ (any case, since the win32 FS is case-insensitive).
+        assert!(is_upload_path("uploads"));
+        assert!(is_upload_path("uploads/notes.py"));
+        assert!(is_upload_path("Uploads/notes.py"));
+        assert!(is_upload_path("UPLOADS/a.rs"));
+        // NOT a nested source dir, nor a lookalike.
+        assert!(!is_upload_path("src/uploads/real.rs"));
+        assert!(!is_upload_path("uploadsx/a.py"));
+        assert!(!is_upload_path("docs/uploads.md"));
+        assert!(!is_upload_path("src/main.rs"));
+    }
 
     #[test]
     fn file_content_hash_deterministic_path_and_content_sensitive() {

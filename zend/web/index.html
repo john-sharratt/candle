@@ -87,6 +87,23 @@
   .zmd .zdots i { width: 7px; height: 7px; border-radius: 50%; background: #5a5652; display: inline-block; animation: zdot 1.3s ease-in-out infinite; }
   .zmd .zdots i:nth-child(2) { animation-delay: .22s; } .zmd .zdots i:nth-child(3) { animation-delay: .44s; }
   .zmd .zstatus { font-size: .82rem; color: #5a5652; font-style: italic; margin-left: .75rem; }
+  /* Selectable regions: chat content + file viewer opt back into text
+     selection (the global mousedown-preventDefault suppresses it on chrome). */
+  .z-selectable, .z-selectable * { -webkit-user-select: text; user-select: text; }
+  /* Per-turn copy button — hover-revealed in the turn's corner. */
+  .z-turn { position: relative; }
+  .z-turn-copy { position: absolute; top: -2px; display: inline-flex; align-items: center; gap: .3rem; font-size: .68rem; color: #7c736a; background: #26231f; border: 1px solid #38342f; border-radius: 6px; padding: .18rem .45rem; cursor: pointer; font-family: inherit; opacity: 0; transition: opacity .13s, color .13s, background .13s; user-select: none; }
+  .z-turn:hover .z-turn-copy { opacity: 1; }
+  .z-turn-copy:hover { color: #ece8e4; background: #2c2926; }
+  .z-turn-copy svg { width: 11px; height: 11px; }
+  /* File-viewer rendered content (markdown / table / code). */
+  .zfile-render { padding: 16px 20px; color: #d7cfc4; line-height: 1.7; font-size: .92rem; }
+  .zfile-render.zmd { padding: 16px 20px; }
+  .zfile-table { border-collapse: collapse; width: 100%; font-size: .82rem; font-family: ui-monospace,monospace; }
+  .zfile-table th, .zfile-table td { border: 1px solid #2e2b27; padding: .35rem .6rem; text-align: left; white-space: pre-wrap; word-break: break-word; }
+  .zfile-table th { background: #1e1b19; color: #cdbfae; font-weight: 650; }
+  .zfile-table tr:nth-child(even) td { background: #1a1816; }
+  .z-uptile:hover { border-color: #4a453f; background: #2c2926; }
   /* ── Ring spinner + loading card (startup overlay + in-chat waiting) ───── */
   @keyframes zspin { to { transform: rotate(360deg); } }
   .z-spin { width: 15px; height: 15px; border-radius: 50%; border: 2px solid #c98a3e; border-top-color: transparent; animation: zspin .9s linear infinite; flex-shrink: 0; box-sizing: border-box; }
@@ -129,6 +146,25 @@
   'use strict';
   const API = window.ZendAPI;
   const ACCENT = '#c98a3e';
+  // Executable / installer / auto-run file types that are never uploaded —
+  // kept in sync with the server's `BLOCKED_UPLOAD_EXTS` (conv_files.rs). The
+  // server is authoritative; this client-side block just fails fast with a
+  // clear message before any bytes leave the browser.
+  const BLOCKED_UPLOAD_EXTS = new Set([
+    'exe','dll','so','dylib','com','scr','pif','cpl','sys','drv','ocx','o','a','lib','bin','elf','out','ko',
+    'msi','msp','msc','cab','dmg','pkg','app','deb','rpm','apk','ipa','appx','appimage','gadget',
+    'bat','cmd','vbs','vbe','wsf','wsh','hta','jse','wsc','reg','lnk','scf','inf',
+    'jar','class',
+  ]);
+  function blockedUploadReason(name) {
+    // Trim trailing dots/spaces first — Windows strips them on the server side,
+    // so `payload.exe.` would materialise as `payload.exe`. Mirror of the
+    // authoritative server gate (conv_files::blocked_upload_reason).
+    const cleaned = String(name || '').replace(/[.\s]+$/, '');
+    const m = /\.([^.]+)$/.exec(cleaned);
+    if (m && BLOCKED_UPLOAD_EXTS.has(m[1].toLowerCase())) return 'executable, installer, and auto-run file types are not allowed';
+    return null;
+  }
   const PROJ_PALETTE = ['#c98a3e', '#6f9ed8', '#6cb39a', '#9b8fdf', '#d08a8a', '#cdb24a'];
   // Below this viewport width the left pane forces to its rail and the
   // projection timeline gutter is hidden, reclaiming horizontal space.
@@ -559,6 +595,9 @@
       const patch = { history: full.history || [] };
       if (full.title != null) patch.title = full.title;
       if (full.turn_count != null) patch.turn_count = full.turn_count;
+      // Recovered upload events hydrate the files pane (and the inline
+      // history tiles ride along in `history` as role:"upload" messages).
+      if (full.uploads) patch.files = full.uploads;
       S.conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, patch) : c);
       // Glue + section content are workspace-wide — store globally so the
       // projection panel renders the framing and expands sections with no fetch.
@@ -632,9 +671,16 @@
     S.conversations = S.conversations.map((c) => {
       if (c.id !== convId) return c;
       const history = c.history.slice();
-      const last = Object.assign({}, history[history.length - 1]);
+      // Patch the STREAMING message, not blindly the tail: an inline
+      // `role:"upload"` tile (or any event) can land on the tail mid-response
+      // — writing tokens into history[last] would then corrupt that event and
+      // freeze the visible stream. Fall back to the tail if none is streaming.
+      let idx = history.length - 1;
+      for (let i = history.length - 1; i >= 0; i--) { if (history[i] && history[i].streaming) { idx = i; break; } }
+      if (idx < 0) idx = history.length - 1;
+      const last = Object.assign({}, history[idx]);
       fn(last);
-      history[history.length - 1] = last;
+      history[idx] = last;
       return Object.assign({}, c, { history });
     });
     scheduleLiveUpdate(convId);
@@ -703,25 +749,114 @@
   function startUpload(fileList) {
     const conv = activeConv();
     if (!conv || !fileList.length) return;
+    const all = [].slice.call(fileList);
+    // Client-side malware gate: split off blocked types so no bytes leave the
+    // browser for them. They still appear in the modal as rejected rows so the
+    // user sees exactly what was refused and why. The server re-checks (it's
+    // authoritative) via the `file_rejected` event handled below.
+    const allowed = [], blockedItems = [];
+    all.forEach((f) => {
+      const reason = blockedUploadReason(f.name);
+      if (reason) blockedItems.push({ fileId: 'blk:' + f.name, name: f.name, totalParts: 0, part: 0, done: false, error: reason });
+      else allowed.push(f);
+    });
     // Pass the real File objects: the mock reads .name/.size; the live adapter
     // POSTs the bytes as multipart.
-    const items = [];
-    const handle = API.uploadFiles(conv.id, fileList, {
-      onFileStart: (fileId, name, totalParts) => { items.push({ fileId, name, totalParts, part: 0, done: false, error: null }); render(); },
-      onPart: (fileId, partIndex) => { const it = items.find((x) => x.fileId === fileId); if (it) it.part = partIndex + 1; render(); },
-      onFileDone: (fileId) => { const it = items.find((x) => x.fileId === fileId); if (it) { it.part = it.totalParts; it.done = true; } render(); },
-      onError: (fileId, message) => { const it = items.find((x) => x.fileId === fileId); if (it) it.error = message; render(); },
-      onAllDone: (metas) => {
-        S.conversations = S.conversations.map((c) => c.id === conv.id ? Object.assign({}, c, { files: (c.files || []).concat(metas) }) : c);
-        const lastId = metas.length ? metas[metas.length - 1].id : null;
-        setState({ upload: null, filesOpen: true, lastUploadedId: lastId }, () => {
-          requestAnimationFrame(() => { if (filesListEl) filesListEl.scrollTop = filesListEl.scrollHeight; });
-        });
-        clearTimeout(hlTimer);
-        hlTimer = setTimeout(() => setState({ lastUploadedId: null }), 2600);
-      },
-    });
-    setState({ upload: { items, handle }, dragActive: false });
+    const items = blockedItems.slice();
+    // The two engine-bound phases that run after the bytes land on disk. They
+    // stay 'pending' until the server emits their events. The display names
+    // live in buildUploadModal (the stage rows) — here we track only state.
+    const phases = [
+      { key: 'read_file', state: 'pending' },
+      { key: 'analysis', state: 'pending' },
+    ];
+    // Per-stage stats shown at the top of the modal, measured live as the
+    // upload advances through its stages:
+    //   upload    — bytes known client-side, timed from POST to phase-1 end.
+    //   ingest    — prefill token count streamed by the server (phase 2).
+    //   summarize — summary-decode tokens + server-measured decode ms.
+    // `*Ts` are start instants; `*Ms` freeze the elapsed once the stage ends.
+    const stats = {
+      bytes: allowed.reduce((a, f) => a + (f.size || 0), 0),
+      upTs: Date.now(), upMs: null,
+      inTs: null, inMs: null, inTok: 0, inCached: false,
+      sumTok: 0, sumMs: 0,
+    };
+    const stampUpload = () => { if (stats.upMs == null) stats.upMs = Date.now() - stats.upTs; };
+    // Final server-measured throughput (the `stats` SSE event), stamped onto
+    // the inline tiles so they render the "in Xs (X t/s, X MB/s)" line and the
+    // viewer shows the upload time. `null` until the pipeline reports it.
+    let finalStats = null;
+    const finish = (metas) => {
+      stampUpload();
+      if (metas && metas.length) {
+        // Stamp the measured throughput onto each tile's metadata (the server
+        // persisted the same onto the upload event, so a reload matches).
+        if (finalStats) metas.forEach((m) => { m.stats = finalStats; });
+        // Drop an inline `upload` event at the end of the live history so the
+        // tiles show immediately (the server persists the same event and
+        // replays it at this position on reload). The files pane is NOT opened
+        // — the inline tile is enough.
+        const evt = { role: 'upload', content: '', files: metas };
+        S.conversations = S.conversations.map((c) => c.id === conv.id
+          ? Object.assign({}, c, { files: (c.files || []).concat(metas), history: (c.history || []).concat([evt]) })
+          : c);
+      }
+      // The upload stream has ended (onAllDone). Any phase still 'running' will
+      // never get a 'done' event now (abnormal end — server closed mid-ingest,
+      // model unloaded, …), so mark it done rather than leaving the modal open
+      // with a frozen spinner. Keep the modal open ONLY if something was
+      // rejected, so the user can read the reason.
+      phases.forEach((p) => { if (p.state === 'running') p.state = 'done'; });
+      if (items.some((it) => it.error)) { render(); return; }
+      setState({ upload: null });
+    };
+    let handle = { cancel: () => {} };
+    if (allowed.length) {
+      handle = API.uploadFiles(conv.id, allowed, {
+        onFileStart: (fileId, name, totalParts) => { items.push({ fileId, name, totalParts, part: 0, done: false, error: null }); render(); },
+        onPart: (fileId, partIndex) => { const it = items.find((x) => x.fileId === fileId); if (it) it.part = partIndex + 1; render(); },
+        onFileDone: (fileId) => {
+          const it = items.find((x) => x.fileId === fileId);
+          if (it) { it.part = it.totalParts; it.done = true; }
+          // Phase 1 ends when every accepted file has landed — freeze upload time.
+          const acc = items.filter((x) => !x.error);
+          if (acc.length && acc.every((x) => x.done)) stampUpload();
+          render();
+        },
+        onError: (fileId, message) => { const it = items.find((x) => x.fileId === fileId); if (it) it.error = message; render(); },
+        onFileRejected: (name, reason) => { items.push({ fileId: 'srv:' + name, name: name, totalParts: 0, part: 0, done: false, error: reason }); render(); },
+        onPhase: (phase, state, extra) => {
+          const ph = phases.find((p) => p.key === phase);
+          if (ph) {
+            if (state === 'progress') { ph.state = 'running'; if (extra) { ph.current = extra.current; ph.total = extra.total; } }
+            else ph.state = (state === 'start') ? 'running' : 'done';
+          }
+          if (phase === 'read_file') {
+            if (state === 'start') { stampUpload(); if (stats.inTs == null) stats.inTs = Date.now(); }
+            if (extra) {
+              if (typeof extra.prefillTokens === 'number') stats.inTok = extra.prefillTokens;
+              if (typeof extra.summaryTokens === 'number') stats.sumTok = extra.summaryTokens;
+              if (typeof extra.summaryMs === 'number') stats.sumMs = extra.summaryMs;
+            }
+            if (state === 'done') {
+              if (stats.inMs == null && stats.inTs != null) stats.inMs = Date.now() - stats.inTs;
+              // ingested==true with zero prefilled tokens ⇒ the content was
+              // already in the substrate (content-hash dedup) — a legitimate
+              // no-op, shown as "already in substrate" rather than a blank stage.
+              stats.inCached = !!(extra && extra.ingested) && stats.inTok === 0;
+            }
+          }
+          render();
+        },
+        onStats: (s) => { finalStats = s; render(); },
+        onAllDone: finish,
+      });
+    } else {
+      // Everything was blocked client-side — nothing to send.
+      requestAnimationFrame(() => finish([]));
+    }
+    setState({ upload: { items, handle, phases, stats }, dragActive: false });
   }
   function cancelUpload() { if (S.upload && S.upload.handle) S.upload.handle.cancel(); setState({ upload: null }); }
 
@@ -986,9 +1121,14 @@
     });
     conv.history.forEach((m, idx) => {
       if (skipMsg[idx]) return;
+      if (m.role === 'upload') {
+        if (m.files && m.files.length) scroller.appendChild(buildUploadTiles(m.files));
+        return;
+      }
       if (m.role === 'user') {
-        scroller.appendChild(h('div', { style: 'display:flex; flex-direction:row-reverse; gap:0.85rem; margin-bottom:2rem; padding-left:3rem;' },
-          h('div', { style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content)));
+        scroller.appendChild(h('div', { class: 'z-turn z-selectable', style: 'display:flex; flex-direction:row-reverse; gap:0.85rem; margin-bottom:2rem; padding-left:3rem;' },
+          h('div', { style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content),
+          turnCopyBtn(m, 'right:0;')));
       } else {
         const open = !!S.thinkOpen[conv.id + ':' + idx];
         const zmd = h('div', { class: 'zmd', style: 'flex:1; min-width:0; word-break:break-word; line-height:1.7;', html: nodeHtml(m, open, toolOut[idx]) });
@@ -998,10 +1138,72 @@
         // needs it laid out. The live-stream path measures an already-attached
         // node, so it calls applyProjSegments synchronously.
         if (!S.narrow) applyProjSegments(zmd, m);
-        scroller.appendChild(h('div', { 'data-msg': idx, style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd));
+        scroller.appendChild(h('div', { 'data-msg': idx, class: 'z-turn z-selectable', style: 'display:flex; margin-bottom:2rem; padding-right:2rem;' }, zmd,
+          turnCopyBtn(m, 'right:2rem;')));
       }
     });
     return scroller;
+  }
+
+  // An inline row of file tiles for an `upload` history event — one tile per
+  // file, tiled left-aligned when several were dropped together. Clicking a
+  // tile opens the files pane and that specific file. The tile carries the
+  // file metadata (id/name/ext/kind/size/added) the viewer needs, so opening
+  // fetches the content by id like any files-pane click.
+  function buildUploadTiles(files) {
+    const tiles = files.map((f) => {
+      const cols = fileColors[f.kind] || fileColors.text;
+      return h('button', { class: 'z-uptile', title: 'Open ' + f.name,
+        // The inline tile is the entry point — clicking it opens the document
+        // viewer directly (the files side-pane stays closed).
+        onClick: () => openFile(f),
+        style: 'display:flex; align-items:center; gap:8px; max-width:240px; background:#26231f; border:1px solid #38342f; border-radius:9px; padding:7px 10px; cursor:pointer; font-family:inherit; text-align:left;' },
+        h('span', { style: 'flex-shrink:0; width:26px; height:26px; border-radius:6px; background:' + cols[1] + '; color:' + cols[0] + '; font-size:8.5px; font-weight:700; display:flex; align-items:center; justify-content:center; font-family:ui-monospace,monospace;' }, f.ext),
+        h('span', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; gap:1px;' },
+          h('span', { style: 'font-size:0.78rem; color:#ece8e4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, f.name),
+          h('span', { style: 'font-size:0.66rem; color:#7c736a; font-family:ui-monospace,monospace;' }, f.size || '')));
+    });
+    const row = h('div', { style: 'display:flex; flex-wrap:wrap; gap:8px; margin-bottom:5px; padding-right:2rem;' }, tiles);
+    // A single batch-level throughput line under the tiles when the pipeline
+    // measured it (persisted with the event, so it survives a reload).
+    const st = files.length ? files[0].stats : null;
+    const statText = uploadStatText(st);
+    const statLine = statText
+      ? h('div', { class: 'z-uptile-stat', style: 'font-size:0.68rem; color:#7c736a; font-family:ui-monospace,monospace; margin-bottom:2rem;' }, statText)
+      : h('div', { style: 'margin-bottom:2rem;' });
+    return h('div', {}, row, statLine);
+  }
+
+  // Compact one-line throughput summary for a persisted upload's stats — used
+  // both inline under the tiles and (expanded) in the file viewer. Empty string
+  // when no stats were measured.
+  function uploadStatText(st) {
+    if (!st) return '';
+    const bits = [];
+    const totalS = ((st.uploadMs || 0) + (st.ingestMs || 0)) / 1000;
+    if (totalS > 0) bits.push('in ' + totalS.toFixed(1) + 's');
+    const rates = [];
+    if (st.ingestTokens > 0 && st.ingestMs > 0) rates.push(Math.round(st.ingestTokens / (st.ingestMs / 1000)).toLocaleString() + ' t/s');
+    if (st.bytes > 0 && st.uploadMs > 0) rates.push(((st.bytes / 1e6) / (st.uploadMs / 1000)).toFixed(1) + ' MB/s');
+    return bits.join(' ') + (rates.length ? ' (' + rates.join(', ') + ')' : '');
+  }
+
+  // A hover-revealed "Copy" button for a whole turn (user or assistant),
+  // pinned to a corner of the turn row via `posStyle` (e.g. 'right:0;'). It
+  // copies the turn's raw text — the assistant's markdown source, not the
+  // rendered HTML — so pasted content stays plain and faithful. `msg` is the
+  // history entry (read at click time, so a turn copied mid-stream copies
+  // whatever has decoded so far, never a stale build-time snapshot).
+  function turnCopyBtn(msg, posStyle) {
+    const icon = '<svg viewBox="0 0 14 14" fill="none"><rect x="4.4" y="4.4" width="7.6" height="7.6" rx="1.3" stroke="currentColor" stroke-width="1.1"/><path d="M9.5 4.4V3.1A1.1 1.1 0 0 0 8.4 2H3.1A1.1 1.1 0 0 0 2 3.1v5.3A1.1 1.1 0 0 0 3.1 9.5h1.3" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    return h('button', { class: 'z-turn-copy', style: posStyle, title: 'Copy message',
+      onClick: (e) => {
+        e.stopPropagation();
+        try { navigator.clipboard.writeText(msg.content || ''); } catch (_) {}
+        const lbl = e.currentTarget.querySelector('span');
+        if (lbl) { lbl.textContent = 'Copied'; setTimeout(() => { lbl.textContent = 'Copy'; }, 1400); }
+      },
+      html: icon + '<span>Copy</span>' });
   }
 
   // The palette color a projection bar uses, keyed by its ORDER in the message
@@ -1266,23 +1468,128 @@
   // ── upload modal ─────────────────────────────────────────────────────────
   function buildUploadModal() {
     const items = S.upload.items;
-    const allDone = items.length && items.every((x) => x.done);
-    const rows = items.map((it) => {
-      const pct = it.totalParts ? Math.round((it.part / it.totalParts) * 100) : 0;
-      return h('div', { style: 'margin-bottom:0.85rem;' },
-        h('div', { style: 'display:flex; justify-content:space-between; font-size:0.8rem; color:#cfc8c0; margin-bottom:5px;' },
-          h('span', { style: 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, it.name),
-          h('span', { class: 'z-upstat', style: 'font-family:ui-monospace,monospace; font-size:0.72rem; color:' + (it.done ? '#6cb39a' : '#7c736a') + ';' }, it.error ? 'error' : (it.done ? '✓ done' : 'prefilling part ' + it.part + '/' + it.totalParts))),
-        h('div', { style: 'position:relative; height:8px; background:#161412; border:1px solid #2e2b27; border-radius:4px; overflow:hidden;' },
-          h('div', { class: 'z-upbar', style: 'position:absolute; top:0; bottom:0; left:0; width:' + pct + '%; background:' + (it.error ? '#e05555' : ACCENT) + '; transition:width .15s;' })));
-    });
-    const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(520px,95%); display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
+    const stats = S.upload.stats || null;
+    const phases = S.upload.phases || [];
+    const phasesRunning = phases.some((p) => p.state === 'running');
+    const settled = (x) => x.done || x.error;
+    const filesSettled = items.length && items.every(settled);
+    const allSettled = filesSettled && !phasesRunning;
+    const anyRejected = items.some((x) => x.error);
+    const hasAccepted = items.some((x) => !x.error);
+    const now = Date.now();
+    const nf = (n) => Math.round(n).toLocaleString();
+    const fx = (n, d) => n.toFixed(d);
+
+    // One glyph per stage: a check when done, a live spinner while running, an
+    // idle dot before it starts. The modal rebuilds every progress tick
+    // (~150ms), which recreates the spinner and would restart its CSS rotation
+    // from 0° (a visible jerk) — anchor `animation-delay` to the wall clock so
+    // consecutive rebuilds read as one continuous spin.
+    const spinDelay = -(now % 700);
+    const stepGlyph = (state) => state === 'done'
+      ? '<span style="color:#6cb39a;">✓</span>'
+      : (state === 'running'
+        ? '<span class="z-upspin" style="display:inline-block;width:11px;height:11px;border:1.5px solid #c98a3e;border-right-color:transparent;border-radius:50%;animation:zspin .7s linear infinite;animation-delay:' + spinDelay + 'ms;"></span>'
+        : '<span style="color:#5a5652;">•</span>');
+
+    // Each pipeline stage is ONE row: [glyph] name … [live metric], with a
+    // progress bar underneath only while it runs. The stage name carries the
+    // verb; the climbing count/rate rides on the right as a readout — so the
+    // number never reads as a fixed target being acted on.
+    const stageRow = (state, label, metric, barPct) => {
+      const running = state === 'running', done = state === 'done';
+      const col = done ? '#cfc8c0' : (running ? '#e2d9cd' : '#7c736a');
+      const bar = (running && barPct != null)
+        ? h('div', { style: 'position:relative; height:6px; margin:2px 0 4px 22px; background:#161412; border:1px solid #2e2b27; border-radius:4px; overflow:hidden;' },
+            h('div', { class: 'z-upbar', style: 'position:absolute; top:0; bottom:0; left:0; width:' + barPct + '%; background:' + ACCENT + '; transition:width .15s;' }))
+        : null;
+      return h('div', {},
+        h('div', { style: 'display:flex; align-items:center; gap:9px; padding:5px 0; font-size:0.8rem; color:' + col + ';' },
+          h('span', { style: 'width:13px; display:inline-flex; justify-content:center;', html: stepGlyph(state) }),
+          h('span', { style: 'flex:none;' }, label),
+          metric ? h('span', { class: 'z-upmetric', style: 'flex:1; text-align:right; font-family:ui-monospace,monospace; font-size:0.7rem; color:#7c736a; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, metric) : null),
+        bar);
+    };
+    // Build a "<qty> <unit>[ in Xs][ · rate]" metric, showing the rate only once
+    // enough time has elapsed to be meaningful (avoids a divide-by-near-zero
+    // spike on the first tick).
+    const metricOf = (qty, unit, doneMs, liveMs, rateUnit) => {
+      if (!(qty > 0)) return '';
+      const finished = doneMs != null;
+      const ms = finished ? doneMs : liveMs;
+      const rate = ms > 40 ? qty / (ms / 1000) : null;
+      return nf(qty) + ' ' + unit
+        + (finished ? ' in ' + fx(ms / 1000, 1) + 's' : '')
+        + (rate != null ? ' · ' + nf(rate) + ' ' + rateUnit : '');
+    };
+
+    const rf = phases.find((p) => p.key === 'read_file') || { state: 'pending' };
+    const an = phases.find((p) => p.key === 'analysis') || { state: 'pending' };
+
+    // Stage 1 — Upload (bytes over the wire). Bar aggregates every accepted
+    // file's parts; the MB metric is derived from the known byte total.
+    const upState = filesSettled ? 'done' : 'running';
+    let upMetric = '';
+    if (stats && stats.bytes > 0) {
+      const mb = stats.bytes / 1e6;
+      const ms = stats.upMs != null ? stats.upMs : (now - stats.upTs);
+      const rate = ms > 40 ? mb / (ms / 1000) : null;
+      upMetric = fx(mb, 2) + ' MB'
+        + (stats.upMs != null ? ' in ' + fx(ms / 1000, 1) + 's' : '')
+        + (rate != null ? ' · ' + fx(rate, 1) + ' MB/s' : '');
+    }
+    let upBar = null;
+    if (upState === 'running') {
+      const totP = items.reduce((a, it) => a + (it.error ? 0 : (it.totalParts || 0)), 0);
+      const donP = items.reduce((a, it) => a + (it.error ? 0 : (it.part || 0)), 0);
+      upBar = totP > 0 ? Math.round((donP / totP) * 100) : 0;
+    }
+
+    // Stage 2 — Read into the substrate (prefill). Bar + tokens/s from the
+    // read_file phase; Stage 3 — Summarize (decode), spinner only (the
+    // summariser drain is indeterminate), metric from the summary decode.
+    const inMetric = (stats && stats.inCached)
+      ? 'already in substrate'
+      : metricOf(stats ? stats.inTok : 0, 'tokens',
+        stats && stats.inMs != null ? stats.inMs : null,
+        stats && stats.inTs ? now - stats.inTs : 0, 't/s');
+    const inBar = rf.state === 'running' ? (rf.total > 0 ? Math.round((rf.current / rf.total) * 100) : 0) : null;
+    // Summary tokens/ms stream during phase 2, but the Summarize row maps to
+    // phase 3 — don't show its metric (or a "finished" reading) until that
+    // stage has actually started, or it reads as done before its glyph moves.
+    const sumMetric = an.state === 'pending' ? '' : metricOf(stats ? stats.sumTok : 0, 'tokens',
+      stats && stats.sumMs ? stats.sumMs : null, 0, 't/s');
+
+    const stageRows = [stageRow(upState, 'Upload', upMetric, upBar)];
+    if (hasAccepted) {
+      stageRows.push(stageRow(rf.state, 'Read into substrate', inMetric, inBar));
+      stageRows.push(stageRow(an.state, 'Summarize', sumMetric, null));
+    }
+
+    // Rejected files don't belong to a stage — list them compactly with their
+    // reason so the user sees exactly what was refused.
+    const rejectedRows = items.filter((x) => x.error).map((it) => h('div', { style: 'margin-top:8px;' },
+      h('div', { style: 'display:flex; justify-content:space-between; gap:8px; font-size:0.78rem;' },
+        h('span', { style: 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#cfc8c0;' }, it.name),
+        h('span', { class: 'z-upstat', style: 'flex:none; font-family:ui-monospace,monospace; font-size:0.72rem; color:#e0938a;' }, 'rejected')),
+      h('div', { style: 'margin-top:3px; font-size:0.72rem; color:#c78d84; line-height:1.4;' }, it.error)));
+
+    // Title names the file(s) being uploaded — one name, or "N files".
+    const named = items.filter((x) => !x.error);
+    const title = named.length === 1 ? named[0].name
+      : (named.length > 1 ? named.length + ' files'
+        : (anyRejected ? 'Upload blocked' : 'Upload'));
+
+    const body = stageRows.concat(rejectedRows.length
+      ? [h('div', { style: 'margin-top:10px; padding-top:10px; border-top:1px solid #2e2b27;' }, rejectedRows)]
+      : []);
+    const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(460px,95%); display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
       h('div', { style: 'padding:15px 17px; border-bottom:1px solid #2e2b27; display:flex; align-items:center; gap:10px;' },
         h('span', { html: '<svg viewBox="0 0 24 24" fill="none" style="width:18px;height:18px;color:#c98a3e;"><path d="M12 4v11M7 10l5 5 5-5M5 19h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>' }),
-        h('div', { class: 'z-uptitle', style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, allDone ? 'Upload complete' : 'Uploading — prefilling in parts')),
-      h('div', { style: 'padding:15px 17px;' }, rows.length ? rows : [h('div', { style: 'color:#7c736a; font-size:0.82rem;' }, 'Preparing…')]),
+        h('div', { class: 'z-uptitle', style: 'font-size:0.95rem; font-weight:650; color:#ece8e4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, title)),
+      h('div', { style: 'padding:13px 17px;' }, body),
       h('div', { style: 'padding:11px 17px 15px; display:flex; justify-content:flex-end;' },
-        h('button', { class: 'z-upcancel', onClick: cancelUpload, style: 'font-size:0.78rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:8px; padding:6px 14px; cursor:pointer; font-family:inherit;' }, 'Cancel')));
+        h('button', { class: 'z-upcancel', onClick: allSettled ? () => setState({ upload: null }) : cancelUpload, style: 'font-size:0.78rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:8px; padding:6px 14px; cursor:pointer; font-family:inherit;' }, allSettled ? 'Close' : 'Cancel')));
     return h('div', { class: 'z-modal-ov', style: 'position:fixed; inset:0; z-index:460; background:rgba(0,0,0,0.62); display:flex; align-items:center; justify-content:center; padding:40px;' }, modal);
   }
 
@@ -1363,19 +1670,80 @@
         gen + ' tokens in ' + secs.toFixed(1) + 's (' + Math.round(tps) + ' t/s)'));
   }
 
+  // Lowercased final extension of a filename, or '' if none.
+  function fileExt(name) {
+    const m = /\.([a-z0-9]+)$/i.exec(String(name || ''));
+    return m ? m[1].toLowerCase() : '';
+  }
+  // Parse one CSV/TSV row respecting `"`-quoted fields (doubled quotes escape).
+  function parseDelimLine(line, sep) {
+    const out = []; let cur = '', q = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) {
+        if (c === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+        else cur += c;
+      } else if (c === '"') q = true;
+      else if (c === sep) { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+    out.push(cur);
+    return out;
+  }
+  // Render the file body element by extension: markdown, JSON, CSV/TSV as a
+  // table, everything else as a monospace source view. The source view is the
+  // safe default — HTML and the like are shown as text, never executed.
+  function renderFileBody(fv) {
+    const content = fv.content || '';
+    const ext = fileExt(fv.name);
+    const mono = (text) => h('pre', { class: 'z-selectable', style: 'margin:0; padding:15px 17px; font-family:ui-monospace,monospace; font-size:12.5px; line-height:1.6; color:#cdbfae; white-space:pre; overflow-x:auto;' }, text);
+    if (fv.kind === 'img') {
+      return h('div', { style: 'display:flex; align-items:center; justify-content:center; min-height:280px; padding:40px;', html: '<div style="text-align:center; color:#5a5652;"><svg viewBox="0 0 24 24" fill="none" style="width:40px;height:40px;margin-bottom:10px;"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.4"/><circle cx="8.5" cy="9.5" r="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M5 18l5-5 4 3 2-2 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg><div style="font-size:0.82rem;">Image preview unavailable in this demo</div></div>' });
+    }
+    if (ext === 'md' || ext === 'markdown') {
+      return h('div', { class: 'zmd zfile-render z-selectable', html: renderMd(content) });
+    }
+    if (ext === 'json') {
+      let pretty = content;
+      try { pretty = JSON.stringify(JSON.parse(content), null, 2); } catch (_) {}
+      return mono(pretty);
+    }
+    if (ext === 'csv' || ext === 'tsv') {
+      const sep = ext === 'tsv' ? '\t' : ',';
+      const rows = content.replace(/\r\n/g, '\n').split('\n').filter((l) => l.length > 0);
+      if (rows.length) {
+        const cells = rows.map((r) => parseDelimLine(r, sep));
+        const table = h('table', { class: 'zfile-table' });
+        const thead = h('thead'); const htr = h('tr');
+        cells[0].forEach((c) => htr.appendChild(h('th', {}, c)));
+        thead.appendChild(htr); table.appendChild(thead);
+        const tbody = h('tbody');
+        for (let i = 1; i < cells.length; i++) {
+          const tr = h('tr');
+          cells[i].forEach((c) => tr.appendChild(h('td', {}, c)));
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        return h('div', { class: 'zfile-render z-selectable', style: 'padding:12px 14px; overflow-x:auto;' }, table);
+      }
+    }
+    return mono(content);
+  }
+
   function buildFileViewer() {
     const fv = S.fileView;
     const cols = fileColors[fv.kind] || fileColors.text;
-    const isImg = fv.kind === 'img';
-    const body = isImg
-      ? h('div', { style: 'display:flex; align-items:center; justify-content:center; min-height:280px; padding:40px;', html: '<div style="text-align:center; color:#5a5652;"><svg viewBox="0 0 24 24" fill="none" style="width:40px;height:40px;margin-bottom:10px;"><rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.4"/><circle cx="8.5" cy="9.5" r="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M5 18l5-5 4 3 2-2 3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg><div style="font-size:0.82rem;">Image preview unavailable in this demo</div></div>' })
-      : h('pre', { style: 'margin:0; padding:15px 17px; font-family:ui-monospace,monospace; font-size:12.5px; line-height:1.6; color:#cdbfae; white-space:pre;' }, fv.content || '');
+    const body = renderFileBody(fv);
     const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(820px,95%); max-height:86vh; display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
       h('div', { style: 'flex-shrink:0; display:flex; align-items:center; gap:11px; padding:14px 16px; border-bottom:1px solid #2e2b27;' },
         h('span', { style: 'flex-shrink:0; width:32px; height:32px; border-radius:7px; background:' + cols[1] + '; color:' + cols[0] + '; font-size:9.5px; font-weight:700; display:flex; align-items:center; justify-content:center; font-family:ui-monospace,monospace;' }, fv.ext),
         h('div', { style: 'flex:1; min-width:0;' },
           h('div', { style: 'font-size:0.92rem; font-weight:650; color:#ece8e4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, fv.name),
-          h('div', { style: 'font-size:0.71rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:2px;' }, fv.size + ' · ' + fv.added)),
+          h('div', { style: 'font-size:0.71rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:2px;' }, fv.size + ' · ' + fv.added),
+          // Measured upload throughput (when this file came in through the
+          // upload pipeline and its stats were persisted) — placed right under
+          // the size/time line as a subtle accent note.
+          (fv.stats && uploadStatText(fv.stats)) ? h('div', { style: 'font-size:0.7rem; color:#c98a3e; font-family:ui-monospace,monospace; margin-top:3px;' }, 'Uploaded ' + uploadStatText(fv.stats)) : null),
         h('button', { onClick: () => deleteFile(fv), title: 'Delete file', style: 'flex-shrink:0; display:flex; align-items:center; gap:5px; font-size:0.74rem; color:#b8867f; background:rgba(200,80,80,0.07); border:1px solid rgba(200,80,80,0.2); border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M2.5 3.5h9M5 3.5V2.3h4v1.2M5.6 6v4M8.4 6v4M3.4 3.5l.5 8h6.2l.5-8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Delete</span>' }),
         h('button', { onClick: () => downloadFile(fv), title: 'Download', style: 'flex-shrink:0; display:flex; align-items:center; gap:5px; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M7 1.5v7M4 6l3 3 3-3M2.5 11.5h9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Download</span>' }),
         h('button', { onClick: copyFileView, style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy'),
@@ -1888,9 +2256,14 @@
     else if (S.substrateOpen) setState({ substrateOpen: false });
     else if (S.filesOpen) setState({ filesOpen: false });
   });
+  // Keep focus in the composer when clicking inert chrome, but NEVER
+  // suppress the default on interactive controls or on selectable text —
+  // `preventDefault` on mousedown cancels the browser's text selection, so
+  // suppressing it everywhere made chat/file content impossible to select
+  // and copy.
   document.addEventListener('mousedown', (e) => {
     const t = e.target;
-    if (t && t.closest && t.closest('textarea, input, select, [contenteditable], button, a, label, [data-act]')) return;
+    if (t && t.closest && t.closest('textarea, input, select, [contenteditable], button, a, label, [data-act], .z-selectable')) return;
     e.preventDefault();
   });
   document.addEventListener('click', (e) => {

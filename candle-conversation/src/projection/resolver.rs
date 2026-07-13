@@ -834,6 +834,18 @@ impl Conversation {
         self.read().pending_summary_len(timeline)
     }
 
+    /// Total summariser backlog across every timeline — each timeline's
+    /// pending-summary queue length plus one for a timeline still flagged
+    /// `needs_reconcile` (a leaf sealed but its parent summary not yet
+    /// built). `0` means the summariser is fully drained everywhere. Used
+    /// to wait out an upload's analysis phase.
+    pub fn total_pending_summaries(&self) -> usize {
+        let g = self.read();
+        g.all_timeline_ids()
+            .map(|tl| g.pending_summary_len(tl) + usize::from(g.needs_reconcile(tl)))
+            .sum()
+    }
+
     /// Most recent score-density [`SelectionDiagnostics`] for
     /// `timeline`, or `None` if no projection has run yet (or the
     /// projection used the rule-based path).  Pure test-harness

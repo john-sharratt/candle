@@ -46,6 +46,7 @@ pub fn spawn(
     on_refresh: Arc<dyn Fn() + Send + Sync + 'static>,
 ) -> anyhow::Result<RecommendedWatcher> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let root = workspace.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |res: NotifyResult<Event>| {
         let Ok(event) = res else {
             return;
@@ -56,8 +57,14 @@ pub fn spawn(
         // Drop events confined to ignored directories. Critically this includes
         // the daemon's OWN `.substrate/` redo-log writes — without this filter,
         // persistence I/O continuously self-triggers a workspace refresh (a
-        // feedback loop) — plus build/VCS churn that never affects source.
-        if !event.paths.is_empty() && event.paths.iter().all(|p| is_ignored_path(p)) {
+        // feedback loop) — plus build/VCS churn that never affects source, and
+        // the endpoint-managed top-level `uploads/` dir (see `is_top_level_uploads`).
+        if !event.paths.is_empty()
+            && event
+                .paths
+                .iter()
+                .all(|p| is_ignored_path(p) || is_top_level_uploads(p, &root))
+        {
             return;
         }
         let _ = tx.send(());
@@ -97,6 +104,12 @@ pub fn spawn(
 /// daemon's own substrate store (self-trigger feedback), the build output, or
 /// the VCS / dependency dirs. Matched on any path component so it catches the
 /// dir itself and everything beneath it.
+///
+/// The top-level `uploads/` dir is handled separately by [`is_top_level_uploads`]
+/// (a root-relative, first-component match) rather than here — an any-component
+/// match would also suppress a legitimate nested `src/uploads/` source dir,
+/// diverging from [`crate::repo_scan::walk_workspace`], which excludes only the
+/// top-level dir.
 fn is_ignored_path(path: &Path) -> bool {
     path.components().any(|c| {
         matches!(
@@ -104,6 +117,21 @@ fn is_ignored_path(path: &Path) -> bool {
             Some(".substrate") | Some(".git") | Some("target") | Some("node_modules")
         )
     })
+}
+
+/// Whether `path` is under the daemon's TOP-LEVEL `uploads/` dir (first
+/// component of the workspace-relative path, case-insensitively — the win32 FS
+/// is case-insensitive). Uploaded files are ingested (and measured) exclusively
+/// by the upload endpoint; a watcher-driven background refresh would race it and
+/// make the endpoint's measured read_file stage cache-hit ("instant, 0 tokens").
+/// Matched precisely so a nested `src/uploads/` source dir keeps its watch —
+/// mirroring `walk_workspace`'s exclusion so the two never disagree.
+fn is_top_level_uploads(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("uploads"))
 }
 
 fn is_refresh_relevant(kind: &EventKind) -> bool {
@@ -189,5 +217,43 @@ mod tests {
             AccessMode::Read
         ))));
         assert!(!is_refresh_relevant(&EventKind::Access(AccessKind::Read)));
+    }
+
+    #[test]
+    fn ignores_daemon_managed_and_noise_dirs() {
+        for p in [
+            "ws/.substrate/substrate.log",
+            "ws/.git/index",
+            "ws/target/debug/x",
+            "ws/node_modules/pkg/i.js",
+        ] {
+            assert!(is_ignored_path(Path::new(p)), "should ignore {p}");
+        }
+        // Ordinary source files still trigger refreshes — and `uploads` is NOT
+        // matched by is_ignored_path (it's a root-relative check, below).
+        for p in ["ws/src/main.rs", "ws/docs/readme.md", "ws/lib/x.py"] {
+            assert!(!is_ignored_path(Path::new(p)), "should watch {p}");
+        }
+        assert!(!is_ignored_path(Path::new("ws/src/uploads/real.rs")));
+    }
+
+    #[test]
+    fn top_level_uploads_is_excluded_precisely() {
+        let root = Path::new("ws");
+        // The daemon's top-level uploads dir (any case) — endpoint-managed.
+        assert!(is_top_level_uploads(Path::new("ws/uploads/notes.py"), root));
+        assert!(is_top_level_uploads(
+            Path::new("ws/uploads/nested/a.rs"),
+            root
+        ));
+        assert!(is_top_level_uploads(Path::new("ws/Uploads/notes.py"), root));
+        // A nested `src/uploads/` in a real project keeps its watch.
+        assert!(!is_top_level_uploads(
+            Path::new("ws/src/uploads/real.rs"),
+            root
+        ));
+        assert!(!is_top_level_uploads(Path::new("ws/src/main.rs"), root));
+        // Path outside the root → not matched (no strip_prefix).
+        assert!(!is_top_level_uploads(Path::new("other/uploads/a"), root));
     }
 }

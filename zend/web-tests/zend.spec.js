@@ -84,6 +84,24 @@ test.describe('1.2 chat rendering', () => {
     await page.locator('.copy-btn').first().click();
     await expect(page.locator('.copy-btn').first()).toHaveText(/Copied/);
   });
+  test('per-turn copy button copies the whole turn', async ({ page }) => {
+    await boot(page);
+    const btn = page.locator('.z-turn-copy').first();
+    await btn.click();
+    await expect(btn.locator('span')).toHaveText('Copied');
+  });
+  test('chat turns are text-selectable (not preventDefault-blocked)', async ({ page }) => {
+    await boot(page);
+    // The global mousedown handler must not cancel selection inside a turn.
+    const blocked = await page.evaluate(() => {
+      const turn = document.querySelector('.z-turn.z-selectable');
+      if (!turn) return 'no turn';
+      const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+      turn.dispatchEvent(ev);
+      return ev.defaultPrevented;   // false => selection is allowed
+    });
+    expect(blocked).toBe(false);
+  });
 });
 
 test.describe('1.3 streaming', () => {
@@ -167,17 +185,68 @@ test.describe('1.8 files + upload', () => {
   test('files pane lists seeded files; viewer opens', async ({ page }) => {
     await boot(page);
     await page.getByTitle('Conversation files').click();
-    await expect(page.locator('.z-file-row')).toHaveCount(4);
+    await expect(page.locator('.z-file-row')).toHaveCount(6);
     await page.locator('.z-file-row').first().click();
     await expect(page.getByText('Download')).toBeVisible();
   });
 
-  test('drag-drop shows the upload modal with a per-part bar, then completes', async ({ page }) => {
+  test('markdown file renders as markdown; csv as a table', async ({ page }) => {
+    await boot(page);
+    await page.getByTitle('Conversation files').click();
+    await page.getByText('substrate-schema.md').click();
+    // The .md body renders through the markdown pipeline (heading element),
+    // not as a raw <pre>.
+    await expect(page.locator('.zfile-render.zmd h1')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await page.getByText('bench.csv').click();
+    await expect(page.locator('table.zfile-table thead th').first()).toHaveText('shape');
+    // The quoted field with an embedded comma stays one cell.
+    await expect(page.locator('table.zfile-table td', { hasText: 'q512_f16, prefix4k' })).toBeVisible();
+  });
+
+  test('executable uploads are blocked with a reason, never stored', async ({ page }) => {
+    await boot(page);
+    await dropFiles(page, [{ name: 'malware.exe', content: 'MZ...' }]);
+    // The modal shows the rejected row + reason; the file is never admitted.
+    await expect(page.getByText(/executable, installer, and auto-run/)).toBeVisible();
+    await expect(page.locator('.z-upstat', { hasText: 'rejected' })).toBeVisible();
+    await page.getByRole('button', { name: 'Close' }).click();
+    await page.getByTitle('Conversation files').click();
+    await expect(page.getByText('malware.exe')).toHaveCount(0);
+  });
+
+  test('uploaded file appears inline in history and opens on click', async ({ page }) => {
+    await boot(page);
+    await dropFiles(page, [{ name: 'inline-demo.py', content: 'print("hi")\n' }]);
+    // Wait out the modal (upload + phases), then the inline tile shows in chat.
+    await expect(page.locator('.z-upbar')).toHaveCount(0, { timeout: 10000 });
+    const tile = page.locator('.z-uptile', { hasText: 'inline-demo.py' });
+    await expect(tile).toBeVisible();
+    // The persisted throughput renders as an inline stat line under the tiles.
+    await expect(page.locator('.z-uptile-stat').filter({ hasText: 't/s' })).toBeVisible();
+    // Clicking the tile opens the document viewer directly (files pane stays
+    // closed); the viewer places the measured upload time in its header.
+    await tile.click();
+    await expect(page.getByText('Download')).toBeVisible();
+    await expect(page.getByText(/Uploaded in/)).toBeVisible();
+  });
+
+  test('drag-drop runs the three stages (upload, read, summarize), then completes', async ({ page }) => {
     await boot(page);
     await dropFiles(page, [{ name: 'notes.py', content: 'print(1)\n'.repeat(400) }]);
-    await expect(page.getByText(/Uploading|prefilling/)).toBeVisible();
+    // The modal is titled by the file; the pipeline shows one row per stage.
+    await expect(page.locator('.z-uptitle', { hasText: 'notes.py' })).toBeVisible();
+    await expect(page.getByText('Upload', { exact: true })).toBeVisible();
     await expect(page.locator('.z-upbar')).toBeVisible();
-    // completes -> modal closes, files pane opens
+    // Stages 2 + 3 appear as their own rows once the engine phases run.
+    await expect(page.getByText('Read into substrate')).toBeVisible();
+    await expect(page.getByText('Summarize', { exact: true })).toBeVisible();
+    // Each stage's metric rides inline on its row: upload MB/s, and token
+    // counts with t/s for the read + summarize stages (measured live).
+    await expect(page.locator('.z-upmetric').filter({ hasText: 'MB/s' })).toBeVisible();
+    await expect(page.locator('.z-upmetric').filter({ hasText: 'tokens' }).first()).toBeVisible();
+    await expect(page.locator('.z-upmetric').filter({ hasText: 't/s' }).first()).toBeVisible();
+    // completes -> running bars gone, modal closes, tile shows in chat
     await expect(page.locator('.z-upbar')).toHaveCount(0, { timeout: 10000 });
     await expect(page.getByText('notes.py')).toBeVisible();
   });
