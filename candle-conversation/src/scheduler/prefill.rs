@@ -34,7 +34,13 @@ impl Scheduler {
     /// `PrefillProgress(0, total)` events so callers see their submission
     /// was picked up.
     pub(super) fn promote_new_prefills(&mut self) {
-        const MAX_ACTIVE_PREFILLS: usize = 16;
+        // Width of the ragged-batched prefill forward — how many in-flight
+        // prefills coalesce into one forward. Matched to `code_read`'s worker
+        // count (`CODE_READ_PARALLELISM = 24`) so a burst of small parallel
+        // scopes fills a wide, expert-load-amortising forward. Affordable now
+        // that the rolling window bounds each scope's KV; VRAM-pressure
+        // backpressure (below) still throttles when the working set is too big.
+        const MAX_ACTIVE_PREFILLS: usize = 24;
         while self.active_prefills.len() < MAX_ACTIVE_PREFILLS {
             // VRAM-pressure backpressure (wave budgeting). Each admitted prefill
             // pins its conversation's KV in VRAM, so under pressure we stop

@@ -21,7 +21,6 @@
 //! wave-batched grouped GEMM coalesces work across the concurrent
 //! sessions, and the resolver's `active_timelines_for_group` iterator
 //! surfaces all of them to dialogue retrieval without code changes.
-//! Override the worker count with `ZEND_CODE_READ_PARALLELISM`.
 
 pub mod carve;
 pub mod header;
@@ -197,18 +196,15 @@ pub const MAX_DECODE_FAILURES: usize = 16;
 /// these concurrent sessions, so the effective decode rate scales
 /// near-linearly until the model's expert-cache hot set saturates.
 ///
-/// Default is 16 — matched to the scheduler's prefill admission cap
-/// (`MAX_ACTIVE_PREFILLS = 16`). Ingest is prefill-bound, and the scheduler only
-/// ever has 16 prefills in flight, so workers beyond 16 cannot add prefill
-/// throughput — they just queue while still pinning their per-file conversation
-/// KV in VRAM and running per-turn post-processing on their own thread (extra
-/// CPU contention). Matching the two keeps the live working set and the
-/// per-insert CPU load bounded while keeping the prefill pipe full. Raise it via
-/// `ZEND_CODE_READ_PARALLELISM` to lean on the VRAM-pressure backpressure path:
-/// the admission gate stops promoting new prefills + force-compacts under
-/// pressure, and the per-arena VRAM budget (`CANDLE_KV_VRAM_RESERVE_MB`) fails
-/// fast + compacts rather than letting the driver page KV to host memory.
-pub const CODE_READ_PARALLELISM: usize = 16;
+/// 24 — matched to the scheduler's prefill admission cap
+/// (`MAX_ACTIVE_PREFILLS`). Ingest is prefill-bound and the scheduler ragged-
+/// batches all in-flight prefills into one forward, so this is the width of the
+/// batched prefill. Raised from 16 now that the rolling-window ingest
+/// (`CODE_READ_WINDOW_TURNS`) bounds each scope's attended KV — the smaller
+/// per-scope working set leaves room for more concurrent scopes, which is what
+/// lets a burst of small scopes accumulate into a large amortising forward
+/// (design `docs/unified_wave_inference_engine.md`).
+pub const CODE_READ_PARALLELISM: usize = 24;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
 /// (no reprojection), inheriting the utility C5 compression level.
@@ -219,15 +215,9 @@ fn code_read_config(config: SequenceConfig) -> SequenceConfig {
     utility_config(config)
 }
 
-/// Resolve the worker count for the parallel ingest.  Reads
-/// `ZEND_CODE_READ_PARALLELISM` if set and parseable, otherwise
-/// returns [`CODE_READ_PARALLELISM`].  Clamped to `[1, 256]`.
+/// Worker count for the parallel ingest — [`CODE_READ_PARALLELISM`].
 fn parallelism() -> usize {
-    std::env::var("ZEND_CODE_READ_PARALLELISM")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, 256))
-        .unwrap_or(CODE_READ_PARALLELISM)
+    CODE_READ_PARALLELISM
 }
 
 /// Per-file content hash (path-qualified) — the conversation's
@@ -483,6 +473,56 @@ pub fn ingest_code_reading(
     )?;
 
     Ok(state)
+}
+
+/// Fair, fully-parallel dispatch cursor over per-file scope work for the
+/// ingest pool. Each file is split into scope work units; the 24 workers
+/// (`CODE_READ_PARALLELISM`) pull scopes from here so that:
+///
+/// * **every file makes progress fairly** — a file with many scopes never
+///   starves the others; and
+/// * **a single file with many scopes saturates ALL workers** — maximum
+///   parallelism when there's nothing to be fair between.
+///
+/// Fairness is max-min: each [`Self::next`] hands out the next scope of the file
+/// that has been dispatched the fewest so far (ties by file order), so dispatch
+/// spreads evenly across files while collapsing to one file when only one has
+/// work. Pure over its `(file, scope)` index space → unit-testable; the pool
+/// wraps it in a `Mutex` and each worker prefills the scope it's handed.
+///
+/// Consumed by the scheduler-side parallel-scope ingest (the fork → parallel
+/// prefill → snapshot → `record_turn`-into-the-shared-timeline op, modelled on
+/// the summariser's compression seal). Kept here — tested — as that build's
+/// dispatch policy.
+#[allow(dead_code)]
+struct FairScopeCursor {
+    /// Per file: `(dispatched_so_far, total_scopes)`.
+    files: Vec<(usize, usize)>,
+}
+
+#[allow(dead_code)]
+impl FairScopeCursor {
+    fn new(scope_counts: &[usize]) -> Self {
+        Self {
+            files: scope_counts.iter().map(|&n| (0, n)).collect(),
+        }
+    }
+
+    /// Next `(file_idx, scope_idx)` to prefill, chosen fairly. `None` once every
+    /// scope of every file has been dispatched.
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let pick = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, (done, total))| done < total)
+            .min_by_key(|(i, (done, _))| (*done, *i))
+            .map(|(i, _)| i)?;
+        let (done, _) = &mut self.files[pick];
+        let scope_idx = *done;
+        *done += 1;
+        Some((pick, scope_idx))
+    }
 }
 
 /// Drive a bounded worker pool over `per_file`: each worker pulls the
@@ -857,6 +897,45 @@ fn slice_lines(bytes: &[u8], offsets: &[usize], start_line: u32, end_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drain the cursor into the full dispatch order.
+    fn drain(counts: &[usize]) -> Vec<(usize, usize)> {
+        let mut c = FairScopeCursor::new(counts);
+        let mut out = Vec::new();
+        while let Some(x) = c.next() {
+            out.push(x);
+        }
+        out
+    }
+
+    #[test]
+    fn fair_cursor_single_file_uses_all_parallelism() {
+        // One file with many scopes → every worker draws from it, in order.
+        assert_eq!(drain(&[5]), vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]);
+    }
+
+    #[test]
+    fn fair_cursor_interleaves_files_evenly() {
+        // Equal files → round-robin so all progress together.
+        assert_eq!(
+            drain(&[3, 3]),
+            vec![(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]
+        );
+        assert_eq!(
+            drain(&[2, 2, 2]),
+            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
+        );
+    }
+
+    #[test]
+    fn fair_cursor_small_file_is_not_starved() {
+        // A 1-scope file gets its go immediately, then the big file drains — no
+        // starvation, and total dispatch count is exact.
+        assert_eq!(drain(&[1, 4]), vec![(0, 0), (1, 0), (1, 1), (1, 2), (1, 3)]);
+        // Empty files contribute nothing; overall count is Σ scopes.
+        assert_eq!(drain(&[0, 2, 0, 1]).len(), 3);
+        assert_eq!(drain(&[]), Vec::<(usize, usize)>::new());
+    }
 
     #[test]
     fn is_upload_path_matches_top_level_uploads_only() {
