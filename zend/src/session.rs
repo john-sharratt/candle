@@ -1070,7 +1070,8 @@ impl InferenceState {
         // each turn only pays a cheap `Arc` clone instead of re-cloning the
         // ~93-section schema (see `ModeBuilders`).
         let mode_builders =
-            ModeBuilders::build(&proj_builder_refresh, &crate::tools::safe_tool_names());
+            ModeBuilders::build(&proj_builder_refresh, &crate::tools::safe_tool_names())
+                .map_err(|e| anyhow::anyhow!("tools-mode projection builders: {e}"))?;
         let think_closer_phrase = tokenizer
             .encode(THINK_CLOSER_PHRASE, false)
             .map(|e| e.get_ids().to_vec())
@@ -1227,8 +1228,8 @@ fn build_mode_builder(
     match mode {
         ToolMode::Comprehensive => {}
         ToolMode::Restricted => {
-            // Drop the high-risk tools; the `tool_summary` overview (sealed on the
-            // base builder, in the K/V chain) rides along unchanged.
+            // Drop the high-risk tools; the summary association below points this
+            // mode at the restricted catalog listing.
             b.retain_collection_sections(dialogue, "tools", safe_tool_names)
                 .map_err(|e| anyhow::anyhow!("restricted tools projection: {e}"))?;
         }
@@ -1237,13 +1238,35 @@ fn build_mode_builder(
                 .map_err(|e| anyhow::anyhow!("none tools projection: {e}"))?;
         }
     }
+    // Associate the sealed tool-catalog summary (built by `build_tool_summary`,
+    // prefilled into its reserved section at startup) with the `tools` collection,
+    // so projection emits the FULL tool-name listing just before the selected
+    // subset. Without this the catalog K/V is sealed but orphaned — the model only
+    // ever sees the 1-3 provenance-selected tools and concludes a tool it can't see
+    // (e.g. `datetime` on a "what is the time?" turn) doesn't exist. The projection
+    // emits it whenever the selection is a proper subset (§ `record` in
+    // `emit_system_prompt_items`), which for a 93-tool catalog is every turn.
+    // `None` mode has no tools block, so no summary.
+    let summary = match mode {
+        ToolMode::Comprehensive => Some(Reserved::ToolSummary),
+        ToolMode::Restricted => Some(Reserved::ToolSummaryRestricted),
+        ToolMode::None => None,
+    };
+    if let Some(reserved) = summary {
+        let tools = b.id_for_collection_in(dialogue, "tools").ok_or_else(|| {
+            anyhow::anyhow!("projection schema missing 'tools' collection in dialogue layer")
+        })?;
+        b.set_collection_summary_section(dialogue, tools, SectionId::reserved(reserved))
+            .map_err(|e| anyhow::anyhow!("tool summary association ({mode:?}): {e}"))?;
+    }
     Ok(Arc::new(b))
 }
 
 /// The three per-tools-mode projection builders, built once at startup so each
 /// turn hands out a cheap `Arc` clone instead of re-cloning the ~93-section
-/// schema. A mode whose build fails falls back to the comprehensive builder so
-/// the daemon still starts.
+/// schema. Restricted / None fall back to the comprehensive builder if their
+/// section-retain fails, so the daemon still starts; Comprehensive is fatal (see
+/// [`ModeBuilders::build`]).
 struct ModeBuilders {
     none: Arc<Builder>,
     restricted: Arc<Builder>,
@@ -1251,8 +1274,13 @@ struct ModeBuilders {
 }
 
 impl ModeBuilders {
-    fn build(base: &Builder, safe_tool_names: &HashSet<String>) -> Self {
-        let comprehensive = Arc::new(base.clone());
+    fn build(base: &Builder, safe_tool_names: &HashSet<String>) -> anyhow::Result<Self> {
+        // Comprehensive is the default mode and has no better fallback than itself:
+        // a `base.clone()` here would silently re-orphan the tool-catalog summary
+        // (the exact bug `build_mode_builder`'s association fixes), so a failure —
+        // only reachable via a missing dialogue layer / `tools` collection, i.e. a
+        // broken schema the daemon can't serve anyway — is fatal.
+        let comprehensive = build_mode_builder(base, safe_tool_names, ToolMode::Comprehensive)?;
         let restricted = match build_mode_builder(base, safe_tool_names, ToolMode::Restricted) {
             Ok(b) => b,
             Err(e) => {
@@ -1267,11 +1295,11 @@ impl ModeBuilders {
                 Arc::clone(&comprehensive)
             }
         };
-        Self {
+        Ok(Self {
             none,
             restricted,
             comprehensive,
-        }
+        })
     }
 
     /// The prebuilt projection for `mode` (a cheap `Arc` clone).
@@ -2157,9 +2185,12 @@ impl ZendSession {
 
     /// Enable or disable AVL summarisation for `conv_id`'s timeline. Only takes
     /// effect once the timeline exists (i.e. after its first turn has been
-    /// submitted). Returns `None` if the model isn't loaded. Called by the
-    /// CUDA-gated `duplication_replay` control to isolate whether the async
-    /// summariser's concurrent activity influences a conversation's decode.
+    /// submitted). Returns `None` if the model isn't loaded. Exercised only by the
+    /// CUDA-gated `duplication_replay` integration test (via the `zend` lib), to
+    /// isolate whether the async summariser's concurrent activity influences a
+    /// conversation's decode — so the `zend` *binary* never calls it and its copy
+    /// of this module reads as dead; the lib copy the test links is public API.
+    #[allow(dead_code)]
     pub fn set_conversation_summarize(&self, conv_id: &str, summarize: bool) -> Option<()> {
         let state = self.inference.read().unwrap().as_ref().map(Arc::clone)?;
         let timeline = timeline_for(conv_id);

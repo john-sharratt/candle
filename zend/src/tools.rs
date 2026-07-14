@@ -119,9 +119,12 @@ pub fn install_tool_catalog(
             .map_err(|e| anyhow::anyhow!("add_section_to_collection({}): {}", tool.name, e))?;
         out.push((tool.name.to_string(), id, json_line));
     }
-    // The tool-catalog overview is the `tool_summary` tree section (a real link
-    // in the K/V chain, sealed before `<tools>`), not a separately-injected
-    // reserved section — so no summary association is needed on the collection.
+    // This function only lays down the per-tool sections. The tool-catalog
+    // *overview* is sealed separately into the `ToolSummary` /
+    // `ToolSummaryRestricted` reserved sections at session startup and associated
+    // with this collection per mode in `build_mode_builder` (via
+    // `set_collection_summary_section`), so projection emits the full name listing
+    // ahead of the provenance-selected subset.
     Ok(out)
 }
 
