@@ -524,6 +524,13 @@
     return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
   }
 
+  // Belief score badge for a selected projection member: compact, e.g. "1.3k"
+  // for 1325 or "436" for a sub-1k score.
+  function fmtScore(n) {
+    n = Math.round(n || 0);
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+
   function logColors(level) {
     return ({
       TRACE: ['#9b8fdf', 'rgba(124,111,207,0.13)'], DEBUG: ['#5e9cd8', 'rgba(78,140,200,0.13)'],
@@ -762,7 +769,7 @@
       hist = conv.history.slice(0, uk >= 0 ? uk : (i >= 0 ? i : 0));
     }
     savedSubstrateScroll = null;   // a fresh open starts at the top, not last session's offset
-    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg || null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {} });
+    setState({ substrateOpen: true, substrateNode: node, substrateMsg: msg || null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
     // Fallback: if a panel opens before any conversation hydrated (e.g. a brand
     // new chat), pull the workspace-wide glue + content via the main GET.
     if (S.substrateContent == null) {
@@ -1490,6 +1497,10 @@
         h('span', { style: 'width:6px; height:6px; border-radius:2px; flex-shrink:0; background:' + (s.selected ? '#6cb39a' : '#403b35') + ';' }),
         h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace;' }, s.name || '(unnamed)'),
         s.selected ? null : h('span', { style: 'font-size:9.5px; color:#5a5652; letter-spacing:0.04em; flex-shrink:0;' }, 'SKIPPED'),
+        // Belief score for a selected member — the provenance confidence that put
+        // it in scope (the same `z × margin` value the substrate stamps). Only
+        // shown when selected and non-zero; skipped/zero-belief rows stay clean.
+        (s.selected && s.score) ? h('span', { style: 'font-size:10px; color:#6cb39a; font-family:ui-monospace,monospace; flex-shrink:0;' }, fmtScore(s.score)) : null,
         h('span', { style: 'font-size:10.5px; color:#5a5652; font-family:ui-monospace,monospace; flex-shrink:0;' }, fmtTok(s.tokens) + ' tok'));
       const wrap = h('div', {}, row);
       if (open) {
