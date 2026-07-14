@@ -282,6 +282,32 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// End-to-end performance report for the BDP flat provenance scan. Four
+    /// phases: (1) prepare the scanning engine — time the fast metadata substrate
+    /// load; (2) assemble the tag-scoped gallery (the `belief_gallery` rebuild
+    /// that runs every live reprojection) and report its scale + wide-Q shape;
+    /// (3) sweep a series of probe-window sizes, timing `score_slots` over
+    /// `--iters` each for latency + throughput; (4) summarise the live
+    /// per-reprojection cost and the O(corpus) growth — the whole problem domain.
+    ScanBench {
+        /// Gallery tag scope (matches the collection policy's `tags`).
+        #[arg(long, default_value = "tool")]
+        tag: String,
+        /// Probe turn stream id (decimal or `0x`-hex). Omit to auto-pick the first
+        /// tagged turn carrying a signature.
+        #[arg(long)]
+        probe: Option<String>,
+        /// Time only this one probe-window size (last N tokens). Omit to sweep the
+        /// default series (32 / 64 / 128 / 256 / 512 / full).
+        #[arg(long)]
+        probe_tokens: Option<usize>,
+        /// Scan repetitions timed per probe size for the latency statistics.
+        #[arg(long, default_value_t = 30)]
+        iters: usize,
+        /// Batch size (concurrent probes per wave) for the GPU scan phase.
+        #[arg(long, default_value_t = 32)]
+        gpu_batch: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -347,7 +373,324 @@ fn main() -> Result<()> {
         Cmd::Tree { timeline, text } => tree(&mut log, timeline, text)?,
         Cmd::TurnAudit { timeline, text } => turn_audit(&mut log, timeline, text)?,
         Cmd::Dump { timeline, full } => dump(&mut log, timeline, full)?,
+        Cmd::ScanBench {
+            tag,
+            probe,
+            probe_tokens,
+            iters,
+            gpu_batch,
+        } => {
+            let probe_id = probe.as_deref().map(parse_stream_id).transpose()?;
+            scan_bench(&mut log, &tag, probe_id, probe_tokens, iters, gpu_batch)?
+        }
     }
+    Ok(())
+}
+
+/// Median-timing of one closure over `iters` runs (plus one warm-up), returning
+/// `(min, median, mean, max)` in milliseconds.
+fn time_ms(iters: usize, mut f: impl FnMut()) -> (f64, f64, f64, f64) {
+    use std::time::Instant;
+    f(); // warm up: rayon pool spin-up + cache
+    let mut t: Vec<f64> = Vec::with_capacity(iters.max(1));
+    for _ in 0..iters.max(1) {
+        let s = Instant::now();
+        f();
+        t.push(s.elapsed().as_secs_f64() * 1e3);
+    }
+    t.sort_by(|a, b| a.total_cmp(b));
+    let min = t[0];
+    let median = t[t.len() / 2];
+    let mean = t.iter().sum::<f64>() / t.len() as f64;
+    let max = *t.last().unwrap();
+    (min, median, mean, max)
+}
+
+/// End-to-end performance report for the BDP flat provenance scan. See the `Cmd`
+/// docstring: measures engine prep (metadata load + gallery assembly), sweeps a
+/// series of probe sizes through `score_slots`, and summarises the live
+/// per-reprojection cost and the O(corpus) growth.
+fn scan_bench(
+    log: &mut LogFile,
+    tag: &str,
+    probe_id: Option<StreamId>,
+    probe_tokens: Option<usize>,
+    iters: usize,
+    gpu_batch: usize,
+) -> Result<()> {
+    use candle_conversation::provenance::{score_slots, WideQSig};
+    use std::time::Instant;
+
+    // Live reproject cadence/probe cap (candle-conversation defaults) — used to
+    // project the steady-state per-reprojection cost.
+    const LIVE_PROBE_CAP: usize = 256;
+    const LIVE_REPROJECT_EVERY: usize = 64;
+
+    // ── Phase 1: prepare the scanning engine — fast metadata load ───────────
+    // Same filtered walk the daemon uses on cold-load: skips the multi-GB KV /
+    // token payloads, keeps the wide-Q sig blobs the gallery reads.
+    println!("── Phase 1: load (fast metadata walk) ──────────────────────────");
+    let t_build = Instant::now();
+    let mut substrate = build_substrate(log)?;
+    let load_s = t_build.elapsed().as_secs_f64();
+    let n_streams = substrate.all_streams().count();
+    println!("  substrate load: {load_s:.2} s   ({n_streams} streams)");
+
+    // ── Phase 2: assemble the tag-scoped gallery (belief_gallery equivalent) ─
+    // This rebuild runs on EVERY live reprojection. With the decoded-sig cache it
+    // decodes the static gallery once per session and serves the memo thereafter,
+    // so we time it COLD (first, decodes) and WARM (cached) to show the win.
+    use std::sync::Arc;
+    println!("\n── Phase 2: gallery assembly (per-reprojection in production) ──");
+    let assemble = |sub: &Substrate| {
+        let mut slot_names: Vec<String> = Vec::new();
+        let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+        let mut slots: Vec<usize> = Vec::new();
+        let mut probe_pick: Option<Arc<Vec<WideQSig>>> = None;
+        for (sid, e) in sub.all_streams() {
+            let Some(StreamDecl::Turn(t)) = &e.decl else {
+                continue;
+            };
+            if !t.tags.iter().any(|x| x == tag) {
+                continue;
+            }
+            let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
+                continue;
+            };
+            let Some(window) = sub.decoded_wide_sig(sid) else {
+                continue;
+            };
+            if probe_id.is_none() && probe_pick.is_none() {
+                probe_pick = Some(window.clone());
+            }
+            let slot = slot_names
+                .iter()
+                .position(|n| n == name)
+                .unwrap_or_else(|| {
+                    slot_names.push(name.clone());
+                    slot_names.len() - 1
+                });
+            windows.push(window);
+            slots.push(slot);
+        }
+        (slot_names, windows, slots, probe_pick)
+    };
+    let t_cold = Instant::now();
+    let (slot_names, windows, slots, probe_pick) = assemble(&substrate);
+    let cold_ms = t_cold.elapsed().as_secs_f64() * 1e3;
+    let t_warm = Instant::now();
+    let _ = assemble(&substrate);
+    let warm_ms = t_warm.elapsed().as_secs_f64() * 1e3;
+
+    // Churn check: simulate a turn seal (one sig write). Incremental per-stream
+    // eviction must leave the rest of the gallery cached, so re-assembly stays
+    // warm — a global-clear invalidation would re-decode all of it here.
+    use candle_conversation::persistence::content_hash::turn_stream_id;
+    use candle_conversation::provenance::encode_wide_sigs;
+    substrate.set_wide_q_sigs_blob(turn_stream_id(u64::MAX, 0), encode_wide_sigs(&[]));
+    let t_churn = Instant::now();
+    let _ = assemble(&substrate);
+    let churn_ms = t_churn.elapsed().as_secs_f64() * 1e3;
+
+    if windows.is_empty() {
+        println!("  gallery is EMPTY for tag {tag:?} — nothing to scan.");
+        return Ok(());
+    }
+
+    let total_gallery_tokens: usize = windows.iter().map(|w| w.len()).sum();
+    let n_slots = slot_names.len();
+    let shape = windows[0].first();
+    let (n_heads, wph) = shape
+        .map(|s| (s.n_heads as usize, s.words_per_head()))
+        .unwrap_or((0, 0));
+    let n_groups = n_heads / 4;
+    println!(
+        "  gallery: {} windows, {} tokens, {n_slots} slots",
+        windows.len(),
+        total_gallery_tokens
+    );
+    println!(
+        "  sig shape: {n_heads} heads × {wph} words/head → {n_groups} groups × {} words/group",
+        4 * wph
+    );
+    println!("  cold assembly (first, decodes all): {cold_ms:.1} ms");
+    println!("  warm assembly (cached decode):      {warm_ms:.1} ms   ← per-reprojection steady state");
+    println!("  after a turn seal (1 sig write):    {churn_ms:.1} ms   ← incremental evict, no churn");
+
+    // Resolve the probe window (named stream or the auto-pick).
+    let full_probe: Vec<WideQSig> = match probe_id {
+        Some(id) => substrate
+            .decoded_wide_sig(id)
+            .map(|a| (*a).clone())
+            .with_context(|| format!("probe stream {} has no wide-Q signature", id.0))?,
+        None => (*probe_pick.expect("non-empty gallery guarantees a probe pick")).clone(),
+    };
+
+    // ── Phase 3: reference vs packed — parity + latency ─────────────────────
+    use candle_conversation::provenance::{score_packed, PackedGallery};
+    let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+
+    // Build the contiguous packed gallery once (this is the repack; in production
+    // it's cached like the decoded windows).
+    let t_pack = Instant::now();
+    let packed = PackedGallery::from_windows(&wref, &slots, n_slots);
+    let pack_ms = t_pack.elapsed().as_secs_f64() * 1e3;
+    println!("\n── Phase 2c: packed gallery ────────────────────────────────────");
+    println!(
+        "  packed: {} tokens, {:.1} MB contiguous  (built in {pack_ms:.1} ms — cached in production)",
+        packed.n_tokens(),
+        packed.byte_len() as f64 / 1e6
+    );
+
+    // Parity: the packed scan MUST equal the reference bit-for-bit on real data.
+    let ref_full = score_slots(&full_probe, &wref, &slots, n_slots);
+    let packed_full = score_packed(&full_probe, &packed);
+    let parity = ref_full == packed_full;
+    println!(
+        "  parity vs reference (full {}-tok probe): {}",
+        full_probe.len(),
+        if parity { "IDENTICAL ✓" } else { "MISMATCH ✗" }
+    );
+
+    println!("\n── Phase 3: flat-scan latency — reference vs packed ({iters} iters) ─");
+    let sizes: Vec<usize> = match probe_tokens {
+        Some(n) => vec![n.min(full_probe.len()).max(1)],
+        None => {
+            let mut v: Vec<usize> = [32usize, 64, 128, 256, 512]
+                .into_iter()
+                .filter(|&n| n < full_probe.len())
+                .collect();
+            v.push(full_probe.len()); // always include the full turn
+            v
+        }
+    };
+    println!(
+        "  {:>6}  {:>12}  {:>12}  {:>8}",
+        "probe", "reference", "packed", "speedup"
+    );
+    // Cost coefficient at the live probe cap, for the summary projection.
+    let mut live_scan_ms = 0.0f64;
+    for &sz in &sizes {
+        let probe: Vec<WideQSig> = full_probe[full_probe.len() - sz..].to_vec();
+        let (_, ref_med, _, _) = time_ms(iters, || {
+            let _ = score_slots(&probe, &wref, &slots, n_slots);
+        });
+        let (_, pak_med, _, _) = time_ms(iters, || {
+            let _ = score_packed(&probe, &packed);
+        });
+        println!(
+            "  {sz:>6}  {ref_med:>9.2} ms  {pak_med:>9.2} ms  {:>7.2}×",
+            ref_med / pak_med
+        );
+        if sz <= LIVE_PROBE_CAP {
+            live_scan_ms = pak_med; // packed is the new steady-state kernel
+        }
+    }
+
+    // ── Phase 4: problem-domain summary ─────────────────────────────────────
+    // Per-scan cost is linear in gallery tokens; derive a per-token-per-Mtoken
+    // coefficient so growth is projectable.
+    let ns_per_agreement = (live_scan_ms * 1e6)
+        / (LIVE_PROBE_CAP.min(full_probe.len()) as f64 * total_gallery_tokens as f64 * n_groups as f64);
+    let per_reproj = warm_ms + live_scan_ms;
+    println!("\n── Phase 4: problem domain ─────────────────────────────────────");
+    println!("  ONE-TIME prep (engine load):        {load_s:.2} s   ({n_streams} streams)");
+    println!(
+        "  STEADY-STATE per reprojection:      {per_reproj:.1} ms  (every {LIVE_REPROJECT_EVERY} decoded tokens)"
+    );
+    println!(
+        "    ├─ gallery assembly (cached):     {warm_ms:.1} ms   (was {cold_ms:.1} ms uncached)"
+    );
+    println!(
+        "    └─ flat scan @ {}-tok probe cap:  {live_scan_ms:.1} ms   ← O(probe × gallery × groups)",
+        LIVE_PROBE_CAP.min(full_probe.len())
+    );
+    println!(
+        "  SCALING: linear in gallery tokens (now {} over {n_slots} slots). At 10× corpus the",
+        total_gallery_tokens
+    );
+    println!(
+        "    scan alone → ~{:.0} ms/reprojection. Kernel cost ≈ {ns_per_agreement:.2} ns/group-agreement.",
+        live_scan_ms * 10.0
+    );
+    println!("  DESIGN TARGET: 3–10 ms full-corpus scan → current gap is the optimization surface.");
+
+    // ── Phase 5: GPU batched scan (non-resident VRAM, pinned RAM mirror) ─────
+    use candle_conversation::provenance::BatchedGpuGallery;
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("\n── Phase 5: GPU ── skipped (no CUDA device: {e})");
+            return Ok(());
+        }
+    };
+    println!("\n── Phase 5: GPU batched scan (pinned RAM mirror, non-resident VRAM) ─");
+
+    // One-time: page-lock the gallery into the resident pinned RAM mirror.
+    let t_pin = Instant::now();
+    let gpu_gallery = BatchedGpuGallery::from_packed(&packed)
+        .map_err(|e| anyhow::anyhow!("stage pinned gallery: {e}"))?;
+    let pin_ms = t_pin.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "  pinned RAM mirror: {:.1} MB staged in {pin_ms:.1} ms  (ONE-TIME; mutated incrementally in production)",
+        gpu_gallery.byte_len() as f64 / 1e6
+    );
+
+    // Live-cap probe, replicated into a wave of `gpu_batch` concurrent requests.
+    let cap = LIVE_PROBE_CAP.min(full_probe.len());
+    let one_probe: Vec<WideQSig> = full_probe[full_probe.len() - cap..].to_vec();
+    let batch_owned: Vec<Vec<WideQSig>> = (0..gpu_batch.max(1)).map(|_| one_probe.clone()).collect();
+    let batch_refs: Vec<&[WideQSig]> = batch_owned.iter().map(|p| p.as_slice()).collect();
+
+    // Parity on the real corpus: GPU (one probe) must equal the CPU packed scan.
+    match gpu_gallery.scan(&device, &[one_probe.as_slice()]) {
+        Ok(g) => {
+            let cpu = score_packed(&one_probe, &packed);
+            let max_rel = g[0]
+                .iter()
+                .zip(&cpu)
+                .map(|(&a, &b)| (a - b).abs() / (1.0 + a.abs().max(b.abs())))
+                .fold(0.0f32, f32::max);
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+            };
+            let same_rank = argmax(&g[0]) == argmax(&cpu);
+            println!(
+                "  parity vs CPU packed ({cap}-tok probe): max rel err {max_rel:.2e}, same top case: {}",
+                if same_rank { "yes ✓" } else { "NO ✗" }
+            );
+        }
+        Err(e) => {
+            println!("  GPU scan failed: {e}");
+            return Ok(());
+        }
+    }
+
+    // Per-wave: pinned gallery → VRAM upload + batched kernel + download + free.
+    let (gmin, gmed, _gmean, gmax) = time_ms(iters.min(10).max(3), || {
+        let _ = gpu_gallery.scan(&device, &batch_refs).expect("gpu scan");
+    });
+    let wave_agr =
+        gpu_batch as f64 * cap as f64 * n_groups as f64 * total_gallery_tokens as f64;
+    println!(
+        "  wave of {gpu_batch} probes ({cap}-tok each): median {gmed:.2} ms  [{gmin:.2}–{gmax:.2}]",
+    );
+    println!(
+        "  per-probe amortized: {:.3} ms   (vs CPU packed {live_scan_ms:.1} ms/probe)",
+        gmed / gpu_batch as f64
+    );
+    println!(
+        "  throughput: {:.0} Ggroup-agr/s  ({:.2} µs per probe-token)",
+        wave_agr / (gmed / 1e3) / 1e9,
+        gmed * 1e3 / (gpu_batch as f64 * cap as f64),
+    );
+    println!(
+        "  each wave: {:.1} MB pinned H2D → scan → free VRAM (non-resident).",
+        packed.byte_len() as f64 / 1e6
+    );
     Ok(())
 }
 

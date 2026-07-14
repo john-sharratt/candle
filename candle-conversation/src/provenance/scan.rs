@@ -33,20 +33,20 @@ use super::WideQSig;
 
 /// KV heads per folded layer-group — equals `n_kv_head` (heads are kept separate
 /// through the fold). Mirrors [`super::wide_sig::PROV_HEADS_PER_LAYER`].
-const HEADS_PER_GROUP: usize = super::wide_sig::PROV_HEADS_PER_LAYER;
+pub(super) const HEADS_PER_GROUP: usize = super::wide_sig::PROV_HEADS_PER_LAYER;
 
 /// Needle-gate keep-fraction: the belief is summed over only the top
 /// `NEEDLE_KEEP_FRAC` of query tokens by vote magnitude. Validated at 0.25 in
 /// §82 (holds 100% Tool-3/Tool-5, sharpens Tool-1, on ~75% fewer effective
 /// tokens) — and, being magnitude- not position-keyed, generalizes to content
 /// windows where the relevant reference is a sparse needle among boilerplate.
-const NEEDLE_KEEP_FRAC: f32 = 0.25;
+pub(super) const NEEDLE_KEEP_FRAC: f32 = 0.25;
 
 /// Sign-agreement between two layer-group signatures = `popcount(XNOR)` over the
 /// group's words. Fast-paths the locked 8-word (4-head × 128-bit) group width so
 /// it vectorizes; falls back to a generic loop for other widths.
 #[inline]
-fn group_agreement(a: &[u64], b: &[u64]) -> u32 {
+pub(super) fn group_agreement(a: &[u64], b: &[u64]) -> u32 {
     if a.len() == 8 && b.len() == 8 {
         let mut s = 0u32;
         for k in 0..8 {
@@ -152,9 +152,19 @@ pub fn score_provenance_late_fusion(
         })
         .collect();
 
-    // Needle gate: keep only the top `NEEDLE_KEEP_FRAC` of query tokens by total
-    // vote magnitude, so a sparse discriminative signal dominates and the diffuse
-    // remainder is dropped — position-independently. See the module docs (§82).
+    needle_gate_tally(&per_query, n_cases)
+}
+
+/// The needle gate + per-case tally shared by the pointer-gallery
+/// ([`score_provenance_late_fusion`]) and packed-gallery ([`super::score_packed`])
+/// scans. Keeping it in one place guarantees the two backends produce
+/// **bit-identical** votes given identical per-query contributions.
+///
+/// `per_query[i]` is query token `i`'s list of `(case, z × margin)` group votes.
+/// Only the top [`NEEDLE_KEEP_FRAC`] of query tokens by total vote magnitude are
+/// summed into the per-case result — the sparse discriminative *needle*, dropping
+/// the diffuse *haystack*, position-independently (§82).
+pub(super) fn needle_gate_tally(per_query: &[Vec<(usize, f32)>], n_cases: usize) -> Vec<f32> {
     if per_query.is_empty() {
         return vec![0.0; n_cases];
     }

@@ -23,6 +23,8 @@
 
 pub mod belief;
 pub mod gather;
+pub mod gpu;
+pub mod packed;
 pub mod raw_store;
 pub mod scan;
 pub mod selection;
@@ -30,6 +32,8 @@ pub mod wide_sig;
 
 pub use belief::{ToolBelief, DEFAULT_LEAK_BETA};
 pub use gather::{belief_step, score_slots, SlotBelief};
+pub use gpu::{score_batched_gpu, BatchedGpuGallery};
+pub use packed::{score_packed, PackedGallery};
 pub use raw_store::extract_q_vector_r16;
 pub use scan::score_provenance_late_fusion;
 pub use selection::{GroupBudget, SectionPolicy, SectionSelector};

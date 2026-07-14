@@ -136,6 +136,10 @@ const FLASH_KERNELS: [&str; 12] = [
     "src/paged-glue/paged_glue_api_bf16.cu",
 ];
 
+/// Provenance BDP scan — compiled WITHOUT `--use_fast_math` so its float math is
+/// IEEE round-to-nearest and bit-matches the CPU `score_packed` reference.
+const PROVENANCE_KERNELS: [&str; 1] = ["src/provenance/bdp_scan.cu"];
+
 // ============================================================================
 // Archive group definition and construction
 // ============================================================================
@@ -286,7 +290,18 @@ fn build_archive_groups(is_msvc: bool) -> Vec<ArchiveGroup> {
         groups.push(ArchiveGroup {
             name: "sampling".to_string(),
             kernels: sampling_kernels,
-            compile_args: sampling_args,
+            compile_args: sampling_args.clone(),
+            include_dirs: flash_includes.clone(),
+        });
+    }
+
+    // 3b. Provenance BDP scan — full fast-math (like sampling); the scan result
+    // is a relevance ranking, so ~ULP float differences vs the CPU are fine.
+    {
+        groups.push(ArchiveGroup {
+            name: "provenance".to_string(),
+            kernels: PROVENANCE_KERNELS.iter().map(|s| s.to_string()).collect(),
+            compile_args: sampling_args.clone(),
             include_dirs: flash_includes.clone(),
         });
     }

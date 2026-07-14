@@ -15,6 +15,9 @@ pub mod quantized;
 #[path = "sampling/api.rs"]
 pub mod sampling;
 
+#[path = "provenance/api.rs"]
+pub mod provenance;
+
 #[path = "paged-decode/api.rs"]
 pub mod paged_decode;
 

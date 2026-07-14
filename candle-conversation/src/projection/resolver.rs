@@ -12,7 +12,7 @@ use super::schema::{LayerSchema, Schema, SystemPromptItem};
 use crate::persistence::record::TreeMetadataPayload;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
-use crate::provenance::{decode_wide_sigs, score_slots, WideQSig};
+use crate::provenance::{score_slots, WideQSig};
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
     TurnPartWrite,
@@ -236,11 +236,11 @@ impl Conversation {
         collection: &str,
         tags: &[String],
         slot_of: impl Fn(&str) -> Option<usize>,
-    ) -> (Vec<Vec<WideQSig>>, Vec<usize>) {
+    ) -> (Vec<Arc<Vec<WideQSig>>>, Vec<usize>) {
         let sub = self.inner.read().unwrap();
-        let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+        let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
-        for (_sid, e) in sub.all_streams() {
+        for (sid, e) in sub.all_streams() {
             let Some(StreamDecl::Turn(d)) = &e.decl else {
                 continue;
             };
@@ -252,12 +252,12 @@ impl Conversation {
             if !in_scope {
                 continue;
             }
-            let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            // Cached decode: the static gallery is decoded once per session
+            // (invalidated when a turn's sig blob changes), not re-parsed on every
+            // reprojection. `None` covers absent or empty windows.
+            let Some(window) = sub.decoded_wide_sig(sid) else {
                 continue;
             };
-            if window.is_empty() {
-                continue;
-            }
             let slot = d.tags.iter().find_map(|t| slot_of(t)).or_else(|| {
                 e.projection_events
                     .as_ref()
@@ -437,7 +437,7 @@ impl Conversation {
             // of scanning `all_streams()` per group (which is O(all timelines'
             // streams) on the reproject hot path).
             let count = sub.turn_count(timeline);
-            let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+            let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
             let mut indices: Vec<TurnIndex> = Vec::new();
             for i in 0..count {
                 let idx = TurnIndex(i);
@@ -451,15 +451,10 @@ impl Conversation {
                 {
                     continue;
                 }
-                let Some(e) = sub.stream_of(turn_stream_id(timeline.raw(), i)) else {
+                // Cached decode (see `belief_gallery`): decode once per session.
+                let Some(window) = sub.decoded_wide_sig(turn_stream_id(timeline.raw(), i)) else {
                     continue;
                 };
-                let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
-                    continue;
-                };
-                if window.is_empty() {
-                    continue;
-                }
                 windows.push(window);
                 indices.push(idx);
             }
