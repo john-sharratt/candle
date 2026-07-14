@@ -137,7 +137,7 @@ pub enum SystemItem {
 }
 
 /// A conversation turn provenance pulled into this projection's window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectedTurn {
     /// The schema layer this turn's group belongs to (`dialogue`, `code_reading`,
     /// …) — so the panel can surface every projected memory tier, not just the
@@ -167,6 +167,18 @@ pub struct SelectedTurn {
     /// re-derivation is non-deterministic). `None` only for the live user message.
     #[serde(default)]
     pub timeline: Option<u64>,
+    /// Whether provenance selected this turn for the projection. Always `true`
+    /// for a turn that made it into the materialized segments; the field mirrors
+    /// [`SelectedSection::selected`] so the belief carry generalizes across the
+    /// section and turn axes. Serde-default keeps redo-log records back-compat.
+    #[serde(default)]
+    pub selected: bool,
+    /// The turn's belief score at this projection — stamped so the next
+    /// reprojection can seed its [`PriorBelief`](super::project::PriorBelief) turn
+    /// group from the prior event (RelLeak decay/reinforcement across a turn).
+    /// `0.0` when the turn carried no belief score (recency groups, live message).
+    #[serde(default)]
+    pub score: f32,
 }
 
 /// Serde default for [`SelectedTurn::kind`] on records written before the field
@@ -182,7 +194,7 @@ fn default_turn_kind() -> TurnKind {
 /// client-side reconstruction. The system prompt is covered separately by
 /// [`ProjectionSelection::system`]; this is the conversation region only (and
 /// excludes the live, still-decoding user turn).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MaterializedPiece {
     /// A glue island the assembler gap-fills verbatim — the inter-turn boundary
@@ -301,6 +313,118 @@ pub fn aggregate(
         substrate_tokens,
         buckets,
         selection: ProjectionSelection::default(),
+        materialized: Vec::new(),
+    }
+}
+
+/// A synthesized staged event for an ingest turn (a repo_map cluster, a
+/// code_read scope, the per-file summary decode).  These append-only trunks
+/// run no per-turn projection, so the event is built from the trunk's known
+/// composition instead of a projection walk: `system` is the layer's fixed
+/// sections, `turns` the turn itself plus its immediate predecessor — the
+/// resolvable `(timeline, index)` references a wide-Q scan follows to bring
+/// the turn in.  Pure; the caller persists it keyed to the turn's stream id.
+pub fn staged_ingest_event(
+    start_token: u32,
+    seconds: f64,
+    system: Vec<SystemItem>,
+    turns: Vec<SelectedTurn>,
+) -> ProjectionEvent {
+    let system_tokens: u32 = system
+        .iter()
+        .map(|item| match item {
+            SystemItem::Glue { tokens, .. } | SystemItem::Section { tokens, .. } => *tokens,
+            SystemItem::Collection { sections, .. } => sections
+                .iter()
+                .filter(|s| s.selected)
+                .map(|s| s.tokens)
+                .sum(),
+        })
+        .sum();
+    let turn_tokens: u32 = turns.iter().map(|t| t.tokens).sum();
+    let mut buckets = Vec::with_capacity(2);
+    if system_tokens > 0 {
+        buckets.push(ProjectionBucket {
+            label: "system".to_string(),
+            kind: BucketKind::System,
+            tokens: system_tokens,
+        });
+    }
+    if turn_tokens > 0 {
+        buckets.push(ProjectionBucket {
+            label: "turns".to_string(),
+            kind: BucketKind::Turns,
+            tokens: turn_tokens,
+        });
+    }
+    ProjectionEvent {
+        start_token,
+        seconds,
+        materialized_tokens: system_tokens + turn_tokens,
+        substrate_tokens: 0,
+        buckets,
+        selection: ProjectionSelection { system, turns },
+        materialized: Vec::new(),
+    }
+}
+
+/// A synthesized event for a summariser node (SoT leaf digest or SoS rollup).
+/// Compression frames run no projection, so `system` is honestly empty;
+/// `selection.turns[0]` is the node itself and the rest are the turns it
+/// covers — the resolvable chain a wide-Q scan follows: sig hit on the node's
+/// stream → this event → node + children `(timeline, index)` keys.
+pub fn summary_node_event(
+    layer: &str,
+    group: &str,
+    timeline: u64,
+    node: (TurnIndex, TurnKind, u32),
+    children: Vec<(TurnIndex, TurnKind, u32)>,
+) -> ProjectionEvent {
+    let (node_idx, node_kind, node_tokens) = node;
+    let mut turns = Vec::with_capacity(1 + children.len());
+    turns.push(SelectedTurn {
+        layer: layer.to_string(),
+        group: group.to_string(),
+        index: node_idx.0,
+        role: "assistant".to_string(),
+        tokens: node_tokens,
+        kind: node_kind,
+        reason: None,
+        timeline: Some(timeline),
+        // The node and its covered turns form the recorded chain; they carry no
+        // belief score (compression frames run no belief scan).
+        selected: true,
+        score: 0.0,
+    });
+    for (idx, kind, tokens) in children {
+        turns.push(SelectedTurn {
+            layer: layer.to_string(),
+            group: group.to_string(),
+            index: idx.0,
+            role: "assistant".to_string(),
+            tokens,
+            kind,
+            reason: None,
+            timeline: Some(timeline),
+            selected: true,
+            score: 0.0,
+        });
+    }
+    let total: u32 = turns.iter().map(|t| t.tokens).sum();
+    ProjectionEvent {
+        start_token: 0,
+        seconds: 0.0,
+        materialized_tokens: total,
+        substrate_tokens: 0,
+        buckets: vec![ProjectionBucket {
+            label: group.to_string(),
+            kind: BucketKind::Turns,
+            tokens: total,
+        }],
+        selection: ProjectionSelection {
+            system: Vec::new(),
+            turns,
+        },
         materialized: Vec::new(),
     }
 }
@@ -430,6 +554,10 @@ fn build_selection(
                     kind: resolver.turn_kind(t.group(), t.index()),
                     reason: origins.get(&(t.group(), t.index())).copied(),
                     timeline: t.timeline.map(|tl| tl.raw()),
+                    // A turn in the segments was selected; stamp its belief score
+                    // so the next reprojection can seed its turn-group carry.
+                    selected: true,
+                    score: scores.turn(t.group(), t.index()),
                 });
             }
             ProjectionSegment::NewUserMessage { tokens } => {
@@ -444,6 +572,8 @@ fn build_selection(
                     kind: TurnKind::Normal,
                     reason: None,
                     timeline: None,
+                    selected: false,
+                    score: 0.0,
                 });
             }
             // Compression-internal turn-half — not a displayed dialogue turn.
@@ -701,9 +831,11 @@ mod tests {
         GeneratedIdentity, ProjectionSegment, ResolvedSection, ResolvedTurn, SealedKind,
     };
     use super::{
-        aggregate, from_projection, BucketKind, SegmentTokens, SelectionScores, SystemItem,
+        aggregate, decode_events, encode_events, from_projection, staged_ingest_event,
+        summary_node_event, BucketKind, SegmentTokens, SelectedTurn, SelectionScores, SystemItem,
     };
     use crate::substrate::ContentResolver;
+    use crate::summary_tree::TurnKind;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1358,5 +1490,127 @@ layers:
             "summary must show before <tools>: {:?}",
             sel.system
         );
+    }
+
+    // ── staged_ingest_event / summary_node_event (pure constructors) ─────────
+
+    fn sel_turn(index: u32, tokens: u32, timeline: u64) -> SelectedTurn {
+        SelectedTurn {
+            layer: "code_reading".to_string(),
+            group: "scopes".to_string(),
+            index,
+            role: "user".to_string(),
+            tokens,
+            kind: TurnKind::Normal,
+            reason: None,
+            timeline: Some(timeline),
+            selected: true,
+            score: 0.0,
+        }
+    }
+
+    #[test]
+    fn staged_ingest_event_carries_self_and_prev_references_and_buckets() {
+        let system = vec![SystemItem::Section {
+            name: "frame".to_string(),
+            tokens: 40,
+        }];
+        let turns = vec![sel_turn(4, 300, 77), sel_turn(5, 250, 77)];
+        let ev = staged_ingest_event(12, 1.5, system, turns);
+
+        assert_eq!(ev.start_token, 12);
+        assert_eq!(ev.seconds, 1.5);
+        assert_eq!(ev.selection.turns.len(), 2, "prev + self");
+        assert_eq!(ev.selection.turns[0].index, 4);
+        assert_eq!(ev.selection.turns[1].index, 5);
+        assert_eq!(
+            ev.selection.turns[1].timeline,
+            Some(77),
+            "the (timeline, index) reference must be resolvable"
+        );
+        let by_kind: Vec<(BucketKind, u32)> =
+            ev.buckets.iter().map(|b| (b.kind, b.tokens)).collect();
+        assert_eq!(
+            by_kind,
+            vec![(BucketKind::System, 40), (BucketKind::Turns, 550)]
+        );
+        assert_eq!(ev.materialized_tokens, 590);
+    }
+
+    #[test]
+    fn staged_ingest_event_roundtrips_through_encode_decode() {
+        let ev = staged_ingest_event(
+            0,
+            0.0,
+            vec![SystemItem::Section {
+                name: "frame".to_string(),
+                tokens: 8,
+            }],
+            vec![sel_turn(0, 100, 42)],
+        );
+        let events = vec![ev.clone(), staged_ingest_event(9, 0.0, Vec::new(), vec![])];
+        let decoded = decode_events(&encode_events(&events));
+        assert_eq!(decoded, events);
+        assert_eq!(decoded[0].selection.turns[0].timeline, Some(42));
+    }
+
+    #[test]
+    fn selected_turn_deserializes_pre_belief_records_with_defaults() {
+        // A redo-log record written before the belief-carry fields existed has
+        // neither `selected` nor `score`; serde defaults keep it loadable, so
+        // an old substrate opens without a migration.
+        let json = r#"{
+            "layer": "dialogue",
+            "group": "conversation",
+            "index": 7,
+            "role": "user",
+            "tokens": 42,
+            "timeline": 5
+        }"#;
+        let t: SelectedTurn = serde_json::from_str(json).unwrap();
+        assert_eq!(t.index, 7);
+        assert!(!t.selected, "missing `selected` defaults to false");
+        assert_eq!(t.score, 0.0, "missing `score` defaults to 0.0");
+        // New records round-trip the fields.
+        let full = SelectedTurn {
+            selected: true,
+            score: 900.0,
+            ..t
+        };
+        let s = serde_json::to_string(&full).unwrap();
+        let back: SelectedTurn = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.selected, true);
+        assert_eq!(back.score, 900.0);
+    }
+
+    #[test]
+    fn summary_node_event_lists_node_first_then_children() {
+        let ev = summary_node_event(
+            "code_reading",
+            "scopes",
+            77,
+            (TurnIndex(9), TurnKind::SummaryOfTurns, 120),
+            vec![
+                (TurnIndex(3), TurnKind::Normal, 400),
+                (TurnIndex(4), TurnKind::Normal, 500),
+            ],
+        );
+        assert!(
+            ev.selection.system.is_empty(),
+            "compression frames run no projection"
+        );
+        assert_eq!(ev.selection.turns.len(), 3);
+        assert_eq!(ev.selection.turns[0].index, 9, "the node itself is first");
+        assert_eq!(ev.selection.turns[0].kind, TurnKind::SummaryOfTurns);
+        assert_eq!(ev.selection.turns[0].timeline, Some(77));
+        assert_eq!(ev.selection.turns[1].index, 3);
+        assert_eq!(ev.selection.turns[2].index, 4);
+        assert_eq!(ev.buckets.len(), 1);
+        assert_eq!(ev.buckets[0].kind, BucketKind::Turns);
+        assert_eq!(ev.buckets[0].tokens, 120 + 400 + 500);
+        assert_eq!(ev.materialized_tokens, 1020);
+
+        let decoded = decode_events(&encode_events(&[ev.clone()]));
+        assert_eq!(decoded, vec![ev]);
     }
 }

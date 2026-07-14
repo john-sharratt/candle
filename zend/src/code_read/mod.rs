@@ -106,10 +106,21 @@ fn emit_file_turns<S: InsertTurnSink>(
             header::render_tool_call(path, scope),
             header::render_tool_response(path, scope, language, &body),
         );
-        sink.insert_prefill_turn(&user, &assistant)?;
+        // Gather-scope tags: `["code", <path>]` scopes the turn into a
+        // code-tagged provenance gallery and keeps it out of the untagged
+        // dialogue partition; the path tag doubles as the slot label.
+        sink.insert_prefill_turn(
+            &user,
+            &assistant,
+            vec!["code".to_string(), path.to_string()],
+        )?;
     }
     let summary_prompt = header::render_file_summary_prompt(path);
-    sink.decode_summary_turn(&summary_prompt, header::FILE_SUMMARY_MAX_TOKENS)?;
+    sink.decode_summary_turn(
+        &summary_prompt,
+        header::FILE_SUMMARY_MAX_TOKENS,
+        vec!["code".to_string(), path.to_string(), "summary".to_string()],
+    )?;
     Ok(())
 }
 

@@ -125,6 +125,12 @@ pub struct SealResult {
     pub turn_token_count: usize,
     /// Chunk size in tokens (mirrors the scheduler's chunk_size).
     pub chunk_size: usize,
+    /// The substrate `TurnIndex` this seal recorded (`SealAction::Turn`
+    /// only; `None` for section seals).  Callers keying per-turn persists
+    /// (staged projection events) MUST use this rather than
+    /// `turn_count - 1`: the async summariser appends its node turns to
+    /// the same timeline, so counting races.
+    pub turn_index: Option<u32>,
 }
 
 /// Complete response from a turn.

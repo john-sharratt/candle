@@ -57,11 +57,21 @@ fn code_read_emits_one_prefill_per_part_plus_one_summary() {
     );
 
     // Single file → n_scopes prefills + exactly one decoded summary.
-    let decoded = sink.turns.iter().filter(|(_, _, d)| *d).count();
-    let prefills = sink.turns.iter().filter(|(_, _, d)| !*d).count();
+    let decoded = sink.turns.iter().filter(|(_, _, d, _)| *d).count();
+    let prefills = sink.turns.iter().filter(|(_, _, d, _)| !*d).count();
     assert_eq!(decoded, 1, "exactly one whole-file summary decode per file");
     assert_eq!(prefills, n_scopes, "one prefill turn per carved part");
     assert_eq!(sink.turns.len(), n_scopes + 1);
+
+    // Gather-scope tags: every scope turn carries `["code", <path>]`, the
+    // summary decode adds the `"summary"` marker.
+    for (_, _, decoded, tags) in &sink.turns {
+        if *decoded {
+            assert_eq!(tags, &["code", "src/lib.rs", "summary"]);
+        } else {
+            assert_eq!(tags, &["code", "src/lib.rs"]);
+        }
+    }
 }
 
 #[test]
@@ -79,7 +89,7 @@ fn code_read_summary_is_the_last_turn_and_only_decode() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    let (last_user, _, last_decoded) = sink.turns.last().expect("at least one turn");
+    let (last_user, _, last_decoded, _) = sink.turns.last().expect("at least one turn");
     assert!(last_decoded, "the final turn is the decoded summary");
     assert!(
         last_user.starts_with("Summarize the entire file `src/lib.rs`"),
@@ -88,7 +98,7 @@ fn code_read_summary_is_the_last_turn_and_only_decode() {
     assert!(last_user.contains("200 words"));
 
     // Everything before the final turn is a prefilled part read.
-    for (user, _, decoded) in &sink.turns[..sink.turns.len() - 1] {
+    for (user, _, decoded, _) in &sink.turns[..sink.turns.len() - 1] {
         assert!(!decoded, "part turns are prefills, not decodes");
         assert!(
             user.starts_with("Source excerpt — `src/lib.rs` lines "),
@@ -140,7 +150,7 @@ fn code_read_part_assistant_is_tool_response_with_fenced_code() {
     let tr = sink
         .turns
         .iter()
-        .find(|(_, a, _)| a.contains("<tool_response>") && a.contains("pub fn two"))
+        .find(|(_, a, _, _)| a.contains("<tool_response>") && a.contains("pub fn two"))
         .expect("part turn carrying fn two in its tool_response");
     // The content lives in the assistant slot of a prefill turn.
     assert!(!tr.2, "part turns are prefills, never decodes");
@@ -169,7 +179,7 @@ fn code_read_user_prompts_never_carry_tool_markup() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    for (user, _, _) in &sink.turns {
+    for (user, _, _, _) in &sink.turns {
         assert!(
             !user.contains("<tool_call>"),
             "user prompt must not contain <tool_call>: {user:?}"
@@ -194,7 +204,7 @@ fn code_read_skips_files_outside_watch_patterns() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    for (u, a, _) in &sink.turns {
+    for (u, a, _, _) in &sink.turns {
         assert!(!u.contains("blob.bin") && !a.contains("blob.bin"));
         assert!(!u.contains("image.svg") && !a.contains("image.svg"));
     }
@@ -217,8 +227,8 @@ fn code_read_falls_back_to_fixed_window_on_unknown_language() {
     let part_reads: Vec<&str> = sink
         .turns
         .iter()
-        .filter(|(u, _, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
-        .map(|(u, _, _)| u.as_str())
+        .filter(|(u, _, _, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
+        .map(|(u, _, _, _)| u.as_str())
         .collect();
     assert!(
         part_reads.len() >= 3,
@@ -241,8 +251,8 @@ fn code_read_progress_reports_real_fraction() {
         ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
     // Two files → two whole-file summary decodes; the rest are part prefills.
-    let decoded = sink.turns.iter().filter(|(_, _, d)| *d).count();
-    let prefills = sink.turns.iter().filter(|(_, _, d)| !*d).count();
+    let decoded = sink.turns.iter().filter(|(_, _, d, _)| *d).count();
+    let prefills = sink.turns.iter().filter(|(_, _, d, _)| !*d).count();
     assert_eq!(decoded, 2, "one summary per file (a.rs, b.rs)");
     assert_eq!(prefills, n_scopes, "one prefill per carved part");
 

@@ -177,7 +177,15 @@ layers:
             nothing.
     groups:
       - id: structure
-        selection: { kind: always_visible }
+        # Cap the reconstructed repo map at the two most-relevant clusters.
+        # With no provenance scores yet (all zero) the tie-break is ascending
+        # turn index, so the workspace-root overview (turn 0, tag ".") is always
+        # one of them; once the turn-level wide-Q scan scores clusters, the two
+        # highest-scoring survive. `default` is the floor: if a future threshold
+        # filters every cluster out, the root cluster is re-injected so repo_map
+        # never vanishes from the projection.
+        selection: { kind: top_k, k: 2 }
+        default: { tag: "." }
         budget:
           priority: 100
 

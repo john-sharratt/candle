@@ -68,7 +68,8 @@ use super::project::OptionalState;
 use super::schema::{
     Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
     LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
-    SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim,
+    SelectionDefault, SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema,
+    TreeCollection, TreeDim,
     TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
 
@@ -325,6 +326,9 @@ enum YamlSystemPromptItem {
         /// members concatenate directly.
         #[serde(default)]
         member_glue: Option<String>,
+        /// Fallback section (by name) when selection is empty.
+        #[serde(default)]
+        default: Option<YamlSelectionDefault>,
     },
     /// An ordered, individually-toggleable tree of sealed sections.  Each node
     /// is a `section` (mandatory), an `optional` (binary toggle), or a
@@ -523,6 +527,15 @@ struct YamlGroup {
     /// Selection policy override; inherits the enclosing layer's when absent.
     #[serde(default)]
     policy: Option<YamlPolicy>,
+    /// Fallback member (by tag) when selection is empty.
+    #[serde(default)]
+    default: Option<YamlSelectionDefault>,
+}
+
+/// YAML shadow of [`SelectionDefault`] — `default: { tag: "…" }`.
+#[derive(Deserialize)]
+struct YamlSelectionDefault {
+    tag: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -824,6 +837,7 @@ fn build(
                     summary,
                     sections,
                     member_glue,
+                    default: coll_default,
                 } => {
                     let cid = *layer_collections
                         .get(name)
@@ -895,6 +909,7 @@ fn build(
                         summary_section: None,
                         member_glue: member_glue.clone().unwrap_or_default(),
                         member_glue_tokens: None,
+                        default: parse_default(coll_default.as_ref()),
                     }));
                 }
                 YamlSystemPromptItem::SectionTree { nodes } => {
@@ -940,6 +955,7 @@ fn build(
                 score_threshold: yg.score_threshold,
                 policy: group_policy,
                 budget: group_budget,
+                default: parse_default(yg.default.as_ref()),
             });
         }
 
@@ -1706,6 +1722,7 @@ fn build_section_tree<'a>(
                     summary_section: None,
                     member_glue: member_glue.map(str::to_string).unwrap_or_default(),
                     member_glue_tokens: None,
+                    default: None,
                 };
                 // Capture the branch templates so runtime member additions
                 // (the tool catalog) can seal ×branch without re-deriving them.
@@ -1931,4 +1948,13 @@ fn parse_selection(name: &str, ys: &YamlSelection) -> Result<SelectionRule, Cons
         }
         other => Err(ConstructionError::UnknownSelectionKind(other.to_string())),
     }
+}
+
+/// Convert the YAML `default:` block into a [`SelectionDefault`], dropping an
+/// empty tag (treated as absent).
+fn parse_default(yd: Option<&YamlSelectionDefault>) -> Option<SelectionDefault> {
+    yd.map(|d| SelectionDefault {
+        tag: d.tag.trim().to_string(),
+    })
+    .filter(|d| !d.tag.is_empty())
 }

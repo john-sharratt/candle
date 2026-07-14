@@ -35,6 +35,20 @@ impl Scheduler {
     /// the outer dispatcher already chose this phase to run, and the budget
     /// is what guarantees the other phase gets airtime.
     fn run_decode_until_budget(&mut self) {
+        // Fire any reprojection queued by the just-completed prefill quantum
+        // BEFORE the first decode step of this quantum. The turn's first
+        // reprojection is queued in `finalise_prefill`, right after the first
+        // token is sampled — for a think turn that first token is `<think>`
+        // itself, so this is the projection point immediately after `<think>`:
+        // it scans the freshly-prefilled query and re-selects the tools before
+        // the model decodes its first *reasoning* token. Draining only at the
+        // end of `batch_decode_step` (below) would let that first reasoning
+        // token be sampled against the query-blind opening projection first,
+        // which is exactly where a wrong-tool / hallucinated answer anchors.
+        let t_reproj0 = Instant::now();
+        self.drain_pending_reprojections();
+        self.wave_stats
+            .add_phase(WavePhase::Reproject, t_reproj0.elapsed().as_millis() as u64);
         for _ in 0..DECODE_BUDGET {
             if self.decode_width() == 0 {
                 // No live decode work, but there may be sequences inserted as

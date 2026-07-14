@@ -712,6 +712,7 @@ impl Builder {
                 summary_section: None,
                 member_glue: String::new(),
                 member_glue_tokens: None,
+                default: None,
             }));
         self.name_maps
             .collection_names
@@ -1227,6 +1228,7 @@ impl Builder {
                         min_percent: None,
                         max_percent: None,
                     },
+                    default: None,
                 }],
                 policy: SelectionPolicy::default_policy(),
                 gather_scope: GatherScope::default(),

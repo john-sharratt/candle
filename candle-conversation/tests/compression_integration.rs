@@ -198,6 +198,39 @@ fn compression_tree_over_32_turns() -> candle_conversation::Result<()> {
             !ids.is_empty(),
             "compressed node {idx:?} must carry decoded tokens"
         );
+
+        // Every summary node carries the staged provenance linkage: a
+        // wide-Q signature captured at its re-prefill seal, and one
+        // synthesized projection event whose selection names the node
+        // itself first and then exactly the children it covers.
+        assert!(
+            guard
+                .wide_q_sigs_blob(timeline, idx)
+                .is_some_and(|b| !b.is_empty()),
+            "summary node {idx:?} must persist a wide-Q signature"
+        );
+        let events = guard
+            .projection_events_blob(timeline, idx)
+            .map(candle_conversation::projection::decode_events)
+            .unwrap_or_default();
+        assert_eq!(
+            events.len(),
+            1,
+            "summary node {idx:?} carries one synthesized event"
+        );
+        let sel = &events[0].selection;
+        assert!(sel.system.is_empty(), "compression runs no projection");
+        assert_eq!(
+            (sel.turns[0].index, sel.turns[0].kind, sel.turns[0].timeline),
+            (idx.0, meta.kind, Some(timeline.raw())),
+            "the node references itself first"
+        );
+        let referenced: Vec<u32> = sel.turns[1..].iter().map(|t| t.index).collect();
+        let children: Vec<u32> = meta.children.iter().map(|c| c.0).collect();
+        assert_eq!(
+            referenced, children,
+            "the node references exactly the turns it covers"
+        );
     }
 
     eprintln!("==== Totals: {n_sot} SummaryOfTurns, {n_sos} SummaryOfSummaries ====\n");

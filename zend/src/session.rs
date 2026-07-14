@@ -2787,6 +2787,35 @@ fn pre_collection_prelude(builder: &Builder) -> String {
 }
 
 #[cfg(test)]
+mod projection_schema_tests {
+    use super::build_projection_builder;
+    use candle_conversation::projection::SelectionRule;
+    use std::path::Path;
+
+    /// The shipped `projection.yaml` parses, and the reconstructed repo map is
+    /// capped and floored: `structure` is a `top_k(2)` group with a `"."`
+    /// default so the workspace-root cluster always survives selection.
+    #[test]
+    fn projection_yaml_parses_and_repo_map_is_capped_with_default() {
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let structure = builder
+            .id_for_group("structure")
+            .expect("repo_map declares a 'structure' group");
+        let group = builder.group(structure).expect("group schema present");
+
+        match &group.selection {
+            SelectionRule::TopK { k } => assert_eq!(*k, 2, "repo map capped at 2 clusters"),
+            other => panic!("structure should be top_k(2), got {other:?}"),
+        }
+        assert_eq!(
+            group.default.as_ref().map(|d| d.tag.as_str()),
+            Some("."),
+            "repo_map default floor is the workspace-root cluster",
+        );
+    }
+}
+
+#[cfg(test)]
 mod held_tail_tests {
     use super::render_held_tail;
 

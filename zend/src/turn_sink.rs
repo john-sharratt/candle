@@ -28,15 +28,28 @@ use candle_conversation::{SamplingConfig, Sequence, TurnEvent, TurnOptions};
 /// Accepts a structured `(user, assistant)` turn stream from the
 /// workspace-ingestion paths.
 pub trait InsertTurnSink {
-    /// Prefill a complete user/assistant exchange with no model
-    /// decode.
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<()>;
+    /// Prefill a complete user/assistant exchange with no model decode.
+    /// `tags` are the turn's gather-scope tags (e.g. `["code", <path>]`) —
+    /// persisted on the TurnDecl so tag-scoped provenance galleries admit
+    /// the turn, alongside the staged projection events the production
+    /// sink records for it.
+    fn insert_prefill_turn(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<()>;
 
     /// Submit `user` and decode the assistant response with the
-    /// supplied `max_tokens` cap.  Returns the decoded text so the
-    /// caller can inspect it; the summary's K/V lands on the
-    /// sequence automatically as part of `finish_turn`.
-    fn decode_summary_turn(&mut self, user: &str, max_tokens: usize) -> anyhow::Result<String>;
+    /// supplied `max_tokens` cap and gather-scope `tags`.  Returns the
+    /// decoded text so the caller can inspect it; the summary's K/V lands
+    /// on the sequence automatically as part of the staged finish.
+    fn decode_summary_turn(
+        &mut self,
+        user: &str,
+        max_tokens: usize,
+        tags: Vec<String>,
+    ) -> anyhow::Result<String>;
 
     /// Restart-resume cache probe: whether some conversation in the
     /// substrate already carries `key == value` in its `custom` metadata
@@ -66,18 +79,23 @@ impl<'a> SequenceTurnSink<'a> {
 }
 
 impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<()> {
+    fn insert_prefill_turn(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         tracing::debug!(
             target: "zend::turn_sink",
             user_bytes = user.len(),
             assistant_bytes = assistant.len(),
-            "insert_prefill_turn: calling Sequence::insert_turn",
+            "insert_prefill_turn: calling Sequence::insert_turn_staged",
         );
         let result = self
             .inner
-            .insert_turn(user, assistant)
-            .map_err(|e| anyhow::anyhow!("insert_turn: {e}"));
+            .insert_turn_staged(user, assistant, tags)
+            .map_err(|e| anyhow::anyhow!("insert_turn_staged: {e}"));
         tracing::debug!(
             target: "zend::turn_sink",
             ms = start.elapsed().as_millis() as u64,
@@ -87,10 +105,16 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         result
     }
 
-    fn decode_summary_turn(&mut self, user: &str, max_tokens: usize) -> anyhow::Result<String> {
+    fn decode_summary_turn(
+        &mut self,
+        user: &str,
+        max_tokens: usize,
+        tags: Vec<String>,
+    ) -> anyhow::Result<String> {
         let options = TurnOptions {
             max_tokens: Some(max_tokens),
             sampling: Some(SamplingConfig::argmax()),
+            tags,
             ..Default::default()
         };
 
@@ -181,15 +205,15 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
         let finish_start = std::time::Instant::now();
         tracing::debug!(
             target: "zend::turn_sink",
-            "decode_summary_turn: calling finish_turn",
+            "decode_summary_turn: calling finish_turn_staged",
         );
         self.inner
-            .finish_turn(handle, &resp)
-            .map_err(|e| anyhow::anyhow!("finish_turn: {e}"))?;
+            .finish_turn_staged(handle, &resp)
+            .map_err(|e| anyhow::anyhow!("finish_turn_staged: {e}"))?;
         tracing::debug!(
             target: "zend::turn_sink",
             ms = finish_start.elapsed().as_millis() as u64,
-            "decode_summary_turn: finish_turn returned",
+            "decode_summary_turn: finish_turn_staged returned",
         );
         Ok(text)
     }
@@ -212,7 +236,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
 }
 
 /// Recording sink for integration tests.  Stores every
-/// `(user, assistant, decoded)` triple the ingestion path emits,
+/// `(user, assistant, decoded, tags)` entry the ingestion path emits,
 /// in order, so test cases can verify the conversation shape
 /// without loading a model.  `decoded == true` flags the entries
 /// produced by [`InsertTurnSink::decode_summary_turn`]; the
@@ -221,7 +245,7 @@ impl<'a> InsertTurnSink for SequenceTurnSink<'a> {
 #[allow(dead_code)]
 #[derive(Default)]
 pub struct RecordingTurnSink {
-    pub turns: Vec<(String, String, bool)>,
+    pub turns: Vec<(String, String, bool, Vec<String>)>,
     pub summary_stub: String,
 }
 
@@ -236,15 +260,25 @@ impl RecordingTurnSink {
 }
 
 impl InsertTurnSink for RecordingTurnSink {
-    fn insert_prefill_turn(&mut self, user: &str, assistant: &str) -> anyhow::Result<()> {
+    fn insert_prefill_turn(
+        &mut self,
+        user: &str,
+        assistant: &str,
+        tags: Vec<String>,
+    ) -> anyhow::Result<()> {
         self.turns
-            .push((user.to_string(), assistant.to_string(), false));
+            .push((user.to_string(), assistant.to_string(), false, tags));
         Ok(())
     }
 
-    fn decode_summary_turn(&mut self, user: &str, _max_tokens: usize) -> anyhow::Result<String> {
+    fn decode_summary_turn(
+        &mut self,
+        user: &str,
+        _max_tokens: usize,
+        tags: Vec<String>,
+    ) -> anyhow::Result<String> {
         self.turns
-            .push((user.to_string(), self.summary_stub.clone(), true));
+            .push((user.to_string(), self.summary_stub.clone(), true, tags));
         Ok(self.summary_stub.clone())
     }
 }

@@ -24,11 +24,12 @@ use crate::persistence::content_hash::{section_stream_id, turn_stream_id, Conten
 use crate::persistence::elevate::elevate_to_hot;
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
+use crate::projection::event::{group_name_of, layer_name_of_group};
 use crate::projection::{
-    Builder, CompressionPrompt, Conversation, GeneratedIdentity, OptionalState, PriorBelief,
-    ProjectionMode, ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind,
-    SectionId, SelectionState, SummaryMode, SystemPromptItem, TimelineId, TurnId, TurnIndex,
-    TurnKey, NO_THINK_SELECTOR,
+    encode_events, summary_node_event, Builder, CompressionPrompt, Conversation, GeneratedIdentity,
+    GroupKey, OptionalState, PriorBelief, ProjectionMode, ProjectionSegment, ProjectionTarget,
+    ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SummaryMode,
+    SystemPromptItem, TimelineId, TurnId, TurnIndex, TurnKey, NO_THINK_SELECTOR,
 };
 use crate::provenance::{encode_wide_sigs, extract_q_vector_r16, fold_provenance, WideQSig};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
@@ -469,6 +470,13 @@ fn record_phase(start: Instant, phase: &'static str) {
 /// turns keep scoring it alongside the most recent reasoning.
 const QUERY_HEAD_CHUNKS: usize = 2;
 
+/// Factor the previous turn's carried tool belief is scaled by when it seeds
+/// the next turn's opening projection ([`PriorBelief::decay_scores`]). Halving
+/// makes the carry a soft prior rather than a hard pin, so a topic-changed
+/// turn's fresh decode-Q can overtake the prior turn's tool within a few
+/// tokens instead of being suppressed for the whole opening window.
+const CARRIED_BELIEF_TURN_DECAY: f32 = 0.5;
+
 /// All the per-conversation context the scheduler needs to do continuous
 /// re-projection on its own thread, without round-tripping back to the
 /// caller.  Built once at [`SchedulerRequest::SubmitTurn`] time and stored
@@ -759,6 +767,15 @@ struct CompressionJob {
     conversation: Conversation,
     /// Projection target (layer, group, timeline) the node records into.
     target: ProjectionTarget,
+    /// Forest kind of the node being built (`SummaryOfTurns` leaf or
+    /// `SummaryOfSummaries`) — stamped on the node's synthesized projection
+    /// event; the node's own `tree_meta` isn't written until after
+    /// `response_tx` fires, so the kind must travel with the job.
+    kind: TurnKind,
+    /// The turns this node compresses, in child order — the provenance
+    /// linkage its synthesized projection event references, and the source
+    /// of its inherited gather-scope tags.
+    children: Vec<TurnIndex>,
     /// Scratch slot driving the user-half pass; freed once that half completes.
     /// `None` when the question-half is echoed verbatim (short user content),
     /// so no decode pass runs and `user_result` is pre-filled.
@@ -786,6 +803,17 @@ struct PendingCompressionSeal {
     /// spans), built when the exchange was framed.
     layout: TurnLayout,
     token_ids: Vec<u32>,
+    /// Forest kind of the node — see [`CompressionJob::kind`].
+    kind: TurnKind,
+    /// The turns this node compresses — referenced by the node's synthesized
+    /// projection event so a wide-Q hit on the summary resolves to the
+    /// covered turns.
+    children: Vec<TurnIndex>,
+    /// Gather-scope tags inherited as the union of the children's TurnDecl
+    /// tags: a code_read leaf carries its scan turn's `["code", <path>]`, a
+    /// SoS the union of its children's; untagged (dialogue) children yield
+    /// an untagged summary, preserving the tag-partition invariant.
+    tags: Vec<String>,
     response_tx: Sender<Result<TurnIndex, ProbeError>>,
 }
 
@@ -1777,11 +1805,21 @@ impl Scheduler {
                     // evolves through this turn's reprojections and is harvested
                     // back at seal, so provenance selection is continuous across
                     // turn boundaries instead of resetting to catalog order.
-                    let carried_belief = self
+                    //
+                    // Decayed at the boundary so it seeds as a SOFT PRIOR, not a
+                    // hard pin: the incoming query has no decode-Q evidence yet
+                    // (its prefill-Q hits the call↔definition domain gap), so a
+                    // full-strength prior would let the previous turn's tool own
+                    // the whole opening window and the model could commit to a
+                    // wrong framing before the correct tool is selected. Halving
+                    // lets the fresh decode-Q overtake a stale tool within a few
+                    // tokens; a real continuation re-accumulates just as fast.
+                    let mut carried_belief = self
                         .carried_beliefs
                         .get(&parent_id)
                         .cloned()
                         .unwrap_or_default();
+                    carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
                     let projection = inputs.projection.project_with_mode_and_sink(
                         target,
                         &view,
@@ -2617,6 +2655,8 @@ impl Scheduler {
             CompressionJob {
                 conversation: conv,
                 target,
+                kind,
+                children,
                 user_slot,
                 assistant_slot,
                 user_result: user_verbatim.then(|| CompressionPassResult {
@@ -2684,6 +2724,8 @@ impl Scheduler {
             job_id,
             conv.clone(),
             target,
+            kind,
+            children.to_vec(),
             user_tokens,
             assistant_tokens,
             response_tx,
@@ -3221,6 +3263,8 @@ impl Scheduler {
         let CompressionJob {
             conversation,
             target,
+            kind,
+            children,
             user_result,
             assistant_result,
             response_tx,
@@ -3232,6 +3276,8 @@ impl Scheduler {
             job_id,
             conversation,
             target,
+            kind,
+            children,
             user.tokens,
             assistant.tokens,
             response_tx,
@@ -3283,15 +3329,22 @@ impl Scheduler {
 
     /// Shared by the model-decode path ([`Self::enqueue_compression_turn`]) and
     /// the deterministic structural path ([`Self::handle_summary_probe`]).
+    #[allow(clippy::too_many_arguments)]
     fn seal_compression_turn(
         &mut self,
         job_id: u64,
         conversation: Conversation,
         target: ProjectionTarget,
+        kind: TurnKind,
+        children: Vec<TurnIndex>,
         user_tokens: Vec<u32>,
         assistant_tokens: Vec<u32>,
         response_tx: Sender<Result<TurnIndex, ProbeError>>,
     ) -> Result<(), String> {
+        // The node inherits the union of its children's gather-scope tags —
+        // exact per node and recursive by construction (a SoS's children are
+        // earlier summary nodes carrying their own inherited tags).
+        let tags = conversation.union_turn_tags(target.timeline, &children);
         // Despite the `/no_think` directive the model may still emit an (empty)
         // `<think></think>` block before the summary. Summaries are stored as
         // plain content, so strip the block from each half here — before the
@@ -3385,6 +3438,9 @@ impl Scheduler {
                 target,
                 layout,
                 token_ids: token_ids.clone(),
+                kind,
+                children,
+                tags,
                 response_tx,
             },
         );
@@ -3664,6 +3720,11 @@ impl Scheduler {
                 return;
             }
         };
+        // Capture the node's wide per-token `sign(Q)` while the slot is still
+        // live — the re-prefill's K/V is freshly R16 here, exactly as at a
+        // normal turn seal. The whole slot is the marker-framed turn
+        // (`reprojection: None`), so the range is 1:1 with the Tokens record.
+        let wide_sigs = self.gather_wide_sigs(slot, (0, block_count));
         // The slice holds RAII `ChunkGid` clones, so the K/V survives the free.
         self.free_summary_slot(slot);
         let block_end = sealed_gpu.first().map(|s| s.chunks.len()).unwrap_or(0);
@@ -3702,8 +3763,11 @@ impl Scheduler {
             layout: pending.layout,
             token_ids: TokenBuffer::from(pending.token_ids),
             token_count,
-            // Compression/summary turns are never a gather target — untagged.
-            tags: Vec::new(),
+            // The node inherits the union of its children's gather-scope
+            // tags, so tag-scoped provenance galleries admit the summary in
+            // place of the turns it compresses; untagged (dialogue) children
+            // yield an untagged summary.
+            tags: pending.tags.clone(),
             block_start: 0,
             block_end: block_end as u64,
             sealed_gpu: Some(Arc::new(sealed_gpu)),
@@ -3727,6 +3791,63 @@ impl Scheduler {
         let stream_id = turn_stream_id(timeline.raw(), idx.0);
         if let Err(e) = conversation.persist_tokens_only(stream_id, &persist_token_ids) {
             tracing::warn!("persist summary tokens failed: {e}");
+        }
+        // Persist the node's wide-Q signature under the same stream — the
+        // gallery entry a provenance scan matches against the summary.
+        if !wide_sigs.is_empty() {
+            if let Err(e) =
+                conversation.persist_wide_q_sigs(stream_id, &encode_wide_sigs(&wide_sigs))
+            {
+                tracing::warn!("persist summary wide-Q sigs failed: {e}");
+            }
+        }
+        // Synthesize + persist the node's projection event: the mandatory
+        // provenance linkage naming the node itself and the turns it covers
+        // by `(timeline, index)`, so a wide-Q hit on the summary resolves to
+        // real turns. Compression frames run no projection — the event's
+        // system list is honestly empty.
+        {
+            let (layer_name, group_name) = self
+                .timeline_projections
+                .get(&timeline)
+                .map(|b| {
+                    let schema = b.schema();
+                    (
+                        layer_name_of_group(schema, pending.target.group)
+                            .unwrap_or_default()
+                            .to_string(),
+                        group_name_of(schema, pending.target.group)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            let children_meta: Vec<(TurnIndex, TurnKind, u32)> = {
+                let read = conversation.read();
+                pending
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let kind = read
+                            .tree_meta_of(timeline, c)
+                            .map(|m| m.kind)
+                            .unwrap_or(TurnKind::Normal);
+                        (c, kind, read.turn_token_count_of(timeline, c) as u32)
+                    })
+                    .collect()
+            };
+            let event = summary_node_event(
+                &layer_name,
+                &group_name,
+                timeline.raw(),
+                (idx, pending.kind, token_count as u32),
+                children_meta,
+            );
+            if let Err(e) =
+                conversation.persist_projection_events(stream_id, &encode_events(&[event]))
+            {
+                tracing::warn!("persist summary projection event failed: {e}");
+            }
         }
         self.persist_trigger.fire();
 
@@ -4969,6 +5090,10 @@ impl Scheduler {
                     "perform_seal_and_write: no conversation registered for slot {seal_slot}"
                 ))
             })?;
+        // The substrate TurnIndex a `SealAction::Turn` records — surfaced on
+        // the SealResult so per-turn persists key by the exact index instead
+        // of racing `turn_count - 1` against the async summariser.
+        let mut recorded_turn_index: Option<u32> = None;
         match seal_action {
             SealAction::Turn => {
                 let target = seal_target.ok_or_else(|| {
@@ -5006,6 +5131,7 @@ impl Scheduler {
                 let idx = conversation
                     .record_turn(target.timeline, role, write, |seqs| Ok(seqs.to_vec()))
                     .map_err(ConversationError::Model)?;
+                recorded_turn_index = Some(idx.0);
 
                 // Drain pending section quantizations.  Every section in
                 // the queue was ingested earlier in this conversation
@@ -5177,6 +5303,7 @@ impl Scheduler {
             block_to,
             turn_token_count,
             chunk_size,
+            turn_index: recorded_turn_index,
         }))
     }
 
@@ -5534,11 +5661,18 @@ impl Scheduler {
         // Seed this reprojection's belief from the last one on the decode state
         // (empty on the first) — the RelLeak decay/reinforcement carries across
         // the turn. The new belief is written back in `reproject_view_complete`.
-        let prior_belief = self
+        let mut prior_belief = self
             .active_decodes
             .get(&view_id)
             .map(|s| s.belief.clone())
             .unwrap_or_default();
+        // This turn's first reprojection is the turn boundary: no projection has
+        // run against the decoded content yet (`last_projection_end == 0`).
+        let is_turn_boundary = self
+            .active_decodes
+            .get(&view_id)
+            .map(|s| s.last_projection_end == 0)
+            .unwrap_or(false);
 
         // 1. Compute the probe's CHUNK range — the turn's own content, in the
         //    same chunk coordinates the seal captures for the belief gallery.
@@ -5597,18 +5731,79 @@ impl Scheduler {
         record_phase(t_probe, "reproject_probe_extract");
 
         // 4. Wide-Q belief scoring: scan the probe against each belief-driven
-        //    collection's tag-scoped gallery of past turns→selected-section,
-        //    producing the per-section scores the belief policy selects from in
+        //    collection's tag-scoped gallery of past turns→selected-section AND
+        //    each belief-driven turn group's own turns (self-match), producing the
+        //    per-section / per-turn scores the belief policy selects from in
         //    `project()`. No provenance scan, no persisted scores — projection-local.
+        //    `group_candidates` carries each turn group's freshly-scored turns for
+        //    the turn-boundary challenger below.
         let t_scan = Instant::now();
         let schema = policy.projection.schema();
-        let projection_scores = match schema.layers.iter().find(|l| l.id == policy.target.layer) {
-            Some(layer) => policy.substrate.score_belief_collections(layer, &probe),
-            None => crate::substrate::ProjectionScores::new(),
-        };
+        let (projection_scores, group_candidates) =
+            policy.substrate.score_beliefs(schema, policy.target, &probe);
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
+
+        // Turn-boundary challenger: on this turn's FIRST reprojection, give each
+        // top-N belief collection's strongest fresh signal a slot even when it's
+        // below `min_score`, evicting the weakest carried incumbent only if the
+        // selection is full. Lets a topic-changed query's new intent break in
+        // without lowering the threshold (which would admit noise mid-turn); the
+        // strong carried signals survive, and RelLeak decays the challenger back
+        // out over the turn if its fresh score doesn't hold up.
+        if is_turn_boundary {
+            // Collections (tool catalog) live in the target layer: challenge on
+            // section fresh scores.
+            if let Some(layer) = schema.layers.iter().find(|l| l.id == policy.target.layer) {
+                for item in &layer.system_prompt.items {
+                    if let SystemPromptItem::Collection(coll) = item {
+                        let budget_max = coll.policy.config.budget_max;
+                        if budget_max < 3 {
+                            continue;
+                        }
+                        let fresh: Vec<(String, f32)> = coll
+                            .sections
+                            .iter()
+                            .map(|s| (s.name.clone(), projection_scores.section(s.id)))
+                            .collect();
+                        prior_belief.seat_turn_boundary_challenger(
+                            GroupKey::Collection(coll.name.clone()),
+                            &fresh,
+                            budget_max,
+                            coll.policy.config.min_score,
+                        );
+                    }
+                }
+            }
+            // Belief-driven turn groups span every layer (memory tiers, repo
+            // map): look each candidate group up across the whole schema and
+            // challenge on its per-turn fresh scores, keyed by turn index.
+            for (gid, cands) in &group_candidates {
+                let Some(group) = schema
+                    .layers
+                    .iter()
+                    .flat_map(|l| l.groups.iter())
+                    .find(|g| g.id == *gid)
+                else {
+                    continue;
+                };
+                let cfg = group.belief_config(cands.len());
+                if cfg.budget_max < 3 {
+                    continue;
+                }
+                let fresh: Vec<(String, f32)> = cands
+                    .iter()
+                    .map(|(idx, score)| (idx.0.to_string(), *score))
+                    .collect();
+                prior_belief.seat_turn_boundary_challenger(
+                    GroupKey::TurnGroup(group.name.clone()),
+                    &fresh,
+                    cfg.budget_max,
+                    cfg.min_score,
+                );
+            }
+        }
 
         // 5. Re-project against the freshly-scored substrate.
         //

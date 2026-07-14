@@ -1477,6 +1477,46 @@ impl Sequence {
         assistant_text: &str,
         tags: Vec<String>,
     ) -> crate::Result<()> {
+        self.insert_turn_inner(user_message, assistant_text, tags)?;
+        Ok(())
+    }
+
+    /// [`insert_turn_tagged`](Self::insert_turn_tagged) + staged provenance
+    /// linkage for ingest turns (repo_map clusters, code_read scopes): after
+    /// the turn seals, synthesizes two [`ProjectionEvent`]s — one for the
+    /// user half (`start_token: 0`), one for the assistant half — whose
+    /// `selection.turns` reference the turn itself and its immediate
+    /// predecessor by `(timeline, index)`, and persists them keyed to the
+    /// turn's stream id. Together with the turn's seal-time wide-Q signature
+    /// this gives a later provenance scan the resolvable chain
+    /// sig hit → event → turn.
+    pub fn insert_turn_staged(
+        &mut self,
+        user_message: &str,
+        assistant_text: &str,
+        tags: Vec<String>,
+    ) -> crate::Result<()> {
+        let (assistant_content_start, turn_index) =
+            self.insert_turn_inner(user_message, assistant_text, tags)?;
+        let Some(idx) = turn_index else {
+            // No substrate seal (no registered target) — nothing to key
+            // events to; the turn itself was still prefilled.
+            return Ok(());
+        };
+        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0)
+    }
+
+    /// Shared body of [`insert_turn_tagged`] / [`insert_turn_staged`]: format,
+    /// tokenize, prefill through the shared projection path, drain to `Done`,
+    /// finalize. Returns the assistant half's grid-token start and the sealed
+    /// substrate `TurnIndex` (from the seal result — never derived by
+    /// counting, which races the async summariser).
+    fn insert_turn_inner(
+        &mut self,
+        user_message: &str,
+        assistant_text: &str,
+        tags: Vec<String>,
+    ) -> crate::Result<(u32, Option<u32>)> {
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -1588,10 +1628,11 @@ impl Sequence {
         // observe Done so we know the parent's KV is fully populated
         // before we register the turn.
         let response = handle.wait()?;
+        let turn_index = response.seal.as_ref().and_then(|s| s.turn_index);
 
         // Run the same post-Done finalize as a regular turn.
         self.finalize_turn_post_done(user_tt, asst_tt, response.seal.as_ref())?;
-        Ok(())
+        Ok((assistant_content_start, turn_index))
     }
 
     /// Blocking convenience: submit + wait.
@@ -1645,12 +1686,144 @@ impl Sequence {
         self.finalize_turn_post_done(user_tt, assistant_tt, response.seal.as_ref())
     }
 
-    /// Belief scores for the just-sealed turn, scored against each belief-driven
-    /// collection's tag-scoped gallery using the turn's own persisted wide-Q
-    /// signature as the probe. The post-turn counterpart of the scheduler's live
-    /// reproject scan — same gallery + scorer, but the probe is the finished
-    /// turn's stored signature rather than a live gather. Empty when the turn has
-    /// no signature (nothing to score against).
+    /// [`finish_turn`](Self::finish_turn) + staged provenance linkage for a
+    /// DECODED ingest turn (the code_read per-file summary): synthesizes and
+    /// persists the same two staged [`ProjectionEvent`]s as
+    /// [`insert_turn_staged`](Self::insert_turn_staged), with the decode's
+    /// wall-clock on the assistant-half event. The assistant half's grid
+    /// start comes from the sealed turn's own [`TurnLayout`] rather than
+    /// re-tokenizing.
+    pub fn finish_turn_staged(
+        &mut self,
+        handle: TurnHandle,
+        response: &TurnResponse,
+    ) -> crate::Result<String> {
+        let turn_index = response.seal.as_ref().and_then(|s| s.turn_index);
+        let seconds = response.stats.decode_ms / 1000.0;
+        let text = self.finish_turn(handle, response)?;
+        if let Some(idx) = turn_index {
+            let assistant_start = {
+                let read = self.substrate.read();
+                read.turn_layout(self.target.timeline, TurnIndex(idx))
+                    .map(|l| l.assistant_content_start())
+                    .unwrap_or(0)
+            };
+            self.persist_staged_ingest_events(idx, assistant_start, seconds)?;
+        }
+        Ok(text)
+    }
+
+    /// Synthesize + persist the two staged [`ProjectionEvent`]s for the
+    /// just-sealed ingest turn `turn_index`: one governing the user half
+    /// (`start_token: 0`), one governing the assistant half. `selection`
+    /// carries the layer's fixed system sections and — the mandatory
+    /// provenance linkage — the turn itself plus its immediate predecessor as
+    /// `(timeline, index)`-resolvable [`SelectedTurn`]s, keyed to the turn's
+    /// stream id (the same key its wide-Q signature persists under).
+    fn persist_staged_ingest_events(
+        &self,
+        turn_index: u32,
+        assistant_content_start: u32,
+        seconds: f64,
+    ) -> crate::Result<()> {
+        use crate::persistence::content_hash::turn_stream_id;
+        use crate::persistence::streams::StreamDecl;
+        use crate::projection::event::group_name_of;
+        use crate::projection::{encode_events, staged_ingest_event, SelectedTurn, SystemItem};
+        use crate::substrate::ContentResolver;
+        use crate::summary_tree::TurnKind;
+
+        let timeline = self.target.timeline;
+        let schema = self.projection.schema();
+        let layer = schema.layers.iter().find(|l| l.id == self.target.layer);
+        let layer_name = layer.map(|l| l.name.clone()).unwrap_or_default();
+        let group_name = group_name_of(schema, self.target.group)
+            .unwrap_or_default()
+            .to_string();
+
+        let (system, turns) = {
+            let read = self.substrate.read();
+            // The trunk's fixed system sections — utility-layer system
+            // prompts are fixed-only, so this is the complete composition.
+            let mut system: Vec<SystemItem> = Vec::new();
+            if let Some(layer) = layer {
+                for item in &layer.system_prompt.items {
+                    if let SystemPromptItem::Section(s) = item {
+                        let tokens = ContentResolver::section_token_count(&read, s.id) as u32;
+                        system.push(SystemItem::Section {
+                            name: s.name.clone(),
+                            tokens,
+                        });
+                    }
+                }
+            }
+            let count = crate::substrate::Substrate::turn_count(&read, timeline);
+            let selected = |idx: u32| -> Option<SelectedTurn> {
+                let t = TurnIndex(idx);
+                if idx >= count {
+                    return None;
+                }
+                let role = read
+                    .stream_of(turn_stream_id(timeline.raw(), idx))
+                    .and_then(|s| s.decl.as_ref())
+                    .and_then(|d| match d {
+                        StreamDecl::Turn(t) => Some(t.role),
+                        _ => None,
+                    })
+                    .map(|r| match r {
+                        0 => "system",
+                        2 => "assistant",
+                        _ => "user",
+                    })
+                    .unwrap_or("user")
+                    .to_string();
+                let kind = read
+                    .tree_meta_of(timeline, t)
+                    .map(|m| m.kind)
+                    .unwrap_or(TurnKind::Normal);
+                Some(SelectedTurn {
+                    layer: layer_name.clone(),
+                    group: group_name.clone(),
+                    index: idx,
+                    role,
+                    tokens: read.turn_token_count_of(timeline, t) as u32,
+                    kind,
+                    reason: None,
+                    timeline: Some(timeline.raw()),
+                    selected: true,
+                    score: 0.0,
+                })
+            };
+            let mut turns = Vec::with_capacity(2);
+            if let Some(prev) = turn_index.checked_sub(1).and_then(selected) {
+                turns.push(prev);
+            }
+            if let Some(own) = selected(turn_index) {
+                turns.push(own);
+            }
+            (system, turns)
+        };
+
+        let events = [
+            staged_ingest_event(0, 0.0, system.clone(), turns.clone()),
+            staged_ingest_event(assistant_content_start, seconds, system, turns),
+        ];
+        self.substrate
+            .persist_projection_events(
+                turn_stream_id(timeline.raw(), turn_index),
+                &encode_events(&events),
+            )
+            .map_err(ConversationError::Model)?;
+        Ok(())
+    }
+
+    /// Belief scores for the just-sealed turn, scored against each belief node
+    /// (the target layer's collections AND every layer's belief-driven turn
+    /// groups) using the turn's own persisted wide-Q signature as the probe. The
+    /// post-turn counterpart of the scheduler's live reproject scan — same
+    /// galleries + scorer, but the probe is the finished turn's stored signature
+    /// rather than a live gather. Empty when the turn has no signature (nothing
+    /// to score against).
     fn last_turn_belief_scores(&self) -> crate::substrate::ProjectionScores {
         use crate::provenance::decode_wide_sigs;
         let empty = crate::substrate::ProjectionScores::new();
@@ -1669,11 +1842,10 @@ impl Sequence {
                 None => return empty,
             }
         };
-        let schema = self.projection.schema();
-        let Some(layer) = schema.layers.iter().find(|l| l.id == self.target.layer) else {
-            return empty;
-        };
-        self.substrate.score_belief_collections(layer, &probe)
+        let (scores, _) = self
+            .substrate
+            .score_beliefs(self.projection.schema(), self.target, &probe);
+        scores
     }
 
     /// Recompute the materialized projection for this conversation and pair it

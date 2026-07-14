@@ -50,8 +50,22 @@
 //!   emission:  insertion order
 //! ```
 
-use super::ids::TurnIndex;
-use super::schema::SelectionRule;
+use super::ids::{GroupId, TurnIndex};
+use super::schema::{SelectionDefault, SelectionRule};
+use crate::substrate::ContentResolver;
+
+/// Resolve a group's declared `default` fallback turn — the member brought in
+/// when normal selection is empty, keyed by a gather-scope tag (e.g. `"."` for
+/// the repo_map workspace-root cluster). `None` when the group has no default
+/// or the tag resolves to no turn. Off the hot path — only consulted on an
+/// empty selection.
+pub fn resolve_default_turn(
+    default: Option<&SelectionDefault>,
+    group: GroupId,
+    resolver: &dyn ContentResolver,
+) -> Option<TurnIndex> {
+    resolver.turn_with_tag(group, &default?.tag)
+}
 
 /// Apply a selection rule to a group's turns.
 ///
@@ -246,7 +260,7 @@ fn select_conversation(
 
 /// Remove turns (lowest-scored first) from `eligible` until the total token
 /// count fits within `budget`. `eligible` must already be sorted by score desc.
-fn trim_to_budget_low_score_first(
+pub(super) fn trim_to_budget_low_score_first(
     eligible: &mut Vec<(TurnIndex, f32)>,
     budget: usize,
     token_counts: &dyn Fn(TurnIndex) -> usize,

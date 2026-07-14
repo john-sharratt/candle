@@ -52,7 +52,7 @@
 //! `LayerSchema.window` has no default — it must be declared.
 
 use super::ids::{CollectionId, GroupId, LayerId, SectionId};
-use super::policy::SelectionPolicy;
+use super::policy::{PolicyConfig, SelectionPolicy};
 
 /// Schema for one layer's system-prompt content.
 ///
@@ -478,6 +478,10 @@ pub struct SectionCollection {
     /// Tokenised [`Self::member_glue`], live-prefilled between members like a
     /// structural template.  `None` until tokenised (or when `member_glue` is empty).
     pub member_glue_tokens: Option<std::sync::Arc<Vec<u32>>>,
+    /// Fallback section (by name) emitted when belief/scores select no member,
+    /// so the collection always contributes at least one section. `None` =
+    /// today's behaviour.
+    pub default: Option<SelectionDefault>,
 }
 
 impl Default for SectionCollection {
@@ -493,6 +497,7 @@ impl Default for SectionCollection {
             summary_section: None,
             member_glue: String::new(),
             member_glue_tokens: None,
+            default: None,
         }
     }
 }
@@ -853,6 +858,46 @@ pub struct GroupSchema {
     /// resolved from the group's `policy:` or inherited from the enclosing layer.
     pub policy: SelectionPolicy,
     pub budget: Budget,
+    /// Fallback turn (by decl tag) brought in when belief/scores select nothing,
+    /// so the group — and its layer — never drops out of the projection. `None`
+    /// = no fallback (today's behaviour).
+    pub default: Option<SelectionDefault>,
+}
+
+impl GroupSchema {
+    /// Whether this group's turns are selected by the provenance belief
+    /// mechanism (RelLeak scores + budget) rather than pure recency.
+    /// `Sequence` is intrinsically a recency rule (recent-N inviolate); every
+    /// other rule ranks by score and so becomes belief-driven once turns carry
+    /// a fresh wide-Q score.
+    pub fn is_belief_driven(&self) -> bool {
+        !matches!(self.selection, SelectionRule::Sequence { .. })
+    }
+
+    /// The belief [`PolicyConfig`] for a belief-driven group: the group's policy
+    /// (β leak rate, inherited) with the **budget** and **score gates** taken
+    /// from the selection *rule* and `score_threshold`, so the belief step
+    /// selects exactly the rule's cap — `top_k(k)` → at most `k`, `single` → 1,
+    /// `always_visible` → all `n_candidates`. This keeps the belief path's
+    /// surviving set identical to what `apply_selection` would rank, just
+    /// carried across reprojections. `n_candidates` bounds the unbounded
+    /// `always_visible` case.
+    pub fn belief_config(&self, n_candidates: usize) -> PolicyConfig {
+        let mut cfg = self.policy.config;
+        cfg.budget_min = 0;
+        cfg.budget_max = match &self.selection {
+            SelectionRule::TopK { k } => *k,
+            SelectionRule::Single => 1,
+            SelectionRule::AlwaysVisible => n_candidates.max(1),
+            // Named/Sequence aren't belief-driven; fall back to the policy budget.
+            SelectionRule::Named { .. } | SelectionRule::Sequence { .. } => {
+                self.policy.config.budget_max
+            }
+        };
+        cfg.min_score = self.score_threshold;
+        cfg.evict_score = self.score_threshold;
+        cfg
+    }
 }
 
 /// Flexbox-style token budget descriptor.
@@ -950,6 +995,19 @@ pub enum SelectionRule {
         recent: usize,
         historical_top_k: usize,
     },
+}
+
+/// A fallback member injected when a group's or collection's normal selection
+/// (belief + challenger + rule) yields nothing. Identified by a single string:
+/// a turn's gather-scope decl tag for groups (e.g. `"."` for the repo_map
+/// workspace-root cluster), or a section name for collections. Guarantees the
+/// group/collection contributes at least one member so its layer never vanishes
+/// from the projection when scores are cold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectionDefault {
+    /// The turn-decl tag (groups) or section name (collections) that identifies
+    /// the fallback member. Must uniquely name one member.
+    pub tag: String,
 }
 
 /// How turn scores are aggregated into a single group score.

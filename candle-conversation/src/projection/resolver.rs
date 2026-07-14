@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
-use super::schema::{LayerSchema, SystemPromptItem};
+use super::schema::{LayerSchema, Schema, SystemPromptItem};
 use crate::persistence::record::TreeMetadataPayload;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
@@ -366,6 +366,122 @@ impl Conversation {
         scores
     }
 
+    /// Score every belief node the projection will consult: the **target
+    /// layer's collections** (the tool catalog) plus **every layer's
+    /// belief-driven turn groups** (repo_map clusters, code scopes, memory tiers
+    /// — each in its own non-target layer). Returns the combined
+    /// [`ProjectionScores`] and, for the scheduler's turn-boundary challenger,
+    /// each scored turn group's candidate `(turn, fresh_score)` list.
+    ///
+    /// The projection materializes *all* visible layers and belief-selects each
+    /// layer's groups, so the scan must cover all layers too — scoping it to the
+    /// target layer alone leaves every non-target turn group on all-zero scores
+    /// (a degenerate index tie-break instead of relevance). An empty probe scores
+    /// nothing.
+    pub fn score_beliefs(
+        &self,
+        schema: &Schema,
+        target: ProjectionTarget,
+        probe: &[WideQSig],
+    ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnIndex, f32)>)>) {
+        let mut scores = ProjectionScores::new();
+        let mut candidates = Vec::new();
+        if probe.is_empty() {
+            return (scores, candidates);
+        }
+        // Collections live in the target layer (the tool catalog).
+        if let Some(layer) = schema.layers.iter().find(|l| l.id == target.layer) {
+            scores = self.score_belief_collections(layer, probe);
+        }
+        // Belief-driven turn groups live across every layer.
+        for layer in &schema.layers {
+            candidates.extend(self.score_belief_groups(layer, target, probe, &mut scores));
+        }
+        (scores, candidates)
+    }
+
+    /// Score every belief-driven **turn group** in `layer` against its own turns
+    /// (self-match), folding the fresh per-turn scores into `scores`.
+    ///
+    /// The turn-group analogue of [`Self::score_belief_collections`]: where a
+    /// collection scans a tag-scoped gallery of *other* turns mapped to section
+    /// slots, a turn group's retrieval target IS the turn itself, so each
+    /// candidate turn is its own slot (identity map) and the probe scores against
+    /// each turn's stored `WideQSig` window directly. A `Sequence` (recency) group
+    /// is skipped — it isn't belief-driven. The group's timeline is resolved the
+    /// same way the projection will (`resolve_turn_timeline(Some(target), …)`) and
+    /// its turns enumerated `0..turn_count(timeline)` exactly as selection does,
+    /// so the `(timeline, index)` keys line up with what selection reads back.
+    pub fn score_belief_groups(
+        &self,
+        layer: &LayerSchema,
+        target: ProjectionTarget,
+        probe: &[WideQSig],
+        scores: &mut ProjectionScores,
+    ) -> Vec<(GroupId, Vec<(TurnIndex, f32)>)> {
+        use crate::persistence::content_hash::turn_stream_id;
+        let mut per_group: Vec<(GroupId, Vec<(TurnIndex, f32)>)> = Vec::new();
+        if probe.is_empty() {
+            return per_group;
+        }
+        let sub = self.inner.read().unwrap();
+        for group in &layer.groups {
+            if !group.is_belief_driven() {
+                continue;
+            }
+            let Some(timeline) = sub.resolve_turn_timeline(Some(target), group.id) else {
+                continue;
+            };
+            // Enumerate the group's turns exactly as selection does — the whole
+            // resolved timeline, `0..turn_count`, fetched by stream id — instead
+            // of scanning `all_streams()` per group (which is O(all timelines'
+            // streams) on the reproject hot path).
+            let count = sub.turn_count(timeline);
+            let mut windows: Vec<Vec<WideQSig>> = Vec::new();
+            let mut indices: Vec<TurnIndex> = Vec::new();
+            for i in 0..count {
+                let idx = TurnIndex(i);
+                // Summary forest nodes are selected only by the score-density
+                // path, never the belief/rule path — mirror project.rs and skip
+                // them so a summary can't take a raw turn's belief slot.
+                if sub
+                    .tree_meta_of(timeline, idx)
+                    .map(|m| m.kind.is_summary())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(e) = sub.stream_of(turn_stream_id(timeline.raw(), i)) else {
+                    continue;
+                };
+                let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+                    continue;
+                };
+                if window.is_empty() {
+                    continue;
+                }
+                windows.push(window);
+                indices.push(idx);
+            }
+            if windows.is_empty() {
+                continue;
+            }
+            let n = windows.len();
+            let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
+            // Identity slot map: turn i is slot i, so `score_slots` computes each
+            // turn's `z × margin` vote against every other candidate turn.
+            let slots: Vec<usize> = (0..n).collect();
+            let fresh = score_slots(probe, &wref, &slots, n);
+            let mut cands: Vec<(TurnIndex, f32)> = Vec::with_capacity(n);
+            for (idx, &score) in indices.iter().zip(&fresh) {
+                scores.set_turn(timeline, *idx, score);
+                cands.push((*idx, score));
+            }
+            per_group.push((group.id, cands));
+        }
+        per_group
+    }
+
     /// Atomically append a turn to the substrate.
     ///
     /// `write` carries the turn's text, token IDs, block range, and
@@ -434,6 +550,34 @@ impl Conversation {
             .map_err(|e| candle::Error::Msg(format!("{err_ctx}: {e}")))?;
         self.write().apply_stream_decl(stream_id, decl);
         Ok(stream_id)
+    }
+
+    /// Union of the gather-scope tags on `children`'s TurnDecls, dedup'd
+    /// with child order preserved. Empty when every child is untagged
+    /// (dialogue turns), so summaries of untagged content stay in the
+    /// untagged partition. Used by the summariser to stamp a summary node
+    /// with the tags of the turns it compresses — a code_read leaf inherits
+    /// its scan turn's `["code", <path>]`, a summary-of-summaries the union
+    /// of its children's.
+    pub fn union_turn_tags(&self, timeline: TimelineId, children: &[TurnIndex]) -> Vec<String> {
+        use crate::persistence::content_hash::turn_stream_id;
+        let read = self.inner.read().unwrap();
+        let mut tags: Vec<String> = Vec::new();
+        for c in children {
+            let sid = turn_stream_id(timeline.raw(), c.0);
+            let Some(entry) = read.stream_of(sid) else {
+                continue;
+            };
+            let Some(StreamDecl::Turn(d)) = &entry.decl else {
+                continue;
+            };
+            for t in &d.tags {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+        }
+        tags
     }
 
     /// Append a summariser-allocated turn (SoT leaf or SoS internal)
@@ -1439,6 +1583,13 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         let timeline = self.timeline_for(group)?;
         let (layer, _) = self.read.timeline_target(timeline)?;
         Some(layer)
+    }
+
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
+        let timeline = self.timeline_for(group)?;
+        // Call the Substrate inherent method (timeline-keyed) via deref — not the
+        // trait method (group-keyed) on `SubstrateRead`.
+        Substrate::turn_with_tag(&self.read, timeline, tag)
     }
 
     fn turn_timeline(&self, group: GroupId, _index: TurnIndex) -> Option<TimelineId> {

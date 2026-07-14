@@ -176,6 +176,22 @@ fn visit(node: &DirNode<'_>, _parent: &str, out: &mut Vec<Cluster>) {
         return;
     }
 
+    // The workspace root, when the repository is too big to absorb, becomes
+    // an OVERVIEW turn: exactly one rollup line per top-level folder — no
+    // more (no absorbed file detail; each folder's contents live in its own
+    // cluster) and no less (every folder appears) — plus the root's own
+    // files.  The root turn is the repo_map layer's always-selected anchor;
+    // absorbing small crates into it file-by-file made whichever crates
+    // happened to be small the ONLY detailed content every projection saw,
+    // skewing repo-level answers toward them.
+    if node.rel_path.is_empty() {
+        emit_root_overview(node, out);
+        for child in &node.children {
+            visit(child, "", out);
+        }
+        return;
+    }
+
     // Subtree too big to absorb wholesale.  Emit a cluster for
     // (this directory's own files + any small leaf children) and
     // recurse into each child sub-directory whose own subtree is
@@ -255,6 +271,94 @@ fn user_prompt_for(rel_path: &str) -> String {
     }
 }
 
+/// Emit the workspace-root overview cluster(s): the folder map first — one
+/// [`child_summary_line`] per top-level directory — then the root's own
+/// files.  Almost always a single cluster; a pathological root holding
+/// hundreds of direct files spills the remainder into `#N`-suffixed chunks
+/// (same shape as [`emit_split_leaf`]) so no single prefill exceeds
+/// [`MAX_CLUSTER_BYTES`].
+///
+/// The first chunk's `content_hash` covers every basename in the tree: a
+/// file added, removed, or renamed anywhere changes some folder's rollup
+/// counts, so the overview re-prefills.  Pure line-count drift leaves the
+/// hash (and the turn) untouched — the same names-not-content policy every
+/// cluster hash follows.
+fn emit_root_overview(node: &DirNode<'_>, out: &mut Vec<Cluster>) {
+    let header_line = "(workspace root)\n";
+    let mut lines: Vec<String> = node.children.iter().map(child_summary_line).collect();
+    lines.extend(node.files.iter().map(|f| render_file_line(f)));
+
+    let body_budget = MAX_CLUSTER_BYTES.saturating_sub(header_line.len() + 1);
+    let mut chunk_idx = 0usize;
+    let mut cursor = 0usize;
+    while cursor < lines.len() {
+        let mut bytes = 0usize;
+        let chunk_start = cursor;
+        while cursor < lines.len() && bytes + lines[cursor].len() <= body_budget {
+            bytes += lines[cursor].len();
+            cursor += 1;
+        }
+        if cursor == chunk_start {
+            cursor += 1;
+        }
+
+        let mut listing = String::with_capacity(header_line.len() + bytes + 1);
+        listing.push_str(header_line);
+        for line in &lines[chunk_start..cursor] {
+            listing.push_str(line);
+        }
+        listing.push('\n');
+
+        let (root_dir, covered_dirs, content_hash) = if chunk_idx == 0 {
+            (
+                node.rel_path.clone(),
+                collect_covered_dirs(node),
+                hash_basenames(node),
+            )
+        } else {
+            (
+                format!("{}#{chunk_idx}", node.rel_path),
+                vec![node.rel_path.clone()],
+                hash_basename_list(&lines[chunk_start..cursor]),
+            )
+        };
+        out.push(Cluster {
+            root_dir,
+            covered_dirs,
+            content_hash,
+            user_prompt: user_prompt_for(&node.rel_path),
+            listing,
+        });
+        chunk_idx += 1;
+    }
+}
+
+/// One-line rollup for a top-level folder: its recursive file and line
+/// totals, plus the module hint (crate / package name) when the folder's
+/// top level declares one.  E.g. `  - candle-core/ (214 files, 96,410
+/// lines, crate: candle-core)` — enough for the model to name and weigh
+/// every part of the repository without any folder's file detail.
+fn child_summary_line(node: &DirNode<'_>) -> String {
+    let (files, lines) = subtree_totals(node);
+    let mut bits = vec![format!("{files} files"), format!("{lines} lines")];
+    if let Some(hint) = node.files.iter().find_map(|f| f.module_hint.as_ref()) {
+        bits.push(hint.render());
+    }
+    format!("  - {} ({})\n", node.rel_path, bits.join(", "))
+}
+
+/// Recursive `(file_count, line_total)` for a subtree.
+fn subtree_totals(node: &DirNode<'_>) -> (usize, u64) {
+    let mut files = node.files.len();
+    let mut lines: u64 = node.files.iter().map(|f| f.line_count as u64).sum();
+    for c in &node.children {
+        let (f, l) = subtree_totals(c);
+        files += f;
+        lines += l;
+    }
+    (files, lines)
+}
+
 /// Split a leaf directory's file list into byte-bounded chunks
 /// and emit one cluster per chunk.  Each chunk re-renders the
 /// directory header so the listing is self-contained.  Chunk index
@@ -268,20 +372,7 @@ fn emit_split_leaf(node: &DirNode<'_>, out: &mut Vec<Cluster>) {
     };
 
     // Pre-render every file line so we know its exact byte cost.
-    let lines: Vec<String> = node
-        .files
-        .iter()
-        .map(|f| {
-            let mut bits = vec![
-                format!("{} lines", f.line_count),
-                f.language.label().to_string(),
-            ];
-            if let Some(h) = &f.module_hint {
-                bits.push(h.render());
-            }
-            format!("  - {} ({})\n", basename(&f.path), bits.join(", "))
-        })
-        .collect();
+    let lines: Vec<String> = node.files.iter().map(|f| render_file_line(f)).collect();
 
     // Greedy pack: fill each chunk up to MAX_CLUSTER_BYTES (minus a
     // small safety margin for the trailing blank line) and emit
@@ -366,18 +457,23 @@ fn render_node_files(node: &DirNode<'_>) -> String {
         return String::new();
     }
     for f in &node.files {
-        let mut bits = vec![
-            format!("{} lines", f.line_count),
-            f.language.label().to_string(),
-        ];
-        if let Some(h) = &f.module_hint {
-            bits.push(h.render());
-        }
-        let bn = basename(&f.path);
-        out.push_str(&format!("  - {bn} ({})\n", bits.join(", ")));
+        out.push_str(&render_file_line(f));
     }
     out.push('\n');
     out
+}
+
+/// `  - name (N lines, Language[, module hint])` — the per-file listing
+/// line every cluster body renderer shares.
+fn render_file_line(f: &FileEntry) -> String {
+    let mut bits = vec![
+        format!("{} lines", f.line_count),
+        f.language.label().to_string(),
+    ];
+    if let Some(h) = &f.module_hint {
+        bits.push(h.render());
+    }
+    format!("  - {} ({})\n", basename(&f.path), bits.join(", "))
 }
 
 fn listing_is_empty(s: &str) -> bool {
@@ -631,6 +727,105 @@ mod tests {
             "each chunk must hash to a distinct content_hash so the refresh path \
              keys them independently",
         );
+    }
+
+    fn entry_with_crate(path: &str, lines: u32, name: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            line_count: lines,
+            language: Language::Toml,
+            size_bytes: 0,
+            module_hint: Some(crate::repo_scan::types::ModuleHint::CargoPackage {
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    /// A workspace too big to absorb, with one SMALL top-level crate (which
+    /// the old builder merged file-by-file into the root turn) and several
+    /// big directories.
+    fn overview_workspace() -> RepoMap {
+        let mut files = vec![
+            entry("Cargo.toml", 5),
+            entry("README.md", 40),
+            // Small crate — 3 files, previously absorbed into the root.
+            entry_with_crate("tiny-onnx/Cargo.toml", 20, "tiny-onnx"),
+            entry("tiny-onnx/src/eval.rs", 2499),
+            entry("tiny-onnx/src/lib.rs", 14),
+        ];
+        for sub in &["core", "nn", "transformers"] {
+            for i in 0..40 {
+                files.push(entry(&format!("{sub}/file_{i:03}.rs"), 50));
+            }
+        }
+        map("overview", files)
+    }
+
+    #[test]
+    fn root_overview_summarizes_each_top_level_folder_no_more_no_less() {
+        let clusters = build_clusters(&overview_workspace());
+        let root = clusters
+            .iter()
+            .find(|c| c.root_dir.is_empty())
+            .expect("root overview cluster");
+
+        // No less: exactly one rollup line per top-level folder.
+        for dir in &["tiny-onnx/", "core/", "nn/", "transformers/"] {
+            let rollups = root
+                .listing
+                .lines()
+                .filter(|l| l.trim_start().starts_with(&format!("- {dir} (")))
+                .count();
+            assert_eq!(rollups, 1, "one rollup line for {dir}: {}", root.listing);
+        }
+        // No more: no subfolder file detail leaks into the root turn.
+        assert!(
+            !root.listing.contains("eval.rs") && !root.listing.contains("file_000.rs"),
+            "root overview must not absorb subfolder files: {}",
+            root.listing
+        );
+        // The root's own files are still listed.
+        assert!(root.listing.contains("Cargo.toml"));
+        assert!(root.listing.contains("README.md"));
+        // Rollups carry the recursive totals and the crate hint.
+        assert!(
+            root.listing
+                .contains("- tiny-onnx/ (3 files, 2533 lines, crate: tiny-onnx)"),
+            "rollup totals + crate hint: {}",
+            root.listing
+        );
+
+        // The small crate's file detail lives in its OWN cluster now.
+        let tiny = clusters
+            .iter()
+            .find(|c| c.root_dir == "tiny-onnx/")
+            .expect("small crate gets its own cluster");
+        assert!(tiny.listing.contains("eval.rs"));
+        assert!(tiny.listing.contains("lib.rs"));
+    }
+
+    #[test]
+    fn root_overview_hash_tracks_structure_anywhere_in_the_tree() {
+        let mut before = overview_workspace();
+        let clusters_before = build_clusters(&before);
+        let root_before = clusters_before
+            .iter()
+            .find(|c| c.root_dir.is_empty())
+            .unwrap()
+            .content_hash
+            .clone();
+
+        // A rename deep inside a big directory changes that folder's rollup
+        // provenance — the overview must re-prefill.
+        before.files.push(entry("core/new_module.rs", 10));
+        let clusters_after = build_clusters(&before);
+        let root_after = clusters_after
+            .iter()
+            .find(|c| c.root_dir.is_empty())
+            .unwrap()
+            .content_hash
+            .clone();
+        assert_ne!(root_before, root_after);
     }
 
     #[test]

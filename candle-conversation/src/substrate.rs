@@ -702,6 +702,15 @@ pub trait ContentResolver {
         None
     }
 
+    /// The turn in `group` whose gather-scope decl tags contain `tag`, if any.
+    /// Used to resolve a group's declared `default` member (a workspace-root
+    /// cluster tagged `"."`, etc.) when normal selection is empty — so the
+    /// group never drops out of the projection. Off the hot path: only consulted
+    /// on an empty selection. Default `None` (mock resolvers carry no tags).
+    fn turn_with_tag(&self, _group: GroupId, _tag: &str) -> Option<TurnIndex> {
+        None
+    }
+
     /// The timeline (conversation) a projected turn belongs to.  The target-aware
     /// resolver resolves this from the projection target, so it is stamped ONCE
     /// onto the emitted [`crate::projection::ResolvedTurn`] and read directly
@@ -3032,6 +3041,22 @@ impl Substrate {
             .map_or(0, |t| t.turns.len() as u32)
     }
 
+    /// The turn on `timeline` whose decl gather-scope tags contain `tag`, if any.
+    /// Backs [`ContentResolver::turn_with_tag`] — used to resolve a group's
+    /// declared `default` member (e.g. the repo_map workspace-root cluster,
+    /// tagged `"."`). Scans the stream decls (as `belief_gallery` does); scoped
+    /// to `timeline` because a group is shared across conversations. `tag` is
+    /// expected to identify a unique turn.
+    pub fn turn_with_tag(&self, timeline: TimelineId, tag: &str) -> Option<TurnIndex> {
+        self.all_streams().find_map(|(_sid, e)| {
+            let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
+                return None;
+            };
+            (d.timeline_id == timeline.raw() && d.tags.iter().any(|t| t == tag))
+                .then(|| TurnIndex(d.turn_index))
+        })
+    }
+
     /// Corpus size for a conversation — `timeline`'s turn tokens plus the
     /// shared section (workspace) tokens. This is the denominator the GUI shows
     /// as "materialized M / N tokens": the size of the unbounded store this
@@ -3775,6 +3800,11 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
         let timeline = self.guard.active_timelines_for_group(group).next()?;
         let (layer, _) = self.guard.timeline_target(timeline)?;
         Some(layer)
+    }
+
+    fn turn_with_tag(&self, group: GroupId, tag: &str) -> Option<TurnIndex> {
+        let timeline = self.guard.active_timelines_for_group(group).next()?;
+        self.guard.turn_with_tag(timeline, tag)
     }
 
     fn section_token_count(&self, section: SectionId) -> usize {
@@ -4814,6 +4844,49 @@ mod tests {
             8192 + 4096,
             "only the tombstoned timeline's chunk + tokens bytes count"
         );
+    }
+
+    /// `turn_with_tag` resolves a declared default member to a real turn: it
+    /// matches a `TurnDecl.tags` entry, is scoped to the requested timeline (a
+    /// group is shared across conversations), and returns `None` for an unknown
+    /// tag.
+    #[test]
+    fn turn_with_tag_matches_scoped_to_timeline() {
+        let mut sub = Substrate::new();
+        let decl = |tl: u64, idx: u32, tags: &[&str]| {
+            StreamDecl::Turn(TurnDecl {
+                timeline_id: tl,
+                turn_index: idx,
+                turn_id_day: 0,
+                turn_id_seq: idx + 1,
+                role: 1,
+                block_start: 0,
+                block_end: 1,
+                layer_id: 1,
+                group_id: 1,
+                anchored_prefix: Vec::new(),
+                view: Vec::new(),
+                segments: Vec::new(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        // Timeline 1: turn 0 is the repo-root cluster, turn 1 a code chunk.
+        sub.apply_stream_decl(turn_stream_id(1, 0), decl(1, 0, &["repo_map", "."]));
+        sub.apply_stream_decl(turn_stream_id(1, 1), decl(1, 1, &["code", "foo.rs"]));
+        // Timeline 2: its own repo-root cluster at turn 0.
+        sub.apply_stream_decl(turn_stream_id(2, 0), decl(2, 0, &["repo_map", "."]));
+
+        let tl1 = TimelineId::from_raw(1).unwrap();
+        let tl2 = TimelineId::from_raw(2).unwrap();
+
+        assert_eq!(sub.turn_with_tag(tl1, "."), Some(TurnIndex(0)));
+        assert_eq!(sub.turn_with_tag(tl1, "foo.rs"), Some(TurnIndex(1)));
+        // Absent tag ⇒ None.
+        assert_eq!(sub.turn_with_tag(tl1, "missing"), None);
+        // Timeline scoping: tl2 resolves its own root, not tl1's; and tl1's
+        // code tag does not leak into tl2.
+        assert_eq!(sub.turn_with_tag(tl2, "."), Some(TurnIndex(0)));
+        assert_eq!(sub.turn_with_tag(tl2, "foo.rs"), None);
     }
 
     /// Archive flag defaults to `false`, can be toggled, and the
