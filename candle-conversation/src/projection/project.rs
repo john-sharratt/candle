@@ -622,8 +622,8 @@ mod prior_belief_tests {
         let sel = ProjectionSelection {
             system: Vec::new(),
             turns: vec![
-                mk("structure", 0, true, 500.0),  // carried
-                mk("structure", 1, false, 200.0), // unselected → not carried
+                mk("structure", 0, true, 500.0),       // carried
+                mk("structure", 1, false, 200.0),      // unselected → not carried
                 mk("structure", u32::MAX, false, 0.0), // live message → skipped
             ],
         };
@@ -641,7 +641,11 @@ mod prior_belief_tests {
         pb.set_turn("structure", TurnIndex(7), 200.0, false);
         // Candidates in a different order than they were carried; the seed must
         // realign by turn index, and unknown turns read (0.0, false).
-        let turns = vec![(TurnIndex(7), 0.0), (TurnIndex(3), 0.0), (TurnIndex(5), 0.0)];
+        let turns = vec![
+            (TurnIndex(7), 0.0),
+            (TurnIndex(3), 0.0),
+            (TurnIndex(5), 0.0),
+        ];
         let (scores, selected) = pb.turn_group("structure", &turns);
         assert_eq!(scores, vec![200.0, 500.0, 0.0]);
         assert_eq!(selected, vec![false, true, false]);
@@ -677,9 +681,17 @@ mod prior_belief_tests {
         let mut newer = PriorBelief::default();
         newer.set_turn("structure", TurnIndex(5), 900.0, true);
         carried.merge_from(&newer);
-        assert_eq!(carried.tgroup("structure").get("2"), None, "replaced wholesale");
+        assert_eq!(
+            carried.tgroup("structure").get("2"),
+            None,
+            "replaced wholesale"
+        );
         assert_eq!(carried.tgroup("structure")["5"], (900.0, true));
-        assert_eq!(carried.coll("tools")["calc"], (200.0, true), "other axis intact");
+        assert_eq!(
+            carried.coll("tools")["calc"],
+            (200.0, true),
+            "other axis intact"
+        );
     }
 
     #[test]
@@ -717,7 +729,7 @@ mod prior_belief_tests {
         );
         assert_eq!(b.coll("tools")["sub_run"], (0.0, false)); // evicted
         assert_eq!(b.coll("tools")["datetime"], (1000.0, true)); // seated
-                                                                        // The strong incumbents survive.
+                                                                 // The strong incumbents survive.
         assert_eq!(b.coll("tools")["http_request"], (1800.0, true));
         assert_eq!(b.coll("tools")["code_run"], (1200.0, true));
     }
@@ -937,6 +949,7 @@ pub fn run<R: ContentResolver>(
         mode,
         selection,
         &PriorBelief::default(),
+        None,
         &mut |_| {},
     )
 }
@@ -961,6 +974,7 @@ pub fn run_with_sink<R: ContentResolver>(
     mode: ProjectionMode,
     selection: &SelectionState,
     prior: &PriorBelief,
+    decode_pos: Option<usize>,
     sink: &mut dyn FnMut(SelectionDiagnostics),
 ) -> Projection {
     let mut selection_scores = super::SelectionScores::default();
@@ -1082,13 +1096,16 @@ pub fn run_with_sink<R: ContentResolver>(
                 // TopK arm — same `belief_step`, keyed by turn instead of section.
                 let (prior_scores, prior_selected) = prior.turn_group(&group.name, &all_turns);
                 let fresh: Vec<f32> = all_turns.iter().map(|(_, s)| *s).collect();
-                let cfg = group.belief_config(all_turns.len());
+                // Early-decode grace: within the opening window the selection band
+                // is lowered and carried picks are floored (see `PolicyConfig::windowed`).
+                let (cfg, floor) = group.belief_config(all_turns.len()).windowed(decode_pos);
                 let beliefs = crate::provenance::belief_step(
                     &fresh,
                     &prior_scores,
                     &prior_selected,
                     cfg.section_policy(0),
                     cfg.budget(),
+                    floor,
                 );
                 let mut out = Vec::new();
                 for ((idx, _), b) in all_turns.iter().zip(&beliefs) {
@@ -1130,7 +1147,8 @@ pub fn run_with_sink<R: ContentResolver>(
             // score gates; it fires only when empty, so it never double-selects
             // or fights the belief challenger.
             if selected.is_empty() {
-                if let Some(idx) = resolve_default_turn(group.default.as_ref(), group.id, resolver) {
+                if let Some(idx) = resolve_default_turn(group.default.as_ref(), group.id, resolver)
+                {
                     let sentinel = layer.score_threshold.max(group.score_threshold);
                     selected.push((idx, sentinel));
                     selection_origins.insert((group.id, idx), SelectionOrigin::Fallback);
@@ -1228,6 +1246,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 mode,
                 selection,
                 prior,
+                decode_pos,
                 &mut selection_scores,
                 &mut resolved_selections,
             )
@@ -1491,6 +1510,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
     mode: ProjectionMode,
     selection_state: &SelectionState,
     prior: &PriorBelief,
+    decode_pos: Option<usize>,
     scores: &mut super::SelectionScores,
     resolved_selections: &mut Vec<ResolvedSelection>,
 ) -> Vec<ProjectionSegment> {
@@ -1526,6 +1546,7 @@ fn emit_system_prompt_items<R: ContentResolver>(
                     &scoring,
                     selection_state,
                     prior,
+                    decode_pos,
                     scores,
                 );
                 record(coll, selected);
@@ -1834,6 +1855,7 @@ fn select_collection_sections<R: ContentResolver>(
     scoring: &CollectionScoring,
     selection_state: &SelectionState,
     prior: &PriorBelief,
+    decode_pos: Option<usize>,
     scores: &mut super::SelectionScores,
 ) -> Vec<ProjectionSegment> {
     if coll.sections.is_empty() {
@@ -1858,12 +1880,17 @@ fn select_collection_sections<R: ContentResolver>(
                 .map(|s| resolver.section_score(s.id))
                 .collect();
             let (prior_scores, prior_selected) = prior.collection(&coll.name, &coll.sections);
+            // Early-decode grace: within the opening window the selection band is
+            // lowered and carried picks are floored (see `PolicyConfig::windowed`),
+            // so the submit guess and a still-accruing correct tool stay in scope.
+            let (cfg, floor) = coll.policy.config.windowed(decode_pos);
             let beliefs = crate::provenance::belief_step(
                 &fresh,
                 &prior_scores,
                 &prior_selected,
-                coll.policy.config.section_policy(0),
-                coll.policy.config.budget(),
+                cfg.section_policy(0),
+                cfg.budget(),
+                floor,
             );
             if tracing::enabled!(tracing::Level::TRACE) {
                 let scores_str = coll

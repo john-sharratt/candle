@@ -60,12 +60,18 @@ pub fn score_slots(
 ///
 /// `fresh.len()` is the slot count; `prior_scores` / `prior_selected` are indexed
 /// the same way (shorter prior arrays read as zero / unselected).
+///
+/// `carry_floor` is the early-decode grace floor (see
+/// [`crate::projection::PolicyConfig::windowed`]): when `Some(f)`, a carried
+/// already-selected slot whose belief decays below `f` is held at `f` so it
+/// survives the opening window; `None` is the steady-state (no floor).
 pub fn belief_step(
     fresh: &[f32],
     prior_scores: &[f32],
     prior_selected: &[bool],
     policy: SectionPolicy,
     budget: GroupBudget,
+    carry_floor: Option<f32>,
 ) -> Vec<SlotBelief> {
     let n = fresh.len();
     let mut seed = vec![0.0f32; n];
@@ -74,7 +80,7 @@ pub fn belief_step(
     }
     let mut sel = SectionSelector::new(vec![policy; n], vec![budget]);
     sel.seed(&seed, prior_selected);
-    sel.update(fresh);
+    sel.update_with_floor(fresh, carry_floor);
     (0..n)
         .map(|i| SlotBelief {
             score: sel.scores()[i],
@@ -104,7 +110,14 @@ mod tests {
     #[test]
     fn first_projection_seeds_from_zero_and_selects_above_min() {
         // No prior → belief equals the fresh scores; slot 1 crosses min 5.
-        let out = belief_step(&[3.0, 6.0, 0.0], &[], &[], policy(0.5, 5.0, 2.0), OPEN);
+        let out = belief_step(
+            &[3.0, 6.0, 0.0],
+            &[],
+            &[],
+            policy(0.5, 5.0, 2.0),
+            OPEN,
+            None,
+        );
         assert_eq!(
             out[0],
             SlotBelief {
@@ -138,6 +151,7 @@ mod tests {
             &[true, false],
             policy(0.5, 5.0, 2.0),
             OPEN,
+            None,
         );
         assert_eq!(out[0].score, 5.0);
         assert_eq!(out[1].score, 8.0);
@@ -154,6 +168,7 @@ mod tests {
             &[true, false],
             policy(0.5, 5.0, 2.0),
             GroupBudget { min: 0, max: 1 },
+            None,
         );
         // slot 0 leaks 0.5*6 = 3 → below min; slot 1 is far stronger and takes max=1.
         assert!(!out[0].selected, "unpinned decayed leader is dropped");
@@ -169,9 +184,39 @@ mod tests {
             &[],
             policy(0.0, 0.0, 0.0),
             GroupBudget { min: 0, max: 2 },
+            None,
         );
         let sel: Vec<bool> = out.iter().map(|s| s.selected).collect();
         assert_eq!(sel, vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn carry_floor_holds_a_decaying_pick_above_the_early_min() {
+        // A prior-selected leader (score 300) with no fresh support decays to
+        // 300*0.6 = 180 under β=0.40; the carry floor 250 holds it at 250 so it
+        // clears the (windowed) evict 187.5 and stays selected — the early-decode
+        // grace the scheduler applies for the first 64 tokens of a turn.
+        let out = belief_step(
+            &[0.0],
+            &[300.0],
+            &[true],
+            policy(0.40, 250.0, 187.5),
+            OPEN,
+            Some(250.0),
+        );
+        assert_eq!(out[0].score, 250.0);
+        assert!(out[0].selected);
+        // Without the floor the same pick decays out of the band.
+        let out = belief_step(
+            &[0.0],
+            &[300.0],
+            &[true],
+            policy(0.40, 250.0, 187.5),
+            OPEN,
+            None,
+        );
+        assert_eq!(out[0].score, 180.0);
+        assert!(!out[0].selected);
     }
 
     #[test]

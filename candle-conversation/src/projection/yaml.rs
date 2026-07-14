@@ -69,8 +69,7 @@ use super::schema::{
     Budget, CompressionPrompt, GatherScope, GroupSchema, GroupSummary, GroupSummaryStage,
     LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema, SectionTree,
     SelectionDefault, SelectionRule, SummaryMode, SystemPromptItem, SystemPromptSchema,
-    TreeCollection, TreeDim,
-    TreeNode, TreeOption, TreeVariant, TurnSummary,
+    TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
 };
 
 /// Sequential SectionId allocator. Ids are globally unique across the whole
@@ -155,6 +154,12 @@ struct YamlPolicy {
     min_score: Option<f32>,
     #[serde(default)]
     evict_score: Option<f32>,
+    #[serde(default)]
+    early_window_tokens: Option<usize>,
+    #[serde(default)]
+    early_min_score: Option<f32>,
+    #[serde(default)]
+    early_evict_score: Option<f32>,
     #[serde(default)]
     budget: Option<YamlPolicyBudget>,
     #[serde(default)]
@@ -593,6 +598,15 @@ fn parse_policy(
     if let Some(v) = yp.evict_score {
         config.evict_score = v;
     }
+    if let Some(v) = yp.early_window_tokens {
+        config.early_window_tokens = v;
+    }
+    if let Some(v) = yp.early_min_score {
+        config.early_min_score = v;
+    }
+    if let Some(v) = yp.early_evict_score {
+        config.early_evict_score = v;
+    }
     if let Some(b) = &yp.budget {
         if let Some(m) = b.min {
             config.budget_min = m;
@@ -622,6 +636,19 @@ fn validate_policy(name: &str, c: &PolicyConfig) -> Result<(), ConstructionError
     }
     if c.evict_score > c.min_score {
         return Err(bad("evict_score must be <= min_score (hysteresis band)"));
+    }
+    if c.early_min_score < 0.0 || c.early_evict_score < 0.0 {
+        return Err(bad("early_min_score and early_evict_score must be >= 0"));
+    }
+    if c.early_evict_score > c.early_min_score {
+        return Err(bad(
+            "early_evict_score must be <= early_min_score (hysteresis band)",
+        ));
+    }
+    if c.early_min_score > c.min_score {
+        return Err(bad(
+            "early_min_score must be <= min_score (the window only lowers the bar)",
+        ));
     }
     if c.budget_max == 0 {
         return Err(bad("budget.max must be > 0"));

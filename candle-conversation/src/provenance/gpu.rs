@@ -98,7 +98,11 @@ impl BatchedGpuGallery {
     pub fn scan(&self, device: &Device, probes: &[&[WideQSig]]) -> Result<Vec<Vec<f32>>> {
         let dev = match device {
             Device::Cuda(d) => d,
-            _ => return Err(candle::Error::Msg("BDP GPU scan requires a CUDA device".into())),
+            _ => {
+                return Err(candle::Error::Msg(
+                    "BDP GPU scan requires a CUDA device".into(),
+                ))
+            }
         };
         let n_cases = self.n_cases;
         let wpt = self.wpt;
@@ -261,7 +265,11 @@ mod tests {
         let probes_owned = vec![
             vec![sig(0xAAAA_AAAA_AAAA_AAAA), sig(0x1234_5678_9ABC_DEF0)],
             vec![sig(0x5555_5555_5555_5555)],
-            vec![sig(0xFFFF_FFFF_0000_0000), sig(0x0F0F_0F0F_0F0F_0F0F), sig(0x0)],
+            vec![
+                sig(0xFFFF_FFFF_0000_0000),
+                sig(0x0F0F_0F0F_0F0F_0F0F),
+                sig(0x0),
+            ],
             vec![],
         ];
         let probes: Vec<&[WideQSig]> = probes_owned.iter().map(|p| p.as_slice()).collect();

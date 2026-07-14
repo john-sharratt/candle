@@ -1034,9 +1034,19 @@ impl Builder {
         mode: ProjectionMode,
         selection: &SelectionState,
         prior: &PriorBelief,
+        decode_pos: Option<usize>,
         sink: &mut dyn FnMut(SelectionDiagnostics),
     ) -> Projection {
-        run_with_sink(&self.schema, target, resolver, mode, selection, prior, sink)
+        run_with_sink(
+            &self.schema,
+            target,
+            resolver,
+            mode,
+            selection,
+            prior,
+            decode_pos,
+            sink,
+        )
     }
 
     /// Token-window budget configured for `layer`.  Used by the

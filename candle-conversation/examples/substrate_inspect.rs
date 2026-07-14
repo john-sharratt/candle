@@ -152,8 +152,8 @@ enum Cmd {
     /// window per turn), this replays each turn's recorded reprojection sequence
     /// through the online belief exactly as production does — sliding
     /// `probe_tokens` window at each reprojection point, `score_slots` → RelLeak
-    /// `belief_step` with the `CommittedToolScope` policy (β0.40, min 1000 / evict
-    /// 750, budget 1..3), belief carried across projections.
+    /// `belief_step` with the `CommittedToolScope` policy (β0.40, min 800 / evict
+    /// 600, budget 1..3, early-decode window), belief carried across projections.
     /// Reports whether the true tool ends the turn in the committed selected set —
     /// the metric a single-shot ranking can't see (an early pin survives the faded
     /// tail). Leave-one-out over the tagged corpus.
@@ -514,8 +514,12 @@ fn scan_bench(
         4 * wph
     );
     println!("  cold assembly (first, decodes all): {cold_ms:.1} ms");
-    println!("  warm assembly (cached decode):      {warm_ms:.1} ms   ← per-reprojection steady state");
-    println!("  after a turn seal (1 sig write):    {churn_ms:.1} ms   ← incremental evict, no churn");
+    println!(
+        "  warm assembly (cached decode):      {warm_ms:.1} ms   ← per-reprojection steady state"
+    );
+    println!(
+        "  after a turn seal (1 sig write):    {churn_ms:.1} ms   ← incremental evict, no churn"
+    );
 
     // Resolve the probe window (named stream or the auto-pick).
     let full_probe: Vec<WideQSig> = match probe_id {
@@ -549,7 +553,11 @@ fn scan_bench(
     println!(
         "  parity vs reference (full {}-tok probe): {}",
         full_probe.len(),
-        if parity { "IDENTICAL ✓" } else { "MISMATCH ✗" }
+        if parity {
+            "IDENTICAL ✓"
+        } else {
+            "MISMATCH ✗"
+        }
     );
 
     println!("\n── Phase 3: flat-scan latency — reference vs packed ({iters} iters) ─");
@@ -591,7 +599,9 @@ fn scan_bench(
     // Per-scan cost is linear in gallery tokens; derive a per-token-per-Mtoken
     // coefficient so growth is projectable.
     let ns_per_agreement = (live_scan_ms * 1e6)
-        / (LIVE_PROBE_CAP.min(full_probe.len()) as f64 * total_gallery_tokens as f64 * n_groups as f64);
+        / (LIVE_PROBE_CAP.min(full_probe.len()) as f64
+            * total_gallery_tokens as f64
+            * n_groups as f64);
     let per_reproj = warm_ms + live_scan_ms;
     println!("\n── Phase 4: problem domain ─────────────────────────────────────");
     println!("  ONE-TIME prep (engine load):        {load_s:.2} s   ({n_streams} streams)");
@@ -613,7 +623,9 @@ fn scan_bench(
         "    scan alone → ~{:.0} ms/reprojection. Kernel cost ≈ {ns_per_agreement:.2} ns/group-agreement.",
         live_scan_ms * 10.0
     );
-    println!("  DESIGN TARGET: 3–10 ms full-corpus scan → current gap is the optimization surface.");
+    println!(
+        "  DESIGN TARGET: 3–10 ms full-corpus scan → current gap is the optimization surface."
+    );
 
     // ── Phase 5: GPU batched scan (non-resident VRAM, pinned RAM mirror) ─────
     use candle_conversation::provenance::BatchedGpuGallery;
@@ -639,7 +651,8 @@ fn scan_bench(
     // Live-cap probe, replicated into a wave of `gpu_batch` concurrent requests.
     let cap = LIVE_PROBE_CAP.min(full_probe.len());
     let one_probe: Vec<WideQSig> = full_probe[full_probe.len() - cap..].to_vec();
-    let batch_owned: Vec<Vec<WideQSig>> = (0..gpu_batch.max(1)).map(|_| one_probe.clone()).collect();
+    let batch_owned: Vec<Vec<WideQSig>> =
+        (0..gpu_batch.max(1)).map(|_| one_probe.clone()).collect();
     let batch_refs: Vec<&[WideQSig]> = batch_owned.iter().map(|p| p.as_slice()).collect();
 
     // Parity on the real corpus: GPU (one probe) must equal the CPU packed scan.
@@ -673,8 +686,7 @@ fn scan_bench(
     let (gmin, gmed, _gmean, gmax) = time_ms(iters.min(10).max(3), || {
         let _ = gpu_gallery.scan(&device, &batch_refs).expect("gpu scan");
     });
-    let wave_agr =
-        gpu_batch as f64 * cap as f64 * n_groups as f64 * total_gallery_tokens as f64;
+    let wave_agr = gpu_batch as f64 * cap as f64 * n_groups as f64 * total_gallery_tokens as f64;
     println!(
         "  wave of {gpu_batch} probes ({cap}-tok each): median {gmed:.2} ms  [{gmin:.2}–{gmax:.2}]",
     );
@@ -1289,9 +1301,8 @@ fn belief_replay(
     cadence: usize,
     trace_ids: &[StreamId],
 ) -> Result<()> {
-    use candle_conversation::provenance::{
-        belief_step, decode_wide_sigs, score_slots, GroupBudget, SectionPolicy, WideQSig,
-    };
+    use candle_conversation::projection::PolicyPreset;
+    use candle_conversation::provenance::{belief_step, decode_wide_sigs, score_slots, WideQSig};
     use rayon::prelude::*;
 
     let substrate = build_substrate(log)?;
@@ -1342,14 +1353,10 @@ fn belief_replay(
         return Ok(());
     }
 
-    // The shipped `tools` collection policy — `CommittedToolScope` (policy.rs).
-    let policy = SectionPolicy {
-        group: 0,
-        beta: 0.40,
-        min_score: 1000.0,
-        evict_score: 750.0,
-    };
-    let budget = GroupBudget { min: 1, max: 3 };
+    // The shipped `tools` collection policy — `CommittedToolScope` (policy.rs),
+    // including its early-decode grace window (lowered band + carried-belief
+    // floor for the first 64 tokens), so the replay matches live selection.
+    let cfg = PolicyPreset::CommittedToolScope.config();
     let trace_set: std::collections::HashSet<u64> = trace_ids.iter().map(|s| s.0).collect();
 
     struct Outcome {
@@ -1399,7 +1406,17 @@ fn belief_replay(
                     continue;
                 }
                 let fresh = score_slots(probe, &gwin, &gslot, n_slots);
-                let beliefs = belief_step(&fresh, &prior_scores, &prior_selected, policy, budget);
+                // `p` is the token position into the owner turn → the decode grace
+                // window applies to its first `early_window_tokens` tokens.
+                let (wcfg, floor) = cfg.windowed(Some(p));
+                let beliefs = belief_step(
+                    &fresh,
+                    &prior_scores,
+                    &prior_selected,
+                    wcfg.section_policy(0),
+                    wcfg.budget(),
+                    floor,
+                );
                 prior_scores = beliefs.iter().map(|b| b.score).collect();
                 prior_selected = beliefs.iter().map(|b| b.selected).collect();
                 let sel = prior_selected.get(owner.slot).copied().unwrap_or(false);
@@ -1454,7 +1471,17 @@ fn belief_replay(
 
     println!("\n══ §80.3 production-faithful reprojection replay (leave-one-out) ══\n");
     println!("corpus:  {n} tagged turns over {n_slots} tools   (tag scope {tag:?})");
-    println!("policy:  CommittedToolScope — β0.40, min 1000 / evict 750, budget 1..3");
+    println!(
+        "policy:  CommittedToolScope — β{:.2}, min {} / evict {}, budget {}..{}  (early window ≤{}: {}/{})",
+        cfg.beta,
+        cfg.min_score,
+        cfg.evict_score,
+        cfg.budget_min,
+        cfg.budget_max,
+        cfg.early_window_tokens,
+        cfg.early_min_score,
+        cfg.early_evict_score
+    );
     println!(
         "probe:   sliding {probe_tokens}-token window, reprojecting every {cadence} tokens (synthesised cadence)"
     );

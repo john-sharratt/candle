@@ -49,7 +49,6 @@ use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
 use crate::persistence::content_hash::turn_stream_id;
-use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, ChunkLoc, ConvMeta, ConvState, RecordLoc,
 };
@@ -62,6 +61,7 @@ use crate::projection::{
     GroupId, LayerId, ProjectionTarget, SectionId, TimelineAllocator, TimelineId, TurnIndex,
     TurnKey,
 };
+use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::summary_tree::{
     select_dense, Node, NodeId, RecencyConfig, SelectionDiagnostics, SelectionOrigin, SummaryTree,
     TurnKind, MERGE_FANOUT,
@@ -5025,7 +5025,10 @@ mod tests {
         let a2 = sub.decoded_wide_sig(sid_a).expect("a");
         let b2 = sub.decoded_wide_sig(sid_b).expect("b");
 
-        assert!(!Arc::ptr_eq(&a1, &a2), "A re-decoded after its own blob change");
+        assert!(
+            !Arc::ptr_eq(&a1, &a2),
+            "A re-decoded after its own blob change"
+        );
         assert!(
             Arc::ptr_eq(&b1, &b2),
             "B's memo must survive A's eviction — no whole-gallery churn"

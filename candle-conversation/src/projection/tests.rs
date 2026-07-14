@@ -297,7 +297,8 @@ fn group_default_parses_present_and_absent() {
     assert!(b2.group(s2).unwrap().default.is_none());
 
     // Whitespace-only tag is dropped to None by `parse_default`.
-    let blank = DEFAULT_FALLBACK_YAML.replace(r#"default: { tag: "root" }"#, r#"default: { tag: "  " }"#);
+    let blank =
+        DEFAULT_FALLBACK_YAML.replace(r#"default: { tag: "root" }"#, r#"default: { tag: "  " }"#);
     let b3 = Builder::from_yaml(&blank).unwrap();
     let s3 = b3.id_for_group("structure").unwrap();
     assert!(b3.group(s3).unwrap().default.is_none());
@@ -4478,7 +4479,10 @@ fn collection_default_parses() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(coll.default.as_ref().map(|d| d.tag.as_str()), Some("tool_c"));
+    assert_eq!(
+        coll.default.as_ref().map(|d| d.tag.as_str()),
+        Some("tool_c")
+    );
 }
 
 #[test]
@@ -4502,7 +4506,9 @@ fn collection_default_injected_when_selection_empty() {
         &resolver,
     );
 
-    let tool_names: HashSet<&str> = ["tool_a", "tool_b", "tool_c", "tool_d"].into_iter().collect();
+    let tool_names: HashSet<&str> = ["tool_a", "tool_b", "tool_c", "tool_d"]
+        .into_iter()
+        .collect();
     let tool_ids: HashSet<SectionId> = tool_names
         .iter()
         .filter_map(|n| b.id_for_section_in(dialogue, n))
@@ -4512,7 +4518,11 @@ fn collection_default_injected_when_selection_empty() {
         .map(|s| s.id)
         .filter(|id| tool_ids.contains(id))
         .collect();
-    assert_eq!(emitted_tools, vec![tool_c], "only the default tool survives");
+    assert_eq!(
+        emitted_tools,
+        vec![tool_c],
+        "only the default tool survives"
+    );
 }
 
 // ── Belief-driven turn selection ─────────────────────────────────────────────
@@ -4532,7 +4542,10 @@ fn belief_config_takes_budget_and_gates_from_the_rule() {
     let cfg = group.belief_config(10);
     assert_eq!(cfg.budget_max, 2, "budget cap comes from top_k k");
     assert_eq!(cfg.budget_min, 0);
-    assert_eq!(cfg.min_score, 0.5, "min/evict gate comes from score_threshold");
+    assert_eq!(
+        cfg.min_score, 0.5,
+        "min/evict gate comes from score_threshold"
+    );
     assert_eq!(cfg.evict_score, 0.5);
 }
 
@@ -4570,7 +4583,11 @@ fn belief_driven_group_selects_top_k_by_score() {
         .collect();
     idxs.sort();
     // Highest two above threshold: turn 2 (0.95) and turn 0 (0.9).
-    assert_eq!(idxs, vec![0, 2], "belief selects the two highest-scored turns");
+    assert_eq!(
+        idxs,
+        vec![0, 2],
+        "belief selects the two highest-scored turns"
+    );
 }
 
 // ── Dialect-template parsing ─────────────────────────────────────────────────

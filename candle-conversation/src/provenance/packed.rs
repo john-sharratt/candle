@@ -221,7 +221,12 @@ mod tests {
 
     /// Build a small synthetic gallery + probe and assert the packed scan is
     /// **exactly** equal (bit-for-bit) to the reference `score_slots`.
-    fn assert_parity(windows: &[Vec<WideQSig>], slots: &[usize], probe: &[WideQSig], n_cases: usize) {
+    fn assert_parity(
+        windows: &[Vec<WideQSig>],
+        slots: &[usize],
+        probe: &[WideQSig],
+        n_cases: usize,
+    ) {
         let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
         let reference = score_slots(probe, &wref, slots, n_cases);
         let packed = PackedGallery::from_windows(&wref, slots, n_cases);
@@ -235,7 +240,10 @@ mod tests {
     #[test]
     fn parity_two_distinct_cases() {
         // Case 0 = 0xAAAA…, case 1 = its complement 0x5555…; probe matches case 0.
-        let windows = vec![vec![sig(0xAAAA_AAAA_AAAA_AAAA)], vec![sig(0x5555_5555_5555_5555)]];
+        let windows = vec![
+            vec![sig(0xAAAA_AAAA_AAAA_AAAA)],
+            vec![sig(0x5555_5555_5555_5555)],
+        ];
         assert_parity(&windows, &[0, 1], &[sig(0xAAAA_AAAA_AAAA_AAAA)], 2);
     }
 
@@ -245,9 +253,17 @@ mod tests {
         let windows = vec![
             vec![sig(0xFF00_FF00_FF00_FF00), sig(0x0F0F_0F0F_0F0F_0F0F)],
             vec![sig(0x5555_5555_5555_5555)],
-            vec![sig(0xFFFF_FFFF_0000_0000), sig(0x00FF_00FF_00FF_00FF), sig(0x1234_5678_9ABC_DEF0)],
+            vec![
+                sig(0xFFFF_FFFF_0000_0000),
+                sig(0x00FF_00FF_00FF_00FF),
+                sig(0x1234_5678_9ABC_DEF0),
+            ],
         ];
-        let probe = vec![sig(0xFF00_FF00_FF00_FF00), sig(0x1234_5678_9ABC_DEF0), sig(0x0)];
+        let probe = vec![
+            sig(0xFF00_FF00_FF00_FF00),
+            sig(0x1234_5678_9ABC_DEF0),
+            sig(0x0),
+        ];
         assert_parity(&windows, &[0, 1, 2], &probe, 3);
     }
 

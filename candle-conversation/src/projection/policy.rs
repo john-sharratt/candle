@@ -16,16 +16,17 @@
 /// A named, tuned policy preset (the §24.6 recommendations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyPreset {
-    /// Stable, correct, small tool scope: β0.40, min 1000 / evict 750, budget
-    /// 1..3. Thresholds are on the `z × margin` hybrid scorer (§24.7) with a
-    /// 256-token probe window (`reproject_max_probe_tokens`) and the needle gate
-    /// (§24.8); the §80.2 sweep derives them for **100% recall** — the true tool is
-    /// always Top-3, and `min 1000` sits in the 100%-recall band (a wide margin
-    /// below the ~1100 recall floor) while trimming the set to ~0.4 false
-    /// positives, `evict 750` below that floor so a correct pick is never evicted.
-    /// A committed tool is held stable across its `<tool_call>` block by the
-    /// scheduler suppressing reprojection there, not by pinning the selection.
-    /// Default for the `tools` collection.
+    /// Stable, correct, small tool scope: β0.40, min 800 / evict 600, budget
+    /// 1..3, plus an early-decode grace window (250/187.5 through the first
+    /// cadence reprojection). Thresholds are on the `z × margin` hybrid scorer
+    /// (§24.7) with a 256-token probe window (`reproject_max_probe_tokens`) and
+    /// the needle gate (§24.8). The §80.2 sweep put the 100%-recall floor near
+    /// 1000, but live decode-Q for the correct tool routinely crests just under it
+    /// (observed misses at ~920), so nominal `min` is relaxed to 800 (`evict 600`,
+    /// the same 0.75 band) to catch them while the window covers the opening tokens
+    /// where the signal is still accruing. A committed tool is held stable across
+    /// its `<tool_call>` block by the scheduler suppressing reprojection there, not
+    /// by pinning the selection. Default for the `tools` collection.
     CommittedToolScope,
     /// Recall over set size: β0.40, min 40 / evict 20, budget 1..5. ~99.7% recall
     /// with the weak tail pruned to ~4 members.
@@ -40,10 +41,25 @@ impl PolicyPreset {
         match self {
             PolicyPreset::CommittedToolScope => PolicyConfig {
                 beta: 0.40,
-                min_score: 1000.0,
-                evict_score: 750.0,
+                // The §80.2 sweep put the 100%-recall floor at ~1000, but live
+                // decode-Q for a correct tool routinely peaks just under it (an
+                // observed datetime turn crested at 921 and was skipped). Nominal
+                // 800 (evict 600, same 0.75 hysteresis band) admits those without
+                // meaningfully widening the false-positive set, and the early-decode
+                // window below still governs the opening 64 tokens.
+                min_score: 800.0,
+                evict_score: 600.0,
                 budget_min: 1,
                 budget_max: 3,
+                // Early-decode grace: for the first 64 generated tokens hold the
+                // bar at 250 (evict 187.5, the same 0.75 hysteresis ratio) so a
+                // correct pick whose decode-Q is still building — and the submit
+                // guess carried into the first reprojection — stays in scope until
+                // its signal crosses, instead of being evicted at token 1 while the
+                // query's prefill-Q reads ≈ 0 for it.
+                early_window_tokens: 64,
+                early_min_score: 250.0,
+                early_evict_score: 187.5,
             },
             PolicyPreset::HighRecallScope => PolicyConfig {
                 beta: 0.40,
@@ -51,6 +67,11 @@ impl PolicyPreset {
                 evict_score: 20.0,
                 budget_min: 1,
                 budget_max: 5,
+                // Already a low bar — no separate early window (mirror the
+                // steady-state band so `windowed` is a no-op).
+                early_window_tokens: 0,
+                early_min_score: 40.0,
+                early_evict_score: 20.0,
             },
             PolicyPreset::SinglePick => PolicyConfig {
                 beta: 0.40,
@@ -58,6 +79,9 @@ impl PolicyPreset {
                 evict_score: 0.0,
                 budget_min: 1,
                 budget_max: 1,
+                early_window_tokens: 0,
+                early_min_score: 0.0,
+                early_evict_score: 0.0,
             },
         }
     }
@@ -89,6 +113,23 @@ pub struct PolicyConfig {
     pub budget_min: usize,
     /// Maximum members this node contributes.
     pub budget_max: usize,
+    /// Last generated-token position (inclusive) covered by the early-decode
+    /// grace window; the window spans decode positions `1..=early_window_tokens`
+    /// (submit / position 0 is excluded — see [`Self::windowed`]). Inside it the
+    /// selection bar drops to `early_min_score`/`early_evict_score` and a carried
+    /// belief is floored at `early_min_score`. The right tool's decode-Q
+    /// signal only builds over roughly this many tokens (the call↔definition
+    /// domain gap makes the query's prefill-Q ≈ 0 for it), so the steady-state
+    /// `min_score` would evict a correct-but-still-accruing pick before it ever
+    /// crosses. The bound is **inclusive** so it covers the first cadence
+    /// reprojection, which fires at exactly this position (`reproject_every_n`) —
+    /// often the earliest reprojection whose decode-Q has any signal. `0`
+    /// disables the window.
+    pub early_window_tokens: usize,
+    /// Selection threshold used inside the early-decode window. `≤ min_score`.
+    pub early_min_score: f32,
+    /// Eviction threshold used inside the early-decode window. `≤ early_min_score`.
+    pub early_evict_score: f32,
 }
 
 impl PolicyConfig {
@@ -107,6 +148,39 @@ impl PolicyConfig {
         GroupBudget {
             min: self.budget_min,
             max: self.budget_max,
+        }
+    }
+
+    /// Resolve the effective config **and** the carried-belief floor at a decode
+    /// position. `decode_pos` is the count of tokens generated so far this turn;
+    /// `None` means "not an early-decode selection" (a stateless/unit projection).
+    ///
+    /// The window covers decode positions `1..=early_window_tokens` — actual decode
+    /// tokens, through the first cadence reprojection (which fires at exactly
+    /// `early_window_tokens`). Inside it the band is lowered to
+    /// `early_min_score`/`early_evict_score` and the floor is `Some(early_min_score)`
+    /// — [`crate::provenance::belief_step`] raises every *carried, already-selected*
+    /// member to at least that floor after the RelLeak decay, so a decaying lock-on
+    /// can drop *relative to fresher rivals* but not out of scope while its own
+    /// decode-Q is still accruing.
+    ///
+    /// Position `0` (the submit / opening projection) is deliberately **excluded**:
+    /// there the "prior" is the *previous* turn's decayed belief, not a this-turn
+    /// pick, so lowering the bar or flooring there would pin a stale cross-turn tool
+    /// into the opening instead of protecting this turn's own signal. Submit and
+    /// everything past the window use the steady band with no floor.
+    pub fn windowed(&self, decode_pos: Option<usize>) -> (PolicyConfig, Option<f32>) {
+        match decode_pos {
+            Some(pos)
+                if self.early_window_tokens > 0
+                    && (1..=self.early_window_tokens).contains(&pos) =>
+            {
+                let mut c = *self;
+                c.min_score = self.early_min_score;
+                c.evict_score = self.early_evict_score;
+                (c, Some(self.early_min_score))
+            }
+            _ => (*self, None),
         }
     }
 }
@@ -160,9 +234,46 @@ mod tests {
     fn committed_tool_scope_matches_locked_values() {
         let c = PolicyPreset::CommittedToolScope.config();
         assert_eq!(c.beta, 0.40);
-        assert_eq!(c.min_score, 1000.0);
-        assert_eq!(c.evict_score, 750.0);
+        assert_eq!(c.min_score, 800.0);
+        assert_eq!(c.evict_score, 600.0);
         assert_eq!((c.budget_min, c.budget_max), (1, 3));
+        assert_eq!(c.early_window_tokens, 64);
+        assert_eq!(c.early_min_score, 250.0);
+        assert_eq!(c.early_evict_score, 187.5);
+    }
+
+    #[test]
+    fn windowed_lowers_band_and_floors_inside_window() {
+        let c = PolicyPreset::CommittedToolScope.config();
+        // Inside the window — decode positions 1..=64, INCLUDING the boundary 64
+        // (the first cadence reprojection): lowered band + a floor at the early min.
+        for pos in [Some(1), Some(63), Some(64)] {
+            let (w, floor) = c.windowed(pos);
+            assert_eq!(w.min_score, 250.0, "pos={pos:?}");
+            assert_eq!(w.evict_score, 187.5, "pos={pos:?}");
+            assert_eq!(floor, Some(250.0), "pos={pos:?}");
+            // Untouched knobs carry through.
+            assert_eq!(w.beta, c.beta);
+            assert_eq!((w.budget_min, w.budget_max), (c.budget_min, c.budget_max));
+        }
+        // Submit (pos 0), past the window (65+), and the stateless `None` case:
+        // steady-state band, no floor. Position 0's "prior" is the previous turn's
+        // decayed belief, so the window must not lower the bar or floor there.
+        for pos in [None, Some(0), Some(65), Some(129), Some(10_000)] {
+            let (w, floor) = c.windowed(pos);
+            assert_eq!(w.min_score, 800.0, "pos={pos:?}");
+            assert_eq!(w.evict_score, 600.0, "pos={pos:?}");
+            assert_eq!(floor, None, "pos={pos:?}");
+        }
+    }
+
+    #[test]
+    fn windowed_is_noop_when_disabled() {
+        // `early_window_tokens == 0` disables the window regardless of position.
+        let c = PolicyPreset::SinglePick.config();
+        let (w, floor) = c.windowed(Some(0));
+        assert_eq!(w, c);
+        assert_eq!(floor, None);
     }
 
     #[test]

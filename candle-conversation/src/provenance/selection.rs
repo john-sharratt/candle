@@ -104,7 +104,29 @@ impl SectionSelector {
 
     /// Apply one projection's per-section scores, then re-evaluate selection.
     pub fn update(&mut self, scores: &[f32]) {
+        self.update_with_floor(scores, None);
+    }
+
+    /// [`Self::update`] with an early-decode carry floor: after the RelLeak decay
+    /// step and *before* selection is re-evaluated, every slot that was
+    /// **prior-selected** (seeded via [`Self::seed`] / newly force-carried) has its
+    /// belief raised to at least `floor`. A carried lock-on therefore decays
+    /// *relative to fresher rivals* (a stronger newcomer still outranks it) but
+    /// cannot fall below the floor — so it survives the early-decode window instead
+    /// of being evicted while its own decode-Q signal is still accruing. Unselected
+    /// slots are untouched (a floor there would fabricate lock-on from nothing).
+    /// `None` reproduces plain [`Self::update`].
+    pub fn update_with_floor(&mut self, scores: &[f32], floor: Option<f32>) {
         self.belief.update(scores);
+        if let Some(floor) = floor {
+            let mut s = self.belief.scores().to_vec();
+            for (i, sc) in s.iter_mut().enumerate() {
+                if self.selected[i] && *sc < floor {
+                    *sc = floor;
+                }
+            }
+            self.belief.set_scores(&s);
+        }
         self.apply_selection();
     }
 
@@ -238,6 +260,44 @@ mod tests {
         assert!(sel.is_selected(0));
         assert!(sel.is_selected(1));
         assert!(!sel.is_selected(2));
+    }
+
+    #[test]
+    fn carry_floor_keeps_decaying_selection_in_scope() {
+        // A slot selected at 300 then starved of fresh signal: without the floor
+        // it decays past the eviction threshold and drops; with a 250 floor it is
+        // held at 250 and stays selected — the early-decode grace behaviour.
+        let p = policy(0.40, 250.0, 187.5);
+        let mut sel = uniform(1, p, OPEN);
+        sel.update(&[300.0]); // selected at 300
+        assert!(sel.is_selected(0));
+        sel.update_with_floor(&[0.0], Some(250.0)); // 300*0.6 = 180 → floored to 250
+        assert_eq!(sel.scores(), &[250.0]);
+        assert!(sel.is_selected(0));
+    }
+
+    #[test]
+    fn carry_floor_still_ranks_below_fresh_newcomer() {
+        // Budget 1: the floored incumbent must not out-rank a stronger fresh pick.
+        let mut sel = SectionSelector::new(
+            vec![policy(0.40, 250.0, 187.5); 2],
+            vec![GroupBudget { min: 0, max: 1 }],
+        );
+        sel.update(&[300.0, 0.0]); // slot 0 selected
+                                   // slot 0 decays (300*0.6=180 → floored 250); slot 1 fresh 400 wins the slot.
+        sel.update_with_floor(&[0.0, 400.0], Some(250.0));
+        assert_eq!(sel.scores(), &[250.0, 400.0]);
+        assert!(!sel.is_selected(0));
+        assert!(sel.is_selected(1));
+    }
+
+    #[test]
+    fn carry_floor_does_not_lift_unselected_slots() {
+        let mut sel = uniform(1, policy(0.40, 250.0, 187.5), OPEN);
+        // Never selected: fresh 50, floor must not fabricate a 250 lock-on.
+        sel.update_with_floor(&[50.0], Some(250.0));
+        assert_eq!(sel.scores(), &[50.0]);
+        assert!(!sel.is_selected(0));
     }
 
     #[test]

@@ -1842,9 +1842,9 @@ impl Sequence {
                 None => return empty,
             }
         };
-        let (scores, _) = self
-            .substrate
-            .score_beliefs(self.projection.schema(), self.target, &probe);
+        let (scores, _) =
+            self.substrate
+                .score_beliefs(self.projection.schema(), self.target, &probe);
         scores
     }
 

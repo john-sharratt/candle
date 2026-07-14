@@ -60,8 +60,7 @@ fn score_belief_groups_self_matches_the_probed_turn() {
     let layer = builder.id_for_layer("mem").unwrap();
     let group = builder.id_for_group("clusters").unwrap();
 
-    let timeline =
-        candle_conversation::projection::TimelineId::from_raw(7).expect("timeline id");
+    let timeline = candle_conversation::projection::TimelineId::from_raw(7).expect("timeline id");
     conv.register_timeline(timeline, layer, group);
 
     // Three turns with distinct sign patterns: turn 1's `0x5555…` is the bitwise
@@ -98,7 +97,8 @@ fn score_belief_groups_self_matches_the_probed_turn() {
         group,
         timeline,
     };
-    let candidates = conv.score_belief_groups(&builder.schema().layers[0], target, &probe, &mut scores);
+    let candidates =
+        conv.score_belief_groups(&builder.schema().layers[0], target, &probe, &mut scores);
 
     // The scan reported all three candidate turns for the group.
     assert_eq!(candidates.len(), 1, "one belief-driven group scanned");
@@ -235,8 +235,7 @@ fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
     let builder = Builder::from_yaml(SCAN_YAML).unwrap();
     let layer = builder.id_for_layer("mem").unwrap();
     let group = builder.id_for_group("clusters").unwrap();
-    let timeline =
-        candle_conversation::projection::TimelineId::from_raw(9).expect("timeline id");
+    let timeline = candle_conversation::projection::TimelineId::from_raw(9).expect("timeline id");
     conv.register_timeline(timeline, layer, group);
 
     // An empty probe scores nothing and reports no candidates.

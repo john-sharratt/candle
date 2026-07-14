@@ -1826,6 +1826,11 @@ impl Scheduler {
                         ProjectionMode::Prefill,
                         &inputs.selection,
                         &carried_belief,
+                        // Opening projection: decode position 0. The early-decode
+                        // window excludes position 0 (its prior is the previous
+                        // turn's decayed belief), so submit selects on the steady
+                        // band; the grace window engages once decode starts.
+                        Some(0),
                         &mut |diag| {
                             diag_to_write = Some((target.timeline, diag));
                         },
@@ -5666,6 +5671,13 @@ impl Scheduler {
             .get(&view_id)
             .map(|s| s.belief.clone())
             .unwrap_or_default();
+        // Tokens generated so far this turn — drives the early-decode grace window
+        // (lowered band + carried-belief floor) so a correct pick whose decode-Q is
+        // still accruing over the first ~64 tokens isn't evicted at token 1.
+        let decode_pos = self
+            .active_decodes
+            .get(&view_id)
+            .map(|s| s.generated_tokens.len());
         // This turn's first reprojection is the turn boundary: no projection has
         // run against the decoded content yet (`last_projection_end == 0`).
         let is_turn_boundary = self
@@ -5740,7 +5752,9 @@ impl Scheduler {
         let t_scan = Instant::now();
         let schema = policy.projection.schema();
         let (projection_scores, group_candidates) =
-            policy.substrate.score_beliefs(schema, policy.target, &probe);
+            policy
+                .substrate
+                .score_beliefs(schema, policy.target, &probe);
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");
@@ -5767,11 +5781,15 @@ impl Scheduler {
                             .iter()
                             .map(|s| (s.name.clone(), projection_scores.section(s.id)))
                             .collect();
+                        // Seed the challenger at the *windowed* selection bar so, in
+                        // the opening grace window, it lands beside the floored
+                        // carried picks (250) rather than dominating them at 1000.
+                        let (wcfg, _) = coll.policy.config.windowed(decode_pos);
                         prior_belief.seat_turn_boundary_challenger(
                             GroupKey::Collection(coll.name.clone()),
                             &fresh,
                             budget_max,
-                            coll.policy.config.min_score,
+                            wcfg.min_score,
                         );
                     }
                 }
@@ -5792,6 +5810,7 @@ impl Scheduler {
                 if cfg.budget_max < 3 {
                     continue;
                 }
+                let (wcfg, _) = cfg.windowed(decode_pos);
                 let fresh: Vec<(String, f32)> = cands
                     .iter()
                     .map(|(idx, score)| (idx.0.to_string(), *score))
@@ -5800,7 +5819,7 @@ impl Scheduler {
                     GroupKey::TurnGroup(group.name.clone()),
                     &fresh,
                     cfg.budget_max,
-                    cfg.min_score,
+                    wcfg.min_score,
                 );
             }
         }
@@ -5827,6 +5846,7 @@ impl Scheduler {
                 ProjectionMode::Prefill,
                 &policy.selection,
                 &prior_belief,
+                decode_pos,
                 &mut |_| {},
             );
             // Walk segments once, populating both the elevate side-lists
