@@ -3,8 +3,7 @@
 //!
 //! Each file becomes ONE conversation. Every carved part of the file
 //! contributes a prefilled tool-call exchange that teaches the model
-//! the canonical "use a tool, read the response" pattern, and the
-//! conversation ends with a single DECODED whole-file summary:
+//! the canonical "use a tool, read the response" pattern:
 //!
 //! ````text
 //! Part turn (user, prefilled):
@@ -27,18 +26,13 @@
 //!   </tool_response>
 //!
 //! ... (one such exchange per part, in file order) ...
-//!
-//! Final turn (assistant, DECODED):
-//!   Summarize the entire file `src/auth/handler.rs` in no more than
-//!   200 words. → <whole-file summary, generated live by the model>
 //! ````
 //!
 //! The per-part prompt is rendered by [`render_part_user_prompt`] and
 //! the parts are inserted via [`crate::turn_sink::InsertTurnSink::
-//! insert_prefill_turn`].  The final summary prompt comes from
-//! [`render_file_summary_prompt`]; the turn is submitted via
-//! [`crate::turn_sink::InsertTurnSink::decode_summary_turn`] and the
-//! model's output becomes part of the code_reading trunk.
+//! insert_prefill_turn`]. There is no inline whole-file summary decode:
+//! the file summary is the async summary tree's root, which the
+//! summariser builds by rolling up these recorded scope turns.
 //!
 //! The `<tool_call>` / `</tool_call>` tags in the part turns mirror the
 //! Hermes format the dialogue layer's tool-call extractor scans for
@@ -49,13 +43,9 @@
 use super::types::Scope;
 use crate::repo_scan::Language;
 
-/// Maximum decoded tokens for the final whole-file summary. The prompt
-/// caps the model at 200 words; ~1.4 tokens/word leaves headroom.
-pub const FILE_SUMMARY_MAX_TOKENS: usize = 300;
-
 /// Per-part user prompt for the one-conversation-per-file layout: a
 /// labelled reference header naming the file and line range (no per-part
-/// summary — the whole file is summarised in the final turn instead).
+/// summary — the whole file is summarised by the async summary tree).
 pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
     // Reference header, not a first-person request: this prefill turn is
     // context-stuffed source the model attends to as background, so framing it
@@ -66,16 +56,6 @@ pub fn render_part_user_prompt(path: &str, scope: &Scope) -> String {
         path = path,
         start = scope.start_line,
         end = scope.end_line,
-    )
-}
-
-/// Final-turn user prompt: summarise the whole file (which the model has
-/// now read part-by-part across the prior prefilled turns) in ≤200 words.
-pub fn render_file_summary_prompt(path: &str) -> String {
-    format!(
-        "Summarize the entire file `{path}` in no more than 200 words, \
-         covering its purpose, key types/functions, and how they fit together.",
-        path = path,
     )
 }
 
@@ -160,7 +140,7 @@ mod tests {
         }
     }
 
-    // ── per-file layout: render_part_user_prompt / render_file_summary_prompt ──
+    // ── per-file layout: render_part_user_prompt ─────────────────────────────
 
     #[test]
     fn part_user_prompt_reads_range_without_summary_instruction() {
@@ -184,13 +164,6 @@ mod tests {
             render_part_user_prompt("src/x.rs", &s),
             render_part_user_prompt("src/x.rs", &s)
         );
-    }
-
-    #[test]
-    fn file_summary_prompt_names_file_and_caps_at_200_words() {
-        let p = render_file_summary_prompt("src/auth/handler.rs");
-        assert!(p.contains("`src/auth/handler.rs`"));
-        assert!(p.contains("200 words"));
     }
 
     // ── render_tool_call ─────────────────────────────────────────────────────

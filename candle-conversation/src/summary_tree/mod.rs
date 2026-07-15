@@ -42,4 +42,4 @@ pub use probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
 pub use select::{select_budget_fit, Selection};
 pub use structural::{leaf_skeleton, structural_rollup, StructuralRollup};
 pub use summariser::{ChannelProbeRunner, MockProbeRunner, SummariserThread, SummariserTrigger};
-pub use tree::{carry_triple, Node, NodeId, SummaryTree, TurnKind, MERGE_FANOUT};
+pub use tree::{carry_run, Node, NodeId, SummaryTree, TurnKind, MERGE_FANOUT};

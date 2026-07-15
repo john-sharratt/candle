@@ -44,6 +44,10 @@ struct MockResolver {
     /// Turn indices that are summary (forest) nodes, reported by `turn_kind`
     /// as `SummaryOfSummaries`. Everything else is `Normal`.
     summary_idx: HashSet<u32>,
+    /// turn_raw → the turn indices it transitively covers in the forest,
+    /// reported by `node_covers`. Empty/absent ⇒ a raw leaf that covers
+    /// nothing. Drives the rule-based descendant-dedup tests.
+    covers: HashMap<u32, Vec<u32>>,
 }
 
 impl MockResolver {
@@ -111,6 +115,15 @@ impl MockResolver {
         self.summary_idx = summary_indices.iter().copied().collect();
         self
     }
+
+    /// Mark turn `summary` as a summary forest node that transitively covers
+    /// `covered` (the turn indices beneath it). Used to exercise the rule-based
+    /// descendant-dedup without a real substrate tree.
+    fn with_summary_cover(mut self, summary: u32, covered: &[u32]) -> Self {
+        self.summary_idx.insert(summary);
+        self.covers.insert(summary, covered.to_vec());
+        self
+    }
 }
 
 impl ContentResolver for MockResolver {
@@ -168,6 +181,13 @@ impl ContentResolver for MockResolver {
         } else {
             TurnKind::Normal
         }
+    }
+
+    fn node_covers(&self, _group: GroupId, index: TurnIndex) -> Vec<TurnIndex> {
+        self.covers
+            .get(&index.0)
+            .map(|v| v.iter().copied().map(TurnIndex).collect())
+            .unwrap_or_default()
     }
 
     fn summary_tree_select(
@@ -824,6 +844,145 @@ layers:
     assert_eq!(proj.sealed_turns().count(), 2);
     let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
     assert_eq!(indices, vec![0, 2]);
+}
+
+/// Minimal single-layer schema whose one group ranks by raw provenance score
+/// (`top_k`), so summary forest nodes compete head-to-head with raw turns.
+const TOPK_YAML: &str = r#"
+layers:
+  - name: layer
+    system_prompt:
+      sections:
+        - id: s1
+          content: "X"
+    window: 8000
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    score_formula: max
+    groups:
+      - id: grp
+        score_threshold: 0.0
+        selection: { kind: top_k, k: 3 }
+"#;
+
+/// Rule-based path: a summary node and the turns it covers can BOTH clear the
+/// score cut (a cross-corpus hit scores the summary directly). The
+/// descendant-dedup drops the summary and keeps the SPECIFIC turns — never a
+/// coarse summary stacked on top of the very content it summarises.
+#[test]
+fn rule_based_dedup_drops_summary_when_its_content_is_selected() {
+    let b = Builder::from_yaml(TOPK_YAML).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let i0 = resolver.append(grp); // Normal
+    let i1 = resolver.append(grp); // Normal
+    let i2 = resolver.append(grp); // Normal
+    let s = resolver.append(grp); // summary covering [0, 1]
+    let resolver = resolver
+        .with_score(grp, i0, 0.9)
+        .with_score(grp, i1, 0.8)
+        .with_score(grp, i2, 0.1) // loses the top-3 slot to the summary
+        .with_score(grp, s, 0.95)
+        .with_summary_cover(s.0, &[i0.0, i1.0]);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    // top_k=3 picks {s, 0, 1}; dedup drops s (it covers both 0 and 1, both
+    // selected). The two specific turns remain; the coarse summary is gone.
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(indices, vec![0, 1]);
+}
+
+/// Rule-based path: when a summary scores a hit but NONE of the turns it covers
+/// were themselves selected, the summary survives — it is the coarse stand-in
+/// for an older span that didn't otherwise make the window. It sorts to its
+/// storage `TurnIndex` (after the turns it covers), standing alone.
+#[test]
+fn rule_based_dedup_keeps_summary_when_its_content_is_not_selected() {
+    // k=2 so only the two highest scorers win.
+    let yaml = TOPK_YAML.replace("k: 3", "k: 2");
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let i0 = resolver.append(grp); // Normal — low score
+    let i1 = resolver.append(grp); // Normal — low score
+    let i2 = resolver.append(grp); // Normal — wins a slot
+    let s = resolver.append(grp); // summary covering [0, 1] — wins a slot
+    let resolver = resolver
+        .with_score(grp, i0, 0.1)
+        .with_score(grp, i1, 0.1)
+        .with_score(grp, i2, 0.8)
+        .with_score(grp, s, 0.9)
+        .with_summary_cover(s.0, &[i0.0, i1.0]);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    // top_k=2 picks {s, 2}; dedup keeps s (neither 0 nor 1 is selected). The
+    // summary emits at its own index, after the raw turn.
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(indices, vec![2, 3]);
+}
+
+/// Rule-based path: dedup is transitive — a top-level SoS that covers a mid-level
+/// SoT (which itself was selected) is dropped in favour of the finer node. Prefer
+/// the most specific covering node at every level.
+#[test]
+fn rule_based_dedup_prefers_the_finer_summary_over_its_ancestor() {
+    // k=2 so only the two summaries (highest scorers) win — isolating the
+    // ancestor-vs-descendant collapse from the low raw turns.
+    let yaml = TOPK_YAML.replace("k: 3", "k: 2");
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let layer = b.id_for_layer("layer").unwrap();
+    let grp = b.id_for_group("grp").unwrap();
+
+    let mut resolver = MockResolver::new();
+    let i0 = resolver.append(grp); // Normal — low score
+    let i1 = resolver.append(grp); // Normal — low score
+    let sot = resolver.append(grp); // SoT covering [0, 1]
+    let sos = resolver.append(grp); // SoS covering [sot, 0, 1] (transitive)
+    let resolver = resolver
+        .with_score(grp, i0, 0.1)
+        .with_score(grp, i1, 0.1)
+        .with_score(grp, sot, 0.9)
+        .with_score(grp, sos, 0.95)
+        .with_summary_cover(sot.0, &[i0.0, i1.0])
+        .with_summary_cover(sos.0, &[sot.0, i0.0, i1.0]);
+
+    let proj = b.project(
+        ProjectionTarget {
+            layer,
+            group: grp,
+            timeline: TimelineId::for_test(1),
+        },
+        &resolver,
+    );
+    // top_k=2 picks {sos, sot}; sos covers sot (selected) so it drops; sot covers
+    // only 0/1 (not selected) so it stays. The coarse ancestor lost to the finer.
+    let indices: Vec<u32> = proj.sealed_turns().map(|t| t.index().0).collect();
+    assert_eq!(indices, vec![sot.0]);
 }
 
 /// Regression: the §8 score-density path returns picks in chronological order

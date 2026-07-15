@@ -234,31 +234,21 @@
         }, 110);
         timers.push(timer);
       });
-      // After every file lands, walk the engine-bound phases (read_file →
-      // analysis) the live daemon runs, then finish. Mirrors the SSE `phase`
-      // events so the mock demonstrates (and tests) the full 3-phase flow.
+      // After every file lands, walk the single engine-bound phase (read_file)
+      // the live daemon reports, then finish. Summarisation runs in the
+      // background and is never surfaced, so the mock emits no phase for it.
       function runPhases() {
         if (cancelled) return;
-        // Synthetic token stats the real daemon measures: prefill accrues over
-        // the read_file bar; the whole-file summary decodes near the end. Sized
-        // off the dropped bytes so the modal's stat lines look realistic.
+        // Synthetic stats the real daemon measures: prefill accrues over the
+        // read_file bar. Sized off the dropped bytes so the modal's stat lines
+        // look realistic.
         const bytes = descriptors.reduce((a, d) => a + (d.size || 4096), 0);
         const totalPrefill = Math.max(128, Math.round(bytes / 4));
-        const totalSummary = Math.max(40, 60 * descriptors.length);
-        const summaryMsTotal = 240 * descriptors.length;
         // read_file streams a determinate per-scope bar (like the real ingest),
-        // carrying the running token counters; analysis is an indeterminate
-        // wait (spinner only).
-        const readStats = (i, steps) => {
-          const frac = i / steps;
-          // Summary tokens land only on the last two ticks (decode is the tail).
-          const sf = Math.max(0, Math.min(1, (i - (steps - 2)) / 2));
-          return {
-            prefillTokens: Math.round(totalPrefill * frac),
-            summaryTokens: Math.round(totalSummary * sf),
-            summaryMs: Math.round(summaryMsTotal * sf),
-          };
-        };
+        // carrying the running prefill token counter.
+        const readStats = (i, steps) => ({
+          prefillTokens: Math.round(totalPrefill * (i / steps)),
+        });
         const withBar = (key, steps, statsFor) => new Promise((res) => {
           if (handlers.onPhase) handlers.onPhase(key, 'start');
           let i = 0;
@@ -277,12 +267,7 @@
           };
           tick();
         });
-        const spin = (key) => new Promise((res) => {
-          if (handlers.onPhase) handlers.onPhase(key, 'start');
-          const t = setTimeout(() => { if (handlers.onPhase) handlers.onPhase(key, 'done'); res(); }, 340);
-          timers.push(t);
-        });
-        withBar('read_file', 6, readStats).then(() => spin('analysis')).then(() => {
+        withBar('read_file', 6, readStats).then(() => {
           if (cancelled) return;
           // Final measured throughput — mirrors the daemon's `stats` SSE event
           // (camelCase, matching UploadStats) so the inline tile + file viewer
@@ -292,8 +277,6 @@
             uploadMs: Math.max(30, Math.round(bytes / 50000)),
             ingestTokens: totalPrefill,
             ingestMs: 6 * 120,
-            summaryTokens: totalSummary,
-            summaryMs: summaryMsTotal,
           });
           if (handlers.onAllDone) handlers.onAllDone(results);
         });

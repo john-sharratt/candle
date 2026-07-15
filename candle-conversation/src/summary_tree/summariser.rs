@@ -35,7 +35,7 @@ use crate::projection::{Conversation, TimelineId, TurnIndex};
 use crate::scheduler::SchedulerRequest;
 use crate::substrate::TreeNodeMeta;
 use crate::summary_tree::probe::{ProbeError, ProbeRequest, ProbeResponse, ProbeRunner};
-use crate::summary_tree::tree::carry_triple;
+use crate::summary_tree::tree::carry_run;
 use crate::summary_tree::TurnKind;
 
 /// How often the summariser wakes up on its own when no triggers
@@ -434,7 +434,7 @@ fn carry_merge(
     loop {
         let peaks = conversation.read().peaks_of(timeline);
         let levels: Vec<u8> = peaks.iter().map(|(_, l)| *l).collect();
-        let Some(start) = carry_triple(&levels) else {
+        let Some(start) = carry_run(&levels) else {
             break;
         };
         let children: Vec<TurnIndex> = peaks[start..].iter().map(|(idx, _)| *idx).collect();
@@ -821,15 +821,15 @@ mod tests {
     }
 
     #[test]
-    fn absorb_three_pending_carries_into_ternary_sos() {
+    fn absorb_a_full_run_carries_into_one_sos() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        for i in 0..3u64 {
+        for i in 0..MERGE_FANOUT as u64 {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
-        // Three Normal turns → three SoT leaves → one ternary SoS peak over them.
+        absorb_pending_turns(&conv, &runner, timeline, MERGE_FANOUT * 2).expect("absorb ok");
+        // MERGE_FANOUT Normal turns → that many SoT leaves → one SoS peak over them.
         let peaks = conv.read().peaks_of(timeline);
         assert_eq!(peaks.len(), 1, "the SoS should be the sole peak");
         let (root, level) = peaks[0];
@@ -847,15 +847,17 @@ mod tests {
     }
 
     #[test]
-    fn many_pending_build_canonical_ternary_forest() {
+    fn many_pending_build_canonical_forest() {
         let tmp = ephemeral_workspace();
         let (conv, timeline) = fresh_conversation(tmp.path());
-        for i in 0..16u64 {
+        // F + 1 turns → base-F "11" → one full SoS (level 2) + one leftover leaf
+        // (level 1). Peak levels {1, 2}.
+        let n = MERGE_FANOUT as u64 + 1;
+        for i in 0..n {
             conv.write().append_with_blocks(timeline, 10, i, i + 1);
         }
         let runner = MockProbeRunner::new(conv.clone());
-        absorb_pending_turns(&conv, &runner, timeline, 4).expect("absorb ok");
-        // 16 = 121 base 3 → peak levels {3, 2, 2, 1}; tallest peak level 3.
+        absorb_pending_turns(&conv, &runner, timeline, (n as usize) * 2).expect("absorb ok");
         let mut levels: Vec<u8> = conv
             .read()
             .peaks_of(timeline)
@@ -863,7 +865,7 @@ mod tests {
             .map(|(_, l)| l)
             .collect();
         levels.sort_unstable();
-        assert_eq!(levels, vec![1, 2, 2, 3]);
+        assert_eq!(levels, vec![1, 2]);
         // Every SoS is canonical (exactly MERGE_FANOUT children) and the forest
         // is whole.
         let tree = conv.read().build_summary_tree_in_memory(timeline);

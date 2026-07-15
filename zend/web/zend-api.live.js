@@ -82,8 +82,15 @@
 
     // ── chat completion (SSE: status events + OpenAI chunk deltas) ──────────
     streamChatCompletion(conv, text, opts, handlers) {
+      // Only real chat turns go to the daemon. The history also holds non-chat
+      // events — notably the inline `upload` tile ({role:'upload'}) startUpload
+      // drops in — whose role isn't a valid `Role` (system|user|assistant). Left
+      // in, the daemon's JSON extractor rejects the whole request (422) before
+      // the handler runs, so the send silently no-ops: the exact "type a message
+      // after uploading and nothing happens" failure.
+      const CHAT_ROLES = { user: 1, assistant: 1, system: 1 };
       const messages = (conv.history || [])
-        .filter((m) => !m.streaming)
+        .filter((m) => !m.streaming && CHAT_ROLES[m.role])
         .map((m) => ({ role: m.role, content: m.content }));
       const controller = new AbortController();
       const payload = {

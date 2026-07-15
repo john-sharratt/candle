@@ -27,9 +27,11 @@
 use ahash::{AHashMap, AHashSet};
 
 /// Fan-out of an internal `SummaryOfSummaries` node: a merge combines exactly
-/// this many same-level peaks into one parent. Ternary (3) halves the
-/// internal-node count versus binary while keeping the peak window tight.
-pub const MERGE_FANOUT: usize = 3;
+/// this many same-level peaks into one parent. 8 gives a shallow `log₈(N)` tree
+/// — each rollup level compresses 8 children into one denser summary, so few
+/// levels reach a single whole-corpus root, and the root is a high-density
+/// overview of everything below it.
+pub const MERGE_FANOUT: usize = 8;
 
 /// Default token cost for a synthesised `SummaryOfSummaries` internal node.
 /// The §6 probe overwrites this with the actual content size once the sealed
@@ -151,7 +153,7 @@ impl Node {
 /// [`MERGE_FANOUT`] equal-level peaks to merge, else `None`. Shared by the pure
 /// [`SummaryTree::append_leaf`] and the substrate-driven summariser so the
 /// carry rule lives in exactly one place.
-pub fn carry_triple(levels: &[u8]) -> Option<usize> {
+pub fn carry_run(levels: &[u8]) -> Option<usize> {
     let n = levels.len();
     if n < MERGE_FANOUT {
         return None;
@@ -338,7 +340,7 @@ impl SummaryTree {
         loop {
             let peaks = self.peaks();
             let levels: Vec<u8> = peaks.iter().map(|id| self.nodes[id].tree_height).collect();
-            let Some(start) = carry_triple(&levels) else {
+            let Some(start) = carry_run(&levels) else {
                 break;
             };
             let children: Vec<NodeId> = peaks[start..].to_vec();
@@ -424,17 +426,19 @@ mod tests {
         levels
     }
 
-    /// Expected peak levels for `n` leaves, derived from base-3 digits.
+    /// Expected peak levels for `n` leaves, derived from base-`MERGE_FANOUT`
+    /// digits (each digit `d` at position `k` is `d` peaks of level `k+1`).
     fn expected_levels(n: u32) -> Vec<u8> {
+        let base = MERGE_FANOUT as u32;
         let mut levels = Vec::new();
         let mut n = n;
         let mut level = 1u8; // leaves are level 1
         while n > 0 {
-            let digit = n % 3;
+            let digit = n % base;
             for _ in 0..digit {
                 levels.push(level);
             }
-            n /= 3;
+            n /= base;
             level += 1;
         }
         levels.sort_unstable();
@@ -459,28 +463,33 @@ mod tests {
     }
 
     #[test]
-    fn three_leaves_carry_into_one_sos() {
+    fn a_full_run_of_leaves_carries_into_one_sos() {
         let mut t = SummaryTree::new();
-        t.append_leaf(leaf(1, 20));
-        t.append_leaf(leaf(2, 20));
-        let created = t.append_leaf(leaf(3, 20));
-        // Third leaf triggers a single carry: one level-2 SoS over [1,2,3].
+        let mut created = Vec::new();
+        for i in 1..=MERGE_FANOUT as u32 {
+            created = t.append_leaf(leaf(i, 20));
+        }
+        // The MERGE_FANOUT-th leaf triggers a single carry: one level-2 SoS over
+        // all of them.
         assert_eq!(created.len(), 1);
         let sos = created[0];
         let node = t.get(sos).unwrap();
         assert_eq!(node.kind, TurnKind::SummaryOfSummaries);
         assert_eq!(node.tree_height, 2);
-        assert_eq!(node.children, vec![NodeId(1), NodeId(2), NodeId(3)]);
+        assert_eq!(
+            node.children,
+            (1..=MERGE_FANOUT as u32).map(NodeId).collect::<Vec<_>>()
+        );
         assert_eq!(t.peaks(), vec![sos]);
     }
 
     #[test]
-    fn nine_leaves_collapse_to_single_level3_peak() {
+    fn fanout_squared_leaves_collapse_to_single_level3_peak() {
         let mut t = SummaryTree::new();
-        for i in 1..=9u32 {
+        // F^2 leaves → a single level-3 peak over F level-2 nodes.
+        for i in 1..=(MERGE_FANOUT * MERGE_FANOUT) as u32 {
             t.append_leaf(leaf(i, 20));
         }
-        // 9 = 3^2 → a single level-3 peak over three level-2 nodes.
         let peaks = t.peaks();
         assert_eq!(peaks.len(), 1);
         let root = t.get(peaks[0]).unwrap();
@@ -494,14 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn peak_levels_track_base3_digits() {
+    fn peak_levels_track_base_fanout_digits() {
         let mut t = SummaryTree::new();
-        for n in 1..=40u32 {
+        // Exercise a couple of full carries: up to F^2 + a bit.
+        let top = (MERGE_FANOUT * MERGE_FANOUT + MERGE_FANOUT) as u32;
+        for n in 1..=top {
             t.append_leaf(leaf(n, 20));
             assert_eq!(
                 peak_level_histogram(&t),
                 expected_levels(n),
-                "peak levels diverged from base-3 digits at n={n}"
+                "peak levels diverged from base-{MERGE_FANOUT} digits at n={n}"
             );
         }
     }
@@ -580,12 +591,22 @@ mod tests {
     }
 
     #[test]
-    fn carry_triple_detects_trailing_run() {
-        assert_eq!(carry_triple(&[]), None);
-        assert_eq!(carry_triple(&[1, 1]), None);
-        assert_eq!(carry_triple(&[2, 1, 1, 1]), Some(1));
-        assert_eq!(carry_triple(&[1, 1, 2]), None);
-        assert_eq!(carry_triple(&[2, 2, 2]), Some(0));
+    fn carry_run_detects_trailing_run() {
+        // A carry fires only when the last MERGE_FANOUT peaks share a level.
+        let f = MERGE_FANOUT;
+        assert_eq!(carry_run(&[]), None);
+        // Fewer than a full run never carries.
+        assert_eq!(carry_run(&vec![1u8; f - 1]), None);
+        // Exactly a full run of equal levels carries from index 0.
+        assert_eq!(carry_run(&vec![1u8; f]), Some(0));
+        // A full run preceded by a higher peak carries from the run's start.
+        let mut with_prefix = vec![2u8];
+        with_prefix.extend(std::iter::repeat(1u8).take(f));
+        assert_eq!(carry_run(&with_prefix), Some(1));
+        // A trailing peak of a different level breaks the run.
+        let mut broken = vec![1u8; f];
+        broken.push(2);
+        assert_eq!(carry_run(&broken), None);
     }
 
     #[test]
@@ -601,7 +622,8 @@ mod tests {
     #[test]
     fn post_order_visits_children_before_peaks() {
         let mut t = SummaryTree::new();
-        for n in 1..=3u32 {
+        // A full run of leaves so a single SoS peak forms.
+        for n in 1..=MERGE_FANOUT as u32 {
             t.append_leaf(leaf(n, 20));
         }
         let order = t.post_order();
@@ -609,8 +631,8 @@ mod tests {
         let peak = t.peaks()[0];
         assert_eq!(*order.last().unwrap(), peak);
         let pos = |id: u32| order.iter().position(|n| *n == NodeId(id)).unwrap();
-        assert!(pos(1) < pos(peak.0));
-        assert!(pos(2) < pos(peak.0));
-        assert!(pos(3) < pos(peak.0));
+        for leaf_id in 1..=MERGE_FANOUT as u32 {
+            assert!(pos(leaf_id) < pos(peak.0));
+        }
     }
 }

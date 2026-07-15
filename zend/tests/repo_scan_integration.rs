@@ -82,7 +82,7 @@ fn repo_scan_large_workspace_emits_multiple_clusters() {
         "expected ≥4 cluster turn pairs, got {}",
         sink.turns.len()
     );
-    let prompts: Vec<&str> = sink.turns.iter().map(|(u, _, _)| u.as_str()).collect();
+    let prompts: Vec<&str> = sink.turns.iter().map(|(u, _)| u.as_str()).collect();
     for sub in &["src/alpha", "src/bravo", "src/charlie", "src/delta"] {
         assert!(
             prompts.iter().any(|p| p.contains(sub)),
@@ -101,7 +101,7 @@ fn repo_scan_assistant_text_lists_actual_files() {
     let combined_listings: String = sink
         .turns
         .iter()
-        .map(|(_, a, _)| a.as_str())
+        .map(|(_, a)| a.as_str())
         .collect::<Vec<_>>()
         .join("\n");
     assert!(combined_listings.contains("Cargo.toml"));

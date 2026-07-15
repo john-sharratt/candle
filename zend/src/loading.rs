@@ -79,10 +79,6 @@ enum Inner {
         total: u64,
         /// Cumulative tokens prefilled during this step (ingest stat).
         prefill_tokens: u64,
-        /// Cumulative tokens decoded for whole-file summaries this step,
-        /// and the wall-clock spent decoding them (the "summarized" stat).
-        summary_tokens: u64,
-        summary_ms: u64,
         /// Wall-clock instant the current step was entered — used for
         /// per-step elapsed-time logging at transitions.
         started: Instant,
@@ -90,13 +86,14 @@ enum Inner {
     Ready,
 }
 
-/// Live token/time counters for an in-flight ingest step, polled to drive the
-/// upload modal's per-stage stats (ingested/summarized tokens & t/s).
+/// Live token counters for an in-flight ingest step, polled to drive the
+/// upload modal's per-stage stats (ingested tokens & t/s). The whole-file
+/// summary is no longer decoded inline — it's the async summary tree's root,
+/// tracked separately by the upload's analysis phase — so there are no
+/// summary token counters here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IngestStats {
     pub prefill_tokens: u64,
-    pub summary_tokens: u64,
-    pub summary_ms: u64,
 }
 
 impl LoadProgress {
@@ -109,8 +106,6 @@ impl LoadProgress {
                 progressed: 0,
                 total: 0,
                 prefill_tokens: 0,
-                summary_tokens: 0,
-                summary_ms: 0,
                 started: Instant::now(),
             }),
         }
@@ -183,8 +178,6 @@ impl LoadProgress {
             progressed: 0,
             total: 0,
             prefill_tokens: 0,
-            summary_tokens: 0,
-            summary_ms: 0,
             started: Instant::now(),
         };
     }
@@ -233,35 +226,12 @@ impl LoadProgress {
         }
     }
 
-    /// Add one whole-file summary decode: `tokens` decoded over `ms`
-    /// wall-clock. Accumulates across the files in a multi-file ingest so
-    /// the upload's "summarized" stat reflects the whole batch.
-    pub fn add_summary(&self, tokens: u64, ms: u64) {
-        if let Inner::Loading {
-            summary_tokens,
-            summary_ms,
-            ..
-        } = &mut *self.inner.lock().unwrap()
-        {
-            *summary_tokens += tokens;
-            *summary_ms += ms;
-        }
-    }
-
-    /// Snapshot the current step's ingest token/time counters — polled by
-    /// the upload SSE loop to stream per-stage stats to the GUI.
+    /// Snapshot the current step's ingest token counters — polled by the upload
+    /// SSE loop to stream the per-stage "ingested tokens & t/s" stat to the GUI.
     pub fn ingest_stats(&self) -> IngestStats {
-        if let Inner::Loading {
-            prefill_tokens,
-            summary_tokens,
-            summary_ms,
-            ..
-        } = &*self.inner.lock().unwrap()
-        {
+        if let Inner::Loading { prefill_tokens, .. } = &*self.inner.lock().unwrap() {
             IngestStats {
                 prefill_tokens: *prefill_tokens,
-                summary_tokens: *summary_tokens,
-                summary_ms: *summary_ms,
             }
         } else {
             IngestStats::default()

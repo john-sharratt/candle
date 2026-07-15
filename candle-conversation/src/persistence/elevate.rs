@@ -41,7 +41,7 @@ use sysinfo::System;
 /// Sum of `SealedChunk.byte_size` across every chunk of every layer
 /// in a per-layer `Vec<SealedSequence>` — the per-tier memory cost
 /// of holding this turn hot or warm.
-fn sealed_total_bytes(seqs: &[SealedSequence]) -> u64 {
+pub(crate) fn sealed_total_bytes(seqs: &[SealedSequence]) -> u64 {
     seqs.iter()
         .flat_map(|s| s.chunks.iter())
         .map(|c| c.byte_size)

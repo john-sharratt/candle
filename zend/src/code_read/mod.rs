@@ -5,8 +5,8 @@
 //! scope-aware parts; each part contributes a prefilled `read_file`
 //! request, a prefilled `<tool_call>` echo, and a prefilled
 //! `<tool_response>` carrying the source with line numbers.  The
-//! conversation closes with a single decoded whole-file summary
-//! (≤200 words) the model produces live.
+//! whole-file summary is not decoded inline — it is the root of the
+//! async summary tree the summariser rolls up over these scope turns.
 //!
 //! Refresh is per-file: content hashes ([`CodeReadState`]) decide
 //! which files changed; deleted files' conversations are tombstoned,
@@ -16,11 +16,15 @@
 //! **Parallel ingest.**  At the candle workspace's tens of thousands
 //! of files, a single-session ingest would run for tens of hours.
 //! Instead [`CODE_READ_PARALLELISM`] workers each process whole files
-//! concurrently (prefill + summary decode as one unit), minting a
-//! distinct per-file conversation per file.  The scheduler's
-//! wave-batched grouped GEMM coalesces work across the concurrent
-//! sessions, and the resolver's `active_timelines_for_group` iterator
-//! surfaces all of them to dialogue retrieval without code changes.
+//! concurrently, minting a distinct per-file conversation per file.
+//! Within a file, the scopes prefill in parallel too — each on its own
+//! scratch slot via `Sequence::ingest_scopes_parallel`, then recombined
+//! into the file timeline in source order — so a file's scopes (and
+//! scopes across files) batch into large forwards that amortise the MoE
+//! expert-weight load instead of prefilling one-at-a-time.  The
+//! scheduler owns cross-file fairness and the scratch-slot bound; the
+//! resolver's `active_timelines_for_group` iterator surfaces every
+//! file's timeline to dialogue retrieval without code changes.
 
 pub mod carve;
 pub mod header;
@@ -34,7 +38,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{Builder, GroupId, LayerId, SystemPromptItem};
 use candle_conversation::{ConversationEngine, SequenceConfig};
@@ -83,22 +87,27 @@ impl CodeReadState {
     }
 }
 
-/// Emit one file's turns into `sink` — the one-conversation-per-file
-/// shape: a prefill turn per carved part (read_file tool-call + response)
-/// so the model reads the whole file across the conversation, then a final
-/// decoded turn summarising the entire file in ≤200 words. Shared by the
-/// production per-file ingest ([`process_one_file`]) and the sink-driven
-/// reference/test path ([`ingest_code_reading_into_sink`]).
+/// Emit one file's scope turns into `sink` — a prefill turn per carved scope
+/// (read_file tool-call + response) so the model absorbs the whole file across
+/// the conversation. There is NO per-file summary decode: the file summary is
+/// the root of the async summary tree the summariser builds over these turns
+/// (`log₈(N)` `SummaryOfSummaries` rollup). Shared by the production per-file
+/// ingest ([`process_one_file`]) and the sink-driven reference/test path
+/// ([`ingest_code_reading_into_sink`]).
 fn emit_file_turns<S: InsertTurnSink>(
     sink: &mut S,
     path: &str,
     language: Language,
     scopes: &[Scope],
     bytes: &[u8],
-    mut on_prefill: impl FnMut(usize),
-    mut on_summary: impl FnMut(usize, std::time::Duration),
+    on_prefilled: candle_conversation::ScopeProgressFn,
 ) -> anyhow::Result<()> {
     let line_offsets = compute_line_offsets(bytes);
+    // Build every scope's (user, assistant) exchange up-front, then prefill them
+    // all in parallel — one scratch slot per scope — so the file's scopes batch
+    // into large amortising forwards instead of prefilling one-at-a-time. The
+    // scopes are recorded into the file timeline in this (source) order.
+    let mut scope_turns: Vec<(String, String)> = Vec::with_capacity(scopes.len());
     for scope in scopes {
         let body = slice_lines(bytes, &line_offsets, scope.start_line, scope.end_line);
         let user = header::render_part_user_prompt(path, scope);
@@ -107,29 +116,22 @@ fn emit_file_turns<S: InsertTurnSink>(
             header::render_tool_call(path, scope),
             header::render_tool_response(path, scope, language, &body),
         );
-        let tokens = sink.insert_prefill_turn(&user, &assistant)?;
-        // Report progress + tokens per part so a single-file ingest's bar moves
-        // as the file is read (not 0% → 100% at the end) and the "ingested
-        // tokens" stat ticks up live.
-        on_prefill(tokens);
+        scope_turns.push((user, assistant));
     }
-    let summary_prompt = header::render_file_summary_prompt(path);
-    let started = std::time::Instant::now();
-    let (_text, summary_tokens) =
-        sink.decode_summary_turn(&summary_prompt, header::FILE_SUMMARY_MAX_TOKENS)?;
-    // The summary decode is its own progress unit (see the `+ 1` in the ingest
-    // totals) — it's the slow tail of a file, so counting it keeps the bar from
-    // sitting at 100% while it still decodes. Its token count + wall-clock feed
-    // the upload's "summarized in Xs (@ t/s)" stat.
-    on_summary(summary_tokens, started.elapsed());
+    // `on_prefilled` fires per scope as it lands on the wave, so the ingest bar
+    // and token count advance live instead of jumping only when the file's whole
+    // batch flushes.
+    sink.insert_prefill_turns_parallel(&scope_turns, on_prefilled)?;
     Ok(())
 }
 
-/// Progress units one file contributes: one per carved scope (prefill) plus
-/// one for the whole-file summary decode. Keeps the `total` fed to
-/// [`LoadProgress`] in step with the [`emit_file_turns`] `on_part` callbacks.
+/// Progress units one file contributes: one per carved scope (prefill). The
+/// file summary is no longer decoded inline — it is the async summary tree's
+/// root, tracked separately — so a file's ingest units are exactly its scopes.
+/// Keeps the `total` fed to [`LoadProgress`] in step with the
+/// [`emit_file_turns`] `on_prefill` callbacks.
 fn file_progress_units(scopes: &[Scope]) -> usize {
-    scopes.len() + 1
+    scopes.len()
 }
 
 /// Sink-driven reference for the per-file `code_reading` ingest — carves
@@ -164,6 +166,9 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
     );
     progress.set_step_progress(0, total as u64);
 
+    // This reference path drives its own coarse per-file progress below, so the
+    // per-scope callback is a no-op.
+    let noop: candle_conversation::ScopeProgressFn = Arc::new(|_| {});
     let mut done = 0usize;
     for (file, scopes, bytes, _fhash) in &per_file {
         emit_file_turns(
@@ -172,8 +177,7 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
             file.language,
             scopes,
             bytes,
-            |_tokens| {},
-            |_tokens, _elapsed| {},
+            Arc::clone(&noop),
         )?;
         done += scopes.len();
         progress.set_step_progress(done as u64, total as u64);
@@ -190,20 +194,21 @@ pub fn ingest_code_reading_into_sink<S: InsertTurnSink>(
 /// systemic.
 pub const MAX_DECODE_FAILURES: usize = 16;
 
-/// Default number of concurrent worker timelines used by the
-/// parallel ingest path.  Override with `ZEND_CODE_READ_PARALLELISM`.
-/// The scheduler's wave-batched grouped GEMM coalesces work across
-/// these concurrent sessions, so the effective decode rate scales
-/// near-linearly until the model's expert-cache hot set saturates.
+/// Number of files ingested concurrently by the worker pool. Each worker owns
+/// one file conversation and drives it through [`process_one_file`]; a file's
+/// own scopes prefill in parallel underneath, via the scheduler's parallel
+/// scope-ingest (`Sequence::ingest_scopes_parallel`). So the effective prefill
+/// width is the scheduler's scope-slot bound (`Scheduler::MAX_SCOPE_SLOTS`),
+/// NOT this — this only sets how many files' scopes are in flight at once for
+/// cross-file fairness (a lone file still claims all the scope slots).
 ///
-/// 24 — matched to the scheduler's prefill admission cap
-/// (`MAX_ACTIVE_PREFILLS`). Ingest is prefill-bound and the scheduler ragged-
-/// batches all in-flight prefills into one forward, so this is the width of the
-/// batched prefill. Raised from 16 now that the rolling-window ingest
-/// (`CODE_READ_WINDOW_TURNS`) bounds each scope's attended KV — the smaller
-/// per-scope working set leaves room for more concurrent scopes, which is what
-/// lets a burst of small scopes accumulate into a large amortising forward
-/// (design `docs/unified_wave_inference_engine.md`).
+/// 24 files concurrently. **Invariant:** this plus `MAX_SCOPE_SLOTS` must stay
+/// below the model's sequence-slot capacity — each worker holds one file
+/// conversation slot and the pump allocates up to `MAX_SCOPE_SLOTS` scratch
+/// slots on top, so `24 + 20 = 44` must fit (the dev target seats 64). If the
+/// two together exceed capacity the pump's re-queue-on-capacity backpressure
+/// keeps it correct (it just runs narrower), but it must not consume every slot
+/// or the blocked workers can't free theirs — keep the sum under capacity.
 pub const CODE_READ_PARALLELISM: usize = 24;
 
 /// [`utility_config`] specialised for the `code_reading` layer: append-only
@@ -279,15 +284,18 @@ fn carve_workspace(
 ///
 /// Files whose extension isn't a recognised code language are skipped (there is
 /// nothing to read). Returns the per-file content-hash state for the files that
-/// were ingested, to merge into the running [`CodeReadState`].
+/// were ingested (to merge into the running [`CodeReadState`]) plus the count of
+/// files whose ingest tolerated-failed (e.g. out of KV VRAM), so the upload can
+/// surface a real failure. Summarisation of the ingested scopes runs entirely in
+/// the background summariser and is not awaited here.
 pub fn ingest_files(
     engine: &Mutex<ConversationEngine>,
     proj_builder: &Builder,
     workspace: &Path,
     rel_paths: &[String],
     config: SequenceConfig,
-    progress: &LoadProgress,
-) -> anyhow::Result<CodeReadState> {
+    progress: &Arc<LoadProgress>,
+) -> anyhow::Result<(CodeReadState, usize)> {
     // Build a minimal RepoMap for just these files — `carve_workspace` needs
     // only the path + language; the other `FileEntry` fields are unused by the
     // carve, so they're left at defaults.
@@ -307,7 +315,7 @@ pub fn ingest_files(
         });
     }
     if map.files.is_empty() {
-        return Ok(CodeReadState::default());
+        return Ok((CodeReadState::default(), 0));
     }
 
     let layer = proj_builder
@@ -334,7 +342,7 @@ pub fn ingest_files(
         .unwrap()
         .conversation_metadata_values("content_sha256");
 
-    run_file_pool(
+    let n_failed = run_file_pool(
         engine,
         proj_builder,
         &system_prompt,
@@ -347,7 +355,7 @@ pub fn ingest_files(
         progress,
         parallelism(),
     )?;
-    Ok(state)
+    Ok((state, n_failed))
 }
 
 /// Whether a workspace-relative `path` (with `/` separators) lives under the
@@ -397,11 +405,12 @@ fn reconcile_deleted(engine: &Mutex<ConversationEngine>, present_paths: &HashSet
 ///
 /// Each file becomes its own `(code_reading, scopes)` conversation: one
 /// prefill turn per carved part (read_file tool-call + response) so the
-/// model reads the whole file, then a final decoded turn that summarises
-/// the entire file in ≤200 words. The conversation is tagged with a
-/// content hash + descriptive metadata, then freed — its sealed turns and
-/// metadata persist in the substrate, so retrieval and the restart-resume
-/// cache work off the substrate, not a live sequence.
+/// model reads the whole file. The whole-file summary is not decoded
+/// inline — it is the async summary tree's root, rolled up later by the
+/// summariser. The conversation is tagged with a content hash +
+/// descriptive metadata, then freed — its sealed turns and metadata
+/// persist in the substrate, so retrieval and the restart-resume cache
+/// work off the substrate, not a live sequence.
 ///
 /// Reconciliation runs first: conversations for files no longer on disk
 /// are tombstoned, then a one-pass snapshot of present content hashes lets
@@ -416,7 +425,7 @@ pub fn ingest_code_reading(
     workspace: &Path,
     map: &RepoMap,
     config: SequenceConfig,
-    progress: &LoadProgress,
+    progress: &Arc<LoadProgress>,
 ) -> anyhow::Result<CodeReadState> {
     let layer = proj_builder
         .id_for_layer("code_reading")
@@ -446,15 +455,13 @@ pub fn ingest_code_reading(
         .unwrap()
         .conversation_metadata_values("content_sha256");
 
-    let user_override = std::env::var("ZEND_CODE_READ_PARALLELISM").is_ok();
     tracing::info!(
         n_workers = n_workers,
         n_files = per_file.len(),
         n_scopes = total,
         n_cached = present_hashes.len(),
-        env_override = user_override,
-        "code_read: per-file ingest across {n_workers} workers \
-         (set ZEND_CODE_READ_PARALLELISM=N to override; lower it if you hit CUDA OOM)",
+        "code_read: per-file ingest across {n_workers} file workers; each file's \
+         scopes prefill in parallel underneath (scheduler scope-slot bound)",
     );
     progress.set_step_progress(0, total as u64);
 
@@ -475,60 +482,13 @@ pub fn ingest_code_reading(
     Ok(state)
 }
 
-/// Fair, fully-parallel dispatch cursor over per-file scope work for the
-/// ingest pool. Each file is split into scope work units; the 24 workers
-/// (`CODE_READ_PARALLELISM`) pull scopes from here so that:
-///
-/// * **every file makes progress fairly** — a file with many scopes never
-///   starves the others; and
-/// * **a single file with many scopes saturates ALL workers** — maximum
-///   parallelism when there's nothing to be fair between.
-///
-/// Fairness is max-min: each [`Self::next`] hands out the next scope of the file
-/// that has been dispatched the fewest so far (ties by file order), so dispatch
-/// spreads evenly across files while collapsing to one file when only one has
-/// work. Pure over its `(file, scope)` index space → unit-testable; the pool
-/// wraps it in a `Mutex` and each worker prefills the scope it's handed.
-///
-/// Consumed by the scheduler-side parallel-scope ingest (the fork → parallel
-/// prefill → snapshot → `record_turn`-into-the-shared-timeline op, modelled on
-/// the summariser's compression seal). Kept here — tested — as that build's
-/// dispatch policy.
-#[allow(dead_code)]
-struct FairScopeCursor {
-    /// Per file: `(dispatched_so_far, total_scopes)`.
-    files: Vec<(usize, usize)>,
-}
-
-#[allow(dead_code)]
-impl FairScopeCursor {
-    fn new(scope_counts: &[usize]) -> Self {
-        Self {
-            files: scope_counts.iter().map(|&n| (0, n)).collect(),
-        }
-    }
-
-    /// Next `(file_idx, scope_idx)` to prefill, chosen fairly. `None` once every
-    /// scope of every file has been dispatched.
-    fn next(&mut self) -> Option<(usize, usize)> {
-        let pick = self
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(_, (done, total))| done < total)
-            .min_by_key(|(i, (done, _))| (*done, *i))
-            .map(|(i, _)| i)?;
-        let (done, _) = &mut self.files[pick];
-        let scope_idx = *done;
-        *done += 1;
-        Some((pick, scope_idx))
-    }
-}
-
 /// Drive a bounded worker pool over `per_file`: each worker pulls the
 /// next file from a shared cursor and runs [`process_one_file`]. Workers
 /// share progress / decode-failure counters and an abort flag (first
-/// error stops the rest). Returns once every file is processed.
+/// error stops the rest). Returns once every file is processed, yielding
+/// the number of files whose ingest was *tolerated-failed* (e.g. the GPU
+/// ran out of KV VRAM mid-prefill) — so the upload can surface a real
+/// failure instead of a silent "done".
 #[allow(clippy::too_many_arguments)]
 fn run_file_pool(
     engine: &Mutex<ConversationEngine>,
@@ -540,11 +500,13 @@ fn run_file_pool(
     per_file: &[(FileEntry, Vec<Scope>, Vec<u8>, String)],
     present_hashes: &HashSet<String>,
     total: usize,
-    progress: &LoadProgress,
+    progress: &Arc<LoadProgress>,
     n_workers: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let cursor = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
+    // `Arc` so per-file `process_one_file` can hand a clone to the scheduler's
+    // per-scope progress callback (which must be `'static`).
+    let done = Arc::new(AtomicUsize::new(0));
     let decode_failures = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
     let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -600,20 +562,22 @@ fn run_file_pool(
     // under the pool the last stored value can settle a step short even though
     // every unit ran; pin it to 100% now that the pool has fully drained.
     progress.set_step_progress(total as u64, total as u64);
+    let n_failed = decode_failures.load(Ordering::Relaxed);
     tracing::info!(
         n_files = per_file.len(),
-        n_decode_failures = decode_failures.load(Ordering::Relaxed),
+        n_decode_failures = n_failed,
         "code_read per-file ingest complete",
     );
-    Ok(())
+    Ok(n_failed)
 }
 
 /// Ingest one file into a fresh per-file conversation: skip via the
 /// resume-cache snapshot if its content hash is already present;
 /// otherwise prefill each carved part (read_file tool-call + response),
-/// decode a final ≤200-word whole-file summary, tag the conversation
-/// with its content hash + metadata, then drop it (freeing the GPU slot;
-/// the sealed turns + tags persist in the substrate).
+/// tag the conversation with its content hash + metadata, then drop it
+/// (freeing the GPU slot; the sealed turns + tags persist in the
+/// substrate). The file summary is not decoded here — it is the async
+/// summary tree's root, rolled up later by the background summariser.
 #[allow(clippy::too_many_arguments)]
 fn process_one_file(
     engine: &Mutex<ConversationEngine>,
@@ -628,9 +592,9 @@ fn process_one_file(
     file_hash: &str,
     present_hashes: &HashSet<String>,
     total: usize,
-    done: &AtomicUsize,
+    done: &Arc<AtomicUsize>,
     decode_failures: &AtomicUsize,
-    progress: &LoadProgress,
+    progress: &Arc<LoadProgress>,
 ) -> anyhow::Result<()> {
     // Resume cache: this content hash was already in the (live, non-
     // tombstoned) substrate at ingest start — skip the prefill+decode.
@@ -680,7 +644,22 @@ fn process_one_file(
     // Count the progress units this file actually reported, so a tolerated
     // failure can reconcile the rest (the per-part callbacks only fire for
     // parts that completed).
-    let fired = std::cell::Cell::new(0usize);
+    // Per-scope progress: the scheduler fires this as each scope lands, so the
+    // bar climbs and the token count ticks up live (one unit per scope) rather
+    // than jumping when the whole file's batch flushes. `fired` counts scopes
+    // that actually reported, so a tolerated failure can reconcile the rest.
+    let fired = Arc::new(AtomicUsize::new(0));
+    let on_prefilled: candle_conversation::ScopeProgressFn = {
+        let done = Arc::clone(done);
+        let fired = Arc::clone(&fired);
+        let progress = Arc::clone(progress);
+        Arc::new(move |tokens: usize| {
+            fired.fetch_add(1, Ordering::Relaxed);
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.set_step_progress(d as u64, total as u64);
+            progress.add_prefill_tokens(tokens as u64);
+        })
+    };
     let emit_result = {
         let mut sink = SequenceTurnSink::new(&mut conv);
         emit_file_turns(
@@ -689,18 +668,7 @@ fn process_one_file(
             file.language,
             scopes,
             bytes,
-            |tokens| {
-                fired.set(fired.get() + 1);
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                progress.set_step_progress(d as u64, total as u64);
-                progress.add_prefill_tokens(tokens as u64);
-            },
-            |tokens, elapsed| {
-                fired.set(fired.get() + 1);
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                progress.set_step_progress(d as u64, total as u64);
-                progress.add_summary(tokens as u64, elapsed.as_millis() as u64);
-            },
+            on_prefilled,
         )
     };
 
@@ -709,7 +677,7 @@ fn process_one_file(
         // for parts that completed, so a tolerated failure below would leave
         // `done` short of `total` and the bar never reaches 100%. Advance
         // `done` by the units this file didn't get to report.
-        let missing = file_progress_units(scopes).saturating_sub(fired.get());
+        let missing = file_progress_units(scopes).saturating_sub(fired.load(Ordering::Relaxed));
         if missing > 0 {
             let d = done.fetch_add(missing, Ordering::Relaxed) + missing;
             progress.set_step_progress(d as u64, total as u64);
@@ -750,7 +718,8 @@ fn process_one_file(
         );
     }
     // `conv` drops here → FreeSequence releases the GPU slot; the sealed
-    // turns and metadata remain in the substrate.
+    // turns and metadata remain in the substrate. Summarisation of these
+    // scopes happens later in the background summariser.
     Ok(())
 }
 
@@ -784,7 +753,7 @@ pub fn refresh_code_reading(
     workspace: &Path,
     map: &RepoMap,
     prior: &CodeReadState,
-    progress: &LoadProgress,
+    progress: &Arc<LoadProgress>,
 ) -> anyhow::Result<RefreshOutcome> {
     // Carve once — drives both the change comparison and the re-ingest.
     let (per_file, next) = carve_workspace(workspace, map);
@@ -897,45 +866,6 @@ fn slice_lines(bytes: &[u8], offsets: &[usize], start_line: u32, end_line: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Drain the cursor into the full dispatch order.
-    fn drain(counts: &[usize]) -> Vec<(usize, usize)> {
-        let mut c = FairScopeCursor::new(counts);
-        let mut out = Vec::new();
-        while let Some(x) = c.next() {
-            out.push(x);
-        }
-        out
-    }
-
-    #[test]
-    fn fair_cursor_single_file_uses_all_parallelism() {
-        // One file with many scopes → every worker draws from it, in order.
-        assert_eq!(drain(&[5]), vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]);
-    }
-
-    #[test]
-    fn fair_cursor_interleaves_files_evenly() {
-        // Equal files → round-robin so all progress together.
-        assert_eq!(
-            drain(&[3, 3]),
-            vec![(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]
-        );
-        assert_eq!(
-            drain(&[2, 2, 2]),
-            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
-        );
-    }
-
-    #[test]
-    fn fair_cursor_small_file_is_not_starved() {
-        // A 1-scope file gets its go immediately, then the big file drains — no
-        // starvation, and total dispatch count is exact.
-        assert_eq!(drain(&[1, 4]), vec![(0, 0), (1, 0), (1, 1), (1, 2), (1, 3)]);
-        // Empty files contribute nothing; overall count is Σ scopes.
-        assert_eq!(drain(&[0, 2, 0, 1]).len(), 3);
-        assert_eq!(drain(&[]), Vec::<(usize, usize)>::new());
-    }
 
     #[test]
     fn is_upload_path_matches_top_level_uploads_only() {

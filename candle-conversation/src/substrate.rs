@@ -810,6 +810,23 @@ pub trait ContentResolver {
         TurnKind::Normal
     }
 
+    /// The turn indices `index` transitively covers in `group`'s summary forest
+    /// — every descendant node (SummaryOfSummaries / SummaryOfTurns / Normal)
+    /// beneath it, at every level. Empty for a raw `Normal` turn (a leaf covers
+    /// nothing). A summary only ever covers turns on its OWN timeline, so this
+    /// is self-contained per timeline.
+    ///
+    /// Used by the rule-based selection's descendant-dedup: a summary that wins
+    /// a slot on provenance score is dropped when any node it covers also wins,
+    /// so the projection keeps the SPECIFIC over the coarse (never a summary
+    /// stacked on top of the very turns it summarises).
+    ///
+    /// Default impl returns empty (mock resolvers / non-summarised timelines
+    /// have no forest, so nothing is covered).
+    fn node_covers(&self, _group: GroupId, _index: TurnIndex) -> Vec<TurnIndex> {
+        Vec::new()
+    }
+
     /// Whether a sealed turn was decoded with `/no_think` thinking suppression —
     /// the assembler re-renders the `/no_think` soft-switch glue after
     /// `user_start` for such turns, so the materialized-glue builder needs the
@@ -1789,6 +1806,38 @@ impl Substrate {
             count,
             bytes: freed,
         }
+    }
+
+    /// Drop the hot copy of each of `turns` that also holds a warm copy, keeping
+    /// warm — the cheap inverse of a warm→hot lift (no migrate, since the warm
+    /// bytes already exist). Unlike [`Self::evict_hot_to_free`], which evicts the
+    /// oldest *non*-kept residences until a byte target is met, this targets an
+    /// explicit set: used to release a *transient* working set (e.g. a summary
+    /// pass's children, lifted only so the compressor could attend over them)
+    /// back out of VRAM the instant it's no longer needed, so background
+    /// elevation churn can't accumulate hot residency and exhaust the card.
+    /// Turns that are cold-only or hot-without-warm are left untouched (dropping
+    /// hot without a warm copy would lose their K/V). Returns the number demoted.
+    pub fn demote_turns_to_warm(&mut self, turns: &[TurnKey]) -> usize {
+        let mut demoted = 0;
+        for &key in turns {
+            let Some(residence) = self
+                .turn(key.timeline, key.index)
+                .map(|e| e.content.residence)
+            else {
+                continue;
+            };
+            let (has_hot, has_warm) = {
+                let slot = &self.residence[residence.0];
+                (slot.hot.is_some(), slot.warm.is_some())
+            };
+            if has_hot && has_warm {
+                self.residence[residence.0].hot = None;
+                Self::remove_from_lru(&mut self.hot_lru, residence);
+                demoted += 1;
+            }
+        }
+        demoted
     }
 
     // ── Timeline registry ────────────────────────────────────────────────────
@@ -4170,10 +4219,10 @@ mod tests {
 
     /// Three SoT leaves carry into one ternary SoS; the SoS is the sole peak.
     #[test]
-    fn peaks_of_derives_ternary_forest() {
+    fn peaks_of_derives_forest() {
         let (_, _, timeline, mut sub) = make_timeline();
         let mut leaves = Vec::new();
-        for n in 0..3u32 {
+        for n in 0..MERGE_FANOUT as u32 {
             let idx = sub.append_with_blocks(timeline, 10, n as u64, n as u64 + 1);
             sub.set_tree_meta(
                 timeline,
@@ -4186,13 +4235,14 @@ mod tests {
             );
             leaves.push(idx);
         }
-        // Before the SoS exists, all three leaves are peaks; reconcile wants to
-        // build the SoS over them.
-        assert_eq!(sub.peaks_of(timeline).len(), 3);
+        // Before the SoS exists, all MERGE_FANOUT leaves are peaks; reconcile wants
+        // to build the SoS over them.
+        assert_eq!(sub.peaks_of(timeline).len(), MERGE_FANOUT);
         let next = sub.reconcile_next(timeline).expect("an SoS to build");
         assert_eq!(next, leaves);
         // Record the SoS; now it is the single peak and the forest is whole.
-        let sos = sub.append_with_blocks(timeline, 10, 3, 4);
+        let sos =
+            sub.append_with_blocks(timeline, 10, MERGE_FANOUT as u64, MERGE_FANOUT as u64 + 1);
         sub.set_tree_meta(
             timeline,
             sos,
@@ -4237,7 +4287,7 @@ mod tests {
                 },
             );
         }
-        // A legacy binary SoS (2 children) — not canonical for MERGE_FANOUT=3.
+        // A legacy binary SoS (2 children) — not canonical under MERGE_FANOUT.
         let bin = sub.append_with_blocks(timeline, 10, 2, 3);
         sub.set_tree_meta(
             timeline,
@@ -4698,6 +4748,63 @@ mod tests {
         assert_eq!(report.count, 1);
         assert!(sub.residence[a.0].hot.is_some(), "a protected by keep set");
         assert!(sub.residence[b.0].hot.is_none(), "b evicted instead");
+    }
+
+    /// Targeted demotion drops the hot copy of exactly the NAMED turns (keeping
+    /// warm) and leaves every other hot turn resident — the inverse of the
+    /// keep-set eviction. A turn with no warm copy is left hot (dropping it would
+    /// lose its K/V), and re-demoting an already-warm-only turn is a no-op.
+    #[test]
+    fn demote_turns_to_warm_drops_named_keeps_warm_and_rest() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let (a_idx, a) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (b_idx, b) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+        let (c_idx, c) = install_hot_and_warm(&mut sub, timeline, 100_000_000);
+
+        let demoted = sub.demote_turns_to_warm(&[
+            TurnKey {
+                timeline,
+                index: a_idx,
+            },
+            TurnKey {
+                timeline,
+                index: b_idx,
+            },
+        ]);
+        assert_eq!(demoted, 2, "a + b demoted");
+        assert!(sub.residence[a.0].hot.is_none(), "a hot dropped");
+        assert!(
+            sub.residence[a.0].warm.is_some(),
+            "a warm KEPT (cheap reload)"
+        );
+        assert!(sub.residence[b.0].hot.is_none(), "b hot dropped");
+        assert!(sub.residence[b.0].warm.is_some(), "b warm KEPT");
+        assert!(sub.residence[c.0].hot.is_some(), "c (unnamed) still hot");
+
+        // Idempotent: a is now warm-only, so re-demoting it frees nothing.
+        assert_eq!(
+            sub.demote_turns_to_warm(&[TurnKey {
+                timeline,
+                index: a_idx
+            }]),
+            0,
+            "already warm-only → no-op"
+        );
+
+        // A hot turn with NO warm copy is left hot — dropping it would lose K/V.
+        sub.residence[c.0].warm = None;
+        assert_eq!(
+            sub.demote_turns_to_warm(&[TurnKey {
+                timeline,
+                index: c_idx
+            }]),
+            0,
+            "hot-without-warm is not demotable"
+        );
+        assert!(
+            sub.residence[c.0].hot.is_some(),
+            "c hot-without-warm untouched"
+        );
     }
 
     /// `install_cold` frees a section's hot VRAM only when its residence is

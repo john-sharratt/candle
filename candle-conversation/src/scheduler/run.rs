@@ -110,6 +110,11 @@ impl Scheduler {
             // 2. Promote queued PrefillWork → ActivePrefill (up to cap).
             let t_promote = Instant::now();
             self.promote_new_prefills();
+            // Admit queued scope prefills onto freshly-available scratch slots.
+            // Submit + completion already pump; this catches scopes re-queued when
+            // the model was at sequence capacity, retrying once other sequences
+            // (live turns) free a slot.
+            self.pump_scope_prefills();
             self.wave_stats
                 .add_phase(WavePhase::Promote, t_promote.elapsed().as_millis() as u64);
 
@@ -148,6 +153,16 @@ impl Scheduler {
                 self.timed_prefill();
                 self.timed_section();
                 self.timed_decode();
+            }
+
+            // AIMD reopen: if a prior pressure episode narrowed the admission
+            // window, probe it back open by one slot per loop once VRAM is no
+            // longer under pressure — gradual recovery so we don't snap to full
+            // width and re-trip on the next wide wave. Gated on the window being
+            // closed so the steady state (window at full width) never pays the
+            // VRAM query.
+            if self.admit_window < Self::MAX_PREFILL_WIDTH && !self.vram_under_pressure() {
+                self.grow_admit_window();
             }
 
             // Flush the wave summary + phase breakdown if its 2 s window

@@ -384,9 +384,7 @@ impl Scheduler {
                 self.active_decodes.get(id).is_some_and(|s| {
                     matches!(
                         s.seal_action,
-                        SealAction::CompressionSetup { .. }
-                            | SealAction::CompressionPass { .. }
-                            | SealAction::CompressionTurn { .. }
+                        SealAction::CompressionPass { .. } | SealAction::CompressionTurn { .. }
                     )
                 })
             });

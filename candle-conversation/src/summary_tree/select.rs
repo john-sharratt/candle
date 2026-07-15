@@ -280,7 +280,7 @@ fn rightmost_normal_pos(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tree::Node;
+    use super::super::tree::{Node, MERGE_FANOUT};
     use super::*;
 
     /// Build a tree where every Normal turn is `tokens_per_normal`
@@ -420,8 +420,9 @@ mod tests {
     fn only_summaries_when_budget_covers_just_the_peaks() {
         // At exactly the baseline budget there's no room to open anything —
         // every selected node is a covering summary, none is raw, and the
-        // whole timeline is still covered.
-        let (tree, _) = build_uniform_tree(6, 1, 10, 15);
+        // whole timeline is still covered. A full run of leaves so one SoS peak
+        // covers them all (refining it costs strictly more than the peak budget).
+        let (tree, _) = build_uniform_tree(MERGE_FANOUT as u32, 1, 10, 15);
         let sel = select_budget_fit(&tree, peak_cost(&tree), 0);
         assert!(!sel.selected.is_empty());
         assert!(
@@ -519,10 +520,12 @@ mod tests {
     fn floor_guarantees_newest_raw_even_over_budget() {
         // The budget covers only the coarse summaries, but a floor of 3 forces
         // the newest three turns raw anyway — the rule wins over the budget for
-        // recent context, and the older turns stay summarised.
-        let (tree, normals) = build_uniform_tree(6, 1, 10, 15);
+        // recent context, and the older turns stay summarised. Two full-run SoS
+        // peaks so the newest turns and `normals[0]` sit under different peaks.
+        let n = (2 * MERGE_FANOUT) as u32;
+        let (tree, normals) = build_uniform_tree(n, 1, 10, 15);
         let sel = select_budget_fit(&tree, peak_cost(&tree), 3);
-        for i in 3..6 {
+        for i in (n as usize - 3)..n as usize {
             assert!(
                 sel.contains(normals[i]),
                 "floor turn {i} must be raw regardless of budget",

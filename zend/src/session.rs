@@ -730,7 +730,7 @@ impl InferenceState {
     /// When `map` is `Some`, the refresh reuses that workspace walk
     /// instead of doing its own.
     pub(crate) fn refresh_code_reading(&self, map: Option<RepoMap>) -> anyhow::Result<bool> {
-        self.refresh_code_reading_with_progress(map, &LoadProgress::new())
+        self.refresh_code_reading_with_progress(map, &Arc::new(LoadProgress::new()))
     }
 
     /// Ingest **only** the given workspace-relative files into the
@@ -739,15 +739,18 @@ impl InferenceState {
     /// it's safe under `--skip-code-read` and can't overload the model with the
     /// entire repo. Merges the ingested files' content hashes into the running
     /// `CodeReadState` so the resume cache and future watcher refreshes skip
-    /// them. Reports per-scope progress into `progress`. Returns whether
-    /// anything was ingested.
+    /// them. Reports per-scope progress into `progress`. Returns
+    /// `(ingested, failed)`: whether anything was newly ingested, and whether
+    /// at least one file's ingest tolerated-failed (e.g. the GPU ran out of KV
+    /// VRAM) — so the upload can report a real failure instead of a silent
+    /// no-op.
     pub(crate) fn ingest_uploaded_files(
         &self,
         rel_paths: &[String],
-        progress: &LoadProgress,
-    ) -> anyhow::Result<bool> {
+        progress: &Arc<LoadProgress>,
+    ) -> anyhow::Result<(bool, bool)> {
         let ctx = self.refresh_ctx();
-        let state = crate::code_read::ingest_files(
+        let (state, n_failed) = crate::code_read::ingest_files(
             &self.engine,
             &ctx.proj_builder,
             &self.workspace,
@@ -755,14 +758,15 @@ impl InferenceState {
             ctx.config,
             progress,
         )?;
+        let failed = n_failed > 0;
         if state.file_hashes.is_empty() {
-            return Ok(false);
+            return Ok((false, failed));
         }
         let mut guard = self.code_read_conv.lock().unwrap();
         for (path, hash) in state.file_hashes {
             guard.state.file_hashes.insert(path, hash);
         }
-        Ok(true)
+        Ok((true, failed))
     }
 
     /// As [`Self::refresh_code_reading`], but reports per-scope ingest
@@ -771,7 +775,7 @@ impl InferenceState {
     pub(crate) fn refresh_code_reading_with_progress(
         &self,
         map: Option<RepoMap>,
-        progress: &LoadProgress,
+        progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<bool> {
         let map = map.unwrap_or_else(|| crate::repo_scan::walk_workspace(&self.workspace));
         let prior_state = self.code_read_conv.lock().unwrap().state.clone();
@@ -790,6 +794,62 @@ impl InferenceState {
                 *guard = CodeReadConv { state };
                 Ok(true)
             }
+        }
+    }
+
+    /// Tombstone the per-file `code_read` conversation of every uploaded file
+    /// that has since been deleted from the `uploads/` folder.
+    ///
+    /// Uploads are endpoint-managed and deliberately excluded from the workspace
+    /// walk (so `refresh_code_reading`'s `reconcile_deleted` never retires them —
+    /// that would delete freshly-uploaded content on the next refresh). But a
+    /// genuine deletion of an uploaded file — whether from the filesystem or via
+    /// the GUI — must still retire its conversation; otherwise deleted uploads
+    /// accumulate live turns forever, growing the redo log and the projection
+    /// candidate set without bound.
+    ///
+    /// Cheap and self-limiting: a metadata scan plus one `Path::exists` probe per
+    /// upload conversation, no workspace walk and no re-ingest. Tombstoning only
+    /// *absent* files makes it a no-op for still-present uploads, so the watcher
+    /// can fire it on any `uploads/` event (create / modify / delete) — an
+    /// in-flight upload's own create events simply match nothing.
+    ///
+    /// Runs at startup (to retire uploads deleted while the daemon was down) and
+    /// on every `uploads/` watcher burst.
+    pub(crate) fn reconcile_uploaded_files(&self) {
+        let engine = self.engine.lock().unwrap();
+        let mut tombstoned = 0usize;
+        for (tl, path) in engine.conversations_with_metadata_key("path") {
+            if !crate::code_read::is_upload_path(&path) {
+                continue;
+            }
+            // `path` is workspace-relative with `/` separators; `Path::join`
+            // accepts them on win32, and `exists()` is case-insensitive there.
+            if self.workspace.join(&path).exists() {
+                continue;
+            }
+            match engine.tombstone_timeline(tl) {
+                Ok(()) => {
+                    tombstoned += 1;
+                    tracing::info!(
+                        target: "zend::session",
+                        path = %path,
+                        "reconcile_uploaded_files: tombstoned deleted upload's conversation",
+                    );
+                }
+                Err(err) => tracing::warn!(
+                    target: "zend::session",
+                    path = %path,
+                    "reconcile_uploaded_files: tombstone failed: {err:#}",
+                ),
+            }
+        }
+        if tombstoned > 0 {
+            tracing::info!(
+                target: "zend::session",
+                count = tombstoned,
+                "reconcile_uploaded_files: retired deleted uploads",
+            );
         }
     }
 }
@@ -1597,10 +1657,6 @@ pub struct UploadStats {
     pub ingest_tokens: u64,
     /// Wall-clock of the read_file ingest (phase 2).
     pub ingest_ms: u64,
-    /// Tokens decoded for the whole-file summaries.
-    pub summary_tokens: u64,
-    /// Wall-clock spent decoding those summaries.
-    pub summary_ms: u64,
 }
 
 /// One uploaded file recorded against a conversation — the substrate
@@ -1739,39 +1795,27 @@ impl ZendSession {
     /// the model and is safe under `--skip-code-read`. Returns `Ok(true)` when
     /// something was ingested, `Ok(false)` for a no-op (non-code files, or the
     /// model not loaded). Per-scope progress streams into `progress`.
+    /// Returns `(ingested, failed)` — see `ingest_uploaded_files`.
     pub fn read_file_phase(
         &self,
         rel_paths: &[String],
-        progress: &crate::loading::LoadProgress,
-    ) -> anyhow::Result<bool> {
+        progress: &Arc<crate::loading::LoadProgress>,
+    ) -> anyhow::Result<(bool, bool)> {
         let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
-            return Ok(false);
+            return Ok((false, false));
         };
         state.ingest_uploaded_files(rel_paths, progress)
     }
 
-    /// **Phase 3 of the upload pipeline** — wait for the summariser to carve
-    /// the newly-ingested sections on their boundaries and summarise them.
-    /// Fires the summariser, then polls the substrate's pending-summary
-    /// backlog until it drains (or `timeout` elapses). Returns the number of
-    /// summaries still pending at return (0 on a clean drain). A no-op that
-    /// returns 0 when the model isn't loaded.
-    ///
-    /// The engine mutex is taken only for the brief poll — never held across
-    /// the sleep — so the summariser and decode threads run freely between
-    /// polls.
-    pub fn analysis_phase(&self, timeout: std::time::Duration) -> usize {
-        let Some(state) = self.inference.read().unwrap().as_ref().map(Arc::clone) else {
-            return 0;
-        };
-        state.engine.lock().unwrap().trigger_summariser();
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let pending = state.engine.lock().unwrap().total_pending_summaries();
-            if pending == 0 || std::time::Instant::now() >= deadline {
-                return pending;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(120));
+    /// Kick the async summariser so the just-ingested turns start folding into
+    /// their summary trees promptly instead of waiting for the next periodic
+    /// tick. **Fire-and-forget**: summarisation is a fully background task,
+    /// invisible to the upload — the pipeline never waits on it, shows no
+    /// progress for it, and records nothing about it. A no-op when the model
+    /// isn't loaded (the periodic tick picks the work up once it is).
+    pub fn kick_summariser(&self) {
+        if let Some(state) = self.inference.read().unwrap().as_ref() {
+            state.engine.lock().unwrap().trigger_summariser();
         }
     }
 
@@ -1907,6 +1951,34 @@ impl ZendSession {
         };
         let timeline = timeline_for(conv_id);
         let engine = state.engine.lock().unwrap();
+        // Register the conv_id so an upload-only conversation (one started by
+        // dropping a file on the home page, which may never submit a chat turn)
+        // is a *listed* conversation: `known_conversations` — and thus the
+        // sidebar + the client's server-authoritative sync — only surface
+        // timelines that carry a conv_id. Normally the chat submit sets this;
+        // without it here the conversation exists only client-side and gets
+        // dropped on the next sync (vanishes from the list, and a send bounces
+        // back to home). Idempotent for a conversation that already has one.
+        if let Err(e) = engine.set_conversation_conv_id(timeline, conv_id) {
+            tracing::warn!(conv_id = %conv_id, "record_uploads: set conv_id failed: {e}");
+        }
+        // Give it a provisional label from the file(s) if it has none yet, so it
+        // shows a sensible name in the sidebar before any chat turn — the titler
+        // refines it once the user actually talks. Never overwrite an existing
+        // label (an upload into a conversation that already has turns).
+        if engine
+            .conversation_label_of(timeline)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            let label = match files.first() {
+                Some(f) if files.len() == 1 => f.name.clone(),
+                _ => format!("{} files", files.len()),
+            };
+            if let Err(e) = engine.set_conversation_label(timeline, &label) {
+                tracing::warn!(conv_id = %conv_id, "record_uploads: set label failed: {e}");
+            }
+        }
         // Position: the number of already-present turns. `record_uploads`
         // runs between turns (the user drops a file, then sends), so every
         // prior turn is sealed and visible in `recovered_history`.
@@ -2272,7 +2344,30 @@ impl ZendSession {
                                 }
                             }
                         });
-                        match crate::watcher::spawn(&state.workspace, on_refresh) {
+                        // Uploads are endpoint-managed, so upload churn never
+                        // drives the source refresh above — but a deletion of an
+                        // uploaded file still has to retire its substrate
+                        // conversation. Fire the cheap tombstone-if-absent
+                        // reconcile once at startup (uploads deleted while the
+                        // daemon was down) and on every `uploads/` watcher burst.
+                        state.reconcile_uploaded_files();
+                        let inference_for_uploads = Arc::clone(&slot);
+                        let on_uploads_changed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                            let Some(state) = inference_for_uploads
+                                .read()
+                                .unwrap()
+                                .as_ref()
+                                .map(Arc::clone)
+                            else {
+                                return;
+                            };
+                            state.reconcile_uploaded_files();
+                        });
+                        match crate::watcher::spawn(
+                            &state.workspace,
+                            on_refresh,
+                            on_uploads_changed,
+                        ) {
                             Ok(w) => *session_for_watcher.watcher.lock().unwrap() = Some(w),
                             Err(e) => tracing::warn!("workspace watcher failed to start: {e:#}"),
                         }

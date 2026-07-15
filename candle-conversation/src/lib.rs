@@ -72,7 +72,7 @@ pub use config::{
     pick_max_hot_turns, DecodeHealthConfig, DryConfig, EngineConfig, SamplingConfig,
     SchedulerConfig, SequenceConfig,
 };
-pub use conversation::{GlueMarkers, Sequence};
+pub use conversation::{GlueMarkers, ScopeTurn, Sequence};
 pub use engine::{ConversationEngine, SubstrateReloadStatus, ThinkSteering};
 pub use error::ConversationError;
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
@@ -82,6 +82,7 @@ pub use projection::{
 pub use provenance::{
     ProbeSignatures, ProvenanceFile, SigEntry, TokenSignature, TurnChunkRank, TurnSignatures,
 };
+pub use scheduler::ScopeProgressFn;
 pub use sequence_handle::SequenceId;
 pub use stats::TurnStats;
 pub use token_buffer::TokenBuffer;

@@ -1,19 +1,14 @@
 //! Tier-2 integration test for the `code_reading` layer's per-file
 //! tool-call conversation shape.
 //!
-//! Each file becomes ONE conversation:
-//!
-//!   * one prefill turn per carved part —
+//! Each file becomes ONE conversation: one prefill turn per carved part —
 //!       user      : "Source excerpt — `X` lines N-M:"
 //!       assistant : `<tool_call>{...}</tool_call>\n<tool_response>...`
-//!   * one final DECODED turn —
-//!       user      : "Summarize the entire file `X` in no more than 200 words…"
-//!       assistant : model-generated whole-file summary
 //!
-//! The [`RecordingTurnSink`] captures each call's `was_decoded` flag;
-//! tests assert that every part is a prefill and the single trailing
-//! summary is the only decode.  The decoded turn returns a
-//! deterministic stub so tests don't need a model loaded.
+//! There is no inline whole-file summary decode: the file summary is the
+//! async summary tree's root, built by the summariser over these recorded
+//! scope turns. The [`RecordingTurnSink`] captures every `(user, assistant)`
+//! prefill pair so tests can verify the conversation shape without a model.
 
 use std::fs;
 use std::path::Path;
@@ -37,7 +32,7 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 }
 
 #[test]
-fn code_read_emits_one_prefill_per_part_plus_one_summary() {
+fn code_read_emits_one_prefill_per_part() {
     let dir = fixture("per_file_shape");
     let root = dir.path().to_path_buf();
     write(
@@ -56,17 +51,17 @@ fn code_read_emits_one_prefill_per_part_plus_one_summary() {
         "expected ≥2 scopes (alpha + beta), got {n_scopes}"
     );
 
-    // Single file → n_scopes prefills + exactly one decoded summary.
-    let decoded = sink.turns.iter().filter(|(_, _, d)| *d).count();
-    let prefills = sink.turns.iter().filter(|(_, _, d)| !*d).count();
-    assert_eq!(decoded, 1, "exactly one whole-file summary decode per file");
-    assert_eq!(prefills, n_scopes, "one prefill turn per carved part");
-    assert_eq!(sink.turns.len(), n_scopes + 1);
+    // Single file → exactly one prefill turn per carved part, no summary decode.
+    assert_eq!(
+        sink.turns.len(),
+        n_scopes,
+        "one prefill turn per carved part"
+    );
 }
 
 #[test]
-fn code_read_summary_is_the_last_turn_and_only_decode() {
-    let dir = fixture("summary_last");
+fn code_read_every_turn_is_a_part_prefill() {
+    let dir = fixture("all_prefills");
     let root = dir.path().to_path_buf();
     write(
         &root,
@@ -79,17 +74,9 @@ fn code_read_summary_is_the_last_turn_and_only_decode() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    let (last_user, _, last_decoded) = sink.turns.last().expect("at least one turn");
-    assert!(last_decoded, "the final turn is the decoded summary");
-    assert!(
-        last_user.starts_with("Summarize the entire file `src/lib.rs`"),
-        "final user prompt summarises the whole file, got: {last_user:?}"
-    );
-    assert!(last_user.contains("200 words"));
-
-    // Everything before the final turn is a prefilled part read.
-    for (user, _, decoded) in &sink.turns[..sink.turns.len() - 1] {
-        assert!(!decoded, "part turns are prefills, not decodes");
+    // Every recorded turn is a prefilled part read — the file summary is not
+    // decoded inline anymore.
+    for (user, _) in &sink.turns {
         assert!(
             user.starts_with("Source excerpt — `src/lib.rs` lines "),
             "part user prompt reads a line range, got: {user:?}"
@@ -140,10 +127,9 @@ fn code_read_part_assistant_is_tool_response_with_fenced_code() {
     let tr = sink
         .turns
         .iter()
-        .find(|(_, a, _)| a.contains("<tool_response>") && a.contains("pub fn two"))
+        .find(|(_, a)| a.contains("<tool_response>") && a.contains("pub fn two"))
         .expect("part turn carrying fn two in its tool_response");
     // The content lives in the assistant slot of a prefill turn.
-    assert!(!tr.2, "part turns are prefills, never decodes");
     assert!(tr.1.contains("<tool_response>\n"));
     assert!(tr.1.ends_with("</tool_response>"));
     assert!(tr.1.contains("```rust"));
@@ -155,10 +141,9 @@ fn code_read_part_assistant_is_tool_response_with_fenced_code() {
 
 #[test]
 fn code_read_user_prompts_never_carry_tool_markup() {
-    // No user prompt — neither the part reads nor the final summary —
-    // may contain `<tool_call>` / `<tool_response>` markup.  Those tags
-    // are reserved for the prefilled assistant slot; were they to leak
-    // into a user turn, the dialogue layer's tool-call extractor could
+    // No user prompt may contain `<tool_call>` / `<tool_response>` markup.
+    // Those tags are reserved for the prefilled assistant slot; were they to
+    // leak into a user turn, the dialogue layer's tool-call extractor could
     // not tell a real tool call apart from this prefill marker.
     let dir = fixture("no_user_tool_markup");
     let root = dir.path().to_path_buf();
@@ -169,7 +154,7 @@ fn code_read_user_prompts_never_carry_tool_markup() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    for (user, _, _) in &sink.turns {
+    for (user, _) in &sink.turns {
         assert!(
             !user.contains("<tool_call>"),
             "user prompt must not contain <tool_call>: {user:?}"
@@ -194,7 +179,7 @@ fn code_read_skips_files_outside_watch_patterns() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    for (u, a, _) in &sink.turns {
+    for (u, a) in &sink.turns {
         assert!(!u.contains("blob.bin") && !a.contains("blob.bin"));
         assert!(!u.contains("image.svg") && !a.contains("image.svg"));
     }
@@ -212,13 +197,13 @@ fn code_read_falls_back_to_fixed_window_on_unknown_language() {
     let progress = LoadProgress::new();
     ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    // Part reads start with "Source excerpt"; the trailing summary starts
-    // with "Summarize", so it's excluded from the window count.
+    // Every turn is a part read ("Source excerpt"); a 250-line file splits
+    // into several fixed windows.
     let part_reads: Vec<&str> = sink
         .turns
         .iter()
-        .filter(|(u, _, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
-        .map(|(u, _, _)| u.as_str())
+        .filter(|(u, _)| u.contains("notes.txt") && u.starts_with("Source excerpt"))
+        .map(|(u, _)| u.as_str())
         .collect();
     assert!(
         part_reads.len() >= 3,
@@ -240,11 +225,8 @@ fn code_read_progress_reports_real_fraction() {
     let (n_scopes, _state) =
         ingest_code_reading_into_sink(&mut sink, &root, &map, &progress).unwrap();
 
-    // Two files → two whole-file summary decodes; the rest are part prefills.
-    let decoded = sink.turns.iter().filter(|(_, _, d)| *d).count();
-    let prefills = sink.turns.iter().filter(|(_, _, d)| !*d).count();
-    assert_eq!(decoded, 2, "one summary per file (a.rs, b.rs)");
-    assert_eq!(prefills, n_scopes, "one prefill per carved part");
+    // Two files → every turn is a part prefill; no inline summary decodes.
+    assert_eq!(sink.turns.len(), n_scopes, "one prefill per carved part");
 
     let snap = progress.snapshot().expect("still loading");
     assert!(snap.progress >= 0.999, "should be at 100% after ingest");

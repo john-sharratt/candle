@@ -93,7 +93,7 @@
 //! converged), strictly correct in edge cases the literal algorithm got
 //! wrong, and visibly simpler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
@@ -563,15 +563,15 @@ pub fn run_with_sink<R: ContentResolver>(
             }
 
             let count = resolver.turn_count(group.id);
-            // Summary turns are FOREST nodes, not raw conversation turns — they
-            // may only enter the projection via the score-density selector, which
-            // drops a summary once its turns are selected and orders it ABOVE them.
-            // The rule-based path picks purely by index, so if summaries weren't
-            // excluded here it would inject a summary alongside the very turns it
-            // covers (and after them). Filter them out; when the forest actually
-            // needs to compress, score-density handles that path instead.
+            // Candidates are every turn in the group — raw turns AND summary
+            // forest nodes alike. A summary carries its own K/V and provenance
+            // signature, so a cross-corpus hit can score a summary node directly
+            // and pull it into the window when the raw turns it covers didn't
+            // themselves score high enough. The `score_density` path (target
+            // group with a tree) still overrides this list wholesale; on the
+            // rule-based (top-k) path, summaries compete on score and the
+            // descendant-dedup below keeps the SPECIFIC over the coarse.
             let all_turns: Vec<(TurnIndex, f32)> = (0..count)
-                .filter(|&i| !resolver.turn_kind(group.id, TurnIndex(i)).is_summary())
                 .map(|i| {
                     let idx = TurnIndex(i);
                     let score = resolver.turn_score(group.id, idx, FIXED_FORMULA, &weights);
@@ -644,7 +644,7 @@ pub fn run_with_sink<R: ContentResolver>(
                     &tc,
                 );
 
-                selected_indices
+                let mut selected: Vec<(TurnIndex, f32)> = selected_indices
                     .iter()
                     .map(|&idx| {
                         let score = all_turns
@@ -654,7 +654,28 @@ pub fn run_with_sink<R: ContentResolver>(
                             .unwrap_or(0.0);
                         (idx, score)
                     })
-                    .collect()
+                    .collect();
+
+                // Descendant-dedup: with summaries in the candidate pool, a
+                // summary node and one of the turns it covers can both survive
+                // the score cut. Prefer the SPECIFIC — drop any selected node
+                // that transitively covers another selected node, leaving the
+                // finest antichain (never a summary stacked over its own
+                // content). Only pays the coverage walk when a summary was
+                // actually picked; a pure-Normal selection is untouched.
+                let any_summary = selected
+                    .iter()
+                    .any(|(idx, _)| resolver.turn_kind(group.id, *idx).is_summary());
+                if any_summary {
+                    let picked: HashSet<TurnIndex> = selected.iter().map(|(idx, _)| *idx).collect();
+                    selected.retain(|(idx, _)| {
+                        resolver
+                            .node_covers(group.id, *idx)
+                            .into_iter()
+                            .all(|covered| !picked.contains(&covered))
+                    });
+                }
+                selected
             };
 
             // Rule-based path has no per-pick origin; derive it from the
@@ -898,11 +919,15 @@ pub fn run_with_sink<R: ContentResolver>(
                 })
                 .collect();
             // Raw turns carry a chronological `TurnIndex`, so sorting yields the
-            // right reading order. Summary nodes do NOT — their index is the
-            // storage slot (always higher than the turns they summarise), so an
-            // index sort would drop each summary BELOW its own content. The
-            // score-density path already emitted the correct chronological order
-            // (summary above content); leave it untouched.
+            // right reading order. On the rule-based path a summary node may also
+            // survive (score cut + descendant-dedup), and its index is the storage
+            // slot — higher than the turns it covers — so it sorts to the recent
+            // end of this group's block. That is correct here: the dedup already
+            // guarantees NONE of the turns it covers are also selected, so it
+            // stands alone as the coarse cover of an older span (reference context
+            // for a non-target group), not stacked on top of its own content. The
+            // score-density path emits its own chronological order (summary above
+            // the turns it refines); leave it untouched.
             if !gs.score_density {
                 group_turns.sort();
             }

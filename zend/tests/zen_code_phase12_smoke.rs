@@ -23,7 +23,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle::Device;
 use candle_conversation::models::Model;
@@ -183,7 +183,7 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         start.elapsed().as_secs_f64()
     );
 
-    let progress = LoadProgress::new();
+    let progress = Arc::new(LoadProgress::new());
     let (repo_map, walked, _cluster_state) = zend::repo_scan::ingest_repo_map(
         &engine,
         proj_builder_repo_map,

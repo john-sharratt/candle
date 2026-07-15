@@ -867,18 +867,6 @@ impl Conversation {
         self.read().pending_summary_len(timeline)
     }
 
-    /// Total summariser backlog across every timeline — each timeline's
-    /// pending-summary queue length plus one for a timeline still flagged
-    /// `needs_reconcile` (a leaf sealed but its parent summary not yet
-    /// built). `0` means the summariser is fully drained everywhere. Used
-    /// to wait out an upload's analysis phase.
-    pub fn total_pending_summaries(&self) -> usize {
-        let g = self.read();
-        g.all_timeline_ids()
-            .map(|tl| g.pending_summary_len(tl) + usize::from(g.needs_reconcile(tl)))
-            .sum()
-    }
-
     /// Most recent score-density [`SelectionDiagnostics`] for
     /// `timeline`, or `None` if no projection has run yet (or the
     /// projection used the rule-based path).  Pure test-harness
@@ -1336,6 +1324,26 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .tree_meta_of(timeline, index)
             .map(|m| m.kind)
             .unwrap_or(TurnKind::Normal)
+    }
+
+    fn node_covers(&self, group: GroupId, index: TurnIndex) -> Vec<TurnIndex> {
+        let Some(timeline) = self.timeline_for(group) else {
+            return Vec::new();
+        };
+        // Walk the immutable forest downward from `index`, collecting every
+        // transitive child. `tree_meta_of` gives a node's direct children;
+        // Normal leaves have none, so a raw turn yields an empty cover set.
+        let mut out = Vec::new();
+        let mut stack = vec![index];
+        while let Some(node) = stack.pop() {
+            if let Some(meta) = self.read.tree_meta_of(timeline, node) {
+                for &child in &meta.children {
+                    out.push(child);
+                    stack.push(child);
+                }
+            }
+        }
+        out
     }
 
     fn turn_no_think(&self, timeline: TimelineId, index: TurnIndex) -> bool {

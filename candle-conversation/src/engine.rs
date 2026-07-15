@@ -488,15 +488,8 @@ impl ConversationEngine {
         self.conversation.pending_summary_len(timeline)
     }
 
-    /// Total summariser backlog across every timeline — `0` once the
-    /// summariser has fully drained. Polled to wait out an upload's
-    /// analysis phase (see zend's `analysis_phase`).
-    pub fn total_pending_summaries(&self) -> usize {
-        self.conversation.total_pending_summaries()
-    }
-
     /// Wake the summariser thread now instead of waiting for its next
-    /// tick — used to kick off the analysis phase of an upload promptly.
+    /// tick — used to kick off summarisation of freshly-ingested turns promptly.
     pub fn trigger_summariser(&self) {
         self.summariser_thread.trigger();
     }

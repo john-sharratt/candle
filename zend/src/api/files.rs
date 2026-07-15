@@ -9,16 +9,17 @@
 //! independent of the inference engine — so upload/list/get/delete work (and are
 //! harness-tested) with no model loaded.
 //!
-//! Upload is a **three-phase** SSE pipeline (streamed live, not buffered):
+//! Upload is a **two-phase** SSE pipeline (streamed live, not buffered):
 //!
 //! 1. **upload** — write each accepted file to `<workspace>/uploads/` (and the
 //!    conv-file store the pane reads): `file_start` -> `part`×N -> `file_done`.
 //! 2. **read_file** — trigger the normal `code_read` ingest so the new file is
 //!    read into the substrate; wait for it (`phase` events).
-//! 3. **analysis** — wait for the summariser to carve + summarise the new
-//!    sections on their boundaries (`phase` events).
 //!
-//! Phases 2–3 are no-ops (skipped) when the model isn't loaded yet.
+//! Summarisation of the ingested scopes then runs entirely in the **background**
+//! summariser — the upload kicks it and returns immediately, never waiting on
+//! it or reporting its progress. Phase 2 is a no-op (skipped) when the model
+//! isn't loaded yet.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,10 +41,6 @@ use crate::session::ZendSession;
 
 /// Bytes per upload-progress "part" — carve granularity for the GUI bar.
 const PART_BYTES: u64 = 8192;
-
-/// Cap on how long the analysis phase waits for the summariser to drain
-/// before returning what's left — bounds a stuck request.
-const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// One accepted file's bytes, read from the multipart body before the
 /// (blocking, engine-bound) phases run.
@@ -211,17 +208,18 @@ pub async fn upload(
                             "state": "progress",
                             "current": current,
                             "total": total,
-                            // Live token counters feed the modal's ingest /
-                            // summarize stat lines (tokens & t/s).
+                            // Live token counter feeds the modal's ingest stat
+                            // line (tokens & t/s).
                             "prefillTokens": s.prefill_tokens,
-                            "summaryTokens": s.summary_tokens,
-                            "summaryMs": s.summary_ms,
                         }),
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }
-            let read = worker.join().unwrap_or(Ok(false));
+            let (ingested, failed) = worker
+                .join()
+                .unwrap_or(Ok((false, false)))
+                .unwrap_or((false, false));
             let ingest_ms = ingest_start.elapsed().as_millis() as u64;
             let s = progress.ingest_stats();
             let _ = send(named(
@@ -229,25 +227,33 @@ pub async fn upload(
                 serde_json::json!({
                     "phase": "read_file",
                     "state": "done",
-                    "ingested": read.unwrap_or(false),
+                    "ingested": ingested,
+                    // At least one file couldn't be read (typically the GPU ran
+                    // out of KV VRAM mid-prefill) — the client shows this as a
+                    // failed stage instead of a silent "done" with no stats.
+                    "failed": failed,
                     "prefillTokens": s.prefill_tokens,
-                    "summaryTokens": s.summary_tokens,
-                    "summaryMs": s.summary_ms,
                 }),
             ));
 
+            // Summarisation is a fully background task — the upload NEVER waits
+            // on it, shows no progress for it, and records nothing about it.
+            // Just kick the summariser so the ingested scopes start folding into
+            // their trees promptly (the periodic tick would get there anyway),
+            // then finish the pipeline immediately.
+            if ingested {
+                session.kick_summariser();
+            }
+
             // Persist the measured throughput onto the upload events (so it
             // recovers with the conversation) and stream a final `stats` event.
-            // Done right after phase 2 (the ingest that produced the numbers)
-            // and unconditionally — the ingest happened, so the stats are real
-            // whether or not the client is still listening.
+            // Unconditional — the ingest happened, so the stats are real whether
+            // or not the client is still listening.
             let stats = crate::session::UploadStats {
                 bytes: upload_bytes,
                 upload_ms,
                 ingest_tokens: s.prefill_tokens,
                 ingest_ms,
-                summary_tokens: s.summary_tokens,
-                summary_ms: s.summary_ms,
             };
             let ids: Vec<u64> = upload_events.iter().map(|e| e.id).collect();
             session.record_upload_stats(&id, &ids, &stats);
@@ -255,27 +261,6 @@ pub async fn upload(
                 "stats",
                 serde_json::to_value(&stats).unwrap_or_default(),
             ));
-
-            // ── Phase 3: analysis → summariser drain ──────────────────────
-            // Skip the (up to ANALYSIS_TIMEOUT) summariser drain if the client
-            // has disconnected — it's the expensive open-ended phase, and there
-            // is no one to receive its result. The summariser still runs on its
-            // own thread on the next natural tick; we just don't block on it.
-            if !tx.is_closed() {
-                let _ = send(named(
-                    "phase",
-                    serde_json::json!({ "phase": "analysis", "state": "start" }),
-                ));
-                let pending = session.analysis_phase(ANALYSIS_TIMEOUT);
-                let _ = send(named(
-                    "phase",
-                    serde_json::json!({
-                        "phase": "analysis",
-                        "state": "done",
-                        "pending": pending,
-                    }),
-                ));
-            }
         }
 
         let _ = send(Event::default().event("done").data("[DONE]"));

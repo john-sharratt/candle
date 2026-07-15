@@ -25,6 +25,7 @@
   @keyframes zblink { 50% { opacity: 0; } }
   @keyframes zdot { 0%,65%,100% { transform: translateY(0); opacity: .35; } 32% { transform: translateY(-6px); opacity: 1; } }
   @keyframes zpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  @keyframes zslide { 0% { left: -35%; } 100% { left: 100%; } }
   @keyframes zspin { to { transform: rotate(360deg); } }
   .zspin { display:inline-block; width:13px; height:13px; border:2px solid #3a352f; border-top-color:#c7b89a; border-radius:50%; animation: zspin .7s linear infinite; }
   .zsub-hdr { transition: background .12s; } .zsub-hdr:hover { background:#272320 !important; }
@@ -643,15 +644,19 @@
     let activeId = S.activeId;
     let target;
     const titleOf = (t) => t.length > 44 ? t.slice(0, 42) + '…' : t;
-    if (activeId === null) {
+    // Resolve the target conversation. `activeId === null` (home) OR a stale
+    // activeId whose conversation is no longer in the list (defensive — a sync
+    // shouldn't drop the active one, but never hard-crash send if it did) both
+    // start a fresh conversation rather than dereferencing `undefined`.
+    target = activeId !== null ? conversations.find((c) => c.id === activeId) : null;
+    if (!target) {
       const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now();
-      target = { id, title: titleOf(text), archived: false, updated_ms: Date.now(), turn_count: 0, history: [] };
+      target = { id, title: titleOf(text), archived: false, updated_ms: Date.now(), turn_count: 0, history: [], files: [] };
       conversations = [target].concat(conversations);
       activeId = id;
       S.loaded[id] = true;
-    } else {
-      target = conversations.find((c) => c.id === activeId);
-      if (target.history.length === 0) target.title = titleOf(text);
+    } else if (target.history.length === 0) {
+      target.title = titleOf(text);
     }
     target.history = target.history.concat([
       { role: 'user', content: text },
@@ -711,6 +716,14 @@
     });
     scheduleLiveUpdate(convId);
   }
+  // Cancel the in-flight response stream. Aborts the underlying fetch, which
+  // rejects into the adapter's `.catch` → `onDone`, so `streaming` clears and
+  // the composer unlocks. This is the escape hatch when a turn wedges (e.g. the
+  // background summariser is monopolising GPU slots and the decode never
+  // starts) — without it a hung stream would lock the conversation permanently.
+  function stopStream() {
+    if (stream) { try { stream.cancel(); } catch (_) {} }
+  }
   function startStream(convId, userText) {
     if (stream) stream.cancel();
     const conv = S.conversations.find((c) => c.id === convId);
@@ -747,9 +760,14 @@
 
   // ── files / upload ───────────────────────────────────────────────────────
   function startUpload(fileList) {
-    const conv = activeConv();
-    if (!conv || !fileList.length) return;
+    if (!fileList.length) return;
     const all = [].slice.call(fileList);
+    // Uploads only ever target an already-open conversation — `onChatDrop` gates
+    // the drop on `canDropFiles()`, so there is no home-screen "conjure a new
+    // conversation from the drop" path. Defensive: bail if somehow called with no
+    // active conversation rather than uploading into the void.
+    const conv = activeConv();
+    if (!conv) return;
     // Client-side malware gate: split off blocked types so no bytes leave the
     // browser for them. They still appear in the modal as rejected rows so the
     // user sees exactly what was refused and why. The server re-checks (it's
@@ -763,24 +781,21 @@
     // Pass the real File objects: the mock reads .name/.size; the live adapter
     // POSTs the bytes as multipart.
     const items = blockedItems.slice();
-    // The two engine-bound phases that run after the bytes land on disk. They
-    // stay 'pending' until the server emits their events. The display names
-    // live in buildUploadModal (the stage rows) — here we track only state.
+    // The one engine-bound phase that runs after the bytes land on disk. It
+    // stays 'pending' until the server emits its events. Summarisation is a
+    // background task — the server never reports it, so there is no stage for it.
     const phases = [
       { key: 'read_file', state: 'pending' },
-      { key: 'analysis', state: 'pending' },
     ];
     // Per-stage stats shown at the top of the modal, measured live as the
     // upload advances through its stages:
     //   upload    — bytes known client-side, timed from POST to phase-1 end.
     //   ingest    — prefill token count streamed by the server (phase 2).
-    //   summarize — summary-decode tokens + server-measured decode ms.
     // `*Ts` are start instants; `*Ms` freeze the elapsed once the stage ends.
     const stats = {
       bytes: allowed.reduce((a, f) => a + (f.size || 0), 0),
       upTs: Date.now(), upMs: null,
-      inTs: null, inMs: null, inTok: 0, inCached: false,
-      sumTok: 0, sumMs: 0,
+      inTs: null, inMs: null, inTok: 0, inCached: false, inFailed: false,
     };
     const stampUpload = () => { if (stats.upMs == null) stats.upMs = Date.now() - stats.upTs; };
     // Final server-measured throughput (the `stats` SSE event), stamped onto
@@ -836,8 +851,6 @@
             if (state === 'start') { stampUpload(); if (stats.inTs == null) stats.inTs = Date.now(); }
             if (extra) {
               if (typeof extra.prefillTokens === 'number') stats.inTok = extra.prefillTokens;
-              if (typeof extra.summaryTokens === 'number') stats.sumTok = extra.summaryTokens;
-              if (typeof extra.summaryMs === 'number') stats.sumMs = extra.summaryMs;
             }
             if (state === 'done') {
               if (stats.inMs == null && stats.inTs != null) stats.inMs = Date.now() - stats.inTs;
@@ -845,6 +858,9 @@
               // already in the substrate (content-hash dedup) — a legitimate
               // no-op, shown as "already in substrate" rather than a blank stage.
               stats.inCached = !!(extra && extra.ingested) && stats.inTok === 0;
+              // A file couldn't be read (usually out of GPU KV VRAM) — surface it
+              // as a failed stage rather than a silent "done" with no stats.
+              stats.inFailed = !!(extra && extra.failed);
             }
           }
           render();
@@ -856,7 +872,7 @@
       // Everything was blocked client-side — nothing to send.
       requestAnimationFrame(() => finish([]));
     }
-    setState({ upload: { items, handle, phases, stats }, dragActive: false });
+    setState({ upload: { convId: conv.id, items, handle, phases, stats }, dragActive: false });
   }
   function cancelUpload() { if (S.upload && S.upload.handle) S.upload.handle.cancel(); setState({ upload: null }); }
 
@@ -1042,11 +1058,18 @@
   // ── center column ────────────────────────────────────────────────────────
   function buildCenter() {
     const conv = activeConv();
-    const isEmpty = !conv || conv.history.length === 0;
+    // Show the conversation view (not the home/empty state) as soon as the
+    // conversation has any content OR is the target of an in-progress upload.
+    // This also gates file drag-and-drop (`canDropFiles`): uploads are only
+    // accepted once the chat view is showing, never on the home/greeting screen.
+    const uploadingHere = !!(conv && S.upload && S.upload.convId === conv.id);
+    const isEmpty = !conv
+      || (conv.history.length === 0 && !(conv.files && conv.files.length) && !uploadingHere);
     const inner = h('div', { style: 'flex:1; min-width:0; display:flex; flex-direction:column; overflow:hidden; position:relative;' },
       isEmpty ? buildEmptyState() : buildChat(conv));
 
     const dropZone = h('div', {
+      class: 'z-dropzone',
       onDragEnter: onChatDragEnter, onDragOver: onChatDragOver, onDragLeave: onChatDragLeave, onDrop: onChatDrop,
       style: 'flex:1; min-height:0; display:flex; position:relative;',
     });
@@ -1087,6 +1110,15 @@
       { title: 'Review changes', sub: 'Critique the latest work on this branch', prompt: 'Review the most recent commits and flag anything that looks incomplete or risky.' },
       { title: "What's next", sub: 'Highest-leverage next steps', prompt: 'What should I work on next for the most meaningful progress on this project?' },
     ];
+    // Files can only be uploaded into an open conversation (drag-and-drop into the
+    // chat), so priming a fresh conversation is the entry point for a read-these-
+    // files session: this card opens one, and the user then drags the files in.
+    const fileCard = {
+      title: 'Read some files',
+      sub: 'Start a session, then drag files into the chat to have them read',
+      prompt: "I'm about to share some files for you to read and get familiar with. Let me know when you're ready and I'll upload them.",
+    };
+    const fileIcon = '<svg viewBox="0 0 24 24" fill="none" style="width:20px;height:20px;flex-shrink:0;color:#c9a25a;"><path d="M14 3v5h5M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     return h('div', { style: 'flex:1; min-height:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2.25rem; padding:0 2.5rem 3rem;' },
       h('div', { style: 'display:flex; flex-direction:column; align-items:center; gap:1.25rem;' },
         h('div', { html: starLogo(52, '#26231f', 9) }),
@@ -1094,7 +1126,12 @@
       h('div', { style: 'display:grid; grid-template-columns:1fr 1fr; gap:0.5rem; width:100%; max-width:500px;' },
         cards.map((card) => h('button', { onClick: () => send(card.prompt), style: 'display:flex; flex-direction:column; gap:0.3rem; background:#26231f; border:1px solid #252220; border-radius:10px; padding:0.9rem 1rem; cursor:pointer; text-align:left;' },
           h('span', { style: 'font-size:0.84rem; font-weight:600; color:#ece8e4;' }, card.title),
-          h('span', { style: 'font-size:0.76rem; color:#9a9490; line-height:1.4;' }, card.sub)))));
+          h('span', { style: 'font-size:0.76rem; color:#9a9490; line-height:1.4;' }, card.sub))),
+        h('button', { onClick: () => send(fileCard.prompt), style: 'grid-column:1 / -1; display:flex; flex-direction:row; align-items:center; gap:0.7rem; background:#26231f; border:1px solid #252220; border-radius:10px; padding:0.9rem 1rem; cursor:pointer; text-align:left;' },
+          h('span', { style: 'display:flex; align-items:center;', html: fileIcon }),
+          h('span', { style: 'display:flex; flex-direction:column; gap:0.3rem;' },
+            h('span', { style: 'font-size:0.84rem; font-weight:600; color:#ece8e4;' }, fileCard.title),
+            h('span', { style: 'font-size:0.76rem; color:#9a9490; line-height:1.4;' }, fileCard.sub)))));
   }
 
   function buildChat(conv) {
@@ -1167,25 +1204,34 @@
     // A single batch-level throughput line under the tiles when the pipeline
     // measured it (persisted with the event, so it survives a reload).
     const st = files.length ? files[0].stats : null;
-    const statText = uploadStatText(st);
-    const statLine = statText
-      ? h('div', { class: 'z-uptile-stat', style: 'font-size:0.68rem; color:#7c736a; font-family:ui-monospace,monospace; margin-bottom:2rem;' }, statText)
+    const statLines = uploadStatLines(st);
+    const statLine = statLines.length
+      ? h('div', { class: 'z-uptile-stat', style: 'font-size:0.68rem; color:#7c736a; font-family:ui-monospace,monospace; margin-bottom:2rem;' }, statLines.join(' · '))
       : h('div', { style: 'margin-bottom:2rem;' });
     return h('div', {}, row, statLine);
   }
 
-  // Compact one-line throughput summary for a persisted upload's stats — used
-  // both inline under the tiles and (expanded) in the file viewer. Empty string
-  // when no stats were measured.
-  function uploadStatText(st) {
-    if (!st) return '';
-    const bits = [];
-    const totalS = ((st.uploadMs || 0) + (st.ingestMs || 0)) / 1000;
-    if (totalS > 0) bits.push('in ' + totalS.toFixed(1) + 's');
-    const rates = [];
-    if (st.ingestTokens > 0 && st.ingestMs > 0) rates.push(Math.round(st.ingestTokens / (st.ingestMs / 1000)).toLocaleString() + ' t/s');
-    if (st.bytes > 0 && st.uploadMs > 0) rates.push(((st.bytes / 1e6) / (st.uploadMs / 1000)).toFixed(1) + ' MB/s');
-    return bits.join(' ') + (rates.length ? ' (' + rates.join(', ') + ')' : '');
+  // The upload's measured pipeline stages, each as its own
+  // "<verb> <qty> in <Xs> (<rate>)" line — upload (bytes / MB/s) and read
+  // (prefill tokens / t/s). Summarisation is a background task and is
+  // deliberately NOT reported here. Returns [] when no stats were measured. The
+  // file viewer shows them stacked; the inline tile joins them with " · ".
+  function uploadStatLines(st) {
+    if (!st) return [];
+    const fx1 = (n) => n.toFixed(1);
+    const lines = [];
+    if (st.bytes > 0) {
+      const mb = st.bytes / 1e6;
+      const s = (st.uploadMs || 0) / 1000;
+      const rate = (st.uploadMs > 0) ? ' (' + fx1(mb / s) + ' MB/s)' : '';
+      lines.push('Uploaded ' + fx1(mb) + ' MB' + (s > 0 ? ' in ' + fx1(s) + 's' : '') + rate);
+    }
+    if (st.ingestTokens > 0) {
+      const s = (st.ingestMs || 0) / 1000;
+      const rate = (st.ingestMs > 0) ? ' (' + Math.round(st.ingestTokens / s).toLocaleString() + ' t/s)' : '';
+      lines.push('Read ' + st.ingestTokens.toLocaleString() + ' tokens' + (s > 0 ? ' in ' + fx1(s) + 's' : '') + rate);
+    }
+    return lines;
   }
 
   // A hover-revealed "Copy" button for a whole turn (user or assistant),
@@ -1376,7 +1422,13 @@
       onInput: onPromptInput, onKeyDown: onPromptKeyDown,
       style: 'width:100%; background:none; border:none; outline:none; color:#ece8e4; font:inherit; font-size:0.95rem; resize:none; min-height:24px; max-height:200px; line-height:1.55; overflow-y:hidden; padding:0.15rem 0 0.4rem;',
     });
-    const sendBtn = h('button', { 'aria-label': 'Send', onClick: () => send(S.promptValue), disabled: !ready, style: 'flex-shrink:0; width:34px; height:34px; border-radius:9px; border:none; background:' + ACCENT + '; color:#fff; cursor:' + (ready ? 'pointer' : 'default') + '; display:flex; align-items:center; justify-content:center; opacity:' + (ready ? 1 : 0.3) + '; padding:0;', html: '<svg viewBox="0 0 16 16" fill="none" style="width:14px;height:14px;"><path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
+    // While a response streams, the button becomes a Stop control (always
+    // enabled) so a wedged or unwanted generation can be cancelled — the
+    // conversation is never left permanently locked. Otherwise it's the Send
+    // button, enabled only when there's text to send.
+    const sendBtn = streaming
+      ? h('button', { 'aria-label': 'Stop', title: 'Stop generating', onClick: stopStream, style: 'flex-shrink:0; width:34px; height:34px; border-radius:9px; border:none; background:#3a352f; color:#e2d9cd; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;', html: '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>' })
+      : h('button', { 'aria-label': 'Send', onClick: () => send(S.promptValue), disabled: !ready, style: 'flex-shrink:0; width:34px; height:34px; border-radius:9px; border:none; background:' + ACCENT + '; color:#fff; cursor:' + (ready ? 'pointer' : 'default') + '; display:flex; align-items:center; justify-content:center; opacity:' + (ready ? 1 : 0.3) + '; padding:0;', html: '<svg viewBox="0 0 16 16" fill="none" style="width:14px;height:14px;"><path d="M8 13V3M3 8l5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' });
 
     const box = h('div', { style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
       ta,
@@ -1456,10 +1508,20 @@
   // ── drag & drop ──────────────────────────────────────────────────────────
   let dragDepth = 0;
   function hasFileDrag(e) { return !!(e.dataTransfer && [].slice.call(e.dataTransfer.types || []).indexOf('Files') !== -1); }
-  function onChatDragEnter(e) { if (!hasFileDrag(e)) return; e.preventDefault(); dragDepth += 1; if (!S.dragActive) setState({ dragActive: true }); }
-  function onChatDragOver(e) { if (!hasFileDrag(e)) return; e.preventDefault(); try { e.dataTransfer.dropEffect = 'copy'; } catch (_) {} }
-  function onChatDragLeave(e) { dragDepth -= 1; if (dragDepth <= 0) { dragDepth = 0; if (S.dragActive) setState({ dragActive: false }); } }
-  function onChatDrop(e) { e.preventDefault(); dragDepth = 0; const list = e.dataTransfer ? [].slice.call(e.dataTransfer.files) : []; if (list.length) startUpload(list); else setState({ dragActive: false }); }
+  // File drag-and-drop uploads target an OPEN conversation that is showing its
+  // chat — never the home / greeting screen. (Dropping on home used to conjure a
+  // new conversation; that path proved unreliable and was removed in favour of
+  // the "Read some files" starter card, which opens a conversation first.) We
+  // still `preventDefault` on every file drag so a file dropped on the home
+  // screen is swallowed rather than opened by the browser.
+  function canDropFiles() {
+    const c = activeConv();
+    return !!(c && (c.history.length || (c.files && c.files.length) || (S.upload && S.upload.convId === c.id)));
+  }
+  function onChatDragEnter(e) { if (!hasFileDrag(e)) return; e.preventDefault(); if (!canDropFiles()) return; dragDepth += 1; if (!S.dragActive) setState({ dragActive: true }); }
+  function onChatDragOver(e) { if (!hasFileDrag(e)) return; e.preventDefault(); try { e.dataTransfer.dropEffect = canDropFiles() ? 'copy' : 'none'; } catch (_) {} }
+  function onChatDragLeave(e) { if (!canDropFiles()) return; dragDepth -= 1; if (dragDepth <= 0) { dragDepth = 0; if (S.dragActive) setState({ dragActive: false }); } }
+  function onChatDrop(e) { e.preventDefault(); dragDepth = 0; if (!canDropFiles()) { if (S.dragActive) setState({ dragActive: false }); return; } const list = e.dataTransfer ? [].slice.call(e.dataTransfer.files) : []; if (list.length) startUpload(list); else setState({ dragActive: false }); }
   function buildDragOverlay() {
     return h('div', { style: 'position:absolute; inset:14px; z-index:60; border:2px dashed #7a6f60; border-radius:16px; background:rgba(26,23,20,0.86); display:flex; align-items:center; justify-content:center; pointer-events:none;', html:
       '<div style="text-align:center; color:#cfc8c0;"><svg viewBox="0 0 24 24" fill="none" style="width:34px;height:34px;margin-bottom:8px;"><path d="M12 4v11M7 10l5 5 5-5M5 19h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><div style="font-size:0.95rem; font-weight:600;">Drop files to upload</div><div style="font-size:0.76rem; color:#8a8074; margin-top:3px;">to this conversation</div></div>' });
@@ -1488,9 +1550,11 @@
     const spinDelay = -(now % 700);
     const stepGlyph = (state) => state === 'done'
       ? '<span style="color:#6cb39a;">✓</span>'
-      : (state === 'running'
-        ? '<span class="z-upspin" style="display:inline-block;width:11px;height:11px;border:1.5px solid #c98a3e;border-right-color:transparent;border-radius:50%;animation:zspin .7s linear infinite;animation-delay:' + spinDelay + 'ms;"></span>'
-        : '<span style="color:#5a5652;">•</span>');
+      : state === 'error'
+        ? '<span style="color:#e0938a;">⚠</span>'
+        : (state === 'running'
+          ? '<span class="z-upspin" style="display:inline-block;width:11px;height:11px;border:1.5px solid #c98a3e;border-right-color:transparent;border-radius:50%;animation:zspin .7s linear infinite;animation-delay:' + spinDelay + 'ms;"></span>'
+          : '<span style="color:#5a5652;">•</span>');
 
     // Each pipeline stage is ONE row: [glyph] name … [live metric], with a
     // progress bar underneath only while it runs. The stage name carries the
@@ -1498,11 +1562,26 @@
     // number never reads as a fixed target being acted on.
     const stageRow = (state, label, metric, barPct) => {
       const running = state === 'running', done = state === 'done';
-      const col = done ? '#cfc8c0' : (running ? '#e2d9cd' : '#7c736a');
-      const bar = (running && barPct != null)
-        ? h('div', { style: 'position:relative; height:6px; margin:2px 0 4px 22px; background:#161412; border:1px solid #2e2b27; border-radius:4px; overflow:hidden;' },
-            h('div', { class: 'z-upbar', style: 'position:absolute; top:0; bottom:0; left:0; width:' + barPct + '%; background:' + ACCENT + '; transition:width .15s;' }))
-        : null;
+      const col = state === 'error' ? '#e0938a' : done ? '#cfc8c0' : (running ? '#e2d9cd' : '#7c736a');
+      // `barPct === 'indeterminate'` renders a sliding segment — used when a
+      // stage is genuinely working but reports no measurable fraction (e.g. the
+      // scope prefill lands as one atomic batch, so there's nothing to fill
+      // incrementally); a static 0%-wide bar would just read as frozen.
+      const trackStyle = 'position:relative; height:6px; margin:2px 0 4px 22px; background:#161412; border:1px solid #2e2b27; border-radius:4px; overflow:hidden;';
+      let bar = null;
+      if (running && barPct === 'indeterminate') {
+        // The modal re-renders (full DOM rebuild) on every progress event, which
+        // would restart a CSS animation from frame 0 each time — a rapid flicker
+        // near the left edge instead of a slide. Anchor the animation to
+        // wall-clock time with a negative delay (same trick as the spinner's
+        // `spinDelay`) so each freshly-built element resumes at the current phase.
+        const slideDelay = -(now % 1100);
+        bar = h('div', { style: trackStyle },
+          h('div', { style: 'position:absolute; top:0; bottom:0; width:35%; background:' + ACCENT + '; animation:zslide 1.1s ease-in-out infinite; animation-delay:' + slideDelay + 'ms;' }));
+      } else if (running && barPct != null) {
+        bar = h('div', { style: trackStyle },
+          h('div', { class: 'z-upbar', style: 'position:absolute; top:0; bottom:0; left:0; width:' + barPct + '%; background:' + ACCENT + '; transition:width .15s;' }));
+      }
       return h('div', {},
         h('div', { style: 'display:flex; align-items:center; gap:9px; padding:5px 0; font-size:0.8rem; color:' + col + ';' },
           h('span', { style: 'width:13px; display:inline-flex; justify-content:center;', html: stepGlyph(state) }),
@@ -1524,7 +1603,6 @@
     };
 
     const rf = phases.find((p) => p.key === 'read_file') || { state: 'pending' };
-    const an = phases.find((p) => p.key === 'analysis') || { state: 'pending' };
 
     // Stage 1 — Upload (bytes over the wire). Bar aggregates every accepted
     // file's parts; the MB metric is derived from the known byte total.
@@ -1545,25 +1623,27 @@
       upBar = totP > 0 ? Math.round((donP / totP) * 100) : 0;
     }
 
-    // Stage 2 — Read into the substrate (prefill). Bar + tokens/s from the
-    // read_file phase; Stage 3 — Summarize (decode), spinner only (the
-    // summariser drain is indeterminate), metric from the summary decode.
-    const inMetric = (stats && stats.inCached)
-      ? 'already in substrate'
-      : metricOf(stats ? stats.inTok : 0, 'tokens',
-        stats && stats.inMs != null ? stats.inMs : null,
-        stats && stats.inTs ? now - stats.inTs : 0, 't/s');
-    const inBar = rf.state === 'running' ? (rf.total > 0 ? Math.round((rf.current / rf.total) * 100) : 0) : null;
-    // Summary tokens/ms stream during phase 2, but the Summarize row maps to
-    // phase 3 — don't show its metric (or a "finished" reading) until that
-    // stage has actually started, or it reads as done before its glyph moves.
-    const sumMetric = an.state === 'pending' ? '' : metricOf(stats ? stats.sumTok : 0, 'tokens',
-      stats && stats.sumMs ? stats.sumMs : null, 0, 't/s');
+    // Stage 2 — Read (scope prefill). This is the last stage the modal shows:
+    // summarisation runs in the background and is never surfaced here.
+    const readState = (stats && stats.inFailed) ? 'error' : rf.state;
+    const inMetric = (stats && stats.inFailed)
+      ? 'out of GPU memory — try again'
+      : (stats && stats.inCached)
+        ? 'already in substrate'
+        : metricOf(stats ? stats.inTok : 0, 'tokens',
+          stats && stats.inMs != null ? stats.inMs : null,
+          stats && stats.inTs ? now - stats.inTs : 0, 't/s');
+    // The scheduler reports each scope as it lands, so `rf.current` climbs per
+    // scope and the bar fills live. Until the first scope lands (`current === 0`)
+    // there's no fraction yet — show a sliding indeterminate bar rather than a
+    // frozen 0%; it flips to the real percentage the moment progress starts.
+    const inBar = readState !== 'running' ? null
+      : (rf.total > 0 && rf.current > 0) ? Math.round((rf.current / rf.total) * 100)
+        : 'indeterminate';
 
     const stageRows = [stageRow(upState, 'Upload', upMetric, upBar)];
     if (hasAccepted) {
-      stageRows.push(stageRow(rf.state, 'Read into substrate', inMetric, inBar));
-      stageRows.push(stageRow(an.state, 'Summarize', sumMetric, null));
+      stageRows.push(stageRow(readState, 'Read', inMetric, inBar));
     }
 
     // Rejected files don't belong to a stage — list them compactly with their
@@ -1740,10 +1820,11 @@
         h('div', { style: 'flex:1; min-width:0;' },
           h('div', { style: 'font-size:0.92rem; font-weight:650; color:#ece8e4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' }, fv.name),
           h('div', { style: 'font-size:0.71rem; color:#7c736a; font-family:ui-monospace,monospace; margin-top:2px;' }, fv.size + ' · ' + fv.added),
-          // Measured upload throughput (when this file came in through the
-          // upload pipeline and its stats were persisted) — placed right under
-          // the size/time line as a subtle accent note.
-          (fv.stats && uploadStatText(fv.stats)) ? h('div', { style: 'font-size:0.7rem; color:#c98a3e; font-family:ui-monospace,monospace; margin-top:3px;' }, 'Uploaded ' + uploadStatText(fv.stats)) : null),
+          // Measured pipeline throughput (when this file came in through the
+          // upload pipeline and its stats were persisted) — one line per stage
+          // (upload / read; summarisation is a background task and not reported),
+          // placed under the size/time line as a subtle accent note.
+          ...uploadStatLines(fv.stats).map((line) => h('div', { style: 'font-size:0.7rem; color:#c98a3e; font-family:ui-monospace,monospace; margin-top:3px;' }, line))),
         h('button', { onClick: () => deleteFile(fv), title: 'Delete file', style: 'flex-shrink:0; display:flex; align-items:center; gap:5px; font-size:0.74rem; color:#b8867f; background:rgba(200,80,80,0.07); border:1px solid rgba(200,80,80,0.2); border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M2.5 3.5h9M5 3.5V2.3h4v1.2M5.6 6v4M8.4 6v4M3.4 3.5l.5 8h6.2l.5-8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Delete</span>' }),
         h('button', { onClick: () => downloadFile(fv), title: 'Download', style: 'flex-shrink:0; display:flex; align-items:center; gap:5px; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 10px; cursor:pointer; font-family:inherit;', html: '<svg viewBox="0 0 14 14" fill="none" style="width:11px;height:11px;"><path d="M7 1.5v7M4 6l3 3 3-3M2.5 11.5h9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>&nbsp;Download</span>' }),
         h('button', { onClick: copyFileView, style: 'flex-shrink:0; font-size:0.74rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:7px; padding:5px 11px; cursor:pointer; font-family:inherit;' }, 'Copy'),

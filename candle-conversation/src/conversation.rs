@@ -15,7 +15,7 @@ use crate::projection::{
 };
 use crate::provenance::ProvenanceFile;
 use crate::scheduler::projection_assembler::{materialize_conversation, BoundaryMarkers};
-use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest};
+use crate::scheduler::{ProjectionInputs, ReprojectionPolicy, SchedulerRequest, ScopeProgressFn};
 use crate::sequence_handle::{BlockCount, SequenceId};
 use crate::token_buffer::TokenBuffer;
 use crate::tree::token_text::TokenizedText;
@@ -139,6 +139,27 @@ pub(crate) fn window_sealed_tokens(
 use crate::stencil::TriggerRegistry;
 use crossbeam::channel::Sender;
 use std::sync::Arc;
+
+/// One code scope to ingest in parallel — the `(user, assistant)` pair a single
+/// [`Sequence::insert_turn`] takes, but many are prefilled concurrently on
+/// scratch slots and recombined into the conversation's timeline in scope order.
+/// The user half is the tool-call request ("Read X lines A–B"), the assistant
+/// half the file-content echo. See [`Sequence::ingest_scopes_parallel`].
+pub struct ScopeTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// A scope tokenised into its cold-prefill grid + the content offsets the sealed
+/// turn's layout needs — the client-side product handed to the scheduler's
+/// `PrefillScope` request.
+struct PreparedScopeGrid {
+    tokens: TokenBuffer,
+    token_count: usize,
+    user_content_start: u32,
+    user_content_end: u32,
+    assistant_content_start: u32,
+}
 
 /// A client-side conversation handle.
 ///
@@ -1472,6 +1493,136 @@ impl Sequence {
         // Run the same post-Done finalize as a regular turn.
         self.finalize_turn_post_done(user_tt, asst_tt, response.seal.as_ref())?;
         Ok(total)
+    }
+
+    /// Ingest `scopes` into this conversation's timeline, prefilled **in parallel**
+    /// and recorded in scope order. Returns the per-scope prefilled token counts
+    /// (in scope order — sum for the "tokens ingested" metric). Blocks until every
+    /// scope is recorded.
+    ///
+    /// Unlike a run of [`insert_turn`](Self::insert_turn) calls — each prefilling
+    /// one-at-a-time on this conversation's single slot — every scope here cold-
+    /// prefills on its own scratch slot, so a file's N scopes (and scopes across
+    /// concurrently-ingesting files) batch into large forwards that amortise the
+    /// MoE expert-weight load (design §6). The scheduler owns cross-file fairness
+    /// and the scratch-slot bound, so this fires all scopes up-front without
+    /// managing backpressure; it then waits for the batch to record.
+    ///
+    /// Each scope's K/V is system-unconditioned (like a compression summary's
+    /// re-prefill) — the async summary tree bridges the scopes with
+    /// `SummaryOfTurns` nodes so the recombined file reads coherently.
+    pub fn ingest_scopes_parallel(
+        &mut self,
+        scopes: &[ScopeTurn],
+        on_prefilled: ScopeProgressFn,
+    ) -> crate::Result<Vec<usize>> {
+        if self.turn_in_flight {
+            return Err(ConversationError::TurnInFlight {
+                sequence_id: self.id,
+            });
+        }
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timeline = self.target.timeline;
+        let scope_total = scopes.len() as u32;
+        let mut receivers = Vec::with_capacity(scopes.len());
+        let mut per_scope_tokens = Vec::with_capacity(scopes.len());
+        for (i, scope) in scopes.iter().enumerate() {
+            let grid = self.prepare_scope_grid(&scope.user, &scope.assistant)?;
+            per_scope_tokens.push(grid.token_count);
+            let (tx, rx) = crossbeam::channel::unbounded();
+            self.scheduler_tx
+                .send(SchedulerRequest::PrefillScope {
+                    timeline,
+                    projection: Arc::clone(&self.projection),
+                    scope_index: i as u32,
+                    scope_total,
+                    tokens: grid.tokens,
+                    user_content_start: grid.user_content_start,
+                    user_content_end: grid.user_content_end,
+                    assistant_content_start: grid.assistant_content_start,
+                    user_text: scope.user.clone(),
+                    assistant_text: scope.assistant.clone(),
+                    response_tx: tx,
+                    on_prefilled: Arc::clone(&on_prefilled),
+                })
+                .map_err(|_| ConversationError::SchedulerGone)?;
+            receivers.push(rx);
+        }
+        // The scheduler records the whole batch in scope order once every scope has
+        // landed, then answers each channel — so these recvs unblock together, in
+        // submission order. Surface the first scope error (if any) after draining
+        // the rest so no channel is left dangling.
+        let mut first_err = None;
+        for rx in receivers {
+            match rx.recv() {
+                Ok(Ok(_idx)) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(ConversationError::SchedulerGone);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(per_scope_tokens),
+        }
+    }
+
+    /// Tokenise one scope into its cold-prefill grid + content offsets, matching
+    /// [`insert_turn`](Self::insert_turn)'s layout byte-for-byte:
+    /// `[/no_think][user][user_end][assistant_start][assistant]`. The `/no_think`
+    /// prefix keeps the model out of a reasoning frame over the supplied content.
+    fn prepare_scope_grid(
+        &self,
+        user_message: &str,
+        assistant_text: &str,
+    ) -> crate::Result<PreparedScopeGrid> {
+        let no_think_prefix = self.config.dialect.no_think;
+        let assistant_start_marker = self.config.dialect.assistant_start;
+        let formatted = format!(
+            "{}{}{}{}{}",
+            no_think_prefix,
+            user_message,
+            self.config.dialect.user_end,
+            assistant_start_marker,
+            assistant_text,
+        );
+        let tokens = self.tokenize(&formatted)?;
+        // Tokenise each prefix against the SAME strings the grid is built from so
+        // the offsets land on the real token grid; clamp + monotonise so a
+        // tokenizer that merges across a join can never invert the windows.
+        let user_content_start = self.tokenize(no_think_prefix)?.len();
+        let user_content_end = self
+            .tokenize(&format!("{no_think_prefix}{user_message}"))?
+            .len();
+        let assistant_content_start = self
+            .tokenize(&format!(
+                "{}{}{}{}",
+                no_think_prefix, user_message, self.config.dialect.user_end, assistant_start_marker,
+            ))?
+            .len();
+        let total = tokens.len();
+        let user_content_start = user_content_start.min(total) as u32;
+        let user_content_end =
+            (user_content_end.min(total).max(user_content_start as usize)) as u32;
+        let assistant_content_start = (assistant_content_start
+            .min(total)
+            .max(user_content_end as usize)) as u32;
+        Ok(PreparedScopeGrid {
+            token_count: total,
+            tokens,
+            user_content_start,
+            user_content_end,
+            assistant_content_start,
+        })
     }
 
     /// Blocking convenience: submit + wait.
