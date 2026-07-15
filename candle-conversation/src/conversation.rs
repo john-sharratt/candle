@@ -1899,9 +1899,11 @@ impl Sequence {
                 None => return empty,
             }
         };
-        let (scores, _) =
-            self.substrate
-                .score_beliefs(self.projection.schema(), self.target, &probe);
+        let (scores, _) = self
+            .substrate
+            // observe = true: the seal scan is the once-per-turn learning
+            // point for the score-normalization hit levels.
+            .score_beliefs(self.projection.schema(), self.target, &probe, true);
         scores
     }
 

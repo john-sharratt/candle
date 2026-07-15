@@ -3,16 +3,17 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 
 use super::event::{decode_events, ProjectionSelection, SystemItem};
 use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, TurnIndex, TurnKey};
 use super::project::ProjectionTarget;
 use super::schema::{LayerSchema, Schema, SystemPromptItem};
+use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::record::TreeMetadataPayload;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
-use crate::provenance::{score_slots_weighted, WideQSig};
+use crate::provenance::{decode_wide_sigs, score_slots_weighted, WideQSig};
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
     TurnPartWrite,
@@ -22,6 +23,12 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::SealedSequence;
+
+/// Upper bound on how many recent dialogue turns the normalization warm-up
+/// replays on load (`ensure_normalization_warm`). The asymmetric-EWMA hit levels
+/// converge in a few dozen steps, so this caps the one-time cost without changing
+/// the warmed levels materially.
+const WARM_REPLAY_MAX_TURNS: usize = 512;
 
 /// Contiguous `[start, end)` sub-window bounds over a `len`-token sig, split at
 /// sorted, deduped `seams`. An empty `seams` yields one window `[0, len)` — the
@@ -77,6 +84,15 @@ pub struct Conversation {
     /// The mandatory persistence layer — every turn is recorded into its
     /// redo log (`docs/kv_tier_migration.md` §13.6).
     persistence: Arc<Mutex<SubstratePersistence>>,
+    /// Runtime, in-memory score normalization (per-scope hit levels). NOT
+    /// persisted — rebuilt from the substrate's existing turns on first use, then
+    /// evolved as new turns seal. Shared across clones of this handle so learning
+    /// pools over all sessions. See `docs/provenance_score_normalization.md`.
+    normalization: Arc<Mutex<NormalizationCache>>,
+    /// Runs the warm-from-substrate replay exactly once, on the first belief scan,
+    /// blocking any concurrent first callers until it completes (so nothing scores
+    /// against a half-warmed cache).
+    normalization_warm: Arc<Once>,
 }
 
 impl Default for Conversation {
@@ -110,6 +126,8 @@ impl Conversation {
             inner: Arc::new(RwLock::new(substrate)),
             allocator: Arc::new(TimelineAllocator::new()),
             persistence: Arc::new(Mutex::new(persistence)),
+            normalization: Arc::new(Mutex::new(NormalizationCache::default())),
+            normalization_warm: Arc::new(Once::new()),
         }
     }
 
@@ -123,6 +141,8 @@ impl Conversation {
             inner: Arc::new(RwLock::new(substrate)),
             allocator: Arc::new(TimelineAllocator::new()),
             persistence: Arc::new(Mutex::new(persistence)),
+            normalization: Arc::new(Mutex::new(NormalizationCache::default())),
+            normalization_warm: Arc::new(Once::new()),
         }
     }
 
@@ -397,26 +417,78 @@ impl Conversation {
     /// target layer alone leaves every non-target turn group on all-zero scores
     /// (a degenerate index tie-break instead of relevance). An empty probe scores
     /// nothing.
+    /// `observe` folds this probe's raw turn-group scores into the normalization
+    /// hit levels: `true` only on the once-per-turn seal scan
+    /// ([`crate::conversation`]'s `last_turn_belief_scores`), `false` on every
+    /// live reprojection (which only reads the levels to normalize). See
+    /// `docs/provenance_score_normalization.md` §4.2.
     pub fn score_beliefs(
         &self,
         schema: &Schema,
         target: ProjectionTarget,
         probe: &[WideQSig],
+        observe: bool,
     ) -> (ProjectionScores, Vec<(GroupId, Vec<(TurnIndex, f32)>)>) {
         let mut scores = ProjectionScores::new();
         let mut candidates = Vec::new();
         if probe.is_empty() {
             return (scores, candidates);
         }
+        self.ensure_normalization_warm(schema, target);
         // Collections live in the target layer (the tool catalog).
         if let Some(layer) = schema.layers.iter().find(|l| l.id == target.layer) {
             scores = self.score_belief_collections(layer, probe);
         }
         // Belief-driven turn groups live across every layer.
         for layer in &schema.layers {
-            candidates.extend(self.score_belief_groups(layer, target, probe, &mut scores));
+            candidates.extend(self.score_belief_groups(layer, target, probe, &mut scores, observe));
         }
         (scores, candidates)
+    }
+
+    /// Build the normalization hit levels from the substrate's existing **sealed
+    /// dialogue turns** — one seal-style observe per turn — so a freshly-loaded
+    /// process starts WARM. The cache is runtime-only (not persisted), so without
+    /// this a restart would be cold until new traffic accrued. Runs exactly once
+    /// (via [`Once`], which blocks any concurrent first callers until it finishes,
+    /// so nothing scores against a half-warm cache); every later call is a cheap
+    /// no-op. See `docs/provenance_score_normalization.md` §4.4.
+    ///
+    /// Turns are ordered by `(timeline, turn index)` so the warmed levels don't
+    /// depend on `HashMap` iteration order, and the replay is bounded to the last
+    /// [`WARM_REPLAY_MAX_TURNS`] (the asymmetric EWMA converges in a few dozen
+    /// steps, so older turns barely move it — this caps the one-time cost on a huge
+    /// substrate). It reuses the live turn-group scan with `observe = true`; the
+    /// normalized scores it also computes are discarded (reusing the scan beats
+    /// duplicating the sub-window flattening for a marginal saving). Only dialogue
+    /// turns (empty-tagged — gallery turns are tagged) are probes; the still-
+    /// decoding current turn is excluded (no sealed signature yet).
+    fn ensure_normalization_warm(&self, schema: &Schema, target: ProjectionTarget) {
+        self.normalization_warm.call_once(|| {
+            let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
+                let sub = self.inner.read().unwrap();
+                sub.all_streams()
+                    .filter_map(|(_sid, e)| {
+                        let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
+                            return None;
+                        };
+                        if !d.tags.is_empty() {
+                            return None;
+                        }
+                        let sig = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b))?;
+                        (!sig.is_empty()).then_some((d.timeline_id, d.turn_index, sig))
+                    })
+                    .collect()
+            };
+            probes.sort_by_key(|(tl, idx, _)| (*tl, *idx));
+            let start = probes.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
+            for (_, _, probe) in &probes[start..] {
+                let mut throwaway = ProjectionScores::new();
+                for layer in &schema.layers {
+                    let _ = self.score_belief_groups(layer, target, probe, &mut throwaway, true);
+                }
+            }
+        });
     }
 
     /// Score every belief-driven **turn group** in `layer` against its own turns
@@ -437,6 +509,7 @@ impl Conversation {
         target: ProjectionTarget,
         probe: &[WideQSig],
         scores: &mut ProjectionScores,
+        observe: bool,
     ) -> Vec<(GroupId, Vec<(TurnIndex, f32)>)> {
         use crate::persistence::content_hash::turn_stream_id;
         let mut per_group: Vec<(GroupId, Vec<(TurnIndex, f32)>)> = Vec::new();
@@ -531,11 +604,32 @@ impl Conversation {
             // uniform. Configured in the schema YAML, not hard-coded.
             let fresh =
                 score_slots_weighted(probe, &wref, &wslot, n_turns, &group.policy.layer_weights);
+            // Normalize the raw scores against each turn's learned hit level so
+            // selection compares candidates on a common 0-1000 band, not a shared
+            // absolute scale (docs/provenance_score_normalization.md). Scope =
+            // group@timeline — a re-scan mints a new timeline, hence a fresh scope,
+            // resetting learning for the regenerated clusters; child = the turn's
+            // index within that gallery.
+            let scope = ScopeKey::turn_group(group.id.raw() as u64, timeline.raw());
+            let raw_pairs: Vec<(ChildKey, f32)> = (0..n_turns)
+                .map(|ai| (ChildKey::turn(arc_turn[ai].0 as u64), fresh[ai]))
+                .collect();
+            // One lock for the read-then-(maybe)-write, so no other thread mutates
+            // the levels between this turn's normalize and observe. Learning only
+            // fires on the once-per-turn seal scan, not on every reprojection.
+            let normed = {
+                let mut cache = self.normalization.lock().unwrap();
+                let normed = cache.normalize(&scope, &raw_pairs);
+                if observe {
+                    cache.observe(&scope, &raw_pairs);
+                }
+                normed
+            };
             let mut cands: Vec<(TurnIndex, f32)> = Vec::with_capacity(n_turns);
-            for (ai, &sc) in fresh.iter().enumerate() {
+            for (ai, (_, sc)) in normed.iter().enumerate() {
                 let idx = arc_turn[ai];
-                scores.set_turn(timeline, idx, sc);
-                cands.push((idx, sc));
+                scores.set_turn(timeline, idx, *sc);
+                cands.push((idx, *sc));
             }
             per_group.push((group.id, cands));
         }

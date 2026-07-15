@@ -207,19 +207,23 @@ layers:
           # (perf-investigation) won a `sqrt of N` turn and, at β0.40, its belief bled
           # into the next (candle-core) turn and crowded the correct cluster out.
           # β0.65 makes a cluster that isn't re-matched this turn leak below evict
-          # within a step or two; min/evict stay at the tool scale (clusters clear 800).
+          # within a step or two.
           beta: 0.65
-          # min/evict kept at the tool scale. Lowering them to the repo_map belief
-          # scale (~200) was tried and reverted: it admitted the spurious noise floor
-          # (metal-kernels, voxtral) without seating candle-core, because candle-core
-          # ranks #1..#10 across identical queries and generic clusters (root, docs)
-          # own the top — a probe/ranking problem no threshold fixes.
-          min_score: 800
-          evict_score: 600
-          # Early-decode grace, SHORTENED from the tool window (64) but not removed.
+          # NORMALIZED SCALE. This group's scores now pass through the score-
+          # normalization module (docs/provenance_score_normalization.md): each
+          # cluster's raw vote is rescaled against its own learned hit level, so a
+          # full hit ≈ 1000 per reprojection and the belief accumulates ~1/β of that
+          # for a sustained hit. These are INITIAL values on that scale — steady
+          # min/evict gate the accumulated belief; the early window gates the fresh
+          # first-projection hit. Confirm against the live belief scores (GUI /
+          # substrate_inspect) and retune; the raw-scale ranking problem is now
+          # solved upstream by normalization, so the threshold's only job is to
+          # separate a real hit from the noise floor.
+          min_score: 600
+          evict_score: 400
           early_window_tokens: 24
-          early_min_score: 250
-          early_evict_score: 187.5
+          early_min_score: 400
+          early_evict_score: 280
         budget:
           priority: 100
 

@@ -5751,10 +5751,12 @@ impl Scheduler {
         //    the turn-boundary challenger below.
         let t_scan = Instant::now();
         let schema = policy.projection.schema();
+        // observe = false: a live reprojection only READS the normalization hit
+        // levels; learning happens once per turn at seal (last_turn_belief_scores).
         let (projection_scores, group_candidates) =
             policy
                 .substrate
-                .score_beliefs(schema, policy.target, &probe);
+                .score_beliefs(schema, policy.target, &probe, false);
 
         let scan_ms = t_scan.elapsed().as_millis() as u64;
         record_phase(t_scan, "reproject_belief_scan");

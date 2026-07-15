@@ -1,43 +1,35 @@
-//! §85 — per-scope running-mean normalization, modelled over the whole substrate.
+//! §85 — the real `normalization` module, driven over the whole substrate.
 //!
 //! Replays every dialogue turn (empty-tag conversation turns) as a probe against
-//! a scope's gallery, in substrate order, maintaining a per-member RUNNING MEAN of
-//! raw scores (the carry-forward promiscuity baseline). Each probe is normalized
-//! `1000 × raw / max(running_mean, prior)` using the means as they stood BEFORE
-//! that probe (causal), then the probe is folded into the means. Reports:
-//!   * the distribution of normalized scores (top-1 / top-3 / selected) — the data
-//!     to calibrate min_score / evict on the 0-1000 scale;
-//!   * for FOCUS probes (e.g. the candle-core questions), the raw vs normalized
-//!     rank + score of the focus cluster, to see whether the right target wins.
+//! the repo_map turn-group gallery, in substrate order. For each probe it calls
+//! the production `NormalizationCache::normalize` (read) then `observe` (write,
+//! once per turn — the seal cadence), so this is an end-to-end check that the
+//! module reproduces the calibrated accuracy (`docs/provenance_score_normalization.md`
+//! §7). Reports the normalized-score distribution and, for FOCUS probes (the
+//! candle-core questions), whether the right cluster wins after normalization.
 //!
 //! ```text
 //! cargo run -p zend --example provenance_calibrate --release -- [workspace]
-//!   REPO_TL=<id>        pin the repo_map timeline (else newest by turn count)
-//!   FOCUS=candle-core   substring of the "correct" cluster for focus probes
+//!   REPO_TL=<id>            pin the repo_map timeline (else newest by turn count)
+//!   FOCUS=candle-core       substring of the "correct" cluster for focus probes
 //!   FOCUS_PROBES=0x..,0x..   dialogue turns whose correct answer is FOCUS
-//!   WARMUP=3            probes a member needs before its own mean is trusted
-//!   FLOOR_PCTL=0.92     percentile (over member means) used as the denom floor
+//!   ALPHA_UP / ALPHA_DN / HIT_PRIOR / FLOOR_MIN / FLOOR_PCTL  NormConfig overrides
 //! ```
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
 use candle_conversation::persistence::streams::StreamDecl;
 use candle_conversation::persistence::SubstratePersistence;
 use candle_conversation::provenance::{decode_wide_sigs, score_provenance_late_fusion, WideQSig};
 use candle_conversation::substrate::Substrate;
 
-/// A member's carry-forward baseline: running mean of raw scores + count.
-#[derive(Clone, Default)]
-struct Running {
-    mean: f32,
-    count: u32,
-}
-impl Running {
-    fn update(&mut self, x: f32) {
-        self.count += 1;
-        self.mean += (x - self.mean) / self.count as f32;
-    }
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn pctl(vals: &[f32], p: f32) -> f32 {
@@ -61,36 +53,15 @@ fn main() -> anyhow::Result<()> {
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .collect();
-    let warmup: u32 = std::env::var("WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let floor_pctl: f32 = std::env::var("FLOOR_PCTL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.92);
-    // Cold-start prior: the denominator a cluster gets before it has warmed up, and
-    // a hard minimum for the floor — kills the "divide by ~1" early explosions.
-    let prior: f32 = std::env::var("PRIOR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50.0);
-    // HIT-LEVEL normalizer: divide by the score a cluster reaches when it IS the
-    // answer, so a full hit ≈ 1000 and a decode lock-on rides above it. Tracked as
-    // an asymmetric EWMA — rises fast toward a strong match, decays slowly — so it
-    // settles at the cluster's characteristic hit magnitude, not its mean.
-    let a_up: f32 = std::env::var("ALPHA_UP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.30);
-    let a_dn: f32 = std::env::var("ALPHA_DN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.02);
-    let hit_prior: f32 = std::env::var("HIT_PRIOR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(400.0);
+    let defaults = NormConfig::default();
+    let cfg = NormConfig {
+        alpha_up: env_f32("ALPHA_UP", defaults.alpha_up),
+        alpha_dn: env_f32("ALPHA_DN", defaults.alpha_dn),
+        hit_prior: env_f32("HIT_PRIOR", defaults.hit_prior),
+        floor_min: env_f32("FLOOR_MIN", defaults.floor_min),
+        floor_pctl: env_f32("FLOOR_PCTL", defaults.floor_pctl),
+        scale: defaults.scale,
+    };
 
     let mut substrate = Substrate::new();
     let _p = SubstratePersistence::open_in_with_substrate(&workspace, &mut substrate)
@@ -152,7 +123,7 @@ fn main() -> anyhow::Result<()> {
             continue;
         };
         if !d.tags.is_empty() {
-            continue; // gallery turn, not dialogue
+            continue;
         }
         let Some(sig) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
             continue;
@@ -164,108 +135,86 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "═══ §85 running-mean normalization over {} dialogue probes ═══",
+        "═══ §85 normalization module over {} dialogue probes ═══",
         probes.len()
     );
-    println!("scope: repo_map group, {n} clusters | warmup {warmup} | floor pctl {floor_pctl}\n");
+    println!("scope: repo_map turn-group, {n} clusters | cfg {cfg:?}\n");
 
-    let mut run: Vec<Running> = vec![Running::default(); n];
-    let mut hit: Vec<f32> = vec![hit_prior; n]; // per-cluster hit level (EWMA)
-                                                // Distributions to calibrate thresholds.
-    let mut top1_norm: Vec<f32> = Vec::new();
-    let mut top2_norm: Vec<f32> = Vec::new();
-    let mut all_norm: Vec<f32> = Vec::new();
-    // Focus tracking.
+    // The production module — the thing under test.
+    let scope = ScopeKey::turn_group(1, 1);
+    let mut cache = NormalizationCache::new(cfg);
+    let child_keys: Vec<ChildKey> = names.iter().map(ChildKey::named).collect();
+
+    let mut raw_mean = vec![0.0f32; n]; // diagnostics only (loudest clusters)
+    let mut top1: Vec<f32> = Vec::new();
+    let mut top2: Vec<f32> = Vec::new();
+    let mut all: Vec<f32> = Vec::new();
     let is_focus = |nm: &str| nm.contains(&focus);
     let mut focus_rows: Vec<String> = Vec::new();
 
-    for (pid, sig) in &probes {
+    for (turn_i, (pid, sig)) in probes.iter().enumerate() {
         let raw = score_provenance_late_fusion(sig, &gref, &gallery_case, n);
-        // Floor = percentile over the warmed members' current means; prior for
-        // cold members = the same floor.
-        // Denominator = the cluster's hit level, floored, so a full hit ≈ 1000.
-        let floor = pctl(
-            &hit.iter().copied().filter(|h| *h > 0.0).collect::<Vec<_>>(),
-            0.10,
-        )
-        .max(prior);
-        let norm: Vec<(usize, f32)> = (0..n)
-            .map(|ci| (ci, 1000.0 * raw[ci] / hit[ci].max(floor)))
-            .collect();
-        let mut ns = norm.clone();
-        ns.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let raw_pairs: Vec<(ChildKey, f32)> =
+            (0..n).map(|ci| (child_keys[ci].clone(), raw[ci])).collect();
 
-        top1_norm.push(ns[0].1);
-        if ns.len() > 1 {
-            top2_norm.push(ns[1].1);
+        // READ: normalize against hit levels as they stand before this turn.
+        let norm = cache.normalize(&scope, &raw_pairs);
+        let norm_by_i: Vec<f32> = norm.iter().map(|(_, v)| *v).collect(); // preserves order
+
+        let mut ranked: Vec<(usize, f32)> = norm_by_i.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        top1.push(ranked[0].1);
+        if ranked.len() > 1 {
+            top2.push(ranked[1].1);
         }
-        for (_, v) in &norm {
-            all_norm.push(*v);
-        }
+        all.extend(&norm_by_i);
 
         if focus_probes.contains(pid) {
-            let mut rs: Vec<(usize, f32)> = (0..n).map(|ci| (ci, raw[ci])).collect();
-            rs.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let raw_rank = rs
-                .iter()
-                .position(|(ci, _)| is_focus(&names[*ci]))
-                .map(|r| r + 1);
-            let norm_rank = ns
-                .iter()
-                .position(|(ci, _)| is_focus(&names[*ci]))
-                .map(|r| r + 1);
-            let norm_sc = ns
+            let mut raw_ranked: Vec<(usize, f32)> = raw.iter().copied().enumerate().collect();
+            raw_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let raw_rank = raw_ranked.iter().position(|(ci, _)| is_focus(&names[*ci]));
+            let norm_rank = ranked.iter().position(|(ci, _)| is_focus(&names[*ci]));
+            let norm_sc = ranked
                 .iter()
                 .find(|(ci, _)| is_focus(&names[*ci]))
                 .map(|(_, s)| *s)
                 .unwrap_or(0.0);
-            let top = &names[ns[0].0];
             focus_rows.push(format!(
-                "  {pid:#018x}  raw #{:<3} → norm #{:<3} ({norm_sc:>6.0})   norm top1: {} ({:.0})",
-                raw_rank.map(|r| r as i32).unwrap_or(-1),
-                norm_rank.map(|r| r as i32).unwrap_or(-1),
-                short(top),
-                ns[0].1,
+                "  #{turn_i:<3} {pid:#018x}  raw #{:<3} → norm #{:<3} ({norm_sc:>6.0})   norm top1: {} ({:.0})",
+                raw_rank.map(|r| r as i32 + 1).unwrap_or(-1),
+                norm_rank.map(|r| r as i32 + 1).unwrap_or(-1),
+                short(&names[ranked[0].0]),
+                ranked[0].1,
             ));
         }
 
-        // Fold this probe into the running stats (causal: after normalizing).
+        // WRITE: fold this turn into the hit levels (seal cadence, once per turn).
+        cache.observe(&scope, &raw_pairs);
         for ci in 0..n {
-            run[ci].update(raw[ci]);
-            // Asymmetric EWMA hit level: rise fast toward a strong match, decay slow.
-            let a = if raw[ci] > hit[ci] { a_up } else { a_dn };
-            hit[ci] += a * (raw[ci] - hit[ci]);
+            raw_mean[ci] += (raw[ci] - raw_mean[ci]) / (turn_i + 1) as f32;
         }
     }
 
-    // ── Calibration distributions ───────────────────────────────────────────────
-    println!("## normalized-score distribution (calibrate min_score / evict here)\n");
+    println!("## normalized-score distribution (0-1000 scale)\n");
     let ps = [0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99];
     println!(
-        "  {:<14} {}",
+        "  {:<12} {}",
         "percentile:",
         ps.iter()
             .map(|p| format!("{:>7.0}%", p * 100.0))
             .collect::<String>()
     );
-    let show = |label: &str, v: &[f32]| {
+    for (label, v) in [("top-1", &top1), ("top-2", &top2), ("all (noise)", &all)] {
         let row: String = ps.iter().map(|p| format!("{:>8.0}", pctl(v, *p))).collect();
-        println!("  {label:<14}{row}");
-    };
-    show("top-1 norm", &top1_norm);
-    show("top-2 norm", &top2_norm);
-    show("all norm", &all_norm);
+        println!("  {label:<12}{row}");
+    }
     println!();
 
-    // Per-cluster final means — the loudest (promiscuous) clusters.
     let mut by_mean: Vec<usize> = (0..n).collect();
-    by_mean.sort_by(|a, b| run[*b].mean.total_cmp(&run[*a].mean));
-    println!("## loudest clusters by final running mean (the discounted ones)\n");
-    for &ci in by_mean.iter().take(6) {
-        println!(
-            "  mean {:>8.1}  (n={})   {}",
-            run[ci].mean, run[ci].count, names[ci]
-        );
+    by_mean.sort_by(|a, b| raw_mean[*b].total_cmp(&raw_mean[*a]));
+    println!("## loudest clusters by raw mean (the discounted ones)\n");
+    for &ci in by_mean.iter().take(5) {
+        println!("  raw_mean {:>7.1}   {}", raw_mean[ci], names[ci]);
     }
     println!();
 
@@ -275,7 +224,6 @@ fn main() -> anyhow::Result<()> {
             println!("{r}");
         }
     }
-
     Ok(())
 }
 

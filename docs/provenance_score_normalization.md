@@ -93,41 +93,53 @@ normalized(c | probe) = 1000 × raw(c | probe) / max(hit_level(c), floor(scope))
   query for a candidate locks on hardest).
 - **< ~450** — below the noise floor; not a real hit.
 
-### 3.3 Per-scope, at every budget node
+### 3.3 Per-scope = per score-competition node (verified against `project.rs`)
 
-Normalization is computed **per budget scope**, not over the whole substrate,
-because the budget only ever competes *within* a scope. Selection is a tree of
-budgets:
+Normalization is computed **per scope where scores are actually compared**, not
+over the whole substrate. Reading the selection path, every score comparison is
+**within a single group or collection**:
 
-- **Layer** node → children are turn groups / top-level turns. Normalizing here
-  answers "which conversation/dir" (coarse) and discounts a container that is
-  generically loud as a whole.
-- **Turn group / section collection** node → children are members (clusters /
-  tools / files). Normalizing here answers "which member within" (fine).
-- **…recursively** into sub-windows within a turn (the "which file inside this
-  listing" case — the self-referencing sub-windows).
+- Member selection (`apply_selection` / the belief path) picks members *within*
+  one turn group or section collection, comparing scores among that node's
+  members only.
+- The token trim (`trim_to_budget_low_score_first`) runs on **one group's**
+  selected set against **that group's** budget.
+- The **layer is not a score competition.** The layer/group budget is a
+  `flexbox_distribute` over `budget` priority + natural consumption — it hands out
+  *token space*, never compares member scores across groups. So there is **no
+  layer-scope normalization**; scores from different groups are never put on the
+  same axis.
+
+The score-competition scopes are therefore:
+
+- **Turn group** → children are its turns (repo_map dir clusters, dialogue turns).
+- **Section collection** → children are its sections (tools).
+- **Sub-window** (future) → children are the regions within one turn (files inside
+  a repo_map listing — the self-referencing sub-windows).
+
+The nested "coarse → fine" selection — *pick the dir, then the file inside it* — is
+**turn group → sub-window**, both score-competition scopes. A member is
+re-normalized at each scope it competes in: a loud region inside an irrelevant
+cluster is filtered when the cluster loses at the group scope, before its
+sub-windows ever compete. (Layer naming in the earlier sketch mapped to the group
+level; the code's "layer" is the token-budget tier, orthogonal to scoring.)
 
 Each node keeps its own per-child hit levels, floor, and cold-start prior over
 **its direct children only**, so a rarely-touched dir warms up against sibling
-dirs and a rarely-touched file against sibling files. A member runs the gauntlet:
-it survives the layer cut on its group's layer-normalized score, then the group
-cut on its own group-normalized score (effectively multiplicative — a loud member
-in an irrelevant container is filtered coarsely before it competes finely).
-
-Because each scope normalizes into the same ~0–1000 band, selection thresholds
-become **uniform across scopes** (the "800 for tools vs 200 for repo_map" problem
-dissolves), and any layer-level token trim comparing members across groups sees a
-common scale for free. Per-node thresholds remain *available* (varied now, a good
-uniform default later).
+dirs and a rarely-touched file against sibling files. Because each scope
+normalizes into the same ~0–1000 band, selection thresholds become **uniform
+across scopes** (the "800 for tools vs 200 for repo_map" problem dissolves).
+Per-node thresholds remain *available* (varied now, a good uniform default later).
 
 ---
 
 ## 4. Module design
 
 **Separation of duties:** normalization data is **runtime-derived, in-memory, and
-NOT persisted.** It is not part of the substrate/redo-log — it is a cache computed
-from query traffic that changes continuously at runtime. At process load it starts
-empty and builds up as projections run.
+NOT persisted.** It is not part of the substrate/redo-log — it is a cache
+*derived* from the substrate. On load it is **rebuilt from the substrate's
+existing turns** (not started cold), then evolved as new turns seal. Not persisting
+it is fine because it is reconstructible from the substrate at any time.
 
 Proposed location: `candle-conversation/src/normalization/` (one concern per
 file):
@@ -137,19 +149,35 @@ file):
 | `mod.rs` | public API: `NormalizationCache`, `ScopeKey`, `normalize`/`observe` |
 | `hit_level.rs` | `HitLevel` (asymmetric-EWMA state + update), `Running` mean for diagnostics |
 | `scope.rs` | `ScopeState` — per-child hit-level map, floor, prior; `normalize_scores` + `observe` |
-| `cache.rs` | `NormalizationCache` — scope map keyed by `ScopeKey`, substrate-generation reconciliation |
+| `cache.rs` | `NormalizationCache` — scope map keyed by `ScopeKey`; evicts a group's stale-timeline scopes on `observe` |
 | `tests.rs` | unit tests (§6) |
 
 ### 4.1 Types
 
-- `ScopeKey` — identifies a budget scope: `Layer(LayerId)`, `Collection(GroupId,
-  CollectionId)`, `TurnGroup(GroupId)`, and (later) `SubWindow(TurnIndex)`. Derived
-  from the schema node currently being scored.
+Both keys are **structured enums** (not formatted strings), so the scan allocates
+nothing per candidate and the cache can reason about them (§4.3 eviction):
+
+- `ScopeKey` — a **score-competition** scope. **No `Layer` variant** — the layer is
+  token distribution, not a score competition (§3.3):
+  - `TurnGroup { group: u64, timeline: u64 }` — a turn group's gallery on a
+    specific timeline. A re-scan mints a new timeline → a new scope.
+  - `Collection { group: u64, name: String }` — a section collection (tool
+    catalog); its gallery is stable, so no timeline.
+  - `SubWindow { turn: u64 }` — a sub-window within one turn (future).
+- `ChildKey` — a candidate within a scope: `Turn(u64)` (turn index — allocation-
+  free, stable within a gallery version) or `Named(String)` (tool / section name,
+  how `belief_gallery` already keys collection members via `slot_of(tag)`).
 - `HitLevel { level: f32, count: u32 }` — the EWMA state for one child.
-- `ScopeState { children: HashMap<ChildKey, HitLevel>, generation: u64 }` — one
-  budget scope's normalization state. `ChildKey` is the member identity within the
-  scope (tool name / `TurnIndex` / path tag).
-- `NormalizationCache { scopes: HashMap<ScopeKey, ScopeState> }`.
+- `ScopeState { children: HashMap<ChildKey, HitLevel> }` — one scope's state.
+- `NormalizationCache { cfg: NormConfig, scopes: HashMap<ScopeKey, ScopeState> }`.
+
+Turn groups key the child by index rather than by path *tag*: tag-keying (so
+learning survives a re-scan) would need an `all_streams()` scan per turn per
+reprojection — prohibitive on the hot path. Instead a re-scan makes a new
+`(group, timeline)` scope, which correctly resets learning for the regenerated
+clusters and rebuilds it via the cold-start prior over subsequent queries. (Future
+refinement: a cached path-tag→index map to preserve learning across re-scans, if
+the post-re-scan cold-start proves noticeable.)
 
 ### 4.2 Lifecycle and API
 
@@ -159,52 +187,104 @@ the scan (`score_belief_groups` / `score_belief_collections`):
 
 1. `normalize(scope, &[(child, raw)]) -> Vec<(child, normalized)>` — read path.
    For each child, `1000 × raw / max(hit_level, floor)`; a child absent from the
-   scope (never seen) uses the cold-start prior. Pure read; does not mutate.
+   scope (never seen) uses the cold-start prior. Pure read; does not mutate. Runs
+   on **every reprojection**, so selection always sees normalized scores.
 2. `observe(scope, &[(child, raw)])` — write path. Fold each raw into the child's
-   hit-level EWMA (creating it at the prior if new). Called once per reprojection
-   after normalization (causal: normalize against pre-update levels, then update).
+   hit-level EWMA (creating it at the prior if new). Runs **once per turn, at
+   seal** — hooked into `Conversation::last_turn_belief_scores`
+   ([conversation.rs](../candle-conversation/src/conversation.rs)), which already
+   re-scores the just-sealed turn's **whole-turn sig** against every gallery. This
+   is exactly the probe §85 calibrated against.
+
+**Why observe is per-turn, not per-reprojection.** A turn fires many reprojections,
+each with a *different* sliding probe (query-head + trailing window). Observing on
+each would (a) update a child's level N times for one turn — over-decaying idle
+children in proportion to turn length — and (b) diverge from the §85 model, which
+saw one whole-turn probe per turn. Observing once at seal fixes both.
+
+**Probe-scale caveat.** `observe` uses the whole-turn sig; `normalize` uses the
+sliding reprojection probe. For turns shorter than `max_probe_tokens` these are the
+same tokens; for longer turns the reprojection probe drops the middle, so its raw
+magnitude differs by a roughly constant factor. The **ratio** normalizer preserves
+ranking regardless; only the absolute 0–1000 band shifts by that factor. So the
+§7 thresholds are the validated *mechanism + ballpark* — `min_score` / `evict` get
+a final confirmation on the live reprojection scale. (If the shift proves
+material, observe with a reprojection-style probe at seal — query-head + trailing
+window — instead of the whole-turn sig.)
 
 Selection consumes the **normalized** scores: `belief_step` runs on the 0–1000
 values, so belief accumulation, `min_score`, `evict_score`, and the early-decode
 window all operate on the normalized scale.
 
-### 4.3 Cache invalidation / substrate change
+### 4.3 Substrate change / bounded growth
 
-The cache tracks the substrate generation each `ScopeState` was reconciled at. On
-a substrate change (a turn sealed, a repo re-scan, tiering) the scope is
-**reconciled, not wiped**:
+Because a turn group's scope is keyed by `(group, timeline)`, a **re-scan** simply
+produces a *new* scope — the regenerated clusters start fresh at the cold-start
+prior (correct: their content changed) and rebuild over subsequent queries. The
+old scope must not linger, or the cache would leak one `ScopeState` per historical
+re-scan. So `NormalizationCache::observe` **evicts a group's stale-timeline
+scopes**: after observing `TurnGroup { group, timeline }`, it drops any
+`TurnGroup { group, timeline: other }`. The cache therefore holds **one scope per
+active turn group** at steady state. This runs once per turn (at seal) over a
+handful of scopes — cheap.
 
-- **New child** (a candidate that now exists) → inserted at the cold-start prior;
-  warms up over its next hits.
-- **Removed child** → dropped; the floor recomputes from survivors.
-- **Surviving child** → keeps its accumulated hit level. The raw scale may shift
-  when the gallery changes (the scorer's `z` term normalizes over all gallery
-  tokens), but because the hit level is an EWMA *of raw scores* it rides the shift
-  — the ratio `raw / hit_level` is self-stabilizing. A change that *lowers* a
-  child's magnitude re-settles slowly (α_dn), which is the deliberate cost of not
-  letting rarely-queried children collapse between hits.
+*Within* one gallery version the membership is fixed (a re-scan makes a new scope,
+not a mutated one), so there is no per-child add/drop reconciliation to do. When
+the raw scale shifts (the gallery grows and the scorer's `z` term moves), the hit
+level — an EWMA *of raw scores* — rides the shift, so `raw / hit_level` is
+self-stabilizing; a change that *lowers* a child's magnitude re-settles slowly
+(α_dn), the deliberate cost of not letting rarely-queried children collapse.
+Collections (stable galleries) never re-mint, so their scopes are not evicted.
 
-> **Decision to confirm:** preserve accumulated hit levels across reconciliation
-> (recommended — they self-adapt and preserve learning) vs. reset a child on
-> signature change. Recommendation: preserve; add a lazy re-seed of a child only
-> when a *near-duplicate* is detected to be stealing its matches, if measurements
-> show under-selection-after-shrink.
+### 4.4 Warm-on-load
 
-At process restart the cache is empty and rebuilds from traffic; this is
-acceptable because it is diagnostic/selection-shaping state, not ground truth.
+The cache is **not** left cold on restart. On the first belief scan after load,
+`ensure_normalization_warm` replays the substrate's existing **sealed dialogue
+turns** (empty-tagged; gallery turns are tagged) through the same turn-group scan
+with `observe = true`, so the hit levels are rebuilt to what live traffic would
+have produced. Details that matter:
+
+- **Exactly once, no half-warm reads.** Guarded by `std::sync::Once`, which blocks
+  any concurrent first callers until the replay completes — so a second session
+  can't score against a partially-warmed cache.
+- **Deterministic order.** `all_streams()` is a `HashMap` walk (unordered), so the
+  turns are sorted by `(timeline, turn index)` before replay; the warmed levels
+  don't depend on iteration order across restarts.
+- **Bounded cost.** Only the most recent `WARM_REPLAY_MAX_TURNS` (512) turns are
+  replayed — the asymmetric EWMA converges in a few dozen steps, so older turns
+  barely move the levels, and the one-time cost stays bounded on a huge substrate.
+- The still-decoding current turn is excluded (no sealed signature yet). The replay
+  reuses the live scan, so it also computes normalized scores it discards — reusing
+  the scan beats duplicating the sub-window flattening for a marginal saving.
+
+Remaining follow-up: the replay still runs on the *first reprojection* (hot path).
+At 512 turns that is negligible; moving it to an explicit pre-serving startup step
+would remove even that first-scan blip.
 
 ---
 
 ## 5. Integration points
 
-- `resolver.rs::score_belief_groups` / `score_belief_collections`: after computing
-  raw per-member scores for a scope, call `cache.normalize(scope, …)` and hand the
-  normalized scores to the selection path; then `cache.observe(scope, …)`.
-- `scheduler`: the reproject loop already re-scores every cadence; that is the
-  natural `observe` cadence. Submit-time scoring participates too.
-- Thresholds in `policy.rs` / `projection.yaml` are re-interpreted on the 0–1000
-  scale (§7 calibration). `layer_weights` (already shipped) stay upstream of
-  normalization — they shape the raw vote; normalization then rescales per scope.
+The cache lives on the `Conversation` substrate handle (`Arc<Mutex<…>>`, shared
+across clones, not persisted). `score_beliefs` carries an `observe: bool` that
+splits read from write:
+
+- **Read** (`observe = false`, every reprojection): `resolver.rs::score_belief_groups`
+  computes the raw fresh scores, calls `cache.normalize(scope, raw)`, and feeds the
+  **normalized** scores to `set_turn` / the challenger candidates. Runs from the
+  scheduler reproject loop (`mod.rs`, passes `false`).
+- **Write** (`observe = true`, once per turn): `conversation.rs::last_turn_belief_scores`
+  is the seal-time whole-turn scan; it passes `observe = true`, so after computing
+  the same raw scores the group scan folds them into the hit levels. The only
+  writer — reprojections never learn.
+
+**Status.** Wired for **turn groups** (repo_map). **Collections (tools) and
+sub-windows are not yet wired** — tools work well on their raw thresholds, and
+normalizing them needs their own threshold re-derivation on the 0–1000 scale
+(a tools-scope §85 pass); doing it blind would risk a working path. `layer_weights`
+(already shipped) stay upstream — they shape the raw vote; normalization rescales.
+Thresholds in `projection.yaml` for the wired group are re-interpreted on the
+0–1000 scale (§7) and get a final live confirmation (§4.2 probe-scale caveat).
 
 ---
 
@@ -219,8 +299,8 @@ possible:
   (lock-on); a noise-floor score → < threshold; a never-seen child uses the prior.
 - Floor: a quiet child cannot amplify a partial match past the floor; floor tracks
   the scope percentile.
-- Reconciliation: new child seeded at prior; removed child dropped; surviving child
-  keeps its level and re-settles under a scale shift (synthetic raw ×k).
+- Re-scan eviction: observing a new `(group, timeline)` scope drops that group's
+  stale-timeline scope while leaving other groups untouched.
 - Per-scope isolation: two scopes with different scales do not cross-contaminate;
   the same child key in two scopes is independent.
 - Determinism: same probe stream → same normalized output (no `Date::now`/RNG).
@@ -260,14 +340,19 @@ Tuning constants used: `α_up 0.30`, `α_dn 0.02`, `HIT_PRIOR 400`, `FLOOR_PCTL 
 
 - **Ownership**: where the `NormalizationCache` lives (per `Conversation`, per
   substrate handle, or a scheduler-level singleton) and how concurrent sessions
-  share or isolate scopes.
-- **Layer scope + tools scope**: §7 calibrated the repo_map group scope; extend the
-  model to the tools collection and the layer scope and confirm the same
-  parameters (or per-scope priors) hold.
+  share or isolate scopes. `observe` runs from the seal path and `normalize` from
+  the reprojection path, so both need a handle to the same cache.
+- **Tools + dialogue scope calibration**: §7 calibrated the repo_map turn-group
+  scope; extend the model to the tools collection and a dialogue turn group and
+  confirm the same parameters (or per-scope priors) hold.
+- **Live threshold confirmation**: re-measure the normalized distribution on the
+  live **reprojection** probe (not the whole-turn sig) to pin `min_score` / `evict`
+  after the probe-scale shift noted in §4.2.
 - **Gallery-change stress test**: inject/remove clusters mid-replay to measure the
   re-settling lag empirically and lock the α values.
 - **Sub-window scope**: normalize file-within-listing selection (self-referencing
-  sub-windows) once the coarser scopes are in.
+  sub-windows) once the coarser scopes are in — the fine half of the group →
+  sub-window nesting (§3.3).
 
 ---
 

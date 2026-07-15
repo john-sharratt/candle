@@ -50,6 +50,7 @@ mod error;
 mod handle;
 pub mod models;
 pub mod narrator;
+pub mod normalization;
 pub mod persistence;
 pub mod projection;
 pub mod prompts;
