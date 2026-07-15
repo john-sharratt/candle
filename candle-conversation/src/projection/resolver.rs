@@ -1199,10 +1199,10 @@ impl Conversation {
     }
 
     /// Every conversation the workspace substrate knows about —
-    /// `(timeline, conv_id, label, archived)` quads drawn from the
-    /// in-RAM `Substrate::timelines` map. Drives
-    /// `GET /v1/conversations` directly; no sidecar involved.
-    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool)> {
+    /// `(timeline, conv_id, label, archived, order)` tuples drawn from the
+    /// in-RAM `Substrate::timelines` map (`order` = creation-order rank).
+    /// Drives `GET /v1/conversations` directly; no sidecar involved.
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool, u64)> {
         self.read().known_conversations()
     }
 

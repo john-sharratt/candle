@@ -30,9 +30,6 @@
     if (!r.ok && r.status !== 204) throw new Error('POST ' + path + ' -> ' + r.status);
   }
   const enc = (id) => encodeURIComponent(id);
-  // Conversation ids encode creation time where available (older Date.now()
-  // scheme); fall back to 0 so the sidebar's recency sort stays stable.
-  const updatedMs = (id) => { const n = Number(id); return Number.isFinite(n) ? n : 0; };
 
   const ZendLiveAPI = {
     // ── conversations ──────────────────────────────────────────────────────
@@ -42,7 +39,9 @@
         id: String(e.id),
         title: e.label || 'Conversation',
         archived: !!e.archived,
-        updated_ms: updatedMs(e.id),
+        // Server-supplied creation-order rank (monotonic, not a clock). Conv
+        // ids are random u64s, so this is the only reliable sort key.
+        updated_ms: Number(e.updated_ms) || 0,
         turn_count: e.turn_count || 0,
         history: [],
       }));

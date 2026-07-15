@@ -115,6 +115,13 @@ pub struct Substrate {
     /// role, text, token ids). Does **not** hold KV bytes; those live
     /// in [`Self::residence`] addressed by [`TurnEntryData::residence`].
     timelines: HashMap<TimelineId, TimelineEntry>,
+    /// Monotonic counter stamped onto a [`TimelineEntry::order`] the first time
+    /// its `conv_id` is set. Because the redo log replays in append order and a
+    /// conversation's `conv_id` is written once at creation, ordering the
+    /// sidebar by `order` reproduces creation order across recovery and live
+    /// sessions — the conversation ids themselves are random u64s and carry no
+    /// time information.
+    conv_order_counter: u64,
 
     /// Inverse index: every timeline registered against a given group.
     /// Maintained in lockstep with [`Self::timelines`].
@@ -854,6 +861,10 @@ pub struct TimelineEntry {
     /// this conversation, persisted at first-submit time alongside any
     /// label as a `RecordType::Label` record.
     pub conv_id: Option<String>,
+    /// Creation-order rank, stamped from [`Substrate::conv_order_counter`] the
+    /// first time `conv_id` is set. `0` until then. Higher = created later; the
+    /// daemon sidebar sorts on this so newest conversations lead the list.
+    pub order: u64,
     /// Free-form key/value metadata, persisted in the same
     /// `RecordType::Label` record as `label`/`conv_id` and merged
     /// (last-write-wins per key) on update. Used as a content-addressed
@@ -1004,6 +1015,7 @@ impl TimelineEntry {
             group,
             label: None,
             conv_id: None,
+            order: 0,
             custom: BTreeMap::new(),
             archived: false,
             turns: BTreeMap::new(),
@@ -2237,7 +2249,15 @@ impl Substrate {
     /// every timeline that holds non-default values.  Used by compaction
     /// to re-emit live `Label` / `ConvState` records.
     pub fn live_conv_meta(&self) -> Vec<(u64, String, String, bool, BTreeMap<String, String>)> {
-        self.timelines
+        // Emit in creation `order`, not `timelines` (HashMap) iteration order:
+        // the compactor writes these as `Label` records, and reload re-derives
+        // each timeline's `order` from the order its `conv_id` Label replays
+        // (see `set_conv_id`). A nondeterministic order here would scramble the
+        // sidebar's creation-order sort on every compaction. `order` is 0 for
+        // timelines that never got a conv_id (label/custom only); they sort
+        // first and their relative order is immaterial.
+        let mut out: Vec<(u64, u64, String, String, bool, BTreeMap<String, String>)> = self
+            .timelines
             .iter()
             .filter_map(|(tid, tl)| {
                 let conv_id = tl.conv_id.clone().unwrap_or_default();
@@ -2245,8 +2265,21 @@ impl Substrate {
                 if conv_id.is_empty() && label.is_empty() && !tl.archived && tl.custom.is_empty() {
                     None
                 } else {
-                    Some((tid.raw(), conv_id, label, tl.archived, tl.custom.clone()))
+                    Some((
+                        tl.order,
+                        tid.raw(),
+                        conv_id,
+                        label,
+                        tl.archived,
+                        tl.custom.clone(),
+                    ))
                 }
+            })
+            .collect();
+        out.sort_by_key(|(order, tid, ..)| (*order, *tid));
+        out.into_iter()
+            .map(|(_, tid, conv_id, label, archived, custom)| {
+                (tid, conv_id, label, archived, custom)
             })
             .collect()
     }
@@ -3187,8 +3220,17 @@ impl Substrate {
         if conv_id.is_empty() {
             return;
         }
+        // Stamp creation order the first time this timeline gets a conv_id.
+        // During recovery this runs in redo-log (creation) order; live, a new
+        // conversation's first Label bumps the counter last → highest rank.
+        let stamp = self.conv_order_counter + 1;
         if let Some(entry) = self.timelines.get_mut(&timeline) {
+            let first = entry.conv_id.is_none();
             entry.conv_id = Some(conv_id.to_string());
+            if first {
+                entry.order = stamp;
+                self.conv_order_counter = stamp;
+            }
         }
     }
 
@@ -3281,13 +3323,13 @@ impl Substrate {
     /// `label` is empty during the brief window between first-submit
     /// and titler-completion, `archived` is the lifecycle filter the
     /// sidebar applies before rendering.
-    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool)> {
+    pub fn known_conversations(&self) -> Vec<(TimelineId, String, String, bool, u64)> {
         self.timelines
             .iter()
             .filter_map(|(tl, entry)| {
                 let conv_id = entry.conv_id.clone()?;
                 let label = entry.label.clone().unwrap_or_default();
-                Some((*tl, conv_id, label, entry.archived))
+                Some((*tl, conv_id, label, entry.archived, entry.order))
             })
             .collect()
     }
@@ -5075,7 +5117,7 @@ mod tests {
 
         let convs = sub.known_conversations();
         assert_eq!(convs.len(), 1);
-        let (tl, conv_id, label, archived) = &convs[0];
+        let (tl, conv_id, label, archived, _order) = &convs[0];
         assert_eq!(*tl, timeline);
         assert_eq!(conv_id, "abc");
         assert_eq!(label, "tour");
@@ -5150,6 +5192,50 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].1, "abc");
         assert_eq!(convs[0].2, "tour");
+    }
+
+    /// `order` is stamped in creation sequence on first `conv_id` and is stable:
+    /// re-setting a conv_id doesn't re-stamp, and `live_conv_meta` (the compactor's
+    /// Label source) emits in that order so a reload re-derives the same sequence
+    /// instead of scrambling the sidebar on every compaction. Production timeline
+    /// ids are content hashes with no time information, so this ordinal is the only
+    /// creation-order signal.
+    #[test]
+    fn conv_order_stamps_creation_sequence_and_emits_stably() {
+        let layer = LayerId::for_test(1);
+        let group = GroupId::for_test(1);
+        let alloc = TimelineAllocator::new();
+        let mut sub = Substrate::new();
+
+        let (a, b, c) = (alloc.next(), alloc.next(), alloc.next());
+        for (tl, id) in [(a, "a"), (b, "b"), (c, "c")] {
+            sub.register_timeline(tl, layer, group);
+            sub.set_conv_id(tl, id);
+        }
+
+        let order_of = |sub: &Substrate, want: &str| {
+            sub.known_conversations()
+                .into_iter()
+                .find(|(_, cid, ..)| cid == want)
+                .map(|(_, _, _, _, o)| o)
+                .expect("conversation present")
+        };
+        assert_eq!(order_of(&sub, "a"), 1);
+        assert_eq!(order_of(&sub, "b"), 2);
+        assert_eq!(order_of(&sub, "c"), 3);
+
+        // Re-setting the same conv_id must not bump the counter or re-stamp.
+        sub.set_conv_id(a, "a");
+        assert_eq!(order_of(&sub, "a"), 1);
+        assert_eq!(order_of(&sub, "c"), 3, "counter untouched by a re-set");
+
+        // The compactor's Label source emits in creation order, so reload is stable.
+        let emitted: Vec<String> = sub
+            .live_conv_meta()
+            .into_iter()
+            .map(|(_, cid, ..)| cid)
+            .collect();
+        assert_eq!(emitted, ["a", "b", "c"]);
     }
 
     // ── Custom metadata (content-addressed cache) ──────────────────────
