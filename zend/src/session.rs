@@ -2824,7 +2824,7 @@ mod projection_schema_tests {
     use std::path::Path;
 
     /// The shipped `projection.yaml` parses, and the reconstructed repo map is
-    /// capped and floored: `structure` is a `top_k(2)` group with a `"."`
+    /// capped and floored: `structure` is a `top_k(3)` group with a `"."`
     /// default so the workspace-root cluster always survives selection.
     #[test]
     fn projection_yaml_parses_and_repo_map_is_capped_with_default() {
@@ -2835,8 +2835,8 @@ mod projection_schema_tests {
         let group = builder.group(structure).expect("group schema present");
 
         match &group.selection {
-            SelectionRule::TopK { k } => assert_eq!(*k, 2, "repo map capped at 2 clusters"),
-            other => panic!("structure should be top_k(2), got {other:?}"),
+            SelectionRule::TopK { k } => assert_eq!(*k, 3, "repo map capped at 3 clusters"),
+            other => panic!("structure should be top_k(3), got {other:?}"),
         }
         assert_eq!(
             group.default.as_ref().map(|d| d.tag.as_str()),

@@ -84,6 +84,21 @@ pub fn score_provenance_late_fusion(
     gallery_case: &[u32],
     n_cases: usize,
 ) -> Vec<f32> {
+    score_provenance_late_fusion_weighted(query, gallery, gallery_case, n_cases, &[])
+}
+
+/// [`score_provenance_late_fusion`] with a per-layer-group weight on each group's
+/// `z × margin` vote. `group_weights[g]` scales group `g`'s contribution (missing
+/// / empty ⇒ 1.0, i.e. the uniform default). Used to down-weight the noisy lower
+/// layer-group for repo_map retrieval, where the cluster-identity signal lives in
+/// the upper groups (see `docs/tool_selection_provenance_results.md` §83).
+pub fn score_provenance_late_fusion_weighted(
+    query: &[WideQSig],
+    gallery: &[&WideQSig],
+    gallery_case: &[u32],
+    n_cases: usize,
+    group_weights: &[f32],
+) -> Vec<f32> {
     let shape: Option<&WideQSig> = query.first().or_else(|| gallery.first().copied());
     let Some(shape) = shape else {
         return vec![0.0; n_cases];
@@ -145,7 +160,8 @@ pub fn score_provenance_late_fusion(
                     let var = (sumsq as f32 / n_gal - mean * mean).max(1e-6);
                     let z = ((top1 as f32 - mean) / var.sqrt()).max(0.0);
                     let margin = top1.saturating_sub(top2) as f32;
-                    out.push((top1c, z * margin));
+                    let w = group_weights.get(g).copied().unwrap_or(1.0);
+                    out.push((top1c, z * margin * w));
                 }
             }
             out

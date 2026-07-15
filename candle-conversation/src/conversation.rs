@@ -1503,7 +1503,49 @@ impl Sequence {
             // events to; the turn itself was still prefilled.
             return Ok(());
         };
-        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0)
+        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0, &[])
+    }
+
+    /// Like [`Self::insert_turn_staged`], but `assistant_with_seams` carries
+    /// `seam_marker`s at structural boundaries (e.g. subdirectory headers in a
+    /// repo_map cluster listing). Each marker becomes a **self-referencing**
+    /// projection event, so the belief scan scores the interval between seams as an
+    /// independent retrieval sub-window that resolves back to this turn — a query
+    /// matching one region of the listing surfaces the whole cluster without
+    /// diluting against the rest. The markers are stripped before prefill (they are
+    /// not model tokens); the wide-Q sig is captured over the clean text, and the
+    /// seam offsets index it directly (the sig is dense, one entry per grid token).
+    pub fn insert_turn_staged_windowed(
+        &mut self,
+        user_message: &str,
+        assistant_with_seams: &str,
+        seam_marker: &str,
+        tags: Vec<String>,
+    ) -> crate::Result<()> {
+        let segments: Vec<&str> = assistant_with_seams.split(seam_marker).collect();
+        let clean_assistant = segments.concat();
+        let (assistant_content_start, turn_index) =
+            self.insert_turn_inner(user_message, &clean_assistant, tags)?;
+        let Some(idx) = turn_index else {
+            return Ok(());
+        };
+        // Grid-token offset of each seam: tokenize the grid prefix up to it in the
+        // SAME format `insert_turn_inner` seals, so the offset indexes the sig.
+        let mut seams: Vec<u32> = Vec::new();
+        if segments.len() > 1 {
+            let mut prefix = format!(
+                "{}{}{}{}",
+                self.config.dialect.no_think,
+                user_message,
+                self.config.dialect.user_end,
+                self.config.dialect.assistant_start,
+            );
+            for seg in &segments[..segments.len() - 1] {
+                prefix.push_str(seg);
+                seams.push(self.tokenize(&prefix)?.len() as u32);
+            }
+        }
+        self.persist_staged_ingest_events(idx, assistant_content_start, 0.0, &seams)
     }
 
     /// Shared body of [`insert_turn_tagged`] / [`insert_turn_staged`]: format,
@@ -1708,7 +1750,7 @@ impl Sequence {
                     .map(|l| l.assistant_content_start())
                     .unwrap_or(0)
             };
-            self.persist_staged_ingest_events(idx, assistant_start, seconds)?;
+            self.persist_staged_ingest_events(idx, assistant_start, seconds, &[])?;
         }
         Ok(text)
     }
@@ -1725,11 +1767,14 @@ impl Sequence {
         turn_index: u32,
         assistant_content_start: u32,
         seconds: f64,
+        seam_offsets: &[u32],
     ) -> crate::Result<()> {
         use crate::persistence::content_hash::turn_stream_id;
         use crate::persistence::streams::StreamDecl;
         use crate::projection::event::group_name_of;
-        use crate::projection::{encode_events, staged_ingest_event, SelectedTurn, SystemItem};
+        use crate::projection::{
+            encode_events, staged_ingest_event, ProjectionEvent, SelectedTurn, SystemItem,
+        };
         use crate::substrate::ContentResolver;
         use crate::summary_tree::TurnKind;
 
@@ -1804,10 +1849,22 @@ impl Sequence {
             (system, turns)
         };
 
-        let events = [
+        let mut events = vec![
             staged_ingest_event(0, 0.0, system.clone(), turns.clone()),
             staged_ingest_event(assistant_content_start, seconds, system, turns),
         ];
+        // Self-referencing sub-window seams: one marker event per structural
+        // boundary. The belief scan reads their `start_token`s and scores each
+        // `[seam_i, seam_{i+1})` interval as a focused window that resolves back to
+        // this turn (see `Substrate::score_belief_groups`). Empty ⇒ the turn scores
+        // as one whole-turn window, unchanged.
+        for &off in seam_offsets {
+            events.push(ProjectionEvent {
+                start_token: off,
+                self_reference: true,
+                ..Default::default()
+            });
+        }
         self.substrate
             .persist_projection_events(
                 turn_stream_id(timeline.raw(), turn_index),

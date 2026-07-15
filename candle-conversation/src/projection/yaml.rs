@@ -164,6 +164,9 @@ struct YamlPolicy {
     budget: Option<YamlPolicyBudget>,
     #[serde(default)]
     tags: Option<Vec<String>>,
+    /// Per-fold-group vote weights (`[g0, g1, g2]`); omitted ⇒ inherit / uniform.
+    #[serde(default)]
+    layer_weights: Option<Vec<f32>>,
 }
 
 #[derive(Deserialize)]
@@ -620,7 +623,15 @@ fn parse_policy(
         Some(t) => t.clone(),
         None => inherited.tags.clone(),
     };
-    Ok(SelectionPolicy { config, tags })
+    let layer_weights = match &yp.layer_weights {
+        Some(w) => w.clone(),
+        None => inherited.layer_weights.clone(),
+    };
+    Ok(SelectionPolicy {
+        config,
+        tags,
+        layer_weights,
+    })
 }
 
 fn validate_policy(name: &str, c: &PolicyConfig) -> Result<(), ConstructionError> {
@@ -915,6 +926,7 @@ fn build(
                             SelectionPolicy {
                                 config,
                                 tags: layer_policy.tags.clone(),
+                                layer_weights: layer_policy.layer_weights.clone(),
                             }
                         }
                         _ => parse_policy(&label, coll_policy_yaml.as_ref(), &layer_policy)?,

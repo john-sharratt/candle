@@ -692,6 +692,7 @@ impl Builder {
                 SelectionPolicy {
                     config,
                     tags: Vec::new(),
+                    layer_weights: Vec::new(),
                 }
             }
             _ => SelectionPolicy::default_policy(),

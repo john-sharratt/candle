@@ -12,7 +12,7 @@ use super::schema::{LayerSchema, Schema, SystemPromptItem};
 use crate::persistence::record::TreeMetadataPayload;
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
-use crate::provenance::{score_slots, WideQSig};
+use crate::provenance::{score_slots_weighted, WideQSig};
 use crate::substrate::{
     ContentResolver, ProjectionScores, StoredSequence, Substrate, SubstrateRead, SubstrateWrite,
     TurnPartWrite,
@@ -22,6 +22,23 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::TurnLayout;
 use candle_nn::kv_cache::SealedSequence;
+
+/// Contiguous `[start, end)` sub-window bounds over a `len`-token sig, split at
+/// sorted, deduped `seams`. An empty `seams` yields one window `[0, len)` — the
+/// prior whole-turn behaviour. Seams at 0, at/past `len`, or that don't advance
+/// are ignored, so a malformed seam can never produce an empty or inverted range.
+fn subwindow_bounds(len: usize, seams: &[usize]) -> Vec<(usize, usize)> {
+    let mut bounds = Vec::with_capacity(seams.len() + 1);
+    let mut prev = 0usize;
+    for &s in seams {
+        if s > prev && s < len {
+            bounds.push((prev, s));
+            prev = s;
+        }
+    }
+    bounds.push((prev, len));
+    bounds
+}
 
 /// The name of the section a projection selected inside `collection`, if any.
 fn selected_in_collection(sel: &ProjectionSelection, collection: &str) -> Option<String> {
@@ -340,7 +357,9 @@ impl Conversation {
                 continue;
             }
             let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
-            let fresh = score_slots(probe, &wref, &slots, n);
+            // Per-layer-group weights from the collection's `policy.layer_weights`
+            // (empty ⇒ uniform — the tool default). Configured in the schema YAML.
+            let fresh = score_slots_weighted(probe, &wref, &slots, n, &coll.policy.layer_weights);
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let nonzero = fresh.iter().filter(|&&s| s != 0.0).count();
                 let top = fresh
@@ -437,8 +456,15 @@ impl Conversation {
             // of scanning `all_streams()` per group (which is O(all timelines'
             // streams) on the reproject hot path).
             let count = sub.turn_count(timeline);
-            let mut windows: Vec<Arc<Vec<WideQSig>>> = Vec::new();
-            let mut indices: Vec<TurnIndex> = Vec::new();
+            // Per candidate turn: its full sig plus the self-referencing sub-window
+            // seams recorded on it. A turn with no seams scores as one whole-turn
+            // window (the prior behaviour); a turn with N seams scores as N+1
+            // focused windows that all resolve back to it — so a query matching one
+            // structural region of a prefilled listing surfaces the whole turn
+            // without diluting against the rest.
+            let mut arcs: Vec<Arc<Vec<WideQSig>>> = Vec::new();
+            let mut arc_turn: Vec<TurnIndex> = Vec::new();
+            let mut arc_bounds: Vec<Vec<(usize, usize)>> = Vec::new();
             for i in 0..count {
                 let idx = TurnIndex(i);
                 // Summary forest nodes are selected only by the score-density
@@ -455,22 +481,61 @@ impl Conversation {
                 let Some(window) = sub.decoded_wide_sig(turn_stream_id(timeline.raw(), i)) else {
                     continue;
                 };
-                windows.push(window);
-                indices.push(idx);
+                let len = window.len();
+                // Self-referencing projection events mark sub-window seams (token
+                // offsets). Clamp into the sig's index space and derive contiguous
+                // `[start, end)` bounds; no seams ⇒ one window over the whole turn.
+                let mut seams: Vec<usize> = sub
+                    .projection_events_blob(timeline, idx)
+                    .map(decode_events)
+                    .map(|evs| {
+                        evs.iter()
+                            .filter(|e| e.self_reference)
+                            .map(|e| (e.start_token as usize).min(len))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                seams.sort_unstable();
+                seams.dedup();
+                arc_bounds.push(subwindow_bounds(len, &seams));
+                arcs.push(window);
+                arc_turn.push(idx);
             }
-            if windows.is_empty() {
+            if arcs.is_empty() {
                 continue;
             }
-            let n = windows.len();
-            let wref: Vec<&[WideQSig]> = windows.iter().map(|w| w.as_slice()).collect();
-            // Identity slot map: turn i is slot i, so `score_slots` computes each
-            // turn's `z × margin` vote against every other candidate turn.
-            let slots: Vec<usize> = (0..n).collect();
-            let fresh = score_slots(probe, &wref, &slots, n);
-            let mut cands: Vec<(TurnIndex, f32)> = Vec::with_capacity(n);
-            for (idx, &score) in indices.iter().zip(&fresh) {
-                scores.set_turn(timeline, *idx, score);
-                cands.push((*idx, score));
+            // Flatten every turn's sub-windows into gallery windows, all tagged
+            // with the SAME slot as their owning turn (`wslot[i] = arc index`). So
+            // `score_slots` aggregates a turn's regions into ONE case — best-token
+            // agreement across the whole cluster — rather than making each region
+            // its own case that splits the turn's vote and competes with its
+            // siblings (which penalised large clusters). The seams still bound the
+            // windows, ready for the diverse-window step, but never fight each
+            // other. Then the L46-weighted vote (§83) decides the cluster.
+            let mut wref: Vec<&[WideQSig]> = Vec::new();
+            let mut wslot: Vec<usize> = Vec::new();
+            for (ai, arc) in arcs.iter().enumerate() {
+                for &(s, e) in &arc_bounds[ai] {
+                    if e > s {
+                        wref.push(&arc[s..e]);
+                        wslot.push(ai);
+                    }
+                }
+            }
+            if wref.is_empty() {
+                continue;
+            }
+            let n_turns = arcs.len();
+            // Per-layer-group vote weights from the group's `policy.layer_weights`
+            // (empty ⇒ uniform). Repo_map peaks on L46 (§83); other groups inherit
+            // uniform. Configured in the schema YAML, not hard-coded.
+            let fresh =
+                score_slots_weighted(probe, &wref, &wslot, n_turns, &group.policy.layer_weights);
+            let mut cands: Vec<(TurnIndex, f32)> = Vec::with_capacity(n_turns);
+            for (ai, &sc) in fresh.iter().enumerate() {
+                let idx = arc_turn[ai];
+                scores.set_turn(timeline, idx, sc);
+                cands.push((idx, sc));
             }
             per_group.push((group.id, cands));
         }
@@ -1626,8 +1691,29 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::selected_in_collection;
+    use super::{selected_in_collection, subwindow_bounds};
     use crate::projection::{ProjectionSelection, SelectedSection, SystemItem};
+
+    #[test]
+    fn subwindow_bounds_splits_and_degrades_gracefully() {
+        // No seams → one whole-turn window (the prior behaviour).
+        assert_eq!(subwindow_bounds(688, &[]), vec![(0, 688)]);
+        // Interior seams → contiguous, gap-free intervals covering [0, len).
+        assert_eq!(
+            subwindow_bounds(688, &[100, 300]),
+            vec![(0, 100), (100, 300), (300, 688)]
+        );
+        // Seams at 0, at/past len, and non-advancing duplicates are no-ops — never
+        // an empty or inverted range.
+        assert_eq!(subwindow_bounds(688, &[0]), vec![(0, 688)]);
+        assert_eq!(subwindow_bounds(688, &[688, 900]), vec![(0, 688)]);
+        assert_eq!(
+            subwindow_bounds(688, &[100, 100]),
+            vec![(0, 100), (100, 688)]
+        );
+        // Empty turn → a single empty window (the caller filters `e > s`).
+        assert_eq!(subwindow_bounds(0, &[]), vec![(0, 0)]);
+    }
 
     #[test]
     fn selected_in_collection_finds_the_selected_member() {

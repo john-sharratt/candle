@@ -184,8 +184,42 @@ layers:
         # highest-scoring survive. `default` is the floor: if a future threshold
         # filters every cluster out, the root cluster is re-injected so repo_map
         # never vanishes from the projection.
-        selection: { kind: top_k, k: 2 }
+        # k: 3 — the workspace-root cluster reliably wins one slot on belief
+        # (its listing names every crate, so it matches most repo questions), so
+        # 2 leaves only a single content slot that a specific dir (candle-core/src)
+        # narrowly loses to generic prose clusters (docs/). 3 = root + 2 content;
+        # the queried dir ranks top-3 across every probed query. See §83.
+        selection: { kind: top_k, k: 3 }
         default: { tag: "." }
+        policy:
+          # Repo_map cluster identity concentrates in the L46 fold-group (§83):
+          # peak the belief vote on group 1 and keep groups 0 (L0-45) and 2 (L47)
+          # only as a faint tie-breaker. Group 0 alone ranks the target #17 (pure
+          # path noise), so it must be near-zero — at 0.3 it dragged the target to
+          # #2 and it lost the single non-root slot. [0.1,1,0.1] is the softest
+          # vector that ranks candle-core #1 across BOTH probed queries (the 0.3
+          # group-2 variant overfits one). Retuned by the §83 `provenance_layers`
+          # sweep on the live timeline; adjust there before changing.
+          layer_weights: [0.1, 1.0, 0.1]
+          # Carry LEAKED HARDER than the tool default (β = RelLeak leak fraction, so
+          # HIGHER = faster decay = less carry). repo_map must reflect the CURRENT
+          # question, not linger on a prior topic's cluster. A numeric attractor dir
+          # (perf-investigation) won a `sqrt of N` turn and, at β0.40, its belief bled
+          # into the next (candle-core) turn and crowded the correct cluster out.
+          # β0.65 makes a cluster that isn't re-matched this turn leak below evict
+          # within a step or two; min/evict stay at the tool scale (clusters clear 800).
+          beta: 0.65
+          # min/evict kept at the tool scale. Lowering them to the repo_map belief
+          # scale (~200) was tried and reverted: it admitted the spurious noise floor
+          # (metal-kernels, voxtral) without seating candle-core, because candle-core
+          # ranks #1..#10 across identical queries and generic clusters (root, docs)
+          # own the top — a probe/ranking problem no threshold fixes.
+          min_score: 800
+          evict_score: 600
+          # Early-decode grace, SHORTENED from the tool window (64) but not removed.
+          early_window_tokens: 24
+          early_min_score: 250
+          early_evict_score: 187.5
         budget:
           priority: 100
 
@@ -1026,6 +1060,23 @@ layers:
           policy:
             preset: committed_tool_scope
             tags: [tool]
+            # Uniform layer weighting — tool identity is spread across the upper
+            # fold-groups, and this is the tuning that gave the current hit rate.
+            # (Explicit for clarity; empty would mean the same.)
+            layer_weights: [1.0, 1.0, 1.0]
+            # Carry, made explicit — these are the committed_tool_scope values the
+            # tools were tuned to (a tool stays relevant for several turns, so it is
+            # deliberately STICKIER than repo_map). Pinned here so the repo_map
+            # overrides above read as a contrast, not a hidden divergence.
+            beta: 0.40
+            min_score: 800
+            evict_score: 600
+            # Early-decode grace: the first 64 tokens of a new assistant turn run a
+            # lowered bar (250/187.5) so a correct tool whose decode-Q is still
+            # accruing isn't evicted before it establishes. See policy.rs.
+            early_window_tokens: 64
+            early_min_score: 250
+            early_evict_score: 187.5
           # `selection` mirrors the policy budget (max 3) for the pre-belief
           # selection path; once the belief loop drives selection the policy's
           # budget is the single source of truth.
