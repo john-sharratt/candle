@@ -97,8 +97,13 @@ fn score_belief_groups_self_matches_the_probed_turn() {
         group,
         timeline,
     };
-    let candidates =
-        conv.score_belief_groups(&builder.schema().layers[0], target, &probe, &mut scores);
+    let candidates = conv.score_belief_groups(
+        &builder.schema().layers[0],
+        target,
+        &probe,
+        &mut scores,
+        false,
+    );
 
     // The scan reported all three candidate turns for the group.
     assert_eq!(candidates.len(), 1, "one belief-driven group scanned");
@@ -212,7 +217,7 @@ fn score_beliefs_scores_a_group_in_a_non_target_layer() {
         timeline: dlg_tl,
     };
     let probe = vec![sig(fills[1])];
-    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe);
+    let (scores, cands) = conv.score_beliefs(builder.schema(), target, &probe, false);
 
     // The non-target clusters group was scored, and the probed turn wins.
     let s0 = scores.turn(mem_tl, TurnIndex(0));
@@ -246,6 +251,6 @@ fn score_belief_groups_ignores_recency_groups_and_empty_probe() {
         timeline,
     };
     let candidates =
-        conv.score_belief_groups(&builder.schema().layers[0], target, &[], &mut scores);
+        conv.score_belief_groups(&builder.schema().layers[0], target, &[], &mut scores, false);
     assert!(candidates.is_empty(), "empty probe → no scan");
 }
