@@ -7,7 +7,7 @@
  * Implemented (Phase 2.1 — endpoints that exist today, validated by the
  * gui_api_harness integration test):
  *   - seedConversations / getConversation   GET /v1/conversations[/{id}]
- *   - archiveConversation / unarchiveConversation  POST …/archive|unarchive
+ *   - archiveConversation (one-way)          POST …/archive
  *   - streamChatCompletion (token + status)  POST /v1/chat/completions (SSE)
  *   - subscribeLogs / seedLogs               WS /ws/logs (structured JSON frames)
  *
@@ -65,7 +65,6 @@
       };
     },
     archiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/archive'); },
-    unarchiveConversation(id) { return postVoid('/v1/conversations/' + enc(id) + '/unarchive'); },
 
     // GET /v1/status — daemon loading state (drives the startup overlay). If the
     // daemon isn't reachable yet, report a synthetic "connecting" loading state.

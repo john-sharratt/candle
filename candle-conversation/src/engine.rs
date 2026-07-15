@@ -4,6 +4,7 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::Sequence;
 use crate::error::ConversationError;
 use crate::handle::{TokenDecoder, TurnEvent};
+use crate::persistence::record::DistillMode;
 use crate::persistence::thread::PersistenceThread;
 use crate::persistence::SubstratePersistence;
 use crate::projection::{
@@ -632,12 +633,13 @@ impl ConversationEngine {
             .map_err(ConversationError::Model)
     }
 
-    /// Mark `timeline` for distillation (keep sig, drop content at compaction) —
-    /// see [`crate::projection::Conversation::distill_timeline`]. Idempotent;
-    /// gate on [`Self::is_timeline_distilled`] to skip already-distilled timelines.
-    pub fn distill_timeline(&self, timeline: TimelineId) -> crate::Result<()> {
+    /// Mark `timeline` for distillation at `mode` (shed content at compaction) —
+    /// see [`crate::projection::Conversation::distill_timeline`]. A later call may
+    /// upgrade the mode; gate on [`Self::is_timeline_distilled`] only to avoid
+    /// re-marking at the same mode.
+    pub fn distill_timeline(&self, timeline: TimelineId, mode: DistillMode) -> crate::Result<()> {
         self.conversation
-            .distill_timeline(timeline)
+            .distill_timeline(timeline, mode)
             .map_err(ConversationError::Model)
     }
 

@@ -794,11 +794,32 @@ impl TombstonePayload {
     }
 }
 
+/// The degree to which a distilled timeline's turns shed content at compaction.
+/// Both modes drop the KV chunks (the bulk of the on-disk cost); they differ on
+/// what else survives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistillMode {
+    /// Keep `StreamDecl` + `WideQSig` + projection events; drop tokens + KV
+    /// chunks. The provenance corpus (calibration exemplars): retrievable by
+    /// signature, no verbatim text, not resumable. The default so pre-`mode`
+    /// on-disk `Distilled` records decode to the original behaviour.
+    #[default]
+    ProvenanceOnly,
+    /// Keep `StreamDecl` + tokens; drop KV chunks + `WideQSig` + projection
+    /// events. Archived conversations: a plain read-only text record — not
+    /// retrievable by provenance, not resumable.
+    TextOnly,
+}
+
 /// JSON payload for a [`RecordType::Distilled`] record — names the timeline whose
-/// turns should shed their content (keep sig, drop tokens + KV) at compaction.
+/// turns should shed content at compaction, and the [`DistillMode`] degree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistillPayload {
     pub timeline_id: u64,
+    /// Absent on pre-`mode` records → [`DistillMode::ProvenanceOnly`].
+    #[serde(default)]
+    pub mode: DistillMode,
 }
 
 impl DistillPayload {
@@ -1267,5 +1288,27 @@ mod tests {
         // future tweak doesn't accidentally allow multi-sector
         // headers.
         const _: () = assert!(MAX_HEADER_LINE < ALIGN);
+    }
+
+    #[test]
+    fn distill_payload_roundtrips_both_modes() {
+        for mode in [DistillMode::ProvenanceOnly, DistillMode::TextOnly] {
+            let p = DistillPayload {
+                timeline_id: 42,
+                mode,
+            };
+            assert_eq!(DistillPayload::decode(&p.encode()).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn distill_payload_pre_mode_records_decode_provenance_only() {
+        // Records written before `mode` existed carry only `timeline_id`; the
+        // serde default keeps them decoding to the original behaviour so live
+        // substrates (whose calibration corpus is already distilled) load.
+        let legacy = br#"{"timeline_id":7}"#;
+        let decoded = DistillPayload::decode(legacy).unwrap();
+        assert_eq!(decoded.timeline_id, 7);
+        assert_eq!(decoded.mode, DistillMode::ProvenanceOnly);
     }
 }

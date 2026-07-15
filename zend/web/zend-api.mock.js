@@ -99,7 +99,6 @@
     },
 
     archiveConversation(id) { return delay(60); },
-    unarchiveConversation(id) { return delay(60); },
 
     // GET /v1/status — the mock daemon is always ready (no model to load).
     getStatus() {

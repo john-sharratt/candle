@@ -10,7 +10,7 @@ use super::ids::{GroupId, LayerId, SectionId, TimelineAllocator, TimelineId, Tur
 use super::project::ProjectionTarget;
 use super::schema::{LayerSchema, Schema, SystemPromptItem};
 use crate::normalization::{ChildKey, NormalizationCache, ScopeKey};
-use crate::persistence::record::TreeMetadataPayload;
+use crate::persistence::record::{DistillMode, TreeMetadataPayload};
 use crate::persistence::streams::{ContentAddress, SectionDecl, StreamDecl, StreamId, TurnDecl};
 use crate::persistence::SubstratePersistence;
 use crate::provenance::{decode_wide_sigs, score_slots_weighted, WideQSig};
@@ -1257,14 +1257,15 @@ impl Conversation {
         self.read().is_tombstoned(timeline)
     }
 
-    /// Mark `timeline` for distillation — in-RAM (so the compactor sees it this
-    /// session) and on disk (a [`crate::persistence::record::RecordType::Distilled`]
-    /// record, so it survives reload). Its turns shed content at the next
-    /// compaction. Idempotent; callers should gate on [`Self::is_timeline_distilled`].
-    pub fn distill_timeline(&self, timeline: TimelineId) -> candle::Result<()> {
-        self.write().distill_timeline(timeline);
+    /// Mark `timeline` for distillation at `mode` — in-RAM (so the compactor
+    /// sees it this session) and on disk (a
+    /// [`crate::persistence::record::RecordType::Distilled`] record, so it
+    /// survives reload). Its turns shed content at the next compaction. A later
+    /// call may upgrade the mode (e.g. provenance-only → text-only on archive).
+    pub fn distill_timeline(&self, timeline: TimelineId, mode: DistillMode) -> candle::Result<()> {
+        self.write().distill_timeline(timeline, mode);
         let mut p = self.persistence.lock().unwrap();
-        p.write_distill(timeline.raw())
+        p.write_distill(timeline.raw(), mode)
             .map_err(|e| candle::Error::Msg(format!("write_distill: {e}")))?;
         Ok(())
     }

@@ -194,6 +194,7 @@
     showArchived: (function () { try { return localStorage.getItem('zend.showArchived') === '1'; } catch (_) { return false; } })(),
     sidebarCollapsed: false,
     sidebarDrawer: false,   // narrow only: the conversation list open as an overlay drawer
+    confirm: null,          // in-app confirm dialog: { title, body, confirmLabel, danger, onConfirm }
     narrow: (typeof window !== 'undefined' && window.innerWidth < NARROW_W),
     wide: (typeof window !== 'undefined' && window.innerWidth >= WIDE_W),
     sidebarW: 220,
@@ -608,6 +609,18 @@
   function newConv() { writeHashConv(null); setState({ activeId: null, promptValue: '', sidebarDrawer: false }, focusPrompt); }
   function archiveConv(id, e) {
     if (e) e.stopPropagation();
+    // Archiving is one-way and lossy: the KV cache is discarded and the
+    // conversation is compressed to a read-only text record, so it can't be
+    // reopened or continued. Confirm via an in-app modal before committing.
+    setState({ confirm: {
+      title: 'Archive conversation?',
+      body: 'It will be compressed to a read-only text record — the KV cache is discarded, so it can’t be reopened or continued. This can’t be undone.',
+      confirmLabel: 'Archive',
+      danger: true,
+      onConfirm: () => doArchiveConv(id),
+    } });
+  }
+  function doArchiveConv(id) {
     API.archiveConversation(id);
     let conversations = S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: true }) : c);
     let activeId = S.activeId;
@@ -616,12 +629,7 @@
       activeId = vis.length ? vis[0].id : null;
     }
     writeHashConv(activeId);   // keep the URL in sync so a reload doesn't restore the just-archived chat
-    setState({ conversations, activeId }, focusPrompt);
-  }
-  function unarchiveConv(id, e) {
-    if (e) e.stopPropagation();
-    API.unarchiveConversation(id);
-    setState({ conversations: S.conversations.map((c) => c.id === id ? Object.assign({}, c, { archived: false }) : c) }, focusPrompt);
+    setState({ conversations, activeId, confirm: null }, focusPrompt);
   }
   function toggleArchived() {
     const showArchived = !S.showArchived;
@@ -891,6 +899,7 @@
     if (S.fileView) overlays.push(buildFileViewer());
     if (S.substrateOpen) overlays.push(buildSubstrate());
     if (S.upload) overlays.push(buildUploadModal());
+    if (S.confirm) overlays.push(buildConfirmModal());
 
     root.innerHTML = '';
     root.appendChild(layout);
@@ -928,8 +937,9 @@
       },
         h('span', { style: 'position:absolute; left:0; top:20%; bottom:20%; width:2px; border-radius:1px; background:' + (active ? ACCENT : 'transparent') + ';' }),
         h('span', { style: 'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-style:' + (c.archived ? 'italic' : 'normal') + '; color:' + (c.archived ? '#5a7088' : 'inherit') + ';' }, c.title),
+        // Archived is terminal (no restore) — show a static badge, no action.
         c.archived
-          ? h('span', { 'data-act': 'unarchive', title: 'Restore conversation', onClick: (e) => unarchiveConv(c.id, e), style: 'flex-shrink:0; width:20px; height:20px; border-radius:4px; color:#8197ad; font-size:13px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; margin-left:3px; opacity:0.85;' }, '↺')
+          ? h('span', { title: 'Archived (read-only)', style: 'flex-shrink:0; font-size:11px; line-height:1; color:#5a7088; margin-left:3px; opacity:0.75;' }, '🗄')
           : h('span', { 'data-act': 'archive', title: 'Archive conversation', onClick: (e) => archiveConv(c.id, e), style: 'flex-shrink:0; width:20px; height:20px; border-radius:4px; color:#8197ad; font-size:14px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; margin-left:3px; opacity:0.85;' }, '×')
       );
     });
@@ -1345,6 +1355,24 @@
   }
 
   // ── upload modal ─────────────────────────────────────────────────────────
+  // Generic in-app confirm dialog. S.confirm = { title, body, confirmLabel,
+  // danger, onConfirm }. Backdrop/Cancel/Escape dismiss; the confirm button is
+  // focused so Enter commits.
+  function buildConfirmModal() {
+    const c = S.confirm;
+    const close = () => setState({ confirm: null });
+    const warnIcon = '<svg viewBox="0 0 24 24" fill="none" style="width:18px;height:18px;color:' + (c.danger ? '#d67b5c' : '#c98a3e') + ';"><path d="M12 9v4M12 17h.01M10.3 3.9 2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const modal = h('div', { class: 'z-modal', onClick: (e) => e.stopPropagation(), style: 'width:min(440px,95%); display:flex; flex-direction:column; background:#1c1a18; border:1px solid #38342f; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;' },
+      h('div', { style: 'padding:15px 17px; border-bottom:1px solid #2e2b27; display:flex; align-items:center; gap:10px;' },
+        h('span', { html: warnIcon }),
+        h('div', { style: 'font-size:0.95rem; font-weight:650; color:#ece8e4;' }, c.title)),
+      h('div', { style: 'padding:15px 17px; font-size:0.85rem; line-height:1.55; color:#b8b2ac;' }, c.body),
+      h('div', { style: 'padding:11px 17px 15px; display:flex; justify-content:flex-end; gap:9px;' },
+        h('button', { onClick: close, style: 'font-size:0.78rem; color:#b8b2ac; background:#232120; border:1px solid #38342f; border-radius:8px; padding:6px 14px; cursor:pointer; font-family:inherit;' }, 'Cancel'),
+        h('button', { ref: (el) => el && setTimeout(() => el.focus(), 0), onClick: () => { if (c.onConfirm) c.onConfirm(); }, style: 'font-size:0.78rem; color:#fff; background:' + (c.danger ? '#b4462f' : ACCENT) + '; border:none; border-radius:8px; padding:6px 16px; cursor:pointer; font-family:inherit; font-weight:600;' }, c.confirmLabel || 'Confirm')));
+    return h('div', { class: 'z-modal-ov', onClick: close, onKeyDown: (e) => { if (e.key === 'Escape') close(); }, style: 'position:fixed; inset:0; z-index:470; background:rgba(0,0,0,0.62); display:flex; align-items:center; justify-content:center; padding:40px;' }, modal);
+  }
+
   function buildUploadModal() {
     const items = S.upload.items;
     const allDone = items.length && items.every((x) => x.done);
